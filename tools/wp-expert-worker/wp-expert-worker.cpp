@@ -2114,6 +2114,23 @@ public:
     }
 
     ~ExpertSlotPool() {
+        // DESTRUCTION-ORDER LANDMINE, DEFUSED EXPLICITLY.
+        //
+        // spec_batches_ is declared ABOVE slots_/slot_index_ in this class, so
+        // C++'s reverse-declaration-order teardown would destroy slots_ and
+        // slot_index_ FIRST and spec_batches_ LAST. A live (still-reading)
+        // entry's ~Batch() -> abandon_batch() -> complete_batch() drains the
+        // read and calls drain_one_read(), which looks the landed page up in
+        // slot_index_ -- a hash-map access into an already-destroyed member.
+        // Reordering the member declarations would also fix this, but doing it
+        // HERE, explicitly, matches the host_threads_ pattern right below (a
+        // resource that must be torn down before whatever it touches goes
+        // away) and needs no reader to cross-reference two distant member
+        // declarations to see why it is safe. clear() drives every live entry
+        // through the exact same abandon/complete/join/release path normal
+        // retirement uses, just earlier -- while slots_ and slot_index_ are
+        // still alive to be looked up.
+        spec_batches_.clear();
         // A landing thread outliving the pool would std::terminate on a joinable
         // thread, and it holds raw pointers into catalog pages and the staging
         // arena. Join every one of them -- possibly several now -- before
@@ -2285,17 +2302,23 @@ public:
             std::chrono::steady_clock::time_point lookup_started,
             uint32_t n_tokens = 0) {
         // Take anything the reader threads already landed -- free residency for
-        // this request, and it frees the pins. Non-blocking.
-        if (spec_batch_ && !spec_recursion_) {
+        // this request, and it frees the pins. Non-blocking. spec_any_in_flight
+        // ("is anything live"), not spec_in_flight ("at the WP_EXPERT_SPEC_MAX_
+        // INFLIGHT cap") -- this interlock must run whenever even one batch is
+        // outstanding, regardless of whether the pool has room for another.
+        if (spec_any_in_flight() && !spec_recursion_) {
             spec_recursion_ = true;
             spec_pagein_poll(false);
             // An in-flight speculative slot is not yet valid, so find_slot below
             // cannot see it and this request would issue a SECOND read of the
-            // same page. Wait for the bounded read already in flight instead.
-            if (spec_batch_) {
+            // same page. Wait for the bounded read already in flight instead --
+            // targeted at just the batch holding this page (see spec_pagein_
+            // poll's wait_for comment), so an unrelated in-flight batch cannot
+            // stall this request once WP_EXPERT_SPEC_MAX_INFLIGHT > 1.
+            if (spec_any_in_flight()) {
                 for (const ExpertPage * page : pages) {
                     if (page != nullptr && spec_in_flight_for(*page)) {
-                        spec_pagein_poll(true);
+                        spec_pagein_poll(false, page);
                         break;
                     }
                 }
@@ -2690,20 +2713,29 @@ public:
     // or a batch is still in flight).
     size_t spec_pagein_submit(const std::vector<const ExpertPage *> & pages,
                               const std::vector<uint64_t> & leases) {
-        if (pages.empty() || spec_batch_) {
-            return 0;   // one speculative batch in flight at a time
+        // WP_EXPERT_SPEC_MAX_INFLIGHT: refuse once spec_batches_ is already at
+        // capacity, same shape as the old "one speculative batch in flight at a
+        // time" refusal but against a configurable cap instead of a hardcoded 1.
+        if (pages.empty() || spec_batches_.size() >= (size_t) spec_max_inflight_) {
+            return 0;
         }
         std::vector<const ExpertPage *> cold;
         cold.reserve(pages.size());
-        spec_leases_.clear();
-        spec_leases_.reserve(pages.size());
+        std::vector<uint64_t> cold_leases;
+        cold_leases.reserve(pages.size());
         for (size_t i = 0; i < pages.size(); ++i) {
             const ExpertPage * page = pages[i];
-            if (page == nullptr || page->is_resident || find_slot(*page) != slots_.size()) {
-                continue;   // pinned resident, or already in a slot: nothing to do
+            if (page == nullptr || page->is_resident || find_slot(*page) != slots_.size() ||
+                spec_in_flight_for(*page)) {
+                // pinned resident, already in a slot, or already being read by
+                // another in-flight speculative batch: nothing to do. The last
+                // check only matters once spec_max_inflight_ > 1 -- with a
+                // single batch spec_in_flight_for can never be true here
+                // because nothing else could be in flight to submit against.
+                continue;
             }
             cold.push_back(page);
-            spec_leases_.push_back(i < leases.size() ? leases[i] : spec_lease_);
+            cold_leases.push_back(i < leases.size() ? leases[i] : spec_lease_);
         }
         if (cold.empty()) {
             return 0;
@@ -2723,31 +2755,32 @@ public:
             }
             if (cold.size() > budget) {
                 cold.resize(budget);
-                spec_leases_.resize(budget);
+                cold_leases.resize(budget);
             }
         }
+        SpecBatch entry;
         try {
             // measure=false: a speculative read's cost belongs to the spec
             // counters, not to a request's phase timers. Mixing them would make
             // ns_read on the dispatch path stop meaning "time this request spent
             // reading".
-            spec_batch_ = std::make_unique<Batch>(ensure_batch(cold, false, {}));
+            entry.batch = std::make_unique<Batch>(ensure_batch(cold, false, {}));
             // Safe to set after the fact: reads land on reader threads, but the
             // flag is only consulted by drain_one_read, which runs exclusively
             // on THIS thread and cannot run before submit returns.
-            spec_batch_->state_->speculative = true;
-            if (spec_batch_->copy_event_ != nullptr) {
-                ggml_backend_event_free(spec_batch_->copy_event_);
-                spec_batch_->copy_event_ = nullptr;
+            entry.batch->state_->speculative = true;
+            if (entry.batch->copy_event_ != nullptr) {
+                ggml_backend_event_free(entry.batch->copy_event_);
+                entry.batch->copy_event_ = nullptr;
             }
         } catch (const std::exception &) {
             // Advisory: a failed speculative read must not fail the worker. The
             // same error will surface on the demand path, where it belongs.
             ++spec_errors_;
-            spec_batch_.reset();
             return 0;
         }
-        spec_inflight_ = std::move(cold);
+        entry.inflight = std::move(cold);
+        entry.leases   = std::move(cold_leases);
         // LOG AT SUBMIT, NOT AT HARVEST. The read is issued here, so this is when
         // the cost is paid and when the position in the stream is meaningful.
         // Logging at harvest inverts the order against R: an async batch can be
@@ -2756,15 +2789,32 @@ public:
         // next R -- then cannot credit the page to the request that used it. That
         // alone moved USED from 686 to 424 with no change in behaviour.
         if (spec_log_ != nullptr) {
-            for (const ExpertPage * page : spec_inflight_) {
+            for (const ExpertPage * page : entry.inflight) {
                 fprintf(spec_log_, "S %d %d\n", page->layer, page->expert);
             }
             fflush(spec_log_);
         }
-        return spec_inflight_.size();
+        const size_t n = entry.inflight.size();
+        spec_batches_.push_back(std::move(entry));
+        return n;
     }
 
-    bool spec_in_flight() const { return spec_batch_ != nullptr; }
+    // AT CAPACITY, not "any batch live" -- this is the pump gate
+    // (spec_pagein_step) and the submit-availability check (has_spec_submit_
+    // work). Callers that mean "is there ANY speculative work outstanding"
+    // (the demand-path interlock in ensure_batch, the prefill-gate harvest,
+    // has_spec_work) must use spec_any_in_flight() instead -- see its comment
+    // for why the two are NOT the same once WP_EXPERT_SPEC_MAX_INFLIGHT > 1.
+    bool spec_in_flight() const {
+        return spec_batches_.size() >= (size_t) spec_max_inflight_;
+    }
+
+    // ANY speculative batch live, regardless of the WP_EXPERT_SPEC_MAX_INFLIGHT
+    // cap. At the default cap of 1 this is identical to spec_in_flight(); once
+    // the cap is raised they diverge -- e.g. 1 of 4 slots occupied is "not at
+    // capacity" (spec_in_flight()==false, keep submitting) but still "work
+    // outstanding" (spec_any_in_flight()==true, keep polling/waiting on it).
+    bool spec_any_in_flight() const { return !spec_batches_.empty(); }
 
     // Is there anywhere for a predicted page to land? Without the host tier the
     // answer is no and the caller must keep it on the VRAM path.
@@ -2975,46 +3025,83 @@ public:
 
     // Is `page` currently being read speculatively? The demand path has to ask,
     // because an in-flight slot is not yet valid, so find_slot cannot see it and
-    // the request would issue a SECOND read of the same page.
+    // the request would issue a SECOND read of the same page. Searches every
+    // live batch -- with WP_EXPERT_SPEC_MAX_INFLIGHT > 1 the page could be in
+    // any of them, not just "the" batch.
     bool spec_in_flight_for(const ExpertPage & page) const {
-        for (const ExpertPage * p : spec_inflight_) {
-            if (p->layer == page.layer && p->expert == page.expert) {
-                return true;
+        for (const SpecBatch & entry : spec_batches_) {
+            for (const ExpertPage * p : entry.inflight) {
+                if (p->layer == page.layer && p->expert == page.expert) {
+                    return true;
+                }
             }
         }
         return false;
     }
 
-    // Harvest whatever has landed, WITHOUT BLOCKING. Returns true when the batch
-    // finished and was retired. Safe to call from the idle pump and from the
-    // dispatch path; both run on the dispatch thread, which is required because
-    // drain_one_read performs the H2D upload and Vulkan command pools have
-    // thread affinity.
-    bool spec_pagein_poll(bool block) {
-        if (!spec_batch_) {
-            return false;
-        }
-        Batch & batch = *spec_batch_;
-        while (batch.received_ < batch.state_->pageins.size()) {
-            if (!block) {
-                std::lock_guard<std::mutex> lock(batch.state_->mutex);
-                if (batch.state_->ready.empty()) {
-                    return false;   // still in flight; come back later
+    // Harvest whatever has landed, WITHOUT BLOCKING BY DEFAULT. Walks every
+    // live batch (not just "the" one) and retires whichever have fully landed.
+    // Returns true if at least one batch finished and was retired. Safe to
+    // call from the idle pump and from the dispatch path; both run on the
+    // dispatch thread, which is required because drain_one_read performs the
+    // H2D upload and Vulkan command pools have thread affinity.
+    //
+    // `wait_for`, when non-null, force-drains (blocks on) only the ONE batch
+    // -- if any -- that is reading that specific page; every OTHER live batch
+    // is still polled non-blockingly. This is what lets the demand-path
+    // interlock in ensure_batch wait for the read it actually needs without
+    // stalling on unrelated in-flight batches once WP_EXPERT_SPEC_MAX_INFLIGHT
+    // > 1 (at the default cap of 1 there is at most one batch to begin with,
+    // so this is byte-identical to the old single-batch blocking wait).
+    bool spec_pagein_poll(bool block, const ExpertPage * wait_for = nullptr) {
+        bool did_work = false;
+        for (size_t i = 0; i < spec_batches_.size(); ) {
+            SpecBatch & entry = spec_batches_[i];
+            bool must_block = block;
+            if (!must_block && wait_for != nullptr) {
+                for (const ExpertPage * p : entry.inflight) {
+                    if (p->layer == wait_for->layer && p->expert == wait_for->expert) {
+                        must_block = true;
+                        break;
+                    }
                 }
             }
-            drain_one_read(batch);
+            Batch & batch = *entry.batch;
+            bool landed = true;
+            while (batch.received_ < batch.state_->pageins.size()) {
+                if (!must_block) {
+                    std::lock_guard<std::mutex> lock(batch.state_->mutex);
+                    if (batch.state_->ready.empty()) {
+                        landed = false;   // still in flight; come back later
+                        break;
+                    }
+                }
+                drain_one_read(batch);
+            }
+            if (landed) {
+                retire_spec_batch(i);   // erases spec_batches_[i]; do not advance i
+                did_work = true;
+            } else {
+                ++i;
+            }
         }
-        retire_spec_batch();
-        return true;
+        return did_work;
     }
 
-    // Called when a demand request needs a page this batch is reading. Bounded:
+    // Called when a demand request needs a page some batch is reading. Bounded:
     // at most WP_EXPERT_SPEC_CHUNK pages, and the read is already in flight.
     void spec_pagein_finish() { spec_pagein_poll(true); }
 
 private:
-    void retire_spec_batch() {
-        Batch & batch = *spec_batch_;
+    // Retires spec_batches_[i]: joins its reads, stamps the landed slots, frees
+    // its pins, and erases it from the live list. `i` must be a valid index;
+    // every submitted batch reaches this exactly once, either here or via the
+    // catch below -- no path leaves a completed batch unretired (see the
+    // free_q=0 / orphaned-Done comment elsewhere in this file for why that
+    // invariant matters).
+    void retire_spec_batch(size_t i) {
+        SpecBatch & entry = spec_batches_[i];
+        Batch & batch = *entry.batch;
         uint64_t n_read = 0;
         try {
             complete_batch(batch);
@@ -3027,19 +3114,19 @@ private:
             // is_resident() here would silently skip exactly the pages this path
             // exists to stamp, leaving every speculative page with a FRESH tick
             // and reintroducing the pollution the stale tick prevents.
-            for (size_t i = 0; i < spec_inflight_.size(); ++i) {
-                const size_t slot_index = batch.slot_index(i);
+            for (size_t j = 0; j < entry.inflight.size(); ++j) {
+                const size_t slot_index = batch.slot_index(j);
                 if (slot_index >= slots_.size()) {
                     continue;
                 }
                 Slot & slot = slots_[slot_index];
                 if (slot.valid &&
-                    slot.key == std::pair<int, int>(spec_inflight_[i]->layer,
-                                                    spec_inflight_[i]->expert)) {
+                    slot.key == std::pair<int, int>(entry.inflight[j]->layer,
+                                                    entry.inflight[j]->expert)) {
                     slot.tick        = ++spec_tick_;
                     slot.uses        = 0;
                     slot.lease_until = evictions_ +
-                        (i < spec_leases_.size() ? spec_leases_[i] : spec_lease_);
+                        (j < entry.leases.size() ? entry.leases[j] : spec_lease_);
                     // This landed page has not been touched by any demand
                     // request yet -- mark it unconfirmed-speculative for
                     // WP_EXPERT_SPEC_MAX_SLOTS. Guarded on !spec_pending so a
@@ -3055,8 +3142,7 @@ private:
         }
         spec_pageins_ += n_read;
         release_pins(batch);
-        spec_batch_.reset();
-        spec_inflight_.clear();
+        spec_batches_.erase(spec_batches_.begin() + (ptrdiff_t) i);
     }
 
 public:
@@ -3067,6 +3153,12 @@ public:
     // submission was blocked or shrunk by it.
     size_t   n_spec_pending()     const { return n_spec_pending_; }
     uint64_t spec_blocked_budget() const { return spec_blocked_budget_; }
+    // Live in-flight speculative BATCH count and the WP_EXPERT_SPEC_MAX_INFLIGHT
+    // cap it is checked against -- surfaced on the WP_HINT_LOG counter line
+    // (spec_inflight[live/cap]) so a run proves its own configuration rather
+    // than requiring the operator to trust an env var was read correctly.
+    size_t   spec_inflight_live() const { return spec_batches_.size(); }
+    size_t   spec_inflight_cap()  const { return (size_t) spec_max_inflight_; }
 
     // BORROWED, NOT OWNED -- the Worker opens WP_HINT_LOG and outlives the pool.
     //
@@ -4112,12 +4204,37 @@ private:
     // because WP_EXPERT_SPEC_MAX_SLOTS was already spent. Surfaced on the
     // WP_HINT_LOG counter line so the cap binding is visible.
     uint64_t                    spec_blocked_budget_ = 0;
-    // The one speculative batch that may be in flight. Holding the Batch holds
-    // its slot pins, which is what stops an in-flight read's slot from being
-    // recycled underneath it.
-    std::unique_ptr<Batch>          spec_batch_;
-    std::vector<const ExpertPage *> spec_inflight_;
-    std::vector<uint64_t>           spec_leases_;
+    // WP_EXPERT_SPEC_MAX_INFLIGHT -- how many speculative page-in BATCHES may be
+    // in flight at once, i.e. the size of spec_batches_ the pump gate allows.
+    // MEASURED 2026-08-19: with the old hard cap of one, the pump logged
+    // pump[.../vbusy/.../vsubmit]=2494007/.../2484065/.../1441 -- 2,484,065
+    // pump calls found the single spec_batch_ occupied and could only harvest,
+    // against 1,441 real submits, while spec_queue_left sat at 51 the entire
+    // run. Every prefetch tuning knob (WP_HINT_ROUTER2_K/CONF/PAGES,
+    // WP_HINT_REUSE_PAGES, WP_EXPERT_SPEC_MAX_SLOTS) changes how many hints get
+    // QUEUED, but with the queue draining at one SPEC_CHUNK-sized batch per
+    // completion, none of those knobs could move measured throughput -- K=3/7/15
+    // and conf=0.4/0.75/0.8 all landed at the identical 2.686-2.697 t/s. Parsed
+    // exactly like WP_EXPERT_SPEC_MAX_SLOTS: a positive integer, absent/empty/
+    // <=0 means 1 -- so the default build is byte-identical in behaviour to
+    // today (one batch in flight, submit-drain-submit).
+    const long                 spec_max_inflight_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 1;
+        return v > 0 ? v : 1;
+    }();
+    // One entry per in-flight speculative BATCH: the Batch itself (holding its
+    // slot pins, which is what stops an in-flight read's slot from being
+    // recycled underneath it), the pages it is reading, and their leases --
+    // parallel to `batch`, same indexing as spec_pagein_submit built `cold`.
+    // Capped at spec_max_inflight_ elements; spec_pagein_submit refuses to grow
+    // it past that, same shape as the old "one batch at a time" refusal.
+    struct SpecBatch {
+        std::unique_ptr<Batch>          batch;
+        std::vector<const ExpertPage *> inflight;
+        std::vector<uint64_t>           leases;
+    };
+    std::vector<SpecBatch>          spec_batches_;
     // WP_EXPERT_SPEC_HOST_THREADS -- concurrent host-landing reader threads.
     // Default 1 = today's EXACT behaviour: submit one page -> read it -> reap
     // -> submit the next page, one landing thread at a time.
@@ -4687,7 +4804,10 @@ public:
         if (spec_prefill_gate_active_) {
             ++pump_gated_;
             // Prefill gate: harvest what is in flight, submit nothing new.
-            if (harvest && pool_.spec_in_flight()) {
+            // spec_any_in_flight, not spec_in_flight -- gated harvest must drain
+            // every live batch, not only fire once the pool is at the
+            // WP_EXPERT_SPEC_MAX_INFLIGHT cap.
+            if (harvest && pool_.spec_any_in_flight()) {
                 return pool_.spec_pagein_poll(false);
             }
             return false;
@@ -4718,6 +4838,15 @@ public:
             // the pipeline being busy.
             ++pump_host_filtered_;
         }
+        // spec_in_flight() is the AT-CAPACITY gate (spec_batches_.size() >=
+        // WP_EXPERT_SPEC_MAX_INFLIGHT), deliberately -- with more than one
+        // in-flight batch allowed, "busy" must mean "no room for another
+        // submission", not "something is outstanding" (that's
+        // spec_any_in_flight, used above for the gated-harvest branch and
+        // below in has_spec_work). At the default cap of 1 the two conditions
+        // coincide and this is byte-identical to today's pump gate --
+        // pump_vram_busy_ still increments exactly once per pump call that
+        // finds the pool full, whether "full" means one batch or N.
         if (pool_.spec_in_flight()) {
             ++pump_vram_busy_;
             return harvest ? pool_.spec_pagein_poll(false) : false;
@@ -4744,7 +4873,7 @@ public:
     // must keep spinning to harvest it even when the queue is empty.
     bool has_spec_work() const {
         return !spec_queue_.empty() || !host_queue_.empty() ||
-               pool_.spec_in_flight() || pool_.spec_host_in_flight();
+               pool_.spec_any_in_flight() || pool_.spec_host_in_flight();
     }
 
     // Something to SUBMIT right now, as opposed to something in flight. Only the
@@ -4755,6 +4884,9 @@ public:
         if (spec_prefill_gate_active_) {
             return false;   // gated: nothing may be submitted, so do not spin
         }
+        // !pool_.spec_in_flight() here means "not at the WP_EXPERT_SPEC_MAX_
+        // INFLIGHT cap", i.e. there is room to submit -- the same capacity
+        // sense spec_pagein_step's pump gate uses, not spec_any_in_flight.
         return (!spec_queue_.empty() && !pool_.spec_in_flight()) ||
                (!host_queue_.empty() && !pool_.spec_host_busy());
     }
@@ -4775,7 +4907,8 @@ public:
                       "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu "
                       "spec_cap[pending/blocked_budget]=%zu/%llu "
                       "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit]="
-                      "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu",
+                      "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+                      "spec_inflight[live/cap]=%zu/%zu",
                       (unsigned long long) hint_frames_,
                       (unsigned long long) hint_experts_,
                       (unsigned long long) hint_foreign_layer_,
@@ -4806,7 +4939,9 @@ public:
                       (unsigned long long) pump_host_filtered_,
                       (unsigned long long) pump_vram_busy_,
                       (unsigned long long) pump_vram_empty_,
-                      (unsigned long long) pump_vram_submit_);
+                      (unsigned long long) pump_vram_submit_,
+                      pool_.spec_inflight_live(),
+                      pool_.spec_inflight_cap());
         return buf;
     }
 
@@ -5503,18 +5638,23 @@ private:
     // min(WP_EXPERT_READ_WORKERS, staging_.buffer_count()) FOR EVERY CALLER,
     // demand or spec-VRAM alike (see the s_read_workers comment ~30 lines
     // above ensure_batch's read_worker spawn loop), and spec_pagein_submit
-    // refuses to start a second spec-VRAM batch while one is already in
-    // flight (spec_batch_ != nullptr in spec_pagein_submit). So the worst
-    // case this flag can produce is exactly the one host_thread_cap_'s own
-    // comment already derives with numbers: one demand batch (<=4 readers by
-    // default) plus one spec-VRAM batch (<=4 readers by default) concurrently
-    // = <=8 of the pool's default 16 buffers, with host landings capped
-    // separately at buffer_count()/2. This flag does not raise that ceiling;
-    // it only makes the two batches overlap in time far more often than they
-    // used to (previously the timing rarely lined up). StagingPool::borrow()
-    // was already proven sound for exactly that overlap: no borrower holds a
+    // refuses to start another spec-VRAM batch once spec_batches_ is already
+    // at WP_EXPERT_SPEC_MAX_INFLIGHT (default 1, i.e. exactly the old "one
+    // batch at a time" refusal). So the worst case this flag can produce is
+    // exactly the one host_thread_cap_'s own comment already derives with
+    // numbers AT THE DEFAULT CAP: one demand batch (<=4 readers by default)
+    // plus one spec-VRAM batch (<=4 readers by default) concurrently = <=8 of
+    // the pool's default 16 buffers, with host landings capped separately at
+    // buffer_count()/2. Raising WP_EXPERT_SPEC_MAX_INFLIGHT scales the
+    // spec-VRAM side of that bound linearly -- N batches of <=4 readers each
+    // -- so an operator who raises it should also mind staging_.buffer_count()
+    // headroom; this flag itself does not raise the per-batch reader cap, it
+    // only makes batches overlap in time far more often than they used to
+    // (previously the timing rarely lined up). StagingPool::borrow() was
+    // already proven sound for exactly that overlap: no borrower holds a
     // lease while waiting on a second, so a blocked borrow always has a
-    // draining page ahead of it and cannot deadlock.
+    // draining page ahead of it and cannot deadlock, no matter how many
+    // spec-VRAM batches are concurrently borrowing.
     //
     // *** WHY dispatch() AND NOT serve_connection(). ***
     // finish_split_dispatch() (the BEGIN/ACTS split path) calls this same

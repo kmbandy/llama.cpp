@@ -1607,6 +1607,163 @@ void test_prefetch_hint_without_spec_reads_nothing() {
     require(server_result == 0, "worker returned failure after ignored hints");
 }
 
+// WP_EXPERT_SPEC_MAX_INFLIGHT: the pump gate that used to hard-serialize the
+// speculative page-in path to one batch at a time is now configurable. This
+// pins two things: (a) the DEFAULT (the env var unset) is byte-identical to
+// the old behaviour -- reads never overlap -- and (b) raising the cap to N
+// really does let N batches read concurrently, not just N pages queued that
+// still drain one at a time.
+//
+// Concurrency is proven with a gate hook, not a timing guess: read_started
+// blocks (up to a short bound) until `target` reads are simultaneously
+// inside it. If the implementation only ever has one batch in flight, the
+// second read_started call can never fire while the first is still blocked
+// there, so peak is pinned at 1 by construction, not by luck. The bound is
+// short (not the unbounded wait a real deadlock-detector would use) because
+// a hook that fails to unblock only means the test's own assertion on `peak`
+// fails afterward -- read_started's caller already wraps this in a try/catch
+// (see read_worker), so timing out here can never crash the test binary.
+struct ConcurrencyGate {
+    std::mutex              mutex;
+    std::condition_variable cv;
+    int                     current        = 0;
+    int                     peak           = 0;
+    int                     barrier_target = 0;
+    std::chrono::milliseconds wait_limit{400};
+    wp_expert_worker::TestHooks hooks;
+
+    ConcurrencyGate() {
+        hooks.read_started = [this](int, int) {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++current;
+            peak = std::max(peak, current);
+            cv.notify_all();
+            if (barrier_target > 0) {
+                // No throw on timeout, unlike IoTracker's barrier: this test
+                // reads `peak` afterward instead of treating "did not reach
+                // the target" as itself the failure, so a plain timeout here
+                // must be harmless, not fatal.
+                cv.wait_for(lock, wait_limit,
+                            [&]() { return peak >= barrier_target; });
+            }
+        };
+        hooks.read_finished = [this](int, int) {
+            std::lock_guard<std::mutex> lock(mutex);
+            --current;
+            cv.notify_all();
+        };
+    }
+
+    int peak_reads() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return peak;
+    }
+};
+
+void test_spec_max_inflight(const char * env_value, int hinted_experts,
+                            int barrier_target, int expected_peak,
+                            const char * failure_message) {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_EXPERT_SPEC_CHUNK", "1", 1) == 0,
+            "failed to pin the spec chunk to one page per submit");
+    if (env_value != nullptr) {
+        require(setenv("WP_EXPERT_SPEC_MAX_INFLIGHT", env_value, 1) == 0,
+                "failed to set WP_EXPERT_SPEC_MAX_INFLIGHT");
+    } else {
+        unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");   // exercise the true default
+    }
+
+    ConcurrencyGate gate;
+    gate.barrier_target = barrier_target;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;   // floor for this fixture -- see the note above
+    // Each in-flight read holds a staging buffer for its duration (see
+    // StagingPool::borrow() in read_worker) -- the staging pool, not
+    // WP_EXPERT_SPEC_MAX_INFLIGHT, would otherwise be the concurrency ceiling
+    // actually being measured. Size it to comfortably clear barrier_target so
+    // this test proves the BATCH cap, not an unrelated buffer shortage.
+    options.host_budget_bytes = (uint64_t) (barrier_target + 1) * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &gate.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        std::vector<int32_t> experts;
+        for (int32_t e = 0; e < hinted_experts; ++e) {
+            experts.push_back(e);
+        }
+        pipe_expert_prefetch_hint frame;
+        frame.layer      = LAYER;
+        frame.provenance = PIPE_HINT_CERTAIN;
+        frame.expert_ids = experts;
+        payload = pipe_encode_expert_prefetch_hint(frame);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0, payload.data(), payload.size()),
+                "failed to send prefetch hint");
+
+        // Give the idle pump real time to run: it only fires between pipe
+        // frames (see await_request), so there is nothing to block on here --
+        // the gate itself is what makes this deterministic rather than the
+        // sleep. The sleep only needs to outlast wait_limit plus however many
+        // pump ticks it takes to submit `hinted_experts` one-page batches.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_EXPERT_SPEC_CHUNK");
+        unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    require(unsetenv("WP_EXPERT_SPEC_PAGEIN") == 0, "failed to disarm speculative page-in");
+    require(unsetenv("WP_EXPERT_SPEC_CHUNK") == 0, "failed to clear the spec chunk override");
+    require(unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT") == 0,
+            "failed to clear WP_EXPERT_SPEC_MAX_INFLIGHT");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "spec-max-inflight worker returned failure");
+    require(gate.peak_reads() == expected_peak, failure_message);
+}
+
 } // namespace
 
 static void test_scatter_compact_rows_matches_get_rows_back() {
@@ -1964,6 +2121,16 @@ int main() {
         test_predicted_hint_lands_in_host_ram();
         test_prefetch_spec_pagein_and_eviction_order("0");
         test_prefetch_spec_pagein_and_eviction_order("64");
+        test_spec_max_inflight(
+            /*env_value=*/ nullptr, /*hinted_experts=*/ 2, /*barrier_target=*/ 2,
+            /*expected_peak=*/ 1,
+            "WP_EXPERT_SPEC_MAX_INFLIGHT default did not serialize speculative "
+            "batches to one at a time");
+        test_spec_max_inflight(
+            /*env_value=*/ "3", /*hinted_experts=*/ 3, /*barrier_target=*/ 3,
+            /*expected_peak=*/ 3,
+            "WP_EXPERT_SPEC_MAX_INFLIGHT=3 did not allow three speculative "
+            "batches to read concurrently");
         test_stripe_min_part_restores_overlap_byte_identical();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
