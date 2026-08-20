@@ -943,6 +943,117 @@ void test_prefetch_hint_suppresses_unchanged_repeats() {
     require(unsetenv("WP_PREFETCH_HINT") == 0, "failed to disable prefetch hints");
 }
 
+// Last-token reuse: the experts a layer just dispatched are offered as PREDICTED
+// for the next decode. Default OFF (3.147 config of record). Armed, a note+flush
+// sends one frame; an identical flush is suppressed; a prefill-width note does
+// not overwrite a decode stash.
+void test_prefetch_hint_reuses_last_dispatched_experts() {
+    require(setenv("WP_DISPATCH_STATIC_ASSIGN", "1", 1) == 0, "failed to force static assignment");
+    require(setenv("WP_PREFETCH_HINT", "1", 1) == 0, "failed to enable prefetch hints");
+    require(unsetenv("WP_HINT_REUSE_LAST") == 0, "failed to clear reuse flag");
+
+    selection_server worker(0, 0, 150, 150);
+    {
+        pipe_expert_dispatcher::graph_dispatcher dispatcher(
+            "127.0.0.1:" + std::to_string(worker.port),
+            N_EMBD, N_FF_EXP, /*n_expert=*/151, /*n_expert_used=*/151);
+
+        std::vector<pipe_expert_assignment> assignments;
+        for (int32_t id : { 4, 9, 40 }) {
+            pipe_expert_assignment a;
+            a.expert_id = id;
+            a.weights   = { 1.0f };
+            assignments.push_back(std::move(a));
+        }
+
+        dispatcher.note_dispatched_experts(LAYER, assignments, /*n_tokens=*/1);
+        require(dispatcher.flush_reuse_hints() == 0,
+                "reuse flushed a frame with WP_HINT_REUSE_LAST unset");
+    }
+    worker.finish();
+    require(worker.hint_frames == 0, "reuse sent a frame while the flag was off");
+
+    require(setenv("WP_HINT_REUSE_LAST", "1", 1) == 0, "failed to enable reuse");
+    selection_server worker2(0, 0, 150, 150);
+    {
+        pipe_expert_dispatcher::graph_dispatcher dispatcher(
+            "127.0.0.1:" + std::to_string(worker2.port),
+            N_EMBD, N_FF_EXP, /*n_expert=*/151, /*n_expert_used=*/151);
+
+        std::vector<pipe_expert_assignment> assignments;
+        for (int32_t id : { 4, 9, 40 }) {
+            pipe_expert_assignment a;
+            a.expert_id = id;
+            a.weights   = { 1.0f };
+            assignments.push_back(std::move(a));
+        }
+
+        dispatcher.note_dispatched_experts(LAYER, assignments, /*n_tokens=*/1);
+        require(dispatcher.flush_reuse_hints() == 1, "first reuse flush did not send");
+        require(dispatcher.flush_reuse_hints() == 0, "identical reuse flush was re-sent");
+
+        // Prefill-width note must not clobber the decode stash (and must not
+        // itself be recorded).
+        std::vector<pipe_expert_assignment> prefill = assignments;
+        dispatcher.note_dispatched_experts(LAYER, prefill, /*n_tokens=*/64);
+        require(dispatcher.flush_reuse_hints() == 0,
+                "a prefill-width note replaced the decode reuse set");
+
+        dispatcher.clear_reuse_hints();
+        require(dispatcher.flush_reuse_hints() == 0, "clear_reuse_hints left a frame to send");
+    }
+    worker2.finish();
+    require(worker2.hint_frames == 1, "worker did not receive exactly one reuse frame");
+    require((worker2.hinted_experts == std::vector<int32_t>{ 4, 9, 40 }),
+            "reuse frame did not carry the dispatched expert ids");
+
+    // Hash layers are skipped: tid2eid is exact, reuse must not compete with it.
+    selection_server worker3(0, 0, 150, 150);
+    {
+        pipe_expert_dispatcher::graph_dispatcher dispatcher(
+            "127.0.0.1:" + std::to_string(worker3.port),
+            N_EMBD, N_FF_EXP, /*n_expert=*/151, /*n_expert_used=*/151);
+        static const int32_t table[] = { 4, 9 };
+        dispatcher.register_hash_layer(LAYER, /*n_expert_used=*/2, /*n_vocab=*/1, table);
+        std::vector<pipe_expert_assignment> assignments;
+        for (int32_t id : { 4, 9, 40 }) {
+            pipe_expert_assignment a;
+            a.expert_id = id;
+            a.weights   = { 1.0f };
+            assignments.push_back(std::move(a));
+        }
+        dispatcher.note_dispatched_experts(LAYER, assignments, /*n_tokens=*/1);
+        require(dispatcher.flush_reuse_hints() == 0,
+                "reuse offered a hash layer the tid2eid path already owns");
+    }
+    worker3.finish();
+    require(worker3.hint_frames == 0, "a hash-layer reuse frame reached the worker");
+
+    // Page budget is all-or-nothing per layer: 3 ids with budget 2 send nothing.
+    require(setenv("WP_HINT_REUSE_PAGES", "2", 1) == 0, "failed to set reuse page budget");
+    selection_server worker4(0, 0, 150, 150);
+    {
+        pipe_expert_dispatcher::graph_dispatcher dispatcher(
+            "127.0.0.1:" + std::to_string(worker4.port),
+            N_EMBD, N_FF_EXP, /*n_expert=*/151, /*n_expert_used=*/151);
+        std::vector<pipe_expert_assignment> assignments;
+        for (int32_t id : { 4, 9, 40 }) {
+            pipe_expert_assignment a;
+            a.expert_id = id;
+            a.weights   = { 1.0f };
+            assignments.push_back(std::move(a));
+        }
+        dispatcher.note_dispatched_experts(LAYER, assignments, /*n_tokens=*/1);
+        require(dispatcher.flush_reuse_hints() == 0,
+                "reuse split a layer to fit the page budget");
+    }
+    worker4.finish();
+    require(worker4.hint_frames == 0, "a over-budget reuse frame reached the worker");
+    require(unsetenv("WP_HINT_REUSE_PAGES") == 0, "failed to clear reuse page budget");
+    require(unsetenv("WP_HINT_REUSE_LAST") == 0, "failed to disable reuse");
+    require(unsetenv("WP_PREFETCH_HINT") == 0, "failed to disable prefetch hints");
+}
+
 // With WP_DISPATCH_STATIC_ASSIGN=0 the worker choice depends on live residency
 // and a rotating cursor, none of which exist at hint time. A guess would cost a
 // wasted read AND leave the real worker cold, so the hint declines outright.
@@ -1571,7 +1682,8 @@ void run_test() {
     test_prefetch_hint_never_duplicates_across_sharing_workers();
     test_prefetch_hint_declines_when_choice_is_unpredictable();
     test_prefetch_hint_suppresses_unchanged_repeats();
-    std::cout << "prefetch hint: routing, no-duplication, decline and dedup checks passed\n";
+    test_prefetch_hint_reuses_last_dispatched_experts();
+    std::cout << "prefetch hint: routing, no-duplication, decline, dedup and reuse-last checks passed\n";
     require(unsetenv("WP_DISPATCH_SPEED_SPLIT") == 0, "failed to disable speed-aware dispatch");
     temp_dir      temp;
     weight_map    weights;

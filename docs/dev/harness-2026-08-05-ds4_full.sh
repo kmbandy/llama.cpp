@@ -390,6 +390,10 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # than assignment order. Byte-identical (slots pre-assigned, compute order is
 # assignment order); targets prefill's ~31 page-ins/batch seek pattern.
 [ -n "${OFFSET_SORT:-}" ] && WPOST="$WPOST WP_EXPERT_OFFSET_SORT=$OFFSET_SORT"
+# LAYER_AHEAD=1 -- during prefill, spec-page the NEXT layer's full catalog in
+# (blob, offset) order while THIS layer computes. Not a guess: prefill union
+# is ~98.6%. Bypasses PREFILL_GATE and the 64-deep hint queue.
+[ -n "${LAYER_AHEAD:-}" ] && WPOST="$WPOST WP_PREFILL_LAYER_AHEAD=$LAYER_AHEAD"
 # ASYNC_H2D=1 -- issue staging->VRAM stripe copies with tensor_set_async on the
 # compute stream; staging reuse is fenced by per-buffer backend events at
 # borrow(). Backends without events (Vulkan today) log async_h2d=off and keep

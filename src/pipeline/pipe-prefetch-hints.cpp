@@ -126,42 +126,81 @@ std::vector<int32_t> router2_top_experts(const float * weights,
         return {};
     }
 
-    // TWO pooled quantities, and they are NOT interchangeable.
-    //
-    // `pooled` is DS4's actual selection score, sqrt(softplus(logit)) + bias --
-    // that is what the model ranks by, so it is what the hint ranks by.
-    //
-    // `pooled_logit` is the RAW logit, and it is what the confidence gate needs.
-    // Softmaxing the selection score does not work: sqrt(softplus(.)) compresses
-    // logits of +-5 into roughly 0.08..2.24, so across 256 experts the largest
-    // achievable share is ~0.05 and ANY floor at or above that rejects every
-    // expert on every layer. Measured 2026-08-19 before this fix: floors of
-    // 0.10, 0.5 and 0.8 all produced identical hint volume, because router2 was
-    // emitting nothing at all and the traffic seen was the unrelated hash-layer
-    // hints. Raw logits keep their exponential spread, which is what makes a
-    // softmax share meaningful and comparable across layers -- and it is the
-    // quantity the whole-expert pager gates on (wp-router-predictor.cpp).
-    std::vector<double> pooled((size_t) n_expert, -std::numeric_limits<double>::infinity());
-    std::vector<double> pooled_logit((size_t) n_expert, -std::numeric_limits<double>::infinity());
+    top_m = std::min(top_m, n_expert);
+    std::vector<int> hits((size_t) n_expert, 0);
+    double           best_p = 0.0;
+    std::vector<double> logits((size_t) n_expert);
+    std::vector<double> scores((size_t) n_expert);
+    std::vector<int32_t> order((size_t) n_expert);
     for (int64_t token = 0; token < n_tokens; ++token) {
         const float * h = activations + (size_t) token * (size_t) n_embd;
+        double        max_logit = -std::numeric_limits<double>::infinity();
         for (int32_t expert = 0; expert < n_expert; ++expert) {
-            const float * row    = weights + (size_t) expert * (size_t) n_embd;
-            float         logits = 0.0f;
-            for (int32_t i = 0; i < n_embd; ++i) {
-                logits += h[i] * row[i];
+            const float * row = weights + (size_t) expert * (size_t) n_embd;
+            float         d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            int32_t       i  = 0;
+            for (; i + 3 < n_embd; i += 4) {
+                d0 += h[i]     * row[i];
+                d1 += h[i + 1] * row[i + 1];
+                d2 += h[i + 2] * row[i + 2];
+                d3 += h[i + 3] * row[i + 3];
             }
-            const float  softplus   = std::max(logits, 0.0f) + std::log1p(std::exp(-std::fabs(logits)));
-            const double score      = (double) std::sqrt(softplus) + (double) bias[expert];
-            pooled[(size_t) expert] = std::max(pooled[(size_t) expert], score);
-            pooled_logit[(size_t) expert] =
-                std::max(pooled_logit[(size_t) expert], (double) logits);
+            float dot = d0 + d1 + d2 + d3;
+            for (; i < n_embd; ++i) {
+                dot += h[i] * row[i];
+            }
+            logits[(size_t) expert] = (double) dot;
+            const float softplus =
+                std::max(dot, 0.0f) + std::log1p(std::exp(-std::fabs(dot)));
+            scores[(size_t) expert] = (double) std::sqrt(softplus) + (double) bias[expert];
+            order[(size_t) expert]  = expert;
+            max_logit = std::max(max_logit, logits[(size_t) expert]);
+        }
+        double denom = 0.0;
+        for (int32_t expert = 0; expert < n_expert; ++expert) {
+            denom += std::exp(logits[(size_t) expert] - max_logit);
+        }
+        if (!(denom > 0.0)) {
+            denom = 1.0;
+        }
+        for (int32_t expert = 0; expert < n_expert; ++expert) {
+            best_p = std::max(best_p,
+                              std::exp(logits[(size_t) expert] - max_logit) / denom);
+        }
+        std::partial_sort(order.begin(), order.begin() + top_m, order.end(),
+                          [&scores](int32_t a, int32_t b) {
+                              if (scores[(size_t) a] != scores[(size_t) b]) {
+                                  return scores[(size_t) a] > scores[(size_t) b];
+                              }
+                              return a < b;
+                          });
+        for (int32_t i = 0; i < top_m; ++i) {
+            ++hits[(size_t) order[(size_t) i]];
         }
     }
-    if (min_conf > 0.0f) {
-        return rank_top_gated(pooled, pooled_logit, top_m, min_conf);
+    if (min_conf > 0.0f && best_p < (double) min_conf) {
+        return {};
     }
-    return rank_top(pooled, top_m);
+    std::vector<int32_t> kept;
+    kept.reserve((size_t) n_expert);
+    for (int32_t expert = 0; expert < n_expert; ++expert) {
+        if (hits[(size_t) expert] > 0) {
+            kept.push_back(expert);
+        }
+    }
+    if (kept.size() > (size_t) PREFETCH_HINT_MAX_EXPERTS) {
+        std::nth_element(kept.begin(),
+                         kept.begin() + PREFETCH_HINT_MAX_EXPERTS, kept.end(),
+                         [&hits](int32_t a, int32_t b) {
+                             if (hits[(size_t) a] != hits[(size_t) b]) {
+                                 return hits[(size_t) a] > hits[(size_t) b];
+                             }
+                             return a < b;
+                         });
+        kept.resize((size_t) PREFETCH_HINT_MAX_EXPERTS);
+        std::sort(kept.begin(), kept.end());
+    }
+    return kept;
 }
 
 uint64_t ngram_hint_table::key(int32_t token, int32_t layer) {

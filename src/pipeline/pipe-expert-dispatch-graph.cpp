@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -352,6 +353,145 @@ bool graph_dispatcher::hint_enabled() {
     return enabled;
 }
 
+bool graph_dispatcher::reuse_last_enabled() {
+    // Not cached: the unit test has to A/B the flag in one process, and a
+    // getenv per hint is lost in the noise next to a 9 MiB page-in.
+    const char * value = std::getenv("WP_HINT_REUSE_LAST");
+    return value != nullptr && value[0] == '1';
+}
+
+// Decode/spec-verify only. Same 32 that WP_DEFER_MAX_WIDTH / spec prefill
+// gate / LAST_K use to tell a verify batch from a 2048-token prefill.
+static uint32_t reuse_max_tokens() {
+    static const uint32_t value = [] {
+        const char * e = std::getenv("WP_HINT_REUSE_MAX_TOKENS");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 32;
+        return v > 0 ? (uint32_t) v : 32u;
+    }();
+    return value;
+}
+
+// WP_HINT_REUSE_PAGES: max expert-pages a reuse flush may offer. Default 32
+// so a 64-deep worker queue still has room for hash CERTAIN + router2.
+// 0 = uncapped (the 2026-08-19 flood: 43 layers x ~6 ids into a 64-page queue).
+// Not cached: the unit test A/Bs the budget in one process.
+static size_t reuse_page_budget() {
+    const char * e = std::getenv("WP_HINT_REUSE_PAGES");
+    if (e == nullptr || e[0] == '\0') {
+        return 32;
+    }
+    const long v = strtol(e, nullptr, 10);
+    return v > 0 ? (size_t) v : 0;
+}
+
+void graph_dispatcher::note_dispatched_experts(
+        int32_t layer, const std::vector<pipe_expert_assignment> & assignments,
+        uint32_t n_tokens) noexcept {
+    try {
+        if (!reuse_last_enabled() || !hint_enabled() || layer < 0 ||
+            n_tokens == 0 || n_tokens > reuse_max_tokens() || assignments.empty()) {
+            return;
+        }
+        // Rank by how many tokens in this ubatch actually used the expert, so a
+        // verify-batch union that exceeds PREFETCH_HINT_MAX_EXPERTS keeps the
+        // ones shared across positions, not the lowest ids.
+        struct ranked {
+            int32_t expert_id;
+            int     n_used;
+        };
+        std::vector<ranked> ranked_experts;
+        ranked_experts.reserve(assignments.size());
+        for (const pipe_expert_assignment & assignment : assignments) {
+            if (assignment.expert_id < 0) {
+                continue;
+            }
+            int n_used = 0;
+            for (float w : assignment.weights) {
+                if (w != 0.0f) {
+                    ++n_used;
+                }
+            }
+            if (n_used > 0) {
+                ranked_experts.push_back({ assignment.expert_id, n_used });
+            }
+        }
+        if (ranked_experts.empty()) {
+            return;
+        }
+        const size_t cap = (size_t) PREFETCH_HINT_MAX_EXPERTS;
+        if (ranked_experts.size() > cap) {
+            std::nth_element(ranked_experts.begin(),
+                             ranked_experts.begin() + (ptrdiff_t) cap,
+                             ranked_experts.end(),
+                             [](const ranked & a, const ranked & b) {
+                                 return a.n_used != b.n_used ? a.n_used > b.n_used
+                                                             : a.expert_id < b.expert_id;
+                             });
+            ranked_experts.resize(cap);
+        }
+        reuse_set set;
+        set.n_tokens = n_tokens;
+        set.experts.reserve(ranked_experts.size());
+        for (const ranked & e : ranked_experts) {
+            set.experts.push_back(e.expert_id);
+        }
+        std::sort(set.experts.begin(), set.experts.end());
+        last_dispatched_[layer] = std::move(set);
+    } catch (...) {
+        // Advisory. A dropped reuse set costs one missed hint.
+    }
+}
+
+size_t graph_dispatcher::flush_reuse_hints() noexcept {
+    if (!reuse_last_enabled() || !hint_enabled() || last_dispatched_.empty()) {
+        return 0;
+    }
+    size_t sent = 0;
+    try {
+        const size_t                 budget = reuse_page_budget();
+        size_t                       pages  = 0;
+        const std::vector<int32_t> & hash_layers = oracle_.layers();
+        // Map is layer-ascending. Skip hash layers (tid2eid already exact),
+        // emit soonest first, stop when the next FULL layer would exceed the
+        // page budget. A partial layer is not offered: n_expert_used or nothing.
+        for (const auto & entry : last_dispatched_) {
+            if (std::binary_search(hash_layers.begin(), hash_layers.end(), entry.first)) {
+                continue;
+            }
+            const std::vector<int32_t> & experts = entry.second.experts;
+            if (experts.empty()) {
+                continue;
+            }
+            if (budget != 0 && pages + experts.size() > budget) {
+                break;
+            }
+            std::vector<int32_t> & previous = last_reuse_hint_[entry.first];
+            if (previous == experts) {
+                pages += experts.size();
+                continue;
+            }
+            const size_t n = remote.send_prefetch_hints(entry.first, experts,
+                                                        PIPE_HINT_PREDICTED,
+                                                        entry.second.n_tokens);
+            if (n == 0) {
+                // in_flight / no route: do not mark sent, retry this layer next
+                // flush. Breaking keeps soonest-first instead of skipping to L40.
+                break;
+            }
+            previous = experts;
+            pages += experts.size();
+            sent += n;
+        }
+    } catch (...) {
+    }
+    return sent;
+}
+
+void graph_dispatcher::clear_reuse_hints() noexcept {
+    last_dispatched_.clear();
+    last_reuse_hint_.clear();
+}
+
 void graph_dispatcher::register_hash_layer(int32_t         layer,
                                            int32_t         n_expert_used,
                                            int32_t         n_vocab,
@@ -604,25 +744,19 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
         }
         {
             std::lock_guard<std::mutex> lock(pred_mutex_);
-            // *** LATEST-WINS MAILBOX: COUNT WHAT IT THROWS AWAY. ***
-            // This is a ONE-SLOT handoff. enqueue_prediction is called once per
-            // LAYER (43x per token); if the scorer thread is still working on
-            // the previous snapshot, this overwrite silently discards a whole
-            // layer's prediction. The scorer does an n_expert x n_embd GEMV per
-            // target layer per snapshot, so at 43 layers/token it plausibly
-            // cannot keep up -- meaning the effective prediction rate, and
-            // WHICH layers get predicted, are decided by thread timing rather
-            // than by anything principled. Until 2026-08-19 nothing recorded
-            // that, so every conclusion about K and conf was drawn without
-            // knowing how often the predictor actually ran.
-            if (pred_inbox_.valid) {
-                ++pred_dropped_;
-            }
             ++pred_offered_;
-            pred_inbox_.layer    = layer;
-            pred_inbox_.n_tokens = n_tokens;
+            // First snapshot this decode is the one with lead. Overwriting it
+            // with a later layer (latest-wins) is what made K=7 score middle
+            // layers with no lead. Drop the NEW job instead.
+            if (pred_snapshot_taken_) {
+                ++pred_dropped_;
+                return;
+            }
+            pred_snapshot_taken_     = true;
+            pred_inbox_.layer        = layer;
+            pred_inbox_.n_tokens     = n_tokens;
             pred_inbox_.activations.assign(activations.begin(), activations.end());
-            pred_inbox_.valid    = true;
+            pred_inbox_.valid        = true;
         }
         pred_cv_.notify_one();
     } catch (...) {
@@ -709,14 +843,38 @@ void graph_dispatcher::flush_predicted_hints() noexcept {
             }
             ready.swap(pred_ready_);
         }
-        for (auto & entry : ready) {
-            std::vector<int32_t> & previous = last_pred_hint_[entry.first];
-            if (previous == entry.second.experts) {
-                continue;   // the worker would resolve it to pages already queued
+        // Cap so reuse (32) + router2 fits the 64-deep worker queue. Default 16
+        // PAGES PER DECODE, not per flush. 0 = uncapped. Soonest layer first,
+        // all-or-nothing per layer.
+        static const size_t page_budget = [] {
+            const char * e = std::getenv("WP_HINT_ROUTER2_PAGES");
+            if (e == nullptr || e[0] == '\0') {
+                return (size_t) 16;
             }
-            previous = entry.second.experts;
-            (void) remote.send_prefetch_hints(entry.first, entry.second.experts,
-                                              PIPE_HINT_PREDICTED, entry.second.n_tokens);
+            const long v = strtol(e, nullptr, 10);
+            return v > 0 ? (size_t) v : (size_t) 0;
+        }();
+        for (auto & entry : ready) {
+            const std::vector<int32_t> & experts = entry.second.experts;
+            if (experts.empty()) {
+                continue;
+            }
+            if (page_budget != 0 &&
+                router2_pages_this_decode_ + experts.size() > page_budget) {
+                break;
+            }
+            std::vector<int32_t> & previous = last_pred_hint_[entry.first];
+            if (previous == experts) {
+                continue;
+            }
+            const size_t n = remote.send_prefetch_hints(entry.first, experts,
+                                                        PIPE_HINT_PREDICTED,
+                                                        entry.second.n_tokens);
+            if (n == 0) {
+                break;
+            }
+            previous = experts;
+            router2_pages_this_decode_ += experts.size();
         }
     } catch (...) {
         // Swallow. A broken socket surfaces on the next real dispatch.
@@ -833,6 +991,8 @@ std::string graph_dispatcher::failure_message() const {
 }
 
 void graph_dispatcher::begin_decode() noexcept {
+    router2_pages_this_decode_ = 0;
+    pred_snapshot_taken_       = false;
     remote.begin_deferral_window();
     decode_t0_ = dispatch_clock::now();
     if (!collect_stats_ && forward_log_ == nullptr) {
@@ -1085,6 +1245,7 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             owner->flush_predicted_hints();
             owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
         }
+        owner->note_dispatched_experts(context->layer, assignments, (uint32_t) n_tokens);
         if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
             capture_prefix != nullptr && capture_prefix[0] != '\0') {
             owner->capture_routing(capture_prefix, context->layer, wire_activations,
@@ -1226,6 +1387,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             owner->flush_predicted_hints();
             owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
         }
+        owner->note_dispatched_experts(context->layer, assignments, (uint32_t) n_tokens);
         if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
             capture_prefix != nullptr && capture_prefix[0] != '\0') {
             owner->capture_routing(capture_prefix, context->layer, wire_activations,
@@ -1284,10 +1446,12 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             return;
         }
         const bool collect_stats = owner->decode_active_;
-        const dispatch_clock::time_point unpack_start =
-            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+        // finish_dispatch() includes the worker wait. Time unpack after it so
+        // unpack is the host memcpy into dst, not a second copy of ns_wait.
         const std::vector<float> result = owner->remote.finish_dispatch();
         const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
+        const dispatch_clock::time_point unpack_start =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
         if (ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32) {
             std::memcpy(dst->data, result.data(), result.size() * sizeof(float));
         } else {

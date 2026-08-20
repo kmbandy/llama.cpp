@@ -12,26 +12,21 @@ static constexpr int32_t PREFETCH_HINT_MAX_EXPERTS = 16;
 static constexpr size_t  PREFETCH_HINT_MAX_TOKENS  = 16;
 
 // Score a target layer's experts by applying ITS router to the activations of
-// an earlier layer, max-pooled over token positions, and return the top-M
-// ASCENDING (the wire's dedup invariant).
+// an earlier layer and return the union of each token's top-M, ASCENDING
+// (the wire's dedup invariant).
 //
-// min_conf is a SOFTMAX PROBABILITY FLOOR over the max-pooled RAW LOGITS: an
-// expert is emitted only if its share of the routing mass clears it. 0 = no
-// gate, which is what this function did before and is kept for the A/B.
+// A verify batch is several tokens, each with its own top-n_expert_used.
+// Max-pooling scores then taking a global top-M keeps the loudest M and
+// drops experts that are rank-1 for a quiet token -- the set the target
+// will actually dispatch. Per-token top-M then union is the set we need.
 //
-// Ranking uses DS4's selection score, sqrt(softplus(logit))+bias, but the GATE
-// must use the raw logits -- that transform compresses the dynamic range far
-// enough that no expert can reach even a 0.10 share across 256 experts, so
-// gating on it rejects everything at every threshold (measured 2026-08-19).
-//
-// WHY THE GATE IS NOT OPTIONAL IN PRACTICE. The whole-expert pager shipped this
-// exact predictor without a confidence floor and it lost: taking a flat top-M
-// means that on a layer where the router is UNDECIDED you still fetch M experts,
-// and widening M only reaches deeper into low-probability ones. Measured there
-// (2026-07-22 and -27): +12-14% NVMe bytes for a 2-3.6% hit rate, with M=4
-// scoring WORSE than M=2. With the floor, a peaked layer emits its few real
-// candidates and an undecided layer emits NOTHING -- which is the only way a
-// speculative read is affordable on a concurrency-bound drive.
+// min_conf is ALL-OR-NOTHING on the layer: softmax mass of the BEST expert
+// (max over tokens, over RAW logits). If that clears the floor, emit the
+// full per-token union (a layer that needs 6 and ships 2 still demand-pages).
+// If not, emit nothing. 0 = no gate. Ranking still uses DS4's selection
+// score sqrt(softplus(logit))+bias; the gate uses raw logits because the
+// selection transform compresses the mass so no expert can reach 0.10
+// across 256 (measured 2026-08-19).
 std::vector<int32_t> router2_top_experts(const float * weights,
                                          const float * bias,
                                          const float * activations,

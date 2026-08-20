@@ -4410,6 +4410,24 @@ public:
         // default member initialiser, so it is open before the body runs.
         pool_.set_spec_log(hint_log_);
         stats_.set_staging_kind(pool_.staging_kind());
+        for (auto & kv : catalog_.pages) {
+            layer_pages_sorted_[kv.first.first].push_back(&kv.second);
+        }
+        for (auto & kv : layer_pages_sorted_) {
+            std::sort(kv.second.begin(), kv.second.end(),
+                      [](const ExpertPage * a, const ExpertPage * b) {
+                          if (a->blob != b->blob) {
+                              return a->blob < b->blob;
+                          }
+                          return a->offset < b->offset;
+                      });
+        }
+        if (prefill_layer_ahead_) {
+            std::cerr << "WARN wp expert worker: WP_PREFILL_LAYER_AHEAD=1 layers="
+                      << catalog_.layers.size()
+                      << " width>" << prefill_layer_ahead_width_
+                      << std::endl;
+        }
         std::cerr << "WARN wp expert worker: pinned_pages="
                   << resident_.pinned_pages()
                   << " pinned_bytes=" << pool_.resources().pinned_bytes
@@ -4575,6 +4593,36 @@ public:
     void note_prefetch_hint_bad() {
         ++hint_bad_;
         log_prefetch_hints();
+    }
+
+    int32_t next_served_layer(int32_t layer) const {
+        const auto it = std::upper_bound(catalog_.layers.begin(), catalog_.layers.end(), layer);
+        return it == catalog_.layers.end() ? -1 : *it;
+    }
+
+    // Prefill L+1 union stream. Demand batch for L is already issued (and
+    // pinned). One spec-VRAM batch of every page we serve on the next layer,
+    // already (blob, offset) sorted at load. spec_pagein_submit is async and
+    // filters residents; PREFILL_GATE is not consulted -- this is not a guess.
+    void submit_prefill_layer_ahead(int32_t layer, uint32_t n_tokens) {
+        if (!prefill_layer_ahead_ || !spec_enabled_ ||
+            n_tokens <= prefill_layer_ahead_width_) {
+            return;
+        }
+        const int32_t nxt = next_served_layer(layer);
+        if (nxt < 0) {
+            return;
+        }
+        const auto it = layer_pages_sorted_.find(nxt);
+        if (it == layer_pages_sorted_.end() || it->second.empty()) {
+            return;
+        }
+        std::vector<uint64_t> leases(it->second.size(), pool_.spec_lease());
+        const size_t n = pool_.spec_pagein_submit(it->second, leases);
+        if (n > 0) {
+            ++ahead_submits_;
+            ahead_pages_ += n;
+        }
     }
 
 
@@ -4780,11 +4828,19 @@ public:
     }
 
     void report_prefetch_hints() const {
-        if (hint_frames_ == 0 && hint_bad_ == 0) {
+        if (hint_frames_ == 0 && hint_bad_ == 0 && ahead_submits_ == 0) {
             return;
         }
-        std::fprintf(stderr, "wp-expert-worker prefetch hints: %s\n",
-                     prefetch_hint_line().c_str());
+        if (hint_frames_ > 0 || hint_bad_ > 0) {
+            std::fprintf(stderr, "wp-expert-worker prefetch hints: %s\n",
+                         prefetch_hint_line().c_str());
+        }
+        if (ahead_submits_ > 0) {
+            std::fprintf(stderr,
+                         "wp-expert-worker prefill layer-ahead: submits=%llu pages=%llu\n",
+                         (unsigned long long) ahead_submits_,
+                         (unsigned long long) ahead_pages_);
+        }
     }
 
     pipe_expert_hello hello() const {
@@ -4892,6 +4948,11 @@ public:
             request_stats.host_bytes = batch.host_bytes();
         }
 
+        // WP_PREFILL_LAYER_AHEAD: after THIS layer's demand reads are issued
+        // (slots pinned), start the NEXT layer's full catalog in (blob,offset)
+        // order as one spec-VRAM batch. Bypasses the 64-deep hint queue and
+        // PREFILL_GATE -- this is not a guess; prefill union is ~98.6%.
+        submit_prefill_layer_ahead(request.layer, request.n_tokens);
         // WP_EXPERT_DOUBLE_BUFFER: see double_buffer_reads_'s comment for the
         // full argument. Short version -- THIS request's own pages are already
         // pinned and (if cold) reading by this point, so it is now safe to let
@@ -5253,6 +5314,7 @@ public:
                 std::chrono::steady_clock::time_point{};
             pending.batch.emplace(pool_.ensure_batch(pages, stats_.enabled(), lookup_started,
                                                      pending.request.n_tokens));
+            submit_prefill_layer_ahead(pending.request.layer, pending.request.n_tokens);
             split_pending_.emplace(std::move(pending));
             split_seq_id_ = seq_id;
         } catch (...) {
@@ -5326,6 +5388,20 @@ private:
         const char * e = std::getenv("WP_EXPERT_SPEC_PAGEIN");
         return e != nullptr && e[0] == '1';
     }();
+    // WP_PREFILL_LAYER_AHEAD=1 -- while a prefill-shaped request for layer L
+    // computes, spec-page the NEXT served layer's full catalog in disk order.
+    // Default OFF. Width matches the decode/prefill cut used by PREFILL_GATE.
+    const bool         prefill_layer_ahead_ = [] {
+        const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD");
+        return e != nullptr && e[0] == '1';
+    }();
+    const uint32_t     prefill_layer_ahead_width_ = [] {
+        const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 32;
+        return v > 0 ? (uint32_t) v : (uint32_t) 32;
+    }();
+    uint64_t           ahead_submits_ = 0;
+    uint64_t           ahead_pages_   = 0;
     // WP_EXPERT_SPEC_CHUNK -- pages read per idle step. 1 by default: this is
     // the worst-case delay a real request can inherit from a speculative read already in
     // progress, about one 12.75 MB O_DIRECT read. Raising it trades that latency
@@ -6749,6 +6825,10 @@ private:
     uint64_t io_gen_ = 0, params_gen_ = 0;
 
     Catalog        catalog_;
+    // Per-layer catalog views, (blob, offset) sorted at load. Used by
+    // WP_PREFILL_LAYER_AHEAD so the L+1 union is a sequential NVMe stream
+    // rather than assignment-order random seeks.
+    std::map<int, std::vector<const ExpertPage *>> layer_pages_sorted_;
     backend_ptr    backend_;
     ResidentExpertPool resident_;
     ExpertSlotPool pool_;

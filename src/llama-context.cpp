@@ -3098,6 +3098,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //
         // ubatch.token is null for an embedding-input batch; tid2eid is a TOKEN
         // ID table, so there is simply nothing to look up and nothing to send.
+        if (expert_dispatch != nullptr) {
+            // Lag-1 reuse is token-id-free: it offers the previous decode's
+            // real expert ids. Prefill (n_tokens > 32) would be a near-dense
+            // union and would evict the decode working set, so drop the stash
+            // instead of flushing it into that sweep.
+            if (ubatch.n_tokens > 32) {
+                expert_dispatch->clear_reuse_hints();
+            } else {
+                expert_dispatch->flush_reuse_hints();
+            }
+        }
         if (expert_dispatch != nullptr && ubatch.token != nullptr) {
             expert_dispatch->note_batch_tokens(ubatch.token, ubatch.n_tokens);
             // Filter the mask token at the hint site (throughput-analysis §6.1):

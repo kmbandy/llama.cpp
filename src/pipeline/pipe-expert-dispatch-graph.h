@@ -119,6 +119,20 @@ class graph_dispatcher {
     // bare run must stay byte-identical to the config of record.
     static bool hint_enabled();
 
+    // Lag-1 expert reuse. The experts this layer just dispatched are a ~40%
+    // predictor of the NEXT token on the SAME layer (measured 2026-07-19,
+    // lag-1 overlap 0.399 vs 0.023 chance). Recorded at compute(); flushed
+    // at the next decode's pre-graph hint site.
+    // WP_HINT_REUSE_LAST=1 to arm (default off). WP_HINT_REUSE_PAGES (default
+    // 32) caps the flush in expert-pages, soonest layer first, skipping hash
+    // layers 0..H (tid2eid is already exact). A layer is all-or-nothing.
+    static bool reuse_last_enabled();
+    void note_dispatched_experts(int32_t layer,
+                                 const std::vector<pipe_expert_assignment> & assignments,
+                                 uint32_t n_tokens) noexcept;
+    size_t flush_reuse_hints() noexcept;
+    void clear_reuse_hints() noexcept;
+
     // ---- cross-layer predicted prefetch -------------------------------------
     //
     // Register a host f32 copy of blk.<layer>.ffn_gate_inp (w, [n_expert rows x
@@ -181,16 +195,15 @@ class graph_dispatcher {
     // +9.4s/run against -3.0s of worker wait bought -- the hints pay only if
     // the math is free):
     //
-    // enqueue_prediction() copies this layer's dispatch activations into a
-    // latest-wins slot for the scorer thread and returns immediately. The
-    // scorer applies router_{layer+2}, max-pools over the token positions, and
-    // parks the top-M result. flush_predicted_hints() -- called from compute() on
-    // the dispatch thread BEFORE dispatch, where the sockets are quiet
-    // (in_flight == 0 under WP_DEFER_K=0) -- sends whatever is parked. The
-    // hint therefore goes out at the NEXT layer's dispatch: one layer of the
-    // two-layer lead is spent on the handoff.
-    // Neither half ever throws: a hint carries no correctness weight, so no
-    // predictor failure may latch the dispatcher.
+    // FIRST SNAPSHOT WINS. enqueue_prediction is called once per MoE layer;
+    // only the first call this decode is scored. Later layers are dropped on
+    // purpose so K lookahead is from the START of the decode (soonest
+    // consume), not from whichever layer the scorer happened to be free for.
+    // Latest-wins was a race: 40-55% of snapshots dropped, and the survivors
+    // were middle/late layers with no lead (measured 2026-08-19).
+    // The scorer applies routers layer+2 .. layer+1+K and parks top-M unions.
+    // flush_predicted_hints() sends soonest-first up to WP_HINT_ROUTER2_PAGES
+    // per decode. Neither half ever throws.
     void enqueue_prediction(int32_t layer, const std::vector<float> & activations,
                             int64_t n_tokens) noexcept;
     void flush_predicted_hints() noexcept;
@@ -255,12 +268,22 @@ class graph_dispatcher {
     // N-gram hints have their own repeat history so router2 results do not
     // make an unchanged token-table result look new on the next step.
     std::map<int32_t, std::vector<int32_t>>        last_ngram_hint_;
+    // Last dispatched expert set per layer, waiting to be offered as PREDICTED
+    // for the next decode. Separate from last_pred_hint_ so a reuse frame is
+    // not mistaken for a router2 frame (they can coincide, and the worker
+    // would discard the second anyway).
+    struct reuse_set {
+        uint32_t             n_tokens = 1;
+        std::vector<int32_t> experts;
+    };
+    std::map<int32_t, reuse_set>                   last_dispatched_;
+    std::map<int32_t, std::vector<int32_t>>        last_reuse_hint_;
     // Scorer thread <-> dispatch thread handoff. pred_mutex_ guards the four
     // fields below; the scorer owns its own scratch.
     std::mutex                                     pred_mutex_;
     std::condition_variable                        pred_cv_;
-    // Latest-wins inbox: a stale activation snapshot is worthless (its target
-    // layer is about to be dispatched anyway), so a new enqueue overwrites.
+    // First-snapshot inbox: only the earliest layer this decode is scored.
+    // Later enqueues increment pred_dropped_ and leave the inbox alone.
     struct pred_job {
         int32_t            layer    = -1;
         int64_t            n_tokens = 0;
@@ -275,6 +298,12 @@ class graph_dispatcher {
     // Ready sets awaiting flush, keyed by target layer (a newer set for the
     // same target overwrites -- same staleness argument).
     std::map<int32_t, pred_result>                 pred_ready_;
+    // Expert-pages router2 has already offered this decode. WP_HINT_ROUTER2_PAGES
+    // is a PER-DECODE cap (default 16), not per flush -- flush runs once per
+    // MoE layer and a per-call cap never bound (measured 2026-08-19: +23k
+    // spec_pageins when the 16-page cap reset 43x per token).
+    size_t                                         router2_pages_this_decode_ = 0;
+    bool                                           pred_snapshot_taken_ = false;
     // Prediction-cadence census (2026-08-19). offered = enqueue_prediction calls
     // (once per layer per forward pass); dropped = snapshots the latest-wins
     // mailbox overwrote before the scorer could take them; scored = snapshots

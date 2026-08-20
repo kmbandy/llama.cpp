@@ -98,7 +98,10 @@ void write_test_table(const fs::path & path) {
     });
 }
 
-void test_router2_max_pool() {
+void test_router2_per_token_union() {
+    // Token 0 wants e0 then e2; token 1 wants e1 then e2. Max-pool-then-top-2
+    // kept {0,1} and dropped e2, which is in BOTH tokens' top-2 -- the set the
+    // target actually dispatches. Per-token top-2 union is {0,1,2}.
     const float weights[] = {
         4.0f, 0.0f, 0.0f, 4.0f, 3.0f, 3.0f, 0.0f, 0.0f,
     };
@@ -110,7 +113,8 @@ void test_router2_max_pool() {
         1.0f,
     };
     const std::vector<int32_t> top = router2_top_experts(weights, bias, activations, 2, 4, 2, 2);
-    require(top == std::vector<int32_t>({ 0, 1 }), "router2 did not max-pool token scores before top-M");
+    require(top == std::vector<int32_t>({ 0, 1, 2 }),
+            "router2 must union each token's top-M, not max-pool then top-M");
 }
 
 void test_router2_confidence_gate() {
@@ -125,22 +129,16 @@ void test_router2_confidence_gate() {
     const float bias[]        = { 0.0f, 0.0f, 0.0f, 0.0f };
     const float activations[] = { 1.0f, 0.0f };
 
-    // No gate: the old behaviour. Top-4 is emitted whole, including the two
-    // experts the router gave no mass at all -- these are the reads the
-    // whole-expert pager measured as pure cost.
     const std::vector<int32_t> ungated =
         router2_top_experts(weights, bias, activations, 1, 4, 2, 4, /*min_conf=*/0.0f);
     require(ungated.size() == 4, "ungated router2 must still emit the full top-M");
 
-    // Gated: the dead experts must be dropped. A floor of 0.2 cannot be cleared
-    // by an expert holding a near-zero share of the routing mass.
+    // All-or-nothing: best expert clears 0.2, so the WHOLE top-M is emitted.
+    // Truncating to only the ids above the floor leaves a layer partially
+    // covered, which still demand-pages.
     const std::vector<int32_t> gated =
         router2_top_experts(weights, bias, activations, 1, 4, 2, 4, /*min_conf=*/0.2f);
-    require(gated.size() < ungated.size(), "confidence gate dropped nothing");
-    require(std::find(gated.begin(), gated.end(), 0) != gated.end(),
-            "confidence gate dropped the DOMINANT expert");
-    require(std::find(gated.begin(), gated.end(), 3) == gated.end(),
-            "confidence gate kept an expert with no routing mass");
+    require(gated == ungated, "peaked layer that clears the floor must emit the full top-M");
     require(std::is_sorted(gated.begin(), gated.end()),
             "gated router2 output must stay ascending for the wire");
 
@@ -157,8 +155,6 @@ void test_router2_confidence_gate() {
         router2_top_experts(flat_w, bias, activations, 1, 4, 2, 4, /*min_conf=*/0.5f);
     require(flat.empty(), "confidence gate emitted experts on a layer with no signal");
 
-    // Same flat layer with the gate off: still emits, proving the emptiness
-    // above is the GATE and not a degenerate input.
     const std::vector<int32_t> flat_ungated =
         router2_top_experts(flat_w, bias, activations, 1, 4, 2, 4, /*min_conf=*/0.0f);
     require(flat_ungated.size() == 4, "flat layer must emit when the gate is off");
@@ -195,7 +191,7 @@ int main(int argc, char ** argv) {
     require(argc == 1, "usage: test-wp-prefetch-hints [table]");
     const fs::path path = fs::temp_directory_path() / ("wp-prefetch-hints-" + std::to_string((long) getpid()) + ".bin");
     try {
-        test_router2_max_pool();
+        test_router2_per_token_union();
         test_router2_confidence_gate();
         test_ngram_format_and_scoring(path);
         std::error_code ignored;

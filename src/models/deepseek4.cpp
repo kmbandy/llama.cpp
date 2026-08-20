@@ -25,6 +25,32 @@ static bool dsv4_has_dspark_head(const llama_model_loader & ml) {
 // Pin activation to the device that owns weight so RMS/mul stay co-located.
 // Without this, hc_pre rms_norm follows residual onto the wrong GPU and the
 // residual-sized flat_norm is staged again for mul_mat(hc_fn) (node/RMS_NORM).
+// WP_N_EXPERT_USED: softmax-layer top-k override (default = trained k). Hash
+// layers keep the tid2eid width so HELLO/worker hparams stay matched.
+static int32_t ds4_n_expert_used(const llama_hparams & hparams, int il) {
+    const int32_t trained = (int32_t) hparams.n_expert_used;
+    if (il >= 0 && (uint32_t) il < hparams.dsv4_hash_layer_count) {
+        return trained;
+    }
+    static const int32_t override = [] {
+        const char * e = std::getenv("WP_N_EXPERT_USED");
+        if (e == nullptr || e[0] == '\0') {
+            return 0;
+        }
+        return std::atoi(e);
+    }();
+    if (override > 0 && override < trained) {
+        static bool logged = false;
+        if (!logged) {
+            LLAMA_LOG_WARN("ds4: WP_N_EXPERT_USED=%d (trained %d; hash layers keep %d)\n",
+                           override, trained, trained);
+            logged = true;
+        }
+        return override;
+    }
+    return trained;
+}
+
 static void dsv4_pin_to_weight(
         ggml_backend_sched_t sched,
         ggml_tensor * act,
@@ -1615,7 +1641,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
             ggml_tensor * moe = build_moe_ffn(cur, layer.ffn_gate_inp,
                     layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
-                    layer.ffn_exp_probs_b, n_expert, hparams.n_expert_used,
+                    layer.ffn_exp_probs_b, n_expert, ds4_n_expert_used(hparams, il),
                     LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func, il);
             ggml_tensor * shared = build_ffn(cur,
@@ -1697,7 +1723,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
-                layer.ffn_exp_probs_b, n_expert, hparams.n_expert_used,
+                layer.ffn_exp_probs_b, n_expert, ds4_n_expert_used(hparams, -1),
                 LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func, -1);
         ggml_tensor * ffn_shexp = build_ffn(cur,
@@ -1841,7 +1867,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 layer.ffn_gate_exps,
                 layer.ffn_down_exps,
                 exp_probs_b,
-                n_expert, hparams.n_expert_used,
+                n_expert, ds4_n_expert_used(hparams, il),
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
@@ -1999,7 +2025,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.ffn_gate_exps,
             layer.ffn_down_exps,
             layer.ffn_exp_probs_b,
-            n_expert, hparams.n_expert_used,
+            n_expert, ds4_n_expert_used(hparams, il),
             LLM_FFN_SILU, hparams.expert_weights_norm,
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,
