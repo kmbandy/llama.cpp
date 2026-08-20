@@ -2306,24 +2306,65 @@ public:
         // ("is anything live"), not spec_in_flight ("at the WP_EXPERT_SPEC_MAX_
         // INFLIGHT cap") -- this interlock must run whenever even one batch is
         // outstanding, regardless of whether the pool has room for another.
+        //
+        // HARDENED AFTER THE s0 INVESTIGATION (2026-08-20): neither
+        // spec_recursion_'s reset NOR the poll calls below were exception-safe.
+        // spec_recursion_ = false ran only on the FALL-THROUGH path, so a
+        // single exception escaping spec_pagein_poll (a backend H2D throw, an
+        // allocation failure mid-drain, anything) left spec_recursion_ stuck
+        // true FOREVER -- every later ensure_batch call on this pool would then
+        // skip the interlock silently, AND the batch spec_pagein_poll was
+        // draining when it threw is never retired (retire_spec_batch never
+        // runs), so its slots stay pinned forever too: a permanent pin leak
+        // that eventually starves select_victim on every subsequent request,
+        // with no exception string anywhere (serve_connection's catch, if it
+        // even still owns a live socket, only ever saw the FIRST occurrence).
+        // That shape -- listens fine, then every request fails, no coredump,
+        // no logged exception -- matches the s0 production symptom exactly, so
+        // even without a confirmed trigger this is cheap insurance: never let
+        // a harvest hiccup here escalate into "silently wedged for the rest of
+        // the process". A failure here degrades to "re-read the page on the
+        // normal demand path below", which is always correct, just not free.
         if (spec_any_in_flight() && !spec_recursion_) {
+            struct RecursionGuard {
+                bool & flag;
+                ~RecursionGuard() { flag = false; }
+            } recursion_guard{ spec_recursion_ };
             spec_recursion_ = true;
-            spec_pagein_poll(false);
-            // An in-flight speculative slot is not yet valid, so find_slot below
-            // cannot see it and this request would issue a SECOND read of the
-            // same page. Wait for the bounded read already in flight instead --
-            // targeted at just the batch holding this page (see spec_pagein_
-            // poll's wait_for comment), so an unrelated in-flight batch cannot
-            // stall this request once WP_EXPERT_SPEC_MAX_INFLIGHT > 1.
-            if (spec_any_in_flight()) {
-                for (const ExpertPage * page : pages) {
-                    if (page != nullptr && spec_in_flight_for(*page)) {
-                        spec_pagein_poll(false, page);
-                        break;
+            try {
+                spec_pagein_poll(false);
+                // An in-flight speculative slot is not yet valid, so find_slot
+                // below cannot see it and this request would issue a SECOND
+                // read of the same page. Wait for the bounded read already in
+                // flight instead -- targeted at just the batch holding this
+                // page (see spec_pagein_poll's wait_for comment), so an
+                // unrelated in-flight batch cannot stall this request once
+                // WP_EXPERT_SPEC_MAX_INFLIGHT > 1.
+                if (spec_any_in_flight()) {
+                    for (const ExpertPage * page : pages) {
+                        if (page != nullptr && spec_in_flight_for(*page)) {
+                            spec_pagein_poll(false, page);
+                            break;
+                        }
                     }
                 }
+            } catch (const std::exception & error) {
+                // LOGGED, NOT SWALLOWED SILENTLY: this is the one place a spec-
+                // harvest failure could otherwise vanish with no trace. Printed
+                // even without WP_HINT_LOG so it lands in the worker's own
+                // stderr log unconditionally.
+                std::fprintf(stderr,
+                             "W ensure_batch: speculative harvest failed, "
+                             "continuing on the demand path: %s\n",
+                             error.what());
+                ++spec_errors_;
+            } catch (...) {
+                std::fprintf(stderr,
+                             "W ensure_batch: speculative harvest failed with a "
+                             "non-standard exception, continuing on the demand "
+                             "path\n");
+                ++spec_errors_;
             }
-            spec_recursion_ = false;
         }
         Batch batch(this, pages.size());
         try {

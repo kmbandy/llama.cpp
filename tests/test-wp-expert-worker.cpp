@@ -1764,6 +1764,353 @@ void test_spec_max_inflight(const char * env_value, int hinted_experts,
     require(gate.peak_reads() == expected_peak, failure_message);
 }
 
+
+// REGRESSION: a demand dispatch for a page that is CURRENTLY being read by an
+// in-flight speculative batch must wait for that read and reuse it -- never
+// hang, never throw, never read the page twice. This is the exact path
+// investigated for the s0 (ROCm, 9 MiB pages, 22.9 GiB pool) production
+// failure: s0 is the leg most likely to still have a speculative batch in
+// flight when the next demand request lands (wide pages -> slow reads), so it
+// is the only leg that reliably exercises ensure_batch's demand-path
+// interlock against a REAL in-flight read, even at the default
+// WP_EXPERT_SPEC_MAX_INFLIGHT=1. s1/s2's narrower pages read fast enough that
+// the interlock's blocking branch was essentially never taken there.
+//
+// The hook artificially stalls the speculative read for exactly the page this
+// test then demands, so the demand dispatch is GUARANTEED to observe
+// spec_in_flight_for(page)==true and take the targeted-wait branch in
+// spec_pagein_poll(false, page) -- the branch the existing spec tests never
+// force, because their reads always finish before the next request lands.
+struct DelayedReadLog {
+    std::mutex                       mutex;
+    std::condition_variable          cv;
+    std::vector<std::pair<int, int>> reads;
+    int                               delay_layer  = -1;
+    int                               delay_expert = -1;
+    std::chrono::milliseconds        delay{0};
+    bool                              started_signal = false;
+    wp_expert_worker::TestHooks      hooks;
+
+    DelayedReadLog() {
+        hooks.read_started = [this](int layer, int expert) {
+            bool is_target = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                reads.emplace_back(layer, expert);
+                is_target = (layer == delay_layer && expert == delay_expert);
+                if (is_target) {
+                    started_signal = true;
+                }
+            }
+            cv.notify_all();
+            // Deliberately OUTSIDE the lock: this stalls the reader thread to
+            // hold the window open, not the bookkeeping that other threads
+            // (there are none here but the dispatch thread reading `reads`)
+            // need to make progress.
+            if (is_target && delay.count() > 0) {
+                std::this_thread::sleep_for(delay);
+            }
+        };
+    }
+
+    bool wait_for_start(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, timeout, [&]() { return started_signal; });
+    }
+
+    size_t count_of(int layer, int expert) {
+        std::lock_guard<std::mutex> lock(mutex);
+        size_t n = 0;
+        for (const auto & r : reads) {
+            n += (r.first == layer && r.second == expert) ? 1 : 0;
+        }
+        return n;
+    }
+};
+
+void test_demand_dispatch_waits_for_inflight_spec_batch() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_EXPERT_SPEC_CHUNK", "1", 1) == 0,
+            "failed to pin the spec chunk to one page per submit");
+    // WP_EXPERT_SPEC_MAX_INFLIGHT deliberately left UNSET: this test's whole
+    // point is that the DEFAULT (cap=1) path is safe against a real in-flight
+    // batch, which is the premise the s0 failure put in question.
+    unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+
+    DelayedReadLog reads;
+    reads.delay_layer  = LAYER;
+    reads.delay_expert = 1;
+    reads.delay        = std::chrono::milliseconds(600);
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;   // floor for this fixture -- see the note above
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        // 1. Hint expert 1 on LAYER. The idle pump submits it as a one-page
+        //    speculative batch; the hook stalls that read for 600 ms once it
+        //    starts, so the batch is GUARANTEED still in flight when step 3's
+        //    demand dispatch for the same page lands.
+        pipe_expert_prefetch_hint frame;
+        frame.layer      = LAYER;
+        frame.provenance = PIPE_HINT_CERTAIN;
+        frame.expert_ids = { 1 };
+        payload = pipe_encode_expert_prefetch_hint(frame);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0, payload.data(), payload.size()),
+                "failed to send prefetch hint");
+
+        // 2. Confirm the speculative read genuinely started (staging
+        //    borrowed, read_started fired) before demanding the same page --
+        //    otherwise this test would not be exercising the interlock at all.
+        require(reads.wait_for_start(std::chrono::milliseconds(2000)),
+                "the speculative read for (LAYER, 1) never started");
+
+        // 3. THE REGRESSION CHECK. Demand the SAME page while its speculative
+        //    read is still stalled inside the hook. ensure_batch's interlock
+        //    must detect spec_in_flight_for(page)==true and block via
+        //    spec_pagein_poll(false, page) until that read lands, then reuse
+        //    it as a hit -- not hang, not throw (which would unwind
+        //    serve_connection and close the socket, exactly the s0 symptom:
+        //    the client's recv/send would fail with no exception logged), and
+        //    not issue a second read of the same page.
+        pipe_expert_dispatch_req request;
+        request.layer       = LAYER;
+        request.n_tokens    = N_TOKENS;
+        request.activations.resize((size_t) N_TOKENS * N_EMBD);
+        request.assignments = { { 1, std::vector<float>(N_TOKENS, 0.5f) } };
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, 100, payload.data(), payload.size()),
+                "failed to send the demand dispatch that overlaps the in-flight spec batch");
+
+        // Generous: must clear the 600 ms stall plus the read/H2D/compute
+        // itself. If ensure_batch's interlock deadlocked or the connection
+        // was closed out from under us, this recv will fail or time out --
+        // exactly the symptom under investigation, so failing loudly here
+        // (rather than hanging the test suite forever) is deliberate.
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "worker closed the connection instead of answering the demand "
+                "dispatch that overlapped an in-flight speculative batch -- "
+                "this is the s0 failure mode");
+        if (type == PIPE_ERROR) {
+            const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+            throw std::runtime_error(
+                "demand dispatch overlapping an in-flight spec batch failed: " + error.msg);
+        }
+        require(type == PIPE_EXPERT_PARTIAL && seq_id == 100,
+                "demand dispatch overlapping an in-flight spec batch did not complete");
+
+        // 4. And it must have been ONE read, not two: the interlock exists
+        //    precisely so the demand path reuses the speculative read instead
+        //    of racing a second one against it.
+        require(reads.count_of(LAYER, 1) == 1,
+                "a page already being read speculatively was read a second "
+                "time by the overlapping demand dispatch");
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_EXPERT_SPEC_CHUNK");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    require(unsetenv("WP_EXPERT_SPEC_PAGEIN") == 0, "failed to disarm speculative page-in");
+    require(unsetenv("WP_EXPERT_SPEC_CHUNK") == 0, "failed to clear the spec chunk override");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0,
+            "worker returned failure after a demand dispatch overlapped an "
+            "in-flight speculative batch");
+}
+
+
+// REGRESSION, PREFILL-AHEAD VARIANT: WP_PREFILL_LAYER_AHEAD submits the
+// NEXT layer's ENTIRE page set as one multi-page speculative batch directly
+// from dispatch()/begin_split_dispatch(), bypassing the WP_EXPERT_SPEC_CHUNK-
+// bounded router queue the test above exercises. This is the shape closest to
+// the s0 production failure: 9 MiB pages, WP_PREFILL_LAYER_AHEAD in play, and
+// a batch big enough that some OTHER layer's demand dispatch is likely to
+// still find it in flight. The single-page test above never engages this
+// path at all (its requests are decode-shaped, well under
+// WP_PREFILL_LAYER_AHEAD_WIDTH), so it cannot stand in for this one.
+void test_demand_dispatch_waits_for_inflight_prefill_ahead_batch() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_PREFILL_LAYER_AHEAD", "1", 1) == 0,
+            "failed to arm WP_PREFILL_LAYER_AHEAD");
+    require(setenv("WP_PREFILL_LAYER_AHEAD_WIDTH", "1", 1) == 0,
+            "failed to lower the prefill-ahead width so this test's requests qualify");
+    // WP_EXPERT_SPEC_MAX_INFLIGHT deliberately left UNSET -- default cap=1,
+    // the exact configuration the s0 failure report says is broken.
+    unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+
+    DelayedReadLog reads;
+    reads.delay_layer  = OTHER_LAYER;
+    reads.delay_expert = 1;
+    reads.delay        = std::chrono::milliseconds(600);
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    // Enough slots to hold LAYER's own demand pages AND every page of
+    // OTHER_LAYER's full-catalog ahead-submit pinned at once.
+    options.slots             = 8;
+    options.host_budget_bytes = 4 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        const uint32_t prefill_tokens = 4;   // > WP_PREFILL_LAYER_AHEAD_WIDTH=1
+        const auto dispatch = [&](int32_t layer, std::vector<int32_t> experts,
+                                  uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer    = layer;
+            request.n_tokens = prefill_tokens;
+            request.activations.resize((size_t) prefill_tokens * N_EMBD);
+            for (int32_t e : experts) {
+                request.assignments.push_back(
+                    { e, std::vector<float>(prefill_tokens, 0.5f) });
+            }
+            payload = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq,
+                                    payload.data(), payload.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload),
+                    "worker closed the connection instead of answering -- "
+                    "this is the s0 failure mode");
+            if (type == PIPE_ERROR) {
+                const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+                throw std::runtime_error("dispatch failed: " + error.msg);
+            }
+            require(type == PIPE_EXPERT_PARTIAL && seq_id == seq,
+                    "dispatch did not complete");
+        };
+
+        // 1. Prefill-shaped dispatch on LAYER. dispatch()'s own ensure_batch
+        //    pins LAYER's page, then submit_prefill_layer_ahead(LAYER, 4)
+        //    fires and submits ALL of OTHER_LAYER's pages (experts 0..3) as
+        //    ONE speculative batch, bypassing WP_EXPERT_SPEC_CHUNK entirely.
+        //    The hook stalls (OTHER_LAYER, 1)'s read for 600 ms.
+        dispatch(LAYER, { 0 }, 100);
+
+        // 2. Confirm the ahead-submit really landed a read in flight for the
+        //    stalled page before demanding it -- otherwise this test would
+        //    not be exercising the interlock at all.
+        require(reads.wait_for_start(std::chrono::milliseconds(2000)),
+                "the prefill-ahead speculative read for (OTHER_LAYER, 1) "
+                "never started");
+
+        // 3. THE REGRESSION CHECK. Demand OTHER_LAYER's expert 1 while its
+        //    page is still being read by the in-flight ahead-submit batch.
+        //    ensure_batch's interlock must block via
+        //    spec_pagein_poll(false, page) until the WHOLE 4-page batch
+        //    drains, then reuse the landed page -- not hang, not throw (an
+        //    escaped exception here unwinds serve_connection and closes the
+        //    socket exactly like the s0 symptom), and not read it twice.
+        dispatch(OTHER_LAYER, { 1 }, 101);
+
+        require(reads.count_of(OTHER_LAYER, 1) == 1,
+                "a page already being read by the prefill-ahead batch was "
+                "read a second time by the overlapping demand dispatch");
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_PREFILL_LAYER_AHEAD");
+        unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    require(unsetenv("WP_EXPERT_SPEC_PAGEIN") == 0, "failed to disarm speculative page-in");
+    require(unsetenv("WP_PREFILL_LAYER_AHEAD") == 0,
+            "failed to clear WP_PREFILL_LAYER_AHEAD");
+    require(unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH") == 0,
+            "failed to clear WP_PREFILL_LAYER_AHEAD_WIDTH");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0,
+            "worker returned failure after a demand dispatch overlapped an "
+            "in-flight prefill-ahead speculative batch");
+}
+
 } // namespace
 
 static void test_scatter_compact_rows_matches_get_rows_back() {
@@ -2131,6 +2478,8 @@ int main() {
             /*expected_peak=*/ 3,
             "WP_EXPERT_SPEC_MAX_INFLIGHT=3 did not allow three speculative "
             "batches to read concurrently");
+        test_demand_dispatch_waits_for_inflight_spec_batch();
+        test_demand_dispatch_waits_for_inflight_prefill_ahead_batch();
         test_stripe_min_part_restores_overlap_byte_identical();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
