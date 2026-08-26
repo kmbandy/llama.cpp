@@ -62,6 +62,30 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static bool server_ds4_const_shape_enabled() {
+    const char * value = std::getenv("WP_DS4_CONST_SHAPE");
+    return value != nullptr && value[0] == '1';
+}
+
+// MAD-LAB / verify-width padding is a separate, opt-in knob from
+// WP_DS4_CONST_SHAPE (2026-08-24 split). WP_DS4_CONST_SHAPE=1 alone no
+// longer implies a default width of 7: measured live, that implicit pad
+// drove every verify step to worst-case-width dense compute (decode
+// 2.56->1.39 t/s, -45%) because DS4 verify cost scales with tokens
+// verified (see server_spec_const_width() call sites below) -- padding is
+// not free dispatch overhead, it is real additional expert routing/compute.
+// WP_SPEC_CONST_WIDTH must be set explicitly to pad the verify batch; it
+// is deprecated in favor of running const-shape unpadded. Neither var set,
+// or WP_SPEC_CONST_WIDTH=0 -> width 0 -> byte-identical to the pre-existing
+// off path either way.
+static int32_t server_spec_const_width() {
+    static const int32_t width = [] {
+        const char * value = std::getenv("WP_SPEC_CONST_WIDTH");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    return width;
+}
+
 // MAD-125: walk the active memory pointer chain and return the
 // llama_kv_cache_paged at the bottom (if any). Three nestings to cover:
 //   - paged is the raw active memory (rare standalone test case)
@@ -329,6 +353,23 @@ struct server_batch {
 struct server_slot {
     int id;
 
+    // MAD-LAB DS4-Flash pipeline-streams: this slot's index WITHIN its
+    // stream (0..stream.slots.size()-1), NOT the global slot id. Every
+    // per-stream resource -- spec/spec2's dparams array (sized by that
+    // stream's slot count via common_speculative_init(..., n_slots_a-or-b)),
+    // and each llama_context's own KV/seq-id space (sequence ids for a
+    // context must be dense from 0 for THAT context, not globally unique
+    // across both contexts) -- is indexed by this, never by `id`. Set once
+    // at slot construction in init(): stream_slot_idx == id for stream A
+    // (slots [0, n_slots_a) happen to line up with their own local index,
+    // which is exactly why a stream-B bug here went undetected until a live
+    // run actually exercised stream B -- see the pipeline-streams stage-2
+    // post-mortem). `id` remains the GLOBAL slot id and stays the only
+    // thing used for task routing (pop_deferred_task, get_slot_by_id),
+    // logging (SLT_*), and response id_slot fields -- never for indexing
+    // into a per-stream resource.
+    int stream_slot_idx = 0;
+
     // Invalidates fingerprint jobs when this slot is released or reused.
     uint64_t fp_epoch = 0;
 
@@ -412,8 +453,10 @@ struct server_slot {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        // MAD-LAB DS4-Flash pipeline-streams: stream-local seq id, see
+        // server_slot::stream_slot_idx.
+        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -425,16 +468,16 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_NONE); // MAD-LAB
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_NONE); // MAD-LAB
         }
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, stream_slot_idx); // MAD-LAB: stream-local seq id
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -445,7 +488,7 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(id, -1, -1);
+        mem.seq_rm(stream_slot_idx, -1, -1); // MAD-LAB: stream-local seq id
 
         prompt.clear();
         kv_evict_through = 0;
@@ -519,7 +562,7 @@ struct server_slot {
         task_prev = std::move(task);
         task.reset();
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        llama_set_sampler(ctx_tgt, stream_slot_idx, nullptr); // MAD-LAB: stream-local seq id
 
         // clear alora start
         alora_invocation_start = -1;
@@ -637,6 +680,11 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
+        const int32_t spec_const_width = server_spec_const_width();
+        if (spec_const_width > 0) {
+            n_draft_max = std::min(n_draft_max, spec_const_width);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
@@ -646,13 +694,14 @@ struct server_slot {
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
         if (spec_draft.empty()) {
+            // The single-token path is ordinary decode/NLL-gate scoring, not a verify batch.
             // no speculative decoding
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true);
+                add_ok &= batch.add(stream_slot_idx, inp_embd, prompt.tokens.pos_next(), true); // MAD-LAB: stream-local seq id, not global slot id
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
+                add_ok &= batch.add(stream_slot_idx, sampled, prompt.tokens.pos_next(), true); // MAD-LAB: stream-local seq id, not global slot id
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -670,9 +719,9 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true);
+            add_ok &= batch.add(stream_slot_idx, sampled, pos0++, true); // MAD-LAB: stream-local seq id
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true);
+                add_ok &= batch.add(stream_slot_idx, token, pos0++, true); // MAD-LAB: stream-local seq id
             }
 
             // MAD-LAB / WP_SPEC_CONST_WIDTH (HIP-graph shape invariance):
@@ -686,32 +735,50 @@ struct server_slot {
             // every spec verify step submits exactly the same token count.
             //
             // Phantoms are pure batch padding: SAME sequence (keeps n_seqs_unq==1 ->
-            // plan.n_stream constant), output=false (no logits extracted), and they
-            // are deliberately NOT recorded in spec_i_batch and NOT pushed into
+            // plan.n_stream constant), output=true (keeps the LM-head row count
+            // constant), and they are deliberately NOT recorded in spec_i_batch and NOT pushed into
             // prompt.tokens -- so they are invisible to sampling/acceptance and to
             // the prompt. They occupy the positions a full-length draft would have
             // used; real tokens never attend to them (causal mask, strictly higher
             // positions); their KV is discarded by the unconditional
             // seq_rm(slot.id, pos_next, -1) that runs after every verify step (see
-            // the accept path). Best-effort: a phantom that would overflow the batch
-            // is simply skipped (never trips the real-token assert below).
+            // the accept path).
             //
             // Config, not hardcode: default off preserves current serving; set it to
             // the configured spec draft n-max and enable alongside WP_HIP_GRAPHS for
             // the capture run.
-            static const int32_t s_spec_const_width = []() {
-                const char * e = getenv("WP_SPEC_CONST_WIDTH");
-                return e ? atoi(e) : 0;
-            }();
-            if (s_spec_const_width > 0 && (int32_t) spec_draft.size() < s_spec_const_width) {
+            //
+            // MAD-LAB / WP_DS4_CONST_SHAPE (2026-08-24: DECOUPLED from this pad).
+            // WP_DS4_CONST_SHAPE=1 no longer implies a default width here -- it used
+            // to default the pin to 7 (spec-draft-n-max) when WP_SPEC_CONST_WIDTH
+            // was unset, but that made every verify step pay dense compute at the
+            // worst-case width even when the real accepted-draft count was small:
+            // DS4 decode cost is ~linear in tokens verified (each extra verify
+            // position routes several more experts), so padding is not free
+            // dispatch overhead, it is real added compute -- measured decode
+            // 2.56->1.39 t/s (-45%) with const-shape alone. WP_DS4_CONST_SHAPE keeps
+            // the OTHER canonicalization axes constant (n_stream, index-vector rank,
+            // indexer/CSA top-k KV-length padding -- see ds4_const_shape_enabled()
+            // call sites in src/models/deepseek4.cpp) which is where the measured
+            // expert-fingerprint stability comes from; it does NOT touch verify
+            // width. Width padding is now WP_SPEC_CONST_WIDTH's decision alone,
+            // independent of WP_DS4_CONST_SHAPE, and is a manual opt-in for capture
+            // experiments (effectively deprecated). Unset/0 -> width 0 -> padding
+            // branch below never fires -> byte-identical to the pre-existing off
+            // path.
+            const int32_t spec_const_width = server_spec_const_width();
+            if (server_ds4_const_shape_enabled() && spec_const_width > 0) {
+                GGML_ASSERT((int32_t) spec_draft.size() <= spec_const_width);
+            }
+            if (spec_const_width > 0 && (int32_t) spec_draft.size() < spec_const_width) {
                 const llama_token mask_tok =
                     llama_vocab_mask(llama_model_get_vocab(llama_get_model(ctx_tgt)));
                 if (mask_tok != LLAMA_TOKEN_NULL) {
-                    for (int32_t i = (int32_t) spec_draft.size(); i < s_spec_const_width; ++i) {
-                        if (!batch.add(this->id, mask_tok, pos0++, /*output=*/ false)) {
-                            break;
-                        }
+                    for (int32_t i = (int32_t) spec_draft.size(); i < spec_const_width; ++i) {
+                        add_ok &= batch.add(stream_slot_idx, mask_tok, pos0++, /*output=*/ true); // MAD-LAB: stream-local seq id
                     }
+                } else if (server_ds4_const_shape_enabled()) {
+                    GGML_ABORT("WP_DS4_CONST_SHAPE requires a vocabulary mask token for verify padding");
                 }
             }
         }
@@ -928,8 +995,20 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        mem.seq_rm(other.id,     -1, -1);
-        mem.seq_cp(id, other.id, -1, -1);
+        // MAD-LAB DS4-Flash pipeline-streams: `mem` here is THIS slot's own
+        // memory wrapper (bound to this->ctx_tgt/ctx_dft), so seq_cp only
+        // makes sense if `other` shares the same underlying KV memory --
+        // i.e. the same stream. That is also exactly why the ids below must
+        // be stream_slot_idx (dense per-context seq space), not global id.
+        // Parent/child slot assignment is not currently stream-aware (see
+        // activate_parent_child_tasks()'s comment); if a parent and its
+        // child ever land in different streams this call is wrong
+        // regardless of which id flavor is used (seq_cp cannot copy KV
+        // across two separate llama_context instances) -- a pre-existing,
+        // separately-flagged gap this fix does not close.
+        GGML_ASSERT(ctx_tgt == other.ctx_tgt && "copy_state_to: parent/child slots must share the same stream's context");
+        mem.seq_rm(other.stream_slot_idx,                   -1, -1);
+        mem.seq_cp(stream_slot_idx, other.stream_slot_idx,  -1, -1);
 
         other.n_decoded   = n_decoded;
         other.n_remaining = n_remaining;
@@ -1104,6 +1183,24 @@ struct server_metrics {
         }
     }
 
+    // MAD-LAB DS4-Flash pipeline-streams: decode() now calls this with a
+    // stream's std::vector<server_slot*> (server_stream::slots) rather than
+    // the impl-level std::vector<server_slot>, mirroring the iterate()
+    // dual-overload pattern above server_context_impl. Same body, pointer
+    // dereference. NOTE (stage-2 flag, not fixed here): n_decode_total /
+    // n_busy_slots_total / n_tokens_max are plain, non-atomic counters --
+    // fine for stage 1's single caller, but calling this from two streams'
+    // threads concurrently in stage 2 without a lock or atomics would race.
+    void on_decoded(const std::vector<server_slot *> & slots) {
+        n_decode_total++;
+        for (const auto * slot : slots) {
+            if (slot->is_processing()) {
+                n_busy_slots_total++;
+            }
+            n_tokens_max = std::max(n_tokens_max, (uint64_t) slot->prompt.n_tokens());
+        }
+    }
+
     void reset_bucket() {
         n_prompt_tokens_processed = 0;
         t_prompt_processing       = 0;
@@ -1112,6 +1209,72 @@ struct server_metrics {
     }
 };
 
+
+// MAD-LAB DS4-Flash pipeline-streams: bundles every piece of per-stream
+// state that pre_decode()/decode()/post_decode() used to read off
+// server_context_impl directly (ctx_tgt, ctx_dft, spec, the shared `batch`,
+// the shared `slots`, and the previously function-local-static
+// paged_admit_rotor). STAGE 1 (this struct's introduction): exactly one
+// instance exists, built from stream A's values (ctx_tgt/ctx_dft/spec/batch
+// unchanged from today), and pre_decode()/decode()/post_decode() are
+// converted to take it as a parameter instead of reading `this->` members
+// -- called from update_slots() unconditionally, at both
+// n_pipeline_streams==1 and >=2, so the default path is byte-identical by
+// construction (there is only one server_stream either way in this stage).
+// STAGE 2 (not yet implemented) adds a second instance wired to
+// ctx_tgt2/spec2/batch_b and a second call, driven on its own thread.
+//
+// mem_for_admit is deliberately NOT a field here: today's code computes it
+// fresh each tick via llama_get_memory(ctx_tgt) as a pre_decode() LOCAL, not
+// a stored member, so pre_decode() keeps doing exactly that off
+// stream.ctx_tgt -- storing a second copy here would just be a second,
+// potentially-stale, source of truth for the same pointer.
+//
+// alora_scale/alora_disabled_id are NOT fields here either: they already
+// live on server_batch (batch.alora_scale / batch.alora_disabled_id, see
+// server_batch above), so routing pre_decode()/update_slots() through
+// stream.batch already makes them per-stream for free.
+//
+// n_swa is NOT a field here: it is llama_model_n_swa(model), a property of
+// the shared model_tgt weights, identical for every stream by construction
+// (all streams share one loaded model) -- there is nothing to bundle.
+struct server_stream {
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+    llama_model   * model_dft = nullptr;
+    common_speculative * spec = nullptr;
+
+    common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // this stream's server_batch (server_context_impl::batch for stream A,
+    // ::batch_b for stream B in stage 2) -- pointer because server_batch
+    // owns a llama_batch with a non-trivial destructor and is not meant to
+    // be copied.
+    server_batch * batch = nullptr;
+
+    // this stream's slots, in ascending slot-id order. At
+    // n_pipeline_streams==1 this is every slot, in the same order
+    // std::vector<server_slot>::begin()..end() would give -- so iterate()
+    // over this list is byte-identical to iterate(slots, ...) over the raw
+    // member today.
+    std::vector<server_slot *> slots;
+
+    // was a function-local `static uint64_t paged_admit_rotor` inside
+    // pre_decode() -- moved here because a static local is ONE counter
+    // shared by every call, which is correct for a single stream but wrong
+    // once stage 2 calls pre_decode() twice (once per stream) with
+    // genuinely separate paged-KV pools (server_context_impl::ctx_tgt vs
+    // ctx_tgt2) and no shared admission budget between them.
+    uint64_t paged_admit_rotor = 0;
+
+    // was server_context_impl::n_empty_consecutive -- same reasoning: an
+    // impl-level member would be shared across streams once there are two,
+    // conflating "stream A produced 4 empty batches in a row" with "stream
+    // B did," which is not what the upstream safety abort (decode(),
+    // ++n_empty_consecutive > 3) means to detect.
+    int32_t n_empty_consecutive = 0;
+};
 
 //
 // server_context_impl (private implementation)
@@ -1161,10 +1324,36 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
+    // MAD-LAB DS4-Flash pipeline-streams: stream B's context (nullptr unless
+    // params_base.n_pipeline_streams >= 2). Built directly off model_tgt via
+    // llama_init_from_model() (NOT common_init_from_params(), which would
+    // reload the model) so it shares model_tgt's already-loaded weights but
+    // gets its own KV cache and -- because llama_context_params::ctx_other
+    // is left null, see src/llama-context.cpp:622-660 -- its own expert-
+    // dispatch connection (design (b), see update_slots() PIPELINE-STREAMS
+    // comment). Owned here; freed in destroy() with llama_free().
+    llama_context * ctx_tgt2 = nullptr;
+
     server_batch batch;
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): stream B's own batch,
+    // init()-sized identically to `batch` (see the stream_b population
+    // block in init()). Never touched by the main thread while the
+    // stream-B thread is running this tick's decode.
+    server_batch batch_b;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
+
+    // MAD-LAB DS4-Flash pipeline-streams: stream B's own draft/MTP context,
+    // bound to ctx_tgt2 (never ctx_tgt) -- see the spec2 construction block
+    // in init(), a straight mirror of the model_dft/ctx_dft block below but
+    // targeting ctx_tgt2. For MTP/DSpark-self speculative (the dflash
+    // config) this taps model_tgt's already-loaded weights, same as
+    // model_dft/ctx_dft; for an external --model-draft it loads a second
+    // copy of the draft model (documented, not silently duplicated).
+    llama_model   * model_dft2 = nullptr;
+    llama_context * ctx_dft2   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
 
@@ -1172,6 +1361,16 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // MAD-LAB DS4-Flash pipeline-streams: stream B's own common_speculative
+    // instance (item 2 of the pipeline-streams task -- today spec/spec_init
+    // above is ONE shared instance for all slots, a known compromise; a
+    // second stream gets its own draft state instead of sharing stream A's).
+    // Built the same way spec_init/spec are built below, against ctx_tgt2.
+    // nullptr unless params_base.n_pipeline_streams >= 2 AND speculative
+    // decoding is configured.
+    common_speculative_init_result_ptr spec_init2;
+    common_speculative_ptr spec2;
 
     std::unique_ptr<pipe_dense_segment_client::client> segment_client;
     uint64_t segment_session_id = 1;
@@ -1215,7 +1414,60 @@ private:
     int trace = 0;
     int spec_phase = 0; // WP_SPEC_PHASE: per-block phase timing for speculative decode
     int slots_debug = 0;
-    int n_empty_consecutive = 0;
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 1): stream A's bundle --
+    // replaces the standalone n_empty_consecutive member and the
+    // function-local `static uint64_t paged_admit_rotor` that used to live
+    // inside pre_decode(). Populated once slots/spec/batch exist, at the
+    // end of init() (see the "pipeline-streams: build stream A's
+    // server_stream" block). pre_decode()/decode()/post_decode() are called
+    // with this unconditionally today (n_pipeline_streams==1 and >=2 alike)
+    // -- there is exactly one server_stream in play until stage 2 adds a
+    // second, so this is a pure representation change, not a behavior one.
+    server_stream stream_a;
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): stream B's bundle,
+    // populated in init() only when n_pipeline_streams >= 2 (wired to
+    // ctx_tgt2/ctx_dft2/model_dft2/spec2/batch_b and the second half of
+    // `slots`). Left default-constructed (all null/empty) otherwise --
+    // never read in that case because stream_b_thread_ is never spawned and
+    // the tick logic below skips it.
+    server_stream stream_b;
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): persistent thread for
+    // stream B, spawned once in init() when n_pipeline_streams >= 2 (never
+    // otherwise -- the n_pipeline_streams==1 path never touches any of
+    // this). Parked on stream_b_cv_ between ticks; woken by
+    // run_stream_b_tick_if_any() setting stream_b_has_work_ and notifying;
+    // signals completion by clearing stream_b_has_work_ and notifying
+    // stream_b_done_cv_, which update_slots() waits on before returning.
+    // See run_stream_tick()/update_slots() for the per-tick protocol and
+    // the PIPELINE-STREAMS comment there for why this is a per-tick join
+    // (not fully independent cross-tick ticking) as a first cut.
+    std::thread             stream_b_thread_;
+    std::mutex               stream_b_mtx_;
+    std::condition_variable  stream_b_cv_;       // main thread -> stream-B thread: "you have work"
+    std::condition_variable  stream_b_done_cv_;   // stream-B thread -> main thread: "done"
+    bool                     stream_b_has_work_ = false;
+    bool                     stream_b_done_ = true; // starts "done" (idle)
+    std::atomic<bool>        stream_b_thread_stop_{false};
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2) metrics decision: a
+    // narrow lock around the handful of server_metrics calls inside
+    // decode()/post_decode() (on_decoded/on_prompt_eval/on_prediction),
+    // rather than deferring all metrics collection to after the join.
+    // Chosen over "main-thread-after-join" because those calls are already
+    // interleaved token-by-token with per-slot sampling logic throughout
+    // post_decode() -- buffering and merging counts after the fact would
+    // mean threading a second, parallel bookkeeping structure through the
+    // same body this stage just finished de-duplicating via `stream`.
+    // server_metrics's own counters are plain (non-atomic) members, so
+    // without this lock two threads calling on_decoded/on_prompt_eval/
+    // on_prediction concurrently would race on ++/max updates -- narrow
+    // enough (increment-sized critical sections) not to meaningfully
+    // serialize the two streams' actual decode work, which is what this
+    // whole design is for.
+    std::mutex metrics_mtx_;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1301,7 +1553,20 @@ private:
         }
     }
 
-    void drain_paged_fingerprints() {
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): takes the stream's own
+    // ctx_tgt now (was the impl member, i.e. always stream A's). Note the
+    // fp_worker_/start_fp_worker() background embedder below this point is
+    // NOT per-stream -- it is one shared worker/queue for the whole
+    // server, and start_fp_worker() is a no-op once any mt_tier has
+    // claimed it (first caller wins, see its "if (fp_worker_.joinable())
+    // return;" guard). If --kv-tier-semantic-index is ever combined with
+    // --pipeline-streams >= 2, whichever stream's mt_tier calls this first
+    // gets fingerprinting; the other stream's fingerprint jobs are silently
+    // never embedded. Not a crash and not decode-result corruption --
+    // fingerprinting is already documented as best-effort/droppable
+    // elsewhere in this function -- but it is a real, un-fixed limitation
+    // of this stage, flagged rather than silently accepted.
+    void drain_paged_fingerprints(llama_context * ctx_tgt) {
         if (!params_base.kv_tier_paged_blocks) {
             return;
         }
@@ -1391,15 +1656,48 @@ private:
         }
     }
 
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): stop stream_b_thread_
+    // before anything it might touch (ctx_tgt2, stream_b.*) gets freed.
+    // Safe to call even if the thread was never spawned (join is only
+    // attempted if joinable).
+    void stop_stream_b_thread() {
+        stream_b_thread_stop_.store(true);
+        {
+            std::lock_guard<std::mutex> lock(stream_b_mtx_);
+            stream_b_cv_.notify_all();
+        }
+        if (stream_b_thread_.joinable()) {
+            stream_b_thread_.join();
+        }
+    }
+
     void destroy() {
+        stop_stream_b_thread();
         stop_fp_worker();
 
         spec.reset();
         spec_init.reset();
+        spec2.reset();
+        spec_init2.reset();
         segment_client.reset();
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
+        ctx_dft2   = nullptr; // MAD-LAB: owned by spec_init2, just reset above
+        model_dft2 = nullptr;
+        // MAD-LAB: stream_a/stream_b hold copies of these pointers; clear
+        // them too so nothing downstream can read a freed context between
+        // destroy() and the next init() (relevant on the sleep/wake path).
+        stream_a = server_stream{};
+        stream_b = server_stream{};
+
+        // ctx_tgt2 is NOT owned by llama_init (unlike ctx_tgt) -- it was
+        // built directly via llama_init_from_model(), so it must be freed
+        // explicitly, and before llama_init.reset() destroys model_tgt.
+        if (ctx_tgt2 != nullptr) {
+            llama_free(ctx_tgt2);
+            ctx_tgt2 = nullptr;
+        }
 
         llama_init.reset();
 
@@ -1496,6 +1794,50 @@ private:
         }
 
         params_base = params;
+
+        // MAD-LAB DS4-Flash pipeline-streams: split --ctx-size evenly across
+        // streams up front, before ctx_tgt (stream A) is built below, so
+        // both/all streams are sized symmetrically and stream A's
+        // construction goes through the exact same common_init_from_params()
+        // path it always has (no separate code path for stream A). At
+        // n_pipeline_streams==1 this is a no-op division by 1 -- byte-
+        // identical to today per the campaign's exactness rule.
+        //
+        // Chosen sizing: params.n_ctx (the existing --ctx-size /
+        // LLAMA_ARG_CTX_SIZE knob) / n_pipeline_streams, floor-divided, with
+        // n_ctx==0 (== "use the model's trained context") left untouched --
+        // splitting an auto-sized ctx here would require knowing the
+        // model's default ctx before common_init_from_params() computes it,
+        // which is not available yet. No new --ctx-size-per-stream flag was
+        // added; if a use case needs asymmetric per-stream sizing later,
+        // that is the natural extension point.
+        if (params_base.n_pipeline_streams >= 2) {
+            if (!params_base.segment_manifest.empty()) {
+                SRV_ERR("%s", "--pipeline-streams >= 2 is not supported together with "
+                               "--segment-manifest (dense segment client is not yet "
+                               "duplicated per stream; unset one of the two)\n");
+                return false;
+            }
+            if (params_base.n_ctx > 0) {
+                const int32_t split = params_base.n_ctx / params_base.n_pipeline_streams;
+                SRV_INF("pipeline-streams: splitting --ctx-size %d across %d streams -> %d per stream\n",
+                        params_base.n_ctx, params_base.n_pipeline_streams, split);
+                params_base.n_ctx = split;
+            } else {
+                SRV_WRN("%s", "pipeline-streams: --ctx-size is 0 (model default); "
+                               "each stream will independently get the model's full "
+                               "trained context instead of an even split -- pass an "
+                               "explicit --ctx-size to size streams predictably\n");
+            }
+        }
+
+        const int32_t spec_const_width = server_spec_const_width();
+        if (server_ds4_const_shape_enabled() && spec_const_width > 0 &&
+                params_base.speculative.draft.n_max > spec_const_width) {
+            SRV_WRN("ds4: WP_DS4_CONST_SHAPE=1 clamps spec-draft-n-max from %d to %d\n",
+                    params_base.speculative.draft.n_max, spec_const_width);
+            params_base.speculative.draft.n_max = spec_const_width;
+        }
         if (!params_base.segment_manifest.empty() && params_base.n_cache_reuse > 0) {
             SRV_WRN("%s", "dense segments do not support shifted prompt reuse; disabling --cache-reuse\n");
             params_base.n_cache_reuse = 0;
@@ -1713,6 +2055,43 @@ private:
             return false;
         }
 
+        // MAD-LAB DS4-Flash pipeline-streams: build stream B's context.
+        // Deliberately NOT common_init_from_params() again -- that reloads
+        // the model from disk into a second set of weights. Instead go
+        // straight to llama_init_from_model() with model_tgt (already
+        // loaded) and a llama_context_params derived from the SAME
+        // (already ctx-split, see above) params_base used for ctx_tgt.
+        // Because llama_context_params::ctx_other is left at its default
+        // (null) here, the llama_context constructor takes the "not
+        // borrowed" branch at src/llama-context.cpp:642-660 and opens its
+        // OWN expert-dispatch connection -- this is the entirety of design
+        // (b) (two independent dispatchers) from the pipeline-streams task;
+        // no change to src/llama-context.cpp was needed. Contrast with the
+        // existing MTP/draft context further below, which sets
+        // params_base.speculative.draft.ctx_tgt = ctx_tgt (see
+        // common_speculative_init_from_params(), which threads that through
+        // to llama_context_params::ctx_other) to deliberately borrow
+        // (design (a)) -- appropriate there because the draft context's
+        // expert traffic is meant to ride the SAME worker connection as the
+        // target's, not a design to copy for pipeline-streams.
+        if (params_base.n_pipeline_streams >= 2) {
+            llama_context_params cparams2 = common_context_params_to_llama(params_base);
+            ctx_tgt2 = llama_init_from_model(model_tgt, cparams2);
+            if (ctx_tgt2 == nullptr) {
+                SRV_ERR("%s", "pipeline-streams: failed to create stream B context "
+                               "(second expert-dispatch connection likely refused by "
+                               "the worker -- check WP_WORKER_MULTI_CONN on the worker "
+                               "side)\n");
+                return false;
+            }
+            SRV_INF("pipeline-streams: stream B context constructed with its own "
+                    "expert-dispatch connection (n_ctx=%d)\n", llama_n_ctx(ctx_tgt2));
+            SRV_WRN("%s", "pipeline-streams: serving loop is not yet dual-stream -- "
+                          "all slots still run on stream A (see the PIPELINE-STREAMS "
+                          "comment at update_slots()); stream B's context/dispatcher "
+                          "is constructed and idle\n");
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -1874,6 +2253,58 @@ private:
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
+
+            // MAD-LAB DS4-Flash pipeline-streams (item 2): stream B's own
+            // draft/MTP context, bound to ctx_tgt2. Straight mirror of the
+            // block above, with every ctx_tgt below replaced by ctx_tgt2 and
+            // every *_dft replaced by *_dft2, so stream B's draft state can
+            // never touch stream A's target context or KV. Gated separately
+            // from `has_spec` so a pipeline-streams==1 run (or a streams>=2
+            // run with segment_manifest set, which already refused to start
+            // above) takes exactly the code path it always has.
+            if (params_base.n_pipeline_streams >= 2 && ctx_tgt2 != nullptr) {
+                common_params params_dft2 = common_base_params_to_speculative(params_base);
+
+                params_dft2.load_progress_callback           = load_progress_callback;
+                params_dft2.load_progress_callback_user_data = &load_progress_spec;
+
+                if (params_base.speculative.draft.n_ctx > 0) {
+                    const uint32_t tgt_n_ctx   = llama_n_ctx_seq(ctx_tgt2);
+                    const int32_t  draft_n_ctx = params_base.speculative.draft.n_ctx;
+                    params_dft2.n_ctx = (int32_t) (((uint32_t) draft_n_ctx < tgt_n_ctx)
+                        ? (uint32_t) draft_n_ctx
+                        : tgt_n_ctx);
+                }
+
+                params_dft2.kv_tiered_enabled             = false;
+                params_dft2.kv_tier_paged_blocks          = false;
+                params_dft2.kv_tier_paged_blocks_explicit = true;
+                params_dft2.kv_tier_total_ctx             = 0;
+
+                spec_init2 = common_speculative_init_from_params(params_dft2, model_tgt, ctx_tgt2);
+                model_dft2 = spec_init2->model();
+                ctx_dft2   = spec_init2->context();
+
+                if (has_draft && model_dft2 == nullptr) {
+                    SRV_ERR("%s", "pipeline-streams: failed to load stream B's draft model\n");
+                    return false;
+                }
+
+                if (ctx_dft2 == nullptr) {
+                    SRV_ERR("%s", "pipeline-streams: failed to create stream B's MTP/draft context\n");
+                    return false;
+                }
+
+                if (has_draft) {
+                    SRV_WRN("%s", "pipeline-streams: stream B loaded its OWN copy of "
+                                  "the external draft model (--model-draft) -- this "
+                                  "doubles draft-model VRAM; MTP/DSpark-self speculative "
+                                  "does not hit this path (no separate draft weights)\n");
+                }
+
+                SRV_INF("%s", "pipeline-streams: stream B draft/MTP context constructed, "
+                              "bound to ctx_tgt2\n");
+            }
         }
 
         if (has_mmproj) {
@@ -2000,6 +2431,44 @@ private:
             }
         }
 
+        // MAD-LAB DS4-Flash pipeline-streams (item 3): build spec2 -- the
+        // stream-B mirror of spec above -- now that ctx_tgt2/ctx_dft2 exist
+        // (built earlier in this function, gated on
+        // params_base.n_pipeline_streams >= 2). common_speculative_init()
+        // reads its target/draft contexts off the common_params_speculative
+        // it is given (params.draft.ctx_tgt / params.draft.ctx_dft), so a
+        // shallow copy of params_base.speculative with those two fields
+        // overridden to ctx_tgt2/ctx_dft2 is enough to get a fully
+        // independent instance -- it does NOT share any state with `spec`.
+        common_context_seq_rm_type ctx_tgt2_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        common_context_seq_rm_type ctx_dft2_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        if (ctx_tgt2 != nullptr) {
+            ctx_tgt2_seq_rm_type = common_context_can_seq_rm(ctx_tgt2);
+            if (ctx_tgt2_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                common_params_speculative speculative_b = params_base.speculative;
+                speculative_b.draft.ctx_tgt = ctx_tgt2;
+                speculative_b.draft.ctx_dft = ctx_dft2;
+                try {
+                    // n_seq sized for however many slots stream B ends up
+                    // with -- computed the same way the slot split below
+                    // computes n_slots_b, kept in sync deliberately (both
+                    // read params_base.n_parallel and n_pipeline_streams).
+                    const int n_slots_b = params_base.n_parallel / params_base.n_pipeline_streams;
+                    spec2.reset(common_speculative_init(speculative_b, std::max(1, n_slots_b)));
+                } catch (const std::exception & e) {
+                    SRV_ERR("pipeline-streams: failed to initialize stream B speculative decoding: %s\n", e.what());
+                }
+            }
+            if (ctx_dft2) {
+                ctx_dft2_seq_rm_type = common_context_can_seq_rm(ctx_dft2);
+            }
+            if (!spec2) {
+                spec_init2.reset();
+                ctx_dft2   = nullptr;
+                model_dft2 = nullptr;
+            }
+        }
+
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
@@ -2012,26 +2481,62 @@ private:
             model_dft = nullptr;
         }
 
+        // MAD-LAB DS4-Flash pipeline-streams (item 3): assign slots to
+        // streams. Stream B gets slots [n_slots_a, n_parallel), stream A
+        // gets [0, n_slots_a) -- a contiguous split rather than interleaved
+        // parity so slot-id-based logging/debugging stays easy to read
+        // ("slots 0..N/2-1 are stream A"). At n_pipeline_streams==1,
+        // n_slots_a == n_parallel and every slot is stream A, unchanged
+        // from today.
+        const int n_slots_b = (params_base.n_pipeline_streams >= 2)
+            ? params_base.n_parallel / params_base.n_pipeline_streams
+            : 0;
+        const int n_slots_a = params_base.n_parallel - n_slots_b;
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
+            const bool is_stream_b = i >= n_slots_a && ctx_tgt2 != nullptr;
+
             slot.id      = i;
-            slot.ctx_tgt = ctx_tgt;
-            slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
-            slot.spec    = spec.get();
+            // MAD-LAB DS4-Flash pipeline-streams: stream-local index, dense
+            // from 0 within EACH stream -- stream A is slots [0, n_slots_a)
+            // so stream_slot_idx == id there (that equality is exactly what
+            // let a missing conversion go undetected for stream A); stream
+            // B is slots [n_slots_a, n_parallel), so its stream_slot_idx is
+            // id - n_slots_a, i.e. also dense from 0.
+            slot.stream_slot_idx = is_stream_b ? (i - n_slots_a) : i;
+            slot.ctx_tgt = is_stream_b ? ctx_tgt2 : ctx_tgt;
+            slot.ctx_dft = is_stream_b ? ctx_dft2 : ctx_dft;
+            slot.mem.init(slot.ctx_tgt, slot.ctx_dft);
+            slot.spec    = is_stream_b ? spec2.get() : spec.get();
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
-            SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+            SLT_TRC(slot, "new slot, n_ctx = %d, stream = %s\n", slot.n_ctx, is_stream_b ? "B" : "A");
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
             slot.reset();
+        }
+
+        if (params_base.n_pipeline_streams >= 2) {
+            SRV_INF("pipeline-streams: %d slots on stream A, %d slots on stream B "
+                    "(ctx_tgt2_seq_rm=%d, ctx_dft2_seq_rm=%d)\n",
+                    n_slots_a, n_slots_b, (int) ctx_tgt2_seq_rm_type, (int) ctx_dft2_seq_rm_type);
+            // MAD-LAB DS4-Flash pipeline-streams: the hard refusal that used
+            // to be here is gone -- update_slots()/decode()/post_decode()
+            // now route every slot's decode through its OWN stream's
+            // context end to end (server_stream, run_stream_decode_loop(),
+            // the transitive-helper audit converting try_clear_idle_slots/
+            // launch_slot_with_task/process_token/populate_token_probs/
+            // send_final_response/send_rerank/drain_paged_fingerprints to
+            // slot.*/stream.* reads). stream_b + batch_b + stream_b_thread_
+            // are wired up just below.
         }
 
         {
@@ -2066,7 +2571,63 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            batch.init(std::max(n_batch, n_slots_a), n_embd);
+        }
+
+        // MAD-LAB DS4-Flash pipeline-streams (stage 2): populate stream_a
+        // with just its own slots -- [0, n_slots_a), not "every slot"
+        // anymore now that a stream B can exist.
+        {
+            stream_a.ctx_tgt   = ctx_tgt;
+            stream_a.ctx_dft   = ctx_dft;
+            stream_a.model_dft = model_dft;
+            stream_a.spec      = spec.get();
+            stream_a.ctx_tgt_seq_rm_type = ctx_tgt_seq_rm_type;
+            stream_a.ctx_dft_seq_rm_type = ctx_dft_seq_rm_type;
+            stream_a.batch     = &batch;
+            stream_a.slots.clear();
+            stream_a.slots.reserve((size_t) n_slots_a);
+            for (int i = 0; i < n_slots_a; i++) {
+                stream_a.slots.push_back(&slots[i]);
+            }
+            stream_a.paged_admit_rotor    = 0;
+            stream_a.n_empty_consecutive  = 0;
+        }
+
+        // MAD-LAB DS4-Flash pipeline-streams (stage 2): batch_b + stream_b +
+        // stream_b_thread_, only when n_pipeline_streams >= 2. batch_b is
+        // init()-sized the same way `batch` is above, just against
+        // n_slots_b instead of n_slots_a. stream_b_thread_ is spawned here
+        // (once, for the lifetime of this init()) rather than per-tick --
+        // see stream_b_thread_main()/run_stream_decode_loop() for its body
+        // and update_slots() for the per-tick dispatch/join protocol.
+        if (params_base.n_pipeline_streams >= 2) {
+            const int32_t n_batch = llama_n_batch(ctx_tgt2);
+            const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
+            batch_b.init(std::max(n_batch, n_slots_b), n_embd);
+
+            stream_b.ctx_tgt   = ctx_tgt2;
+            stream_b.ctx_dft   = ctx_dft2;
+            stream_b.model_dft = model_dft2;
+            stream_b.spec      = spec2.get();
+            stream_b.ctx_tgt_seq_rm_type = ctx_tgt2_seq_rm_type;
+            stream_b.ctx_dft_seq_rm_type = ctx_dft2_seq_rm_type;
+            stream_b.batch     = &batch_b;
+            stream_b.slots.clear();
+            stream_b.slots.reserve((size_t) n_slots_b);
+            for (int i = n_slots_a; i < params_base.n_parallel; i++) {
+                stream_b.slots.push_back(&slots[i]);
+            }
+            stream_b.paged_admit_rotor    = 0;
+            stream_b.n_empty_consecutive  = 0;
+
+            stream_b_thread_stop_.store(false);
+            {
+                std::lock_guard<std::mutex> lock(stream_b_mtx_);
+                stream_b_has_work_ = false;
+                stream_b_done_ = true;
+            }
+            stream_b_thread_ = std::thread([this] { stream_b_thread_main(); });
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -2374,14 +2935,20 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): scoped to stream.slots
+    // -- purging a slot only helps if it frees KV space in the STREAM
+    // that just failed to decode; a stream-B slot's KV lives in ctx_tgt2,
+    // which does nothing for a stream-A retry (and vice versa) now that
+    // the two streams have separate paged-KV pools.
+    bool try_clear_idle_slots(server_stream & stream) {
         bool res = false;
 
         if (!params_base.kv_unified) {
             return res;
         }
 
-        for (auto & slot : slots) {
+        for (auto * slot_ptr : stream.slots) {
+            auto & slot = *slot_ptr;
             if (slot.is_processing()) {
                 continue;
             }
@@ -2480,7 +3047,7 @@ private:
             }
         }
 
-        if (!task.tokens.validate(ctx_tgt)) {
+        if (!task.tokens.validate(slot.ctx_tgt)) { // MAD-LAB: this slot's own stream's context
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
@@ -2506,9 +3073,9 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                llama_set_sampler(slot.ctx_tgt, slot.stream_slot_idx, common_sampler_get(slot.smpl.get())); // MAD-LAB: stream-local seq id
             } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                llama_set_sampler(slot.ctx_tgt, slot.stream_slot_idx, nullptr); // MAD-LAB: stream-local seq id
             }
 
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2533,7 +3100,9 @@ private:
             : SLOT_STATE_STARTED;
 
         // reset server kill-switch counter
-        n_empty_consecutive = 0;
+        // MAD-LAB DS4-Flash pipeline-streams (stage 2): resets THIS slot's
+        // own stream's counter, not always stream_a.
+        stream_for_slot(slot).n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
@@ -2613,7 +3182,7 @@ private:
         if (params_base.kv_tiered_enabled) {
             const int n_tokens = slot.prompt.n_tokens();
 
-            auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx_tgt));
+            auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(slot.ctx_tgt)); // MAD-LAB: this slot's own stream's context
             uint32_t cap = (uint32_t)slot.n_ctx;
             if (mt_tier) {
                 const uint32_t phys = mt_tier->physical_attn_cells();
@@ -2658,7 +3227,7 @@ private:
                     const llama_pos p0 = slot.kv_evict_through;
                     const llama_pos p1 = p0 + (llama_pos)n_evict;
                     const uint32_t backed_up = mt_tier->backup_proactive(
-                        slot.id, p0, p1);
+                        slot.stream_slot_idx, p0, p1); // MAD-LAB: stream-local seq id
                     if (backed_up > 0) {
                         // Semantic fingerprint: embed the detokenized chunk
                         // so a future query (likely a separate request with
@@ -2675,9 +3244,9 @@ private:
                         if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
                             const auto & toks = slot.prompt.tokens.get_text_tokens();
                             llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
-                                ? mt_get_paged_cache(llama_get_memory(ctx_tgt)) : nullptr;
+                                ? mt_get_paged_cache(llama_get_memory(slot.ctx_tgt)) : nullptr; // MAD-LAB
                             const int n_fp = mt_record_fingerprints_for_range(
-                                mt_tier, paged_cache, ctx_tgt, slot.id, toks, p0, p1,
+                                mt_tier, paged_cache, slot.ctx_tgt, slot.stream_slot_idx, toks, p0, p1, // MAD-LAB: stream-local seq id
                                 (uint32_t) params_base.kv_tier_paged_block_size);
                             if (n_fp > 0) {
                                 SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for proactive backup\n",
@@ -2817,12 +3386,12 @@ private:
 
                 result.probs.push_back({
                     cur_p->data[i].id,
-                    common_token_to_piece(ctx_tgt, cur_p->data[i].id, special),
+                    common_token_to_piece(slot.ctx_tgt, cur_p->data[i].id, special), // MAD-LAB
                     cur_p->data[i].p
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = get_token_probabilities(slot.ctx_tgt, idx, n_probs_request); // MAD-LAB
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -2840,7 +3409,7 @@ private:
             for (size_t i = 0; i < n_probs; i++) {
                 result.probs.push_back({
                     cur[i].id,
-                    common_token_to_piece(ctx_tgt, cur[i].id, special),
+                    common_token_to_piece(slot.ctx_tgt, cur[i].id, special), // MAD-LAB
                     cur[i].p
                 });
             }
@@ -2949,7 +3518,7 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->timings         = slot.get_timings();
-        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
+        res->prompt          = slot.task->tokens.detokenize(slot.ctx_tgt, true); // MAD-LAB
         res->response_fields = std::move(slot.task->params.response_fields);
 
         res->truncated             = slot.truncated;
@@ -2972,7 +3541,7 @@ private:
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
             if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
-                const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
+                const llama_tokens stop_word_toks = common_tokenize(slot.ctx_tgt, slot.stopping_word, false); // MAD-LAB
 
                 size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());
                 res->probs_output = std::vector<completion_token_output>(
@@ -3002,7 +3571,7 @@ private:
         std::vector<float> embd_res(n_embd_out, 0.0f);
 
         for (int i = 0; i < batch.n_tokens; ++i) {
-            if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
+            if (!batch.logits[i] || batch.seq_id[i][0] != slot.stream_slot_idx) {
                 continue;
             }
 
@@ -3042,13 +3611,13 @@ private:
         res->n_tokens = slot.task->n_tokens();
 
         for (int i = 0; i < batch.n_tokens; ++i) {
-            if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
+            if (!batch.logits[i] || batch.seq_id[i][0] != slot.stream_slot_idx) {
                 continue;
             }
 
-            const float * embd = llama_get_embeddings_seq(ctx_tgt, batch.seq_id[i][0]);
+            const float * embd = llama_get_embeddings_seq(slot.ctx_tgt, batch.seq_id[i][0]); // MAD-LAB
             if (embd == NULL) {
-                embd = llama_get_embeddings_ith(ctx_tgt, i);
+                embd = llama_get_embeddings_ith(slot.ctx_tgt, i); // MAD-LAB
             }
 
             if (embd == NULL) {
@@ -3185,10 +3754,19 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // MAD-LAB DS4-Flash pipeline-streams: create_checkpoint() isn't
+        // parameterized by server_stream (it doesn't need to be) -- slot.
+        // ctx_tgt/ctx_dft/spec are already this slot's own stream's context
+        // (wired at slot construction in init(), see the earlier
+        // pipeline-streams slot-split work), which for any slot in
+        // stream.slots is by construction the same pointer as
+        // stream.ctx_tgt/ctx_dft/spec. Using the per-slot fields here avoids
+        // adding a parameter to a function whose only per-tick input is
+        // already the slot.
+        cur.update_tgt(slot.ctx_tgt, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
+        cur.update_dft(slot.ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
         // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        common_speculative_get_state(slot.spec, slot.stream_slot_idx, cur.data_spec); // MAD-LAB: stream-local seq id (spec's dparams sized per-stream)
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3394,7 +3972,7 @@ private:
 
                     const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
                     const size_t token_count = tokens.size();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    const size_t nwrite = llama_state_seq_save_file(slot->ctx_tgt, filepath.c_str(), slot->stream_slot_idx, tokens.data(), token_count); // MAD-LAB: stream-local seq id, this slot's own stream's context
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -3432,7 +4010,7 @@ private:
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);
                     size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                    size_t nread = llama_state_seq_load_file(slot->ctx_tgt, filepath.c_str(), slot->stream_slot_idx, tokens.data(), tokens.size(), &token_count); // MAD-LAB: stream-local seq id, this slot's own stream's context
                     if (nread == 0) {
                         slot->prompt.clear(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
@@ -3560,6 +4138,37 @@ private:
         }
     }
 
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): scoped variant, used
+    // from within a per-stream tick (pre_decode()/run_stream_tick()
+    // exception handling) so a stream-A failure cannot abort stream-B's
+    // in-flight slots (separate contexts, separate failure domains) and
+    // vice versa. The unscoped abort_all_slots() above is kept for the
+    // few call sites that are genuinely global (e.g. shutdown).
+    void abort_all_slots(server_stream & stream, const std::string & reason) {
+        for (auto * slot_ptr : stream.slots) {
+            auto & slot = *slot_ptr;
+            if (slot.is_processing()) {
+                send_error(slot, reason, ERROR_TYPE_SERVER);
+                slot.release();
+            }
+        }
+    }
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): maps a slot to its
+    // stream by comparing slot.ctx_tgt against each stream's ctx_tgt --
+    // slot.ctx_tgt was wired to the correct stream's context at slot
+    // construction in init() and never changes afterward, so this is a
+    // safe, cheap way for code that only has a `server_slot&` (not a
+    // `server_stream&`) to find the right stream. Falls back to stream_a
+    // if stream_b was never constructed (n_pipeline_streams < 2) or if the
+    // slot somehow doesn't match either (should not happen; defensive).
+    server_stream & stream_for_slot(server_slot & slot) {
+        if (stream_b.ctx_tgt != nullptr && slot.ctx_tgt == stream_b.ctx_tgt) {
+            return stream_b;
+        }
+        return stream_a;
+    }
+
     // @ngxson : for debugging only
     int64_t t_pre_decode  = 0;
     int64_t t_decode      = 0;
@@ -3590,6 +4199,39 @@ private:
     };
 #endif
 
+    // PIPELINE-STREAMS (MAD-LAB DS4-Flash, NOT YET WIRED): this function is
+    // still single-context / single-thread regardless of
+    // params_base.n_pipeline_streams. All slots are pinned to slot.ctx_tgt
+    // == ctx_tgt (stream A) at slot construction above; decode() below
+    // always calls llama_decode() against the server_context_impl::ctx_tgt
+    // MEMBER (not slot.ctx_tgt), and the batch built at the top of this
+    // function mixes every ready slot's tokens into ONE llama_batch/
+    // llama_decode() call. ctx_tgt2 (stream B, constructed in init() with
+    // its own KV cache and its own expert-dispatch connection -- see the
+    // comment there) exists and is live, but nothing currently drives it.
+    //
+    // What full wiring needs, concretely:
+    //   1. Split `slots` into a stream-A group and a stream-B group (e.g.
+    //      by slot.id parity, or a new slot.stream_id), each with its
+    //      slot.ctx_tgt/slot.spec pointing at its own stream's ctx_tgt(2)/
+    //      spec(2).
+    //   2. Build TWO independent llama_batch views (one per group) instead
+    //      of the single `batch` below, and run pre_decode/decode/
+    //      post_decode against each group's OWN context.
+    //   3. Run stream B's decode() on a second OS thread (per the task's
+    //      "smallest honest seam") so its blocking llama_decode() call can
+    //      overlap stream A's -- join before this function returns so a
+    //      "tick" still completes both streams before the task-queue loop
+    //      advances. decode()/post_decode() touch slot state and call
+    //      queue_results.send(...); confirm server_response's internal
+    //      locking (tools/server/server-*.h, class server_response) is
+    //      actually safe for two concurrent senders before relying on it --
+    //      it was written for the existing single-decode-thread model
+    //      where callers are otherwise serialized.
+    //   4. Everything downstream of a batch/decode (post_decode, sampling,
+    //      speculative harvest at ~:4990-ish) already reads ctx_tgt off the
+    //      slot or off `batch_view` sizes, so it should generalize once (1)
+    //      and (2) are in place; audit rather than assume.
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3604,7 +4246,10 @@ private:
         }
 #endif
 
-        drain_paged_fingerprints();
+        drain_paged_fingerprints(ctx_tgt);
+        if (stream_b.ctx_tgt != nullptr) {
+            drain_paged_fingerprints(stream_b.ctx_tgt);
+        }
 
         // check if all slots are idle
         {
@@ -3630,25 +4275,114 @@ private:
             }
         }
 
+        // MAD-LAB DS4-Flash pipeline-streams (stage 2) PIPELINE-STREAMS
+        // threading model:
+        //   1. pre_decode() + render() run SEQUENTIALLY on this (the main/
+        //      task-queue) thread for BOTH streams, one after the other,
+        //      before either stream's decode starts. This is deliberate,
+        //      not a missed overlap opportunity: pre_decode() is where all
+        //      the KV-tier/checkpoint/cache-reuse/paged-admission state
+        //      mutation happens, and stream_a/stream_b touch fully
+        //      disjoint state there (separate rotor, separate slots,
+        //      separate batch) so nothing stops them running concurrently
+        //      too -- but that state is also the least-audited part of
+        //      this refactor, so the first cut keeps it single-threaded
+        //      and puts the persistent thread ONLY around the part that
+        //      actually blocks on the GPU/dispatcher (decode()) and the
+        //      per-token sampling after it (post_decode()), which is where
+        //      the real wall-clock overlap this design exists for comes
+        //      from.
+        //   2. run_stream_decode_loop(stream_b) is dispatched to
+        //      stream_b_thread_ ONLY if pre_decode(stream_b) actually
+        //      produced work (batch_b.size() > 0) -- idle-skip: the thread
+        //      is never woken for an empty tick, so it never holds
+        //      anything a busy stream A needs, and the "join" below is a
+        //      no-op wait on a condition already satisfied.
+        //   3. This thread then runs run_stream_decode_loop(stream_a)
+        //      directly -- this is where stream A's llama_decode()/GPU
+        //      submission can overlap stream B's (running concurrently on
+        //      stream_b_thread_).
+        //   4. join_stream_b_tick() blocks until stream B's dispatched tick
+        //      (if any) completes, before this function returns.
+        // This is a PER-TICK JOIN (first cut), not fully independent
+        // cross-tick ticking: the surrounding harness (server_queue::
+        // start_loop(), on which see the earlier per-round audit) is built
+        // around exactly one update_slots() call representing "this tick,
+        // all slots," and fully decoupling stream B onto its own cadence
+        // would mean splitting start_loop() itself into two independent
+        // task-admission/dispatch loops -- a materially bigger change than
+        // giving stream B's blocking llama_decode() its own thread. If a
+        // live gate shows the per-tick join is costing real overlap (stream
+        // A regularly finishing well before stream B, or vice versa, and
+        // waiting idle), that cross-tick decoupling is the known next step.
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
-            pre_decode();
+            pre_decode(stream_a);
             batch.render();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
-            abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+            abort_all_slots(stream_a, "pre_decode() failed: " + std::string(e.what()));
         }
 
-        GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+        bool stream_b_dispatched = false;
+        if (stream_b.ctx_tgt != nullptr) {
+            try {
+                scoped_timer t(t_pre_decode, n_pre_decode);
+                pre_decode(stream_b);
+                batch_b.render();
+            } catch (const std::exception & e) {
+                SRV_ERR("pre_decode() (stream B) failed: %s\n", e.what());
+                abort_all_slots(stream_b, "pre_decode() failed: " + std::string(e.what()));
+            }
 
-        if (batch.slot_batched) {
-            auto & slot_batched      = batch.slot_batched;
-            auto & alora_scale       = batch.alora_scale;
-            auto & alora_disabled_id = batch.alora_disabled_id;
+            if (batch_b.size() > 0) {
+                stream_b_dispatched = true;
+                std::lock_guard<std::mutex> lock(stream_b_mtx_);
+                stream_b_has_work_ = true;
+                stream_b_done_ = false;
+                stream_b_cv_.notify_one();
+            }
+        }
+
+        run_stream_decode_loop(stream_a);
+
+        if (stream_b_dispatched) {
+            std::unique_lock<std::mutex> lock(stream_b_mtx_);
+            stream_b_done_cv_.wait(lock, [this] { return stream_b_done_; });
+        }
+
+        // MAD-LAB DS4-Flash pipeline-streams: the n_cmpl>1 parent/child
+        // activation walk needs to see every slot regardless of stream, so
+        // it runs once here, in the single-threaded part of the tick, after
+        // stream A's (and stream B's already-joined) decode/post_decode
+        // work for this tick is done -- see activate_parent_child_tasks()
+        // for why it isn't parameterized.
+        activate_parent_child_tasks();
+    }
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): the chunked decode()/
+    // post_decode() loop, extracted out of update_slots() so it can run for
+    // either stream -- stream A on the calling (main) thread, stream B on
+    // stream_b_thread_. Assumes stream.batch has already been rendered by a
+    // preceding pre_decode(stream) + stream.batch->render() (done in
+    // update_slots(), sequentially for both streams -- see the threading
+    // model comment there for why pre_decode is not itself dual-threaded in
+    // this stage). Also applies the lora/embeddings-per-batch setup that
+    // used to live inline in update_slots(), now per-stream (was reading
+    // the impl-level `ctx_tgt`/`batch` members, i.e. always stream A's).
+    void run_stream_decode_loop(server_stream & stream) {
+        server_batch & sbatch = *stream.batch;
+
+        GGML_ASSERT(sbatch.slot_batched || sbatch.size() == 0);
+
+        if (sbatch.slot_batched) {
+            auto & slot_batched      = sbatch.slot_batched;
+            auto & alora_scale       = sbatch.alora_scale;
+            auto & alora_disabled_id = sbatch.alora_disabled_id;
 
             // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
             // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+            common_set_adapter_lora(stream.ctx_tgt, slot_batched->lora);
 
             // if the lora is temporarily disabled for an alora, re-enable it
             // for next time
@@ -3657,28 +4391,32 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd() ||
+            // MAD-LAB: segment_client is guaranteed null whenever
+            // n_pipeline_streams >= 2 (init() refuses --segment-manifest +
+            // --pipeline-streams together), so this is dead-but-correct at
+            // N=2 and unchanged at N=1.
+            llama_set_embeddings(stream.ctx_tgt, slot_batched->need_embd() ||
                 (segment_client && segment_client->has_remote_segments()));
         }
 
         if (segment_client && segment_client->has_remote_segments()) {
-            batch.set_all_output();
+            sbatch.set_all_output();
         }
 
         llama_batch batch_view;
         int32_t off_next = 0;
-        int32_t n_batch = llama_n_batch(ctx_tgt);
-        for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+        int32_t n_batch = llama_n_batch(stream.ctx_tgt);
+        for (int32_t off = 0; off < sbatch.size(); off = off_next) {
+            const int32_t n_tokens = std::min(n_batch, sbatch.size() - off);
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
-                batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
-                drain_paged_fingerprints();
+                batch_view = sbatch.get_view(off, n_tokens);
+                bool ok = decode(stream, n_batch, off, batch_view);
+                drain_paged_fingerprints(stream.ctx_tgt);
 #ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
+                llama_synchronize(stream.ctx_tgt);
 #endif
 
                 if (ok) {
@@ -3686,29 +4424,86 @@ private:
                     off_next = off + n_tokens;
 
                     // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
+                    n_batch = llama_n_batch(stream.ctx_tgt);
                 } else {
                     // try again with the updated n_batch
                     continue;
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
-                abort_all_slots("decode() failed: " + std::string(e.what()));
+                abort_all_slots(stream, "decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off, batch_view);
+                post_decode(stream, n_tokens, off, batch_view);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
-                abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                abort_all_slots(stream, "post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
     }
 
-    void pre_decode() {
+    // MAD-LAB DS4-Flash pipeline-streams (stage 2): body of stream_b_thread_.
+    // Parked on stream_b_cv_ waiting for stream_b_has_work_; runs exactly
+    // run_stream_decode_loop(stream_b) (pre_decode/render for stream B
+    // already happened on the main thread before this was signaled -- see
+    // update_slots()); signals stream_b_done_cv_ when finished. Exits when
+    // stream_b_thread_stop_ is set (destroy()).
+    void stream_b_thread_main() {
+        for (;;) {
+            std::unique_lock<std::mutex> lock(stream_b_mtx_);
+            stream_b_cv_.wait(lock, [this] {
+                return stream_b_thread_stop_.load() || stream_b_has_work_;
+            });
+            if (stream_b_thread_stop_.load() && !stream_b_has_work_) {
+                return;
+            }
+            stream_b_has_work_ = false;
+            lock.unlock();
+
+            run_stream_decode_loop(stream_b);
+
+            lock.lock();
+            stream_b_done_ = true;
+            lock.unlock();
+            stream_b_done_cv_.notify_one();
+        }
+    }
+
+    // MAD-LAB DS4-Flash pipeline-streams (stage 1): pre_decode() reads ONLY
+    // through `stream` now, via the shadow locals right below -- no member
+    // access to ctx_tgt/ctx_dft/model_dft/spec/ctx_tgt_seq_rm_type/
+    // ctx_dft_seq_rm_type/batch/slots/paged_admit_rotor survives past this
+    // point in the function; every one of those names is redeclared here to
+    // alias the struct instead, so ordinary C++ name lookup routes every
+    // existing reference in the ~800-line body below to `stream` with zero
+    // further textual changes, EXCEPT the handful the compiler forces
+    // because the shadow's type differs from the member's (see the two
+    // `slots` fixups below, and the `spec.get()` -> `spec` fixups, both
+    // marked MAD-LAB inline). This is a pure parameterization: no branch,
+    // no reordering, no new logic -- called once, unconditionally, with
+    // stream_a, whether n_pipeline_streams is 1 or >= 2.
+    void pre_decode(server_stream & stream) {
+        llama_context * const ctx_tgt   = stream.ctx_tgt;
+        llama_context * const ctx_dft   = stream.ctx_dft;
+        common_speculative * const spec = stream.spec;
+        const common_context_seq_rm_type ctx_tgt_seq_rm_type = stream.ctx_tgt_seq_rm_type;
+        const common_context_seq_rm_type ctx_dft_seq_rm_type = stream.ctx_dft_seq_rm_type;
+        server_batch & batch = *stream.batch;
+        uint64_t & paged_admit_rotor = stream.paged_admit_rotor;
+        int32_t & n_empty_consecutive = stream.n_empty_consecutive;
+        // MAD-LAB: was `std::vector<server_slot> & slots` (the impl
+        // member); now this stream's slot list. Type change is
+        // deliberate -- iterate(slots, ...) below auto-resolves to the
+        // std::vector<server_slot*> overload (same callback signature, zero
+        // body change); any bare `for (auto & slot : slots)` would instead
+        // fail to compile (slot becomes server_slot*), which is exactly how
+        // the two direct-index sites below were found and fixed.
+        std::vector<server_slot *> & slots = stream.slots;
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3763,7 +4558,7 @@ private:
                         llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
                             ? mt_get_paged_cache(llama_get_memory(ctx_tgt)) : nullptr;
                         const int n_fp = mt_record_fingerprints_for_range(
-                            mt_tier, paged_cache, ctx_tgt, slot.id, toks, n_keep, n_keep + n_discard,
+                            mt_tier, paged_cache, ctx_tgt, slot.stream_slot_idx, toks, n_keep, n_keep + n_discard, // MAD-LAB: stream-local seq id
                             (uint32_t) params_base.kv_tier_paged_block_size);
                         if (n_fp > 0) {
                             SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for context shift\n",
@@ -3775,8 +4570,8 @@ private:
                 }
 
                 // slot.mem covers both the target and draft contexts (upstream 2026-07-31).
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                slot.mem.seq_rm (slot.stream_slot_idx, n_keep            , n_keep + n_discard);
+                slot.mem.seq_add(slot.stream_slot_idx, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3827,15 +4622,20 @@ private:
         std::vector<llama_seq_id> paged_evicted_this_iter;
         paged_admitted.reserve(slots.size());
 
-        static uint64_t paged_admit_rotor = 0;
+        // MAD-LAB: paged_admit_rotor is stream.paged_admit_rotor now (shadowed
+        // above), not a function-local static -- see the server_stream comment.
         const size_t    n_slots_total     = slots.size();
         const size_t    rotor_off         = (n_slots_total > 0)
                                                 ? (size_t)(paged_admit_rotor % n_slots_total)
                                                 : 0;
         ++paged_admit_rotor;
 
+        // MAD-LAB: slots[i] is now server_slot* (stream-scoped vector), so
+        // this needs a dereference where it didn't before -- the compiler
+        // caught this one (return type server_slot& vs the pointer the old
+        // body would have produced).
         auto rotated_slot = [&](size_t i) -> server_slot & {
-            return slots[(rotor_off + i) % n_slots_total];
+            return *slots[(rotor_off + i) % n_slots_total];
         };
 
         std::vector<server_slot *> generating;
@@ -3858,7 +4658,7 @@ private:
             generating.push_back(&slot);
 
             if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+                common_speculative_get_draft_params(spec, slot.stream_slot_idx).drafting = false; // MAD-LAB: spec is now a raw ptr
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3878,16 +4678,16 @@ private:
 
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.stream_slot_idx),
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.stream_slot_idx));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                        common_speculative_get_draft_params(spec, slot.stream_slot_idx) = { // MAD-LAB: spec is now a raw ptr
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
@@ -3905,7 +4705,7 @@ private:
         // generate the actual drafts (if any)
         {
             const int64_t t0 = spec_phase ? ggml_time_us() : 0;
-            common_speculative_draft(spec.get());
+            common_speculative_draft(spec); // MAD-LAB: spec is now a raw ptr
             if (spec_phase && !drafting.empty()) {
                 size_t n_drafted = 0;
                 for (const auto * s : drafting) {
@@ -3928,11 +4728,11 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft_full) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.load_dft(ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.stream_slot_idx, ckpt.pos_max + 1, -1)) {
+                    GGML_ABORT("failed to remove sequence %d\n", slot.stream_slot_idx);
                 }
             }
 
@@ -3947,7 +4747,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3959,7 +4759,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
         });
@@ -3974,23 +4774,35 @@ private:
         const size_t admit_rotor_off = (n_generating > 0)
                                            ? (size_t)(paged_admit_rotor % n_generating)
                                            : 0;
+        const int32_t spec_const_width = server_spec_const_width();
         for (size_t _i = 0; _i < n_generating; ++_i) {
             auto & slot = *generating[(admit_rotor_off + _i) % n_generating];
 
-            // MAD-120: admission. Decode adds 1 token per slot per iter.
+            const int32_t n_verify_tokens = slot.spec_draft.empty()
+                ? 1
+                : 1 + std::max(spec_const_width, (int32_t) slot.spec_draft.size());
+            if (spec_const_width > 0 && !slot.spec_draft.empty() &&
+                    batch.size() + n_verify_tokens > batch.n_tokens_alloc) {
+                SLT_DBG(slot, "deferring constant-shape verify: need %d batch rows, have %d\n",
+                        n_verify_tokens, batch.n_tokens_alloc - batch.size());
+                continue;
+            }
+
+            // MAD-120: admission. Reserve the complete padded verify batch when enabled.
             if (!llama_memory_paged_can_admit(
-                        mem_for_admit, slot.id, /*n_new_tokens=*/1,
+                        mem_for_admit, slot.stream_slot_idx,
+                        spec_const_width > 0 && !slot.spec_draft.empty() ? n_verify_tokens : 1,
                         paged_admitted.data(), paged_admitted.size())) {
-                int n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
+                int n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.stream_slot_idx);
                 SLT_INF(slot, "MAD-120 preempt (decode): hot pool full, "
                               "evicted %d block(s) to warm; will retry next iter\n",
                               n_evicted);
-                paged_evicted_this_iter.push_back(slot.id);
+                paged_evicted_this_iter.push_back(slot.stream_slot_idx);
                 continue;
             }
 
             slot.handle_last_sampled_token(batch);
-            paged_admitted.push_back(slot.id);
+            paged_admitted.push_back(slot.stream_slot_idx);
         }
 
         // process in chunks of params.n_batch
@@ -4045,20 +4857,20 @@ private:
                                               slot.state == SLOT_STATE_STARTED)) {
                     const uint32_t n_new_est = slot.task ? (uint32_t) slot.task->n_tokens() : 0;
                     if (!llama_memory_paged_can_admit(
-                                mem_for_admit, slot.id, n_new_est,
+                                mem_for_admit, slot.stream_slot_idx, n_new_est,
                                 paged_admitted.data(), paged_admitted.size())) {
                         // Already evicted above? skip the duplicate evict.
                         bool already = false;
                         for (auto sid : paged_evicted_this_iter) {
-                            if (sid == slot.id) { already = true; break; }
+                            if (sid == slot.stream_slot_idx) { already = true; break; }
                         }
                         int n_evicted = 0;
                         if (!already) {
-                            n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
+                            n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.stream_slot_idx);
                             SLT_INF(slot, "MAD-120 preempt (prefill): hot pool full, "
                                           "evicted %d block(s) to warm; will retry next iter\n",
                                           n_evicted);
-                            paged_evicted_this_iter.push_back(slot.id);
+                            paged_evicted_this_iter.push_back(slot.stream_slot_idx);
                         }
 
                         // MAD-141: deadlock break. evict_seq returns 0 when
@@ -4099,7 +4911,7 @@ private:
                     }
                     // Slot was admitted — any prior no-progress streak ends here.
                     slot.paged_preempt_no_progress_count = 0;
-                    paged_admitted.push_back(slot.id);
+                    paged_admitted.push_back(slot.stream_slot_idx);
                 }
 
                 // this slot still has a prompt to be processed
@@ -4219,7 +5031,7 @@ private:
                                     // fan-out workload nothing is ever evicted, so this
                                     // fired on every request and restored nothing.
                                     const bool can_restore = paged_cache
-                                        ? paged_cache->has_restorable_blocks(slot.id)
+                                        ? paged_cache->has_restorable_blocks(slot.stream_slot_idx)
                                         : true;  // chunk path has no cheap predicate; unchanged
 
 
@@ -4236,11 +5048,11 @@ private:
                                             if (!qemb.empty()) {
                                                 const uint32_t restored = paged_cache
                                                     ? paged_cache->restore_semantic_paged(
-                                                          slot.id, qemb,
+                                                          slot.stream_slot_idx, qemb,
                                                           params_base.kv_semantic_top_k,
                                                           params_base.kv_semantic_threshold)
                                                     : mt_tier->restore_semantic(
-                                                          slot.id, qemb,
+                                                          slot.stream_slot_idx, qemb,
                                                           params_base.kv_semantic_top_k,
                                                           params_base.kv_semantic_threshold);
                                                 if (restored > 0) {
@@ -4306,8 +5118,8 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            slot.mem.seq_rm (slot.stream_slot_idx, head_p, head_c);
+                                            slot.mem.seq_add(slot.stream_slot_idx, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -4349,9 +5161,9 @@ private:
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
-                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.stream_slot_idx);
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
+                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.stream_slot_idx, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
@@ -4418,10 +5230,10 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_tgt(ctx_tgt, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_dft(ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        common_speculative_set_state(spec, slot.stream_slot_idx, it->data_spec); // MAD-LAB: spec is now a raw ptr
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -4491,7 +5303,7 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    slot.mem.seq_rm(slot.stream_slot_idx, p0, -1);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -4577,7 +5389,7 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
+                        add_ok &= batch.add(slot.stream_slot_idx,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             slot.need_embd());
@@ -4649,8 +5461,8 @@ private:
                         }
                     }
 
-                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.stream_slot_idx);
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.stream_slot_idx);
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
@@ -4682,9 +5494,26 @@ private:
         }
     }
 
+    // MAD-LAB DS4-Flash pipeline-streams (stage 1): decode() reads ONLY
+    // through `stream` now -- same shadowing approach as pre_decode() above.
+    // The n_cmpl>1 parent/child activation loop that used to live at the
+    // end of this function has been HOISTED to update_slots() (see
+    // activate_parent_child_tasks()) instead of parameterized: unlike
+    // everything else here, it genuinely needs to see every slot regardless
+    // of stream (a child could in principle land on a different stream's
+    // slot than its parent), so it belongs in the single-threaded part of
+    // the tick, not inside a per-stream call that will eventually run on a
+    // per-stream thread.
+    //
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+    bool decode(server_stream & stream, int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+        llama_context * const ctx_tgt   = stream.ctx_tgt;
+        common_speculative * const spec = stream.spec;
+        server_batch & batch = *stream.batch;
+        int32_t & n_empty_consecutive = stream.n_empty_consecutive;
+        std::vector<server_slot *> & slots = stream.slots;
+
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         if (batch.size() == 0) {
@@ -4702,7 +5531,11 @@ private:
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
         if (spec && batch.has_embd) {
-            if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
+            // MAD-LAB: model_dft/model_tgt are NOT stream fields -- model_tgt
+            // is the one shared model every stream decodes against, and
+            // stream.model_dft (added for exactly this check) is this
+            // stream's own draft/MTP model, mirroring model_dft/model_tgt today.
+            if (llama_model_n_embd_inp(stream.model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
             }
@@ -4716,7 +5549,14 @@ private:
             SRV_INF("SPECPHASE local_decode_us=%" PRId64 " n_tokens=%d\n", ggml_time_us() - t_local0, batch_view.n_tokens);
         }
 
-        metrics.on_decoded(slots);
+        // MAD-LAB DS4-Flash pipeline-streams (stage 2): narrow lock -- see
+        // metrics_mtx_'s declaration for why. server_metrics's counters
+        // are not otherwise thread-safe, and this can now be called from
+        // either stream's thread.
+        {
+            std::lock_guard<std::mutex> lock(metrics_mtx_);
+            metrics.on_decoded(slots);
+        }
 
         if (ret != 0) {
             {
@@ -4742,7 +5582,11 @@ private:
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
-                    for (auto & slot : slots) {
+                    // MAD-LAB: scoped to stream.slots -- a decode() failure
+                    // on this stream's context must not touch the other
+                    // stream's slots (separate contexts, separate KV pools).
+                    for (auto * slot_ptr : slots) {
+                        auto & slot = *slot_ptr;
                         if (slot.is_processing()) {
                             send_error(slot, err);
                             slot.release();
@@ -4759,7 +5603,7 @@ private:
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
+            if (!try_clear_idle_slots(stream)) {
                 n_batch /= 2;
             }
 
@@ -4887,7 +5731,7 @@ private:
             //
             // Pairs with the need && empty check below: need+present consumes,
             // need+absent errors, !need+present is ignored.
-            if (spec && common_speculative_need_embd_nextn(spec.get()) && !terminal.nextn.empty()) {
+            if (spec && common_speculative_need_embd_nextn(spec) && !terminal.nextn.empty()) { // MAD-LAB: spec is a raw ptr
                 float * nextn = ctx_tgt->get_embeddings_nextn();
                 if (terminal.nextn.size() != (size_t) batch_view.n_tokens * n_embd || nextn == nullptr) {
                     throw std::runtime_error("dense segment terminal NextN activations have an invalid width");
@@ -4914,7 +5758,7 @@ private:
                     throw std::runtime_error("failed to install a forwarded interior tap");
                 }
             }
-            if (spec && common_speculative_need_embd_nextn(spec.get()) && terminal.nextn.empty()) {
+            if (spec && common_speculative_need_embd_nextn(spec) && terminal.nextn.empty()) { // MAD-LAB: spec is a raw ptr
                 throw std::runtime_error("dense segment terminal did not return NextN activations");
             }
         }
@@ -4923,7 +5767,7 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         const int64_t t_proc0 = spec_phase ? ggml_time_us() : 0;
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!common_speculative_process(spec, batch_view)) { // MAD-LAB: spec is a raw ptr
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -4933,7 +5777,26 @@ private:
             SRV_INF("SPECPHASE process_us=%" PRId64 "\n", ggml_time_us() - t_proc0);
         }
 
-        // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
+        // MAD-LAB DS4-Flash pipeline-streams: the n_cmpl>1 parent/child
+        // activation loop that used to live here has been hoisted to
+        // activate_parent_child_tasks(), called once from update_slots()
+        // after every stream's decode() has run this tick -- see that
+        // function for why.
+
+        return true;
+    }
+
+    // MAD-LAB DS4-Flash pipeline-streams: hoisted out of decode() (see the
+    // comment there). Handles `n_cmpl > 1` tasks -- when a parent's prompt
+    // finishes, copy its state to every child slot waiting on it. This
+    // genuinely needs to see every slot regardless of stream (a child could
+    // land on a different stream's slot than its parent -- slot->stream
+    // assignment is not request-aware), so unlike the rest of decode()/
+    // post_decode() it is NOT parameterized by server_stream and stays a
+    // single call over the full `slots` member, run from the
+    // single-threaded part of the tick (i.e. after any per-stream threads
+    // for this tick have already been joined).
+    void activate_parent_child_tasks() {
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
                 std::vector<server_slot *> children;
@@ -4955,11 +5818,21 @@ private:
                 }
             }
         }
-
-        return true;
     }
 
-    void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+    // MAD-LAB DS4-Flash pipeline-streams (stage 1): post_decode() reads
+    // ONLY through `stream` now. Most of this function already used
+    // slot.ctx_tgt/slot.ctx_dft/slot.spec (per-slot fields wired to the
+    // right stream since the earlier pipeline-streams slot-split work) --
+    // the shadows below only matter for the handful of bare
+    // ctx_tgt_seq_rm_type/ctx_tgt/spec.get() reads that weren't already
+    // going through the slot.
+    void post_decode(server_stream & stream, int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        llama_context * const ctx_tgt   = stream.ctx_tgt;
+        common_speculative * const spec = stream.spec;
+        const common_context_seq_rm_type ctx_tgt_seq_rm_type = stream.ctx_tgt_seq_rm_type;
+        std::vector<server_slot *> & slots = stream.slots;
+
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -5015,7 +5888,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    common_speculative_begin(spec, slot.stream_slot_idx, slot.prompt.tokens.get_text_tokens()); // MAD-LAB: spec is a raw ptr
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -5048,7 +5921,7 @@ private:
                 slot.t_print_last = t_now;
                 slot.n_decoded_last = 0;
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                metrics.on_prompt_eval(slot);
+                { std::lock_guard<std::mutex> lock(metrics_mtx_); metrics.on_prompt_eval(slot); } // MAD-LAB: narrow lock, see metrics_mtx_
             }
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
@@ -5066,7 +5939,7 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
-                metrics.on_prediction(slot);
+                { std::lock_guard<std::mutex> lock(metrics_mtx_); metrics.on_prediction(slot); } // MAD-LAB: narrow lock, see metrics_mtx_
                 slot.release();
 
                 return;
@@ -5120,17 +5993,17 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        ckpt.load_tgt(slot.ctx_tgt, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.load_dft(slot.ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
                         if (segment_client && segment_client->has_remote_segments()) {
                             segment_client->trim(segment_session_id, segment_cache_epoch,
                                                  (uint32_t) (ckpt.pos_max + 1));
                         }
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        slot.mem.seq_rm(slot.stream_slot_idx, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -5143,7 +6016,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec, slot.stream_slot_idx, accepted.size() - 1); // MAD-LAB: spec is a raw ptr
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -5186,7 +6059,7 @@ private:
                     SRV_INF("SPECPHASE trim_us=%" PRId64 "\n", ggml_time_us() - t_trim0);
                 }
             }
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            slot.mem.seq_rm(slot.stream_slot_idx, slot.prompt.tokens.pos_next(), -1);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -5202,7 +6075,7 @@ private:
                 if (slot.n_decoded == 1) {
                     slot.t_start_generation = t_now;
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                    metrics.on_prompt_eval(slot);
+                    { std::lock_guard<std::mutex> lock(metrics_mtx_); metrics.on_prompt_eval(slot); } // MAD-LAB: narrow lock, see metrics_mtx_
                 }
 
                 slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
@@ -5220,7 +6093,7 @@ private:
                 if (!process_token(result, slot)) {
                     slot.print_timings();
                     send_final_response(slot);
-                    metrics.on_prediction(slot);
+                    { std::lock_guard<std::mutex> lock(metrics_mtx_); metrics.on_prediction(slot); } // MAD-LAB: narrow lock, see metrics_mtx_
                     slot.release();
 
                     return;
