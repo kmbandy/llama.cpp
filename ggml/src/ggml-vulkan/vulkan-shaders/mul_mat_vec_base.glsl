@@ -73,9 +73,10 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     a_offset =
 #ifdef MUL_MAT_ID
             // Under weight paging an expert is at an arbitrary pool slot, so the
-            // uniform stride does not describe where its weights are. Indexed by
-            // expert_id, not by active slot, so one publication serves every
-            // token in the batch — different tokens route to different experts.
+            // per-expert stride does not describe where its weights are. Indexed
+            // by expert_id, not by active slot, so one publication serves every
+            // token in the batch.
+            // In the non-paged case, batch_stride_a is in logical A elements.
             (p.paged != 0) ? data_wp_expert_off[expert_id]
                            : expert_id * (p.batch_stride_a / QUANT_K);
 #else

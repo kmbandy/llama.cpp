@@ -27,6 +27,10 @@ static __global__ void acc_f32(const float * x, const float * y, float * dst, co
     dst[i] = val;
 }
 
+static __global__ void acc_f32_inplace_one(const float * y, float * dst, const int64_t offset) {
+    dst[offset] += y[0];
+}
+
 static void acc_f32_cuda(const float * x, const float * y, float * dst, const int64_t n_elements,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s1, const int64_t s2, const int64_t s3, const int64_t offset, cudaStream_t stream) {
@@ -57,5 +61,9 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s3     = dst->op_params[2] / sizeof(float);
     const int64_t offset = dst->op_params[3] / sizeof(float);
 
-    acc_f32_cuda(src0_d, src1_d, dst_d, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset, stream);
+    if (src0_d == dst_d && ggml_nelements(src1) == 1) {
+        acc_f32_inplace_one<<<1, 1, 0, stream>>>(src1_d, dst_d, offset);
+    } else {
+        acc_f32_cuda(src0_d, src1_d, dst_d, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset, stream);
+    }
 }

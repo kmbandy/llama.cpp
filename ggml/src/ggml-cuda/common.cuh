@@ -1244,8 +1244,19 @@ struct ggml_cuda_graph {
     cudaGraphExec_t instance = nullptr;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
+    std::vector<int> node_types;
+    bool addr_patchable = false;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    enum capture_reason : uint8_t {
+        CAPTURE_NEWKEY,
+        CAPTURE_TTL,
+        CAPTURE_LRU,
+        CAPTURE_TOPO,
+        CAPTURE_ADDR_STRICT,
+        CAPTURE_ADDR_PATCH,
+        CAPTURE_OTHER,
+    } capture_reason = CAPTURE_NEWKEY;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1433,6 +1444,7 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    std::unordered_set<const void *> ttl_evicted_graph_keys;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1450,22 +1462,46 @@ struct ggml_backend_cuda_context {
                 const int n = atoi(e);
                 p.cap = n > 0 ? (size_t) n : 0;
             }
+            const char * wp_graphs = getenv("WP_HIP_GRAPHS");
+            p.track_ttl = wp_graphs != nullptr && strcmp(wp_graphs, "1") == 0;
+            if (p.track_ttl) {
+                // WP_HIP_GRAPH_TTL_S and WP_HIP_GRAPH_SWEEP_S are seconds.
+                if (const char * e = getenv("WP_HIP_GRAPH_TTL_S")) {
+                    const int64_t seconds = atoll(e);
+                    if (seconds > 0) {
+                        p.ttl_us = seconds * 1'000'000;
+                    }
+                }
+                if (const char * e = getenv("WP_HIP_GRAPH_SWEEP_S")) {
+                    const int64_t seconds = atoll(e);
+                    if (seconds > 0) {
+                        p.sweep_us = seconds * 1'000'000;
+                    }
+                }
+            }
             return p;
         }();
 
-        // TTL sweep every 5s: drop graphs unused for >=10s.
+        // TTL sweep every 5s by default: drop graphs unused for >=10s.
         if (time_now - last_graph_eviction_sweep >= cache_pol.sweep_us) {
             last_graph_eviction_sweep = time_now;
-            ggml_cuda_graph_cache_evict_ttl(cuda_graphs, time_now, cache_pol.ttl_us);
+            ggml_cuda_graph_cache_evict_ttl(cuda_graphs, time_now, cache_pol.ttl_us,
+                                             cache_pol.track_ttl ? &ttl_evicted_graph_keys : nullptr);
         }
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
+            const bool ttl_evicted = cache_pol.track_ttl &&
+                ttl_evicted_graph_keys.erase(first_node_ptr) != 0;
             // Optional cap (GGML_CUDA_GRAPH_MAX). Default is unlimited so a
             // split decode working set (~40-90 segments × a few shapes) can
             // stay resident long enough for warmup. LRU, not LFU.
-            ggml_cuda_graph_cache_evict_lru(cuda_graphs, cache_pol.cap, first_node_ptr);
+            const size_t n_lru = ggml_cuda_graph_cache_evict_lru(cuda_graphs, cache_pol.cap, first_node_ptr);
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it->second->capture_reason = ttl_evicted ? ggml_cuda_graph::CAPTURE_TTL :
+                n_lru != 0 ? ggml_cuda_graph::CAPTURE_LRU : ggml_cuda_graph::CAPTURE_NEWKEY;
+        } else if (cache_pol.track_ttl) {
+            ttl_evicted_graph_keys.erase(first_node_ptr);
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -1573,6 +1609,11 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    float x_clamp_min = 0.0f;
+    float x_clamp_max = 0.0f;
+    float gate_clamp_min = 0.0f;
+    float gate_clamp_max = 0.0f;
+    bool use_clamp = false;
     ggml_glu_op glu_op;
 };
 struct ggml_cuda_mm_fusion_args_device {
@@ -1581,6 +1622,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    float x_clamp_min = 0.0f;
+    float x_clamp_max = 0.0f;
+    float gate_clamp_min = 0.0f;
+    float gate_clamp_max = 0.0f;
+    bool use_clamp = false;
     ggml_glu_op glu_op;
 };
 

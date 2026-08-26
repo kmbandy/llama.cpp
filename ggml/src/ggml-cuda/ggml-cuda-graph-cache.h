@@ -18,15 +18,12 @@
 //   The backend scheduler rebuilds split subgraphs every compute, so
 //   those never repeat. Topology is (op, type, flags, name, ne, nb).
 //
-//   Device addresses (dst->data and src data) ARE part of the WP_HIP_GRAPHS
-//   cache key. HIP's hipGraphExecUpdate is not a safe pointer-patch: s0
-//   SIGSEGV'd SEGV_MAPERR in it (2026-08-20, compute_batch of a 17-expert
-//   verify union) after we destroyed the source graph the exec was built
-//   from. One shape-key + Update-per-expert was also why worker graphs
-//   never replayed (every layer's experts looked like "same graph, new
-//   ptrs"). Keying by (topo, addrs) makes a resident expert in the same
-//   slot a pure Launch; a new slot is a new capture. CUDA without
-//   WP_HIP_GRAPHS still keys on nodes[0] and uses ExecUpdate.
+//   Device addresses are compared AFTER lookup, not mixed into the key.
+//   HIP cannot ExecUpdate (s0 SIGSEGV SEGV_MAPERR, 2026-08-20). Mixing
+//   addrs into the key made every gallocr/activation pointer a unique
+//   graph so we recaptured 100% of computes — slower than eager. Equal
+//   addrs -> Launch; unequal -> eager (next stable pair recaptures).
+//   CUDA without WP_HIP_GRAPHS still keys on nodes[0] and uses ExecUpdate.
 
 #pragma once
 
@@ -34,19 +31,27 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 struct ggml_cuda_graph_cache_policy {
     size_t  cap      = 256;
     int64_t ttl_us   = 10'000'000;
     int64_t sweep_us =  5'000'000;
+    bool    track_ttl = false;
 };
 
 template <typename Map>
-size_t ggml_cuda_graph_cache_evict_ttl(Map & graphs, int64_t time_now, int64_t ttl_us) {
+size_t ggml_cuda_graph_cache_evict_ttl(
+        Map & graphs, int64_t time_now, int64_t ttl_us,
+        std::unordered_set<typename Map::key_type> * ttl_evicted_keys = nullptr) {
     size_t n = 0;
     for (auto it = graphs.begin(); it != graphs.end(); ) {
         if (time_now - it->second->last_used_time >= ttl_us) {
+            if (ttl_evicted_keys != nullptr) {
+                ttl_evicted_keys->insert(it->first);
+            }
             it = graphs.erase(it);
             ++n;
         } else {
@@ -103,11 +108,29 @@ inline uint64_t ggml_cuda_graph_fnv1a_bytes(uint64_t h, const void * p, size_t n
 // Mix the fields that identify a node's captured kernel shape. Pointers
 // and VIEW offsets are excluded so ephemeral split rebuilds and a
 // moving KV write position hash to the same slot when the op/shape match.
+// ggml auto-names anonymous tensors "node_<N>"/"leaf_<N>" with a GLOBAL
+// monotonically increasing counter, so a fragment containing one gets a
+// different name on EVERY graph build — its key can never repeat and capture
+// churns forever (measured 2026-08-23: 35% permanent fallback, node_1734 vs
+// node_2173 the only differing topo field). Canonicalize: for such names,
+// hash/compare only the prefix and any non-digit suffix.
+inline size_t ggml_cuda_graph_canon_name_len(const char * name) {
+    size_t n = strnlen(name, GGML_MAX_NAME);
+    const char * p = nullptr;
+    if (n > 5 && strncmp(name, "node_", 5) == 0) { p = name + 5; }
+    if (n > 5 && strncmp(name, "leaf_", 5) == 0) { p = name + 5; }
+    if (p == nullptr) { return n; }
+    const char * q = p;
+    while (*q >= '0' && *q <= '9') { ++q; }
+    if (q == p) { return n; }          // no digits: not an auto-name
+    return (size_t)(p - name);         // keep "node_"/"leaf_" prefix only
+}
+
 inline uint64_t ggml_cuda_graph_mix_tensor_topo(uint64_t h, const ggml_tensor * t) {
     if (t == nullptr) {
         return ggml_cuda_graph_fnv1a_mix(h, 0);
     }
-    h = ggml_cuda_graph_fnv1a_bytes(h, t->name, strnlen(t->name, GGML_MAX_NAME));
+    h = ggml_cuda_graph_fnv1a_bytes(h, t->name, ggml_cuda_graph_canon_name_len(t->name));
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->op);
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->type);
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->flags);
@@ -153,7 +176,14 @@ inline bool ggml_cuda_graph_tensor_topo_equal(const ggml_tensor & a, const ggml_
     if (memcmp(a.nb, b.nb, sizeof(a.nb)) != 0) {
         return false;
     }
-    if (strncmp(a.name, b.name, GGML_MAX_NAME) != 0) {
+    {
+        const size_t la = ggml_cuda_graph_canon_name_len(a.name);
+        const size_t lb = ggml_cuda_graph_canon_name_len(b.name);
+        if (la != lb || strncmp(a.name, b.name, la) != 0) {
+            return false;
+        }
+    }
+    if (false) {
         return false;
     }
     if (a.op != GGML_OP_VIEW &&

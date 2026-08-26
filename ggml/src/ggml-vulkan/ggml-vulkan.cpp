@@ -10888,7 +10888,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t y_ne = (uint64_t)y_staged_row_stride * padded_n * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
+    const uint64_t src0_type_size = ggml_type_size(src0->type);
+    const uint64_t src0_blck_size = ggml_blck_size(src0->type);
+    const uint64_t src0_canonical_nb2 =
+        (ne00 * ne01 / src0_blck_size) * src0_type_size;
+    const bool src0_strided = src0->nb[2] != src0_canonical_nb2;
+    const bool src0_stride_representable = src0_type_size != 0 &&
+        src0_blck_size != 0 && src0->nb[2] % src0_type_size == 0 &&
+        (src0->nb[2] / src0_type_size) <= UINT32_MAX / src0_blck_size;
+    static const bool arena_id_enabled = [] {
+        const char * e = std::getenv("WP_EXPERT_ARENA_ID");
+        return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+    }();
+    const bool src0_arena_stride = arena_id_enabled && src0_strided && src0_stride_representable;
+    const uint64_t qx_sz = src0_arena_stride ? ggml_nbytes(src0) :
+        src0_type_size * x_ne / src0_blck_size;
     const uint64_t qy_sz = ggml_type_size(src1->type) * ggml_nelements(src1) / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
@@ -11079,6 +11093,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ggml_vk_sync_buffers(ctx, subctx);
 
     uint32_t stride_batch_x = ne00*ne01;
+    if (src0_arena_stride) {
+        const uint64_t stride_batch_x64 =
+            (src0->nb[2] / src0_type_size) * src0_blck_size;
+        GGML_ASSERT(src0_type_size != 0 && src0->nb[2] % src0_type_size == 0);  // NOLINT
+        GGML_ASSERT(stride_batch_x64 <= UINT32_MAX);  // NOLINT
+        stride_batch_x = (uint32_t) stride_batch_x64;
+    }
     uint32_t stride_b_y = y_decode_vector_staging ? y_staged_row_stride : ne10;
     uint32_t stride_batch_y = y_decode_vector_staging ? y_staged_row_stride * padded_n : ne10*ne11;
 
@@ -11163,6 +11184,27 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const uint64_t ne01 = src0->ne[1];
     // const uint64_t ne02 = src0->ne[2];
     // const uint64_t ne03 = src0->ne[3];
+
+    const uint64_t src0_type_size = ggml_type_size(src0->type);
+    const uint64_t src0_blck_size = ggml_blck_size(src0->type);
+    const uint64_t src0_canonical_nb2 =
+        (ne00 * ne01 / src0_blck_size) * src0_type_size;
+    const bool src0_strided = src0->nb[2] != src0_canonical_nb2;
+    const bool src0_stride_representable = src0_type_size != 0 &&
+        src0_blck_size != 0 && src0->nb[2] % src0_type_size == 0 &&
+        (src0->nb[2] / src0_type_size) <= UINT32_MAX / src0_blck_size;
+    static const bool arena_id_enabled = [] {
+        const char * e = std::getenv("WP_EXPERT_ARENA_ID");
+        return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+    }();
+    const bool src0_arena_stride = arena_id_enabled && src0_strided && src0_stride_representable;
+    uint32_t stride_batch_x = (uint32_t)(ne00 * ne01);
+    if (src0_arena_stride) {
+        const uint64_t stride_batch_x64 =
+            (src0->nb[2] / src0_type_size) * src0_blck_size;
+        GGML_ASSERT(stride_batch_x64 <= UINT32_MAX);  // NOLINT
+        stride_batch_x = (uint32_t) stride_batch_x64;
+    }
 
     const uint64_t ne10 = src1->ne[0];
     const uint64_t ne11 = src1->ne[1];
@@ -11598,7 +11640,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
-            (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
+            stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags,
             (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1,
             wp_paged ? 1u : 0u
@@ -11628,7 +11670,22 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src2 = dst->src[2];
-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    const uint64_t type_size = ggml_type_size(src0->type);
+    const uint64_t block_size = ggml_blck_size(src0->type);
+    const uint64_t canonical_nb2 =
+        (src0->ne[0] * src0->ne[1] / block_size) * type_size;
+    const bool strided = src0->nb[2] != canonical_nb2;
+    const bool stride_representable = type_size != 0 && block_size != 0 &&
+        src0->nb[2] % type_size == 0 &&
+        (src0->nb[2] / type_size) <= UINT32_MAX / block_size;
+    static const bool arena_id_enabled = [] {
+        const char * e = std::getenv("WP_EXPERT_ARENA_ID");
+        return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+    }();
+    const bool supported_type =
+        src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type);
+    return supported_type && src2->ne[1] <= 8 &&
+        (!arena_id_enabled || !strided || stride_representable);
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -11639,10 +11696,8 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
     const bool use_vec = ggml_vk_use_mul_mat_vec_id(cgraph, node_idx);
     // GGML_VK_WP_FORK=1: which mul_mat_id implementation is actually running.
-    // The vec path serves batches of <= 8 tokens (decode and short prefills) and
-    // the mm path everything longer. BOTH understand weight paging; they did not
-    // always, and a paged prefill silently taking the mm path was the cause of
-    // the "6666..." garbage.
+    // The vec path serves batches of <= 8 tokens. MM handles wider batches and
+    // strided arena weights whose stride cannot be represented by batch_stride_a.
     if (getenv("GGML_VK_WP_FORK") != nullptr) {
         static size_t n_vec = 0, n_mm = 0;
         (use_vec ? n_vec : n_mm)++;

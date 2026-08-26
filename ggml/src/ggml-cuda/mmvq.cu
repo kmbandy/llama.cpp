@@ -555,21 +555,31 @@ static __global__ void mul_mat_vec_q(
     bool use_gate_bias = false;
     bool use_scale = false;
     bool use_gate_scale = false;
+    bool use_clamp = false;
     [[maybe_unused]] const void * vgate = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
     const float * x_scale = nullptr;
     const float * gate_scale = nullptr;
+    float x_clamp_min = 0.0f;
+    float x_clamp_max = 0.0f;
+    float gate_clamp_min = 0.0f;
+    float gate_clamp_max = 0.0f;
     ggml_glu_op active_glu;
 
     if constexpr (has_fusion) {
-        use_gate      = fusion.gate      != nullptr;
-        use_bias      = fusion.x_bias    != nullptr;
-        use_gate_bias = fusion.gate_bias != nullptr && use_gate;
-        vgate         = fusion.gate;
-        x_bias        = (const float *) fusion.x_bias;
-        gate_bias     = (const float *) fusion.gate_bias;
-        active_glu    = fusion.glu_op;
+        use_gate       = fusion.gate      != nullptr;
+        use_bias       = fusion.x_bias    != nullptr;
+        use_gate_bias  = fusion.gate_bias != nullptr && use_gate;
+        vgate          = fusion.gate;
+        x_bias         = (const float *) fusion.x_bias;
+        gate_bias      = (const float *) fusion.gate_bias;
+        use_clamp      = fusion.use_clamp;
+        x_clamp_min    = fusion.x_clamp_min;
+        x_clamp_max    = fusion.x_clamp_max;
+        gate_clamp_min = fusion.gate_clamp_min;
+        gate_clamp_max = fusion.gate_clamp_max;
+        active_glu     = fusion.glu_op;
         if constexpr (type == GGML_TYPE_NVFP4) {
             use_scale      = fusion.x_scale    != nullptr;
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
@@ -708,12 +718,18 @@ static __global__ void mul_mat_vec_q(
                         result *= x_scales;
                     }
                     result += x_biases[j];
+                    if (use_clamp) {
+                        result = fminf(fmaxf(result, x_clamp_min), x_clamp_max);
+                    }
                     if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
                         }
                         gate_value += gate_biases[j];
+                        if (use_clamp) {
+                            gate_value = fminf(fmaxf(gate_value, gate_clamp_min), gate_clamp_max);
+                        }
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
@@ -736,7 +752,9 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_clamp, active_glu,
+                gate_bias, x_bias, x_scale, gate_scale, x_clamp_min, x_clamp_max, gate_clamp_min,
+                gate_clamp_max, tmp_gate);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1274,6 +1292,11 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
+        fusion_local.x_clamp_min = fusion->x_clamp_min;
+        fusion_local.x_clamp_max = fusion->x_clamp_max;
+        fusion_local.gate_clamp_min = fusion->gate_clamp_min;
+        fusion_local.gate_clamp_max = fusion->gate_clamp_max;
+        fusion_local.use_clamp = fusion->use_clamp;
         fusion_local.glu_op = fusion->glu_op;
     }
 
@@ -1294,6 +1317,13 @@ void ggml_cuda_mul_mat_vec_q(
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
         if (size_alloc > size_data) {
+            if (!ggml_is_contiguously_allocated(src0) || src0->view_src) {
+                fprintf(stderr, "mmvq pad-clear DIAG: name=%s op=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] nbytes=%zu alloc=%zu view_src=%s\n",
+                    src0->name, ggml_op_name(src0->op), ggml_type_name(src0->type),
+                    (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3],
+                    src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                    ggml_nbytes(src0), size_alloc, src0->view_src ? src0->view_src->name : "none");
+            }
             GGML_ASSERT(ggml_is_contiguously_allocated(src0));
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
