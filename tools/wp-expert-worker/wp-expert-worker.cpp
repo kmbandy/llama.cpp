@@ -649,13 +649,17 @@ private:
     uint64_t          n_experts_  = 0;
 };
 
-ResourcePlan plan_resources(
+static ResourcePlan plan_resources_impl(
         const std::vector<ResourcePage> & pages,
         int requested_slots,
         uint64_t host_budget_bytes,
         uint64_t pinned_bytes,
         const std::vector<int> & reserve_blocks,
-        uint64_t reserve_bytes) {
+        uint64_t reserve_bytes,
+        uint64_t arena_alignment) {
+    if (arena_alignment == 0) {
+        arena_alignment = 1;
+    }
     if (requested_slots <= 0) {
         throw std::invalid_argument("invalid expert resource plan dimensions");
     }
@@ -746,7 +750,27 @@ ResourcePlan plan_resources(
             }
             return bytes;
         };
-        while (planned_bytes() > result.slot_budget_bytes) {
+
+        auto planned_arena_bytes = [&]() {
+            uint64_t bytes = 0;
+            for (const SlotClass & slot_class : classes) {
+                if (slot_class.size > UINT64_MAX - (arena_alignment - 1)) {
+                    throw std::overflow_error("expert arena size overflows");
+                }
+                const uint64_t stride =
+                    (slot_class.size + arena_alignment - 1) / arena_alignment * arena_alignment;
+                if ((uint64_t) slot_class.slots > UINT64_MAX / stride ||
+                        bytes > UINT64_MAX - stride * (uint64_t) slot_class.slots) {
+                    throw std::overflow_error("expert arena size overflows");
+                }
+                bytes += stride * (uint64_t) slot_class.slots;
+            }
+            return bytes;
+        };
+
+        while (planned_bytes() > result.slot_budget_bytes ||
+                (classes.size() > 1 &&
+                 planned_arena_bytes() > result.slot_budget_bytes)) {
             SlotClass * trim = nullptr;
             for (SlotClass & slot_class : classes) {
                 const int keep = std::max(1, slot_class.pin_floor);
@@ -855,6 +879,34 @@ ResourcePlan plan_resources(
     result.staging_buffer_bytes = max_staging_size;
     result.staging_bytes        = max_staging_size * staging_count;
     return result;
+}
+
+ResourcePlan plan_resources(
+        const std::vector<ResourcePage> & pages,
+        int requested_slots,
+        uint64_t host_budget_bytes,
+        uint64_t pinned_bytes,
+        const std::vector<int> & reserve_blocks,
+        uint64_t reserve_bytes) {
+    return plan_resources_impl(
+        pages, requested_slots, host_budget_bytes, pinned_bytes,
+        reserve_blocks, reserve_bytes, 1);
+}
+
+static ResourcePlan plan_resources_for_backend(
+        const std::vector<ResourcePage> & pages,
+        int requested_slots,
+        uint64_t host_budget_bytes,
+        uint64_t pinned_bytes,
+        const std::vector<int> & reserve_blocks,
+        uint64_t reserve_bytes,
+        ggml_backend_t backend) {
+    const ggml_backend_buffer_type_t buft =
+        ggml_backend_get_default_buffer_type(backend);
+    return plan_resources_impl(
+        pages, requested_slots, host_budget_bytes, pinned_bytes,
+        reserve_blocks, reserve_bytes,
+        (uint64_t) ggml_backend_buft_get_alignment(buft));
 }
 
 std::vector<DeviceMemberLayout> plan_device_member_layout(
@@ -2457,7 +2509,13 @@ public:
         allocate_slot_arenas();
         size_t arena_index  = 0;
         uint64_t arena_used = 0;
-        for (const SlotClass & slot_class : resources_.slot_classes) {
+        for (size_t class_index = 0;
+                class_index < resources_.slot_classes.size(); ++class_index) {
+            const SlotClass & slot_class = resources_.slot_classes[class_index];
+            if (resources_.slot_classes.size() > 1) {
+                arena_index = arena_class_starts_.at(class_index);
+                arena_used = 0;
+            }
             for (int i = 0; i < slot_class.slots; ++i) {
                 const uint64_t need = arena_slot_stride(slot_class.size);
                 if (arena_index >= arenas_.size()) {
@@ -2470,14 +2528,20 @@ public:
                     if (arena_index >= arenas_.size()) {
                         throw std::runtime_error("expert slot arenas exhausted");
                     }
+                    cap = (uint64_t) ggml_backend_buffer_get_size(arenas_[arena_index].get());
+                }
+                if (resources_.slot_classes.size() > 1 &&
+                        (need > cap || arena_used > cap - need)) {
+                    throw std::runtime_error("expert slot arenas exhausted");
                 }
                 slots_.push_back(
                     make_slot_in(arenas_[arena_index].get(), arena_used, slot_class.size));
                 arena_used += need;
                 slots_.back().reserved = reserved_indices.count((int) slots_.size() - 1) != 0;
-                // Count the SLOT bytes, not the buffer size: one arena backs many
-                // slots, so summing buffer sizes would multiply-count it.
-                resources_.device_bytes += slot_class.size;
+                // Keep uniform-page accounting byte-identical; class-local
+                // arenas report the allocated stride.
+                resources_.device_bytes += resources_.slot_classes.size() == 1
+                    ? slot_class.size : need;
             }
         }
         resources_.staging_buffers      = staging_.buffer_count();
@@ -4908,8 +4972,43 @@ private:
         if (max_buf == 0 || max_buf > SIZE_MAX / 2) {
             max_buf = (size_t) 1 << 30;
         }
-        // Never split a slot across arenas: cap each arena at a whole number of
-        // the largest stride in play.
+        if (resources_.slot_classes.size() > 1) {
+            // Keep each size class in its own arena set. Invariant: the sum of
+            // allocated arena bytes must not exceed the requested slot budget,
+            // and every planned slot must have a home.
+            arena_class_starts_.reserve(resources_.slot_classes.size());
+            uint64_t allocated = 0;
+            for (const SlotClass & slot_class : resources_.slot_classes) {
+                const uint64_t stride = arena_slot_stride(slot_class.size);
+                arena_class_starts_.push_back(arenas_.size());
+                if ((uint64_t) slot_class.slots > UINT64_MAX / stride) {
+                    throw std::overflow_error("expert arena size overflows");
+                }
+                const uint64_t class_total = stride * (uint64_t) slot_class.slots;
+                if (class_total > resources_.slot_budget_bytes - allocated) {
+                    throw std::runtime_error("expert slot arena plan exceeds slot budget");
+                }
+                uint64_t arena_bytes = (uint64_t) max_buf / stride * stride;
+                if (arena_bytes == 0) {
+                    arena_bytes = stride;
+                }
+                uint64_t remaining = class_total;
+                while (remaining > 0) {
+                    const uint64_t want = std::min(arena_bytes, remaining);
+                    buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) want));
+                    if (!buf) {
+                        throw std::runtime_error(
+                            "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
+                    }
+                    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    arenas_.push_back(std::move(buf));
+                    remaining -= want;
+                    allocated += want;
+                }
+            }
+            return;
+        }
+        // Uniform-class path: cap each arena at a whole number of the stride.
         uint64_t max_stride = 0;
         for (const SlotClass & slot_class : resources_.slot_classes) {
             max_stride = std::max(max_stride, arena_slot_stride(slot_class.size));
@@ -5616,6 +5715,7 @@ private:
     // The large backing allocations every slot is carved from. Declared BEFORE
     // slots_ so it outlives them: Slot::buffer points in here and does not own.
     std::vector<buffer_ptr>    arenas_;
+    std::vector<size_t>        arena_class_starts_;
     std::vector<Slot>          slots_;
     // find_slot's O(1) index: slot_key(layer, expert) -> slot index, for every
     // currently-VALID slot. Maintained at every write to Slot::valid/Slot::key,
@@ -5778,10 +5878,10 @@ public:
                   resident_expert_blocks),
         pool_(
             backend_.get(),
-            plan_resources(
+            plan_resources_for_backend(
                 resource_pages(catalog_), slots, host_budget_bytes,
                 resident_.pinned_bytes(), expert_reserve_blocks,
-                expert_reserve_bytes),
+                expert_reserve_bytes, backend_.get()),
             host_victim_bytes,
             test_hooks, expert_reserve_blocks, catalog_.pages.size()),
         compute_galloc_(ggml_gallocr_new(
