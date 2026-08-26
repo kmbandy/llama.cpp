@@ -1,20 +1,11 @@
 /**
- * Migration Service - Unified data migration hook
+ * MigrationService - Unified data migration hook
  *
- * Centralizes all data migrations (localStorage, IndexedDB, legacy formats) into a single
- * initialization point. Each migration copies data to new format WITHOUT deleting the old.
- *
- * **Architecture:**
- * - Migrations are defined as objects with `id` and `run()` methods
- * - Migration state is tracked in localStorage to avoid re-running
- * - `runAllMigrations()` should be called once at app startup
- * - All migrations are NON-DESTRUCTIVE - legacy data is preserved for downgrade compatibility
- *
- * **Current Migrations:**
- * 1. localStorage prefix: Copy LlamaCppWebui.* → LlamaUi.* (both preserved)
- * 2. IndexedDB database: Copy LlamacppWebui → LlamaUi (both preserved)
- * 3. Legacy message format: Transform in-place (preserves structure, migrates markers)
- * 4. Theme key: Copy standalone `theme` → config object (both preserved)
+ * Centralizes all data migrations (localStorage, IndexedDB, legacy formats)
+ * into a single initialization point. Each migration copies data to the new
+ * format WITHOUT deleting the old, and state is tracked in localStorage so
+ * `runAllMigrations()` (called once at startup) never re-runs a completed
+ * migration. All migrations are non-destructive for downgrade compatibility.
  */
 
 import {
@@ -22,13 +13,14 @@ import {
 	DB_APP_NAME_DEPRECATED,
 	IDXDB_STORES,
 	IDXDB_TABLES,
+	LEGACY_AGENTIC_REGEX,
+	LEGACY_REASONING_TAGS,
 	NEW_TO_DEPRECATED_MAP,
+	SETTINGS_KEYS,
 	STORAGE_APP_NAME,
 	STORAGE_APP_NAME_DEPRECATED
 } from '$lib/constants';
-import { LEGACY_AGENTIC_REGEX, LEGACY_REASONING_TAGS } from '$lib/constants/agentic';
-import { SETTINGS_KEYS } from '$lib/constants/settings-keys';
-import { MessageRole } from '$lib/enums';
+import { BooleanString, MessageRole } from '$lib/enums';
 import Dexie from 'dexie';
 
 // Types
@@ -612,10 +604,10 @@ const configTypesMigration: Migration = {
 		// schema rejects them. No config string field holds exactly "true"/"false", so the
 		// match is unambiguous.
 		for (const key of Object.keys(config)) {
-			if (config[key] === 'true') {
+			if (config[key] === BooleanString.TRUE) {
 				config[key] = true;
 				changed = true;
-			} else if (config[key] === 'false') {
+			} else if (config[key] === BooleanString.FALSE) {
 				config[key] = false;
 				changed = true;
 			}

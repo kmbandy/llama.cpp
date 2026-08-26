@@ -3,14 +3,14 @@ set(TARGET llama-wp-expert-worker-lib)
 add_library(${TARGET}
     wp-expert-worker.cpp
     ${CMAKE_SOURCE_DIR}/src/weight-pager/wp-router.cpp
-    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
+    ${CMAKE_SOURCE_DIR}/vendor/hash/sha256/sha256.c
 )
 target_include_directories(${TARGET} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/pipeline
     ${CMAKE_SOURCE_DIR}/vendor
-    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps
+    ${CMAKE_SOURCE_DIR}/vendor/hash
 )
 # llama-expert-dispatch is a STATIC lib that calls llama_pipeline_validate_stages,
 # which lives in libllama. Static archives are resolved left-to-right, so it must

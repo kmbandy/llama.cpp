@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    5
+#define RPC_PROTO_MAJOR_VERSION    6
 #define RPC_PROTO_MINOR_VERSION    0
 // fork patch version 3: our 105 ops + upstream's 4 new DSA/DSV4 ops = 109
 #define RPC_PROTO_PATCH_VERSION    3

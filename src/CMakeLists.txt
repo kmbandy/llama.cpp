@@ -21,14 +21,14 @@ add_library(llama-expert-dispatch STATIC
             pipeline/pipe-protocol.cpp
             pipeline/pipe-reduce-simd.cpp
             pipeline/pipe-transport.cpp
-            ../examples/gguf-hash/deps/sha256/sha256.c
+            ../vendor/hash/sha256/sha256.c
             )
 target_include_directories(llama-expert-dispatch PUBLIC
             .
             pipeline
             ../ggml/include
             )
-target_include_directories(llama-expert-dispatch PRIVATE ../vendor ../examples/gguf-hash/deps)
+target_include_directories(llama-expert-dispatch PRIVATE ../vendor ../vendor/hash)
 target_compile_features(llama-expert-dispatch PUBLIC cxx_std_17)
 target_link_libraries(llama-expert-dispatch PUBLIC ggml)
 set_target_properties(llama-expert-dispatch PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -51,6 +51,7 @@ add_library(llama
             llama-kv-cache-iswa.cpp
             llama-kv-cache-paged.cpp
             llama-kv-cache-dsa.cpp
+            llama-kv-cache-dsa-iswa.cpp
             llama-kv-cache-msa.cpp
             llama-kv-cache-dsv4.cpp
             llama-memory.cpp
@@ -77,9 +78,14 @@ add_library(llama
             )
 
 set_target_properties(llama PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+)
+
+target_compile_definitions(llama PRIVATE
+    LLAMA_VERSION="${LLAMA_VERSION}"
+    LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
 target_include_directories(llama PRIVATE .)
