@@ -36,6 +36,7 @@ extern "C" {
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -72,6 +73,16 @@ bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t, ggml_tensor *,
     __attribute__((weak));
 bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t,
                                                                ggml_backend_event_t)
+    __attribute__((weak));
+// WP_READER_H2D: reader-thread H2D on a dedicated non-blocking per-device
+// stream (see the long comment on the definition in ggml-cuda.cu for why
+// this exists instead of calling ggml_backend_tensor_set from a reader
+// thread -- the MAD-114/gfx1201 legacy-stream capture hazard). Same
+// weak-symbol pattern as the three declarations above: null on any build
+// that doesn't link ggml-cuda's wp extensions (e.g. a pure-Vulkan worker),
+// so every call site must check the pointer before calling.
+bool ggml_backend_cuda_wp_reader_copy(ggml_backend_t, ggml_tensor *,
+                                      const void *, size_t, size_t)
     __attribute__((weak));
 
 namespace wp_expert_worker {
@@ -191,6 +202,7 @@ struct RequestStats {
     uint64_t ns_encode = 0;        // fp32 -> fp16 of the reply
     uint64_t ns_h2d = 0;
     uint64_t bytes_h2d = 0;
+    uint64_t n_reader_h2d = 0;  // WP_READER_H2D: pages uploaded by a reader thread
     // ROUTING DENSITY (2026-08-04). compute_batch runs the FULL FFN for every
     // assigned expert over ALL request.n_tokens and then multiplies by a
     // per-token router weight that is ZERO for tokens not routed to that expert
@@ -204,6 +216,15 @@ struct RequestStats {
     // D2 (2026-08-07): shape-keyed graph cache traffic.
     uint64_t n_gcache_hit  = 0;
     uint64_t n_gcache_miss = 0;
+    uint64_t n_arena_hit   = 0;
+    uint64_t n_arena_groups = 0;
+    uint64_t n_arena_build = 0;
+    uint64_t n_hipgraph_capture = 0;
+    uint64_t n_hipgraph_replay  = 0;
+    uint64_t n_d3_collapse = 0;
+    uint64_t n_d3_typed    = 0;
+    uint64_t n_d3_bounce   = 0;
+    bool d3_counted = false;
     // D1 (2026-08-07): the coalesced routing-weight/gather-idx blob upload.
     // The per-tensor uploads it replaces were never timed anywhere -- they sat
     // in the gap between ns_graph_build and ns_submit (the "accounting hole"),
@@ -223,6 +244,54 @@ struct RequestStats {
 void self_bench_tick(ggml_backend_t backend);
 bool self_bench_stats(uint64_t & n, uint64_t & min_us, uint64_t & mean_us);
 
+// WP_WORKER_MULTI_CONN=N (N>=2) -- lever-queue item #9, "worker
+// double-buffering". Declared up here (rather than next to serve_connection,
+// where the reasoning for it and its sibling g_worker_gpu_mutex live) purely
+// because WorkerStats::report() below needs to see this vector; see the
+// long comment above serve_connection() for the full design.
+//
+// Per-connection live request counters, purely for the WP_WORKER_STATS
+// report line. Sized to multi_conn_n by run() BEFORE any connection thread
+// starts and never resized after -- each connection thread only ever
+// increments the ONE cell at its own index (std::thread's constructor
+// happens-before covers publishing the sized vector to every thread), so
+// the increments themselves need no lock, and report()'s read of each cell
+// is an independent atomic load -- safe regardless of what any other
+// thread's increment is doing concurrently.
+std::vector<std::atomic<uint64_t>> g_worker_conn_request_counts;
+
+// Per-connection outstanding STAGING LEASE counts, for the WP_WORKER_STATS
+// report line only -- see the StagingPool per-connection quota (the
+// 2026-08-25 deadlock fix comment on StagingPool) for what actually enforces
+// the cap. Sized identically to g_worker_conn_request_counts, same
+// construction-happens-before-any-thread argument applies: each StagingPool
+// borrow()/release() only ever touches the ONE cell for its own conn_index,
+// so no lock is needed for either the increments/decrements or report()'s
+// read. This is exactly the diagnostic that would have made the 2026-08-25
+// wedge visible at a glance (one connection's staging_held pinned at its
+// quota while the other sits at 0, instead of two threads just... not
+// making progress).
+std::vector<std::atomic<int64_t>> g_worker_staging_held;
+
+// Fires once per BEGIN-frame ensure_batch() call that took the unlocked
+// read-issue path added 2026-08-25 (see the "READ-ISSUE UNLOCKED FROM
+// g_worker_gpu_mutex" comment in ExpertSlotPool::ensure_batch): planning
+// (slot hit/victim resolution, pins, host-tier fill) ran under
+// g_worker_gpu_mutex as before, but spawning the page-in reader threads and
+// notifying them to start ran with the mutex released, so the other
+// connection's compute is not blocked waiting for this connection's reads
+// to be issued. Global, not per-connection: this is a "did the path fire at
+// all" counter for the controller, not a per-stream breakdown like
+// conn_reqs. Stays 0 forever outside multi-conn mode (the unlock is gated
+// on gpu_lock->owns_lock(), which is never true there).
+std::atomic<uint64_t> g_worker_n_begin_unlocked_reads{0};
+
+// WP_READER_H2D_VERIFY=1 tripwire counter: mismatches found by
+// tensor_verify_page_range, incremented from reader threads (concurrent,
+// hence atomic) after a WP_READER_H2D upload. 0 whenever the verify knob
+// is off, same as every other WP_* diagnostic.
+std::atomic<uint64_t> g_worker_n_reader_h2d_verify_fail{0};
+
 class WorkerStats {
 public:
     WorkerStats() :
@@ -241,6 +310,17 @@ public:
 
     void set_staging_kind(const char * kind) {
         staging_kind_ = kind;
+    }
+
+    void set_shield_stats(uint64_t hits, uint64_t exhausted) {
+        n_shield_hits_      = hits;
+        n_shield_exhausted_ = exhausted;
+    }
+
+    void set_layerahead_stats(uint64_t hints, uint64_t pageins, uint64_t hits) {
+        n_layerahead_hints_   = hints;
+        n_layerahead_pageins_ = pageins;
+        n_layerahead_hits_    = hits;
     }
 
     ~WorkerStats() {
@@ -271,6 +351,14 @@ public:
         ns_submit_ += request.ns_submit;
         n_gcache_hit_ += request.n_gcache_hit;
         n_gcache_miss_ += request.n_gcache_miss;
+        n_arena_hit_ += request.n_arena_hit;
+        n_arena_groups_ += request.n_arena_groups;
+        n_arena_build_ += request.n_arena_build;
+        n_hipgraph_capture_ += request.n_hipgraph_capture;
+        n_hipgraph_replay_ += request.n_hipgraph_replay;
+        n_d3_collapse_ += request.n_d3_collapse;
+        n_d3_typed_ += request.n_d3_typed;
+        n_d3_bounce_ += request.n_d3_bounce;
         // PER-REQUEST DISTRIBUTION, not just the total. The cumulative ns_submit
         // cannot distinguish "every request costs 2.1 ms" from "most cost 0.2 ms
         // and a few cost 50 ms", and those have completely different fixes. An
@@ -301,6 +389,7 @@ public:
         n_weight_total_   += request.n_weight_total;
         ns_h2d_ += request.ns_h2d;
         bytes_h2d_ += request.bytes_h2d;
+        n_reader_h2d_ += request.n_reader_h2d;
         ns_demote_ += request.ns_demote;
         ns_ensure_post_ += request.ns_ensure_post;
         ++n_requests_;
@@ -335,6 +424,11 @@ private:
                   << " n_pagein=" << n_pagein_
                   << " n_pagein_reserved=" << n_pagein_reserved_
                   << " n_pagein_general=" << n_pagein_general_
+                  << " n_shield_hits=" << n_shield_hits_
+                  << " n_shield_exhausted=" << n_shield_exhausted_
+                  << " n_layerahead_hints=" << n_layerahead_hints_
+                  << " n_layerahead_pageins=" << n_layerahead_pageins_
+                  << " n_layerahead_hits=" << n_layerahead_hits_
                   << " n_host_hit=" << n_host_hit_
                   << " n_host_demote=" << n_host_demote_
                   << " bytes_read=" << bytes_read_
@@ -345,6 +439,7 @@ private:
                   << " bytes_h2d=" << bytes_h2d_
                   << " gb_s_h2d=" << (ns_h2d_ == 0 ? 0.0 :
                         (double) bytes_h2d_ / (double) ns_h2d_)
+                  << " n_reader_h2d=" << n_reader_h2d_
                   << " staging_kind=" << staging_kind_
                   << " ns_host_get=" << ns_host_get_
                   << " ns_demote=" << ns_demote_
@@ -356,6 +451,14 @@ private:
                   << " ns_submit=" << ns_submit_
                   << " gcache_hit=" << n_gcache_hit_
                   << " gcache_miss=" << n_gcache_miss_
+                  << " n_arena_hit=" << n_arena_hit_
+                  << " n_arena_groups=" << n_arena_groups_
+                  << " n_arena_build=" << n_arena_build_
+                  << " n_hipgraph_capture=" << n_hipgraph_capture_
+                  << " n_hipgraph_replay=" << n_hipgraph_replay_
+                  << " n_d3_collapse=" << n_d3_collapse_
+                  << " n_d3_typed=" << n_d3_typed_
+                  << " n_d3_bounce=" << n_d3_bounce_
                   << " ns_readback=" << ns_readback_
                   << " ns_send=" << ns_send_
                   << " host_bytes=" << host_bytes_
@@ -386,6 +489,35 @@ private:
                           << " probe_static_us_mean=" << pmean;
             }
         }
+        // WP_WORKER_MULTI_CONN: per-connection request counts, so a live N-conn
+        // run visibly shows every stream making progress rather than just one
+        // combined total that could be hiding a stalled connection. Empty
+        // outside multi-conn mode (g_worker_conn_request_counts stays
+        // default-sized 0), so this is a no-op on the default path.
+        if (!g_worker_conn_request_counts.empty()) {
+            std::cout << " conn_reqs=[";
+            for (size_t i = 0; i < g_worker_conn_request_counts.size(); ++i) {
+                if (i != 0) std::cout << ',';
+                std::cout << g_worker_conn_request_counts[i].load(std::memory_order_relaxed);
+            }
+            std::cout << ']';
+        }
+        // Per-connection outstanding staging leases -- see StagingPool's
+        // quota (2026-08-25 deadlock fix). A connection pinned at its quota
+        // while another sits idle is the signature of the wedge this exists
+        // to diagnose; empty outside multi-conn mode, same as conn_reqs.
+        if (!g_worker_staging_held.empty()) {
+            std::cout << " staging_held=[";
+            for (size_t i = 0; i < g_worker_staging_held.size(); ++i) {
+                if (i != 0) std::cout << ',';
+                std::cout << g_worker_staging_held[i].load(std::memory_order_relaxed);
+            }
+            std::cout << ']';
+        }
+        std::cout << " n_begin_unlocked_reads="
+                  << g_worker_n_begin_unlocked_reads.load(std::memory_order_relaxed);
+        std::cout << " n_reader_h2d_verify_fail="
+                  << g_worker_n_reader_h2d_verify_fail.load(std::memory_order_relaxed);
         std::cout << std::endl;
     }
 
@@ -405,6 +537,11 @@ private:
     uint64_t          n_pagein_     = 0;
     uint64_t          n_pagein_reserved_ = 0;
     uint64_t          n_pagein_general_ = 0;
+    uint64_t          n_shield_hits_ = 0;
+    uint64_t          n_shield_exhausted_ = 0;
+    uint64_t          n_layerahead_hints_   = 0;
+    uint64_t          n_layerahead_pageins_ = 0;
+    uint64_t          n_layerahead_hits_    = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          n_host_demote_ = 0;
     uint64_t          bytes_read_ = 0;
@@ -416,6 +553,14 @@ private:
     uint64_t          ns_submit_ = 0;
     uint64_t          n_gcache_hit_ = 0;
     uint64_t          n_gcache_miss_ = 0;
+    uint64_t          n_arena_hit_ = 0;
+    uint64_t          n_arena_groups_ = 0;
+    uint64_t          n_arena_build_ = 0;
+    uint64_t          n_hipgraph_capture_ = 0;
+    uint64_t          n_hipgraph_replay_ = 0;
+    uint64_t          n_d3_collapse_ = 0;
+    uint64_t          n_d3_typed_ = 0;
+    uint64_t          n_d3_bounce_ = 0;
     uint64_t          ns_readback_ = 0;
     uint64_t          ns_prep_ = 0;
     uint64_t          ns_prep_setup_ = 0;
@@ -433,6 +578,7 @@ private:
     uint64_t          ns_demote_ = 0;
     uint64_t          ns_ensure_post_ = 0;
     uint64_t          bytes_h2d_  = 0;
+    uint64_t          n_reader_h2d_ = 0;
     std::string       staging_kind_ = "unknown";
     uint64_t          n_requests_ = 0;
     uint64_t          n_experts_  = 0;
@@ -1396,6 +1542,29 @@ Catalog & layout_sliced_pages(
     }
 
     const uint64_t alignment = ggml_backend_buft_get_alignment(buft);
+    if (alignment == 0) {
+        throw std::runtime_error("invalid expert slice device alignment");
+    }
+    uint64_t slot_alignment = alignment;
+    const char * const arena_env = std::getenv("WP_EXPERT_ARENA_ID");
+    const bool arena_requested =
+        arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1;
+    if (arena_requested) {
+        // CUDA/HIP converts quantized nb[2] from bytes to blocks. Keep that conversion exact.
+        for (const auto & layer : catalog.descriptor.layers) {
+            for (const auto & role : layer.second) {
+                const uint64_t type_size = ggml_type_size(role.second.type);
+                if (type_size == 0) {
+                    throw std::runtime_error("invalid expert arena role type size");
+                }
+                const uint64_t divisor = std::gcd(slot_alignment, type_size);
+                if (slot_alignment > UINT64_MAX / (type_size / divisor)) {
+                    throw std::overflow_error("expert arena slot alignment overflows");
+                }
+                slot_alignment *= type_size / divisor;
+            }
+        }
+    }
     for (auto & item : catalog.pages) {
         ExpertPage & page = item.second;
         const auto & specs = catalog.descriptor.layers.at(page.layer);
@@ -1439,6 +1608,12 @@ Catalog & layout_sliced_pages(
             }
             device_size = std::max(device_size, layout[i].offset + layout[i].size);
         }
+        if (arena_requested) {
+            if (device_size > UINT64_MAX - (slot_alignment - 1)) {
+                throw std::overflow_error("expert slice device size overflows");
+            }
+            device_size = (device_size + slot_alignment - 1) / slot_alignment * slot_alignment;
+        }
         page.device_size = device_size;
     }
     return catalog;
@@ -1480,6 +1655,59 @@ void tensor_get_page(
                         [tensor, destination](size_t destination_offset, size_t device_offset, size_t n) {
         ggml_backend_tensor_get(
             tensor, (char *) destination + destination_offset, device_offset, n);
+    });
+}
+
+// WP_READER_H2D: same chunking as tensor_set_page_range (for_each_page_chunk,
+// so bytes/layout are byte-identical), but through the dedicated
+// non-blocking-stream weak symbol instead of ggml_backend_tensor_set --
+// see the ggml_backend_cuda_wp_reader_copy declaration and its definition
+// in ggml-cuda.cu for why calling ggml_backend_tensor_set from a reader
+// thread is unsafe (the gfx1201/MAD-114 legacy-stream capture hazard).
+// Throws if the symbol is unresolved (non-CUDA/HIP build -- should never
+// be reached; the reader_h2d_enabled_ gate already checked the backend) or
+// if the copy itself fails, exactly like a read error, so the caller
+// (reader_h2d_upload) can carry it in ReadResult::error.
+void tensor_set_page_range_reader(
+        ggml_backend_t backend, ggml_tensor * tensor, const ExpertPage & page,
+        const void * source, size_t page_offset, size_t size) {
+    if (ggml_backend_cuda_wp_reader_copy == nullptr) {
+        throw std::runtime_error("wp reader H2D: ggml_backend_cuda_wp_reader_copy is unresolved");
+    }
+    for_each_page_chunk(page, page_offset, size,
+                        [&](size_t source_offset, size_t device_offset, size_t n) {
+        if (!ggml_backend_cuda_wp_reader_copy(
+                backend, tensor, (const char *) source + source_offset, device_offset, n)) {
+            throw std::runtime_error("wp reader H2D: reader-stream copy failed");
+        }
+    });
+}
+
+// WP_READER_H2D_VERIFY=1 tripwire: after a successful reader-thread upload,
+// D2H-read a small sample back and memcmp it against the staging bytes that
+// were just uploaded. Uses plain ggml_backend_tensor_get -- NOT a new HIP
+// helper -- because get_tensor's CUDA/HIP implementation
+// (ggml_backend_cuda_buffer_get_tensor) always uses cudaStreamPerThread,
+// never the legacy stream, on every arch including gfx1201: there is no
+// MAD-114 branch on the get side, so it is already capture-safe to call
+// from a reader thread with no changes. Cheap and approximate by design
+// (a diagnostic, not an exhaustive check): samples only the first and last
+// up to 4 KiB of the PAGE range, and assumes that range does not itself
+// straddle a page-member boundary whose device offset diverges from its
+// source offset (true for the common single-member/contiguous page; a
+// scattered multi-member page could under-sample near a boundary, which
+// only weakens the tripwire, never produces a false positive against
+// correctly-uploaded bytes).
+void tensor_verify_page_range(
+        ggml_tensor * tensor, const ExpertPage & page, const void * source,
+        size_t page_offset, size_t size, uint64_t & mismatches) {
+    for_each_page_chunk(page, page_offset, size,
+                        [&](size_t source_offset, size_t device_offset, size_t n) {
+        std::vector<uint8_t> readback(n);
+        ggml_backend_tensor_get(tensor, readback.data(), device_offset, n);
+        if (std::memcmp(readback.data(), (const char *) source + source_offset, n) != 0) {
+            ++mismatches;
+        }
     });
 }
 
@@ -1686,17 +1914,52 @@ public:
         }
     }
 
+    // *** PER-CONNECTION STAGING QUOTA -- THE 2026-08-25 MULTI-CONN DEADLOCK
+    // FIX. ***
+    //
+    // Live stacks that day (WP_WORKER_MULTI_CONN=2, WP_EXPERT_STAGING_BUFFERS=32)
+    // showed:
+    //   - connection thread X: holding g_worker_gpu_mutex inside
+    //     finish_split_dispatch -> Worker::dispatch -> drain_one_read, parked
+    //     in batch.state_->cv.wait() for a ReadResult.
+    //   - connection thread Y: parked in pthread_mutex_lock at the top of
+    //     serve_connection's loop, waiting for the SAME g_worker_gpu_mutex.
+    //   - every reader thread (ensure_batch's read_worker/stripe_read_worker
+    //     pool): parked in borrow() below, because available_ was EMPTY.
+    // Mechanism: a Lease travels inside ReadResult::staging and is only
+    // released once drain_one_read performs its H2D upload, which runs under
+    // g_worker_gpu_mutex. Connection Y's earlier BEGIN had already spawned
+    // readers that finished their reads and queued them on Y's batch, each
+    // holding a lease -- but Y cannot drain them (and free those leases)
+    // until it gets the mutex, which X holds while X's OWN readers are stuck
+    // in borrow() because Y's undrained results have pinned every buffer.
+    // Hold-and-wait across two independent transactions sharing one bounded
+    // pool -- classic deadlock, and impossible in single-connection mode
+    // (there is only ever one transaction).
+    //
+    // THE INVARIANT: in multi-conn mode (quota_ < buffer_count_), each
+    // connection may hold at most `quota_` leases at once --
+    // floor(buffer_count_ / N) for N connections. That bounds how many
+    // buffers ANY one connection's undrained results can pin, so the other
+    // connection's readers can never be starved down to zero -- there is
+    // always at least one buffer outside every other connection's quota for
+    // this connection's own readers to make progress with, which lets this
+    // connection's own drain (the only thing that can free ITS leases) always
+    // run to completion and release them. Single-connection mode
+    // (conn_index == -1, or quota_ == buffer_count_) is untouched: quota_
+    // defaults to buffer_count_, so the wait predicate is exactly
+    // `!available_.empty()`, byte-identical to before this fix.
     class Lease {
     public:
         Lease(Lease && other) noexcept :
-            owner_(other.owner_), data_(other.data_) {
+            owner_(other.owner_), data_(other.data_), conn_index_(other.conn_index_) {
             other.owner_ = nullptr;
             other.data_  = nullptr;
         }
 
         ~Lease() {
             if (owner_ != nullptr) {
-                owner_->release(data_);
+                owner_->release(data_, conn_index_);
             }
         }
 
@@ -1711,21 +1974,42 @@ public:
     private:
         friend class StagingPool;
 
-        Lease(StagingPool * owner, void * data) :
-            owner_(owner), data_(data) {
+        Lease(StagingPool * owner, void * data, int conn_index) :
+            owner_(owner), data_(data), conn_index_(conn_index) {
         }
 
         StagingPool * owner_ = nullptr;
         void *        data_  = nullptr;
+        int           conn_index_ = -1;
     };
 
-    Lease borrow() {
+    // conn_index: -1 ("none") is the reserved value for a borrow issued
+    // outside any connection's transaction (single-connection default path,
+    // and the idle-pump host-landing/prefetch paths -- see the call sites at
+    // spec_host_submit and spec_pagein_submit). It always draws from the
+    // global pool with no quota, same as every borrow() before this fix.
+    Lease borrow(int conn_index = -1) {
         void * result = nullptr;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            available_cv_.wait(lock, [&]() { return !available_.empty(); });
+            available_cv_.wait(lock, [&]() {
+                if (available_.empty()) {
+                    return false;
+                }
+                if (conn_index < 0 || quota_ >= buffer_count_) {
+                    return true;
+                }
+                return held_by_conn_[conn_index] < quota_;
+            });
             result = available_.back();
             available_.pop_back();
+            if (conn_index >= 0 && quota_ < buffer_count_) {
+                ++held_by_conn_[conn_index];
+                if ((size_t) conn_index < g_worker_staging_held.size()) {
+                    g_worker_staging_held[(size_t) conn_index].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
         }
         // Async H2D: wait for any in-flight copy OUT of this buffer before a
         // reader thread refills it. Outside the pool lock -- the wait is on
@@ -1744,7 +2028,7 @@ public:
                 ggml_backend_event_synchronize(ev);
             }
         }
-        return Lease(this, result);
+        return Lease(this, result, conn_index);
     }
 
     int buffer_count() const {
@@ -1760,13 +2044,56 @@ public:
         return pinned_;
     }
 
+    // Called once from run(), after WP_WORKER_MULTI_CONN=N is parsed and
+    // BEFORE any connection thread starts (so no borrow() can race the quota
+    // change). n<=1 (including the untouched default single-connection path)
+    // restores quota_ == buffer_count_, i.e. no cap -- byte-identical to
+    // before this fix. n>buffer_count_ cannot give every connection even one
+    // guaranteed buffer, so rather than assert (and kill a worker over a
+    // config typo) this falls back to the same uncapped N=1 semantics, loudly:
+    // multi-conn is still safe (single connection ever ran that starting
+    // config, whatever it was), the flag just does not get its double-
+    // buffering behaviour until reconfigured.
+    void set_multi_conn(int n) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (n <= 1) {
+            quota_ = buffer_count_;
+            return;
+        }
+        if (n > buffer_count_) {
+            std::cerr << "wp expert worker: WARNING WP_WORKER_MULTI_CONN=" << n
+                      << " exceeds staging buffer_count=" << buffer_count_
+                      << "; per-connection staging quota disabled (falling back to "
+                         "N=1 semantics -- see the 2026-08-25 deadlock comment on "
+                         "StagingPool)" << std::endl;
+            quota_ = buffer_count_;
+            return;
+        }
+        quota_ = buffer_count_ / n;
+    }
+
 private:
-    void release(void * data) {
+    void release(void * data, int conn_index) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             available_.push_back(data);
+            if (conn_index >= 0 && quota_ < buffer_count_) {
+                auto it = held_by_conn_.find(conn_index);
+                if (it != held_by_conn_.end() && it->second > 0) {
+                    --it->second;
+                }
+                if ((size_t) conn_index < g_worker_staging_held.size()) {
+                    g_worker_staging_held[(size_t) conn_index].fetch_sub(
+                        1, std::memory_order_relaxed);
+                }
+            }
         }
-        available_cv_.notify_one();
+        // notify_all, not notify_one: with a per-connection quota, waiters
+        // block on DIFFERENT predicates (different conn_index's `held_by_conn_
+        // < quota_`). A released buffer that satisfies waiter B's predicate
+        // but not waiter A's must not be swallowed by waking only A, which
+        // would then just go back to sleep while B stays parked forever.
+        available_cv_.notify_all();
     }
 
     uint64_t                                        buffer_bytes_ = 0;
@@ -1777,6 +2104,12 @@ private:
     std::vector<void *>                             available_;
     std::mutex                                      mutex_;
     std::condition_variable                         available_cv_;
+    // Per-connection outstanding-lease counts backing the quota above.
+    // Guarded by mutex_; quota_ defaults to buffer_count_ (no cap) until
+    // set_multi_conn() runs. int, not size_t: it is compared directly
+    // against quota_ (also int) in the wait predicate.
+    std::unordered_map<int, int>                    held_by_conn_;
+    int                                              quota_ = buffer_count_;
     // Async H2D (WP_EXPERT_ASYNC_H2D). events_ maps a staging buffer's base
     // pointer to the event that fences its last in-flight copy; guarded by
     // mutex_. async_h2d_ is atomic only because the runtime-disarm path in
@@ -1901,6 +2234,27 @@ private:
         size_t             slot_index  = 0;
         const ExpertPage * page        = nullptr;
         int                fd          = -1;
+        // Destination tensor for this page-in's H2D, captured HERE, at plan
+        // time, under g_worker_gpu_mutex (see the pageins.push_back() call
+        // site in ensure_batch). WP_READER_H2D reader threads copy through
+        // this pointer instead of looking the slot up in slots_[slot_index]
+        // -- slots_ is pool-wide state shared with the other connection and
+        // must not be touched off the lock. raw is stable for the slot's
+        // whole lifetime (arena-backed, non-owning -- see Slot::raw), so the
+        // pointer stays valid for as long as the pin from ensure_batch keeps
+        // this slot from being reassigned.
+        ggml_tensor *      raw         = nullptr;
+        // WP_READER_H2D eligibility for this page-in, decided ONCE per
+        // ensure_batch() call (see the "reader_h2d_this_batch" local right
+        // before batch.state_->pageins.push_back below) and copied onto
+        // every PageIn of that batch. Deciding it once, at plan time, rather
+        // than re-reading staging_.async_h2d()/copy_stream_h2d() from each
+        // reader thread as it processes each stripe, guarantees every
+        // stripe of one page agrees on whether the reader or drain_one_read
+        // performs its H2D -- a stripe-by-stripe re-check could disagree
+        // mid-page if the async knobs are runtime-disarmed between stripes,
+        // silently under-uploading a page that still gets marked valid.
+        bool               reader_h2d  = false;
     };
 
     // One STRIPE of one page-in. A page is read in WP_EXPERT_READ_STRIPES
@@ -1921,6 +2275,20 @@ private:
         std::chrono::steady_clock::time_point read_started;
         std::chrono::steady_clock::time_point read_finished;
         bool                                read_timed = false;
+        // WP_READER_H2D: true if this result's H2D was already performed
+        // (or deliberately skipped as a no-op -- see below) on the reader
+        // thread, so drain_one_read must not copy it again. Set on EVERY
+        // stripe of a page once pagein.reader_h2d is true for that page,
+        // not just the last one: a non-last stripe carries no bytes of its
+        // own to upload (the page's bytes only become a complete, copyable
+        // range once the LAST stripe lands), so it is marked uploaded with
+        // h2d_bytes/h2d_ns left at 0 -- a pure no-op for drain_one_read,
+        // which already skips its "if (result->last)" publish block for a
+        // non-last result. Only the last stripe's result carries the real
+        // whole-page copy (h2d_bytes == the page size) and its timing.
+        bool                                uploaded = false;
+        uint64_t                            h2d_ns    = 0;
+        uint64_t                            h2d_bytes = 0;
     };
 
     // WP_EXPERT_STRIPE_PARALLEL=1: the read work unit becomes the STRIPE, not
@@ -1949,6 +2317,13 @@ private:
     struct BatchState {
         std::vector<PageIn>                       pageins;
         std::atomic<size_t>                     next{0};
+        // Which connection's transaction this batch belongs to (-1 = none:
+        // single-connection default path, or a speculative/prefetch batch
+        // with no connection context). Threaded into every staging_.borrow()
+        // call the reader threads make (read_worker/stripe_read_worker) so
+        // the per-connection staging quota (StagingPool's 2026-08-25 deadlock
+        // fix) can be enforced. Set once in ensure_batch, read-only after.
+        int                                      conn_index = -1;
         // Stripe-parallel mode only; empty otherwise. Built once in
         // ensure_batch before the workers start, read-only afterwards.
         std::vector<StripeJob>                  stripe_jobs;
@@ -2152,6 +2527,32 @@ public:
         void *                base   = nullptr;
     };
 
+    struct ArenaLayout {
+        struct Arena {
+            ggml_backend_buffer_t buffer = nullptr;
+            void *                base = nullptr;
+            uint64_t              capacity = 0;
+            size_t                first_slot = 0;
+            size_t                n_slots = 0;
+        };
+
+        ggml_backend_buffer_t buffer = nullptr;
+        void *                base = nullptr;
+        uint64_t              slot_stride = 0;
+        size_t                n_slots = 0;
+        std::vector<Arena>    arenas;
+
+        const Arena * arena_for_slot(size_t slot) const {
+            for (const Arena & arena : arenas) {
+                if (slot >= arena.first_slot &&
+                        slot - arena.first_slot < arena.n_slots) {
+                    return &arena;
+                }
+            }
+            return nullptr;
+        }
+    };
+
     class Batch {
     public:
         Batch(Batch && other) noexcept;
@@ -2209,6 +2610,13 @@ public:
 
         uint64_t bytes_h2d() const {
             return bytes_h2d_;
+        }
+
+        // WP_READER_H2D: pages whose H2D was performed on a reader thread
+        // instead of here in drain_one_read. 0 whenever the knob is off (or
+        // the backend doesn't support it), same as every other WP_* stat.
+        uint64_t n_reader_h2d() const {
+            return n_reader_h2d_;
         }
 
         uint64_t n_resident() const {
@@ -2284,6 +2692,7 @@ public:
         uint64_t                   host_bytes_ = 0;
         uint64_t                   ns_h2d_    = 0;
         uint64_t                   bytes_h2d_ = 0;
+        uint64_t                   n_reader_h2d_ = 0;
         ggml_backend_event_t       copy_event_ = nullptr;
         // Drain state. Lives on the Batch rather than in complete_batch's frame
         // so a drain can stop part-way (complete_upto) and be resumed. A read
@@ -2296,11 +2705,75 @@ public:
         bool                       have_read_time_ = false;
     };
 
+    std::optional<ArenaLayout> arena_layout() const {
+        if (resources_.slot_classes.size() != 1 ||
+                slots_.empty() ||
+                slots_.size() != (size_t) resources_.slot_classes[0].slots) {
+            return std::nullopt;
+        }
+        const uint64_t stride = arena_slot_stride(resources_.slot_classes[0].size);
+        // 2026 WP_WORKER_COLLAPSE generalization: slots may now be backed by
+        // more than one arena buffer (grouped allocation), so this walks
+        // arenas_ in slot order instead of assuming a single arena_[0]. When
+        // there is exactly one arena this produces byte-identical results to
+        // the old single-arena fast path below (layout.buffer/base set).
+        ArenaLayout layout;
+        layout.slot_stride = stride;
+        layout.n_slots = slots_.size();
+        size_t first_slot = 0;
+        for (const buffer_ptr & buffer : arenas_) {
+            const uint64_t capacity = (uint64_t) ggml_backend_buffer_get_size(buffer.get());
+            if (capacity == 0 || first_slot >= slots_.size()) {
+                return std::nullopt;
+            }
+            size_t n_slots = 0;
+            while (first_slot + n_slots < slots_.size()) {
+                const Slot & slot = slots_[first_slot + n_slots];
+                if (slot.buffer != buffer.get() ||
+                        slot.offset != (uint64_t) n_slots * stride) {
+                    break;
+                }
+                ++n_slots;
+            }
+            if (n_slots == 0 ||
+                    (uint64_t) n_slots > UINT64_MAX / stride ||
+                    (uint64_t) n_slots * stride > capacity) {
+                return std::nullopt;
+            }
+            ArenaLayout::Arena arena;
+            arena.buffer = buffer.get();
+            arena.base = ggml_backend_buffer_get_base(buffer.get());
+            arena.capacity = capacity;
+            arena.first_slot = first_slot;
+            arena.n_slots = n_slots;
+            layout.arenas.push_back(arena);
+            first_slot += n_slots;
+        }
+        if (first_slot != slots_.size()) {
+            return std::nullopt;
+        }
+        if (layout.arenas.size() == 1) {
+            layout.buffer = layout.arenas[0].buffer;
+            layout.base = layout.arenas[0].base;
+        }
+        return layout;
+    }
+
+    // gpu_lock: the caller's g_worker_gpu_mutex unique_lock, or nullptr.
+    // Passed through ONLY by the WP_WORKER_MULTI_CONN BEGIN-frame path
+    // (Worker::begin_split_dispatch, from serve_connection's PIPE_EXPERT_
+    // DISPATCH_BEGIN branch) -- every other caller (the non-split dispatch
+    // fallback at line ~5802, the speculative submit path at line ~3086)
+    // leaves it null, so for them this function's shared-state footprint is
+    // unchanged: still one lock, held start to finish. See the "READ-ISSUE
+    // UNLOCKED" block below for what the parameter actually does.
     Batch ensure_batch(
             const std::vector<const ExpertPage *> & pages,
             bool measure,
             std::chrono::steady_clock::time_point lookup_started,
-            uint32_t n_tokens = 0) {
+            uint32_t n_tokens = 0,
+            int conn_index = -1,
+            std::unique_lock<std::mutex> * gpu_lock = nullptr) {
         // Take anything the reader threads already landed -- free residency for
         // this request, and it frees the pins. Non-blocking. spec_any_in_flight
         // ("is anything live"), not spec_in_flight ("at the WP_EXPERT_SPEC_MAX_
@@ -2343,7 +2816,15 @@ public:
                 if (spec_any_in_flight()) {
                     for (const ExpertPage * page : pages) {
                         if (page != nullptr && spec_in_flight_for(*page)) {
-                            spec_pagein_poll(false, page);
+                            // cap=1: identical to the pre-MAX_INFLIGHT path
+                            // (spec_pagein_poll(true) on the one live batch).
+                            // cap>1: block only the batch that holds this page
+                            // so an unrelated in-flight read cannot stall demand.
+                            if (spec_max_inflight_ <= 1) {
+                                spec_pagein_poll(true);
+                            } else {
+                                spec_pagein_poll(false, page);
+                            }
                             break;
                         }
                     }
@@ -2399,6 +2880,10 @@ public:
                 // WP_EXPERT_SPEC_MAX_SLOTS from this point on, same as the
                 // pager's speculative_[slot]=0 on a demand hit (wp-pool.cpp).
                 if (slot.spec_pending) {
+                    if (slot.layer_ahead) {
+                        ++n_layerahead_hits_;
+                        slot.layer_ahead = false;
+                    }
                     slot.spec_pending = false;
                     --n_spec_pending_;
                 }
@@ -2496,11 +2981,35 @@ public:
                           });
             }
             batch.state_ = std::make_shared<BatchState>();
+            batch.state_->conn_index = conn_index;
             batch.state_->admit_host_on_read =
                 host_victim_enabled_ && fill_host_on_read_ && !demote_d2h_ &&
                 n_tokens > 0 && n_tokens <= 8;
             batch.copy_event_ = staging_.new_copy_event();
             batch.state_->pageins.reserve(pageins.size());
+            // WP_READER_H2D: decide once, here, under the lock, for every
+            // page-in this ensure_batch() call is about to plan -- see the
+            // PageIn::reader_h2d comment for why a single per-batch decision
+            // (not a per-stripe re-check on the reader thread) is required
+            // for correctness. async_h2d() is read here rather than cached,
+            // so a runtime disarm takes effect on the next batch exactly
+            // like it does for drain_one_read today; reader_h2d_enabled_
+            // itself is fixed for the process (backend + WP_READER_H2D are
+            // both decided at construction). copy_stream_h2d() is NOT
+            // checked: it defaults ON for every real CUDA/HIP backend
+            // (ggml_cuda_wp_copy_requested in ggml-cuda.cu, opt-out only via
+            // WP_EXPERT_COPY_STREAM=0), so gating on it left this path dead
+            // on every ROCm/CUDA worker that hadn't explicitly disabled the
+            // copy stream. It is safe to ignore here because reader_h2d_upload
+            // always issues tensor_set_page_range_reader -- a SYNCHRONOUS
+            // copy (by the time it returns) on its own dedicated
+            // non-blocking reader stream (ggml_backend_cuda_wp_reader_copy
+            // in ggml-cuda.cu), never StagingPool's copy_stream_h2d_ stream
+            // -- so it never needs the copy-stream event bookkeeping
+            // (StagingPool::mark_in_flight / events_) that copy_stream_h2d()
+            // exists to gate in drain_one_read.
+            const bool reader_h2d_this_batch =
+                reader_h2d_enabled_ && !staging_.async_h2d();
             try {
                 for (size_t entry_index : pageins) {
                     const ExpertPage & page = *pages[entry_index];
@@ -2530,6 +3039,7 @@ public:
                         // page-in or another speculative one (WP_EXPERT_SPEC_MAX_SLOTS).
                         if (slot.spec_pending) {
                             slot.spec_pending = false;
+                            slot.layer_ahead = false;
                             --n_spec_pending_;
                         }
                     }
@@ -2621,7 +3131,8 @@ public:
                         }
                     } else {
                         batch.state_->pageins.push_back({
-                            entry_index, slot_index, &page, fd_for(page.blob)
+                            entry_index, slot_index, &page, fd_for(page.blob),
+                            slot.raw, reader_h2d_this_batch
                         });
                         ++batch.n_pagein_;
                         if (std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer)) {
@@ -2650,6 +3161,84 @@ public:
             }
 
             batch.state_->measure = measure;
+
+            // *** READ-ISSUE UNLOCKED FROM g_worker_gpu_mutex (2026-08-25) ***
+            //
+            // Everything above this point -- hit resolution + pin, victim
+            // selection + pin, demote_slot on evicted valid slots, the
+            // synchronous host-tier fill for host hits, fd_for() resolution
+            // for real page-ins -- mutates slots_, slot_index_, tick_,
+            // evict_age_/evictions_, n_spec_pending_/n_layerahead_hits_,
+            // host_tier_, and fds_: state shared with the OTHER connection's
+            // thread, so it MUST run under g_worker_gpu_mutex (gpu_lock, held
+            // by the caller since before this call) exactly as before.
+            //
+            // What follows -- stripe-job planning, spawning the reader
+            // threads, and notify_all() -- touches only batch.state_ (this
+            // Batch's own BatchState: pageins/stripe_jobs/page_shared were
+            // just built above and are, per the BatchState comment, "read-
+            // only after"; start/cancel/mutex/cv are private to this batch)
+            // and staging_ (StagingPool has owned its own mutex plus the
+            // 2026-08-25 per-connection quota since the earlier deadlock fix,
+            // so borrow()/release() from any thread, any connection, is
+            // already safe without g_worker_gpu_mutex). None of it touches
+            // slots_ or any other pool-wide structure, so it is safe to run
+            // with the lock released.
+            //
+            // WHY THE OTHER CONNECTION CANNOT INVALIDATE THIS: every slot
+            // this batch will read from or write into was PINNED above,
+            // still under the lock (++slot.pin_count on both the hit loop
+            // and the pagein-reservation loop). select_victim_impl skips any
+            // slot with pin_count != 0, so the other connection's own
+            // planning -- which still requires the lock we are about to
+            // release, and will therefore itself run strictly after this
+            // unlocked window closes or strictly before this window opened
+            // -- cannot select, evict, or reassign a slot this batch is
+            // about to read into. The pin is exactly the reservation
+            // mechanism release_pins()/abandon_batch() later undo; nothing
+            // new was invented here.
+            //
+            // Only the BEGIN path (Worker::begin_split_dispatch, via
+            // serve_connection's PIPE_EXPERT_DISPATCH_BEGIN branch) passes a
+            // non-null gpu_lock, and only when g_worker_gpu_mutex != nullptr
+            // (WP_WORKER_MULTI_CONN >= 2) -- gpu_lock->owns_lock() is then
+            // guaranteed true (serve_connection just locked it for this
+            // iteration). Every other caller passes gpu_lock == nullptr, so
+            // owns_unlock stays false and this whole block is a no-op there
+            // regardless of the env knob below: single-connection and
+            // non-BEGIN callers keep taking the lock for the full duration of
+            // ensure_batch, byte-identical to before this change.
+            //
+            // WP_BEGIN_UNLOCKED_READS=1: opt IN to the unlock above. Unset or
+            // any other value: stay fully locked through read-issue, i.e. the
+            // exact pre-2026-08-25 behaviour, for an A/B pair off one binary.
+            // Read once (static, same idiom as WP_EXPERT_READ_WORKERS above
+            // and every other WP_* knob in this file) rather than on every
+            // call -- getenv() is not free and the value cannot change once
+            // the process is up.
+            static const bool s_begin_unlocked_reads = [] {
+                const char * e = std::getenv("WP_BEGIN_UNLOCKED_READS");
+                return e != nullptr && e[0] == '1';
+            }();
+            const bool owns_unlock = s_begin_unlocked_reads &&
+                                     gpu_lock != nullptr && gpu_lock->owns_lock();
+            if (owns_unlock) {
+                gpu_lock->unlock();
+                g_worker_n_begin_unlocked_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+            // RAII, not a manual relock at the bottom of the try: a thread
+            // spawn below (std::thread's constructor) can throw
+            // std::system_error, and if it does the outer catch(...) calls
+            // cancel_workers()/release_pins(), both of which touch slots_
+            // (shared) and therefore need the lock back FIRST. A destructor
+            // that always relocks on scope exit -- success or exception --
+            // is what makes that true unconditionally, without duplicating
+            // the relock at every return/throw site.
+            struct RelockOnExit {
+                std::unique_lock<std::mutex> * lock;
+                bool                           owns;
+                ~RelockOnExit() { if (owns) lock->lock(); }
+            } relock_guard{ gpu_lock, owns_unlock };
 
             // Stripe-parallel: pre-plan every (page, stripe) so reader threads
             // claim stripes, not pages. Page-major order keeps the number of
@@ -2701,6 +3290,12 @@ public:
                 batch.state_->start = true;
             }
             batch.state_->cv.notify_all();
+            // relock_guard's destructor fires here (end of scope, normal
+            // return path) and reacquires gpu_lock before we hand control
+            // back to begin_split_dispatch, which still touches Worker-wide
+            // state (split_pending_by_conn_, submit_prefill_layer_ahead)
+            // after this call returns and needs the lock held for that, same
+            // as before this change.
             stamp_ensure_post();
             return batch;
         } catch (...) {
@@ -2752,12 +3347,17 @@ public:
     //
     // Returns the number of pages submitted (0 if they were all already present
     // or a batch is still in flight).
+    // layer_ahead: one extra in-flight batch beyond WP_EXPERT_SPEC_MAX_INFLIGHT
+    // so the prefill whole-next-layer path is not serialized behind the decode
+    // spec pump's default cap of 1. Decode spec_pagein_step still passes false.
     size_t spec_pagein_submit(const std::vector<const ExpertPage *> & pages,
-                              const std::vector<uint64_t> & leases) {
+                              const std::vector<uint64_t> & leases,
+                              bool layer_ahead = false) {
         // WP_EXPERT_SPEC_MAX_INFLIGHT: refuse once spec_batches_ is already at
         // capacity, same shape as the old "one speculative batch in flight at a
         // time" refusal but against a configurable cap instead of a hardcoded 1.
-        if (pages.empty() || spec_batches_.size() >= (size_t) spec_max_inflight_) {
+        const size_t cap = (size_t) spec_max_inflight_ + (layer_ahead ? 1 : 0);
+        if (pages.empty() || spec_batches_.size() >= cap) {
             return 0;
         }
         std::vector<const ExpertPage *> cold;
@@ -2805,7 +3405,10 @@ public:
             // counters, not to a request's phase timers. Mixing them would make
             // ns_read on the dispatch path stop meaning "time this request spent
             // reading".
-            entry.batch = std::make_unique<Batch>(ensure_batch(cold, false, {}));
+            // conn_index -1 ("none"): speculative page-in runs off the idle
+            // pump, not inside any connection's transaction -- see the
+            // StagingPool quota comment. Uncapped, same as before this fix.
+            entry.batch = std::make_unique<Batch>(ensure_batch(cold, false, {}, 0, -1));
             // Safe to set after the fact: reads land on reader threads, but the
             // flag is only consulted by drain_one_read, which runs exclusively
             // on THIS thread and cannot run before submit returns.
@@ -2820,8 +3423,9 @@ public:
             ++spec_errors_;
             return 0;
         }
-        entry.inflight = std::move(cold);
-        entry.leases   = std::move(cold_leases);
+        entry.inflight    = std::move(cold);
+        entry.leases      = std::move(cold_leases);
+        entry.layer_ahead = layer_ahead;
         // LOG AT SUBMIT, NOT AT HARVEST. The read is issued here, so this is when
         // the cost is paid and when the position in the stream is meaningful.
         // Logging at harvest inverts the order against R: an async batch can be
@@ -2856,6 +3460,13 @@ public:
     // capacity" (spec_in_flight()==false, keep submitting) but still "work
     // outstanding" (spec_any_in_flight()==true, keep polling/waiting on it).
     bool spec_any_in_flight() const { return !spec_batches_.empty(); }
+
+    // Outstanding DEMAND page reads -- the Worker pump's demand-first gate
+    // (WP_EXPERT_SPEC_DEMAND_FIRST) consults this before submitting new
+    // speculative read chunks. Same atomic the host landing thread yields on.
+    bool demand_reads_outstanding() const {
+        return demand_reads_pending_.load(std::memory_order_relaxed) > 0;
+    }
 
     // Is there anywhere for a predicted page to land? Without the host tier the
     // answer is no and the caller must keep it on the VRAM path.
@@ -2929,7 +3540,11 @@ public:
                             std::this_thread::sleep_for(std::chrono::microseconds(200));
                         }
                     }
-                    StagingPool::Lease lease = staging_.borrow();
+                    // conn_index -1 ("none"): a host-landing thread runs off
+                    // the idle pump, with no connection transaction of its
+                    // own -- see the idle-pump note on the StagingPool quota
+                    // comment. Draws from the global pool, uncapped.
+                    StagingPool::Lease lease = staging_.borrow(-1);
                     // Fire the same hooks as every other read path. A host
                     // landing IS a read -- instrumentation that cannot see it
                     // would under-report exactly the bytes this feature spends.
@@ -3174,6 +3789,7 @@ private:
                     // slot can never be double-counted.
                     if (!slot.spec_pending) {
                         slot.spec_pending = true;
+                        slot.layer_ahead  = entry.layer_ahead;
                         ++n_spec_pending_;
                     }
                 }
@@ -3190,6 +3806,43 @@ public:
     uint64_t spec_pageins()  const { return spec_pageins_; }
     uint64_t spec_bytes()  const { return spec_bytes_; }
     uint64_t spec_errors() const { return spec_errors_; }
+    uint64_t n_shield_hits() const { return n_shield_hits_; }
+    uint64_t n_shield_exhausted() const { return n_shield_exhausted_; }
+
+    // Hint frames and victim selection are both owned by the dispatch thread.
+    // Keep only the configured number of hint frames, with counts so a page
+    // repeated in two frames remains shielded until both frames expire.
+    void note_hint_frame(
+            uint32_t provenance,
+            const std::vector<std::pair<int32_t, int32_t>> & pages) {
+        if (hint_shield_depth_ == 0) {
+            return;
+        }
+        std::vector<uint64_t> keys;
+        if (provenance != PIPE_HINT_PREDICTED || hint_shield_predicted_) {
+            keys.reserve(pages.size());
+            for (const auto & page : pages) {
+                const uint64_t key = slot_key(page.first, page.second);
+                keys.push_back(key);
+                ++hint_shield_counts_[key];
+            }
+        }
+        hint_shield_history_.push_back(std::move(keys));
+        while (hint_shield_history_.size() > hint_shield_depth_) {
+            const std::vector<uint64_t> & expired = hint_shield_history_.front();
+            for (uint64_t key : expired) {
+                const auto it = hint_shield_counts_.find(key);
+                if (it == hint_shield_counts_.end()) {
+                    continue;
+                }
+                if (--it->second == 0) {
+                    hint_shield_counts_.erase(it);
+                }
+            }
+            hint_shield_history_.pop_front();
+        }
+    }
+
     // Live occupancy against WP_EXPERT_SPEC_MAX_SLOTS, and how many times
     // submission was blocked or shrunk by it.
     size_t   n_spec_pending()     const { return n_spec_pending_; }
@@ -3200,6 +3853,20 @@ public:
     // than requiring the operator to trust an env var was read correctly.
     size_t   spec_inflight_live() const { return spec_batches_.size(); }
     size_t   spec_inflight_cap()  const { return (size_t) spec_max_inflight_; }
+    uint64_t n_layerahead_hits()  const { return n_layerahead_hits_; }
+
+    // Unpinned slots are the ones select_victim can take without stealing a
+    // live demand or in-flight spec pin. Layer-ahead uses this as the silent
+    // fallback budget: fetch min(layer, unpinned), never error.
+    size_t unpinned_slots() const {
+        size_t n = 0;
+        for (const Slot & slot : slots_) {
+            if (slot.pin_count <= 0) {
+                ++n;
+            }
+        }
+        return n;
+    }
 
     // BORROWED, NOT OWNED -- the Worker opens WP_HINT_LOG and outlives the pool.
     //
@@ -3224,6 +3891,13 @@ public:
     // used, not whichever was requested.
     const char * staging_kind() const {
         return staging_.pinned() ? "pinned" : "pageable";
+    }
+
+    // Delegates to StagingPool::set_multi_conn -- see that method and the
+    // StagingPool class comment (2026-08-25 deadlock fix) for the quota
+    // formula and why this must run before any connection thread starts.
+    void set_staging_multi_conn(int n) {
+        staging_.set_multi_conn(n);
     }
 
 private:
@@ -3280,6 +3954,9 @@ private:
         // exact rather than inferred from lease_until (a lease can expire while
         // the page is still sitting there unconfirmed, and that must still count).
         bool                spec_pending = false;
+        // Set with spec_pending when the landing came from WP_PREFILL_LAYER_AHEAD.
+        // Demand hit counts n_layerahead_hits_ and clears both.
+        bool                layer_ahead  = false;
     };
 
     // (layer, expert) -> uint64 for slot_index_. Same packing as SPINE's
@@ -3326,7 +4003,13 @@ private:
             host_tier_.store_from_device(slot.cache_id, slot.raw->data, (size_t) slot.size);
     }
 
-    size_t select_victim(const ExpertPage & page) const {
+    bool hint_shielded(const Slot & slot) const {
+        return hint_shield_depth_ != 0 && slot.valid &&
+            hint_shield_counts_.count(slot_key(slot.key.first, slot.key.second)) != 0;
+    }
+
+    size_t select_victim_impl(
+            const ExpertPage & page, bool skip_shielded, bool * shielded_seen) const {
         const uint64_t page_size = page.size;
         const bool wants_reserved = std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer);
         size_t victim = slots_.size();
@@ -3336,6 +4019,12 @@ private:
                 (!wants_reserved && slot.reserved) ||
                 (wants_reserved && !slot.reserved) ||
                 page_size > slot.capacity) {
+                continue;
+            }
+            if (skip_shielded && hint_shielded(slot)) {
+                if (shielded_seen != nullptr) {
+                    *shielded_seen = true;
+                }
                 continue;
             }
             if (victim == slots_.size() ||
@@ -3351,6 +4040,12 @@ private:
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
                 if (slot.pin_count != 0 || slot.valid || slot.reserved || page_size > slot.capacity) continue;
+                if (skip_shielded && hint_shielded(slot)) {
+                    if (shielded_seen != nullptr) {
+                        *shielded_seen = true;
+                    }
+                    continue;
+                }
                 if (victim == slots_.size() || slot.capacity < slots_[victim].capacity) victim = i;
             }
             if (victim != slots_.size()) return victim;
@@ -3364,6 +4059,12 @@ private:
                 page_size > slot.capacity) {
                 continue;
             }
+            if (skip_shielded && hint_shielded(slot)) {
+                if (shielded_seen != nullptr) {
+                    *shielded_seen = true;
+                }
+                continue;
+            }
             if (victim == slots_.size() ||
                 slot.capacity < slots_[victim].capacity ||
                 (slot.capacity == slots_[victim].capacity &&
@@ -3375,6 +4076,12 @@ private:
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
                 if (slot.pin_count != 0 || !slot.valid || page_size > slot.capacity) continue;
+                if (skip_shielded && hint_shielded(slot)) {
+                    if (shielded_seen != nullptr) {
+                        *shielded_seen = true;
+                    }
+                    continue;
+                }
                 if (victim == slots_.size() || slot.capacity < slots_[victim].capacity ||
                     (slot.capacity == slots_[victim].capacity &&
                      rank_less(slot, slots_[victim]))) victim = i;
@@ -3383,10 +4090,99 @@ private:
         return victim;
     }
 
+    size_t select_victim(const ExpertPage & page) {
+        if (hint_shield_depth_ == 0) {
+            return select_victim_impl(page, false, nullptr);
+        }
+        bool shielded_seen = false;
+        const size_t victim = select_victim_impl(page, true, &shielded_seen);
+        if (victim != slots_.size()) {
+            if (shielded_seen) {
+                ++n_shield_hits_;
+            }
+            return victim;
+        }
+        const size_t fallback = select_victim_impl(page, false, nullptr);
+        if (fallback != slots_.size() && shielded_seen) {
+            ++n_shield_exhausted_;
+        }
+        return fallback;
+    }
+
     // Stripe-claiming reader (WP_EXPERT_STRIPE_PARALLEL=1). Work unit = one
     // stripe; the first claimer of a page borrows its staging lease; the last
     // COMPLETER (atomic countdown) publishes `last`, inheriting any stripe's
     // failure so drain never sees a half-read page as ready.
+    // WP_READER_H2D: perform the whole-page H2D for `pagein` from a reader
+    // thread, using the staging buffer `result.staging`, and stamp `result`
+    // for drain_one_read to skip its own copy. Called only once every
+    // stripe of the page has landed in that (shared) staging buffer -- see
+    // the call sites in stripe_read_worker/read_worker, both of which only
+    // reach this on the page's LAST stripe. Touches no pool state (slots_,
+    // slot_index_, tick_): pagein.raw was captured at plan time under the
+    // lock precisely so this can run off it. On failure the exception is
+    // carried in result.error exactly like a read error, so drain_one_read
+    // -- which checks result->error before ever looking at result->uploaded
+    // -- never publishes a half-uploaded slot.
+    // WP_READER_H2D_VERIFY=1: cheap post-upload tripwire -- see
+    // tensor_verify_page_range. Default off; only ever enabled for
+    // diagnosis (adds a D2H read-back + memcmp per uploaded page).
+    static bool reader_h2d_verify_enabled() {
+        static const bool enabled = [] {
+            const char * e = std::getenv("WP_READER_H2D_VERIFY");
+            return e != nullptr && e[0] == '1';
+        }();
+        return enabled;
+    }
+
+    void reader_h2d_upload(const PageIn & pagein, bool measure, ReadResult & result) {
+        const std::chrono::steady_clock::time_point t0 =
+            measure ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point();
+        try {
+            // NOT tensor_set_page_range / ggml_backend_tensor_set: on
+            // gfx1201 that takes the MAD-114 legacy-stream synchronous
+            // hipMemcpy, which is illegal to issue from this reader thread
+            // while a connection thread may be mid HIP-graph capture (the
+            // 2026-08-25 SIGABRT: "operation would make the legacy stream
+            // depend on a capturing blocking stream"). Route through the
+            // dedicated non-blocking reader stream instead -- see
+            // ggml_backend_cuda_wp_reader_copy in ggml-cuda.cu for the full
+            // ordering argument (a host-synchronized DMA that has fully
+            // retired before any later kernel launch is a stronger
+            // guarantee than the same-stream kernel ordering MAD-114 is
+            // actually about).
+            tensor_set_page_range_reader(
+                backend_, pagein.raw, *pagein.page, result.staging->get(),
+                0, (size_t) pagein.page->size);
+        } catch (...) {
+            result.error = std::current_exception();
+            return;
+        }
+        result.uploaded  = true;
+        result.h2d_bytes = (uint64_t) pagein.page->size;
+        if (measure) {
+            result.h2d_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        }
+        if (reader_h2d_verify_enabled()) {
+            const size_t page_size = (size_t) pagein.page->size;
+            const size_t sample    = std::min<size_t>(4096, page_size);
+            uint64_t mismatches = 0;
+            tensor_verify_page_range(
+                pagein.raw, *pagein.page, result.staging->get(), 0, sample, mismatches);
+            if (page_size > sample) {
+                tensor_verify_page_range(
+                    pagein.raw, *pagein.page, result.staging->get(),
+                    page_size - sample, sample, mismatches);
+            }
+            if (mismatches > 0) {
+                g_worker_n_reader_h2d_verify_fail.fetch_add(
+                    mismatches, std::memory_order_relaxed);
+            }
+        }
+    }
+
     void stripe_read_worker(const std::shared_ptr<BatchState> & state) {
         while (true) {
             const size_t j = state->next.fetch_add(1, std::memory_order_relaxed);
@@ -3418,7 +4214,8 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(shared.lease_mutex);
                     if (!shared.lease) {
-                        shared.lease = std::make_shared<StagingPool::Lease>(staging_.borrow());
+                        shared.lease = std::make_shared<StagingPool::Lease>(
+                            staging_.borrow(state->conn_index));
                         if (test_hooks_ != nullptr && test_hooks_->staging_borrowed) {
                             test_hooks_->staging_borrowed();
                         }
@@ -3482,6 +4279,26 @@ private:
                         result->error = std::current_exception();
                     }
                 }
+                // WP_READER_H2D: every stripe of this page landed in
+                // result->staging (the acq_rel fetch_sub above is the
+                // synchronizes-with edge that makes every sibling thread's
+                // writes visible here -- see PageShared's remaining/failed
+                // comment), so the whole page can be uploaded now, off the
+                // connection thread. pagein.reader_h2d was decided once for
+                // the whole batch at plan time (see PageIn::reader_h2d), so
+                // every non-last stripe of this same page already took the
+                // no-op branch below instead of drain_one_read's copy.
+                if (result->error == nullptr && pagein.reader_h2d) {
+                    reader_h2d_upload(pagein, state->measure, *result);
+                }
+            } else if (result->error == nullptr && pagein.reader_h2d) {
+                // Not the last stripe: this stripe's bytes are not yet a
+                // complete, copyable page range on their own (the LAST
+                // stripe above does the single whole-page copy once every
+                // stripe has landed). Mark uploaded with zero bytes/ns so
+                // drain_one_read's "if (result->uploaded)" branch treats
+                // this as a pure no-op instead of copying a partial stripe.
+                result->uploaded = true;
             }
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
@@ -3526,7 +4343,8 @@ private:
             std::shared_ptr<StagingPool::Lease> staging;
             std::exception_ptr fatal;
             try {
-                staging = std::make_shared<StagingPool::Lease>(staging_.borrow());
+                staging = std::make_shared<StagingPool::Lease>(
+                    staging_.borrow(state->conn_index));
                 if (test_hooks_ != nullptr &&
                     test_hooks_->staging_borrowed) {
                     test_hooks_->staging_borrowed();
@@ -3590,6 +4408,25 @@ private:
                         }
                     }
                 }
+                // WP_READER_H2D: the serial reader reads every stripe of a
+                // page in program order on this one thread, so by the time
+                // the LAST stripe (or a failed stripe, which forces
+                // result->last above) is reached, every earlier stripe's
+                // bytes are already in `staging` -- same-thread program
+                // order needs no extra synchronization, unlike the
+                // cross-thread stripe_parallel_ case. pagein.reader_h2d was
+                // decided once for the whole batch at plan time (see
+                // PageIn::reader_h2d).
+                if (result->last && result->error == nullptr && pagein.reader_h2d) {
+                    reader_h2d_upload(pagein, state->measure, *result);
+                } else if (!result->last && result->error == nullptr && pagein.reader_h2d) {
+                    // Not the last stripe: no complete page range to copy
+                    // yet (see the whole-page-at-last-stripe design above).
+                    // Mark uploaded with zero bytes/ns so drain_one_read
+                    // treats this as a pure no-op instead of copying a
+                    // partial stripe.
+                    result->uploaded = true;
+                }
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     state->ready.push_back(std::move(result));
@@ -3636,6 +4473,23 @@ private:
                 }
             } else {
                 Slot & slot = slots_[pagein.slot_index];
+                if (result->uploaded) {
+                    // WP_READER_H2D already performed this page's H2D on the
+                    // reader thread (the last-stripe branch in
+                    // stripe_read_worker/read_worker), or this result is a
+                    // non-last stripe's deliberate no-op (see
+                    // ReadResult::uploaded and PageIn::reader_h2d) -- either
+                    // way there is nothing left to copy here. Only account
+                    // for the real copy; the no-op carries h2d_bytes == 0
+                    // and must not be double-counted as a page.
+                    if (result->h2d_bytes > 0) {
+                        if (batch.state_->measure) {
+                            batch.ns_h2d_    += result->h2d_ns;
+                            batch.bytes_h2d_ += result->h2d_bytes;
+                        }
+                        ++batch.n_reader_h2d_;
+                    }
+                } else {
                 const bool measure_h2d = batch.state_->measure;
                 const std::chrono::steady_clock::time_point h2d_started =
                     measure_h2d ? std::chrono::steady_clock::now() :
@@ -3693,6 +4547,7 @@ private:
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - h2d_started).count();
                     batch.bytes_h2d_ += result->len;
+                }
                 }
                 // Everything below publishes the page to the compute path and so
                 // must happen EXACTLY ONCE, on the final stripe -- otherwise a
@@ -3784,6 +4639,14 @@ private:
         while (batch.received_ < batch.state_->pageins.size() && range_pending()) {
             drain_one_read(batch);
         }
+        // A partial drain may have issued H2D copies on the dedicated copy
+        // stream. Fence those copies before compute starts; complete() records
+        // the final fence too, but that is after the overlapped compute point.
+        if (batch.copy_event_ != nullptr &&
+                !staging_.record_copy_event(batch.copy_event_)) {
+            ggml_backend_event_free(batch.copy_event_);
+            batch.copy_event_ = nullptr;
+        }
     }
 
     void complete_batch(Batch & batch) {
@@ -3857,16 +4720,15 @@ private:
 
     FILE * spec_log_ = nullptr;
 
-    // Per-slot stride inside an arena: the slot's bytes rounded up to the
-    // backend's tensor alignment, so every slot's base is legally aligned for
-    // ggml_backend_buffer_init_tensor. The slice page (1671168 B) is already a
-    // multiple of 4096, so on both backends here this rounds to itself -- the
-    // round-up is for correctness on any future page geometry, not padding we
-    // expect to pay.
+    // Per-slot stride inside an arena. layout_sliced_pages also makes the page
+    // divisible by each role's type size when arena ids are requested.
     uint64_t arena_slot_stride(uint64_t size) const {
         const size_t align =
             ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(backend_));
         const uint64_t a = align == 0 ? 1 : (uint64_t) align;
+        if (size > UINT64_MAX - (a - 1)) {
+            throw std::overflow_error("expert arena slot stride overflows");
+        }
         return ((size + a - 1) / a) * a;
     }
 
@@ -3881,10 +4743,33 @@ private:
         if (total == 0) {
             return;
         }
+        // Arena ids need one base+stride address space because a ggml tensor cannot cross backend buffers.
+        const char * const arena_env = std::getenv("WP_EXPERT_ARENA_ID");
+        const char * const backend_name = ggml_backend_name(backend_);
+        const bool single_id_arena = arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1 &&
+            backend_name != nullptr &&
+            (std::strstr(backend_name, "ROCm") != nullptr ||
+             std::strstr(backend_name, "CUDA") != nullptr ||
+             std::strstr(backend_name, "Vulkan") != nullptr) &&
+            resources_.slot_classes.size() == 1;
+        if (single_id_arena && total > (uint64_t) SIZE_MAX) {
+            throw std::overflow_error("expert slot arena is too large");
+        }
         // Respect the backend's max single-allocation size; split across as many
         // arenas as that requires. Vulkan reports a real cap here (and a 4 GB
         // buffer would exceed maxStorageBufferRange on Polaris anyway).
         size_t max_buf = ggml_backend_buft_get_max_size(buft);
+        if (single_id_arena) {
+            if (max_buf == 0 || max_buf == SIZE_MAX || total <= max_buf) {
+                buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) total));
+                if (buf) {
+                    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    arenas_.push_back(std::move(buf));
+                    return;
+                }
+            }
+            std::fprintf(stderr, "WARN wp expert worker: WP_EXPERT_ARENA_ID single allocation failed; using split arenas\n");
+        }
         if (max_buf == 0 || max_buf > SIZE_MAX / 2) {
             max_buf = (size_t) 1 << 30;
         }
@@ -4163,6 +5048,50 @@ private:
         const char * e = std::getenv("WP_EXPERT_STRIPE_PARALLEL");
         return e != nullptr && e[0] == '1';
     }();
+    // WP_READER_H2D=1 -- move a page-in's H2D off the connection thread's
+    // g_worker_gpu_mutex-held critical path (drain_one_read) onto the
+    // reader thread that produced the bytes, once the page's last stripe
+    // has landed in the staging buffer (see stripe_read_worker /
+    // read_worker and the PageIn::reader_h2d comment). Default OFF: unset
+    // or any value other than "1" reproduces exactly today's behaviour, no
+    // matter the backend.
+    //
+    // Gated to CUDA/HIP only. The copy itself does NOT go through
+    // ggml_backend_tensor_set / ggml_backend_cuda_buffer_set_tensor -- on
+    // gfx1201 (R9700) that takes the MAD-114 legacy-stream synchronous
+    // hipMemcpy branch (ggml_cuda_device_needs_mad114_legacy_memcpy,
+    // ggml/src/ggml-cuda/ggml-cuda.cu), and the legacy stream implicitly
+    // synchronizes with every other blocking stream on the device --
+    // including a connection thread's concurrent HIP-graph capture
+    // (WP_HIP_GRAPHS), which SIGABRTs ("operation would make the legacy
+    // stream depend on a capturing blocking stream": this worker DOES run
+    // graph capture through ggml-cuda's generic path, not only the
+    // arena path -- the 2026-08-25 live crash this gate exists to avoid).
+    // Instead every reader-thread copy goes through
+    // tensor_set_page_range_reader -> ggml_backend_cuda_wp_reader_copy, a
+    // dedicated per-device NON-BLOCKING stream defined in ggml-cuda.cu that
+    // never implicitly syncs with the legacy stream, so it cannot collide
+    // with a concurrent capture. See that function's comment for the full
+    // ordering argument for why a host-synchronized copy on that stream is
+    // still safely visible to any kernel launched afterward (including on
+    // gfx1201).
+    //
+    // NOT enabled for Vulkan: ggml_backend_vk_buffer_set_tensor
+    // (ggml-vulkan.cpp) funnels through ggml_vk_buffer_write, which is not
+    // documented or otherwise provably safe to call from multiple threads
+    // concurrently without external synchronization the way the CUDA/HIP
+    // path is. Absent that proof this stays off there -- and off for any
+    // other/unknown backend -- regardless of the env var.
+    const bool                 reader_h2d_enabled_ = [this] {
+        const char * e = std::getenv("WP_READER_H2D");
+        if (e == nullptr || e[0] != '1') {
+            return false;
+        }
+        const char * const name = ggml_backend_name(backend_);
+        return name != nullptr &&
+               (std::strstr(name, "CUDA") != nullptr ||
+                std::strstr(name, "ROCm") != nullptr);
+    }();
     TestHooks *                test_hooks_ = nullptr;
     wp::HostTier               host_tier_;
     bool                       host_victim_enabled_ = false;
@@ -4241,6 +5170,7 @@ private:
     // page is still occupying the slot unconfirmed, and that must still count
     // against the budget until the slot is either hit or evicted.
     size_t                      n_spec_pending_ = 0;
+    uint64_t                    n_layerahead_hits_ = 0;
     // Times spec_pagein_submit refused to submit (or had to shrink a chunk)
     // because WP_EXPERT_SPEC_MAX_SLOTS was already spent. Surfaced on the
     // WP_HINT_LOG counter line so the cap binding is visible.
@@ -4274,6 +5204,7 @@ private:
         std::unique_ptr<Batch>          batch;
         std::vector<const ExpertPage *> inflight;
         std::vector<uint64_t>           leases;
+        bool                            layer_ahead = false;
     };
     std::vector<SpecBatch>          spec_batches_;
     // WP_EXPERT_SPEC_HOST_THREADS -- concurrent host-landing reader threads.
@@ -4401,6 +5332,21 @@ private:
         const char * e = std::getenv("WP_EXPERT_LFU");
         return e == nullptr || e[0] != '0';   // ON by default
     }();
+    // WP_EXPERT_HINT_SHIELD=N keeps pages named by the last N hint frames out
+    // of demand eviction. 0 is the default-off control arm.
+    const size_t              hint_shield_depth_ = [] {
+        const char * e = std::getenv("WP_EXPERT_HINT_SHIELD");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
+        return v > 0 ? (size_t) v : (size_t) 0;
+    }();
+    const bool                 hint_shield_predicted_ = [] {
+        const char * e = std::getenv("WP_EXPERT_HINT_SHIELD_PREDICTED");
+        return e != nullptr && e[0] == '1';
+    }();
+    std::deque<std::vector<uint64_t>> hint_shield_history_;
+    std::unordered_map<uint64_t, size_t> hint_shield_counts_;
+    uint64_t                   n_shield_hits_ = 0;
+    uint64_t                   n_shield_exhausted_ = 0;
     // Victim ordering: is `a` a strictly BETTER victim than `b`? With LFU off
     // this is pure LRU, byte for byte what shipped before, so a control arm
     // needs no separate build.
@@ -4473,6 +5419,7 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     host_bytes_(other.host_bytes_),
     ns_h2d_(other.ns_h2d_),
     bytes_h2d_(other.bytes_h2d_),
+    n_reader_h2d_(other.n_reader_h2d_),
     copy_event_(other.copy_event_),
     // Drain state travels with the batch. It was omitted here originally --
     // harmless while every move ran before the first drain (NRVO covered the
@@ -4532,6 +5479,8 @@ public:
     struct split_pending {
         pipe_expert_dispatch_req request;
         std::optional<ExpertSlotPool::Batch> batch;
+        bool arena_eligible = false;
+        uint64_t seq_id = 0;
     };
     Worker(
             Catalog catalog,
@@ -4585,6 +5534,19 @@ public:
                       << catalog_.layers.size()
                       << " width>" << prefill_layer_ahead_width_
                       << std::endl;
+        }
+        std::cerr << "WARN wp expert worker: WP_EXPERT_SPEC_DEMAND_FIRST="
+                  << (spec_demand_first_ ? 1 : 0)
+                  << std::endl;
+        const char * const arena_env = std::getenv("WP_EXPERT_ARENA_ID");
+        std::cerr << "WARN wp expert worker: WP_EXPERT_ARENA_ID="
+                  << (arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1 ? 1 : 0)
+                  << " arena_ready=" << (pool_.arena_layout().has_value() ? 1 : 0)
+                  << std::endl;
+        if (const char * e = std::getenv("WP_WORKER_NULL"); e != nullptr && e[0] == '1') {
+            std::cerr << "WARN wp expert worker: WP_WORKER_NULL=1 (TIMING PROBE: "
+                         "requests answered with zeros, no reads, no compute, "
+                         "outputs are garbage)" << std::endl;
         }
         std::cerr << "WARN wp expert worker: pinned_pages="
                   << resident_.pinned_pages()
@@ -4698,16 +5660,30 @@ public:
         hint_experts_ += hint.expert_ids.size();
         log_hint_ids(hint);
         if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), hint.layer)) {
+            pool_.note_hint_frame(hint.provenance, {});
             hint_foreign_layer_ += hint.expert_ids.size();
             log_prefetch_hints();
             return;
         }
+        std::vector<std::pair<int32_t, int32_t>> shield_pages;
+        shield_pages.reserve(hint.expert_ids.size());
         size_t predicted_this_frame = 0;
+        // Whole-slice layer-ahead frames are larger than the decode generation
+        // cap (16). Keep them off spec_queue_ (WP_SPEC_QUEUE_MAX=64 would drop
+        // most of a 256-expert layer). The catalog path fetches the slice.
+        const bool whole_slice_ahead =
+            prefill_layer_ahead_ &&
+            hint.provenance == PIPE_HINT_CERTAIN &&
+            hint.expert_ids.size() > 16;
         for (int32_t expert_id : hint.expert_ids) {
             if (expert_id < catalog_.descriptor.expert_first ||
                 expert_id > catalog_.descriptor.expert_last ||
                 catalog_.pages.count({ hint.layer, expert_id }) == 0) {
                 ++hint_foreign_expert_;
+                continue;
+            }
+            shield_pages.emplace_back(hint.layer, expert_id);
+            if (whole_slice_ahead) {
                 continue;
             }
             // Resolved here, on the frame thread, so the idle path does no map
@@ -4738,13 +5714,57 @@ public:
                     // CERTAIN (or host-less) -> VRAM spec_queue_. Newest-wins:
                     // when full, drop the OLDEST page (already late) so the
                     // incoming hint -- the one with remaining lead -- stays.
-                    enqueue_newest(spec_queue_,
-                                   { page, hint.provenance == PIPE_HINT_PREDICTED
-                                             ? pool_.spec_lease_predicted()
-                                             : pool_.spec_lease() });
+                    //
+                    // MAD-LAB 2026-08-21: the host branch's per-frame predicted
+                    // cap never applied on this fallthrough, so an n-gram flood
+                    // (76k frames/run) drowned the certain hash-layer hints in
+                    // this shared queue and resident fraction FELL (vspec arm,
+                    // §8.13 follow-up). Two rules restore the hierarchy:
+                    // predicted admissions respect the per-frame cap, and a
+                    // guess can never evict a certain hint -- eviction takes
+                    // the oldest PREDICTED entry first, and a predicted arrival
+                    // is refused outright when the queue is full of certain
+                    // work. Discriminated by lease value (predicted lease
+                    // defaults to 4 vs 64; equal leases degrade to old
+                    // behaviour, never worse).
+                    const bool predicted = hint.provenance == PIPE_HINT_PREDICTED;
+                    if (predicted && spec_predict_topm_ != 0 &&
+                        predicted_this_frame >= spec_predict_topm_) {
+                        ++spec_dropped_;
+                        continue;
+                    }
+                    if (predicted) {
+                        ++predicted_this_frame;
+                    }
+                    const uint64_t lease =
+                        predicted ? pool_.spec_lease_predicted() : pool_.spec_lease();
+                    if (spec_queue_max_ != 0 && spec_queue_.size() >= spec_queue_max_) {
+                        const uint64_t pred_lease = pool_.spec_lease_predicted();
+                        const uint64_t cert_lease = pool_.spec_lease();
+                        auto victim = spec_queue_.end();
+                        if (pred_lease != cert_lease) {
+                            victim = std::find_if(
+                                spec_queue_.begin(), spec_queue_.end(),
+                                [pred_lease](const std::pair<const ExpertPage *, uint64_t> & e) {
+                                    return e.second == pred_lease;
+                                });
+                        }
+                        if (victim != spec_queue_.end()) {
+                            spec_queue_.erase(victim);
+                            ++spec_dropped_;
+                        } else if (predicted && pred_lease != cert_lease) {
+                            ++spec_dropped_;
+                            continue;
+                        } else {
+                            spec_queue_.pop_front();
+                            ++spec_dropped_;
+                        }
+                    }
+                    spec_queue_.emplace_back(page, lease);
                 }
             }
         }
+        pool_.note_hint_frame(hint.provenance, shield_pages);
         log_prefetch_hints();
     }
 
@@ -4758,28 +5778,91 @@ public:
         return it == catalog_.layers.end() ? -1 : *it;
     }
 
-    // Prefill L+1 union stream. Demand batch for L is already issued (and
-    // pinned). One spec-VRAM batch of every page we serve on the next layer,
-    // already (blob, offset) sorted at load. spec_pagein_submit is async and
-    // filters residents; PREFILL_GATE is not consulted -- this is not a guess.
+    void note_expert_recency(int32_t expert_id) {
+        if (expert_id < 0) {
+            return;
+        }
+        if ((size_t) expert_id >= expert_recency_.size()) {
+            expert_recency_.resize((size_t) expert_id + 1, 0);
+        }
+        expert_recency_[(size_t) expert_id] = ++recency_tick_;
+    }
+
+    uint64_t expert_recency_of(int32_t expert_id) const {
+        if (expert_id < 0 || (size_t) expert_id >= expert_recency_.size()) {
+            return 0;
+        }
+        return expert_recency_[(size_t) expert_id];
+    }
+
+    // Prefill L+1 whole-slice stream. Demand batch for L is already issued
+    // (and pinned). Catalog-driven: the worker already owns its slice, so this
+    // does not wait on spine hint frames. spec_pagein_submit is async and
+    // filters residents; PREFILL_GATE / SPEC_CHUNK / SPEC_QUEUE_MAX are not
+    // consulted -- this is not a guess. Demand-first: skip while demand reads
+    // are still outstanding and retry from later call sites in dispatch().
     void submit_prefill_layer_ahead(int32_t layer, uint32_t n_tokens) {
-        if (!prefill_layer_ahead_ || !spec_enabled_ ||
-            n_tokens <= prefill_layer_ahead_width_) {
+        if (!prefill_layer_ahead_ || n_tokens <= prefill_layer_ahead_width_) {
             return;
         }
         const int32_t nxt = next_served_layer(layer);
-        if (nxt < 0) {
+        if (nxt < 0 || nxt == ahead_target_) {
             return;
         }
         const auto it = layer_pages_sorted_.find(nxt);
         if (it == layer_pages_sorted_.end() || it->second.empty()) {
             return;
         }
-        std::vector<uint64_t> leases(it->second.size(), pool_.spec_lease());
-        const size_t n = pool_.spec_pagein_submit(it->second, leases);
+        if (pool_.demand_reads_outstanding()) {
+            ++pump_vram_demand_defer_;
+            return;
+        }
+        (void) pool_.spec_pagein_poll(false);
+
+        std::vector<const ExpertPage *> pages = it->second;
+        const size_t budget = pool_.unpinned_slots();
+        if (budget == 0) {
+            return;
+        }
+        if (pages.size() > budget) {
+            std::nth_element(
+                pages.begin(), pages.begin() + (ptrdiff_t) budget, pages.end(),
+                [this](const ExpertPage * a, const ExpertPage * b) {
+                    const uint64_t ra = expert_recency_of(a->expert);
+                    const uint64_t rb = expert_recency_of(b->expert);
+                    if (ra != rb) {
+                        return ra > rb;
+                    }
+                    if (a->blob != b->blob) {
+                        return a->blob < b->blob;
+                    }
+                    return a->offset < b->offset;
+                });
+            pages.resize(budget);
+            std::sort(pages.begin(), pages.end(),
+                      [](const ExpertPage * a, const ExpertPage * b) {
+                          if (a->blob != b->blob) {
+                              return a->blob < b->blob;
+                          }
+                          return a->offset < b->offset;
+                      });
+        }
+        if (ahead_offered_layer_ != nxt) {
+            n_layerahead_hints_ += it->second.size();
+            ahead_offered_layer_ = nxt;
+        }
+        std::vector<uint64_t> leases(pages.size(), pool_.spec_lease());
+        const size_t n = pool_.spec_pagein_submit(pages, leases, /*layer_ahead=*/ true);
         if (n > 0) {
+            ahead_target_ = nxt;
+            n_layerahead_pageins_ += n;
             ++ahead_submits_;
             ahead_pages_ += n;
+        } else if (pool_.spec_inflight_live() < pool_.spec_inflight_cap() + 1) {
+            // All filtered (resident or already in flight): nothing left to
+            // fetch for this target. Still at-cap returns 0 without this mark
+            // so a later retry can submit.
+            ahead_target_ = nxt;
         }
     }
 
@@ -4865,6 +5948,10 @@ public:
             ++pump_host_empty_;
         }
         if (!pool_.spec_host_busy() && !host_queue_.empty()) {
+            if (spec_demand_first_ && pool_.demand_reads_outstanding()) {
+                ++pump_vram_demand_defer_;
+                return harvest ? pool_.spec_pagein_poll(false) : false;
+            }
             const size_t take = std::min(spec_chunk_, host_queue_.size());
             std::vector<const ExpertPage *> chunk(
                 host_queue_.begin(), host_queue_.begin() + (ptrdiff_t) take);
@@ -4890,6 +5977,10 @@ public:
         // finds the pool full, whether "full" means one batch or N.
         if (pool_.spec_in_flight()) {
             ++pump_vram_busy_;
+            return harvest ? pool_.spec_pagein_poll(false) : false;
+        }
+        if (spec_demand_first_ && pool_.demand_reads_outstanding()) {
+            ++pump_vram_demand_defer_;
             return harvest ? pool_.spec_pagein_poll(false) : false;
         }
         if (spec_queue_.empty()) {
@@ -4937,7 +6028,7 @@ public:
     // n_pagein and bytes_read because spend and saving are only interpretable
     // together.
     std::string prefetch_hint_line() const {
-        char buf[1024];
+        char buf[1280];
         std::snprintf(buf, sizeof(buf),
                       "frames=%llu experts=%llu "
                       "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
@@ -4947,9 +6038,10 @@ public:
                       "host_promoted=%llu host_wasted=%llu "
                       "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu "
                       "spec_cap[pending/blocked_budget]=%zu/%llu "
-                      "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit]="
-                      "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
-                      "spec_inflight[live/cap]=%zu/%zu",
+                      "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit/vdemand_defer]="
+                      "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+                      "spec_inflight[live/cap]=%zu/%zu "
+                      "n_layerahead[hints/pageins/hits]=%llu/%llu/%llu",
                       (unsigned long long) hint_frames_,
                       (unsigned long long) hint_experts_,
                       (unsigned long long) hint_foreign_layer_,
@@ -4981,8 +6073,12 @@ public:
                       (unsigned long long) pump_vram_busy_,
                       (unsigned long long) pump_vram_empty_,
                       (unsigned long long) pump_vram_submit_,
+                      (unsigned long long) pump_vram_demand_defer_,
                       pool_.spec_inflight_live(),
-                      pool_.spec_inflight_cap());
+                      pool_.spec_inflight_cap(),
+                      (unsigned long long) n_layerahead_hints_,
+                      (unsigned long long) n_layerahead_pageins_,
+                      (unsigned long long) pool_.n_layerahead_hits());
         return buf;
     }
 
@@ -5011,11 +6107,15 @@ public:
             std::fprintf(stderr, "wp-expert-worker prefetch hints: %s\n",
                          prefetch_hint_line().c_str());
         }
-        if (ahead_submits_ > 0) {
+        if (ahead_submits_ > 0 || n_layerahead_hints_ > 0) {
             std::fprintf(stderr,
-                         "wp-expert-worker prefill layer-ahead: submits=%llu pages=%llu\n",
+                         "wp-expert-worker prefill layer-ahead: submits=%llu pages=%llu "
+                         "n_layerahead_hints=%llu n_layerahead_pageins=%llu n_layerahead_hits=%llu\n",
                          (unsigned long long) ahead_submits_,
-                         (unsigned long long) ahead_pages_);
+                         (unsigned long long) ahead_pages_,
+                         (unsigned long long) n_layerahead_hints_,
+                         (unsigned long long) n_layerahead_pageins_,
+                         (unsigned long long) pool_.n_layerahead_hits());
         }
     }
 
@@ -5069,10 +6169,91 @@ public:
         }
     }
 
+    bool grouped_gemv_eligible(const pipe_expert_dispatch_req & request) const {
+        static const bool enabled = [] {
+            const char * e = std::getenv("WP_EXPERT_GROUPED_GEMV");
+            return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+        }();
+        const char * const backend_name = ggml_backend_name(backend_.get());
+        return enabled && backend_name != nullptr &&
+            std::strstr(backend_name, "ROCm") != nullptr &&
+            request.n_tokens >= 1 && request.n_tokens <= 8 &&
+            request.assignments.size() >= 1 &&
+            request.assignments.size() <= (size_t) 8 * request.n_tokens;
+    }
+
+    bool arena_id_eligible(
+            const pipe_expert_dispatch_req & request,
+            const ExpertSlotPool::Batch & batch) const {
+        static const bool enabled = [] {
+            const char * e = std::getenv("WP_EXPERT_ARENA_ID");
+            return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+        }();
+        const char * const backend_name = ggml_backend_name(backend_.get());
+        // Vulkan uses its MM mul_mat_id path for the strided arena view.
+        const bool backend_supported = backend_name != nullptr &&
+            (std::strstr(backend_name, "ROCm") != nullptr ||
+             std::strstr(backend_name, "CUDA") != nullptr ||
+             std::strstr(backend_name, "Vulkan") != nullptr);
+        const std::optional<ExpertSlotPool::ArenaLayout> layout_opt = pool_.arena_layout();
+        if (!enabled || !backend_supported ||
+                request.n_tokens < 1 || request.n_tokens > 8 ||
+                request.assignments.empty() ||
+                request.assignments.size() > (size_t) 8 * request.n_tokens ||
+                !layout_opt.has_value()) {
+            return false;
+        }
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            const std::vector<float> & weights = request.assignments[i].weights;
+            if (weights.size() != request.n_tokens ||
+                    std::any_of(weights.begin(), weights.end(), [](float weight) {
+                        return !std::isfinite(weight);
+                    })) {
+                return false;
+            }
+            if (batch.slot_index(i) == std::numeric_limits<size_t>::max()) {
+                return false;
+            }
+        }
+        const ExpertSlotPool::ArenaLayout & layout = *layout_opt;
+        static const char * k_roles[3] = {"gate", "up", "down"};
+        const auto & specs = catalog_.descriptor.layers.at(request.layer);
+        for (const char * role : k_roles) {
+            const ggml_type type = specs.at(role).type;
+            const uint64_t type_size = ggml_type_size(type);
+            const uint64_t block_size = ggml_blck_size(type);
+            if (type_size == 0 || block_size == 0 ||
+                    layout.slot_stride % type_size != 0 ||
+                    layout.slot_stride / type_size > UINT32_MAX / block_size) {
+                return false;
+            }
+        }
+        const ExpertPage & first = catalog_.pages.at({
+            request.layer, request.assignments[0].expert_id
+        });
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            const ExpertPage & page = catalog_.pages.at({
+                request.layer, request.assignments[i].expert_id
+            });
+            if (page.device_size > layout.slot_stride ||
+                    batch.slot_index(i) >= layout.n_slots) {
+                return false;
+            }
+            for (const char * role : k_roles) {
+                if (page.roles.at(role).device_offset !=
+                        first.roles.at(role).device_offset) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     pipe_expert_partial dispatch(
             const pipe_expert_dispatch_req & request,
             RequestStats & request_stats,
-            std::optional<ExpertSlotPool::Batch> prepared = std::nullopt) {
+            std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
+            int conn_index = -1) {
         const bool owns_gate = !prepared.has_value();
         if (owns_gate) {
             spec_prefill_gate_active_ = spec_prefill_gate_enabled_ &&
@@ -5091,6 +6272,29 @@ public:
         } demand_gate{ pool_, owns_gate };
         validate_dispatch(request);
 
+        // WP_WORKER_NULL=1 -- TIMING PROBE ONLY (hop-theory probe B/C,
+        // 2026-08-22): decode-path requests answered with zeros, no reads,
+        // no compute. Real wire + protocol, zero work -- isolates the
+        // per-request protocol floor from worker-internal cost. Outputs are
+        // garbage; never pair with a quality gate.
+        static const bool worker_null = [] {
+            const char * e = std::getenv("WP_WORKER_NULL");
+            return e != nullptr && e[0] == '1';
+        }();
+        // Decode-path requests only: a prepared batch (split dispatch) has
+        // pinned slots and in-flight reads that must be consumed, and prefill
+        // rides that path -- abandoning it mid-flight killed the worker on the
+        // first prefill of the 10:07 run. Prefill/split go through the real
+        // path; the probe only needs decode timing.
+        if (worker_null && !prepared.has_value() && request.n_tokens <= 8) {
+            pipe_expert_partial out;
+            out.layer    = request.layer;
+            out.n_tokens = request.n_tokens;
+            out.partial.assign(
+                (size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
+            return out;
+        }
+
         // Already f32 on the wire as of PIPE_VERSION 4; this used to widen a
         // f16 value back to f32, which recovered the storage type but NOT the
         // ~3e-4 of precision the spine had already thrown away.
@@ -5102,13 +6306,14 @@ public:
         std::vector<const ExpertPage *> pages;
         pages.reserve(request.assignments.size());
         for (const pipe_expert_assignment & assignment : request.assignments) {
+            note_expert_recency(assignment.expert_id);
             pages.push_back(&catalog_.pages.at({
                 request.layer, assignment.expert_id
             }));
         }
         ExpertSlotPool::Batch batch = prepared.has_value()
             ? std::move(*prepared)
-            : pool_.ensure_batch(pages, measure, lookup_started, request.n_tokens);
+            : pool_.ensure_batch(pages, measure, lookup_started, request.n_tokens, conn_index);
         if (measure) {
             request_stats.ns_lookup  = batch.lookup_ns();
             request_stats.n_resident      = batch.n_resident();
@@ -5124,10 +6329,11 @@ public:
             request_stats.host_bytes = batch.host_bytes();
         }
 
-        // WP_PREFILL_LAYER_AHEAD: after THIS layer's demand reads are issued
-        // (slots pinned), start the NEXT layer's full catalog in (blob,offset)
-        // order as one spec-VRAM batch. Bypasses the 64-deep hint queue and
-        // PREFILL_GATE -- this is not a guess; prefill union is ~98.6%.
+        // WP_PREFILL_LAYER_AHEAD: after THIS layer's demand pins, try the NEXT
+        // layer's catalog as one spec-VRAM batch. Demand-first defers while
+        // this layer's reads are still outstanding; retries after complete_upto
+        // / complete so the read overlaps remaining compute. Bypasses the
+        // 64-deep hint queue, PREFILL_GATE, and SPEC_CHUNK.
         submit_prefill_layer_ahead(request.layer, request.n_tokens);
         // WP_EXPERT_DOUBLE_BUFFER: see double_buffer_reads_'s comment for the
         // full argument. Short version -- THIS request's own pages are already
@@ -5150,6 +6356,8 @@ public:
             have_hits |= batch.is_resident(i);
             have_pageins |= !batch.is_resident(i);
         }
+        const bool grouped_gemv_request =
+            grouped_gemv_eligible(request) || arena_id_eligible(request, batch);
         // PHASE TIMERS. ns_compute is the wall span of this whole section, but
         // ns_read/h2d/submit/readback only summed to 78% of it on the RX 480
         // (8.95 s of 11.53 s) -- 1.34 ms per request attributed to nothing.
@@ -5253,7 +6461,7 @@ public:
         // nothing to overlap and the plain serial path is strictly better
         // (no extra per-expert graph submits, no fold pass).
         const bool resident_first_eligible =
-            s_resident_first &&
+            !grouped_gemv_request && s_resident_first &&
             !request.assignments.empty() &&
             request.n_tokens <= s_resident_first_max_tokens &&
             have_pageins;
@@ -5330,7 +6538,7 @@ public:
             // 40.8 s of the 74.0 s decode dispatch wait, so this is not a rounding
             // error. n_pagein == 0 means every expert is already resident and the
             // serial path is strictly better.
-            const size_t chunks   = batch.n_pagein() == 0
+            const size_t chunks   = grouped_gemv_request || batch.n_pagein() == 0
                 ? 1
                 : std::max<size_t>(1, std::min(s_compute_chunks, n_assign));
             for (size_t c = 0; c < chunks; ++c) {
@@ -5341,6 +6549,7 @@ public:
                 }
                 batch.complete_upto(end);
                 request_stats.ns_wait += lap();
+                submit_prefill_layer_ahead(request.layer, request.n_tokens);
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ c > 0, request_stats,
@@ -5353,10 +6562,12 @@ public:
         // first read error. Cheap and already drained after the loop above.
         batch.complete();
         request_stats.ns_wait += lap();
+        submit_prefill_layer_ahead(request.layer, request.n_tokens);
         if (measure) {
             request_stats.ns_read = batch.read_ns();
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
+            request_stats.n_reader_h2d = batch.n_reader_h2d();
         }
         if (resident_first_eligible) {
             // Reads are drained (batch.complete() above): compute every
@@ -5464,8 +6675,38 @@ public:
         return response;
     }
 
-    void begin_split_dispatch(const pipe_expert_dispatch_begin & begin, uint64_t seq_id) {
-        if (split_pending_) {
+    // conn_index identifies which connection's split-dispatch transaction
+    // this is (see split_pending_by_conn_'s comment above the member decl).
+    // Single-connection default path always passes -1.
+    //
+    // WP_WORKER_MULTI_CONN correctness fix (2026-08-24, ported from the
+    // main-box canonical copy): this USED TO be a single
+    // std::optional<split_pending> plus a bare split_seq_id_, i.e.
+    // Worker-wide "the one in-flight BEGIN/ACTS split-dispatch transaction"
+    // -- correct only under the single-connection assumption. BEGIN and its
+    // matching ACTS/ACTS_PUBLISH/ACTS_REF frame are two SEPARATE loop
+    // iterations in serve_connection, each taking g_worker_gpu_mutex
+    // independently -- the lock is released between them. With two live
+    // connections, connection B's BEGIN can land in that gap between
+    // connection A's BEGIN and A's ACTS, and since this state was keyed by
+    // nothing, B's BEGIN either threw "BEGIN arrived before ACTS" or
+    // silently overwrote A's pending transaction outright -- A's
+    // subsequent ACTS then failed has_split_dispatch()/seq_id-mismatch and
+    // got a PIPE_ERROR frame instead of its expected ACK/PARTIAL. This is
+    // the exact mechanism behind "sent an unexpected frame in place of the
+    // dedup publish ack" / "died while publishing dedup activations" seen
+    // on this box's 8803 leg under real two-dispatcher load.
+    //
+    // gpu_lock: forwarded to pool_.ensure_batch() below, unchanged -- see
+    // that function's parameter comment and its "READ-ISSUE UNLOCKED" block
+    // for what it does. Only serve_connection's PIPE_EXPERT_DISPATCH_BEGIN
+    // branch passes non-null; every other caller (there are none today
+    // besides that branch) gets the default nullptr and this function's
+    // locking footprint is unchanged.
+    void begin_split_dispatch(const pipe_expert_dispatch_begin & begin, uint64_t seq_id,
+                              int conn_index = -1,
+                              std::unique_lock<std::mutex> * gpu_lock = nullptr) {
+        if (split_pending_by_conn_.count(conn_index) != 0) {
             throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                       "expert dispatch BEGIN arrived before ACTS");
         }
@@ -5478,21 +6719,34 @@ public:
         std::vector<const ExpertPage *> pages;
         pages.reserve(request.assignments.size());
         for (const pipe_expert_assignment & assignment : request.assignments) {
+            note_expert_recency(assignment.expert_id);
             pages.push_back(&catalog_.pages.at({ request.layer, assignment.expert_id }));
         }
+        // spec_prefill_gate_active_ and pool_.demand_serving() are still
+        // Worker/pool-wide (not keyed by conn_index) -- known imprecision
+        // under multi-conn (one connection's finish/abandon can clear a gate
+        // meant for another's still-in-flight transaction), tracked
+        // separately. NOT the bug fixed here: spec_prefill_gate_active_'s
+        // only readers are spec_pagein_step()/has_spec_submit_work(), both
+        // reachable only from await_request()'s keepalive/spec pump, which
+        // is unconditionally skipped whenever g_worker_gpu_mutex != nullptr
+        // (see await_request's comment) -- so in multi-conn mode this value
+        // is written but never read, hence harmless there today.
         spec_prefill_gate_active_ = spec_prefill_gate_enabled_ &&
                                         request.n_tokens > spec_prefill_gate_width_;
         pool_.demand_serving(true);
         try {
             split_pending pending;
             pending.request = std::move(request);
+            pending.seq_id = seq_id;
             const auto lookup_started = stats_.enabled() ? std::chrono::steady_clock::now() :
                 std::chrono::steady_clock::time_point{};
             pending.batch.emplace(pool_.ensure_batch(pages, stats_.enabled(), lookup_started,
-                                                     pending.request.n_tokens));
+                                                     pending.request.n_tokens, conn_index,
+                                                     gpu_lock));
+            pending.arena_eligible = arena_id_eligible(pending.request, *pending.batch);
             submit_prefill_layer_ahead(pending.request.layer, pending.request.n_tokens);
-            split_pending_.emplace(std::move(pending));
-            split_seq_id_ = seq_id;
+            split_pending_by_conn_.emplace(conn_index, std::move(pending));
         } catch (...) {
             pool_.demand_serving(false);
             spec_prefill_gate_active_ = false;
@@ -5502,21 +6756,22 @@ public:
 
     pipe_expert_partial finish_split_dispatch(
             const pipe_expert_dispatch_acts & acts, uint64_t seq_id,
-            RequestStats & request_stats) {
-        if (!split_pending_) {
+            RequestStats & request_stats, int conn_index = -1) {
+        const auto it = split_pending_by_conn_.find(conn_index);
+        if (it == split_pending_by_conn_.end()) {
             throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                       "expert dispatch ACTS has no BEGIN");
         }
-        if (seq_id != split_seq_id_) {
+        if (seq_id != it->second.seq_id) {
             throw pipe_protocol_error(PIPE_ERR_STALE_SEQ,
                                       "expert dispatch ACTS sequence does not match BEGIN");
         }
-        split_pending pending = std::move(*split_pending_);
-        split_pending_.reset();
+        split_pending pending = std::move(it->second);
+        split_pending_by_conn_.erase(it);
         pending.request.activations = acts.activations;
         try {
             pipe_expert_partial response = dispatch(
-                pending.request, request_stats, std::move(pending.batch));
+                pending.request, request_stats, std::move(pending.batch), conn_index);
             pool_.demand_serving(false);
             spec_prefill_gate_active_ = false;
             return response;
@@ -5527,17 +6782,31 @@ public:
         }
     }
 
-    void abandon_split_dispatch() noexcept {
-        split_pending_.reset();
+    void abandon_split_dispatch(int conn_index = -1) noexcept {
+        split_pending_by_conn_.erase(conn_index);
         pool_.demand_serving(false);
         spec_prefill_gate_active_ = false;
     }
 
-    bool has_split_dispatch() const { return split_pending_.has_value(); }
-    uint32_t split_n_tokens() const { return split_pending_->request.n_tokens; }
+    bool has_split_dispatch(int conn_index = -1) const {
+        return split_pending_by_conn_.count(conn_index) != 0;
+    }
+    uint32_t split_n_tokens(int conn_index = -1) const {
+        return split_pending_by_conn_.at(conn_index).request.n_tokens;
+    }
+    bool split_arena_eligible(int conn_index = -1) const {
+        return split_pending_by_conn_.at(conn_index).arena_eligible;
+    }
 
     const ResourcePlan & resources() const {
         return pool_.resources();
+    }
+
+    // See ExpertSlotPool::set_staging_multi_conn / StagingPool::set_multi_conn
+    // (the 2026-08-25 deadlock fix). run() calls this once, right after
+    // parsing WP_WORKER_MULTI_CONN and before spawning any connection thread.
+    void set_staging_multi_conn(int n) {
+        pool_.set_staging_multi_conn(n);
     }
 
     int pinned_pages() const {
@@ -5549,6 +6818,9 @@ public:
     }
 
     void record_stats(const RequestStats & request, size_t n_experts) {
+        stats_.set_shield_stats(pool_.n_shield_hits(), pool_.n_shield_exhausted());
+        stats_.set_layerahead_stats(
+            n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits());
         stats_.record(request, n_experts);
     }
 
@@ -5566,18 +6838,25 @@ private:
     }();
     // WP_PREFILL_LAYER_AHEAD=1 -- while a prefill-shaped request for layer L
     // computes, spec-page the NEXT served layer's full catalog in disk order.
-    // Default OFF. Width matches the decode/prefill cut used by PREFILL_GATE.
+    // Default OFF. Width 8: n_tokens > 8 is prefill; decode/verify is 1..8
+    // (same window as the arena path). WP_PREFILL_LAYER_AHEAD_WIDTH overrides.
     const bool         prefill_layer_ahead_ = [] {
         const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD");
         return e != nullptr && e[0] == '1';
     }();
     const uint32_t     prefill_layer_ahead_width_ = [] {
         const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
-        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 32;
-        return v > 0 ? (uint32_t) v : (uint32_t) 32;
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 8;
+        return v > 0 ? (uint32_t) v : (uint32_t) 8;
     }();
     uint64_t           ahead_submits_ = 0;
     uint64_t           ahead_pages_   = 0;
+    uint64_t           n_layerahead_hints_   = 0;
+    uint64_t           n_layerahead_pageins_ = 0;
+    int32_t            ahead_target_         = -1;
+    int32_t            ahead_offered_layer_  = -1;
+    std::vector<uint64_t> expert_recency_;
+    uint64_t           recency_tick_ = 0;
     // WP_EXPERT_SPEC_CHUNK -- pages read per idle step. 1 by default: this is
     // the worst-case delay a real request can inherit from a speculative read already in
     // progress, about one 12.75 MB O_DIRECT read. Raising it trades that latency
@@ -5730,6 +7009,19 @@ private:
     uint64_t                        pump_vram_busy_     = 0;
     uint64_t                        pump_vram_empty_    = 0;
     uint64_t                        pump_vram_submit_   = 0;
+    uint64_t                        pump_vram_demand_defer_ = 0;
+    // WP_EXPERT_SPEC_DEMAND_FIRST=1 -- do not SUBMIT new speculative reads
+    // (VRAM or host lane) while demand reads are outstanding. In-flight
+    // speculative batches are untouched; the gate protects only the next
+    // submission, so the worst case a demand read waits behind is one
+    // already-submitted chunk instead of the whole spec queue. Motivated by
+    // the 2026-08-22 request-anatomy measurement: demand ns_wait 6.9 ms vs a
+    // ~2.8 ms clean pipeline, the gap being spec reads ahead of demand on the
+    // shared readers/drive. DEFAULT OFF: byte-identical behaviour until A/B'd.
+    const bool spec_demand_first_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_DEMAND_FIRST");
+        return e != nullptr && e[0] == '1';
+    }();
     std::deque<std::pair<const ExpertPage *, uint64_t>> spec_queue_;
     // Predicted pages bound for host RAM. Separate queue, not a flag on the
     // other one: they take a different read path to a different destination.
@@ -5904,8 +7196,8 @@ private:
         ++request_stats.n_device_allocs;
     }
 
-    // D3 (WP_EXPERT_BATCH_MOE): scratch buffer for the N whole-page device-to-
-    // device copies compute_batch_grouped issues per request. NOT gen-tracked
+    // Grouped GEMV scratch buffer for the 3N role-slice device-to-device copies
+    // compute_batch_grouped issues per request. NOT gen-tracked
     // like io_/params_buffer_ -- compute_batch_grouped bypasses the D2 graph
     // cache entirely (see its header comment), so nothing outlives one call
     // that could be left dangling by a grow-triggered reallocation.
@@ -5982,6 +7274,12 @@ private:
     // all_experts=true builds ONE graph over every assignment in index order,
     // ignoring residency. See the determinism note on handle_request: splitting
     // by residency makes the floating-point ASSOCIATION depend on I/O timing.
+    //
+    // ArenaGraphKey/ArenaRoleKey/ArenaGraphEntry/ArenaGroup are defined below,
+    // near compute_batch_arena_multi -- nested-class member order doesn't
+    // matter in C++, and keeping the arena-cache types together with the
+    // arena compute functions that use them is clearer than splitting them
+    // across the file.
     void compute_batch(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -6027,6 +7325,14 @@ private:
             n_selected += selected(i) ? 1 : 0;
         }
         if (n_selected == 0) {
+            return;
+        }
+
+        if (arena_id_eligible(request, batch) &&
+                sel_begin == 0 && sel_end >= request.assignments.size() &&
+                n_selected == request.assignments.size() &&
+                result_offset == std::numeric_limits<size_t>::max() &&
+                compute_batch_arena(request, pages, batch, request_stats)) {
             return;
         }
 
@@ -6091,27 +7397,45 @@ private:
                   ggml_backend_get_default_buffer_type(backend_.get()))
             : 1;
 
-        // *** D3 (WP_EXPERT_BATCH_MOE): GROUPED mul_mat_id ACROSS ALL SELECTED
-        // EXPERTS. Default OFF -- opt-in until measured on real hardware. ***
+        // *** GROUPED GEMV: GROUPED mul_mat_id ACROSS ALL SELECTED EXPERTS. ***
         // Collapses the per-expert loop's 3 ggml_mul_mat (gate/up/down) into 3
         // ggml_mul_mat_id calls total, batched over every selected expert. See
         // compute_batch_grouped for the full rationale, the mul_mat_id layout,
         // and why gate+up are NOT merged into one call (that would require
         // clamping a non-contiguous split view, which ggml_cuda_op_clamp gets
         // silently wrong for n_rows > 1 -- see the comment there).
-        // Dense-only, whole-request-only: gather's per-expert idx varies (breaks
-        // one shared ids tensor), and a partial [sel_begin,sel_end) chunk covers
-        // only some assignments, so both fall back to the per-expert loop. The
-        // D2 graph cache is a separate rebind model -- this path never uses it.
+        // The old batch flag is dense-only and whole-request-only: gather's
+        // per-expert idx varies (breaks one shared ids tensor), and a partial
+        // [sel_begin,sel_end) chunk covers only some assignments. The new
+        // grouped GEMV arm also uses the dense route-weight representation for
+        // n_tokens=1..8, so it remains one shared batched dispatch. The D2 graph cache
+        // is a separate rebind model -- this path never uses it.
         static const bool s_batch_moe = [] {
             const char * e = std::getenv("WP_EXPERT_BATCH_MOE");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
         }();
-        if (s_batch_moe && !use_gather && sel_begin == 0 &&
+        // WP_EXPERT_GROUPED_GEMV=1 is the explicit decode/verify arm. Keep it
+        // separate from WP_EXPERT_BATCH_MOE: that older switch was not safe on
+        // width-sliced pages. The helper uses the round-3 scratch layout and
+        // accepts at most eight routed assignments per token.
+        const bool grouped_gemv = grouped_gemv_eligible(request);
+        static const bool s_worker_collapse = [] {
+            const char * e = std::getenv("WP_WORKER_COLLAPSE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        const bool d3_grouped =
+            (grouped_gemv || (s_batch_moe && !use_gather) || (s_worker_collapse && !use_gather)) &&
+                sel_begin == 0 &&
                 sel_end >= request.assignments.size() &&
-                result_offset == std::numeric_limits<size_t>::max()) {
+                result_offset == std::numeric_limits<size_t>::max();
+        if (s_worker_collapse && !d3_grouped && !request_stats.d3_counted) {
+            ++request_stats.n_d3_bounce;
+            request_stats.d3_counted = true;
+        }
+        if (d3_grouped) {
             compute_batch_grouped(
-                request, pages, batch, selected, n_selected, add_previous, request_stats);
+                request, pages, batch, selected, n_selected, add_previous, request_stats,
+                s_worker_collapse, grouped_gemv);
             return;
         }
         std::vector<uint8_t> params_host;
@@ -6537,7 +7861,10 @@ private:
         }
     }
 
-    // *** D3: GROUPED mul_mat_id ACROSS EVERY SELECTED EXPERT. ***
+    // WP_EXPERT_ARENA_ID=1 uses persistent grouped dispatch over the slot arena.
+    // Cache hits only upload slot ids and router weights; weight pointers stay untouched.
+
+    // *** GROUPED GEMV: GROUPED mul_mat_id ACROSS EVERY SELECTED EXPERT. ***
     //
     // WHY. The per-expert loop above issues 3 ggml_mul_mat (gate, up, down) +
     // 2 ggml_clamp + 1 swiglu_split + 1 ggml_mul (router weight) + 1 ggml_add
@@ -6572,31 +7899,20 @@ private:
     // provably safe regardless of n_tokens.
     //
     // HOW THE BATCHED WEIGHT TENSOR IS BUILT. mul_mat_id's `as` argument needs
-    // one tensor with UNIFORM per-expert stride (nb2); this worker's expert
-    // weights live in independently-allocated LRU slot buffers (ExpertSlotPool
-    // ::Slot owns its own buffer_ptr -- there is no shared base+stride across
-    // slots), so no view can present them as one tensor for free. This copies
-    // each selected expert's WHOLE PAGE (up|gate|down, already byte-contiguous
-    // per page) into one scratch buffer at regular page_size-spaced offsets --
-    // N device-to-device ggml_cpy dispatches, one per expert, unavoidable
-    // without a custom multi-source-gather kernel (out of scope: no GPU/build
-    // access to test one). Once copied, a role's batched weight is a FREE
-    // tensor attach (no dispatch): ne=[n_embd, n_ff_slice, n_selected],
-    // nb1=row_size(n_embd) (standard, contiguous per expert; ggml_new_tensor_3d's
-    // default), nb2 overridden to page_size (skips the OTHER two roles' bytes
-    // -- this is a plain strided BATCH view, which ggml's GEMM kernels index
-    // via nb1/nb2 directly, not a per-row split like the rejected merged path
-    // above). Not a ggml_view_3d call: views inherit the PARENT tensor's type,
-    // so a view over an I8 byte-anchor cannot become an MXFP4-typed tensor --
-    // see batched_role() below for the actual construction.
+    // one tensor with UNIFORM per-expert stride (nb2). The normal grouped path
+    // copies each selected role into its page-sized scratch slot. The
+    // WP_WORKER_COLLAPSE path (collapse_copies) uses one typed strided source
+    // per role when the selected slots form a regular span. CUDA/HIP give
+    // each role an allocated typed owner and copy through an I32/F16 byte
+    // view of that owner. Vulkan keeps the role-major scratch layout.
+    // Irregular spans, and callers with collapse_copies off (e.g. the plain
+    // WP_EXPERT_GROUPED_GEMV / WP_EXPERT_BATCH_MOE arms), use the typed
+    // per-role dense-pack fallback.
     //
-    // NET: N copies + 3 mul_mat_id + 2 clamp + 1 swiglu_split + 1 weight-mul
-    // + (n_selected - 1) fold-adds + 1 final ggml_cpy into `result`
-    // ~= 2*n_selected + 7 dispatches, vs ~8*n_selected before -- e.g. 23 vs 64
-    // at n_selected=8. Not the aspirational "3 dispatches total" (that would
-    // need the multi-source gather above), but a real ~2.8x cut, achievable
-    // with stock ggml ops whose stride/contiguity behaviour is verifiable from
-    // source without a GPU.
+    // NET: collapse mode has 3 role copies + 3 mul_mat_id + 2 clamp + 1
+    // swiglu_split + 1 weight-mul + (n_selected - 1) fold-adds + 1 final cpy.
+    // The fold stays a left fold to keep the legacy floating-point association;
+    // reducing it with a tree would save nodes but change output bits.
     //
     // MATH: identical to the existing dense (non-gather) path. Every selected
     // expert is computed for every token (weights[i][t] is 0 for tokens not
@@ -6620,7 +7936,7 @@ private:
     // slot buffers each request; this path instead copies into a private
     // scratch buffer every request, which is a different graph shape D2 was
     // never taught about). Integrating D2 here -- caching the graph and only
-    // reissuing the N copies + two small uploads per request -- is a
+    // reissuing the 3N copies + two small uploads per request -- is a
     // reasonable follow-up once this path is validated on real hardware.
     void compute_batch_grouped(
             const pipe_expert_dispatch_req & request,
@@ -6629,7 +7945,9 @@ private:
             const std::function<bool(size_t)> & selected,
             size_t n_selected,
             bool add_previous,
-            RequestStats & request_stats) {
+            RequestStats & request_stats,
+            bool collapse_copies,
+            bool warn_grouped_gemv) {
         const auto build_started = std::chrono::steady_clock::now();
 
         // Assignment indices selected for this call, in order -- this IS the
@@ -6648,30 +7966,58 @@ private:
         // field), so every selected page shares one RoleSpec map and one
         // page size -- both required for the uniform nb2 stride below.
         const int layer = pages[sel[0]]->layer;
+        struct GroupedInvocationLog {
+            bool     enabled;
+            int      layer;
+            uint32_t n_tokens;
+            size_t   n_experts;
+            uint64_t page_device_size;
+            bool     success = false;
+
+            ~GroupedInvocationLog() {
+                if (!enabled) {
+                    return;
+                }
+                std::fprintf(
+                    stderr,
+                    "WARN wp grouped gemv: layer=%d n_tokens=%u n_experts=%zu "
+                    "page_device_size=%llu status=%s\n",
+                    layer, n_tokens, n_experts,
+                    (unsigned long long) page_device_size,
+                    success ? "success" : "failure");
+            }
+        } grouped_log{
+            warn_grouped_gemv,
+            layer,
+            request.n_tokens,
+            n,
+            pages[sel[0]]->device_size,
+        };
+
         const auto & specs = catalog_.descriptor.layers.at(layer);
         const RoleSpec & gate_spec = specs.at("gate");
         const RoleSpec & up_spec   = specs.at("up");
         const RoleSpec & down_spec = specs.at("down");
-        const uint64_t page_size = pages[sel[0]]->size;
+        const uint64_t page_size = pages[sel[0]]->device_size;
         const int64_t  n_embd    = catalog_.descriptor.hparams.n_embd;
         const uint32_t n_tokens  = request.n_tokens;
-
-        // 1) Copy each selected expert's WHOLE PAGE (up|gate|down, already
-        // byte-contiguous -- see the header comment) into scratch at
-        // page_size-spaced offsets. N dispatches; unavoidable, see above.
-        grow_batch_scratch(page_size * n, request_stats);
-        void * scratch_base = ggml_backend_buffer_get_base(batch_scratch_.get());
 
         // Generously budgeted -- ggml_init only reserves metadata (no device
         // memory), so slack here is free, and undersizing is a hard abort in
         // ggml_new_graph_custom / ggml_build_forward_expand. Actual usage is
-        // roughly: 2n (page copies: src+dst) + 3 (batched role weights) + n
+        // roughly: 2n (typed role copies: src+dst) + 3 (batched role weights) + n
         // (per-expert contrib views) + (n-1) (fold adds) + ~15 fixed
         // (ids, input, gate/up/down outputs, clamps, swiglu, weighted mul,
         // result, final copy) tensors; nodes are the same set minus the
         // non-graph leaves (as_gate/as_up/as_down/ids/route_w/input/result).
-        const size_t tensor_count = 10 * n + 60;
-        const size_t graph_nodes  = 5 * n + 24;
+        // CUDA collapse replaces each packed destination with a view. The
+        // tensor count is unchanged; the three views need three extra nodes.
+        // The typed fallback creates 6n copy tensors (THREE roles x src+dst
+        // per expert, not the 2n the old comment claimed), and cgraph's leaf
+        // table is sized by `graph_nodes` too — leaf count ~6n+6 overflowed
+        // the old 5n+27 budget at n>=22 (live crash: n=23, ggml.c:7411).
+        const size_t tensor_count = 14 * n + 60;
+        const size_t graph_nodes  = 8 * n + 40;
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
                               ggml_graph_overhead_custom(graph_nodes, false),
@@ -6684,46 +8030,252 @@ private:
         }
         ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
 
-        for (size_t k = 0; k < n; ++k) {
-            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
-            ggml_tensor * src = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) page_size);
-            attach_weight(src, loaded.buffer, loaded.base, 0);
-            ggml_tensor * dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) page_size);
-            attach_weight(dst, batch_scratch_.get(), scratch_base, (uint64_t) k * page_size);
-            ggml_tensor * cpy = ggml_cpy(ctx.get(), src, dst);
-            // Not reachable from the graph's data-flow root (as_gate/as_up/
-            // as_down below are independently-attached leaves that ALIAS this
-            // memory rather than consuming `cpy` as a src) -- expand it as its
-            // own root NOW so it lands in cgraph->nodes[] ahead of the
-            // mul_mat_id calls below. ggml_backend_graph_compute submits nodes
-            // to one stream in array order with no reordering, so this
-            // ordering is what makes the copy happen-before the reads; the
-            // same "expand a side-effect node early" idiom src/llama-graph.cpp
-            // build_moe_ffn uses for its `weights` tensor.
-            ggml_build_forward_expand(graph, cpy);
+        const ExpertPage & page0 = *pages[sel[0]];
+        const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
+        const size_t scratch_align = ggml_backend_buft_get_alignment(buft);
+        if (scratch_align == 0) {
+            throw std::runtime_error("invalid grouped scratch alignment");
+        }
+        void * scratch_base = nullptr;
+        const auto role_bytes = [](const RoleSpec & spec) {
+            return ggml_row_size(spec.type, spec.ne0) * (size_t) spec.ne1;
+        };
+        const auto role_copy_type = [&](const RoleSpec & spec) {
+            const size_t bytes = role_bytes(spec);
+            return bytes % sizeof(uint32_t) == 0 ? GGML_TYPE_I32 :
+                   bytes % sizeof(uint16_t) == 0 ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+        };
+        const auto role_copy_count = [&](const RoleSpec & spec) {
+            const enum ggml_type type = role_copy_type(spec);
+            return type == GGML_TYPE_COUNT ? 0 : role_bytes(spec) / ggml_type_size(type);
+        };
+
+        const char * const backend_name = ggml_backend_name(backend_.get());
+        const bool cuda_collapse = collapse_copies && backend_name != nullptr &&
+            (std::strstr(backend_name, "CUDA") != nullptr ||
+             std::strstr(backend_name, "ROCm") != nullptr);
+        bool use_batched_copies = collapse_copies;
+        ggml_backend_buffer_t source_buffer = nullptr;
+        void * source_base = nullptr;
+        uint64_t source_offset = 0;
+        uint64_t source_stride = 0;
+        if (use_batched_copies) {
+            const ExpertSlotPool::Loaded first_loaded = batch.loaded(sel[0]);
+            source_buffer = first_loaded.buffer;
+            const uintptr_t first_address = reinterpret_cast<uintptr_t>(first_loaded.base);
+            source_base = source_buffer == nullptr ? nullptr :
+                          ggml_backend_buffer_get_base(source_buffer);
+            const uintptr_t buffer_address = reinterpret_cast<uintptr_t>(source_base);
+            if (source_buffer == nullptr || source_base == nullptr ||
+                    first_loaded.base == nullptr || first_address < buffer_address) {
+                use_batched_copies = false;
+            } else {
+                source_offset = first_address - buffer_address;
+                if (n == 1) {
+                    source_stride = page_size;
+                } else {
+                    const ExpertSlotPool::Loaded second_loaded = batch.loaded(sel[1]);
+                    const uintptr_t second_address =
+                        reinterpret_cast<uintptr_t>(second_loaded.base);
+                    if (second_loaded.buffer != source_buffer ||
+                            second_address <= first_address) {
+                        use_batched_copies = false;
+                    } else {
+                        source_stride = second_address - first_address;
+                        for (size_t k = 2; k < n; ++k) {
+                            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
+                            const uintptr_t address =
+                                reinterpret_cast<uintptr_t>(loaded.base);
+                            if (loaded.buffer != source_buffer ||
+                                    address < first_address ||
+                                    source_stride > (UINTPTR_MAX - first_address) / k ||
+                                    address != first_address + k * source_stride) {
+                                use_batched_copies = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (use_batched_copies) {
+                    if (source_stride == 0) {
+                        use_batched_copies = false;
+                    }
+                    for (size_t k = 0; k < n; ++k) {
+                        const ExpertPage & page = *pages[sel[k]];
+                        if (page.device_size != page_size ||
+                                page.roles.at("gate").device_offset !=
+                                    page0.roles.at("gate").device_offset ||
+                                page.roles.at("up").device_offset !=
+                                    page0.roles.at("up").device_offset ||
+                                page.roles.at("down").device_offset !=
+                                    page0.roles.at("down").device_offset) {
+                            use_batched_copies = false;
+                            break;
+                        }
+                    }
+                }
+                if (role_copy_type(gate_spec) == GGML_TYPE_COUNT ||
+                        role_copy_type(up_spec) == GGML_TYPE_COUNT ||
+                        role_copy_type(down_spec) == GGML_TYPE_COUNT) {
+                    use_batched_copies = false;
+                }
+            }
         }
 
-        // 2) Batched per-role weight views: NOT a ggml_view_* call (those
-        // inherit the PARENT tensor's type -- ggml_view_impl passes a->type
-        // straight through -- so a view over an I8 byte-anchor cannot become
-        // an MXFP4-typed tensor). Instead: create the tensor with the REAL
-        // role type/shape directly, like make_weight() already does for the
-        // per-expert case, then override nb[2] before attaching. This is safe
-        // -- ggml_backend_cuda_buffer_init_tensor (called by attach_weight)
-        // never reads or recomputes nb, it only conditionally zero-pads
-        // quantized tensors on non-COMPUTE-usage buffers, and
-        // grow_batch_scratch marks batch_scratch_ COMPUTE usage, so that
-        // branch never fires here.
-        const auto batched_role = [&](const RoleSpec & spec, uint64_t role_offset) {
-            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n);
-            t->nb[2] = page_size;   // per-expert stride: skip the other two roles' bytes
-            attach_weight(t, batch_scratch_.get(), scratch_base, role_offset);
-            return t;
-        };
-        const ExpertPage & page0 = *pages[sel[0]];
-        ggml_tensor * as_gate = batched_role(gate_spec, page0.roles.at("gate").offset);
-        ggml_tensor * as_up   = batched_role(up_spec,   page0.roles.at("up").offset);
-        ggml_tensor * as_down = batched_role(down_spec, page0.roles.at("down").offset);
+        if (collapse_copies && !request_stats.d3_counted) {
+            if (use_batched_copies) {
+                ++request_stats.n_d3_collapse;
+            } else {
+                ++request_stats.n_d3_typed;
+            }
+            request_stats.d3_counted = true;
+        }
+
+        size_t gate_region = 0;
+        size_t up_region = 0;
+        size_t down_region = 0;
+        ggml_tensor * as_gate = nullptr;
+        ggml_tensor * as_up = nullptr;
+        ggml_tensor * as_down = nullptr;
+        if (use_batched_copies) {
+            if (cuda_collapse) {
+                as_gate = ggml_new_tensor_3d(
+                    ctx.get(), gate_spec.type, gate_spec.ne0, gate_spec.ne1, (int64_t) n);
+                as_up = ggml_new_tensor_3d(
+                    ctx.get(), up_spec.type, up_spec.ne0, up_spec.ne1, (int64_t) n);
+                as_down = ggml_new_tensor_3d(
+                    ctx.get(), down_spec.type, down_spec.ne0, down_spec.ne1, (int64_t) n);
+
+                const auto byte_alias = [&](ggml_tensor * owner, const RoleSpec & spec) {
+                    const enum ggml_type copy_type = role_copy_type(spec);
+                    const size_t copy_count = role_copy_count(spec);
+                    ggml_tensor * alias = ggml_view_3d(
+                        ctx.get(), owner, owner->ne[0], owner->ne[1], owner->ne[2],
+                        owner->nb[1], owner->nb[2], 0);
+                    alias->type = copy_type;
+                    alias->ne[0] = (int64_t) copy_count;
+                    alias->ne[1] = 1;
+                    alias->ne[2] = (int64_t) n;
+                    alias->nb[0] = ggml_type_size(copy_type);
+                    alias->nb[1] = ggml_row_size(copy_type, copy_count);
+                    alias->nb[2] = owner->nb[2];
+                    alias->nb[3] = alias->nb[2] * (size_t) n;
+                    return alias;
+                };
+                const auto batched_copy = [&](const RoleSpec & spec, const char * role,
+                                              ggml_tensor * owner) {
+                    const enum ggml_type copy_type = role_copy_type(spec);
+                    ggml_tensor * src = ggml_new_tensor_3d(
+                        ctx.get(), copy_type, (int64_t) role_copy_count(spec), 1, (int64_t) n);
+                    src->nb[2] = source_stride;
+                    ggml_tensor * alias = byte_alias(owner, spec);
+                    attach_weight(src, source_buffer, source_base,
+                                  source_offset + page0.roles.at(role).device_offset);
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), src, alias));
+                };
+                batched_copy(gate_spec, "gate", as_gate);
+                batched_copy(up_spec, "up", as_up);
+                batched_copy(down_spec, "down", as_down);
+            } else {
+                const auto region_size = [&](const RoleSpec & spec) {
+                    ggml_tensor * probe = ggml_new_tensor_3d(
+                        ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n);
+                    return GGML_PAD(ggml_backend_buft_get_alloc_size(buft, probe), scratch_align);
+                };
+                gate_region = region_size(gate_spec);
+                up_region = region_size(up_spec);
+                down_region = region_size(down_spec);
+                const size_t up_offset = gate_region;
+                const size_t down_offset = up_offset + up_region;
+                grow_batch_scratch(down_offset + down_region, request_stats);
+                scratch_base = ggml_backend_buffer_get_base(batch_scratch_.get());
+                as_gate = ggml_new_tensor_3d(
+                    ctx.get(), gate_spec.type, gate_spec.ne0, gate_spec.ne1, (int64_t) n);
+                as_up = ggml_new_tensor_3d(
+                    ctx.get(), up_spec.type, up_spec.ne0, up_spec.ne1, (int64_t) n);
+                as_down = ggml_new_tensor_3d(
+                    ctx.get(), down_spec.type, down_spec.ne0, down_spec.ne1, (int64_t) n);
+                attach_weight(as_gate, batch_scratch_.get(), scratch_base, 0);
+                attach_weight(as_up, batch_scratch_.get(), scratch_base, up_offset);
+                attach_weight(as_down, batch_scratch_.get(), scratch_base, down_offset);
+
+                const auto batched_copy = [&](const RoleSpec & spec, const char * role,
+                                              size_t region_offset) {
+                    const enum ggml_type copy_type = role_copy_type(spec);
+                    ggml_tensor * src = ggml_new_tensor_3d(
+                        ctx.get(), copy_type, (int64_t) role_copy_count(spec), 1, (int64_t) n);
+                    src->nb[2] = source_stride;
+                    ggml_tensor * packed = ggml_new_tensor_3d(
+                        ctx.get(), copy_type, (int64_t) role_copy_count(spec), 1, (int64_t) n);
+                    attach_weight(packed, batch_scratch_.get(), scratch_base,
+                                  region_offset);
+                    attach_weight(src, source_buffer, source_base,
+                                  source_offset + page0.roles.at(role).device_offset);
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), src, packed));
+                };
+                batched_copy(gate_spec, "gate", 0);
+                batched_copy(up_spec, "up", up_region);
+                batched_copy(down_spec, "down", gate_region + up_region);
+            }
+        } else {
+            // Dense-pack each role: [role_bytes * n] contiguous per region, so
+            // the batched weight tensors below have CANONICAL strides. The old
+            // page-image layout (dst offset = role_offset + k*page_size, then
+            // t->nb[2] = page_size) put non-canonically-strided mxfp4 tensors
+            // in a COMPUTE-usage buffer, which trips CUDA mmvq's padding-clear
+            // GGML_ASSERT(ggml_is_contiguously_allocated(src0)) on every
+            // request that misses the collapse-copy fast path.
+            const auto role_region = [&](const RoleSpec & spec) {
+                // Size by the backend's ALLOC size, not nbytes: quantized
+                // types get row padding (mmvq's over-read guard), and an
+                // exact-fit region fails attach_weight's bounds check.
+                ggml_tensor * probe = ggml_new_tensor_3d(
+                    ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n);
+                return GGML_PAD(ggml_backend_buft_get_alloc_size(buft, probe), scratch_align);
+            };
+            const size_t gate_reg = role_region(gate_spec);
+            const size_t up_reg = role_region(up_spec);
+            const size_t down_reg = role_region(down_spec);
+            const size_t up_base = gate_reg;
+            const size_t down_base = gate_reg + up_reg;
+            grow_batch_scratch(down_base + down_reg, request_stats);
+            scratch_base = ggml_backend_buffer_get_base(batch_scratch_.get());
+            const auto typed_copy = [&](const RoleSpec & spec, const char * role,
+                                        size_t region_base, size_t k) {
+                const enum ggml_type copy_type = role_copy_type(spec);
+                const size_t copy_count = role_copy_count(spec);
+                ggml_tensor * src = ggml_new_tensor_1d(
+                    ctx.get(), copy_type == GGML_TYPE_COUNT ? GGML_TYPE_I8 : copy_type,
+                    (int64_t) (copy_type == GGML_TYPE_COUNT ? role_bytes(spec) : copy_count));
+                const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
+                attach_weight(src, loaded.buffer, loaded.base,
+                              page0.roles.at(role).device_offset);
+                ggml_tensor * dst = ggml_new_tensor_1d(
+                    ctx.get(), copy_type == GGML_TYPE_COUNT ? GGML_TYPE_I8 : copy_type,
+                    (int64_t) (copy_type == GGML_TYPE_COUNT ? role_bytes(spec) : copy_count));
+                attach_weight(dst, batch_scratch_.get(), scratch_base,
+                              region_base + k * role_bytes(spec));
+                if (copy_type == GGML_TYPE_COUNT) {
+                    ggml_backend_tensor_copy(src, dst);
+                } else {
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), src, dst));
+                }
+            };
+            for (size_t k = 0; k < n; ++k) {
+                typed_copy(gate_spec, "gate", 0, k);
+                typed_copy(up_spec, "up", up_base, k);
+                typed_copy(down_spec, "down", down_base, k);
+            }
+            const auto batched_role = [&](const RoleSpec & spec, size_t region_base) {
+                ggml_tensor * t = ggml_new_tensor_3d(
+                    ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n);
+                attach_weight(t, batch_scratch_.get(), scratch_base, region_base);
+                return t;
+            };
+            as_gate = batched_role(gate_spec, 0);
+            as_up = batched_role(up_spec, up_base);
+            as_down = batched_role(down_spec, down_base);
+        }
 
         // 3) `ids`: mul_mat_id's expert-selection tensor. This call computes
         // EVERY selected expert for EVERY token (the existing dense/masked
@@ -6837,6 +8389,583 @@ private:
             request_stats.n_weight_nonzero += nz;
             request_stats.n_weight_total   += wv.size();
         }
+        grouped_log.success = true;
+    }
+
+    struct ArenaGroup {
+        size_t arena_index = 0;
+        std::vector<size_t> assignments;
+    };
+
+    struct ArenaRoleKey {
+        enum ggml_type type = GGML_TYPE_COUNT;
+        int64_t        ne0 = 0;
+        int64_t        ne1 = 0;
+        uint64_t       offset = 0;
+
+        bool operator==(const ArenaRoleKey & o) const {
+            return type == o.type && ne0 == o.ne0 && ne1 == o.ne1 &&
+                   offset == o.offset;
+        }
+    };
+
+    bool compute_batch_arena_multi(
+            const pipe_expert_dispatch_req & request,
+            const ExpertSlotPool::Batch & batch,
+            RequestStats & request_stats,
+            const ExpertSlotPool::ArenaLayout & layout,
+            const std::array<ArenaRoleKey, 3> & roles,
+            const std::vector<ArenaGroup> & groups) {
+        const size_t n = request.assignments.size();
+        const size_t params_align = ggml_backend_buft_get_alignment(
+            ggml_backend_get_default_buffer_type(backend_.get()));
+        if (params_align == 0) {
+            throw std::runtime_error("invalid arena parameter alignment");
+        }
+        std::vector<size_t> ids_offsets;
+        std::vector<size_t> route_offsets;
+        ids_offsets.reserve(groups.size());
+        route_offsets.reserve(groups.size());
+        size_t ids_bytes = 0;
+        for (const ArenaGroup & group : groups) {
+            ids_offsets.push_back(ids_bytes);
+            ids_bytes += group.assignments.size() * (size_t) request.n_tokens *
+                         sizeof(int32_t);
+        }
+        const size_t route_offset = GGML_PAD(ids_bytes, params_align);
+        size_t route_bytes = 0;
+        for (const ArenaGroup & group : groups) {
+            route_offsets.push_back(route_offset + route_bytes);
+            route_bytes += group.assignments.size() * (size_t) request.n_tokens *
+                           sizeof(float);
+        }
+        const size_t params_span = route_offset + route_bytes;
+        grow_params_buffer(params_span, request_stats);
+
+        ArenaGraphKey key{request.n_tokens, (uint32_t) n};
+        for (const ArenaGroup & group : groups) {
+            key.group_arenas.push_back((uint32_t) group.arena_index);
+            key.group_sizes.push_back((uint32_t) group.assignments.size());
+        }
+        uint32_t clamp_bits = 0;
+        std::memcpy(&clamp_bits, &request.swiglu_clamp, sizeof(clamp_bits));
+        static const size_t cache_max = [] {
+            const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE_MAX");
+            const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
+            return v > 0 ? (size_t) v : (size_t) 16;
+        }();
+
+        auto it = arena_graph_cache_.find(key);
+        if (it != arena_graph_cache_.end() &&
+                (it->second.graph == nullptr ||
+                 it->second.io_gen != io_gen_ ||
+                 it->second.params_gen != params_gen_ ||
+                 it->second.clamp_bits != clamp_bits ||
+                 it->second.roles != roles)) {
+            arena_graph_cache_.erase(it);
+            it = arena_graph_cache_.end();
+        }
+        const bool hit = it != arena_graph_cache_.end();
+        if (!hit) {
+            if (arena_graph_cache_.size() >= cache_max) {
+                auto victim = arena_graph_cache_.begin();
+                for (auto j = arena_graph_cache_.begin(); j != arena_graph_cache_.end(); ++j) {
+                    if (j->second.last_used < victim->second.last_used) {
+                        victim = j;
+                    }
+                }
+                arena_graph_cache_.erase(victim);
+            }
+            it = arena_graph_cache_.emplace(key, ArenaGraphEntry{}).first;
+            ArenaGraphEntry & entry = it->second;
+            entry.roles = roles;
+            entry.clamp_bits = clamp_bits;
+            entry.io_gen = io_gen_;
+            entry.params_gen = params_gen_;
+            ++request_stats.n_arena_build;
+
+            const auto build_started = std::chrono::steady_clock::now();
+            // Group terms cover role views, IDs, routing weights, the three
+            // matmuls, clamps, and the per-group intermediate tensors. The n
+            // terms cover assignment views and the left fold. Fixed headroom
+            // covers shared inputs, result, copy, and graph leaves.
+            const size_t tensor_count = 12 * groups.size() + 4 * n + 64;
+            const size_t graph_nodes = 8 * groups.size() + 4 * n + 32;
+            entry.ctx.reset(ggml_init({
+                /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                                  ggml_graph_overhead_custom(graph_nodes, false),
+                /* .mem_base = */ nullptr,
+                /* .no_alloc = */ true,
+            }));
+            if (!entry.ctx) {
+                throw std::runtime_error("failed to allocate multi-arena graph metadata");
+            }
+            ggml_context * ctx = entry.ctx.get();
+            const auto make_role = [&](const ArenaGroup & group,
+                                       const ArenaRoleKey & role) {
+                const ExpertSlotPool::ArenaLayout::Arena & arena =
+                    layout.arenas[group.arena_index];
+                ggml_tensor * tensor = ggml_new_tensor_3d(
+                    ctx, role.type, role.ne0, role.ne1, (int64_t) arena.n_slots);
+                tensor->nb[2] = layout.slot_stride;
+                attach_weight(tensor, arena.buffer, arena.base, role.offset);
+                return tensor;
+            };
+            const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
+            ggml_tensor * input2d = make_io_tensor(ctx, request.n_tokens, 0);
+            ggml_set_input(input2d);
+            ggml_tensor * input3d = ggml_reshape_3d(
+                ctx, input2d, n_embd, 1, request.n_tokens);
+            std::vector<ggml_tensor *> contributions(n, nullptr);
+            for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+                const ArenaGroup & group = groups[group_index];
+                const size_t group_size = group.assignments.size();
+                ggml_tensor * as_gate = make_role(group, roles[0]);
+                ggml_tensor * as_up   = make_role(group, roles[1]);
+                ggml_tensor * as_down = make_role(group, roles[2]);
+                ggml_tensor * ids = ggml_new_tensor_2d(
+                    ctx, GGML_TYPE_I32, (int64_t) group_size, request.n_tokens);
+                ggml_set_input(ids);
+                attach_weight(ids, params_buffer_.get(),
+                              ggml_backend_buffer_get_base(params_buffer_.get()),
+                              ids_offsets[group_index]);
+                ggml_tensor * route_w = ggml_new_tensor_3d(
+                    ctx, GGML_TYPE_F32, 1, (int64_t) group_size, request.n_tokens);
+                ggml_set_input(route_w);
+                attach_weight(route_w, params_buffer_.get(),
+                              ggml_backend_buffer_get_base(params_buffer_.get()),
+                              route_offsets[group_index]);
+                ggml_tensor * gate_out = ggml_mul_mat_id(ctx, as_gate, input3d, ids);
+                ggml_tensor * up_out   = ggml_mul_mat_id(ctx, as_up, input3d, ids);
+                if (request.swiglu_clamp > 1e-6f) {
+                    up_out = ggml_clamp(
+                        ctx, up_out, -request.swiglu_clamp, request.swiglu_clamp);
+                    gate_out = ggml_clamp(
+                        ctx, gate_out, -INFINITY, request.swiglu_clamp);
+                }
+                ggml_tensor * hidden = ggml_swiglu_split(ctx, gate_out, up_out);
+                ggml_tensor * down_out = ggml_mul_mat_id(ctx, as_down, hidden, ids);
+                ggml_tensor * weighted = ggml_mul(ctx, down_out, route_w);
+                for (size_t local = 0; local < group_size; ++local) {
+                    const size_t assignment = group.assignments[local];
+                    contributions[assignment] = ggml_view_2d(
+                        ctx, weighted, n_embd, request.n_tokens,
+                        weighted->nb[2], local * weighted->nb[1]);
+                }
+            }
+            ggml_tensor * sum = nullptr;
+            for (ggml_tensor * contribution : contributions) {
+                sum = sum != nullptr ? ggml_add(ctx, sum, contribution) : contribution;
+            }
+            if (sum == nullptr) {
+                throw std::runtime_error("multi-arena graph produced no contribution");
+            }
+            ggml_tensor * result = make_io_tensor(ctx, request.n_tokens, io_result_offset_);
+            ggml_tensor * copy = ggml_cpy(ctx, sum, result);
+            ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_nodes, false);
+            ggml_build_forward_expand(graph, copy);
+            entry.galloc.reset(ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend_.get())));
+            if (!entry.galloc || !ggml_gallocr_alloc_graph(entry.galloc.get(), graph)) {
+                throw std::runtime_error("failed to allocate multi-arena expert graph");
+            }
+            if (ggml_gallocr_get_buffer_size(entry.galloc.get(), 0) > 0) {
+                ++request_stats.n_device_allocs;
+            }
+            entry.blob = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) params_span);
+            attach_weight(entry.blob, params_buffer_.get(),
+                          ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            entry.graph = graph;
+            request_stats.ns_graph_build +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - build_started).count();
+        }
+
+        ArenaGraphEntry & entry = it->second;
+        entry.last_used = ++arena_graph_cache_tick_;
+        std::vector<uint8_t> params_host(params_span, 0);
+        for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+            const ArenaGroup & group = groups[group_index];
+            const ExpertSlotPool::ArenaLayout::Arena & arena =
+                layout.arenas[group.arena_index];
+            const size_t group_size = group.assignments.size();
+            for (uint32_t t = 0; t < request.n_tokens; ++t) {
+                for (size_t local = 0; local < group_size; ++local) {
+                    const size_t assignment = group.assignments[local];
+                    const size_t slot = batch.slot_index(assignment);
+                    const int32_t local_slot = (int32_t) (slot - arena.first_slot);
+                    const size_t index = (size_t) t * group_size + local;
+                    std::memcpy(params_host.data() + ids_offsets[group_index] +
+                                    index * sizeof(int32_t),
+                                &local_slot, sizeof(local_slot));
+                    const float weight = request.assignments[assignment].weights[t];
+                    std::memcpy(params_host.data() + route_offsets[group_index] +
+                                    index * sizeof(float),
+                                &weight, sizeof(weight));
+                }
+            }
+        }
+        const auto params_started = std::chrono::steady_clock::now();
+        ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
+        request_stats.ns_params_set +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - params_started).count();
+        const auto submit_started = std::chrono::steady_clock::now();
+        const enum ggml_status status =
+            ggml_backend_graph_compute(backend_.get(), entry.graph);
+        request_stats.ns_submit +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - submit_started).count();
+        ++request_stats.n_graph_submits;
+        if (status != GGML_STATUS_SUCCESS) {
+            entry.graph = nullptr;
+            throw std::runtime_error("multi-arena expert backend graph compute failed");
+        }
+        ++request_stats.n_arena_hit;
+        request_stats.n_arena_groups += groups.size();
+        for (const pipe_expert_assignment & assignment : request.assignments) {
+            for (float weight : assignment.weights) {
+                request_stats.n_weight_nonzero += weight != 0.0f;
+                ++request_stats.n_weight_total;
+            }
+        }
+        return true;
+    }
+
+    // WP_EXPERT_ARENA_ID=1 uses persistent grouped dispatch over the slot arena.
+    bool compute_batch_arena(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            RequestStats & request_stats) {
+        const std::optional<ExpertSlotPool::ArenaLayout> layout_opt = pool_.arena_layout();
+        if (!layout_opt.has_value()) {
+            return false;
+        }
+        const ExpertSlotPool::ArenaLayout & layout = *layout_opt;
+        const size_t n = request.assignments.size();
+        if (n == 0 || n > (size_t) INT32_MAX || layout.n_slots > (size_t) INT32_MAX) {
+            return false;
+        }
+
+        static const char * k_roles[3] = {"gate", "up", "down"};
+        const auto & specs = catalog_.descriptor.layers.at(request.layer);
+        std::array<ArenaRoleKey, 3> roles;
+        for (size_t j = 0; j < roles.size(); ++j) {
+            const RoleSpec & spec = specs.at(k_roles[j]);
+            roles[j] = {spec.type, spec.ne0, spec.ne1,
+                        pages[0]->roles.at(k_roles[j]).device_offset};
+            const size_t type_size = ggml_type_size(spec.type);
+            const size_t block_size = ggml_blck_size(spec.type);
+            if (type_size == 0 || block_size == 0 ||
+                    layout.slot_stride % type_size != 0 ||
+                    layout.slot_stride / type_size > UINT32_MAX / block_size) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < pages.size(); ++i) {
+            if (pages[i]->device_size > layout.slot_stride) {
+                return false;
+            }
+            for (size_t j = 0; j < roles.size(); ++j) {
+                if (pages[i]->roles.at(k_roles[j]).device_offset != roles[j].offset) {
+                    return false;
+                }
+            }
+            if (batch.slot_index(i) >= layout.n_slots) {
+                return false;
+            }
+        }
+
+        std::vector<ArenaGroup> groups;
+        for (size_t arena_index = 0; arena_index < layout.arenas.size(); ++arena_index) {
+            ArenaGroup group;
+            group.arena_index = arena_index;
+            for (size_t i = 0; i < n; ++i) {
+                const ExpertSlotPool::ArenaLayout::Arena * arena =
+                    layout.arena_for_slot(batch.slot_index(i));
+                if (arena == nullptr) {
+                    return false;
+                }
+                const size_t owner = (size_t) (arena - layout.arenas.data());
+                if (owner == arena_index) {
+                    group.assignments.push_back(i);
+                }
+            }
+            if (!group.assignments.empty()) {
+                groups.push_back(std::move(group));
+            }
+        }
+        if (groups.empty()) {
+            return false;
+        }
+
+        // Keep the one-arena graph below unchanged. Multi-arena requests use a
+        // separate graph because each mul_mat_id needs a different buffer base.
+        // Route by LAYOUT shape, not group count: a single-group request on a
+        // multi-arena layout must still use its group's arena base — the
+        // legacy builder below attaches via layout.buffer/base, which are
+        // null when arenas.size() > 1 (live crash: ggml-backend.cpp:123).
+        if (layout.arenas.size() > 1) {
+            return compute_batch_arena_multi(
+                request, batch, request_stats, layout, roles, groups);
+        }
+
+        const size_t params_align = ggml_backend_buft_get_alignment(
+            ggml_backend_get_default_buffer_type(backend_.get()));
+        if (params_align == 0) {
+            throw std::runtime_error("invalid arena parameter alignment");
+        }
+        const size_t ids_bytes = n * (size_t) request.n_tokens * sizeof(int32_t);
+        const size_t route_offset = GGML_PAD(ids_bytes, params_align);
+        const size_t route_bytes = n * (size_t) request.n_tokens * sizeof(float);
+        const size_t params_span = route_offset + route_bytes;
+        grow_params_buffer(params_span, request_stats);
+
+        ArenaGraphKey key{request.n_tokens, (uint32_t) n};
+        uint32_t clamp_bits = 0;
+        std::memcpy(&clamp_bits, &request.swiglu_clamp, sizeof(clamp_bits));
+        static const size_t cache_max = [] {
+            const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE_MAX");
+            const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
+            return v > 0 ? (size_t) v : (size_t) 16;
+        }();
+        // WP_ARENA_FOLD_COLLAPSE / WP_ARENA_HIP_GRAPH -- single-arena bucket
+        // only (the multi-arena path above never reaches here). fold_collapse
+        // reduces the per-expert fold with one ggml_sum_rows instead of
+        // (n-1) ggml_add nodes; hip_graph_replay additionally requires
+        // fold_collapse and opts this bucket's graph into HIP graph
+        // capture/replay (see the capture-then-replay state machine below).
+        static const bool fold_collapse = [] {
+            const char * e = std::getenv("WP_ARENA_FOLD_COLLAPSE");
+            return e != nullptr && e[0] == '1';
+        }();
+        static const bool hip_graph_replay = [] {
+            const char * fold = std::getenv("WP_ARENA_FOLD_COLLAPSE");
+            const char * graph = std::getenv("WP_ARENA_HIP_GRAPH");
+            return fold != nullptr && fold[0] == '1' &&
+                   graph != nullptr && graph[0] == '1';
+        }();
+
+        auto it = arena_graph_cache_.find(key);
+        if (it != arena_graph_cache_.end() &&
+                (it->second.graph == nullptr ||
+                 it->second.io_gen != io_gen_ ||
+                 it->second.params_gen != params_gen_ ||
+                 it->second.clamp_bits != clamp_bits ||
+                 it->second.roles != roles)) {
+            arena_graph_cache_.erase(it);
+            it = arena_graph_cache_.end();
+        }
+        const bool hit = it != arena_graph_cache_.end();
+        if (!hit) {
+            if (arena_graph_cache_.size() >= cache_max) {
+                auto victim = arena_graph_cache_.begin();
+                for (auto j = arena_graph_cache_.begin(); j != arena_graph_cache_.end(); ++j) {
+                    if (j->second.last_used < victim->second.last_used) {
+                        victim = j;
+                    }
+                }
+                arena_graph_cache_.erase(victim);
+            }
+            it = arena_graph_cache_.emplace(key, ArenaGraphEntry{}).first;
+            ArenaGraphEntry & entry = it->second;
+            entry.roles = roles;
+            entry.clamp_bits = clamp_bits;
+            entry.io_gen = io_gen_;
+            entry.params_gen = params_gen_;
+            ++request_stats.n_arena_build;
+
+            const auto build_started = std::chrono::steady_clock::now();
+            const size_t tensor_count = 8 * n + 64;
+            const size_t graph_nodes = 4 * n + 32;
+            entry.ctx.reset(ggml_init({
+                /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                                  ggml_graph_overhead_custom(graph_nodes, false),
+                /* .mem_base = */ nullptr,
+                /* .no_alloc = */ true,
+            }));
+            if (!entry.ctx) {
+                throw std::runtime_error("failed to allocate arena graph metadata");
+            }
+            ggml_context * ctx = entry.ctx.get();
+
+            const auto make_role = [&](const ArenaRoleKey & role) {
+                ggml_tensor * tensor = ggml_new_tensor_3d(
+                    ctx, role.type, role.ne0, role.ne1, (int64_t) layout.n_slots);
+                tensor->nb[2] = layout.slot_stride;
+                attach_weight(tensor, layout.buffer, layout.base, role.offset);
+                return tensor;
+            };
+            ggml_tensor * as_gate = make_role(roles[0]);
+            ggml_tensor * as_up   = make_role(roles[1]);
+            ggml_tensor * as_down = make_role(roles[2]);
+
+            ggml_tensor * ids = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_I32, (int64_t) n, request.n_tokens);
+            ggml_set_input(ids);
+            attach_weight(ids, params_buffer_.get(),
+                          ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            ggml_tensor * route_w = ggml_new_tensor_3d(
+                ctx, GGML_TYPE_F32, 1, (int64_t) n, request.n_tokens);
+            ggml_set_input(route_w);
+            attach_weight(route_w, params_buffer_.get(),
+                          ggml_backend_buffer_get_base(params_buffer_.get()), route_offset);
+
+            const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
+            ggml_tensor * input2d = make_io_tensor(ctx, request.n_tokens, 0);
+            ggml_set_input(input2d);
+            ggml_tensor * input3d = ggml_reshape_3d(
+                ctx, input2d, n_embd, 1, request.n_tokens);
+            ggml_tensor * gate_out = ggml_mul_mat_id(ctx, as_gate, input3d, ids);
+            ggml_tensor * up_out   = ggml_mul_mat_id(ctx, as_up, input3d, ids);
+            if (request.swiglu_clamp > 1e-6f) {
+                up_out = ggml_clamp(
+                    ctx, up_out, -request.swiglu_clamp, request.swiglu_clamp);
+                gate_out = ggml_clamp(
+                    ctx, gate_out, -INFINITY, request.swiglu_clamp);
+            }
+            ggml_tensor * hidden = ggml_swiglu_split(ctx, gate_out, up_out);
+            ggml_tensor * down_out = ggml_mul_mat_id(ctx, as_down, hidden, ids);
+            ggml_tensor * weighted = ggml_mul(ctx, down_out, route_w);
+
+            ggml_tensor * sum = nullptr;
+            if (fold_collapse) {
+                // mul_mat_id lays out [n_embd, n_assignments, n_tokens]. Make
+                // the assignment axis contiguous and reduce it in one op.
+                ggml_tensor * rows = ggml_cont(
+                    ctx, ggml_permute(ctx, weighted, 1, 0, 2, 3));
+                sum = ggml_reshape_2d(
+                    ctx, ggml_sum_rows(ctx, rows), n_embd, request.n_tokens);
+            } else {
+                for (size_t k = 0; k < n; ++k) {
+                    ggml_tensor * contrib = ggml_view_2d(
+                        ctx, weighted, n_embd, request.n_tokens,
+                        weighted->nb[2], k * weighted->nb[1]);
+                    sum = sum != nullptr ? ggml_add(ctx, sum, contrib) : contrib;
+                }
+            }
+            ggml_tensor * result = make_io_tensor(ctx, request.n_tokens, io_result_offset_);
+            ggml_tensor * copy = ggml_cpy(ctx, sum, result);
+            ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_nodes, false);
+            ggml_build_forward_expand(graph, copy);
+
+            entry.galloc.reset(ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend_.get())));
+            if (!entry.galloc || !ggml_gallocr_alloc_graph(entry.galloc.get(), graph)) {
+                throw std::runtime_error("failed to allocate arena expert graph");
+            }
+            if (ggml_gallocr_get_buffer_size(entry.galloc.get(), 0) > 0) {
+                ++request_stats.n_device_allocs;
+            }
+            entry.blob = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) params_span);
+            attach_weight(entry.blob, params_buffer_.get(),
+                          ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            entry.graph = graph;
+            request_stats.ns_graph_build +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - build_started).count();
+        }
+
+        ArenaGraphEntry & entry = it->second;
+        entry.last_used = ++arena_graph_cache_tick_;
+        std::vector<uint8_t> params_host(params_span, 0);
+        std::vector<int32_t> ids_host(n * request.n_tokens);
+        std::vector<float> route_host(n * request.n_tokens);
+        for (uint32_t t = 0; t < request.n_tokens; ++t) {
+            for (size_t k = 0; k < n; ++k) {
+                ids_host[(size_t) t * n + k] = (int32_t) batch.slot_index(k);
+                route_host[(size_t) t * n + k] = request.assignments[k].weights[t];
+            }
+        }
+        std::memcpy(params_host.data(), ids_host.data(), ids_bytes);
+        std::memcpy(params_host.data() + route_offset, route_host.data(), route_bytes);
+        const auto params_started = std::chrono::steady_clock::now();
+        ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
+        request_stats.ns_params_set +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - params_started).count();
+
+        const char * const saved_hip_graphs = std::getenv("WP_HIP_GRAPHS");
+        const bool saved_hip_graphs_set = saved_hip_graphs != nullptr;
+        const std::string saved_hip_graphs_value =
+            saved_hip_graphs_set ? saved_hip_graphs : "";
+        const char * const saved_disable_graphs =
+            std::getenv("GGML_CUDA_DISABLE_GRAPHS");
+        const bool saved_disable_graphs_set = saved_disable_graphs != nullptr;
+        const std::string saved_disable_graphs_value =
+            saved_disable_graphs_set ? saved_disable_graphs : "";
+        const bool hip_graph_attempt = hip_graph_replay &&
+            !entry.hip_graph_failed && !saved_disable_graphs_set;
+        const auto restore_graph_env = [&]() {
+            if (saved_hip_graphs_set) {
+                setenv("WP_HIP_GRAPHS", saved_hip_graphs_value.c_str(), 1);
+            } else {
+                unsetenv("WP_HIP_GRAPHS");
+            }
+            if (saved_disable_graphs_set) {
+                setenv("GGML_CUDA_DISABLE_GRAPHS", saved_disable_graphs_value.c_str(), 1);
+            } else {
+                unsetenv("GGML_CUDA_DISABLE_GRAPHS");
+            }
+        };
+        const auto graph_compute = [&](bool use_hip_graph) {
+            if (hip_graph_replay) {
+                if (use_hip_graph) {
+                    setenv("WP_HIP_GRAPHS", "1", 1);
+                } else {
+                    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+                }
+            }
+            const auto result = ggml_backend_graph_compute(backend_.get(), entry.graph);
+            restore_graph_env();
+            return result;
+        };
+        const auto submit_started = std::chrono::steady_clock::now();
+        enum ggml_status status = graph_compute(hip_graph_attempt);
+        request_stats.ns_submit +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - submit_started).count();
+        ++request_stats.n_graph_submits;
+        if (status != GGML_STATUS_SUCCESS && hip_graph_attempt) {
+            // Graph capture is an optional optimization. Retry this bucket
+            // eagerly and keep it on the eager path for the process lifetime.
+            entry.hip_graph_failed = true;
+            entry.hip_graph_submits = 0;
+            std::fprintf(stderr,
+                         "WARN wp expert worker: HIP graph disabled for arena bucket "
+                         "tokens=%u assignments=%u clamp_bits=%u\n",
+                         request.n_tokens, (unsigned) n, clamp_bits);
+            const auto fallback_started = std::chrono::steady_clock::now();
+            status = graph_compute(false);
+            request_stats.ns_submit +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - fallback_started).count();
+            ++request_stats.n_graph_submits;
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            entry.graph = nullptr;
+            throw std::runtime_error("arena expert backend graph compute failed");
+        }
+        if (hip_graph_attempt) {
+            if (entry.hip_graph_submits == 0) {
+                entry.hip_graph_submits = 1;
+            } else if (entry.hip_graph_submits == 1) {
+                ++request_stats.n_hipgraph_capture;
+                entry.hip_graph_submits = 2;
+            } else {
+                ++request_stats.n_hipgraph_replay;
+            }
+        }
+        ++request_stats.n_arena_hit;
+        request_stats.n_arena_groups += groups.size();
+        for (const pipe_expert_assignment & assignment : request.assignments) {
+            for (float weight : assignment.weights) {
+                request_stats.n_weight_nonzero += weight != 0.0f;
+                ++request_stats.n_weight_total;
+            }
+        }
+        return true;
     }
 
     void read_result(std::vector<float> & result, RequestStats & request_stats) {
@@ -6977,6 +9106,39 @@ private:
     // of resetting warmup. Gather caches when every selected expert has the
     // same idx rank (verify). Mixed ranks skip the cache. Entries pin their
     // gallocr VRAM (~2-4 MB each); the LRU cap bounds it.
+    struct ArenaGraphKey {
+        uint32_t n_tokens = 0;
+        uint32_t n_assignments = 0;
+        std::vector<uint32_t> group_arenas;
+        std::vector<uint32_t> group_sizes;
+
+        bool operator<(const ArenaGraphKey & o) const {
+            return std::tie(n_tokens, n_assignments, group_arenas, group_sizes) <
+                   std::tie(o.n_tokens, o.n_assignments, o.group_arenas, o.group_sizes);
+        }
+    };
+
+
+    struct ArenaGraphEntry {
+        context_ptr                 ctx;
+        galloc_ptr                  galloc;
+        ggml_cgraph *               graph = nullptr;
+        ggml_tensor *               blob = nullptr;
+        std::array<ArenaRoleKey, 3> roles;
+        uint32_t                    clamp_bits = 0;
+        uint64_t                    io_gen = 0;
+        uint64_t                    params_gen = 0;
+        uint64_t                    last_used = 0;
+        // WP_ARENA_FOLD_COLLAPSE + WP_ARENA_HIP_GRAPH (single-arena path
+        // only -- see compute_batch_arena): HIP graph capture/replay state
+        // for this bucket. hip_graph_submits counts consecutive successful
+        // eager submits before attempting capture (0 -> 1 -> capture -> 2 =
+        // steady-state replay); hip_graph_failed permanently falls back to
+        // eager for this bucket once a captured replay fails.
+        uint8_t                     hip_graph_submits = 0;
+        bool                        hip_graph_failed = false;
+    };
+
     struct GraphKey {
         uint32_t n_tokens = 0;
         uint32_t n_selected = 0;
@@ -7000,6 +9162,8 @@ private:
     };
     std::map<GraphKey, GraphCacheEntry> graph_cache_;
     uint64_t graph_cache_tick_ = 0;
+    std::map<ArenaGraphKey, ArenaGraphEntry> arena_graph_cache_;
+    uint64_t arena_graph_cache_tick_ = 0;
     // Buffer generations: a grow REPLACES the device buffer, so every cached
     // graph holding tensors bound into the old one is stale. Bumped by the
     // grow_* functions; checked at cache lookup.
@@ -7019,13 +9183,12 @@ private:
     uint64_t            io_grow_count_ = 0;
     buffer_ptr     params_buffer_;
     size_t         params_buffer_size_ = 0;
-    // WP_EXPERT_BATCH_MOE (D3): scratch VRAM for the grouped mul_mat_id path
-    // (see compute_batch_grouped). Holds N whole-page copies (up|gate|down,
-    // byte-contiguous per page -- see load_catalog/wp-repack's role_mask sort)
-    // at uniform page_size-spaced offsets, so a per-role tensor attached at
-    // its role offset with nb[2] overridden to page_size (see
-    // compute_batch_grouped::batched_role) turns them into mul_mat_id's
-    // required [n_embd, n_ff_slice, n_selected] batched weight tensor.
+    // WP_EXPERT_BATCH_MOE / WP_EXPERT_GROUPED_GEMV (D3): scratch VRAM for the
+    // grouped mul_mat_id path (see compute_batch_grouped). The normal grouped
+    // path holds N page-sized role slots. WP_WORKER_COLLAPSE uses role-major
+    // contiguous regions when the selected slot span permits three batched
+    // copies; both layouts expose [n_embd, n_ff_slice, n_selected] batched
+    // weight tensors.
     // Content never outlives one compute_batch_grouped call (same invariant
     // as params_buffer_), so growing it here is always safe.
     buffer_ptr     batch_scratch_;
@@ -7033,8 +9196,9 @@ private:
     size_t         io_result_offset_ = 0;
     WorkerStats    stats_;
     int            slots_ = 0;
-    std::optional<split_pending> split_pending_;
-    uint64_t split_seq_id_ = 0;
+    // Keyed by conn_index -- see the long comment above begin_split_dispatch()
+    // for why this must not be a single Worker-wide std::optional.
+    std::unordered_map<int, split_pending> split_pending_by_conn_;
 };
 
 bool validate_client_hello(
@@ -7239,11 +9403,81 @@ std::optional<std::vector<float>> subscribe(uint64_t seq_id, int32_t layer, uint
 } // namespace wp_dedup
 #endif // __linux__
 
-int serve_connection(pipe_socket_t & socket, Worker & worker) {
+// WP_WORKER_MULTI_CONN=N (N>=2) -- production worker double-buffering,
+// lever-queue item #9. A throwaway N=2, one-coarse-mutex probe (2026-08-22)
+// measured 126.9 aggregate rps vs 66.9 single-stream (+90%) with per-request
+// latency up only 14.6->15.4ms, fed by two replay streams under a lock that
+// covered the ENTIRE per-request handling body including the network send.
+// This is the real version: same coarse GPU-section lock (see the
+// correctness argument below -- it is intentional, not left over), but
+// narrowed to stop covering the response encode + socket send, so a
+// connection's own network I/O can now overlap the OTHER connection's GPU
+// work instead of serializing behind it too. Persistent serving (run()
+// below runs N acceptor threads in a loop, not accept-N-then-exit) replaces
+// the probe's accept-exactly-N.
+//
+// Unset or "1" (or any WP_WORKER_MULTI_CONN<2) is the byte-identical
+// default path: single accept(), g_worker_gpu_mutex stays null, every check
+// against it below is one branch on a null pointer, no lock ever taken.
+//
+// WHY STILL ONE COARSE LOCK AROUND THE WORKER-TOUCHING WORK (not per-
+// substructure locks): worker.dispatch() (and begin/finish_split_dispatch,
+// which wrap it) is ONE call that walks ExpertSlotPool pool_ lookup ->
+// page-in read -> H2D -> the shared ggml_gallocr* compute_galloc_ graph
+// build/alloc -> GPU submit -> readback, all as one interleaved sequence
+// with no safe seam already exposed at the API boundary (pool_.ensure_batch
+// starts page-in reads AND touches residency/LRU bookkeeping in the same
+// call that also returns slots pinned for the compute that follows). GPU
+// submission must be serialized regardless (single device, single command
+// stream) and neither pool_, compute_galloc_, nor the resident_
+// (ResidentExpertPool -- pinned-page tracking, see Worker::resident_ /
+// pinned_pages()) residency state are documented or evidenced anywhere in
+// this file as safe for concurrent access -- they are mutated throughout
+// dispatch(), not just at the edges. Splitting "the NVMe read part" from
+// "the GPU compute part" so they can run under separate locks would mean
+// restructuring ExpertSlotPool's batch/read/compute pipeline into
+// interruptible phases, which is exactly the slot-pool redesign this task
+// is scoped to NOT do. So: one mutex, g_worker_gpu_mutex, covers every
+// Worker-state-touching call (dispatch/begin/finish/abandon_split_dispatch,
+// note_prefetch_hint(_bad), log_reference, report_prefetch_hints,
+// record_stats) -- correctness over cleverness, per the campaign brief;
+// the +90% already measured with a FULLY coarse lock (covering network I/O
+// too) means the overlap this narrower lock adds on top (recv of the next
+// request, and send of the previous response, now able to run concurrently
+// with another connection's GPU-lock-holding dispatch) is a strict
+// improvement over what was already a decisive win, not a bet on more.
+std::mutex * g_worker_gpu_mutex = nullptr;
+
+int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -1) {
     struct PendingCleanup {
         Worker & worker;
-        ~PendingCleanup() { worker.abandon_split_dispatch(); }
-    } pending_cleanup{ worker };
+        int      conn_index;
+        ~PendingCleanup() {
+            // Connection close is NOT inside the per-request gpu_lock below
+            // (that lock is scoped to one loop iteration; this destructor
+            // fires after the loop exits, on `return` from anywhere in this
+            // function, including recv/protocol failures). Single-connection
+            // default: only one thread ever exists, no race possible.
+            // Multi-conn: another connection's thread can still be
+            // mid-dispatch under the lock when this one closes, so take the
+            // same lock here rather than leave this as an unguarded touch of
+            // shared Worker state (split_pending_by_conn_, pool_.demand_
+            // serving) -- and pass THIS connection's own conn_index so it
+            // only ever tears down its own pending transaction, never
+            // another connection's (see split_pending_by_conn_'s comment).
+            // NOTE: this graft previously declared conn_index as a
+            // serve_connection parameter but never actually threaded it into
+            // PendingCleanup or any of the split-dispatch calls below --
+            // every one of them was still hitting the single Worker-wide
+            // split_pending_ this fix removes.
+            if (g_worker_gpu_mutex != nullptr) {
+                std::lock_guard<std::mutex> lock(*g_worker_gpu_mutex);
+                worker.abandon_split_dispatch(conn_index);
+            } else {
+                worker.abandon_split_dispatch(conn_index);
+            }
+        }
+    } pending_cleanup{ worker, conn_index };
     const pipe_expert_hello mine = worker.hello();
     const std::vector<uint8_t> hello_payload = pipe_encode_expert_hello(mine);
     if (!pipe_send_frame(
@@ -7341,6 +9575,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     pipe_expert_dispatch_begin split_log_begin;
     RequestStats split_log_stats;
     std::chrono::steady_clock::time_point split_log_started;
+    bool null_split_active = false;   // §8.25 WP_WORKER_NULL split-path flag
 
     // WP_REF_LOG=path -- the full REFERENCE stream: "<layer> <expert> <expert> ..."
     // one line per request, every expert asked for whether it was resident or paged in.
@@ -7364,6 +9599,29 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     const auto KEEPALIVE_IDLE_MS = std::chrono::milliseconds(2000);
     auto last_request_at = std::chrono::steady_clock::now();
     auto await_request = [&]() {
+        // WP_WORKER_MULTI_CONN: the keepalive/speculative pump below touches
+        // shared Worker state (keepalive_tick, spec_pagein_step,
+        // drop_spec_work) and runs BEFORE recv, i.e. before this thread has
+        // any chance to take g_worker_gpu_mutex for the iteration it's
+        // priming. Two real options were considered:
+        //   1. Take the GPU lock around the whole pump loop too.
+        //   2. Skip the pump entirely in multi-conn mode (kept, below).
+        // (1) is unsafe-by-a-different-route: the pump's inner loop can
+        // block in ppoll() for up to keepalive_us per iteration while idle,
+        // and holding the GPU lock across that would stall the OTHER
+        // connection's dispatch for the same duration -- worse than just
+        // skipping the pump, since it would turn "idle time filled by
+        // another stream" (the whole premise of multi-conn) into "idle time
+        // spent holding the lock nobody else can use". (2) is also not a
+        // real loss: the pump exists to keep the GPU from clock-dropping
+        // during single-connection idle gaps; multi-conn's entire premise is
+        // that a second stream fills those idle gaps with real work, so the
+        // pump's job is already substantially done by the other connection
+        // in the cases that matter. Recv falls straight through to a
+        // blocking wait, same as the probe.
+        if (g_worker_gpu_mutex != nullptr) {
+            return;
+        }
         // The speculative path needs this loop even when the keepalive pump is off:
         // they share the idle window but are independent features, and gating
         // speculation on WP_KEEPALIVE_US would silently couple two experiments.
@@ -7419,6 +9677,31 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     // Comma operator so the pump runs before EVERY recv, including after the
     // PING branch's `continue` -- appending it to the loop body would skip that.
     while ((await_request(), pipe_recv_frame(socket, type, seq_id, payload))) {
+        // WP_WORKER_MULTI_CONN: default-held for the whole per-request
+        // handling below, same shape as the probe (RAII releases it on
+        // every exit from this scope -- return, continue, or falling off
+        // the bottom -- so a second connection's thread can proceed the
+        // instant this one lets go, without touching every individual
+        // return/continue site). Single-connection default path: mutex
+        // pointer is null, this is one branch and no lock is ever taken --
+        // byte-identical to before.
+        //
+        // UNLIKE the probe, the four response-bearing branches below
+        // (ACTS, ACTS_PUBLISH, ACTS_REF, plain DISPATCH_REQ) explicitly
+        // gpu_lock.unlock() right before their pipe_send_frame() of the
+        // computed response and gpu_lock.lock() again immediately after --
+        // encoding and sending an already-computed pipe_expert_partial (a
+        // local value, no shared-state references) does not touch pool_,
+        // compute_galloc_, or any residency structure, so it is provably
+        // safe to run unlocked. That window is exactly "this connection's
+        // network send" overlapping "the other connection's GPU-lock-
+        // holding dispatch", which is the overlap this task asks for.
+        // spec_pagein_after_dispatch() (pool_-touching) and record_stats()
+        // stay locked, immediately after the relock.
+        std::unique_lock<std::mutex> gpu_lock;
+        if (g_worker_gpu_mutex != nullptr) {
+            gpu_lock = std::unique_lock<std::mutex>(*g_worker_gpu_mutex);
+        }
         last_request_at = std::chrono::steady_clock::now();
         if (type == PIPE_PING) {
             if (!pipe_send_frame(socket, PIPE_PONG, seq_id, nullptr, 0)) {
@@ -7456,7 +9739,27 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 split_log_stats = RequestStats{};
                 split_log_started = req_log != nullptr ? std::chrono::steady_clock::now() :
                     std::chrono::steady_clock::time_point{};
-                worker.begin_split_dispatch(split_log_begin, seq_id);
+                // WP_WORKER_NULL=1 (TIMING PROBE, §8.25): decode-scale split
+                // dispatches are nulled AT BEGIN — the batch is never prepared,
+                // no slot pinned, no read issued — and ACTS below answers with
+                // a zeroed partial. Prefill (n_tokens>8) stays real.
+                static const bool worker_null_split = [] {
+                    const char * e = std::getenv("WP_WORKER_NULL");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (worker_null_split && split_log_begin.n_tokens <= 8) {
+                    null_split_active = true;
+                    continue;
+                }
+                // &gpu_lock, not gated here on g_worker_gpu_mutex != nullptr:
+                // ensure_batch's own owns_unlock check (gpu_lock->owns_lock())
+                // already collapses to a no-op whenever gpu_lock was never
+                // locked in the first place -- true both for single-connection
+                // mode (g_worker_gpu_mutex == nullptr, gpu_lock stays a
+                // default-constructed unique_lock with no mutex) and for a
+                // multi-conn PING/other frame's gpu_lock passed by mistake, so
+                // there is no separate gate to keep in sync with that one.
+                worker.begin_split_dispatch(split_log_begin, seq_id, conn_index, &gpu_lock);
             } catch (const pipe_protocol_error & error) {
                 pipe_send_error(socket, seq_id, error.code, error.what());
                 return 1;
@@ -7468,23 +9771,52 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
         }
         if (type == PIPE_EXPERT_DISPATCH_ACTS) {
             try {
-                if (!worker.has_split_dispatch()) {
+                if (null_split_active) {
+                    // §8.25 null path: zeroed partial, no batch ever existed.
+                    null_split_active = false;
+                    pipe_expert_partial znull;
+                    znull.layer    = split_log_begin.layer;
+                    znull.n_tokens = split_log_begin.n_tokens;
+                    znull.partial.assign(
+                        (size_t) split_log_begin.n_tokens * mine.n_embd, 0.0f);
+                    const std::vector<uint8_t> zenc = pipe_encode_expert_partial(znull);
+                    if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                         zenc.data(), zenc.size())) {
+                        return 1;
+                    }
+                    continue;
+                }
+                if (!worker.has_split_dispatch(conn_index)) {
                     throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                               "expert dispatch ACTS has no BEGIN");
                 }
                 const pipe_expert_dispatch_acts acts = pipe_decode_expert_dispatch_acts(
-                    payload.data(), payload.size(), worker.split_n_tokens(), mine.n_embd);
+                    payload.data(), payload.size(), worker.split_n_tokens(conn_index), mine.n_embd);
                 // BEGIN fixes assignment index order; splitting changes only when
                 // reads start, never the computation order or resulting bytes.
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats);
+                    acts, seq_id, split_log_stats, conn_index);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
                 const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
-                if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                     encoded.data(), encoded.size())) {
+                // Unlock for the send: `encoded` is a local byte buffer and
+                // the socket write touches no Worker state, so this
+                // connection's network I/O can overlap another connection's
+                // GPU-lock-holding dispatch. Relock immediately after --
+                // record_stats()/spec_pagein_after_dispatch() below both
+                // touch pool_/stats_ and must stay serialized.
+                const bool relock1 = gpu_lock.owns_lock();
+                if (relock1) gpu_lock.unlock();
+                const bool sent1 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                                   encoded.data(), encoded.size());
+                if (relock1) gpu_lock.lock();
+                if (!sent1) {
                     return 1;
+                }
+                if (conn_index >= 0) {
+                    g_worker_conn_request_counts[(size_t) conn_index].fetch_add(
+                        1, std::memory_order_relaxed);
                 }
                 if (worker.stats_enabled()) {
                     split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -7512,16 +9844,16 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
         // namespace above.
         if (type == PIPE_EXPERT_DISPATCH_ACTS_PUBLISH) {
             try {
-                if (!worker.has_split_dispatch()) {
+                if (!worker.has_split_dispatch(conn_index)) {
                     throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                               "expert dispatch ACTS_PUBLISH has no BEGIN");
                 }
                 const int32_t layer_for_shm = split_log_begin.layer;
                 pipe_expert_dispatch_acts_publish publish = pipe_decode_expert_dispatch_acts_publish(
-                    payload.data(), payload.size(), worker.split_n_tokens(), mine.n_embd);
+                    payload.data(), payload.size(), worker.split_n_tokens(conn_index), mine.n_embd);
                 std::string publish_error;
                 const bool published = wp_dedup::publish(
-                    seq_id, layer_for_shm, publish.activations, worker.split_n_tokens(),
+                    seq_id, layer_for_shm, publish.activations, worker.split_n_tokens(conn_index),
                     (uint32_t) mine.n_embd, publish.n_subscribers, publish_error);
                 if (!published) {
                     // Advisory to the log only -- the spine finds out via the
@@ -7544,14 +9876,23 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 pipe_expert_dispatch_acts acts;
                 acts.activations = std::move(publish.activations);
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats);
+                    acts, seq_id, split_log_stats, conn_index);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
                 const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
-                if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                     encoded.data(), encoded.size())) {
+                // Same unlock-for-send window as the ACTS branch above.
+                const bool relock2 = gpu_lock.owns_lock();
+                if (relock2) gpu_lock.unlock();
+                const bool sent2 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                                   encoded.data(), encoded.size());
+                if (relock2) gpu_lock.lock();
+                if (!sent2) {
                     return 1;
+                }
+                if (conn_index >= 0) {
+                    g_worker_conn_request_counts[(size_t) conn_index].fetch_add(
+                        1, std::memory_order_relaxed);
                 }
                 if (published) {
                     // This worker is one of the n_subscribers+1 holders
@@ -7591,13 +9932,13 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
         // pipe-expert-dispatcher.cpp), not a general relaxation of that rule.
         if (type == PIPE_EXPERT_DISPATCH_ACTS_REF) {
             try {
-                if (!worker.has_split_dispatch()) {
+                if (!worker.has_split_dispatch(conn_index)) {
                     throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                               "expert dispatch ACTS_REF has no BEGIN");
                 }
                 const pipe_expert_dispatch_acts_ref ref =
                     pipe_decode_expert_dispatch_acts_ref(payload.data(), payload.size());
-                if (ref.n_tokens != worker.split_n_tokens()) {
+                if (ref.n_tokens != worker.split_n_tokens(conn_index)) {
                     throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                               "expert dispatch ACTS_REF n_tokens does not match BEGIN");
                 }
@@ -7609,7 +9950,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                     std::fprintf(stderr,
                                  "wp-expert-worker: dedup subscribe failed (seq=%llu layer=%d): %s\n",
                                  (unsigned long long) seq_id, layer_for_shm, sub_error.c_str());
-                    worker.abandon_split_dispatch();
+                    worker.abandon_split_dispatch(conn_index);
                     if (!pipe_send_error(socket, seq_id, PIPE_ERR_ACTS_UNAVAILABLE, sub_error)) {
                         return 1;
                     }
@@ -7619,14 +9960,23 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 pipe_expert_dispatch_acts acts;
                 acts.activations = std::move(*acts_vec);
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats);
+                    acts, seq_id, split_log_stats, conn_index);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
                 const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
-                if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                     encoded.data(), encoded.size())) {
+                // Same unlock-for-send window as the ACTS branch above.
+                const bool relock3 = gpu_lock.owns_lock();
+                if (relock3) gpu_lock.unlock();
+                const bool sent3 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                                   encoded.data(), encoded.size());
+                if (relock3) gpu_lock.lock();
+                if (!sent3) {
                     return 1;
+                }
+                if (conn_index >= 0) {
+                    g_worker_conn_request_counts[(size_t) conn_index].fetch_add(
+                        1, std::memory_order_relaxed);
                 }
                 if (worker.stats_enabled()) {
                     split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -7647,7 +9997,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             continue;
         }
 #endif // __linux__
-        if (worker.has_split_dispatch()) {
+        if (worker.has_split_dispatch(conn_index)) {
             pipe_send_error(socket, seq_id, PIPE_ERR_BAD_FRAME,
                             "frame is not legal between dispatch BEGIN and ACTS");
             return 1;
@@ -7694,17 +10044,28 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 req_log != nullptr ? std::chrono::steady_clock::now() :
                                      std::chrono::steady_clock::time_point();
             const pipe_expert_partial response = worker.dispatch(
-                request, request_stats);
+                request, request_stats, std::nullopt, conn_index);
             const bool measure = worker.stats_enabled();
             const std::chrono::steady_clock::time_point send_started =
                 measure ? std::chrono::steady_clock::now() :
                           std::chrono::steady_clock::time_point();
             const std::vector<uint8_t> encoded =
                 pipe_encode_expert_partial(response);
-            if (!pipe_send_frame(
+            // Same unlock-for-send window as the split-dispatch branches
+            // above: `encoded`/`response` are local values, the socket
+            // write touches no Worker state.
+            const bool relock4 = gpu_lock.owns_lock();
+            if (relock4) gpu_lock.unlock();
+            const bool sent4 = pipe_send_frame(
                     socket, PIPE_EXPERT_PARTIAL, seq_id,
-                    encoded.data(), encoded.size())) {
+                    encoded.data(), encoded.size());
+            if (relock4) gpu_lock.lock();
+            if (!sent4) {
                 return 1;
+            }
+            if (conn_index >= 0) {
+                g_worker_conn_request_counts[(size_t) conn_index].fetch_add(
+                    1, std::memory_order_relaxed);
             }
             if (measure) {
                 request_stats.ns_send =
@@ -7735,7 +10096,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     // this line is best effort and arm 1 never saw it. WP_HINT_LOG is the
     // durable record -- NOT WP_REQ_LOG, which carries no hint fields and was
     // wrongly named here before.
-    worker.report_prefetch_hints();
+    //
+    // report_prefetch_hints() reads pool_.n_layerahead_hits() and Worker's
+    // own hint counters -- shared state another connection's thread can be
+    // mid-dispatch-mutating, so this needs the same lock as everything else
+    // that touches Worker state (see PendingCleanup above for the same
+    // reasoning on abandon_split_dispatch()).
+    if (g_worker_gpu_mutex != nullptr) {
+        std::lock_guard<std::mutex> lock(*g_worker_gpu_mutex);
+        worker.report_prefetch_hints();
+    } else {
+        worker.report_prefetch_hints();
+    }
     return 0;
 }
 
@@ -7928,6 +10300,82 @@ int run(const Options & options) {
                   << " slots=" << slot_class.slots
                   << " pin_floor=" << slot_class.pin_floor
                   << " pages=" << slot_class.pages << '\n';
+    }
+
+    // WP_WORKER_MULTI_CONN=N (N>=2) -- see g_worker_gpu_mutex comment above
+    // serve_connection for the lock design. Unset/absent/"1"/anything <2 is
+    // the untouched default path below: strictly one connection at a time,
+    // byte-identical to before this flag existed.
+    //
+    // PERSISTENT SERVING, not accept-exactly-N-then-exit (that was the
+    // throwaway probe's shape): N slot threads each loop
+    // accept() -> serve_connection() -> accept() forever. When a
+    // connection closes, serve_connection() returns, that thread's slot is
+    // immediately free, and its very next accept() call can pick up a new
+    // client -- so up to N connections are live at once, not exactly N for
+    // the process's whole lifetime. Multiple threads blocked in accept() on
+    // the SAME listening socket is well-defined POSIX behaviour (the kernel
+    // hands each ready connection to exactly one waiting caller); this is
+    // the standard thread-pool-acceptor pattern, not something specific to
+    // this socket wrapper.
+    //
+    // SHUTDOWN: this loop has no in-process stop condition -- an
+    // orchestrator drives connect/disconnect cycles, this worker does not
+    // decide when it's done. No signal handler is installed here (same as
+    // the single-connection default path above), so SIGTERM's default
+    // disposition (terminate) applies immediately, even with every slot
+    // thread blocked in accept() or mid-request. The orchestrator-visible
+    // change from the old accept-exactly-N probe is: this worker no longer
+    // exits on its own once the streams close, so re-running the probe
+    // comparison against this version means killing the process
+    // (SIGTERM/SIGKILL, exactly as the single-connection path has always
+    // required) instead of waiting on it -- see the run recipe in the task
+    // report for the concrete command.
+    int multi_conn_n = 1;
+    if (const char * e = std::getenv("WP_WORKER_MULTI_CONN")) {
+        const long v = strtol(e, nullptr, 10);
+        if (v >= 2) {
+            multi_conn_n = (int) v;
+        }
+    }
+
+    if (multi_conn_n >= 2) {
+        std::mutex serialize_mutex;
+        g_worker_gpu_mutex = &serialize_mutex;
+        g_worker_conn_request_counts = std::vector<std::atomic<uint64_t>>((size_t) multi_conn_n);
+        g_worker_staging_held = std::vector<std::atomic<int64_t>>((size_t) multi_conn_n);
+        // Per-connection staging quota (see StagingPool's 2026-08-25 deadlock
+        // fix comment) -- must be set before any connection thread starts so
+        // no borrow() call can race the quota changing under it.
+        worker.set_staging_multi_conn(multi_conn_n);
+        std::vector<std::thread> threads;
+        threads.reserve((size_t) multi_conn_n);
+        pipe_socket_t * const server_raw = server.get();
+        for (int i = 0; i < multi_conn_n; ++i) {
+            threads.emplace_back([server_raw, &worker, i] {
+                for (;;) {
+                    pipe_socket_ptr client = server_raw->accept();
+                    if (!client) {
+                        // Listening socket is gone (closed/errored): this
+                        // slot has nothing left to do. Other slots may
+                        // still be serving live connections -- only this
+                        // one thread exits.
+                        return;
+                    }
+                    std::cout << "wp multi-conn: slot " << i
+                              << " accepted a connection" << std::endl;
+                    (void) serve_connection(*client, worker, i);
+                    std::cout << "wp multi-conn: slot " << i
+                              << " connection closed, awaiting a new one"
+                              << std::endl;
+                }
+            });
+        }
+        // Runs until the process is killed (see SHUTDOWN above) -- these
+        // threads never return on their own in normal operation.
+        for (auto & t : threads) { t.join(); }
+        g_worker_gpu_mutex = nullptr;
+        return 0;
     }
 
     int result = 0;

@@ -135,6 +135,18 @@ struct ProfGuard {
         if (on) {
             s_prof_total_ns += wp_now_ns() - t0;
             ++s_prof_calls;
+            // MAD-LAB 2026-08-21: periodic in-band dump. The profile used to
+            // print only from the pager destructor, but the spine's shutdown
+            // wedges indefinitely on this rig (SIGTERM -> "cleaning up" ->
+            // hang; two capture attempts lost to SIGKILL), so a live run
+            // could never surface the numbers. Profile mode only; costs one
+            // clock read per call against a path this flag exists to time.
+            static std::uint64_t s_last_dump_ns = t0;
+            const std::uint64_t now = wp_now_ns();
+            if (now - s_last_dump_ns > 30ull * 1000000000ull) {
+                s_last_dump_ns = now;
+                weight_pager_eval_cb_print_profile();
+            }
         }
     }
 };
