@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from torch import Tensor
@@ -9,7 +9,7 @@ from torch import Tensor
 import gguf
 import numpy as np
 
-from .base import ModelBase, MmprojModel
+from .base import LazyTorchTensor, ModelBase, MmprojModel
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
@@ -26,9 +26,25 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # MTP EXPORT IS ENABLED HERE, deliberately diverging from upstream.
+    #
+    # Upstream set supports_mtp_export = False / no_mtp = True with the note
+    # "the MTP block is a separate draft head; vLLM drops it too". The effect is
+    # that EVERY GGUF built from upstream's converter silently lacks the head --
+    # including Unsloth's UD-* quants -- so speculative decode is unavailable to
+    # anyone using them, and the tensors cannot be recovered from the quantized
+    # file afterwards.
+    #
+    # The weights do exist upstream: Qwen/Qwen3.8-Flash-Next ships 31 mtp.*
+    # tensors and text_config.mtp_num_hidden_layers = 1. _QwenMtpMixin is
+    # already in this class's MRO (via _LinearAttentionVReorderBase ->
+    # Qwen3NextModel), so dropping the two overrides is all that is needed to
+    # reach the standard --mtp / --no-mtp handling in convert_hf_to_gguf.py,
+    # which is gated on supports_mtp_export and defaults to False in base.py.
+    #
+    # Note this MTP block carries its OWN 512-expert MoE (mtp.layers.0.mlp.
+    # experts.gate_up_proj is [512, 1280, 2560]), so the draft is ~4B and is
+    # itself sparse -- it is not a cheap dense head like most NextN blocks.
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -55,6 +71,46 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                 return [int(x) for x in t.tolist()]
         raise ValueError(f"PLE constant {suffix!r} missing from the checkpoint")
 
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+
+        # The reference ADDS the two MTP input projections, and
+        #     A*e + B*h == [A|B] * concat(e, h)
+        # so they join into the single eh_proj the tensor map already knows and the
+        # graph consumes as one matmul. Exact, not an approximation.
+        # ref: ggml-org#27739; conversion/deepseek.py joins the DeepSeek-V4 pair the same way.
+        e_name = "mtp.fc_embedding.weight"
+        h_name = "mtp.fc_hidden.weight"
+
+        have_e = e_name in self.model_tensors
+        have_h = h_name in self.model_tensors
+        if not have_e and not have_h:
+            return
+        if not have_e or not have_h:
+            raise KeyError(f"unpaired MTP input projection: need both {e_name} and {h_name}")
+
+        e = LazyTorchTensor.to_eager(self.model_tensors[e_name]())
+        h = LazyTorchTensor.to_eager(self.model_tensors[h_name]())
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ,
+                                       self.hparams["num_hidden_layers"]),
+               torch.cat([e, h], dim=1).contiguous())
+
+        del self.model_tensors[e_name]
+        del self.model_tensors[h_name]
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name = item[0]
+
+        # The MTP block brings its OWN hyper-connection mixer, which takes the
+        # model-level slot in an MTP-only file (this arch has no output_norm -- the
+        # final mixer carries it). Rename before _QwenMtpMixin drops it as a
+        # non-MTP tensor. ref: ggml-org#27739
+        if name.startswith("mtp.hyper_connection_mixer."):
+            return None if cls.no_mtp else (name.replace("mtp.", "model.", 1), item[1])
+
+        return super().filter_tensors(item)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hp = self.hparams
@@ -68,12 +124,28 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
+        # The loader reads this array at n_layer_all, which INCLUDES the MTP block, so
+        # it must be block_count long or llama_model_loader rejects the file with
+        # "wrong array length; expected 49, got 48". self.block_count is n_layer plus
+        # the MTP layers (_QwenMtpMixin), and equals n_layer when --no-mtp, so a plain
+        # target file is unchanged. The MTP block gets 0: its attention runs DENSE, and
+        # 0 is exactly how this array spells "not a QSA layer".
         self.gguf_writer.add_attention_compress_ratios(
             [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            + [0] * (self.block_count - n_layer)
         )
 
+        # The MTP block reads the target's hyper-connection STREAMS, not the collapsed
+        # hidden state, so BOTH files declare the wider row: the target for the nextn
+        # read-back and the draft for common/speculative.cpp. Same as DeepSeek-V4.
+        self.gguf_writer.add_embedding_length_out(hp["hc_count"] * hp["hidden_size"])
+
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
-        # so emit no PLE keys rather than optional ones
+        # so emit no PLE keys rather than optional ones.
+        # An MTP-only file has no PLE layer at all (the reference clears
+        # ple_layer_ids for the MTP block), so skip the whole group there.
+        if self.mtp_only:
+            return
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
         if not ple_layers:
             return
