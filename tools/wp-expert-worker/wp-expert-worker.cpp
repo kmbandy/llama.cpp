@@ -189,6 +189,7 @@ struct RequestStats {
     uint64_t n_device_allocs = 0;
     uint64_t ns_graph_build = 0;
     uint64_t ns_submit = 0;
+    uint64_t ns_final_sync = 0;
     uint64_t ns_readback = 0;
     uint64_t ns_prep = 0;
     uint64_t ns_prep_setup = 0;   // ggml_init + new_tensor + buft queries
@@ -349,6 +350,7 @@ public:
         n_device_allocs_ += request.n_device_allocs;
         ns_graph_build_ += request.ns_graph_build;
         ns_submit_ += request.ns_submit;
+        ns_final_sync_ += request.ns_final_sync;
         n_gcache_hit_ += request.n_gcache_hit;
         n_gcache_miss_ += request.n_gcache_miss;
         n_arena_hit_ += request.n_arena_hit;
@@ -449,6 +451,7 @@ private:
                   << " n_device_allocs=" << n_device_allocs_
                   << " ns_graph_build=" << ns_graph_build_
                   << " ns_submit=" << ns_submit_
+                  << " ns_final_sync=" << ns_final_sync_
                   << " gcache_hit=" << n_gcache_hit_
                   << " gcache_miss=" << n_gcache_miss_
                   << " n_arena_hit=" << n_arena_hit_
@@ -551,6 +554,7 @@ private:
     uint64_t          n_device_allocs_ = 0;
     uint64_t          ns_graph_build_ = 0;
     uint64_t          ns_submit_ = 0;
+    uint64_t          ns_final_sync_ = 0;
     uint64_t          n_gcache_hit_ = 0;
     uint64_t          n_gcache_miss_ = 0;
     uint64_t          n_arena_hit_ = 0;
@@ -5482,6 +5486,18 @@ public:
         bool arena_eligible = false;
         uint64_t seq_id = 0;
     };
+
+    struct AsyncDispatchGuard {
+        Worker & worker;
+        int previous_conn_index;
+
+        AsyncDispatchGuard(Worker & worker, int conn_index) :
+            worker(worker), previous_conn_index(worker.begin_async_dispatch(conn_index)) {}
+
+        ~AsyncDispatchGuard() {
+            worker.end_async_dispatch(previous_conn_index);
+        }
+    };
     Worker(
             Catalog catalog,
             const std::string & device,
@@ -6314,6 +6330,9 @@ public:
         ExpertSlotPool::Batch batch = prepared.has_value()
             ? std::move(*prepared)
             : pool_.ensure_batch(pages, measure, lookup_started, request.n_tokens, conn_index);
+        // Declare this after batch: its destructor synchronizes before batch
+        // releases pins or permits slot reuse on an exceptional exit.
+        AsyncDispatchGuard async_dispatch_guard(*this, conn_index);
         if (measure) {
             request_stats.ns_lookup  = batch.lookup_ns();
             request_stats.n_resident      = batch.n_resident();
@@ -6825,6 +6844,65 @@ public:
     }
 
 private:
+    struct AsyncSubmitState {
+        // Keep one host vector per upload: several submits can be in flight.
+        std::vector<std::vector<uint8_t>> params;
+        std::vector<std::vector<int32_t>> ids;
+        std::vector<std::vector<float>> route_weights;
+        bool pending = false;
+    };
+
+    // WP_SUBMIT_ASYNC is opt-in. The tensor upload and graph compute use the
+    // same backend stream, so the upload is ordered before its consumer. This
+    // avoids the MAD-114 gfx1201 cross-stream visibility hazard.
+    const bool submit_async_ = [] {
+        const char * e = std::getenv("WP_SUBMIT_ASYNC");
+        return e != nullptr && e[0] == '1';
+    }();
+
+    int begin_async_dispatch(int conn_index) {
+        const int previous = active_async_conn_index_;
+        active_async_conn_index_ = conn_index;
+        if (submit_async_) {
+            AsyncSubmitState & state = async_submit_state_by_conn_[conn_index];
+            state.params.clear();
+            state.ids.clear();
+            state.route_weights.clear();
+            state.pending = false;
+        }
+        return previous;
+    }
+
+    void synchronize_async(RequestStats * request_stats) {
+        if (!submit_async_) {
+            return;
+        }
+        const auto it = async_submit_state_by_conn_.find(active_async_conn_index_);
+        if (it == async_submit_state_by_conn_.end() || !it->second.pending) {
+            return;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        ggml_backend_synchronize(backend_.get());
+        if (request_stats != nullptr) {
+            request_stats->ns_final_sync +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+        }
+        it->second.pending = false;
+        it->second.params.clear();
+        it->second.ids.clear();
+        it->second.route_weights.clear();
+    }
+
+    void end_async_dispatch(int previous_conn_index) {
+        synchronize_async(nullptr);
+        active_async_conn_index_ = previous_conn_index;
+    }
+
+    AsyncSubmitState & async_submit_state() {
+        return async_submit_state_by_conn_.at(active_async_conn_index_);
+    }
+
     // ---- prefetch hints (see note_prefetch_hint) ----
     //
     // WP_EXPERT_SPEC_PAGEIN=1 arms speculative page-ins. DEFAULT OFF and separate from the
@@ -7573,14 +7651,26 @@ private:
             }
             if (params_span > 0) {
                 const auto params_started = std::chrono::steady_clock::now();
-                ggml_backend_tensor_set(gc->blob, params_host.data(), 0, params_span);
+                if (submit_async_) {
+                    AsyncSubmitState & state = async_submit_state();
+                    state.params.emplace_back(std::move(params_host));
+                    state.pending = true;
+                    ggml_backend_tensor_set_async(
+                        backend_.get(), gc->blob, state.params.back().data(), 0, params_span);
+                } else {
+                    ggml_backend_tensor_set(gc->blob, params_host.data(), 0, params_span);
+                }
                 request_stats.ns_params_set +=
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - params_started).count();
             }
             const auto submit_started = std::chrono::steady_clock::now();
-            const enum ggml_status status =
-                ggml_backend_graph_compute(backend_.get(), gc->graph);
+            if (submit_async_) {
+                async_submit_state().pending = true;
+            }
+            const enum ggml_status status = submit_async_
+                ? ggml_backend_graph_compute_async(backend_.get(), gc->graph)
+                : ggml_backend_graph_compute(backend_.get(), gc->graph);
             request_stats.ns_submit +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - submit_started).count();
@@ -7839,14 +7929,26 @@ private:
                 gc->blob = blob;
             }
             const auto params_started = std::chrono::steady_clock::now();
-            ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
+            if (submit_async_) {
+                AsyncSubmitState & state = async_submit_state();
+                state.params.emplace_back(std::move(params_host));
+                state.pending = true;
+                ggml_backend_tensor_set_async(
+                    backend_.get(), blob, state.params.back().data(), 0, params_span);
+            } else {
+                ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
+            }
             request_stats.ns_params_set +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - params_started).count();
         }
         const auto submit_started = std::chrono::steady_clock::now();
-        const enum ggml_status status =
-            ggml_backend_graph_compute(backend_.get(), graph);
+        if (submit_async_) {
+            async_submit_state().pending = true;
+        }
+        const enum ggml_status status = submit_async_
+            ? ggml_backend_graph_compute_async(backend_.get(), graph)
+            : ggml_backend_graph_compute(backend_.get(), graph);
         request_stats.ns_submit +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - submit_started).count();
@@ -8370,11 +8472,29 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - build_started).count();
 
-        ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(route_w, route_w_host.data(), 0, route_w_host.size() * sizeof(float));
+        if (submit_async_) {
+            AsyncSubmitState & state = async_submit_state();
+            state.ids.emplace_back(std::move(ids_host));
+            state.route_weights.emplace_back(std::move(route_w_host));
+            state.pending = true;
+            ggml_backend_tensor_set_async(
+                backend_.get(), ids, state.ids.back().data(), 0,
+                state.ids.back().size() * sizeof(int32_t));
+            ggml_backend_tensor_set_async(
+                backend_.get(), route_w, state.route_weights.back().data(), 0,
+                state.route_weights.back().size() * sizeof(float));
+        } else {
+            ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(route_w, route_w_host.data(), 0, route_w_host.size() * sizeof(float));
+        }
 
         const auto submit_started = std::chrono::steady_clock::now();
-        const enum ggml_status status = ggml_backend_graph_compute(backend_.get(), graph);
+        if (submit_async_) {
+            async_submit_state().pending = true;
+        }
+        const enum ggml_status status = submit_async_
+            ? ggml_backend_graph_compute_async(backend_.get(), graph)
+            : ggml_backend_graph_compute(backend_.get(), graph);
         request_stats.ns_submit +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - submit_started).count();
@@ -8969,6 +9089,7 @@ private:
     }
 
     void read_result(std::vector<float> & result, RequestStats & request_stats) {
+        synchronize_async(&request_stats);
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead(),
             /* .mem_base = */ nullptr,
@@ -9083,7 +9204,12 @@ private:
             throw std::runtime_error("failed to allocate resident-first fold graph");
         }
         const auto submit_started = std::chrono::steady_clock::now();
-        const enum ggml_status status = ggml_backend_graph_compute(backend_.get(), graph);
+        if (submit_async_) {
+            async_submit_state().pending = true;
+        }
+        const enum ggml_status status = submit_async_
+            ? ggml_backend_graph_compute_async(backend_.get(), graph)
+            : ggml_backend_graph_compute(backend_.get(), graph);
         request_stats.ns_submit +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - submit_started).count();
@@ -9196,6 +9322,8 @@ private:
     size_t         io_result_offset_ = 0;
     WorkerStats    stats_;
     int            slots_ = 0;
+    int            active_async_conn_index_ = -1;
+    std::unordered_map<int, AsyncSubmitState> async_submit_state_by_conn_;
     // Keyed by conn_index -- see the long comment above begin_split_dispatch()
     // for why this must not be a single Worker-wide std::optional.
     std::unordered_map<int, split_pending> split_pending_by_conn_;
@@ -9516,12 +9644,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     //   ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit
     //   ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end
     //   ns_params_set n_host_hit n_host_demote ns_host_get ns_demote ns_ensure_post
+    //   ns_final_sync
     // epoch_end (added 2026-08-06) is the request's wall-clock END in epoch
     // seconds; start = epoch_end - ns_wall/1e9.
     // ns_params_set (added 2026-08-07): the coalesced D1 blob upload; 0 when
     // WP_EXPERT_PARAMS_COALESCE is off. Appended AFTER epoch_end -- the format
     // is positional-from-the-left, so trailing additions never move existing
     // columns, but anything indexing epoch_end as [-1] must switch to [21].
+    // ns_final_sync is the deferred backend sync when WP_SUBMIT_ASYNC=1.
+    // It is appended as the final column and is zero on the default path.
     // Segment into tokens by watching request.layer wrap back to its minimum.
     //
     // n_tokens (added 2026-08-03) IS THE PREFILL/DECODE LABEL, and it is the whole
@@ -9552,7 +9683,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         fprintf(req_log,
                 "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
                 "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu "
-                "%llu %llu %llu %llu %llu\n",
+                "%llu %llu %llu %llu %llu %llu\n",
                 layer, n_tokens, n_assignments,
                 (unsigned long long) s.n_resident, (unsigned long long) s.n_pagein,
                 (unsigned long long) s.bytes_read, (unsigned long long) ns_wall,
@@ -9569,7 +9700,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 (unsigned long long) s.n_host_demote,
                 (unsigned long long) s.ns_host_get,
                 (unsigned long long) s.ns_demote,
-                (unsigned long long) s.ns_ensure_post);
+                (unsigned long long) s.ns_ensure_post,
+                (unsigned long long) s.ns_final_sync);
         fflush(req_log);
     };
     pipe_expert_dispatch_begin split_log_begin;

@@ -838,7 +838,7 @@ echo "=== SLICED workers: s0 R9700:8801 | s1 1070:8803 | s2 RX480:8804 | d0 CPU:
 # --- s0: R9700 (ROCm0) slice0 w1408, layers 0-42 ---
 HOSTVICTIM_MAIN_ARG=""; [ "${HOSTVICTIM_MAIN:-0}" != 0 ] && HOSTVICTIM_MAIN_ARG="WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN "   # 0 = tier OFF (worker rejects an explicit 0)
 HOSTVICTIM_2026_ARG=""; [ "${HOSTVICTIM_2026:-0}" != 0 ] && HOSTVICTIM_2026_ARG="WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 "
-main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${WEXTRA_S0:-} ${HOSTVICTIM_MAIN_ARG}${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }${SPEC_MAX_SLOTS_MAIN:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_MAIN }${REQLOG_S0:+WP_REQ_LOG=$REQLOG_S0 }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=${KEEPALIVE_S0:-200} ${WEXTRA_S0:-} ${HOSTVICTIM_MAIN_ARG}${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }${SPEC_MAX_SLOTS_MAIN:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_MAIN }${REQLOG_S0:+WP_REQ_LOG=$REQLOG_S0 }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
     --shard-manifest $S0/ds4-s0-experts-experts-manifest${MANIFEST_SUFFIX}.json \
     --descriptor $S0/ds4-s0-experts-experts-manifest${MANIFEST_SUFFIX}.expert-descriptor.json \
     $SLICE_PIN_S0 --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_S0 > $OUT/w-s0.log 2>&1 < /dev/null & echo \$! > $OUT/w-s0.pid; }"
