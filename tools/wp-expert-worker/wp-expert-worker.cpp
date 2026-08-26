@@ -323,6 +323,11 @@ public:
         n_layerahead_hits_    = hits;
     }
 
+    void set_pin_stats(size_t n_pinned, uint64_t demand_hits) {
+        n_pinned_ = n_pinned;
+        n_pinned_demand_hits_ = demand_hits;
+    }
+
     ~WorkerStats() {
         report();
     }
@@ -429,6 +434,8 @@ private:
                   << " n_layerahead_hints=" << n_layerahead_hints_
                   << " n_layerahead_pageins=" << n_layerahead_pageins_
                   << " n_layerahead_hits=" << n_layerahead_hits_
+                  << " n_pinned=" << n_pinned_
+                  << " n_pinned_demand_hits=" << n_pinned_demand_hits_
                   << " n_host_hit=" << n_host_hit_
                   << " n_host_demote=" << n_host_demote_
                   << " bytes_read=" << bytes_read_
@@ -542,6 +549,8 @@ private:
     uint64_t          n_layerahead_hints_   = 0;
     uint64_t          n_layerahead_pageins_ = 0;
     uint64_t          n_layerahead_hits_    = 0;
+    size_t             n_pinned_ = 0;
+    uint64_t           n_pinned_demand_hits_ = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          n_host_demote_ = 0;
     uint64_t          bytes_read_ = 0;
@@ -2354,13 +2363,16 @@ public:
     ExpertSlotPool(
             ggml_backend_t backend, ResourcePlan resources,
             uint64_t host_victim_bytes, TestHooks * test_hooks,
-            const std::vector<int> & reserve_blocks) :
+            const std::vector<int> & reserve_blocks, size_t page_count = 0) :
         backend_(backend),
         resources_(std::move(resources)),
         staging_(resources_, backend),
         test_hooks_(test_hooks) {
         reserve_blocks_ = reserve_blocks;
         std::sort(reserve_blocks_.begin(), reserve_blocks_.end());
+        if (lfu_history_enabled_) {
+            lfu_history_.assign(page_count, 0);
+        }
         if (resources_.slot_count < 0 ||
             (resources_.slot_count == 0 && resources_.pinned_bytes == 0) ||
             (resources_.slot_count > 0 && resources_.staging_buffer_bytes == 0) ||
@@ -2521,6 +2533,8 @@ public:
         }
 #endif
     }
+
+    size_t pin_pages(const std::vector<const ExpertPage *> & pages);
 
     struct Loaded {
         ggml_backend_buffer_t buffer = nullptr;
@@ -2773,7 +2787,8 @@ public:
             std::chrono::steady_clock::time_point lookup_started,
             uint32_t n_tokens = 0,
             int conn_index = -1,
-            std::unique_lock<std::mutex> * gpu_lock = nullptr) {
+            std::unique_lock<std::mutex> * gpu_lock = nullptr,
+            bool count_demand = true) {
         // Take anything the reader threads already landed -- free residency for
         // this request, and it frees the pins. Non-blocking. spec_any_in_flight
         // ("is anything live"), not spec_in_flight ("at the WP_EXPERT_SPEC_MAX_
@@ -2856,6 +2871,9 @@ public:
             // immediately usable while sibling pageins are read.
             for (size_t i = 0; i < pages.size(); ++i) {
                 const ExpertPage & page = *pages[i];
+                if (count_demand) {
+                    note_demand_reference(page);
+                }
                 const size_t slot_index = find_slot(page);
                 if (slot_index == slots_.size()) {
                     if (page.is_resident) {
@@ -2875,6 +2893,9 @@ public:
                 ++slot.pin_count;
                 slot.tick = ++tick_;
                 ++slot.uses;
+                if (slot.pinned && count_demand) {
+                    ++n_pinned_demand_hits_;
+                }
                 // Promotion: a demand hit on a still-unconfirmed speculative
                 // slot confirms the guess. It stops counting against
                 // WP_EXPERT_SPEC_MAX_SLOTS from this point on, same as the
@@ -3117,7 +3138,8 @@ public:
                         // before it can ever prove itself, and stale pages that
                         // were hot early squat forever. Those two are the only
                         // reasons plain use-counting loses to LRU.
-                        slot.uses     = evict_age_ + 1;
+                        slot.uses     = lfu_history_enabled_ ? history_uses(page) :
+                                         evict_age_ + 1;
                         batch.entries_[entry_index].loaded = {
                             slot.buffer, slot.raw->data
                         };
@@ -3408,7 +3430,8 @@ public:
             // conn_index -1 ("none"): speculative page-in runs off the idle
             // pump, not inside any connection's transaction -- see the
             // StagingPool quota comment. Uncapped, same as before this fix.
-            entry.batch = std::make_unique<Batch>(ensure_batch(cold, false, {}, 0, -1));
+            entry.batch = std::make_unique<Batch>(
+                ensure_batch(cold, false, {}, 0, -1, nullptr, false));
             // Safe to set after the fact: reads land on reader threads, but the
             // flag is only consulted by drain_one_read, which runs exclusively
             // on THIS thread and cannot run before submit returns.
@@ -3808,6 +3831,8 @@ public:
     uint64_t spec_errors() const { return spec_errors_; }
     uint64_t n_shield_hits() const { return n_shield_hits_; }
     uint64_t n_shield_exhausted() const { return n_shield_exhausted_; }
+    size_t n_pinned() const { return n_pinned_; }
+    uint64_t n_pinned_demand_hits() const { return n_pinned_demand_hits_; }
 
     // Hint frames and victim selection are both owned by the dispatch thread.
     // Keep only the configured number of hint frames, with counts so a page
@@ -3861,7 +3886,7 @@ public:
     size_t unpinned_slots() const {
         size_t n = 0;
         for (const Slot & slot : slots_) {
-            if (slot.pin_count <= 0) {
+            if (!slot.pinned && slot.pin_count <= 0) {
                 ++n;
             }
         }
@@ -3957,6 +3982,7 @@ private:
         // Set with spec_pending when the landing came from WP_PREFILL_LAYER_AHEAD.
         // Demand hit counts n_layerahead_hits_ and clears both.
         bool                layer_ahead  = false;
+        bool                pinned      = false;
     };
 
     // (layer, expert) -> uint64 for slot_index_. Same packing as SPINE's
@@ -3993,7 +4019,8 @@ private:
     }
 
     bool demote_slot(const Slot & slot) {
-        if (!host_victim_enabled_ || !slot.valid || slot.cache_id < 0 || slot.size == 0) {
+        if (slot.pinned || !host_victim_enabled_ || !slot.valid ||
+            slot.cache_id < 0 || slot.size == 0) {
             return false;
         }
         if (fill_host_on_read_ && !demote_d2h_ && host_tier_.contains(slot.cache_id)) {
@@ -4015,7 +4042,7 @@ private:
         size_t victim = slots_.size();
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
-            if (slot.pin_count != 0 || slot.valid ||
+            if (slot.pinned || slot.pin_count != 0 || slot.valid ||
                 (!wants_reserved && slot.reserved) ||
                 (wants_reserved && !slot.reserved) ||
                 page_size > slot.capacity) {
@@ -4039,7 +4066,8 @@ private:
         if (wants_reserved) {
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
-                if (slot.pin_count != 0 || slot.valid || slot.reserved || page_size > slot.capacity) continue;
+                if (slot.pinned || slot.pin_count != 0 || slot.valid ||
+                    slot.reserved || page_size > slot.capacity) continue;
                 if (skip_shielded && hint_shielded(slot)) {
                     if (shielded_seen != nullptr) {
                         *shielded_seen = true;
@@ -4053,7 +4081,7 @@ private:
 
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
-            if (slot.pin_count != 0 || !slot.valid ||
+            if (slot.pinned || slot.pin_count != 0 || !slot.valid ||
                 (!wants_reserved && slot.reserved) ||
                 (wants_reserved && !slot.reserved) ||
                 page_size > slot.capacity) {
@@ -4075,7 +4103,8 @@ private:
         if (wants_reserved && victim == slots_.size()) {
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
-                if (slot.pin_count != 0 || !slot.valid || page_size > slot.capacity) continue;
+                if (slot.pinned || slot.pin_count != 0 || !slot.valid ||
+                    page_size > slot.capacity) continue;
                 if (skip_shielded && hint_shielded(slot)) {
                     if (shielded_seen != nullptr) {
                         *shielded_seen = true;
@@ -4598,7 +4627,8 @@ private:
                     slot.page     = pagein.page;
                     slot.size     = pagein.page->size;
                     slot.tick  = ++tick_;
-                    slot.uses  = evict_age_ + 1;
+                    slot.uses  = lfu_history_enabled_ ? history_uses(*pagein.page) :
+                                  evict_age_ + 1;
                     Batch::Entry & entry =
                         batch.entries_[pagein.entry_index];
                     entry.loaded = {
@@ -5332,6 +5362,41 @@ private:
         const char * e = std::getenv("WP_EXPERT_LFU");
         return e == nullptr || e[0] != '0';   // ON by default
     }();
+    const bool                 lfu_history_enabled_ = [] {
+        const char * e = std::getenv("WP_EXPERT_LFU_HISTORY");
+        return e != nullptr && e[0] == '1';
+    }();
+    const uint64_t             lfu_history_halflife_ = [] {
+        const char * e = std::getenv("WP_EXPERT_LFU_HALFLIFE");
+        const long v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 4096;
+        return v > 0 ? (uint64_t) v : (uint64_t) 4096;
+    }();
+    void note_demand_reference(const ExpertPage & page) {
+        if (!lfu_history_enabled_ || page.cache_id < 0) {
+            return;
+        }
+        const size_t index = (size_t) page.cache_id;
+        if (index >= lfu_history_.size()) {
+            lfu_history_.resize(index + 1, 0);
+        }
+        if (lfu_history_[index] != std::numeric_limits<uint64_t>::max()) {
+            ++lfu_history_[index];
+        }
+        if (++lfu_history_references_ == lfu_history_halflife_) {
+            for (uint64_t & uses : lfu_history_) {
+                uses /= 2;
+            }
+            lfu_history_references_ = 0;
+        }
+    }
+    uint64_t history_uses(const ExpertPage & page) const {
+        const size_t index = page.cache_id < 0 ? lfu_history_.size() :
+            (size_t) page.cache_id;
+        return index < lfu_history_.size() ? lfu_history_[index] : 0;
+    }
+    uint64_t history_uses(const Slot & slot) const {
+        return slot.page == nullptr ? 0 : history_uses(*slot.page);
+    }
     // WP_EXPERT_HINT_SHIELD=N keeps pages named by the last N hint frames out
     // of demand eviction. 0 is the default-off control arm.
     const size_t              hint_shield_depth_ = [] {
@@ -5347,6 +5412,10 @@ private:
     std::unordered_map<uint64_t, size_t> hint_shield_counts_;
     uint64_t                   n_shield_hits_ = 0;
     uint64_t                   n_shield_exhausted_ = 0;
+    std::vector<uint64_t>       lfu_history_;
+    uint64_t                    lfu_history_references_ = 0;
+    size_t                      n_pinned_ = 0;
+    uint64_t                    n_pinned_demand_hits_ = 0;
     // Victim ordering: is `a` a strictly BETTER victim than `b`? With LFU off
     // this is pure LRU, byte for byte what shipped before, so a control arm
     // needs no separate build.
@@ -5366,8 +5435,12 @@ private:
         if (a_leased != b_leased) {
             return b_leased;
         }
-        if (lfu_ && a.uses != b.uses) {
-            return a.uses < b.uses;
+        if (lfu_ || lfu_history_enabled_) {
+            const uint64_t a_uses = lfu_history_enabled_ ? history_uses(a) : a.uses;
+            const uint64_t b_uses = lfu_history_enabled_ ? history_uses(b) : b.uses;
+            if (a_uses != b_uses) {
+                return a_uses < b_uses;
+            }
         }
         return a.tick < b.tick;
     }
@@ -5397,6 +5470,32 @@ private:
     std::vector<int>           reserve_blocks_;
     std::map<std::string, int> fds_;
 };
+
+size_t ExpertSlotPool::pin_pages(const std::vector<const ExpertPage *> & pages) {
+    size_t n_pinned = 0;
+    for (const ExpertPage * page : pages) {
+        if (page == nullptr || page->is_resident) {
+            continue;
+        }
+        size_t slot_index = find_slot(*page);
+        if (slot_index == slots_.size()) {
+            std::vector<const ExpertPage *> one{page};
+            Batch batch = ensure_batch(one, false, {}, 0, -1, nullptr, false);
+            batch.complete();
+            slot_index = find_slot(*page);
+        }
+        if (slot_index == slots_.size()) {
+            throw std::runtime_error("pinned expert did not land in a slot");
+        }
+        Slot & slot = slots_[slot_index];
+        if (!slot.pinned) {
+            slot.pinned = true;
+            ++n_pinned_;
+            ++n_pinned;
+        }
+    }
+    return n_pinned;
+}
 
 ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     owner_(other.owner_),
@@ -5505,7 +5604,7 @@ public:
                 resident_.pinned_bytes(), expert_reserve_blocks,
                 expert_reserve_bytes),
             host_victim_bytes,
-            test_hooks, expert_reserve_blocks),
+            test_hooks, expert_reserve_blocks, catalog_.pages.size()),
         compute_galloc_(ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend_.get()))),
         slots_(pool_.resources().slot_count) {
@@ -5528,6 +5627,66 @@ public:
                           }
                           return a->offset < b->offset;
                       });
+        }
+        const char * const pin_path = std::getenv("WP_EXPERT_PIN_FILE");
+        if (pin_path != nullptr && pin_path[0] != '\0') {
+            size_t pin_budget = pool_.resources().slot_count;
+            const char * const max_env = std::getenv("WP_EXPERT_PIN_MAX_SLOTS");
+            if (max_env != nullptr && max_env[0] != '\0') {
+                const long long parsed = std::strtoll(max_env, nullptr, 10);
+                pin_budget = parsed > 0 ? (size_t) parsed : 0;
+            }
+            if (pin_budget > (size_t) pool_.resources().slot_count) {
+                pin_budget = (size_t) pool_.resources().slot_count;
+            }
+            std::ifstream pin_file(pin_path);
+            if (!pin_file) {
+                throw std::runtime_error(
+                    "failed to open WP_EXPERT_PIN_FILE: " + std::string(pin_path));
+            }
+            std::vector<const ExpertPage *> pin_pages;
+            std::set<std::pair<int, int>> seen_pins;
+            std::string line;
+            size_t line_number = 0;
+            bool truncated = false;
+            while (std::getline(pin_file, line)) {
+                ++line_number;
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                std::istringstream input(line);
+                int layer = -1;
+                int expert = -1;
+                if (!(input >> layer >> expert)) {
+                    std::cerr << "WARN wp expert worker: ignoring malformed pin line "
+                              << line_number << std::endl;
+                    continue;
+                }
+                const std::pair<int, int> key = { layer, expert };
+                if (!seen_pins.insert(key).second) {
+                    continue;
+                }
+                const auto it = catalog_.pages.find(key);
+                if (it == catalog_.pages.end()) {
+                    std::cerr << "WARN wp expert worker: ignoring unknown pin "
+                              << layer << " " << expert << std::endl;
+                    continue;
+                }
+                if (pin_pages.size() >= pin_budget) {
+                    truncated = true;
+                    continue;
+                }
+                pin_pages.push_back(&it->second);
+            }
+            const size_t loaded = pool_.pin_pages(pin_pages);
+            std::cerr << "WARN wp expert worker: pin_file=" << pin_path
+                      << " n_pinned=" << loaded
+                      << " pin_budget=" << pin_budget
+                      << " demand_hits=0" << std::endl;
+            if (truncated) {
+                std::cerr << "WARN wp expert worker: pin file truncated in file order"
+                          << " at " << pin_budget << " slots" << std::endl;
+            }
         }
         if (prefill_layer_ahead_) {
             std::cerr << "WARN wp expert worker: WP_PREFILL_LAYER_AHEAD=1 layers="
@@ -6038,6 +6197,7 @@ public:
                       "host_promoted=%llu host_wasted=%llu "
                       "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu "
                       "spec_cap[pending/blocked_budget]=%zu/%llu "
+                      "pin[n/hits]=%zu/%llu "
                       "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit/vdemand_defer]="
                       "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
                       "spec_inflight[live/cap]=%zu/%zu "
@@ -6064,6 +6224,8 @@ public:
                       (unsigned long long) pool_.host_skip_tier(),
                       pool_.n_spec_pending(),
                       (unsigned long long) pool_.spec_blocked_budget(),
+                      pool_.n_pinned(),
+                      (unsigned long long) pool_.n_pinned_demand_hits(),
                       (unsigned long long) pump_calls_,
                       (unsigned long long) pump_gated_,
                       (unsigned long long) pump_host_busy_,
@@ -6819,6 +6981,7 @@ public:
 
     void record_stats(const RequestStats & request, size_t n_experts) {
         stats_.set_shield_stats(pool_.n_shield_hits(), pool_.n_shield_exhausted());
+        stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
         stats_.set_layerahead_stats(
             n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits());
         stats_.record(request, n_experts);
