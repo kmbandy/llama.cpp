@@ -106,13 +106,27 @@ tcp_open() {
     fi
 }
 
+# Expected ports are DERIVED from the worker env file (2026-08-23) so the env
+# file is the single cutover point. DSPARK_ON_GPU=1 (config of record since
+# 08-20) drops the CPU dspark workers 8807/8808 — probing them kept this
+# permanently false and stackd never reached "spine-ready". W6900=1 (rung 2)
+# adds the 6900XT worker on main:8802.
+env_flag_on() {  # $1=VAR — LAST uncommented VAR= assignment wins (sourced file)
+    [ -f "$WORKER_ENV_FILE" ] || return 1
+    [ "$(/usr/bin/grep -E "^${1}=" "$WORKER_ENV_FILE" | tail -1 | tr -d '[:space:]')" = "${1}=1" ]
+}
+
+main_worker_ports() {
+    printf '8801\n'
+    env_flag_on W6900 && printf '8802\n'
+    env_flag_on DSPARK_ON_GPU || printf '8807\n8808\n'
+}
+
 all_worker_ports_open() {
-    # SLICED layout (2026-08-18): main s0 8801 + d0 8807 + d1 8808; 2026 s1 8803 + s2 8804.
-    # (Was 8801/8802/8803/8804 for the dead whole-expert layout -- 8802 never opens
-    #  in sliced mode, which pinned this false and kept stackd off the "spine ready" state.)
-    tcp_open 100.86.191.92 8801 &&
-    tcp_open 100.86.191.92 8807 &&
-    tcp_open 100.86.191.92 8808 &&
+    local p
+    for p in $(main_worker_ports); do
+        tcp_open 100.86.191.92 "$p" || return 1
+    done
     tcp_open 100.124.155.84 8803 &&
     tcp_open 100.124.155.84 8804
 }
@@ -125,10 +139,11 @@ workers_running() {
 # (covers the window where local pgrep misses but remote workers still hold).
 workers_present() {
     /usr/bin/pgrep -f '[l]lama-wp-expert-worker' >/dev/null 2>&1 && return 0
-    # SLICED layout ports (any one answering => a worker still present).
-    tcp_open 100.86.191.92 8801 && return 0
-    tcp_open 100.86.191.92 8807 && return 0
-    tcp_open 100.86.191.92 8808 && return 0
+    # Any expected port answering => a worker still present.
+    local p
+    for p in $(main_worker_ports); do
+        tcp_open 100.86.191.92 "$p" && return 0
+    done
     tcp_open 100.124.155.84 8803 && return 0
     tcp_open 100.124.155.84 8804 && return 0
     return 1

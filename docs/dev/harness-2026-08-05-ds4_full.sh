@@ -54,9 +54,20 @@ DENSE=/home/kmbandy/models/DS4-Flash-dense/ds4-dense.gguf
 # sliced worker defs. This is what the WORKERS_ONLY / ds4-stackd path launches.
 # The legacy whole-expert ES_* sets above are DEAD (DS4-eshard-main/-main-trunk
 # deleted from main); the sliced launch below does NOT read them.
-S0=/home/kmbandy/models/ds4-eslice/slice0        # R9700  width 1408 (main NVMe)
-S1=/mnt/nvme/ds4-eslice/slice1                   # 1070   width 320  (2026 NVMe)
-S2=/mnt/nvme/ds4-eslice/slice2                   # RX480  width 320  (2026 NVMe)
+# Slice dirs are env-overridable for the 2026-08-23 4-slice reslice
+# (768,640,320,320 in ~/models/ds4-eslice4): rung 2 points S0_DIR at the new
+# 768-wide slice0 and arms the 6900XT worker (W6900=1) with the 640-wide
+# slice1. S1/S2 on 2026 keep their old dirs — the new spec's slices 2/3 are
+# byte-identical (column ranges [1408,1728)/[1728,2048) unchanged).
+S0=${S0_DIR:-/home/kmbandy/models/ds4-eslice/slice0}  # R9700  width 1408 (main NVMe)
+S1=${S1_DIR:-/mnt/nvme/ds4-eslice/slice1}             # 1070   width 320  (2026 NVMe)
+S2=${S2_DIR:-/mnt/nvme/ds4-eslice/slice2}             # RX480  width 320  (2026 NVMe)
+# Optional 4th GPU worker: 6900XT (ROCm1) serving the 640-wide eslice4 slice1
+# on :8802 — RUNG 2 ONLY (the spine must have moved off ROCm1 first, or the
+# worker pool collides with the dense model). W6900=1 arms it.
+W6900=${W6900:-0}
+S6900=${S6900_DIR:-/home/kmbandy/models/ds4-eslice4/slice1}
+S6900_BASE=${S6900_BASE:-ds4-s6900-experts}          # manifest name prefix in $S6900
 D0=/home/kmbandy/models/DS4-eshard-dspark        # dspark experts 0-84   (real blobs)
 D1=/home/kmbandy/models/DS4-eshard-main-dspark   # dspark experts 85-255 (symlinks)
 SLOTS_S0=${SLOTS_S0:-3400}   # 3400*9.19MB = 31.2GB of 32GB (R9700). 3450 plateaued at
@@ -68,6 +79,9 @@ SLOTS_S1=${SLOTS_S1:-3750}   # 3750*2.09MB = 7.84GB of 8GB (1070)
 SLOTS_S2=${SLOTS_S2:-3900}   # 3900*2.09MB = 8.15GB of 8GB (RX480 + vidmem cap)
 SLOTS_D0=${SLOTS_D0:-85}
 SLOTS_D1=${SLOTS_D1:-171}
+# 6900XT worker pool (rung 2): 640-wide page = 9.19MB*640/1408 = 4.18MB.
+# 3400*4.18MB = 14.2GB of 16.4GB — first-gate conservative; ceiling ~3600.
+SLOTS_S6900=${SLOTS_S6900:-3400}
 # ===========================================================================
 # 2026-08-01: 2026's Tailscale IP CHANGED in the CachyOS reinstall.
 # Was 100.102.191.30 (still in the SOP guide and four repo design docs).
@@ -302,6 +316,36 @@ KEEPALIVE=${KEEPALIVE:-100}
 # (former defaults: 1 GiB per 2026 worker / 6 GiB R9700). Mind §5.1/§5.2 of
 # docs/dev/2026-08-06-weight-pager-handoff.md before raising 2026's: the RX 480
 # transiently dumps 7.5 GB into GTT, so the practical ceiling is ~2 GiB/worker.
+# DSPARK_ON_GPU=1: serve layers 43-45 from the sliced GPU legs, pinned resident,
+# and do not launch the CPU workers d0/d1 at all. See the header of
+# scratchpad/sweep2/dspark-on-gpu.py for the full rationale and sizing.
+#   MANIFEST_SUFFIX  ""        -> plain manifest, layers 0..45 (head INCLUDED)
+#                    "-dspark" -> the withdrawing variant, layers 0..42
+# The pin is layer-keyed; 43-45 is the head's block range.
+DSPARK_ON_GPU=${DSPARK_ON_GPU:-0}
+if [ "$DSPARK_ON_GPU" = "1" ]; then
+    MANIFEST_SUFFIX=""
+    SLICE_PIN="--weight-paging-resident-experts 43-45"
+else
+    MANIFEST_SUFFIX="-dspark"
+    SLICE_PIN=""
+fi
+# S0_UNPIN=1 (rung 1, 2026-08-23): drop the layer-43-45 pin on s0 ONLY. The
+# pin costs 768 pages = 7.1GB of the R9700 pool; the memory-reclaim plan lets
+# the LRU keep genuinely-hot head pages resident organically instead. s1/s2
+# (and s6900) keep $SLICE_PIN — their pins are ~1.6GB/3.2GB and their pools
+# are not the fleet wall. Gate: acceptance must hold ~3.5 after unpinning.
+if [ "${S0_UNPIN:-0}" = "1" ]; then
+    SLICE_PIN_S0=""
+else
+    SLICE_PIN_S0="$SLICE_PIN"
+fi
+# The 6900XT worker has no "-dspark" manifest variant generated — it only
+# exists in the DSPARK_ON_GPU=1 world (plain manifest, head included).
+if [ "$W6900" = "1" ] && [ "$DSPARK_ON_GPU" != "1" ]; then
+    echo "FATAL: W6900=1 requires DSPARK_ON_GPU=1 (no -dspark manifest for slice1)" >&2
+    exit 2
+fi
 HOSTVICTIM_2026=${HOSTVICTIM_2026:-0}
 HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-0}
 # ---------------------------------------------------------------------------
@@ -661,7 +705,11 @@ NO_480=${NO_480:-}
 # / stackd path the router owns the spine and its own dispatch string; here this
 # only drives the per-worker wait list below. Legacy NO_480 / DSPARK_HOST /
 # DSPARK_SPLIT branches are DEAD (whole-expert data deleted from main) -- gone.
-DISPATCH_ENDPOINTS="${IPMAIN}:8801,${IP2026}:8803,${IP2026}:8804,${IPMAIN}:8807,${IPMAIN}:8808"
+if [ "$DSPARK_ON_GPU" = "1" ]; then
+    DISPATCH_ENDPOINTS="${IPMAIN}:8801,${IP2026}:8803,${IP2026}:8804"
+else
+    DISPATCH_ENDPOINTS="${IPMAIN}:8801,${IP2026}:8803,${IP2026}:8804,${IPMAIN}:8807,${IPMAIN}:8808"
+fi
 
 mkdir -p "$OUT"; main_sh "mkdir -p $OUT"; w2026_sh "mkdir -p $OUT"
 # DELETE LAST ARM'S WORKER LOGS BEFORE ANYTHING LAUNCHES.
@@ -705,7 +753,9 @@ w2026_sh "pkill -f '[l]lama-wp-expert-worker' 2>/dev/null; true"
 echo "=== waiting for worker ports to be free ==="
 for _ in $(seq 1 120); do
     busy=0
-    for prt in 8801 8807 8808; do
+    _wait_ports="8801 8807 8808"
+    [ "$DSPARK_ON_GPU" = "1" ] && _wait_ports="8801"
+    for prt in $_wait_ports; do
         n=$(main_sh "ss -ltn | grep -c ':$prt '" 2>/dev/null | tail -1)
         [ "${n:-0}" -ge 1 ] && busy=1
     done
@@ -747,7 +797,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------- preflight: refuse to run into a stale process ----------
-MAIN_PORTS="8095 8801 8807 8808"
+if [ "$DSPARK_ON_GPU" = "1" ]; then MAIN_PORTS="8095 8801"; else MAIN_PORTS="8095 8801 8807 8808"; fi
 LOCAL_PORTS="8803 8804"
 for port in $MAIN_PORTS; do
     if [ "$(main_sh "ss -ltn | grep -c ':$port '" 2>/dev/null | tail -1)" -ge 1 ] 2>/dev/null; then
@@ -786,14 +836,38 @@ echo "=== SLICED workers: s0 R9700:8801 | s1 1070:8803 | s2 RX480:8804 | d0 CPU:
 # The CPU workers (d0/d1) get neither: their experts are already in RAM.
 #
 # --- s0: R9700 (ROCm0) slice0 w1408, layers 0-42 ---
-main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }${SPEC_MAX_SLOTS_MAIN:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_MAIN }${REQLOG_S0:+WP_REQ_LOG=$REQLOG_S0 }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
-    --shard-manifest $S0/ds4-s0-experts-experts-manifest-dspark.json \
-    --descriptor $S0/ds4-s0-experts-experts-manifest-dspark.expert-descriptor.json \
-    --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_S0 > $OUT/w-s0.log 2>&1 < /dev/null & echo \$! > $OUT/w-s0.pid; }"
+HOSTVICTIM_MAIN_ARG=""; [ "${HOSTVICTIM_MAIN:-0}" != 0 ] && HOSTVICTIM_MAIN_ARG="WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN "   # 0 = tier OFF (worker rejects an explicit 0)
+HOSTVICTIM_2026_ARG=""; [ "${HOSTVICTIM_2026:-0}" != 0 ] && HOSTVICTIM_2026_ARG="WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 "
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${WEXTRA_S0:-} ${HOSTVICTIM_MAIN_ARG}${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }${SPEC_MAX_SLOTS_MAIN:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_MAIN }${REQLOG_S0:+WP_REQ_LOG=$REQLOG_S0 }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    --shard-manifest $S0/ds4-s0-experts-experts-manifest${MANIFEST_SUFFIX}.json \
+    --descriptor $S0/ds4-s0-experts-experts-manifest${MANIFEST_SUFFIX}.expert-descriptor.json \
+    $SLICE_PIN_S0 --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_S0 > $OUT/w-s0.log 2>&1 < /dev/null & echo \$! > $OUT/w-s0.pid; }"
 sleep 3
 S0_PID=$(main_sh "cat $OUT/w-s0.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $S0_PID"
 echo "  w-s0 (R9700) pid ${S0_PID:-?}"
 
+# --- s6900: 6900XT (ROCm1) eslice4 slice1 w640, RUNG 2 ONLY (W6900=1) ---
+# Same box as s0, so it shares the main-side victim/spec env unless its own
+# HOSTVICTIM_6900 / SPEC_MAX_SLOTS_6900 are set (they should be: two workers
+# now split main's ~15GB RAM, 3GB tier each per the 08-23 plan).
+# WP_ENSURE_BATCH_HOST=1 is LOAD-BEARING on this leg: the 6900XT has a 256MB
+# BAR (no ReBAR resize applied), and the pager's direct BAR-mapped page-in
+# faults the GPU at init ("Memory access fault ... Page not present"). The
+# host-staged O_DIRECT path was proven bit-identical on this card 2026-07-26.
+# s0 (R9700, 32G BAR) keeps the direct path — do NOT add this to its line.
+if [ "$W6900" = "1" ]; then
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE WP_ENSURE_BATCH_HOST=1 ${HOSTVICTIM_6900:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_6900 }${SPEC_MAX_SLOTS_6900:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_6900 }${REQLOG_S6900:+WP_REQ_LOG=$REQLOG_S6900 }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    --shard-manifest $S6900/${S6900_BASE}-experts-manifest${MANIFEST_SUFFIX}.json \
+    --descriptor $S6900/${S6900_BASE}-experts-manifest${MANIFEST_SUFFIX}.expert-descriptor.json \
+    $SLICE_PIN --device ROCm1 --listen 0.0.0.0:8802 --slots $SLOTS_S6900 > $OUT/w-s6900.log 2>&1 < /dev/null & echo \$! > $OUT/w-s6900.pid; }"
+sleep 3
+S6900_PID=$(main_sh "cat $OUT/w-s6900.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $S6900_PID"
+echo "  w-s6900 (6900XT) pid ${S6900_PID:-?}"
+fi
+
+if [ "$DSPARK_ON_GPU" = "1" ]; then
+    echo "  w-d0/w-d1 SKIPPED (DSPARK_ON_GPU=1: layers 43-45 pinned on the slice legs)"
+else
 # --- d0: main CPU dspark, layers 43-45, experts 0-84 ---
 # DSPARK_THREADS=<n> sets WP_CPU_THREADS for the CPU dspark workers (d0/d1 only;
 # GPU legs ignore it). Unset => worker default (8, clamped to hw concurrency).
@@ -815,12 +889,13 @@ main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${DSPARK_THREADS:+
 sleep 2
 D1_PID=$(main_sh "cat $OUT/w-d1.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $D1_PID"
 echo "  w-d1 (CPU 85-255) pid ${D1_PID:-?}"
+fi
 
 # --- s1: 2026 GTX 1070 (CUDA0) slice1 w320, layers 0-42 ---
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }${SPEC_MAX_SLOTS_2026:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
-    --shard-manifest $S1/ds4-s1-experts-experts-manifest-dspark.json \
-    --descriptor $S1/ds4-s1-experts-experts-manifest-dspark.expert-descriptor.json \
-    --device CUDA0 --listen 0.0.0.0:8803 --slots $SLOTS_S1 > $OUT/w-s1.log 2>&1 < /dev/null & echo \$! > $OUT/w-s1.pid; }"
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WNULL_2026:+WP_WORKER_NULL=$WNULL_2026 }${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026_ARG}${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }${SPEC_MAX_SLOTS_2026:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+    --shard-manifest $S1/ds4-s1-experts-experts-manifest${MANIFEST_SUFFIX}.json \
+    --descriptor $S1/ds4-s1-experts-experts-manifest${MANIFEST_SUFFIX}.expert-descriptor.json \
+    $SLICE_PIN --device CUDA0 --listen 0.0.0.0:8803 --slots $SLOTS_S1 > $OUT/w-s1.log 2>&1 < /dev/null & echo \$! > $OUT/w-s1.pid; }"
 sleep 2
 S1_PID=$(w2026_sh "cat $OUT/w-s1.pid" 2>/dev/null); REMOTE_2026_PIDS="$REMOTE_2026_PIDS $S1_PID"
 echo "  w-s1 (1070) pid ${S1_PID:-?} on 2026"
@@ -828,10 +903,10 @@ echo "  w-s1 (1070) pid ${S1_PID:-?} on 2026"
 # --- s2: 2026 RX 480 (Vulkan0) slice2 w320, layers 0-42 ---
 # The 480 has a 256 MB BAR and no ReBAR; without the host-visible-vidmem cap ~95%
 # of its slots spill into GTT and every matmul streams over PCIe (doc §1/§2).
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }${SPEC_MAX_SLOTS_2026:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
-    --shard-manifest $S2/ds4-s2-experts-experts-manifest-dspark.json \
-    --descriptor $S2/ds4-s2-experts-experts-manifest-dspark.expert-descriptor.json \
-    --device Vulkan0 --listen 0.0.0.0:8804 --slots $SLOTS_S2 > $OUT/w-s2.log 2>&1 < /dev/null & echo \$! > $OUT/w-s2.pid; }"
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WNULL_2026:+WP_WORKER_NULL=$WNULL_2026 }GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026_ARG}${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }${SPEC_MAX_SLOTS_2026:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+    --shard-manifest $S2/ds4-s2-experts-experts-manifest${MANIFEST_SUFFIX}.json \
+    --descriptor $S2/ds4-s2-experts-experts-manifest${MANIFEST_SUFFIX}.expert-descriptor.json \
+    $SLICE_PIN --device Vulkan0 --listen 0.0.0.0:8804 --slots $SLOTS_S2 > $OUT/w-s2.log 2>&1 < /dev/null & echo \$! > $OUT/w-s2.pid; }"
 sleep 2
 S2_PID=$(w2026_sh "cat $OUT/w-s2.pid" 2>/dev/null); REMOTE_2026_PIDS="$REMOTE_2026_PIDS $S2_PID"
 echo "  w-s2 (480) pid ${S2_PID:-?} on 2026"
@@ -895,18 +970,29 @@ if [ -n "$DSPARK_SPLIT" ]; then
 fi
 
 cd "$MAIN_REPO" || exit 1
-echo "=== waiting for all five sliced workers to listen (main: 8801/8807/8808, 2026: 8803/8804) ==="
+# Ports must mirror what was actually launched above, or this gate times out at
+# 30 min and the EXIT trap kills the HEALTHY workers (that exact bug killed
+# s0+s6900 at 22:36 and 23:12 on 08-23: DSPARK_ON_GPU=1 skips d0/d1 but the
+# gate still probed 8807/8808 — same trap ds4-stackd was already patched for).
+echo "=== waiting for sliced workers to listen (main: 8801${W6900:+/8802-if-armed}, 2026: 8803/8804; d0/d1 only if dspark CPU workers launched) ==="
 for _ in $(seq 1 900); do
     a=$(main_sh  "ss -ltn | grep -c ':8801 '" 2>/dev/null | tail -1)
-    d0=$(main_sh "ss -ltn | grep -c ':8807 '" 2>/dev/null | tail -1)
-    d1=$(main_sh "ss -ltn | grep -c ':8808 '" 2>/dev/null | tail -1)
+    if [ "$W6900" = "1" ]; then
+        e=$(main_sh "ss -ltn | grep -c ':8802 '" 2>/dev/null | tail -1)
+    else e=1; fi
+    if [ "$DSPARK_ON_GPU" = "1" ]; then
+        d0=1; d1=1   # dspark lives on the slice legs; 8807/8808 never start
+    else
+        d0=$(main_sh "ss -ltn | grep -c ':8807 '" 2>/dev/null | tail -1)
+        d1=$(main_sh "ss -ltn | grep -c ':8808 '" 2>/dev/null | tail -1)
+    fi
     b=$(w2026_sh "ss -ltn | grep -c ':8803 '" 2>/dev/null | tail -1)
     c=$(w2026_sh "ss -ltn | grep -c ':8804 '" 2>/dev/null | tail -1)
-    [ "${a:-0}" -ge 1 ] && [ "${b:-0}" -ge 1 ] && [ "${c:-0}" -ge 1 ] && [ "${d0:-0}" -ge 1 ] && [ "${d1:-0}" -ge 1 ] && break
+    [ "${a:-0}" -ge 1 ] && [ "${b:-0}" -ge 1 ] && [ "${c:-0}" -ge 1 ] && [ "${d0:-0}" -ge 1 ] && [ "${d1:-0}" -ge 1 ] && [ "${e:-0}" -ge 1 ] && break
     sleep 2
 done
-echo "  s0(r9700)=${a:-0} s1(1070)=${b:-0} s2(480)=${c:-0} d0=${d0:-0} d1=${d1:-0}"
-[ "${a:-0}" -ge 1 ] && [ "${b:-0}" -ge 1 ] && [ "${c:-0}" -ge 1 ] && [ "${d0:-0}" -ge 1 ] && [ "${d1:-0}" -ge 1 ] || {
+echo "  s0(r9700)=${a:-0} s6900=${e:-0} s1(1070)=${b:-0} s2(480)=${c:-0} d0=${d0:-0} d1=${d1:-0}"
+[ "${a:-0}" -ge 1 ] && [ "${b:-0}" -ge 1 ] && [ "${c:-0}" -ge 1 ] && [ "${d0:-0}" -ge 1 ] && [ "${d1:-0}" -ge 1 ] && [ "${e:-0}" -ge 1 ] || {
     echo "NOT ALL SLICED WORKERS LISTENING"
     main_sh  "tail -20 $OUT/w-s0.log $OUT/w-d0.log $OUT/w-d1.log"
     w2026_sh "tail -20 $OUT/w-s1.log $OUT/w-s2.log"; exit 1; }
