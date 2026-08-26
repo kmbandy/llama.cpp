@@ -30,6 +30,14 @@ public:
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
+                            /* indexer: consumed by ggml_get_rows in qwen4exp.cpp
+                             * build_qsa_top_k, not by an attention kernel, so this
+                             * cache is restricted to types get_rows implements. It
+                             * holds 128-dim pooled indexer keys and measured only
+                             * 288.00 MiB at c=32768, so quantization saves nothing
+                             * meaningful. */
+                ggml_type   idx_type_k,
+                ggml_type   idx_type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
                  uint32_t   n_pad,

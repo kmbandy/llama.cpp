@@ -3438,6 +3438,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
+                            // QSA reads this cache with ggml_get_rows in qwen4exp.cpp build_qsa_top_k,
+                            // not an attention kernel, so keep it to types get_rows implements. It holds
+                            // 128-dim pooled indexer keys and measured only 288.00 MiB at c=32768, so
+                            // quantization saves nothing meaningful.
+                            /* idx_type_k        */ GGML_TYPE_F16,
+                            /* idx_type_v        */ GGML_TYPE_F16,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
