@@ -698,6 +698,43 @@ static void test_expert_partial_dtype_rejects() {
     }
 }
 
+static void test_expert_dispatch_non_finite_rejected() {
+    pipe_expert_dispatch_req request;
+    request.layer = 1;
+    request.n_tokens = 1;
+    request.assignments = { { 2, { std::numeric_limits<float>::quiet_NaN() } } };
+    request.activations = { 1.0f, 2.0f };
+    const std::vector<uint8_t> request_encoded = pipe_encode_expert_dispatch_req(request);
+    CHECK_THROWS_PROTO(
+        pipe_decode_expert_dispatch_req(request_encoded.data(), request_encoded.size(), 2),
+        PIPE_ERR_BAD_FRAME);
+
+    pipe_expert_dispatch_begin begin;
+    begin.layer = request.layer;
+    begin.n_tokens = request.n_tokens;
+    begin.assignments = request.assignments;
+    const std::vector<uint8_t> begin_encoded = pipe_encode_expert_dispatch_begin(begin);
+    CHECK_THROWS_PROTO(
+        pipe_decode_expert_dispatch_begin(begin_encoded.data(), begin_encoded.size()),
+        PIPE_ERR_BAD_FRAME);
+
+    pipe_expert_dispatch_acts acts;
+    acts.activations = { std::numeric_limits<float>::quiet_NaN(), 1.0f };
+    const std::vector<uint8_t> encoded = pipe_encode_expert_dispatch_acts(acts);
+    CHECK_THROWS_PROTO(
+        pipe_decode_expert_dispatch_acts(encoded.data(), encoded.size(), 1, 2),
+        PIPE_ERR_BAD_FRAME);
+    pipe_expert_dispatch_acts_publish publish;
+    publish.n_subscribers = 1;
+    publish.activations = acts.activations;
+    const std::vector<uint8_t> publish_encoded =
+        pipe_encode_expert_dispatch_acts_publish(publish);
+    CHECK_THROWS_PROTO(
+        pipe_decode_expert_dispatch_acts_publish(
+            publish_encoded.data(), publish_encoded.size(), 1, 2),
+        PIPE_ERR_BAD_FRAME);
+}
+
 static void test_token_roundtrip() {
     // empty
     {
@@ -1302,6 +1339,7 @@ int main() {
     test_expert_partial_f32_default_bit_identical();
     test_expert_partial_f16_roundtrip_tolerance();
     test_expert_partial_dtype_rejects();
+    test_expert_dispatch_non_finite_rejected();
     test_token_roundtrip();
     test_error_roundtrip();
     test_endianness_explicit();

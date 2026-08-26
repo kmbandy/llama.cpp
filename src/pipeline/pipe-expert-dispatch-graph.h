@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <thread>
 #include <map>
 #include <memory>
@@ -33,7 +34,8 @@ class graph_dispatcher {
                      int32_t             n_ff_exp,
                      int32_t             n_expert,
                      int32_t             n_expert_used,
-                     int32_t             last_no_defer_layer = -1);
+                     int32_t             last_no_defer_layer = -1,
+                     int32_t             phantom_token = -1);
     ~graph_dispatcher();
 
     graph_dispatcher(const graph_dispatcher &)             = delete;
@@ -168,6 +170,18 @@ class graph_dispatcher {
     // default 0.05).
     static float router2_conf_step();
 
+    // WP_HINT_QUEUE_DEPTH=N (default 0/unset): 0 keeps the legacy one-slot
+    // mailbox byte-identical (a snapshot the predictor thread has not yet
+    // drained is silently overwritten -- see enqueue_prediction). N>0 gives
+    // the spine-to-predictor handoff a bounded FIFO of depth N instead, so a
+    // snapshot is dropped only when N are already queued, and that loss is
+    // counted (pred_queue_overflow()) instead of silent. Depth does not
+    // change which snapshot is scored first within a decode (see
+    // pred_snapshot_taken_) -- only whether a scored-but-not-yet-drained
+    // snapshot from an earlier decode can survive to be drained instead of
+    // being clobbered.
+    static size_t pred_queue_depth();
+
     size_t n_workers() const;
     bool failed() const noexcept;
     std::string failure_message() const;
@@ -189,6 +203,8 @@ class graph_dispatcher {
 
     void latch_failure(const char * message) noexcept;
     void write_layer_trace(int32_t layer) noexcept;
+    bool is_phantom_row(int64_t token) const noexcept;
+    void zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd) const noexcept;
 
     // Predicted-hint pipeline, two halves so the router GEMM never touches the
     // dispatch critical path (measured 2026-08-07: synchronous scoring cost
@@ -208,6 +224,12 @@ class graph_dispatcher {
                             int64_t n_tokens) noexcept;
     void flush_predicted_hints() noexcept;
     void predictor_loop();
+    // Prefill whole-slice L+1 CERTAIN hints. Advisory; never throws.
+    // WP_PREFILL_LAYER_AHEAD=1 and n_tokens > width. Worker catalog path is
+    // the fetch engine; these frames keep the spine/worker hint counters in
+    // the same A/B and stay off the decode spec queue (worker skips enqueue
+    // when the frame is larger than the decode generation cap of 16).
+    void prefetch_layer_ahead(int32_t layer, uint32_t n_tokens) noexcept;
 
     // WP_PREDICT_CAPTURE=<prefix>: append (layer, h, selected experts) records
     // to <prefix>.<pid>.bin -- the dispatch-path routing capture that replaces
@@ -290,7 +312,21 @@ class graph_dispatcher {
         std::vector<float> activations;
         bool               valid    = false;
     };
+    // Legacy one-slot mailbox. Used verbatim (unconditional overwrite, no
+    // count) when pred_queue_depth() == 0, for byte-identical default
+    // behaviour. When the depth knob is set, pred_queue_ below is used
+    // instead and this stays empty.
     pred_job                                       pred_inbox_;
+    // Bounded FIFO used when WP_HINT_QUEUE_DEPTH > 0. push_back on
+    // enqueue_prediction's dispatch thread, pop_front on the predictor
+    // thread; both hold pred_mutex_ while touching it.
+    std::deque<pred_job>                           pred_queue_;
+    // High-water mark of pred_queue_.size(), i.e. the deepest backlog the
+    // predictor ever fell behind by. Read this to size WP_HINT_QUEUE_DEPTH:
+    // if the hwm keeps hitting the configured depth, the predictor is
+    // structurally too slow for the offer rate at this K, and a deeper queue
+    // only trades loss for staleness -- see pred_queue_overflow_.
+    size_t                                         pred_queue_hwm_ = 0;
     struct pred_result {
         uint32_t             n_tokens = 0;
         std::vector<int32_t> experts;
@@ -313,19 +349,81 @@ class graph_dispatcher {
     std::atomic<uint64_t>                          pred_offered_{0};
     std::atomic<uint64_t>                          pred_dropped_{0};
     std::atomic<uint64_t>                          pred_scored_{0};
+    // Queue-path counters (WP_HINT_QUEUE_DEPTH > 0 only; stay 0 otherwise).
+    // pred_queue_overflow_ is the loss pred_dropped_ could never see: a
+    // snapshot that passed the same-decode first-wins gate but arrived while
+    // pred_queue_depth() entries were already queued and undrained. That is
+    // the count that should track down to ~0 as the knob is raised to cover
+    // the real consumer lag; it does not track K, only depth vs. drain rate.
+    std::atomic<uint64_t>                          pred_queue_overflow_{0};
 
   public:
     // Exposed so the decode path can log the cadence at end_decode.
     uint64_t pred_offered() const { return pred_offered_.load(std::memory_order_relaxed); }
     uint64_t pred_dropped() const { return pred_dropped_.load(std::memory_order_relaxed); }
     uint64_t pred_scored()  const { return pred_scored_.load(std::memory_order_relaxed); }
+    uint64_t pred_queue_overflow() const { return pred_queue_overflow_.load(std::memory_order_relaxed); }
+    // Snapshot of the high-water mark. Not atomic -- only ever read from the
+    // dispatch thread at end_decode(), same thread that (via pred_mutex_)
+    // updates it, so a lock here would be for a race that cannot happen on
+    // this read; kept simple rather than adding a fifth atomic.
+    size_t pred_queue_high_water() const { return pred_queue_hwm_; }
 
   private:
+    // MAD-LAB DS4-Flash pipeline-streams: per-dispatcher socket exclusivity.
+    // A single-stream server never needed this -- exactly one thread ever
+    // drove a `graph_dispatcher`'s decode, so compute()/compute_issue()/
+    // compute_wait() (the ggml custom-op callbacks that do the actual
+    // socket I/O -- see below) and the hint-send entry points
+    // (prefetch_for_tokens/prefetch_ngram_for_tokens/flush_reuse_hints/
+    // flush_predicted_hints, called from llama_context::decode() and from
+    // inside compute()/compute_issue() respectively) were implicitly
+    // serialized by there being only one caller thread.
+    //
+    // Pipeline-streams breaks that implicit invariant WITHOUT anyone
+    // calling this dispatcher's sockets from two DIFFERENT stream threads:
+    // a speculative draft context (ctx_dft) BORROWS its target's dispatcher
+    // (src/llama-context.cpp:622-660, params.ctx_other), so ctx_dft2's
+    // expert_dispatch IS THE SAME graph_dispatcher OBJECT as ctx_tgt2's.
+    // common_speculative_draft() (called from
+    // tools/server/server-context.cpp's pre_decode(), which this server
+    // runs for BOTH streams sequentially on the MAIN thread) can invoke
+    // llama_decode(ctx_dft2, ...) -- see the multiple llama_decode(ctx_dft,
+    // ...) call sites in common/speculative.cpp -- which runs THIS SAME
+    // dispatcher's compute()/compute_issue()/compute_wait() callbacks on
+    // the MAIN thread, while stream_b_thread_ can simultaneously be
+    // running llama_decode(ctx_tgt2, ...) against the identical dispatcher
+    // object. Two threads, one dispatcher, its own sockets -- exactly the
+    // "MUST NOT be called with a dispatch in flight: it writes to the same
+    // sockets" hazard prefetch_for_tokens()'s doc comment already named,
+    // now reachable via the draft-context path instead of a hint call
+    // racing a dispatch on one thread.
+    //
+    // Fix: one mutex per dispatcher instance, held for the full duration of
+    // every entry point that touches `remote` (the socket-owning
+    // connection): compute()/compute_issue()/compute_wait() (the real
+    // dispatch + publish path) and prefetch_for_tokens()/
+    // prefetch_ngram_for_tokens()/flush_reuse_hints()/flush_predicted_hints()
+    // (the hint-send path). Recursive because flush_predicted_hints() is
+    // called from INSIDE compute()/compute_issue() (same thread, nested) --
+    // a plain mutex would self-deadlock there. This does not serialize
+    // stream A against stream B (separate graph_dispatcher instances,
+    // separate mutexes) -- it only serializes a dispatcher against itself,
+    // which is what "per-dispatcher socket exclusivity" means. Correctness
+    // over hint throughput: a hint call that loses the race just declines
+    // (mirrors the existing in_flight-declines-a-hint pattern) or, for the
+    // rarer case of a dispatch itself blocking briefly on a same-dispatcher
+    // hint flush already in progress, pays a short wait -- never a torn
+    // frame on the wire.
+    mutable std::recursive_mutex                  io_mutex_;
+
     bool                                           pred_stop_ = false;
     std::thread                                    pred_thread_;
     std::atomic<bool>                              pred_thread_started_{ false };
     std::unique_ptr<ngram_hint_table>              ngram_table_;
     int32_t                                        ngram_top_m_ = 0;
+    int32_t                                        phantom_token_ = -1;
+    std::vector<uint8_t>                           phantom_rows_;
     // WP_PREDICT_CAPTURE stream; opened on first record, closed in the dtor.
     FILE *                                         capture_file_ = nullptr;
     std::atomic<uint64_t>                          next_seq_id{ 1 };

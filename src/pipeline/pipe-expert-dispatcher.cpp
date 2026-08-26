@@ -102,6 +102,30 @@ bool split_frame_enabled() {
     return value != nullptr && value[0] != '0';
 }
 
+// WP_CONCURRENT_ISSUE -- default OFF. Independent of, and deliberately NOT
+// built on, WP_ASYNC_ISSUE's socket_writer (a FIFO queue drained by a thread
+// woken per-frame via condvar, MAX_QUEUE=8 backpressure, payload moved into
+// the queued frame). That shape was measured net-negative (+60 ms/dispatch,
+// occasional multi-second stalls -- see async_issue_enabled() above and KG
+// 777a57ff) and issue_requests() never waits for it, so a slow/wedged writer
+// is only discovered lazily at the next await/enqueue.
+//
+// This flag instead uses a persistent one-job-slot sender per socket (see
+// concurrent_sender): issue_requests() posts every worker's frame(s) without
+// blocking, THEN joins every posted job before returning -- so the send wall
+// time collapses from the SUM of per-link sends to the MAX, but the caller's
+// contract (issue_requests returns only once every worker has been sent, and
+// throws exactly as the serial path does on a failed send) is unchanged. No
+// queue and nothing to grow unbounded: at most one job is ever outstanding
+// per socket, because this thread posts then joins before that socket's next
+// job is ever posted. No payload copy: the job holds a pointer straight into
+// the request's payload/begin_payload/acts_payload vectors, which outlive the
+// join.
+bool concurrent_issue_enabled() {
+    const char * value = std::getenv("WP_CONCURRENT_ISSUE");
+    return value != nullptr && value[0] != '0';
+}
+
 // WP_DISPATCH_HARVEST=1 opts in to as-ready harvesting (poll() across all
 // outstanding worker sockets, accumulate each partial the moment it arrives,
 // then reduce in FIXED request order so the sum stays float-order
@@ -126,6 +150,59 @@ bool split_frame_enabled() {
 // justifies flipping it.
 bool harvest_enabled() {
     const char * value = std::getenv("WP_DISPATCH_HARVEST");
+    return value != nullptr && value[0] == '1';
+}
+
+// WP_UNPACK_OVERLAP=1 -- DEFAULT OFF. A second, independent opt-in into the
+// SAME poll_harvest_receive() mechanism as WP_DISPATCH_HARVEST above, kept as
+// its own flag rather than folded into that one because the two were measured
+// for different things and the record for WP_DISPATCH_HARVEST (see the block
+// above: net neutral for WAIT time, because the workers were already
+// overlapping and the layer still completes at max(worker arrival) either
+// way -- KG 777a57ff / "HARVEST-AS-READY ... CLOSED AS NEUTRAL") should not be
+// read as a verdict on THIS question.
+//
+// The question this flag answers is narrower: today's fixed-order path
+// (accumulate_partial, one worker at a time -- block-recv worker i, THEN
+// wire-decode + fold worker i, THEN move to worker i+1) pays every worker's
+// decode/deserialize cost serially, back to back, even for a worker whose
+// bytes had already been sitting in its socket's receive buffer for
+// milliseconds while we were still blocked on an earlier worker in fixed
+// order. TCP reception itself is async in the kernel regardless of when we
+// call recv() -- so if worker A (early in fixed order) is this layer's long
+// pole and workers B..E answer sooner but later in fixed order, the naive
+// loop still decodes A, then B, then C, ... entirely after A's slow arrival,
+// serializing every worker's CPU decode cost onto the tail of the slowest
+// worker's network wait. poll_harvest_receive() breaks that coupling: it
+// decodes each response AS SOON AS ITS SOCKET IS READY (poll(), arrival
+// order), so a fast worker's bytes get wire-decoded WHILE the slow worker's
+// data is still in flight over the network -- genuine overlap of spine CPU
+// decode work with the remaining network wait, using the SAME dispatch
+// thread that already blocks in the harvest loop (zero new threads; compare
+// WP_ASYNC_ISSUE, per-socket ISSUE-side writer threads, KG 777a57ff,
+// measured NET-NEGATIVE with nondeterministic multi-second stalls -- this is
+// deliberately not that shape). The final SUM/fold still walks `requests` in
+// the same fixed worker-registration order as always (see the "WHY SUM IN
+// FIXED ORDER" note on harvest_partials), so summation order and therefore
+// the teacher-forced NLL are unaffected -- only WHEN each response gets
+// wire-decoded moves, never in what order the decoded values are added.
+//
+// Because this reuses poll_harvest_receive()/harvest_partials() -- the exact
+// same code as WP_DISPATCH_HARVEST=1 -- setting either flag takes the same
+// branch in finish_dispatch()/collect_pending_deferred(). They are kept as
+// two names because they answer two different measurement questions and a
+// future re-test of one should not be read as also re-testing the other.
+//
+// Timer-attribution note: with this flag on, `stats.ns_wait` (issue -> last
+// raw payload observed) now reflects the true last-TO-ARRIVE worker rather
+// than always the fixed-order-last worker, and per-worker decode/fold cost
+// that used to land after the last fixed-order recv (visible as "unpack" in
+// the forward-budget WARN line) is now spread earlier, overlapped with wait
+// on a slower peer. The WARN line's ns_unpack bucket can therefore shrink
+// even though no work was removed -- see the note printed at construction
+// below and the one added next to the forward-budget WARN format string.
+bool unpack_overlap_enabled() {
+    const char * value = std::getenv("WP_UNPACK_OVERLAP");
     return value != nullptr && value[0] == '1';
 }
 
@@ -495,12 +572,39 @@ struct dispatcher::impl {
         static constexpr size_t MAX_QUEUE = 8;
     };
 
+    // WP_CONCURRENT_ISSUE: one persistent sender thread per socket, but unlike
+    // socket_writer above there is no queue -- a single job slot, posted then
+    // joined by issue_requests() before it returns. See concurrent_issue_enabled()
+    // for why this is a different shape from WP_ASYNC_ISSUE, not a copy of it.
+    struct concurrent_sender {
+        pipe_socket_ptr    socket;   // own ref, same reasoning as socket_writer's
+        std::thread        thread;
+        std::mutex         mutex;
+        std::condition_variable cv;
+        bool               stop      = false;
+        bool               has_job   = false;
+        bool               job_done  = true;
+        bool               ok        = true;
+        // Job description. Valid only while has_job is true; points directly
+        // into the posting request's payload vectors (no copy) which outlive
+        // the join because issue_requests() does not return until job_done.
+        pipe_frame_type    type1 = PIPE_HELLO;
+        pipe_frame_type    type2 = PIPE_HELLO;
+        bool               has_second = false;
+        uint64_t           seq_id = 0;
+        const uint8_t *     data1 = nullptr;
+        size_t              len1  = 0;
+        const uint8_t *     data2 = nullptr;
+        size_t              len2  = 0;
+    };
+
     struct worker {
         endpoint                                 target;
         worker_info                              info;
         pipe_expert_hello                        hello;
         pipe_socket_ptr                          socket;
         std::unique_ptr<socket_writer>           writer;
+        std::unique_ptr<concurrent_sender>       sender;
         // D9: residency LRU as std::list + unordered_map (key = layer<<32|expert)
         // instead of an O(n_slots) vector memmove per assignment. Dispatch-thread
         // only -- the writer threads never touch it.
@@ -658,6 +762,16 @@ struct dispatcher::impl {
     // WP_ASYNC_ISSUE latch (D1). True => issue/hint frames go through per-socket
     // writer threads instead of blocking send() on the dispatch thread.
     bool                                                async_issue = false;
+    // WP_CONCURRENT_ISSUE latch. See concurrent_issue_enabled() for the design
+    // note. Forced off when async_issue is also requested (mutually exclusive:
+    // both would try to put THIS request's frames on the wire through a
+    // different mechanism) -- enforced in the constructor, not on the dispatch
+    // path.
+    bool                                                concurrent_issue = false;
+    // WP_UNPACK_OVERLAP latch. See unpack_overlap_enabled() for the full
+    // design note. Latched once, like the other flags above, so a per-layer
+    // getenv never appears on the dispatch path.
+    bool                                                unpack_overlap = false;
     bool                                                split_frame = false;
     // WP_DISPATCH_DEDUP_ACTIVATIONS latch. Requires split_frame (the mechanism
     // extends the BEGIN/ACTS split with two more per-machine-role ACTS
@@ -712,8 +826,21 @@ struct dispatcher::impl {
     explicit impl(const std::vector<endpoint> & endpoints) :
                 speed_split(speed_split_enabled()),
                 static_assign(static_assign_enabled()),
-                async_issue(async_issue_enabled()) {
+                async_issue(async_issue_enabled()),
+                unpack_overlap(unpack_overlap_enabled()) {
         decode_prefer_port_ = decode_prefer_port_enabled();
+        if (unpack_overlap) {
+            std::fprintf(stderr,
+                         "expert dispatch: WP_UNPACK_OVERLAP=1 -- decoding worker partials as they "
+                         "arrive (poll order), folding in fixed worker order (bit-exact); forward-"
+                         "budget ns_wait may now include decode cost that used to show as ns_unpack\n");
+        }
+        concurrent_issue = concurrent_issue_enabled() && !async_issue;
+        if (concurrent_issue_enabled() && !concurrent_issue) {
+            std::fprintf(stderr,
+                         "expert dispatch: WP_CONCURRENT_ISSUE requested but disabled "
+                         "(mutually exclusive with WP_ASYNC_ISSUE)\n");
+        }
         decode_max_tokens_  = decode_max_tokens_enabled();
         const int connect_retry_s = dispatch_connect_retry_seconds();
         const auto connect_deadline = dispatch_clock::now() + std::chrono::seconds(connect_retry_s);
@@ -883,11 +1010,13 @@ struct dispatcher::impl {
                          (unsigned) decode_max_tokens_, decode_prefer_port_);
         }
         start_writers();
+        start_concurrent_senders();
     }
 
     // Normal destruction lets queued frames drain before joining writers.
     ~impl() {
         stop_writers(false);
+        stop_concurrent_senders();
         if (req_log_ != nullptr) fclose(req_log_);
         if (writer_log_ != nullptr) fclose(writer_log_);
         if (routing_dump_ != nullptr) fclose(routing_dump_);
@@ -1086,6 +1215,130 @@ struct dispatcher::impl {
             w->queue.push_back(std::move(frame));
         }
         w->cv.notify_one();
+    }
+
+    void start_concurrent_senders() {
+        if (!concurrent_issue) {
+            return;
+        }
+        try {
+            for (worker & value : workers) {
+                value.sender.reset(new concurrent_sender{});
+                value.sender->socket = value.socket;   // own ref, see field comment
+                concurrent_sender * s = value.sender.get();
+                s->thread = std::thread([this, s]() { concurrent_sender_loop(s); });
+            }
+        } catch (...) {
+            stop_concurrent_senders();
+            throw;
+        }
+    }
+
+    void stop_concurrent_senders() {
+        for (worker & value : workers) {
+            concurrent_sender * s = value.sender.get();
+            if (!s) {
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(s->mutex);
+                s->stop = true;
+            }
+            s->cv.notify_all();
+        }
+        for (worker & value : workers) {
+            concurrent_sender * s = value.sender.get();
+            if (!s) {
+                continue;
+            }
+            if (s->thread.joinable()) {
+                s->thread.join();
+            }
+            s->socket.reset();
+        }
+    }
+
+    // Sender thread body: block for a job, run its one or two blocking sends on
+    // THIS thread (so this socket's frame order is exactly as posted, matching
+    // the serial path's per-socket order), report completion, go back to
+    // sleep. No queue: the poster (issue_requests, via join_concurrent_job)
+    // never posts a socket's next job until it has joined this one, so there is
+    // at most one job in flight per socket and nothing here can back up.
+    void concurrent_sender_loop(concurrent_sender * s) {
+        while (true) {
+            std::unique_lock<std::mutex> lock(s->mutex);
+            s->cv.wait(lock, [s]() { return s->stop || s->has_job; });
+            if (!s->has_job) {
+                // stop with no pending job
+                break;
+            }
+            const pipe_frame_type type1 = s->type1;
+            const pipe_frame_type type2 = s->type2;
+            const bool             has_second = s->has_second;
+            const uint64_t          seq_id = s->seq_id;
+            const uint8_t * const   data1 = s->data1;
+            const size_t             len1 = s->len1;
+            const uint8_t * const   data2 = s->data2;
+            const size_t             len2 = s->len2;
+            lock.unlock();
+
+            bool ok = pipe_send_frame(*s->socket, type1, seq_id, data1, len1);
+            if (ok && has_second) {
+                ok = pipe_send_frame(*s->socket, type2, seq_id, data2, len2);
+            }
+
+            lock.lock();
+            s->ok       = ok;
+            s->has_job  = false;
+            s->job_done = true;
+            lock.unlock();
+            s->cv.notify_all();
+        }
+    }
+
+    // Post one frame's worth of a job (non-split path).
+    void post_concurrent_job(concurrent_sender & s, pipe_frame_type type, const std::vector<uint8_t> & payload,
+                             uint64_t seq_id) {
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            s.type1       = type;
+            s.data1       = payload.data();
+            s.len1        = payload.size();
+            s.has_second  = false;
+            s.seq_id      = seq_id;
+            s.has_job     = true;
+            s.job_done    = false;
+        }
+        s.cv.notify_one();
+    }
+
+    // Post a two-frame job (split-frame path): BEGIN then ACTS, sent back to
+    // back by the same sender thread so this socket's wire order is unchanged.
+    void post_concurrent_job(concurrent_sender & s, pipe_frame_type type1, const std::vector<uint8_t> & payload1,
+                             pipe_frame_type type2, const std::vector<uint8_t> & payload2, uint64_t seq_id) {
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            s.type1       = type1;
+            s.data1       = payload1.data();
+            s.len1        = payload1.size();
+            s.type2       = type2;
+            s.data2       = payload2.data();
+            s.len2        = payload2.size();
+            s.has_second  = true;
+            s.seq_id      = seq_id;
+            s.has_job     = true;
+            s.job_done    = false;
+        }
+        s.cv.notify_one();
+    }
+
+    // Block until the job posted to this socket finishes. Returns whether the
+    // send(s) succeeded; the caller (issue_requests) throws with the same
+    // wording the serial path uses on failure.
+    bool join_concurrent_job(concurrent_sender & s) {
+        std::unique_lock<std::mutex> lock(s.mutex);
+        s.cv.wait(lock, [&s]() { return s.job_done; });
+        return s.ok;
     }
 
     void build_routes() {
@@ -1580,8 +1833,10 @@ struct dispatcher::impl {
         // (the reason we are poisoning) or once it sees the stop flag; joining
         // here guarantees no thread is left running into impl storage. Idempotent
         // with ~impl's stop_writers() -- the threads are already joined by the
-        // time the object is destroyed.
+        // time the object is destroyed. Same reasoning for the concurrent-issue
+        // senders.
         stop_writers(true);
+        stop_concurrent_senders();
         for (worker & value : workers) {
             value.socket.reset();
         }
@@ -2072,6 +2327,13 @@ struct dispatcher::impl {
         for (planned_request & request : requests) {
             by_worker_index[request.worker_index] = &request;
         }
+        // WP_CONCURRENT_ISSUE: requests posted to a socket's sender thread in
+        // this pass are joined in this same fixed (issue_order) order in the
+        // second pass below, once every socket's job has been posted -- so the
+        // wall time this loop pays for sends collapses to the MAX per-link send
+        // instead of their SUM, while still throwing on the first FAILED send
+        // in the same order the serial path would have reached it.
+        std::vector<std::pair<worker *, planned_request *>> concurrent_pending;
         for (size_t widx : issue_order) {
             planned_request * req_ptr = by_worker_index[widx];
             if (req_ptr == nullptr) {
@@ -2114,6 +2376,15 @@ struct dispatcher::impl {
                 acts.layer = request.layer;
                 acts.payload = std::move(request.acts_payload);
                 enqueue_frame(value, std::move(acts));
+            } else if (split_frame && concurrent_issue) {
+                // Scatter: post BEGIN+ACTS to this worker's persistent sender
+                // thread and move on to the next worker immediately -- do NOT
+                // block here. All sockets' sends run concurrently; joined below
+                // once every worker in this dispatch has been posted.
+                post_concurrent_job(*value.sender, PIPE_EXPERT_DISPATCH_BEGIN, request.begin_payload,
+                                    PIPE_EXPERT_DISPATCH_ACTS, request.acts_payload, seq_id);
+                concurrent_pending.emplace_back(&value, &request);
+                continue;
             } else if (split_frame) {
                 if (!send_frame(PIPE_EXPERT_DISPATCH_BEGIN, request.begin_payload) ||
                     !send_frame(PIPE_EXPERT_DISPATCH_ACTS, request.acts_payload)) {
@@ -2131,10 +2402,33 @@ struct dispatcher::impl {
                 frame.layer   = request.layer;
                 frame.payload = std::move(request.payload);
                 enqueue_frame(value, std::move(frame));
+            } else if (concurrent_issue) {
+                // Scatter (non-split path); see the split_frame branch above.
+                post_concurrent_job(*value.sender, PIPE_EXPERT_DISPATCH_REQ, request.payload, seq_id);
+                concurrent_pending.emplace_back(&value, &request);
+                continue;
             } else if (!send_frame(PIPE_EXPERT_DISPATCH_REQ, request.payload)) {
                 throw std::runtime_error("expert dispatcher failed to send expert(s) " +
                                          assignment_experts(request.assignments) + " to worker " +
                                          value.info.endpoint);
+            }
+            note_in_flight_delta(+1);
+            ++stats.requests_issued;
+        }
+        // Join pass: block on each posted job in the same fixed order the
+        // requests were posted (== issue_order), so a failure surfaces against
+        // the same worker the serial path would have failed on first. This is
+        // where the wait for "slowest link" actually happens -- everything
+        // before this point only enqueued a job.
+        for (auto & [worker_ptr, request_ptr] : concurrent_pending) {
+            if (!join_concurrent_job(*worker_ptr->sender)) {
+                if (split_frame) {
+                    throw std::runtime_error("expert dispatcher failed to send split expert request to worker " +
+                                             worker_ptr->info.endpoint);
+                }
+                throw std::runtime_error("expert dispatcher failed to send expert(s) " +
+                                         assignment_experts(request_ptr->assignments) + " to worker " +
+                                         worker_ptr->info.endpoint);
             }
             note_in_flight_delta(+1);
             ++stats.requests_issued;
@@ -2519,13 +2813,14 @@ struct dispatcher::impl {
         std::vector<planned_request> requests = std::move(pending_def.requests);
         pending_def.requests.clear();
 
-        // WP_DISPATCH_HARVEST=1: the deferred fold has the identical serial-
-        // await shape harvest_partials fixes for immediate requests -- N-1's
-        // deferred requests were also issued to every slice worker, then
-        // awaited worker-by-worker here. Route through the same poll-and-
-        // reduce-in-fixed-order helper so both await paths agree under one
-        // flag; default OFF keeps this loop's prior behaviour untouched.
-        if (harvest_enabled()) {
+        // WP_DISPATCH_HARVEST=1 or WP_UNPACK_OVERLAP=1: the deferred fold has
+        // the identical serial-await shape harvest_partials fixes for
+        // immediate requests -- N-1's deferred requests were also issued to
+        // every slice worker, then awaited worker-by-worker here. Route
+        // through the same poll-and-reduce-in-fixed-order helper so both
+        // await paths agree under either flag; default (both off) keeps this
+        // loop's prior behaviour untouched.
+        if (harvest_enabled() || unpack_overlap) {
             std::vector<std::vector<float>> partials =
                 poll_harvest_receive(requests, seq_id, layer, n_tok, nullptr);
             for (size_t i = 0; i < requests.size(); ++i) {
@@ -2774,12 +3069,19 @@ struct dispatcher::impl {
             }
 
             dispatch_clock::time_point last_response;
-            // See harvest_enabled() for the flag's meaning and the measured
-            // default-OFF rationale; both the immediate-request harvest here
-            // and the deferred-fold harvest in collect_pending_deferred share
-            // one flag so they can never disagree about which await shape is
-            // in effect for a given run.
-            const bool harvest = harvest_enabled();
+            // See harvest_enabled() for WP_DISPATCH_HARVEST's meaning and the
+            // measured default-OFF rationale, and unpack_overlap_enabled()
+            // for WP_UNPACK_OVERLAP -- a second, independent opt-in into the
+            // SAME poll-and-fixed-order-fold mechanism (poll_harvest_receive/
+            // harvest_partials), aimed at overlapping per-worker wire-decode
+            // cost with a slower peer's network wait rather than at reducing
+            // wait time itself. Either flag takes this branch; both the
+            // immediate-request harvest here and the deferred-fold harvest in
+            // collect_pending_deferred read the SAME `unpack_overlap` latch
+            // (member field, latched once at construction) so a dispatch can
+            // never disagree with itself about which await shape is in
+            // effect for a given run.
+            const bool harvest = harvest_enabled() || unpack_overlap;
             if (harvest) {
                 harvest_partials(result, imm_requests, seq_id, layer, n_tokens, &last_response);
                 for (size_t request_index = 0; request_index < imm_requests.size(); ++request_index) {

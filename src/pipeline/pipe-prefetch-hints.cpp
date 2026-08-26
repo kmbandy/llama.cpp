@@ -121,17 +121,38 @@ std::vector<int32_t> router2_top_experts(const float * weights,
                                          int32_t       n_embd,
                                          int32_t       top_m,
                                          float         min_conf) {
+    router2_scratch scratch;
+    return router2_top_experts(weights, bias, activations, n_tokens, n_expert, n_embd,
+                               top_m, min_conf, scratch);
+}
+
+std::vector<int32_t> router2_top_experts(const float *      weights,
+                                         const float *      bias,
+                                         const float *      activations,
+                                         int64_t            n_tokens,
+                                         int32_t            n_expert,
+                                         int32_t            n_embd,
+                                         int32_t            top_m,
+                                         float              min_conf,
+                                         router2_scratch &  scratch) {
     if (weights == nullptr || bias == nullptr || activations == nullptr || n_tokens <= 0 || n_expert <= 0 ||
         n_embd <= 0 || top_m <= 0) {
         return {};
     }
 
     top_m = std::min(top_m, n_expert);
-    std::vector<int> hits((size_t) n_expert, 0);
-    double           best_p = 0.0;
-    std::vector<double> logits((size_t) n_expert);
-    std::vector<double> scores((size_t) n_expert);
-    std::vector<int32_t> order((size_t) n_expert);
+    // Reuse the caller's scratch: resize only grows the underlying buffer
+    // (never shrinks capacity), and every slot is overwritten below before
+    // it is read, so no explicit clear is needed for logits/scores/order.
+    std::vector<int> &     hits   = scratch.hits;
+    std::vector<double> &  logits = scratch.logits;
+    std::vector<double> &  scores = scratch.scores;
+    std::vector<int32_t> & order  = scratch.order;
+    hits.assign((size_t) n_expert, 0);
+    logits.resize((size_t) n_expert);
+    scores.resize((size_t) n_expert);
+    order.resize((size_t) n_expert);
+    double best_p = 0.0;
     for (int64_t token = 0; token < n_tokens; ++token) {
         const float * h = activations + (size_t) token * (size_t) n_embd;
         double        max_logit = -std::numeric_limits<double>::infinity();
@@ -181,7 +202,8 @@ std::vector<int32_t> router2_top_experts(const float * weights,
     if (min_conf > 0.0f && best_p < (double) min_conf) {
         return {};
     }
-    std::vector<int32_t> kept;
+    std::vector<int32_t> & kept = scratch.kept;
+    kept.clear();
     kept.reserve((size_t) n_expert);
     for (int32_t expert = 0; expert < n_expert; ++expert) {
         if (hits[(size_t) expert] > 0) {
@@ -200,7 +222,8 @@ std::vector<int32_t> router2_top_experts(const float * weights,
         kept.resize((size_t) PREFETCH_HINT_MAX_EXPERTS);
         std::sort(kept.begin(), kept.end());
     }
-    return kept;
+    // Caller receives its own copy -- scratch.kept is overwritten next call.
+    return std::vector<int32_t>(kept.begin(), kept.end());
 }
 
 uint64_t ngram_hint_table::key(int32_t token, int32_t layer) {

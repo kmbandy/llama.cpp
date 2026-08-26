@@ -33,6 +33,19 @@ bool dispatch_stats_enabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+// Guards phantom-row detection (note_batch_tokens below): only meaningful
+// when the verify/draft batch is actually padded with phantom mask tokens,
+// which since the 2026-08-24 split is WP_SPEC_CONST_WIDTH's decision alone
+// -- WP_DS4_CONST_SHAPE=1 no longer implies padding (see
+// tools/server/server-context.cpp server_spec_const_width()).
+bool const_shape_enabled() {
+    static const bool enabled = [] {
+        const char * width = std::getenv("WP_SPEC_CONST_WIDTH");
+        return width != nullptr && std::atoi(width) > 0;
+    }();
+    return enabled;
+}
+
 bool layer_trace_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_DS4_LAYER_TRACE");
@@ -126,8 +139,10 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
                                    int32_t             n_ff_exp,
                                    int32_t             n_expert,
                                    int32_t             n_expert_used,
-                                   int32_t             last_no_defer_layer) :
+                                   int32_t             last_no_defer_layer,
+                                   int32_t             phantom_token) :
     remote(parse_endpoints(endpoints)),
+    phantom_token_(phantom_token),
     collect_stats_(dispatch_stats_enabled()) {
     if (layer_trace_enabled()) {
         const char * p = std::getenv("WP_DS4_LAYER_TRACE");
@@ -135,6 +150,11 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
         if (layer_trace_ != nullptr) {
             LLAMA_LOG_WARN("expert dispatch: WP_DS4_LAYER_TRACE=%s (one line per layer)\n", p);
         }
+    }
+    if (const char * p = std::getenv("WP_DISPATCH_NULL"); p != nullptr && p[0] == '1') {
+        LLAMA_LOG_WARN(
+            "expert dispatch: WP_DISPATCH_NULL=1 (TIMING PROBE: routed experts "
+            "zeroed, workers never contacted, outputs are garbage)\n");
     }
     if (const char * p = std::getenv("WP_FORWARD_LOG"); p != nullptr && p[0] != '\0') {
         forward_log_ = std::fopen(p, "w");
@@ -323,11 +343,11 @@ ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * te
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("after_issue has no issue node for layer " + std::to_string(layer));
     }
-    // 0 * issued[0], broadcast and added. Identity on finite values; the only
-    // purpose is a compute edge so shexp cannot be scheduled before the send.
+    // ACC keeps both src edges, so the scheduler cannot start this tensor before issue.
+    // Only one element is touched instead of broadcasting zero over the full tensor.
     ggml_tensor * gate = ggml_view_1d(ctx, it->second->issued, 1, 0);
     ggml_tensor * zero = ggml_scale(ctx, gate, 0.0f);
-    return ggml_add(ctx, tensor, ggml_repeat(ctx, zero, tensor));
+    return ggml_acc_inplace(ctx, tensor, zero, tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
 }
 
 ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, ggml_tensor * shexp, int32_t layer) {
@@ -443,6 +463,8 @@ void graph_dispatcher::note_dispatched_experts(
 }
 
 size_t graph_dispatcher::flush_reuse_hints() noexcept {
+    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
     if (!reuse_last_enabled() || !hint_enabled() || last_dispatched_.empty()) {
         return 0;
     }
@@ -527,6 +549,11 @@ size_t graph_dispatcher::predicted_top_m() {
 
 size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_tokens,
                                              size_t n_certain, const float * conf) {
+    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration. This
+    // is the exact function whose doc comment already said "MUST NOT be
+    // called with a dispatch in flight: it writes to the same sockets" --
+    // now enforced rather than just documented.
+    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
     if (!hint_enabled() || oracle_.empty() || tokens == nullptr || n_tokens == 0) {
         return 0;
     }
@@ -686,6 +713,18 @@ int graph_dispatcher::router2_lookahead() {
     return value;
 }
 
+size_t graph_dispatcher::pred_queue_depth() {
+    static const size_t value = [] {
+        const char * v = std::getenv("WP_HINT_QUEUE_DEPTH");
+        if (v == nullptr || v[0] == '\0') {
+            return (size_t) 0;   // legacy one-slot mailbox, byte-identical
+        }
+        const long n = strtol(v, nullptr, 10);
+        return n > 0 ? (size_t) n : (size_t) 0;
+    }();
+    return value;
+}
+
 float graph_dispatcher::router2_conf_step() {
     static const float value = [] {
         const char * v = std::getenv("WP_HINT_ROUTER2_CONF_STEP");
@@ -742,21 +781,52 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
         if (!pred_thread_started_.exchange(true)) {
             pred_thread_ = std::thread([this] { predictor_loop(); });
         }
+        const size_t depth = pred_queue_depth();
         {
             std::lock_guard<std::mutex> lock(pred_mutex_);
             ++pred_offered_;
             // First snapshot this decode is the one with lead. Overwriting it
             // with a later layer (latest-wins) is what made K=7 score middle
-            // layers with no lead. Drop the NEW job instead.
+            // layers with no lead. Drop the NEW job instead. This gate decides
+            // WHAT gets scored (the earliest layer, for maximum lead) and is
+            // unchanged by WP_HINT_QUEUE_DEPTH -- the queue only changes
+            // whether an ACCEPTED snapshot can survive the predictor still
+            // being busy with a previous one.
             if (pred_snapshot_taken_) {
                 ++pred_dropped_;
                 return;
             }
-            pred_snapshot_taken_     = true;
-            pred_inbox_.layer        = layer;
-            pred_inbox_.n_tokens     = n_tokens;
-            pred_inbox_.activations.assign(activations.begin(), activations.end());
-            pred_inbox_.valid        = true;
+            pred_snapshot_taken_ = true;
+
+            if (depth == 0) {
+                // Legacy path: one slot, unconditional overwrite, byte-identical
+                // to the mailbox this replaces when the knob is unset. If the
+                // predictor has not yet drained a previous decode's snapshot
+                // (pred_inbox_.valid still true), this silently replaces it --
+                // exactly as before. That silent loss is invisible to
+                // pred_dropped_/pred_offered_/pred_scored_, which is the gap
+                // WP_HINT_QUEUE_DEPTH exists to close.
+                pred_inbox_.layer    = layer;
+                pred_inbox_.n_tokens = n_tokens;
+                pred_inbox_.activations.assign(activations.begin(), activations.end());
+                pred_inbox_.valid    = true;
+            } else {
+                // Bounded FIFO: never overwrites a queued-but-undrained
+                // snapshot. Full is the only way to lose one here, and that
+                // loss is counted (pred_queue_overflow_) and distinct from
+                // pred_dropped_ (same-decode duplicate suppression above).
+                if (pred_queue_.size() >= depth) {
+                    ++pred_queue_overflow_;
+                    return;
+                }
+                pred_job job;
+                job.layer    = layer;
+                job.n_tokens = n_tokens;
+                job.activations.assign(activations.begin(), activations.end());
+                job.valid    = true;
+                pred_queue_.push_back(std::move(job));
+                pred_queue_hwm_ = std::max(pred_queue_hwm_, pred_queue_.size());
+            }
         }
         pred_cv_.notify_one();
     } catch (...) {
@@ -765,16 +835,28 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
 }
 
 void graph_dispatcher::predictor_loop() {
+    // Reused across every job this thread ever scores (single-threaded
+    // consumer, so no locking needed): see router2_scratch on why this
+    // matters once WP_HINT_QUEUE_DEPTH lets more than one snapshot per
+    // decode reach the K-deep GEMV loop below.
+    router2_scratch scratch;
     for (;;) {
         pred_job job;
         {
             std::unique_lock<std::mutex> lock(pred_mutex_);
-            pred_cv_.wait(lock, [this] { return pred_stop_ || pred_inbox_.valid; });
+            pred_cv_.wait(lock, [this] {
+                return pred_stop_ || pred_inbox_.valid || !pred_queue_.empty();
+            });
             if (pred_stop_) {
                 return;
             }
-            job = std::move(pred_inbox_);
-            pred_inbox_.valid = false;
+            if (!pred_queue_.empty()) {
+                job = std::move(pred_queue_.front());
+                pred_queue_.pop_front();
+            } else {
+                job = std::move(pred_inbox_);
+                pred_inbox_.valid = false;
+            }
             ++pred_scored_;
         }
         try {
@@ -818,7 +900,7 @@ void graph_dispatcher::predictor_loop() {
                 const router_layer & rl = it->second;
                 std::vector<int32_t> experts = router2_top_experts(
                     rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
-                    n_expert, n_embd, m, conf);
+                    n_expert, n_embd, m, conf, scratch);
                 if (experts.empty()) {
                     continue;   // the gate rejected the whole layer: correct, not a failure
                 }
@@ -834,6 +916,11 @@ void graph_dispatcher::predictor_loop() {
 }
 
 void graph_dispatcher::flush_predicted_hints() noexcept {
+    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+    // Recursive because this is called from INSIDE compute()/compute_issue()
+    // (same thread, already holding io_mutex_) as well as, in principle,
+    // standalone -- a plain mutex would self-deadlock on the nested case.
+    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
     try {
         std::map<int32_t, pred_result> ready;
         {
@@ -881,7 +968,54 @@ void graph_dispatcher::flush_predicted_hints() noexcept {
     }
 }
 
+void graph_dispatcher::prefetch_layer_ahead(int32_t layer, uint32_t n_tokens) noexcept {
+    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
+    try {
+        static const bool enabled = [] {
+            const char * v = std::getenv("WP_PREFILL_LAYER_AHEAD");
+            return v != nullptr && v[0] == '1';
+        }();
+        static const uint32_t width = [] {
+            const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+            const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 8;
+            return v > 0 ? (uint32_t) v : 8u;
+        }();
+        if (!enabled || n_tokens <= width) {
+            return;
+        }
+        int32_t nxt = -1;
+        for (const worker_info & worker : remote.workers()) {
+            const auto it = std::upper_bound(
+                worker.layers.begin(), worker.layers.end(), layer);
+            if (it != worker.layers.end() && (nxt < 0 || *it < nxt)) {
+                nxt = *it;
+            }
+        }
+        if (nxt < 0) {
+            return;
+        }
+        const int32_t n_expert = remote.n_expert();
+        if (n_expert <= 0) {
+            return;
+        }
+        // One frame of the full expert set; send_prefetch_hints partitions by
+        // worker. Protocol allows more than PREFETCH_HINT_MAX_EXPERTS (that
+        // cap is generation-side for decode). A whole-slice frame is how the
+        // worker tells this apart from a decode CERTAIN hint and keeps it off
+        // the 64-deep spec queue.
+        std::vector<int32_t> experts((size_t) n_expert);
+        for (int32_t e = 0; e < n_expert; ++e) {
+            experts[(size_t) e] = e;
+        }
+        (void) remote.send_prefetch_hints(nxt, experts, PIPE_HINT_CERTAIN, n_tokens);
+    } catch (...) {
+    }
+}
+
 size_t graph_dispatcher::prefetch_ngram_for_tokens(const int32_t * tokens, size_t n_tokens) noexcept {
+    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
     if (ngram_table_ == nullptr || tokens == nullptr || n_tokens == 0 ||
         n_tokens > PREFETCH_HINT_MAX_TOKENS) {
         return 0;
@@ -944,7 +1078,20 @@ void graph_dispatcher::capture_routing(const char * prefix, int32_t layer,
 void graph_dispatcher::note_batch_tokens(const int32_t * tokens, size_t n_tokens) noexcept {
     try {
         if (tokens == nullptr || n_tokens == 0) {
+            phantom_rows_.clear();
             return;
+        }
+        phantom_rows_.clear();
+        if (const_shape_enabled() && phantom_token_ >= 0) {
+            for (size_t i = 0; i < n_tokens; ++i) {
+                if (tokens[i] == phantom_token_) {
+                    phantom_rows_.assign(n_tokens, 0);
+                    for (size_t j = i; j < n_tokens; ++j) {
+                        phantom_rows_[j] = tokens[j] == phantom_token_;
+                    }
+                    break;
+                }
+            }
         }
         if (capture_file_ == nullptr) {
             const char * prefix = std::getenv("WP_PREDICT_CAPTURE");
@@ -965,6 +1112,18 @@ void graph_dispatcher::note_batch_tokens(const int32_t * tokens, size_t n_tokens
         std::fwrite(tokens, sizeof(int32_t), n_tokens, capture_file_);
         std::fflush(capture_file_);
     } catch (...) {
+    }
+}
+
+bool graph_dispatcher::is_phantom_row(int64_t token) const noexcept {
+    return token >= 0 && (size_t) token < phantom_rows_.size() && phantom_rows_[(size_t) token] != 0;
+}
+
+void graph_dispatcher::zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd) const noexcept {
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        if (is_phantom_row(token)) {
+            std::fill(result.begin() + token*n_embd, result.begin() + (token + 1)*n_embd, 0.0f);
+        }
     }
 }
 
@@ -991,6 +1150,14 @@ std::string graph_dispatcher::failure_message() const {
 }
 
 void graph_dispatcher::begin_decode() noexcept {
+    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+    // begin_decode()/end_decode() bracket a whole llama_decode() call for
+    // this dispatcher's context (expert_dispatch_decode_scope in
+    // llama-context.cpp) and touch `remote`'s deferral-window/workers
+    // state, so they need the same exclusivity as compute()/compute_issue()/
+    // compute_wait() -- which nest inside this same call, hence recursive.
+    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
+    phantom_rows_.clear();
     router2_pages_this_decode_ = 0;
     pred_snapshot_taken_       = false;
     remote.begin_deferral_window();
@@ -1015,6 +1182,9 @@ void graph_dispatcher::begin_decode() noexcept {
 }
 
 void graph_dispatcher::end_decode() noexcept {
+    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration and
+    // begin_decode()'s comment.
+    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
     // PREDICTION CADENCE. Emitted once per decode so a run's log says how often
     // the predictor actually ran, rather than how often it was asked to. See the
     // latest-wins comment in enqueue_prediction.
@@ -1025,12 +1195,26 @@ void graph_dispatcher::end_decode() noexcept {
             // stderr, not LLAMA_LOG_INFO: the library log level filters INFO out of
             // the router's journal (verified 2026-08-19 -- the same reason the
             // union diagnostic uses fprintf).
+            //
+            // queue=<depth> (0 = legacy one-slot mailbox) overflow=<count> is
+            // WP_HINT_QUEUE_DEPTH's own loss counter -- distinct from `dropped`
+            // above, which only counts same-decode duplicate snapshots (the
+            // first-wins gate, unaffected by the queue). overflow is the count
+            // that should read ~0 once the depth covers the real
+            // predictor-vs-offer-rate lag; hwm is how deep the backlog got, so
+            // hwm pinned at queue tells you the depth itself is still too
+            // shallow (or the K-deep GEMV loop is the actual bottleneck and no
+            // depth will fix it -- see router2_scratch).
             std::fprintf(stderr,
-                "expert dispatch predictor: offered=%llu scored=%llu dropped=%llu (%.1f%% dropped)\n",
+                "expert dispatch predictor: offered=%llu scored=%llu dropped=%llu (%.1f%% dropped) "
+                "queue=%zu overflow=%llu hwm=%zu\n",
                 (unsigned long long) offered,
                 (unsigned long long) pred_scored(),
                 (unsigned long long) dropped,
-                100.0 * (double) dropped / (double) offered);
+                100.0 * (double) dropped / (double) offered,
+                pred_queue_depth(),
+                (unsigned long long) pred_queue_overflow(),
+                pred_queue_high_water());
         }
     }
     // Last-layer path should have left nothing pending; if anything remains it
@@ -1136,6 +1320,22 @@ void graph_dispatcher::end_decode() noexcept {
         (double) decode_first_await_in_flight_ / (double) decode_layers_,
         decode_max_in_flight_,
         n_workers());
+    // WP_UNPACK_OVERLAP=1 (see pipe-expert-dispatcher.cpp's
+    // unpack_overlap_enabled() for the mechanism): the dispatcher now decodes
+    // each worker's response as its socket becomes ready instead of strictly
+    // after the previous fixed-order worker, so a decode that used to happen
+    // entirely after the last recv (and show up in `unpack` above) can now
+    // happen while an earlier-in-fixed-order-but-slower worker is still on
+    // the wire. That moves its cost into `wait` above instead. The SUM
+    // (issue+wait+unpack == total) is unaffected; only the split between wait
+    // and unpack shifts. Printed once per decode block, same cadence as the
+    // line above, so a run's log always says which attribution is in effect.
+    if (std::getenv("WP_UNPACK_OVERLAP") != nullptr && std::getenv("WP_UNPACK_OVERLAP")[0] == '1') {
+        LLAMA_LOG_WARN(
+            "expert dispatch: WP_UNPACK_OVERLAP=1 -- wait/unpack split above may attribute "
+            "some decode cost to `wait` that previously showed as `unpack` (see "
+            "unpack_overlap_enabled() in pipe-expert-dispatcher.cpp); total is unaffected\n");
+    }
     for (const worker_dispatch_stats & worker : decode_workers_) {
         const double avg_wait_ms = worker.n_requests == 0
             ? 0.0
@@ -1167,8 +1367,31 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
         }
         owner = context->owner;
+        // MAD-LAB DS4-Flash pipeline-streams: per-dispatcher socket
+        // exclusivity -- see io_mutex_'s declaration for why this is needed
+        // even though a single graph_dispatcher used to have exactly one
+        // caller thread. Recursive: flush_predicted_hints() below re-enters
+        // this same lock on the same thread.
+        std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
         if (owner->failed()) {
             ggml_set_zero(dst);
+            return;
+        }
+        // WP_DISPATCH_NULL=1 -- TIMING PROBE ONLY (outputs are garbage; never
+        // pair with a quality gate). Zero the routed-expert result and return
+        // without contacting any worker: the decode then costs only the
+        // spine's own compute + graph scaffolding. Hop-theory probe A,
+        // 2026-08-22. Combined op only (run with WP_DISPATCH_SPLIT_SHEXP=0);
+        // decode_layers_ still counts so WP_FORWARD_LOG emits.
+        static const bool dispatch_null = [] {
+            const char * e = std::getenv("WP_DISPATCH_NULL");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (dispatch_null) {
+            ggml_set_zero(dst);
+            if (owner->decode_active_) {
+                ++owner->decode_layers_;
+            }
             return;
         }
         const bool collect_stats = owner->decode_active_;
@@ -1213,6 +1436,9 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
 
         std::map<int32_t, pipe_expert_assignment> by_expert;
         for (int64_t token = 0; token < n_tokens; ++token) {
+            if (owner->is_phantom_row(token)) {
+                continue;
+            }
             std::set<int32_t> token_experts;
             for (int64_t slot = 0; slot < n_expert_used; ++slot) {
                 const int     index  = (int) (token * n_expert_used + slot);
@@ -1251,14 +1477,16 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             owner->capture_routing(capture_prefix, context->layer, wire_activations,
                                    selected_experts, n_tokens, n_expert_used);
         }
+        owner->prefetch_layer_ahead(context->layer, (uint32_t) n_tokens);
 
         const uint64_t           seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
         // dispatch() issues deferred reads before returning, waits only for
         // immediate experts, and folds the previous layer's deferred partials
         // into the returned block (residual path for layer N+1).
-        const std::vector<float> result =
+        std::vector<float> result =
             owner->remote.dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
                                    context->swiglu_clamp);
+        owner->zero_phantom_rows(result, n_tokens, n_embd);
         const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
         const dispatch_clock::time_point unpack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
@@ -1323,6 +1551,8 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
         }
         owner = context->owner;
+        // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+        std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
         if (owner->failed()) {
             if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
                 *static_cast<float *>(dst->data) = 0.0f;
@@ -1361,6 +1591,9 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
 
         std::map<int32_t, pipe_expert_assignment> by_expert;
         for (int64_t token = 0; token < n_tokens; ++token) {
+            if (owner->is_phantom_row(token)) {
+                continue;
+            }
             std::set<int32_t> token_experts;
             for (int64_t slot = 0; slot < n_expert_used; ++slot) {
                 const int     index  = (int) (token * n_expert_used + slot);
@@ -1393,6 +1626,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             owner->capture_routing(capture_prefix, context->layer, wire_activations,
                                    selected_experts, n_tokens, n_expert_used);
         }
+        owner->prefetch_layer_ahead(context->layer, (uint32_t) n_tokens);
 
         const uint64_t seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
         owner->remote.begin_dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
@@ -1441,6 +1675,8 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch wait op has no dispatcher");
         }
         owner = context->owner;
+        // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+        std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
         if (owner->failed()) {
             ggml_set_zero(dst);
             return;
@@ -1448,7 +1684,8 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         const bool collect_stats = owner->decode_active_;
         // finish_dispatch() includes the worker wait. Time unpack after it so
         // unpack is the host memcpy into dst, not a second copy of ns_wait.
-        const std::vector<float> result = owner->remote.finish_dispatch();
+        std::vector<float> result = owner->remote.finish_dispatch();
+        owner->zero_phantom_rows(result, dst->ne[1], owner->remote.n_embd());
         const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
         const dispatch_clock::time_point unpack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};

@@ -36,6 +36,38 @@ std::vector<int32_t> router2_top_experts(const float * weights,
                                          int32_t       top_m,
                                          float         min_conf = 0.0f);
 
+// Scratch reused across the K per-layer GEMVs the predictor runs for ONE
+// snapshot, and across snapshots (the predictor is single-threaded, so this
+// is safe to own for the life of the thread). Without it every one of the K
+// calls pays four heap allocations (hits/logits/scores/order) sized
+// n_expert -- at K=15 that is 60 allocations per snapshot competing with the
+// dot-product loop for the same cache lines. Batching the K GEMVs onto one
+// scratch set does not reduce the O(K * n_expert * n_embd) FLOPs -- that
+// part is fundamental to scoring K distinct router matrices -- but it takes
+// the allocator off the consumer's critical path, which is the difference
+// between "slow" and "structurally unable to keep up with the queue depth".
+struct router2_scratch {
+    std::vector<int>     hits;
+    std::vector<double>  logits;
+    std::vector<double>  scores;
+    std::vector<int32_t> order;
+    std::vector<int32_t> kept;
+};
+
+// Same scoring as above, but writing through `scratch` instead of allocating
+// fresh vectors. Call this from a hot loop that scores several target layers
+// back-to-back (e.g. the predictor's K-deep lookahead) with the SAME
+// router2_scratch instance.
+std::vector<int32_t> router2_top_experts(const float * weights,
+                                         const float * bias,
+                                         const float * activations,
+                                         int64_t       n_tokens,
+                                         int32_t       n_expert,
+                                         int32_t       n_embd,
+                                         int32_t       top_m,
+                                         float         min_conf,
+                                         router2_scratch & scratch);
+
 // WPNGRAM v1 is little-endian: header(version, dimensions, row count), one
 // popularity row per layer, then keyed token rows. Each row stores its full
 // count total plus up to 16 (u16 expert, u32 count) entries.
