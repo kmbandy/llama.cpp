@@ -50,6 +50,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
+        // The indexer is read with ggml_get_rows to score blocks and has no values, so a V
+        // store is never touched. It used 192 of 288 MiB at c=32768 and 1536 of 2304 MiB at
+        // c=262144. hparams_idx is private to this cache, so this does not affect main
+        // attention, recurrent state, or other architectures.
+        hparams_idx.n_embd_head_k_mla_impl = hparams_idx.n_embd_head_k();
+        hparams_idx.n_embd_head_v_mla_impl = hparams_idx.n_embd_head_k();
+
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
