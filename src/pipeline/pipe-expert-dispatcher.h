@@ -91,9 +91,10 @@ struct prefetch_hint_stats {
     // this path declines rather than guesses.
     uint64_t n_skipped_dynamic = 0;
     // Calls declined because a request was still outstanding on the sockets
-    // (WP_DEFER_K > 0). Interleaving a hint there would desynchronise a stream
-    // whose reader matches responses by seq_id.
+    // (WP_DEFER_K > 0) while WP_HINT_INFLIGHT is off.
     uint64_t n_skipped_in_flight = 0;
+    // Frames sent while at least one request response was outstanding.
+    uint64_t n_sent_in_flight = 0;
 };
 
 // Cumulative expert-deferral mechanism counters (spec section 4).
