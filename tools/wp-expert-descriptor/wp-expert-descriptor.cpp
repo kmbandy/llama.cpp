@@ -343,14 +343,26 @@ int run(const Options & options) {
         gguf_find_key(first_loaded.first.get(), (architecture + ".hidden_activation").c_str());
     if (activation_id >= 0) {
         activation = required_string(first_loaded.first.get(), architecture + ".hidden_activation");
-    } else if (architecture == "glm-dsa" || architecture == "deepseek4") {
+    } else if (architecture == "glm-dsa" || architecture == "deepseek4" ||
+               architecture == "qwen4exp") {
         // NOTE 2026-07-31: this was a one-entry allowlist ("glm-dsa"), so every
         // other SwiGLU model failed here with a message implying the MODEL was
         // deficient rather than this list. deepseek4 added on evidence, not
         // assumption: the GGUF carries deepseek4.swiglu_clamp_exp and
         // .swiglu_clamp_shexp, which only a SwiGLU FFN emits.
+        // qwen4exp (Qwen3.8-Flash-Next) added 2026-08-26 on the same standard.
+        // Its GGUF declares no activation KV at all -- the only qwen4exp.* FFN
+        // keys are expert_count / expert_used_count /
+        // expert_feed_forward_length / expert_shared_feed_forward_length -- so
+        // the evidence is the graph instead: src/models/qwen4exp.cpp builds the
+        // routed experts with build_moe_ffn(..., LLM_FFN_SILU, ...) and the
+        // shared expert with build_ffn(..., LLM_FFN_SILU, LLM_FFN_PAR, il),
+        // i.e. gated SiLU on both paths.
         // TODO: derive this from the presence of a swiglu_clamp key (or an
-        // explicit activation KV) instead of naming architectures.
+        // explicit activation KV) instead of naming architectures. Note that
+        // qwen4exp would NOT be caught by a swiglu_clamp probe -- it emits no
+        // such key -- so that derivation needs the arch's own FFN metadata,
+        // not just a clamp sniff.
         activation = "silu";
     } else {
         throw std::runtime_error(
