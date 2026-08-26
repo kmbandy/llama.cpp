@@ -1255,10 +1255,12 @@ void graph_dispatcher::end_decode() noexcept {
         const prefetch_hint_stats & hstats = remote.get_prefetch_hint_stats();
         LLAMA_LOG_WARN(
             "expert dispatch prefetch hint: layers=%zu frames=%llu experts=%llu "
-            "send_failed=%llu no_route=%llu skip_dynamic=%llu skip_in_flight=%llu\n",
+            "sent_in_flight=%llu send_failed=%llu no_route=%llu "
+            "skip_dynamic=%llu skip_in_flight=%llu\n",
             oracle_.layers().size(),
             (unsigned long long) hstats.n_frames,
             (unsigned long long) hstats.n_experts,
+            (unsigned long long) hstats.n_sent_in_flight,
             (unsigned long long) hstats.n_send_failed,
             (unsigned long long) hstats.n_no_oracle,
             (unsigned long long) hstats.n_skipped_dynamic,

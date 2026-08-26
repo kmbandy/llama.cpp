@@ -58,6 +58,14 @@ bool static_assign_enabled() {
     return value == nullptr || value[0] != '0';
 }
 
+// WP_HINT_INFLIGHT -- default OFF. The worker dispatch loop consumes complete
+// frames and type-dispatches hints, so a hint can safely follow an outstanding
+// request on the same socket. Keep the old guard unless this is enabled.
+bool hint_inflight_enabled() {
+    const char * value = std::getenv("WP_HINT_INFLIGHT");
+    return value != nullptr && value[0] == '1';
+}
+
 // Decode/verify (n_tokens <= max) prefer this worker port among candidates.
 // DEFAULT OFF. Opt in with WP_DISPATCH_DECODE_PORT=8803 (GTX 1070). This
 // shifts 0-84 decode off the RX 480; it does not make either card faster.
@@ -758,6 +766,7 @@ struct dispatcher::impl {
     // choose_worker and send_prefetch_hints -- one field so a hint can never be
     // routed by a different rule than the request that follows it.
     bool                                                static_assign = true;
+    bool                                                hint_inflight = false;
     bool                                                stats_logging = false;
     // WP_ASYNC_ISSUE latch (D1). True => issue/hint frames go through per-socket
     // writer threads instead of blocking send() on the dispatch thread.
@@ -826,6 +835,7 @@ struct dispatcher::impl {
     explicit impl(const std::vector<endpoint> & endpoints) :
                 speed_split(speed_split_enabled()),
                 static_assign(static_assign_enabled()),
+                hint_inflight(hint_inflight_enabled()),
                 async_issue(async_issue_enabled()),
                 unpack_overlap(unpack_overlap_enabled()) {
         decode_prefer_port_ = decode_prefer_port_enabled();
@@ -2063,12 +2073,12 @@ struct dispatcher::impl {
         if (poisoned || experts.empty()) {
             return 0;
         }
-        // ENFORCED, not just documented. With WP_DEFER_K > 0 a partial from the
-        // previous layer is still outstanding on one of these sockets, and
-        // interleaving a hint frame ahead of it would desynchronise a stream
-        // whose reader matches responses by seq_id. Declining is free; the hint
-        // was optional.
-        if (in_flight != 0) {
+        // The old default protects the request/response stream conservatively.
+        // The worker receives complete frames and dispatches hints by type, so
+        // WP_HINT_INFLIGHT=1 can safely use the same socket while a response is
+        // outstanding.
+        const bool sent_in_flight = in_flight != 0;
+        if (sent_in_flight && !hint_inflight) {
             ++hint_stats.n_skipped_in_flight;
             return 0;
         }
@@ -2158,6 +2168,9 @@ struct dispatcher::impl {
             }
             ++hint_stats.n_frames;
             hint_stats.n_experts += (uint64_t) hint.expert_ids.size();
+            if (sent_in_flight) {
+                ++hint_stats.n_sent_in_flight;
+            }
             ++sent;
         }
         return sent;

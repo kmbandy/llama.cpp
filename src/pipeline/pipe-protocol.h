@@ -460,6 +460,8 @@ struct pipe_expert_dispatch_acts_ref {
 // the hint carries NO correctness weight. That is deliberate and it is the
 // property that makes this safe to add: the dispatch path is unchanged, so a
 // hint that is wrong, late, or dropped can only cost I/O, never an answer.
+// Workers receive complete frames and dispatch by type, so this frame may occur
+// between request frames, including between split BEGIN and ACTS frames.
 //
 // EXPERT IDS, NOT PAGES. The spine cannot resolve a page: under cross-machine
 // dispatch deepseek4.cpp marks the routed experts TENSOR_SKIP, so the spine has

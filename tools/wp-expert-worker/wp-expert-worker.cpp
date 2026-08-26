@@ -6037,6 +6037,7 @@ public:
                       "host_landed=%llu host_bytes=%llu host_errors=%llu "
                       "host_promoted=%llu host_wasted=%llu "
                       "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu "
+                      "demand_prefetch_late[queued/inflight]=%llu/%llu "
                       "spec_cap[pending/blocked_budget]=%zu/%llu "
                       "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit/vdemand_defer]="
                       "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
@@ -6062,6 +6063,8 @@ public:
                       (unsigned long long) pool_.host_skip_pin(),
                       (unsigned long long) pool_.host_skip_vram(),
                       (unsigned long long) pool_.host_skip_tier(),
+                      (unsigned long long) n_demand_prefetch_queued_,
+                      (unsigned long long) n_demand_prefetch_inflight_,
                       pool_.n_spec_pending(),
                       (unsigned long long) pool_.spec_blocked_budget(),
                       (unsigned long long) pump_calls_,
@@ -6310,6 +6313,9 @@ public:
             pages.push_back(&catalog_.pages.at({
                 request.layer, assignment.expert_id
             }));
+        }
+        if (!prepared.has_value()) {
+            note_demand_prefetch_lateness(pages);
         }
         ExpertSlotPool::Batch batch = prepared.has_value()
             ? std::move(*prepared)
@@ -6722,6 +6728,7 @@ public:
             note_expert_recency(assignment.expert_id);
             pages.push_back(&catalog_.pages.at({ request.layer, assignment.expert_id }));
         }
+        note_demand_prefetch_lateness(pages);
         // spec_prefill_gate_active_ and pool_.demand_serving() are still
         // Worker/pool-wide (not keyed by conn_index) -- known imprecision
         // under multi-conn (one connection's finish/abandon can clear a gate
@@ -6825,6 +6832,31 @@ public:
     }
 
 private:
+    // Count demand pages for which a hint has not reached a usable slot yet.
+    // The queue check includes the separate host landing queue.
+    void note_demand_prefetch_lateness(const std::vector<const ExpertPage *> & pages) {
+        if (!spec_enabled_) {
+            return;
+        }
+        for (const ExpertPage * page : pages) {
+            const bool queued = std::any_of(
+                spec_queue_.begin(), spec_queue_.end(),
+                [page](const std::pair<const ExpertPage *, uint64_t> & entry) {
+                    return entry.first->layer == page->layer && entry.first->expert == page->expert;
+                }) || std::any_of(
+                host_queue_.begin(), host_queue_.end(),
+                [page](const ExpertPage * entry) {
+                    return entry->layer == page->layer && entry->expert == page->expert;
+                });
+            if (queued) {
+                ++n_demand_prefetch_queued_;
+            }
+            if (pool_.spec_in_flight_for(*page)) {
+                ++n_demand_prefetch_inflight_;
+            }
+        }
+    }
+
     // ---- prefetch hints (see note_prefetch_hint) ----
     //
     // WP_EXPERT_SPEC_PAGEIN=1 arms speculative page-ins. DEFAULT OFF and separate from the
@@ -7038,6 +7070,8 @@ private:
     uint64_t           hint_foreign_layer_  = 0;
     uint64_t           hint_foreign_expert_ = 0;
     uint64_t           hint_bad_            = 0;
+    uint64_t           n_demand_prefetch_queued_ = 0;
+    uint64_t           n_demand_prefetch_inflight_ = 0;
 
     // WP_HINT_LOG=path -- the counter line, appended after every hint frame and
     // fflushed, so `tail -1` is the final answer.
