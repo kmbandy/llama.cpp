@@ -1804,14 +1804,33 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
         }
     }
 
+    // Only a MIDDLE wipe can leave stale K/V that the kernel actually reads.
+    // For a tail truncate (p1 > cur_max) we drop pos_max to p0-1 below, and
+    // set_input derives h_context_lens_[s] = pos_max + 1 (== p0), so the
+    // kernel's per-seq bound stops exactly at p0: the unwiped slots in the
+    // straddling block sit past context_len and are never attended. They are
+    // overwritten in place by the next tokens appended to the seq. That case
+    // is the normal path for speculative-decode rejection and rollback, so
+    // warning on it is pure noise — log it at DEBUG instead.
     if (blocks_partial_skipped > 0) {
-        LLAMA_LOG_WARN("llama_kv_cache_paged::seq_rm: range [%d,%d) is not "
-                       "block-aligned (block_size=%u). %u block(s) wholly "
-                       "freed; %u block(s) partially overlapped — those keep "
-                       "stale K/V in the unwiped slots and the kernel will "
-                       "attend to them. Round caller's range to block "
-                       "boundaries for clean wipes.\n",
-                       p0, p1, bsize, blocks_freed, blocks_partial_skipped);
+        const bool tail_truncate = p1 > cur_max;
+        if (tail_truncate) {
+            LLAMA_LOG_DEBUG("llama_kv_cache_paged::seq_rm: tail truncate "
+                            "[%d,%d) is not block-aligned (block_size=%u). "
+                            "%u block(s) wholly freed; %u straddling block(s) "
+                            "kept — their slots past context_len=%d are "
+                            "unreachable and will be overwritten on append.\n",
+                            p0, p1, bsize, blocks_freed, blocks_partial_skipped,
+                            p0);
+        } else {
+            LLAMA_LOG_WARN("llama_kv_cache_paged::seq_rm: range [%d,%d) is not "
+                           "block-aligned (block_size=%u). %u block(s) wholly "
+                           "freed; %u block(s) partially overlapped — those keep "
+                           "stale K/V in the unwiped slots and the kernel will "
+                           "attend to them. Round caller's range to block "
+                           "boundaries for clean wipes.\n",
+                           p0, p1, bsize, blocks_freed, blocks_partial_skipped);
+        }
     }
 
     // Update pos_max iff the wipe touches the tail (p1 covers past cur_max).

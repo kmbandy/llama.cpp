@@ -35,6 +35,10 @@
 #include <string>
 #include <unordered_set>
 
+// WP ubatch-width hint into ggml-cuda's graph-capture prefill classifier
+// (defined in ggml-cuda.cu; weak so CPU/Vulkan-only builds link clean).
+extern "C" void ggml_cuda_wp_set_ubatch_width_hint(int32_t n_tokens) __attribute__((weak));
+
 //
 // llama_context
 //
@@ -647,7 +651,8 @@ llama_context::llama_context(
                 (int32_t) hparams.n_ff_exp,
                 (int32_t) hparams.n_expert,
                 (int32_t) hparams.n_expert_used,
-                last_no_defer));
+                last_no_defer,
+                (int32_t) model.vocab.token_mask()));
             expert_dispatch = expert_dispatch_owned.get();
             LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
             register_hash_oracle(model, *expert_dispatch_owned);
@@ -2488,6 +2493,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static uint64_t wp_gc_n  [3] = {0, 0, 0};
     static uint64_t wp_gc_tok[3] = {0, 0, 0};
     static const char * const wp_ph_name[3] = { "decode ", "verify ", "PREFILL" };
+    // WP: publish the true ubatch width to the CUDA/HIP graph-capture layer.
+    // Its prefill-shape heuristic misclassifies decode fragments whose wide
+    // dim is context (lightning-indexer mul_mats) — with the hint it keys on
+    // the real batch width instead. Weak symbol: no-op off-CUDA builds.
+    if (ggml_cuda_wp_set_ubatch_width_hint) {
+        ggml_cuda_wp_set_ubatch_width_hint((int32_t) ubatch.n_tokens);
+    }
     const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
     const auto wp_gc_t0 = wp_spine_stats ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point();

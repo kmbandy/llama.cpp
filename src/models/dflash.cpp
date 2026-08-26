@@ -3,6 +3,11 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-ext.h"
+
+#include <atomic>
+#include <cinttypes>
+#include <unordered_set>
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -303,8 +308,70 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 // Takes no llm_graph_context on purpose: `base` and `conf_inp` are parameters rather
 // than res->t_logits / res->t_embd, and nothing is expanded into a graph -- the caller
 // owns gf and decides what to build. Returns false if the ubatch carries more drafts
-// per block than the head was trained for, in which case the caller keeps `base`
-// unbiased (the same early-out the in-graph path has always had).
+// per block than the head was trained for, OR if the ubatch's blocks are not all the
+// same width (a torn block from ubatch splitting -- see the multi-sequence-safe note
+// below), in which case the caller keeps `base` unbiased (the same early-out the
+// in-graph path has always had).
+// MAD-LAB / multi-sequence-safe: how many times a ragged (non-block-aligned) ubatch
+// reached the DSpark Markov head and was skipped, across both the in-graph and the
+// standalone (services-mode) call paths. Prevention (the draft context's hard
+// n_ubatch >= n_seq*block_width check at construction, see common/speculative.cpp)
+// should make this permanently zero for every real drafting decode; a nonzero value
+// means that invariant was violated somewhere and the affected block's confidence was
+// forced to 0 rather than served stale -- see llama_dspark_markov_ragged_skipped_inc()
+// below and its counterpart read in common_speculative_print_stats().
+static std::atomic<int64_t> g_dspark_markov_ragged_skipped{0};
+
+// MAD-LAB / multi-sequence-safe: rate-limited diagnostic for the ragged path, added
+// 2026-08-24 because the recount fix (dspark_count_seqs_with_tokens(), below) and its
+// reserve-ubatch fallback did NOT bring a live --parallel 2 rig's counter to 0 (it read 4
+// at the first stats print, same as before both fixes), so the exact call shape needs to
+// be captured from the log on the next live cycle instead of guessed at from stats alone.
+// Capped at 8 total lines across both increment sites so a pathological run can't flood
+// the log; the counter itself (unrate-limited) is still exact.
+//
+// Grep for "DSPARK_RAGGED" to find these.
+static std::atomic<int32_t> g_dspark_ragged_log_budget{8};
+
+// site: "in-graph" (build_dspark_markov_head(), the path this rig's services_mode=0
+//   config actually exercises) or "standalone" (llama_dspark_build_markov_graph()'s own
+//   check, reached directly by the services-mode replay in src/llama-context.cpp /
+//   common/speculative.cpp, which has no llama_ubatch to inspect -- ubatch_n_seqs_unq and
+//   used_fallback are reported as -1 there, meaning "not applicable").
+// n_tok / n_blocks: the exact values the divisibility check failed on.
+// ubatch_n_tokens: g.ubatch.n_tokens, logged alongside n_tok (g.res->t_logits->ne[1]) so a
+//   divergence between the two -- which would mean the LM head output rows don't match
+//   the ubatch's own token count -- shows up directly instead of being assumed away.
+// ubatch_n_seqs_unq: the raw (possibly wrong) ubatch.n_seqs_unq field, for comparison
+//   against the corrected n_blocks.
+// used_fallback: 1 if the per-token seq_id scan came back empty and this call fell back
+//   to trusting ubatch.n_seqs_unq (the synthetic graph_reserve()-ubatch case); 0 if the
+//   scan found real per-token sequence data; -1 = not applicable (standalone site).
+static void llama_dspark_markov_ragged_skipped_inc(
+        const char * site,
+        int64_t      n_tok,
+        int64_t      n_blocks,
+        int64_t      ubatch_n_tokens,
+        int64_t      ubatch_n_seqs_unq,
+        int          used_fallback) {
+    g_dspark_markov_ragged_skipped.fetch_add(1, std::memory_order_relaxed);
+
+    int32_t budget = g_dspark_ragged_log_budget.load(std::memory_order_relaxed);
+    while (budget > 0 &&
+           !g_dspark_ragged_log_budget.compare_exchange_weak(budget, budget - 1, std::memory_order_relaxed)) {
+        // retry with the freshly observed `budget`
+    }
+    if (budget > 0) {
+        LLAMA_LOG_WARN("%s: DSPARK_RAGGED site=%s n_tok=%" PRId64 " n_blocks=%" PRId64
+                       " ubatch.n_tokens=%" PRId64 " ubatch.n_seqs_unq=%" PRId64 " used_fallback=%d\n",
+                       __func__, site, n_tok, n_blocks, ubatch_n_tokens, ubatch_n_seqs_unq, used_fallback);
+    }
+}
+
+int64_t llama_dspark_markov_ragged_skipped_fetch_reset(void) {
+    return g_dspark_markov_ragged_skipped.exchange(0, std::memory_order_relaxed);
+}
+
 bool llama_dspark_build_markov_graph(
         ggml_context      * ctx0,
         const llama_model & model,
@@ -332,7 +399,40 @@ bool llama_dspark_build_markov_graph(
     GGML_ASSERT(block_size > 0 && "DSpark draft requires a valid block_size in GGUF metadata");
     // MAD-LAB: end
 
-    GGML_ASSERT(n_blocks > 0 && n_tok % n_blocks == 0 && "DSpark markov head requires equal-size blocks");
+    // MAD-LAB / multi-sequence-safe: this head assumes the ubatch holds exactly one
+    // equal-width DSpark block per drafting sequence -- true when draft() (common/
+    // speculative.cpp) builds every active sequence's block with the same width AND the
+    // whole batch survives as one ubatch. That second half is not guaranteed once
+    // --parallel > 1: llama_kv_cache::init_batch() picks split_simple() whenever this
+    // context runs a single unified KV stream (n_stream == 1, the common multi-slot
+    // config), and split_simple() slices strictly by raw token position with no
+    // awareness of sequence boundaries. If n_ubatch is small enough to fall inside a
+    // block, one ubatch can end up holding a partial block from one sequence plus a few
+    // leading tokens of the next, and n_blocks (the caller's g.ubatch.n_seqs_unq) no
+    // longer divides n_tok evenly. There is no way to recover the chained-Markov bias
+    // for a torn block from inside a single graph build (the missing block positions
+    // simply are not present here), so bail out the same way dsv4_build_dspark_head()
+    // (src/models/deepseek4.cpp) already does for the identical shape mismatch: skip
+    // biasing and let the caller keep `base` unbiased, instead of aborting the process
+    // (previously a GGML_ASSERT here -- see the DS4-Flash --parallel 2 crash at this
+    // line, common/speculative.cpp's draft() batches every drafting sequence's block
+    // into one shared decode).
+    //
+    // n_blocks == 1 (the --parallel 1 / single-sequence case) always divides evenly, so
+    // this bailout is unreachable there and the computation below is unchanged.
+    //
+    // This should be unreachable for a real drafting decode: the draft context's
+    // constructor (common/speculative.cpp) hard-requires n_ubatch >= n_seq*block_width so
+    // split_simple() can never tear a block across ubatches. If it fires anyway, count it
+    // -- build_dspark_markov_head() (below) forces the confidence channel to an explicit,
+    // honest 0 for this call rather than leaving it unset/stale, and the standalone
+    // (services-mode) caller drops the whole draft round; neither path serves a biased
+    // logit next to a garbage confidence.
+    if (n_blocks <= 0 || n_tok % n_blocks != 0) {
+        llama_dspark_markov_ragged_skipped_inc("standalone", n_tok, n_blocks, /*ubatch_n_tokens=*/-1,
+                                               /*ubatch_n_seqs_unq=*/-1, /*used_fallback=*/-1);
+        return false;
+    }
     // runtime tokens per block in this ubatch (anchor + drafted positions), bounded by training block_size
     const int64_t block_drafts = n_tok / n_blocks;
     if (block_drafts > block_size) {
@@ -399,16 +499,154 @@ bool llama_dspark_build_markov_graph(
     return true;
 }
 
+// MAD-LAB / multi-sequence-safe: the number of sequences that actually own a token in
+// this ubatch, i.e. the number of DSpark blocks really present here -- computed directly
+// from the per-token seq_id assignment rather than trusted from ubatch.n_seqs_unq.
+//
+// ubatch.n_seqs_unq is *supposed* to be exactly this (llama_batch_allocr::ubatch_add(),
+// src/llama-batch.cpp, derives it from a bitset of the seq_id values actually seen on the
+// tokens it copied in). But live-rig evidence at --parallel 2 (2026-08-2x, DS4-Flash
+// spine, n_ubatch=2048 so tearing is provably not the cause) shows the two disagreeing:
+// with exactly ONE sequence drafting, n_tok never divided evenly by ubatch.n_seqs_unq,
+// on every single draft() call -- consistent with n_seqs_unq reporting the 2-slot
+// context/cache width rather than the 1 sequence whose tokens are actually in this
+// specific decode. The exact upstream mechanism producing that stale/wrong count is not
+// yet isolated, but this head does not need to trust it: recomputing straight from
+// ubatch.seq_id is self-correcting regardless of the cause, and it is the more honest
+// question anyway -- not "how many sequences does the allocr/cache believe are live" but
+// "how many sequences' block tokens are in THIS ubatch".
+//
+// This is not just a crash-avoidance fix: had n_blocks (wrongly) still divided n_tok
+// evenly by coincidence (e.g. an 8-token single-sequence block miscounted as 2 blocks of
+// 4), llama_dspark_build_markov_graph() would have computed WRONG strided views --
+// treating the single sequence's own later positions as a second block's anchor -- and
+// silently corrupted the Markov chain/confidence without ever tripping the ragged check
+// at all. Recomputing here fixes that class of error too, not only the assert/skip case.
+static int64_t dspark_count_seqs_with_tokens(const llama_ubatch & ubatch, bool * out_used_fallback = nullptr) {
+    std::unordered_set<llama_seq_id> seen;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            seen.insert(ubatch.seq_id[i][s]);
+        }
+    }
+    if (!seen.empty()) {
+        if (out_used_fallback) {
+            *out_used_fallback = false;
+        }
+        return (int64_t) seen.size();
+    }
+
+    if (out_used_fallback) {
+        *out_used_fallback = true;
+    }
+
+    // MAD-LAB / multi-sequence-safe: the scan above found nothing, which is NOT the same
+    // thing as "zero sequences drafted". llama_batch_allocr::ubatch_reserve()
+    // (src/llama-batch.cpp:400) builds synthetic memory-sizing probe ubatches for
+    // graph_reserve()/sched_reserve() -- run once per distinct shape this context hasn't
+    // built a graph for yet, which includes the first few real draft() calls before the
+    // shape settles (matches the live evidence: ragged fires a handful of times at
+    // startup, then goes flat for hundreds of real calls). ubatch_reserve() leaves
+    // n_seq_id/seq_id value-initialized (all 0 / all null) -- it only sets
+    // seq_id_unq/n_seqs_unq, deliberately, because a reserve build's outputs are never
+    // read. A real drafting ubatch always has n_seq_id[i] >= 1 for every token
+    // (common_batch_add() never emits an empty seq_id list), so an empty `seen` here can
+    // only mean this is one of those synthetic probes, not an empty real one.
+    //
+    // Reserve ubatches ARE always well-formed by construction: ubatch_reserve() builds
+    // exactly n_seq_tokens*n_seqs tokens, so n_tokens is trivially divisible by n_seqs.
+    // ubatch.n_seqs_unq is authoritative for them (it IS n_seqs, set directly, not
+    // derived from per-token data) -- fall back to it only in this specific,
+    // unambiguous case, not for real drafting ubatches (see the long comment above,
+    // where n_seqs_unq was shown to be the unreliable one).
+    return (int64_t) ubatch.n_seqs_unq;
+}
+
 // In-graph wrapper: used by the DFlash/DSV4 decoders when the LM head IS reachable
 // from the draft context, so `base` is res->t_logits produced upstream in the same
 // graph and `conf_inp` is res->t_embd. Keeps one implementation of the head shared
 // with the standalone (services-mode) path.
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+    // MAD-LAB / multi-sequence-safe: root-caused 2026-08-24 via the DSPARK_RAGGED
+    // instrumentation below -- the 4 residual ragged events (site=in-graph,
+    // used_fallback=0, n_tok=31, ubatch.n_tokens=32, ubatch.n_seqs_unq=2) were NOT real
+    // drafting calls and NOT a tearing/miscounting problem at all. They were the "pp"
+    // worst-case buffer-sizing reserve pass (sched_reserve(), src/llama-context.cpp,
+    // called twice at startup -- hence 4 = 2 call sites x 2 sched_reserve() runs,
+    // matching the two observed timestamp pairs). draft_graph_n_tokens() clamps that
+    // pass's ubatch to k_draft_graph_tokens=32 tokens over n_seq_max=2 sequences, but
+    // reserve_graph_n_outputs() (src/llama-context.cpp) DELIBERATELY requests only 31
+    // output rows -- "Keep n_outputs strictly below n_tokens so get_rows stays on", i.e.
+    // it intentionally exercises the non-identity build_inp_out_ids() path while sizing
+    // compute buffers, by forcing n_outputs = n_tokens-1 whenever the natural cap would
+    // otherwise equal n_tokens. That is where res->t_logits ends up with 31 rows against
+    // a 32-token, 2-sequence ubatch: 31 is not a divisibility bug, it is n_tokens-1 by
+    // deliberate design, and 31 was never going to divide evenly by any n_blocks > 1.
+    //
+    // A real drafting decode never does this: draft() (common/speculative.cpp) requests
+    // logits=true for every token in the block, so n_outputs == n_tokens always there,
+    // and build_inp_out_ids() takes the identity path. So "res->t_logits->ne[1] !=
+    // ubatch.n_tokens" is a clean, precise signal for "this is the reserve/buffer-sizing
+    // probe, not a real block" -- more precise than inferring it from a shape mismatch
+    // that (as this exact case proved) can also occur for reasons that have nothing to
+    // do with sequence tearing or miscounting.
+    //
+    // The reserve pass's output is provably never consumed (ggml_backend_sched_reserve
+    // only needs the graph's node topology/shapes, not real values), and the OTHER
+    // reserve pass in the same sched_reserve() call (tg: graph_reserve(n_seqs, n_seqs,
+    // n_seqs, ...) at src/llama-context.cpp -- n_outputs == n_tokens there, not run
+    // through reserve_graph_n_outputs at all) already exercises this head with a valid,
+    // divisible shape (n_tokens=2, n_seqs_unq=2) for worst-case memory sizing purposes.
+    // So there is nothing to size here that isn't already sized elsewhere: skip cleanly,
+    // don't touch t_h_nextn (nothing will ever read it for this pass), and don't count
+    // it -- this is expected, not a violated invariant.
+    if (g.res->t_logits->ne[1] != (int64_t) g.ubatch.n_tokens) {
+        return;
+    }
+
+    // MAD-LAB / multi-sequence-safe: detect the ragged-block case (a ubatch whose
+    // (corrected) block count does not evenly divide its token count -- see the long
+    // comment in llama_dspark_build_markov_graph() above) BEFORE calling into the shared
+    // head, so we can respond to it differently from that function's *other*
+    // false-return reason (block_drafts > block_size, an unrelated, pre-existing,
+    // opt-in-only case reached via WP_DS4_CONST_SHAPE that must keep its old "leave
+    // everything alone" behavior unchanged for parallel=1 bit-identity).
+    //
+    // t_h_nextn feeds llama_get_embeddings_nextn(), which conf_min gating and the
+    // dispatch/prefetch hint both read as this block's acceptance confidence. Silently
+    // `return`-ing here (the old behavior) leaves it whatever it was before this graph was
+    // built -- unset, or a stale tensor from a prior ubatch under graph reuse -- so a
+    // confidence-gate consumer could accept a torn, unverified block because its garbage
+    // confidence happened to read high. That is strictly worse than the crash this used to
+    // be. Force an explicit, honest 0 instead: the gate then rejects every draft position
+    // this call produced, which is the safe direction to fail in.
+    bool used_fallback = false;
+    const int64_t n_blocks_chk = dspark_count_seqs_with_tokens(g.ubatch, &used_fallback);
+    const int64_t n_tok_chk    = g.res->t_logits->ne[1];
+    if (n_blocks_chk <= 0 || n_tok_chk % n_blocks_chk != 0) {
+        llama_dspark_markov_ragged_skipped_inc("in-graph", n_tok_chk, n_blocks_chk,
+                                               (int64_t) g.ubatch.n_tokens, (int64_t) g.ubatch.n_seqs_unq,
+                                               used_fallback ? 1 : 0);
+
+        ggml_tensor * zero_conf = ggml_fill(g.ctx0,
+                ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, g.res->t_embd->ne[0], g.res->t_embd->ne[1]),
+                0.0f);
+        g.res->t_h_nextn = zero_conf;
+        ggml_build_forward_expand(g.gf, zero_conf);
+        // `base` (g.res->t_logits) is left exactly as the LM head produced it -- unbiased,
+        // never stale -- same as every other early-out in this head.
+        return;
+    }
+
     ggml_tensor * out  = nullptr;
     ggml_tensor * conf = nullptr;
 
     if (!llama_dspark_build_markov_graph(g.ctx0, model, tokens,
-                g.res->t_logits, g.res->t_embd, g.ubatch.n_seqs_unq, &out, &conf)) {
+                g.res->t_logits, g.res->t_embd, n_blocks_chk, &out, &conf)) {
+        // Only the block_drafts > block_size case can reach here now (the ragged shape was
+        // already handled above) -- unchanged behavior: base stays unbiased, conf is left
+        // alone. This is the same pre-existing, opt-in-only (WP_DS4_CONST_SHAPE) early-out
+        // this function has always had.
         return;
     }
 

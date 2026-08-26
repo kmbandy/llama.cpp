@@ -223,6 +223,20 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // returns the DFlash hyper-connection stream multiplier
 LLAMA_API uint32_t        llama_model_dflash_hc_mult    (const struct llama_model * model);
 LLAMA_API uint32_t        llama_model_dflash_block_size (const struct llama_model * model);
+// true if this model carries its own DSpark Markov/confidence head weights (in-graph
+// path, model.dspark_markov_w1 != nullptr) -- used by the draft context constructor
+// (common/speculative.cpp) to decide whether the multi-sequence-safe n_ubatch >=
+// n_seq*block_width invariant needs to be enforced at load.
+LLAMA_API bool            llama_model_has_dspark_markov  (const struct llama_model * model);
+
+// MAD-LAB / multi-sequence-safe: fetch-and-reset the count of ubatches that reached the
+// DSpark Markov head with a ragged (non-block-aligned) shape and had their confidence
+// forced to 0 instead of being served biased-logits-next-to-stale-confidence. Defined in
+// src/models/dflash.cpp. Should be permanently 0 for a correctly configured draft
+// context (see the hard n_ubatch check in common_speculative_impl_draft_dflash's
+// constructor); common_speculative_print_stats() folds this into the dflash/dspark
+// implementation's own counters so a nonzero value is visible in the normal stats line.
+LLAMA_API int64_t         llama_dspark_markov_ragged_skipped_fetch_reset(void);
 
 // Weight-pager draft-as-paging-oracle: after a draft model produces tokens,
 // map them through DS4 hash-layer tid2eid and pin/prefetch those expert

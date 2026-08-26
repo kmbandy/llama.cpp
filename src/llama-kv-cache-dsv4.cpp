@@ -18,6 +18,24 @@
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
+static bool dsv4_const_shape_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("WP_DS4_CONST_SHAPE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool dsv4_csa_lazy_state_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("WP_DS4_CSA_LAZY_STATE");
+        return value != nullptr && value[0] == '1';
+    }();
+    // Constant-shape graphs always emit the padded state path. Skipping the
+    // path at non-boundary positions changes the graph topology.
+    return enabled && !dsv4_const_shape_enabled();
+}
+
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
@@ -196,6 +214,19 @@ static bool dsv4_batch_has_coupled(const llama_batch & batch) {
 static int64_t dsv4_comp_graph_n_stream(const llama_ubatch & ubatch, uint32_t n_stream) {
     // Coupled sequence sets must stay in one graph stream because their
     // compressed state is shared. Independent per-seq state can fan out.
+    //
+    // MAD-LAB / WP_DS4_CONST_SHAPE, axis A3 (n_stream): at n_parallel<=1
+    // (single-tenant spine serving, the DS4-Flash config this rewrite targets)
+    // n_stream<=1 and ubatch.n_seqs_unq<=1 always hold, so this returns the
+    // CONSTANT 1 on every call -- A3 is closed by construction for that
+    // config, no pad+mask needed. It only varies (ubatch.n_seqs_unq, up to
+    // n_stream) under multi-tenant serving (n_parallel>1, multiple concurrent
+    // sequences sharing the compressed-stream cache), which is out of scope
+    // here: closing it would need padding this return to a persistent max
+    // stream count and masking the empty per-stream q/kv/cur lanes the same
+    // way dsv4_pad_live_plan_to_reserve_rank pads the index vectors below,
+    // and it is untested on hardware because this serving config never
+    // exercises n_seqs_unq>1.
     if (n_stream <= 1 || ubatch.n_seqs_unq <= 1 || dsv4_ubatch_has_coupled(ubatch)) {
         return 1;
     }
@@ -422,8 +453,24 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
 
 // Stretch a live plan's index tensors up to the reserve ranks. Extra slots
 // repeat the last real index (or the masked last cache row for an empty
-// write). The graph always sees the same shapes; dummy writes land on the
+// write). The default graph sees the same shapes; dummy writes land on the
 // already-masked scratch row CSA uses for non-boundary decode.
+//
+// MAD-LAB / WP_DS4_CONST_SHAPE, axis A5 (accepted-count feedback): the
+// accepted draft count each verify step (0..n_max) feeds this plan's
+// state_persist_*/state_restore_*/state_snapshot_*/state_write_* vectors
+// (built above from rollback/n_seq_tokens, both accepted-count-derived) --
+// those are exactly the "accepted-count-dependent graph inputs" the rewrite
+// asked to close. The default path always stretches them to
+// dsv4_build_reserve_comp_plan's max rank, so
+// A5's index-tensor SHAPES are already constant regardless of accepted
+// count; only the CONTENTS (which real index vs. a repeated/masked filler)
+// vary, which is the pad+mask idiom working as intended -- ne/nb stay fixed,
+// data does not. WP_DS4_CSA_LAZY_STATE leaves only compressor write ranks
+// empty off-boundary. The repeated/masked fill values are inert reads/writes
+// (repeating the last real index re-touches an already-written row; the
+// kv_size-1 fallback for an empty write lands on the reserve's dedicated
+// masked scratch row), so padding never perturbs a real lane.
 static void dsv4_pad_live_plan_to_reserve_rank(
         llama_kv_cache_dsv4_context::comp_plan & plan,
         const llama_ubatch & ubatch,
@@ -432,7 +479,8 @@ static void dsv4_pad_live_plan_to_reserve_rank(
         uint32_t state_size,
         uint32_t kv_size,
         uint32_t n_stream,
-        uint32_t n_rs_seq) {
+        uint32_t n_rs_seq,
+        bool pad_compressor_write) {
     const auto reserve = dsv4_build_reserve_comp_plan(
             ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq);
 
@@ -456,10 +504,12 @@ static void dsv4_pad_live_plan_to_reserve_rank(
     pad_i32(plan.state_restore_dst_idxs, reserve.state_restore_dst_idxs.size());
     pad_i32(plan.state_snapshot_src_idxs, reserve.state_snapshot_src_idxs.size());
     pad_i32(plan.state_snapshot_dst_idxs, reserve.state_snapshot_dst_idxs.size());
-    pad_i32(plan.state_read_idxs, reserve.state_read_idxs.size());
-    pad_i64(plan.state_write_idxs, reserve.state_write_idxs.size(),
-            kv_size > 0 ? (int64_t) kv_size - 1 : 0);
-    pad_i32(plan.state_write_pos, reserve.state_write_pos.size());
+    if (pad_compressor_write) {
+        pad_i32(plan.state_read_idxs, reserve.state_read_idxs.size());
+        pad_i64(plan.state_write_idxs, reserve.state_write_idxs.size(),
+                kv_size > 0 ? (int64_t) kv_size - 1 : 0);
+        pad_i32(plan.state_write_pos, reserve.state_write_pos.size());
+    }
 
     // Decode/verify: pin kq_mask width at the allocated cache size so it
     // does not step every 256 visible rows. Prefill keeps the 256-aligned
@@ -610,7 +660,8 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         }
     }
 
-    if (ratio == DSV4_CSA_RATIO && !plan.state_pos.empty()) {
+    if (ratio == DSV4_CSA_RATIO && !plan.state_pos.empty() &&
+            (!dsv4_csa_lazy_state_enabled() || !plan.state_write_idxs.empty())) {
         assert(kv_size > 0);
 
         // Pad each stream to the reserve plan's block count.
@@ -748,8 +799,10 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         return env && atoi(env) > 0;
     }();
 
+    const bool pad_compressor_write = ratio != DSV4_CSA_RATIO ||
+            !dsv4_csa_lazy_state_enabled() || !plan.state_write_idxs.empty();
     dsv4_pad_live_plan_to_reserve_rank(
-            plan, ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq);
+            plan, ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, pad_compressor_write);
 
     if (debug) {
         LLAMA_LOG_INFO("%s: ratio=%u, n_tokens=%u, state_persist_dst=%s, state_write_pos=%s\n",

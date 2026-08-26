@@ -42,6 +42,21 @@ static bool wp_dspark_debug() {
     return s_on;
 }
 
+// MAD-LAB / verify-width padding is a separate, opt-in knob from
+// WP_DS4_CONST_SHAPE (2026-08-24 split, mirrors tools/server/server-context.cpp
+// server_spec_const_width()). WP_DS4_CONST_SHAPE=1 alone no longer defaults
+// this to 7 -- padding the drafter's block to a constant width is real added
+// compute on the hot verify path, not free dispatch overhead (measured: DS4
+// decode cost is ~linear in tokens verified). WP_SPEC_CONST_WIDTH must be set
+// explicitly to enable it; deprecated in favor of running const-shape unpadded.
+static int32_t wp_ds4_const_shape_width() {
+    static const int32_t width = [] {
+        const char * value = std::getenv("WP_SPEC_CONST_WIDTH");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    return width;
+}
+
 // MAD-LAB / WP_DSPARK_ANCHOR_ABLATE: anchor-sensitivity probe.
 //
 // Set to a token id to REPLACE the anchor (dp.id_last) in the DSpark noise block with that
@@ -195,6 +210,19 @@ struct common_speculative_impl {
     size_t n_acc_tokens = 0; // number of tokens accepted by the target model.
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
+    std::vector<double> n_draft_conf_sum;
+    std::vector<size_t> n_draft_conf_count;
+    std::vector<size_t> n_draft_len_hist;
+
+    // MAD-LAB / multi-sequence-safe: count of ragged (non-block-aligned) ubatches the
+    // DSpark Markov head skipped, forcing that call's confidence to an explicit 0 instead
+    // of serving it stale. Only common_speculative_impl_draft_dflash ever increments this
+    // (via llama_dspark_markov_ragged_skipped_fetch_reset(), src/models/dflash.cpp); every
+    // other implementation leaves it at 0. Should stay 0 for a correctly configured
+    // DSpark draft context -- see the hard n_ubatch check in that constructor. Printed
+    // unconditionally in common_speculative_print_stats() so a nonzero value is visible
+    // in the normal stats line, not just in a log grep.
+    size_t n_markov_ragged_skipped = 0;
 
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
@@ -1015,6 +1043,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<float> base_buf;
     std::vector<float> conf_buf;
 
+    const bool collect_conf_stats;
+
     // The previous block's drafted tokens, carried across draft() calls to be
     // hinted at the top of the next one -- see the hint site in draft() for why
     // this block's own tokens cannot buy any lead time.
@@ -1049,6 +1079,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         : common_speculative_impl(type, n_seq)
         , params(params.draft)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+        , collect_conf_stats(params.draft.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN || wp_dspark_debug())
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1108,8 +1139,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // INFO maps to 4 and is filtered, WARN maps to 2 and passes. A gate whose
         // value you cannot see in the log has cost this project multiple
         // retracted measurement sets.
-        LOG_WRN("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f (0=gate off)\n",
-                __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
+        LOG_WRN("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f, conf_mode=%s (0=gate off)\n",
+                __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min,
+                this->params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN ? "per-token" : "chain");
         LOG_WRN("%s: - block_size=%d (source=%s), mask_token_id=%d, n_extract=%u, hc_mult=%d\n", __func__, block_size, block_size_source, mask_token_id, target_layer_ids_n, hc_mult);
         LOG_WRN("%s: - services_mode=%d (1 = sidecar without an LM head: token_embd gather and head projection run on the target)\n",
                 __func__, (int) services_mode);
@@ -1122,6 +1154,59 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
             this->params.n_max = std::min(this->params.n_max, n_draft_max);
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
+        }
+
+        // Keep the draft result within the server verify width. The verify
+        // batch has one sampled row in addition to the draft rows.
+        const int32_t const_shape_width = wp_ds4_const_shape_width();
+        if (const_shape_width > 0) {
+            const int32_t draft_width = const_shape_width;
+            this->params.n_max = std::min(this->params.n_max, draft_width);
+            this->params.n_min = std::min(this->params.n_min, draft_width);
+        }
+
+        // MAD-LAB / multi-sequence-safe: PREVENT torn DSpark blocks, don't just tolerate
+        // them. draft() (below) packs one equal-width block per drafting sequence into a
+        // single shared llama_decode(ctx_dft, ...) call -- up to n_seq blocks of
+        // n_shape_tokens each, back-to-back in one llama_batch. llama_kv_cache::init_batch()
+        // (src/llama-kv-cache.cpp) splits that batch with split_simple() whenever ctx_dft
+        // runs a single unified KV stream (n_stream==1, the common --parallel>1 config,
+        // inherited from the target's --kv-unified unless overridden), and split_simple()
+        // slices strictly by raw token position with NO regard for sequence boundaries. If
+        // the worst-case batch (every slot drafting a full-width block at once) is larger
+        // than ctx_dft's n_ubatch, split_simple() can cut straight through the middle of a
+        // block -- one ubatch ends up holding a partial block from one sequence plus a few
+        // leading tokens of the next, which is exactly the shape the DSpark Markov head
+        // (src/models/dflash.cpp, llama_dspark_build_markov_graph) cannot recover a correct
+        // chained-Markov bias or confidence for.
+        //
+        // Only the DSpark markov head imposes this block-alignment requirement (plain
+        // DFlash denoising is fine split across ubatches -- the KV cache still accumulates
+        // correctly), so only enforce it when the draft model actually carries markov
+        // weights. Fail HARD at construction, not with a warning that can go unread: the
+        // caller (common_speculative_init_from_params, tools/server/server-context.cpp)
+        // already catches std::runtime_error from this constructor and disables speculative
+        // decoding rather than crashing the server, so this degrades the server to "no
+        // speculative decoding" with a clear, actionable message instead of either aborting
+        // mid-request (the original crash) or silently degrading the confidence channel.
+        if (llama_model_has_dspark_markov(model_dft)) {
+            const int32_t n_block_tokens_max = this->params.n_max + (is_dspark ? 0 : 1);
+            const int32_t n_shape_tokens_max = const_shape_width > 0 ? const_shape_width + 1 : n_block_tokens_max;
+            const int64_t n_ubatch_dft       = llama_n_ubatch(ctx_dft);
+            const int64_t worst_case_tokens  = (int64_t) n_seq * n_shape_tokens_max;
+
+            if (worst_case_tokens > n_ubatch_dft) {
+                throw std::runtime_error(string_format(
+                    "%s: ctx_dft's n_ubatch (%d) is too small for DSpark multi-sequence "
+                    "drafting: with n_parallel=%u sequences each drafting a block of up to "
+                    "%d tokens, the shared draft batch can reach %" PRId64 " tokens, which "
+                    "the KV cache's ubatch splitter can tear mid-block once n_ubatch is "
+                    "smaller than that. Raise the draft context's --ubatch-size (-ub, or "
+                    "the draft-specific override if this rig has one) to at least %" PRId64
+                    ", or reduce --parallel / the draft block width.",
+                    __func__, (int) n_ubatch_dft, n_seq, n_shape_tokens_max,
+                    worst_case_tokens, worst_case_tokens));
+            }
         }
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,            n_seq);
@@ -1428,6 +1513,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_draft = params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
+            const int32_t const_shape_width = wp_ds4_const_shape_width();
+            const int32_t n_shape_tokens = const_shape_width > 0 ? const_shape_width + 1 : n_block_tokens;
+            GGML_ASSERT(n_block_tokens <= n_shape_tokens);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             // MAD-LAB / WP_DSPARK_ANCHOR_ABLATE: normally anchor_id == dp.id_last.
@@ -1443,6 +1531,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 common_batch_add(batch, i == 0 ? anchor_id : mask_token_id, n + i, { seq_id }, true);
+            }
+
+            if (n_block_tokens < n_shape_tokens) {
+                if (mask_token_id == LLAMA_TOKEN_NULL) {
+                    GGML_ABORT("WP_DS4_CONST_SHAPE requires a vocabulary mask token for draft padding");
+                }
+                for (int32_t i = n_block_tokens; i < n_shape_tokens; ++i) {
+                    common_batch_add(batch, mask_token_id, n + i, { seq_id }, true);
+                }
             }
 
             // (a) MAD-LAB / WP_DSPARK_DEBUG: draft-cache census, BEFORE the block decode.
@@ -1589,12 +1686,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             batch.embd = embd_buf.data();
         }
 
+        // MAD-LAB / multi-sequence-safe: the constructor's hard n_ubatch >=
+        // n_seq*n_shape_tokens check (see above) is what actually prevents
+        // llama_kv_cache::init_batch()'s split_simple() from ever tearing this batch
+        // mid-block, so there is nothing to re-check per call here anymore -- this is
+        // just the debug-build tripwire confirming that invariant still holds should
+        // this function's batch-sizing math ever drift out of sync with the
+        // constructor's.
+        assert(batch.n_tokens <= (int32_t) llama_n_ubatch(ctx_dft));
+
         // decode all sequence's noise block in a single batch
         int ret = llama_decode(ctx_dft, batch);
 
         // Detach before any path can free the batch: llama_batch_free() frees ->embd,
         // and this buffer is owned by embd_buf.
         batch.embd = nullptr;
+
+        // MAD-LAB / multi-sequence-safe: fold in whatever the graph build(s) inside that
+        // llama_decode() just tallied. is_dspark is the only type that ever wires up the
+        // Markov head, so this stays 0 for every other impl; polled unconditionally
+        // (regardless of `ret`) since the counter reflects graph construction, not decode
+        // success.
+        if (is_dspark) {
+            n_markov_ragged_skipped += (size_t) llama_dspark_markov_ragged_skipped_fetch_reset();
+        }
 
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
@@ -1663,6 +1778,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // each token it just proposed is. Carried to the next draft() for the
         // predicted half of the prefetch hint.
         std::vector<std::vector<float>> draft_conf(n_seq);
+        std::vector<std::vector<float>> draft_conf_all(n_seq);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1722,7 +1838,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const float c = conf_dbg ? conf_dbg[(size_t) idx * conf_stride_dbg] : -1.0f;
 
-                    SPC_INF("DBG slot seq=%d call=%d i=%d pos=%d conf=%.4f gap=%.3f | "
+                    // raw-vs-resolved discriminator for the pos>=2 exact-zero readout:
+                    // the raw pointer indexes by batch position; _ith resolves through the
+                    // output-row map. Disagreement = layout bug; agreement on 0 = the graph
+                    // never wrote the row.
+                    float c_ith = -1.0f;
+                    if (!services_mode) {
+                        const float * row_ith = llama_get_embeddings_nextn_ith(ctx_dft, idx);
+                        if (row_ith != nullptr) {
+                            c_ith = row_ith[0];
+                        }
+                    }
+                    SPC_INF("DBG confrow seq=%d i=%d raw=%.3e ith=%.3e\n", seq_id, i, c, c_ith);
+
+                    SPC_INF("DBG slot seq=%d call=%d i=%d pos=%d conf=%.3e gap=%.3f | "
                             "top1=%6d (%8.3f) '%s' | top2=%6d (%8.3f) '%s' | top3=%6d (%8.3f) '%s'%s\n",
                             seq_id, dbg_n_draft, i, (int) dp.n_past + i, c, v[0] - v[1],
                             t[0], v[0], common_token_to_piece(ctx_dft, t[0]).c_str(),
@@ -1746,17 +1875,51 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * conf        = services_mode
                     ? (conf_buf.empty() ? nullptr : conf_buf.data())
                     : llama_get_embeddings_nextn(ctx_dft);
-                const size_t  conf_stride = services_mode ? 1 : (size_t) n_embd_nextn;
+
+                // MAD-LAB 2026-08-21: in-graph rows MUST be read through the
+                // output-row map. The raw pointer indexes by batch position, but the
+                // masked nextn buffer's row order is the OUTPUT order — for this
+                // batch shape rows 2+ land elsewhere and the raw read returned
+                // literal unwritten 0.0f, silently truncating every draft at
+                // length 2 regardless of floor (verified raw=0.000e+00 vs
+                // ith=~1.0 on-rig). services_mode conf_buf is per-token dense and
+                // keeps the direct read.
+                const auto conf_row = [&](int32_t idx) -> float {
+                    if (services_mode) {
+                        return conf[idx];
+                    }
+                    const float * row = llama_get_embeddings_nextn_ith(ctx_dft, idx);
+                    return row != nullptr ? row[0] : 1.0f;
+                };
+
+                // MAD-LAB: per-token mode treats a decreasing head score as a
+                // survival score and gates on its conditional ratio.
+                const auto gate_conf_at = [&](int32_t i) {
+                    const int32_t idx = beg + i;
+                    const float raw_conf = conf ? conf_row(idx) : 1.0f;
+                    if (params.conf_mode != COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN || i == 0 || !conf) {
+                        return raw_conf;
+                    }
+                    const float prev_conf = conf ? conf_row(idx - 1) : 1.0f;
+                    return std::min(1.0f, raw_conf / std::max(prev_conf, 1.0e-6f));
+                };
+
+                if (collect_conf_stats) {
+                    for (int32_t i = 0; i < n_block_tokens; ++i) {
+                        draft_conf_all[seq_id].push_back(gate_conf_at(i));
+                    }
+                }
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    // n_embd_nextn: conf comes from llama_get_embeddings_nextn(), whose
-                    // rows are n_embd_out wide. Striding n_embd_dec here read a quarter
-                    // into the wrong row for every idx > 0 and truncated blocks on
-                    // arbitrary values.
-                    if (i > 0 && conf && params.conf_min > 0.0f &&
-                        conf[(size_t) idx * conf_stride] < params.conf_min) {
+                    const float raw_conf = conf ? conf_row(idx) : 1.0f;
+                    const float gate_conf = gate_conf_at(i);
+
+                    // MAD-LAB: chain mode keeps the legacy ungated first position;
+                    // per-token mode applies the floor to every predicted position.
+                    const bool gate_position = params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN || i > 0;
+                    if (gate_position && conf && params.conf_min > 0.0f && gate_conf < params.conf_min) {
                         break;
                     }
 
@@ -1775,8 +1938,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
-                    draft_conf[seq_id].push_back(
-                            conf ? conf[(size_t) idx * conf_stride] : 1.0f);
+                    draft_conf[seq_id].push_back(raw_conf);
 
                     if (capture_n_embd > 0) {
                         const float * row = capture_rows + (size_t) idx * capture_n_embd;
@@ -1819,6 +1981,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 draft_conf[seq_id].clear();
                 if (common_speculative_capture_enabled()) {
                     capture_embd[seq_id].clear();
+                }
+            }
+
+            if (collect_conf_stats) {
+                if (n_draft_len_hist.size() <= result.size()) {
+                    n_draft_len_hist.resize(result.size() + 1, 0);
+                }
+                n_draft_len_hist[result.size()]++;
+                for (size_t i = 0; i < draft_conf_all[seq_id].size(); ++i) {
+                    if (n_draft_conf_sum.size() <= i) {
+                        n_draft_conf_sum.resize(i + 1, 0.0);
+                        n_draft_conf_count.resize(i + 1, 0);
+                    }
+                    n_draft_conf_sum[i] += draft_conf_all[seq_id][i];
+                    n_draft_conf_count[i]++;
                 }
             }
         }
@@ -3540,6 +3717,41 @@ void common_speculative_print_stats(const common_speculative * spec) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(2) << mean;
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
+        }
+
+        if (!impl->n_draft_len_hist.empty()) {
+            std::ostringstream tmp;
+            for (size_t i = 0; i < impl->n_draft_len_hist.size(); ++i) {
+                if (i > 0) {
+                    tmp << ", ";
+                }
+                tmp << i << ":" << impl->n_draft_len_hist[i];
+            }
+            str_stats += ", #draft len hist = (" + tmp.str() + ")";
+        }
+        if (!impl->n_draft_conf_count.empty()) {
+            std::ostringstream tmp;
+            // scientific, not fixed: a saturated-sigmoid mean (~1e-5) and a true 0.0
+            // are indistinguishable at %.3f, and that distinction is the whole point
+            // of this counter on the dspark arm.
+            tmp << std::scientific << std::setprecision(3);
+            for (size_t i = 0; i < impl->n_draft_conf_count.size(); ++i) {
+                if (i > 0) {
+                    tmp << ", ";
+                }
+                tmp << (double) impl->n_draft_conf_sum[i] / (double) impl->n_draft_conf_count[i];
+            }
+            str_stats += ", #draft conf/pos = (" + tmp.str() + ")";
+        }
+
+        // MAD-LAB / multi-sequence-safe: nonzero here means a ragged ubatch reached the
+        // DSpark Markov head despite the draft context's load-time n_ubatch guard (see
+        // common_speculative_impl_draft_dflash's constructor) -- that call's confidence
+        // was forced to 0 rather than served stale, but the invariant that's supposed to
+        // make this impossible was violated somewhere. Treat any nonzero value here as a
+        // bug to chase down, not a tuning knob.
+        if (impl->n_markov_ragged_skipped > 0) {
+            str_stats += ", #markov ragged skipped = " + std::to_string(impl->n_markov_ragged_skipped);
         }
 
         // Promoted from TRC to INF (2026-08-16), alongside the server-side "acc per pos"

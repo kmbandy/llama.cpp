@@ -2762,6 +2762,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
+        {"--pipeline-streams"}, "N",
+        string_format(
+            "MAD-LAB DS4-Flash: number of independently-progressing spine "
+            "streams, each with its own llama_context and its own "
+            "expert-dispatch connection (default: %d = today's single-"
+            "context path, byte-identical). --ctx-size is split evenly "
+            "across streams when N > 1. As of this build, N > 1 wires up "
+            "the extra context(s)/dispatcher(s) only; update_slots() still "
+            "serves everything on stream A",
+            params.n_pipeline_streams),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("error: --pipeline-streams must be >= 1\n");
+            }
+            params.n_pipeline_streams = value;
+        }
+    ).set_env("WP_PIPELINE_STREAMS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
@@ -4462,6 +4480,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.conf_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CONF_MIN"));
+    // MAD-LAB: opt-in conditional confidence gate for DSpark.
+    add_opt(common_arg(
+        {"--spec-draft-conf-mode"}, "MODE",
+        "DSpark confidence gate mode: chain or per-token (default: chain)",
+        [](common_params & params, const std::string & value) {
+            if (value == "chain") {
+                params.speculative.draft.conf_mode = COMMON_SPECULATIVE_DRAFT_CONF_MODE_CHAIN;
+            } else if (value == "per-token") {
+                params.speculative.draft.conf_mode = COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN;
+            } else {
+                throw std::invalid_argument("invalid DSpark confidence gate mode: " + value);
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CONF_MODE"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

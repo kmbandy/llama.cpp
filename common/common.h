@@ -184,6 +184,13 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
+// MAD-LAB: keep the legacy first-failing-position gate selectable while testing
+// a conditional per-token confidence gate.
+enum common_speculative_draft_conf_mode {
+    COMMON_SPECULATIVE_DRAFT_CONF_MODE_CHAIN,
+    COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN,
+};
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set
@@ -343,6 +350,8 @@ struct common_params_speculative_draft {
     // 0.9 is not a calibrated threshold across heads/positions; treat any
     // nonzero value as an explicit experiment.
     float conf_min = 0.0f;
+    // MAD-LAB: default preserves the existing draft-length policy byte-for-byte.
+    common_speculative_draft_conf_mode conf_mode = COMMON_SPECULATIVE_DRAFT_CONF_MODE_CHAIN;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
@@ -461,6 +470,17 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    // MAD-LAB DS4-Flash: number of independently-progressing spine streams
+    // (each stream = its own llama_context + its own expert-dispatch
+    // connection, so worker-side pipeline parallelism across streams is
+    // possible). 1 == today's single-context code path, byte-identical.
+    // See tools/server/server-context.cpp server_context_impl::init() for
+    // the construction of ctx_tgt2..N; --ctx-size is split evenly across
+    // streams when this is > 1. Currently only the context/dispatcher
+    // plumbing is wired; the update_slots() serving loop still drives a
+    // single stream (stream A) regardless of this value -- see the
+    // "PIPELINE-STREAMS" comment at update_slots().
+    int32_t n_pipeline_streams    =     1;
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence

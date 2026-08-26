@@ -1269,6 +1269,34 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
+
+    private:
+        struct constant_cache_entry {
+            ggml_type type;
+            int64_t ne[GGML_MAX_DIMS];
+            uint32_t value_bits;
+            ggml_tensor * tensor;
+        };
+
+        struct weight_view_cache_entry {
+            ggml_tensor * source;
+            int64_t ne0;
+            int64_t i0;
+            ggml_tensor * view;
+        };
+
+        ggml_tensor * get_constant(
+                ggml_type type,
+                const int64_t ne[GGML_MAX_DIMS],
+                float value) const;
+
+        ggml_tensor * get_weight_view_1d(
+                ggml_tensor * tensor,
+                int64_t ne0,
+                int64_t i0) const;
+
+        mutable std::vector<constant_cache_entry> constant_cache;
+        mutable std::vector<weight_view_cache_entry> weight_view_cache;
     };
 
     struct graph_mtp : public graph {

@@ -412,10 +412,8 @@ private:
     const llama_memory_status status;
 };
 
-// Live compressor plan. Rank of every index tensor matches the reserve plan
-// for the same ubatch so llm_graph_input_dsv4::can_reuse stays true across
-// decode tokens (compression commits and growing n_visible must not rebuild
-// the graph / recapture a HIP graph).
+// Live compressor plan. By default, index ranks match the reserve plan so
+// compression commits and growing n_visible do not rebuild the graph.
 llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         const llama_ubatch & ubatch,
         uint32_t ratio,
