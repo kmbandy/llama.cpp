@@ -151,6 +151,7 @@ ggml_tensor * scatter_compact_rows(
 }
 
 static constexpr uint64_t DEFAULT_STAGING_BUFFERS = 16;
+static constexpr size_t DIRECT_ALIGNMENT = 4096;
 
 // WP_EXPERT_STAGING_BUFFERS=<n> changes the staging depth only when the
 // caller did not set --host-budget.  Default-off: an unset, empty, zero, or
@@ -165,10 +166,47 @@ uint64_t staging_buffers_from_env() {
     char * end = nullptr;
     errno = 0;
     const unsigned long long parsed = std::strtoull(env, &end, 10);
-    if (errno == ERANGE || end == env || *end != '\0' || parsed == 0) {
+    if (errno == ERANGE || end == env || *end != '\0' || parsed == 0 ||
+            parsed > std::numeric_limits<size_t>::max()) {
         return DEFAULT_STAGING_BUFFERS;
     }
     return (uint64_t) parsed;
+}
+
+static size_t read_inflight_from_env() {
+    const char * env = std::getenv("WP_READ_INFLIGHT");
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 0;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' || parsed == 0 ||
+            parsed > std::numeric_limits<size_t>::max()) {
+        return 0;
+    }
+    return (size_t) parsed;
+}
+
+static size_t read_chunk_bytes_from_env() {
+    const char * env = std::getenv("WP_READ_CHUNK_BYTES");
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 0;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' || parsed < DIRECT_ALIGNMENT ||
+            parsed > std::numeric_limits<size_t>::max()) {
+        return 0;
+    }
+    const size_t chunk = (size_t) parsed;
+    return chunk / DIRECT_ALIGNMENT * DIRECT_ALIGNMENT;
+}
+
+static bool read_direct_from_env() {
+    const char * env = std::getenv("WP_READ_DIRECT");
+    return env != nullptr && std::strcmp(env, "1") == 0;
 }
 
 struct RequestStats {
@@ -238,6 +276,9 @@ struct RequestStats {
     // demote_slot). ns_demote is the D2H subset; ns_host_get is the restore.
     uint64_t ns_demote = 0;
     uint64_t ns_ensure_post = 0;
+    uint64_t n_read_inflight_max = 0;
+    uint64_t ns_read_issue = 0;
+    uint64_t ns_read_complete = 0;
 };
 
 // Forward declarations: the probe itself is defined further down, next to
@@ -394,6 +435,9 @@ public:
         n_reader_h2d_ += request.n_reader_h2d;
         ns_demote_ += request.ns_demote;
         ns_ensure_post_ += request.ns_ensure_post;
+        n_read_inflight_max_ = std::max(n_read_inflight_max_, request.n_read_inflight_max);
+        ns_read_issue_ += request.ns_read_issue;
+        ns_read_complete_ += request.ns_read_complete;
         ++n_requests_;
         n_experts_ += n_experts;
 
@@ -437,6 +481,11 @@ private:
                   << " ns_recv=unavailable"
                   << " ns_lookup=" << ns_lookup_
                   << " ns_read=" << ns_read_
+                  << " ns_read_issue=" << ns_read_issue_
+                  << " ns_read_complete=" << ns_read_complete_
+                  << " n_read_inflight_max=" << n_read_inflight_max_
+                  << " read_bytes_per_s=" << (ns_read_complete_ == 0 ? 0.0 :
+                        (double) bytes_read_ * 1000000000.0 / (double) ns_read_complete_)
                   << " ns_h2d=" << ns_h2d_
                   << " bytes_h2d=" << bytes_h2d_
                   << " gb_s_h2d=" << (ns_h2d_ == 0 ? 0.0 :
@@ -581,6 +630,9 @@ private:
     uint64_t          ns_h2d_     = 0;
     uint64_t          ns_demote_ = 0;
     uint64_t          ns_ensure_post_ = 0;
+    uint64_t          n_read_inflight_max_ = 0;
+    uint64_t          ns_read_issue_ = 0;
+    uint64_t          ns_read_complete_ = 0;
     uint64_t          bytes_h2d_  = 0;
     uint64_t          n_reader_h2d_ = 0;
     std::string       staging_kind_ = "unknown";
@@ -827,8 +879,6 @@ static constexpr const char * INDEX_FORMAT =
     "llama.cpp.weight-pager.expert-shard-index";
 static constexpr const char * DESCRIPTOR_FORMAT =
     "llama.cpp.weight-pager.expert-descriptor";
-static constexpr size_t DIRECT_ALIGNMENT = 4096;
-
 struct RoleSpec {
     enum ggml_type type = GGML_TYPE_COUNT;
     int64_t        ne0 = 0;
@@ -2338,6 +2388,8 @@ private:
         bool                                    start  = false;
         bool                                    cancel = false;
         bool                                    measure = false;
+        std::atomic<size_t>                     read_inflight{0};
+        std::atomic<size_t>                     read_inflight_max{0};
         // True for a batch submitted by spec_pagein_submit. Its page-ins are
         // logged as "S" AT SUBMIT; drain_one_read must NOT also log them as
         // "D", or every harvested speculative read masquerades as the demand
@@ -2623,6 +2675,18 @@ public:
             return n_reader_h2d_;
         }
 
+        uint64_t n_read_inflight_max() const {
+            return n_read_inflight_max_;
+        }
+
+        uint64_t ns_read_issue() const {
+            return ns_read_issue_;
+        }
+
+        uint64_t ns_read_complete() const {
+            return ns_read_complete_;
+        }
+
         uint64_t n_resident() const {
             return n_resident_;
         }
@@ -2697,6 +2761,9 @@ public:
         uint64_t                   ns_h2d_    = 0;
         uint64_t                   bytes_h2d_ = 0;
         uint64_t                   n_reader_h2d_ = 0;
+        uint64_t                   n_read_inflight_max_ = 0;
+        uint64_t                   ns_read_issue_ = 0;
+        uint64_t                   ns_read_complete_ = 0;
         ggml_backend_event_t       copy_event_ = nullptr;
         // Drain state. Lives on the Batch rather than in complete_batch's frame
         // so a drain can stop part-way (complete_upto) and be resumed. A read
@@ -2706,6 +2773,10 @@ public:
         std::exception_ptr         first_error_;
         std::chrono::steady_clock::time_point first_read_;
         std::chrono::steady_clock::time_point last_read_;
+        std::chrono::steady_clock::time_point first_read_issue_;
+        std::chrono::steady_clock::time_point last_read_issue_;
+        std::chrono::steady_clock::time_point first_read_complete_;
+        std::chrono::steady_clock::time_point last_read_complete_;
         bool                       have_read_time_ = false;
     };
 
@@ -3250,7 +3321,7 @@ public:
             // ceil(threads / stripes-per-page), so borrow() never deadlocks:
             // a thread blocked on borrow holds no lease itself, and earlier
             // pages retire to free buffers.
-            if (stripe_parallel_) {
+            if (stripe_parallel_ || read_chunk_bytes_ != 0) {
                 auto & st = *batch.state_;
                 st.page_shared.reserve(st.pageins.size());
                 for (size_t pi = 0; pi < st.pageins.size(); ++pi) {
@@ -3277,11 +3348,17 @@ public:
                     (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
                 return parsed > 0 ? (size_t) parsed : (size_t) 4;
             }();
-            const size_t worker_count = stripe_parallel_
+            const size_t requested_workers = read_inflight_ != 0
+                ? read_inflight_
+                : (stripe_parallel_ || read_chunk_bytes_ != 0 ? s_read_workers
+                                                               : staging_.buffer_count());
+            const size_t worker_count = !batch.state_->stripe_jobs.empty()
                 ? std::min<size_t>(batch.state_->stripe_jobs.size(),
-                                   std::min<size_t>(s_read_workers, (size_t) staging_.buffer_count()))
+                                   std::min<size_t>(requested_workers,
+                                                    (size_t) staging_.buffer_count()))
                 : std::min<size_t>(
-                      batch.state_->pageins.size(), (size_t) staging_.buffer_count());
+                      batch.state_->pageins.size(),
+                      std::min<size_t>(requested_workers, (size_t) staging_.buffer_count()));
             batch.workers_.reserve(worker_count);
             for (size_t i = 0; i < worker_count; ++i) {
                 batch.workers_.emplace_back(
@@ -3897,6 +3974,10 @@ public:
         return staging_.pinned() ? "pinned" : "pageable";
     }
 
+    size_t read_inflight() const { return read_inflight_; }
+    size_t read_chunk_bytes() const { return read_chunk_bytes_; }
+    bool read_direct() const { return read_direct_; }
+
     // Delegates to StagingPool::set_multi_conn -- see that method and the
     // StagingPool class comment (2026-08-25 deadlock fix) for the quota
     // formula and why this must run before any connection thread starts.
@@ -4236,7 +4317,8 @@ private:
                 }
                 read_page_range(*pagein.page, pagein.fd,
                                 (char *) result->staging->get() + job.offset,
-                                job.offset, job.len);
+                                job.offset, job.len,
+                                state->measure ? state.get() : nullptr);
                 if (state->measure && result->read_timed) {
                     result->read_finished = std::chrono::steady_clock::now();
                 }
@@ -4387,7 +4469,8 @@ private:
                         read_page_range(
                             *pagein.page, pagein.fd,
                             (char *) staging->get() + result->offset,
-                            result->offset, result->len);
+                            result->offset, result->len,
+                            state->measure ? state.get() : nullptr);
                     } catch (...) {
                         result->error = std::current_exception();
                     }
@@ -4468,6 +4551,18 @@ private:
                 }
                 if (!batch.have_read_time_ || result->read_finished > batch.last_read_) {
                     batch.last_read_ = result->read_finished;
+                }
+                if (!batch.have_read_time_ || result->read_started < batch.first_read_issue_) {
+                    batch.first_read_issue_ = result->read_started;
+                }
+                if (!batch.have_read_time_ || result->read_started > batch.last_read_issue_) {
+                    batch.last_read_issue_ = result->read_started;
+                }
+                if (!batch.have_read_time_ || result->read_finished < batch.first_read_complete_) {
+                    batch.first_read_complete_ = result->read_finished;
+                }
+                if (!batch.have_read_time_ || result->read_finished > batch.last_read_complete_) {
+                    batch.last_read_complete_ = result->read_finished;
                 }
                 batch.have_read_time_ = true;
             }
@@ -4674,7 +4769,13 @@ private:
         if (batch.have_read_time_) {
             batch.ns_read_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 batch.last_read_ - batch.first_read_).count();
+            batch.ns_read_issue_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                batch.last_read_issue_ - batch.first_read_issue_).count();
+            batch.ns_read_complete_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                batch.last_read_complete_ - batch.first_read_issue_).count();
         }
+        batch.n_read_inflight_max_ = batch.state_->read_inflight_max.load(
+            std::memory_order_relaxed);
         if (batch.first_error_ != nullptr) {
             std::rethrow_exception(batch.first_error_);
         }
@@ -4859,10 +4960,16 @@ private:
         if (it != fds_.end()) {
             return it->second;
         }
-        const int fd = open(key.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        int fd = -1;
+        if (read_direct_) {
+            fd = open(key.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        }
+        if (fd < 0) {
+            fd = open(key.c_str(), O_RDONLY | O_CLOEXEC);
+        }
         if (fd < 0) {
             throw std::runtime_error(
-                "failed to open O_DIRECT shard " + key + ": " + std::strerror(errno));
+                "failed to open expert shard " + key + ": " + std::strerror(errno));
         }
         fds_.emplace(key, fd);
         return fd;
@@ -4872,20 +4979,46 @@ private:
 #endif
     }
 
-    // Read [offset, offset+len) of a page. offset is 4096-aligned by
-    // construction (see stripe_plan); the final stripe carries whatever
-    // remainder the page has, which is exactly the tail a single whole-page
-    // read submits today, so O_DIRECT sees no length it did not see before.
+    // Read [offset, offset+len) of a page. Direct reads are opt-in; an
+    // alignment refusal retries through a buffered fd.
     void read_page_range(const ExpertPage & page, int fd, void * dst,
-                         size_t offset, size_t len) {
+                         size_t offset, size_t len, BatchState * state = nullptr) {
 #if defined(__linux__)
+        struct ReadInflightGuard {
+            std::atomic<size_t> * count = nullptr;
+            ~ReadInflightGuard() {
+                if (count != nullptr) {
+                    count->fetch_sub(1, std::memory_order_relaxed);
+                }
+            }
+        } guard;
+        if (state != nullptr) {
+            const size_t active = state->read_inflight.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            size_t previous = state->read_inflight_max.load(std::memory_order_relaxed);
+            while (previous < active &&
+                   !state->read_inflight_max.compare_exchange_weak(
+                       previous, active, std::memory_order_relaxed)) {
+            }
+            guard.count = &state->read_inflight;
+        }
         ssize_t n = -1;
         do {
             n = pread(fd, dst, len, (off_t) (page.offset + (uint64_t) offset));
         } while (n < 0 && errno == EINTR);
+        if (n < 0 && read_direct_ && errno == EINVAL) {
+            const int buffered_fd = open(page.blob.c_str(), O_RDONLY | O_CLOEXEC);
+            if (buffered_fd >= 0) {
+                do {
+                    n = pread(buffered_fd, dst, len,
+                              (off_t) (page.offset + (uint64_t) offset));
+                } while (n < 0 && errno == EINTR);
+                close(buffered_fd);
+            }
+        }
         if (n < 0 || (size_t) n != len) {
             throw std::runtime_error(
-                "short O_DIRECT expert read from " + page.blob.string() +
+                "short expert read from " + page.blob.string() +
                 ": got " + std::to_string(n) + " want " + std::to_string(len) +
                 " at +" + std::to_string(offset));
         }
@@ -4895,6 +5028,7 @@ private:
         (void) dst;
         (void) offset;
         (void) len;
+        (void) state;
 #endif
     }
 
@@ -4914,6 +5048,23 @@ private:
         // 12.75 MiB whole-expert page) silently disables striping on the sliced
         // rig's ~1.5-9 MiB width-slice pages.
         const size_t kMinPart = stripe_min_part_;
+        if (read_chunk_bytes_ != 0) {
+            const size_t part = read_chunk_bytes_ < total ? read_chunk_bytes_ : total;
+            if (part < total) {
+                size_t off = 0;
+                while (off + part < total) {
+                    out.emplace_back(off, part);
+                    off += part;
+                }
+                out.emplace_back(off, total - off);
+            } else {
+                out.emplace_back(0, total);
+            }
+            if (test_hooks_ != nullptr && test_hooks_->stripe_planned) {
+                test_hooks_->stripe_planned(page_size, n_pageins, out.size());
+            }
+            return out;
+        }
         size_t n = read_stripes_;
         // *** GATE ON THE BATCH BEING READ-SPARSE. ***
         // Striping only pays when a page has no OTHER page to overlap against.
@@ -5044,6 +5195,11 @@ private:
     size_t                     read_stripes_ = read_stripes_from_env();
     size_t                     stripe_max_pageins_ = stripe_max_pageins_from_env();
     size_t                     stripe_min_part_ = stripe_min_part_from_env();
+    // 0 keeps the existing reader count; a positive value caps page/chunk
+    // reads for this batch, subject to the staging pool and connection quota.
+    size_t                     read_inflight_ = read_inflight_from_env();
+    size_t                     read_chunk_bytes_ = read_chunk_bytes_from_env();
+    const bool                 read_direct_ = read_direct_from_env();
     // WP_EXPERT_STRIPE_PARALLEL=1 -- stripes of one page are claimed by
     // MULTIPLE reader threads concurrently (QD>1 per page) instead of read
     // serially by the page's claimer. Default off: bare runs stay on the
@@ -5424,6 +5580,9 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     ns_h2d_(other.ns_h2d_),
     bytes_h2d_(other.bytes_h2d_),
     n_reader_h2d_(other.n_reader_h2d_),
+    n_read_inflight_max_(other.n_read_inflight_max_),
+    ns_read_issue_(other.ns_read_issue_),
+    ns_read_complete_(other.ns_read_complete_),
     copy_event_(other.copy_event_),
     // Drain state travels with the batch. It was omitted here originally --
     // harmless while every move ran before the first drain (NRVO covered the
@@ -5434,6 +5593,10 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     first_error_(std::move(other.first_error_)),
     first_read_(other.first_read_),
     last_read_(other.last_read_),
+    first_read_issue_(other.first_read_issue_),
+    last_read_issue_(other.last_read_issue_),
+    first_read_complete_(other.first_read_complete_),
+    last_read_complete_(other.last_read_complete_),
     have_read_time_(other.have_read_time_) {
     other.owner_ = nullptr;
     other.copy_event_ = nullptr;
@@ -6590,6 +6753,9 @@ public:
         submit_prefill_layer_ahead(request.layer, request.n_tokens);
         if (measure) {
             request_stats.ns_read = batch.read_ns();
+            request_stats.n_read_inflight_max = batch.n_read_inflight_max();
+            request_stats.ns_read_issue = batch.ns_read_issue();
+            request_stats.ns_read_complete = batch.ns_read_complete();
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
             request_stats.n_reader_h2d = batch.n_reader_h2d();
@@ -6827,6 +6993,10 @@ public:
     const ResourcePlan & resources() const {
         return pool_.resources();
     }
+
+    size_t read_inflight() const { return pool_.read_inflight(); }
+    size_t read_chunk_bytes() const { return pool_.read_chunk_bytes(); }
+    bool read_direct() const { return pool_.read_direct(); }
 
     // See ExpertSlotPool::set_staging_multi_conn / StagingPool::set_multi_conn
     // (the 2026-08-25 deadlock fix). run() calls this once, right after
@@ -10457,6 +10627,9 @@ int run(const Options & options) {
               << " size_classes=" << (resources.size_classes ? 1 : 0)
               << " staging=" << resources.staging_buffers << "x"
               << resources.staging_buffer_bytes
+              << " read_inflight=" << worker.read_inflight()
+              << " read_chunk_bytes=" << worker.read_chunk_bytes()
+              << " read_direct=" << (worker.read_direct() ? 1 : 0)
               << " host_budget=" << resources.host_budget_bytes
               << " host_victim_budget=" << options.host_victim_bytes
               << " partial_dtype=f32"
