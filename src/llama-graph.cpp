@@ -2832,6 +2832,14 @@ ggml_tensor * llm_graph_context::cap_lm_head_rows(ggml_tensor * cur) const {
         return cur;
     }
 
+    // MAD-LAB: llama_context::output_reserve() sizes the logits buffer off this
+    // same predicate. Slicing here for an arch it does not know about would write
+    // fewer rows than the buffer expects; not slicing for one it does cap would
+    // overflow it. Keep the two in lockstep.
+    if (!llm_arch_caps_lm_head_rows(arch)) {
+        return cur;
+    }
+
     const int64_t n_rows = cur->ne[1];
     if (n_rows <= (int64_t) llm_graph_logit_row_cap) {
         return cur;

@@ -3415,12 +3415,22 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // Vocab logits are only needed for the decode/spec window. DSpark prefill
     // asks for hundreds of *embedding* rows; sizing logits by that request is
     // what parked n_vocab*2048 on ROCm_Host after the sampling copies were cut.
+    //
+    // MAD-LAB: gate this on llm_arch_caps_lm_head_rows(), the SAME predicate the
+    // graph uses in cap_lm_head_rows(). Capping unconditionally was a bug: only
+    // DEEPSEEK4/DFLASH graphs slice the head, so for every other arch the graph
+    // still emitted all n_outputs rows into a 32-row buffer and decode() aborted
+    // on `(dst_row + n_copy)*n_vocab <= logits.size`. The pooling exemption stays
+    // because cap_lm_head_rows() exempts pooling graphs too.
+    const bool cap_logit_rows =
+        llm_arch_caps_lm_head_rows(model.arch) &&
+        !(cparams.embeddings &&
+          (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
+           cparams.pooling_type == LLAMA_POOLING_TYPE_RANK));
+
     const int64_t n_logit_rows = has_logits
-        ? ((cparams.embeddings &&
-            (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
-             cparams.pooling_type == LLAMA_POOLING_TYPE_RANK))
-                ? n_outputs_max
-                : std::min(n_outputs_max, (int64_t) k_draft_graph_tokens))
+        ? (cap_logit_rows ? std::min(n_outputs_max, (int64_t) k_draft_graph_tokens)
+                          : n_outputs_max)
         : 0;
 
     logits.size     = has_logits     ? n_vocab*n_logit_rows      : 0;

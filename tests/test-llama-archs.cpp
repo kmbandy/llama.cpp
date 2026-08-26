@@ -518,6 +518,13 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_QWEN35_MTP || arch == LLM_ARCH_QWEN35MOE_MTP) {
         return false; // MTP-only arch; requires a sibling trunk model and cannot run standalone.
     }
+    if (llm_arch_caps_lm_head_rows(arch)) {
+        // MAD-LAB: this fork's DEEPSEEK4/DFLASH graphs slice the LM head to the last
+        // llm_graph_logit_row_cap rows (cap_lm_head_rows). get_logits() below asks for
+        // logits at every one of its 128 positions, which such a graph cannot produce,
+        // so there is no all-rows CPU oracle to compare against.
+        return false;
+    }
 
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU

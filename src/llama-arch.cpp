@@ -1104,6 +1104,17 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_caps_lm_head_rows(const llm_arch & arch) {
+    switch (arch) {
+        // the only two archs that call cap_lm_head_rows() in their graphs
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DFLASH:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:

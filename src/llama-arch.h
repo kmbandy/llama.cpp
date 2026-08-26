@@ -779,4 +779,11 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+
+// MAD-LAB: true for archs whose graph slices the LM head down to the last
+// llm_graph_logit_row_cap rows (see llm_graph_context::cap_lm_head_rows).
+// llama_context::output_reserve() sizes the logits buffer off the SAME predicate;
+// if the two ever disagree the graph writes more rows than the buffer holds and
+// llama_context::decode() aborts on its bounds assert.
+bool llm_arch_caps_lm_head_rows(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
