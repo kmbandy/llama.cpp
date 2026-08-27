@@ -2213,6 +2213,53 @@ static void test_scatter_add_compact_rows_accumulates() {
     require(ggml_get_f32_1d(out, 2 * n_embd) == 1.0f, "untouched row 2 stays 1");
 }
 
+static void test_partial_last_column_round_trip() {
+    constexpr int n_embd = 2560;
+    constexpr int n_ff_exp = 640;
+    constexpr int n_tokens = 2;
+
+    std::vector<float> hidden((size_t) n_tokens * n_ff_exp);
+    std::vector<float> down((size_t) n_embd * n_ff_exp);
+    for (size_t i = 0; i < hidden.size(); ++i) {
+        hidden[i] = ((int) (i % 17) - 8) * 0.013f;
+    }
+    for (size_t i = 0; i < down.size(); ++i) {
+        down[i] = ((int) (i % 23) - 11) * 0.001f;
+    }
+
+    // CPU replay of a [640 -> 2560] expert down projection. Keep the
+    // accumulation order used by the worker's scalar reference path.
+    std::vector<float> cpu((size_t) n_tokens * n_embd, 0.0f);
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int output = 0; output < n_embd; ++output) {
+            float value = 0.0f;
+            for (int input = 0; input < n_ff_exp; ++input) {
+                value += down[(size_t) output * n_ff_exp + input] *
+                         hidden[(size_t) token * n_ff_exp + input];
+            }
+            cpu[(size_t) token * n_embd + output] = value;
+        }
+    }
+
+    pipe_expert_partial source;
+    source.layer    = 4;
+    source.n_tokens = n_tokens;
+    source.dtype    = PIPE_HIDDEN_F32;
+    source.partial  = cpu;
+    const std::vector<uint8_t> payload = pipe_encode_expert_partial(source);
+    const pipe_expert_partial decoded =
+        pipe_decode_expert_partial(payload.data(), payload.size(), n_embd);
+
+    for (int token = 0; token < n_tokens; ++token) {
+        const float * expected = cpu.data() + (size_t) token * n_embd;
+        const float * actual = decoded.partial.data() + (size_t) token * n_embd;
+        require(std::memcmp(expected, actual, (size_t) n_embd * sizeof(float)) == 0,
+                "expert partial changed during f32 encode/decode");
+        require(std::memcmp(&expected[n_embd - 1], &actual[n_embd - 1], sizeof(float)) == 0,
+                "expert partial last column changed during f32 encode/decode");
+    }
+}
+
 static void test_decode_prefill_compute_profile() {
     // Unset / empty / missing → new defaults (min tokens 2, coalesce on, cache on).
     require(wp_expert_worker::parse_gather_min_tokens(nullptr) == 2,
@@ -2459,6 +2506,7 @@ int main() {
         test_decode_prefill_compute_profile();
         test_scatter_compact_rows_matches_get_rows_back();
         test_scatter_add_compact_rows_accumulates();
+        test_partial_last_column_round_trip();
         test_slice_device_member_layout();
         test_glm_size_class_plan();
         run_test();
