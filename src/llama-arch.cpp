@@ -1145,11 +1145,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN3TTS:
-        // MAD-LAB: qwen4exp (PR #27742) ships no tensor-split rules for its
-        // hyper-connection / PLE / indexer tensors, so the Meta backend aborts in
-        // split_states_equal() rather than refusing the load. Deny it here so
-        // llama_model_load fails cleanly under -sm tensor instead.
-        case LLM_ARCH_QWEN4EXP:
             return false;
         default:
             return true;
