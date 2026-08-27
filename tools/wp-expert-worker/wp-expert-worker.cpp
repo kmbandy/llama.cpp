@@ -8103,6 +8103,15 @@ private:
             key.idx_rank     = gather_rank;
             key.add_previous = add_previous;
             std::memcpy(&key.clamp_bits, &request.swiglu_clamp, sizeof(key.clamp_bits));
+            // See the note on GraphKey: a cache hit rebinds pointers, never
+            // types, so two layers whose expert tensors are quantized
+            // differently must not share an entry.
+            {
+                const auto & key_specs = catalog_.descriptor.layers.at(request.layer);
+                key.type_gate = (uint32_t) key_specs.at("gate").type;
+                key.type_up   = (uint32_t) key_specs.at("up").type;
+                key.type_down = (uint32_t) key_specs.at("down").type;
+            }
             auto it = graph_cache_.find(key);
             // graph == nullptr marks a half-built entry (an exception hit the
             // build path after insertion): stale, rebuild. Buffer-generation
@@ -9797,9 +9806,28 @@ private:
         uint32_t idx_rank = 0;   // 0 = dense; else gather row count per expert
         bool     add_previous = false;
         uint32_t clamp_bits = 0;
+        // MAD-LAB 2026-08-26: THE WEIGHT TYPES ARE PART OF THE KEY.
+        //
+        // The D2 fast path rebinds only each weight tensor's buffer+data
+        // POINTER (attach_weight); the cached ggml_tensor keeps the TYPE and
+        // SHAPE it was built with. This model's expert tensors are not
+        // uniformly quantized -- it is an Unsloth UD-Q4_K_XL dynamic quant, so
+        // e.g. layer 2 is q8_0 down + q5_K gate/up while layers 0/1/3/5 are
+        // q5_1 down + q4_K gate/up. Those two shapes collide on every other
+        // key field (same n_tokens, n_selected, idx_rank, add_previous, clamp),
+        // so a graph built for one layer was replayed for the other and the
+        // matmul decoded q8_0 bytes as q5_1: deterministic garbage, identical
+        // on CUDA/Vulkan/CPU because all three faithfully misinterpret the
+        // same bytes, and invisible to any check on the shard data (which is
+        // byte-identical to the source GGUF).
+        uint32_t type_gate = 0;
+        uint32_t type_up   = 0;
+        uint32_t type_down = 0;
         bool operator<(const GraphKey & o) const {
-            return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits) <
-                   std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits);
+            return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
+                            type_gate, type_up, type_down) <
+                   std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits,
+                            o.type_gate, o.type_up, o.type_down);
         }
     };
     struct GraphCacheEntry {
