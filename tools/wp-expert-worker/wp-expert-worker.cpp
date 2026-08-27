@@ -2255,6 +2255,23 @@ public:
             }
             ggml_backend_buffer_set_usage(
                 allocation.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // MAD-LAB 2026-08-26: ZERO WEIGHT MEMORY ON ALLOCATION.
+            // A quantized expert tensor is allocated at the backend's PADDED
+            // size (ggml_backend_buft_get_alloc_size), but only its real
+            // ggml_nbytes are ever written from the shard. ggml itself warns
+            // the padding must be zeroed "to avoid possible NaN values"
+            // (ggml-cuda.cu, ggml_backend_cuda_buffer_init_tensor) -- the
+            // quantized matmul reads the padded tail, and garbage there is
+            // decoded as f16 block scales, where a random exponent-all-ones
+            // pattern is literally NaN/Inf. This worker never initialised ANY
+            // device memory (no memset / no buffer_clear anywhere in the
+            // file), and the one mechanism that would have zeroed the padding
+            // -- init_tensor's memset inside attach_weight -- is not reliable
+            // here: it aborts with "invalid argument" on this very allocation.
+            // Only `down` is affected in practice (ne0=640, 640 %% 512 = 128,
+            // so it pads; gate/up have ne0=2560 and do not), which is exactly
+            // the role in that abort's stack.
+            ggml_backend_buffer_clear(allocation.buffer.get(), 0);
             allocation.ctx.reset(ggml_init({
                 /* .mem_size = */ ggml_tensor_overhead() * 2,
                 /* .mem_buffer = */ nullptr,
@@ -4963,6 +4980,8 @@ private:
                 buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) total));
                 if (buf) {
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    // see the zeroing note on the resident-page allocation above
+                    ggml_backend_buffer_clear(buf.get(), 0);
                     arenas_.push_back(std::move(buf));
                     return;
                 }
@@ -5001,6 +5020,8 @@ private:
                             "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
                     }
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    // see the zeroing note on the resident-page allocation above
+                    ggml_backend_buffer_clear(buf.get(), 0);
                     arenas_.push_back(std::move(buf));
                     remaining -= want;
                     allocated += want;
@@ -5029,6 +5050,8 @@ private:
                     "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
             }
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // see the zeroing note on the resident-page allocation above
+            ggml_backend_buffer_clear(buf.get(), 0);
             arenas_.push_back(std::move(buf));
             remaining -= want;
         }
@@ -5835,9 +5858,25 @@ void attach_weight(
     }
     tensor->buffer = buffer;
     tensor->data   = (uint8_t *) base + offset;
-    if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("failed to attach expert weight tensor to slot");
-    }
+    // MAD-LAB 2026-08-26: DO NOT call ggml_backend_buffer_init_tensor here.
+    //
+    // For the quantized expert weights this function attaches, init_tensor's
+    // ONLY job is zeroing the row padding a quantized tensor allocates beyond
+    // ggml_nbytes -- and it is not fit for that purpose on either backend we
+    // run:
+    //   * CUDA/ROCm does the zeroing, but aborts the whole process here with
+    //     "ROCm error: invalid argument" out of
+    //     hipMemset(data + original_size, 0, padded_size - original_size)
+    //     (ggml-cuda.cu:907). GGML_ABORT, so it cannot even be caught.
+    //   * Vulkan's ggml_backend_vk_buffer_init_tensor is a NO-OP and never
+    //     zeroed the padding at all, which is why the RX 480 and the GTX 1070
+    //     produced byte-identical non-finite partials -- the padded tail was
+    //     decoded as f16 block scales, and a garbage exponent-all-ones pattern
+    //     is NaN/Inf.
+    // Both are now moot: every weight buffer is zeroed once at allocation
+    // (ggml_backend_buffer_clear at each USAGE_WEIGHTS site), so the padding is
+    // already 0 before any shard bytes land, which is strictly stronger than
+    // what init_tensor offered and costs nothing per attach.
 }
 
 class Worker {
