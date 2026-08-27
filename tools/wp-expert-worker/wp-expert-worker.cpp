@@ -1707,9 +1707,29 @@ Catalog & layout_sliced_pages(
             const RoleSpec & spec = specs.at(member.first);
             ggml_tensor * tensor =
                 ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
-            const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+            size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
             if (alloc_size < member.second->size) {
                 throw std::runtime_error("invalid expert slice device allocation size");
+            }
+            // MAD-LAB 2026-08-26: RESERVE QUANTIZED ROW SLACK ON EVERY BACKEND.
+            //
+            // CUDA/ROCm pads a quantized tensor up to MATRIX_ROW_PADDING (512)
+            // elements precisely "to avoid out-of-bounds memory accesses" from
+            // the quantized matmul kernels. Vulkan's
+            // ggml_backend_vk_buffer_type_get_alloc_size returns a bare
+            // ggml_nbytes and reserves NO slack at all -- so on Vulkan an
+            // over-reading kernel walks straight into the NEXT expert packed
+            // behind it in the slot, decodes those bytes as f16 block scales,
+            // and an exponent-all-ones pattern there is NaN/Inf. That is the
+            // RX 480 (:8804) returning non-finite partials while the same
+            // shard bytes are provably byte-identical to the source GGUF.
+            //
+            // Reserve the slack ourselves rather than trusting the backend to.
+            // The buffer is zeroed once at allocation and nothing ever writes
+            // this tail, so an over-read now lands in zeros -- which is the
+            // guarantee CUDA's padding was already providing.
+            if (ggml_is_quantized(spec.type) && spec.ne0 % 512 != 0) {
+                alloc_size += ggml_row_size(spec.type, 512 - (spec.ne0 % 512));
             }
             allocation_sizes.push_back((uint64_t) alloc_size);
         }
@@ -2255,6 +2275,23 @@ public:
             }
             ggml_backend_buffer_set_usage(
                 allocation.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // MAD-LAB 2026-08-26: ZERO WEIGHT MEMORY ON ALLOCATION.
+            // A quantized expert tensor is allocated at the backend's PADDED
+            // size (ggml_backend_buft_get_alloc_size), but only its real
+            // ggml_nbytes are ever written from the shard. ggml itself warns
+            // the padding must be zeroed "to avoid possible NaN values"
+            // (ggml-cuda.cu, ggml_backend_cuda_buffer_init_tensor) -- the
+            // quantized matmul reads the padded tail, and garbage there is
+            // decoded as f16 block scales, where a random exponent-all-ones
+            // pattern is literally NaN/Inf. This worker never initialised ANY
+            // device memory (no memset / no buffer_clear anywhere in the
+            // file), and the one mechanism that would have zeroed the padding
+            // -- init_tensor's memset inside attach_weight -- is not reliable
+            // here: it aborts with "invalid argument" on this very allocation.
+            // Only `down` is affected in practice (ne0=640, 640 %% 512 = 128,
+            // so it pads; gate/up have ne0=2560 and do not), which is exactly
+            // the role in that abort's stack.
+            ggml_backend_buffer_clear(allocation.buffer.get(), 0);
             allocation.ctx.reset(ggml_init({
                 /* .mem_size = */ ggml_tensor_overhead() * 2,
                 /* .mem_buffer = */ nullptr,
@@ -4963,6 +5000,8 @@ private:
                 buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) total));
                 if (buf) {
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    // see the zeroing note on the resident-page allocation above
+                    ggml_backend_buffer_clear(buf.get(), 0);
                     arenas_.push_back(std::move(buf));
                     return;
                 }
@@ -5001,6 +5040,8 @@ private:
                             "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
                     }
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    // see the zeroing note on the resident-page allocation above
+                    ggml_backend_buffer_clear(buf.get(), 0);
                     arenas_.push_back(std::move(buf));
                     remaining -= want;
                     allocated += want;
@@ -5029,6 +5070,8 @@ private:
                     "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
             }
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // see the zeroing note on the resident-page allocation above
+            ggml_backend_buffer_clear(buf.get(), 0);
             arenas_.push_back(std::move(buf));
             remaining -= want;
         }
@@ -5835,9 +5878,25 @@ void attach_weight(
     }
     tensor->buffer = buffer;
     tensor->data   = (uint8_t *) base + offset;
-    if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("failed to attach expert weight tensor to slot");
-    }
+    // MAD-LAB 2026-08-26: DO NOT call ggml_backend_buffer_init_tensor here.
+    //
+    // For the quantized expert weights this function attaches, init_tensor's
+    // ONLY job is zeroing the row padding a quantized tensor allocates beyond
+    // ggml_nbytes -- and it is not fit for that purpose on either backend we
+    // run:
+    //   * CUDA/ROCm does the zeroing, but aborts the whole process here with
+    //     "ROCm error: invalid argument" out of
+    //     hipMemset(data + original_size, 0, padded_size - original_size)
+    //     (ggml-cuda.cu:907). GGML_ABORT, so it cannot even be caught.
+    //   * Vulkan's ggml_backend_vk_buffer_init_tensor is a NO-OP and never
+    //     zeroed the padding at all, which is why the RX 480 and the GTX 1070
+    //     produced byte-identical non-finite partials -- the padded tail was
+    //     decoded as f16 block scales, and a garbage exponent-all-ones pattern
+    //     is NaN/Inf.
+    // Both are now moot: every weight buffer is zeroed once at allocation
+    // (ggml_backend_buffer_clear at each USAGE_WEIGHTS site), so the padding is
+    // already 0 before any shard bytes land, which is strictly stronger than
+    // what init_tensor offered and costs nothing per attach.
 }
 
 class Worker {
@@ -8044,6 +8103,15 @@ private:
             key.idx_rank     = gather_rank;
             key.add_previous = add_previous;
             std::memcpy(&key.clamp_bits, &request.swiglu_clamp, sizeof(key.clamp_bits));
+            // See the note on GraphKey: a cache hit rebinds pointers, never
+            // types, so two layers whose expert tensors are quantized
+            // differently must not share an entry.
+            {
+                const auto & key_specs = catalog_.descriptor.layers.at(request.layer);
+                key.type_gate = (uint32_t) key_specs.at("gate").type;
+                key.type_up   = (uint32_t) key_specs.at("up").type;
+                key.type_down = (uint32_t) key_specs.at("down").type;
+            }
             auto it = graph_cache_.find(key);
             // graph == nullptr marks a half-built entry (an exception hit the
             // build path after insertion): stale, rebuild. Buffer-generation
@@ -9738,9 +9806,28 @@ private:
         uint32_t idx_rank = 0;   // 0 = dense; else gather row count per expert
         bool     add_previous = false;
         uint32_t clamp_bits = 0;
+        // MAD-LAB 2026-08-26: THE WEIGHT TYPES ARE PART OF THE KEY.
+        //
+        // The D2 fast path rebinds only each weight tensor's buffer+data
+        // POINTER (attach_weight); the cached ggml_tensor keeps the TYPE and
+        // SHAPE it was built with. This model's expert tensors are not
+        // uniformly quantized -- it is an Unsloth UD-Q4_K_XL dynamic quant, so
+        // e.g. layer 2 is q8_0 down + q5_K gate/up while layers 0/1/3/5 are
+        // q5_1 down + q4_K gate/up. Those two shapes collide on every other
+        // key field (same n_tokens, n_selected, idx_rank, add_previous, clamp),
+        // so a graph built for one layer was replayed for the other and the
+        // matmul decoded q8_0 bytes as q5_1: deterministic garbage, identical
+        // on CUDA/Vulkan/CPU because all three faithfully misinterpret the
+        // same bytes, and invisible to any check on the shard data (which is
+        // byte-identical to the source GGUF).
+        uint32_t type_gate = 0;
+        uint32_t type_up   = 0;
+        uint32_t type_down = 0;
         bool operator<(const GraphKey & o) const {
-            return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits) <
-                   std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits);
+            return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
+                            type_gate, type_up, type_down) <
+                   std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits,
+                            o.type_gate, o.type_up, o.type_down);
         }
     };
     struct GraphCacheEntry {
