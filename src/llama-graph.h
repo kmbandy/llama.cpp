@@ -1095,10 +1095,12 @@ struct llm_graph_context {
     const llama_cross            * cross;
     pipe_expert_dispatcher::graph_dispatcher * expert_dispatch;
     // When true, build_moe_ffn's dispatch branch returns the ISSUE node and
-    // the caller must complete_moe_dispatch() after building shexp so shexp
-    // runs between send and recv. DS4 sets this; other arches keep the
-    // combined custom-op.
+    // the caller must shexp_after_issue() the shared-expert *input* (so the
+    // GPU FFN cannot start before send) then complete_moe_dispatch() after
+    // building shexp (wait + add). DS4 and qwen4exp set this.
     bool moe_dispatch_split_shexp = false;
+
+    ggml_tensor * shexp_after_issue(ggml_tensor * cur, int il);
 
     ggml_tensor * complete_moe_dispatch(ggml_tensor * moe_or_issued,
                                         ggml_tensor * shexp,

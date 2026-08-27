@@ -1717,19 +1717,52 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
+    int unsynced_backend_id = -1;
+
+    auto sync_backend = [&](int backend_id) {
+        if (backend_id < 0) {
+            return;
+        }
+        if (sched->events[backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(sched->backends[backend_id]);
+        }
+    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // HIP graph capture needs an idle stream. Overlap wait with shexp, then
+        // drain the GPU before the next split that actually uses that backend.
+        if (unsynced_backend_id >= 0 && split_backend_id == unsynced_backend_id) {
+            sync_backend(unsynced_backend_id);
+            unsynced_backend_id = -1;
+        }
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
+        // (#26040). Exception: expert-dispatch wait is MAP_CUSTOM2 on CPU with
+        // only CPU srcs — a different buffer type from the GPU shexp FFN, so
+        // gallocr cannot reuse VRAM for the wait output. Syncing here is what
+        // left the GPU idle for the whole worker RPC (48 layers).
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+            bool dispatch_wait = split->graph.n_nodes > 0;
+            for (int ni = 0; dispatch_wait && ni < split->graph.n_nodes; ++ni) {
+                const struct ggml_tensor * node = split->graph.nodes[ni];
+                if (node == NULL || node->op != GGML_OP_MAP_CUSTOM2) {
+                    dispatch_wait = false;
+                }
+            }
+            if (dispatch_wait) {
+                unsynced_backend_id = prev_backend_id;
             } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                sync_backend(prev_backend_id);
+                if (unsynced_backend_id == prev_backend_id) {
+                    unsynced_backend_id = -1;
+                }
             }
         }
 

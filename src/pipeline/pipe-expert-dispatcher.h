@@ -113,6 +113,22 @@ struct deferral_stats {
     int defer_k = 0;
 };
 
+// Optional same-process worker. When a factory is installed and returns a
+// backend for an endpoint, the dispatcher skips TCP for that worker and
+// calls dispatch() directly. Used to fold localhost trunk shards into the
+// spine process (no 34-hop loopback RPC). Factory may return nullptr to
+// keep the socket path. Called from llama-server via
+// wp_expert_worker::install_inproc_factory().
+class inproc_backend {
+  public:
+    virtual ~inproc_backend() = default;
+    virtual pipe_expert_hello hello() = 0;
+    virtual pipe_expert_partial dispatch(const pipe_expert_dispatch_req & request) = 0;
+};
+
+using inproc_backend_factory = std::unique_ptr<inproc_backend> (*)(const endpoint &);
+void set_inproc_backend_factory(inproc_backend_factory factory);
+
 class dispatcher {
   public:
     explicit dispatcher(const std::vector<endpoint> & endpoints);

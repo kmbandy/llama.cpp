@@ -109,6 +109,13 @@ ResourcePlan inspect_resources(const Options & options);
 // and return after it closes; this is used by the CPU integration test.
 int run(const Options & options);
 
+// Register an in-process factory with the expert dispatcher. When
+// WP_TRUNK_INPROC=1 and WP_TRUNK_INPROC_SHARDS lists a port, that worker is
+// constructed inside the spine process instead of over TCP. llama-server
+// must call this before llama_init so the dispatcher constructor sees it.
+// No-op if the env flag is off; TCP workers are unchanged.
+void install_inproc_factory();
+
 // Decode/prefill compute-profile policy. Pure functions of the env string so
 // tests can pin defaults without latching process-lifetime getenv statics.
 //

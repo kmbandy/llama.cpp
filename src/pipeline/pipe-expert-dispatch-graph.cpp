@@ -343,22 +343,25 @@ ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * te
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("after_issue has no issue node for layer " + std::to_string(layer));
     }
-    // ACC keeps both src edges, so the scheduler cannot start this tensor before issue.
-    // Only one element is touched instead of broadcasting zero over the full tensor.
+    // ACC keeps both src edges, so the FFN that consumes this result cannot
+    // start before issue. Inplace: one element, no residual copy. `tensor` is
+    // the shexp *input* (a scale/view of the residual), not the issue
+    // activations themselves — issue has already copied those to the CPU.
     ggml_tensor * gate = ggml_view_1d(ctx, it->second->issued, 1, 0);
     ggml_tensor * zero = ggml_scale(ctx, gate, 0.0f);
     return ggml_acc_inplace(ctx, tensor, zero, tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
 }
 
-ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, ggml_tensor * shexp, int32_t layer) {
+ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     const auto it = op_contexts.find(layer);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("build_wait has no issue node for layer " + std::to_string(layer));
     }
-    if (shexp == nullptr) {
-        throw std::invalid_argument("build_wait requires the shexp tensor so wait cannot overtake it");
-    }
-    return ggml_map_custom2(ctx, it->second->issued, shexp, compute_wait, 1, it->second.get());
+    // Two copies of `issued`: compute_wait's signature is still custom2, but
+    // both srcs are the CPU issue node. A GPU shexp src here made wait a
+    // GPU→CPU split input and serialized recv behind shexp.
+    ggml_tensor * issued = it->second->issued;
+    return ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
 }
 
 size_t graph_dispatcher::n_workers() const {

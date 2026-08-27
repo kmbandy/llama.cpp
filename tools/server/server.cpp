@@ -12,6 +12,7 @@
 #include "llama.h"
 #include "log.h"
 #include "pipe-dense-segment-manifest.h"
+#include "wp-expert-worker.h"
 
 #include <atomic>
 #include <clocale>
@@ -110,6 +111,7 @@ int llama_server(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+    wp_expert_worker::install_inproc_factory();
 
     return llama_server(params, argc, argv);
 }

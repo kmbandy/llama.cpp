@@ -1772,7 +1772,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 layer.ffn_exp_probs_b, n_expert, ds4_n_expert_used(hparams, -1),
                 LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func, -1);
-        ggml_tensor * ffn_shexp = build_ffn(cur,
+        ggml_tensor * ffn_shexp = build_ffn(shexp_after_issue(cur, -1),
                 layer.ffn_up_shexp, nullptr, nullptr,
                 layer.ffn_gate_shexp, nullptr, nullptr,
                 layer.ffn_down_shexp, nullptr, nullptr,
@@ -1926,7 +1926,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 selected_experts);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * ffn_shexp = build_ffn(cur,
+        ggml_tensor * ffn_shexp = build_ffn(shexp_after_issue(cur, il),
                 layer.ffn_up_shexp, nullptr, nullptr,
                 layer.ffn_gate_shexp, nullptr, nullptr,
                 layer.ffn_down_shexp, nullptr, nullptr,
@@ -2078,7 +2078,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             il);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
-    ggml_tensor * ffn_shexp = build_ffn(cur,
+    ggml_tensor * ffn_shexp = build_ffn(shexp_after_issue(cur, il),
             layer.ffn_up_shexp, nullptr, nullptr,
             layer.ffn_gate_shexp, nullptr, nullptr,
             layer.ffn_down_shexp, nullptr, nullptr,

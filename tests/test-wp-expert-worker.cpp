@@ -2351,6 +2351,120 @@ static void test_partial_last_column_round_trip() {
     ggml_backend_free(backend);
 }
 
+// Prefill-shaped Q5_1 down-proj on CUDA/HIP. Chat NaNs at n_tokens≈42 (MMQ)
+// with first non-finite at dim 2559. The round-trip above only covers
+// n_tokens=2 (MMVQ). This dirties MATRIX_ROW_PADDING then runs n_tokens=32
+// on K=640 N=2560 Q5_1. MMQ must clear that pad (not only USAGE_COMPUTE)
+// or the last output column is NaN.
+static void test_q5_1_down_proj_prefill_last_column() {
+    constexpr int n_embd = 2560;
+    constexpr int n_ff_exp = 640;
+    constexpr int n_tokens = 32;
+
+    ggml_backend_load_all();
+    ggml_backend_t backend = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        const char * name = ggml_backend_dev_name(device);
+        if (name != nullptr && (std::strstr(name, "CUDA") != nullptr ||
+                                std::strstr(name, "ROCm") != nullptr ||
+                                std::strstr(name, "HIP") != nullptr)) {
+            backend = ggml_backend_dev_init(device, nullptr);
+            break;
+        }
+    }
+    if (backend == nullptr) {
+        std::cout << "test_q5_1_down_proj_prefill_last_column: no CUDA/HIP backend; skipping\n";
+        return;
+    }
+
+    std::vector<float> hidden((size_t) n_tokens * n_ff_exp);
+    std::vector<float> down((size_t) n_embd * n_ff_exp);
+    for (size_t i = 0; i < hidden.size(); ++i) {
+        hidden[i] = ((int) (i % 17) - 8) * 0.013f;
+    }
+    for (size_t i = 0; i < down.size(); ++i) {
+        down[i] = ((int) (i % 23) - 11) * 0.001f;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to create Q5_1 prefill context");
+
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_1, n_ff_exp, n_embd);
+    ggml_tensor * input   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff_exp, n_tokens);
+    ggml_tensor * output  = ggml_mul_mat(ctx, weights, input);
+    ggml_cgraph * graph   = ggml_new_graph_custom(ctx, 4, false);
+    ggml_build_forward_expand(graph, output);
+
+    const size_t weight_bytes = ggml_nbytes(weights);
+    const size_t weight_alloc = ggml_backend_buft_get_alloc_size(
+        ggml_backend_get_default_buffer_type(backend), weights);
+    const size_t input_bytes  = ggml_nbytes(input);
+    const size_t output_bytes = ggml_nbytes(output);
+    require(weight_alloc >= weight_bytes, "Q5_1 alloc size smaller than nbytes");
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "failed to allocate Q5_1 prefill tensors");
+
+    std::vector<uint8_t> quantized(weight_bytes);
+    require(ggml_quantize_chunk(GGML_TYPE_Q5_1, down.data(), quantized.data(),
+                                0, n_embd, n_ff_exp, nullptr) == quantized.size(),
+            "failed to quantize Q5_1 down weights");
+
+    // Dirty every byte in the backend buffer (including MATRIX_ROW_PADDING),
+    // then write only ggml_nbytes of weights. Matches the worker skipping
+    // init_tensor: the padded tail is not part of the shard copy.
+    ggml_backend_buffer_clear(buffer, 0xFF);
+    ggml_backend_tensor_set(weights, quantized.data(), 0, weight_bytes);
+    ggml_backend_tensor_set(input, hidden.data(), 0, input_bytes);
+    // Worker zeros the pad via an I8 tensor covering the whole slot (weight
+    // tensors cannot tensor_memset past ggml_nbytes). Mirror that here.
+    if (weight_alloc > weight_bytes) {
+        ggml_tensor * raw = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) weight_alloc);
+        raw->buffer = weights->buffer;
+        raw->data   = weights->data;
+        ggml_backend_tensor_memset(raw, 0, weight_bytes, weight_alloc - weight_bytes);
+    }
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "Q5_1 [640x2560] n_tokens=32 graph failed");
+    std::vector<float> device_output(output_bytes / sizeof(float));
+    ggml_backend_tensor_get(output, device_output.data(), 0, output_bytes);
+
+    int n_bad = 0;
+    int first_tok = -1;
+    int first_dim = -1;
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int dim = 0; dim < n_embd; ++dim) {
+            if (!std::isfinite(device_output[(size_t) token * n_embd + dim])) {
+                if (n_bad == 0) {
+                    first_tok = token;
+                    first_dim = dim;
+                }
+                n_bad++;
+            }
+        }
+    }
+    if (n_bad != 0) {
+        throw std::runtime_error(
+            "Q5_1 [640x2560] n_tokens=32 dirty-pad produced " +
+            std::to_string(n_bad) + " non-finite values; first token " +
+            std::to_string(first_tok) + " dim " + std::to_string(first_dim));
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 static void test_decode_prefill_compute_profile() {
     // Unset / empty / missing → new defaults (min tokens 2, coalesce on, cache on).
     require(wp_expert_worker::parse_gather_min_tokens(nullptr) == 2,
@@ -2598,6 +2712,7 @@ int main() {
         test_scatter_compact_rows_matches_get_rows_back();
         test_scatter_add_compact_rows_accumulates();
         test_partial_last_column_round_trip();
+        test_q5_1_down_proj_prefill_last_column();
         test_slice_device_member_layout();
         test_glm_size_class_plan();
         run_test();

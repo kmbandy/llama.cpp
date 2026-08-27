@@ -1638,21 +1638,35 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+ggml_tensor * llm_graph_context::shexp_after_issue(ggml_tensor * cur, int il) {
+    if (!moe_dispatch_split_shexp || expert_dispatch == nullptr || il < 0 || cur == nullptr) {
+        return cur;
+    }
+    // Distinct tensor so acc_inplace cannot alias the activations issue reads.
+    // scale(1) is a real op (new storage); after_issue then pins that storage
+    // to the issue node. Issue copies `cur` first; this acc runs after.
+    ggml_tensor * gated = ggml_scale(ctx0, cur, 1.0f);
+    gated = expert_dispatch->after_issue(ctx0, gated, il);
+    cb(gated, "ffn_shexp_in", il);
+    return gated;
+}
+
 ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issued,
                                                        ggml_tensor * shexp,
                                                        int           il) {
     if (moe_dispatch_split_shexp && expert_dispatch != nullptr && il >= 0) {
-        // REVERTED 2026-08-17: an earlier HIP-graph-fallback fix pinned shexp to
-        // backend_cpu here, which broke compute (500 "Compute error") -- shexp is the
-        // GPU shared-expert FFN result, real GPU work, NOT a CPU dispatch op. Forcing
-        // GPU compute onto CPU is invalid. after_issue is a dependency edge; leave the
-        // backend to the scheduler. The captures=0 HIP-graph churn is elsewhere (chase
-        // with LLAMA_GRAPH_RESULT_DEBUG=2, which prints the failing can_reuse check).
-        shexp = expert_dispatch->after_issue(ctx0, shexp, il);
-        moe_or_issued = expert_dispatch->build_wait(ctx0, shexp, il);
+        // shexp FFN is already pinned to issue via shexp_after_issue on its
+        // input. Do NOT after_issue the shexp *output* — that made the GPU
+        // FFN a split that finished before wait, so skip-sync only overlapped
+        // a 1-element acc with recv.
+        moe_or_issued = expert_dispatch->build_wait(ctx0, il);
+        ggml_backend_sched_set_tensor_backend(sched, moe_or_issued, backend_cpu);
         cb(moe_or_issued, "ffn_moe_out", il);
     }
-    ggml_tensor * out = ggml_add(ctx0, moe_or_issued, shexp);
+    // shexp first so expand visits the GPU FFN split before CPU wait. The
+    // scheduler leaves MAP_CUSTOM2 wait splits unsynced against the previous
+    // GPU, so shexp stays in flight during recv.
+    ggml_tensor * out = ggml_add(ctx0, shexp, moe_or_issued);
     cb(out, "ffn_out", il);
     return out;
 }

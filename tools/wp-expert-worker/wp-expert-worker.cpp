@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "pipe-expert-dispatcher.h"
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
 #include "weight-pager/wp-host-tier.h"
@@ -975,6 +976,7 @@ struct MemberSpan {
     uint64_t offset = 0;
     uint64_t size   = 0;
     uint64_t device_offset = 0;
+    uint64_t device_bytes = 0;
 };
 
 struct ExpertPage {
@@ -1652,9 +1654,10 @@ std::vector<ResourcePage> resource_pages(const Catalog & catalog) {
 
 Catalog & layout_sliced_pages(
         Catalog & catalog, ggml_backend_buffer_type_t buft) {
-    if (!catalog.descriptor.sliced) {
-        return catalog;
-    }
+    // Whole-expert pages used to skip this and keep device_size == blob size.
+    // CUDA MMQ over-reads the last quantized row (qwen4exp down Q5_1 ne0=640)
+    // into MATRIX_ROW_PADDING; without slack that is the next slot and dim
+    // 2559 becomes NaN. Apply the same layout to unsliced catalogs.
 
     const uint64_t alignment = ggml_backend_buft_get_alignment(buft);
     if (alignment == 0) {
@@ -1738,6 +1741,7 @@ Catalog & layout_sliced_pages(
         uint64_t device_size = 0;
         for (size_t i = 0; i < members.size(); ++i) {
             members[i].second->device_offset = layout[i].offset;
+            members[i].second->device_bytes  = layout[i].size;
             if (layout[i].offset > UINT64_MAX - layout[i].size) {
                 throw std::overflow_error("expert slice device layout overflows");
             }
@@ -1774,6 +1778,24 @@ void for_each_page_chunk(
     }
 }
 
+void zero_quantized_member_padding(ggml_tensor * slot_raw, const ExpertPage & page) {
+    // CUDA MMQ over-reads the last quantized row into MATRIX_ROW_PADDING.
+    // slot_raw is I8 covering the whole slot, so this write is in-bounds
+    // even though the weight tensor's ggml_nbytes does not include the pad.
+    if (slot_raw == nullptr) {
+        return;
+    }
+    for (const auto & role : page.roles) {
+        const MemberSpan & member = role.second;
+        if (member.device_bytes <= member.size) {
+            continue;
+        }
+        const size_t pad_off = (size_t) (member.device_offset + member.size);
+        const size_t pad_len = (size_t) (member.device_bytes - member.size);
+        ggml_backend_tensor_memset(slot_raw, 0, pad_off, pad_len);
+    }
+}
+
 void tensor_set_page_range(
         ggml_tensor * tensor, const ExpertPage & page, const void * source,
         size_t page_offset, size_t size) {
@@ -1782,6 +1804,7 @@ void tensor_set_page_range(
         ggml_backend_tensor_set(
             tensor, (const char *) source + source_offset, device_offset, n);
     });
+    zero_quantized_member_padding(tensor, page);
 }
 
 void tensor_get_page(
@@ -1816,6 +1839,7 @@ void tensor_set_page_range_reader(
             throw std::runtime_error("wp reader H2D: reader-stream copy failed");
         }
     });
+    zero_quantized_member_padding(tensor, page);
 }
 
 // WP_READER_H2D_VERIFY=1 tripwire: after a successful reader-thread upload,
@@ -2703,6 +2727,7 @@ public:
             ggml_backend_buffer_t buffer = nullptr;
             void *                base = nullptr;
             uint64_t              capacity = 0;
+            uint64_t              stride = 0;
             size_t                first_slot = 0;
             size_t                n_slots = 0;
         };
@@ -2896,30 +2921,40 @@ public:
     };
 
     std::optional<ArenaLayout> arena_layout() const {
-        if (resources_.slot_classes.size() != 1 ||
-                slots_.empty() ||
-                slots_.size() != (size_t) resources_.slot_classes[0].slots) {
+        if (slots_.empty() || arenas_.empty()) {
             return std::nullopt;
         }
-        const uint64_t stride = arena_slot_stride(resources_.slot_classes[0].size);
-        // 2026 WP_WORKER_COLLAPSE generalization: slots may now be backed by
-        // more than one arena buffer (grouped allocation), so this walks
-        // arenas_ in slot order instead of assuming a single arena_[0]. When
-        // there is exactly one arena this produces byte-identical results to
-        // the old single-arena fast path below (layout.buffer/base set).
+        // One stride per arena buffer. Qwen's UD mix (Q4_K vs Q5_K/Q8 layer 2)
+        // is more than one slot class, so a single-class check left 480/9700
+        // with arena_ready=0 and decode n=1 on the 80-kernel per-expert graph.
+        // Each buffer is still a regular packed run (offset = i * stride).
         ArenaLayout layout;
-        layout.slot_stride = stride;
         layout.n_slots = slots_.size();
         size_t first_slot = 0;
+        uint64_t common_stride = 0;
+        bool stride_uniform = true;
         for (const buffer_ptr & buffer : arenas_) {
             const uint64_t capacity = (uint64_t) ggml_backend_buffer_get_size(buffer.get());
             if (capacity == 0 || first_slot >= slots_.size()) {
                 return std::nullopt;
             }
+            const Slot & head = slots_[first_slot];
+            if (head.buffer != buffer.get() || head.offset != 0) {
+                return std::nullopt;
+            }
+            // Slot::size is bytes currently occupied (0 until a page lands).
+            // Stride is the allocated capacity, padded to backend alignment.
+            const uint64_t stride = arena_slot_stride(head.capacity);
+            if (common_stride == 0) {
+                common_stride = stride;
+            } else if (stride != common_stride) {
+                stride_uniform = false;
+            }
             size_t n_slots = 0;
             while (first_slot + n_slots < slots_.size()) {
                 const Slot & slot = slots_[first_slot + n_slots];
                 if (slot.buffer != buffer.get() ||
+                        arena_slot_stride(slot.capacity) != stride ||
                         slot.offset != (uint64_t) n_slots * stride) {
                     break;
                 }
@@ -2934,6 +2969,7 @@ public:
             arena.buffer = buffer.get();
             arena.base = ggml_backend_buffer_get_base(buffer.get());
             arena.capacity = capacity;
+            arena.stride = stride;
             arena.first_slot = first_slot;
             arena.n_slots = n_slots;
             layout.arenas.push_back(arena);
@@ -2942,9 +2978,11 @@ public:
         if (first_slot != slots_.size()) {
             return std::nullopt;
         }
+        layout.slot_stride = stride_uniform ? common_stride : 0;
         if (layout.arenas.size() == 1) {
             layout.buffer = layout.arenas[0].buffer;
             layout.base = layout.arenas[0].base;
+            layout.slot_stride = layout.arenas[0].stride;
         }
         return layout;
     }
@@ -4751,6 +4789,7 @@ private:
                             ggml_backend_tensor_set(slot.raw, source, device_offset, n);
                         }
                     });
+                    zero_quantized_member_padding(slot.raw, *pagein.page);
                     if (async_copy) {
                         staging_.mark_in_flight(result->staging->get());
                     }
@@ -5878,25 +5917,10 @@ void attach_weight(
     }
     tensor->buffer = buffer;
     tensor->data   = (uint8_t *) base + offset;
-    // MAD-LAB 2026-08-26: DO NOT call ggml_backend_buffer_init_tensor here.
-    //
-    // For the quantized expert weights this function attaches, init_tensor's
-    // ONLY job is zeroing the row padding a quantized tensor allocates beyond
-    // ggml_nbytes -- and it is not fit for that purpose on either backend we
-    // run:
-    //   * CUDA/ROCm does the zeroing, but aborts the whole process here with
-    //     "ROCm error: invalid argument" out of
-    //     hipMemset(data + original_size, 0, padded_size - original_size)
-    //     (ggml-cuda.cu:907). GGML_ABORT, so it cannot even be caught.
-    //   * Vulkan's ggml_backend_vk_buffer_init_tensor is a NO-OP and never
-    //     zeroed the padding at all, which is why the RX 480 and the GTX 1070
-    //     produced byte-identical non-finite partials -- the padded tail was
-    //     decoded as f16 block scales, and a garbage exponent-all-ones pattern
-    //     is NaN/Inf.
-    // Both are now moot: every weight buffer is zeroed once at allocation
-    // (ggml_backend_buffer_clear at each USAGE_WEIGHTS site), so the padding is
-    // already 0 before any shard bytes land, which is strictly stronger than
-    // what init_tensor offered and costs nothing per attach.
+    // Do not init_tensor / tensor_memset the quantized pad on this tensor:
+    // tensor_memset cannot write past ggml_nbytes, and init_tensor's
+    // cuda/hipMemset of the tail is "invalid argument" on arena-offset
+    // pointers. Padding is zeroed after H2D on slot.raw (I8, full slot).
 }
 
 class Worker {
@@ -6682,7 +6706,7 @@ public:
             std::strstr(backend_name, "ROCm") != nullptr &&
             request.n_tokens >= 1 && request.n_tokens <= 8 &&
             request.assignments.size() >= 1 &&
-            request.assignments.size() <= (size_t) 8 * request.n_tokens;
+            request.assignments.size() <= (size_t) 16 * request.n_tokens;
     }
 
     bool arena_id_eligible(
@@ -6702,7 +6726,7 @@ public:
         if (!enabled || !backend_supported ||
                 request.n_tokens < 1 || request.n_tokens > 8 ||
                 request.assignments.empty() ||
-                request.assignments.size() > (size_t) 8 * request.n_tokens ||
+                request.assignments.size() > (size_t) 16 * request.n_tokens ||
                 !layout_opt.has_value()) {
             return false;
         }
@@ -6721,16 +6745,12 @@ public:
         const ExpertSlotPool::ArenaLayout & layout = *layout_opt;
         static const char * k_roles[3] = {"gate", "up", "down"};
         const auto & specs = catalog_.descriptor.layers.at(request.layer);
-        for (const char * role : k_roles) {
-            const ggml_type type = specs.at(role).type;
+        auto stride_ok = [](uint64_t stride, ggml_type type) {
             const uint64_t type_size = ggml_type_size(type);
             const uint64_t block_size = ggml_blck_size(type);
-            if (type_size == 0 || block_size == 0 ||
-                    layout.slot_stride % type_size != 0 ||
-                    layout.slot_stride / type_size > UINT32_MAX / block_size) {
-                return false;
-            }
-        }
+            return type_size != 0 && block_size != 0 && stride % type_size == 0 &&
+                stride / type_size <= UINT32_MAX / block_size;
+        };
         const ExpertPage & first = catalog_.pages.at({
             request.layer, request.assignments[0].expert_id
         });
@@ -6738,9 +6758,19 @@ public:
             const ExpertPage & page = catalog_.pages.at({
                 request.layer, request.assignments[i].expert_id
             });
-            if (page.device_size > layout.slot_stride ||
-                    batch.slot_index(i) >= layout.n_slots) {
+            if (batch.slot_index(i) >= layout.n_slots) {
                 return false;
+            }
+            const ExpertSlotPool::ArenaLayout::Arena * arena =
+                layout.arena_for_slot(batch.slot_index(i));
+            if (arena == nullptr || arena->stride == 0 ||
+                    page.device_size > arena->stride) {
+                return false;
+            }
+            for (const char * role : k_roles) {
+                if (!stride_ok(arena->stride, specs.at(role).type)) {
+                    return false;
+                }
             }
             for (const char * role : k_roles) {
                 if (page.roles.at(role).device_offset !=
@@ -9162,7 +9192,7 @@ private:
                     layout.arenas[group.arena_index];
                 ggml_tensor * tensor = ggml_new_tensor_3d(
                     ctx, role.type, role.ne0, role.ne1, (int64_t) arena.n_slots);
-                tensor->nb[2] = layout.slot_stride;
+                tensor->nb[2] = arena.stride != 0 ? arena.stride : layout.slot_stride;
                 attach_weight(tensor, arena.buffer, arena.base, role.offset);
                 return tensor;
             };
@@ -9312,15 +9342,26 @@ private:
                         pages[0]->roles.at(k_roles[j]).device_offset};
             const size_t type_size = ggml_type_size(spec.type);
             const size_t block_size = ggml_blck_size(spec.type);
-            if (type_size == 0 || block_size == 0 ||
-                    layout.slot_stride % type_size != 0 ||
-                    layout.slot_stride / type_size > UINT32_MAX / block_size) {
+            if (type_size == 0 || block_size == 0) {
                 return false;
             }
         }
         for (size_t i = 0; i < pages.size(); ++i) {
-            if (pages[i]->device_size > layout.slot_stride) {
+            const ExpertSlotPool::ArenaLayout::Arena * arena =
+                layout.arena_for_slot(batch.slot_index(i));
+            const uint64_t stride = arena != nullptr && arena->stride != 0
+                ? arena->stride : layout.slot_stride;
+            if (stride == 0 || pages[i]->device_size > stride) {
                 return false;
+            }
+            for (size_t j = 0; j < roles.size(); ++j) {
+                const size_t type_size = ggml_type_size(roles[j].type);
+                const size_t block_size = ggml_blck_size(roles[j].type);
+                if (type_size == 0 || block_size == 0 ||
+                        stride % type_size != 0 ||
+                        stride / type_size > UINT32_MAX / block_size) {
+                    return false;
+                }
             }
             for (size_t j = 0; j < roles.size(); ++j) {
                 if (pages[i]->roles.at(k_roles[j]).device_offset != roles[j].offset) {
@@ -9446,9 +9487,11 @@ private:
             ggml_context * ctx = entry.ctx.get();
 
             const auto make_role = [&](const ArenaRoleKey & role) {
+                const uint64_t stride = !layout.arenas.empty() && layout.arenas[0].stride != 0
+                    ? layout.arenas[0].stride : layout.slot_stride;
                 ggml_tensor * tensor = ggml_new_tensor_3d(
                     ctx, role.type, role.ne0, role.ne1, (int64_t) layout.n_slots);
-                tensor->nb[2] = layout.slot_stride;
+                tensor->nb[2] = stride;
                 attach_weight(tensor, layout.buffer, layout.base, role.offset);
                 return tensor;
             };
@@ -11087,6 +11130,138 @@ int run(const Options & options) {
         result = serve_connection(*client, worker);
     } while (!options.once);
     return result;
+}
+
+namespace {
+
+bool trunk_inproc_enabled() {
+    const char * e = std::getenv("WP_TRUNK_INPROC");
+    return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+}
+
+struct trunk_shard_spec {
+    int                   port = 0;
+    std::string           device;
+    int                   slots = 0;
+    std::filesystem::path manifest;
+    std::filesystem::path descriptor;
+    uint64_t              host_victim_bytes = 0;
+};
+
+// WP_TRUNK_INPROC_SHARDS=
+//   port,device,slots,manifest,descriptor[,host_victim_bytes][;port,...]
+std::vector<trunk_shard_spec> parse_trunk_shards() {
+    const char * e = std::getenv("WP_TRUNK_INPROC_SHARDS");
+    if (e == nullptr || e[0] == '\0') {
+        throw std::runtime_error("WP_TRUNK_INPROC=1 requires WP_TRUNK_INPROC_SHARDS");
+    }
+    std::vector<trunk_shard_spec> specs;
+    std::string text = e;
+    size_t begin = 0;
+    while (begin <= text.size()) {
+        const size_t semi = text.find(';', begin);
+        const std::string item = text.substr(
+            begin, semi == std::string::npos ? std::string::npos : semi - begin);
+        if (!item.empty()) {
+            std::vector<std::string> fields;
+            size_t f0 = 0;
+            while (f0 <= item.size()) {
+                const size_t comma = item.find(',', f0);
+                fields.push_back(item.substr(
+                    f0, comma == std::string::npos ? std::string::npos : comma - f0));
+                if (comma == std::string::npos) {
+                    break;
+                }
+                f0 = comma + 1;
+            }
+            if (fields.size() < 5 || fields.size() > 6) {
+                throw std::runtime_error(
+                    "WP_TRUNK_INPROC_SHARDS entry must be "
+                    "port,device,slots,manifest,descriptor[,host_victim_bytes]");
+            }
+            trunk_shard_spec spec;
+            spec.port = std::atoi(fields[0].c_str());
+            spec.device = fields[1];
+            spec.slots = std::atoi(fields[2].c_str());
+            spec.manifest = fields[3];
+            spec.descriptor = fields[4];
+            if (fields.size() == 6) {
+                spec.host_victim_bytes = (uint64_t) std::strtoull(fields[5].c_str(), nullptr, 10);
+            }
+            if (spec.port <= 0 || spec.port > 65535 || spec.slots <= 0 ||
+                    spec.device.empty() || spec.manifest.empty() || spec.descriptor.empty()) {
+                throw std::runtime_error("WP_TRUNK_INPROC_SHARDS has an invalid entry: " + item);
+            }
+            specs.push_back(std::move(spec));
+        }
+        if (semi == std::string::npos) {
+            break;
+        }
+        begin = semi + 1;
+    }
+    if (specs.empty()) {
+        throw std::runtime_error("WP_TRUNK_INPROC_SHARDS is empty");
+    }
+    return specs;
+}
+
+class InProcessEngine final : public pipe_expert_dispatcher::inproc_backend {
+    Worker worker_;
+
+  public:
+    explicit InProcessEngine(const trunk_shard_spec & spec) :
+        worker_(
+            load_catalog(fs::canonical(spec.manifest), fs::canonical(spec.descriptor)),
+            spec.device,
+            spec.slots,
+            /*host_budget_bytes=*/0,
+            spec.host_victim_bytes,
+            /*test_hooks=*/nullptr,
+            /*resident_expert_blocks=*/{},
+            /*expert_reserve_blocks=*/{},
+            /*expert_reserve_bytes=*/0) {}
+
+    pipe_expert_hello hello() override {
+        return worker_.hello();
+    }
+
+    pipe_expert_partial dispatch(const pipe_expert_dispatch_req & request) override {
+        RequestStats stats;
+        return worker_.dispatch(request, stats);
+    }
+};
+
+std::unique_ptr<pipe_expert_dispatcher::inproc_backend>
+make_inproc_backend(const pipe_expert_dispatcher::endpoint & target) {
+    if (!trunk_inproc_enabled()) {
+        return nullptr;
+    }
+    static const std::vector<trunk_shard_spec> specs = parse_trunk_shards();
+    for (const trunk_shard_spec & spec : specs) {
+        if (spec.port != target.port) {
+            continue;
+        }
+        {
+            const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
+            if (wp_graphs == nullptr || wp_graphs[0] != '1') {
+                if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
+                    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+                }
+            }
+        }
+        std::fprintf(stderr,
+                     "wp expert worker: in-process %s:%d device=%s slots=%d\n",
+                     target.host.c_str(), target.port, spec.device.c_str(), spec.slots);
+        return std::unique_ptr<pipe_expert_dispatcher::inproc_backend>(
+            new InProcessEngine(spec));
+    }
+    return nullptr;
+}
+
+} // namespace
+
+void install_inproc_factory() {
+    pipe_expert_dispatcher::set_inproc_backend_factory(&make_inproc_backend);
 }
 
 } // namespace wp_expert_worker

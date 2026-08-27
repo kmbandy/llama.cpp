@@ -249,7 +249,7 @@ enum class wp_spine_section {
 // tensors end up named "ffn_moe_out-<il>" and "ffn_moe_issued-<il>" never
 // survives on the graph node. build_issue() is ggml_map_custom3 (3 inputs:
 // activations, selected_experts, weights) and build_wait() is ggml_map_custom2
-// (2 inputs: issued, shexp) -- pipeline/pipe-expert-dispatch-graph.cpp:289-340 --
+// (2 inputs: issued, issued) -- pipeline/pipe-expert-dispatch-graph.cpp --
 // so GGML_OP_MAP_CUSTOM3 vs GGML_OP_MAP_CUSTOM2 cleanly disambiguates them
 // regardless of the name collision.
 static wp_spine_section wp_spine_classify(const ggml_tensor * t) {
@@ -622,12 +622,21 @@ llama_context::llama_context(
     // MAD-LAB: a speculative context reuses its parent's dispatcher connection.
     const bool expert_dispatch_borrowed =
         params.ctx_other != nullptr && params.ctx_other->expert_dispatch != nullptr;
-    const bool expert_dispatch_enabled =
+    bool expert_dispatch_enabled =
         (params.expert_dispatch != nullptr && params.expert_dispatch[0] != '\0') || expert_dispatch_borrowed;
     if (model.routed_experts_external && !expert_dispatch_enabled) {
         throw std::runtime_error(
             "model metadata 'weight_pager.routed_experts_external' is true but "
             "--expert-dispatch is missing; refusing to run without routed experts");
+    }
+    // A sidecar MTP/DFlash GGUF ships its own routed experts in-file. It still
+    // inherits the target's --expert-dispatch string (and ctx_other, which would
+    // otherwise borrow the spine's worker connection). Dispatching those layers
+    // hits workers that only hold the trunk. Compute MoE locally unless this
+    // model actually marked experts as external.
+    if (expert_dispatch_enabled && !model.routed_experts_external) {
+        LLAMA_LOG_INFO("%s: --expert-dispatch ignored; model ships routed experts in-file\n", __func__);
+        expert_dispatch_enabled = false;
     }
     if (expert_dispatch_enabled) {
         // MAD-LAB: QWEN4EXP joins the list. Its build_layer_ffn calls the same
@@ -3720,6 +3729,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||

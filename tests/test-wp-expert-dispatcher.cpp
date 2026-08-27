@@ -491,7 +491,7 @@ static void test_graph_op_split_shexp(const weight_map & weights,
         endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
     ggml_tensor * issued = dispatcher.build_issue(ctx.get(), inp, ids, w, LAYER, TEST_SWIGLU_CLAMP);
     ggml_tensor * shexp  = dispatcher.after_issue(ctx.get(), inp, LAYER);
-    ggml_tensor * out    = dispatcher.build_wait(ctx.get(), shexp, LAYER);
+    ggml_tensor * out    = dispatcher.build_wait(ctx.get(), LAYER);
     ggml_cgraph * gf     = ggml_new_graph_custom(ctx.get(), 32, false);
     ggml_build_forward_expand(gf, out);
     dispatcher.begin_decode();

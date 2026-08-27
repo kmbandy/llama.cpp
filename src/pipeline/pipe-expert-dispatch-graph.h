@@ -50,8 +50,15 @@ class graph_dispatcher {
 
     // Split of build() so a sibling GPU op (shared expert) can sit between
     // the worker send and the worker recv. build_issue sends; after_issue
-    // adds a 0-valued dependence on that send; build_wait recvs and
-    // produces the MoE residual. build() remains the combined path.
+    // pins the shexp *input* (scale+acc_inplace of 0*issued[0]) so the FFN
+    // cannot start before send; build_wait recvs. build() remains combined.
+    //
+    // build_wait depends ONLY on the issue node. Joining wait to shexp as a
+    // graph src forced the scheduler to finish shexp (and copy it to host)
+    // before recv — GPU idle for the whole RPC. The ggml_add of wait+shexp
+    // is the join; wait's compute does not read shexp (GGML_UNUSED).
+    // after_issue the shexp INPUT, not the output: pinning the output left
+    // the FFN in an earlier GPU split that finished before wait.
     ggml_tensor * build_issue(ggml_context * ctx,
                               ggml_tensor *  activations,
                               ggml_tensor *  selected_experts,
@@ -59,7 +66,7 @@ class graph_dispatcher {
                               int32_t        layer,
                               float          swiglu_clamp);
     ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer);
-    ggml_tensor * build_wait(ggml_context * ctx, ggml_tensor * shexp, int32_t layer);
+    ggml_tensor * build_wait(ggml_context * ctx, int32_t layer);
 
     // ---- hash-layer prefetch ------------------------------------------------
     //

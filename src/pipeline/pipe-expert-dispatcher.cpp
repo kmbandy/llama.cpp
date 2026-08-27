@@ -38,6 +38,8 @@
 namespace pipe_expert_dispatcher {
 namespace {
 
+inproc_backend_factory g_inproc_factory = nullptr;
+
 using dispatch_clock = std::chrono::steady_clock;
 
 bool dispatch_stats_enabled() {
@@ -611,6 +613,7 @@ struct dispatcher::impl {
         endpoint                                 target;
         worker_info                              info;
         pipe_expert_hello                        hello;
+        std::unique_ptr<inproc_backend>          inproc;
         pipe_socket_ptr                          socket;
         std::unique_ptr<socket_writer>           writer;
         std::unique_ptr<concurrent_sender>       sender;
@@ -672,6 +675,10 @@ struct dispatcher::impl {
         // re-derive anything -- it resends literally the bytes this request
         // would have carried had dedup never been attempted.
         std::vector<uint8_t>                dedup_fallback_acts_payload;
+
+        // In-process trunk workers: skip encode/TCP. Dispatch runs in
+        // await/finish, not issue — HIP graph capture is still open then.
+        pipe_expert_dispatch_req            inproc_wire;
     };
 
     struct temporal_layer_stats {
@@ -896,6 +903,17 @@ struct dispatcher::impl {
             connected.target        = target;
             connected.info.endpoint = label;
             connected.info.machine  = target.machine;
+            if (g_inproc_factory != nullptr) {
+                connected.inproc = g_inproc_factory(target);
+            }
+            if (connected.inproc) {
+                connected.hello = connected.inproc->hello();
+                std::fprintf(stderr,
+                             "expert dispatch: in-process worker %s experts=%d..%d slots=%u layers=%zu\n",
+                             label.c_str(),
+                             connected.hello.expert_first, connected.hello.expert_last,
+                             connected.hello.n_slots, connected.hello.layers.size());
+            } else {
             bool retryable_connect = false;
             do {
                 connected.socket = pipe_socket_t::connect(target.host.c_str(), target.port, &retryable_connect);
@@ -938,6 +956,10 @@ struct dispatcher::impl {
             if (connected.hello.role != PIPE_EXPERT_ROLE_WORKER) {
                 throw std::runtime_error("expert dispatcher peer " + label + " is not an expert worker");
             }
+            }
+            if (connected.hello.role != PIPE_EXPERT_ROLE_WORKER) {
+                throw std::runtime_error("expert dispatcher peer " + label + " is not an expert worker");
+            }
 
             if (workers.empty()) {
                 n_embd         = connected.hello.n_embd;
@@ -958,17 +980,20 @@ struct dispatcher::impl {
             connected.info.layers         = connected.hello.layers;
             connected.info.shard_identity = connected.hello.shard_identity;
 
+            if (!connected.inproc) {
             pipe_expert_hello client = connected.hello;
             client.role              = PIPE_EXPERT_ROLE_CLIENT;
             client.expert_first      = -1;
             client.expert_last       = -1;
             client.n_slots           = 0;
             client.layers.clear();
-            payload = pipe_encode_expert_hello(client);
+            std::vector<uint8_t> payload = pipe_encode_expert_hello(client);
             if (!pipe_send_frame(*connected.socket, PIPE_HELLO, 0, payload.data(), payload.size())) {
                 throw std::runtime_error("expert dispatcher failed to send HELLO to worker " + label);
             }
 
+            pipe_frame_type type;
+            uint64_t        seq_id = 0;
             if (!pipe_recv_frame(*connected.socket, type, seq_id, payload)) {
                 throw std::runtime_error("expert dispatcher worker " + label + " died during HELLO");
             }
@@ -986,6 +1011,7 @@ struct dispatcher::impl {
             if (!ack.accepted) {
                 throw std::runtime_error("expert dispatcher worker " + label +
                                          " rejected HELLO: " + ack.reason);
+            }
             }
 
             public_workers.push_back(connected.info);
@@ -1085,6 +1111,9 @@ struct dispatcher::impl {
         }
         try {
             for (worker & value : workers) {
+                if (!value.socket) {
+                    continue;
+                }
                 value.writer.reset(new socket_writer{});
                 value.writer->socket = value.socket;   // own ref for the thread
                 value.writer->endpoint = value.info.endpoint;
@@ -1234,6 +1263,9 @@ struct dispatcher::impl {
         }
         try {
             for (worker & value : workers) {
+                if (!value.socket) {
+                    continue;
+                }
                 value.sender.reset(new concurrent_sender{});
                 value.sender->socket = value.socket;   // own ref, see field comment
                 concurrent_sender * s = value.sender.get();
@@ -1864,6 +1896,12 @@ struct dispatcher::impl {
         // D1 async: if this worker's writer thread already failed (its send did
         // not complete), the partial we are about to await will never arrive.
         // Surface that now instead of blocking on a dead socket.
+        if (value.inproc) {
+            const pipe_expert_partial partial = value.inproc->dispatch(request.inproc_wire);
+            note_in_flight_delta(-1);
+            payload = pipe_encode_expert_partial(partial);
+            return PIPE_EXPERT_PARTIAL;
+        }
         if (async_issue) {
             socket_writer * w = value.writer.get();
             if (w) {
@@ -2031,6 +2069,11 @@ struct dispatcher::impl {
                 wire_request.n_tokens    = n_tokens;
                 wire_request.assignments = request.assignments;
                 wire_request.activations = activations;
+            }
+            if (workers[request.worker_index].inproc) {
+                request.inproc_wire = std::move(wire_request);
+                requests.push_back(std::move(request));
+                continue;
             }
             const dispatch_clock::time_point encode_started =
                 layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
@@ -2364,6 +2407,19 @@ struct dispatcher::impl {
                 continue;
             }
             worker & value = workers[request.worker_index];
+            if (value.inproc) {
+                // Do NOT HIP-compute here. Issue runs inside the spine's
+                // graph_compute while WP_HIP_GRAPHS may be capturing the next
+                // GPU split; hipMemcpy from a second backend then aborts
+                // ("legacy stream depend on a capturing blocking stream").
+                // Wait/finish_dispatch is after that capture window.
+                if (collect_stats || req_log_ != nullptr) {
+                    request.issued_at = dispatch_clock::now();
+                }
+                note_in_flight_delta(+1);
+                ++stats.requests_issued;
+                continue;
+            }
             const auto send_frame = [&](pipe_frame_type type, const std::vector<uint8_t> & payload) {
                 if (!layer_trace_enabled()) {
                     return pipe_send_frame(*value.socket, type, seq_id, payload.data(), payload.size());
@@ -2734,7 +2790,13 @@ struct dispatcher::impl {
                 if (done[i]) {
                     continue;
                 }
-                const int fd = workers[requests[i].worker_index].socket->poll_fd();
+                worker & w = workers[requests[i].worker_index];
+                if (!w.socket) {
+                    pfds.clear();
+                    idx.clear();
+                    break;
+                }
+                const int fd = w.socket->poll_fd();
                 if (fd < 0) {
                     pfds.clear();
                     idx.clear();
@@ -3223,6 +3285,10 @@ struct dispatcher::impl {
         return collect_pending_deferred(/*mark_fold_open=*/false);
     }
 };
+
+void set_inproc_backend_factory(inproc_backend_factory factory) {
+    g_inproc_factory = factory;
+}
 
 dispatcher::dispatcher(const std::vector<endpoint> & endpoints) : pimpl(new impl(endpoints)) {}
 
