@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <numeric>
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <climits>
@@ -2620,6 +2621,27 @@ struct dispatcher::impl {
         // removed 2026-08-19, see pipe-protocol.h), but the decode path still
         // accepts f16 from a stale worker mid-rolling-restart, so this comment and
         // the code below make no assumption about which one arrives.
+        // MAD-LAB DIAGNOSTIC: the spine validates every weight it SENDS (see
+        // pipe-protocol.cpp, "expert dispatch has a non-finite weight") but never
+        // validated a partial it RECEIVES. That asymmetry let a worker return
+        // NaN rows that landed silently in ffn_moe_out via scatter_add, and only
+        // surfaced one layer later as a bogus "non-finite weight" rejection --
+        // blaming the spine's routing for the previous layer's corrupted output.
+        // Name the worker and the row instead.
+        for (size_t i = 0; i < partial.partial.size(); ++i) {
+            if (std::isfinite(partial.partial[i])) {
+                continue;
+            }
+            const size_t row = i / (size_t) n_embd;
+            const uint32_t token = request.token_ids.empty()
+                ? (uint32_t) row : request.token_ids[row];
+            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                     " returned a NON-FINITE partial at layer " +
+                                     std::to_string(layer) + " row " + std::to_string(row) +
+                                     " (token " + std::to_string(token) + ") dim " +
+                                     std::to_string(i % (size_t) n_embd) +
+                                     " for expert(s) " + assignment_experts(request.assignments));
+        }
         out.assign(partial.partial.begin(), partial.partial.end());
         GGML_ASSERT(out.size() == want_vals);
         GGML_UNUSED(n_values);

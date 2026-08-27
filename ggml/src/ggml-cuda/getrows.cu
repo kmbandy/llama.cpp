@@ -344,6 +344,14 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        // MAD-LAB: turbo4 rows come back in the ROTATED domain -- dequantize_turbo4_0
+        // deliberately omits the inverse WHT (see ggml-turbo-quant.c, dequantize_row_turbo4_0).
+        // Main attention compensates by WHT-rotating Q; any other consumer of a turbo4
+        // tensor through get_rows MUST apply ggml_turbo_wht(direction=1) itself.
+        case GGML_TYPE_TURBO4_0:
+            get_rows_cuda_q<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_ML8_FP8:
             // QR=1: each dequantize call produces two consecutive e4m3 elements scaled by per-block fp16 scale.
             // Block layout: block_ml8_fp8 { ggml_half scale; uint8_t qs[32]; } = 34 bytes.

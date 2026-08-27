@@ -630,8 +630,13 @@ llama_context::llama_context(
             "--expert-dispatch is missing; refusing to run without routed experts");
     }
     if (expert_dispatch_enabled) {
-        if (model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_GLM_DSA && model.arch != LLM_ARCH_DEEPSEEK4) {
-            throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2 or GLM-DSA graph");
+        // MAD-LAB: QWEN4EXP joins the list. Its build_layer_ffn calls the same
+        // build_moe_ffn, and it satisfies that function's dispatch preconditions:
+        // LLM_FFN_SILU, no expert biases, no per-expert scales, and a shared expert
+        // that is computed on the spine and added after the dispatch returns.
+        if (model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_GLM_DSA &&
+            model.arch != LLM_ARCH_DEEPSEEK4 && model.arch != LLM_ARCH_QWEN4EXP) {
+            throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2, GLM-DSA, DeepSeek4 or Qwen4Exp graph");
         }
         // last_no_defer_layer = last main-graph MoE index (excludes NextN/MTP).
         // Worker HELLO lists can include the MTP block (e.g. layer 78) which the

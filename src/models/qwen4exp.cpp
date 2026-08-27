@@ -181,8 +181,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+
+        // expert_flags is OURS: with cross-machine dispatch the routed experts live
+        // on the workers, so the spine must not load them. The router (ffn_gate_inp)
+        // and the shared expert stay resident -- only the ROUTED experts are external.
+        const int expert_flags = routed_experts_external ? TENSOR_SKIP | TENSOR_NOT_REQUIRED : 0;
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, expert_flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, expert_flags);
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
@@ -226,8 +231,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, idx_flags);
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        // OR-ed with the MTP block's own SKIP flag so the nextn logic still applies.
+        const int mtp_expert_flags = flags | (routed_experts_external ? TENSOR_SKIP | TENSOR_NOT_REQUIRED : 0);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_expert_flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_expert_flags);
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
@@ -642,6 +649,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
+    // turbo4 stores keys ROTATED and its dequant never un-rotates (main attention
+    // compensates on Q instead). We cannot: index_k_norm's per-dimension gain and
+    // ggml_rope_multi below are both defined in the ORIGINAL basis and neither
+    // commutes with an orthogonal WHT. So the inverse goes on the POOLED vector --
+    // legal because pooling is add+scale, i.e. linear, so mean(W k) == W mean(k),
+    // and it costs one 128-point WHT per block instead of one per gathered member.
+    const bool idx_rotated = k_all->type == GGML_TYPE_TURBO4_0;
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
     // gathers per stream: blk_cells row s indexes stream s's own cells
@@ -658,6 +672,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+    if (idx_rotated) {
+        pooled = ggml_turbo_wht(ctx0, pooled, /*direction=*/ 1, /*group_size=*/ 0, nullptr);
+        cb(pooled, "indexer_k_unrot", il);
+    }
     cb(pooled, "indexer_k_pooled", il);
 
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.

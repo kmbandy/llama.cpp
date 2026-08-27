@@ -10842,6 +10842,17 @@ int run(const Options & options) {
         options.device.empty()) {
         throw std::invalid_argument("invalid expert worker options");
     }
+    // Same as WeightPager: default HIP graph keying recaptures every submit
+    // (nodes[0] is ephemeral; this worker rebinds expert data pointers).
+    // Capture stays available only when WP_HIP_GRAPHS=1 selects the stable-key path.
+    {
+        const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
+        if (wp_graphs == nullptr || wp_graphs[0] != '1') {
+            if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
+                setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+            }
+        }
+    }
     const fs::path manifest = fs::canonical(options.shard_manifest);
     const fs::path descriptor = fs::canonical(options.descriptor);
     Worker worker(

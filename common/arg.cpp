@@ -3074,7 +3074,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.expert_dispatch = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_EXPERT_DISPATCH"));
+    // MAD-LAB: LLAMA_EXAMPLE_COMMON added so llama-eval-callback can attach to a
+    // dispatch rig. A spine whose routed experts are external cannot build its MoE
+    // graph at all without dispatch, so without this the per-tensor debug hook --
+    // the only way to see WHICH tensor first goes non-finite -- is unusable on
+    // exactly the configuration that needs debugging.
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_EXPERT_DISPATCH"));
     add_opt(common_arg(
         {"--segment-manifest"}, "PATH",
         "serve a dense pipeline manifest from its first segment (single server slot only)",
