@@ -915,13 +915,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             __syncthreads();
         }
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, offset_x + kb0_stop, stride_row_x);
+        const int64_t y_start = int64_t(kb0) * qk;
+        const int64_t y_stop = int64_t(kb0_stop) * qk;
         {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            const bool y0_valid = y_start < y_stop;
+            const int * by0 = y0_valid ? y + ncols_y * (y_start / ne_block) * sz : y;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l] = y0_valid ? by0[l] : 0;
             }
         }
 
@@ -932,12 +935,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
 
         {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            const bool y1_valid = y_start + ne_block < y_stop;
+            const int * by0 = y1_valid ? y + ncols_y * ((y_start / ne_block) * sz + sz) : y;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l] = y1_valid ? by0[l] : 0;
             }
         }
 

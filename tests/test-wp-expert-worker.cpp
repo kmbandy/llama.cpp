@@ -2280,47 +2280,74 @@ static void test_partial_last_column_round_trip() {
         return;
     }
 
-    ggml_init_params params = {
-        /*.mem_size   =*/ 16 * 1024 * 1024,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
+    const std::vector<ggml_type> types = {
+        GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S,
+        GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
     };
-    ggml_context * ctx = ggml_init(params);
-    require(ctx != nullptr, "failed to create CUDA/HIP regression context");
 
-    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_1, n_ff_exp, n_embd);
-    ggml_tensor * input   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  n_ff_exp, n_tokens);
-    ggml_tensor * output  = ggml_mul_mat(ctx, weights, input);
-    ggml_cgraph * graph   = ggml_new_graph_custom(ctx, 4, false);
-    ggml_build_forward_expand(graph, output);
-    require(ggml_backend_supports_op(backend, output),
-            "CUDA/HIP backend does not support Q5_1 regression op");
-
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    require(buffer != nullptr, "failed to allocate CUDA/HIP regression tensors");
-
-    std::vector<uint8_t> quantized(ggml_row_size(GGML_TYPE_Q5_1, n_ff_exp) * n_embd);
-    require(ggml_quantize_chunk(GGML_TYPE_Q5_1, down.data(), quantized.data(),
-                                0, n_embd, n_ff_exp, nullptr) == quantized.size(),
-            "failed to quantize CUDA/HIP regression weights");
-    ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
-    ggml_backend_tensor_set(input, hidden.data(), 0, hidden.size() * sizeof(float));
-
-    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
-            "CUDA/HIP [640 -> 2560] regression graph failed");
-    std::vector<float> device_output((size_t) n_tokens * n_embd);
-    ggml_backend_tensor_get(output, device_output.data(), 0, device_output.size() * sizeof(float));
-    for (int token = 0; token < n_tokens; ++token) {
-        for (int output_idx = 0; output_idx < n_embd; ++output_idx) {
-            require(std::isfinite(device_output[(size_t) token * n_embd + output_idx]),
-                    "CUDA/HIP [640 -> 2560] regression produced a non-finite value");
+    for (const ggml_type type : types) {
+        const int block_size = ggml_blck_size(type);
+        const int n_k = (n_ff_exp + block_size - 1) / block_size * block_size;
+        std::vector<float> hidden_padded((size_t) n_tokens * n_k, 0.0f);
+        std::vector<float> down_padded((size_t) n_embd * n_k, 0.0f);
+        for (int token = 0; token < n_tokens; ++token) {
+            std::memcpy(hidden_padded.data() + (size_t) token * n_k,
+                        hidden.data() + (size_t) token * n_ff_exp,
+                        (size_t) n_ff_exp * sizeof(float));
         }
-        require(std::isfinite(device_output[(size_t) token * n_embd + n_embd - 1]),
-                "CUDA/HIP [640 -> 2560] regression last column is non-finite");
-    }
+        for (int output_idx = 0; output_idx < n_embd; ++output_idx) {
+            std::memcpy(down_padded.data() + (size_t) output_idx * n_k,
+                        down.data() + (size_t) output_idx * n_ff_exp,
+                        (size_t) n_ff_exp * sizeof(float));
+        }
 
-    ggml_backend_buffer_free(buffer);
-    ggml_free(ctx);
+        ggml_init_params params = {
+            /*.mem_size   =*/ 16 * 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        require(ctx != nullptr, "failed to create CUDA/HIP regression context");
+
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, type, n_k, n_embd);
+        ggml_tensor * input   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_k, n_tokens);
+        ggml_tensor * output  = ggml_mul_mat(ctx, weights, input);
+        ggml_cgraph * graph   = ggml_new_graph_custom(ctx, 4, false);
+        ggml_build_forward_expand(graph, output);
+        require(ggml_backend_supports_op(backend, output),
+                "CUDA/HIP backend does not support quantized regression op");
+
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        require(buffer != nullptr, "failed to allocate CUDA/HIP regression tensors");
+
+        const size_t row_size = ggml_row_size(type, n_k);
+        std::vector<uint8_t> quantized(row_size * n_embd);
+        std::vector<float> imatrix(n_k, 1.0f);
+        const float * im = ggml_quantize_requires_imatrix(type) ? imatrix.data() : nullptr;
+        require(ggml_quantize_chunk(type, down_padded.data(), quantized.data(),
+                                    0, n_embd, n_k, im) == quantized.size(),
+                "failed to quantize CUDA/HIP regression weights");
+        ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+        ggml_backend_tensor_set(input, hidden_padded.data(), 0, hidden_padded.size() * sizeof(float));
+
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+                "CUDA/HIP [640 -> 2560] regression graph failed");
+        std::vector<float> device_output((size_t) n_tokens * n_embd);
+        ggml_backend_tensor_get(output, device_output.data(), 0, device_output.size() * sizeof(float));
+        for (int token = 0; token < n_tokens; ++token) {
+            for (int output_idx = 0; output_idx < n_embd; ++output_idx) {
+                require(std::isfinite(device_output[(size_t) token * n_embd + output_idx]),
+                        "CUDA/HIP [640 -> 2560] regression produced a non-finite value");
+            }
+            require(std::isfinite(device_output[(size_t) token * n_embd + n_embd - 1]),
+                    "CUDA/HIP [640 -> 2560] regression last column is non-finite");
+        }
+
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
     ggml_backend_free(backend);
 }
 
