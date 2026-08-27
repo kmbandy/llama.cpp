@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
@@ -2258,6 +2259,69 @@ static void test_partial_last_column_round_trip() {
         require(std::memcmp(&expected[n_embd - 1], &actual[n_embd - 1], sizeof(float)) == 0,
                 "expert partial last column changed during f32 encode/decode");
     }
+
+    ggml_backend_load_all();
+    ggml_backend_t backend = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        const char * name = ggml_backend_dev_name(device);
+        if (name != nullptr && (std::strstr(name, "CUDA") != nullptr ||
+                                std::strstr(name, "ROCm") != nullptr ||
+                                std::strstr(name, "HIP") != nullptr)) {
+            backend = ggml_backend_dev_init(device, nullptr);
+            break;
+        }
+    }
+    if (backend == nullptr) {
+        std::cout << "test_partial_last_column_round_trip: no CUDA/HIP backend; skipping device case\n";
+        return;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to create CUDA/HIP regression context");
+
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_1, n_ff_exp, n_embd);
+    ggml_tensor * input   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  n_ff_exp, n_tokens);
+    ggml_tensor * output  = ggml_mul_mat(ctx, weights, input);
+    ggml_cgraph * graph   = ggml_new_graph_custom(ctx, 4, false);
+    ggml_build_forward_expand(graph, output);
+    require(ggml_backend_supports_op(backend, output),
+            "CUDA/HIP backend does not support Q5_1 regression op");
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "failed to allocate CUDA/HIP regression tensors");
+
+    std::vector<uint8_t> quantized(ggml_row_size(GGML_TYPE_Q5_1, n_ff_exp) * n_embd);
+    require(ggml_quantize_chunk(GGML_TYPE_Q5_1, down.data(), quantized.data(),
+                                0, n_embd, n_ff_exp, nullptr) == quantized.size(),
+            "failed to quantize CUDA/HIP regression weights");
+    ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+    ggml_backend_tensor_set(input, hidden.data(), 0, hidden.size() * sizeof(float));
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "CUDA/HIP [640 -> 2560] regression graph failed");
+    std::vector<float> device_output((size_t) n_tokens * n_embd);
+    ggml_backend_tensor_get(output, device_output.data(), 0, device_output.size() * sizeof(float));
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int output_idx = 0; output_idx < n_embd; ++output_idx) {
+            require(std::isfinite(device_output[(size_t) token * n_embd + output_idx]),
+                    "CUDA/HIP [640 -> 2560] regression produced a non-finite value");
+        }
+        require(std::isfinite(device_output[(size_t) token * n_embd + n_embd - 1]),
+                "CUDA/HIP [640 -> 2560] regression last column is non-finite");
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
 }
 
 static void test_decode_prefill_compute_profile() {

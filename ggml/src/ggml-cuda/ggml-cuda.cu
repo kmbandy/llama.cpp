@@ -2735,17 +2735,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    // AMD MMQ tiles read quantized K in fixed-size chunks and do not mask a
-    // short final chunk. Keep those weights on the dequantized BLAS path.
-    const int mmq_k = (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4)
-        ? MMQ_ITER_K_FP4 : MMQ_ITER_K;
-    const bool amd_unaligned_k = GGML_CUDA_CC_IS_AMD(cc) &&
-        ggml_is_quantized(src0->type) && src0->ne[0] % mmq_k != 0;
-    if (amd_unaligned_k) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
-    }
-
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
