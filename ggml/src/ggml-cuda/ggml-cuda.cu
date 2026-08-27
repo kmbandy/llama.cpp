@@ -2735,6 +2735,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // RDNA4 MMQ/MMVQ tiles read quantized K in 256-element chunks. Keep
+    // 32-element-block weights with a short final chunk on the dequantized
+    // BLAS path; this is common for expert down projections (K=640).
+    const bool rdna4_unaligned_k = GGML_CUDA_CC_IS_RDNA4(cc) &&
+        src0->ne[0] % 256 != 0 && ggml_blck_size(src0->type) == 32;
+    if (rdna4_unaligned_k) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3576,6 +3586,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (cuda_ctx->wp_copy_enabled && cuda_ctx->wp_copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->wp_copy_stream));
+    }
 
     GGML_UNUSED(backend);
 }
@@ -6453,6 +6466,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         // 32-value sub-blocks, the row size does not guarantee
                         // the QK_K super-blocks the get_rows kernel iterates on
                         return op->src[0]->ne[0] % QK_K == 0;
+                    case GGML_TYPE_TURBO4_0:
+                        // 128-element blocks; a partial trailing block would read past it
+                        return op->src[0]->ne[0] % QK_TURBO4 == 0;
                     default:
                         return false;
                 }
