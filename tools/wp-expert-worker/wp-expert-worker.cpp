@@ -1707,9 +1707,29 @@ Catalog & layout_sliced_pages(
             const RoleSpec & spec = specs.at(member.first);
             ggml_tensor * tensor =
                 ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
-            const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+            size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
             if (alloc_size < member.second->size) {
                 throw std::runtime_error("invalid expert slice device allocation size");
+            }
+            // MAD-LAB 2026-08-26: RESERVE QUANTIZED ROW SLACK ON EVERY BACKEND.
+            //
+            // CUDA/ROCm pads a quantized tensor up to MATRIX_ROW_PADDING (512)
+            // elements precisely "to avoid out-of-bounds memory accesses" from
+            // the quantized matmul kernels. Vulkan's
+            // ggml_backend_vk_buffer_type_get_alloc_size returns a bare
+            // ggml_nbytes and reserves NO slack at all -- so on Vulkan an
+            // over-reading kernel walks straight into the NEXT expert packed
+            // behind it in the slot, decodes those bytes as f16 block scales,
+            // and an exponent-all-ones pattern there is NaN/Inf. That is the
+            // RX 480 (:8804) returning non-finite partials while the same
+            // shard bytes are provably byte-identical to the source GGUF.
+            //
+            // Reserve the slack ourselves rather than trusting the backend to.
+            // The buffer is zeroed once at allocation and nothing ever writes
+            // this tail, so an over-read now lands in zeros -- which is the
+            // guarantee CUDA's padding was already providing.
+            if (ggml_is_quantized(spec.type) && spec.ne0 % 512 != 0) {
+                alloc_size += ggml_row_size(spec.type, 512 - (spec.ne0 % 512));
             }
             allocation_sizes.push_back((uint64_t) alloc_size);
         }
