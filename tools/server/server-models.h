@@ -114,6 +114,20 @@ struct server_model_meta {
     server_model_placement placement;
     bool hidden = false; // hidden from GET /models, but still accept if requested
 
+    // Parsed from the preset's `env` key, captured at placement-parse time for the same
+    // reason as placement.vram_mb_override: update_args() calls unset_reserved_args(),
+    // which strips the router-only options from the preset in place, so reading `env`
+    // at spawn time would always find it already gone.
+    //
+    // Each entry is either "KEY=VALUE" (set) or "-KEY" (remove from the child env).
+    // Applied over the environment the router itself inherited when spawning this
+    // model's child, so a per-model setting beats a router-wide one.
+    //
+    // Declared at the END of this struct deliberately: server_model_meta is built with
+    // POSITIONAL aggregate initialisers in several places, so a field inserted anywhere
+    // above silently shifts every one of them onto the wrong member.
+    std::vector<std::string> env_overrides;
+
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
     }

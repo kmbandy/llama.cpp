@@ -5172,6 +5172,18 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     ).set_env("LLAMA_ARG_ROUTER_VRAM_MB").set_preset_only());
 
     args.push_back(common_arg(
+        {"env"}, "K=V[,K=V,-K]",
+        "in server router mode, per-model environment for THIS model's child process only.\n"
+        "Comma-separated. 'K=V' sets K, and a leading '-' ('-K') REMOVES K from the child's\n"
+        "environment entirely. Applied on top of the environment the router itself inherited,\n"
+        "so a model can override -- or delete -- a variable set router-wide.\n"
+        "Exists because systemd Environment= on the router service is process-wide: every\n"
+        "model the router spawns inherited one shared set of tuning vars, so levers measured\n"
+        "for one model were silently applied to all of them.",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_ENV").set_preset_only());
+
+    args.push_back(common_arg(
         {"pinned"},
         {"no-pinned"},
         "in server router mode, prevent automatic eviction of this model",

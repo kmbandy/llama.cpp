@@ -51,6 +51,7 @@ extern char **environ;
 
 static constexpr const char * ROUTER_ARG_GPU          = "LLAMA_ARG_ROUTER_GPU";
 static constexpr const char * ROUTER_ARG_VRAM_MB      = "LLAMA_ARG_ROUTER_VRAM_MB";
+static constexpr const char * ROUTER_ARG_ENV          = "LLAMA_ARG_ROUTER_ENV";
 static constexpr const char * ROUTER_ARG_PINNED       = "LLAMA_ARG_ROUTER_PINNED";
 static constexpr const char * ROUTER_ARG_EXCLUSIVE    = "LLAMA_ARG_ROUTER_EXCLUSIVE";
 static constexpr const char * ROUTER_ARG_IDLE_TIMEOUT = "LLAMA_ARG_ROUTER_IDLE_TIMEOUT";
@@ -333,6 +334,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_GPUS");
     preset.unset_option(ROUTER_ARG_GPU);
     preset.unset_option(ROUTER_ARG_VRAM_MB);
+    preset.unset_option(ROUTER_ARG_ENV);
     preset.unset_option(ROUTER_ARG_PINNED);
     preset.unset_option(ROUTER_ARG_EXCLUSIVE);
     preset.unset_option(ROUTER_ARG_IDLE_TIMEOUT);
@@ -768,6 +770,42 @@ static void parse_model_vram_mb(server_model_meta & meta) {
     }
 }
 
+// Parse the preset's `env` into meta.env_overrides. Entries are comma-separated;
+// "KEY=VALUE" sets, a leading '-' ("-KEY") removes. Malformed entries are dropped
+// with a warning rather than failing the load: a typo in one tuning var should not
+// take a model offline.
+static void parse_model_env(server_model_meta & meta) {
+    meta.env_overrides.clear();
+    std::string val;
+    if (!meta.preset.get_option(ROUTER_ARG_ENV, val) || val.empty()) {
+        return;
+    }
+    for (auto entry : string_split<std::string>(val, ',')) {
+        entry = string_strip(entry);
+        if (entry.empty()) {
+            continue;
+        }
+        if (entry[0] == '-') {
+            const std::string key = string_strip(entry.substr(1));
+            // A bare "-" or a key with '=' in it is not a removal request.
+            if (key.empty() || key.find('=') != std::string::npos) {
+                SRV_WRN("ignoring malformed env removal '%s' for model '%s' (expected -KEY)\n",
+                        entry.c_str(), meta.name.c_str());
+                continue;
+            }
+            meta.env_overrides.push_back("-" + key);
+            continue;
+        }
+        const size_t eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            SRV_WRN("ignoring malformed env entry '%s' for model '%s' (expected KEY=VALUE or -KEY)\n",
+                    entry.c_str(), meta.name.c_str());
+            continue;
+        }
+        meta.env_overrides.push_back(entry);
+    }
+}
+
 void server_models::parse_model_placement(server_model_meta & meta) {
     meta.placement = {};
     std::string pinned;
@@ -787,6 +825,10 @@ void server_models::parse_model_placement(server_model_meta & meta) {
     // Parsed before the `gpu.empty() || "any"` early-return below so that models without
     // an explicit slot still get their override.
     parse_model_vram_mb(meta);
+
+    // Same capture-now hazard as vram-mb above: unset_reserved_args() strips
+    // ROUTER_ARG_ENV from the preset in place right after this runs.
+    parse_model_env(meta);
 
     std::string gpu;
     if (meta.preset.get_option(ROUTER_ARG_GPU, gpu)) {
@@ -1965,6 +2007,26 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+
+        // Per-model `env` from the preset, applied OVER the environment the router
+        // inherited. Entries REPLACE any existing definition rather than being appended:
+        // duplicate KEY= entries in envp resolve inconsistently across libc getenv
+        // implementations, so "override" has to mean override, not "hope the later one wins".
+        for (const auto & override_entry : inst.meta.env_overrides) {
+            const bool remove = override_entry[0] == '-';
+            const std::string key = remove
+                ? override_entry.substr(1)
+                : override_entry.substr(0, override_entry.find('='));
+            const std::string prefix = key + "=";
+            for (auto it = child_env.begin(); it != child_env.end(); ) {
+                it = it->compare(0, prefix.size(), prefix) == 0 ? child_env.erase(it) : it + 1;
+            }
+            if (!remove) {
+                child_env.push_back(override_entry);
+            }
+            SRV_INF("model '%s': env %s%s\n", inst.meta.name.c_str(),
+                    remove ? "unset " : "", remove ? key.c_str() : override_entry.c_str());
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
