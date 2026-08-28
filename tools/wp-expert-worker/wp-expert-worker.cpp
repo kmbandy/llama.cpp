@@ -90,7 +90,7 @@ bool ggml_backend_cuda_wp_reader_copy(ggml_backend_t, ggml_tensor *,
 namespace wp_expert_worker {
 
 int parse_gather_min_tokens(const char * env) {
-    if (env == nullptr || env[0] == '\0') {
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
         return 2;
     }
     const int v = std::atoi(env);
@@ -234,6 +234,55 @@ static uint64_t read_stats_interval_ms_from_env() {
         return default_interval_ms;
     }
     return (uint64_t) parsed;
+}
+
+// WP_EXPERT_LFU_PLACEMENT controls frequency-aware multi-device placement.
+// DEFAULT OFF, deliberately. This policy has never been measured on hardware,
+// and an unmeasured lever that is on by default stops a bare run from being the
+// config of record -- every subsequent comparison would silently include it.
+// That exact trap (a harness whose defaults were not the record) already cost
+// this project a day of invalid A/Bs. Turn it on explicitly, as the ONE
+// variable, and flip this default once it has numbers.
+// WP_EXPERT_LFU_PLACEMENT=1 enables it; anything else keeps the static map.
+static bool lfu_placement_from_env() {
+    const char * env = std::getenv("WP_EXPERT_LFU_PLACEMENT");
+    return env != nullptr && env[0] == '1';
+}
+
+// Maximum successful page migrations per dispatch request.
+static size_t lfu_migration_cap_from_env() {
+    const char * env = std::getenv("WP_EXPERT_LFU_MIGRATION_CAP");
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 2;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' ||
+            parsed > std::numeric_limits<size_t>::max()) {
+        return 2;
+    }
+    return (size_t) parsed;
+}
+
+// Percentage of the boundary count used by the LFU placement hysteresis.
+static uint64_t lfu_hysteresis_pct_from_env() {
+    const char * env = std::getenv("WP_EXPERT_LFU_HYSTERESIS_PCT");
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 25;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' || parsed == 0) {
+        return 25;
+    }
+    return std::min<uint64_t>(parsed, 100);
+}
+
+static uint64_t placement_now_ns() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 static std::atomic<bool> g_read_direct_fallback{false};
@@ -10326,6 +10375,23 @@ public:
                 throw std::invalid_argument("worker device slot budgets must be positive");
             }
         }
+        const size_t n_pages = catalog_.pages.size();
+        page_access_counts_ = std::make_unique<std::atomic<uint64_t>[]>(n_pages);
+        page_current_owner_ = std::make_unique<std::atomic<uint32_t>[]>(n_pages);
+        page_static_owners_.resize(n_pages);
+        resident_expert_blocks_ = resident_expert_blocks;
+        std::sort(resident_expert_blocks_.begin(), resident_expert_blocks_.end());
+        for (const auto & item : catalog_.pages) {
+            const ExpertPage & page = item.second;
+            if (page.cache_id < 0 || (size_t) page.cache_id >= n_pages) {
+                throw std::invalid_argument("expert page cache ids are not contiguous");
+            }
+            const size_t id = (size_t) page.cache_id;
+            const size_t owner = static_owner_for_page(page.layer, page.expert);
+            page_static_owners_[id] = owner;
+            page_access_counts_[id].store(0, std::memory_order_relaxed);
+            page_current_owner_[id].store((uint32_t) owner, std::memory_order_relaxed);
+        }
         devices_.reserve(device_names_.size());
         const bool single_device = device_names_.size() == 1;
         for (size_t i = 0; i < device_names_.size(); ++i) {
@@ -10341,13 +10407,18 @@ public:
                 single_device ? nullptr : &host_tier_, single_device,
                 page_owner, &logs_));
         }
+        initialize_placement_policy();
         if (!single_device) {
             load_pin_file();
         }
     }
 
-    size_t owning_device_for_page(int layer, int expert) const {
-        // Stage 2 replaces this body with the LFU placement policy.
+    size_t owning_device_for_page(
+            int layer, int expert, size_t * migration_budget = nullptr) const {
+        return owner_for_page(layer, expert, migration_budget);
+    }
+
+    size_t static_owner_for_page(int layer, int expert) const {
         (void) layer;
         const int first = catalog_.descriptor.expert_first;
         const int last = catalog_.descriptor.expert_last;
@@ -10553,13 +10624,16 @@ public:
                 request, request_stats, std::move(prepared), conn_index);
         }
         validate_dispatch(request);
+        note_dispatch_references(request);
         pipe_expert_partial result;
         result.layer = request.layer;
         result.n_tokens = request.n_tokens;
         result.dtype = PIPE_HIDDEN_F32;
         result.partial.assign(
             (size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
-        const std::vector<AssignmentGroup> groups = assignment_groups(request);
+        size_t migration_budget = migration_cap_;
+        const std::vector<AssignmentGroup> groups =
+            assignment_groups(request, &migration_budget);
         for (const AssignmentGroup & group : groups) {
             pipe_expert_dispatch_req sub = make_subrequest(request, group.begin, group.end);
             RequestStats sub_stats;
@@ -10597,7 +10671,17 @@ public:
         request.assignments = begin.assignments;
         request.swiglu_clamp = begin.swiglu_clamp;
         validate_dispatch(request);
-        std::vector<AssignmentGroup> groups = assignment_groups(request);
+        {
+            std::lock_guard<std::mutex> lock(split_mutex_);
+            if (split_pending_by_conn_.count(conn_index) != 0) {
+                throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                          "expert dispatch BEGIN arrived before ACTS");
+            }
+        }
+        note_dispatch_references(request);
+        size_t migration_budget = migration_cap_;
+        std::vector<AssignmentGroup> groups =
+            assignment_groups(request, &migration_budget);
         if (groups.empty()) {
             groups.push_back({0, 0, 0});
         }
@@ -10715,6 +10799,302 @@ public:
     }
 
 private:
+    struct PlacementSnapshot {
+        std::vector<uint32_t> owner;
+        std::vector<uint64_t> promotion_floor;
+        std::vector<uint64_t> demotion_ceiling;
+    };
+
+    size_t page_id_for(int layer, int expert) const {
+        const auto it = catalog_.pages.find({layer, expert});
+        if (it == catalog_.pages.end() || it->second.cache_id < 0) {
+            return page_static_owners_.size();
+        }
+        const size_t id = (size_t) it->second.cache_id;
+        return id < page_static_owners_.size() ? id : page_static_owners_.size();
+    }
+
+    size_t owner_for_page(int layer, int expert, size_t * migration_budget) const {
+        const size_t id = page_id_for(layer, expert);
+        if (id == page_static_owners_.size()) {
+            return static_owner_for_page(layer, expert);
+        }
+        if (!placement_enabled_ || !placement_ready_ || migration_budget == nullptr ||
+                resident_layer(layer)) {
+            return placement_enabled_ && placement_ready_
+                ? (size_t) page_current_owner_[id].load(std::memory_order_relaxed)
+                : page_static_owners_[id];
+        }
+
+        const std::shared_ptr<const PlacementSnapshot> snapshot =
+            std::atomic_load_explicit(&placement_snapshot_, std::memory_order_acquire);
+        const size_t current =
+            (size_t) page_current_owner_[id].load(std::memory_order_relaxed);
+        if (!snapshot || current >= device_names_.size() ||
+                id >= snapshot->owner.size()) {
+            return current;
+        }
+        const size_t desired = (size_t) snapshot->owner[id];
+        if (desired == current) {
+            return current;
+        }
+
+        const uint64_t count = page_access_counts_[id].load(std::memory_order_relaxed);
+        const uint64_t boundary = current > desired
+            ? snapshot->promotion_floor[id] : snapshot->demotion_ceiling[id];
+        const uint64_t margin = std::max<uint64_t>(
+            8, boundary / 100 * hysteresis_pct_ +
+                boundary % 100 * hysteresis_pct_ / 100);
+        const bool enough = current > desired
+            ? margin <= UINT64_MAX - boundary &&
+                  count >= boundary + margin
+            : boundary >= margin && count <= boundary - margin;
+        if (!enough) {
+            placement_declined_hysteresis_.fetch_add(1, std::memory_order_relaxed);
+            return current;
+        }
+        if (*migration_budget == 0) {
+            placement_declined_cap_.fetch_add(1, std::memory_order_relaxed);
+            return current;
+        }
+        uint32_t expected = (uint32_t) current;
+        if (!page_current_owner_[id].compare_exchange_strong(
+                expected, (uint32_t) desired, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return (size_t) expected;
+        }
+        --*migration_budget;
+        placement_migrations_.fetch_add(1, std::memory_order_relaxed);
+        return desired;
+    }
+
+    bool resident_layer(int layer) const {
+        return std::binary_search(
+            resident_expert_blocks_.begin(), resident_expert_blocks_.end(), layer);
+    }
+
+    void note_dispatch_references(
+            const pipe_expert_dispatch_req & request) const {
+        if (!multi_device()) {
+            return;
+        }
+        for (const pipe_expert_assignment & assignment : request.assignments) {
+            const size_t id = page_id_for(request.layer, assignment.expert_id);
+            if (id == page_static_owners_.size()) {
+                continue;
+            }
+            uint64_t count = page_access_counts_[id].load(std::memory_order_relaxed);
+            while (count != UINT64_MAX &&
+                   !page_access_counts_[id].compare_exchange_weak(
+                       count, count + 1, std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {
+            }
+        }
+        const uint64_t previous = placement_references_.fetch_add(
+            (uint64_t) request.assignments.size(), std::memory_order_relaxed);
+        const uint64_t added = (uint64_t) request.assignments.size();
+        const uint64_t after = previous > UINT64_MAX - added
+            ? UINT64_MAX : previous + added;
+        if (previous / placement_refresh_period_ !=
+                after / placement_refresh_period_) {
+            refresh_placement_snapshot();
+        }
+        maybe_report_placement_stats();
+    }
+
+    void initialize_placement_policy() {
+        if (!multi_device()) {
+            return;
+        }
+        bool use_size_classes = true;
+        for (const std::unique_ptr<DeviceWorker> & device : devices_) {
+            use_size_classes = use_size_classes && device->resources().size_classes;
+        }
+        if (use_size_classes) {
+            for (const auto & item : catalog_.pages) {
+                if (!resident_layer(item.second.layer)) {
+                    placement_class_sizes_.push_back(item.second.size);
+                }
+            }
+            std::sort(placement_class_sizes_.begin(), placement_class_sizes_.end());
+            placement_class_sizes_.erase(
+                std::unique(placement_class_sizes_.begin(), placement_class_sizes_.end()),
+                placement_class_sizes_.end());
+        } else {
+            uint64_t max_page_size = 0;
+            for (const auto & item : catalog_.pages) {
+                if (!resident_layer(item.second.layer)) {
+                    max_page_size = std::max(max_page_size, item.second.size);
+                }
+            }
+            placement_class_sizes_.push_back(max_page_size);
+        }
+        placement_pages_by_class_.resize(placement_class_sizes_.size());
+        for (const auto & item : catalog_.pages) {
+            const ExpertPage & page = item.second;
+            if (resident_layer(page.layer)) {
+                continue;
+            }
+            const size_t id = (size_t) page.cache_id;
+            const size_t class_id = use_size_classes
+                ? (size_t) (std::lower_bound(
+                      placement_class_sizes_.begin(), placement_class_sizes_.end(),
+                      page.size) - placement_class_sizes_.begin())
+                : 0;
+            placement_pages_by_class_[class_id].push_back(id);
+        }
+        placement_capacity_.assign(
+            placement_class_sizes_.size(), std::vector<size_t>(devices_.size(), 0));
+        for (size_t device_id = 0; device_id < devices_.size(); ++device_id) {
+            const ResourcePlan & resources = devices_[device_id]->resources();
+            for (size_t class_id = 0; class_id < placement_class_sizes_.size(); ++class_id) {
+                for (const SlotClass & slot_class : resources.slot_classes) {
+                    if ((use_size_classes && slot_class.size == placement_class_sizes_[class_id]) ||
+                            (!use_size_classes && slot_class.size >= placement_class_sizes_[class_id])) {
+                        placement_capacity_[class_id][device_id] =
+                            (size_t) slot_class.slots;
+                        break;
+                    }
+                }
+            }
+        }
+        placement_ready_ = true;
+        refresh_placement_snapshot();
+    }
+
+    void refresh_placement_snapshot() const {
+        if (!placement_ready_ || !placement_enabled() ||
+                placement_refreshing_.test_and_set(std::memory_order_acquire)) {
+            return;
+        }
+        struct RefreshGuard {
+            std::atomic_flag & flag;
+            ~RefreshGuard() { flag.clear(std::memory_order_release); }
+        } refresh_guard{placement_refreshing_};
+        std::shared_ptr<PlacementSnapshot> snapshot =
+            std::make_shared<PlacementSnapshot>();
+        const size_t n_pages = page_static_owners_.size();
+        snapshot->owner.resize(n_pages);
+        snapshot->promotion_floor.resize(n_pages);
+        snapshot->demotion_ceiling.resize(n_pages);
+        std::vector<uint64_t> counts(n_pages, 0);
+        for (size_t id = 0; id < n_pages; ++id) {
+            counts[id] = page_access_counts_[id].load(std::memory_order_relaxed);
+        }
+        for (size_t class_id = 0; class_id < placement_pages_by_class_.size(); ++class_id) {
+            std::vector<size_t> pages = placement_pages_by_class_[class_id];
+            std::sort(pages.begin(), pages.end(), [&](size_t a, size_t b) {
+                if (counts[a] != counts[b]) {
+                    return counts[a] > counts[b];
+                }
+                if (page_static_owners_[a] != page_static_owners_[b]) {
+                    return page_static_owners_[a] < page_static_owners_[b];
+                }
+                return a < b;
+            });
+            std::vector<size_t> band_begin(device_names_.size(), pages.size());
+            std::vector<size_t> band_end(device_names_.size(), pages.size());
+            size_t cursor = 0;
+            for (size_t device_id = 0; device_id < device_names_.size(); ++device_id) {
+                band_begin[device_id] = cursor;
+                const size_t take = std::min(
+                    placement_capacity_[class_id][device_id], pages.size() - cursor);
+                cursor += take;
+                band_end[device_id] = cursor;
+                for (size_t rank = band_begin[device_id]; rank < band_end[device_id]; ++rank) {
+                    snapshot->owner[pages[rank]] = (uint32_t) device_id;
+                }
+            }
+            if (cursor < pages.size()) {
+                size_t device_id = device_names_.size();
+                for (size_t i = device_names_.size(); i-- > 0;) {
+                    if (placement_capacity_[class_id][i] != 0) {
+                        device_id = i;
+                        break;
+                    }
+                }
+                if (device_id == device_names_.size()) {
+                    for (size_t rank = cursor; rank < pages.size(); ++rank) {
+                        snapshot->owner[pages[rank]] =
+                            (uint32_t) page_static_owners_[pages[rank]];
+                    }
+                    continue;
+                }
+                if (band_begin[device_id] == pages.size()) {
+                    band_begin[device_id] = cursor;
+                }
+                band_end[device_id] = pages.size();
+                for (size_t rank = cursor; rank < pages.size(); ++rank) {
+                    snapshot->owner[pages[rank]] = (uint32_t) device_id;
+                }
+                for (size_t i = device_id + 1; i < device_names_.size(); ++i) {
+                    band_begin[i] = pages.size();
+                    band_end[i] = pages.size();
+                }
+            }
+            for (size_t device_id = 0; device_id < device_names_.size(); ++device_id) {
+                if (band_begin[device_id] == pages.size()) {
+                    continue;
+                }
+                const uint64_t first = counts[pages[band_begin[device_id]]];
+                const uint64_t last = counts[pages[band_end[device_id] - 1]];
+                for (size_t rank = band_begin[device_id]; rank < band_end[device_id]; ++rank) {
+                    snapshot->promotion_floor[pages[rank]] = last;
+                    snapshot->demotion_ceiling[pages[rank]] = first;
+                }
+            }
+        }
+        std::atomic_store_explicit(
+            &placement_snapshot_, std::shared_ptr<const PlacementSnapshot>(snapshot),
+            std::memory_order_release);
+    }
+
+    bool placement_enabled() const {
+        return placement_enabled_;
+    }
+
+    void maybe_report_placement_stats() const {
+        if (!placement_ready_ || placement_interval_ns_ == 0) {
+            return;
+        }
+        const uint64_t now = placement_now_ns();
+        uint64_t next = placement_next_report_ns_.load(std::memory_order_relaxed);
+        if (now < next || !placement_next_report_ns_.compare_exchange_strong(
+                next, now > UINT64_MAX - placement_interval_ns_ ? UINT64_MAX :
+                    now + placement_interval_ns_, std::memory_order_relaxed)) {
+            return;
+        }
+        std::vector<size_t> page_counts(device_names_.size(), 0);
+        for (size_t id = 0; id < page_static_owners_.size(); ++id) {
+            const size_t owner = (size_t) page_current_owner_[id].load(
+                std::memory_order_relaxed);
+            if (owner < page_counts.size()) {
+                ++page_counts[owner];
+            }
+        }
+        std::fprintf(stderr,
+                     "wp expert worker placement stats enabled=%d page_counts=[",
+                     placement_enabled_ ? 1 : 0);
+        for (size_t i = 0; i < page_counts.size(); ++i) {
+            if (i != 0) {
+                std::fputc(',', stderr);
+            }
+            std::fprintf(stderr, "%zu", page_counts[i]);
+        }
+        std::fprintf(stderr,
+                     "] migrations=%llu declined_cap=%llu declined_hysteresis=%llu "
+                     "migration_cap=%zu hysteresis_pct=%llu references=%llu\n",
+                     (unsigned long long) placement_migrations_.load(std::memory_order_relaxed),
+                     (unsigned long long) placement_declined_cap_.load(std::memory_order_relaxed),
+                     (unsigned long long) placement_declined_hysteresis_.load(
+                         std::memory_order_relaxed),
+                     migration_cap_,
+                     (unsigned long long) hysteresis_pct_,
+                     (unsigned long long) placement_references_.load(
+                         std::memory_order_relaxed));
+        std::fflush(stderr);
+    }
+
     struct AssignmentGroup {
         size_t device = 0;
         size_t begin = 0;
@@ -10728,17 +11108,19 @@ private:
     };
 
     std::vector<AssignmentGroup> assignment_groups(
-            const pipe_expert_dispatch_req & request) const {
+            const pipe_expert_dispatch_req & request,
+            size_t * migration_budget = nullptr) const {
         std::vector<AssignmentGroup> result;
         if (request.assignments.empty()) {
             return result;
         }
         size_t begin = 0;
         size_t owner = owning_device_for_page(
-            request.layer, request.assignments.front().expert_id);
+            request.layer, request.assignments.front().expert_id, migration_budget);
         for (size_t i = 1; i <= request.assignments.size(); ++i) {
             const size_t next = i == request.assignments.size() ? owner :
-                owning_device_for_page(request.layer, request.assignments[i].expert_id);
+                owning_device_for_page(request.layer, request.assignments[i].expert_id,
+                                       migration_budget);
             if (i == request.assignments.size() || next != owner) {
                 result.push_back({owner, begin, i});
                 begin = i;
@@ -10862,6 +11244,29 @@ private:
     std::vector<int> device_slots_;
     WorkerLogFiles logs_;
     wp::HostTier host_tier_;
+    const bool placement_enabled_ = lfu_placement_from_env();
+    const size_t migration_cap_ = lfu_migration_cap_from_env();
+    const uint64_t hysteresis_pct_ = lfu_hysteresis_pct_from_env();
+    static constexpr uint64_t placement_refresh_period_ = 256;
+    const uint64_t placement_interval_ms_ = read_stats_interval_ms_from_env();
+    const uint64_t placement_interval_ns_ = placement_interval_ms_ * 1000000ull;
+    mutable std::atomic<uint64_t> placement_next_report_ns_{
+        placement_interval_ns_ == 0 ? std::numeric_limits<uint64_t>::max() :
+            placement_now_ns() + placement_interval_ns_};
+    mutable std::atomic<uint64_t> placement_references_{0};
+    mutable std::atomic<uint64_t> placement_migrations_{0};
+    mutable std::atomic<uint64_t> placement_declined_cap_{0};
+    mutable std::atomic<uint64_t> placement_declined_hysteresis_{0};
+    mutable std::atomic_flag placement_refreshing_ = ATOMIC_FLAG_INIT;
+    std::unique_ptr<std::atomic<uint64_t>[]> page_access_counts_;
+    std::unique_ptr<std::atomic<uint32_t>[]> page_current_owner_;
+    std::vector<size_t> page_static_owners_;
+    std::vector<int> resident_expert_blocks_;
+    std::vector<uint64_t> placement_class_sizes_;
+    std::vector<std::vector<size_t>> placement_pages_by_class_;
+    std::vector<std::vector<size_t>> placement_capacity_;
+    mutable std::shared_ptr<const PlacementSnapshot> placement_snapshot_;
+    bool placement_ready_ = false;
     std::vector<std::unique_ptr<DeviceWorker>> devices_;
     mutable std::vector<std::mutex> device_mutexes_;
     mutable std::mutex split_mutex_;
