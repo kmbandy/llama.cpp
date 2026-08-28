@@ -5161,6 +5161,17 @@ private:
         if (batch.completed_) {
             return;
         }
+        // A Batch can reach here with no state_: ensure_batch sets owner_
+        // before it builds the state, so if it throws in between, its catch
+        // releases pins and rethrows, and THEN ~Batch() runs abandon_batch()
+        // on a half-built object. Dereferencing state_ there segfaults, which
+        // kills the worker and destroys the real exception -- the spine only
+        // ever sees "worker died while computing". Nothing was queued without
+        // a state, so there is nothing to drain.
+        if (batch.state_ == nullptr) {
+            batch.completed_ = true;
+            return;
+        }
 
         while (batch.received_ < batch.state_->pageins.size()) {
             drain_one_read(batch);
@@ -11737,10 +11748,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             }
             worker.spec_pagein_after_dispatch();
         } catch (const pipe_protocol_error & error) {
+            // LOG LOCALLY as well as replying. The spine renders a dropped or
+            // errored connection as "worker died while computing <experts>",
+            // which names the symptom and never the cause; without this the
+            // only copy of the real message is in flight on a socket that is
+            // about to close.
+            std::fprintf(stderr, "wp expert worker: protocol error (code %d): %s\n",
+                         (int) error.code, error.what());
             if (!pipe_send_error(socket, seq_id, error.code, error.what())) {
                 return 1;
             }
         } catch (const std::exception & error) {
+            std::fprintf(stderr, "wp expert worker: compute error: %s\n", error.what());
             pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
             return 1;
         }
