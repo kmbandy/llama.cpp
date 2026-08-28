@@ -55,6 +55,7 @@ constexpr int          FORMAT_VERSION_SLICED = 2;
 constexpr const char * INDEX_FORMAT     = "llama.cpp.weight-pager.expert-shard-index";
 constexpr const char * MANIFEST_FORMAT  = "llama.cpp.weight-pager.expert-shard-manifest";
 constexpr size_t       COPY_BUFFER_SIZE = 8u * 1024u * 1024u;
+constexpr uint64_t     DIRECT_ALIGNMENT = 4096;
 
 // v2 output files get their own base suffix so a sliced set can never collide
 // with, overwrite, or be mistaken for the v1 set built from the same model.
@@ -174,6 +175,27 @@ struct VerifyCounts {
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
 using ggml_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 
+uint64_t padded_page_bytes(uint64_t payload_bytes) {
+    const uint64_t remainder = payload_bytes % DIRECT_ALIGNMENT;
+    if (remainder == 0) {
+        return payload_bytes;
+    }
+    const uint64_t padding = DIRECT_ALIGNMENT - remainder;
+    if (payload_bytes > std::numeric_limits<uint64_t>::max() - padding) {
+        throw std::overflow_error("expert page size overflows");
+    }
+    return payload_bytes + padding;
+}
+
+void append_page_padding(std::vector<char> & out, uint64_t payload_bytes) {
+    const uint64_t page_bytes = padded_page_bytes(payload_bytes);
+    const uint64_t padding    = page_bytes - payload_bytes;
+    if (padding > std::numeric_limits<size_t>::max() - out.size()) {
+        throw std::overflow_error("expert page payload is too large");
+    }
+    out.insert(out.end(), static_cast<size_t>(padding), 0);
+}
+
 void print_usage(const char * argv0) {
     std::cout << "usage:\n"
               << "  " << argv0 << " [sharding options] MODEL OUTPUT_BASE\n"
@@ -245,6 +267,8 @@ void print_usage(const char * argv0) {
               << "      w / role_blck * n_embd * role_type_size\n"
               << "  A slice costs the sum of those three role sizes. Widths must satisfy every\n"
               << "  role whose FFN dimension is ne0; roles sliced on ne1 impose no alignment.\n"
+              << "  The page size recorded for a slice is that payload rounded up to the\n"
+              << "  direct-I/O alignment; zero padding follows the down member.\n"
               << "\n"
               << "  The v2 index adds, per group, a \"slices\" array giving each slice's index,\n"
               << "  ff_first, ff_last (exclusive), blob offset and byte size, with the same\n"
@@ -1003,9 +1027,11 @@ void build_group_slices(const wp_repack::ExpertGroup &                group,
 
     out.clear();
     for (const wp_repack::SliceRange & range : ranges) {
+        const size_t page_begin = out.size();
         for (size_t r = 0; r < 3; ++r) {
             append_role_slice(role_masks[r], role_bytes[r], variant, n_embd, range, out);
         }
+        append_page_padding(out, out.size() - page_begin);
     }
 }
 
@@ -1022,6 +1048,7 @@ std::string hash_groups_sliced(const std::vector<wp_repack::ExpertGroup> & group
     sha_update_u64(hash, static_cast<uint64_t>(geom.n_ff));
     sha_update_u64(hash, static_cast<uint64_t>(geom.n_embd));
     sha_update_u64(hash, static_cast<uint64_t>(geom.blck));
+    sha_update_u64(hash, DIRECT_ALIGNMENT);
     sha_update_u64(hash, widths.size());
     for (const int64_t w : widths) {
         sha_update_u64(hash, static_cast<uint64_t>(w));
@@ -1069,6 +1096,7 @@ std::string hash_groups_flat_sliced(const std::vector<wp_repack::ExpertGroup> & 
     sha256_t hash;
     sha256_init(&hash);
     sha_update_string(hash, "llama.cpp.wp-repack.identity.v1");
+    sha_update_u64(hash, DIRECT_ALIGNMENT);
     sha_update_u64(hash, indices.size());
     for (size_t index : indices) {
         if (index >= groups.size()) {
@@ -1134,6 +1162,8 @@ json slicing_json(const wp_repack::SliceSpec &                         spec,
         { "n_ff_exp",          geom.n_ff                },
         { "n_embd",            geom.n_embd              },
         { "slice_alignment",   geom.blck                },
+        { "page_alignment",    DIRECT_ALIGNMENT        },
+        { "page_padding",      "zero"                  },
         { "geometry_variants", json::array()            },
     };
 
@@ -1208,7 +1238,8 @@ json build_sliced_index(const fs::path &                            output_base,
         { "groups",       json::array()                                       },
     };
 
-    uint64_t blob_offset = 0;
+    uint64_t blob_offset   = 0;
+    uint64_t payload_bytes = 0;
     for (size_t group_index : shard.group_indices) {
         const wp_repack::ExpertGroup & group = groups.at(group_index);
         const SliceGeometryVariant & variant = geom.variant_for_group(group_index);
@@ -1228,13 +1259,16 @@ json build_sliced_index(const fs::path &                            output_base,
                 variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
             };
             const uint64_t slice_bytes = role_bytes[0] + role_bytes[1] + role_bytes[2];
+            const uint64_t page_bytes  = padded_page_bytes(slice_bytes);
             group_json["slices"].push_back({
                 { "slice_idx", range.index                              },
                 { "ff_first",  range.first                              },
                 { "ff_last",   range.last                               },
                 { "width",     range.width()                            },
                 { "offset",    cursor                                   },
-                { "bytes",     slice_bytes                              },
+                { "bytes",     page_bytes                               },
+                { "payload_bytes", slice_bytes                          },
+                { "padding_bytes", page_bytes - slice_bytes              },
                 { "members",   json::array({
                        slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range, cursor),
                        slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range, cursor + role_bytes[0]),
@@ -1242,16 +1276,16 @@ json build_sliced_index(const fs::path &                            output_base,
                                          cursor + role_bytes[0] + role_bytes[1]),
                    })                                                   },
             });
-            cursor += slice_bytes;
+            cursor += page_bytes;
+            payload_bytes += slice_bytes;
         }
         blob_offset = cursor;
         index["groups"].push_back(std::move(group_json));
     }
 
-    // Slicing reorders bytes but never adds or drops any, so the sliced set must
-    // weigh exactly what the v1 set would have.
-    if (blob_offset != shard.size) {
-        throw std::runtime_error("sliced blob byte count " + std::to_string(blob_offset) +
+    // Slicing reorders payload bytes but page padding increases the blob size.
+    if (payload_bytes != shard.size) {
+        throw std::runtime_error("sliced payload byte count " + std::to_string(payload_bytes) +
                                  " does not match the unsliced expert bytes " + std::to_string(shard.size));
     }
     index["blob_bytes"] = blob_offset;
@@ -1368,6 +1402,7 @@ json build_split_index(const fs::path &                            output_base,
             variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
         };
         const uint64_t slice_bytes = role_bytes[0] + role_bytes[1] + role_bytes[2];
+        const uint64_t page_bytes  = padded_page_bytes(slice_bytes);
 
         index["groups"].push_back({
             { "block_idx",    group.block_idx                      },
@@ -1377,6 +1412,9 @@ json build_split_index(const fs::path &                            output_base,
             { "ff_first",     range.first                         },
             { "ff_last",      range.last                          },
             { "width",        range.width()                       },
+            { "bytes",        page_bytes                          },
+            { "payload_bytes", slice_bytes                        },
+            { "padding_bytes", page_bytes - slice_bytes            },
             { "members",      json::array({
                    slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range, blob_offset),
                    slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range,
@@ -1385,7 +1423,7 @@ json build_split_index(const fs::path &                            output_base,
                                      blob_offset + role_bytes[0] + role_bytes[1]),
                })                                                    },
         });
-        blob_offset += slice_bytes;
+        blob_offset += page_bytes;
     }
 
     index["blob_bytes"] = blob_offset;
@@ -1467,6 +1505,11 @@ void repack_sliced_split(const CliOptions &                          options,
                     if (payload.size() != slice_bytes) {
                         throw std::runtime_error("internal split slice payload size mismatch");
                     }
+                    append_page_padding(payload, slice_bytes);
+                    const uint64_t page_bytes = padded_page_bytes(slice_bytes);
+                    if (payload.size() != page_bytes) {
+                        throw std::runtime_error("internal split page size mismatch");
+                    }
 
                     const json & group_json = output.index["groups"].at(group_position);
                     const uint64_t expected_offset = group_json["members"].front()["offset"].get<uint64_t>();
@@ -1477,7 +1520,7 @@ void repack_sliced_split(const CliOptions &                          options,
                     if (!*output.blob) {
                         throw std::runtime_error("failed to write split sliced expert blob");
                     }
-                    output.blob_offset += slice_bytes;
+                    output.blob_offset += page_bytes;
                 }
             }
         }
@@ -1615,9 +1658,10 @@ void repack_sliced(const CliOptions &                          options,
         std::cout << "writing sliced shard " << i + 1 << "/" << shards.size() << " layers " << shards[i].layer_first
                   << "-" << shards[i].layer_last << " groups " << shards[i].group_indices.size() << " bytes "
                   << shards[i].size << '\n';
-        manifest["shards"].push_back(write_shard_sliced(output_base, i, shards.size(), shards[i], groups, model.files,
-                                                        geom, spec, ranges, sources, options.manifest_only));
-        total_bytes += shards[i].size;
+        const json shard_manifest = write_shard_sliced(output_base, i, shards.size(), shards[i], groups, model.files,
+                                                       geom, spec, ranges, sources, options.manifest_only);
+        manifest["shards"].push_back(shard_manifest);
+        total_bytes += shard_manifest["blob_bytes"].get<uint64_t>();
     }
     manifest["total_blob_bytes"] = total_bytes;
     const fs::path out_manifest  = manifest_path(output_base);
@@ -1786,7 +1830,9 @@ wp_repack::SliceSpec slicing_from_json(const json &                             
     const json & block = value.at("expert_slicing");
 
     if (block.at("n_ff_exp").get<int64_t>() != geom.n_ff || block.at("n_embd").get<int64_t>() != geom.n_embd ||
-        block.at("slice_alignment").get<int64_t>() != geom.blck) {
+        block.at("slice_alignment").get<int64_t>() != geom.blck ||
+        block.at("page_alignment").get<uint64_t>() != DIRECT_ALIGNMENT ||
+        block.at("page_padding").get<std::string>() != "zero") {
         throw std::runtime_error("recorded slice geometry disagrees with the model's expert tensors");
     }
 
@@ -1917,6 +1963,34 @@ bool split_slice_from_json(const json &                              value,
 std::vector<size_t> indices_for_range(const std::vector<wp_repack::ExpertGroup> & groups, int first, int last);
 void                add_counts(VerifyCounts & total, const VerifyCounts & value);
 
+void verify_zero_padding(std::ifstream & blob,
+                         uint64_t        offset,
+                         uint64_t        size,
+                         std::vector<char> & buffer) {
+    uint64_t remaining = size;
+    uint64_t checked   = 0;
+    while (remaining > 0) {
+        const size_t chunk = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
+        blob.clear();
+        blob.seekg(static_cast<std::streamoff>(offset + checked));
+        if (!blob) {
+            throw std::runtime_error("failed to seek while verifying page padding");
+        }
+        blob.read(buffer.data(), static_cast<std::streamsize>(chunk));
+        if (blob.gcount() != static_cast<std::streamsize>(chunk)) {
+            throw std::runtime_error("short read while verifying page padding");
+        }
+        for (size_t i = 0; i < chunk; ++i) {
+            if (buffer[i] != 0) {
+                throw std::runtime_error("page padding byte mismatch at blob offset " +
+                                         std::to_string(offset + checked + i));
+            }
+        }
+        remaining -= chunk;
+        checked += chunk;
+    }
+}
+
 VerifyCounts verify_index_sliced(const fs::path &                            index_path,
                                  const json &                                index,
                                  const std::vector<wp_repack::ExpertGroup> & groups,
@@ -1979,6 +2053,7 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
     std::vector<char> scratch;
     std::vector<char> expected_payload;
     std::vector<char> actual_payload;
+    std::vector<char> padding_buffer(COPY_BUFFER_SIZE);
     bool              group_shape_set = false;
     bool              flat_group_shape = false;
 
@@ -2060,14 +2135,22 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
                 if (slice_json->at("slice_idx").get<int>() != range.index ||
                     slice_json->at("ff_first").get<int64_t>() != range.first ||
                     slice_json->at("ff_last").get<int64_t>() != range.last ||
-                    slice_json->at("width").get<int64_t>() != range.width() ||
-                    slice_json->at("bytes").get<uint64_t>() != slice_bytes) {
+                    slice_json->at("width").get<int64_t>() != range.width()) {
                     throw std::runtime_error("slice descriptor mismatch");
                 }
                 if (slice_json->at("offset").get<uint64_t>() != cursor) {
                     throw std::runtime_error("slice blob offsets are not contiguous");
                 }
                 members_json = &slice_json->at("members");
+            }
+
+            const uint64_t page_bytes = padded_page_bytes(slice_bytes);
+            const json & page_json = flat ? actual : *slice_json;
+            if (page_json.at("bytes").get<uint64_t>() != page_bytes ||
+                page_json.at("payload_bytes").get<uint64_t>() != slice_bytes ||
+                page_json.at("padding_bytes").get<uint64_t>() != page_bytes - slice_bytes ||
+                cursor % DIRECT_ALIGNMENT != 0) {
+                throw std::runtime_error("page size or alignment mismatch");
             }
 
             const json & members = *members_json;
@@ -2092,8 +2175,9 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
                 ++counts.members;
             }
 
-            cursor += slice_bytes;
-            counts.bytes += slice_bytes;
+            verify_zero_padding(blob, cursor + slice_bytes, page_bytes - slice_bytes, padding_buffer);
+            cursor += page_bytes;
+            counts.bytes += page_bytes;
         }
 
         if (cursor - group_offset != expected_payload.size()) {
