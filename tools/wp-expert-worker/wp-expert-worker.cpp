@@ -1937,7 +1937,14 @@ Catalog & layout_sliced_pages(
             }
             device_size = (device_size + slot_alignment - 1) / slot_alignment * slot_alignment;
         }
-        page.device_size = device_size;
+        // The slot has to hold what the READ delivers, and a sliced page is
+        // padded to the O_DIRECT alignment -- page.size includes that padding
+        // while the layout above is computed purely from the role tensors and
+        // does not. Without this clamp the slot is sized to the aligned payload
+        // (e.g. 2,508,936) while the read is the padded page (2,510,848), and
+        // select_victim finds nothing that fits: "no expert slot can hold
+        // requested page", on exactly the 5 layers that carry padding.
+        page.device_size = std::max(device_size, page.size);
     }
     return catalog;
 }
