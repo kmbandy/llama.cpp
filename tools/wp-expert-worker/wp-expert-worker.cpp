@@ -12015,6 +12015,14 @@ int run(const Options & options) {
                       << device_resources.staging_buffer_bytes << '\n';
         }
     }
+    // FLUSH. Everything above goes to stdout; the WARN lines around it go to
+    // stderr, which is unbuffered. Under a redirect that means the startup
+    // report -- slot counts, per-class breakdown, per-device budgets, the one
+    // place the worker says what it actually allocated -- sits in the buffer
+    // while the process runs, so a log tailed during a run appears to end at
+    // the read-path line and the numbers you need are invisible. Cost me a
+    // diagnosis today; the banner is worth nothing if it arrives at exit.
+    std::cout << std::flush;
 
     // WP_WORKER_MULTI_CONN=N (N>=2) -- see g_worker_gpu_mutex comment above
     // serve_connection for the lock design. Unset/absent/"1"/anything <2 is
