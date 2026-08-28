@@ -510,6 +510,16 @@ int run(const Options & options) {
                 checked_bytes += size;
                 ++checked_members;
             }
+            // Sliced pages are padded to the O_DIRECT alignment after their last
+            // role member, so the next group does NOT start where this group's
+            // payload ended. Skip the padding, or every group after the first
+            // padded one reports a bogus "disagrees with GGUF shape/type bytes".
+            // Count it in checked_bytes too: both blob_bytes and the manifest's
+            // total_blob_bytes are ON-DISK totals, so a payload-only tally would
+            // fail the coverage and cross-check comparisons below.
+            const uint64_t page_padding = group.value("padding_bytes", (uint64_t) 0);
+            next_offset   += page_padding;
+            checked_bytes += page_padding;
             ++checked_groups;
         }
         if (next_offset != get_value<uint64_t>(index, "blob_bytes", index_path)) {

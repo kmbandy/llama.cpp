@@ -31,6 +31,7 @@ extern "C" {
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -1547,6 +1548,15 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
                 next_offset += size;
                 page.size += size;
             }
+            // A sliced page is padded with zeros after its last role member so
+            // its size is a whole number of O_DIRECT blocks. The member spans
+            // only cover the PAYLOAD, so page.size summed from them is short by
+            // the padding -- read the recorded padding and extend the page, or
+            // an otherwise valid store is rejected as unaligned. Member offsets
+            // are unaffected: padding sits after every member.
+            const uint64_t page_padding = group.value("padding_bytes", (uint64_t) 0);
+            page.size    += page_padding;
+            next_offset  += page_padding;
             if (page.offset % DIRECT_ALIGNMENT != 0 ||
                 page.size % DIRECT_ALIGNMENT != 0) {
                 throw std::runtime_error(
@@ -1711,6 +1721,7 @@ backend_ptr init_backend(const std::string & device) {
 //   static ALSO degrades to ~647 us => it is process/backend state under load
 //     (in-flight transfers, reader threads, queue depth), not the graph.
 struct SelfBenchProbe {
+    ggml_backend_t       backend = nullptr;
     ggml_context *        wctx  = nullptr;
     ggml_backend_buffer_t wbuf  = nullptr;
     ggml_context *        gctx  = nullptr;
@@ -1797,6 +1808,7 @@ void run_self_bench(ggml_backend_t backend, uint32_t n_embd, uint32_t n_ff) {
               << " mean_us=" << total / iters / 1000
               << std::endl;
     if (std::getenv("WP_SELF_BENCH_EVERY") != nullptr) {
+        g_probe.backend = backend;
         g_probe.wctx = wctx; g_probe.wbuf = wbuf;
         g_probe.gctx = gctx; g_probe.graph = graph; g_probe.ga = ga;
         g_probe.ready = true;
@@ -1810,12 +1822,16 @@ void run_self_bench(ggml_backend_t backend, uint32_t n_embd, uint32_t n_ff) {
 
 // One timed compute of the static graph, called from the serving path.
 
-std::vector<ResourcePage> resource_pages(const Catalog & catalog) {
+std::vector<ResourcePage> resource_pages(
+        const Catalog & catalog,
+        const std::function<bool(int, int)> & page_owner = {}) {
     std::vector<ResourcePage> result;
     result.reserve(catalog.pages.size());
     for (const auto & item : catalog.pages) {
-        result.push_back({ item.second.layer, item.second.device_size,
-                           item.second.is_resident, item.second.size });
+        if (!page_owner || page_owner(item.second.layer, item.second.expert)) {
+            result.push_back({ item.second.layer, item.second.device_size,
+                               item.second.is_resident, item.second.size });
+        }
     }
     return result;
 }
@@ -2452,11 +2468,13 @@ private:
 class ResidentExpertPool {
 public:
     ResidentExpertPool(ggml_backend_t backend, Catalog & catalog,
-                       const std::vector<int> & blocks) :
+                       const std::vector<int> & blocks,
+                       const std::function<bool(int, int)> & page_owner = {}) :
         backend_(backend) {
         for (auto & item : catalog.pages) {
             ExpertPage & page = item.second;
-            if (!std::binary_search(blocks.begin(), blocks.end(), page.layer)) {
+            if (!std::binary_search(blocks.begin(), blocks.end(), page.layer) ||
+                    (page_owner && !page_owner(page.layer, page.expert))) {
                 continue;
             }
             Allocation allocation;
@@ -2569,6 +2587,37 @@ private:
     std::vector<Allocation> allocations_;
     uint64_t pinned_bytes_ = 0;
     int pinned_pages_ = 0;
+};
+
+class ExpertSlotPool;
+thread_local ExpertSlotPool * g_host_reader_pool = nullptr;
+
+struct WorkerLogFiles {
+    WorkerLogFiles() {
+        if (const char * path = std::getenv("WP_PAGEIN_LOG")) {
+            if (path[0] != '\0') {
+                pagein = fopen(path, "w");
+            }
+        }
+        if (const char * path = std::getenv("WP_HINT_LOG")) {
+            if (path[0] != '\0') {
+                hint = fopen(path, "w");
+            }
+        }
+    }
+
+    ~WorkerLogFiles() {
+        if (pagein != nullptr) {
+            fclose(pagein);
+        }
+        if (hint != nullptr) {
+            fclose(hint);
+        }
+    }
+
+    FILE * pagein = nullptr;
+    FILE * hint = nullptr;
+    std::mutex mutex;
 };
 
 class ExpertSlotPool {
@@ -2700,12 +2749,19 @@ public:
     ExpertSlotPool(
             ggml_backend_t backend, ResourcePlan resources,
             uint64_t host_victim_bytes, TestHooks * test_hooks,
-            const std::vector<int> & reserve_blocks, size_t page_count = 0) :
+            const std::vector<int> & reserve_blocks, size_t page_count = 0,
+            wp::HostTier * shared_host_tier = nullptr,
+            WorkerLogFiles * logs = nullptr) :
         backend_(backend),
         resources_(std::move(resources)),
         staging_(resources_, backend),
-        test_hooks_(test_hooks) {
+        test_hooks_(test_hooks),
+        owned_host_tier_(shared_host_tier == nullptr
+            ? std::make_unique<wp::HostTier>() : nullptr),
+        host_tier_(shared_host_tier != nullptr ? shared_host_tier : owned_host_tier_.get()) {
         reserve_blocks_ = reserve_blocks;
+        logs_ = logs;
+        pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
         std::sort(reserve_blocks_.begin(), reserve_blocks_.end());
         if (lfu_history_enabled_) {
             lfu_history_.assign(page_count, 0);
@@ -2807,29 +2863,18 @@ public:
             if (arena_bytes >
                 (uint64_t) std::numeric_limits<size_t>::max() ||
                 arena_bytes < host_victim_bytes ||   // overflow
-                !host_tier_.init((size_t) arena_bytes, 0)) {
+                (!host_tier_->is_initialized() &&
+                 !host_tier_->init((size_t) arena_bytes, 0))) {
                 throw std::runtime_error("failed to initialize host victim tier");
             }
             if (host_spec_bytes != 0) {
-                host_tier_.set_spec_budget((size_t) host_spec_bytes);
+                host_tier_->set_spec_budget((size_t) host_spec_bytes);
             }
-            host_tier_.set_device_reader(
-                [this](void * dst_host, const void * src_device, size_t n, int page_idx) {
-                    // Match by cache_id, never by data pointer: on Vulkan every
-                    // standalone slot buffer's base is the same sentinel, so
-                    // slot.raw->data collides across slots and pointer matching
-                    // reads whichever slot comes first -- the 2026-08-06 tier
-                    // corruption (604/605 restores wrong on the RX 480, clean
-                    // on CUDA/ROCm whose addresses are real and unique).
-                    (void) src_device;
-                    for (const Slot & slot : slots_) {
-                        if (slot.valid && slot.raw != nullptr && slot.page != nullptr &&
-                            slot.cache_id == page_idx && n == slot.page->size) {
-                            tensor_get_page(slot.raw, *slot.page, dst_host);
-                            return true;
-                        }
-                    }
-                    return false;
+            host_tier_->set_device_reader(
+                [](void * dst_host, const void * src_device, size_t n, int page_idx) {
+                    return g_host_reader_pool != nullptr &&
+                        g_host_reader_pool->read_device_page(
+                            dst_host, src_device, n, page_idx);
                 });
             host_victim_enabled_ = true;
             // Arm HostTier's Pass 0 so an unconfirmed prediction is drained
@@ -2838,7 +2883,7 @@ public:
             // own comment calls that "prefetch actively degrading the tier it is
             // meant to fill". This line silently failed to apply once already:
             // a str.replace with the wrong indentation is a no-op, not an error.
-            host_tier_.set_speculative_tier(true);
+            host_tier_->set_speculative_tier(true);
             fprintf(stderr,
                     "wp::HostTier: victim=%llu MiB spec_reserved=%llu MiB arena=%llu MiB "
                     "fill_on_read=%d (decode n_tokens<=8) demote_d2h=%d\n",
@@ -3345,7 +3390,7 @@ public:
             if (host_victim_enabled_) {
                 for (size_t entry_index : pageins) {
                     const ExpertPage & page = *pages[entry_index];
-                    if (host_tier_.borrow(
+                    if (host_tier_->borrow(
                             page.cache_id, &host_hits[entry_index].src,
                             (size_t) page.size, &host_hits[entry_index].borrow)) {
                         continue;
@@ -3357,7 +3402,7 @@ public:
                 for (size_t entry_index : pageins) {
                     HostHit & host_hit = host_hits[entry_index];
                     if (host_hit.borrow != wp::HostTier::kInvalidBorrowHandle) {
-                        host_tier_.release(
+                        host_tier_->release(
                             pages[entry_index]->cache_id, host_hit.borrow);
                         host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
                     }
@@ -3503,10 +3548,10 @@ public:
                                       std::chrono::steady_clock::time_point();
                         tensor_set_page_range(
                             slot.raw, page, host_hit.src, 0, (size_t) page.size);
-                        host_tier_.release(page.cache_id, host_hit.borrow);
+                        host_tier_->release(page.cache_id, host_hit.borrow);
                         host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
                         if (!fill_host_on_read_ || demote_d2h_) {
-                            host_tier_.erase(page.cache_id);
+                            host_tier_->erase(page.cache_id);
                         }
                         slot.valid    = true;
                         slot.key      = { page.layer, page.expert };
@@ -3556,7 +3601,7 @@ public:
                 release_host_hits();
                 throw;
             }
-            batch.host_bytes_ = host_victim_enabled_ ? host_tier_.used_bytes() : 0;
+            batch.host_bytes_ = host_victim_enabled_ ? host_tier_->used_bytes() : 0;
 
             if (batch.state_->pageins.empty()) {
                 batch.completed_ = true;
@@ -3839,6 +3884,7 @@ public:
         // next R -- then cannot credit the page to the request that used it. That
         // alone moved USED from 686 to 424 with no change in behaviour.
         if (spec_log_ != nullptr) {
+            std::lock_guard<std::mutex> lock(*log_mutex_);
             for (const ExpertPage * page : entry.inflight) {
                 fprintf(spec_log_, "S %d %d\n", page->layer, page->expert);
             }
@@ -3918,7 +3964,7 @@ public:
             if (page == nullptr || page->cache_id < 0) { ++host_skip_bad_;  continue; }
             if (page->is_resident)                     { ++host_skip_pin_;  continue; }
             if (find_slot(*page) != slots_.size())     { ++host_skip_vram_; continue; }
-            if (host_tier_.contains(page->cache_id))   { ++host_skip_tier_; continue; }
+            if (host_tier_->contains(page->cache_id))   { ++host_skip_tier_; continue; }
             try {
                 cold.emplace_back(page, fd_for(page->blob));
             } catch (const std::exception &) {
@@ -4017,7 +4063,7 @@ public:
                     if (test_hooks_ != nullptr && test_hooks_->read_finished) {
                         test_hooks_->read_finished(page->layer, page->expert);
                     }
-                    if (host_tier_.store(page->cache_id, lease.get(),
+                    if (host_tier_->store(page->cache_id, lease.get(),
                                          (size_t) page->size, /*speculative=*/true)) {
                         host_landed_.fetch_add(1, std::memory_order_relaxed);
                         host_bytes_.fetch_add(page->size, std::memory_order_relaxed);
@@ -4077,8 +4123,8 @@ public:
     uint64_t host_landed() const { return host_landed_.load(std::memory_order_relaxed); }
     uint64_t host_spec_bytes() const { return host_bytes_.load(std::memory_order_relaxed); }
     uint64_t host_spec_errors() const { return host_errors_.load(std::memory_order_relaxed); }
-    uint64_t host_spec_promotions() const { return host_tier_.speculative_promotions(); }
-    uint64_t host_spec_wasted() const { return host_tier_.speculative_evicted_unused(); }
+    uint64_t host_spec_promotions() const { return host_tier_->speculative_promotions(); }
+    uint64_t host_spec_wasted() const { return host_tier_->speculative_evicted_unused(); }
     uint64_t host_skip_bad()   const { return host_skip_bad_; }
     uint64_t host_skip_pin()   const { return host_skip_pin_; }
     uint64_t host_skip_vram()  const { return host_skip_vram_; }
@@ -4275,7 +4321,7 @@ public:
         return n;
     }
 
-    // BORROWED, NOT OWNED -- the Worker opens WP_HINT_LOG and outlives the pool.
+    // BORROWED, NOT OWNED -- WorkerLogFiles outlives the pool.
     //
     // The hint log is an ORDERED EVENT STREAM, and the order is the entire point.
     // "Speculatively read, then evicted, then demand-read again" and "speculated
@@ -4283,7 +4329,10 @@ public:
     // fixes, and the ONLY thing that separates them is whether the demand read
     // came after the speculative one. Two log files have no shared clock, so
     // pool-side page-ins and worker-side hints must go through the SAME handle.
-    void set_spec_log(FILE * f) { spec_log_ = f; }
+    void set_spec_log(FILE * f, std::mutex * mutex) {
+        spec_log_ = f;
+        log_mutex_ = mutex;
+    }
 
     // The lease a page gets by provenance. Read by the Worker, which owns the
     // hint queue and resolves provenance to a lease at enqueue time.
@@ -4318,6 +4367,19 @@ public:
     // formula and why this must run before any connection thread starts.
     void set_staging_multi_conn(int n) {
         staging_.set_multi_conn(n);
+    }
+
+    bool read_device_page(void * dst_host, const void * src_device, size_t n,
+                          int page_idx) const {
+        (void) src_device;
+        for (const Slot & slot : slots_) {
+            if (slot.valid && slot.raw != nullptr && slot.page != nullptr &&
+                    slot.cache_id == page_idx && n == slot.page->size) {
+                tensor_get_page(slot.raw, *slot.page, dst_host);
+                return true;
+            }
+        }
+        return false;
     }
 
 private:
@@ -4418,11 +4480,15 @@ private:
             slot.cache_id < 0 || slot.size == 0) {
             return false;
         }
-        if (fill_host_on_read_ && !demote_d2h_ && host_tier_.contains(slot.cache_id)) {
+        if (fill_host_on_read_ && !demote_d2h_ && host_tier_->contains(slot.cache_id)) {
             return true;
         }
-        return slot.page != nullptr &&
-            host_tier_.store_from_device(slot.cache_id, slot.raw->data, (size_t) slot.size);
+        const auto previous = g_host_reader_pool;
+        g_host_reader_pool = this;
+        const bool stored = slot.page != nullptr && host_tier_->store_from_device(
+            slot.cache_id, slot.raw->data, (size_t) slot.size);
+        g_host_reader_pool = previous;
+        return stored;
     }
 
     bool hint_shielded(const Slot & slot) const {
@@ -5000,6 +5066,7 @@ private:
                     // Default off; one fprintf per pagein, negligible against a
                     // 13.37 MB O_DIRECT read.
                     if (pagein_log_ != nullptr) {
+                        std::lock_guard<std::mutex> lock(*log_mutex_);
                         fprintf(pagein_log_, "%d %d\n", pagein.page->layer, pagein.page->expert);
                         // The harness SIGKILLs workers at teardown, so a buffered
                         // stream is lost entirely -- the first run produced two
@@ -5015,6 +5082,7 @@ private:
                     // logged "S" at submit, and a second line here would claim
                     // speculation provoked the very demand read it prevented.
                     if (spec_log_ != nullptr && !batch.state_->speculative) {
+                        std::lock_guard<std::mutex> lock(*log_mutex_);
                         fprintf(spec_log_, "D %d %d\n", pagein.page->layer, pagein.page->expert);
                         fflush(spec_log_);
                     }
@@ -5023,7 +5091,7 @@ private:
                     // of 12.75 MiB; not a GPU sync.
                     if (batch.state_->admit_host_on_read &&
                         result->staging && pagein.page->cache_id >= 0) {
-                        host_tier_.store(pagein.page->cache_id,
+                        host_tier_->store(pagein.page->cache_id,
                                          result->staging->get(),
                                          (size_t) pagein.page->size);
                     }
@@ -5159,12 +5227,10 @@ private:
         release_pins(batch);
     }
 
-    FILE * pagein_log_ = [] {
-        const char * p = std::getenv("WP_PAGEIN_LOG");
-        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
-    }();
-
+    WorkerLogFiles * logs_ = nullptr;
+    FILE * pagein_log_ = nullptr;
     FILE * spec_log_ = nullptr;
+    std::mutex * log_mutex_ = nullptr;
 
     // Per-slot stride inside an arena. layout_sliced_pages also makes the page
     // divisible by each role's type size when arena ids are requested.
@@ -5656,7 +5722,8 @@ private:
                 std::strstr(name, "ROCm") != nullptr);
     }();
     TestHooks *                test_hooks_ = nullptr;
-    wp::HostTier               host_tier_;
+    std::unique_ptr<wp::HostTier> owned_host_tier_;
+    wp::HostTier *              host_tier_ = nullptr;
     bool                       host_victim_enabled_ = false;
     // WP_EXPERT_FILL_HOST_ON_READ=1 keeps decode reads in the host tier so a
     // later eviction can skip the synchronous D2H. Default off for A/B.
@@ -6115,7 +6182,7 @@ void attach_weight(
     // pointers. Padding is zeroed after H2D on slot.raw (I8, full slot).
 }
 
-class Worker {
+class DeviceWorker {
 public:
     struct split_pending {
         pipe_expert_dispatch_req request;
@@ -6125,17 +6192,17 @@ public:
     };
 
     struct AsyncDispatchGuard {
-        Worker & worker;
+        DeviceWorker & worker;
         int previous_conn_index;
 
-        AsyncDispatchGuard(Worker & worker, int conn_index) :
+        AsyncDispatchGuard(DeviceWorker & worker, int conn_index) :
             worker(worker), previous_conn_index(worker.begin_async_dispatch(conn_index)) {}
 
         ~AsyncDispatchGuard() {
             worker.end_async_dispatch(previous_conn_index);
         }
     };
-    Worker(
+    DeviceWorker(
             Catalog catalog,
             const std::string & device,
             int slots,
@@ -6144,21 +6211,28 @@ public:
             TestHooks * test_hooks,
             const std::vector<int> & resident_expert_blocks,
             const std::vector<int> & expert_reserve_blocks,
-            uint64_t expert_reserve_bytes) :
+            uint64_t expert_reserve_bytes,
+            wp::HostTier * shared_host_tier = nullptr,
+            bool load_pin_file = true,
+            std::function<bool(int, int)> page_owner = {},
+            WorkerLogFiles * logs = nullptr) :
         catalog_(std::move(catalog)),
+        page_owner_(std::move(page_owner)),
+        logs_(logs),
         backend_(init_backend(device)),
         resident_(backend_.get(),
                   layout_sliced_pages(
                       catalog_, ggml_backend_get_default_buffer_type(backend_.get())),
-                  resident_expert_blocks),
+                  resident_expert_blocks, page_owner_),
         pool_(
             backend_.get(),
             plan_resources_for_backend(
-                resource_pages(catalog_), slots, host_budget_bytes,
+                resource_pages(catalog_, page_owner_), slots, host_budget_bytes,
                 resident_.pinned_bytes(), expert_reserve_blocks,
                 expert_reserve_bytes, backend_.get()),
             host_victim_bytes,
-            test_hooks, expert_reserve_blocks, catalog_.pages.size()),
+            test_hooks, expert_reserve_blocks, catalog_.pages.size(),
+            shared_host_tier, logs),
         compute_galloc_(ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend_.get()))),
         slots_(pool_.resources().slot_count) {
@@ -6166,11 +6240,15 @@ public:
             throw std::runtime_error("failed to create expert graph allocator");
         }
         // The pool logs demand and speculative page-ins into the Worker's handle
-        // so every event lands in one ordered stream. Safe here: hint_log_ has a
-        // default member initialiser, so it is open before the body runs.
-        pool_.set_spec_log(hint_log_);
+        // so every event lands in one ordered stream. The coordinator owns the
+        // handle because all device workers write to the same log.
+        pool_.set_spec_log(logs_ != nullptr ? logs_->hint : nullptr,
+                           logs_ != nullptr ? &logs_->mutex : nullptr);
         stats_.set_staging_kind(pool_.staging_kind());
         for (auto & kv : catalog_.pages) {
+            if (page_owner_ && !page_owner_(kv.second.layer, kv.second.expert)) {
+                continue;
+            }
             layer_pages_sorted_[kv.first.first].push_back(&kv.second);
         }
         for (auto & kv : layer_pages_sorted_) {
@@ -6183,7 +6261,7 @@ public:
                       });
         }
         const char * const pin_path = std::getenv("WP_EXPERT_PIN_FILE");
-        if (pin_path != nullptr && pin_path[0] != '\0') {
+        if (load_pin_file && pin_path != nullptr && pin_path[0] != '\0') {
             size_t pin_budget = pool_.resources().slot_count;
             const char * const max_env = std::getenv("WP_EXPERT_PIN_MAX_SLOTS");
             if (max_env != nullptr && max_env[0] != '\0') {
@@ -6807,15 +6885,16 @@ public:
     // log answers neither question. Duplicates WP_REF_LOG on purpose -- see
     // set_spec_log for why a second file will not do.
     void log_reference(int32_t layer, const std::vector<pipe_expert_assignment> & assignments) {
-        if (hint_log_ == nullptr) {
+        if (logs_ == nullptr || logs_->hint == nullptr) {
             return;
         }
-        std::fprintf(hint_log_, "R %d", layer);
+        std::lock_guard<std::mutex> lock(logs_->mutex);
+        std::fprintf(logs_->hint, "R %d", layer);
         for (const pipe_expert_assignment & a : assignments) {
-            std::fprintf(hint_log_, " %d", a.expert_id);
+            std::fprintf(logs_->hint, " %d", a.expert_id);
         }
-        std::fputc('\n', hint_log_);
-        std::fflush(hint_log_);
+        std::fputc('\n', logs_->hint);
+        std::fflush(logs_->hint);
     }
 
     void report_prefetch_hints() const {
@@ -7553,6 +7632,21 @@ public:
         return resident_.pinned_pages();
     }
 
+    size_t pin_pages(const std::vector<std::pair<int, int>> & keys, size_t budget) {
+        std::vector<const ExpertPage *> pages;
+        pages.reserve(std::min(keys.size(), budget));
+        for (const std::pair<int, int> key : keys) {
+            const auto it = catalog_.pages.find(key);
+            if (it != catalog_.pages.end()) {
+                pages.push_back(&it->second);
+            }
+            if (pages.size() == budget) {
+                break;
+            }
+        }
+        return pool_.pin_pages(pages);
+    }
+
     bool stats_enabled() const {
         return stats_.enabled();
     }
@@ -7883,17 +7977,13 @@ private:
     // death, and it dates the FIRST frame at which a foreign count appears, which
     // is the next question if one ever does. ~150 bytes per frame against a frame
     // that already crossed WireGuard.
-    FILE * const       hint_log_ = [] {
-        const char * p = std::getenv("WP_HINT_LOG");
-        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
-    }();
-
     void log_prefetch_hints() {
-        if (hint_log_ == nullptr) {
+        if (logs_ == nullptr || logs_->hint == nullptr) {
             return;
         }
-        std::fprintf(hint_log_, "C %s\n", prefetch_hint_line().c_str());
-        std::fflush(hint_log_);
+        std::lock_guard<std::mutex> lock(logs_->mutex);
+        std::fprintf(logs_->hint, "C %s\n", prefetch_hint_line().c_str());
+        std::fflush(logs_->hint);
     }
 
     // H -- what was PREDICTED, as received on the wire, before any shard filter.
@@ -7901,15 +7991,16 @@ private:
     // owns an expert, the ids are the evidence and the counters are only the
     // alarm.
     void log_hint_ids(const pipe_expert_prefetch_hint & hint) {
-        if (hint_log_ == nullptr) {
+        if (logs_ == nullptr || logs_->hint == nullptr) {
             return;
         }
-        std::fprintf(hint_log_, "H %d", hint.layer);
+        std::lock_guard<std::mutex> lock(logs_->mutex);
+        std::fprintf(logs_->hint, "H %d", hint.layer);
         for (int32_t expert_id : hint.expert_ids) {
-            std::fprintf(hint_log_, " %d", expert_id);
+            std::fprintf(logs_->hint, " %d", expert_id);
         }
-        std::fputc('\n', hint_log_);
-        std::fflush(hint_log_);
+        std::fputc('\n', logs_->hint);
+        std::fflush(logs_->hint);
     }
 
 
@@ -10086,6 +10177,8 @@ private:
     uint64_t io_gen_ = 0, params_gen_ = 0;
 
     Catalog        catalog_;
+    std::function<bool(int, int)> page_owner_;
+    WorkerLogFiles * logs_ = nullptr;
     // Per-layer catalog views, (blob, offset) sorted at load. Used by
     // WP_PREFILL_LAYER_AHEAD so the L+1 union is a sequential NVMe stream
     // rather than assignment-order random seeks.
@@ -10117,6 +10210,644 @@ private:
     // Keyed by conn_index -- see the long comment above begin_split_dispatch()
     // for why this must not be a single Worker-wide std::optional.
     std::unordered_map<int, split_pending> split_pending_by_conn_;
+};
+
+static void accumulate_request_stats(RequestStats & dst, const RequestStats & src) {
+    dst.ns_lookup += src.ns_lookup;
+    dst.ns_read += src.ns_read;
+    dst.ns_compute += src.ns_compute;
+    dst.ns_send += src.ns_send;
+    dst.n_resident += src.n_resident;
+    dst.n_pagein += src.n_pagein;
+    dst.n_host_hit += src.n_host_hit;
+    dst.n_host_demote += src.n_host_demote;
+    dst.bytes_read += src.bytes_read;
+    dst.n_pagein_reserved += src.n_pagein_reserved;
+    dst.n_pagein_general += src.n_pagein_general;
+    dst.ns_host_get += src.ns_host_get;
+    dst.host_bytes += src.host_bytes;
+    dst.n_graph_submits += src.n_graph_submits;
+    dst.n_device_allocs += src.n_device_allocs;
+    dst.ns_graph_build += src.ns_graph_build;
+    dst.ns_submit += src.ns_submit;
+    dst.ns_final_sync += src.ns_final_sync;
+    dst.ns_readback += src.ns_readback;
+    dst.ns_prep += src.ns_prep;
+    dst.ns_prep_setup += src.ns_prep_setup;
+    dst.ns_prep_grow += src.ns_prep_grow;
+    dst.ns_prep_attach += src.ns_prep_attach;
+    dst.ns_prep_set += src.ns_prep_set;
+    dst.ns_hits += src.ns_hits;
+    dst.ns_wait += src.ns_wait;
+    dst.ns_pagein_compute += src.ns_pagein_compute;
+    dst.ns_result += src.ns_result;
+    dst.ns_encode += src.ns_encode;
+    dst.ns_h2d += src.ns_h2d;
+    dst.bytes_h2d += src.bytes_h2d;
+    dst.n_reader_h2d += src.n_reader_h2d;
+    dst.n_weight_nonzero += src.n_weight_nonzero;
+    dst.n_weight_total += src.n_weight_total;
+    dst.n_gcache_hit += src.n_gcache_hit;
+    dst.n_gcache_miss += src.n_gcache_miss;
+    dst.n_arena_hit += src.n_arena_hit;
+    dst.n_arena_groups += src.n_arena_groups;
+    dst.n_arena_build += src.n_arena_build;
+    dst.n_hipgraph_capture += src.n_hipgraph_capture;
+    dst.n_hipgraph_replay += src.n_hipgraph_replay;
+    dst.n_d3_collapse += src.n_d3_collapse;
+    dst.n_d3_typed += src.n_d3_typed;
+    dst.n_d3_bounce += src.n_d3_bounce;
+    dst.ns_params_set += src.ns_params_set;
+    dst.ns_demote += src.ns_demote;
+    dst.ns_ensure_post += src.ns_ensure_post;
+    dst.n_read_inflight_max = std::max(dst.n_read_inflight_max, src.n_read_inflight_max);
+    dst.ns_read_issue += src.ns_read_issue;
+    dst.ns_read_complete += src.ns_read_complete;
+    dst.d3_counted = dst.d3_counted || src.d3_counted;
+}
+
+class Worker {
+public:
+    Worker(
+            Catalog catalog,
+            const std::string & device,
+            int slots,
+            uint64_t host_budget_bytes,
+            uint64_t host_victim_bytes,
+            TestHooks * test_hooks,
+            const std::vector<int> & resident_expert_blocks,
+            const std::vector<int> & expert_reserve_blocks,
+            uint64_t expert_reserve_bytes) :
+        Worker(std::move(catalog), std::vector<std::string>{device},
+               std::vector<int>{slots}, host_budget_bytes, host_victim_bytes,
+               test_hooks, resident_expert_blocks, expert_reserve_blocks,
+               expert_reserve_bytes) {
+    }
+
+    Worker(
+            Catalog catalog,
+            const std::vector<std::string> & devices,
+            const std::vector<int> & device_slots,
+            uint64_t host_budget_bytes,
+            uint64_t host_victim_bytes,
+            TestHooks * test_hooks,
+            const std::vector<int> & resident_expert_blocks,
+            const std::vector<int> & expert_reserve_blocks,
+            uint64_t expert_reserve_bytes) :
+        catalog_(std::move(catalog)),
+        device_names_(devices),
+        device_slots_(device_slots),
+        logs_(),
+        device_mutexes_(devices.size()) {
+        if (device_names_.empty() || device_names_.size() != device_slots_.size()) {
+            throw std::invalid_argument(
+                "worker device and slot lists must have the same non-zero length");
+        }
+        for (const int slots : device_slots_) {
+            if (slots <= 0) {
+                throw std::invalid_argument("worker device slot budgets must be positive");
+            }
+        }
+        devices_.reserve(device_names_.size());
+        const bool single_device = device_names_.size() == 1;
+        for (size_t i = 0; i < device_names_.size(); ++i) {
+            const std::function<bool(int, int)> page_owner = single_device
+                ? std::function<bool(int, int)>()
+                : [this, i](int layer, int expert) {
+                    return owning_device_for_page(layer, expert) == i;
+                };
+            devices_.emplace_back(std::make_unique<DeviceWorker>(
+                catalog_, device_names_[i], device_slots_[i], host_budget_bytes,
+                host_victim_bytes, test_hooks, resident_expert_blocks,
+                expert_reserve_blocks, expert_reserve_bytes,
+                single_device ? nullptr : &host_tier_, single_device,
+                page_owner, &logs_));
+        }
+        if (!single_device) {
+            load_pin_file();
+        }
+    }
+
+    size_t owning_device_for_page(int layer, int expert) const {
+        // Stage 2 replaces this body with the LFU placement policy.
+        (void) layer;
+        const int first = catalog_.descriptor.expert_first;
+        const int last = catalog_.descriptor.expert_last;
+        const uint64_t count = last >= first
+            ? (uint64_t) (last - first) + 1 : 0;
+        const uint64_t ordinal = expert >= first ? (uint64_t) (expert - first) : 0;
+        const uint64_t total = std::accumulate(
+            device_slots_.begin(), device_slots_.end(), (uint64_t) 0);
+        const uint64_t point = count > 0 ? ordinal * total / count : 0;
+        uint64_t begin = 0;
+        for (size_t i = 0; i < device_slots_.size(); ++i) {
+            begin += (uint64_t) device_slots_[i];
+            if (point < begin) {
+                return i;
+            }
+        }
+        return device_slots_.size() - 1;
+    }
+
+    pipe_expert_hello hello() const {
+        pipe_expert_hello result = devices_.front()->hello();
+        uint64_t slots = 0;
+        for (const std::unique_ptr<DeviceWorker> & device : devices_) {
+            slots += device->hello().n_slots;
+        }
+        if (slots > UINT32_MAX) {
+            throw std::overflow_error("expert worker slot count overflows HELLO");
+        }
+        result.n_slots = (uint32_t) slots;
+        return result;
+    }
+
+    const ResourcePlan & resources() const {
+        return devices_.front()->resources();
+    }
+
+    const ResourcePlan & device_resources(size_t index) const {
+        return devices_.at(index)->resources();
+    }
+
+    const std::string & device_name(size_t index) const {
+        return device_names_.at(index);
+    }
+
+    size_t device_count() const {
+        return devices_.size();
+    }
+
+    bool multi_device() const {
+        return devices_.size() > 1;
+    }
+
+    size_t read_inflight() const { return devices_.front()->read_inflight(); }
+    size_t read_chunk_bytes() const { return devices_.front()->read_chunk_bytes(); }
+    bool read_direct() const { return devices_.front()->read_direct(); }
+    bool read_direct_fallback() const {
+        for (const std::unique_ptr<DeviceWorker> & device : devices_) {
+            if (device->read_direct_fallback()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int pinned_pages() const {
+        int result = 0;
+        for (const std::unique_ptr<DeviceWorker> & device : devices_) {
+            result += device->pinned_pages();
+        }
+        return result;
+    }
+
+    bool stats_enabled() const {
+        return devices_.front()->stats_enabled();
+    }
+
+    void record_stats(const RequestStats & request, size_t n_experts) {
+        if (!multi_device()) {
+            devices_.front()->record_stats(request, n_experts);
+        }
+    }
+
+    void set_staging_multi_conn(int n) {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            devices_[i]->set_staging_multi_conn(n);
+        }
+    }
+
+    void keepalive_tick() {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            devices_[i]->keepalive_tick();
+        }
+    }
+
+    bool keepalive_enabled() const {
+        for (const std::unique_ptr<DeviceWorker> & device : devices_) {
+            if (device->keepalive_enabled()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int keepalive_us() const {
+        int result = std::numeric_limits<int>::max();
+        for (const std::unique_ptr<DeviceWorker> & device : devices_) {
+            if (device->keepalive_enabled()) {
+                result = std::min(result, device->keepalive_us());
+            }
+        }
+        return result == std::numeric_limits<int>::max() ? 0 : result;
+    }
+
+    bool has_spec_work() const {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            if (devices_[i]->has_spec_work()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool has_spec_submit_work() const {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            if (devices_[i]->has_spec_submit_work()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void drop_spec_work() {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            devices_[i]->drop_spec_work();
+        }
+    }
+
+    bool spec_pagein_step(bool harvest = true) {
+        bool result = false;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            result |= devices_[i]->spec_pagein_step(harvest);
+        }
+        return result;
+    }
+
+    void spec_pagein_after_dispatch() {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            devices_[i]->spec_pagein_after_dispatch();
+        }
+    }
+
+    void note_prefetch_hint(const pipe_expert_prefetch_hint & hint) {
+        std::vector<std::vector<int32_t>> ids(devices_.size());
+        for (const int32_t expert : hint.expert_ids) {
+            const size_t owner = catalog_.pages.count({ hint.layer, expert }) != 0
+                ? owning_device_for_page(hint.layer, expert) : 0;
+            ids[owner].push_back(expert);
+        }
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            if (ids[i].empty()) {
+                continue;
+            }
+            pipe_expert_prefetch_hint sub = hint;
+            sub.expert_ids = std::move(ids[i]);
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            devices_[i]->note_prefetch_hint(sub);
+        }
+    }
+
+    void note_prefetch_hint_bad() {
+        std::lock_guard<std::mutex> lock(device_mutexes_.front());
+        devices_.front()->note_prefetch_hint_bad();
+    }
+
+    void log_reference(int32_t layer,
+                       const std::vector<pipe_expert_assignment> & assignments) {
+        std::lock_guard<std::mutex> lock(device_mutexes_.front());
+        devices_.front()->log_reference(layer, assignments);
+    }
+
+    void report_prefetch_hints() const {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            devices_[i]->report_prefetch_hints();
+        }
+    }
+
+    pipe_expert_partial dispatch(
+            const pipe_expert_dispatch_req & request,
+            RequestStats & request_stats,
+            std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
+            int conn_index = -1) {
+        if (prepared.has_value() || !multi_device()) {
+            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            return devices_.front()->dispatch(
+                request, request_stats, std::move(prepared), conn_index);
+        }
+        validate_dispatch(request);
+        pipe_expert_partial result;
+        result.layer = request.layer;
+        result.n_tokens = request.n_tokens;
+        result.dtype = PIPE_HIDDEN_F32;
+        result.partial.assign(
+            (size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
+        const std::vector<AssignmentGroup> groups = assignment_groups(request);
+        for (const AssignmentGroup & group : groups) {
+            pipe_expert_dispatch_req sub = make_subrequest(request, group.begin, group.end);
+            RequestStats sub_stats;
+            pipe_expert_partial partial;
+            {
+                std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                partial = devices_[group.device]->dispatch(
+                    sub, sub_stats, std::nullopt, conn_index);
+                if (devices_[group.device]->stats_enabled()) {
+                    devices_[group.device]->record_stats(sub_stats, group.end - group.begin);
+                }
+            }
+            accumulate_request_stats(request_stats, sub_stats);
+            if (partial.partial.size() != result.partial.size()) {
+                throw std::runtime_error("expert device partial sizes disagree");
+            }
+            for (size_t i = 0; i < result.partial.size(); ++i) {
+                result.partial[i] += partial.partial[i];
+            }
+        }
+        return result;
+    }
+
+    void begin_split_dispatch(const pipe_expert_dispatch_begin & begin, uint64_t seq_id,
+                              int conn_index = -1,
+                              std::unique_lock<std::mutex> * gpu_lock = nullptr) {
+        if (!multi_device()) {
+            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            devices_.front()->begin_split_dispatch(begin, seq_id, conn_index, gpu_lock);
+            return;
+        }
+        pipe_expert_dispatch_req request;
+        request.layer = begin.layer;
+        request.n_tokens = begin.n_tokens;
+        request.assignments = begin.assignments;
+        request.swiglu_clamp = begin.swiglu_clamp;
+        validate_dispatch(request);
+        std::vector<AssignmentGroup> groups = assignment_groups(request);
+        if (groups.empty()) {
+            groups.push_back({0, 0, 0});
+        }
+        {
+            std::lock_guard<std::mutex> lock(split_mutex_);
+            if (split_pending_by_conn_.count(conn_index) != 0) {
+                throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                          "expert dispatch BEGIN arrived before ACTS");
+            }
+            split_pending_by_conn_.emplace(conn_index,
+                                           SplitPending{begin, seq_id, groups});
+        }
+    }
+
+    pipe_expert_partial finish_split_dispatch(
+            const pipe_expert_dispatch_acts & acts, uint64_t seq_id,
+            RequestStats & request_stats, int conn_index = -1) {
+        if (!multi_device()) {
+            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            return devices_.front()->finish_split_dispatch(
+                acts, seq_id, request_stats, conn_index);
+        }
+        SplitPending pending;
+        {
+            std::lock_guard<std::mutex> lock(split_mutex_);
+            const auto it = split_pending_by_conn_.find(conn_index);
+            if (it == split_pending_by_conn_.end()) {
+                throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                          "expert dispatch ACTS has no BEGIN");
+            }
+            if (seq_id != it->second.seq_id) {
+                throw pipe_protocol_error(PIPE_ERR_STALE_SEQ,
+                                          "expert dispatch ACTS sequence does not match BEGIN");
+            }
+            pending = std::move(it->second);
+            split_pending_by_conn_.erase(it);
+        }
+        pipe_expert_partial result;
+        result.layer = pending.begin.layer;
+        result.n_tokens = pending.begin.n_tokens;
+        result.dtype = PIPE_HIDDEN_F32;
+        result.partial.assign(
+            (size_t) result.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
+        for (const AssignmentGroup & group : pending.groups) {
+            pipe_expert_dispatch_req sub_request;
+            sub_request.layer = pending.begin.layer;
+            sub_request.n_tokens = pending.begin.n_tokens;
+            sub_request.swiglu_clamp = pending.begin.swiglu_clamp;
+            sub_request.assignments.assign(
+                pending.begin.assignments.begin() + (ptrdiff_t) group.begin,
+                pending.begin.assignments.begin() + (ptrdiff_t) group.end);
+            sub_request.activations = acts.activations;
+            RequestStats sub_stats;
+            pipe_expert_partial partial;
+            {
+                std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                partial = devices_[group.device]->dispatch(
+                    sub_request, sub_stats, std::nullopt, conn_index);
+                if (devices_[group.device]->stats_enabled()) {
+                    devices_[group.device]->record_stats(
+                        sub_stats, group.end - group.begin);
+                }
+            }
+            accumulate_request_stats(request_stats, sub_stats);
+            if (partial.partial.size() != result.partial.size()) {
+                throw std::runtime_error("expert device partial sizes disagree");
+            }
+            for (size_t i = 0; i < result.partial.size(); ++i) {
+                result.partial[i] += partial.partial[i];
+            }
+        }
+        return result;
+    }
+
+    void abandon_split_dispatch(int conn_index = -1) noexcept {
+        if (!multi_device()) {
+            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            devices_.front()->abandon_split_dispatch(conn_index);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(split_mutex_);
+            const auto it = split_pending_by_conn_.find(conn_index);
+            if (it == split_pending_by_conn_.end()) {
+                return;
+            }
+            split_pending_by_conn_.erase(it);
+        }
+    }
+
+    bool has_split_dispatch(int conn_index = -1) const {
+        if (!multi_device()) {
+            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            return devices_.front()->has_split_dispatch(conn_index);
+        }
+        std::lock_guard<std::mutex> lock(split_mutex_);
+        return split_pending_by_conn_.count(conn_index) != 0;
+    }
+
+    uint32_t split_n_tokens(int conn_index = -1) const {
+        if (!multi_device()) {
+            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            return devices_.front()->split_n_tokens(conn_index);
+        }
+        std::lock_guard<std::mutex> lock(split_mutex_);
+        return split_pending_by_conn_.at(conn_index).begin.n_tokens;
+    }
+
+    bool split_arena_eligible(int conn_index = -1) const {
+        if (!multi_device()) {
+            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            return devices_.front()->split_arena_eligible(conn_index);
+        }
+        return false;
+    }
+
+private:
+    struct AssignmentGroup {
+        size_t device = 0;
+        size_t begin = 0;
+        size_t end = 0;
+    };
+
+    struct SplitPending {
+        pipe_expert_dispatch_begin begin;
+        uint64_t seq_id = 0;
+        std::vector<AssignmentGroup> groups;
+    };
+
+    std::vector<AssignmentGroup> assignment_groups(
+            const pipe_expert_dispatch_req & request) const {
+        std::vector<AssignmentGroup> result;
+        if (request.assignments.empty()) {
+            return result;
+        }
+        size_t begin = 0;
+        size_t owner = owning_device_for_page(
+            request.layer, request.assignments.front().expert_id);
+        for (size_t i = 1; i <= request.assignments.size(); ++i) {
+            const size_t next = i == request.assignments.size() ? owner :
+                owning_device_for_page(request.layer, request.assignments[i].expert_id);
+            if (i == request.assignments.size() || next != owner) {
+                result.push_back({owner, begin, i});
+                begin = i;
+                owner = next;
+            }
+        }
+        return result;
+    }
+
+    pipe_expert_dispatch_req make_subrequest(
+            const pipe_expert_dispatch_req & request, size_t begin, size_t end) const {
+        pipe_expert_dispatch_req result;
+        result.layer = request.layer;
+        result.n_tokens = request.n_tokens;
+        result.swiglu_clamp = request.swiglu_clamp;
+        result.assignments.assign(request.assignments.begin() + (ptrdiff_t) begin,
+                                  request.assignments.begin() + (ptrdiff_t) end);
+        result.activations = request.activations;
+        return result;
+    }
+
+    void validate_dispatch(const pipe_expert_dispatch_req & request) const {
+        if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), request.layer)) {
+            throw pipe_protocol_error(
+                PIPE_ERR_EXPERT_LAYER,
+                "worker does not serve layer " + std::to_string(request.layer));
+        }
+        if (request.assignments.size() >
+                (size_t) catalog_.descriptor.hparams.n_expert) {
+            throw pipe_protocol_error(
+                PIPE_ERR_BAD_FRAME,
+                "expert dispatch has more assignments than model experts");
+        }
+        std::set<int32_t> seen_experts;
+        for (const pipe_expert_assignment & assignment : request.assignments) {
+            if (!seen_experts.insert(assignment.expert_id).second) {
+                throw pipe_protocol_error(
+                    PIPE_ERR_BAD_FRAME,
+                    "expert dispatch repeats expert " + std::to_string(assignment.expert_id));
+            }
+            if (assignment.expert_id < catalog_.descriptor.expert_first ||
+                    assignment.expert_id > catalog_.descriptor.expert_last ||
+                    catalog_.pages.count({ request.layer, assignment.expert_id }) == 0) {
+                throw pipe_protocol_error(
+                    PIPE_ERR_EXPERT_RANGE,
+                    "worker does not serve expert " + std::to_string(assignment.expert_id));
+            }
+        }
+    }
+
+    void load_pin_file() {
+        const char * const pin_path = std::getenv("WP_EXPERT_PIN_FILE");
+        if (pin_path == nullptr || pin_path[0] == '\0') {
+            return;
+        }
+        size_t pin_budget = 0;
+        for (const std::unique_ptr<DeviceWorker> & device : devices_) {
+            pin_budget += (size_t) device->resources().slot_count;
+        }
+        if (const char * max_env = std::getenv("WP_EXPERT_PIN_MAX_SLOTS")) {
+            const long long parsed = std::strtoll(max_env, nullptr, 10);
+            pin_budget = parsed > 0 ? (size_t) parsed : 0;
+        }
+        std::ifstream pin_file(pin_path);
+        if (!pin_file) {
+            throw std::runtime_error(
+                "failed to open WP_EXPERT_PIN_FILE: " + std::string(pin_path));
+        }
+        std::vector<std::vector<std::pair<int, int>>> pages(devices_.size());
+        std::set<std::pair<int, int>> seen;
+        std::string line;
+        size_t line_number = 0;
+        size_t selected = 0;
+        bool truncated = false;
+        while (std::getline(pin_file, line)) {
+            ++line_number;
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::istringstream input(line);
+            int layer = -1;
+            int expert = -1;
+            if (!(input >> layer >> expert)) {
+                std::cerr << "WARN wp expert worker: ignoring malformed pin line "
+                          << line_number << std::endl;
+                continue;
+            }
+            const std::pair<int, int> key = {layer, expert};
+            if (!seen.insert(key).second) {
+                continue;
+            }
+            if (catalog_.pages.count(key) == 0) {
+                std::cerr << "WARN wp expert worker: ignoring unknown pin "
+                          << layer << " " << expert << std::endl;
+                continue;
+            }
+            if (selected >= pin_budget) {
+                truncated = true;
+                continue;
+            }
+            pages[owning_device_for_page(layer, expert)].push_back(key);
+            ++selected;
+        }
+        size_t loaded = 0;
+        for (size_t i = 0; i < pages.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            loaded += devices_[i]->pin_pages(pages[i], pages[i].size());
+        }
+        std::cerr << "WARN wp expert worker: pin_file=" << pin_path
+                  << " n_pinned=" << loaded
+                  << " pin_budget=" << pin_budget
+                  << " demand_hits=0" << std::endl;
+        if (truncated) {
+            std::cerr << "WARN wp expert worker: pin file truncated in file order"
+                      << " at " << pin_budget << " slots" << std::endl;
+        }
+    }
+
+    Catalog catalog_;
+    std::vector<std::string> device_names_;
+    std::vector<int> device_slots_;
+    WorkerLogFiles logs_;
+    wp::HostTier host_tier_;
+    std::vector<std::unique_ptr<DeviceWorker>> devices_;
+    mutable std::vector<std::mutex> device_mutexes_;
+    mutable std::mutex split_mutex_;
+    std::unordered_map<int, SplitPending> split_pending_by_conn_;
 };
 
 bool validate_client_hello(
@@ -11044,7 +11775,7 @@ bool self_bench_stats(uint64_t & n, uint64_t & min_us, uint64_t & mean_us) {
 }
 
 void self_bench_tick(ggml_backend_t backend) {
-    if (!g_probe.ready) return;
+    if (!g_probe.ready || g_probe.backend != backend) return;
     const auto t0 = std::chrono::steady_clock::now();
     ggml_backend_graph_compute(backend, g_probe.graph);
     const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -11055,15 +11786,24 @@ void self_bench_tick(ggml_backend_t backend) {
 }
 
 ResourcePlan inspect_resources(const Options & options) {
-    if (options.slots <= 0 || options.device.empty()) {
-        throw std::invalid_argument("invalid expert worker resource options");
+    std::vector<std::string> devices = options.devices;
+    if (devices.empty() && !options.device.empty()) {
+        devices.push_back(options.device);
+    }
+    std::vector<int> device_slots = options.device_slots;
+    if (device_slots.empty() && options.slots > 0) {
+        device_slots.push_back(options.slots);
+    }
+    if (devices.empty() || devices.size() != device_slots.size()) {
+        throw std::invalid_argument(
+            "worker device and slot lists must have the same non-zero length");
     }
     const fs::path manifest   = fs::canonical(options.shard_manifest);
     const fs::path descriptor = fs::canonical(options.descriptor);
     Worker worker(
         load_catalog(manifest, descriptor),
-        options.device,
-        options.slots,
+        devices,
+        device_slots,
         options.host_budget_bytes,
         options.host_victim_bytes,
         options.test_hooks,
@@ -11073,10 +11813,22 @@ ResourcePlan inspect_resources(const Options & options) {
 }
 
 int run(const Options & options) {
-    if (options.slots <= 0 || options.listen_host.empty() ||
+    std::vector<std::string> devices = options.devices;
+    if (devices.empty() && !options.device.empty()) {
+        devices.push_back(options.device);
+    }
+    std::vector<int> device_slots = options.device_slots;
+    if (device_slots.empty() && options.slots > 0) {
+        device_slots.push_back(options.slots);
+    }
+    if (devices.empty() || devices.size() != device_slots.size() ||
+        options.listen_host.empty() ||
         options.listen_port <= 0 || options.listen_port > 65535 ||
-        options.device.empty()) {
-        throw std::invalid_argument("invalid expert worker options");
+        std::any_of(device_slots.begin(), device_slots.end(), [](int slots) {
+            return slots <= 0;
+        })) {
+        throw std::invalid_argument(
+            "worker device and slot lists must have the same non-zero length and positive budgets");
     }
     // Same as WeightPager: default HIP graph keying recaptures every submit
     // (nodes[0] is ephemeral; this worker rebinds expert data pointers).
@@ -11093,8 +11845,8 @@ int run(const Options & options) {
     const fs::path descriptor = fs::canonical(options.descriptor);
     Worker worker(
         load_catalog(manifest, descriptor),
-        options.device,
-        options.slots,
+        devices,
+        device_slots,
         options.host_budget_bytes,
         options.host_victim_bytes,
         options.test_hooks,
@@ -11247,6 +11999,22 @@ int run(const Options & options) {
                   << " pin_floor=" << slot_class.pin_floor
                   << " pages=" << slot_class.pages << '\n';
     }
+    if (worker.device_count() > 1) {
+        for (size_t i = 0; i < worker.device_count(); ++i) {
+            const ResourcePlan & device_resources = worker.device_resources(i);
+            std::cout << "expert worker device=" << worker.device_name(i)
+                      << " slots=" << device_resources.slot_count
+                      << " requested_slots=" << device_resources.requested_slots
+                      << " budget_bytes=" << device_resources.device_budget_bytes
+                      << " slot_budget_bytes=" << device_resources.slot_budget_bytes
+                      << " resident_bytes=" << device_resources.pinned_bytes +
+                          device_resources.device_bytes
+                      << " pinned_bytes=" << device_resources.pinned_bytes
+                      << " device_bytes=" << device_resources.device_bytes
+                      << " staging=" << device_resources.staging_buffers << "x"
+                      << device_resources.staging_buffer_bytes << '\n';
+        }
+    }
 
     // WP_WORKER_MULTI_CONN=N (N>=2) -- see g_worker_gpu_mutex comment above
     // serve_connection for the lock design. Unset/absent/"1"/anything <2 is
@@ -11287,7 +12055,7 @@ int run(const Options & options) {
 
     if (multi_conn_n >= 2) {
         std::mutex serialize_mutex;
-        g_worker_gpu_mutex = &serialize_mutex;
+        g_worker_gpu_mutex = worker.multi_device() ? nullptr : &serialize_mutex;
         g_worker_conn_request_counts = std::vector<std::atomic<uint64_t>>((size_t) multi_conn_n);
         g_worker_staging_held = std::vector<std::atomic<int64_t>>((size_t) multi_conn_n);
         // Per-connection staging quota (see StagingPool's 2026-08-25 deadlock

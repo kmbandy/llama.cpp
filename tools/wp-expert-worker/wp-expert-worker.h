@@ -75,9 +75,11 @@ struct Options {
     std::filesystem::path shard_manifest;
     std::filesystem::path descriptor;
     std::string           device;
+    std::vector<std::string> devices;
     std::string           listen_host;
     int                   listen_port = 0;
     int                   slots       = 0;
+    std::vector<int>      device_slots;
     uint64_t              host_budget_bytes = 0;
     uint64_t              host_victim_bytes = 0;
     std::vector<int>      resident_expert_blocks;

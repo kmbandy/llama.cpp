@@ -23,6 +23,7 @@ void print_usage(const char * argv0) {
         << " [--weight-paging-resident-experts BLOCKS]"
         << " [--expert-reserve-blocks BLOCKS --expert-reserve-bytes SIZE]\n"
         << "       --slots is the device budget in largest-page equivalents\n"
+        << "       --device NAME1,NAME2 with --slots N1,N2 selects multiple devices\n"
         << "       staging defaults to up to 16 largest-page buffers\n"
         << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional staging budget\n"
         << "       WP_EXPERT_HOST_VICTIM_BYTES supplies the optional VRAM victim tier\n"
@@ -66,6 +67,44 @@ uint64_t parse_size(const std::string & text, const char * option) {
     return (uint64_t) value * multiplier;
 }
 
+std::vector<std::string> parse_devices(const std::string & text) {
+    std::vector<std::string> result;
+    size_t begin = 0;
+    while (begin <= text.size()) {
+        const size_t end = text.find(',', begin);
+        const std::string device = text.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (device.empty()) {
+            throw std::invalid_argument("--device requires non-empty device names");
+        }
+        result.push_back(device);
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return result;
+}
+
+std::vector<int> parse_slots(const std::string & text) {
+    std::vector<int> result;
+    size_t begin = 0;
+    while (begin <= text.size()) {
+        const size_t end = text.find(',', begin);
+        const std::string value = text.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (value.empty()) {
+            throw std::invalid_argument("--slots requires positive integers");
+        }
+        result.push_back(parse_positive_int(value, "--slots"));
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return result;
+}
+
 void parse_endpoint(const std::string & text, std::string & host, int & port) {
     const size_t colon = text.rfind(':');
     if (colon == std::string::npos || colon == 0 || colon + 1 == text.size()) {
@@ -98,10 +137,14 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
             options.descriptor = take();
         } else if (arg == "--device") {
             options.device = take();
+            options.devices = parse_devices(options.device);
         } else if (arg == "--listen") {
             endpoint = take();
         } else if (arg == "--slots") {
-            options.slots = parse_positive_int(take(), "--slots");
+            const std::string value = take();
+            options.device_slots = parse_slots(value);
+            options.slots = options.device_slots.size() == 1
+                ? options.device_slots.front() : 0;
         } else if (arg == "--host-budget-bytes") {
             options.host_budget_bytes =
                 parse_positive_u64(take(), "--host-budget-bytes");
@@ -124,9 +167,13 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
         }
     }
     if (options.shard_manifest.empty() || options.descriptor.empty() ||
-        options.device.empty() || endpoint.empty() || options.slots <= 0) {
+        options.device.empty() || endpoint.empty() || options.device_slots.empty()) {
         throw std::invalid_argument(
             "--shard-manifest, --descriptor, --device, --listen, and --slots are required");
+    }
+    if (options.devices.size() != options.device_slots.size()) {
+        throw std::invalid_argument(
+            "--device and --slots must contain the same number of comma-separated values");
     }
     parse_endpoint(endpoint, options.listen_host, options.listen_port);
     if (options.host_budget_bytes == 0) {
