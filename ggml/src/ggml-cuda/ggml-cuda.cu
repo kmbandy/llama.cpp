@@ -3619,6 +3619,33 @@ static void ggml_cuda_wp_graph_count_init() {
     std::call_once(ggml_cuda_wp_graph_atexit_once, []() { atexit(ggml_cuda_wp_graph_print_counts); });
 }
 
+// Periodic dump, because the atexit() above is NOT reachable in this harness:
+// the router SIGKILLs its model children, so atexit handlers never run and these
+// counters were silently unobservable for the whole life of the process. (Logged
+// in the KG after it ate a hip-graphs engagement measurement once already --
+// exit-time prints are incompatible with a SIGKILL teardown.)
+//
+// Fires every WP_HIP_GRAPHS_LOG_EVERY graph_compute calls (default 256, 0 = off)
+// so "are graphs actually replaying, or capturing/falling back every token" is
+// answerable from a live process.
+static void ggml_cuda_wp_graph_count_tick() {
+    static const uint64_t every = [] {
+        const char * e = std::getenv("WP_HIP_GRAPHS_LOG_EVERY");
+        if (e == nullptr) {
+            return (uint64_t) 256;
+        }
+        const long v = std::atol(e);
+        return v >= 0 ? (uint64_t) v : (uint64_t) 256;
+    }();
+    if (every == 0) {
+        return;
+    }
+    static std::atomic<uint64_t> calls{0};
+    if ((calls.fetch_add(1, std::memory_order_relaxed) + 1) % every == 0) {
+        ggml_cuda_wp_graph_print_counts();
+    }
+}
+
 // Prefill-shaped graphs (activation width > decode/spec window) must not be
 // captured. Each distinct prompt length would otherwise park a HIP graph and
 // its host-visible scratch for the process lifetime — the 2057/1136/1010 MiB
@@ -5513,6 +5540,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // See ggml_cuda_wp_graph_count_tick(): the atexit dump never runs under this
+    // harness's SIGKILL teardown, so the counters are reported periodically from
+    // here (once per backend graph_compute call) instead.
+    if (ggml_cuda_wp_hip_graphs_enabled()) {
+        ggml_cuda_wp_graph_count_tick();
+    }
 
     if (cuda_ctx->wp_copy_enabled && cuda_ctx->wp_copy_pending &&
         cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->wp_copy_latest_event, 0) != cudaSuccess) {

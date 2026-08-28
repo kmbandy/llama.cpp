@@ -638,6 +638,32 @@ struct dispatcher::impl {
         std::vector<uint8_t>                payload;
         std::vector<uint8_t>                begin_payload;
         std::vector<uint8_t>                acts_payload;
+        // PER-REQUEST split-frame decision (2026-08-27). WP_SPLIT_FRAME used to
+        // be a connection-lifetime latch, so EVERY request paid two frames --
+        // but split-frame exists only to carry WP_DISPATCH_DEDUP_ACTIVATIONS,
+        // and dedup is itself gated to n_tokens > WP_DISPATCH_DEDUP_MIN_TOKENS
+        // (see dedup_publish_and_ref). Decode therefore paid the second frame
+        // to enable a mechanism that then declined to run.
+        //
+        // THROUGHPUT CLAIM RETRACTED 2026-08-28. An earlier version of this
+        // comment recorded "decode 6.88 -> 7.51 tok/s (+9.1%)" for latching
+        // split-frame off. That number is WITHDRAWN: it was measured across
+        // two spine loads, and the spine has a decode warm-up curve (~175
+        // ms/tok cold falling to ~128 ms/tok as cumulative decode crosses
+        // ~1200-1700 tokens) that confounded every A/B run that night. The
+        // paired prefill figure (79.5 -> 71.1 tok/s) is confounded the same
+        // way. Do not cite either number; do not re-derive a lever from them.
+        //
+        // This gate is kept on STRUCTURAL grounds only, which stand on their
+        // own: below the dedup threshold the second frame carries a mechanism
+        // that then declines to run, so it is a wasted packet per request on a
+        // TCP_NODELAY socket. Its throughput effect is UNMEASURED. Any future
+        // measurement must warm both arms past ~1700 decode tokens since the
+        // last worker cycle and state the warm-up position alongside the number.
+        //
+        // Set from the same n_tokens threshold dedup uses, so prefill frames
+        // are byte-identical to the latched behaviour and only decode changes.
+        bool                                split_wire = false;
         dispatch_clock::time_point          issued_at;
         dispatch_clock::time_point          await_started_at;
         dispatch_clock::time_point          await_finished_at;
@@ -1959,6 +1985,12 @@ struct dispatcher::impl {
         // cost this targets is a prefill cost).
         const bool slice_encode_once =
             layer_is_slice && s_slice_encode_once && !s_union_stats && n_tokens > 1;
+        // See planned_request::split_wire. Split the frame only at a width where
+        // dedup can actually engage; below it the second frame buys nothing and
+        // costs a packet per request on a TCP_NODELAY socket. Uniform across a
+        // layer's workers (n_tokens is a property of the ubatch), so the
+        // slice_encode_once shared-payload cache below stays coherent.
+        const bool split_wire = split_frame && n_tokens > dedup_min_tokens_;
         std::vector<uint8_t>  shared_payload, shared_begin_payload, shared_acts_payload;
         std::vector<uint32_t> shared_token_ids;
         bool have_shared = false;
@@ -1969,7 +2001,8 @@ struct dispatcher::impl {
             if (slice_encode_once && have_shared) {
                 // Identical-frame fast path: copy the already-encoded bytes.
                 request.token_ids = shared_token_ids;
-                if (split_frame) {
+                request.split_wire = split_wire;
+                if (split_wire) {
                     request.begin_payload = shared_begin_payload;
                     request.acts_payload  = shared_acts_payload;
                 } else {
@@ -2077,7 +2110,8 @@ struct dispatcher::impl {
             }
             const dispatch_clock::time_point encode_started =
                 layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
-            if (split_frame) {
+            request.split_wire = split_wire;
+            if (split_wire) {
                 pipe_expert_dispatch_begin begin;
                 begin.layer = wire_request.layer;
                 begin.n_tokens = wire_request.n_tokens;
@@ -2097,7 +2131,7 @@ struct dispatcher::impl {
             if (slice_encode_once) {
                 // Stash the first covering worker's encoded frame for reuse.
                 shared_token_ids = request.token_ids;
-                if (split_frame) {
+                if (split_wire) {
                     shared_begin_payload = request.begin_payload;
                     shared_acts_payload  = request.acts_payload;
                 } else {
@@ -2433,7 +2467,7 @@ struct dispatcher::impl {
             if (collect_stats || req_log_ != nullptr) {
                 request.issued_at = dispatch_clock::now();
             }
-            if (split_frame && async_issue) {
+            if (request.split_wire && async_issue) {
                 wire_frame begin;
                 begin.type = PIPE_EXPERT_DISPATCH_BEGIN;
                 begin.seq_id = seq_id;
@@ -2446,7 +2480,7 @@ struct dispatcher::impl {
                 acts.layer = request.layer;
                 acts.payload = std::move(request.acts_payload);
                 enqueue_frame(value, std::move(acts));
-            } else if (split_frame && concurrent_issue) {
+            } else if (request.split_wire && concurrent_issue) {
                 // Scatter: post BEGIN+ACTS to this worker's persistent sender
                 // thread and move on to the next worker immediately -- do NOT
                 // block here. All sockets' sends run concurrently; joined below
@@ -2455,7 +2489,7 @@ struct dispatcher::impl {
                                     PIPE_EXPERT_DISPATCH_ACTS, request.acts_payload, seq_id);
                 concurrent_pending.emplace_back(&value, &request);
                 continue;
-            } else if (split_frame) {
+            } else if (request.split_wire) {
                 if (!send_frame(PIPE_EXPERT_DISPATCH_BEGIN, request.begin_payload) ||
                     !send_frame(PIPE_EXPERT_DISPATCH_ACTS, request.acts_payload)) {
                     throw std::runtime_error("expert dispatcher failed to send split expert request to worker " +
@@ -2492,7 +2526,7 @@ struct dispatcher::impl {
         // before this point only enqueued a job.
         for (auto & [worker_ptr, request_ptr] : concurrent_pending) {
             if (!join_concurrent_job(*worker_ptr->sender)) {
-                if (split_frame) {
+                if (request_ptr->split_wire) {
                     throw std::runtime_error("expert dispatcher failed to send split expert request to worker " +
                                              worker_ptr->info.endpoint);
                 }
