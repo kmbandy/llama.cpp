@@ -12,7 +12,8 @@
  * catalog name, source tensor name, source file index, and source file offset.
  * The global -experts-manifest.json lists the complete shard set and its
  * structural SHA-256. Hashes cover canonical group identity (IDs, role masks,
- * sizes, and names), while --verify also compares every payload byte.
+ * sizes, and names), while --verify also compares every payload byte. With
+ * --slice-output-split, each slice has its own complete set of these files.
  */
 
 #include "ggml.h"
@@ -82,6 +83,7 @@ struct ModelCatalog {
 struct CliOptions {
     bool                               verify          = false;
     bool                               allow_partial   = false;
+    bool                               slice_output_split = false;
     uint64_t                           max_shard_bytes = 0;
     std::vector<wp_repack::LayerRange> layer_ranges;
     bool                               sliced          = false;
@@ -190,6 +192,8 @@ void print_usage(const char * argv0) {
               << "                         in elements (\"1024,512,256,256\") or bandwidth ratios\n"
               << "                         (\"4:2:1:1\"), which are solved against the model's real\n"
               << "                         n_ff_exp. Enables format v2; v1 is unaffected.\n\n"
+              << "  --slice-output-split  with --expert-slices, write one self-contained v2\n"
+              << "                         blob/index/manifest set per slice\n\n"
               << "Existing output files are never overwritten.\n"
               << "\n"
               << "FORMAT v1 (default)\n"
@@ -246,7 +250,14 @@ void print_usage(const char * argv0) {
               << "  adds a top-level \"expert_slicing\" block recording the spec text, the ratios\n"
               << "  if any, the resolved widths, n_ff_exp, n_embd, and distinct per-group role\n"
               << "  geometry variants with their group assignments -- enough for a consumer to\n"
-              << "  validate per-layer byte sizes without the model.\n";
+              << "  validate per-layer byte sizes without the model.\n"
+              << "\n"
+              << "FORMAT v2 split (--expert-slices --slice-output-split)\n"
+              << "  BASE" << SLICED_BASE_SUFFIX << "-slice-NNNNN-experts-NNNNN-of-MMMMM.wpb\n"
+              << "  BASE" << SLICED_BASE_SUFFIX << "-slice-NNNNN-experts-NNNNN-of-MMMMM.wpi.json\n"
+              << "  BASE" << SLICED_BASE_SUFFIX << "-slice-NNNNN-experts-manifest.json\n"
+              << "  NNNNN is the zero-based slice index. Each set records slice_idx,\n"
+              << "  slice_ff_first, slice_ff_last, and slice_width at the top level.\n";
 }
 
 uint64_t parse_bytes(const std::string & text) {
@@ -321,6 +332,8 @@ CliOptions parse_cli(int argc, char ** argv) {
             // so it deliberately does NOT count as a sharding mode.
             options.slice_spec = wp_repack::parse_slice_spec(argv[i]);
             options.sliced     = true;
+        } else if (arg == "--slice-output-split") {
+            options.slice_output_split = true;
         } else if (arg.size() > 1 && arg[0] == '-') {
             throw std::invalid_argument("unknown option: " + arg);
         } else {
@@ -342,6 +355,12 @@ CliOptions parse_cli(int argc, char ** argv) {
         // it needs no hint. Point it at the v2 manifest, or at the "BASE-eslice"
         // base; taking a spec here would let it disagree with what was written.
         throw std::invalid_argument("--expert-slices is not valid with --verify; pass the v2 manifest or output base");
+    }
+    if (options.slice_output_split && !options.sliced) {
+        throw std::invalid_argument("--slice-output-split requires --expert-slices");
+    }
+    if (options.verify && options.slice_output_split) {
+        throw std::invalid_argument("--slice-output-split is not valid with --verify");
     }
 
     options.model  = positional[0];
@@ -542,6 +561,12 @@ std::string numbered_name(const std::string & base, size_t index, size_t total) 
 ShardPaths shard_paths(const fs::path & output_base, size_t index, size_t total) {
     const std::string prefix = numbered_name(output_base.string(), index, total);
     return { fs::path(prefix + ".wpb"), fs::path(prefix + ".wpi.json") };
+}
+
+fs::path slice_output_base(const fs::path & output_base, const wp_repack::SliceRange & range) {
+    std::ostringstream suffix;
+    suffix << output_base.string() << "-slice-" << std::setw(5) << std::setfill('0') << range.index;
+    return fs::path(suffix.str());
 }
 
 fs::path manifest_path(const fs::path & output_base) {
@@ -856,6 +881,25 @@ void read_member(std::ifstream & source, uint64_t offset, uint64_t size, std::ve
     }
 }
 
+void read_group_roles(const wp_repack::ExpertGroup &                group,
+                      std::vector<std::ifstream> &                  sources,
+                      std::vector<char> &                           scratch,
+                      std::vector<std::vector<char>> &              role_bytes) {
+    const wp_repack::ExpertMember * roles[3] = {
+        &member_for_role(group, wp::ROLE_UP, "up"),
+        &member_for_role(group, wp::ROLE_GATE, "gate"),
+        &member_for_role(group, wp::ROLE_DOWN, "down"),
+    };
+    role_bytes.resize(3);
+    for (size_t r = 0; r < 3; ++r) {
+        if (roles[r]->file_idx >= sources.size()) {
+            throw std::runtime_error("catalog source file index is out of range");
+        }
+        read_member(sources[roles[r]->file_idx], roles[r]->file_offset, roles[r]->size, scratch);
+        role_bytes[r].swap(scratch);
+    }
+}
+
 // Append one role's contribution to one slice. up/gate are a single contiguous
 // run of whole rows; down is a column cut, so it is gathered row by row. Both
 // paths copy source bytes verbatim -- never a value is recomputed.
@@ -905,24 +949,13 @@ void build_group_slices(const wp_repack::ExpertGroup &                group,
                         std::vector<std::ifstream> &                  sources,
                         std::vector<char> &                           scratch,
                         std::vector<char> &                           out) {
-    const wp_repack::ExpertMember * roles[3] = {
-        &member_for_role(group, wp::ROLE_UP, "up"),
-        &member_for_role(group, wp::ROLE_GATE, "gate"),
-        &member_for_role(group, wp::ROLE_DOWN, "down"),
-    };
     const uint8_t role_masks[3] = { wp::ROLE_UP, wp::ROLE_GATE, wp::ROLE_DOWN };
 
     // Hold all three roles at once: the output is slice-major, so every role is
     // revisited once per slice. One expert is ~13 MB, which is cheap next to
     // re-reading each role N_slices times from disk.
     std::vector<std::vector<char>> role_bytes(3);
-    for (size_t r = 0; r < 3; ++r) {
-        if (roles[r]->file_idx >= sources.size()) {
-            throw std::runtime_error("catalog source file index is out of range");
-        }
-        read_member(sources[roles[r]->file_idx], roles[r]->file_offset, roles[r]->size, scratch);
-        role_bytes[r].swap(scratch);
-    }
+    read_group_roles(group, sources, scratch, role_bytes);
 
     out.clear();
     for (const wp_repack::SliceRange & range : ranges) {
@@ -935,7 +968,8 @@ void build_group_slices(const wp_repack::ExpertGroup &                group,
 std::string hash_groups_sliced(const std::vector<wp_repack::ExpertGroup> & groups,
                                const std::vector<size_t> &                 indices,
                                const SliceGeometry &                       geom,
-                               const std::vector<int64_t> &                widths) {
+                               const std::vector<int64_t> &                widths,
+                               const wp_repack::SliceRange *               output_range = nullptr) {
     sha256_t hash;
     sha256_init(&hash);
     // Domain-separated from v1: identical experts sliced differently must not
@@ -947,6 +981,12 @@ std::string hash_groups_sliced(const std::vector<wp_repack::ExpertGroup> & group
     sha_update_u64(hash, widths.size());
     for (const int64_t w : widths) {
         sha_update_u64(hash, static_cast<uint64_t>(w));
+    }
+    if (output_range != nullptr) {
+        sha_update_string(hash, "llama.cpp.wp-repack.identity.v2.slice-output-split");
+        sha_update_u64(hash, static_cast<uint64_t>(output_range->index));
+        sha_update_u64(hash, static_cast<uint64_t>(output_range->first));
+        sha_update_u64(hash, static_cast<uint64_t>(output_range->last));
     }
     sha_update_u64(hash, indices.size());
 
@@ -1178,6 +1218,194 @@ json write_shard_sliced(const fs::path &                            output_base,
     };
 }
 
+struct SliceSplitShardOutput {
+    ShardPaths                  paths;
+    fs::path                    temp_blob;
+    std::unique_ptr<std::ofstream> blob;
+    json                        index;
+    uint64_t                    blob_offset = 0;
+};
+
+void repack_sliced_split(const CliOptions &                          options,
+                         const ModelCatalog &                        model,
+                         const std::vector<wp_repack::ExpertGroup> & groups,
+                         const std::vector<wp_repack::ShardPlan> &   shards,
+                         const std::string &                         sharding_mode,
+                         const fs::path &                            output_base,
+                         const SliceGeometry &                       geom,
+                         const wp_repack::SliceSpec &                spec,
+                         const std::vector<wp_repack::SliceRange> &  ranges,
+                         std::vector<std::ifstream> &                sources) {
+    const std::vector<size_t> selected = flatten_indices(shards);
+    const size_t               slice_count = ranges.size();
+    std::vector<fs::path>      slice_bases(slice_count);
+    std::vector<SliceSplitShardOutput> outputs;
+    outputs.reserve(slice_count * shards.size());
+
+    for (size_t s = 0; s < slice_count; ++s) {
+        slice_bases[s] = slice_output_base(output_base, ranges[s]);
+        if (!slice_bases[s].parent_path().empty()) {
+            fs::create_directories(slice_bases[s].parent_path());
+        }
+        ensure_outputs_absent(slice_bases[s], shards);
+
+        for (size_t i = 0; i < shards.size(); ++i) {
+            SliceSplitShardOutput output;
+            output.paths = shard_paths(slice_bases[s], i, shards.size());
+            output.temp_blob = fs::path(output.paths.blob.string() + ".tmp");
+            output.blob = std::make_unique<std::ofstream>(output.temp_blob, std::ios::binary);
+            if (!*output.blob) {
+                throw std::runtime_error("failed to create " + output.temp_blob.string());
+            }
+
+            output.index = {
+                { "format",              INDEX_FORMAT                                        },
+                { "version",             FORMAT_VERSION_SLICED                               },
+                { "blob_file",           output.paths.blob.filename().string()                 },
+                { "shard_index",         i                                                   },
+                { "shard_count",         shards.size()                                       },
+                { "layer_first",         shards[i].layer_first                               },
+                { "layer_last",          shards[i].layer_last                                },
+                { "group_count",         shards[i].group_indices.size()                      },
+                { "slice_output_split",  true                                                },
+                { "slice_idx",           ranges[s].index                                    },
+                { "slice_ff_first",      ranges[s].first                                    },
+                { "slice_ff_last",       ranges[s].last                                     },
+                { "slice_width",         ranges[s].width()                                   },
+                { "expert_slicing",      slicing_json(spec, geom, groups)                   },
+                { "blob_bytes",          0                                                   },
+                { "content_hash",
+                 {
+                      { "algorithm", "sha256" },
+                      { "value", hash_groups_sliced(groups, shards[i].group_indices, geom, spec.widths,
+                                                     &ranges[s]) },
+                  }                                                                  },
+                { "model_files",         model.files                                         },
+                { "groups",              json::array()                                       },
+            };
+            outputs.push_back(std::move(output));
+        }
+    }
+
+    std::vector<char>                  scratch;
+    std::vector<char>                  payload;
+    std::vector<std::vector<char>>     role_bytes;
+    const uint8_t                      role_masks[3] = { wp::ROLE_UP, wp::ROLE_GATE, wp::ROLE_DOWN };
+
+    for (size_t i = 0; i < shards.size(); ++i) {
+        for (size_t group_index : shards[i].group_indices) {
+            const wp_repack::ExpertGroup & group = groups.at(group_index);
+            const SliceGeometryVariant & variant = geom.variant_for_group(group_index);
+            read_group_roles(group, sources, scratch, role_bytes);
+
+            for (size_t s = 0; s < slice_count; ++s) {
+                SliceSplitShardOutput & output = outputs[s * shards.size() + i];
+                const wp_repack::SliceRange & range = ranges[s];
+                const uint64_t role_bytes_for_slice[3] = {
+                    variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
+                    variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
+                    variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
+                };
+                const uint64_t slice_bytes = role_bytes_for_slice[0] + role_bytes_for_slice[1] +
+                                              role_bytes_for_slice[2];
+
+                payload.clear();
+                for (size_t r = 0; r < 3; ++r) {
+                    append_role_slice(role_masks[r], role_bytes[r], variant, geom.n_embd, range, payload);
+                }
+                if (payload.size() != slice_bytes) {
+                    throw std::runtime_error("internal split slice payload size mismatch");
+                }
+
+                const uint64_t cursor = output.blob_offset;
+                json group_json = {
+                    { "block_idx",        group.block_idx                      },
+                    { "expert_idx",       group.expert_idx                     },
+                    { "geometry_variant", geom.group_variants[group_index]     },
+                    { "slices",            json::array({ {
+                           { "slice_idx", range.index                              },
+                           { "ff_first",  range.first                              },
+                           { "ff_last",   range.last                               },
+                           { "width",     range.width()                            },
+                           { "offset",    cursor                                   },
+                           { "bytes",     slice_bytes                              },
+                           { "members",   json::array({
+                                  slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range,
+                                                    cursor),
+                                  slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range,
+                                                    cursor + role_bytes_for_slice[0]),
+                                  slice_member_json(group, wp::ROLE_DOWN, "down", variant, geom.n_embd, range,
+                                                    cursor + role_bytes_for_slice[0] + role_bytes_for_slice[1]),
+                              })                                                    },
+                       } })                                                            },
+                };
+
+                output.blob->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                if (!*output.blob) {
+                    throw std::runtime_error("failed to write split sliced expert blob");
+                }
+                output.blob_offset += slice_bytes;
+                output.index["groups"].push_back(std::move(group_json));
+            }
+        }
+    }
+
+    for (size_t s = 0; s < slice_count; ++s) {
+        json manifest = {
+            { "format",              MANIFEST_FORMAT                                 },
+            { "version",             FORMAT_VERSION_SLICED                           },
+            { "input_model",         fs::canonical(fs::path(options.model)).string() },
+            { "model_files",         model.files                                     },
+            { "sharding_mode",       sharding_mode                                   },
+            { "total_group_count",   selected.size()                                 },
+            { "total_blob_bytes",    0                                               },
+            { "shard_count",         shards.size()                                   },
+            { "slice_output_split",  true                                            },
+            { "slice_idx",           ranges[s].index                                },
+            { "slice_ff_first",      ranges[s].first                                },
+            { "slice_ff_last",       ranges[s].last                                 },
+            { "slice_width",         ranges[s].width()                              },
+            { "expert_slicing",      slicing_json(spec, geom, groups)               },
+            { "content_hash",
+             {
+                  { "algorithm", "sha256" },
+                  { "value", hash_groups_sliced(groups, selected, geom, spec.widths, &ranges[s]) },
+              }                                                                        },
+            { "shards",              json::array()                                   },
+        };
+
+        uint64_t total_bytes = 0;
+        for (size_t i = 0; i < shards.size(); ++i) {
+            SliceSplitShardOutput & output = outputs[s * shards.size() + i];
+            output.index["blob_bytes"] = output.blob_offset;
+            output.blob->close();
+            if (!*output.blob) {
+                throw std::runtime_error("failed to finish " + output.temp_blob.string());
+            }
+            fs::rename(output.temp_blob, output.paths.blob);
+            write_json(output.paths.index, output.index);
+
+            manifest["shards"].push_back({
+                { "blob_file",    output.paths.blob.filename().string() },
+                { "index_file",   output.paths.index.filename().string() },
+                { "shard_index",  i                                    },
+                { "layer_first",  shards[i].layer_first                },
+                { "layer_last",   shards[i].layer_last                 },
+                { "group_count",  shards[i].group_indices.size()       },
+                { "blob_bytes",   output.blob_offset                    },
+                { "content_hash", output.index["content_hash"]          },
+            });
+            total_bytes += output.blob_offset;
+        }
+
+        manifest["total_blob_bytes"] = total_bytes;
+        write_json(manifest_path(slice_bases[s]), manifest);
+        std::cout << "split sliced repack complete: slice=" << ranges[s].index << " ff [" << ranges[s].first << ","
+                  << ranges[s].last << ") shards=" << shards.size() << " groups=" << selected.size()
+                  << " bytes=" << total_bytes << " manifest=" << manifest_path(slice_bases[s]).string() << '\n';
+    }
+}
+
 void repack_sliced(const CliOptions &                          options,
                    const ModelCatalog &                        model,
                    const std::vector<wp_repack::ExpertGroup> & groups,
@@ -1195,9 +1423,16 @@ void repack_sliced(const CliOptions &                          options,
     if (!output_base.parent_path().empty()) {
         fs::create_directories(output_base.parent_path());
     }
-    ensure_outputs_absent(output_base, shards);
 
     const std::vector<size_t> selected = flatten_indices(shards);
+
+    if (options.slice_output_split) {
+        repack_sliced_split(options, model, groups, shards, sharding_mode, output_base, geom, spec, ranges, sources);
+        return;
+    }
+
+    ensure_outputs_absent(output_base, shards);
+
     json                      manifest = {
         { "format",            MANIFEST_FORMAT                                 },
         { "version",           FORMAT_VERSION_SLICED                           },
@@ -1486,6 +1721,29 @@ wp_repack::SliceSpec slicing_from_json(const json &                             
     return spec;
 }
 
+bool split_slice_from_json(const json &                              value,
+                           const std::vector<wp_repack::SliceRange> & ranges,
+                           wp_repack::SliceRange &                   output_range) {
+    if (!value.value("slice_output_split", false)) {
+        return false;
+    }
+    if (!value.contains("slice_idx") || !value.contains("slice_ff_first") || !value.contains("slice_ff_last") ||
+        !value.contains("slice_width")) {
+        throw std::runtime_error("split sliced metadata is missing its slice range");
+    }
+    const int slice_idx = value.at("slice_idx").get<int>();
+    if (slice_idx < 0 || static_cast<size_t>(slice_idx) >= ranges.size()) {
+        throw std::runtime_error("split sliced metadata has an invalid slice index");
+    }
+    output_range = ranges[slice_idx];
+    if (value.at("slice_ff_first").get<int64_t>() != output_range.first ||
+        value.at("slice_ff_last").get<int64_t>() != output_range.last ||
+        value.at("slice_width").get<int64_t>() != output_range.width()) {
+        throw std::runtime_error("split sliced metadata has an invalid slice range");
+    }
+    return true;
+}
+
 // Defined below with the v1 verifier; the sliced verifier reuses them unchanged.
 std::vector<size_t> indices_for_range(const std::vector<wp_repack::ExpertGroup> & groups, int first, int last);
 void                add_counts(VerifyCounts & total, const VerifyCounts & value);
@@ -1504,6 +1762,14 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
 
     const wp_repack::SliceSpec               spec   = slicing_from_json(index, geom, groups);
     const std::vector<wp_repack::SliceRange> ranges = wp_repack::slice_ranges(spec.widths);
+    wp_repack::SliceRange                    output_range;
+    const bool                               split = split_slice_from_json(index, ranges, output_range);
+    std::vector<wp_repack::SliceRange>       verify_ranges;
+    if (split) {
+        verify_ranges.push_back(output_range);
+    } else {
+        verify_ranges = ranges;
+    }
 
     const std::vector<size_t> expected_indices = indices_for_range(groups, layer_first, layer_last);
     const json &              indexed_groups   = index.at("groups");
@@ -1514,7 +1780,7 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
 
     if (index.at("content_hash").at("algorithm").get<std::string>() != "sha256" ||
         index.at("content_hash").at("value").get<std::string>() !=
-            hash_groups_sliced(groups, expected_indices, geom, spec.widths)) {
+            hash_groups_sliced(groups, expected_indices, geom, spec.widths, split ? &output_range : nullptr)) {
         throw std::runtime_error("shard structural content hash mismatch");
     }
 
@@ -1543,7 +1809,7 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
         }
 
         const json & slices = actual.at("slices");
-        if (!slices.is_array() || slices.size() != ranges.size()) {
+        if (!slices.is_array() || slices.size() != verify_ranges.size()) {
             throw std::runtime_error("slice count mismatch for blk " + std::to_string(expected.block_idx) +
                                      " expert " + std::to_string(expected.expert_idx));
         }
@@ -1552,13 +1818,13 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
         // writer used, then compare it byte for byte with what is on disk. This
         // is what makes the down-column gather trustworthy: a wrong stride shows
         // up here rather than as quiet garbage at inference time.
-        build_group_slices(expected, variant, geom.n_embd, ranges, sources, scratch, expected_payload);
+        build_group_slices(expected, variant, geom.n_embd, verify_ranges, sources, scratch, expected_payload);
 
         const uint64_t group_offset = next_offset;
         uint64_t       cursor       = group_offset;
-        for (size_t s = 0; s < ranges.size(); ++s) {
+        for (size_t s = 0; s < verify_ranges.size(); ++s) {
             const json &                  slice_json  = slices.at(s);
-            const wp_repack::SliceRange & range       = ranges[s];
+            const wp_repack::SliceRange & range       = verify_ranges[s];
             const uint64_t                role_bytes[3] = {
                 variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
                 variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
@@ -1643,6 +1909,9 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
     }
 
     const wp_repack::SliceSpec spec = slicing_from_json(manifest, geom, groups);
+    const std::vector<wp_repack::SliceRange> ranges = wp_repack::slice_ranges(spec.widths);
+    wp_repack::SliceRange output_range;
+    const bool split = split_slice_from_json(manifest, ranges, output_range);
 
     VerifyCounts                  total;
     std::vector<size_t>           all_indices;
@@ -1668,8 +1937,15 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
             index.at("shard_count").get<uint64_t>() != shards.size() || index.at("layer_first").get<int>() != first ||
             index.at("layer_last").get<int>() != last || index.at("group_count") != shard.at("group_count") ||
             index.at("blob_bytes") != shard.at("blob_bytes") || index.at("blob_file") != shard.at("blob_file") ||
-            index.at("content_hash") != shard.at("content_hash")) {
+            index.at("content_hash") != shard.at("content_hash") ||
+            index.value("slice_output_split", false) != split) {
             throw std::runtime_error("manifest and shard index metadata disagree");
+        }
+        if (split && (index.at("slice_idx") != manifest.at("slice_idx") ||
+                      index.at("slice_ff_first") != manifest.at("slice_ff_first") ||
+                      index.at("slice_ff_last") != manifest.at("slice_ff_last") ||
+                      index.at("slice_width") != manifest.at("slice_width"))) {
+            throw std::runtime_error("manifest and shard index slice metadata disagree");
         }
         if (index.at("expert_slicing").at("widths").get<std::vector<int64_t>>() != spec.widths) {
             throw std::runtime_error("shard index slice widths disagree with the manifest");
@@ -1683,7 +1959,7 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
     }
     if (manifest.at("content_hash").at("algorithm").get<std::string>() != "sha256" ||
         manifest.at("content_hash").at("value").get<std::string>() !=
-            hash_groups_sliced(groups, all_indices, geom, spec.widths)) {
+            hash_groups_sliced(groups, all_indices, geom, spec.widths, split ? &output_range : nullptr)) {
         throw std::runtime_error("manifest structural content hash mismatch");
     }
     return total;
