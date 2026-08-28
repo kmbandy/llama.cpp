@@ -1727,8 +1727,21 @@ int detect_version(const json & value, const char * format) {
     return version;
 }
 
+// A set is SLICED because it carries expert_slicing, not because of its version
+// number. Combined v2 sets are version 2; canonical per-slice sets are version 1,
+// because that is the version the expert worker's load_catalog requires. Keying
+// "is this sliced?" off the version therefore routes a per-slice set to the v1
+// verifier, which hashes with hash_groups() instead of hash_groups_sliced() and
+// reports a structural hash mismatch on a store that is perfectly correct.
+bool is_sliced_metadata(const json & value) {
+    return value.contains("expert_slicing");
+}
+
 void require_sliced_format(const json & value, const char * format) {
-    if (value.value("format", "") != format || value.value("version", 0) != FORMAT_VERSION_SLICED) {
+    const int version = value.value("version", 0);
+    const bool version_ok = version == FORMAT_VERSION_SLICED ||
+                            (version == FORMAT_VERSION && is_sliced_metadata(value));
+    if (value.value("format", "") != format || !version_ok) {
         throw std::runtime_error("unsupported or invalid sliced repack metadata format");
     }
 }
@@ -1835,22 +1848,36 @@ wp_repack::SliceSpec slicing_from_json(const json &                             
 bool split_slice_from_json(const json &                              value,
                            const std::vector<wp_repack::SliceRange> & ranges,
                            wp_repack::SliceRange &                   output_range) {
-    if (!value.value("slice_output_split", false)) {
+    // A per-slice set is identified by expert_slicing.selected_slice, which is
+    // the canonical marker the expert worker also keys on. It replaced an
+    // ad-hoc set of top-level slice_* keys; those are still accepted so a store
+    // written before that change still verifies, but new metadata does not
+    // carry them and must not be required to.
+    int slice_idx = -1;
+    if (value.contains("expert_slicing") && value.at("expert_slicing").contains("selected_slice")) {
+        slice_idx = value.at("expert_slicing").at("selected_slice").get<int>();
+    } else if (value.value("slice_output_split", false)) {
+        if (!value.contains("slice_idx") || !value.contains("slice_ff_first") ||
+            !value.contains("slice_ff_last") || !value.contains("slice_width")) {
+            throw std::runtime_error("split sliced metadata is missing its slice range");
+        }
+        slice_idx = value.at("slice_idx").get<int>();
+    } else {
         return false;
     }
-    if (!value.contains("slice_idx") || !value.contains("slice_ff_first") || !value.contains("slice_ff_last") ||
-        !value.contains("slice_width")) {
-        throw std::runtime_error("split sliced metadata is missing its slice range");
-    }
-    const int slice_idx = value.at("slice_idx").get<int>();
     if (slice_idx < 0 || static_cast<size_t>(slice_idx) >= ranges.size()) {
         throw std::runtime_error("split sliced metadata has an invalid slice index");
     }
     output_range = ranges[slice_idx];
-    if (value.at("slice_ff_first").get<int64_t>() != output_range.first ||
-        value.at("slice_ff_last").get<int64_t>() != output_range.last ||
-        value.at("slice_width").get<int64_t>() != output_range.width()) {
-        throw std::runtime_error("split sliced metadata has an invalid slice range");
+    // Legacy metadata restated the range alongside the index; cross-check it
+    // when present. Canonical metadata derives the range from the widths and
+    // the selected slice, so there is nothing to disagree with.
+    if (value.contains("slice_ff_first")) {
+        if (value.at("slice_ff_first").get<int64_t>() != output_range.first ||
+            value.at("slice_ff_last").get<int64_t>() != output_range.last ||
+            value.at("slice_width").get<int64_t>() != output_range.width()) {
+            throw std::runtime_error("split sliced metadata has an invalid slice range");
+        }
     }
     return true;
 }
@@ -1892,7 +1919,15 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
     if (index.at("content_hash").at("algorithm").get<std::string>() != "sha256" ||
         index.at("content_hash").at("value").get<std::string>() !=
             hash_groups_sliced(groups, expected_indices, geom, spec.widths, split ? &output_range : nullptr)) {
-        throw std::runtime_error("shard structural content hash mismatch");
+        // Report both values: a bare "mismatch" here cost real time, because the
+        // interesting question is always WHICH of the two is wrong.
+        throw std::runtime_error(
+            "shard structural content hash mismatch: recorded=" +
+            index.at("content_hash").at("value").get<std::string>() + " recomputed=" +
+            hash_groups_sliced(groups, expected_indices, geom, spec.widths, split ? &output_range : nullptr) +
+            " split=" + std::to_string(split ? 1 : 0) +
+            " groups=" + std::to_string(expected_indices.size()) +
+            " slice=" + std::to_string(output_range.index));
     }
 
     const fs::path blob_path = index_path.parent_path() / index.at("blob_file").get<std::string>();
@@ -2048,15 +2083,19 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
             index.at("shard_count").get<uint64_t>() != shards.size() || index.at("layer_first").get<int>() != first ||
             index.at("layer_last").get<int>() != last || index.at("group_count") != shard.at("group_count") ||
             index.at("blob_bytes") != shard.at("blob_bytes") || index.at("blob_file") != shard.at("blob_file") ||
-            index.at("content_hash") != shard.at("content_hash") ||
-            index.value("slice_output_split", false) != split) {
+            index.at("content_hash") != shard.at("content_hash")) {
             throw std::runtime_error("manifest and shard index metadata disagree");
         }
-        if (split && (index.at("slice_idx") != manifest.at("slice_idx") ||
-                      index.at("slice_ff_first") != manifest.at("slice_ff_first") ||
-                      index.at("slice_ff_last") != manifest.at("slice_ff_last") ||
-                      index.at("slice_width") != manifest.at("slice_width"))) {
-            throw std::runtime_error("manifest and shard index slice metadata disagree");
+        // The index must describe the SAME slice the manifest does. Comparing
+        // the legacy slice_output_split flag would silently pass on canonical
+        // metadata, which does not carry it -- derive both sides instead.
+        wp_repack::SliceRange index_range;
+        const bool index_split = split_slice_from_json(index, ranges, index_range);
+        if (index_split != split ||
+            (split && (index_range.index != output_range.index ||
+                       index_range.first != output_range.first ||
+                       index_range.last  != output_range.last))) {
+            throw std::runtime_error("manifest and shard index describe different slices");
         }
         if (index.at("expert_slicing").at("widths").get<std::vector<int64_t>>() != spec.widths) {
             throw std::runtime_error("shard index slice widths disagree with the manifest");
@@ -2289,7 +2328,7 @@ void verify(const CliOptions & options) {
     const int    version = detect_version(root, is_index ? INDEX_FORMAT : MANIFEST_FORMAT);
     VerifyCounts counts;
 
-    if (version == FORMAT_VERSION_SLICED) {
+    if (version == FORMAT_VERSION_SLICED || is_sliced_metadata(root)) {
         const SliceGeometry geom = derive_slice_geometry(groups, model.geom);
         counts = is_index ? verify_index_sliced(target, root, groups, geom, sources)
                           : verify_manifest_sliced(target, root, groups, geom, sources);
