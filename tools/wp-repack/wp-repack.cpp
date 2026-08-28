@@ -192,7 +192,7 @@ void print_usage(const char * argv0) {
               << "                         in elements (\"1024,512,256,256\") or bandwidth ratios\n"
               << "                         (\"4:2:1:1\"), which are solved against the model's real\n"
               << "                         n_ff_exp. Enables format v2; v1 is unaffected.\n\n"
-              << "  --slice-output-split  with --expert-slices, write one self-contained v2\n"
+              << "  --slice-output-split  with --expert-slices, write one self-contained v1\n"
               << "                         blob/index/manifest set per slice\n\n"
               << "Existing output files are never overwritten.\n"
               << "\n"
@@ -252,12 +252,12 @@ void print_usage(const char * argv0) {
               << "  geometry variants with their group assignments -- enough for a consumer to\n"
               << "  validate per-layer byte sizes without the model.\n"
               << "\n"
-              << "FORMAT v2 split (--expert-slices --slice-output-split)\n"
+              << "FORMAT v1 split (--expert-slices --slice-output-split)\n"
               << "  BASE" << SLICED_BASE_SUFFIX << "-slice-NNNNN-experts-NNNNN-of-MMMMM.wpb\n"
               << "  BASE" << SLICED_BASE_SUFFIX << "-slice-NNNNN-experts-NNNNN-of-MMMMM.wpi.json\n"
               << "  BASE" << SLICED_BASE_SUFFIX << "-slice-NNNNN-experts-manifest.json\n"
-              << "  NNNNN is the zero-based slice index. Each set records slice_idx,\n"
-              << "  slice_ff_first, slice_ff_last, and slice_width at the top level.\n";
+              << "  NNNNN is the zero-based slice index. Each set uses the canonical\n"
+              << "  expert-slice manifest and flat per-slice index shape.\n";
 }
 
 uint64_t parse_bytes(const std::string & text) {
@@ -1230,7 +1230,6 @@ void repack_sliced_split(const CliOptions &                          options,
                          const ModelCatalog &                        model,
                          const std::vector<wp_repack::ExpertGroup> & groups,
                          const std::vector<wp_repack::ShardPlan> &   shards,
-                         const std::string &                         sharding_mode,
                          const fs::path &                            output_base,
                          const SliceGeometry &                       geom,
                          const wp_repack::SliceSpec &                spec,
@@ -1238,6 +1237,12 @@ void repack_sliced_split(const CliOptions &                          options,
                          std::vector<std::ifstream> &                sources) {
     const std::vector<size_t> selected = flatten_indices(shards);
     const size_t               slice_count = ranges.size();
+    int                         expert_first = INT_MAX;
+    int                         expert_last  = INT_MIN;
+    for (size_t group_index : selected) {
+        expert_first = std::min(expert_first, groups.at(group_index).expert_idx);
+        expert_last  = std::max(expert_last, groups.at(group_index).expert_idx);
+    }
     std::vector<fs::path>      slice_bases(slice_count);
     std::vector<SliceSplitShardOutput> outputs;
     outputs.reserve(slice_count * shards.size());
@@ -1258,21 +1263,17 @@ void repack_sliced_split(const CliOptions &                          options,
                 throw std::runtime_error("failed to create " + output.temp_blob.string());
             }
 
+            json expert_slicing = slicing_json(spec, geom, groups);
+            expert_slicing["selected_slice"] = ranges[s].index;
             output.index = {
                 { "format",              INDEX_FORMAT                                        },
-                { "version",             FORMAT_VERSION_SLICED                               },
+                { "version",             FORMAT_VERSION                                      },
                 { "blob_file",           output.paths.blob.filename().string()                 },
                 { "shard_index",         i                                                   },
                 { "shard_count",         shards.size()                                       },
                 { "layer_first",         shards[i].layer_first                               },
                 { "layer_last",          shards[i].layer_last                                },
                 { "group_count",         shards[i].group_indices.size()                      },
-                { "slice_output_split",  true                                                },
-                { "slice_idx",           ranges[s].index                                    },
-                { "slice_ff_first",      ranges[s].first                                    },
-                { "slice_ff_last",       ranges[s].last                                     },
-                { "slice_width",         ranges[s].width()                                   },
-                { "expert_slicing",      slicing_json(spec, geom, groups)                   },
                 { "blob_bytes",          0                                                   },
                 { "content_hash",
                  {
@@ -1283,6 +1284,7 @@ void repack_sliced_split(const CliOptions &                          options,
                 { "model_files",         model.files                                         },
                 { "groups",              json::array()                                       },
             };
+            output.index["expert_slicing"] = std::move(expert_slicing);
             outputs.push_back(std::move(output));
         }
     }
@@ -1319,25 +1321,20 @@ void repack_sliced_split(const CliOptions &                          options,
 
                 const uint64_t cursor = output.blob_offset;
                 json group_json = {
-                    { "block_idx",        group.block_idx                      },
-                    { "expert_idx",       group.expert_idx                     },
-                    { "geometry_variant", geom.group_variants[group_index]     },
-                    { "slices",            json::array({ {
-                           { "slice_idx", range.index                              },
-                           { "ff_first",  range.first                              },
-                           { "ff_last",   range.last                               },
-                           { "width",     range.width()                            },
-                           { "offset",    cursor                                   },
-                           { "bytes",     slice_bytes                              },
-                           { "members",   json::array({
-                                  slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range,
-                                                    cursor),
-                                  slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range,
-                                                    cursor + role_bytes_for_slice[0]),
-                                  slice_member_json(group, wp::ROLE_DOWN, "down", variant, geom.n_embd, range,
-                                                    cursor + role_bytes_for_slice[0] + role_bytes_for_slice[1]),
-                              })                                                    },
-                       } })                                                            },
+                    { "block_idx",    group.block_idx                      },
+                    { "expert_idx",   group.expert_idx                     },
+                    { "member_count", 3                                   },
+                    { "slice_idx",    range.index                         },
+                    { "ff_first",     range.first                         },
+                    { "ff_last",      range.last                          },
+                    { "width",        range.width()                       },
+                    { "members",      json::array({
+                           slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range, cursor),
+                           slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range,
+                                             cursor + role_bytes_for_slice[0]),
+                           slice_member_json(group, wp::ROLE_DOWN, "down", variant, geom.n_embd, range,
+                                             cursor + role_bytes_for_slice[0] + role_bytes_for_slice[1]),
+                       })                                                    },
                 };
 
                 output.blob->write(payload.data(), static_cast<std::streamsize>(payload.size()));
@@ -1351,21 +1348,22 @@ void repack_sliced_split(const CliOptions &                          options,
     }
 
     for (size_t s = 0; s < slice_count; ++s) {
+        json expert_slicing = slicing_json(spec, geom, groups);
+        expert_slicing["selected_slice"] = ranges[s].index;
         json manifest = {
             { "format",              MANIFEST_FORMAT                                 },
-            { "version",             FORMAT_VERSION_SLICED                           },
+            { "version",             FORMAT_VERSION                                   },
             { "input_model",         fs::canonical(fs::path(options.model)).string() },
             { "model_files",         model.files                                     },
-            { "sharding_mode",       sharding_mode                                   },
+            { "sharding_mode",       "expert-slice"                                  },
+            { "retained_expert_range",
+             {
+                  { "first", expert_first },
+                  { "last",  expert_last  },
+              }                                                                    },
             { "total_group_count",   selected.size()                                 },
             { "total_blob_bytes",    0                                               },
             { "shard_count",         shards.size()                                   },
-            { "slice_output_split",  true                                            },
-            { "slice_idx",           ranges[s].index                                },
-            { "slice_ff_first",      ranges[s].first                                },
-            { "slice_ff_last",       ranges[s].last                                 },
-            { "slice_width",         ranges[s].width()                              },
-            { "expert_slicing",      slicing_json(spec, geom, groups)               },
             { "content_hash",
              {
                   { "algorithm", "sha256" },
@@ -1373,6 +1371,7 @@ void repack_sliced_split(const CliOptions &                          options,
               }                                                                        },
             { "shards",              json::array()                                   },
         };
+        manifest["expert_slicing"] = std::move(expert_slicing);
 
         uint64_t total_bytes = 0;
         for (size_t i = 0; i < shards.size(); ++i) {
@@ -1427,7 +1426,7 @@ void repack_sliced(const CliOptions &                          options,
     const std::vector<size_t> selected = flatten_indices(shards);
 
     if (options.slice_output_split) {
-        repack_sliced_split(options, model, groups, shards, sharding_mode, output_base, geom, spec, ranges, sources);
+        repack_sliced_split(options, model, groups, shards, output_base, geom, spec, ranges, sources);
         return;
     }
 
