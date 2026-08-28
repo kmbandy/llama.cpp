@@ -15,6 +15,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "wp-gemm.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1252,6 +1253,33 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+    // Multi-column CPU GEMM (WP_CPU_GEMM=1). Mainline's vec_dot produces ONE
+    // output element per call, so the row-only work -- super-block scale decode
+    // and nibble/high-bit unpacking -- is repeated for every column. Measured
+    // on a 3900X at the qwen38-next expert geometry, per-token cost was flat in
+    // the column count (q5_1 amortized at exactly 1.00x). These kernels hoist
+    // that work out of the column loop; they are bit-exact against vec_dot, not
+    // merely within tolerance. Restricted to the plain 2-D contiguous case --
+    // no broadcast, no mmla row pairing -- which is what the expert FFN emits.
+    if (wp_gemm_enabled() && num_rows_per_vec_dot == 1 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            nb0 == sizeof(float) && (src1_cont || src1->type != vec_dot_type)) {
+        const char * A = (const char *) src0->data + ir0_start * nb01;
+        const char * B = (const char *) wdata      + ir1_start * row_size;
+        float      * C = (float *) ((char *) dst->data + ir1_start * nb1) + ir0_start;
+        const int    nx = (int) (ir0_end - ir0_start);
+        const int    ny = (int) (ir1_end - ir1_start);
+        bool done = false;
+        if (type == GGML_TYPE_Q4_K && vec_dot_type == GGML_TYPE_Q8_K) {
+            done = wp_gemm_q4K_q8K((int) ne00, nx, ny, A, nb01, B, row_size, C, nb1 / sizeof(float));
+        } else if (type == GGML_TYPE_Q5_1 && vec_dot_type == GGML_TYPE_Q8_1) {
+            done = wp_gemm_q5_1_q8_1((int) ne00, nx, ny, A, nb01, B, row_size, C, nb1 / sizeof(float));
+        }
+        if (done) {
+            return;
+        }
+    }
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
