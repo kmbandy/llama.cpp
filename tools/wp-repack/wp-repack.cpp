@@ -82,6 +82,7 @@ struct ModelCatalog {
 
 struct CliOptions {
     bool                               verify          = false;
+    bool                               manifest_only   = false;
     bool                               allow_partial   = false;
     bool                               slice_output_split = false;
     uint64_t                           max_shard_bytes = 0;
@@ -185,6 +186,7 @@ void print_usage(const char * argv0) {
               << "                         must cover every expert layer unless --allow-partial\n"
               << "  --allow-partial        permit --layer-ranges that omit layers (subset repack)\n"
               << "  --verify               compare indexes and blob bytes with MODEL\n"
+              << "  --manifest-only       write manifest and indexes without emitting blob files\n"
               << "  -h, --help             show this help\n\n"
               << "expert slicing (format v2):\n"
               << "  --expert-slices SPEC   also split every expert across N slices of the FFN\n"
@@ -308,6 +310,8 @@ CliOptions parse_cli(int argc, char ** argv) {
             std::exit(0);
         } else if (arg == "--verify") {
             options.verify = true;
+        } else if (arg == "--manifest-only") {
+            options.manifest_only = true;
         } else if (arg == "--allow-partial") {
             options.allow_partial = true;
         } else if (arg == "--shard-by-layer") {
@@ -349,6 +353,9 @@ CliOptions parse_cli(int argc, char ** argv) {
     }
     if (options.verify && sharding_modes != 0) {
         throw std::invalid_argument("sharding options are not valid with --verify");
+    }
+    if (options.manifest_only && options.verify) {
+        throw std::invalid_argument("--manifest-only cannot be combined with --verify");
     }
     if (options.verify && options.sliced) {
         // --verify reads the format version out of the metadata it is handed, so
@@ -573,11 +580,15 @@ fs::path manifest_path(const fs::path & output_base) {
     return fs::path(output_base.string() + "-experts-manifest.json");
 }
 
-void ensure_outputs_absent(const fs::path & output_base, const std::vector<wp_repack::ShardPlan> & shards) {
+void ensure_outputs_absent(const fs::path &                              output_base,
+                           const std::vector<wp_repack::ShardPlan> &    shards,
+                           bool                                         include_blobs = true) {
     std::vector<fs::path> paths{ manifest_path(output_base) };
     for (size_t i = 0; i < shards.size(); ++i) {
         const ShardPaths names = shard_paths(output_base, i, shards.size());
-        paths.push_back(names.blob);
+        if (include_blobs) {
+            paths.push_back(names.blob);
+        }
         paths.push_back(names.index);
     }
     for (const fs::path & path : paths) {
@@ -627,20 +638,13 @@ void copy_member(std::ifstream &     source,
     }
 }
 
-json write_shard(const fs::path &                            output_base,
-                 size_t                                      shard_index,
-                 size_t                                      shard_count,
-                 const wp_repack::ShardPlan &                shard,
-                 const std::vector<wp_repack::ExpertGroup> & groups,
-                 const std::vector<std::string> &            model_files,
-                 std::vector<std::ifstream> &                sources) {
+json build_shard_index(const fs::path &                            output_base,
+                       size_t                                      shard_index,
+                       size_t                                      shard_count,
+                       const wp_repack::ShardPlan &                shard,
+                       const std::vector<wp_repack::ExpertGroup> & groups,
+                       const std::vector<std::string> &            model_files) {
     const ShardPaths paths = shard_paths(output_base, shard_index, shard_count);
-    const fs::path   temp_blob(paths.blob.string() + ".tmp");
-    std::ofstream    blob(temp_blob, std::ios::binary);
-    if (!blob) {
-        throw std::runtime_error("failed to create " + temp_blob.string());
-    }
-
     json index = {
         { "format",       INDEX_FORMAT                   },
         { "version",      FORMAT_VERSION                 },
@@ -660,8 +664,7 @@ json write_shard(const fs::path &                            output_base,
         { "groups",       json::array()                  },
     };
 
-    uint64_t          blob_offset = 0;
-    std::vector<char> buffer(COPY_BUFFER_SIZE);
+    uint64_t blob_offset = 0;
     for (size_t group_index : shard.group_indices) {
         const wp_repack::ExpertGroup & group      = groups.at(group_index);
         json                           group_json = {
@@ -672,7 +675,7 @@ json write_shard(const fs::path &                            output_base,
         };
 
         for (const wp_repack::ExpertMember & member : group.members) {
-            if (member.file_idx >= sources.size()) {
+            if (member.file_idx >= model_files.size()) {
                 throw std::runtime_error("catalog source file index is out of range");
             }
             group_json["members"].push_back({
@@ -684,32 +687,73 @@ json write_shard(const fs::path &                            output_base,
                 { "source_file_idx",    member.file_idx           },
                 { "source_file_offset", member.file_offset        },
             });
-            copy_member(sources[member.file_idx], member.file_offset, member.size, blob, buffer);
             blob_offset += member.size;
         }
         index["groups"].push_back(std::move(group_json));
     }
 
-    blob.close();
-    if (!blob) {
-        throw std::runtime_error("failed to finish " + temp_blob.string());
-    }
     if (blob_offset != shard.size) {
         throw std::runtime_error("internal shard byte count mismatch");
     }
-    fs::rename(temp_blob, paths.blob);
-    write_json(paths.index, index);
+    return index;
+}
 
+json shard_manifest_entry(const ShardPaths & paths, const json & index) {
     return {
         { "blob_file",    paths.blob.filename().string()  },
         { "index_file",   paths.index.filename().string() },
-        { "shard_index",  shard_index                     },
-        { "layer_first",  shard.layer_first               },
-        { "layer_last",   shard.layer_last                },
-        { "group_count",  shard.group_indices.size()      },
-        { "blob_bytes",   shard.size                      },
-        { "content_hash", index["content_hash"]           },
+        { "shard_index",  index["shard_index"]             },
+        { "layer_first",  index["layer_first"]             },
+        { "layer_last",   index["layer_last"]              },
+        { "group_count",  index["group_count"]             },
+        { "blob_bytes",   index["blob_bytes"]              },
+        { "content_hash", index["content_hash"]            },
     };
+}
+
+json write_shard(const fs::path &                            output_base,
+                 size_t                                      shard_index,
+                 size_t                                      shard_count,
+                 const wp_repack::ShardPlan &                shard,
+                 const std::vector<wp_repack::ExpertGroup> & groups,
+                 const std::vector<std::string> &            model_files,
+                 std::vector<std::ifstream> &                sources,
+                 bool                                        manifest_only) {
+    const ShardPaths paths = shard_paths(output_base, shard_index, shard_count);
+    const json        index = build_shard_index(output_base, shard_index, shard_count, shard, groups, model_files);
+
+    if (!manifest_only) {
+        const fs::path temp_blob(paths.blob.string() + ".tmp");
+        std::ofstream  blob(temp_blob, std::ios::binary);
+        if (!blob) {
+            throw std::runtime_error("failed to create " + temp_blob.string());
+        }
+
+        uint64_t          blob_offset = 0;
+        std::vector<char> buffer(COPY_BUFFER_SIZE);
+        for (size_t group_index : shard.group_indices) {
+            const wp_repack::ExpertGroup & group = groups.at(group_index);
+            for (const wp_repack::ExpertMember & member : group.members) {
+                if (member.file_idx >= sources.size()) {
+                    throw std::runtime_error("catalog source file index is out of range");
+                }
+                copy_member(sources[member.file_idx], member.file_offset, member.size, blob, buffer);
+                blob_offset += member.size;
+            }
+        }
+
+        blob.close();
+        if (!blob) {
+            throw std::runtime_error("failed to finish " + temp_blob.string());
+        }
+        if (blob_offset != shard.size || fs::file_size(temp_blob) != shard.size) {
+            throw std::runtime_error("internal shard byte count mismatch");
+        }
+        fs::rename(temp_blob, paths.blob);
+    }
+    write_json(paths.index, index);
+
+    return shard_manifest_entry(paths, index);
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1146,7 @@ json slicing_json(const wp_repack::SliceSpec &                         spec,
     return out;
 }
 
-json write_shard_sliced(const fs::path &                            output_base,
+json build_sliced_index(const fs::path &                            output_base,
                         size_t                                      shard_index,
                         size_t                                      shard_count,
                         const wp_repack::ShardPlan &                shard,
@@ -1110,16 +1154,9 @@ json write_shard_sliced(const fs::path &                            output_base,
                         const std::vector<std::string> &            model_files,
                         const SliceGeometry &                       geom,
                         const wp_repack::SliceSpec &                spec,
-                        const std::vector<wp_repack::SliceRange> &  ranges,
-                        std::vector<std::ifstream> &                sources) {
+                        const std::vector<wp_repack::SliceRange> &  ranges) {
     const std::vector<int64_t> & widths = spec.widths;
     const ShardPaths paths = shard_paths(output_base, shard_index, shard_count);
-    const fs::path   temp_blob(paths.blob.string() + ".tmp");
-    std::ofstream    blob(temp_blob, std::ios::binary);
-    if (!blob) {
-        throw std::runtime_error("failed to create " + temp_blob.string());
-    }
-
     json index = {
         { "format",       INDEX_FORMAT                                        },
         { "version",      FORMAT_VERSION_SLICED                               },
@@ -1140,13 +1177,10 @@ json write_shard_sliced(const fs::path &                            output_base,
         { "groups",       json::array()                                       },
     };
 
-    uint64_t          blob_offset = 0;
-    std::vector<char> scratch;
-    std::vector<char> payload;
+    uint64_t blob_offset = 0;
     for (size_t group_index : shard.group_indices) {
         const wp_repack::ExpertGroup & group = groups.at(group_index);
         const SliceGeometryVariant & variant = geom.variant_for_group(group_index);
-        build_group_slices(group, variant, geom.n_embd, ranges, sources, scratch, payload);
 
         json group_json = {
             { "block_idx",        group.block_idx       },
@@ -1179,43 +1213,78 @@ json write_shard_sliced(const fs::path &                            output_base,
             });
             cursor += slice_bytes;
         }
-        if (cursor - blob_offset != payload.size()) {
-            throw std::runtime_error("internal group payload size mismatch");
-        }
-
-        blob.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-        if (!blob) {
-            throw std::runtime_error("failed to write sliced expert blob");
-        }
         blob_offset = cursor;
         index["groups"].push_back(std::move(group_json));
     }
 
-    index["blob_bytes"] = blob_offset;
-
-    blob.close();
-    if (!blob) {
-        throw std::runtime_error("failed to finish " + temp_blob.string());
-    }
     // Slicing reorders bytes but never adds or drops any, so the sliced set must
     // weigh exactly what the v1 set would have.
     if (blob_offset != shard.size) {
         throw std::runtime_error("sliced blob byte count " + std::to_string(blob_offset) +
                                  " does not match the unsliced expert bytes " + std::to_string(shard.size));
     }
-    fs::rename(temp_blob, paths.blob);
+    index["blob_bytes"] = blob_offset;
+    return index;
+}
+
+json write_shard_sliced(const fs::path &                            output_base,
+                        size_t                                      shard_index,
+                        size_t                                      shard_count,
+                        const wp_repack::ShardPlan &                shard,
+                        const std::vector<wp_repack::ExpertGroup> & groups,
+                        const std::vector<std::string> &            model_files,
+                        const SliceGeometry &                       geom,
+                        const wp_repack::SliceSpec &                spec,
+                        const std::vector<wp_repack::SliceRange> &  ranges,
+                        std::vector<std::ifstream> &                sources,
+                        bool                                        manifest_only) {
+    const ShardPaths paths = shard_paths(output_base, shard_index, shard_count);
+    const json        index = build_sliced_index(output_base, shard_index, shard_count, shard, groups, model_files,
+                                                 geom, spec, ranges);
+
+    if (!manifest_only) {
+        const fs::path temp_blob(paths.blob.string() + ".tmp");
+        std::ofstream  blob(temp_blob, std::ios::binary);
+        if (!blob) {
+            throw std::runtime_error("failed to create " + temp_blob.string());
+        }
+
+        uint64_t          blob_offset = 0;
+        std::vector<char> scratch;
+        std::vector<char> payload;
+        for (size_t group_position = 0; group_position < shard.group_indices.size(); ++group_position) {
+            const size_t                    group_index = shard.group_indices[group_position];
+            const wp_repack::ExpertGroup &  group = groups.at(group_index);
+            const SliceGeometryVariant &    variant = geom.variant_for_group(group_index);
+            build_group_slices(group, variant, geom.n_embd, ranges, sources, scratch, payload);
+
+            const json & group_json = index["groups"].at(group_position);
+            const json & last_slice = group_json["slices"].back();
+            const uint64_t expected_offset = group_json["slices"].front()["offset"].get<uint64_t>();
+            const uint64_t expected_end = last_slice["offset"].get<uint64_t>() + last_slice["bytes"].get<uint64_t>();
+            if (expected_offset != blob_offset || expected_end - blob_offset != payload.size()) {
+                throw std::runtime_error("internal group payload size mismatch");
+            }
+
+            blob.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+            if (!blob) {
+                throw std::runtime_error("failed to write sliced expert blob");
+            }
+            blob_offset = expected_end;
+        }
+
+        blob.close();
+        if (!blob) {
+            throw std::runtime_error("failed to finish " + temp_blob.string());
+        }
+        if (blob_offset != index["blob_bytes"].get<uint64_t>() || fs::file_size(temp_blob) != index["blob_bytes"].get<uint64_t>()) {
+            throw std::runtime_error("internal sliced shard byte count mismatch");
+        }
+        fs::rename(temp_blob, paths.blob);
+    }
     write_json(paths.index, index);
 
-    return {
-        { "blob_file",    paths.blob.filename().string()  },
-        { "index_file",   paths.index.filename().string() },
-        { "shard_index",  shard_index                     },
-        { "layer_first",  shard.layer_first               },
-        { "layer_last",   shard.layer_last                },
-        { "group_count",  shard.group_indices.size()      },
-        { "blob_bytes",   blob_offset                     },
-        { "content_hash", index["content_hash"]           },
-    };
+    return shard_manifest_entry(paths, index);
 }
 
 struct SliceSplitShardOutput {
@@ -1225,6 +1294,72 @@ struct SliceSplitShardOutput {
     json                        index;
     uint64_t                    blob_offset = 0;
 };
+
+json build_split_index(const fs::path &                            output_base,
+                       size_t                                      shard_index,
+                       size_t                                      shard_count,
+                       const wp_repack::ShardPlan &                shard,
+                       const std::vector<wp_repack::ExpertGroup> & groups,
+                       const std::vector<std::string> &            model_files,
+                       const SliceGeometry &                       geom,
+                       const wp_repack::SliceSpec &                spec,
+                       const wp_repack::SliceRange &                range) {
+    const ShardPaths paths = shard_paths(output_base, shard_index, shard_count);
+    json              expert_slicing = slicing_json(spec, geom, groups);
+    expert_slicing["selected_slice"] = range.index;
+    json index = {
+        { "format",              INDEX_FORMAT                                        },
+        { "version",             FORMAT_VERSION                                      },
+        { "blob_file",           paths.blob.filename().string()                      },
+        { "shard_index",         shard_index                                         },
+        { "shard_count",         shard_count                                         },
+        { "layer_first",         shard.layer_first                                   },
+        { "layer_last",          shard.layer_last                                    },
+        { "group_count",         shard.group_indices.size()                          },
+        { "blob_bytes",          0                                                    },
+        { "content_hash",
+         {
+              { "algorithm", "sha256" },
+              { "value", hash_groups_sliced(groups, shard.group_indices, geom, spec.widths, &range) },
+          }                                                                          },
+        { "model_files",         model_files                                         },
+        { "groups",              json::array()                                       },
+    };
+    index["expert_slicing"] = std::move(expert_slicing);
+
+    uint64_t blob_offset = 0;
+    for (size_t group_index : shard.group_indices) {
+        const wp_repack::ExpertGroup & group = groups.at(group_index);
+        const SliceGeometryVariant & variant = geom.variant_for_group(group_index);
+        const uint64_t role_bytes[3] = {
+            variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
+            variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
+            variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
+        };
+        const uint64_t slice_bytes = role_bytes[0] + role_bytes[1] + role_bytes[2];
+
+        index["groups"].push_back({
+            { "block_idx",    group.block_idx                      },
+            { "expert_idx",   group.expert_idx                     },
+            { "member_count", 3                                   },
+            { "slice_idx",    range.index                         },
+            { "ff_first",     range.first                         },
+            { "ff_last",      range.last                          },
+            { "width",        range.width()                       },
+            { "members",      json::array({
+                   slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range, blob_offset),
+                   slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range,
+                                     blob_offset + role_bytes[0]),
+                   slice_member_json(group, wp::ROLE_DOWN, "down", variant, geom.n_embd, range,
+                                     blob_offset + role_bytes[0] + role_bytes[1]),
+               })                                                    },
+        });
+        blob_offset += slice_bytes;
+    }
+
+    index["blob_bytes"] = blob_offset;
+    return index;
+}
 
 void repack_sliced_split(const CliOptions &                          options,
                          const ModelCatalog &                        model,
@@ -1252,97 +1387,67 @@ void repack_sliced_split(const CliOptions &                          options,
         if (!slice_bases[s].parent_path().empty()) {
             fs::create_directories(slice_bases[s].parent_path());
         }
-        ensure_outputs_absent(slice_bases[s], shards);
+        ensure_outputs_absent(slice_bases[s], shards, !options.manifest_only);
 
         for (size_t i = 0; i < shards.size(); ++i) {
             SliceSplitShardOutput output;
             output.paths = shard_paths(slice_bases[s], i, shards.size());
             output.temp_blob = fs::path(output.paths.blob.string() + ".tmp");
-            output.blob = std::make_unique<std::ofstream>(output.temp_blob, std::ios::binary);
-            if (!*output.blob) {
-                throw std::runtime_error("failed to create " + output.temp_blob.string());
+            output.index = build_split_index(slice_bases[s], i, shards.size(), shards[i], groups, model.files, geom,
+                                             spec, ranges[s]);
+            if (!options.manifest_only) {
+                output.blob = std::make_unique<std::ofstream>(output.temp_blob, std::ios::binary);
+                if (!*output.blob) {
+                    throw std::runtime_error("failed to create " + output.temp_blob.string());
+                }
             }
-
-            json expert_slicing = slicing_json(spec, geom, groups);
-            expert_slicing["selected_slice"] = ranges[s].index;
-            output.index = {
-                { "format",              INDEX_FORMAT                                        },
-                { "version",             FORMAT_VERSION                                      },
-                { "blob_file",           output.paths.blob.filename().string()                 },
-                { "shard_index",         i                                                   },
-                { "shard_count",         shards.size()                                       },
-                { "layer_first",         shards[i].layer_first                               },
-                { "layer_last",          shards[i].layer_last                                },
-                { "group_count",         shards[i].group_indices.size()                      },
-                { "blob_bytes",          0                                                   },
-                { "content_hash",
-                 {
-                      { "algorithm", "sha256" },
-                      { "value", hash_groups_sliced(groups, shards[i].group_indices, geom, spec.widths,
-                                                     &ranges[s]) },
-                  }                                                                  },
-                { "model_files",         model.files                                         },
-                { "groups",              json::array()                                       },
-            };
-            output.index["expert_slicing"] = std::move(expert_slicing);
             outputs.push_back(std::move(output));
         }
     }
 
-    std::vector<char>                  scratch;
-    std::vector<char>                  payload;
-    std::vector<std::vector<char>>     role_bytes;
-    const uint8_t                      role_masks[3] = { wp::ROLE_UP, wp::ROLE_GATE, wp::ROLE_DOWN };
+    if (!options.manifest_only) {
+        std::vector<char>              scratch;
+        std::vector<char>              payload;
+        std::vector<std::vector<char>> role_bytes;
+        const uint8_t                  role_masks[3] = { wp::ROLE_UP, wp::ROLE_GATE, wp::ROLE_DOWN };
 
-    for (size_t i = 0; i < shards.size(); ++i) {
-        for (size_t group_index : shards[i].group_indices) {
-            const wp_repack::ExpertGroup & group = groups.at(group_index);
-            const SliceGeometryVariant & variant = geom.variant_for_group(group_index);
-            read_group_roles(group, sources, scratch, role_bytes);
+        for (size_t i = 0; i < shards.size(); ++i) {
+            for (size_t group_position = 0; group_position < shards[i].group_indices.size(); ++group_position) {
+                const size_t                   group_index = shards[i].group_indices[group_position];
+                const wp_repack::ExpertGroup & group = groups.at(group_index);
+                const SliceGeometryVariant &   variant = geom.variant_for_group(group_index);
+                read_group_roles(group, sources, scratch, role_bytes);
 
-            for (size_t s = 0; s < slice_count; ++s) {
-                SliceSplitShardOutput & output = outputs[s * shards.size() + i];
-                const wp_repack::SliceRange & range = ranges[s];
-                const uint64_t role_bytes_for_slice[3] = {
-                    variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
-                    variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
-                    variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
-                };
-                const uint64_t slice_bytes = role_bytes_for_slice[0] + role_bytes_for_slice[1] +
-                                              role_bytes_for_slice[2];
+                for (size_t s = 0; s < slice_count; ++s) {
+                    SliceSplitShardOutput & output = outputs[s * shards.size() + i];
+                    const wp_repack::SliceRange & range = ranges[s];
+                    const uint64_t role_bytes_for_slice[3] = {
+                        variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
+                        variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
+                        variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
+                    };
+                    const uint64_t slice_bytes = role_bytes_for_slice[0] + role_bytes_for_slice[1] +
+                                                  role_bytes_for_slice[2];
 
-                payload.clear();
-                for (size_t r = 0; r < 3; ++r) {
-                    append_role_slice(role_masks[r], role_bytes[r], variant, geom.n_embd, range, payload);
+                    payload.clear();
+                    for (size_t r = 0; r < 3; ++r) {
+                        append_role_slice(role_masks[r], role_bytes[r], variant, geom.n_embd, range, payload);
+                    }
+                    if (payload.size() != slice_bytes) {
+                        throw std::runtime_error("internal split slice payload size mismatch");
+                    }
+
+                    const json & group_json = output.index["groups"].at(group_position);
+                    const uint64_t expected_offset = group_json["members"].front()["offset"].get<uint64_t>();
+                    if (expected_offset != output.blob_offset) {
+                        throw std::runtime_error("internal split slice offset mismatch");
+                    }
+                    output.blob->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                    if (!*output.blob) {
+                        throw std::runtime_error("failed to write split sliced expert blob");
+                    }
+                    output.blob_offset += slice_bytes;
                 }
-                if (payload.size() != slice_bytes) {
-                    throw std::runtime_error("internal split slice payload size mismatch");
-                }
-
-                const uint64_t cursor = output.blob_offset;
-                json group_json = {
-                    { "block_idx",    group.block_idx                      },
-                    { "expert_idx",   group.expert_idx                     },
-                    { "member_count", 3                                   },
-                    { "slice_idx",    range.index                         },
-                    { "ff_first",     range.first                         },
-                    { "ff_last",      range.last                          },
-                    { "width",        range.width()                       },
-                    { "members",      json::array({
-                           slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range, cursor),
-                           slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range,
-                                             cursor + role_bytes_for_slice[0]),
-                           slice_member_json(group, wp::ROLE_DOWN, "down", variant, geom.n_embd, range,
-                                             cursor + role_bytes_for_slice[0] + role_bytes_for_slice[1]),
-                       })                                                    },
-                };
-
-                output.blob->write(payload.data(), static_cast<std::streamsize>(payload.size()));
-                if (!*output.blob) {
-                    throw std::runtime_error("failed to write split sliced expert blob");
-                }
-                output.blob_offset += slice_bytes;
-                output.index["groups"].push_back(std::move(group_json));
             }
         }
     }
@@ -1376,12 +1481,17 @@ void repack_sliced_split(const CliOptions &                          options,
         uint64_t total_bytes = 0;
         for (size_t i = 0; i < shards.size(); ++i) {
             SliceSplitShardOutput & output = outputs[s * shards.size() + i];
-            output.index["blob_bytes"] = output.blob_offset;
-            output.blob->close();
-            if (!*output.blob) {
-                throw std::runtime_error("failed to finish " + output.temp_blob.string());
+            if (!options.manifest_only) {
+                output.blob->close();
+                if (!*output.blob) {
+                    throw std::runtime_error("failed to finish " + output.temp_blob.string());
+                }
+                if (output.blob_offset != output.index["blob_bytes"].get<uint64_t>() ||
+                    fs::file_size(output.temp_blob) != output.index["blob_bytes"].get<uint64_t>()) {
+                    throw std::runtime_error("internal split sliced shard byte count mismatch");
+                }
+                fs::rename(output.temp_blob, output.paths.blob);
             }
-            fs::rename(output.temp_blob, output.paths.blob);
             write_json(output.paths.index, output.index);
 
             manifest["shards"].push_back({
@@ -1391,10 +1501,10 @@ void repack_sliced_split(const CliOptions &                          options,
                 { "layer_first",  shards[i].layer_first                },
                 { "layer_last",   shards[i].layer_last                 },
                 { "group_count",  shards[i].group_indices.size()       },
-                { "blob_bytes",   output.blob_offset                    },
+                { "blob_bytes",   output.index["blob_bytes"]             },
                 { "content_hash", output.index["content_hash"]          },
             });
-            total_bytes += output.blob_offset;
+            total_bytes += output.index["blob_bytes"].get<uint64_t>();
         }
 
         manifest["total_blob_bytes"] = total_bytes;
@@ -1430,7 +1540,7 @@ void repack_sliced(const CliOptions &                          options,
         return;
     }
 
-    ensure_outputs_absent(output_base, shards);
+    ensure_outputs_absent(output_base, shards, !options.manifest_only);
 
     json                      manifest = {
         { "format",            MANIFEST_FORMAT                                 },
@@ -1475,7 +1585,7 @@ void repack_sliced(const CliOptions &                          options,
                   << "-" << shards[i].layer_last << " groups " << shards[i].group_indices.size() << " bytes "
                   << shards[i].size << '\n';
         manifest["shards"].push_back(write_shard_sliced(output_base, i, shards.size(), shards[i], groups, model.files,
-                                                        geom, spec, ranges, sources));
+                                                        geom, spec, ranges, sources, options.manifest_only));
         total_bytes += shards[i].size;
     }
     manifest["total_blob_bytes"] = total_bytes;
@@ -1528,11 +1638,13 @@ void repack(const CliOptions & options) {
     }
 
     std::vector<std::ifstream> sources;
-    sources.reserve(model.files.size());
-    for (const std::string & path : model.files) {
-        sources.emplace_back(path, std::ios::binary);
-        if (!sources.back()) {
-            throw std::runtime_error("failed to open source model file: " + path);
+    if (!options.manifest_only) {
+        sources.reserve(model.files.size());
+        for (const std::string & path : model.files) {
+            sources.emplace_back(path, std::ios::binary);
+            if (!sources.back()) {
+                throw std::runtime_error("failed to open source model file: " + path);
+            }
         }
     }
 
@@ -1548,7 +1660,7 @@ void repack(const CliOptions & options) {
     if (!output_base.parent_path().empty()) {
         fs::create_directories(output_base.parent_path());
     }
-    ensure_outputs_absent(output_base, shards);
+    ensure_outputs_absent(output_base, shards, !options.manifest_only);
 
     const std::vector<size_t> selected = flatten_indices(shards);
     json                      manifest = {
@@ -1574,7 +1686,7 @@ void repack(const CliOptions & options) {
                   << shards[i].layer_last << " groups " << shards[i].group_indices.size() << " bytes " << shards[i].size
                   << '\n';
         manifest["shards"].push_back(
-            write_shard(output_base, i, shards.size(), shards[i], groups, model.files, sources));
+            write_shard(output_base, i, shards.size(), shards[i], groups, model.files, sources, options.manifest_only));
         total_bytes += shards[i].size;
     }
     manifest["total_blob_bytes"] = total_bytes;
