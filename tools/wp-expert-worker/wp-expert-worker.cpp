@@ -210,6 +210,174 @@ static bool read_direct_from_env() {
     return env != nullptr && std::strcmp(env, "1") == 0;
 }
 
+static size_t read_workers_from_env() {
+    const char * env = std::getenv("WP_EXPERT_READ_WORKERS");
+    const long parsed =
+        (env != nullptr && env[0] != '\0') ? std::strtol(env, nullptr, 10) : 0;
+    return parsed > 0 ? (size_t) parsed : (size_t) 4;
+}
+
+// WP_READ_STATS_INTERVAL_MS controls the live read-counter dump. Default 5000;
+// zero disables read timing and counters.
+static uint64_t read_stats_interval_ms_from_env() {
+    static constexpr uint64_t default_interval_ms = 5000;
+    const char * env = std::getenv("WP_READ_STATS_INTERVAL_MS");
+    if (env == nullptr || env[0] == '\0') {
+        return default_interval_ms;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' ||
+            parsed > std::numeric_limits<uint64_t>::max() / 1000000ull) {
+        return default_interval_ms;
+    }
+    return (uint64_t) parsed;
+}
+
+static std::atomic<bool> g_read_direct_fallback{false};
+
+class ReadPathStats {
+public:
+    ReadPathStats() :
+        interval_ms_(read_stats_interval_ms_from_env()),
+        interval_ns_(interval_ms_ * 1000000ull),
+        next_report_ns_(interval_ns_ == 0 ? std::numeric_limits<uint64_t>::max() :
+                                             read_now_ns()) {
+        for (auto & bucket : latency_buckets_) {
+            bucket.store(0, std::memory_order_relaxed);
+        }
+    }
+
+    bool enabled() const {
+        return interval_ns_ != 0;
+    }
+
+    uint64_t interval_ms() const {
+        return interval_ms_;
+    }
+
+    void record(size_t bytes, uint64_t ns, uint64_t started_ns, uint64_t finished_ns) {
+        if (!enabled()) {
+            return;
+        }
+        bytes_.fetch_add((uint64_t) bytes, std::memory_order_relaxed);
+        ns_.fetch_add(ns, std::memory_order_relaxed);
+        update_min(first_read_ns_, started_ns);
+        update_max(last_read_ns_, finished_ns);
+        update_min(min_ns_, ns);
+        update_max(max_ns_, ns);
+        latency_buckets_[latency_bucket(ns)].fetch_add(1, std::memory_order_relaxed);
+        n_reads_.fetch_add(1, std::memory_order_relaxed);
+        maybe_report();
+    }
+
+private:
+    static constexpr size_t latency_bucket_count = 64;
+
+    using clock = std::chrono::steady_clock;
+
+    static uint64_t read_now_ns() {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock::now().time_since_epoch()).count();
+    }
+
+    static size_t latency_bucket(uint64_t ns) {
+        size_t bucket = 0;
+        while (ns > 1 && bucket + 1 < latency_bucket_count) {
+            ns >>= 1;
+            ++bucket;
+        }
+        return bucket;
+    }
+
+    static void update_min(std::atomic<uint64_t> & value, uint64_t candidate) {
+        uint64_t current = value.load(std::memory_order_relaxed);
+        while (candidate < current &&
+               !value.compare_exchange_weak(
+                   current, candidate, std::memory_order_relaxed)) {
+        }
+    }
+
+    static void update_max(std::atomic<uint64_t> & value, uint64_t candidate) {
+        uint64_t current = value.load(std::memory_order_relaxed);
+        while (candidate > current &&
+               !value.compare_exchange_weak(
+                   current, candidate, std::memory_order_relaxed)) {
+        }
+    }
+
+    uint64_t percentile_ns(uint64_t rank) const {
+        uint64_t seen = 0;
+        for (size_t i = 0; i < latency_bucket_count; ++i) {
+            seen += latency_buckets_[i].load(std::memory_order_relaxed);
+            if (seen > rank) {
+                return i + 1 < 64 ? (1ull << (i + 1)) - 1 : UINT64_MAX;
+            }
+        }
+        return max_ns_.load(std::memory_order_relaxed);
+    }
+
+    void maybe_report() {
+        const uint64_t now = read_now_ns();
+        uint64_t next = next_report_ns_.load(std::memory_order_relaxed);
+        if (now < next || !next_report_ns_.compare_exchange_strong(
+                next, now > UINT64_MAX - interval_ns_ ? UINT64_MAX :
+                    now + interval_ns_, std::memory_order_relaxed)) {
+            return;
+        }
+        report();
+    }
+
+    void report() const {
+        const uint64_t n = n_reads_.load(std::memory_order_relaxed);
+        if (n == 0) {
+            return;
+        }
+        const uint64_t ns = ns_.load(std::memory_order_relaxed);
+        const uint64_t bytes = bytes_.load(std::memory_order_relaxed);
+        const uint64_t first_ns = first_read_ns_.load(std::memory_order_relaxed);
+        const uint64_t last_ns = last_read_ns_.load(std::memory_order_relaxed);
+        const uint64_t wall_ns = last_ns >= first_ns ? last_ns - first_ns : 0;
+        const uint64_t min_ns = min_ns_.load(std::memory_order_relaxed);
+        const uint64_t max_ns = max_ns_.load(std::memory_order_relaxed);
+        const uint64_t p50_ns = percentile_ns((n - 1) * 50 / 100);
+        const uint64_t p95_ns = percentile_ns((n - 1) * 95 / 100);
+        const double bandwidth_gb_s = wall_ns != 0 ? (double) bytes / (double) wall_ns : 0.0;
+        std::fprintf(stderr,
+                     "wp expert worker read stats n_reads=%llu bytes=%llu "
+                     "read_ns=%llu read_wall_ns=%llu bandwidth_gb_s=%.3f mean_us=%.3f "
+                     "min_us=%.3f p50_us=%.3f p95_us=%.3f max_us=%.3f "
+                     "direct_fallback=%d\n",
+                     (unsigned long long) n,
+                     (unsigned long long) bytes,
+                     (unsigned long long) ns,
+                     (unsigned long long) wall_ns,
+                     bandwidth_gb_s,
+                     (double) ns / (double) n / 1000.0,
+                     (double) min_ns / 1000.0,
+                     (double) p50_ns / 1000.0,
+                     (double) p95_ns / 1000.0,
+                     (double) max_ns / 1000.0,
+                     g_read_direct_fallback.load(std::memory_order_relaxed) ? 1 : 0);
+        std::fflush(stderr);
+    }
+
+    const uint64_t interval_ms_;
+    const uint64_t interval_ns_;
+    std::atomic<uint64_t> next_report_ns_;
+    std::atomic<uint64_t> n_reads_{0};
+    std::atomic<uint64_t> bytes_{0};
+    std::atomic<uint64_t> ns_{0};
+    std::atomic<uint64_t> first_read_ns_{UINT64_MAX};
+    std::atomic<uint64_t> last_read_ns_{0};
+    std::atomic<uint64_t> min_ns_{UINT64_MAX};
+    std::atomic<uint64_t> max_ns_{0};
+    std::array<std::atomic<uint64_t>, latency_bucket_count> latency_buckets_{};
+};
+
+static ReadPathStats g_read_path_stats;
+
 struct RequestStats {
     uint64_t ns_lookup  = 0;
     uint64_t ns_read    = 0;
@@ -3503,15 +3671,9 @@ public:
             // WP_EXPERT_READ_WORKERS=<n>: cap on concurrent stripe reader
             // threads (default 4, the value that was hardcoded here). Still
             // clamped to the staging pool so the borrow invariant above holds.
-            static const size_t s_read_workers = [] {
-                const char * e = std::getenv("WP_EXPERT_READ_WORKERS");
-                const long parsed =
-                    (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
-                return parsed > 0 ? (size_t) parsed : (size_t) 4;
-            }();
             const size_t requested_workers = read_inflight_ != 0
                 ? read_inflight_
-                : (stripe_parallel_ || read_chunk_bytes_ != 0 ? s_read_workers
+                : (stripe_parallel_ || read_chunk_bytes_ != 0 ? read_workers_from_env()
                                                                : staging_.buffer_count());
             const size_t worker_count = !batch.state_->stripe_jobs.empty()
                 ? std::min<size_t>(batch.state_->stripe_jobs.size(),
@@ -4138,9 +4300,18 @@ public:
         return staging_.pinned() ? "pinned" : "pageable";
     }
 
-    size_t read_inflight() const { return read_inflight_; }
+    size_t read_inflight() const {
+        const size_t requested = read_inflight_ != 0
+            ? read_inflight_
+            : (stripe_parallel_ || read_chunk_bytes_ != 0
+                   ? read_workers_from_env() : staging_.buffer_count());
+        return std::min<size_t>(requested, (size_t) staging_.buffer_count());
+    }
     size_t read_chunk_bytes() const { return read_chunk_bytes_; }
     bool read_direct() const { return read_direct_; }
+    bool read_direct_fallback() const {
+        return g_read_direct_fallback.load(std::memory_order_relaxed);
+    }
 
     // Delegates to StagingPool::set_multi_conn -- see that method and the
     // StagingPool class comment (2026-08-25 deadlock fix) for the quota
@@ -5174,6 +5345,9 @@ private:
         int fd = -1;
         if (read_direct_) {
             fd = open(key.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+            if (fd < 0) {
+                g_read_direct_fallback.store(true, std::memory_order_relaxed);
+            }
         }
         if (fd < 0) {
             fd = open(key.c_str(), O_RDONLY | O_CLOEXEC);
@@ -5214,10 +5388,15 @@ private:
             guard.count = &state->read_inflight;
         }
         ssize_t n = -1;
+        const bool measure_read = g_read_path_stats.enabled();
+        const std::chrono::steady_clock::time_point read_started =
+            measure_read ? std::chrono::steady_clock::now() :
+                            std::chrono::steady_clock::time_point();
         do {
             n = pread(fd, dst, len, (off_t) (page.offset + (uint64_t) offset));
         } while (n < 0 && errno == EINTR);
         if (n < 0 && read_direct_ && errno == EINVAL) {
+            g_read_direct_fallback.store(true, std::memory_order_relaxed);
             const int buffered_fd = open(page.blob.c_str(), O_RDONLY | O_CLOEXEC);
             if (buffered_fd >= 0) {
                 do {
@@ -5226,6 +5405,19 @@ private:
                 } while (n < 0 && errno == EINTR);
                 close(buffered_fd);
             }
+        }
+        if (measure_read) {
+            const std::chrono::steady_clock::time_point read_finished =
+                std::chrono::steady_clock::now();
+            const uint64_t elapsed = (uint64_t) std::chrono::duration_cast<
+                std::chrono::nanoseconds>(read_finished - read_started).count();
+            const uint64_t started_ns = (uint64_t) std::chrono::duration_cast<
+                std::chrono::nanoseconds>(read_started.time_since_epoch()).count();
+            const uint64_t finished_ns = (uint64_t) std::chrono::duration_cast<
+                std::chrono::nanoseconds>(read_finished.time_since_epoch()).count();
+            g_read_path_stats.record(
+                n > 0 ? std::min<size_t>((size_t) n, len) : 0,
+                elapsed, started_ns, finished_ns);
         }
         if (n < 0 || (size_t) n != len) {
             throw std::runtime_error(
@@ -7348,6 +7540,7 @@ public:
     size_t read_inflight() const { return pool_.read_inflight(); }
     size_t read_chunk_bytes() const { return pool_.read_chunk_bytes(); }
     bool read_direct() const { return pool_.read_direct(); }
+    bool read_direct_fallback() const { return pool_.read_direct_fallback(); }
 
     // See ExpertSlotPool::set_staging_multi_conn / StagingPool::set_multi_conn
     // (the 2026-08-25 deadlock fix). run() calls this once, right after
@@ -11011,6 +11204,14 @@ int run(const Options & options) {
         }
     }
 
+    std::cerr << "wp expert worker: read_path"
+              << " direct=" << (worker.read_direct() ? "on" : "off")
+              << " direct_fallback=" << (worker.read_direct_fallback() ? 1 : 0)
+              << " inflight=" << worker.read_inflight()
+              << " alignment=" << DIRECT_ALIGNMENT
+              << " stats_interval_ms=" << g_read_path_stats.interval_ms()
+              << std::endl;
+
     pipe_socket_ptr server =
         pipe_socket_t::create_server(options.listen_host.c_str(), options.listen_port);
     if (!server) {
@@ -11034,6 +11235,8 @@ int run(const Options & options) {
               << " read_inflight=" << worker.read_inflight()
               << " read_chunk_bytes=" << worker.read_chunk_bytes()
               << " read_direct=" << (worker.read_direct() ? 1 : 0)
+              << " read_direct_fallback=" << (worker.read_direct_fallback() ? 1 : 0)
+              << " read_alignment=" << DIRECT_ALIGNMENT
               << " host_budget=" << resources.host_budget_bytes
               << " host_victim_budget=" << options.host_victim_bytes
               << " partial_dtype=f32"
