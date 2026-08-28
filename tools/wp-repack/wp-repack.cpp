@@ -1061,6 +1061,37 @@ std::string hash_groups_sliced(const std::vector<wp_repack::ExpertGroup> & group
     return finish_sha(hash);
 }
 
+std::string hash_groups_flat_sliced(const std::vector<wp_repack::ExpertGroup> & groups,
+                                    const std::vector<size_t> &                 indices,
+                                    const SliceGeometry &                       geom,
+                                    const wp_repack::SliceRange &               range) {
+    // This is the v1 hash used by llama-wp-expert-shard for flat groups.
+    sha256_t hash;
+    sha256_init(&hash);
+    sha_update_string(hash, "llama.cpp.wp-repack.identity.v1");
+    sha_update_u64(hash, indices.size());
+    for (size_t index : indices) {
+        if (index >= groups.size()) {
+            throw std::runtime_error("internal group index is out of range");
+        }
+        const wp_repack::ExpertGroup & group = groups[index];
+        const SliceGeometryVariant & variant = geom.variant_for_group(index);
+        sha_update_u64(hash, static_cast<uint64_t>(group.block_idx));
+        sha_update_u64(hash, static_cast<uint64_t>(group.expert_idx));
+        sha_update_u64(hash, static_cast<uint64_t>(range.index));
+        sha_update_u64(hash, static_cast<uint64_t>(range.first));
+        sha_update_u64(hash, static_cast<uint64_t>(range.last));
+        sha_update_u64(hash, group.members.size());
+        for (const wp_repack::ExpertMember & member : group.members) {
+            sha_update_u64(hash, member.role_mask);
+            sha_update_u64(hash, variant.role_slice_bytes(member.role_mask, range.width(), geom.n_embd));
+            sha_update_string(hash, member.catalog_name);
+            sha_update_string(hash, member.source_tensor_name);
+        }
+    }
+    return finish_sha(hash);
+}
+
 json slice_member_json(const wp_repack::ExpertGroup &                group,
                        uint8_t                                       role,
                        const char *                                  what,
@@ -1916,15 +1947,21 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
         throw std::runtime_error("group count mismatch");
     }
 
+    const bool flat_groups = !indexed_groups.empty() && indexed_groups.front().contains("members") &&
+                             !indexed_groups.front().contains("slices");
+    const std::string expected_hash = hash_groups_sliced(groups, expected_indices, geom, spec.widths,
+                                                         split ? &output_range : nullptr);
+    const std::string flat_hash = flat_groups && split ?
+        hash_groups_flat_sliced(groups, expected_indices, geom, output_range) : "";
     if (index.at("content_hash").at("algorithm").get<std::string>() != "sha256" ||
-        index.at("content_hash").at("value").get<std::string>() !=
-            hash_groups_sliced(groups, expected_indices, geom, spec.widths, split ? &output_range : nullptr)) {
+        (index.at("content_hash").at("value").get<std::string>() != expected_hash &&
+         (flat_hash.empty() || index.at("content_hash").at("value").get<std::string>() != flat_hash))) {
         // Report both values: a bare "mismatch" here cost real time, because the
         // interesting question is always WHICH of the two is wrong.
         throw std::runtime_error(
             "shard structural content hash mismatch: recorded=" +
             index.at("content_hash").at("value").get<std::string>() + " recomputed=" +
-            hash_groups_sliced(groups, expected_indices, geom, spec.widths, split ? &output_range : nullptr) +
+            expected_hash +
             " split=" + std::to_string(split ? 1 : 0) +
             " groups=" + std::to_string(expected_indices.size()) +
             " slice=" + std::to_string(output_range.index));
@@ -1942,6 +1979,8 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
     std::vector<char> scratch;
     std::vector<char> expected_payload;
     std::vector<char> actual_payload;
+    bool              group_shape_set = false;
+    bool              flat_group_shape = false;
 
     for (size_t i = 0; i < expected_indices.size(); ++i) {
         const wp_repack::ExpertGroup & expected = groups[expected_indices[i]];
@@ -1949,15 +1988,33 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
         const SliceGeometryVariant &  variant = geom.variant_for_group(group_index);
         const json &                   actual   = indexed_groups.at(i);
         if (actual.at("block_idx").get<int>() != expected.block_idx ||
-            actual.at("expert_idx").get<int>() != expected.expert_idx ||
-            actual.at("geometry_variant").get<size_t>() != geom.group_variants[group_index]) {
+            actual.at("expert_idx").get<int>() != expected.expert_idx) {
             throw std::runtime_error("group identity mismatch");
         }
 
-        const json & slices = actual.at("slices");
-        if (!slices.is_array() || slices.size() != verify_ranges.size()) {
-            throw std::runtime_error("slice count mismatch for blk " + std::to_string(expected.block_idx) +
-                                     " expert " + std::to_string(expected.expert_idx));
+        const bool flat = actual.contains("members");
+        const bool nested = actual.contains("slices");
+        if (flat == nested) {
+            throw std::runtime_error("expert group must use exactly one slice metadata shape");
+        }
+        if (group_shape_set && flat != flat_group_shape) {
+            throw std::runtime_error("expert groups use different slice metadata shapes");
+        }
+        flat_group_shape = flat;
+        group_shape_set = true;
+        if (flat) {
+            if (!split || verify_ranges.size() != 1) {
+                throw std::runtime_error("flat expert group is missing a selected slice");
+            }
+        } else {
+            if (actual.at("geometry_variant").get<size_t>() != geom.group_variants[group_index]) {
+                throw std::runtime_error("group identity mismatch");
+            }
+            const json & slices = actual.at("slices");
+            if (!slices.is_array() || slices.size() != verify_ranges.size()) {
+                throw std::runtime_error("slice count mismatch for blk " + std::to_string(expected.block_idx) +
+                                         " expert " + std::to_string(expected.expert_idx));
+            }
         }
 
         // Regenerate the payload from the source GGUF using the same gather the
@@ -1966,10 +2023,21 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
         // up here rather than as quiet garbage at inference time.
         build_group_slices(expected, variant, geom.n_embd, verify_ranges, sources, scratch, expected_payload);
 
-        const uint64_t group_offset = next_offset;
+        const json * flat_members = nullptr;
+        uint64_t group_offset = next_offset;
+        if (flat) {
+            const json & members = actual.at("members");
+            if (!members.is_array() || actual.at("member_count").get<uint64_t>() != 3 || members.size() != 3) {
+                throw std::runtime_error("flat expert group must have exactly three role members");
+            }
+            flat_members = &members;
+            group_offset = members.front().at("offset").get<uint64_t>();
+            if (group_offset != next_offset) {
+                throw std::runtime_error("flat group blob offsets are not contiguous");
+            }
+        }
         uint64_t       cursor       = group_offset;
         for (size_t s = 0; s < verify_ranges.size(); ++s) {
-            const json &                  slice_json  = slices.at(s);
             const wp_repack::SliceRange & range       = verify_ranges[s];
             const uint64_t                role_bytes[3] = {
                 variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
@@ -1977,18 +2045,32 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
                 variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
             };
             const uint64_t                slice_bytes = role_bytes[0] + role_bytes[1] + role_bytes[2];
-            if (slice_json.at("slice_idx").get<int>() != range.index ||
-                slice_json.at("ff_first").get<int64_t>() != range.first ||
-                slice_json.at("ff_last").get<int64_t>() != range.last ||
-                slice_json.at("width").get<int64_t>() != range.width() ||
-                slice_json.at("bytes").get<uint64_t>() != slice_bytes) {
-                throw std::runtime_error("slice descriptor mismatch");
-            }
-            if (slice_json.at("offset").get<uint64_t>() != cursor) {
-                throw std::runtime_error("slice blob offsets are not contiguous");
+            const json * slice_json = nullptr;
+            const json * members_json = flat_members;
+            if (flat) {
+                if (s != 0 || actual.at("slice_idx").get<int>() != range.index ||
+                    actual.at("ff_first").get<int64_t>() != range.first ||
+                    actual.at("ff_last").get<int64_t>() != range.last ||
+                    actual.at("width").get<int64_t>() != range.width()) {
+                    throw std::runtime_error("slice descriptor mismatch");
+                }
+            } else {
+                const json & slices = actual.at("slices");
+                slice_json = &slices.at(s);
+                if (slice_json->at("slice_idx").get<int>() != range.index ||
+                    slice_json->at("ff_first").get<int64_t>() != range.first ||
+                    slice_json->at("ff_last").get<int64_t>() != range.last ||
+                    slice_json->at("width").get<int64_t>() != range.width() ||
+                    slice_json->at("bytes").get<uint64_t>() != slice_bytes) {
+                    throw std::runtime_error("slice descriptor mismatch");
+                }
+                if (slice_json->at("offset").get<uint64_t>() != cursor) {
+                    throw std::runtime_error("slice blob offsets are not contiguous");
+                }
+                members_json = &slice_json->at("members");
             }
 
-            const json & members = slice_json.at("members");
+            const json & members = *members_json;
             if (!members.is_array() || members.size() != 3) {
                 throw std::runtime_error("a slice must have exactly three role members");
             }
@@ -2062,6 +2144,8 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
     VerifyCounts                  total;
     std::vector<size_t>           all_indices;
     std::set<std::pair<int, int>> seen_groups;
+    bool                           have_flat_groups = false;
+    bool                           group_shape_set  = false;
     for (size_t shard_pos = 0; shard_pos < shards.size(); ++shard_pos) {
         const json &              shard         = shards.at(shard_pos);
         const int                 first         = shard.at("layer_first").get<int>();
@@ -2078,6 +2162,15 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
         const fs::path index_path = path.parent_path() / shard.at("index_file").get<std::string>();
         const json     index      = read_json(index_path);
         require_sliced_format(index, INDEX_FORMAT);
+        const json & index_groups = index.at("groups");
+        const bool index_flat_groups = index_groups.is_array() && !index_groups.empty() &&
+                                       index_groups.front().contains("members") &&
+                                       !index_groups.front().contains("slices");
+        if (group_shape_set && index_flat_groups != have_flat_groups) {
+            throw std::runtime_error("manifest shards use different expert group shapes");
+        }
+        have_flat_groups = index_flat_groups;
+        group_shape_set = true;
         if (shard.at("shard_index").get<uint64_t>() != shard_pos ||
             index.at("shard_index").get<uint64_t>() != shard_pos ||
             index.at("shard_count").get<uint64_t>() != shards.size() || index.at("layer_first").get<int>() != first ||
@@ -2107,9 +2200,13 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
         manifest.at("total_blob_bytes").get<uint64_t>() != total.bytes) {
         throw std::runtime_error("manifest totals mismatch");
     }
+    const std::string expected_hash =
+        hash_groups_sliced(groups, all_indices, geom, spec.widths, split ? &output_range : nullptr);
+    const std::string flat_hash = have_flat_groups && split ?
+        hash_groups_flat_sliced(groups, all_indices, geom, output_range) : "";
     if (manifest.at("content_hash").at("algorithm").get<std::string>() != "sha256" ||
-        manifest.at("content_hash").at("value").get<std::string>() !=
-            hash_groups_sliced(groups, all_indices, geom, spec.widths, split ? &output_range : nullptr)) {
+        (manifest.at("content_hash").at("value").get<std::string>() != expected_hash &&
+         (flat_hash.empty() || manifest.at("content_hash").at("value").get<std::string>() != flat_hash))) {
         throw std::runtime_error("manifest structural content hash mismatch");
     }
     return total;
