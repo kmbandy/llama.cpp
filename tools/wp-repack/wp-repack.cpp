@@ -90,23 +90,71 @@ struct CliOptions {
     std::string                        output;
 };
 
-// The shared shape of one expert across the three FFN roles, in the form the
-// slicer needs. Derived once and then checked to be identical for every expert.
-struct SliceGeometry {
-    int64_t   n_ff           = 0;  // FFN intermediate size -- the axis we slice
-    int64_t   n_embd         = 0;  // model width -- untouched, every slice is full width
-    int64_t   blck           = 0;
-    size_t    type_size      = 0;
-    ggml_type type           = GGML_TYPE_COUNT;
-    uint64_t  gate_row_bytes = 0;  // up/gate: bytes of one FFN row      (contiguous run)
-    uint64_t  down_row_bytes = 0;  // down:    bytes of one n_embd row   (we take a sub-run)
+struct SliceRoleGeometry {
+    ggml_type type       = GGML_TYPE_COUNT;
+    int64_t   blck       = 0;  // elements per quant block along ne0
+    int64_t   slice_blck = 1;  // elements per quant block along the sliced axis
+    size_t    type_size  = 0;
+    uint64_t  row_bytes  = 0;  // bytes for one full ne0 row
+    bool      ffn_ne0    = false;
+};
 
-    // Bytes one slice of width `w` contributes, per role. Identical for all three
-    // roles, because every role holds exactly n_embd * n_ff elements per expert.
-    uint64_t role_slice_bytes(int64_t w) const {
-        return static_cast<uint64_t>(w / blck) * static_cast<uint64_t>(n_embd) * type_size;
+struct SliceGeometryVariant {
+    std::array<SliceRoleGeometry, 3> roles;
+
+    const SliceRoleGeometry & role_geometry(uint8_t role) const {
+        if (role == wp::ROLE_UP) {
+            return roles[0];
+        }
+        if (role == wp::ROLE_GATE) {
+            return roles[1];
+        }
+        if (role == wp::ROLE_DOWN) {
+            return roles[2];
+        }
+        throw std::runtime_error("unknown expert role mask " + std::to_string(role));
+    }
+
+    uint64_t role_slice_bytes(uint8_t role, int64_t w, int64_t n_embd) const {
+        const SliceRoleGeometry & role_geom = role_geometry(role);
+        if (role_geom.ffn_ne0) {
+            return static_cast<uint64_t>(w / role_geom.slice_blck) * static_cast<uint64_t>(n_embd) *
+                   role_geom.type_size;
+        }
+        return static_cast<uint64_t>(w) * role_geom.row_bytes;
     }
 };
+
+// Shape and alignment are shared by all experts. Quantization details are kept
+// per group because dynamic quantization may change them from layer to layer.
+struct SliceGeometry {
+    int64_t                         n_ff = 0;  // FFN intermediate size -- the axis we slice
+    int64_t                         n_embd = 0;  // model width -- untouched, every slice is full width
+    int64_t                         blck = 0;  // binding block size for ratio solving
+    std::vector<SliceGeometryVariant> variants;
+    std::vector<size_t>             group_variants;
+
+    const SliceGeometryVariant & variant_for_group(size_t group_index) const {
+        if (group_index >= group_variants.size() || group_variants[group_index] >= variants.size()) {
+            throw std::runtime_error("internal group geometry index is out of range");
+        }
+        return variants[group_variants[group_index]];
+    }
+};
+
+bool same_slice_role_geometry(const SliceRoleGeometry & a, const SliceRoleGeometry & b) {
+    return a.type == b.type && a.blck == b.blck && a.slice_blck == b.slice_blck && a.type_size == b.type_size &&
+           a.row_bytes == b.row_bytes && a.ffn_ne0 == b.ffn_ne0;
+}
+
+bool same_slice_geometry_variant(const SliceGeometryVariant & a, const SliceGeometryVariant & b) {
+    for (size_t r = 0; r < a.roles.size(); ++r) {
+        if (!same_slice_role_geometry(a.roles[r], b.roles[r])) {
+            return false;
+        }
+    }
+    return true;
+}
 
 struct ShardPaths {
     fs::path blob;
@@ -176,9 +224,9 @@ void print_usage(const char * argv0) {
               << "\n"
               << "  NO REQUANTIZATION HAPPENS, EVER. Every output byte is a verbatim copy of a\n"
               << "  source byte; only their order changes. That holds because slice boundaries\n"
-              << "  are required to be multiples of the expert tensor's quant block size, so a\n"
-              << "  quant block is never cut and its scale never has to be recomputed. A width\n"
-              << "  that is not a block multiple is a hard error, not a rounding.\n"
+              << "  are required to be multiples of the quant block size for each role sliced on\n"
+              << "  ne0, so a quant block is never cut and its scale never has to be recomputed.\n"
+              << "  A width that violates any such role constraint is a hard error, not a rounding.\n"
               << "\n"
               << "  Blob layout is expert-major, then slice-major, then role-major:\n"
               << "      group 0: [slice 0: up|gate|down] [slice 1: up|gate|down] ...\n"
@@ -186,16 +234,19 @@ void print_usage(const char * argv0) {
               << "  so each (group, slice) is ONE contiguous byte range -- the page-in unit for\n"
               << "  the GPU that owns that slice: a single flat read, no scatter at runtime.\n"
               << "\n"
-              << "  Per-role bytes for a slice of width w are identical across all three roles:\n"
-              << "      w / blck * n_embd * type_size\n"
-              << "  so a slice costs exactly 3x that, and the widths alone determine the split.\n"
+              << "  Per-role bytes are calculated from each role's own type and shape. A role\n"
+              << "  sliced on ne1 contributes w * row_bytes; a role sliced on ne0 contributes\n"
+              << "      w / role_blck * n_embd * role_type_size\n"
+              << "  A slice costs the sum of those three role sizes. Widths must satisfy every\n"
+              << "  role whose FFN dimension is ne0; roles sliced on ne1 impose no alignment.\n"
               << "\n"
               << "  The v2 index adds, per group, a \"slices\" array giving each slice's index,\n"
               << "  ff_first, ff_last (exclusive), blob offset and byte size, with the same\n"
               << "  per-member records as v1 plus each member's sliced shape. The v2 manifest\n"
               << "  adds a top-level \"expert_slicing\" block recording the spec text, the ratios\n"
-              << "  if any, the resolved widths, n_ff_exp, n_embd, the ggml type and its block\n"
-              << "  size -- enough for a consumer to validate the geometry without the model.\n";
+              << "  if any, the resolved widths, n_ff_exp, n_embd, and distinct per-group role\n"
+              << "  geometry variants with their group assignments -- enough for a consumer to\n"
+              << "  validate per-layer byte sizes without the model.\n";
 }
 
 uint64_t parse_bytes(const std::string & text) {
@@ -667,8 +718,8 @@ const TensorGeom & geom_for(const std::map<std::string, TensorGeom> & geom, cons
     return it->second;
 }
 
-// Derive the one expert shape the whole model must share, and refuse anything
-// this slicer cannot cut byte-exactly. Every check here is a refusal to guess:
+// Derive the shared expert shape and per-group quantization details, and refuse
+// anything this slicer cannot cut byte-exactly. Every check here is a refusal to guess:
 // if the layout is not the (up/gate = [n_embd, n_ff], down = [n_ff, n_embd])
 // arrangement, a "slice" would silently mean something else.
 SliceGeometry derive_slice_geometry(const std::vector<wp_repack::ExpertGroup> & groups,
@@ -695,13 +746,6 @@ SliceGeometry derive_slice_geometry(const std::vector<wp_repack::ExpertGroup> & 
         const std::string where =
             "blk " + std::to_string(group.block_idx) + " expert " + std::to_string(group.expert_idx);
 
-        if (g_up.type != g_gate.type || g_up.type != g_down.type) {
-            throw std::runtime_error("expert roles do not share one ggml type at " + where +
-                                     "; slicing all three on one boundary would need one block size");
-        }
-        if (g_up.blck <= 0 || g_up.type_size == 0) {
-            throw std::runtime_error("expert tensor type has no usable quant block geometry at " + where);
-        }
         if (g_up.ne0 != g_gate.ne0 || g_up.ne1 != g_gate.ne1) {
             throw std::runtime_error("ffn_up and ffn_gate shapes disagree at " + where);
         }
@@ -715,43 +759,88 @@ SliceGeometry derive_slice_geometry(const std::vector<wp_repack::ExpertGroup> & 
 
         const int64_t n_embd = g_up.ne0;
         const int64_t n_ff   = g_up.ne1;
-        if (g_up.ne0 % g_up.blck != 0 || g_down.ne0 % g_down.blck != 0) {
-            throw std::runtime_error("expert tensor rows are not a whole number of quant blocks at " + where);
+        const TensorGeom * role_geom_sources[3] = { &g_up, &g_gate, &g_down };
+        for (const TensorGeom * role_geom : role_geom_sources) {
+            if (role_geom->blck <= 0 || role_geom->type_size == 0 || role_geom->ne0 % role_geom->blck != 0) {
+                throw std::runtime_error("expert tensor type has no usable quant block geometry at " + where);
+            }
         }
 
-        const uint64_t gate_row_bytes = static_cast<uint64_t>(n_embd / g_up.blck) * g_up.type_size;
-        const uint64_t down_row_bytes = static_cast<uint64_t>(n_ff / g_down.blck) * g_down.type_size;
-        const uint64_t up_bytes       = gate_row_bytes * static_cast<uint64_t>(n_ff);
-        const uint64_t down_bytes     = down_row_bytes * static_cast<uint64_t>(n_embd);
+        SliceGeometryVariant variant;
+        // Assigning to a std::array from a braced list whose elements are themselves
+        // braced aggregate initialisers needs the array type spelled out; the inner
+        // braces are otherwise read as arguments to array's own operator=.
+        variant.roles = std::array<SliceRoleGeometry, 3>{ {
+            { g_up.type, g_up.blck, 1, g_up.type_size, g_up.row_bytes, false },
+            { g_gate.type, g_gate.blck, 1, g_gate.type_size, g_gate.row_bytes, false },
+            { g_down.type, g_down.blck, g_down.blck, g_down.type_size, g_down.row_bytes, true },
+        } };
+        const uint64_t role_bytes[3] = {
+            static_cast<uint64_t>(n_ff) * variant.roles[0].row_bytes,
+            static_cast<uint64_t>(n_ff) * variant.roles[1].row_bytes,
+            static_cast<uint64_t>(n_embd) * static_cast<uint64_t>(n_ff / variant.roles[2].slice_blck) *
+                variant.roles[2].type_size,
+        };
 
         // The catalog derived per-expert sizes by dividing the consolidated
         // tensor; if that disagrees with the shape math, the expert axis is not
         // where we think it is and every offset below would be wrong.
-        if (up.size != up_bytes || gate.size != up_bytes || down.size != down_bytes) {
+        if (up.size != role_bytes[0] || gate.size != role_bytes[1] || down.size != role_bytes[2]) {
             throw std::runtime_error("per-expert byte size disagrees with tensor geometry at " + where);
         }
 
         if (first) {
-            out.n_ff           = n_ff;
-            out.n_embd         = n_embd;
-            out.blck           = g_up.blck;
-            out.type_size      = g_up.type_size;
-            out.type           = g_up.type;
-            out.gate_row_bytes = gate_row_bytes;
-            out.down_row_bytes = down_row_bytes;
-            first              = false;
-        } else if (out.n_ff != n_ff || out.n_embd != n_embd || out.type != g_up.type) {
-            // A per-layer geometry would need per-layer widths, and the whole
-            // point of the widths is that they are one fixed per-GPU split.
+            out.n_ff   = n_ff;
+            out.n_embd = n_embd;
+            out.blck   = std::max({ variant.roles[0].slice_blck, variant.roles[1].slice_blck,
+                                    variant.roles[2].slice_blck });
+            first     = false;
+        } else if (out.n_ff != n_ff || out.n_embd != n_embd) {
             throw std::runtime_error("expert geometry is not uniform across the model (differs at " + where +
-                                     "); this slicer requires one shape for every expert");
+                                     "); n_ff and n_embd must be uniform across every expert");
+        } else if (out.blck != std::max({ variant.roles[0].slice_blck, variant.roles[1].slice_blck,
+                                          variant.roles[2].slice_blck })) {
+            throw std::runtime_error("expert slice alignment is not uniform across the model (differs at " + where +
+                                     "); one width set must be legal for every expert");
         }
+
+        size_t variant_index = 0;
+        for (; variant_index < out.variants.size(); ++variant_index) {
+            if (same_slice_geometry_variant(out.variants[variant_index], variant)) {
+                break;
+            }
+        }
+        if (variant_index == out.variants.size()) {
+            out.variants.push_back(variant);
+        }
+        out.group_variants.push_back(variant_index);
     }
 
     if (first) {
         throw std::runtime_error("no expert groups to derive slice geometry from");
     }
     return out;
+}
+
+void validate_slice_ranges(const std::vector<wp_repack::SliceRange> & ranges, const SliceGeometry & geom) {
+    for (size_t v = 0; v < geom.variants.size(); ++v) {
+        const SliceGeometryVariant & variant = geom.variants[v];
+        for (size_t r = 0; r < variant.roles.size(); ++r) {
+            const SliceRoleGeometry & role = variant.roles[r];
+            if (!role.ffn_ne0) {
+                continue;
+            }
+            for (const wp_repack::SliceRange & range : ranges) {
+                if (range.first % role.slice_blck != 0 || range.last % role.slice_blck != 0) {
+                    throw std::invalid_argument("slice " + std::to_string(range.index) + " boundary [" +
+                                                std::to_string(range.first) + "," + std::to_string(range.last) +
+                                                ") is not aligned to geometry variant " + std::to_string(v) +
+                                                " role " + std::to_string(r) + " quant block size " +
+                                                std::to_string(role.slice_blck));
+                }
+            }
+        }
+    }
 }
 
 void read_member(std::ifstream & source, uint64_t offset, uint64_t size, std::vector<char> & buffer) {
@@ -772,24 +861,26 @@ void read_member(std::ifstream & source, uint64_t offset, uint64_t size, std::ve
 // paths copy source bytes verbatim -- never a value is recomputed.
 void append_role_slice(uint8_t                      role,
                        const std::vector<char> &    role_bytes,
-                       const SliceGeometry &        geom,
+                       const SliceGeometryVariant & variant,
+                       int64_t                       n_embd,
                        const wp_repack::SliceRange & range,
                        std::vector<char> &          out) {
-    const uint64_t expected = geom.role_slice_bytes(range.width());
-    const size_t   before   = out.size();
+    const SliceRoleGeometry & role_geom = variant.role_geometry(role);
+    const uint64_t            expected  = variant.role_slice_bytes(role, range.width(), n_embd);
+    const size_t              before    = out.size();
 
     if (role == wp::ROLE_UP || role == wp::ROLE_GATE) {
-        const uint64_t begin = static_cast<uint64_t>(range.first) * geom.gate_row_bytes;
+        const uint64_t begin = static_cast<uint64_t>(range.first) * role_geom.row_bytes;
         if (begin + expected > role_bytes.size()) {
             throw std::runtime_error("up/gate slice runs past the expert payload");
         }
         out.insert(out.end(), role_bytes.begin() + static_cast<std::ptrdiff_t>(begin),
                    role_bytes.begin() + static_cast<std::ptrdiff_t>(begin + expected));
     } else if (role == wp::ROLE_DOWN) {
-        const uint64_t skip = static_cast<uint64_t>(range.first / geom.blck) * geom.type_size;
-        const uint64_t run  = static_cast<uint64_t>(range.width() / geom.blck) * geom.type_size;
-        for (int64_t row = 0; row < geom.n_embd; ++row) {
-            const uint64_t begin = static_cast<uint64_t>(row) * geom.down_row_bytes + skip;
+        const uint64_t skip = static_cast<uint64_t>(range.first / role_geom.blck) * role_geom.type_size;
+        const uint64_t run  = static_cast<uint64_t>(range.width() / role_geom.blck) * role_geom.type_size;
+        for (int64_t row = 0; row < n_embd; ++row) {
+            const uint64_t begin = static_cast<uint64_t>(row) * role_geom.row_bytes + skip;
             if (begin + run > role_bytes.size()) {
                 throw std::runtime_error("down slice runs past the expert payload");
             }
@@ -808,7 +899,8 @@ void append_role_slice(uint8_t                      role,
 // Materialize every byte of one expert group, laid out slice-major then
 // role-major. Shared by the writer and the verifier so they can never drift.
 void build_group_slices(const wp_repack::ExpertGroup &                group,
-                        const SliceGeometry &                         geom,
+                        const SliceGeometryVariant &                  variant,
+                        int64_t                                        n_embd,
                         const std::vector<wp_repack::SliceRange> &    ranges,
                         std::vector<std::ifstream> &                  sources,
                         std::vector<char> &                           scratch,
@@ -835,7 +927,7 @@ void build_group_slices(const wp_repack::ExpertGroup &                group,
     out.clear();
     for (const wp_repack::SliceRange & range : ranges) {
         for (size_t r = 0; r < 3; ++r) {
-            append_role_slice(role_masks[r], role_bytes[r], geom, range, out);
+            append_role_slice(role_masks[r], role_bytes[r], variant, n_embd, range, out);
         }
     }
 }
@@ -852,7 +944,6 @@ std::string hash_groups_sliced(const std::vector<wp_repack::ExpertGroup> & group
     sha_update_u64(hash, static_cast<uint64_t>(geom.n_ff));
     sha_update_u64(hash, static_cast<uint64_t>(geom.n_embd));
     sha_update_u64(hash, static_cast<uint64_t>(geom.blck));
-    sha_update_u64(hash, static_cast<uint64_t>(geom.type));
     sha_update_u64(hash, widths.size());
     for (const int64_t w : widths) {
         sha_update_u64(hash, static_cast<uint64_t>(w));
@@ -864,8 +955,17 @@ std::string hash_groups_sliced(const std::vector<wp_repack::ExpertGroup> & group
             throw std::runtime_error("internal group index is out of range");
         }
         const wp_repack::ExpertGroup & group = groups[index];
+        const SliceGeometryVariant & variant = geom.variant_for_group(index);
         sha_update_u64(hash, static_cast<uint64_t>(group.block_idx));
         sha_update_u64(hash, static_cast<uint64_t>(group.expert_idx));
+        for (const SliceRoleGeometry & role : variant.roles) {
+            sha_update_u64(hash, static_cast<uint64_t>(role.type));
+            sha_update_u64(hash, static_cast<uint64_t>(role.blck));
+            sha_update_u64(hash, static_cast<uint64_t>(role.slice_blck));
+            sha_update_u64(hash, static_cast<uint64_t>(role.type_size));
+            sha_update_u64(hash, role.row_bytes);
+            sha_update_u64(hash, role.ffn_ne0 ? 1 : 0);
+        }
         sha_update_u64(hash, group.members.size());
         for (const wp_repack::ExpertMember & member : group.members) {
             sha_update_u64(hash, member.role_mask);
@@ -880,23 +980,24 @@ std::string hash_groups_sliced(const std::vector<wp_repack::ExpertGroup> & group
 json slice_member_json(const wp_repack::ExpertGroup &                group,
                        uint8_t                                       role,
                        const char *                                  what,
-                       const SliceGeometry &                         geom,
+                       const SliceGeometryVariant &                  variant,
+                       int64_t                                        n_embd,
                        const wp_repack::SliceRange &                 range,
                        uint64_t                                      offset) {
     const wp_repack::ExpertMember & member = member_for_role(group, role, what);
     const bool                      is_down = role == wp::ROLE_DOWN;
     return {
-        { "role_mask",          member.role_mask                                                  },
-        { "size",               geom.role_slice_bytes(range.width())                              },
-        { "offset",             offset                                                            },
-        { "catalog_name",       member.catalog_name                                               },
-        { "source_tensor_name", member.source_tensor_name                                         },
-        { "source_file_idx",    member.file_idx                                                   },
-        { "source_file_offset", member.file_offset                                                },
+        { "role_mask",          member.role_mask                         },
+        { "size",               variant.role_slice_bytes(role, range.width(), n_embd) },
+        { "offset",             offset                                   },
+        { "catalog_name",       member.catalog_name                      },
+        { "source_tensor_name", member.source_tensor_name                },
+        { "source_file_idx",    member.file_idx                          },
+        { "source_file_offset", member.file_offset                       },
         // The shape this slice's bytes actually form, so a consumer can build the
         // tensor without re-deriving the cut. down is the gathered column slice.
-        { "slice_shape",        json::array({ is_down ? range.width() : geom.n_embd,
-                                              is_down ? geom.n_embd  : range.width() })           },
+        { "slice_shape",        json::array({ is_down ? range.width() : n_embd,
+                                              is_down ? n_embd : range.width() })                  },
         { "contiguous_in_source", !is_down                                                        },
     };
 }
@@ -904,23 +1005,59 @@ json slice_member_json(const wp_repack::ExpertGroup &                group,
 // The slicing geometry block. Written into BOTH the manifest and every index,
 // because a v1 index is documented as self-sufficient and a v2 one has more to
 // be self-sufficient about: without the widths you cannot read the blob at all.
-json slicing_json(const wp_repack::SliceSpec & spec, const SliceGeometry & geom) {
+json slicing_json(const wp_repack::SliceSpec &                         spec,
+                  const SliceGeometry &                               geom,
+                  const std::vector<wp_repack::ExpertGroup> &         groups) {
+    const uint8_t role_masks[3] = { wp::ROLE_UP, wp::ROLE_GATE, wp::ROLE_DOWN };
+    const char * role_names[3]  = { "up", "gate", "down" };
     json out = {
-        { "spec",               spec.text                     },
-        { "from_ratios",        spec.from_ratios              },
-        { "ratios",             spec.ratios                   },
-        { "widths",             spec.widths                   },
-        { "slice_count",        spec.widths.size()            },
-        { "n_ff_exp",           geom.n_ff                     },
-        { "n_embd",             geom.n_embd                   },
-        { "ggml_type",          static_cast<int>(geom.type)   },
-        { "ggml_type_name",     ggml_type_name(geom.type)     },
-        { "quant_block_size",   geom.blck                     },
-        { "quant_block_bytes",  geom.type_size                },
-        { "bytes_per_slice_per_role", json::array()           },
+        { "spec",              spec.text                },
+        { "from_ratios",       spec.from_ratios         },
+        { "ratios",            spec.ratios              },
+        { "widths",            spec.widths              },
+        { "slice_count",       spec.widths.size()       },
+        { "n_ff_exp",          geom.n_ff                },
+        { "n_embd",            geom.n_embd              },
+        { "slice_alignment",   geom.blck                },
+        { "geometry_variants", json::array()            },
     };
-    for (const int64_t w : spec.widths) {
-        out["bytes_per_slice_per_role"].push_back(geom.role_slice_bytes(w));
+
+    for (size_t v = 0; v < geom.variants.size(); ++v) {
+        const SliceGeometryVariant & variant = geom.variants[v];
+        json variant_json = {
+            { "variant_idx",               v                 },
+            { "groups",                     json::array()     },
+            { "role_geometry",              json::object()   },
+            { "bytes_per_slice_per_role",   json::array()     },
+        };
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (geom.group_variants[i] == v) {
+                variant_json["groups"].push_back({
+                    { "block_idx",  groups[i].block_idx  },
+                    { "expert_idx", groups[i].expert_idx },
+                });
+            }
+        }
+        for (size_t r = 0; r < 3; ++r) {
+            const SliceRoleGeometry & role = variant.roles[r];
+            variant_json["role_geometry"][role_names[r]] = {
+                { "ggml_type",        static_cast<int>(role.type) },
+                { "ggml_type_name",   ggml_type_name(role.type)   },
+                { "quant_block_size", role.blck                },
+                { "slice_block_size", role.slice_blck          },
+                { "quant_block_bytes", role.type_size          },
+                { "row_bytes",         role.row_bytes           },
+                { "ffn_axis",          role.ffn_ne0 ? 0 : 1      },
+            };
+        }
+        for (const int64_t w : spec.widths) {
+            json role_bytes = json::array();
+            for (const uint8_t role : role_masks) {
+                role_bytes.push_back(variant.role_slice_bytes(role, w, geom.n_embd));
+            }
+            variant_json["bytes_per_slice_per_role"].push_back(std::move(role_bytes));
+        }
+        out["geometry_variants"].push_back(std::move(variant_json));
     }
     return out;
 }
@@ -952,7 +1089,7 @@ json write_shard_sliced(const fs::path &                            output_base,
         { "layer_first",  shard.layer_first                                   },
         { "layer_last",   shard.layer_last                                    },
         { "group_count",  shard.group_indices.size()                          },
-        { "expert_slicing", slicing_json(spec, geom)                          },
+        { "expert_slicing", slicing_json(spec, geom, groups)                 },
         { "blob_bytes",   0                                                   },
         { "content_hash",
          {
@@ -968,18 +1105,24 @@ json write_shard_sliced(const fs::path &                            output_base,
     std::vector<char> payload;
     for (size_t group_index : shard.group_indices) {
         const wp_repack::ExpertGroup & group = groups.at(group_index);
-        build_group_slices(group, geom, ranges, sources, scratch, payload);
+        const SliceGeometryVariant & variant = geom.variant_for_group(group_index);
+        build_group_slices(group, variant, geom.n_embd, ranges, sources, scratch, payload);
 
         json group_json = {
-            { "block_idx",  group.block_idx      },
-            { "expert_idx", group.expert_idx     },
-            { "slices",     json::array()        },
+            { "block_idx",        group.block_idx       },
+            { "expert_idx",       group.expert_idx      },
+            { "geometry_variant", geom.group_variants[group_index] },
+            { "slices",            json::array()         },
         };
 
         uint64_t cursor = blob_offset;
         for (const wp_repack::SliceRange & range : ranges) {
-            const uint64_t role_bytes  = geom.role_slice_bytes(range.width());
-            const uint64_t slice_bytes = role_bytes * 3;
+            const uint64_t role_bytes[3] = {
+                variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
+                variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
+                variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
+            };
+            const uint64_t slice_bytes = role_bytes[0] + role_bytes[1] + role_bytes[2];
             group_json["slices"].push_back({
                 { "slice_idx", range.index                              },
                 { "ff_first",  range.first                              },
@@ -988,9 +1131,10 @@ json write_shard_sliced(const fs::path &                            output_base,
                 { "offset",    cursor                                   },
                 { "bytes",     slice_bytes                              },
                 { "members",   json::array({
-                       slice_member_json(group, wp::ROLE_UP,   "up",   geom, range, cursor),
-                       slice_member_json(group, wp::ROLE_GATE, "gate", geom, range, cursor + role_bytes),
-                       slice_member_json(group, wp::ROLE_DOWN, "down", geom, range, cursor + role_bytes * 2),
+                       slice_member_json(group, wp::ROLE_UP,   "up",   variant, geom.n_embd, range, cursor),
+                       slice_member_json(group, wp::ROLE_GATE, "gate", variant, geom.n_embd, range, cursor + role_bytes[0]),
+                       slice_member_json(group, wp::ROLE_DOWN, "down", variant, geom.n_embd, range,
+                                         cursor + role_bytes[0] + role_bytes[1]),
                    })                                                   },
             });
             cursor += slice_bytes;
@@ -1044,6 +1188,7 @@ void repack_sliced(const CliOptions &                          options,
     wp_repack::SliceSpec spec = options.slice_spec;
     wp_repack::resolve_slice_widths(spec, geom.n_ff, geom.blck);
     const std::vector<wp_repack::SliceRange> ranges = wp_repack::slice_ranges(spec.widths);
+    validate_slice_ranges(ranges, geom);
 
     const fs::path output_base =
         fs::absolute(fs::path(options.output + SLICED_BASE_SUFFIX)).lexically_normal();
@@ -1062,7 +1207,7 @@ void repack_sliced(const CliOptions &                          options,
         { "total_group_count", selected.size()                                 },
         { "total_blob_bytes",  0                                               },
         { "shard_count",       shards.size()                                   },
-        { "expert_slicing",    slicing_json(spec, geom)                        },
+        { "expert_slicing",    slicing_json(spec, geom, groups)               },
         { "content_hash",
          {
               { "algorithm", "sha256" },
@@ -1071,11 +1216,23 @@ void repack_sliced(const CliOptions &                          options,
         { "shards",            json::array()                                   },
     };
 
-    std::cout << "expert slicing: n_ff_exp=" << geom.n_ff << " n_embd=" << geom.n_embd << " type="
-              << ggml_type_name(geom.type) << " blck=" << geom.blck << " slices=" << spec.widths.size() << '\n';
-    for (const wp_repack::SliceRange & range : ranges) {
-        std::cout << "  slice " << range.index << " ff [" << range.first << "," << range.last << ") width "
-                  << range.width() << " bytes " << geom.role_slice_bytes(range.width()) * 3 << " per expert\n";
+    std::cout << "expert slicing: n_ff_exp=" << geom.n_ff << " n_embd=" << geom.n_embd
+              << " alignment=" << geom.blck << " slices=" << spec.widths.size()
+              << " geometry_variants=" << geom.variants.size() << '\n';
+    for (size_t v = 0; v < geom.variants.size(); ++v) {
+        const SliceGeometryVariant & variant = geom.variants[v];
+        std::cout << "  geometry variant " << v << " roles " << ggml_type_name(variant.roles[0].type) << "/"
+                  << ggml_type_name(variant.roles[1].type) << "/" << ggml_type_name(variant.roles[2].type) << '\n';
+        for (const wp_repack::SliceRange & range : ranges) {
+            const uint64_t role_bytes[3] = {
+                variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
+                variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
+                variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
+            };
+            std::cout << "    slice " << range.index << " ff [" << range.first << "," << range.last << ") width "
+                      << range.width() << " bytes " << role_bytes[0] + role_bytes[1] + role_bytes[2]
+                      << " per expert (variant " << v << ")\n";
+        }
     }
 
     uint64_t total_bytes = 0;
@@ -1233,14 +1390,83 @@ void require_sliced_format(const json & value, const char * format) {
 // Rebuild the SliceSpec a v2 file was written with, and cross-check the geometry
 // it claims against the geometry the model actually has. A blob whose sidecar
 // describes a different model's shape is exactly the failure --verify exists for.
-wp_repack::SliceSpec slicing_from_json(const json & value, const SliceGeometry & geom) {
+wp_repack::SliceSpec slicing_from_json(const json &                               value,
+                                       const SliceGeometry &                     geom,
+                                       const std::vector<wp_repack::ExpertGroup> & groups) {
     const json & block = value.at("expert_slicing");
 
     if (block.at("n_ff_exp").get<int64_t>() != geom.n_ff || block.at("n_embd").get<int64_t>() != geom.n_embd ||
-        block.at("quant_block_size").get<int64_t>() != geom.blck ||
-        block.at("quant_block_bytes").get<uint64_t>() != geom.type_size ||
-        block.at("ggml_type").get<int>() != static_cast<int>(geom.type)) {
+        block.at("slice_alignment").get<int64_t>() != geom.blck) {
         throw std::runtime_error("recorded slice geometry disagrees with the model's expert tensors");
+    }
+
+    const json & variants = block.at("geometry_variants");
+    if (!variants.is_array() || variants.size() != geom.variants.size() || geom.group_variants.size() != groups.size()) {
+        throw std::runtime_error("recorded slice geometry variants disagree with the model's expert tensors");
+    }
+    const char *  role_names[3]  = { "up", "gate", "down" };
+    const uint8_t role_masks[3] = { wp::ROLE_UP, wp::ROLE_GATE, wp::ROLE_DOWN };
+    for (size_t v = 0; v < geom.variants.size(); ++v) {
+        const SliceGeometryVariant & expected_variant = geom.variants[v];
+        const json &                 recorded_variant = variants.at(v);
+        if (recorded_variant.at("variant_idx").get<size_t>() != v) {
+            throw std::runtime_error("recorded slice geometry variant indexes are invalid");
+        }
+
+        const json & recorded_groups = recorded_variant.at("groups");
+        size_t       expected_group_count = 0;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (geom.group_variants[i] == v) {
+                ++expected_group_count;
+            }
+        }
+        if (!recorded_groups.is_array() || recorded_groups.size() != expected_group_count) {
+            throw std::runtime_error("recorded slice geometry group assignments are invalid");
+        }
+        size_t recorded_group = 0;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (geom.group_variants[i] != v) {
+                continue;
+            }
+            const json & group = recorded_groups.at(recorded_group++);
+            if (group.at("block_idx").get<int>() != groups[i].block_idx ||
+                group.at("expert_idx").get<int>() != groups[i].expert_idx) {
+                throw std::runtime_error("recorded slice geometry group assignments disagree with the model");
+            }
+        }
+
+        const json & role_geometry = recorded_variant.at("role_geometry");
+        for (size_t r = 0; r < 3; ++r) {
+            const SliceRoleGeometry & role = expected_variant.roles[r];
+            const json &              recorded = role_geometry.at(role_names[r]);
+            if (recorded.at("ggml_type").get<int>() != static_cast<int>(role.type) ||
+                recorded.at("ggml_type_name").get<std::string>() != ggml_type_name(role.type) ||
+                recorded.at("quant_block_size").get<int64_t>() != role.blck ||
+                recorded.at("slice_block_size").get<int64_t>() != role.slice_blck ||
+                recorded.at("quant_block_bytes").get<uint64_t>() != role.type_size ||
+                recorded.at("row_bytes").get<uint64_t>() != role.row_bytes ||
+                recorded.at("ffn_axis").get<int>() != (role.ffn_ne0 ? 0 : 1)) {
+                throw std::runtime_error("recorded slice geometry disagrees with the model's expert tensors");
+            }
+        }
+
+        const json & recorded_role_bytes = recorded_variant.at("bytes_per_slice_per_role");
+        if (!recorded_role_bytes.is_array() || recorded_role_bytes.size() != block.at("widths").size()) {
+            throw std::runtime_error("recorded per-variant slice byte counts disagree with the slice widths");
+        }
+        for (size_t s = 0; s < recorded_role_bytes.size(); ++s) {
+            const json & recorded = recorded_role_bytes.at(s);
+            if (!recorded.is_array() || recorded.size() != 3) {
+                throw std::runtime_error("recorded per-variant slice byte counts are invalid");
+            }
+            const int64_t width = block.at("widths").at(s).get<int64_t>();
+            for (size_t r = 0; r < 3; ++r) {
+                if (recorded.at(r).get<uint64_t>() !=
+                    expected_variant.role_slice_bytes(role_masks[r], width, geom.n_embd)) {
+                    throw std::runtime_error("recorded per-variant slice byte counts disagree with the model's tensors");
+                }
+            }
+        }
     }
 
     wp_repack::SliceSpec spec;
@@ -1256,6 +1482,7 @@ wp_repack::SliceSpec slicing_from_json(const json & value, const SliceGeometry &
     wp_repack::SliceSpec check = spec;
     check.from_ratios          = false;
     wp_repack::resolve_slice_widths(check, geom.n_ff, geom.blck);
+    validate_slice_ranges(wp_repack::slice_ranges(check.widths), geom);
     return spec;
 }
 
@@ -1275,7 +1502,7 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
         throw std::runtime_error("invalid shard layer range");
     }
 
-    const wp_repack::SliceSpec               spec   = slicing_from_json(index, geom);
+    const wp_repack::SliceSpec               spec   = slicing_from_json(index, geom, groups);
     const std::vector<wp_repack::SliceRange> ranges = wp_repack::slice_ranges(spec.widths);
 
     const std::vector<size_t> expected_indices = indices_for_range(groups, layer_first, layer_last);
@@ -1306,9 +1533,12 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
 
     for (size_t i = 0; i < expected_indices.size(); ++i) {
         const wp_repack::ExpertGroup & expected = groups[expected_indices[i]];
+        const size_t                  group_index = expected_indices[i];
+        const SliceGeometryVariant &  variant = geom.variant_for_group(group_index);
         const json &                   actual   = indexed_groups.at(i);
         if (actual.at("block_idx").get<int>() != expected.block_idx ||
-            actual.at("expert_idx").get<int>() != expected.expert_idx) {
+            actual.at("expert_idx").get<int>() != expected.expert_idx ||
+            actual.at("geometry_variant").get<size_t>() != geom.group_variants[group_index]) {
             throw std::runtime_error("group identity mismatch");
         }
 
@@ -1322,15 +1552,19 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
         // writer used, then compare it byte for byte with what is on disk. This
         // is what makes the down-column gather trustworthy: a wrong stride shows
         // up here rather than as quiet garbage at inference time.
-        build_group_slices(expected, geom, ranges, sources, scratch, expected_payload);
+        build_group_slices(expected, variant, geom.n_embd, ranges, sources, scratch, expected_payload);
 
         const uint64_t group_offset = next_offset;
         uint64_t       cursor       = group_offset;
         for (size_t s = 0; s < ranges.size(); ++s) {
             const json &                  slice_json  = slices.at(s);
             const wp_repack::SliceRange & range       = ranges[s];
-            const uint64_t                role_bytes  = geom.role_slice_bytes(range.width());
-            const uint64_t                slice_bytes = role_bytes * 3;
+            const uint64_t                role_bytes[3] = {
+                variant.role_slice_bytes(wp::ROLE_UP, range.width(), geom.n_embd),
+                variant.role_slice_bytes(wp::ROLE_GATE, range.width(), geom.n_embd),
+                variant.role_slice_bytes(wp::ROLE_DOWN, range.width(), geom.n_embd),
+            };
+            const uint64_t                slice_bytes = role_bytes[0] + role_bytes[1] + role_bytes[2];
             if (slice_json.at("slice_idx").get<int>() != range.index ||
                 slice_json.at("ff_first").get<int64_t>() != range.first ||
                 slice_json.at("ff_last").get<int64_t>() != range.last ||
@@ -1351,8 +1585,10 @@ VerifyCounts verify_index_sliced(const fs::path &                            ind
             for (size_t r = 0; r < 3; ++r) {
                 const wp_repack::ExpertMember & src = member_for_role(expected, order[r], names[r]);
                 const json &                    m   = members.at(r);
-                if (m.at("role_mask").get<uint8_t>() != src.role_mask || m.at("size").get<uint64_t>() != role_bytes ||
-                    m.at("offset").get<uint64_t>() != cursor + role_bytes * r ||
+                const uint64_t member_offset = cursor + (r == 0 ? 0 : role_bytes[0]) +
+                                               (r == 2 ? role_bytes[1] : 0);
+                if (m.at("role_mask").get<uint8_t>() != src.role_mask || m.at("size").get<uint64_t>() != role_bytes[r] ||
+                    m.at("offset").get<uint64_t>() != member_offset ||
                     m.at("catalog_name").get<std::string>() != src.catalog_name ||
                     m.at("source_tensor_name").get<std::string>() != src.source_tensor_name ||
                     m.at("source_file_idx").get<uint16_t>() != src.file_idx ||
@@ -1406,7 +1642,7 @@ VerifyCounts verify_manifest_sliced(const fs::path &                            
         throw std::runtime_error("manifest shard count mismatch");
     }
 
-    const wp_repack::SliceSpec spec = slicing_from_json(manifest, geom);
+    const wp_repack::SliceSpec spec = slicing_from_json(manifest, geom, groups);
 
     VerifyCounts                  total;
     std::vector<size_t>           all_indices;
