@@ -59,6 +59,11 @@ extern "C" {
 #  include <sys/stat.h>
 #  include <sys/types.h>
 #  include <unistd.h>
+// WP_CPU_TIER_PIN: sched_setaffinity / sched_setscheduler for the ONE-SHOT pin
+// of the CPU expert tier's executor thread. Needed because ggml only applies a
+// threadpool's cpumask/prio from inside its `#pragma omp parallel`, which it
+// skips entirely at n_threads == 1 -- see wp_cpu_tier_pin_self().
+#  include <sched.h>
 // WP_DISPATCH_DEDUP_ACTIVATIONS: POSIX shm (shm_open/mmap) for the
 // same-machine activation rendezvous. Same portability tier as the O_DIRECT /
 // posix_memalign / poll() usage already gated behind __linux__ above.
@@ -1865,6 +1870,319 @@ int cpu_worker_n_threads() {
     return (int) n;
 }
 
+// ---------------------------------------------------------------------------
+// *** WP_CPU_TIER_OVERLAP -- LET THE CPU EXPERT TIER RUN ALONGSIDE THE GPUs. ***
+//
+// DEFAULT OFF. Unset (or "0") and every function below is inert: the CPU tier
+// keeps its own serial phase after the GPUs, exactly as measured and shipped.
+//
+// THE PROBLEM THIS SOLVES. See the long comment on the WP_DEVICE_PARALLEL
+// dispatch loop: running the CPU expert tier concurrently with the GPU tiers
+// was tried and REGRESSED everything, because the CPU tier's threads spin at
+// their barriers and deschedule the GPU backends' host/submission threads.
+// Serialising it costs a measured 0.42 ms per layer-request on 2026 and 0.32 ms
+// on main; at 48 layer RPCs per token that is ~15-20 ms/tok on a ~116 ms/tok
+// decode. Recovering it needs the CPU tier to overlap WITHOUT being allowed to
+// eat every core.
+//
+// WHY THE ggml `poll` KNOB IS NOT THE ANSWER HERE. ggml_threadpool_params::poll
+// (poll=0 => blocking wait) only governs ggml's OWN worker threads, which exist
+// only in the `#ifndef GGML_USE_OPENMP` build. This tree builds ggml-cpu with
+// GGML_OPENMP=ON (GGML_OPENMP:BOOL=ON in every build-*/CMakeCache.txt here), so
+// ggml_graph_compute() runs the graph inside `#pragma omp parallel` and
+// ggml_barrier() is `#pragma omp barrier`. The spinning is libgomp's, tuned by
+// GOMP_SPINCOUNT/OMP_WAIT_POLICY, which libgomp latches in a constructor before
+// main() -- setenv() from inside the worker is too late to change it. So `poll`
+// is dead config on this build and env-poking is unreliable.
+//
+// WHAT WE DO INSTEAD -- CONFINE, DON'T UNSPIN. Under OpenMP,
+// ggml_threadpool_new() spawns NO threads: it is purely a carrier for per-thread
+// cpumasks and a scheduling priority, and ggml_graph_compute() applies BOTH
+// FROM INSIDE the parallel region, to whichever OpenMP threads it actually got
+// (ggml-cpu.c: ggml_thread_apply_priority(threadpool->prio) then
+// ggml_thread_apply_affinity(workers[ith].cpumask)). Attaching such a
+// threadpool to the CPU tier's backend therefore gives us, per graph:
+//
+//   1. AFFINITY. The tier's OpenMP team is pinned to a fixed subset of logical
+//      CPUs. It can still spin all it likes -- it simply no longer HAS the
+//      cores the Vulkan/HIP/CUDA submission threads need. Starvation stops
+//      being possible rather than being merely discouraged.
+//   2. PRIORITY. GGML_SCHED_PRIO_LOW is SCHED_BATCH on Linux (see
+//      ggml_thread_apply_priority). SCHED_BATCH marks a thread as CPU-bound and
+//      REMOVES ITS WAKEUP PREEMPTION CREDIT, so a GPU submit thread that wakes
+//      on the same runqueue preempts the spinner immediately instead of waiting
+//      out a scheduling slice. This is the cheap half of the fix and it costs
+//      nothing when there is no contention. It is also unprivileged-safe:
+//      SCHED_OTHER <-> SCHED_BATCH needs no capability.
+//
+// Because both are applied INSIDE the parallel region, they land on the real
+// team every time and do not depend on which thread created the team.
+// ---------------------------------------------------------------------------
+
+bool cpu_tier_overlap_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_CPU_TIER_OVERLAP");
+        return e != nullptr && std::strcmp(e, "0") != 0 && e[0] != '\0';
+    }();
+    return on;
+}
+
+// Thread count for the CPU tier WHEN OVERLAPPING. The serial-phase optimum is
+// not the overlapped optimum: serialised, the tier owns the machine and wants
+// every core it can use; overlapped, it must leave the GPU submission threads
+// somewhere to run. WP_CPU_TIER_THREADS overrides; unset it defaults to
+// cpu_worker_n_threads() so turning the knob on changes ONE thing at a time.
+int cpu_tier_overlap_n_threads() {
+    static const int n = [] {
+        const unsigned int hw         = std::thread::hardware_concurrency();
+        const unsigned int hw_clamped = hw == 0 ? 1 : hw;
+        int v = cpu_worker_n_threads();
+        if (const char * e = std::getenv("WP_CPU_TIER_THREADS")) {
+            const long parsed = std::strtol(e, nullptr, 10);
+            if (parsed > 0) {
+                v = (int) std::min<long>(parsed, (long) hw_clamped);
+            }
+        }
+        return v;
+    }();
+    return n;
+}
+
+// Parse a Linux-style CPU list: "6,7", "16-23", "0-3,8-11". Returns false if
+// nothing was set, so callers can fall back to the derived default.
+bool parse_cpu_list(const char * spec, bool * mask /* GGML_MAX_N_THREADS */) {
+    bool any = false;
+    const char * p = spec;
+    while (*p != '\0') {
+        while (*p == ',' || *p == ' ') { ++p; }
+        if (*p == '\0') { break; }
+        char * end = nullptr;
+        const long lo = std::strtol(p, &end, 10);
+        if (end == p) { break; }
+        long hi = lo;
+        p = end;
+        if (*p == '-') {
+            ++p;
+            hi = std::strtol(p, &end, 10);
+            if (end == p) { break; }
+            p = end;
+        }
+        for (long c = lo; c <= hi; ++c) {
+            if (c >= 0 && c < GGML_MAX_N_THREADS) {
+                mask[c] = true;
+                any = true;
+            }
+        }
+    }
+    return any;
+}
+
+// The CPU set the overlapped tier is confined to.
+//
+// WP_CPU_TIER_CPUS takes a CPU list and is the knob you actually want to set
+// per box, because the right answer is a TOPOLOGY question this code cannot
+// answer portably: logical-CPU numbering differs between the 4c/8t i7-6700K
+// (2026) and the 12c/24t 3900X (main), and whether you want whole physical
+// cores or SMT siblings depends on how much of the box the GPU drivers need.
+//
+// The DEFAULT, when the knob is unset, is the last N logical CPUs, N = the
+// tier's thread count. That is deliberately the conservative choice: on both
+// boxes the high-numbered logical CPUs are the second SMT thread of a physical
+// core, so the tier lands on hyperthreads and the primary siblings stay
+// available to the GPU submission threads. It is a floor, not an optimum --
+// measure, then pin explicitly.
+void cpu_tier_cpumask(bool * mask /* GGML_MAX_N_THREADS */) {
+    std::memset(mask, 0, GGML_MAX_N_THREADS);
+    if (const char * e = std::getenv("WP_CPU_TIER_CPUS")) {
+        if (parse_cpu_list(e, mask)) {
+            return;
+        }
+        std::memset(mask, 0, GGML_MAX_N_THREADS);
+    }
+    const unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) { return; }   // unknown topology: leave the mask empty (= no affinity)
+    const int n  = std::min<int>(cpu_tier_overlap_n_threads(), (int) hw);
+    const int lo = std::max<int>(0, (int) hw - n);
+    for (int c = lo; c < (int) hw && c < GGML_MAX_N_THREADS; ++c) {
+        mask[c] = true;
+    }
+}
+
+// WP_CPU_TIER_STRICT=0|1 (default 1). Strict gives each OpenMP thread ONE
+// distinct CPU out of the mask (ggml_thread_cpumask_next), i.e. a hard 1:1 pin;
+// non-strict gives every thread the whole mask and lets the scheduler move them
+// inside it. Strict is the default because the whole point here is to make the
+// tier's footprint deterministic, and it also stops two of the tier's own
+// spinning threads from landing on one core.
+bool cpu_tier_strict() {
+    static const bool strict = [] {
+        const char * e = std::getenv("WP_CPU_TIER_STRICT");
+        return e == nullptr || (std::strcmp(e, "0") != 0 && e[0] != '\0');
+    }();
+    return strict;
+}
+
+// WP_CPU_TIER_PRIO=low|normal (default low). "low" is SCHED_BATCH on Linux, the
+// wakeup-preemption fix described above. Set it to "normal" if the build ever
+// starts printing "failed to set thread priority" (that warning would fire once
+// per thread per graph, so it would be loud) or if SCHED_BATCH is unavailable.
+enum ggml_sched_priority cpu_tier_prio() {
+    static const enum ggml_sched_priority prio = [] {
+        const char * e = std::getenv("WP_CPU_TIER_PRIO");
+        if (e != nullptr && std::strcmp(e, "normal") == 0) {
+            return GGML_SCHED_PRIO_NORMAL;
+        }
+        return GGML_SCHED_PRIO_LOW;
+    }();
+    return prio;
+}
+
+// ---------------------------------------------------------------------------
+// WP_CPU_TIER_PIN=1 (DEFAULT OFF) -- ONE-SHOT pin of the CPU expert tier's
+// executor thread.
+//
+// WHY THIS EXISTS AND WHY configure_cpu_backend() IS NOT ENOUGH. ggml applies a
+// threadpool's cpumask and priority from INSIDE `#pragma omp parallel`, and
+// ggml_graph_compute() only enters that region when n_threads > 1:
+//
+//     if (n_threads > 1) { #pragma omp parallel ... apply prio/affinity ... }
+//     else               { ggml_graph_compute_thread(&workers[0]); }
+//
+// So at n_threads == 1 -- which is the configuration that makes CPU-tier
+// overlap viable on a 4-core box at all, because it means libgomp never forms a
+// team and therefore never leaves a worker spinning out GOMP_SPINCOUNT between
+// graphs -- the threadpool's cpumask and SCHED_BATCH are DEAD CONFIG. This
+// applies them directly to the tier's own DeviceExecutor thread instead.
+//
+// It is also cheaper where both paths work: ggml re-applies affinity and
+// priority on EVERY graph, for every thread in the team (two syscalls per
+// thread per graph, and this worker runs 48 layer RPCs per token). This is two
+// syscalls for the process lifetime.
+//
+// Safe to combine with the threadpool path: at n_threads > 1 ggml will simply
+// re-apply the same mask and priority over the top of ours.
+//
+// The mask and priority come from WP_CPU_TIER_CPUS / WP_CPU_TIER_PRIO, exactly
+// as for the threadpool, so one topology answer configures both.
+bool cpu_tier_pin_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_CPU_TIER_PIN");
+        return e != nullptr && std::strcmp(e, "0") != 0 && e[0] != '\0';
+    }();
+    return on;
+}
+
+// Called ON the tier's executor thread, once, at thread start.
+void wp_cpu_tier_pin_self() {
+#if defined(__linux__)
+    if (!cpu_tier_pin_enabled()) {
+        return;
+    }
+    bool mask[GGML_MAX_N_THREADS];
+    cpu_tier_cpumask(mask);
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int n = 0;
+    std::string cpus;
+    for (int c = 0; c < GGML_MAX_N_THREADS && c < CPU_SETSIZE; ++c) {
+        if (mask[c]) {
+            CPU_SET(c, &set);
+            ++n;
+            if (!cpus.empty()) { cpus += ","; }
+            cpus += std::to_string(c);
+        }
+    }
+    // An empty mask means "unknown topology" upstream; do not pin to nothing.
+    // NOTE: unlike ggml's strict_cpu, the WHOLE mask is given to the single
+    // thread. WP_CPU_TIER_CPUS=3,7 therefore hands the tier one entire physical
+    // core (both SMT siblings) and lets the scheduler pick, which is what you
+    // want for a one-thread tier -- strict 1:1 pinning only matters when there
+    // are several tier threads to keep off each other.
+    if (n > 0 && sched_setaffinity(0, sizeof(set), &set) != 0) {
+        std::fprintf(stderr,
+            "wp: WP_CPU_TIER_PIN: sched_setaffinity([%s]) failed: %s\n",
+            cpus.c_str(), std::strerror(errno));
+    }
+
+    // SCHED_BATCH removes this thread's wakeup preemption credit, so a GPU
+    // submission thread waking on the same runqueue preempts it immediately
+    // instead of waiting out a slice. Unprivileged-safe (SCHED_OTHER <->
+    // SCHED_BATCH needs no capability); nice value is untouched.
+    if (cpu_tier_prio() == GGML_SCHED_PRIO_LOW) {
+        struct sched_param param;
+        std::memset(&param, 0, sizeof(param));
+        if (sched_setscheduler(0, SCHED_BATCH, &param) != 0) {
+            std::fprintf(stderr,
+                "wp: WP_CPU_TIER_PIN: sched_setscheduler(SCHED_BATCH) failed: %s\n",
+                std::strerror(errno));
+        }
+    }
+
+    std::fprintf(stderr,
+        "wp: WP_CPU_TIER_PIN=1: CPU expert tier executor thread pinned; "
+        "cpus=[%s] prio=%s\n",
+        n > 0 ? cpus.c_str() : "unpinned",
+        cpu_tier_prio() == GGML_SCHED_PRIO_LOW ? "low(SCHED_BATCH)" : "normal");
+#endif
+}
+
+// Configure a CPU backend that will carry the CPU EXPERT TIER.
+//
+// `tier` must be true ONLY for the backend of the "CPU" expert device -- the one
+// driven by its own DeviceExecutor thread. It must be FALSE for the per-device
+// cpu_backend_ used by compute_cpu_on_arrival(), which runs on a GPU device's
+// executor thread: ggml applies prio/affinity to the OpenMP team INCLUDING
+// thread 0, which under libgomp IS the calling thread, and nothing restores it
+// afterwards. Confining a GPU device's submission thread to the CPU tier's
+// cores and dropping it to SCHED_BATCH -- permanently, from a fallback path --
+// is exactly the starvation we are trying to remove.
+void configure_cpu_backend(ggml_backend_t backend, bool tier) {
+    if (backend == nullptr) { return; }
+    if (!tier || !cpu_tier_overlap_enabled()) {
+        ggml_backend_cpu_set_n_threads(backend, cpu_worker_n_threads());
+        return;
+    }
+    const int n_threads = cpu_tier_overlap_n_threads();
+    // n_threads MUST match what the backend asks ggml_graph_compute() for:
+    // under OpenMP the team is sized from cplan->n_threads but indexes
+    // threadpool->workers[omp_get_thread_num()], so a smaller pool is an
+    // out-of-bounds read.
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+
+    // The pool is intentionally never freed: it belongs to a process-lifetime
+    // backend, and under OpenMP it owns no threads -- it is a params carrier
+    // ggml_graph_compute() reads on every graph, so it must outlive all of them.
+    ggml_threadpool_params params;
+    ggml_threadpool_params_init(&params, n_threads);
+    cpu_tier_cpumask(params.cpumask);
+    params.strict_cpu = cpu_tier_strict();
+    params.prio       = cpu_tier_prio();
+    params.paused     = false;
+    ggml_threadpool_t tp = ggml_threadpool_new(&params);
+    if (tp == nullptr) {
+        std::fprintf(stderr,
+            "wp: WP_CPU_TIER_OVERLAP: failed to create the confined CPU-tier "
+            "threadpool; falling back to the default (unconfined) pool\n");
+        return;
+    }
+    ggml_backend_cpu_set_threadpool(backend, tp);
+
+    std::string cpus;
+    for (int c = 0; c < GGML_MAX_N_THREADS; ++c) {
+        if (params.cpumask[c]) {
+            if (!cpus.empty()) { cpus += ","; }
+            cpus += std::to_string(c);
+        }
+    }
+    std::fprintf(stderr,
+        "wp: WP_CPU_TIER_OVERLAP=1: CPU expert tier overlaps the GPU tiers; "
+        "threads=%d cpus=[%s] strict=%d prio=%s\n",
+        n_threads, cpus.empty() ? "default" : cpus.c_str(),
+        (int) params.strict_cpu,
+        params.prio == GGML_SCHED_PRIO_LOW ? "low(SCHED_BATCH)" : "normal");
+}
+
 // WP_EXPERT_PARTIAL_DTYPE=f32|f16 (default f32, CONFIG NOT HARDCODE). Wire
 // encoding of the PARTIAL this worker sends back to the spine after summing
 // its own subset of a layer's routed experts -- see the dtype note on
@@ -1914,9 +2232,9 @@ backend_ptr init_backend(const std::string & device) {
     ggml_backend_t backend = nullptr;
     if (lower == "cpu") {
         backend = ggml_backend_cpu_init();
-        if (backend != nullptr) {
-            ggml_backend_cpu_set_n_threads(backend, cpu_worker_n_threads());
-        }
+        // tier=true: this IS the CPU expert device's backend, the one
+        // WP_CPU_TIER_OVERLAP confines. See configure_cpu_backend().
+        configure_cpu_backend(backend, /* tier = */ true);
     } else {
         ggml_backend_load_all();
         backend = ggml_backend_init_by_name(device.c_str(), nullptr);
@@ -11179,7 +11497,12 @@ private:
             if (!cpu_backend_) {
                 throw std::runtime_error("failed to initialize CPU expert backend");
             }
-            ggml_backend_cpu_set_n_threads(cpu_backend_.get(), cpu_worker_n_threads());
+            // tier=false ON PURPOSE. This backend runs on a GPU DeviceWorker's
+            // executor thread, and ggml applies the threadpool's priority and
+            // affinity to OpenMP thread 0 -- which is the calling thread -- and
+            // never restores them. Confining a GPU submission thread here would
+            // recreate the very starvation WP_CPU_TIER_OVERLAP exists to avoid.
+            configure_cpu_backend(cpu_backend_.get(), /* tier = */ false);
         }
 
         const auto started = std::chrono::steady_clock::now();
@@ -12008,48 +12331,86 @@ public:
             // itself. It is the SMALLEST group (231 us vs 833/714), so serialising
             // it costs little; letting it spin alongside the GPUs cost everything.
             // Ideal layer = max(GPUs) + CPU = 833 + 231 = 1064 us, vs 1779 serial.
+            //
+            // *** WP_CPU_TIER_OVERLAP=1 LIFTS THAT SERIALISATION. *** Default
+            // off; unset, everything below runs exactly as described above.
+            // Set, the CPU tier is launched in the SAME window as the GPUs and
+            // the leg becomes max(GPUs, CPU) instead of max(GPUs) + CPU -- worth
+            // a measured 0.42 ms/leg on 2026 and 0.32 ms/leg on main, ~48 legs
+            // per token. What makes that safe now and unsafe before is that the
+            // tier's backend is bound to a CPU-confined, SCHED_BATCH threadpool
+            // (see configure_cpu_backend): its threads still spin, but they no
+            // longer own cores the GPU submission threads need, and they lose
+            // wakeup preemption against those threads. The knob is per-box
+            // because the right CPU set is a topology question -- see
+            // WP_CPU_TIER_CPUS.
+            const bool cpu_overlap = cpu_tier_overlap_enabled();
             std::vector<size_t> launched;
             size_t cpu_device = SIZE_MAX;
-            for (size_t d = 0; d < by_device.size(); ++d) {
-                if (by_device[d].empty()) { continue; }
-                if (d < device_names_.size() &&
-                        device_names_[d].find("CPU") != std::string::npos) {
-                    cpu_device = d;   // deferred to its own phase below
-                    continue;
-                }
+            // The CPU tier's executor is the only one that gets pinned, and the
+            // only one for which pinning is meaningful -- WP_CPU_TIER_PIN, off
+            // by default. Every other device's executor is a GPU submission
+            // thread and must stay wherever the scheduler wants it.
+            const auto ensure_exec = [this](size_t d) {
                 if (!device_exec_[d]) {
                     device_exec_[d] = std::make_unique<DeviceExecutor>();
-                    device_exec_[d]->start();
+                    device_exec_[d]->start(/* pin = */ is_cpu_device(d));
                 }
+            };
+            for (size_t d = 0; d < by_device.size(); ++d) {
+                if (by_device[d].empty()) { continue; }
+                if (is_cpu_device(d)) {
+                    cpu_device = d;   // scheduled separately, below
+                    break;
+                }
+            }
+            // LAUNCH THE CPU TIER FIRST when overlapping. It is the shortest
+            // group, so starting it last would leave its tail hanging past the
+            // GPUs for no reason; starting it first puts its whole span inside
+            // the GPU window. It still gets its OWN executor thread -- device
+            // work never migrates threads here, overlap or not (an earlier
+            // revision ran a device on the calling thread and took a GPU
+            // memory-access fault for it).
+            if (cpu_overlap && cpu_device != SIZE_MAX) {
+                ensure_exec(cpu_device);
+                device_exec_[cpu_device]->submit(
+                    [run_device, cpu_device] { run_device(cpu_device); });
+                launched.push_back(cpu_device);
+            }
+            for (size_t d = 0; d < by_device.size(); ++d) {
+                if (by_device[d].empty() || d == cpu_device) { continue; }
+                ensure_exec(d);
                 device_exec_[d]->submit([run_device, d] { run_device(d); });
                 launched.push_back(d);
             }
             // Join ALL before rethrowing any, or a still-running executor would
             // keep writing into partials/sub_stats after this frame unwound.
+            // Join the GPUs before the CPU tier even though the CPU tier was
+            // submitted first: the GPU legs are the long pole, so waiting on
+            // them first means the CPU join is almost always already satisfied
+            // and costs no extra spin.
             std::exception_ptr first_error;
-            for (const size_t d : launched) {
+            const auto join = [this, &first_error](size_t d) {
                 try {
                     device_exec_[d]->join_one();
                 } catch (...) {
                     if (!first_error) { first_error = std::current_exception(); }
                 }
+            };
+            for (const size_t d : launched) {
+                if (d == cpu_device) { continue; }
+                join(d);
             }
-            // PHASE 2: the CPU tier, alone, after every GPU has finished. Still
-            // on its OWN executor thread -- thread affinity is not negotiable
-            // (an earlier revision ran a device on the calling thread and took a
-            // GPU memory-access fault for it).
+            // PHASE 2 (default builds): the CPU tier, alone, after every GPU has
+            // finished. With WP_CPU_TIER_OVERLAP=1 it was already submitted
+            // above and this only collects it.
             if (cpu_device != SIZE_MAX) {
-                if (!device_exec_[cpu_device]) {
-                    device_exec_[cpu_device] = std::make_unique<DeviceExecutor>();
-                    device_exec_[cpu_device]->start();
+                if (!cpu_overlap) {
+                    ensure_exec(cpu_device);
+                    device_exec_[cpu_device]->submit(
+                        [run_device, cpu_device] { run_device(cpu_device); });
                 }
-                device_exec_[cpu_device]->submit(
-                    [run_device, cpu_device] { run_device(cpu_device); });
-                try {
-                    device_exec_[cpu_device]->join_one();
-                } catch (...) {
-                    if (!first_error) { first_error = std::current_exception(); }
-                }
+                join(cpu_device);
             }
             if (first_error) { std::rethrow_exception(first_error); }
         } else {
@@ -12250,13 +12611,22 @@ private:
                device_names_[device].rfind("ROCm", 0) == 0;
     }
 
+    bool is_cpu_device(size_t device) const {
+        return device < device_names_.size() &&
+               device_names_[device].find("CPU") != std::string::npos;
+    }
+
     void ensure_device_executor(size_t device) {
         if (device_exec_.size() != devices_.size()) {
             device_exec_.resize(devices_.size());
         }
         if (!device_exec_[device]) {
             device_exec_[device] = std::make_unique<DeviceExecutor>();
-            device_exec_[device]->start();
+            // Pin here too: whichever call site happens to create the CPU
+            // tier's executor first must be the one that places it, because the
+            // pin is applied once at thread start and this executor lives for
+            // the process. See wp_cpu_tier_pin_self().
+            device_exec_[device]->start(/* pin = */ is_cpu_device(device));
         }
     }
 
@@ -12750,6 +13120,12 @@ private:
     // thread, but outside the concurrent GPU window, gives the intended layer
     // cost of max(GPUs) + CPU tier.
     //
+    // WP_CPU_TIER_OVERLAP=1 (default OFF) folds the CPU tier back INTO the
+    // concurrent window, which is only safe because the tier's backend is then
+    // bound to a CPU-confined SCHED_BATCH threadpool -- see
+    // configure_cpu_backend() for the whole argument, including why ggml's
+    // `poll` knob cannot help on this OpenMP build.
+    //
     // POST-FIX MEASUREMENTS (2026-08-29), sliced rig, code cd787a2b7,
     // identical config, only the env var changed; eslice-measure.sh protocol,
     // 1040-tok prompts, 256-tok decodes:
@@ -12774,9 +13150,24 @@ private:
         bool                    has_task = false;
         bool                    idle     = true;
         bool                    stop     = false;
+        // Lock-free mirror of `idle`, published with release ordering AFTER the
+        // mutex-protected store so a spinning joiner can poll it without taking
+        // `mu` on every iteration. The old spin locked and unlocked `mu` up to
+        // 20000 times per join, contending with the very worker thread it was
+        // waiting for -- the joiner's own polling could delay the completion
+        // store it was polling for. Correctness still rests on the CV wait
+        // below; this is purely a fast path.
+        std::atomic<bool>       idle_flag{true};
 
-        void start() {
-            thread = std::thread([this] {
+        // `pin` is true ONLY for the CPU expert tier's executor. See
+        // wp_cpu_tier_pin_self(): at WP_CPU_TIER_THREADS=1 ggml never enters an
+        // OpenMP region and so never applies the threadpool's cpumask/priority,
+        // and this is the only place the tier's thread can be placed at all.
+        void start(bool pin = false) {
+            thread = std::thread([this, pin] {
+                if (pin) {
+                    wp_cpu_tier_pin_self();
+                }
                 for (;;) {
                     std::function<void()> job;
                     {
@@ -12797,6 +13188,7 @@ private:
                         error = caught;
                         idle  = true;
                     }
+                    idle_flag.store(true, std::memory_order_release);
                     cv_done.notify_all();
                 }
             });
@@ -12807,6 +13199,7 @@ private:
                 task     = std::move(job);
                 has_task = true;
                 idle     = false;
+                idle_flag.store(false, std::memory_order_relaxed);
                 error    = nullptr;
             }
             cv_task.notify_one();
@@ -12818,6 +13211,7 @@ private:
                 task     = std::move(job);
                 has_task = true;
                 idle     = false;
+                idle_flag.store(false, std::memory_order_relaxed);
                 error    = nullptr;
             }
             cv_task.notify_one();
@@ -12833,11 +13227,22 @@ private:
             // bounded window first so the common case never sleeps at all, then
             // fall back to the CV so a long group (a cold page-in) still parks
             // the thread instead of burning a core.
-            for (int i = 0; i < 20000; ++i) {
-                {
-                    std::lock_guard<std::mutex> lock(mu);
-                    if (idle) { break; }
-                }
+            //
+            // WP_EXEC_SPIN tunes that window (default 20000 = unchanged; 0
+            // disables the spin and goes straight to the CV). It exists for
+            // WP_CPU_TIER_OVERLAP: this spin makes the CALLING thread runnable
+            // for the whole leg, and on the 4c/8t box adding an overlapped CPU
+            // tier to that is one more contender than the GPU submission
+            // threads may have room for. If overlap measures worse than it
+            // should on 2026, try WP_EXEC_SPIN=0 before giving up on it.
+            static const int spin_rounds = [] {
+                const char * e = std::getenv("WP_EXEC_SPIN");
+                if (e == nullptr) { return 20000; }
+                const long v = std::strtol(e, nullptr, 10);
+                return v < 0 ? 0 : (int) v;
+            }();
+            for (int i = 0; i < spin_rounds; ++i) {
+                if (idle_flag.load(std::memory_order_acquire)) { break; }
                 std::this_thread::yield();
             }
             std::unique_lock<std::mutex> lock(mu);
