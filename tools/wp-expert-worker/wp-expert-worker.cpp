@@ -9295,6 +9295,78 @@ private:
             const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
             return v > 0 ? (size_t) v : (size_t) 16;
         }();
+        // *** WP_EXPERT_FUSE_GATE_UP=1 (DEFAULT OFF). ***
+        //
+        // THE COST THIS ATTACKS. The dense per-expert chain below is six graph
+        // nodes -- mul_mat(gate), mul_mat(up), swiglu_split, mul_mat(down),
+        // mul(route_w), add(fold) -- and every one is a separate Vulkan
+        // dispatch with a pipeline barrier between dependent pairs. MEASURED
+        // 2026-08-29: the 2026 leg costs ~165-175 us PER EXPERT at n_tokens=4
+        // (30 experts, 5.32 ms/request) and ~200 us/expert at n_tokens=1, while
+        // an expert's whole 0.9 MiB weight slice is only ~4 us of RX 480
+        // bandwidth. The per-expert cost is launch and barrier overhead, so the
+        // lever is NODES PER EXPERT, and it is linear in expert count -- it
+        // bounds both single-stream decode and width scaling.
+        //
+        // THE MECHANISM. gate and up are the same type, the same shape
+        // [n_embd, n_ff_slice], and layout_sliced_pages() packs an expert's
+        // roles back to back in slot order, so when `up` sits exactly
+        // ggml_row_size(type, ne0) * ne1 bytes after `gate` the pair is ONE
+        // contiguous [n_embd, 2*n_ff_slice] matrix. One mul_mat over that
+        // produces gate rows 0..ne1-1 and up rows ne1..2*ne1-1 in a single
+        // dispatch, and non-split ggml_swiglu() consumes exactly that layout
+        // (out[i] = silu(a[i]) * a[i + ne1]) -- which is what swiglu_split(gate,
+        // up) computes. Six nodes per expert become five, the two smallest
+        // dispatches (192 rows -> 48 workgroups each on Polaris' rm_kq=4)
+        // become one 96-workgroup dispatch, and one barrier disappears.
+        //
+        // WHY IT SHOULD BE BIT-EXACT (and why it is still behind a flag). Each
+        // output row of a mul_mat_vec is an independent reduction over k by the
+        // same 64 lanes of the same shader; k (2560) does not change and the
+        // GCN pipeline choice does not depend on the row count (dmmv_wg is
+        // pinned to DMMV_WG_SIZE_SUBGROUP on AMD_GCN), so row j's dot product
+        // is computed identically whether the matrix has 192 rows or 384. That
+        // argument is sound but UNVERIFIED on hardware here, hence default OFF.
+        //
+        // THREE HARD GUARDS, all checked per request, all falling back silently:
+        //  * dense only. gather rebuilds ffn_in per expert; the fusion is
+        //    orthogonal but untested there.
+        //  * swiglu_clamp must be off. The clamp is ASYMMETRIC -- up gets
+        //    [-L, L] and gate gets [-INF, L] -- so a single clamp on the fused
+        //    tensor is a different function. See the clamp note below.
+        //  * every selected expert must actually have up adjacent to gate.
+        //    Checked against the real device offsets, not assumed from the
+        //    layout algorithm.
+        static const bool s_fuse_gate_up = [] {
+            const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
+            return e != nullptr && e[0] == '1';
+        }();
+        const auto fuse_gate_up_ok = [&]() {
+            if (!s_fuse_gate_up || use_gather || request.swiglu_clamp > 1e-6f) {
+                return false;
+            }
+            const auto & fspecs = catalog_.descriptor.layers.at(request.layer);
+            const RoleSpec & sg = fspecs.at("gate");
+            const RoleSpec & su = fspecs.at("up");
+            if (sg.type != su.type || sg.ne0 != su.ne0 || sg.ne1 != su.ne1) {
+                return false;
+            }
+            const size_t gate_bytes =
+                ggml_row_size(sg.type, (int64_t) sg.ne0) * (size_t) sg.ne1;
+            for (size_t i = 0; i < request.assignments.size(); ++i) {
+                if (!selected(i)) {
+                    continue;
+                }
+                const ExpertPage & page = *pages[i];
+                const uint64_t go = page.roles.at("gate").device_offset;
+                const uint64_t uo = page.roles.at("up").device_offset;
+                if (uo != go + (uint64_t) gate_bytes) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const bool fuse_gate_up = fuse_gate_up_ok();
         uint32_t gather_rank = 0;
         bool     gather_rank_uniform = !use_gather;
         if (use_gather) {
@@ -9327,6 +9399,7 @@ private:
             key.n_selected   = (uint32_t) n_selected;
             key.idx_rank     = gather_rank;
             key.add_previous = add_previous;
+            key.fused_gate_up = fuse_gate_up;
             std::memcpy(&key.clamp_bits, &request.swiglu_clamp, sizeof(key.clamp_bits));
             // See the note on GraphKey: a cache hit rebinds pointers, never
             // types, so two layers whose expert tensors are quantized
@@ -9393,9 +9466,15 @@ private:
                 const ExpertPage & page = *pages[i];
                 const ExpertSlotPool::Loaded loaded = batch.loaded(i);
                 for (int j = 0; j < 3; ++j) {
+                    // Fused graphs leave the `up` slot null: its rows live in
+                    // the [ne0, 2*ne1] tensor already rebound at slot `gate`.
+                    ggml_tensor * w = gc->expert_w[k * 3 + (size_t) j];
+                    if (w == nullptr) {
+                        continue;
+                    }
                     attach_weight(
-                        gc->expert_w[k * 3 + (size_t) j], loaded.buffer,
-                        loaded.base, page.roles.at(kRoles[j]).device_offset);
+                        w, loaded.buffer, loaded.base,
+                        page.roles.at(kRoles[j]).device_offset);
                 }
                 const auto & wv = request.assignments[i].weights;
                 if (use_gather) {
@@ -9552,8 +9631,33 @@ private:
                 }
                 ffn_in = ggml_get_rows(ctx.get(), input, idx_t);
             }
-            ggml_tensor * gate = ggml_mul_mat(ctx.get(), make_weight("gate"), ffn_in);
-            ggml_tensor * up   = ggml_mul_mat(ctx.get(), make_weight("up"), ffn_in);
+            ggml_tensor * hidden = nullptr;
+            if (fuse_gate_up) {
+                // ONE weight tensor spanning gate then up, attached at gate's
+                // offset; adjacency was verified in fuse_gate_up_ok() above.
+                // Push a null in the `up` slot so the D2 hit path's k*3+j
+                // indexing (gate, up, down) is preserved unchanged.
+                const RoleSpec & sg = specs.at("gate");
+                ggml_tensor * gate_up = ggml_new_tensor_2d(
+                    ctx.get(), sg.type, sg.ne0, 2 * (int64_t) sg.ne1);
+                attach_weight(
+                    gate_up, loaded.buffer, loaded.base,
+                    page.roles.at("gate").device_offset);
+                if (gc != nullptr) {
+                    gc->expert_w.push_back(gate_up);
+                    gc->expert_w.push_back(nullptr);
+                }
+                // [2*ne1, n_rows] -> swiglu halves it: out[i] = silu(a[i]) * a[i+ne1],
+                // i.e. exactly ggml_swiglu_split(gate, up).
+                hidden = ggml_swiglu(
+                    ctx.get(), ggml_mul_mat(ctx.get(), gate_up, ffn_in));
+            }
+            ggml_tensor * gate = nullptr;
+            ggml_tensor * up   = nullptr;
+            if (hidden == nullptr) {
+                gate = ggml_mul_mat(ctx.get(), make_weight("gate"), ffn_in);
+                up   = ggml_mul_mat(ctx.get(), make_weight("up"), ffn_in);
+            }
             // *** SwiGLU CLAMP. ADDED 2026-08-05 -- ITS ABSENCE WAS A CORRECTNESS BUG. ***
             // Mirrors the LLM_ARCH_DEEPSEEK4 branch of build_moe_ffn() in
             // src/llama-graph.cpp EXACTLY: up is clamped symmetrically, the GATE is
@@ -9563,12 +9667,18 @@ private:
             // branch and give different numbers.
             // The spine cannot do this for us: build_moe_ffn() returns at the
             // `expert_dispatch != nullptr` branch before ever reaching the clamp.
+            // NOTE the asymmetry: it is WHY fuse_gate_up bails out whenever the
+            // clamp is armed. A single ggml_clamp over the fused [2*ne1] tensor
+            // would apply the same bounds to both halves and gate must NOT get
+            // a lower bound.
             const float swiglu_limit = request.swiglu_clamp;
-            if (swiglu_limit > 1e-6f) {
-                up   = ggml_clamp(ctx.get(), up,   -swiglu_limit, swiglu_limit);
-                gate = ggml_clamp(ctx.get(), gate, -INFINITY,     swiglu_limit);
+            if (hidden == nullptr) {
+                if (swiglu_limit > 1e-6f) {
+                    up   = ggml_clamp(ctx.get(), up,   -swiglu_limit, swiglu_limit);
+                    gate = ggml_clamp(ctx.get(), gate, -INFINITY,     swiglu_limit);
+                }
+                hidden = ggml_swiglu_split(ctx.get(), gate, up);
             }
-            ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate, up);
             ggml_tensor * output = ggml_mul_mat(ctx.get(), make_weight("down"), hidden);
             // SHAPE MATTERS: [1, n_tokens], NOT [n_tokens]. output is
             // [n_embd, n_tokens]; ggml_mul broadcasts src1 into src0 via
@@ -11282,11 +11392,15 @@ private:
         uint32_t type_gate = 0;
         uint32_t type_up   = 0;
         uint32_t type_down = 0;
+        // WP_EXPERT_FUSE_GATE_UP: a fused graph has ONE [ne0, 2*ne1] weight per
+        // expert where an unfused one has two, so the two shapes must never
+        // share a cache entry (same failure mode as the type fields above).
+        bool     fused_gate_up = false;
         bool operator<(const GraphKey & o) const {
             return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
-                            type_gate, type_up, type_down) <
+                            type_gate, type_up, type_down, fused_gate_up) <
                    std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits,
-                            o.type_gate, o.type_up, o.type_down);
+                            o.type_gate, o.type_up, o.type_down, o.fused_gate_up);
         }
     };
     struct GraphCacheEntry {
@@ -11294,7 +11408,9 @@ private:
         galloc_ptr    galloc;
         ggml_cgraph * graph = nullptr;
         ggml_tensor * blob  = nullptr;
-        std::vector<ggml_tensor *> expert_w;   // gate,up,down per expert, flat
+        // gate,up,down per expert, flat. When fused_gate_up is set the slot
+        // for `up` holds nullptr and slot `gate` holds the [ne0, 2*ne1] view.
+        std::vector<ggml_tensor *> expert_w;
         std::vector<ggml_tensor *> route_w;    // routing weights per expert
         std::vector<ggml_tensor *> gather_idx; // I32 idx per expert (gather only)
         uint64_t io_gen = 0, params_gen = 0, last_used = 0;
