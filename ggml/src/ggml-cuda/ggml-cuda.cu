@@ -730,6 +730,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 #if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
 static void ggml_cuda_hipblaslt_warmup(ggml_backend_cuda_context & ctx) {
+    if (const char * env = std::getenv("WP_HIPBLASLT_WARMUP"); env != nullptr && std::strcmp(env, "0") == 0) {
+        return;
+    }
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!fp16_mma_hardware_available(cc)) {
+        GGML_LOG_DEBUG("%s: skipping hipBLASLt warm-up on device %d (cc 0x%x)\n", __func__, ctx.device, cc & 0xffff);
+        return;
+    }
+
     // hipBLASLt may initialize through the legacy stream on its first GEMM.
     // Do that before any HIP graph capture can start.
     ggml_cuda_set_device(ctx.device);
@@ -741,13 +751,20 @@ static void ggml_cuda_hipblaslt_warmup(ggml_backend_cuda_context & ctx) {
 
     const float alpha = 1.0f;
     const float beta  = 0.0f;
-    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+    const cublasStatus_t status = cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
             1, 1, 1,
             &alpha, data, CUDA_R_32F, 1,
                     data + 1, CUDA_R_32F, 1,
             &beta,  data + 2, CUDA_R_32F, 1,
             CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            CUBLAS_GEMM_DEFAULT);
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        GGML_LOG_WARN("%s: hipBLASLt warm-up failed on device %d: %s\n",
+                      __func__, ctx.device, cublas_get_error_str(status));
+        (void) cudaFree(data);
+        return;
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
     CUDA_CHECK(cudaFree(data));
