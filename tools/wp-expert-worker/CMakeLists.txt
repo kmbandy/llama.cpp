@@ -28,3 +28,10 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
+
+set(TARGET llama-wp-expert-worker-bench-cpu)
+
+add_executable(${TARGET} bench-cpu.cpp)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+target_link_libraries(${TARGET} PRIVATE ggml ggml-cpu ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

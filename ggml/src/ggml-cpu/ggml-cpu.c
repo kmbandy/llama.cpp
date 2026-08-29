@@ -1537,6 +1537,57 @@ UseGgmlGemm2:;
     }
 }
 
+static bool ggml_compute_forward_wp_gate_up(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * gate,
+        const struct ggml_tensor * up) {
+    const struct ggml_tensor * gate_w = gate->src[0];
+    const struct ggml_tensor * up_w   = up->src[0];
+    const struct ggml_tensor * input  = gate->src[1];
+
+    if (params->ith != 0 || params->nth != 1 || !wp_gemm_enabled() ||
+            gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+            gate_w->type != GGML_TYPE_Q4_K || up_w->type != GGML_TYPE_Q4_K ||
+            gate_w->ne[0] != up_w->ne[0] || gate_w->ne[1] != up_w->ne[1] ||
+            gate_w->ne[0] != input->ne[0] || gate_w->ne[1] != gate->ne[0] ||
+            gate_w->ne[2] != 1 || gate_w->ne[3] != 1 ||
+            up_w->ne[2] != 1 || up_w->ne[3] != 1 ||
+            input != up->src[1] || input->type != GGML_TYPE_F32 ||
+            input->ne[2] != 1 || input->ne[3] != 1 || input->ne[1] != gate->ne[1] ||
+            !ggml_is_contiguous(input) || gate_w->nb[0] != ggml_type_size(gate_w->type) ||
+            up_w->nb[0] != ggml_type_size(up_w->type) || gate->nb[0] != sizeof(float) ||
+            up->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    const enum ggml_type vec_dot_type = type_traits_cpu[gate_w->type].vec_dot_type;
+    if (vec_dot_type != GGML_TYPE_Q8_K) {
+        return false;
+    }
+
+    const ggml_from_float_t from_float = type_traits_cpu[vec_dot_type].from_float;
+    const size_t row_size = ggml_row_size(vec_dot_type, input->ne[0]);
+    if (from_float == NULL || params->wdata == NULL || params->wsize < row_size * input->ne[1]) {
+        return false;
+    }
+
+    for (int64_t i = 0; i < input->ne[1]; ++i) {
+        from_float((const float *) ((const char *) input->data + i * input->nb[1]),
+                   (char *) params->wdata + i * row_size, input->ne[0]);
+    }
+
+    const bool gate_done = wp_gemm_q4K_q8K(
+        (int) gate_w->ne[0], (int) gate_w->ne[1], (int) input->ne[1],
+        gate_w->data, gate_w->nb[1], params->wdata, row_size,
+        (float *) gate->data, gate->nb[1] / sizeof(float));
+    const bool up_done = wp_gemm_q4K_q8K(
+        (int) up_w->ne[0], (int) up_w->ne[1], (int) input->ne[1],
+        up_w->data, up_w->nb[1], params->wdata, row_size,
+        (float *) up->data, up->nb[1] / sizeof(float));
+
+    return gate_done && up_done;
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -3163,6 +3214,13 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_MUL_MAT && node_n + 1 < cgraph->n_nodes) {
+        struct ggml_tensor * up = cgraph->nodes[node_n + 1];
+        if (up->op == GGML_OP_MUL_MAT && ggml_compute_forward_wp_gate_up(params, node, up)) {
+            return 1;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
