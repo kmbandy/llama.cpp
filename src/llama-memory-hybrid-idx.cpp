@@ -290,15 +290,26 @@ static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::sl
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
     llama_memory_hybrid_context(status) {}
 
+// MAD-LAB 2026-08-27: DELIBERATE DIVERGENCE from upstream 6c84c7d5d ("give the qwen4exp full
+// memory context its indexer cache"). Upstream populates ctx_idx here so graph_reserve() builds
+// the SPARSE graph and the compute buffer is reserved at load.
+//
+// MEASURED on this rig (llama-cli load, c=262144, ubatch 512, -ctk/-ctv turbo4):
+//   model 4606.45 | KV 1632.13 | indexer 768.00 | RS 112.57 | compute 1809.11  = 8928.26 MiB
+// and the compute buffer is 1809.50 MiB at c=32768, i.e. it does NOT scale with context -- it is
+// ~777 MiB fixed plus ~2 MiB per ubatch token. Reserving it makes the spine 8928 MiB, which does
+// not fit beside the 7925 MiB :8802 worker on the 16368 MiB card, so the spine stops loading.
+//
+// Leaving ctx_idx null reserves the dense graph and lets ggml-alloc grow into whatever a real
+// graph needs. Decode (n_tokens=1) needs a fraction of it: the spine then measures 7744 MiB
+// total, the rig sits at ~15.3 GiB of 16 GiB, and it served at 7.4-8.1 t/s for weeks.
+//
+// This is a deliberate trade: the 1809 MiB reserve is the worst case for a full 512-token prefill
+// ubatch, which this workload does not hit. If one ever does, the growth can fail where the
+// reserve would have failed at load instead. Revisit if the spine gets a card to itself.
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
     llama_memory_hybrid_context(mem),
-    mem(mem),
-    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
-    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
-    ns_ubatch(mem->get_mem_idx() == nullptr ?
-        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+    mem(mem) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
