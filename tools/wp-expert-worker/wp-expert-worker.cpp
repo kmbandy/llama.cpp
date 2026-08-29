@@ -768,9 +768,10 @@ private:
             return;
         }
         // *** SERIALISE THE WHOLE BANNER. ***
-        // It is dozens of separate << calls into std::cout, and under
-        // WP_DEVICE_PARALLEL the device threads report CONCURRENTLY. On
-        // 2026-08-29 two banners interleaved into one torn line:
+        // It is dozens of separate << calls into std::cout, and under the
+        // default-on WP_DEVICE_PARALLEL path device threads report
+        // CONCURRENTLY. On 2026-08-29 two banners interleaved into one torn
+        // line:
         //   device=ROCm0 n_requests=12865 ... device=ROCm1 n_requests=0 ...
         // The torn device parsed as n_requests=0, the analysis computed a
         // non-positive delta for it and SILENTLY DROPPED that device, and I
@@ -12114,74 +12115,39 @@ private:
     std::vector<std::unique_ptr<DeviceWorker>> devices_;
     mutable std::vector<std::mutex> device_mutexes_;
 
-    // *** WP_DEVICE_PARALLEL=1 -- RUN THE DEVICES CONCURRENTLY. ***
+    // *** WP_DEVICE_PARALLEL -- RUN THE DEVICES CONCURRENTLY (DEFAULT ON). ***
     //
-    // THE BUG THIS FIXES (measured 2026-08-29). Worker::dispatch looped over
-    // assignment groups and called devices_[g]->dispatch() BLOCKING, in order.
-    // The three devices in a multi-device worker therefore NEVER overlapped:
-    // a layer cost sum(devices), not max(devices). Weighting each device's
-    // measured dispatch by how often a frame involves it --
-    //     R9700 841 us x 1.00 + 6900XT 837 x 0.90 + CPU 232 x 0.44 = 1696 us
-    // -- against a measured spine wait of 1650-1750 us/layer. That is the whole
-    // gap, and it is why every device sat at ~20-25% busy, why cutting the
-    // R9700's compute 21% (grouped GEMV) did not move tokens/sec, and why
-    // per-token time regressed when the rig went from four single-device
-    // workers to two multi-device ones.
+    // PERSISTENT THREAD PER DEVICE, not a thread per dispatch. The parallel
+    // path buckets groups by device, runs GPU devices concurrently, and keeps
+    // one executor thread per device. Vulkan command pools have thread
+    // affinity, and HIP device work also must stay on the same thread. A
+    // device must not migrate between the caller and another thread.
     //
-    // PERSISTENT THREAD PER DEVICE, not a thread per dispatch. Vulkan command
-    // pools have thread affinity (see spec_pagein_step's note on why H2D stays
-    // on the dispatch thread), so a device's GPU calls must always run on the
-    // SAME thread. A std::async per request would hand a device a different
-    // thread each time and is not safe here.
+    // BIT-EXACTNESS IS PRESERVED. Partials are collected into a group-indexed
+    // vector and folded into `result` sequentially in GROUP ORDER, exactly as
+    // in the serial loop. Only the compute is reordered; the floating-point
+    // association is not.
     //
-    // BIT-EXACTNESS IS PRESERVED. The partials are collected into a
-    // group-indexed vector and folded into `result` sequentially in GROUP
-    // ORDER afterwards, exactly as the serial loop did. Only the compute is
-    // reordered; the floating-point association is not.
+    // The CPU expert tier runs AFTER the GPUs. ggml's CPU backend spin-waits at
+    // its thread barriers, so running it with the GPUs starves their host-side
+    // submission threads. Keeping the CPU tier on its own persistent executor
+    // thread, but outside the concurrent GPU window, gives the intended layer
+    // cost of max(GPUs) + CPU tier.
     //
-    // *** DEFAULT OFF, BECAUSE IT MEASURES WORSE. Do not flip it on without
-    // reading this. (2026-08-29) ***
-    //   decode t/s   serial 6.01/6.10/6.17   parallel 5.39/4.47/5.54
-    //   frame residency  1850 us -> 2440 us
-    // Per-device, the GPU work is UNCHANGED and the CPU-side span explodes:
-    //   R9700   ns_submit 243 -> 255,  read 45 -> 44,  readback 53 -> 54
-    //           BUT ns_compute 826 -> 2150 and the untimed hole 217 -> 1113
-    //   6900XT  ns_submit 258 -> 238   BUT ns_compute 828 -> 2129, hole 149 -> 836
-    // Both GPUs land at ~2.1 ms, i.e. each one's dispatch grows to span the
-    // WHOLE request -- the signature of mutual blocking, not of hardware
-    // contention (hardware contention would show up in submit/read, and does
-    // not). So something inside the process serialises concurrent device work,
-    // and the serial loop was HIDING that cost rather than causing it.
-    // REFUTED as causes, each by measurement, so do not re-derive them:
-    //   * glibc arena contention -- MALLOC_ARENA_MAX 2 -> 8 moved nothing
-    //     (residency 2481 -> 2483 us, decode still ~5.3).
-    //   * condition-variable handoff cost -- join_one() now spins before it
-    //     sleeps, and the result did not move.
-    //   * a broken parallel build -- see the affinity note above; the crash was
-    //     fixed and the CORRECT build still loses.
-    // The build below is correct (no crash, strict per-device thread affinity,
-    // spin-then-block handoff) and STILL measures worse, 2026-08-29:
-    //             serial (sum)            parallel (each)
-    //   R9700     833 us                  2195 us
-    //   6900XT    714 us                  2209 us
-    //   CPU       231 us                   288 us
-    //   decode    6.14/6.53/6.63 t/s      5.32/5.49/5.57 t/s
-    // ns_submit is FLAT across both (243->248, 234->242): the GPU work is
-    // untouched. The CPU-side host span is what inflates -- the untimed hole
-    // 215 -> 1177 and 146 -> 874. Two HIP devices doing host-side work
-    // concurrently in one process serialise in the ROCm runtime, and each
-    // device charges the wait to its own measured span. Notably the CPU device,
-    // which touches no HIP, barely moves (231 -> 288).
-    // CONCLUSION: the win is real in principle (a layer should cost
-    // max(devices), not sum) but it CANNOT be collected inside one process
-    // while the per-request path makes this many HIP calls. The lever is to cut
-    // host-side HIP API calls per request, not to add threads.
-    //
-    // CONSEQUENCE FOR THE RIG, which is the important part: if concurrent
-    // in-process device work cannot be made to pay, then a multi-device worker
-    // is structurally worse than one process per device -- which is what the
-    // rig ran before (four single-device workers, ~113 ms/token vs ~156 now).
-    // Separate processes cannot share an in-process lock.
+    // POST-FIX MEASUREMENTS (2026-08-29), sliced rig, code cd787a2b7,
+    // identical config, only the env var changed; eslice-measure.sh protocol,
+    // 1040-tok prompts, 256-tok decodes:
+    //   serial:   prefill 24.8/24.9 t/s   decode 3.58/3.57 t/s
+    //   parallel: prefill 53.7/55.5 t/s   decode 5.97/6.23 t/s
+    // Decode-only per-device dispatch, from deltas between stat banners:
+    //   2026: CUDA0 0.63 ms, Vulkan0 0.97 ms, CPU 0.24 ms
+    //   main:  ROCm0 0.94 ms, ROCm1 0.75 ms, CPU 0.27 ms
+    // Layer cost = max(GPUs) + CPU tier, as designed.
+    // Same-day config win: dispatching to 2026 over its LAN IP instead of
+    // Tailscale changed RTT 0.94 -> 0.28 ms.
+    // Same-day config win: WP_CPU_THREADS 4 -> 2 on the 4-core i7-6700K
+    // changed Vulkan submit 389 -> 254 us and decode 6.47 -> 7.4 t/s.
+    // Both were CPU starvation on that box.
     struct DeviceExecutor {
         std::thread             thread;
         std::mutex              mu;
@@ -12265,7 +12231,7 @@ private:
     mutable std::vector<std::unique_ptr<DeviceExecutor>> device_exec_;
     const bool device_parallel_ = [] {
         const char * e = std::getenv("WP_DEVICE_PARALLEL");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || std::strcmp(e, "0") != 0;
     }();
     mutable std::mutex split_mutex_;
     std::unordered_map<int, SplitPending> split_pending_by_conn_;
