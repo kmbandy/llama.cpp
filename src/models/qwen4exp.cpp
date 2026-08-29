@@ -421,9 +421,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
+    //
+    // WP_QWEN4EXP_FUSE_HC_NORM=1 (default off) emits the gamma multiply while the
+    // normed tensor is still [n_embd, hc, nt] and reshapes to [hc_dim, nt]
+    // afterwards, instead of reshaping first. The products are identical --
+    // element (e, c, t) is multiplied by w_norm[c*n_embd + e] either way -- but
+    // the RMS_NORM and MUL nodes become adjacent, which is what
+    // ggml_cuda_can_fuse() requires (ggml-cuda.cu:5410, via ggml_can_fuse's
+    // strict node_idx+1 adjacency). The intervening reshape currently blocks the
+    // fusion on all ~97 build_hc_mix calls per decode token; the reshape is a
+    // view either way, so this costs nothing when the fusion does not fire.
+    static const bool fuse_hc_norm = [] {
+        const char * e = std::getenv("WP_QWEN4EXP_FUSE_HC_NORM");
+        return e != nullptr && e[0] == '1';
+    }();
+
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    if (fuse_hc_norm && ggml_is_contiguous(w_norm) && w_norm->ne[0] == hc_dim &&
+        ggml_nrows(w_norm) == 1) {
+        // w_norm: [hc_dim] -> [n_embd, hc, 1], broadcast over the token axis
+        ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_norm, n_embd, hc, 1);
+        xn = ggml_mul(ctx0, xn, w3);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    } else {
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+        xn = ggml_mul(ctx0, xn, w_norm);
+    }
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);

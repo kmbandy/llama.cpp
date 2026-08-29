@@ -105,6 +105,51 @@ inline uint64_t ggml_cuda_graph_fnv1a_bytes(uint64_t h, const void * p, size_t n
     return h;
 }
 
+// WP_HIP_GRAPH_KEY_FAST=0 restores the byte-at-a-time FNV mixing below.
+// Default is the word-at-a-time variant: byte-wise FNV is a fully serial
+// xor->imul dependency chain, and mix_tensor_topo hashes ~84 bytes per tensor
+// across (node + up to GGML_MAX_SRC srcs) for every node of every split, every
+// token. Word-wise mixes the same *information* 8x fewer rounds.
+//
+// This is safe irrespective of hash quality: the graph key only selects a cache
+// slot. After lookup, ggml_cuda_graph_update_required() compares the stored
+// node_props against the live nodes, so a collision shows up as a topology
+// change and forces a recapture. It can cost a capture; it cannot launch the
+// wrong graph.
+inline bool ggml_cuda_graph_key_fast() {
+    static const bool fast = [] {
+        const char * e = std::getenv("WP_HIP_GRAPH_KEY_FAST");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return fast;
+}
+
+// n must be a multiple of 8 and p suitably aligned (ne/nb arrays are).
+inline uint64_t ggml_cuda_graph_fnv1a_words(uint64_t h, const void * p, size_t n) {
+    const uint64_t * w = static_cast<const uint64_t *>(p);
+    for (size_t i = 0; i < n / 8; ++i) {
+        h = ggml_cuda_graph_fnv1a_mix(h, w[i]);
+    }
+    return h;
+}
+
+// Length-prefixed word-wise hash of an arbitrary byte range.
+inline uint64_t ggml_cuda_graph_fnv1a_str(uint64_t h, const char * s, size_t n) {
+    h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) n);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, s + i, sizeof(w));
+        h = ggml_cuda_graph_fnv1a_mix(h, w);
+    }
+    if (i < n) {
+        uint64_t w = 0;
+        memcpy(&w, s + i, n - i);
+        h = ggml_cuda_graph_fnv1a_mix(h, w);
+    }
+    return h;
+}
+
 // Mix the fields that identify a node's captured kernel shape. Pointers
 // and VIEW offsets are excluded so ephemeral split rebuilds and a
 // moving KV write position hash to the same slot when the op/shape match.
@@ -130,7 +175,19 @@ inline uint64_t ggml_cuda_graph_mix_tensor_topo(uint64_t h, const ggml_tensor * 
     if (t == nullptr) {
         return ggml_cuda_graph_fnv1a_mix(h, 0);
     }
-    h = ggml_cuda_graph_fnv1a_bytes(h, t->name, ggml_cuda_graph_canon_name_len(t->name));
+    const size_t name_len = ggml_cuda_graph_canon_name_len(t->name);
+    // op/type/flags all fit in one word, so fold them into a single mix.
+    const uint64_t meta = (uint64_t) t->op
+                        | ((uint64_t) t->type  << 16)
+                        | ((uint64_t) t->flags << 32);
+    if (ggml_cuda_graph_key_fast()) {
+        h = ggml_cuda_graph_fnv1a_str(h, t->name, name_len);
+        h = ggml_cuda_graph_fnv1a_mix(h, meta);
+        h = ggml_cuda_graph_fnv1a_words(h, t->ne, sizeof(t->ne));
+        h = ggml_cuda_graph_fnv1a_words(h, t->nb, sizeof(t->nb));
+        return h;
+    }
+    h = ggml_cuda_graph_fnv1a_bytes(h, t->name, name_len);
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->op);
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->type);
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->flags);

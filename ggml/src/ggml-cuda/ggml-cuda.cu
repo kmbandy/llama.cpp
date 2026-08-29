@@ -3641,8 +3641,14 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_wp_hip_graphs_enabled() {
-    const char * env = getenv("WP_HIP_GRAPHS");
-    return env != nullptr && strcmp(env, "1") == 0;
+    // Cached: this is called ~6x per backend graph_compute, and the split
+    // decode forward makes ~86 of those per token, so a raw getenv() here was
+    // ~500 environ scans/token for a value that cannot change mid-process.
+    static const bool enabled = [] {
+        const char * env = getenv("WP_HIP_GRAPHS");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }();
+    return enabled;
 }
 
 struct ggml_cuda_wp_graph_counters {
@@ -3865,9 +3871,70 @@ static bool ggml_cuda_graph_node_addrs_equal(
     return true;
 }
 
+// WP_HIP_GRAPH_FAST_PROPS=1 (default off) enables this allocation-free
+// unchanged-node check.
+//
+// The stock loop builds a fully zeroed ggml_cuda_graph::node_properties on the
+// stack for EVERY node (memset ~1 KiB), memcpy's the whole ggml_tensor plus up
+// to GGML_MAX_SRC ne/nb pairs into it, then memcmp's the lot. That is ~2.5 KiB
+// of memory traffic per node, on a graph that is re-walked for every split of
+// every token, purely to answer "did anything change?" — which in warm steady
+// state is always "no".
+//
+// This predicate answers the same question by reading the live tensors, and
+// short-circuits on the first difference. It is deliberately conservative: it
+// returns true only when the node is already stored AND matches on exactly the
+// fields the stock path would have compared (topology, src ne/nb, and resolved
+// device addresses). When it returns true the stock path would have set neither
+// `res` nor cleared `only_src_data_ptrs_changed`; the only thing skipped is
+// refreshing object pointers (src[], buffer, extra, view_src, and VIEW
+// op_params) inside node_props, and nothing ever reads those back.
+static bool ggml_cuda_graph_props_unchanged(
+        const ggml_cuda_graph::node_properties & p, const ggml_tensor * n) {
+    const bool stored = p.node.op != GGML_OP_NONE ||
+                        p.node.ne[0] != 0 ||
+                        p.node.data != nullptr;
+    if (!stored) {
+        return false;
+    }
+    if (!ggml_cuda_graph_tensor_topo_equal(p.node, *n)) {
+        return false;
+    }
+    if (!ggml_cuda_graph_tensor_is_view_or_noop(&p.node) && p.node.data != n->data) {
+        return false;
+    }
+    static const int64_t zero_ne[GGML_MAX_DIMS] = {};
+    static const size_t  zero_nb[GGML_MAX_DIMS] = {};
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * s = n->src[j];
+        if (p.node_src_data_ptrs[j] != (s ? s->data : nullptr)) {
+            return false;
+        }
+        const void * ne = s ? (const void *) s->ne : (const void *) zero_ne;
+        const void * nb = s ? (const void *) s->nb : (const void *) zero_nb;
+        if (memcmp(p.node_src_ne[j], ne, sizeof(p.node_src_ne[j])) != 0 ||
+            memcmp(p.node_src_nb[j], nb, sizeof(p.node_src_nb[j])) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_graph_fast_props_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("WP_HIP_GRAPH_FAST_PROPS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+// graph_key MUST be the key the caller already obtained for this exact cgraph.
+// It used to be recomputed here, which meant the O(n_nodes * n_src) structural
+// hash ran a second time per split per token for a provably identical result.
 static bool ggml_cuda_graph_update_required(
         ggml_backend_cuda_context * cuda_ctx,
         ggml_cgraph * cgraph,
+        const void * graph_key,
         bool * src_data_ptrs_only) {
     bool res = false;
     bool only_src_data_ptrs_changed = true;
@@ -3875,7 +3942,6 @@ static bool ggml_cuda_graph_update_required(
         *src_data_ptrs_only = false;
     }
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     // WP_HIP_GRAPHS churn diagnostic (throttled)
@@ -3917,8 +3983,15 @@ static bool ggml_cuda_graph_update_required(
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    // Only safe to skip work when the churn diagnostic is not classifying this
+    // pass (it needs the full memcmp to tell object_ptr_only from addr_ptr_only).
+    const bool fast_props = !churn_log && ggml_cuda_graph_fast_props_enabled();
+
     int churn_nodes_logged = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (fast_props && ggml_cuda_graph_props_unchanged(graph->node_props[i], cgraph->nodes[i])) {
+            continue;
+        }
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
@@ -5695,7 +5768,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             bool properties_src_data_ptrs_only = false;
             const bool properties_changed = ggml_cuda_graph_update_required(
-                cuda_ctx, cgraph, &properties_src_data_ptrs_only);
+                cuda_ctx, cgraph, graph_key, &properties_src_data_ptrs_only);
 
             if (ggml_cuda_wp_hip_graphs_enabled()) {
                 // Key is (topo, device addrs). First visit of that identity is
@@ -5784,6 +5857,22 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+    static bool enable_graph_optimization = [] {
+        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
+        return env != nullptr && atoi(env) == 1;
+    }();
+
+    // Bail BEFORE hashing. ggml_cuda_graph_get_key() is an O(n_nodes * n_src)
+    // structural hash of the whole subgraph, and the scheduler calls
+    // graph_optimize once per split per token (ggml-backend.cpp:1587). With
+    // GGML_CUDA_GRAPH_OPT unset (the default) every byte of that hash was
+    // thrown away. ggml_cuda_graph_set_enabled() is redundant here too: it only
+    // latches disable_due_to_gpu_arch, and graph_compute() calls it on the same
+    // key immediately afterwards.
+    if (!enable_graph_optimization) {
+        return;
+    }
+
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -5792,15 +5881,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cuda_ctx);
     GGML_UNUSED(cgraph);
 #endif
-
-    static bool enable_graph_optimization = [] {
-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
-    }();
-
-    if (!enable_graph_optimization) {
-        return;
-    }
 
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
