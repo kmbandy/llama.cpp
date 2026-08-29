@@ -3092,6 +3092,11 @@ public:
                     ? slot_class.size : need;
             }
         }
+        // Every input to compute_arena_layout() is now final and never changes
+        // again (slot.buffer/offset/capacity are write-once in make_slot_in()).
+        // Compute it here, once, instead of rescanning ~6700 slots two to three
+        // times per decode request from arena_id_eligible().
+        arena_layout_ = compute_arena_layout();
         resources_.staging_buffers      = staging_.buffer_count();
         resources_.staging_buffer_bytes = staging_.buffer_bytes();
         resources_.staging_bytes =
@@ -3424,7 +3429,35 @@ public:
         bool                       have_read_time_ = false;
     };
 
-    std::optional<ArenaLayout> arena_layout() const {
+    // *** MEMOISED. arena_layout() USED TO RESCAN EVERY SLOT ON EVERY CALL. ***
+    // MEASURED 2026-08-29 by inspection of the Vulkan decode path: the body
+    // below walks slots_ once end to end (the `while (first_slot + n_slots <
+    // slots_.size())` run-length scan) and heap-allocates layout.arenas. The
+    // Vulkan device is started with --slots 6700, so that is 6700 Slot records
+    // -- ~870 KiB of L3-resident struct -- traversed per call. dispatch() calls
+    // it two to three times per request (grouped_gemv_request's
+    // arena_id_eligible, compute_batch's arena_id_eligible, and
+    // compute_batch_arena on the arena arm), on the decode critical path,
+    // AND IT DOES SO EVEN WHEN WP_EXPERT_ARENA_ID IS UNSET -- arena_id_eligible
+    // materialised the layout BEFORE testing `enabled`.
+    //
+    // WHY MEMOISING IS SAFE (not a cache-invalidation problem): every field the
+    // scan reads -- slot.buffer, slot.offset, slot.capacity, and the arena
+    // buffers themselves -- is written exactly once, in make_slot_in() /
+    // allocate_slot_arenas(), during construction. Nothing in serving mutates
+    // them; page residency lives in slot.size/page/key, which this function
+    // never looks at. So the layout is a pure function of immutable state and
+    // is computed once, eagerly, at the end of the constructor -- which also
+    // means no lazy-init race with the reader threads.
+    //
+    // Returned BY REFERENCE: the old by-value return copied a
+    // std::optional<ArenaLayout> (and its std::vector<Arena>) into every
+    // caller, i.e. a heap allocation per call on top of the scan.
+    const std::optional<ArenaLayout> & arena_layout() const {
+        return arena_layout_;
+    }
+
+    std::optional<ArenaLayout> compute_arena_layout() const {
         if (slots_.empty() || arenas_.empty()) {
             return std::nullopt;
         }
@@ -6493,6 +6526,10 @@ private:
     std::vector<buffer_ptr>    arenas_;
     std::vector<size_t>        arena_class_starts_;
     std::vector<Slot>          slots_;
+    // Filled once in the constructor, after slots_ is built; see the
+    // memoisation note on arena_layout(). Immutable thereafter, so it is
+    // safe to read from any thread without a lock.
+    std::optional<ArenaLayout> arena_layout_;
     // find_slot's O(1) index: slot_key(layer, expert) -> slot index, for every
     // currently-VALID slot. Maintained at every write to Slot::valid/Slot::key,
     // which is exactly three sites: the invalidate in ensure_batch's pagein loop
@@ -7482,18 +7519,29 @@ public:
             const char * e = std::getenv("WP_EXPERT_ARENA_ID");
             return e != nullptr && std::strtol(e, nullptr, 10) == 1;
         }();
+        // *** ORDER MATTERS: the env gate is first and it short-circuits. ***
+        // This used to evaluate ggml_backend_name(), the three strstr()s and
+        // pool_.arena_layout() BEFORE testing `enabled`, so a worker running
+        // WITHOUT WP_EXPERT_ARENA_ID still paid the whole probe -- including
+        // arena_layout()'s full slot scan -- two to three times per request on
+        // the decode critical path. Every condition below is side-effect free,
+        // so hoisting the cheapest, most selective one is behaviour-identical.
+        if (!enabled) {
+            return false;
+        }
+        if (request.n_tokens < 1 || request.n_tokens > 8 ||
+                request.assignments.empty() ||
+                request.assignments.size() > (size_t) 16 * request.n_tokens) {
+            return false;
+        }
         const char * const backend_name = ggml_backend_name(backend_.get());
         // Vulkan uses its MM mul_mat_id path for the strided arena view.
         const bool backend_supported = backend_name != nullptr &&
             (std::strstr(backend_name, "ROCm") != nullptr ||
              std::strstr(backend_name, "CUDA") != nullptr ||
              std::strstr(backend_name, "Vulkan") != nullptr);
-        const std::optional<ExpertSlotPool::ArenaLayout> layout_opt = pool_.arena_layout();
-        if (!enabled || !backend_supported ||
-                request.n_tokens < 1 || request.n_tokens > 8 ||
-                request.assignments.empty() ||
-                request.assignments.size() > (size_t) 16 * request.n_tokens ||
-                !layout_opt.has_value()) {
+        const std::optional<ExpertSlotPool::ArenaLayout> & layout_opt = pool_.arena_layout();
+        if (!backend_supported || !layout_opt.has_value()) {
             return false;
         }
         for (size_t i = 0; i < request.assignments.size(); ++i) {
@@ -10534,7 +10582,7 @@ private:
             const ExpertSlotPool::Batch & batch,
             RequestStats & request_stats) {
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
-        const std::optional<ExpertSlotPool::ArenaLayout> layout_opt = pool_.arena_layout();
+        const std::optional<ExpertSlotPool::ArenaLayout> & layout_opt = pool_.arena_layout();
         if (!layout_opt.has_value()) {
             return false;
         }
