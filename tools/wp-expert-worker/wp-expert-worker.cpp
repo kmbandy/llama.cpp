@@ -9586,6 +9586,9 @@ private:
         ggml_tensor * sum = (add_previous || (use_gather && s_set_rows)) ? result : nullptr;
         std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
         routing_weights.reserve(n_selected);
+        // Per-expert contributions in assignment order, for WP_EXPERT_FOLD_LAST.
+        std::vector<ggml_tensor *> fold_terms;
+        fold_terms.reserve(n_selected);
         // Parallel to routing_weights: the gathered token indices per expert, kept
         // alive until after ggml_gallocr_alloc_graph so they can be uploaded.
         std::vector<std::pair<ggml_tensor *, std::vector<int32_t>>> gather_idx;
@@ -9735,6 +9738,7 @@ private:
             }
             routing_weights.emplace_back(weights, &request.assignments[i]);
             gather_idx.emplace_back(idx_t, std::move(idx));
+            fold_terms.push_back(weighted);
         }
         // (add_previous is folded in as the SEED above, not appended here.)
         if (sum == nullptr) {
@@ -9745,6 +9749,49 @@ private:
         }
         ggml_tensor * copy = ggml_cpy(ctx.get(), sum, result);
         ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        // *** WP_EXPERT_FOLD_LAST=1 (DEFAULT OFF): EMIT THE FOLD AS ONE RUN. ***
+        //
+        // WHAT IT FIXES. ggml-vulkan fuses a run of GGML_OP_ADD nodes into ONE
+        // multi_add dispatch (ggml_vk_fuse_multi_add), up to MAX_FUSED_ADDS
+        // sources -- but ONLY when the adds are CONSECUTIVE in cgraph->nodes.
+        // ggml_build_forward_expand(copy) walks the fold chain depth first, so
+        // the emitted order is
+        //     [expert 0 chain] [expert 1 chain] add0 [expert 2 chain] add1 ...
+        // Every add is separated from the next by five nodes of the following
+        // expert, so the fusion NEVER fires here and the fold costs n-1
+        // separate, strictly serial dispatches -- n-1 pipeline barriers and
+        // n-1 GPU round trips on top of the n-1 kernels. At n_tokens=4 with 30
+        // experts that is 29 avoidable dispatches per request.
+        //
+        // THE CHANGE IS EMISSION ORDER ONLY. Expanding each per-expert
+        // contribution first marks those subgraphs visited, so the later
+        // expand of `copy` appends add0..add(n-2) back to back. The tensors,
+        // the dependencies and the left-fold ASSOCIATION are untouched --
+        // sum = ((e0+e1)+e2)+... exactly as before -- and ggml executes in
+        // topological order either way, so with the fusion inactive this is
+        // bit-identical.
+        //
+        // WHY IT IS STILL DEFAULT OFF: once the run IS fused, multi_add.comp
+        // sums all sources in one shader invocation rather than as a chain of
+        // pairwise adds. That is the same set of values in the same order, but
+        // it is a different sequence of roundings, and this fold's association
+        // is exactly what moved draft acceptance 0.84286 -> 0.77966 once
+        // before (see the SEED THE FOLD note above). Two more preconditions
+        // are outside this file's control and must be checked on the box:
+        // vk_device::multi_add requires shaderRoundingModeRTEFloat16, and
+        // MAX_FUSED_ADDS caps the run length.
+        //
+        // Dense only: the gather arm folds with scatter_add_compact_rows, not
+        // ggml_add, so there is no run to make consecutive.
+        static const bool s_fold_last = [] {
+            const char * e = std::getenv("WP_EXPERT_FOLD_LAST");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (s_fold_last && !use_gather) {
+            for (ggml_tensor * term : fold_terms) {
+                ggml_build_forward_expand(graph, term);
+            }
+        }
         ggml_build_forward_expand(graph, copy);
 
         // D2 miss: the cached graph needs its OWN allocator. Sharing
