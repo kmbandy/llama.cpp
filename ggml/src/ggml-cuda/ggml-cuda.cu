@@ -5669,8 +5669,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
+        // HIP graph capture is per-thread/per-stream. The worker's one-node
+        // keepalive graph is built before its device executor exists, so keep
+        // it eager instead of replaying it from a different thread.
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph) &&
-            !ggml_cuda_graph_is_prefill_shaped(cgraph);
+            !ggml_cuda_graph_is_prefill_shaped(cgraph) &&
+            (!ggml_cuda_wp_hip_graphs_enabled() || cgraph->n_nodes >= 2);
         if (graph_compatible) {
             bool properties_src_data_ptrs_only = false;
             const bool properties_changed = ggml_cuda_graph_update_required(

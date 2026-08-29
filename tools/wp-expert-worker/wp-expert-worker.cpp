@@ -105,6 +105,14 @@ bool parse_env_default_off(const char * env) {
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+static bool wp_hip_graphs_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("WP_HIP_GRAPHS");
+        return env != nullptr && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool gather_enabled) {
     return gather_enabled && !force_dense && (int64_t) n_tokens >= (int64_t) min_tokens;
 }
@@ -11785,8 +11793,16 @@ public:
 
     void keepalive_tick() {
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
-            devices_[i]->keepalive_tick();
+            if (hip_graph_executor_needed(i)) {
+                ensure_device_executor(i);
+                device_exec_[i]->run([this, i] {
+                    std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                    devices_[i]->keepalive_tick();
+                });
+            } else {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                devices_[i]->keepalive_tick();
+            }
         }
     }
 
@@ -11839,16 +11855,34 @@ public:
     bool spec_pagein_step(bool harvest = true) {
         bool result = false;
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
-            result |= devices_[i]->spec_pagein_step(harvest);
+            if (hip_graph_executor_needed(i)) {
+                ensure_device_executor(i);
+                bool did_work = false;
+                device_exec_[i]->run([this, i, harvest, &did_work] {
+                    std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                    did_work = devices_[i]->spec_pagein_step(harvest);
+                });
+                result |= did_work;
+            } else {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                result |= devices_[i]->spec_pagein_step(harvest);
+            }
         }
         return result;
     }
 
     void spec_pagein_after_dispatch() {
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
-            devices_[i]->spec_pagein_after_dispatch();
+            if (hip_graph_executor_needed(i)) {
+                ensure_device_executor(i);
+                device_exec_[i]->run([this, i] {
+                    std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                    devices_[i]->spec_pagein_after_dispatch();
+                });
+            } else {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                devices_[i]->spec_pagein_after_dispatch();
+            }
         }
     }
 
@@ -11913,7 +11947,7 @@ public:
         // sum(devices) instead of max(devices).
         std::vector<pipe_expert_partial> partials(groups.size());
         std::vector<RequestStats>        sub_stats(groups.size());
-        if (device_parallel_ && groups.size() > 1) {
+        if (device_parallel_ && (groups.size() > 1 || hip_graph_executor_enabled())) {
             if (device_exec_.size() != devices_.size()) {
                 device_exec_.resize(devices_.size());
             }
@@ -12123,7 +12157,19 @@ public:
             sub_request.activations = acts.activations;
             RequestStats sub_stats;
             pipe_expert_partial partial;
-            {
+            if (hip_graph_executor_needed(group.device)) {
+                ensure_device_executor(group.device);
+                device_exec_[group.device]->run([this, &sub_request, &sub_stats, &partial,
+                                                 &group, conn_index] {
+                    std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                    partial = devices_[group.device]->dispatch(
+                        sub_request, sub_stats, std::nullopt, conn_index);
+                    if (devices_[group.device]->stats_enabled()) {
+                        devices_[group.device]->record_stats(
+                            sub_stats, group.end - group.begin);
+                    }
+                });
+            } else {
                 std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                 partial = devices_[group.device]->dispatch(
                     sub_request, sub_stats, std::nullopt, conn_index);
@@ -12186,6 +12232,34 @@ public:
     }
 
 private:
+    bool hip_graph_executor_enabled() const {
+        if (!device_parallel_ || !wp_hip_graphs_enabled()) {
+            return false;
+        }
+        for (size_t i = 0; i < device_names_.size(); ++i) {
+            if (hip_graph_executor_needed(i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool hip_graph_executor_needed(size_t device) const {
+        return device_parallel_ && wp_hip_graphs_enabled() &&
+               device < device_names_.size() &&
+               device_names_[device].rfind("ROCm", 0) == 0;
+    }
+
+    void ensure_device_executor(size_t device) {
+        if (device_exec_.size() != devices_.size()) {
+            device_exec_.resize(devices_.size());
+        }
+        if (!device_exec_[device]) {
+            device_exec_[device] = std::make_unique<DeviceExecutor>();
+            device_exec_[device]->start();
+        }
+    }
+
     struct PlacementSnapshot {
         std::vector<uint32_t> owner;
         std::vector<uint64_t> promotion_floor;
@@ -12736,6 +12810,18 @@ private:
                 error    = nullptr;
             }
             cv_task.notify_one();
+        }
+        void run(std::function<void()> job) {
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv_done.wait(lock, [this] { return idle; });
+                task     = std::move(job);
+                has_task = true;
+                idle     = false;
+                error    = nullptr;
+            }
+            cv_task.notify_one();
+            join_one();
         }
         // Rethrows on the CALLING thread, so a device fault still aborts the
         // request the same way the serial loop's exception did.
