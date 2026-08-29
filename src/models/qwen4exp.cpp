@@ -514,8 +514,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // the MTP sidecar reads the residual streams by raw token position, so it needs every row
-    const bool keep_all_rows = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    // Rows are trimmed after the final mixer instead of at the last layer when either:
+    //   - the MTP sidecar is reading the residual streams by raw token position, or
+    //   - MAD-LAB: routed experts are dispatched to workers. build_issue/build_wait size their
+    //     payloads from n_tokens, so a last-layer FFN running on n_outputs rows sends a view
+    //     past the end of the issue buffer and trips ggml.c:1933 on the first decode.
+    const bool keep_all_rows =
+        (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) ||
+        expert_dispatch != nullptr;
 
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
