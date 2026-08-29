@@ -767,6 +767,19 @@ private:
         if (!enabled_ || n_requests_ == 0) {
             return;
         }
+        // *** SERIALISE THE WHOLE BANNER. ***
+        // It is dozens of separate << calls into std::cout, and under
+        // WP_DEVICE_PARALLEL the device threads report CONCURRENTLY. On
+        // 2026-08-29 two banners interleaved into one torn line:
+        //   device=ROCm0 n_requests=12865 ... device=ROCm1 n_requests=0 ...
+        // The torn device parsed as n_requests=0, the analysis computed a
+        // non-positive delta for it and SILENTLY DROPPED that device, and I
+        // then drew conclusions from a two-device view of a three-device
+        // worker. A corrupt instrument is worse than none: it fails quietly and
+        // still looks like data. Function-local static => one mutex shared by
+        // every WorkerStats instance, which is the scope required.
+        static std::mutex report_mu;
+        std::lock_guard<std::mutex> report_lock(report_mu);
         std::cout << "wp expert worker stats"
                   << " device=" << (device_.empty() ? std::string("?") : device_)
                   << " n_requests=" << n_requests_
