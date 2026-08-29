@@ -728,6 +728,32 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
 }
 
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+static void ggml_cuda_hipblaslt_warmup(ggml_backend_cuda_context & ctx) {
+    // hipBLASLt may initialize through the legacy stream on its first GEMM.
+    // Do that before any HIP graph capture can start.
+    ggml_cuda_set_device(ctx.device);
+    cublasHandle_t handle = ctx.cublas_handle();
+
+    float * data = nullptr;
+    CUDA_CHECK(cudaMalloc(&data, 3*sizeof(float)));
+    CUDA_CHECK(cudaMemsetAsync(data, 0, 3*sizeof(float), ctx.stream()));
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            1, 1, 1,
+            &alpha, data, CUDA_R_32F, 1,
+                    data + 1, CUDA_R_32F, 1,
+            &beta,  data + 2, CUDA_R_32F, 1,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    CUDA_CHECK(cudaFree(data));
+}
+#endif
+
 static bool ggml_cuda_wp_copy_requested(ggml_backend_t backend) {
     if (backend == nullptr) {
         return false;
@@ -7170,6 +7196,10 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
     }
+
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+    ggml_cuda_hipblaslt_warmup(*ctx);
+#endif
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
