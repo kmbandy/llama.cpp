@@ -11028,18 +11028,33 @@ private:
             request_stats.ns_vk_params_set += params_elapsed;
         }
 
-        const char * const saved_hip_graphs = std::getenv("WP_HIP_GRAPHS");
+        // *** ONLY TOUCH THE ENVIRONMENT WHEN HIP GRAPH REPLAY IS ARMED. ***
+        // This block used to run on EVERY arena submit: two getenv, two
+        // std::string constructions, and -- inside graph_compute() below --
+        // an unconditional restore_graph_env() doing setenv/unsetenv, which
+        // take a process-global lock and can reallocate `environ`. On Vulkan
+        // (and on any worker without WP_ARENA_HIP_GRAPH) hip_graph_replay is
+        // false and none of it can change anything, yet the setenv pair sat
+        // INSIDE the ns_submit / ns_vk_graph_compute timer on the decode
+        // critical path. Guarded now; hip_graph_replay is a static, so the
+        // whole block folds away for a worker that never arms replay.
+        const bool hip_env_active = hip_graph_replay;
+        const char * const saved_hip_graphs =
+            hip_env_active ? std::getenv("WP_HIP_GRAPHS") : nullptr;
         const bool saved_hip_graphs_set = saved_hip_graphs != nullptr;
         const std::string saved_hip_graphs_value =
             saved_hip_graphs_set ? saved_hip_graphs : "";
         const char * const saved_disable_graphs =
-            std::getenv("GGML_CUDA_DISABLE_GRAPHS");
+            hip_env_active ? std::getenv("GGML_CUDA_DISABLE_GRAPHS") : nullptr;
         const bool saved_disable_graphs_set = saved_disable_graphs != nullptr;
         const std::string saved_disable_graphs_value =
             saved_disable_graphs_set ? saved_disable_graphs : "";
         const bool hip_graph_attempt = hip_graph_replay &&
             !entry.hip_graph_failed && !saved_disable_graphs_set;
         const auto restore_graph_env = [&]() {
+            if (!hip_env_active) {
+                return;
+            }
             if (saved_hip_graphs_set) {
                 setenv("WP_HIP_GRAPHS", saved_hip_graphs_value.c_str(), 1);
             } else {
