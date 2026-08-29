@@ -11496,7 +11496,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // publishing offsets that reproduce the stock stride and leaving data_a on
     // src0. Correct output here proves the flag/SSBO/shader plumbing; garbage
     // proves the plumbing itself is broken, independent of the pager.
-    if (getenv("GGML_VK_WP_TRACE") != nullptr) {
+    static const bool wp_trace = getenv("GGML_VK_WP_TRACE") != nullptr;
+    if (wp_trace) {
         static int n = 0;
         if (n < 8) {
             ++n;
@@ -11545,7 +11546,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         // honours p.paged and data_wp_expert_off (proved by FORCE), the offsets
         // are exact and the bytes at them are correct, so the remaining question
         // is whether binding 0 is really the pool at dispatch time.
-        if (getenv("GGML_VK_WP_BIND") != nullptr) {
+        static const bool wp_bind = getenv("GGML_VK_WP_BIND") != nullptr;
+        if (wp_bind) {
             static int n = 0;
             if (n < 6) {
                 ++n;
@@ -11617,7 +11619,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // reading the first_active_slot fallback -- which is exactly what a
     // stale/mismatched routing readback in the eval callback would produce, and
     // which every offset-keyed check is blind to.
-    if (wp_paged && getenv("GGML_VK_WP_IDCHK") != nullptr) {
+    static const bool wp_idchk = getenv("GGML_VK_WP_IDCHK") != nullptr;
+    if (wp_paged && wp_idchk) {
         static size_t n_disp = 0, n_viol = 0, n_dup_pairs = 0;
         ++n_disp;
         const size_t n_ids = (size_t) nei0 * (size_t) nei1;
@@ -11761,7 +11764,8 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     // GGML_VK_WP_FORK=1: which mul_mat_id implementation is actually running.
     // The vec path serves batches of <= 8 tokens. MM handles wider batches and
     // strided arena weights whose stride cannot be represented by batch_stride_a.
-    if (getenv("GGML_VK_WP_FORK") != nullptr) {
+    static const bool wp_fork = getenv("GGML_VK_WP_FORK") != nullptr;
+    if (wp_fork) {
         static size_t n_vec = 0, n_mm = 0;
         (use_vec ? n_vec : n_mm)++;
         if (!use_vec && n_mm <= 4) {
@@ -18652,6 +18656,60 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
+    // *** DO NOT SPLIT A GRAPH THAT IS TOO SMALL TO OVERLAP. ***
+    //
+    // The heuristic above is RELATIVE (last_total_flops / 40), so it targets a
+    // roughly constant ~5-8 submits per graph NO MATTER HOW SMALL THE GRAPH IS
+    // -- submit_after() doubles flops_per_submit only for the first three
+    // submits, after which the threshold is ~total/5. That is the right trade
+    // for a prefill graph, where each submit covers tens of milliseconds of GPU
+    // work and the point is to overlap the next command buffer's CPU recording
+    // with it. It is a pure loss for the weight-paging expert graphs: the
+    // wp-expert-worker submits ONE graph PER LAYER PER TOKEN (48 sequential
+    // requests per decode token), and a decode expert graph is ~25-40 nodes
+    // totalling ~12 MFLOP -- about 10 us of GPU time on an RX 480. Splitting
+    // 10 us of work across 6-8 vkQueueSubmits, each with its own semaphore
+    // create/destroy (ggml_vk_graph_cleanup destroys every semaphore per
+    // graph) and its own submit latency, is the dominant cost of the call:
+    // MEASURED 2026-08-29 on RADV POLARIS10, ggml_backend_graph_compute =
+    // 274 us/request against ~10 us of actual shader time.
+    //
+    // So: below a flop floor, do not flush on flops at all. flops_per_submit=0
+    // disables BOTH the pre-record flush and the post-node flop trigger, which
+    // leaves `submitted_nodes >= max_nodes_per_submit` (100) and the
+    // end-of-graph submit -- i.e. exactly one vkQueueSubmit for a graph this
+    // size. The node-count guard is kept as a second belt: the floor is
+    // evaluated against the PREVIOUS graph's flops, so a tiny decode graph
+    // followed by a large prefill graph must not accidentally disable
+    // splitting for the big one.
+    //
+    // SAFETY: this changes only how many command buffers the same nodes are
+    // recorded into, in the same order. No shader, no dispatch dimension and
+    // no numerics change -- results are bit-identical. The driver-timeout
+    // concern that motivates flops_cap above cannot apply, because a graph
+    // under the floor has less total work than a single normal submit.
+    // GGML_VK_MIN_SPLIT_FLOPS=0 restores the old behaviour exactly (A/B knob).
+    static const uint64_t min_split_flops = [] {
+        const char * e = getenv("GGML_VK_MIN_SPLIT_FLOPS");
+        if (e != nullptr && e[0] != '\0') {
+            return (uint64_t) strtoull(e, nullptr, 10);
+        }
+        return (uint64_t) 64'000'000ULL;   // ~5x a decode expert graph
+    }();
+    static const uint32_t min_split_nodes = [] {
+        const char * e = getenv("GGML_VK_MIN_SPLIT_NODES");
+        if (e != nullptr && e[0] != '\0') {
+            return (uint32_t) strtoul(e, nullptr, 10);
+        }
+        return (uint32_t) 256;
+    }();
+    const bool no_split = min_split_flops != 0 &&
+        ctx->last_total_flops < min_split_flops &&
+        (uint32_t) cgraph->n_nodes <= min_split_nodes;
+    if (no_split) {
+        flops_per_submit = 0;
+    }
+
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
             try {
@@ -18922,7 +18980,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
-        bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+        // Suppressed for graphs we deliberately keep to one submit: its only
+        // purpose is to let ggml_vk_wait_for_fence() sleep through the bulk of
+        // a long graph, and buying that with an extra vkQueueSubmit is a net
+        // loss when the whole graph is ~10 us of GPU work.
+        bool almost_ready = !no_split && (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
