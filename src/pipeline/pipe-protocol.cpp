@@ -7,6 +7,7 @@
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -1625,6 +1626,40 @@ bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id
 
     uint8_t hdr[PIPE_HEADER_SIZE];
     pipe_encode_header(hdr, h);
+
+    // WP_SEND_COALESCE=1: put the header and the payload on the wire with a
+    // single gathered write instead of two sends.
+    //
+    // Why this is not cosmetic. Every pipeline socket has TCP_NODELAY set
+    // (pipe-transport.cpp set_no_delay, applied on connect AND on accept), so
+    // the send of the 32-byte header is pushed out on its own as a standalone
+    // TCP segment ahead of the payload. The peer sitting in
+    // pipe_recv_frame -> recv_data(hdr, 32) is woken by that segment, decodes
+    // the header, and then blocks AGAIN in recv_data for the body -- a second
+    // kernel wakeup that only exists because the header travelled alone. On a
+    // decode-layer round trip that happens four times (spine->worker request
+    // header, worker->spine response header, on each of the two legs), and all
+    // four sit inside the requester's measured wait while landing outside the
+    // responder's own after-recv-to-result-ready service clock. That is exactly
+    // the shape of an unattributed requester/responder timing gap.
+    //
+    // Bit-exactness: the byte STREAM is unchanged -- same header bytes, same
+    // payload bytes, same order. Only the segmentation the kernel chooses
+    // changes. The receive side is untouched and cannot tell the difference, so
+    // no decoded value anywhere can differ. Default OFF only so it can be
+    // A/B'd against the current numbers; there is no correctness reason to
+    // leave it off. NOTE: pipe_send_frame is linked by the worker too, so both
+    // the spine and the workers must be rebuilt for the response direction to
+    // benefit.
+    static const bool coalesce = [] {
+        const char * value = std::getenv("WP_SEND_COALESCE");
+        return value != nullptr && value[0] != '0';
+    }();
+
+    if (coalesce) {
+        return sock.send_data2(hdr, PIPE_HEADER_SIZE, payload, payload_len);
+    }
+
     if (!sock.send_data(hdr, PIPE_HEADER_SIZE)) {
         return false;
     }

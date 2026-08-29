@@ -15,6 +15,7 @@
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
+#  include <sys/uio.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
@@ -49,6 +50,7 @@ struct pipe_socket_t::impl {
     explicit impl(sockfd_t fd) : fd(fd) {}
     ~impl();
     bool send_data(const void * data, size_t size);
+    bool send_data2(const void * a, size_t a_size, const void * b, size_t b_size);
     bool recv_data(void * data, size_t size);
     void shutdown();
 
@@ -85,6 +87,61 @@ bool pipe_socket_t::impl::send_data(const void * data, size_t size) {
     return true;
 }
 
+// One gathered write of (a, b). See the note on pipe_socket_t::send_data2.
+// Loops on short writes by advancing the iovec cursor, so the completion
+// contract is identical to send_data's: true only after every byte crossed.
+bool pipe_socket_t::impl::send_data2(const void * a, size_t a_size, const void * b, size_t b_size) {
+#ifdef _WIN32
+    // No writev equivalent worth the WSABUF plumbing here; fall back.
+    if (!send_data(a, a_size)) {
+        return false;
+    }
+    return b_size == 0 || send_data(b, b_size);
+#else
+    if (b_size == 0) {
+        return send_data(a, a_size);
+    }
+    struct iovec iov[2];
+    iov[0].iov_base = const_cast<void *>(a);
+    iov[0].iov_len  = a_size;
+    iov[1].iov_base = const_cast<void *>(b);
+    iov[1].iov_len  = b_size;
+
+    struct msghdr msg;
+    std::memset(&msg, 0, sizeof(msg));
+    msg.msg_iov    = iov;
+    msg.msg_iovlen = 2;
+
+    const size_t total = a_size + b_size;
+    size_t       sent  = 0;
+    while (sent < total) {
+        ssize_t n = sendmsg(fd, &msg, pipe_send_flags());
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            PIPE_LOG_ERROR("pipe sendmsg failed (sent=%zu, total=%zu)\n", sent, total);
+            return false;
+        }
+        sent += (size_t) n;
+        // advance the iovec cursor past the bytes the kernel accepted
+        size_t advance = (size_t) n;
+        while (advance > 0 && msg.msg_iovlen > 0) {
+            if (advance >= msg.msg_iov[0].iov_len) {
+                advance -= msg.msg_iov[0].iov_len;
+                msg.msg_iov++;
+                msg.msg_iovlen--;
+            } else {
+                msg.msg_iov[0].iov_base = (char *) msg.msg_iov[0].iov_base + advance;
+                msg.msg_iov[0].iov_len -= advance;
+                advance = 0;
+            }
+        }
+    }
+    return true;
+#endif
+}
+
 bool pipe_socket_t::impl::recv_data(void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
@@ -119,6 +176,10 @@ pipe_socket_t::~pipe_socket_t() = default;
 
 bool pipe_socket_t::send_data(const void * data, size_t size) {
     return pimpl->send_data(data, size);
+}
+
+bool pipe_socket_t::send_data2(const void * a, size_t a_size, const void * b, size_t b_size) {
+    return pimpl->send_data2(a, a_size, b, b_size);
 }
 
 bool pipe_socket_t::recv_data(void * data, size_t size) {

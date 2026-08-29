@@ -347,6 +347,39 @@ const bool s_issue_widest_first = [] {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }();
 
+// WP_AWAIT_SPIN_US = microseconds to spin on poll(fd, POLLIN, 0) before
+// entering the blocking recv in await_response(). Default 0 (OFF).
+//
+// Every pipeline socket is blocking and nothing sets SO_BUSY_POLL, so the
+// dispatch thread parks in recv() for the whole worker service time and has to
+// be brought back by a normal socket wakeup: softirq -> runqueue -> (possibly)
+// a C-state exit on an otherwise idle core. That wakeup is tens of
+// microseconds at best and can be far worse on an idling box, it happens on
+// EVERY awaited request, and it lands squarely in the unattributed gap between
+// what the worker's own clock reports and what the spine measures as wait --
+// the worker cannot see it and the spine cannot separate it from wire time.
+// Spinning on a zero-timeout poll() for the tail of the wait means the bytes
+// are consumed by a thread that is already on-core.
+//
+// Bit-exact: this only changes WHEN we call recv, never what is received, in
+// what order requests are awaited, or in what order partials are folded. On
+// timeout it falls through to exactly the same blocking pipe_recv_frame the
+// unspun path uses, so behaviour on the slow path is unchanged too.
+//
+// Cost: it burns one core for up to the configured window per request. The
+// useful setting is a little above the observed per-leg service time (worker
+// service is ~0.8 ms/req today), and a value that large is only sane because
+// the spine has nothing else to do while blocked. Start small (e.g. 200) to
+// price the wakeup itself before paying for the whole service window.
+const uint32_t s_await_spin_us = [] {
+    const char * value = std::getenv("WP_AWAIT_SPIN_US");
+    if (value == nullptr || value[0] == '\0') {
+        return (uint32_t) 0;
+    }
+    const long parsed = std::atol(value);
+    return parsed > 0 ? (uint32_t) parsed : (uint32_t) 0;
+}();
+
 // WP_DEFER_K = number of experts computed immediately per token.
 // Unset / empty / non-positive => feature off (defer nothing).
 int parse_wp_defer_k() {
@@ -1911,6 +1944,32 @@ struct dispatcher::impl {
         }
     }
 
+    // Spin on a zero-timeout poll() until this socket has readable bytes or the
+    // WP_AWAIT_SPIN_US budget is exhausted. No-op when the knob is unset. Never
+    // consumes anything from the socket -- the caller's recv path is unchanged
+    // whether this returns because data arrived or because it gave up.
+    void spin_for_readable(pipe_socket_t & sock) {
+        if (s_await_spin_us == 0) {
+            return;
+        }
+        const int fd = sock.poll_fd();
+        if (fd < 0) {
+            return;
+        }
+        const auto deadline = dispatch_clock::now() + std::chrono::microseconds(s_await_spin_us);
+        struct pollfd pfd;
+        pfd.fd      = fd;
+        pfd.events  = POLLIN;
+        do {
+            pfd.revents = 0;
+            const int r = ::poll(&pfd, 1, 0);
+            if (r != 0) {
+                // readable, or an error the blocking recv will surface properly
+                return;
+            }
+        } while (dispatch_clock::now() < deadline);
+    }
+
     pipe_frame_type await_response(planned_request & request, uint64_t wanted_seq_id, std::vector<uint8_t> & payload) {
         if (!stats.first_await_recorded) {
             stats.first_await_recorded  = true;
@@ -1938,6 +1997,11 @@ struct dispatcher::impl {
                 }
             }
         }
+        // WP_AWAIT_SPIN_US: burn the tail of the wait on-core so the response
+        // is consumed without a kernel wakeup. Purely a timing change; on
+        // timeout, on error, or when disabled we fall into the identical
+        // blocking pipe_recv_frame below.
+        spin_for_readable(*value.socket);
         if (!pipe_recv_frame(*value.socket, type, seq_id, payload)) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " died while computing expert(s) " + assignment_experts(request.assignments));

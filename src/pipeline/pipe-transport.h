@@ -28,6 +28,19 @@ struct pipe_socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
 
+    // Send `a` immediately followed by `b` as ONE gathered write (sendmsg with
+    // two iovecs on POSIX; two ordinary sends on Windows). Byte-for-byte
+    // identical on the wire to send_data(a) followed by send_data(b) -- this
+    // exists purely to stop a small frame header from leaving as its own TCP
+    // segment. With TCP_NODELAY set (we set it on every socket) a separate
+    // send() of the 32-byte header is pushed out immediately as a standalone
+    // packet; the peer's recv_data(header) then returns on that packet and
+    // blocks again for the body, costing an extra kernel wakeup per frame per
+    // direction. Both of those wakeups sit inside the requester's wait and
+    // outside the responder's own service clock. Short writes loop to
+    // completion exactly as send_data does.
+    bool send_data2(const void * a, size_t a_size, const void * b, size_t b_size);
+
     // Interrupt blocking I/O without closing the descriptor.
     void shutdown();
 
