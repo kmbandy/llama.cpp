@@ -511,6 +511,17 @@ struct RequestStats {
     uint64_t ns_submit = 0;
     uint64_t ns_final_sync = 0;
     uint64_t ns_readback = 0;
+    // Vulkan-only nested timers. ns_vk_compute_path covers compute_batch;
+    // the other timers identify work inside that span and may overlap it.
+    uint64_t ns_vk_compute_path = 0;
+    uint64_t ns_vk_dispatch_path = 0;
+    uint64_t ns_vk_wait = 0;
+    uint64_t ns_vk_cache_lookup = 0;
+    uint64_t ns_vk_graph_compute = 0;
+    uint64_t ns_vk_params_set = 0;
+    uint64_t ns_vk_fold = 0;
+    uint64_t ns_vk_sync = 0;
+    uint64_t ns_vk_readback = 0;
     uint64_t ns_prep = 0;
     uint64_t ns_prep_setup = 0;   // ggml_init + new_tensor + buft queries
     uint64_t ns_prep_grow = 0;    // grow_io_buffer (device alloc when it grows)
@@ -687,6 +698,15 @@ public:
         ns_graph_build_ += request.ns_graph_build;
         ns_submit_ += request.ns_submit;
         ns_final_sync_ += request.ns_final_sync;
+        ns_vk_compute_path_ += request.ns_vk_compute_path;
+        ns_vk_dispatch_path_ += request.ns_vk_dispatch_path;
+        ns_vk_wait_ += request.ns_vk_wait;
+        ns_vk_cache_lookup_ += request.ns_vk_cache_lookup;
+        ns_vk_graph_compute_ += request.ns_vk_graph_compute;
+        ns_vk_params_set_ += request.ns_vk_params_set;
+        ns_vk_fold_ += request.ns_vk_fold;
+        ns_vk_sync_ += request.ns_vk_sync;
+        ns_vk_readback_ += request.ns_vk_readback;
         n_gcache_hit_ += request.n_gcache_hit;
         n_gcache_miss_ += request.n_gcache_miss;
         n_arena_hit_ += request.n_arena_hit;
@@ -831,6 +851,15 @@ private:
                   << " ns_graph_build=" << ns_graph_build_
                   << " ns_submit=" << ns_submit_
                   << " ns_final_sync=" << ns_final_sync_
+                  << " ns_vk_compute_path=" << ns_vk_compute_path_
+                  << " ns_vk_dispatch_path=" << ns_vk_dispatch_path_
+                  << " ns_vk_wait=" << ns_vk_wait_
+                  << " ns_vk_cache_lookup=" << ns_vk_cache_lookup_
+                  << " ns_vk_graph_compute=" << ns_vk_graph_compute_
+                  << " ns_vk_params_set=" << ns_vk_params_set_
+                  << " ns_vk_fold=" << ns_vk_fold_
+                  << " ns_vk_sync=" << ns_vk_sync_
+                  << " ns_vk_readback=" << ns_vk_readback_
                   << " gcache_hit=" << n_gcache_hit_
                   << " gcache_miss=" << n_gcache_miss_
                   << " n_arena_hit=" << n_arena_hit_
@@ -936,6 +965,15 @@ private:
     uint64_t          ns_graph_build_ = 0;
     uint64_t          ns_submit_ = 0;
     uint64_t          ns_final_sync_ = 0;
+    uint64_t          ns_vk_compute_path_ = 0;
+    uint64_t          ns_vk_dispatch_path_ = 0;
+    uint64_t          ns_vk_wait_ = 0;
+    uint64_t          ns_vk_cache_lookup_ = 0;
+    uint64_t          ns_vk_graph_compute_ = 0;
+    uint64_t          ns_vk_params_set_ = 0;
+    uint64_t          ns_vk_fold_ = 0;
+    uint64_t          ns_vk_sync_ = 0;
+    uint64_t          ns_vk_readback_ = 0;
     uint64_t          n_gcache_hit_ = 0;
     uint64_t          n_gcache_miss_ = 0;
     uint64_t          n_arena_hit_ = 0;
@@ -7372,8 +7410,11 @@ public:
             return e != nullptr && std::strtol(e, nullptr, 10) == 1;
         }();
         const char * const backend_name = ggml_backend_name(backend_.get());
+        const bool backend_supported = backend_name != nullptr &&
+            (std::strstr(backend_name, "ROCm") != nullptr ||
+             std::strstr(backend_name, "Vulkan") != nullptr);
         return enabled && backend_name != nullptr &&
-            std::strstr(backend_name, "ROCm") != nullptr &&
+            backend_supported &&
             request.n_tokens >= 1 && request.n_tokens <= 8 &&
             request.assignments.size() >= 1 &&
             request.assignments.size() <= (size_t) 16 * request.n_tokens;
@@ -7721,9 +7762,14 @@ public:
             io_reserved_hint_ = total;   // prepare_io must not pick the small buffer under this
             grow_io_buffer(total, request_stats);
         }
+        const bool measure_vk = measure && is_vulkan_backend();
+        std::chrono::steady_clock::time_point vk_dispatch_started;
         if (!request.assignments.empty()) {
             prepare_io(activation, request.n_tokens, request_stats);
             request_stats.ns_prep = lap();
+            if (measure_vk) {
+                vk_dispatch_started = std::chrono::steady_clock::now();
+            }
             if (resident_first_eligible) {
                 // Compute every already-resident expert NOW, each into its
                 // own slot -- this is what overlaps with the reader threads
@@ -7871,6 +7917,11 @@ public:
                 /* add_previous = */ have_hits, request_stats);
         }
         request_stats.ns_pagein_compute += lap();
+        if (measure_vk && !request.assignments.empty()) {
+            request_stats.ns_vk_dispatch_path +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - vk_dispatch_started).count();
+        }
         if (!request.assignments.empty()) {
             read_result(sum, request_stats);
         }
@@ -8112,6 +8163,11 @@ public:
         return stats_.enabled();
     }
 
+    bool is_vulkan_backend() const {
+        const char * name = ggml_backend_name(backend_.get());
+        return name != nullptr && std::strstr(name, "Vulkan") != nullptr;
+    }
+
     void record_stats(const RequestStats & request, size_t n_experts) {
         stats_.set_shield_stats(pool_.n_shield_hits(), pool_.n_shield_exhausted());
         stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
@@ -8185,10 +8241,13 @@ private:
         }
         const auto started = std::chrono::steady_clock::now();
         ggml_backend_synchronize(backend_.get());
+        const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
         if (request_stats != nullptr) {
-            request_stats->ns_final_sync +=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - started).count();
+            request_stats->ns_final_sync += elapsed;
+            if (stats_.enabled() && is_vulkan_backend()) {
+                request_stats->ns_vk_sync += elapsed;
+            }
         }
         it->second.pending = false;
         it->second.params.clear();
@@ -8203,6 +8262,24 @@ private:
 
     AsyncSubmitState & async_submit_state() {
         return async_submit_state_by_conn_.at(active_async_conn_index_);
+    }
+
+    enum ggml_status submit_graph(ggml_cgraph * graph, RequestStats & request_stats) {
+        if (submit_async_) {
+            async_submit_state().pending = true;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        const enum ggml_status status = submit_async_
+            ? ggml_backend_graph_compute_async(backend_.get(), graph)
+            : ggml_backend_graph_compute(backend_.get(), graph);
+        const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        request_stats.ns_submit += elapsed;
+        if (stats_.enabled() && is_vulkan_backend()) {
+            request_stats.ns_vk_graph_compute += elapsed;
+        }
+        ++request_stats.n_graph_submits;
+        return status;
     }
 
     // ---- prefetch hints (see note_prefetch_hint) ----
@@ -8886,7 +8963,26 @@ private:
             // io_result_offset_ the same way. Both are disabled below
             // whenever this is overridden; see the two guards further down.
             size_t result_offset = std::numeric_limits<size_t>::max()) {
+        const bool measure_vk = stats_.enabled() && is_vulkan_backend();
+        const std::chrono::steady_clock::time_point vk_compute_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
+        const auto record_vk_compute = [&]() {
+            if (measure_vk) {
+                request_stats.ns_vk_compute_path +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - vk_compute_started).count();
+            }
+        };
+        const std::chrono::steady_clock::time_point vk_wait_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
         batch.wait_copy_event(backend_.get());
+        if (measure_vk) {
+            request_stats.ns_vk_wait +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - vk_wait_started).count();
+        }
         const auto selected = [&](size_t i) {
             return i >= sel_begin && i < sel_end &&
                    (all_experts || (batch.is_resident(i) == hits));
@@ -8896,6 +8992,7 @@ private:
             n_selected += selected(i) ? 1 : 0;
         }
         if (n_selected == 0) {
+            record_vk_compute();
             return;
         }
 
@@ -8904,6 +9001,7 @@ private:
                 n_selected == request.assignments.size() &&
                 result_offset == std::numeric_limits<size_t>::max() &&
                 compute_batch_arena(request, pages, batch, request_stats)) {
+            record_vk_compute();
             return;
         }
 
@@ -9007,6 +9105,7 @@ private:
             compute_batch_grouped(
                 request, pages, batch, selected, n_selected, add_previous, request_stats,
                 s_worker_collapse, grouped_gemv);
+            record_vk_compute();
             return;
         }
         std::vector<uint8_t> params_host;
@@ -9062,6 +9161,9 @@ private:
         }
         GraphCacheEntry * gc = nullptr;
         bool gc_hit = false;
+        const std::chrono::steady_clock::time_point vk_cache_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
         if (s_graph_cache && s_params_coalesce && gather_rank_uniform &&
                 result_offset == std::numeric_limits<size_t>::max()) {
             GraphKey key;
@@ -9108,6 +9210,11 @@ private:
                 gc->params_gen = params_gen_;
             }
             gc->last_used = ++graph_cache_tick_;
+        }
+        if (measure_vk) {
+            request_stats.ns_vk_cache_lookup +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - vk_cache_started).count();
         }
 
         if (gc_hit) {
@@ -9162,24 +9269,19 @@ private:
                 } else {
                     ggml_backend_tensor_set(gc->blob, params_host.data(), 0, params_span);
                 }
-                request_stats.ns_params_set +=
+                const uint64_t params_elapsed =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - params_started).count();
+                request_stats.ns_params_set += params_elapsed;
+                if (measure_vk) {
+                    request_stats.ns_vk_params_set += params_elapsed;
+                }
             }
-            const auto submit_started = std::chrono::steady_clock::now();
-            if (submit_async_) {
-                async_submit_state().pending = true;
-            }
-            const enum ggml_status status = submit_async_
-                ? ggml_backend_graph_compute_async(backend_.get(), gc->graph)
-                : ggml_backend_graph_compute(backend_.get(), gc->graph);
-            request_stats.ns_submit +=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - submit_started).count();
-            ++request_stats.n_graph_submits;
+            const enum ggml_status status = submit_graph(gc->graph, request_stats);
             if (status != GGML_STATUS_SUCCESS) {
                 throw std::runtime_error("cached expert backend graph compute failed");
             }
+            record_vk_compute();
             return;
         }
         if (gc != nullptr) {
@@ -9333,6 +9435,9 @@ private:
                 gc->route_w.push_back(weights);
             }
             ggml_tensor * weighted = ggml_mul(ctx.get(), output, weights);
+            const std::chrono::steady_clock::time_point fold_started =
+                measure_vk ? std::chrono::steady_clock::now() :
+                              std::chrono::steady_clock::time_point();
             if (use_gather) {
                 // Scatter compacted rows back to [n_embd, n_tokens]. Default is
                 // set_rows into a zero dest (linear in n_sel). get_rows_back is
@@ -9348,6 +9453,11 @@ private:
                 }
             } else {
                 sum = sum ? ggml_add(ctx.get(), sum, weighted) : weighted;
+            }
+            if (measure_vk) {
+                request_stats.ns_vk_fold +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - fold_started).count();
             }
             routing_weights.emplace_back(weights, &request.assignments[i]);
             gather_idx.emplace_back(idx_t, std::move(idx));
@@ -9404,16 +9514,32 @@ private:
                     std::vector<float> compact;
                     compact.reserve(idx.size());
                     for (int32_t t : idx) { compact.push_back(wv[(size_t) t]); }
+                    const auto params_started = std::chrono::steady_clock::now();
                     ggml_backend_tensor_set(
                         item.first, compact.data(), 0, compact.size() * sizeof(float));
                     ggml_backend_tensor_set(
                         gather_idx[k].first, idx.data(), 0, idx.size() * sizeof(int32_t));
+                    const uint64_t params_elapsed =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - params_started).count();
+                    request_stats.ns_params_set += params_elapsed;
+                    if (measure_vk) {
+                        request_stats.ns_vk_params_set += params_elapsed;
+                    }
                 }
             } else {
                 request_stats.n_weight_total += wv.size();
                 if (!s_params_coalesce) {
+                    const auto params_started = std::chrono::steady_clock::now();
                     ggml_backend_tensor_set(
                         item.first, wv.data(), 0, wv.size() * sizeof(float));
+                    const uint64_t params_elapsed =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - params_started).count();
+                    request_stats.ns_params_set += params_elapsed;
+                    if (measure_vk) {
+                        request_stats.ns_vk_params_set += params_elapsed;
+                    }
                 }
             }
         }
@@ -9440,21 +9566,15 @@ private:
             } else {
                 ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
             }
-            request_stats.ns_params_set +=
+            const uint64_t params_elapsed =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - params_started).count();
+            request_stats.ns_params_set += params_elapsed;
+            if (measure_vk) {
+                request_stats.ns_vk_params_set += params_elapsed;
+            }
         }
-        const auto submit_started = std::chrono::steady_clock::now();
-        if (submit_async_) {
-            async_submit_state().pending = true;
-        }
-        const enum ggml_status status = submit_async_
-            ? ggml_backend_graph_compute_async(backend_.get(), graph)
-            : ggml_backend_graph_compute(backend_.get(), graph);
-        request_stats.ns_submit +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - submit_started).count();
-        ++request_stats.n_graph_submits;
+        const enum ggml_status status = submit_graph(graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("batched expert backend graph compute failed");
         }
@@ -9552,6 +9672,7 @@ private:
             RequestStats & request_stats,
             bool collapse_copies,
             bool warn_grouped_gemv) {
+        const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const auto build_started = std::chrono::steady_clock::now();
 
         // Assignment indices selected for this call, in order -- this IS the
@@ -9962,11 +10083,19 @@ private:
         // n_tokens.
         ggml_tensor * result = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
         ggml_tensor * sum = add_previous ? result : nullptr;
+        const std::chrono::steady_clock::time_point fold_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
         for (size_t k = 0; k < n; ++k) {
             ggml_tensor * contrib = ggml_view_2d(
                 ctx.get(), weighted, n_embd, (int64_t) n_tokens,
                 weighted->nb[2], (size_t) k * weighted->nb[1]);
             sum = sum ? ggml_add(ctx.get(), sum, contrib) : contrib;
+        }
+        if (measure_vk) {
+            request_stats.ns_vk_fold +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - fold_started).count();
         }
         if (sum == nullptr) {
             throw std::runtime_error("grouped expert compute produced no contribution");
@@ -9986,33 +10115,34 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - build_started).count();
 
+        uint64_t params_elapsed = 0;
         if (submit_async_) {
             AsyncSubmitState & state = async_submit_state();
             state.ids.emplace_back(std::move(ids_host));
             state.route_weights.emplace_back(std::move(route_w_host));
             state.pending = true;
+            const auto params_started = std::chrono::steady_clock::now();
             ggml_backend_tensor_set_async(
                 backend_.get(), ids, state.ids.back().data(), 0,
                 state.ids.back().size() * sizeof(int32_t));
             ggml_backend_tensor_set_async(
                 backend_.get(), route_w, state.route_weights.back().data(), 0,
                 state.route_weights.back().size() * sizeof(float));
+            params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - params_started).count();
         } else {
+            const auto params_started = std::chrono::steady_clock::now();
             ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
             ggml_backend_tensor_set(route_w, route_w_host.data(), 0, route_w_host.size() * sizeof(float));
+            params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - params_started).count();
+        }
+        request_stats.ns_params_set += params_elapsed;
+        if (measure_vk) {
+            request_stats.ns_vk_params_set += params_elapsed;
         }
 
-        const auto submit_started = std::chrono::steady_clock::now();
-        if (submit_async_) {
-            async_submit_state().pending = true;
-        }
-        const enum ggml_status status = submit_async_
-            ? ggml_backend_graph_compute_async(backend_.get(), graph)
-            : ggml_backend_graph_compute(backend_.get(), graph);
-        request_stats.ns_submit +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - submit_started).count();
-        ++request_stats.n_graph_submits;
+        const enum ggml_status status = submit_graph(graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("grouped expert backend graph compute failed");
         }
@@ -10050,6 +10180,7 @@ private:
             const ExpertSlotPool::ArenaLayout & layout,
             const std::array<ArenaRoleKey, 3> & roles,
             const std::vector<ArenaGroup> & groups) {
+        const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const size_t n = request.assignments.size();
         const size_t params_align = ggml_backend_buft_get_alignment(
             ggml_backend_get_default_buffer_type(backend_.get()));
@@ -10089,6 +10220,9 @@ private:
             return v > 0 ? (size_t) v : (size_t) 16;
         }();
 
+        const std::chrono::steady_clock::time_point vk_cache_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
         auto it = arena_graph_cache_.find(key);
         if (it != arena_graph_cache_.end() &&
                 (it->second.graph == nullptr ||
@@ -10100,6 +10234,11 @@ private:
             it = arena_graph_cache_.end();
         }
         const bool hit = it != arena_graph_cache_.end();
+        if (measure_vk) {
+            request_stats.ns_vk_cache_lookup +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - vk_cache_started).count();
+        }
         if (!hit) {
             if (arena_graph_cache_.size() >= cache_max) {
                 auto victim = arena_graph_cache_.begin();
@@ -10188,8 +10327,16 @@ private:
                 }
             }
             ggml_tensor * sum = nullptr;
+            const std::chrono::steady_clock::time_point fold_started =
+                measure_vk ? std::chrono::steady_clock::now() :
+                              std::chrono::steady_clock::time_point();
             for (ggml_tensor * contribution : contributions) {
                 sum = sum != nullptr ? ggml_add(ctx, sum, contribution) : contribution;
+            }
+            if (measure_vk) {
+                request_stats.ns_vk_fold +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - fold_started).count();
             }
             if (sum == nullptr) {
                 throw std::runtime_error("multi-arena graph produced no contribution");
@@ -10241,16 +10388,14 @@ private:
         }
         const auto params_started = std::chrono::steady_clock::now();
         ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
-        request_stats.ns_params_set +=
+        const uint64_t params_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - params_started).count();
-        const auto submit_started = std::chrono::steady_clock::now();
-        const enum ggml_status status =
-            ggml_backend_graph_compute(backend_.get(), entry.graph);
-        request_stats.ns_submit +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - submit_started).count();
-        ++request_stats.n_graph_submits;
+        request_stats.ns_params_set += params_elapsed;
+        if (measure_vk) {
+            request_stats.ns_vk_params_set += params_elapsed;
+        }
+        const enum ggml_status status = submit_graph(entry.graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
             entry.graph = nullptr;
             throw std::runtime_error("multi-arena expert backend graph compute failed");
@@ -10272,6 +10417,7 @@ private:
             const std::vector<const ExpertPage *> & pages,
             const ExpertSlotPool::Batch & batch,
             RequestStats & request_stats) {
+        const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::optional<ExpertSlotPool::ArenaLayout> layout_opt = pool_.arena_layout();
         if (!layout_opt.has_value()) {
             return false;
@@ -10392,6 +10538,9 @@ private:
                    graph != nullptr && graph[0] == '1';
         }();
 
+        const std::chrono::steady_clock::time_point vk_cache_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
         auto it = arena_graph_cache_.find(key);
         if (it != arena_graph_cache_.end() &&
                 (it->second.graph == nullptr ||
@@ -10403,6 +10552,11 @@ private:
             it = arena_graph_cache_.end();
         }
         const bool hit = it != arena_graph_cache_.end();
+        if (measure_vk) {
+            request_stats.ns_vk_cache_lookup +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - vk_cache_started).count();
+        }
         if (!hit) {
             if (arena_graph_cache_.size() >= cache_max) {
                 auto victim = arena_graph_cache_.begin();
@@ -10478,18 +10632,34 @@ private:
 
             ggml_tensor * sum = nullptr;
             if (fold_collapse) {
+                const std::chrono::steady_clock::time_point fold_started =
+                    measure_vk ? std::chrono::steady_clock::now() :
+                                  std::chrono::steady_clock::time_point();
                 // mul_mat_id lays out [n_embd, n_assignments, n_tokens]. Make
                 // the assignment axis contiguous and reduce it in one op.
                 ggml_tensor * rows = ggml_cont(
                     ctx, ggml_permute(ctx, weighted, 1, 0, 2, 3));
                 sum = ggml_reshape_2d(
                     ctx, ggml_sum_rows(ctx, rows), n_embd, request.n_tokens);
+                if (measure_vk) {
+                    request_stats.ns_vk_fold +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - fold_started).count();
+                }
             } else {
+                const std::chrono::steady_clock::time_point fold_started =
+                    measure_vk ? std::chrono::steady_clock::now() :
+                                  std::chrono::steady_clock::time_point();
                 for (size_t k = 0; k < n; ++k) {
                     ggml_tensor * contrib = ggml_view_2d(
                         ctx, weighted, n_embd, request.n_tokens,
                         weighted->nb[2], k * weighted->nb[1]);
                     sum = sum != nullptr ? ggml_add(ctx, sum, contrib) : contrib;
+                }
+                if (measure_vk) {
+                    request_stats.ns_vk_fold +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - fold_started).count();
                 }
             }
             ggml_tensor * result = make_io_tensor(ctx, request.n_tokens, io_result_offset_);
@@ -10529,9 +10699,13 @@ private:
         std::memcpy(params_host.data() + route_offset, route_host.data(), route_bytes);
         const auto params_started = std::chrono::steady_clock::now();
         ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
-        request_stats.ns_params_set +=
+        const uint64_t params_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - params_started).count();
+        request_stats.ns_params_set += params_elapsed;
+        if (measure_vk) {
+            request_stats.ns_vk_params_set += params_elapsed;
+        }
 
         const char * const saved_hip_graphs = std::getenv("WP_HIP_GRAPHS");
         const bool saved_hip_graphs_set = saved_hip_graphs != nullptr;
@@ -10570,9 +10744,13 @@ private:
         };
         const auto submit_started = std::chrono::steady_clock::now();
         enum ggml_status status = graph_compute(hip_graph_attempt);
-        request_stats.ns_submit +=
+        const uint64_t submit_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - submit_started).count();
+        request_stats.ns_submit += submit_elapsed;
+        if (measure_vk) {
+            request_stats.ns_vk_graph_compute += submit_elapsed;
+        }
         ++request_stats.n_graph_submits;
         if (status != GGML_STATUS_SUCCESS && hip_graph_attempt) {
             // Graph capture is an optional optimization. Retry this bucket
@@ -10585,9 +10763,13 @@ private:
                          request.n_tokens, (unsigned) n, clamp_bits);
             const auto fallback_started = std::chrono::steady_clock::now();
             status = graph_compute(false);
-            request_stats.ns_submit +=
+            const uint64_t fallback_elapsed =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - fallback_started).count();
+            request_stats.ns_submit += fallback_elapsed;
+            if (measure_vk) {
+                request_stats.ns_vk_graph_compute += fallback_elapsed;
+            }
             ++request_stats.n_graph_submits;
         }
         if (status != GGML_STATUS_SUCCESS) {
@@ -10632,9 +10814,13 @@ private:
         const auto readback_started = std::chrono::steady_clock::now();
         ggml_backend_tensor_get(
             output, result.data(), 0, result.size() * sizeof(float));
-        request_stats.ns_readback +=
+        const uint64_t readback_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - readback_started).count();
+        request_stats.ns_readback += readback_elapsed;
+        if (stats_.enabled() && is_vulkan_backend()) {
+            request_stats.ns_vk_readback += readback_elapsed;
+        }
     }
 
     void compute_cpu_on_arrival(
@@ -10814,6 +11000,7 @@ private:
     void fold_resident_first_partials(
             uint32_t n_tokens, size_t n_assign, size_t base_offset,
             size_t slot_size, RequestStats & request_stats) {
+        const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         // TENSOR BUDGET -- got this wrong once and it aborted the worker on the
         // first real request (2026-08-19: "ggml_new_object: not enough space in
         // the context's memory pool (needed 4048, available 3776)", GGML_ASSERT
@@ -10837,9 +11024,17 @@ private:
         }
         // Left-fold in assignment-index order -- see the correctness note above.
         ggml_tensor * fold = nullptr;
+        const std::chrono::steady_clock::time_point fold_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
         for (size_t i = 0; i < n_assign; ++i) {
             ggml_tensor * part = make_io_tensor(ctx.get(), n_tokens, base_offset + i * slot_size);
             fold = fold ? ggml_add(ctx.get(), fold, part) : part;
+        }
+        if (measure_vk) {
+            request_stats.ns_vk_fold +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - fold_started).count();
         }
         ggml_tensor * result = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
         ggml_tensor * copy = ggml_cpy(ctx.get(), fold, result);
@@ -10848,17 +11043,7 @@ private:
         if (!ggml_gallocr_alloc_graph(compute_galloc_.get(), graph)) {
             throw std::runtime_error("failed to allocate resident-first fold graph");
         }
-        const auto submit_started = std::chrono::steady_clock::now();
-        if (submit_async_) {
-            async_submit_state().pending = true;
-        }
-        const enum ggml_status status = submit_async_
-            ? ggml_backend_graph_compute_async(backend_.get(), graph)
-            : ggml_backend_graph_compute(backend_.get(), graph);
-        request_stats.ns_submit +=
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - submit_started).count();
-        ++request_stats.n_graph_submits;
+        const enum ggml_status status = submit_graph(graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("resident-first fold graph compute failed");
         }
@@ -11028,6 +11213,15 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.ns_graph_build += src.ns_graph_build;
     dst.ns_submit += src.ns_submit;
     dst.ns_final_sync += src.ns_final_sync;
+    dst.ns_vk_compute_path += src.ns_vk_compute_path;
+    dst.ns_vk_dispatch_path += src.ns_vk_dispatch_path;
+    dst.ns_vk_wait += src.ns_vk_wait;
+    dst.ns_vk_cache_lookup += src.ns_vk_cache_lookup;
+    dst.ns_vk_graph_compute += src.ns_vk_graph_compute;
+    dst.ns_vk_params_set += src.ns_vk_params_set;
+    dst.ns_vk_fold += src.ns_vk_fold;
+    dst.ns_vk_sync += src.ns_vk_sync;
+    dst.ns_vk_readback += src.ns_vk_readback;
     dst.ns_readback += src.ns_readback;
     dst.ns_prep += src.ns_prep;
     dst.ns_prep_setup += src.ns_prep_setup;

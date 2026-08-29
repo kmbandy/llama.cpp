@@ -8919,10 +8919,18 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
 
-    // If the device is not an UMA device the memory is host-accessible through rebar. While writing
-    // through PCIe is sufficient fast reading back data from PCIe is slower than going through
-    // the HW device to host copy path.
-    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma) {
+    // Direct reads from host-visible device memory are opt-in because PCIe reads
+    // can be slower than a device copy for large results.
+    static const size_t direct_read_max_bytes = [] {
+        const char * e = getenv("GGML_VK_HOST_VISIBLE_DIRECT_READ_MAX_BYTES");
+        return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 0;
+    }();
+    const bool host_visible =
+        static_cast<bool>(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+    const bool direct_host_read = host_visible &&
+        (src->device->uma ||
+         (direct_read_max_bytes != 0 && height != 0 && width <= direct_read_max_bytes / height));
+    if (direct_host_read) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
