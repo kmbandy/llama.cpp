@@ -31,6 +31,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <type_traits>   // std::true_type/false_type: bind the BCAST template
+                         // argument outside the loops (see wp_gemm_scale_bcast)
 
 #if defined(__AVX2__) && defined(__FMA__)
 
@@ -67,10 +69,52 @@ inline __m256i scale_shuffle(int i) {
     return _mm256_loadu_si256((const __m256i *) k + i);
 }
 
+// *** WP_CPU_GEMM_SCALE_BCAST=1 (DEFAULT OFF) -- DROP THE SHUFFLE TABLE. ***
+//
+// WHY. The j-loop needs `scale_l` = super-block scale 2j broadcast across all
+// 16 int16 lanes, and `scale_h` = scale 2j+1 likewise. Mainline builds those
+// with a 256-byte index table and vpshufb, and this file inherited that. On
+// Skylake (the 6700K) vpshufb is PORT 5 ONLY, and port 5 is also where the
+// vpand/vpsrlw of the nibble unpack would like to go. So each j-group pays
+// 2 table loads AND 2 port-5 uops for what is, semantically, a broadcast of a
+// single byte.
+//
+// WHY IT IS BIT-IDENTICAL. Follow the value. utmp[0..3] is 16 bytes;
+// _mm_set_epi32(utmp[3],utmp[2],utmp[1],utmp[0]) lays those bytes down in
+// exactly memory order, and _mm256_cvtepu8_epi16 zero-extends byte k to int16
+// lane k. sc128 is lanes 0..7, duplicated into both 128-bit halves of `scales`.
+// vpshufb with index pair (2i, 2i+1) is per-128-bit-lane, so it selects int16
+// element i of sc128 and splats it. Element i of sc128 IS ((uint8_t*)utmp)[i],
+// zero-extended. Therefore
+//     _mm256_shuffle_epi8(scales, scale_shuffle(i))  ==  _mm256_set1_epi16(sc[i])
+// for sc = (const uint8_t *) utmp, with no rounding, saturation or reordering
+// anywhere in between. The arithmetic that consumes it is untouched, so the
+// summation order is untouched and the result is bit-identical -- which
+// wp_gemm_selfcheck in tools/wp-expert-worker/bench-cpu.cpp verifies directly.
+//
+// WHAT IT BUYS. Per j-group: two table loads and two port-5 uops become two
+// vpbroadcastw-from-memory (load port only, no port 5). At NY=1 -- the DECODE
+// case, n_tokens=1, where there is no column reuse to amortize anything and
+// every j-group is pure per-output cost -- that is the difference between ~5
+// loads + 2 p5 uops and ~5 loads + 0 p5 uops per group, with the whole nibble
+// unpack now free to use port 5. The win grows as NY shrinks, i.e. it is
+// aimed squarely at decode.
+//
+// DEFAULT OFF because it has not been measured on the rig; both kernels are
+// compiled and selected once per wp_gemm_q4K_q8K() call, so the branch is not
+// in any loop and BCAST=false is byte-for-byte the shipped kernel.
+inline bool wp_gemm_scale_bcast() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_CPU_GEMM_SCALE_BCAST");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 // One row of A against NY columns of B. The j-loop body loads and unpacks the
 // weight nibbles ONCE and then consumes them for every column -- that hoist is
 // the entire point of this file.
-template <int NY>
+template <int NY, bool BCAST>
 void gemm_q4K_q8K_row(int nb,
                       const block_q4_K * __restrict a,
                       const block_q8_K * const __restrict b[NY],
@@ -100,7 +144,10 @@ void gemm_q4K_q8K_row(int nb,
             _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
         const __m128i mins128 = _mm256_extracti128_si256(mins_and_scales, 1);
         const __m128i sc128   = _mm256_extracti128_si256(mins_and_scales, 0);
-        const __m256i scales  = _mm256_set_m128i(sc128, sc128);
+        // Unused in the BCAST instantiation, which reads the same values as
+        // bytes out of utmp instead. Kept so BCAST=false stays byte-for-byte
+        // the shipped kernel.
+        [[maybe_unused]] const __m256i scales = _mm256_set_m128i(sc128, sc128);
 
         const float xd    = GGML_CPU_FP16_TO_FP32(a[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
         const float xdmin = GGML_CPU_FP16_TO_FP32(a[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin);
@@ -124,10 +171,19 @@ void gemm_q4K_q8K_row(int nb,
 
         const uint8_t * __restrict q4 = a[i].qs;
 
+        // Byte view of the unpacked 6-bit scales; see wp_gemm_scale_bcast().
+        // `scales` and `sc` carry the SAME eight values, and the two branches
+        // below produce bit-identical vectors from them.
+        const uint8_t * __restrict sc = (const uint8_t *) utmp;
+
         for (int j = 0; j < QK_K / 64; ++j) {
             // ---- row-only work, hoisted out of the column loop ----
-            const __m256i scale_l = _mm256_shuffle_epi8(scales, scale_shuffle(2 * j + 0));
-            const __m256i scale_h = _mm256_shuffle_epi8(scales, scale_shuffle(2 * j + 1));
+            const __m256i scale_l = BCAST
+                ? _mm256_set1_epi16((short) sc[2 * j + 0])
+                : _mm256_shuffle_epi8(scales, scale_shuffle(2 * j + 0));
+            const __m256i scale_h = BCAST
+                ? _mm256_set1_epi16((short) sc[2 * j + 1])
+                : _mm256_shuffle_epi8(scales, scale_shuffle(2 * j + 1));
             const __m256i q4bits  = _mm256_loadu_si256((const __m256i *) q4); q4 += 32;
             const __m256i q4l     = _mm256_and_si256(q4bits, m4);
             const __m256i q4h     = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
@@ -234,30 +290,46 @@ bool wp_gemm_q4K_q8K(int n, int nrc_x, int nrc_y,
     }
     const int nb = n / QK_K;
 
+    // Selected ONCE per call, never inside a loop: the two instantiations are
+    // separate code, so the hot loops carry no branch. See wp_gemm_scale_bcast().
+    const bool bcast = wp_gemm_scale_bcast();
+
     // COLUMN-BLOCK OUTER, ROW INNER. The other order is the obvious one and it
     // is wrong: with rows outer, the whole B panel (nrc_y q8_K columns, ~2.6 KB
     // each) is re-read once per row -- 298 MB of traffic at nrc_y=256, which
     // measured as a speedup DECAYING from 1.22x at 4 columns to 1.06x at 256.
     // With columns outer, one 4-column block is ~10 KB and stays L1-resident
     // across every row while A streams from L3 once per block.
-    for (int iy = 0; iy + 4 <= nrc_y; iy += 4) {
-        const block_q8_K * cols[4];
-        for (int k = 0; k < 4; ++k) {
-            cols[k] = (const block_q8_K *) ((const char *) B + (size_t) (iy + k) * by);
+    //
+    // The BCAST template argument is bound OUTSIDE every loop -- the whole
+    // blocked sweep is written once as a lambda and instantiated twice -- so
+    // neither the ix loop nor the j loop carries a branch on it.
+    const auto sweep = [&](auto bcast_tag) {
+        constexpr bool BCAST = decltype(bcast_tag)::value;
+        for (int iy = 0; iy + 4 <= nrc_y; iy += 4) {
+            const block_q8_K * cols[4];
+            for (int k = 0; k < 4; ++k) {
+                cols[k] = (const block_q8_K *) ((const char *) B + (size_t) (iy + k) * by);
+            }
+            for (int ix = 0; ix < nrc_x; ++ix) {
+                const block_q4_K * a = (const block_q4_K *) ((const char *) A + (size_t) ix * bx);
+                gemm_q4K_q8K_row<4, BCAST>(nb, a, cols, C + (size_t) iy * stride_C + ix, stride_C);
+            }
         }
-        for (int ix = 0; ix < nrc_x; ++ix) {
-            const block_q4_K * a = (const block_q4_K *) ((const char *) A + (size_t) ix * bx);
-            gemm_q4K_q8K_row<4>(nb, a, cols, C + (size_t) iy * stride_C + ix, stride_C);
+        for (int iy = nrc_y & ~3; iy < nrc_y; ++iy) {
+            const block_q8_K * cols[1] = {
+                (const block_q8_K *) ((const char *) B + (size_t) iy * by)
+            };
+            for (int ix = 0; ix < nrc_x; ++ix) {
+                const block_q4_K * a = (const block_q4_K *) ((const char *) A + (size_t) ix * bx);
+                gemm_q4K_q8K_row<1, BCAST>(nb, a, cols, C + (size_t) iy * stride_C + ix, stride_C);
+            }
         }
-    }
-    for (int iy = nrc_y & ~3; iy < nrc_y; ++iy) {
-        const block_q8_K * cols[1] = {
-            (const block_q8_K *) ((const char *) B + (size_t) iy * by)
-        };
-        for (int ix = 0; ix < nrc_x; ++ix) {
-            const block_q4_K * a = (const block_q4_K *) ((const char *) A + (size_t) ix * bx);
-            gemm_q4K_q8K_row<1>(nb, a, cols, C + (size_t) iy * stride_C + ix, stride_C);
-        }
+    };
+    if (bcast) {
+        sweep(std::true_type{});
+    } else {
+        sweep(std::false_type{});
     }
     return true;
 }
