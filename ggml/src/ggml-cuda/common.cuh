@@ -1450,6 +1450,10 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // Live entries in the graph cache. Used to tell "cache too small" apart
+    // from "genuinely new shapes" when captures climb.
+    size_t cuda_graph_count() const { return cuda_graphs.size(); }
+
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
@@ -1503,6 +1507,12 @@ struct ggml_backend_cuda_context {
             it->second->capture_reason = ttl_evicted ? ggml_cuda_graph::CAPTURE_TTL :
                 n_lru != 0 ? ggml_cuda_graph::CAPTURE_LRU : ggml_cuda_graph::CAPTURE_NEWKEY;
         } else if (cache_pol.track_ttl) {
+            // DO NOT reset capture_reason here. cuda_graph() is called at SIX
+            // sites per graph evaluation, so clearing the reason on a plain
+            // lookup wipes it before the capture site can count it -- which
+            // made every capture look like an in-place re-capture and hid a
+            // real eviction problem. The reason is consumed (and only then
+            // cleared) at the capture site instead.
             ttl_evicted_graph_keys.erase(first_node_ptr);
         }
         it->second->last_used_time = time_now;

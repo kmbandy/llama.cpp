@@ -285,6 +285,26 @@ static uint64_t placement_now_ns() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+static bool cpu_on_arrival_enabled_from_env() {
+    const char * env = std::getenv("WP_EXPERT_CPU_ON_ARRIVAL");
+    return env != nullptr && env[0] == '1';
+}
+
+static size_t cpu_on_arrival_cap_from_env() {
+    const char * env = std::getenv("WP_EXPERT_CPU_ON_ARRIVAL_MAX");
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 2;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' ||
+            parsed > std::numeric_limits<size_t>::max()) {
+        return 2;
+    }
+    return (size_t) parsed;
+}
+
 static std::atomic<bool> g_read_direct_fallback{false};
 
 class ReadPathStats {
@@ -319,6 +339,23 @@ public:
         update_max(max_ns_, ns);
         latency_buckets_[latency_bucket(ns)].fetch_add(1, std::memory_order_relaxed);
         n_reads_.fetch_add(1, std::memory_order_relaxed);
+        maybe_report();
+    }
+
+    void record_cpu_on_arrival(uint64_t ns) {
+        if (!enabled()) {
+            return;
+        }
+        n_cpu_on_arrival_.fetch_add(1, std::memory_order_relaxed);
+        ns_cpu_on_arrival_.fetch_add(ns, std::memory_order_relaxed);
+        maybe_report();
+    }
+
+    void record_cpu_on_arrival_fallback(uint64_t count) {
+        if (!enabled() || count == 0) {
+            return;
+        }
+        n_cpu_on_arrival_fallback_.fetch_add(count, std::memory_order_relaxed);
         maybe_report();
     }
 
@@ -410,6 +447,13 @@ private:
                      (double) p95_ns / 1000.0,
                      (double) max_ns / 1000.0,
                      g_read_direct_fallback.load(std::memory_order_relaxed) ? 1 : 0);
+        std::fprintf(stderr,
+                     "wp expert worker cpu-on-arrival n_experts=%llu "
+                     "cpu_ns=%llu cap_fallback=%llu\n",
+                     (unsigned long long) n_cpu_on_arrival_.load(std::memory_order_relaxed),
+                     (unsigned long long) ns_cpu_on_arrival_.load(std::memory_order_relaxed),
+                     (unsigned long long) n_cpu_on_arrival_fallback_.load(
+                         std::memory_order_relaxed));
         std::fflush(stderr);
     }
 
@@ -423,6 +467,9 @@ private:
     std::atomic<uint64_t> last_read_ns_{0};
     std::atomic<uint64_t> min_ns_{UINT64_MAX};
     std::atomic<uint64_t> max_ns_{0};
+    std::atomic<uint64_t> n_cpu_on_arrival_{0};
+    std::atomic<uint64_t> ns_cpu_on_arrival_{0};
+    std::atomic<uint64_t> n_cpu_on_arrival_fallback_{0};
     std::array<std::atomic<uint64_t>, latency_bucket_count> latency_buckets_{};
 };
 
@@ -432,6 +479,22 @@ struct RequestStats {
     uint64_t ns_lookup  = 0;
     uint64_t ns_read    = 0;
     uint64_t ns_compute = 0;
+    // Worker::dispatch() entry -> return, ALL exits (RAII). ns_compute starts
+    // only at compute_started, so everything before it (lookup, ensure_batch,
+    // page-in issue) and after it (response build) was invisible. Added
+    // 2026-08-29 to close the ~890 us/layer the spine waits but the worker
+    // does not account for.
+    uint64_t ns_dispatch_total = 0;
+    // The serve_connection segments OUTSIDE dispatch(). Measured 2026-08-29:
+    // ns_dispatch_total (834 us) lands on ns_compute (819), yet frame residency
+    // is ~1809 us against a spine wait of 1680 -- so ~975 us/layer is in this
+    // loop and NOT in dispatch(). These five split it. Pre-send segments are the
+    // only ones that can explain the spine's wait; ns_post_send cannot.
+    uint64_t ns_lock_wait   = 0;   // recv done -> g_worker_gpu_mutex held
+    uint64_t ns_decode_req  = 0;   // pipe_decode_expert_dispatch_req
+    uint64_t ns_pre_dispatch= 0;   // ref_log + log_reference, up to dispatch()
+    uint64_t ns_encode_send = 0;   // encode + unlock + send + relock
+    uint64_t ns_post_send   = 0;   // record_stats, req_log, spec_pagein_after_dispatch
     uint64_t ns_send    = 0;
     uint64_t n_resident      = 0;
     uint64_t n_pagein     = 0;
@@ -498,6 +561,9 @@ struct RequestStats {
     uint64_t n_read_inflight_max = 0;
     uint64_t ns_read_issue = 0;
     uint64_t ns_read_complete = 0;
+    uint64_t n_cpu_on_arrival = 0;
+    uint64_t ns_cpu_on_arrival = 0;
+    uint64_t n_cpu_on_arrival_fallback = 0;
 };
 
 // Forward declarations: the probe itself is defined further down, next to
@@ -560,6 +626,11 @@ public:
                  std::strcmp(std::getenv("WP_WORKER_STATS"), "1") == 0),
         next_report_(clock::now() + std::chrono::seconds(5)) {
     }
+
+    // Without this the multi-device worker emits two IDENTICAL stats lines per
+    // machine (one per DeviceWorker) with nothing to tell ROCm0 from ROCm1 --
+    // which makes the per-device balance question unanswerable from the logs.
+    void set_device(const std::string & d) { device_ = d; }
 
     bool enabled() const {
         return enabled_;
@@ -641,6 +712,12 @@ public:
             for (uint64_t edge = 125000; b < 7 && per >= edge; edge *= 2) ++b;
             ++submit_bucket_[b];
         }
+        ns_dispatch_total_ += request.ns_dispatch_total;
+        ns_lock_wait_    += request.ns_lock_wait;
+        ns_decode_req_   += request.ns_decode_req;
+        ns_pre_dispatch_ += request.ns_pre_dispatch;
+        ns_encode_send_  += request.ns_encode_send;
+        ns_post_send_    += request.ns_post_send;
         ns_readback_ += request.ns_readback;
         ns_prep_ += request.ns_prep;
         ns_prep_setup_ += request.ns_prep_setup;
@@ -662,6 +739,9 @@ public:
         n_read_inflight_max_ = std::max(n_read_inflight_max_, request.n_read_inflight_max);
         ns_read_issue_ += request.ns_read_issue;
         ns_read_complete_ += request.ns_read_complete;
+        n_cpu_on_arrival_ += request.n_cpu_on_arrival;
+        ns_cpu_on_arrival_ += request.ns_cpu_on_arrival;
+        n_cpu_on_arrival_fallback_ += request.n_cpu_on_arrival_fallback;
         ++n_requests_;
         n_experts_ += n_experts;
 
@@ -688,6 +768,7 @@ private:
             return;
         }
         std::cout << "wp expert worker stats"
+                  << " device=" << (device_.empty() ? std::string("?") : device_)
                   << " n_requests=" << n_requests_
                   << " n_experts=" << n_experts_
                   << " n_resident=" << n_resident_
@@ -710,6 +791,9 @@ private:
                   << " ns_read_issue=" << ns_read_issue_
                   << " ns_read_complete=" << ns_read_complete_
                   << " n_read_inflight_max=" << n_read_inflight_max_
+                  << " n_cpu_on_arrival=" << n_cpu_on_arrival_
+                  << " ns_cpu_on_arrival=" << ns_cpu_on_arrival_
+                  << " n_cpu_on_arrival_fallback=" << n_cpu_on_arrival_fallback_
                   << " read_bytes_per_s=" << (ns_read_complete_ == 0 ? 0.0 :
                         (double) bytes_read_ * 1000000000.0 / (double) ns_read_complete_)
                   << " ns_h2d=" << ns_h2d_
@@ -722,6 +806,12 @@ private:
                   << " ns_demote=" << ns_demote_
                   << " ns_ensure_post=" << ns_ensure_post_
                   << " ns_compute=" << ns_compute_
+                  << " ns_dispatch_total=" << ns_dispatch_total_
+                  << " ns_lock_wait=" << ns_lock_wait_
+                  << " ns_decode_req=" << ns_decode_req_
+                  << " ns_pre_dispatch=" << ns_pre_dispatch_
+                  << " ns_encode_send=" << ns_encode_send_
+                  << " ns_post_send=" << ns_post_send_
                   << " n_graph_submits=" << n_graph_submits_
                   << " n_device_allocs=" << n_device_allocs_
                   << " ns_graph_build=" << ns_graph_build_
@@ -843,6 +933,12 @@ private:
     uint64_t          n_d3_typed_ = 0;
     uint64_t          n_d3_bounce_ = 0;
     uint64_t          ns_readback_ = 0;
+    uint64_t          ns_dispatch_total_ = 0;
+    uint64_t          ns_lock_wait_    = 0;
+    uint64_t          ns_decode_req_   = 0;
+    uint64_t          ns_pre_dispatch_ = 0;
+    uint64_t          ns_encode_send_  = 0;
+    uint64_t          ns_post_send_    = 0;
     uint64_t          ns_prep_ = 0;
     uint64_t          ns_prep_setup_ = 0;
     uint64_t          ns_prep_grow_ = 0;
@@ -861,6 +957,10 @@ private:
     uint64_t          n_read_inflight_max_ = 0;
     uint64_t          ns_read_issue_ = 0;
     uint64_t          ns_read_complete_ = 0;
+    uint64_t          n_cpu_on_arrival_ = 0;
+    uint64_t          ns_cpu_on_arrival_ = 0;
+    uint64_t          n_cpu_on_arrival_fallback_ = 0;
+    std::string       device_;
     uint64_t          bytes_h2d_  = 0;
     uint64_t          n_reader_h2d_ = 0;
     std::string       staging_kind_ = "unknown";
@@ -2434,6 +2534,11 @@ public:
         return buffer_count_;
     }
 
+    size_t cpu_lease_cap() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return quota_ > 0 ? (size_t) quota_ - 1 : 0;
+    }
+
     uint64_t buffer_bytes() const {
         return buffer_bytes_;
     }
@@ -2704,6 +2809,7 @@ private:
         // mid-page if the async knobs are runtime-disarmed between stripes,
         // silently under-uploading a page that still gets marked valid.
         bool               reader_h2d  = false;
+        bool               cpu_on_arrival = false;
     };
 
     // One STRIPE of one page-in. A page is read in WP_EXPERT_READ_STRIPES
@@ -2812,6 +2918,8 @@ public:
         resources_(std::move(resources)),
         staging_(resources_, backend),
         test_hooks_(test_hooks),
+        cpu_on_arrival_enabled_(cpu_on_arrival_enabled_from_env()),
+        cpu_on_arrival_cap_(cpu_on_arrival_cap_from_env()),
         owned_host_tier_(shared_host_tier == nullptr
             ? std::make_unique<wp::HostTier>() : nullptr),
         host_tier_(shared_host_tier != nullptr ? shared_host_tier : owned_host_tier_.get()) {
@@ -2848,6 +2956,19 @@ public:
         std::set<int> reserved_indices(resources_.reserved_slot_indices.begin(),
                                        resources_.reserved_slot_indices.end());
         allocate_slot_arenas();
+        // *** PIN THE CPU EXPERT TIER INTO RAM -- NEVER SWAP IT. ***
+        // The CPU device's slot arenas ARE host RAM (a CPU backend buffer is a
+        // plain malloc). Under vm.swappiness=100 + zram the kernel was
+        // compressing this whole ~3.3 GB tier into zram and decompressing it on
+        // every access -- the CPU expert tier is supposed to be the fast RAM
+        // fallback below NVMe, and swapping it defeats its entire purpose (a
+        // zstd decompress of a 2.1 MB page is the same order as reading it back
+        // off the SN850X). Every OTHER RAM tier here is already mlocked
+        // (wp::HostTier under WP_PIN_HOST); this one simply never was.
+        // mlock, not madvise: MADV_DONTNEED/COLD would be the wrong direction,
+        // and only mlock is a hard guarantee the pages stay resident. Applied
+        // to CPU backends only -- a GPU arena is VRAM and mlock does not apply.
+        mlock_cpu_arenas();
         size_t arena_index  = 0;
         uint64_t arena_used = 0;
         for (size_t class_index = 0;
@@ -3031,6 +3152,22 @@ public:
             return entries_.at(index).hit;
         }
 
+        bool is_cpu_on_arrival(size_t index) const {
+            return entries_.at(index).cpu_on_arrival;
+        }
+
+        const void * cpu_staging(size_t index) const {
+            const Entry & entry = entries_.at(index);
+            if (!entry.ready || !entry.cpu_staging) {
+                throw std::logic_error("CPU-on-arrival page is not ready");
+            }
+            return entry.cpu_staging->get();
+        }
+
+        void release_cpu_staging(size_t index) {
+            entries_.at(index).cpu_staging.reset();
+        }
+
         // Slot this entry landed in, or SIZE_MAX for a pinned-resident page that
         // occupies no pool slot. Used by the speculative page-in path to re-stamp the LRU tick.
         size_t slot_index(size_t index) const {
@@ -3096,6 +3233,14 @@ public:
             return ns_read_complete_;
         }
 
+        uint64_t n_cpu_on_arrival() const {
+            return n_cpu_on_arrival_;
+        }
+
+        uint64_t n_cpu_on_arrival_fallback() const {
+            return n_cpu_on_arrival_fallback_;
+        }
+
         uint64_t n_resident() const {
             return n_resident_;
         }
@@ -3143,6 +3288,8 @@ public:
             size_t slot_index = std::numeric_limits<size_t>::max();
             bool   hit        = false;
             bool   ready      = false;
+            bool   cpu_on_arrival = false;
+            std::shared_ptr<StagingPool::Lease> cpu_staging;
         };
 
         explicit Batch(ExpertSlotPool * owner, size_t count) :
@@ -3173,6 +3320,8 @@ public:
         uint64_t                   n_read_inflight_max_ = 0;
         uint64_t                   ns_read_issue_ = 0;
         uint64_t                   ns_read_complete_ = 0;
+        uint64_t                   n_cpu_on_arrival_ = 0;
+        uint64_t                   n_cpu_on_arrival_fallback_ = 0;
         ggml_backend_event_t       copy_event_ = nullptr;
         // Drain state. Lives on the Batch rather than in complete_batch's frame
         // so a drain can stop part-way (complete_upto) and be resumed. A read
@@ -3349,6 +3498,11 @@ public:
         try {
             std::vector<size_t> pageins;
             pageins.reserve(pages.size());
+            std::vector<bool> free_slot_claimed(
+                cpu_on_arrival_enabled_ ? slots_.size() : 0, false);
+            size_t cpu_on_arrival_count = 0;
+            const size_t cpu_on_arrival_max = cpu_on_arrival_enabled_
+                ? cpu_on_arrival_limit() : 0;
 
             // Resolve and pin every hit before selecting a victim. A hit is
             // immediately usable while sibling pageins are read.
@@ -3368,6 +3522,20 @@ public:
                         };
                         ++batch.n_resident_;
                         continue;
+                    }
+                    const bool host_hit = cpu_on_arrival_enabled_ && host_victim_enabled_ &&
+                        host_tier_->contains(page.cache_id);
+                    const size_t free_slot = cpu_on_arrival_enabled_
+                        ? free_slot_for(page, free_slot_claimed) : slots_.size();
+                    if (free_slot != slots_.size()) {
+                        free_slot_claimed[free_slot] = true;
+                    } else if (cpu_on_arrival_enabled_ && !host_hit) {
+                        if (cpu_on_arrival_count < cpu_on_arrival_max) {
+                            batch.entries_[i].cpu_on_arrival = true;
+                            ++cpu_on_arrival_count;
+                        } else {
+                            ++batch.n_cpu_on_arrival_fallback_;
+                        }
                     }
                     pageins.push_back(i);
                     continue;
@@ -3406,6 +3574,9 @@ public:
             // allocations in this request cannot select an earlier pagein.
             for (size_t entry_index : pageins) {
                 const ExpertPage & page = *pages[entry_index];
+                if (batch.entries_[entry_index].cpu_on_arrival) {
+                    continue;
+                }
                 const size_t slot_index = select_victim(page);
                 if (slot_index == slots_.size()) {
                     throw std::runtime_error(
@@ -3517,6 +3688,21 @@ public:
             try {
                 for (size_t entry_index : pageins) {
                     const ExpertPage & page = *pages[entry_index];
+                    if (batch.entries_[entry_index].cpu_on_arrival) {
+                        batch.state_->pageins.push_back({
+                            entry_index, std::numeric_limits<size_t>::max(), &page,
+                            fd_for(page.blob), nullptr, false, true
+                        });
+                        ++batch.n_cpu_on_arrival_;
+                        ++batch.n_pagein_;
+                        if (std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer)) {
+                            ++batch.n_pagein_reserved_;
+                        } else {
+                            ++batch.n_pagein_general_;
+                        }
+                        batch.bytes_read_ += page.size;
+                        continue;
+                    }
                     const size_t slot_index =
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
@@ -3657,6 +3843,8 @@ public:
                 release_host_hits();
                 throw;
             }
+            g_read_path_stats.record_cpu_on_arrival_fallback(
+                batch.n_cpu_on_arrival_fallback_);
             batch.host_bytes_ = host_victim_enabled_ ? host_tier_->used_bytes() : 0;
 
             if (batch.state_->pageins.empty()) {
@@ -4531,6 +4719,32 @@ private:
         return i;
     }
 
+    size_t free_slot_for(
+            const ExpertPage & page, const std::vector<bool> & claimed) const {
+        const bool wants_reserved = std::binary_search(
+            reserve_blocks_.begin(), reserve_blocks_.end(), page.layer);
+        const auto find = [&](bool reserved) {
+            size_t result = slots_.size();
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                const Slot & slot = slots_[i];
+                if (claimed[i] || slot.pinned || slot.pin_count != 0 || slot.valid ||
+                        slot.reserved != reserved || page.size > slot.capacity) {
+                    continue;
+                }
+                if (result == slots_.size() || slot.capacity < slots_[result].capacity) {
+                    result = i;
+                }
+            }
+            return result;
+        };
+        const size_t result = find(wants_reserved);
+        return result != slots_.size() || !wants_reserved ? result : find(false);
+    }
+
+    size_t cpu_on_arrival_limit() {
+        return std::min(cpu_on_arrival_cap_, staging_.cpu_lease_cap());
+    }
+
     bool demote_slot(const Slot & slot) {
         if (slot.pinned || !host_victim_enabled_ || !slot.valid ||
             slot.cache_id < 0 || slot.size == 0) {
@@ -5031,6 +5245,27 @@ private:
                 if (batch.first_error_ == nullptr) {
                     batch.first_error_ = result->error;
                 }
+            } else if (pagein.cpu_on_arrival) {
+                if (result->last) {
+                    if (pagein_log_ != nullptr) {
+                        std::lock_guard<std::mutex> lock(*log_mutex_);
+                        fprintf(pagein_log_, "%d %d\n", pagein.page->layer, pagein.page->expert);
+                        fflush(pagein_log_);
+                    }
+                    if (spec_log_ != nullptr && !batch.state_->speculative) {
+                        std::lock_guard<std::mutex> lock(*log_mutex_);
+                        fprintf(spec_log_, "D %d %d\n", pagein.page->layer, pagein.page->expert);
+                        fflush(spec_log_);
+                    }
+                    if (batch.state_->admit_host_on_read &&
+                            result->staging && pagein.page->cache_id >= 0) {
+                        host_tier_->store(pagein.page->cache_id, result->staging->get(),
+                                          (size_t) pagein.page->size);
+                    }
+                    Batch::Entry & entry = batch.entries_[pagein.entry_index];
+                    entry.cpu_staging = std::move(result->staging);
+                    entry.ready = true;
+                }
             } else {
                 Slot & slot = slots_[pagein.slot_index];
                 if (result->uploaded) {
@@ -5313,6 +5548,51 @@ private:
 
     // Allocate the arena buffers that back every slot. A few large allocations
     // instead of one per slot -- see the comment on Slot::buffer for why.
+    // Pin every CPU slot arena into RAM so the CPU expert tier can never be
+    // swapped/compressed out. No-op on GPU backends (VRAM) and on non-Linux.
+    // WP_PIN_CPU_TIER=0 opts out (mirrors WP_PIN_HOST's escape hatch); default
+    // ON, because a swapped CPU tier is a correctness-of-purpose bug, not a
+    // tunable. Reports the total pinned and any failure loudly -- an EPERM here
+    // (RLIMIT_MEMLOCK too low) means the tier is silently still swappable, and
+    // that must not pass unnoticed.
+    void mlock_cpu_arenas() {
+#if defined(__linux__)
+        const char * const backend_name = ggml_backend_name(backend_);
+        if (backend_name == nullptr || std::strstr(backend_name, "CPU") == nullptr) {
+            return;   // GPU arena is device memory; mlock does not apply.
+        }
+        if (const char * e = std::getenv("WP_PIN_CPU_TIER"); e != nullptr && e[0] == '0') {
+            std::fprintf(stderr, "wp expert worker: WP_PIN_CPU_TIER=0 -- CPU expert tier "
+                         "left swappable (%zu arenas)\n", arenas_.size());
+            return;
+        }
+        size_t pinned = 0, failed = 0;
+        for (const buffer_ptr & arena : arenas_) {
+            void * base = ggml_backend_buffer_get_base(arena.get());
+            const size_t bytes = ggml_backend_buffer_get_size(arena.get());
+            if (base == nullptr || bytes == 0) {
+                continue;
+            }
+            if (mlock(base, bytes) == 0) {
+                pinned += bytes;
+            } else {
+                const int err = errno;
+                ++failed;
+                std::fprintf(stderr, "wp expert worker: mlock(%zu) on CPU expert arena FAILED "
+                             "(%s) -- this arena stays swappable. "
+                             "Raise RLIMIT_MEMLOCK (ulimit -l unlimited) if pinning is required.\n",
+                             bytes, std::strerror(err));
+            }
+        }
+        if (pinned > 0) {
+            std::fprintf(stderr, "wp expert worker: pinned CPU expert tier into RAM, "
+                         "%.1f MiB across %zu arenas (mlock)%s\n",
+                         (double) pinned / 1048576.0, arenas_.size(),
+                         failed ? " -- SOME ARENAS FAILED, tier partially swappable" : "");
+        }
+#endif
+    }
+
     void allocate_slot_arenas() {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
         uint64_t total = 0;
@@ -5728,6 +6008,8 @@ private:
     ggml_backend_t             backend_ = nullptr;
     ResourcePlan               resources_;
     StagingPool                staging_;
+    const bool                 cpu_on_arrival_enabled_ = cpu_on_arrival_enabled_from_env();
+    const size_t                cpu_on_arrival_cap_ = cpu_on_arrival_cap_from_env();
     size_t                     read_stripes_ = read_stripes_from_env();
     size_t                     stripe_max_pageins_ = stripe_max_pageins_from_env();
     size_t                     stripe_min_part_ = stripe_min_part_from_env();
@@ -6190,6 +6472,8 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     n_read_inflight_max_(other.n_read_inflight_max_),
     ns_read_issue_(other.ns_read_issue_),
     ns_read_complete_(other.ns_read_complete_),
+    n_cpu_on_arrival_(other.n_cpu_on_arrival_),
+    n_cpu_on_arrival_fallback_(other.n_cpu_on_arrival_fallback_),
     copy_event_(other.copy_event_),
     // Drain state travels with the batch. It was omitted here originally --
     // harmless while every move ran before the first drain (NRVO covered the
@@ -6312,6 +6596,8 @@ public:
         pool_.set_spec_log(logs_ != nullptr ? logs_->hint : nullptr,
                            logs_ != nullptr ? &logs_->mutex : nullptr);
         stats_.set_staging_kind(pool_.staging_kind());
+        stats_.set_device(device);
+        device_name_ = device;
         for (auto & kv : catalog_.pages) {
             if (page_owner_ && !page_owner_(kv.second.layer, kv.second.expert)) {
                 continue;
@@ -6474,6 +6760,38 @@ public:
                     "wp io-buffer prealloc: %zu bytes for n_tokens<=%u (n_embd=%u)\n",
                     want, prealloc_tokens, (unsigned) catalog_.descriptor.hparams.n_embd);
             grow_io_buffer(want, warmup);
+        }
+        alloc_io_small();
+        // Pinned staging is INDEPENDENT of io-small: io-small fixes the
+        // DESTINATION (Vulkan BAR), this fixes the SOURCE, and a worker can
+        // want one without the other.
+        if (const char * e = std::getenv("WP_IO_SRC_PINNED")) {
+            if (e[0] == '1') {
+                unsigned long tokens = 8;
+                if (const char * t = std::getenv("WP_IO_SRC_TOKENS")) {
+                    if (t[0] != '\0') { tokens = std::strtoul(t, nullptr, 10); }
+                }
+                const size_t one = (size_t) catalog_.descriptor.hparams.n_embd *
+                                   (size_t) tokens * sizeof(float);
+                alloc_io_src_pinned(std::max<size_t>(1u << 20, one + 65536));
+            }
+        }
+        if (const char * e = std::getenv("WP_IO_SET_ASYNC")) {
+            const bool want_async = e[0] == '1';
+            // Name-gated: only HIP/CUDA implement set_tensor_async. See the
+            // block comment in prepare_io for why the fallback is worse.
+            const bool have_async =
+                device_name_.rfind("ROCm", 0) == 0 ||
+                device_name_.rfind("CUDA", 0) == 0;
+            io_set_async_ = want_async && have_async && io_src_base_ != nullptr;
+            if (want_async) {
+                fprintf(stderr,
+                        "wp io-set-async: %s on %s (pinned=%s, backend=%s)\n",
+                        io_set_async_ ? "ENABLED" : "declined",
+                        device_name_.c_str(),
+                        io_src_base_ != nullptr ? "yes" : "NO",
+                        have_async ? "has async" : "NO async iface");
+            }
         }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
@@ -7125,6 +7443,22 @@ public:
             RequestStats & request_stats,
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
             int conn_index = -1) {
+        // RAII so every exit path counts -- dispatch() returns from several
+        // places and throws from more.
+        struct DispatchTotalScope {
+            bool on;
+            RequestStats & st;
+            std::chrono::steady_clock::time_point started;
+            ~DispatchTotalScope() {
+                if (!on) return;
+                st.ns_dispatch_total +=
+                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - started).count();
+            }
+        } dispatch_total_scope{
+            stats_enabled(), request_stats,
+            stats_enabled() ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point() };
         const bool owns_gate = !prepared.has_value();
         if (owns_gate) {
             spec_prefill_gate_active_ = spec_prefill_gate_enabled_ &&
@@ -7205,6 +7539,7 @@ public:
             request_stats.ns_ensure_post = batch.ns_ensure_post();
             request_stats.host_bytes = batch.host_bytes();
         }
+        const bool cpu_on_arrival_request = batch.n_cpu_on_arrival() != 0;
 
         // WP_PREFILL_LAYER_AHEAD: after THIS layer's demand pins, try the NEXT
         // layer's catalog as one spec-VRAM batch. Demand-first defers while
@@ -7234,7 +7569,8 @@ public:
             have_pageins |= !batch.is_resident(i);
         }
         const bool grouped_gemv_request =
-            grouped_gemv_eligible(request) || arena_id_eligible(request, batch);
+            !cpu_on_arrival_request &&
+            (grouped_gemv_eligible(request) || arena_id_eligible(request, batch));
         // PHASE TIMERS. ns_compute is the wall span of this whole section, but
         // ns_read/h2d/submit/readback only summed to 78% of it on the RX 480
         // (8.95 s of 11.53 s) -- 1.34 ms per request attributed to nothing.
@@ -7338,12 +7674,14 @@ public:
         // nothing to overlap and the plain serial path is strictly better
         // (no extra per-expert graph submits, no fold pass).
         const bool resident_first_eligible =
-            !grouped_gemv_request && s_resident_first &&
+            !cpu_on_arrival_request && !grouped_gemv_request && s_resident_first &&
             !request.assignments.empty() &&
             request.n_tokens <= s_resident_first_max_tokens &&
             have_pageins;
         size_t resident_first_base_offset = 0;
         size_t resident_first_slot_size   = 0;
+        size_t cpu_on_arrival_base_offset = 0;
+        size_t cpu_on_arrival_slot_size   = 0;
         if (resident_first_eligible) {
             // Pre-size io_buffer_ for the canonical input+result slot PLUS
             // one partial-result slot per assignment BEFORE prepare_io runs.
@@ -7356,6 +7694,17 @@ public:
                 GGML_PAD(layout.result_offset + layout.result_size, layout.alignment);
             const size_t total = resident_first_base_offset +
                 resident_first_slot_size * request.assignments.size();
+            io_reserved_hint_ = total;   // prepare_io must not pick the small buffer under this
+            grow_io_buffer(total, request_stats);
+        }
+        if (cpu_on_arrival_request) {
+            const IoSlotLayout layout = compute_io_slot_layout(request.n_tokens);
+            cpu_on_arrival_slot_size = GGML_PAD(layout.result_size, layout.alignment);
+            cpu_on_arrival_base_offset =
+                GGML_PAD(layout.result_offset + layout.result_size, layout.alignment);
+            const size_t total = cpu_on_arrival_base_offset +
+                cpu_on_arrival_slot_size * request.assignments.size();
+            io_reserved_hint_ = total;   // prepare_io must not pick the small buffer under this
             grow_io_buffer(total, request_stats);
         }
         if (!request.assignments.empty()) {
@@ -7376,7 +7725,7 @@ public:
                             resident_first_base_offset + i * resident_first_slot_size);
                     }
                 }
-            } else if (overlap && have_hits) {
+            } else if (overlap && have_hits && !cpu_on_arrival_request) {
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ false, request_stats);
@@ -7403,7 +7752,8 @@ public:
         // Chunk count is a tuning knob, not a correctness one: the summation
         // order is the same at every value, so arms differ only in speed. =1
         // restores the exact serial path.
-        if (!overlap && !resident_first_eligible && !request.assignments.empty()) {
+        if (!overlap && !resident_first_eligible && !cpu_on_arrival_request &&
+                !request.assignments.empty()) {
             const size_t n_assign = request.assignments.size();
             // *** GATE ON THERE BEING READS TO HIDE UNDER. ***
             // Clamping to the assignment count is NOT enough: min(4, 2) == 2, so a
@@ -7448,8 +7798,37 @@ public:
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
             request_stats.n_reader_h2d = batch.n_reader_h2d();
+            request_stats.n_cpu_on_arrival = batch.n_cpu_on_arrival();
+            request_stats.n_cpu_on_arrival_fallback = batch.n_cpu_on_arrival_fallback();
         }
-        if (resident_first_eligible) {
+        if (cpu_on_arrival_request) {
+            std::vector<std::vector<float>> cpu_partials(request.assignments.size());
+            for (size_t i = 0; i < request.assignments.size(); ++i) {
+                const size_t result_offset = cpu_on_arrival_base_offset +
+                    i * cpu_on_arrival_slot_size;
+                if (batch.is_cpu_on_arrival(i)) {
+                    compute_cpu_on_arrival(
+                        request, *pages[i], batch, i, cpu_partials[i], request_stats);
+                } else {
+                    compute_batch(
+                        request, pages, batch, /* hits = */ true,
+                        /* add_previous = */ false, request_stats,
+                        /* all_experts = */ true, /* force_dense = */ false,
+                        i, i + 1, result_offset);
+                }
+            }
+            synchronize_async(&request_stats);
+            for (size_t i = 0; i < cpu_partials.size(); ++i) {
+                if (!cpu_partials[i].empty()) {
+                    write_io_partial(
+                        cpu_partials[i],
+                        cpu_on_arrival_base_offset + i * cpu_on_arrival_slot_size);
+                }
+            }
+            fold_resident_first_partials(
+                request.n_tokens, request.assignments.size(),
+                cpu_on_arrival_base_offset, cpu_on_arrival_slot_size, request_stats);
+        } else if (resident_first_eligible) {
             // Reads are drained (batch.complete() above): compute every
             // formerly-missing expert now, each into its own slot, same as
             // the hits loop before prepare_io returned.
@@ -7501,7 +7880,8 @@ public:
             const char * e = std::getenv("WP_SELFCHECK");
             return e != nullptr && e[0] == '1';
         }();
-        if (s_selfcheck && !request.assignments.empty() && !sum.empty()) {
+        if (s_selfcheck && !cpu_on_arrival_request &&
+                !request.assignments.empty() && !sum.empty()) {
             std::vector<float> dense(sum.size(), 0.0f);
             compute_batch(
                 request, pages, batch, /* hits = */ true,
@@ -8114,6 +8494,145 @@ private:
         fprintf(stderr, "wp keepalive enabled: every %d us while idle\n", keepalive_us_);
     }
 
+    // *** WP_IO_SMALL_TOKENS: a small HOST-VISIBLE io buffer for decode. ***
+    //
+    // ns_prep is ~100% ggml_backend_tensor_set (the activation upload) and it
+    // costs 30.5 us/expert on the 6900XT and 14.2 on the RX 480 during decode,
+    // against 6.7 / 2.0 on the R9700 / 1070. Measured 2026-08-29: raising
+    // GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES to 16 MiB collapsed the RX 480's
+    // prep to 0.4 us/expert -- the io buffer had simply grown past the 1 MiB
+    // threshold and gone device-local, making every upload a real H2D.
+    //
+    // That threshold CANNOT fix it: the io buffer is 10.1 MiB and the staging
+    // buffers are 1.2-2.7 MiB, so any cutoff that makes io host-visible also
+    // drags staging into GTT -- which cost 37% of decode. And the 512-token
+    // prealloc cannot shrink, because in-serving grow_io_buffer() caused
+    // 1.29-SECOND submits on the RX 480 (that is why the prealloc exists).
+    //
+    // So: keep the big device buffer for prefill and add a 1 MiB host-visible
+    // one for decode. n_tokens=1 needs 10,240 bytes of activation, so 1 MiB
+    // covers the input, the result, and the per-assignment partial slots that
+    // resident-first / cpu-on-arrival pre-size. COSTS NO SLOTS -- it is host
+    // memory (or BAR on Vulkan), not the expert slot budget.
+    //
+    // Portable entry point only. ggml_backend_dev_host_buffer_type is the same
+    // one StagingPool uses; never a backend-specific host-alloc symbol (that
+    // #if GGML_USE_* branching is a bug class that has recurred here). The
+    // O_DIRECT hazard that makes pinned staging unsafe on Vulkan does NOT
+    // apply: nothing ever read()s into the io buffer, it is only written by
+    // ggml_backend_tensor_set.
+    void alloc_io_small() {
+        static const uint32_t small_tokens = [] {
+            const char * e = std::getenv("WP_IO_SMALL_TOKENS");
+            if (e == nullptr || e[0] == '\0') { return (uint32_t) 0; }
+            const unsigned long v = std::strtoul(e, nullptr, 10);
+            return v > 4096 ? (uint32_t) 0 : (uint32_t) v;
+        }();
+        if (small_tokens == 0 || backend_ == nullptr) {
+            return;
+        }
+        // *** A PLAIN DEVICE BUFFER, DELIBERATELY -- NOT a host buffer type. ***
+        // ggml_backend_dev_host_buffer_type() is NOT portable in the way that
+        // matters here: on Vulkan it returns host-visible DEVICE (BAR) memory,
+        // but on HIP/CUDA it returns real pinned HOST RAM, which ggml treats as
+        // a CPU buffer. Attaching a graph input to one made the spine fail with
+        // llama_decode ret=-3 on the first request (2026-08-29).
+        //
+        // The mechanism that actually works needs no special allocator. ggml-vulkan
+        // keeps the host-visible BAR preference for any allocation with
+        // size <= GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES (force_device_local is
+        // `size > host_visible_max`). The io buffer is only slow because it grew
+        // to 10.1 MiB and crossed that 1 MiB line, so every activation upload
+        // became a real H2D. A SECOND buffer that stays under the line is an
+        // ordinary device buffer -- fully graph-compatible -- that lands in the
+        // BAR and takes memcpy writes.
+        //
+        // SCOPE: this is a VULKAN fix. On HIP/CUDA a small device buffer is
+        // still device memory, so the 6900XT's 30.5 us/expert prep is NOT
+        // addressed here and needs a different mechanism.
+        const size_t one =
+            (size_t) catalog_.descriptor.hparams.n_embd * small_tokens * sizeof(float);
+        const size_t want = std::max<size_t>(1u << 20, 2 * (one + 65536));
+        if (want > (1u << 20)) {
+            // Above the default BAR threshold it would be forced device-local and
+            // buy nothing, so do not spend the memory.
+            fprintf(stderr,
+                    "wp io-small: %zu bytes for n_tokens<=%u exceeds the 1 MiB "
+                    "host-visible threshold, disabled\n", want, small_tokens);
+            return;
+        }
+        buffer_ptr buf(ggml_backend_alloc_buffer(backend_.get(), want));
+        if (!buf || ggml_backend_buffer_get_base(buf.get()) == nullptr) {
+            fprintf(stderr, "wp io-small: allocation failed, staying on the big buffer\n");
+            return;
+        }
+        ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        io_small_      = std::move(buf);
+        io_small_size_ = want;
+        fprintf(stderr, "wp io-small: %zu bytes device buffer for n_tokens<=%u "
+                "(host-visible on Vulkan under the BAR threshold)\n", want, small_tokens);
+        // SEPARATE FLAG, deliberately: the destination fix (io-small, Vulkan
+        // BAR) and the source fix (pinned staging) address different things.
+        // The destination fix is REAL and measured -- RX480 prep 14.2 -> 7.0.
+        //
+        // *** RETRACTION (2026-08-29). *** This comment used to also claim the
+        // pinned-source fix "did NOTHING for the 6900XT (30.5 -> 30.4)" and
+        // "made the GTX 1070 WORSE (2.1 -> 3.8)". BOTH CLAIMS ARE WITHDRAWN.
+        // alloc_io_src_pinned prints "wp io-src: ..." on every outcome, success
+        // or failure, and that string appears in NO log on EITHER machine. The
+        // function was never called: it was nested inside alloc_io_small (which
+        // main never runs, having no WP_IO_SMALL_TOKENS) and WP_IO_SRC_PINNED
+        // was never actually set to 1 in those runs. Those numbers measured a
+        // code path that did not execute. Pinning is UNTESTED, not refuted.
+        // NOTE: pinned staging used to be allocated HERE. It is not, any more
+        // -- see the alloc_io_src_pinned call in the constructor. Nesting it
+        // inside this function silently tied it to WP_IO_SMALL_TOKENS, so
+        // main's worker (which does not set that) had no pinned buffer at all
+        // and WP_IO_SRC_PINNED=1 was a no-op there (found 2026-08-29).
+    }
+
+    // *** THE HIP/CUDA HALF OF THE FIX. ***
+    // The Vulkan half above works by making the DESTINATION land in the BAR. On
+    // HIP/CUDA a small device buffer is still device memory, so that does
+    // nothing there -- and the destination CANNOT be host memory, because a
+    // pinned host buffer is a CPU buffer to ggml and attaching a graph input to
+    // one fails the spine with llama_decode ret=-3 (measured 2026-08-29).
+    //
+    // So fix the SOURCE instead. ggml_backend_tensor_set copies from the caller's
+    // pointer, and `activation` is a std::vector -- pageable memory, which makes
+    // the driver stage through its own internal bounce buffer on every upload.
+    // Copying into a pinned host region first lets the H2D be a direct DMA. The
+    // extra ~10 KB memcpy is ~1 us against a 30.4 us prep on the 6900XT.
+    //
+    // This buffer is NEVER attached to a tensor, so the CPU-buffer graph problem
+    // does not arise; it is only ever the `data` argument. Applies to every
+    // backend, which is the point -- the rig runs at the speed of its slowest
+    // device, so a Vulkan-only fix is worth nothing.
+    void alloc_io_src_pinned(size_t bytes) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_.get());
+        ggml_backend_buffer_type_t host_buft =
+            dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (host_buft == nullptr) {
+            fprintf(stderr, "wp io-src: no host buffer type, uploads stay pageable\n");
+            return;
+        }
+        buffer_ptr buf(ggml_backend_buft_alloc_buffer(host_buft, bytes));
+        void * base = buf ? ggml_backend_buffer_get_base(buf.get()) : nullptr;
+        // ggml_backend_cuda_host_buffer_type_alloc_buffer silently falls back to
+        // a plain CPU buffer when cudaHostAlloc fails and only stamps buft on the
+        // success path -- so verify, or we would claim a pinned upload that is
+        // actually pageable and attribute a null result to the wrong mechanism.
+        if (!buf || base == nullptr ||
+                ggml_backend_buffer_get_type(buf.get()) != host_buft) {
+            fprintf(stderr, "wp io-src: pinned host buffer rejected, uploads stay pageable\n");
+            return;
+        }
+        io_src_pinned_ = std::move(buf);
+        io_src_base_   = base;
+        io_src_size_   = bytes;
+        fprintf(stderr, "wp io-src: %zu bytes pinned host staging for activation uploads\n", bytes);
+    }
+
     void grow_io_buffer(size_t size, RequestStats & request_stats) {
         if (io_buffer_ && io_buffer_size_ >= size) {
             return;
@@ -8209,8 +8728,10 @@ private:
             ggml_context * ctx, uint32_t n_tokens, size_t offset) const {
         ggml_tensor * tensor = ggml_new_tensor_2d(
             ctx, GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
-        attach_weight(
-            tensor, io_buffer_.get(), ggml_backend_buffer_get_base(io_buffer_.get()), offset);
+        // io_active_ is chosen per request in prepare_io; fall back to the big
+        // buffer for any path that builds an io tensor without it.
+        ggml_backend_buffer_t buf = io_active_ != nullptr ? io_active_ : io_buffer_.get();
+        attach_weight(tensor, buf, ggml_backend_buffer_get_base(buf), offset);
         return tensor;
     }
 
@@ -8246,13 +8767,64 @@ private:
         io_result_offset_ = GGML_PAD(input_size, alignment);
         const size_t result_size = ggml_backend_buft_get_alloc_size(buft, input);
         sublap(request_stats.ns_prep_setup);
-        grow_io_buffer(io_result_offset_ + result_size, request_stats);
+        // Pick the buffer for THIS request. io_reserved_hint_ carries the larger
+        // total that resident-first / cpu-on-arrival already reserved, so a
+        // request with per-assignment partial slots cannot land in the small one.
+        const size_t io_need =
+            std::max(io_result_offset_ + result_size, io_reserved_hint_);
+        io_reserved_hint_ = 0;
+        if (io_small_ && io_need <= io_small_size_) {
+            io_active_ = io_small_.get();
+        } else {
+            grow_io_buffer(io_result_offset_ + result_size, request_stats);
+            io_active_ = io_buffer_.get();
+        }
         sublap(request_stats.ns_prep_grow);
         attach_weight(
-            input, io_buffer_.get(), ggml_backend_buffer_get_base(io_buffer_.get()), 0);
+            input, io_active_, ggml_backend_buffer_get_base(io_active_), 0);
         sublap(request_stats.ns_prep_attach);
-        ggml_backend_tensor_set(
-            input, activation.data(), 0, activation.size() * sizeof(float));
+        const size_t act_bytes = activation.size() * sizeof(float);
+        const void * src = activation.data();
+        const bool pinned =
+            io_src_base_ != nullptr && act_bytes <= io_src_size_;
+        if (pinned) {
+            std::memcpy(io_src_base_, activation.data(), act_bytes);
+            src = io_src_base_;
+        }
+        // *** WP_IO_SET_ASYNC: the 6900XT's prep is a STALL, not a transfer. ***
+        // ggml_backend_cuda_buffer_set_tensor is a SYNCHRONOUS cudaMemcpy (made
+        // so deliberately by MAD-114, for cross-stream visibility on HIP), and
+        // the sync form blocks on device-wide ordering. Measured 2026-08-29 on
+        // ROCm1: 119.8 us/request with 99.6% of prepare_io inside that one call,
+        // to move 10 KB -- 85 MB/s, three orders of magnitude under PCIe. Pinning
+        // the SOURCE was already tried and did nothing (30.5 -> 30.4 us/expert),
+        // which is what rules out staging overhead and leaves the host block.
+        //
+        // set_tensor_async issues cudaMemcpyAsync on cuda_ctx->stream() -- the
+        // SAME stream the expert graph runs on -- so ordering is guaranteed by
+        // the stream and MAD-114's cross-stream hazard does not arise. The host
+        // does not block at all.
+        //
+        // TWO conditions, both required:
+        //  * pinned source. cudaMemcpyAsync from PAGEABLE memory stages
+        //    synchronously inside the driver, so async alone buys nothing --
+        //    which is also why pinned alone bought nothing. They only work as a
+        //    pair, and neither half was ever tested with the other.
+        //  * a backend that HAS set_tensor_async. When the iface slot is null
+        //    ggml_backend_tensor_set_async falls back to a full
+        //    ggml_backend_synchronize + sync set, which is strictly WORSE than
+        //    what we do today. Vulkan and CPU are gated out by name.
+        //
+        // Lifetime: the pinned buffer must not be rewritten before the copy
+        // lands. Requests on a device are serialised by the blocking
+        // batch.complete(), so the next prepare_io cannot run until this
+        // request's compute -- and therefore this copy -- has finished.
+        if (io_set_async_ && pinned) {
+            ggml_backend_tensor_set_async(
+                backend_.get(), input, src, 0, act_bytes);
+        } else {
+            ggml_backend_tensor_set(input, src, 0, act_bytes);
+        }
         sublap(request_stats.ns_prep_set);
     }
 
@@ -8993,7 +9565,19 @@ private:
             bool     success = false;
 
             ~GroupedInvocationLog() {
-                if (!enabled) {
+                // ONLY ON FAILURE unless explicitly asked for. This used to log
+                // on EVERY invocation because the caller passes `grouped_gemv`
+                // itself as `enabled`, so turning the path on turned the logging
+                // on: measured 148,287 unbuffered stderr writes in ONE decode
+                // arm (2026-08-29). That is a syscall per request in the hot
+                // path, and it silently taxes any measurement of the very path
+                // it is reporting on. WP_WARN_GROUPED_GEMV=1 restores the
+                // verbose form for debugging.
+                static const bool verbose = [] {
+                    const char * e = std::getenv("WP_WARN_GROUPED_GEMV");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (!enabled || (success && !verbose)) {
                     return;
                 }
                 std::fprintf(
@@ -10039,6 +10623,124 @@ private:
                 std::chrono::steady_clock::now() - readback_started).count();
     }
 
+    void compute_cpu_on_arrival(
+            const pipe_expert_dispatch_req & request,
+            const ExpertPage & page,
+            ExpertSlotPool::Batch & batch,
+            size_t assignment_index,
+            std::vector<float> & result,
+            RequestStats & request_stats) {
+        if (!cpu_backend_) {
+            cpu_backend_.reset(ggml_backend_cpu_init());
+            if (!cpu_backend_) {
+                throw std::runtime_error("failed to initialize CPU expert backend");
+            }
+            ggml_backend_cpu_set_n_threads(cpu_backend_.get(), cpu_worker_n_threads());
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        const auto & specs = catalog_.descriptor.layers.at(page.layer);
+        const size_t activation_bytes = request.activations.size() * sizeof(float);
+        buffer_ptr input_buffer(ggml_backend_cpu_buffer_from_ptr(
+            const_cast<float *>(request.activations.data()), activation_bytes));
+        buffer_ptr weight_buffer(ggml_backend_cpu_buffer_from_ptr(
+            const_cast<void *>(batch.cpu_staging(assignment_index)), (size_t) page.size));
+        if (!input_buffer || !weight_buffer) {
+            throw std::runtime_error("failed to wrap CPU expert inputs");
+        }
+
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(16, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate CPU expert graph metadata");
+        }
+        ggml_tensor * input = ggml_new_tensor_2d(
+            ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd,
+            request.n_tokens);
+        attach_weight(input, input_buffer.get(),
+                      ggml_backend_buffer_get_base(input_buffer.get()), 0);
+        ggml_tensor * gate = ggml_new_tensor_2d(
+            ctx.get(), specs.at("gate").type, specs.at("gate").ne0, specs.at("gate").ne1);
+        ggml_tensor * up = ggml_new_tensor_2d(
+            ctx.get(), specs.at("up").type, specs.at("up").ne0, specs.at("up").ne1);
+        ggml_tensor * down = ggml_new_tensor_2d(
+            ctx.get(), specs.at("down").type, specs.at("down").ne0, specs.at("down").ne1);
+        attach_weight(gate, weight_buffer.get(),
+                      ggml_backend_buffer_get_base(weight_buffer.get()),
+                      page.roles.at("gate").offset);
+        attach_weight(up, weight_buffer.get(),
+                      ggml_backend_buffer_get_base(weight_buffer.get()),
+                      page.roles.at("up").offset);
+        attach_weight(down, weight_buffer.get(),
+                      ggml_backend_buffer_get_base(weight_buffer.get()),
+                      page.roles.at("down").offset);
+
+        ggml_tensor * gate_x = ggml_mul_mat(ctx.get(), gate, input);
+        ggml_tensor * up_x = ggml_mul_mat(ctx.get(), up, input);
+        if (request.swiglu_clamp > 1e-6f) {
+            up_x = ggml_clamp(ctx.get(), up_x, -request.swiglu_clamp, request.swiglu_clamp);
+            gate_x = ggml_clamp(ctx.get(), gate_x, -INFINITY, request.swiglu_clamp);
+        }
+        ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate_x, up_x);
+        ggml_tensor * output = ggml_mul_mat(ctx.get(), down, hidden);
+        ggml_tensor * route = ggml_new_tensor_2d(
+            ctx.get(), GGML_TYPE_F32, 1, request.n_tokens);
+        buffer_ptr route_buffer(ggml_backend_cpu_buffer_from_ptr(
+            const_cast<float *>(request.assignments[assignment_index].weights.data()),
+            request.assignments[assignment_index].weights.size() * sizeof(float)));
+        if (!route_buffer) {
+            throw std::runtime_error("failed to wrap CPU routing weights");
+        }
+        attach_weight(route, route_buffer.get(),
+                      ggml_backend_buffer_get_base(route_buffer.get()), 0);
+        ggml_tensor * weighted = ggml_mul(ctx.get(), output, route);
+        ggml_tensor * result_tensor = ggml_new_tensor_2d(
+            ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, request.n_tokens);
+        ggml_tensor * copy = ggml_cpy(ctx.get(), weighted, result_tensor);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 16, false);
+        ggml_build_forward_expand(graph, copy);
+        galloc_ptr galloc(ggml_gallocr_new(ggml_backend_cpu_buffer_type()));
+        if (!galloc || !ggml_gallocr_alloc_graph(galloc.get(), graph)) {
+            throw std::runtime_error("failed to allocate CPU expert graph");
+        }
+        if (ggml_backend_graph_compute(cpu_backend_.get(), graph) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("CPU expert graph compute failed");
+        }
+        result.resize((size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd);
+        ggml_backend_tensor_get(
+            result_tensor, result.data(), 0, result.size() * sizeof(float));
+        batch.release_cpu_staging(assignment_index);
+        for (float weight : request.assignments[assignment_index].weights) {
+            request_stats.n_weight_nonzero += weight != 0.0f;
+            ++request_stats.n_weight_total;
+        }
+        const uint64_t elapsed = (uint64_t) std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+        request_stats.ns_cpu_on_arrival += elapsed;
+        g_read_path_stats.record_cpu_on_arrival(elapsed);
+    }
+
+    void write_io_partial(const std::vector<float> & partial, size_t offset) {
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead(),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate expert partial metadata");
+        }
+        ggml_tensor * output = make_io_tensor(
+            ctx.get(), (uint32_t) (partial.size() /
+                (size_t) catalog_.descriptor.hparams.n_embd), offset);
+        ggml_backend_tensor_set(
+            output, partial.data(), 0, partial.size() * sizeof(float));
+    }
+
     // *** WP_EXPERT_RESIDENT_FIRST support: per-slot IO layout + the final
     // fold. See the big comment on WP_EXPERT_RESIDENT_FIRST in dispatch() for
     // the overlap argument; these two are just the plumbing. ***
@@ -10251,11 +10953,25 @@ private:
     // rather than assignment-order random seeks.
     std::map<int, std::vector<const ExpertPage *>> layer_pages_sorted_;
     backend_ptr    backend_;
+    backend_ptr    cpu_backend_;
     ResidentExpertPool resident_;
     ExpertSlotPool pool_;
     galloc_ptr     compute_galloc_;
     buffer_ptr     io_buffer_;
     size_t         io_buffer_size_ = 0;
+    // WP_IO_SMALL_TOKENS: a SECOND, small, host-visible io buffer used only for
+    // decode-sized requests. See the block comment on alloc_io_small().
+    buffer_ptr     io_small_;
+    size_t         io_small_size_ = 0;
+    // Pinned HOST staging for the activation SOURCE (all backends). Never a
+    // graph tensor -- only the src pointer handed to ggml_backend_tensor_set.
+    buffer_ptr     io_src_pinned_;
+    void *         io_src_base_ = nullptr;
+    size_t         io_src_size_ = 0;
+    std::string    device_name_;
+    bool           io_set_async_ = false;
+    size_t         io_reserved_hint_ = 0;
+    ggml_backend_buffer_t io_active_ = nullptr;
     uint64_t            io_grow_count_ = 0;
     buffer_ptr     params_buffer_;
     size_t         params_buffer_size_ = 0;
@@ -10330,6 +11046,9 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_read_inflight_max = std::max(dst.n_read_inflight_max, src.n_read_inflight_max);
     dst.ns_read_issue += src.ns_read_issue;
     dst.ns_read_complete += src.ns_read_complete;
+    dst.n_cpu_on_arrival += src.n_cpu_on_arrival;
+    dst.ns_cpu_on_arrival += src.ns_cpu_on_arrival;
+    dst.n_cpu_on_arrival_fallback += src.n_cpu_on_arrival_fallback;
     dst.d3_counted = dst.d3_counted || src.d3_counted;
 }
 
@@ -10634,24 +11353,136 @@ public:
         size_t migration_budget = migration_cap_;
         const std::vector<AssignmentGroup> groups =
             assignment_groups(request, &migration_budget);
-        for (const AssignmentGroup & group : groups) {
-            pipe_expert_dispatch_req sub = make_subrequest(request, group.begin, group.end);
-            RequestStats sub_stats;
-            pipe_expert_partial partial;
-            {
-                std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
-                partial = devices_[group.device]->dispatch(
-                    sub, sub_stats, std::nullopt, conn_index);
-                if (devices_[group.device]->stats_enabled()) {
-                    devices_[group.device]->record_stats(sub_stats, group.end - group.begin);
+        // See DeviceExecutor: the serial version of this loop made a layer cost
+        // sum(devices) instead of max(devices).
+        std::vector<pipe_expert_partial> partials(groups.size());
+        std::vector<RequestStats>        sub_stats(groups.size());
+        if (device_parallel_ && groups.size() > 1) {
+            if (device_exec_.size() != devices_.size()) {
+                device_exec_.resize(devices_.size());
+            }
+            // Groups are bucketed BY DEVICE: two groups on the same device must
+            // still run one after another (one executor thread each), or they
+            // would race on that device's backend.
+            std::vector<std::vector<size_t>> by_device(devices_.size());
+            for (size_t gi = 0; gi < groups.size(); ++gi) {
+                by_device[groups[gi].device].push_back(gi);
+            }
+            // *** STRICT THREAD AFFINITY: A DEVICE IS ALWAYS DRIVEN BY ITS OWN
+            // EXECUTOR THREAD, NEVER BY THE CALLING THREAD. ***
+            // An earlier revision ran the HEAVIEST group inline on the caller to
+            // save one condition-variable handoff. That CRASHED the worker:
+            //   Memory access fault by GPU node-2 on address 0x7fa429b3d000.
+            //   Reason: Page not present or supervisor privilege.
+            // Which device is heaviest changes per REQUEST, so a device's GPU
+            // work migrated between the caller and its executor from one request
+            // to the next. Vulkan command pools have thread affinity and HIP
+            // streams are bound per thread (the same constraint spec_pagein_step
+            // documents for drain_one_read's H2D) -- driving one device from two
+            // different threads is not legal here, however cheap it looks.
+            // The handoff cost is real but is paid down by join_one()'s spin,
+            // NOT by moving work onto the caller.
+            const auto run_device = [this, &by_device, &groups, &request,
+                                     &partials, &sub_stats, conn_index](size_t d) {
+                for (const size_t gi : by_device[d]) {
+                    const AssignmentGroup & group = groups[gi];
+                    pipe_expert_dispatch_req sub =
+                        make_subrequest(request, group.begin, group.end);
+                    std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                    partials[gi] = devices_[group.device]->dispatch(
+                        sub, sub_stats[gi], std::nullopt, conn_index);
+                    if (devices_[group.device]->stats_enabled()) {
+                        devices_[group.device]->record_stats(
+                            sub_stats[gi], group.end - group.begin);
+                    }
+                }
+            };
+            // *** THE CPU EXPERT DEVICE RUNS OUTSIDE THE CONCURRENT WINDOW. ***
+            // MEASURED 2026-08-29 on the box with THREE DIFFERENT BACKENDS
+            // (2026: CUDA0 + Vulkan0 + CPU -- no shared runtime lock anywhere),
+            // running all three concurrently:
+            //     RX480 (Vulkan) ns_submit 261 -> 495 us
+            //     CPU            ns_submit 125 -> 362 us   <-- makes NO GPU calls
+            // The CPU device's own compute tripling proves the cost is CPU CORE
+            // STARVATION, not a GPU-runtime lock: ggml's CPU backend SPIN-WAITS
+            // at its thread barriers, so the expert tier's threads burn every
+            // core they are given and deschedule the GPU devices' submission and
+            // host-side threads. Same cause on main, different leg -- a GPU
+            // submit is mostly waiting on the GPU so it absorbs descheduling,
+            // and the host-side span (the untimed hole) takes the hit instead
+            // (215 -> 1177 us on the R9700).
+            // This is the same effect already on record here: WP_CPU_THREADS
+            // 8 -> 4 cut CPU expert time 46% AND made the RX 480 19% faster for
+            // free, because the CPU tier was starving the Vulkan driver.
+            // So: GPUs overlap each other, and the CPU tier gets the machine to
+            // itself. It is the SMALLEST group (231 us vs 833/714), so serialising
+            // it costs little; letting it spin alongside the GPUs cost everything.
+            // Ideal layer = max(GPUs) + CPU = 833 + 231 = 1064 us, vs 1779 serial.
+            std::vector<size_t> launched;
+            size_t cpu_device = SIZE_MAX;
+            for (size_t d = 0; d < by_device.size(); ++d) {
+                if (by_device[d].empty()) { continue; }
+                if (d < device_names_.size() &&
+                        device_names_[d].find("CPU") != std::string::npos) {
+                    cpu_device = d;   // deferred to its own phase below
+                    continue;
+                }
+                if (!device_exec_[d]) {
+                    device_exec_[d] = std::make_unique<DeviceExecutor>();
+                    device_exec_[d]->start();
+                }
+                device_exec_[d]->submit([run_device, d] { run_device(d); });
+                launched.push_back(d);
+            }
+            // Join ALL before rethrowing any, or a still-running executor would
+            // keep writing into partials/sub_stats after this frame unwound.
+            std::exception_ptr first_error;
+            for (const size_t d : launched) {
+                try {
+                    device_exec_[d]->join_one();
+                } catch (...) {
+                    if (!first_error) { first_error = std::current_exception(); }
                 }
             }
-            accumulate_request_stats(request_stats, sub_stats);
-            if (partial.partial.size() != result.partial.size()) {
+            // PHASE 2: the CPU tier, alone, after every GPU has finished. Still
+            // on its OWN executor thread -- thread affinity is not negotiable
+            // (an earlier revision ran a device on the calling thread and took a
+            // GPU memory-access fault for it).
+            if (cpu_device != SIZE_MAX) {
+                if (!device_exec_[cpu_device]) {
+                    device_exec_[cpu_device] = std::make_unique<DeviceExecutor>();
+                    device_exec_[cpu_device]->start();
+                }
+                device_exec_[cpu_device]->submit(
+                    [run_device, cpu_device] { run_device(cpu_device); });
+                try {
+                    device_exec_[cpu_device]->join_one();
+                } catch (...) {
+                    if (!first_error) { first_error = std::current_exception(); }
+                }
+            }
+            if (first_error) { std::rethrow_exception(first_error); }
+        } else {
+            for (size_t gi = 0; gi < groups.size(); ++gi) {
+                const AssignmentGroup & group = groups[gi];
+                pipe_expert_dispatch_req sub = make_subrequest(request, group.begin, group.end);
+                std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                partials[gi] = devices_[group.device]->dispatch(
+                    sub, sub_stats[gi], std::nullopt, conn_index);
+                if (devices_[group.device]->stats_enabled()) {
+                    devices_[group.device]->record_stats(sub_stats[gi], group.end - group.begin);
+                }
+            }
+        }
+        // FOLD IN GROUP ORDER -- identical association to the serial loop, so
+        // the output stays bit-for-bit what it was. Only compute is reordered.
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            accumulate_request_stats(request_stats, sub_stats[gi]);
+            if (partials[gi].partial.size() != result.partial.size()) {
                 throw std::runtime_error("expert device partial sizes disagree");
             }
             for (size_t i = 0; i < result.partial.size(); ++i) {
-                result.partial[i] += partial.partial[i];
+                result.partial[i] += partials[gi].partial[i];
             }
         }
         return result;
@@ -11269,6 +12100,160 @@ private:
     bool placement_ready_ = false;
     std::vector<std::unique_ptr<DeviceWorker>> devices_;
     mutable std::vector<std::mutex> device_mutexes_;
+
+    // *** WP_DEVICE_PARALLEL=1 -- RUN THE DEVICES CONCURRENTLY. ***
+    //
+    // THE BUG THIS FIXES (measured 2026-08-29). Worker::dispatch looped over
+    // assignment groups and called devices_[g]->dispatch() BLOCKING, in order.
+    // The three devices in a multi-device worker therefore NEVER overlapped:
+    // a layer cost sum(devices), not max(devices). Weighting each device's
+    // measured dispatch by how often a frame involves it --
+    //     R9700 841 us x 1.00 + 6900XT 837 x 0.90 + CPU 232 x 0.44 = 1696 us
+    // -- against a measured spine wait of 1650-1750 us/layer. That is the whole
+    // gap, and it is why every device sat at ~20-25% busy, why cutting the
+    // R9700's compute 21% (grouped GEMV) did not move tokens/sec, and why
+    // per-token time regressed when the rig went from four single-device
+    // workers to two multi-device ones.
+    //
+    // PERSISTENT THREAD PER DEVICE, not a thread per dispatch. Vulkan command
+    // pools have thread affinity (see spec_pagein_step's note on why H2D stays
+    // on the dispatch thread), so a device's GPU calls must always run on the
+    // SAME thread. A std::async per request would hand a device a different
+    // thread each time and is not safe here.
+    //
+    // BIT-EXACTNESS IS PRESERVED. The partials are collected into a
+    // group-indexed vector and folded into `result` sequentially in GROUP
+    // ORDER afterwards, exactly as the serial loop did. Only the compute is
+    // reordered; the floating-point association is not.
+    //
+    // *** DEFAULT OFF, BECAUSE IT MEASURES WORSE. Do not flip it on without
+    // reading this. (2026-08-29) ***
+    //   decode t/s   serial 6.01/6.10/6.17   parallel 5.39/4.47/5.54
+    //   frame residency  1850 us -> 2440 us
+    // Per-device, the GPU work is UNCHANGED and the CPU-side span explodes:
+    //   R9700   ns_submit 243 -> 255,  read 45 -> 44,  readback 53 -> 54
+    //           BUT ns_compute 826 -> 2150 and the untimed hole 217 -> 1113
+    //   6900XT  ns_submit 258 -> 238   BUT ns_compute 828 -> 2129, hole 149 -> 836
+    // Both GPUs land at ~2.1 ms, i.e. each one's dispatch grows to span the
+    // WHOLE request -- the signature of mutual blocking, not of hardware
+    // contention (hardware contention would show up in submit/read, and does
+    // not). So something inside the process serialises concurrent device work,
+    // and the serial loop was HIDING that cost rather than causing it.
+    // REFUTED as causes, each by measurement, so do not re-derive them:
+    //   * glibc arena contention -- MALLOC_ARENA_MAX 2 -> 8 moved nothing
+    //     (residency 2481 -> 2483 us, decode still ~5.3).
+    //   * condition-variable handoff cost -- join_one() now spins before it
+    //     sleeps, and the result did not move.
+    //   * a broken parallel build -- see the affinity note above; the crash was
+    //     fixed and the CORRECT build still loses.
+    // The build below is correct (no crash, strict per-device thread affinity,
+    // spin-then-block handoff) and STILL measures worse, 2026-08-29:
+    //             serial (sum)            parallel (each)
+    //   R9700     833 us                  2195 us
+    //   6900XT    714 us                  2209 us
+    //   CPU       231 us                   288 us
+    //   decode    6.14/6.53/6.63 t/s      5.32/5.49/5.57 t/s
+    // ns_submit is FLAT across both (243->248, 234->242): the GPU work is
+    // untouched. The CPU-side host span is what inflates -- the untimed hole
+    // 215 -> 1177 and 146 -> 874. Two HIP devices doing host-side work
+    // concurrently in one process serialise in the ROCm runtime, and each
+    // device charges the wait to its own measured span. Notably the CPU device,
+    // which touches no HIP, barely moves (231 -> 288).
+    // CONCLUSION: the win is real in principle (a layer should cost
+    // max(devices), not sum) but it CANNOT be collected inside one process
+    // while the per-request path makes this many HIP calls. The lever is to cut
+    // host-side HIP API calls per request, not to add threads.
+    //
+    // CONSEQUENCE FOR THE RIG, which is the important part: if concurrent
+    // in-process device work cannot be made to pay, then a multi-device worker
+    // is structurally worse than one process per device -- which is what the
+    // rig ran before (four single-device workers, ~113 ms/token vs ~156 now).
+    // Separate processes cannot share an in-process lock.
+    struct DeviceExecutor {
+        std::thread             thread;
+        std::mutex              mu;
+        std::condition_variable cv_task;
+        std::condition_variable cv_done;
+        std::function<void()>   task;
+        std::exception_ptr      error;
+        bool                    has_task = false;
+        bool                    idle     = true;
+        bool                    stop     = false;
+
+        void start() {
+            thread = std::thread([this] {
+                for (;;) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock<std::mutex> lock(mu);
+                        cv_task.wait(lock, [this] { return has_task || stop; });
+                        if (stop) { return; }
+                        job = std::move(task);
+                        has_task = false;
+                    }
+                    std::exception_ptr caught;
+                    try {
+                        job();
+                    } catch (...) {
+                        caught = std::current_exception();
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        error = caught;
+                        idle  = true;
+                    }
+                    cv_done.notify_all();
+                }
+            });
+        }
+        void submit(std::function<void()> job) {
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                task     = std::move(job);
+                has_task = true;
+                idle     = false;
+                error    = nullptr;
+            }
+            cv_task.notify_one();
+        }
+        // Rethrows on the CALLING thread, so a device fault still aborts the
+        // request the same way the serial loop's exception did.
+        void join_one() {
+            // SPIN BRIEFLY BEFORE SLEEPING. A device group is ~200-900 us of
+            // work; a condition_variable round trip is 5-50 us under load, and
+            // the first build paid one per device per request (~171k of them in
+            // a decode window) to parallelise work of the same order. Spin for a
+            // bounded window first so the common case never sleeps at all, then
+            // fall back to the CV so a long group (a cold page-in) still parks
+            // the thread instead of burning a core.
+            for (int i = 0; i < 20000; ++i) {
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    if (idle) { break; }
+                }
+                std::this_thread::yield();
+            }
+            std::unique_lock<std::mutex> lock(mu);
+            cv_done.wait(lock, [this] { return idle; });
+            if (error) {
+                std::exception_ptr e = error;
+                error = nullptr;
+                lock.unlock();
+                std::rethrow_exception(e);
+            }
+        }
+        ~DeviceExecutor() {
+            if (!thread.joinable()) { return; }
+            { std::lock_guard<std::mutex> lock(mu); stop = true; }
+            cv_task.notify_all();
+            thread.join();
+        }
+    };
+    mutable std::vector<std::unique_ptr<DeviceExecutor>> device_exec_;
+    const bool device_parallel_ = [] {
+        const char * e = std::getenv("WP_DEVICE_PARALLEL");
+        return e != nullptr && e[0] == '1';
+    }();
     mutable std::mutex split_mutex_;
     std::unordered_map<int, SplitPending> split_pending_by_conn_;
 };
@@ -11520,6 +12505,97 @@ std::optional<std::vector<float>> subscribe(uint64_t seq_id, int32_t layer, uint
 // improvement over what was already a decisive win, not a bet on more.
 std::mutex * g_worker_gpu_mutex = nullptr;
 
+// *** WP_FRAME_TRACE=1 -- PER-FRAME WORKER RESIDENCY. ***
+//
+// THE GAP THIS EXISTS TO CLOSE (2026-08-29). The spine reports waiting
+// 1.66-1.78 ms per layer on the LOOPBACK worker (127.0.0.1:8801), while that
+// worker's own ns_compute is 814 us. ~890 us/layer -- ~43 ms/token -- is
+// unaccounted, on the same machine, with no network in the path. Neither side
+// measured that boundary: the worker's counters all start inside dispatch(),
+// and the spine's stop at the socket.
+//
+// This brackets EVERY frame from "pipe_recv_frame returned" to "this loop
+// iteration finished", by RAII, so continue/return/throw all count. It is the
+// worker-side half of the spine's wait, so:
+//     spine_wait_per_layer - sum(residency of that layer's frames)
+//         == transport + spine-side queueing
+// which is the number that decides whether to attack the wire or the worker.
+//
+// It also settles, without reading any more code, WHICH wire path is live:
+// split (BEGIN + ACTS, two frames per layer) or single DISPATCH_REQ. ns_send
+// reads 0 on every device, which implies the plain branch never runs -- this
+// prints the frame mix and proves it.
+//
+// COST: two steady_clock reads per frame (~50 ns) against a 1.7 ms budget, and
+// one mutex-guarded map update. Report every 20k frames, NOT per frame -- an
+// unbuffered stderr write per request is a syscall in the hot path and would
+// tax the very thing it measures (see the grouped-gemv WARN, same file).
+// *** THREAD-LOCAL, NO LOCK. ***
+// The first version of this took a std::mutex and updated a std::map on EVERY
+// frame, and it cost ~5% of decode throughput: 6.277/6.561/6.653 -> 5.756/
+// 6.193/6.331 t/s, with the low sample BELOW the established 6.14-6.63 band.
+// That is a probe distorting the thing it measures. Judge an instrument by work
+// COMPLETED, not by elapsed time. Fixed rather than kept-with-a-caveat, because
+// the residency number it produces is the one the whole investigation turns on.
+// Single connection = single serve thread, so thread-local needs no lock at all;
+// under WP_WORKER_MULTI_CONN each thread simply reports its own line.
+constexpr int FRAME_SLOTS = 24;
+
+bool frame_trace_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_FRAME_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+const char * frame_type_name(int t) {
+    switch (t) {
+        case PIPE_PING:                         return "PING";
+        case PIPE_EXPERT_DISPATCH_REQ:          return "DISPATCH_REQ";
+        case PIPE_EXPERT_PREFETCH_HINT:         return "PREFETCH_HINT";
+        case PIPE_EXPERT_DISPATCH_BEGIN:        return "BEGIN";
+        case PIPE_EXPERT_DISPATCH_ACTS:         return "ACTS";
+        case PIPE_EXPERT_DISPATCH_ACTS_PUBLISH: return "ACTS_PUBLISH";
+        case PIPE_EXPERT_DISPATCH_ACTS_REF:     return "ACTS_REF";
+        default:                                return "other";
+    }
+}
+
+void note_frame_residency(int type, uint64_t ns) {
+    if (type < 0 || type >= FRAME_SLOTS) { type = 0; }
+    static thread_local uint64_t n_by_type[FRAME_SLOTS]  = {};
+    static thread_local uint64_t ns_by_type[FRAME_SLOTS] = {};
+    // WINDOWED, not cumulative. The cumulative average is dominated by the
+    // prefill frames at the head of a run and decays for the rest of it
+    // (measured 3532 -> 2757 -> 2441 us on one arm, all one steady state);
+    // reading it required differencing consecutive reports by hand. Report the
+    // WINDOW so the printed number is the number.
+    static thread_local uint64_t win_n[FRAME_SLOTS]  = {};
+    static thread_local uint64_t win_ns[FRAME_SLOTS] = {};
+    static thread_local uint64_t since = 0;
+    ++n_by_type[type];  ns_by_type[type] += ns;
+    ++win_n[type];      win_ns[type]     += ns;
+    if (++since < 20000) {
+        return;
+    }
+    since = 0;
+    std::string line = "wp frame-residency (window):";
+    for (int t = 0; t < FRAME_SLOTS; ++t) {
+        if (win_n[t] == 0) { continue; }
+        char buf[224];
+        std::snprintf(buf, sizeof(buf), " %s[n=%llu avg_us=%.1f | life n=%llu avg_us=%.1f]",
+                      frame_type_name(t),
+                      (unsigned long long) win_n[t],
+                      (double) win_ns[t] / (double) win_n[t] / 1000.0,
+                      (unsigned long long) n_by_type[t],
+                      (double) ns_by_type[t] / (double) n_by_type[t] / 1000.0);
+        line += buf;
+        win_n[t] = 0; win_ns[t] = 0;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -1) {
     struct PendingCleanup {
         Worker & worker;
@@ -11753,6 +12829,27 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // Comma operator so the pump runs before EVERY recv, including after the
     // PING branch's `continue` -- appending it to the loop body would skip that.
     while ((await_request(), pipe_recv_frame(socket, type, seq_id, payload))) {
+        // Bracket this whole iteration -- see FrameResidency above. Declared
+        // FIRST so it spans every branch below, including the ones that
+        // `continue` (PING, PREFETCH_HINT, BEGIN) and the ones that return.
+        struct FrameResidencyScope {
+            bool                                  on;
+            int                                   type;
+            std::chrono::steady_clock::time_point started;
+            ~FrameResidencyScope() {
+                if (!on) return;
+                note_frame_residency(type,
+                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - started).count());
+            }
+        } frame_residency_scope{
+            frame_trace_enabled(), (int) type,
+            frame_trace_enabled() ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point() };
+        // Segment stamps. Reuse the scope's own start so the two agree exactly.
+        const bool seg_trace = frame_trace_enabled();
+        const std::chrono::steady_clock::time_point t_frame =
+            frame_residency_scope.started;
         // WP_WORKER_MULTI_CONN: default-held for the whole per-request
         // handling below, same shape as the probe (RAII releases it on
         // every exit from this scope -- return, continue, or falling off
@@ -11778,6 +12875,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         if (g_worker_gpu_mutex != nullptr) {
             gpu_lock = std::unique_lock<std::mutex>(*g_worker_gpu_mutex);
         }
+        const std::chrono::steady_clock::time_point t_locked =
+            seg_trace ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point();
         last_request_at = std::chrono::steady_clock::now();
         if (type == PIPE_PING) {
             if (!pipe_send_frame(socket, PIPE_PONG, seq_id, nullptr, 0)) {
@@ -12086,7 +13186,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const pipe_expert_dispatch_req request =
                 pipe_decode_expert_dispatch_req(
                     payload.data(), payload.size(), mine.n_embd);
+            const std::chrono::steady_clock::time_point t_decoded =
+                seg_trace ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point();
             RequestStats request_stats;
+            if (seg_trace) {
+                request_stats.ns_lock_wait =
+                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_locked - t_frame).count();
+                request_stats.ns_decode_req =
+                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_decoded - t_locked).count();
+            }
             // WP_REQ_LOG: per-request phase dump. The cumulative WorkerStats
             // totals cannot separate "every request is uniformly slow" from
             // "most are fast and a few are enormous", and on the RX 480 the
@@ -12119,8 +13230,19 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const std::chrono::steady_clock::time_point req_started =
                 req_log != nullptr ? std::chrono::steady_clock::now() :
                                      std::chrono::steady_clock::time_point();
+            const std::chrono::steady_clock::time_point t_pre_dispatch =
+                seg_trace ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point();
+            if (seg_trace) {
+                request_stats.ns_pre_dispatch =
+                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_pre_dispatch - t_decoded).count();
+            }
             const pipe_expert_partial response = worker.dispatch(
                 request, request_stats, std::nullopt, conn_index);
+            const std::chrono::steady_clock::time_point t_dispatched =
+                seg_trace ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point();
             const bool measure = worker.stats_enabled();
             const std::chrono::steady_clock::time_point send_started =
                 measure ? std::chrono::steady_clock::now() :
@@ -12144,9 +13266,28 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     1, std::memory_order_relaxed);
             }
             if (measure) {
+                const std::chrono::steady_clock::time_point t_sent =
+                    std::chrono::steady_clock::now();
                 request_stats.ns_send =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - send_started).count();
+                        t_sent - send_started).count();
+                if (seg_trace) {
+                    // encode + unlock + send + relock. Everything between
+                    // dispatch() returning and the bytes being on the wire --
+                    // the last segment that can still be inside the spine's wait.
+                    request_stats.ns_encode_send =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_sent - t_dispatched).count();
+                    // NOTE: this stops at record_stats, so it does NOT include
+                    // spec_pagein_after_dispatch(), which runs after this block.
+                    // That call is AFTER the send and therefore cannot be part of
+                    // what the spine waits for; recover it as
+                    //   frame residency - (lock+decode+pre+dispatch+encode_send)
+                    // from the frame-residency line.
+                    request_stats.ns_post_send =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t_sent).count();
+                }
                 worker.record_stats(
                     request_stats, request.assignments.size());
             }

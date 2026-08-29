@@ -1093,18 +1093,22 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-
-    if (device >= ggml_backend_cuda_get_device_count()) {
-        return nullptr;
-    }
-
+    // NOTE(fork): this used to take a function-local static std::mutex on EVERY
+    // call, although the lock only ever guarded the one-time initialisation
+    // below. That made a process-wide serialisation point out of a pure getter.
+    // It is called from the hot path (ggml_backend_buft_get_alloc_size /
+    // ggml_backend_buffer_get_type, ~18x per expert-dispatch request per
+    // device), and because the mutex is a function-local static it is SHARED BY
+    // EVERY DEVICE -- so two devices doing host-side work concurrently in one
+    // process serialised on it. Profiled 2026-08-29 on the sliced expert rig:
+    // 22% of dispatch-path samples in pthread_mutex_lock/unlock and 10% in this
+    // function and its callers; two concurrent devices each inflated ~2.7x with
+    // ns_submit (the GPU work) untouched. call_once keeps the init exactly as
+    // safe and makes the steady state lock-free.
     static ggml_backend_buffer_type ggml_backend_cuda_buffer_types[GGML_CUDA_MAX_DEVICES];
+    static std::once_flag ggml_backend_cuda_buffer_type_once;
 
-    static bool ggml_backend_cuda_buffer_type_initialized = false;
-
-    if (!ggml_backend_cuda_buffer_type_initialized) {
+    std::call_once(ggml_backend_cuda_buffer_type_once, [] {
         for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
             ggml_backend_cuda_buffer_types[i] = {
                 /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
@@ -1112,9 +1116,13 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
                 /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i)},
             };
         }
-        ggml_backend_cuda_buffer_type_initialized = true;
-    }
+    });
 
+    // Bounds check AFTER init (device_count is stable once the runtime is up)
+    // so the common path is a single compare plus a return.
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
     return &ggml_backend_cuda_buffer_types[device];
 }
 
@@ -3598,6 +3606,14 @@ struct ggml_cuda_wp_graph_counters {
     std::atomic<uint64_t> captures{0};
     std::atomic<uint64_t> replays{0};
     std::atomic<uint64_t> fallbacks{0};
+    // WHY a capture happened. capture_reason was already recorded per graph but
+    // never read, so a collapsing capture:replay ratio was indistinguishable
+    // between "new shape" (benign warmup) and "cache too small" (thrash).
+    std::atomic<uint64_t> cap_newkey{0};
+    std::atomic<uint64_t> cap_lru{0};
+    std::atomic<uint64_t> cap_ttl{0};
+    std::atomic<uint64_t> cap_recapture{0};
+    std::atomic<uint64_t> live_graphs{0};
 };
 
 static ggml_cuda_wp_graph_counters ggml_cuda_wp_graph_counts[GGML_CUDA_MAX_DEVICES];
@@ -3605,14 +3621,23 @@ static std::once_flag ggml_cuda_wp_graph_atexit_once;
 
 static void ggml_cuda_wp_graph_print_counts() {
     uint64_t captures = 0, replays = 0, fallbacks = 0;
+    uint64_t newkey = 0, lru = 0, ttl = 0, live = 0, recap = 0;
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         captures += ggml_cuda_wp_graph_counts[i].captures.load(std::memory_order_relaxed);
         replays += ggml_cuda_wp_graph_counts[i].replays.load(std::memory_order_relaxed);
         fallbacks += ggml_cuda_wp_graph_counts[i].fallbacks.load(std::memory_order_relaxed);
+        newkey += ggml_cuda_wp_graph_counts[i].cap_newkey.load(std::memory_order_relaxed);
+        lru += ggml_cuda_wp_graph_counts[i].cap_lru.load(std::memory_order_relaxed);
+        ttl += ggml_cuda_wp_graph_counts[i].cap_ttl.load(std::memory_order_relaxed);
+        recap += ggml_cuda_wp_graph_counts[i].cap_recapture.load(std::memory_order_relaxed);
+        live += ggml_cuda_wp_graph_counts[i].live_graphs.load(std::memory_order_relaxed);
     }
-    fprintf(stderr, "wp hip-graphs: captures=%llu replays=%llu fallbacks=%llu\n",
+    fprintf(stderr, "wp hip-graphs: captures=%llu replays=%llu fallbacks=%llu "
+            "(newkey=%llu lru_evicted=%llu ttl_evicted=%llu recapture=%llu live=%llu)\n",
             (unsigned long long) captures, (unsigned long long) replays,
-            (unsigned long long) fallbacks);
+            (unsigned long long) fallbacks, (unsigned long long) newkey,
+            (unsigned long long) lru, (unsigned long long) ttl,
+            (unsigned long long) recap, (unsigned long long) live);
 }
 
 static void ggml_cuda_wp_graph_count_init() {
@@ -3725,15 +3750,36 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // "same graph, new src ptrs" and took hipGraphExecUpdate — which SIGSEGV'd
     // (2026-08-20 s0, SEGV_MAPERR, 17-expert verify union). A resident expert
     // in the same slot now hashes to the same key and is a pure Launch.
+    // WP_HIP_GRAPH_KEY_ADDRS=0 drops the resolved device addresses from the key,
+    // leaving a topology-only fingerprint. Addresses are what make the key space
+    // unbounded: any buffer that lands somewhere new mints a fresh key and a
+    // fresh capture, which is why the cache pegs at its cap and 78% of captures
+    // were LRU re-captures (measured 2026-08-28).
+    //
+    // DEFAULT 1 (addresses in), because topology-only was tried on 2026-08-20 and
+    // SIGSEGV'd: on the WORKER every expert shares a topology, so distinct
+    // experts collided on one key and the differing src pointers routed into
+    // hipGraphExecUpdate. That collision is worker-shaped -- this rig enables
+    // graphs on the SPINE only, where experts are remote -- so it may not
+    // reproduce here. Prove it before changing the default.
+    static const bool key_addrs = [] {
+        const char * e = std::getenv("WP_HIP_GRAPH_KEY_ADDRS");
+        return !(e != nullptr && e[0] == '0');
+    }();
+
     uint64_t h = 1469598103934665603ULL;
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) (unsigned) cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]);
-        h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]);
+        if (key_addrs) {
+            h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]);
+        }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]->src[j]);
-                h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]->src[j]);
+                if (key_addrs) {
+                    h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]->src[j]);
+                }
             } else {
                 h = ggml_cuda_graph_fnv1a_mix(h, 0);
             }
@@ -3790,7 +3836,16 @@ static bool ggml_cuda_graph_update_required(
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     // WP_HIP_GRAPHS churn diagnostic (throttled)
-    static std::atomic<int> churn_log_budget{60};
+    // Budget raised via WP_HIP_GRAPHS_CHURN_BUDGET. The default 60 is spent
+    // entirely on the startup first_snapshot captures, so STEADY-STATE churn --
+    // the only kind that explains a collapsing capture:replay ratio -- is never
+    // logged. Default unchanged so a bare run behaves exactly as before.
+    static std::atomic<int> churn_log_budget{[] {
+        const char * e = std::getenv("WP_HIP_GRAPHS_CHURN_BUDGET");
+        if (e == nullptr) { return 60; }
+        const long v = std::strtol(e, nullptr, 10);
+        return (v > 0 && v < 10000000) ? (int) v : 60;
+    }()};
     const bool churn_log = ggml_cuda_wp_hip_graphs_enabled() &&
         churn_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0;
     if (churn_log) {
@@ -5476,7 +5531,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             if (ggml_cuda_wp_hip_graphs_enabled()) {
                 ggml_cuda_wp_graph_count_init();
-                ggml_cuda_wp_graph_counts[cuda_ctx->device].captures.fetch_add(1, std::memory_order_relaxed);
+                auto & c = ggml_cuda_wp_graph_counts[cuda_ctx->device];
+                c.captures.fetch_add(1, std::memory_order_relaxed);
+                // Consume the reason: it is assigned on INSERT and must be
+                // counted exactly once, by the capture that the insert caused.
+                const auto reason = graph->capture_reason;
+                graph->capture_reason = ggml_cuda_graph::CAPTURE_OTHER;
+                switch (reason) {
+                    case ggml_cuda_graph::CAPTURE_LRU:
+                        c.cap_lru.fetch_add(1, std::memory_order_relaxed); break;
+                    case ggml_cuda_graph::CAPTURE_TTL:
+                        c.cap_ttl.fetch_add(1, std::memory_order_relaxed); break;
+                    case ggml_cuda_graph::CAPTURE_OTHER:
+                        c.cap_recapture.fetch_add(1, std::memory_order_relaxed); break;
+                    default:
+                        c.cap_newkey.fetch_add(1, std::memory_order_relaxed); break;
+                }
+                c.live_graphs.store(cuda_ctx->cuda_graph_count(), std::memory_order_relaxed);
             }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
