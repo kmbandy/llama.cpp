@@ -522,6 +522,22 @@ struct RequestStats {
     uint64_t ns_vk_fold = 0;
     uint64_t ns_vk_sync = 0;
     uint64_t ns_vk_readback = 0;
+    // *** ACCOUNTING TIMERS ADDED 2026-08-29 (Vulkan decode gap). ***
+    // The 51cae31f9 banner explained only ~64% of the RX 480's ns_compute
+    // (dispatch 839 us; graph_compute 274 + readback 62 + cache_lookup 1 the
+    // only named costs). These five close the two holes: the untimed
+    // dispatch() prologue between ns_compute's start and the first lap(), and
+    // the untimed head/tail of compute_batch's D2 fast path.
+    //
+    // ns_prologue is recorded on EVERY backend (it is a plain host cost that
+    // the 1070 pays too and the banner never showed); the ns_vk_* ones stay
+    // Vulkan-gated like their neighbours.
+    uint64_t ns_prologue = 0;      // ns_compute start -> the phase-lap origin
+    uint64_t ns_arena_probe = 0;   // arena_id_eligible()/grouped_gemv_eligible()
+    uint64_t ns_vk_arena_probe = 0;
+    uint64_t ns_vk_setup = 0;      // compute_batch entry -> D2 cache lookup
+    uint64_t ns_vk_rebind = 0;     // D2 hit: attach_weight + routing repack
+    uint64_t ns_vk_layer_ahead = 0;// submit_prefill_layer_ahead
     uint64_t ns_prep = 0;
     uint64_t ns_prep_setup = 0;   // ggml_init + new_tensor + buft queries
     uint64_t ns_prep_grow = 0;    // grow_io_buffer (device alloc when it grows)
@@ -707,6 +723,12 @@ public:
         ns_vk_fold_ += request.ns_vk_fold;
         ns_vk_sync_ += request.ns_vk_sync;
         ns_vk_readback_ += request.ns_vk_readback;
+        ns_prologue_ += request.ns_prologue;
+        ns_arena_probe_ += request.ns_arena_probe;
+        ns_vk_arena_probe_ += request.ns_vk_arena_probe;
+        ns_vk_setup_ += request.ns_vk_setup;
+        ns_vk_rebind_ += request.ns_vk_rebind;
+        ns_vk_layer_ahead_ += request.ns_vk_layer_ahead;
         n_gcache_hit_ += request.n_gcache_hit;
         n_gcache_miss_ += request.n_gcache_miss;
         n_arena_hit_ += request.n_arena_hit;
@@ -860,6 +882,12 @@ private:
                   << " ns_vk_fold=" << ns_vk_fold_
                   << " ns_vk_sync=" << ns_vk_sync_
                   << " ns_vk_readback=" << ns_vk_readback_
+                  << " ns_prologue=" << ns_prologue_
+                  << " ns_arena_probe=" << ns_arena_probe_
+                  << " ns_vk_arena_probe=" << ns_vk_arena_probe_
+                  << " ns_vk_setup=" << ns_vk_setup_
+                  << " ns_vk_rebind=" << ns_vk_rebind_
+                  << " ns_vk_layer_ahead=" << ns_vk_layer_ahead_
                   << " gcache_hit=" << n_gcache_hit_
                   << " gcache_miss=" << n_gcache_miss_
                   << " n_arena_hit=" << n_arena_hit_
@@ -974,6 +1002,12 @@ private:
     uint64_t          ns_vk_fold_ = 0;
     uint64_t          ns_vk_sync_ = 0;
     uint64_t          ns_vk_readback_ = 0;
+    uint64_t          ns_prologue_ = 0;
+    uint64_t          ns_arena_probe_ = 0;
+    uint64_t          ns_vk_arena_probe_ = 0;
+    uint64_t          ns_vk_setup_ = 0;
+    uint64_t          ns_vk_rebind_ = 0;
+    uint64_t          ns_vk_layer_ahead_ = 0;
     uint64_t          n_gcache_hit_ = 0;
     uint64_t          n_gcache_miss_ = 0;
     uint64_t          n_arena_hit_ = 0;
@@ -7094,6 +7128,27 @@ public:
         }
     }
 
+    // Wrapper so the layer-ahead hint shows up as its own banner field. It is
+    // called from inside the `phase` lap that becomes ns_pagein_compute, i.e.
+    // from inside the Vulkan ns_vk_dispatch_path envelope, so an expensive
+    // hint would otherwise be indistinguishable from compute.
+    void time_layer_ahead(
+            const pipe_expert_dispatch_req & request, RequestStats & request_stats) {
+        if (!stats_.enabled()) {
+            submit_prefill_layer_ahead(request.layer, request.n_tokens);
+            return;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        submit_prefill_layer_ahead(request.layer, request.n_tokens);
+        const uint64_t elapsed =
+            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        if (is_vulkan_backend()) {
+            request_stats.ns_vk_layer_ahead += elapsed;
+        }
+    }
+
+
 
     // Drop the queue. Called when the connection has been idle long enough that
     // the hinted layer is certainly behind us -- speculating on a layer already
@@ -7623,9 +7678,27 @@ public:
             have_hits |= batch.is_resident(i);
             have_pageins |= !batch.is_resident(i);
         }
+        // MEASURED 2026-08-29: everything from compute_started to the `phase`
+        // origin below was outside every lap(), so it landed in ns_compute and
+        // in NO named field. arena_id_eligible() is the suspect -- it used to
+        // materialise a full ArenaLayout (a scan of all ~6700 Slot records)
+        // BEFORE checking whether WP_EXPERT_ARENA_ID is even set. ns_arena_probe
+        // names that cost directly so the next round can see it go to zero.
+        const std::chrono::steady_clock::time_point probe_started =
+            measure ? std::chrono::steady_clock::now() :
+                      std::chrono::steady_clock::time_point();
         const bool grouped_gemv_request =
             !cpu_on_arrival_request &&
             (grouped_gemv_eligible(request) || arena_id_eligible(request, batch));
+        if (measure) {
+            const uint64_t probe_ns =
+                (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - probe_started).count();
+            request_stats.ns_arena_probe += probe_ns;
+            if (is_vulkan_backend()) {
+                request_stats.ns_vk_arena_probe += probe_ns;
+            }
+        }
         // PHASE TIMERS. ns_compute is the wall span of this whole section, but
         // ns_read/h2d/submit/readback only summed to 78% of it on the RX 480
         // (8.95 s of 11.53 s) -- 1.34 ms per request attributed to nothing.
@@ -7633,6 +7706,11 @@ public:
         // growth), the blocking wait in batch.complete() (thread join + I/O),
         // and the fp32->fp16 encode of the reply.
         auto phase = std::chrono::steady_clock::now();
+        if (measure) {
+            request_stats.ns_prologue +=
+                (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    phase - compute_started).count();
+        }
         auto lap = [&measure, &phase]() -> uint64_t {
             if (!measure) return 0;
             const auto now = std::chrono::steady_clock::now();
@@ -7836,7 +7914,7 @@ public:
                 }
                 batch.complete_upto(end);
                 request_stats.ns_wait += lap();
-                submit_prefill_layer_ahead(request.layer, request.n_tokens);
+                time_layer_ahead(request, request_stats);
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ c > 0, request_stats,
@@ -7849,7 +7927,7 @@ public:
         // first read error. Cheap and already drained after the loop above.
         batch.complete();
         request_stats.ns_wait += lap();
-        submit_prefill_layer_ahead(request.layer, request.n_tokens);
+        time_layer_ahead(request, request_stats);
         if (measure) {
             request_stats.ns_read = batch.read_ns();
             request_stats.n_read_inflight_max = batch.n_read_inflight_max();
@@ -8983,6 +9061,21 @@ private:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - vk_wait_started).count();
         }
+        // Everything from here to the D2 cache lookup was untimed: the
+        // selection scan, the arena probe, the buffer-type alignment queries,
+        // grow_params_buffer and the gather-rank pass. On the RX 480 that span
+        // is the only remaining unnamed cost inside ns_vk_dispatch_path once
+        // graph_compute is subtracted, so name it.
+        const std::chrono::steady_clock::time_point vk_setup_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
+        const auto record_vk_setup = [&]() {
+            if (measure_vk) {
+                request_stats.ns_vk_setup +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - vk_setup_started).count();
+            }
+        };
         const auto selected = [&](size_t i) {
             return i >= sel_begin && i < sel_end &&
                    (all_experts || (batch.is_resident(i) == hits));
@@ -8992,15 +9085,28 @@ private:
             n_selected += selected(i) ? 1 : 0;
         }
         if (n_selected == 0) {
+            record_vk_setup();
             record_vk_compute();
             return;
         }
 
-        if (arena_id_eligible(request, batch) &&
+        const std::chrono::steady_clock::time_point probe_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
+        const bool arena_ok = arena_id_eligible(request, batch);
+        if (measure_vk) {
+            const uint64_t probe_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - probe_started).count();
+            request_stats.ns_arena_probe += probe_ns;
+            request_stats.ns_vk_arena_probe += probe_ns;
+        }
+        if (arena_ok &&
                 sel_begin == 0 && sel_end >= request.assignments.size() &&
                 n_selected == request.assignments.size() &&
                 result_offset == std::numeric_limits<size_t>::max() &&
                 compute_batch_arena(request, pages, batch, request_stats)) {
+            record_vk_setup();
             record_vk_compute();
             return;
         }
@@ -9102,6 +9208,7 @@ private:
             request_stats.d3_counted = true;
         }
         if (d3_grouped) {
+            record_vk_setup();
             compute_batch_grouped(
                 request, pages, batch, selected, n_selected, add_previous, request_stats,
                 s_worker_collapse, grouped_gemv);
@@ -9159,6 +9266,7 @@ private:
                 }
             }
         }
+        record_vk_setup();
         GraphCacheEntry * gc = nullptr;
         bool gc_hit = false;
         const std::chrono::steady_clock::time_point vk_cache_started =
@@ -9225,6 +9333,9 @@ private:
             // re-bind to the same place), upload once, submit the cached graph.
             // Iteration order matches the build below exactly: assignment index.
             ++request_stats.n_gcache_hit;
+            const std::chrono::steady_clock::time_point vk_rebind_started =
+                measure_vk ? std::chrono::steady_clock::now() :
+                              std::chrono::steady_clock::time_point();
             static const char * kRoles[3] = {"gate", "up", "down"};
             size_t k = 0;
             for (size_t i = 0; i < request.assignments.size(); ++i) {
@@ -9257,6 +9368,11 @@ private:
                     place_param(gc->route_w[k], wv.data(), wv.size() * sizeof(float));
                 }
                 ++k;
+            }
+            if (measure_vk) {
+                request_stats.ns_vk_rebind +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - vk_rebind_started).count();
             }
             if (params_span > 0) {
                 const auto params_started = std::chrono::steady_clock::now();
@@ -11222,6 +11338,12 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.ns_vk_fold += src.ns_vk_fold;
     dst.ns_vk_sync += src.ns_vk_sync;
     dst.ns_vk_readback += src.ns_vk_readback;
+    dst.ns_prologue += src.ns_prologue;
+    dst.ns_arena_probe += src.ns_arena_probe;
+    dst.ns_vk_arena_probe += src.ns_vk_arena_probe;
+    dst.ns_vk_setup += src.ns_vk_setup;
+    dst.ns_vk_rebind += src.ns_vk_rebind;
+    dst.ns_vk_layer_ahead += src.ns_vk_layer_ahead;
     dst.ns_readback += src.ns_readback;
     dst.ns_prep += src.ns_prep;
     dst.ns_prep_setup += src.ns_prep_setup;
