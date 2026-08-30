@@ -12924,6 +12924,52 @@ private:
                      (unsigned long long) placement_references_.load(
                          std::memory_order_relaxed));
         std::fflush(stderr);
+        dump_access_counts();
+    }
+
+    // WP_EXPERT_COUNTS_DUMP=<path>: at every placement-stats interval, write the
+    // learned per-expert access counts, hottest first, as pin-file-compatible
+    // "layer expert  # count" lines (tmp + atomic rename). Feed the result back
+    // via WP_EXPERT_PIN_FILE so a fresh worker starts with the hot set resident
+    // instead of re-learning placement from zero after every restart -- access
+    // counts die with the process, which is why LFU tiering never converges on
+    // a restart-heavy rig.
+    void dump_access_counts() const {
+        static const char * const path = std::getenv("WP_EXPERT_COUNTS_DUMP");
+        if (path == nullptr || path[0] == '\0' || !placement_ready_) {
+            return;
+        }
+        struct Row { uint64_t count; int layer; int expert; };
+        std::vector<Row> rows;
+        rows.reserve(page_static_owners_.size());
+        for (const auto & kv : catalog_.pages) {
+            const auto cid = kv.second.cache_id;
+            if (cid < 0 || (size_t) cid >= page_static_owners_.size()) {
+                continue;
+            }
+            const uint64_t c = page_access_counts_[cid].load(std::memory_order_relaxed);
+            if (c == 0) {
+                continue;
+            }
+            rows.push_back({ c, kv.first.first, kv.first.second });
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row & a, const Row & b) {
+            if (a.count != b.count) { return a.count > b.count; }
+            if (a.layer != b.layer) { return a.layer < b.layer; }
+            return a.expert < b.expert;
+        });
+        const std::string tmp = std::string(path) + ".tmp";
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out) {
+            return;
+        }
+        for (const Row & r : rows) {
+            out << r.layer << ' ' << r.expert << "  # " << r.count << '\n';
+        }
+        out.close();
+        if (out) {
+            std::rename(tmp.c_str(), path);
+        }
     }
 
     struct AssignmentGroup {
