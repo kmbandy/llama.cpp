@@ -8773,6 +8773,11 @@ public:
         return name != nullptr && std::strstr(name, "Vulkan") != nullptr;
     }
 
+    bool is_cuda_backend() const {
+        const char * name = ggml_backend_name(backend_.get());
+        return name != nullptr && std::strstr(name, "CUDA") != nullptr;
+    }
+
     ggml_backend_graph_plan_t create_persistent_plan(ggml_cgraph * graph) {
         if (!wp_persistent_graphs_enabled() || !is_vulkan_backend()) {
             return nullptr;
@@ -8911,12 +8916,13 @@ private:
             ggml_backend_graph_plan_t persistent_plan = nullptr) {
         if (submit_async_) {
             AsyncSubmitState & state = async_submit_state();
-            if (is_vulkan_backend() && state.graph_pending) {
-                // Vulkan reuses graph state, so drain before the next submit.
+            if ((is_vulkan_backend() || is_cuda_backend()) && state.graph_pending) {
+                // Reusing graph/galloc state while the prior async graph runs
+                // can rewrite its live allocation; drain before the next submit.
                 synchronize_async(&request_stats);
             }
             state.pending = true;
-            if (is_vulkan_backend()) {
+            if (is_vulkan_backend() || is_cuda_backend()) {
                 state.graph_pending = true;
             }
         }
@@ -9642,6 +9648,12 @@ private:
             request_stats.ns_vk_wait +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - vk_wait_started).count();
+        }
+        if (submit_async_ && is_cuda_backend() &&
+                async_submit_state().graph_pending) {
+            // CUDA may reuse graph/galloc state before submit_graph() runs;
+            // drain before its allocator or tensor bindings can be rewritten.
+            synchronize_async(&request_stats);
         }
         // Everything from here to the D2 cache lookup was untimed: the
         // selection scan, the arena probe, the buffer-type alignment queries,
@@ -11975,6 +11987,10 @@ private:
             uint32_t n_tokens, size_t n_assign, size_t base_offset,
             size_t slot_size, RequestStats & request_stats) {
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
+        if (submit_async_ && is_cuda_backend() &&
+                async_submit_state().graph_pending) {
+            synchronize_async(&request_stats);
+        }
         // TENSOR BUDGET -- got this wrong once and it aborted the worker on the
         // first real request (2026-08-19: "ggml_new_object: not enough space in
         // the context's memory pool (needed 4048, available 3776)", GGML_ASSERT
