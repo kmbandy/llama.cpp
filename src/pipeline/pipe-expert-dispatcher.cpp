@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <numeric>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <condition_variable>
@@ -39,6 +40,26 @@ namespace pipe_expert_dispatcher {
 namespace {
 
 inproc_backend_factory g_inproc_factory = nullptr;
+
+static bool dispatch_hash_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_DISPATCH_HASH_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static uint64_t dispatch_hash_fnv1a(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+std::atomic<uint64_t> g_dispatch_hash_seq{0};
 
 using dispatch_clock = std::chrono::steady_clock;
 
@@ -801,6 +822,7 @@ struct dispatcher::impl {
     prefetch_hint_stats                                 hint_stats;
     pending_deferred_batch                              pending_def;
     size_t                                              in_flight     = 0;
+    uint64_t                                            dispatch_hash_seq_ = 0;
     int32_t                                             n_embd        = 0;
     int32_t                                             n_ff_exp      = 0;
     int32_t                                             n_expert      = 0;
@@ -2765,6 +2787,21 @@ struct dispatcher::impl {
                                      " n_tokens=" + std::to_string(partial.n_tokens) +
                                      " want_n_tokens=" + std::to_string(want_rows) + ")");
         }
+        if (dispatch_hash_trace_enabled()) {
+            const uint64_t hash = dispatch_hash_fnv1a(
+                partial.partial.data(), partial.partial.size() * sizeof(float));
+            if (value.inproc) {
+                std::fprintf(stderr,
+                             "DISPPART seq=%llu layer=%d worker=inproc h=%llu\n",
+                             (unsigned long long) dispatch_hash_seq_, layer,
+                             (unsigned long long) hash);
+            } else {
+                std::fprintf(stderr,
+                             "DISPPART seq=%llu layer=%d worker=%zu h=%llu\n",
+                             (unsigned long long) dispatch_hash_seq_, layer,
+                             request.worker_index, (unsigned long long) hash);
+            }
+        }
         // `partial.partial` is ALWAYS f32 here regardless of what dtype the worker
         // put on the wire (PIPE_VERSION 13's self-describing dtype tag): the tag
         // lives on the frame and pipe_decode_expert_partial() does the fp16->fp32
@@ -3049,6 +3086,9 @@ struct dispatcher::impl {
         uint32_t                     n_tokens = 0;
         uint64_t                     seq_id = 0;
         uint64_t                     activation_count = 0;
+        uint64_t                     hash_seq = 0;
+        uint64_t                     hash_pre = 0;
+        size_t                       hash_reqs = 0;
         std::vector<planned_request> imm_requests;
         std::vector<planned_request> def_requests;
         std::vector<float>           folded_prev;
@@ -3083,6 +3123,15 @@ struct dispatcher::impl {
         }
         if (assignments.empty()) {
             throw std::invalid_argument("expert dispatcher requires at least one activated expert");
+        }
+
+        const bool hash_trace = dispatch_hash_trace_enabled();
+        const uint64_t hash_seq = hash_trace
+            ? g_dispatch_hash_seq.fetch_add(1, std::memory_order_relaxed) : 0;
+        const uint64_t hash_pre = hash_trace
+            ? dispatch_hash_fnv1a(activations.data(), activations.size() * sizeof(float)) : 0;
+        if (hash_trace) {
+            dispatch_hash_seq_ = hash_seq;
         }
 
         std::set<int32_t> seen_experts;
@@ -3209,6 +3258,9 @@ struct dispatcher::impl {
             open_disp.n_tokens         = n_tokens;
             open_disp.seq_id           = seq_id;
             open_disp.activation_count = activation_count;
+            open_disp.hash_seq         = hash_seq;
+            open_disp.hash_pre         = hash_pre;
+            open_disp.hash_reqs        = imm_requests.size() + def_requests.size();
             open_disp.imm_requests     = std::move(imm_requests);
             open_disp.def_requests     = std::move(def_requests);
             open_disp.folded_prev      = std::move(folded_prev);
@@ -3233,6 +3285,9 @@ struct dispatcher::impl {
         const uint32_t n_tokens         = open_disp.n_tokens;
         const uint64_t seq_id           = open_disp.seq_id;
         const uint64_t activation_count = open_disp.activation_count;
+        const uint64_t hash_seq         = open_disp.hash_seq;
+        const uint64_t hash_pre         = open_disp.hash_pre;
+        const size_t   hash_reqs        = open_disp.hash_reqs;
         std::vector<planned_request> imm_requests    = std::move(open_disp.imm_requests);
         std::vector<planned_request> def_requests    = std::move(open_disp.def_requests);
         std::vector<float>           folded_prev     = std::move(open_disp.folded_prev);
@@ -3322,6 +3377,16 @@ struct dispatcher::impl {
                 pending_def.fold_closed = false;
             }
 
+            if (dispatch_hash_trace_enabled()) {
+                const uint64_t hash_post = dispatch_hash_fnv1a(
+                    result.data(), result.size() * sizeof(float));
+                std::fprintf(stderr,
+                             "DISPHASH seq=%llu layer=%d n=%llu pre=%llu post=%llu reqs=%zu\n",
+                             (unsigned long long) hash_seq, layer,
+                             (unsigned long long) activation_count,
+                             (unsigned long long) hash_pre,
+                             (unsigned long long) hash_post, hash_reqs);
+            }
             return result;
         } catch (...) {
             poison();

@@ -94,6 +94,33 @@ bool ggml_backend_cuda_wp_reader_copy(ggml_backend_t, ggml_tensor *,
 
 namespace wp_expert_worker {
 
+static bool wp_worker_hash_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_WORKER_HASH_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static uint64_t wp_worker_hash_fnv1a(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void wp_worker_hash_emit(uint64_t req, int32_t layer, const char * device,
+                                const std::vector<float> & values) {
+    const uint64_t hash = wp_worker_hash_fnv1a(
+        values.data(), values.size() * sizeof(float));
+    std::fprintf(stderr, "WORKHASH req=%llu layer=%d dev=%s n=%zu h=%llu\n",
+                 (unsigned long long) req, layer, device, values.size(),
+                 (unsigned long long) hash);
+}
+
 int parse_gather_min_tokens(const char * env) {
     if (env == nullptr || env[0] == '\0' || env[0] == '-') {
         return 2;
@@ -12564,7 +12591,8 @@ public:
             const pipe_expert_dispatch_req & request,
             RequestStats & request_stats,
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
-            int conn_index = -1) {
+            int conn_index = -1,
+            uint64_t trace_req = 0) {
         if (prepared.has_value() || !multi_device()) {
             std::lock_guard<std::mutex> lock(device_mutexes_.front());
             return devices_.front()->dispatch(
@@ -12611,7 +12639,7 @@ public:
             // The handoff cost is real but is paid down by join_one()'s spin,
             // NOT by moving work onto the caller.
             const auto run_device = [this, &by_device, &groups, &request,
-                                     &partials, &sub_stats, conn_index](size_t d) {
+                                     &partials, &sub_stats, conn_index, trace_req](size_t d) {
                 for (const size_t gi : by_device[d]) {
                     const AssignmentGroup & group = groups[gi];
                     pipe_expert_dispatch_req sub =
@@ -12619,6 +12647,11 @@ public:
                     std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                     partials[gi] = devices_[group.device]->dispatch(
                         sub, sub_stats[gi], std::nullopt, conn_index);
+                    if (wp_worker_hash_trace_enabled()) {
+                        wp_worker_hash_emit(trace_req, request.layer,
+                                            device_names_[group.device].c_str(),
+                                            partials[gi].partial);
+                    }
                     if (devices_[group.device]->stats_enabled()) {
                         devices_[group.device]->record_stats(
                             sub_stats[gi], group.end - group.begin);
@@ -12735,6 +12768,11 @@ public:
                 std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                 partials[gi] = devices_[group.device]->dispatch(
                     sub, sub_stats[gi], std::nullopt, conn_index);
+                if (wp_worker_hash_trace_enabled()) {
+                    wp_worker_hash_emit(trace_req, request.layer,
+                                        device_names_[group.device].c_str(),
+                                        partials[gi].partial);
+                }
                 if (devices_[group.device]->stats_enabled()) {
                     devices_[group.device]->record_stats(sub_stats[gi], group.end - group.begin);
                 }
@@ -12795,7 +12833,8 @@ public:
 
     pipe_expert_partial finish_split_dispatch(
             const pipe_expert_dispatch_acts & acts, uint64_t seq_id,
-            RequestStats & request_stats, int conn_index = -1) {
+            RequestStats & request_stats, int conn_index = -1,
+            uint64_t trace_req = 0) {
         if (!multi_device()) {
             std::lock_guard<std::mutex> lock(device_mutexes_.front());
             return devices_.front()->finish_split_dispatch(
@@ -12833,13 +12872,19 @@ public:
             sub_request.activations = acts.activations;
             RequestStats sub_stats;
             pipe_expert_partial partial;
+            const int32_t trace_layer = pending.begin.layer;
             if (hip_graph_executor_needed(group.device)) {
                 ensure_device_executor(group.device);
                 device_exec_[group.device]->run([this, &sub_request, &sub_stats, &partial,
-                                                 &group, conn_index] {
+                                                 &group, conn_index, trace_req, trace_layer] {
                     std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                     partial = devices_[group.device]->dispatch(
                         sub_request, sub_stats, std::nullopt, conn_index);
+                    if (wp_worker_hash_trace_enabled()) {
+                        wp_worker_hash_emit(trace_req, trace_layer,
+                                            device_names_[group.device].c_str(),
+                                            partial.partial);
+                    }
                     if (devices_[group.device]->stats_enabled()) {
                         devices_[group.device]->record_stats(
                             sub_stats, group.end - group.begin);
@@ -12849,6 +12894,11 @@ public:
                 std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                 partial = devices_[group.device]->dispatch(
                     sub_request, sub_stats, std::nullopt, conn_index);
+                if (wp_worker_hash_trace_enabled()) {
+                    wp_worker_hash_emit(trace_req, trace_layer,
+                                        device_names_[group.device].c_str(),
+                                        partial.partial);
+                }
                 if (devices_[group.device]->stats_enabled()) {
                     devices_[group.device]->record_stats(
                         sub_stats, group.end - group.begin);
@@ -14399,6 +14449,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     znull.n_tokens = split_log_begin.n_tokens;
                     znull.partial.assign(
                         (size_t) split_log_begin.n_tokens * mine.n_embd, 0.0f);
+                    if (wp_worker_hash_trace_enabled()) {
+                        const char * device = worker.device_count() == 1
+                            ? worker.device_name(0).c_str() : "fold";
+                        wp_worker_hash_emit(seq_id, znull.layer, device, znull.partial);
+                    }
                     const std::vector<uint8_t> zenc = pipe_encode_expert_partial(znull);
                     if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
                                          zenc.data(), zenc.size())) {
@@ -14427,10 +14482,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 // BEGIN fixes assignment index order; splitting changes only when
                 // reads start, never the computation order or resulting bytes.
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats, conn_index);
+                    acts, seq_id, split_log_stats, conn_index, seq_id);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+                if (wp_worker_hash_trace_enabled()) {
+                    const char * device = worker.device_count() == 1
+                        ? worker.device_name(0).c_str() : "fold";
+                    wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
+                }
                 pipe_encode_expert_partial_into(encode_buf, response);
                 const std::vector<uint8_t> & encoded = encode_buf;
                 // Unlock for the send: `encoded` aliases this connection's own
@@ -14534,10 +14594,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 pipe_expert_dispatch_acts acts;
                 acts.activations = std::move(publish.activations);
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats, conn_index);
+                    acts, seq_id, split_log_stats, conn_index, seq_id);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+                if (wp_worker_hash_trace_enabled()) {
+                    const char * device = worker.device_count() == 1
+                        ? worker.device_name(0).c_str() : "fold";
+                    wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
+                }
                 pipe_encode_expert_partial_into(encode_buf, response);
                 const std::vector<uint8_t> & encoded = encode_buf;
                 // Same unlock-for-send window as the ACTS branch above.
@@ -14644,10 +14709,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 pipe_expert_dispatch_acts acts;
                 acts.activations = std::move(*acts_vec);
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats, conn_index);
+                    acts, seq_id, split_log_stats, conn_index, seq_id);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+                if (wp_worker_hash_trace_enabled()) {
+                    const char * device = worker.device_count() == 1
+                        ? worker.device_name(0).c_str() : "fold";
+                    wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
+                }
                 pipe_encode_expert_partial_into(encode_buf, response);
                 const std::vector<uint8_t> & encoded = encode_buf;
                 // Same unlock-for-send window as the ACTS branch above.
@@ -14768,7 +14838,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         t_pre_dispatch - t_decoded).count();
             }
             const pipe_expert_partial response = worker.dispatch(
-                request, request_stats, std::nullopt, conn_index);
+                request, request_stats, std::nullopt, conn_index, seq_id);
             const std::chrono::steady_clock::time_point t_dispatched =
                 seg_trace ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point();
@@ -14776,6 +14846,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const std::chrono::steady_clock::time_point send_started =
                 measure ? std::chrono::steady_clock::now() :
                           std::chrono::steady_clock::time_point();
+            if (wp_worker_hash_trace_enabled()) {
+                const char * device = worker.device_count() == 1
+                    ? worker.device_name(0).c_str() : "fold";
+                wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
+            }
             pipe_encode_expert_partial_into(encode_buf, response);
             const std::vector<uint8_t> & encoded = encode_buf;
             // Same unlock-for-send window as the split-dispatch branches
