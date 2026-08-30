@@ -112,6 +112,38 @@ static uint64_t wp_worker_hash_fnv1a(const void * data, size_t size) {
     return hash;
 }
 
+static uint64_t wp_worker_hash_fnv1a_update(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void wp_worker_hash_device_bytes(
+        uint64_t & hash, ggml_backend_buffer_t buffer, void * data, size_t size) {
+    if (buffer == nullptr || data == nullptr || size == 0) {
+        return;
+    }
+    const ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead(),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        throw std::runtime_error("failed to allocate hash metadata");
+    }
+    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) size);
+    tensor->buffer = buffer;
+    tensor->data = data;
+    std::vector<uint8_t> host(size);
+    ggml_backend_tensor_get(tensor, host.data(), 0, size);
+    hash = wp_worker_hash_fnv1a_update(hash, host.data(), host.size());
+    ggml_free(ctx);
+}
+
 static void wp_worker_hash_emit(uint64_t req, int32_t layer, const char * device,
                                 const std::vector<float> & values) {
     const uint64_t hash = wp_worker_hash_fnv1a(
@@ -2585,9 +2617,8 @@ Catalog & layout_sliced_pages(
             // shard bytes are provably byte-identical to the source GGUF.
             //
             // Reserve the slack ourselves rather than trusting the backend to.
-            // The buffer is zeroed once at allocation and nothing ever writes
-            // this tail, so an over-read now lands in zeros -- which is the
-            // guarantee CUDA's padding was already providing.
+            // The buffer is zeroed at allocation and each page load clears its
+            // quantized tail before H2D, so an over-read lands in zeros.
             if (ggml_is_quantized(spec.type) && spec.ne0 % 512 != 0) {
                 alloc_size += ggml_row_size(spec.type, 512 - (spec.ne0 % 512));
             }
@@ -2663,12 +2694,12 @@ void zero_quantized_member_padding(ggml_tensor * slot_raw, const ExpertPage & pa
 void tensor_set_page_range(
         ggml_tensor * tensor, const ExpertPage & page, const void * source,
         size_t page_offset, size_t size) {
+    zero_quantized_member_padding(tensor, page);
     for_each_page_chunk(page, page_offset, size,
                         [tensor, source](size_t source_offset, size_t device_offset, size_t n) {
         ggml_backend_tensor_set(
             tensor, (const char *) source + source_offset, device_offset, n);
     });
-    zero_quantized_member_padding(tensor, page);
 }
 
 void tensor_get_page(
@@ -2696,6 +2727,7 @@ void tensor_set_page_range_reader(
     if (ggml_backend_cuda_wp_reader_copy == nullptr) {
         throw std::runtime_error("wp reader H2D: ggml_backend_cuda_wp_reader_copy is unresolved");
     }
+    zero_quantized_member_padding(tensor, page);
     for_each_page_chunk(page, page_offset, size,
                         [&](size_t source_offset, size_t device_offset, size_t n) {
         if (!ggml_backend_cuda_wp_reader_copy(
@@ -2703,7 +2735,6 @@ void tensor_set_page_range_reader(
             throw std::runtime_error("wp reader H2D: reader-stream copy failed");
         }
     });
-    zero_quantized_member_padding(tensor, page);
 }
 
 // WP_READER_H2D_VERIFY=1 tripwire: after a successful reader-thread upload,
@@ -5855,6 +5886,10 @@ private:
                 // time; the copy overlaps reads/submit and the A/B metric is
                 // the request wall.
                 if (pagein.page->device_size != pagein.page->size) {
+                    // The copy-stream event does not order cudaStreamPerThread.
+                    // Clear the tail before issuing the H2D so the event covers
+                    // every byte the CUDA quantized kernel can read.
+                    zero_quantized_member_padding(slot.raw, *pagein.page);
                     bool async_copy = false;
                     for_each_page_chunk(
                         *pagein.page, result->offset, result->len,
@@ -5874,7 +5909,6 @@ private:
                             ggml_backend_tensor_set(slot.raw, source, device_offset, n);
                         }
                     });
-                    zero_quantized_member_padding(slot.raw, *pagein.page);
                     if (async_copy) {
                         staging_.mark_in_flight(result->staging->get());
                     }
@@ -7093,7 +7127,7 @@ void attach_weight(
     // Do not init_tensor / tensor_memset the quantized pad on this tensor:
     // tensor_memset cannot write past ggml_nbytes, and init_tensor's
     // cuda/hipMemset of the tail is "invalid argument" on arena-offset
-    // pointers. Padding is zeroed after H2D on slot.raw (I8, full slot).
+    // pointers. Padding is zeroed before H2D on slot.raw (I8, full slot).
 }
 
 class DeviceWorker {
@@ -7110,12 +7144,16 @@ public:
     struct AsyncDispatchGuard {
         DeviceWorker & worker;
         int previous_conn_index;
+        uint64_t previous_trace_req;
 
-        AsyncDispatchGuard(DeviceWorker & worker, int conn_index) :
-            worker(worker), previous_conn_index(worker.begin_async_dispatch(conn_index)) {}
+        AsyncDispatchGuard(DeviceWorker & worker, int conn_index, uint64_t trace_req) :
+            worker(worker), previous_conn_index(worker.active_async_conn_index_),
+            previous_trace_req(worker.active_trace_req_) {
+            worker.begin_async_dispatch(conn_index, trace_req);
+        }
 
         ~AsyncDispatchGuard() {
-            worker.end_async_dispatch(previous_conn_index);
+            worker.end_async_dispatch(previous_conn_index, previous_trace_req);
         }
     };
     DeviceWorker(
@@ -8073,7 +8111,8 @@ public:
             const pipe_expert_dispatch_req & request,
             RequestStats & request_stats,
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
-            int conn_index = -1) {
+            int conn_index = -1,
+            uint64_t trace_req = 0) {
         // RAII so every exit path counts -- dispatch() returns from several
         // places and throws from more.
         struct DispatchTotalScope {
@@ -8155,7 +8194,7 @@ public:
             : pool_.ensure_batch(pages, measure, lookup_started, request.n_tokens, conn_index);
         // Declare this after batch: its destructor synchronizes before batch
         // releases pins or permits slot reuse on an exceptional exit.
-        AsyncDispatchGuard async_dispatch_guard(*this, conn_index);
+        AsyncDispatchGuard async_dispatch_guard(*this, conn_index, trace_req);
         if (measure) {
             request_stats.ns_lookup  = batch.lookup_ns();
             request_stats.n_resident      = batch.n_resident();
@@ -8433,6 +8472,7 @@ public:
             const size_t chunks   = grouped_gemv_request || batch.n_pagein() == 0
                 ? 1
                 : std::max<size_t>(1, std::min(s_compute_chunks, n_assign));
+            active_work_chunks_ = chunks;
             for (size_t c = 0; c < chunks; ++c) {
                 const size_t beg = n_assign * c / chunks;
                 const size_t end = n_assign * (c + 1) / chunks;
@@ -8491,7 +8531,7 @@ public:
                 }
             }
             fold_resident_first_partials(
-                request.n_tokens, request.assignments.size(),
+                request, pages, batch, request.n_tokens, request.assignments.size(),
                 cpu_on_arrival_base_offset, cpu_on_arrival_slot_size, request_stats);
         } else if (resident_first_eligible) {
             // Reads are drained (batch.complete() above): compute every
@@ -8514,7 +8554,7 @@ public:
             // left-to-right by index -- not by which finished first -- is
             // what makes this bit-identical to WP_EXPERT_RESIDENT_FIRST=0.
             fold_resident_first_partials(
-                request.n_tokens, request.assignments.size(),
+                request, pages, batch, request.n_tokens, request.assignments.size(),
                 resident_first_base_offset, resident_first_slot_size, request_stats);
         } else if (effective_overlap && have_pageins) {
             compute_batch(
@@ -8687,7 +8727,8 @@ public:
 
     pipe_expert_partial finish_split_dispatch(
             const pipe_expert_dispatch_acts & acts, uint64_t seq_id,
-            RequestStats & request_stats, int conn_index = -1) {
+            RequestStats & request_stats, int conn_index = -1,
+            uint64_t trace_req = 0) {
         const auto it = split_pending_by_conn_.find(conn_index);
         if (it == split_pending_by_conn_.end()) {
             throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
@@ -8702,7 +8743,7 @@ public:
         pending.request.activations = acts.activations;
         try {
             pipe_expert_partial response = dispatch(
-                pending.request, request_stats, std::move(pending.batch), conn_index);
+                pending.request, request_stats, std::move(pending.batch), conn_index, trace_req);
             pool_.demand_serving(false);
             spec_prefill_gate_active_ = false;
             return response;
@@ -8855,6 +8896,25 @@ private:
         bool graph_pending = false;
     };
 
+    struct WorkInputBytes {
+        ggml_backend_buffer_t buffer = nullptr;
+        void * data = nullptr;
+        size_t size = 0;
+    };
+
+    struct WorkInputTrace {
+        bool active = false;
+        uint64_t req = 0;
+        int32_t layer = 0;
+        size_t n_pagein = 0;
+        size_t chunks = 1;
+        int gcache = -1;
+        bool use_gather = false;
+        WorkInputBytes input;
+        std::vector<WorkInputBytes> params;
+        std::vector<WorkInputBytes> slots;
+    };
+
     // WP_SUBMIT_ASYNC is opt-in. The tensor upload and graph compute use the
     // same backend stream, so the upload is ordered before its consumer. This
     // avoids the MAD-114 gfx1201 cross-stream visibility hazard.
@@ -8863,9 +8923,11 @@ private:
         return e != nullptr && e[0] == '1';
     }();
 
-    int begin_async_dispatch(int conn_index) {
-        const int previous = active_async_conn_index_;
+    void begin_async_dispatch(int conn_index, uint64_t trace_req) {
         active_async_conn_index_ = conn_index;
+        active_trace_req_ = trace_req;
+        active_work_chunks_ = 1;
+        work_input_trace_ = {};
         if (submit_async_) {
             AsyncSubmitState & state = async_submit_state_by_conn_[conn_index];
             state.params.clear();
@@ -8874,7 +8936,6 @@ private:
             state.pending = false;
             state.graph_pending = false;
         }
-        return previous;
     }
 
     void synchronize_async(RequestStats * request_stats) {
@@ -8902,13 +8963,105 @@ private:
         it->second.route_weights.clear();
     }
 
-    void end_async_dispatch(int previous_conn_index) {
+    void end_async_dispatch(int previous_conn_index, uint64_t previous_trace_req) {
         synchronize_async(nullptr);
         active_async_conn_index_ = previous_conn_index;
+        active_trace_req_ = previous_trace_req;
+        work_input_trace_ = {};
     }
 
     AsyncSubmitState & async_submit_state() {
         return async_submit_state_by_conn_.at(active_async_conn_index_);
+    }
+
+    void begin_work_input_trace(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            const std::vector<size_t> & selected,
+            bool use_gather, int gcache) {
+        work_input_trace_ = {};
+        if (!wp_worker_hash_trace_enabled() || !submit_async_ || !is_cuda_backend()) {
+            return;
+        }
+        work_input_trace_.active = true;
+        work_input_trace_.req = active_trace_req_;
+        work_input_trace_.layer = request.layer;
+        work_input_trace_.n_pagein = batch.n_pagein();
+        work_input_trace_.chunks = active_work_chunks_;
+        work_input_trace_.gcache = gcache;
+        work_input_trace_.use_gather = use_gather;
+        const size_t input_size = request.activations.size() * sizeof(float);
+        const ggml_backend_buffer_t io_buffer =
+            io_active_ != nullptr ? io_active_ : io_buffer_.get();
+        work_input_trace_.input = {
+            io_buffer,
+            io_buffer == nullptr ? nullptr : ggml_backend_buffer_get_base(io_buffer),
+            input_size,
+        };
+        work_input_trace_.slots.reserve(selected.size());
+        for (size_t i : selected) {
+            const ExpertSlotPool::Loaded loaded = batch.loaded(i);
+            work_input_trace_.slots.push_back({
+                loaded.buffer, loaded.base, pages[i]->device_size,
+            });
+        }
+    }
+
+    void add_work_input_trace_tensor(const ggml_tensor * tensor) {
+        if (!work_input_trace_.active || tensor == nullptr) {
+            return;
+        }
+        work_input_trace_.params.push_back({
+            tensor->buffer, tensor->data, ggml_nbytes(tensor),
+        });
+    }
+
+    void add_work_input_trace_buffer(
+            ggml_backend_buffer_t buffer, void * data, size_t size) {
+        if (!work_input_trace_.active) {
+            return;
+        }
+        work_input_trace_.params.push_back({buffer, data, size});
+    }
+
+    void emit_work_input_trace() {
+        if (!work_input_trace_.active) {
+            return;
+        }
+        ggml_backend_synchronize(backend_.get());
+        uint64_t input_hash = wp_worker_hash_fnv1a(nullptr, 0);
+        uint64_t params_hash = wp_worker_hash_fnv1a(nullptr, 0);
+        uint64_t slots_hash = wp_worker_hash_fnv1a(nullptr, 0);
+        wp_worker_hash_device_bytes(
+            input_hash, work_input_trace_.input.buffer,
+            work_input_trace_.input.data, work_input_trace_.input.size);
+        for (const WorkInputBytes & bytes : work_input_trace_.params) {
+            wp_worker_hash_device_bytes(
+                params_hash, bytes.buffer, bytes.data, bytes.size);
+        }
+        for (const WorkInputBytes & bytes : work_input_trace_.slots) {
+            wp_worker_hash_device_bytes(
+                slots_hash, bytes.buffer, bytes.data, bytes.size);
+        }
+        const char * gcache = work_input_trace_.gcache == 1 ? "hit" :
+            work_input_trace_.gcache == 0 ? "miss" : "none";
+        const int gcache_hit = work_input_trace_.gcache == 1;
+        const int gcache_miss = work_input_trace_.gcache == 0;
+        std::fprintf(
+            stderr,
+            "WORKIN req=%llu layer=%d dev=%s n_pagein=%zu chunks=%zu "
+            "gcache=%s gcache_hit=%d gcache_miss=%d use_gather=%d n_slots=%zu "
+            "input_h=%llu params_h=%llu slots_h=%llu\n",
+            (unsigned long long) work_input_trace_.req,
+            work_input_trace_.layer, device_name_.c_str(),
+            work_input_trace_.n_pagein, work_input_trace_.chunks,
+            gcache, gcache_hit, gcache_miss,
+            work_input_trace_.use_gather ? 1 : 0,
+            work_input_trace_.slots.size(),
+            (unsigned long long) input_hash,
+            (unsigned long long) params_hash,
+            (unsigned long long) slots_hash);
     }
 
     enum ggml_status submit_graph(
@@ -8920,6 +9073,9 @@ private:
                 // Reusing graph/galloc state while the prior async graph runs
                 // can rewrite its live allocation; drain before the next submit.
                 synchronize_async(&request_stats);
+            }
+            if (is_cuda_backend()) {
+                emit_work_input_trace();
             }
             state.pending = true;
             if (is_vulkan_backend() || is_cuda_backend()) {
@@ -9675,8 +9831,20 @@ private:
                    (all_experts || (batch.is_resident(i) == hits));
         };
         size_t n_selected = 0;
+        std::vector<size_t> selected_indices;
+        const bool work_input_trace =
+            wp_worker_hash_trace_enabled() && submit_async_ && is_cuda_backend();
+        if (work_input_trace) {
+            selected_indices.reserve(request.assignments.size());
+        }
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            n_selected += selected(i) ? 1 : 0;
+            if (!selected(i)) {
+                continue;
+            }
+            ++n_selected;
+            if (work_input_trace) {
+                selected_indices.push_back(i);
+            }
         }
         if (n_selected == 0) {
             record_vk_setup();
@@ -10073,6 +10241,8 @@ private:
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - vk_rebind_started).count();
             }
+            begin_work_input_trace(
+                request, pages, batch, selected_indices, use_gather, 1);
             if (params_span > 0) {
                 const auto params_started = std::chrono::steady_clock::now();
                 if (submit_async_) {
@@ -10091,6 +10261,7 @@ private:
                 if (measure_vk) {
                     request_stats.ns_vk_params_set += params_elapsed;
                 }
+                add_work_input_trace_tensor(gc->blob);
             }
             enum ggml_status status = submit_graph(
                 gc->graph, request_stats, gc->persistent_plan);
@@ -10399,6 +10570,9 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - build_started).count();
 
+        begin_work_input_trace(
+            request, pages, batch, selected_indices, use_gather,
+            gc != nullptr ? 0 : -1);
         for (size_t k = 0; k < routing_weights.size(); ++k) {
             const auto & item = routing_weights[k];
             const auto & wv = item.second->weights;
@@ -10428,6 +10602,8 @@ private:
                     if (measure_vk) {
                         request_stats.ns_vk_params_set += params_elapsed;
                     }
+                    add_work_input_trace_tensor(item.first);
+                    add_work_input_trace_tensor(gather_idx[k].first);
                 }
             } else {
                 request_stats.n_weight_total += wv.size();
@@ -10442,6 +10618,7 @@ private:
                     if (measure_vk) {
                         request_stats.ns_vk_params_set += params_elapsed;
                     }
+                    add_work_input_trace_tensor(item.first);
                 }
             }
         }
@@ -10475,6 +10652,8 @@ private:
             if (measure_vk) {
                 request_stats.ns_vk_params_set += params_elapsed;
             }
+            add_work_input_trace_buffer(
+                params_buffer_.get(), ggml_backend_buffer_get_base(params_buffer_.get()), params_span);
         }
         // Warm the first request through the normal path. Vulkan may need to
         // allocate prealloc buffers while it records a graph; recording a plan
@@ -10602,6 +10781,8 @@ private:
         }
         const size_t n = sel.size();
         // compute_batch already returned early for n_selected == 0.
+        begin_work_input_trace(
+            request, pages, batch, sel, /* use_gather = */ false, -1);
 
         // One layer per request (pipe_expert_dispatch_req::layer is a single
         // field), so every selected page shares one RoleSpec map and one
@@ -11057,6 +11238,8 @@ private:
         if (measure_vk) {
             request_stats.ns_vk_params_set += params_elapsed;
         }
+        add_work_input_trace_tensor(ids);
+        add_work_input_trace_tensor(route_w);
 
         const enum ggml_status status = submit_graph(graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
@@ -11091,6 +11274,7 @@ private:
 
     bool compute_batch_arena_multi(
             const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
             const ExpertSlotPool::Batch & batch,
             RequestStats & request_stats,
             const ExpertSlotPool::ArenaLayout & layout,
@@ -11316,6 +11500,10 @@ private:
                 }
             }
         }
+        std::vector<size_t> trace_selected(n);
+        std::iota(trace_selected.begin(), trace_selected.end(), 0);
+        begin_work_input_trace(
+            request, pages, batch, trace_selected, /* use_gather = */ false, -1);
         const auto params_started = std::chrono::steady_clock::now();
         ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
         const uint64_t params_elapsed =
@@ -11325,6 +11513,7 @@ private:
         if (measure_vk) {
             request_stats.ns_vk_params_set += params_elapsed;
         }
+        add_work_input_trace_tensor(entry.blob);
         enum ggml_status status = submit_graph(
             entry.graph, request_stats, entry.persistent_plan);
         if (status != GGML_STATUS_SUCCESS && entry.persistent_plan != nullptr) {
@@ -11440,7 +11629,7 @@ private:
         // null when arenas.size() > 1 (live crash: ggml-backend.cpp:123).
         if (layout.arenas.size() > 1) {
             return compute_batch_arena_multi(
-                request, batch, request_stats, layout, roles, groups);
+                request, pages, batch, request_stats, layout, roles, groups);
         }
 
         const size_t params_align = ggml_backend_buft_get_alignment(
@@ -11665,6 +11854,11 @@ private:
         if (measure_vk) {
             request_stats.ns_vk_params_set += params_elapsed;
         }
+        std::vector<size_t> trace_selected(n);
+        std::iota(trace_selected.begin(), trace_selected.end(), 0);
+        begin_work_input_trace(
+            request, pages, batch, trace_selected, /* use_gather = */ false, -1);
+        add_work_input_trace_tensor(entry.blob);
 
         enum ggml_status status;
         if (entry.persistent_plan != nullptr) {
@@ -11701,6 +11895,9 @@ private:
                 }
             };
             const auto graph_compute = [&](bool use_hip_graph) {
+                if (submit_async_ && is_cuda_backend()) {
+                    emit_work_input_trace();
+                }
                 if (hip_graph_replay) {
                     if (use_hip_graph) {
                         setenv("WP_HIP_GRAPHS", "1", 1);
@@ -11984,6 +12181,9 @@ private:
     // repeating) and the numbers still look plausible but are NOT
     // bit-identical -- see the determinism note above WP_EXPERT_OVERLAP.
     void fold_resident_first_partials(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
             uint32_t n_tokens, size_t n_assign, size_t base_offset,
             size_t slot_size, RequestStats & request_stats) {
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
@@ -12033,6 +12233,10 @@ private:
         if (!ggml_gallocr_alloc_graph(compute_galloc_.get(), graph)) {
             throw std::runtime_error("failed to allocate resident-first fold graph");
         }
+        std::vector<size_t> trace_selected(n_assign);
+        std::iota(trace_selected.begin(), trace_selected.end(), 0);
+        begin_work_input_trace(
+            request, pages, batch, trace_selected, /* use_gather = */ false, -1);
         const enum ggml_status status = submit_graph(graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("resident-first fold graph compute failed");
@@ -12201,6 +12405,9 @@ private:
     WorkerStats    stats_;
     int            slots_ = 0;
     int            active_async_conn_index_ = -1;
+    uint64_t       active_trace_req_ = 0;
+    size_t         active_work_chunks_ = 1;
+    WorkInputTrace work_input_trace_;
     std::unordered_map<int, AsyncSubmitState> async_submit_state_by_conn_;
     // Keyed by conn_index -- see the long comment above begin_split_dispatch()
     // for why this must not be a single Worker-wide std::optional.
@@ -12612,7 +12819,7 @@ public:
         if (prepared.has_value() || !multi_device()) {
             std::lock_guard<std::mutex> lock(device_mutexes_.front());
             return devices_.front()->dispatch(
-                request, request_stats, std::move(prepared), conn_index);
+                request, request_stats, std::move(prepared), conn_index, trace_req);
         }
         validate_dispatch(request);
         note_dispatch_references(request);
@@ -12662,7 +12869,7 @@ public:
                         make_subrequest(request, group.begin, group.end);
                     std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                     partials[gi] = devices_[group.device]->dispatch(
-                        sub, sub_stats[gi], std::nullopt, conn_index);
+                        sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
                     if (wp_worker_hash_trace_enabled()) {
                         wp_worker_hash_emit(trace_req, request.layer,
                                             device_names_[group.device].c_str(),
@@ -12783,7 +12990,7 @@ public:
                 pipe_expert_dispatch_req sub = make_subrequest(request, group.begin, group.end);
                 std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                 partials[gi] = devices_[group.device]->dispatch(
-                    sub, sub_stats[gi], std::nullopt, conn_index);
+                    sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
                 if (wp_worker_hash_trace_enabled()) {
                     wp_worker_hash_emit(trace_req, request.layer,
                                         device_names_[group.device].c_str(),
@@ -12854,7 +13061,7 @@ public:
         if (!multi_device()) {
             std::lock_guard<std::mutex> lock(device_mutexes_.front());
             return devices_.front()->finish_split_dispatch(
-                acts, seq_id, request_stats, conn_index);
+                acts, seq_id, request_stats, conn_index, trace_req);
         }
         SplitPending pending;
         {
@@ -12895,7 +13102,7 @@ public:
                                                  &group, conn_index, trace_req, trace_layer] {
                     std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                     partial = devices_[group.device]->dispatch(
-                        sub_request, sub_stats, std::nullopt, conn_index);
+                        sub_request, sub_stats, std::nullopt, conn_index, trace_req);
                     if (wp_worker_hash_trace_enabled()) {
                         wp_worker_hash_emit(trace_req, trace_layer,
                                             device_names_[group.device].c_str(),
@@ -12909,7 +13116,7 @@ public:
             } else {
                 std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                 partial = devices_[group.device]->dispatch(
-                    sub_request, sub_stats, std::nullopt, conn_index);
+                    sub_request, sub_stats, std::nullopt, conn_index, trace_req);
                 if (wp_worker_hash_trace_enabled()) {
                     wp_worker_hash_emit(trace_req, trace_layer,
                                         device_names_[group.device].c_str(),
