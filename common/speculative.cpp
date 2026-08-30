@@ -2127,6 +2127,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // Per-call scratch. process() and draft() rebuild these before reading them.
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -2530,6 +2531,64 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_embd <= 0) {
+            return false;
+        }
+
+        const int32_t n_rows = verify_h_rows[seq_id];
+        const auto & pending = pending_h[seq_id];
+        const auto & verify  = verify_h[seq_id];
+        if (n_rows < 0 || pending.size() != (size_t) n_embd ||
+                verify.size() != (size_t) n_rows * (size_t) n_embd) {
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(n_rows) + row_bytes + verify.size() * sizeof(float));
+
+        size_t offset = 0;
+        std::memcpy(data.data() + offset, &n_rows, sizeof(n_rows));
+        offset += sizeof(n_rows);
+        std::memcpy(data.data() + offset, pending.data(), row_bytes);
+        offset += row_bytes;
+        if (!verify.empty()) {
+            std::memcpy(data.data() + offset, verify.data(), verify.size() * sizeof(float));
+        }
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_embd <= 0) {
+            return;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() < sizeof(int32_t) + row_bytes) {
+            return;
+        }
+
+        int32_t n_rows = 0;
+        std::memcpy(&n_rows, data.data(), sizeof(n_rows));
+        if (n_rows < 0) {
+            return;
+        }
+
+        const size_t verify_size = (size_t) n_rows * (size_t) n_embd;
+        if (data.size() != sizeof(n_rows) + row_bytes + verify_size * sizeof(float)) {
+            return;
+        }
+
+        pending_h[seq_id].resize(n_embd);
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(n_rows), row_bytes);
+
+        verify_h[seq_id].resize(verify_size);
+        if (!verify_h[seq_id].empty()) {
+            std::memcpy(verify_h[seq_id].data(), data.data() + sizeof(n_rows) + row_bytes, verify_h[seq_id].size() * sizeof(float));
+        }
+        verify_h_rows[seq_id] = n_rows;
     }
 
     bool need_embd_nextn() const override {

@@ -4623,6 +4623,8 @@ private:
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.stream_slot_idx),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.stream_slot_idx));
+                        slot.spec_ckpt.data_spec.clear();
+                        common_speculative_get_state(spec, slot.stream_slot_idx, slot.spec_ckpt.data_spec);
 
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -5983,6 +5985,7 @@ private:
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
+                        common_speculative_set_state(spec, slot.stream_slot_idx, ckpt.data_spec);
 
                         if (segment_client && segment_client->has_remote_segments()) {
                             segment_client->trim(segment_session_id, segment_cache_epoch,

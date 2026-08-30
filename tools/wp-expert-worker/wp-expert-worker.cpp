@@ -110,12 +110,20 @@ bool parse_env_default_off(const char * env) {
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+static bool wp_persistent_graphs_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("WP_PERSISTENT_GRAPHS");
+        return env != nullptr && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 static bool wp_hip_graphs_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("WP_HIP_GRAPHS");
         return env != nullptr && std::strcmp(env, "1") == 0;
     }();
-    return enabled;
+    return enabled || wp_persistent_graphs_enabled();
 }
 
 bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool gather_enabled) {
@@ -2479,8 +2487,17 @@ Catalog & layout_sliced_pages(
     }
     uint64_t slot_alignment = alignment;
     const char * const arena_env = std::getenv("WP_EXPERT_ARENA_ID");
+    const ggml_backend_dev_t buft_device = ggml_backend_buft_get_device(buft);
+    const char * const buft_device_name = buft_device != nullptr
+        ? ggml_backend_dev_name(buft_device) : nullptr;
+    const bool persistent_gpu = wp_persistent_graphs_enabled() &&
+        buft_device != nullptr &&
+        buft_device_name != nullptr &&
+        (std::strstr(buft_device_name, "ROCm") != nullptr ||
+         std::strstr(buft_device_name, "CUDA") != nullptr);
     const bool arena_requested =
-        arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1;
+        (arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1) ||
+        persistent_gpu;
     if (arena_requested) {
         // CUDA/HIP converts quantized nb[2] from bytes to blocks. Keep that conversion exact.
         for (const auto & layer : catalog.descriptor.layers) {
@@ -6119,7 +6136,13 @@ private:
         // Arena ids need one base+stride address space because a ggml tensor cannot cross backend buffers.
         const char * const arena_env = std::getenv("WP_EXPERT_ARENA_ID");
         const char * const backend_name = ggml_backend_name(backend_);
-        const bool single_id_arena = arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1 &&
+        const bool persistent_gpu = wp_persistent_graphs_enabled() &&
+            backend_name != nullptr &&
+            (std::strstr(backend_name, "ROCm") != nullptr ||
+             std::strstr(backend_name, "CUDA") != nullptr);
+        const bool single_id_arena =
+            ((arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1) ||
+             persistent_gpu) &&
             backend_name != nullptr &&
             (std::strstr(backend_name, "ROCm") != nullptr ||
              std::strstr(backend_name, "CUDA") != nullptr ||
@@ -7053,6 +7076,8 @@ void attach_weight(
 
 class DeviceWorker {
 public:
+    ~DeviceWorker();
+
     struct split_pending {
         pipe_expert_dispatch_req request;
         std::optional<ExpertSlotPool::Batch> batch;
@@ -7939,7 +7964,8 @@ public:
             const ExpertSlotPool::Batch & batch) const {
         static const bool enabled = [] {
             const char * e = std::getenv("WP_EXPERT_ARENA_ID");
-            return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+            return (e != nullptr && std::strtol(e, nullptr, 10) == 1) ||
+                   wp_persistent_graphs_enabled();
         }();
         // *** ORDER MATTERS: the env gate is first and it short-circuits. ***
         // This used to evaluate ggml_backend_name(), the three strstr()s and
@@ -7957,10 +7983,14 @@ public:
             return false;
         }
         const char * const backend_name = ggml_backend_name(backend_.get());
+        if (wp_persistent_graphs_enabled() && backend_name != nullptr &&
+                std::strstr(backend_name, "Vulkan") != nullptr) {
+            return false;
+        }
         // Vulkan uses its MM mul_mat_id path for the strided arena view.
         const bool backend_supported = backend_name != nullptr &&
             (std::strstr(backend_name, "ROCm") != nullptr ||
-             std::strstr(backend_name, "CUDA") != nullptr ||
+             (wp_persistent_graphs_enabled() && std::strstr(backend_name, "CUDA") != nullptr) ||
              std::strstr(backend_name, "Vulkan") != nullptr);
         const std::optional<ExpertSlotPool::ArenaLayout> & layout_opt = pool_.arena_layout();
         if (!backend_supported || !layout_opt.has_value()) {
@@ -8157,9 +8187,11 @@ public:
         const std::chrono::steady_clock::time_point probe_started =
             measure ? std::chrono::steady_clock::now() :
                       std::chrono::steady_clock::time_point();
+        const bool arena_request =
+            !cpu_on_arrival_request && arena_id_eligible(request, batch);
         const bool grouped_gemv_request =
             !cpu_on_arrival_request &&
-            (grouped_gemv_eligible(request) || arena_id_eligible(request, batch));
+            (grouped_gemv_eligible(request) || arena_request);
         if (measure) {
             const uint64_t probe_ns =
                 (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -8208,6 +8240,8 @@ public:
             const char * e = std::getenv("WP_EXPERT_OVERLAP");
             return e != nullptr && e[0] == '1';   // default OFF = deterministic
         }();
+        const bool effective_overlap = overlap &&
+            !(wp_persistent_graphs_enabled() && arena_request);
         // WP_EXPERT_COMPUTE_CHUNKS=<n>: split the expert compute into n fixed
         // index chunks so all but the last can run while the tail of the page-in
         // reads is still in flight. 1 = the original strictly-serial path.
@@ -8333,7 +8367,7 @@ public:
                             resident_first_base_offset + i * resident_first_slot_size);
                     }
                 }
-            } else if (overlap && have_hits && !cpu_on_arrival_request) {
+            } else if (effective_overlap && have_hits && !cpu_on_arrival_request) {
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ false, request_stats);
@@ -8360,7 +8394,7 @@ public:
         // Chunk count is a tuning knob, not a correctness one: the summation
         // order is the same at every value, so arms differ only in speed. =1
         // restores the exact serial path.
-        if (!overlap && !resident_first_eligible && !cpu_on_arrival_request &&
+        if (!effective_overlap && !resident_first_eligible && !cpu_on_arrival_request &&
                 !request.assignments.empty()) {
             const size_t n_assign = request.assignments.size();
             // *** GATE ON THERE BEING READS TO HIDE UNDER. ***
@@ -8459,7 +8493,7 @@ public:
             fold_resident_first_partials(
                 request.n_tokens, request.assignments.size(),
                 resident_first_base_offset, resident_first_slot_size, request_stats);
-        } else if (overlap && have_pageins) {
+        } else if (effective_overlap && have_pageins) {
             compute_batch(
                 request, pages, batch, /* hits = */ false,
                 /* add_previous = */ have_hits, request_stats);
@@ -8716,6 +8750,20 @@ public:
         return name != nullptr && std::strstr(name, "Vulkan") != nullptr;
     }
 
+    ggml_backend_graph_plan_t create_persistent_plan(ggml_cgraph * graph) {
+        if (!wp_persistent_graphs_enabled() || !is_vulkan_backend()) {
+            return nullptr;
+        }
+        ggml_backend_graph_plan_t plan = ggml_backend_graph_plan_create(
+            backend_.get(), graph);
+        if (plan == nullptr) {
+            std::fprintf(stderr,
+                         "WARN wp expert worker: persistent Vulkan graph plan unavailable; "
+                         "using graph compute\n");
+        }
+        return plan;
+    }
+
     void record_stats(const RequestStats & request, size_t n_experts) {
         stats_.set_shield_stats(pool_.n_shield_hits(), pool_.n_shield_exhausted());
         stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
@@ -8819,11 +8867,13 @@ private:
         return async_submit_state_by_conn_.at(active_async_conn_index_);
     }
 
-    enum ggml_status submit_graph(ggml_cgraph * graph, RequestStats & request_stats) {
+    enum ggml_status submit_graph(
+            ggml_cgraph * graph, RequestStats & request_stats,
+            ggml_backend_graph_plan_t persistent_plan = nullptr) {
         if (submit_async_) {
             AsyncSubmitState & state = async_submit_state();
             if (is_vulkan_backend() && state.graph_pending) {
-                // Vulkan reuses graph build state, so drain before recording the next graph.
+                // Vulkan reuses graph state, so drain before the next submit.
                 synchronize_async(&request_stats);
             }
             state.pending = true;
@@ -8832,9 +8882,17 @@ private:
             }
         }
         const auto started = std::chrono::steady_clock::now();
-        const enum ggml_status status = submit_async_
-            ? ggml_backend_graph_compute_async(backend_.get(), graph)
-            : ggml_backend_graph_compute(backend_.get(), graph);
+        enum ggml_status status;
+        if (persistent_plan != nullptr) {
+            status = ggml_backend_graph_plan_compute(backend_.get(), persistent_plan);
+            if (!submit_async_) {
+                ggml_backend_synchronize(backend_.get());
+            }
+        } else {
+            status = submit_async_
+                ? ggml_backend_graph_compute_async(backend_.get(), graph)
+                : ggml_backend_graph_compute(backend_.get(), graph);
+        }
         const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
         request_stats.ns_submit += elapsed;
@@ -9645,7 +9703,8 @@ private:
         // Default ON: one tensor_set for routing weights (+ gather idx).
         // Byte-identical to the per-tensor path. Decode graph-cache requires it.
         static const bool s_params_coalesce =
-            parse_env_default_on(std::getenv("WP_EXPERT_PARAMS_COALESCE"));
+            parse_env_default_on(std::getenv("WP_EXPERT_PARAMS_COALESCE")) ||
+            wp_persistent_graphs_enabled();
         // D1 packing state (moved above the D2 cache: the hit path packs and
         // uploads without ever building a graph). Offsets are assigned in build
         // order; params_host mirrors the device span byte-for-byte (pad = 0).
@@ -9679,11 +9738,13 @@ private:
         // width-sliced pages. The helper uses the round-3 scratch layout and
         // accepts at most eight routed assignments per token.
         const bool grouped_gemv = grouped_gemv_eligible(request);
+        const bool persistent_graphs = wp_persistent_graphs_enabled();
         static const bool s_worker_collapse = [] {
             const char * e = std::getenv("WP_WORKER_COLLAPSE");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
         }();
         const bool d3_grouped =
+            !persistent_graphs &&
             (grouped_gemv || (s_batch_moe && !use_gather) || (s_worker_collapse && !use_gather)) &&
                 sel_begin == 0 &&
                 sel_end >= request.assignments.size() &&
@@ -9726,7 +9787,8 @@ private:
         // per expert, so those graphs now hit instead of rebuilding. Mixed
         // ranks (rare; one expert got 2 tokens, another 1) skip the cache.
         static const bool s_graph_cache =
-            parse_env_default_on(std::getenv("WP_EXPERT_GRAPH_CACHE"));
+            parse_env_default_on(std::getenv("WP_EXPERT_GRAPH_CACHE")) ||
+            wp_persistent_graphs_enabled();
         static const size_t s_graph_cache_max = [] {
             const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE_MAX");
             const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
@@ -9846,6 +9908,12 @@ private:
                 key.type_gate = (uint32_t) key_specs.at("gate").type;
                 key.type_up   = (uint32_t) key_specs.at("up").type;
                 key.type_down = (uint32_t) key_specs.at("down").type;
+                key.ne0_gate  = key_specs.at("gate").ne0;
+                key.ne1_gate  = key_specs.at("gate").ne1;
+                key.ne0_up    = key_specs.at("up").ne0;
+                key.ne1_up    = key_specs.at("up").ne1;
+                key.ne0_down  = key_specs.at("down").ne0;
+                key.ne1_down  = key_specs.at("down").ne1;
             }
             auto it = graph_cache_.find(key);
             // graph == nullptr marks a half-built entry (an exception hit the
@@ -9854,7 +9922,13 @@ private:
             if (it != graph_cache_.end() &&
                     (it->second.graph == nullptr ||
                      it->second.io_gen != io_gen_ ||
-                     it->second.params_gen != params_gen_)) {
+                     it->second.params_gen != params_gen_ ||
+                     it->second.io_buffer !=
+                         (io_active_ != nullptr ? io_active_ : io_buffer_.get()))) {
+                if (it->second.persistent_plan != nullptr) {
+                    ggml_backend_graph_plan_free(backend_.get(), it->second.persistent_plan);
+                    it->second.persistent_plan = nullptr;
+                }
                 graph_cache_.erase(it);
                 it = graph_cache_.end();
             }
@@ -9869,11 +9943,16 @@ private:
                             victim = j;
                         }
                     }
+                    if (victim->second.persistent_plan != nullptr) {
+                        ggml_backend_graph_plan_free(backend_.get(), victim->second.persistent_plan);
+                        victim->second.persistent_plan = nullptr;
+                    }
                     graph_cache_.erase(victim);
                 }
                 gc = &graph_cache_[key];
                 gc->io_gen = io_gen_;
                 gc->params_gen = params_gen_;
+                gc->io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
             }
             gc->last_used = ++graph_cache_tick_;
         }
@@ -9957,7 +10036,14 @@ private:
                     request_stats.ns_vk_params_set += params_elapsed;
                 }
             }
-            const enum ggml_status status = submit_graph(gc->graph, request_stats);
+            enum ggml_status status = submit_graph(
+                gc->graph, request_stats, gc->persistent_plan);
+            if (status != GGML_STATUS_SUCCESS && gc->persistent_plan != nullptr) {
+                ggml_backend_graph_plan_free(backend_.get(), gc->persistent_plan);
+                gc->persistent_plan = nullptr;
+                std::fprintf(stderr, "WARN wp expert worker: persistent Vulkan graph replay failed; retrying normal graph compute\n");
+                status = submit_graph(gc->graph, request_stats);
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 throw std::runtime_error("cached expert backend graph compute failed");
             }
@@ -10251,6 +10337,9 @@ private:
         if (ggml_gallocr_get_buffer_size(galloc, 0) > old_compute_size) {
             ++request_stats.n_device_allocs;
         }
+        if (gc != nullptr) {
+            gc->io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
+        }
         request_stats.ns_graph_build +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - build_started).count();
@@ -10332,15 +10421,29 @@ private:
                 request_stats.ns_vk_params_set += params_elapsed;
             }
         }
-        const enum ggml_status status = submit_graph(graph, request_stats);
+        // Warm the first request through the normal path. Vulkan may need to
+        // allocate prealloc buffers while it records a graph; recording a plan
+        // before that setup would leave this shape permanently on the fallback.
+        enum ggml_status status = submit_graph(graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
+            if (gc != nullptr) {
+                gc->graph = nullptr;
+            }
             throw std::runtime_error("batched expert backend graph compute failed");
+        }
+        if (gc != nullptr) {
+            gc->graph = graph;
+            if (wp_persistent_graphs_enabled() && is_vulkan_backend()) {
+                if (submit_async_) {
+                    synchronize_async(&request_stats);
+                } else {
+                    ggml_backend_synchronize(backend_.get());
+                }
+                gc->persistent_plan = create_persistent_plan(graph);
+            }
         }
         // D2: the entry becomes valid ONLY now -- a build that threw anywhere
         // above leaves graph == nullptr and the next lookup rebuilds it.
-        if (gc != nullptr) {
-            gc->graph = graph;
-        }
     }
 
     // WP_EXPERT_ARENA_ID=1 uses persistent grouped dispatch over the slot arena.
@@ -10986,8 +11089,13 @@ private:
                 (it->second.graph == nullptr ||
                  it->second.io_gen != io_gen_ ||
                  it->second.params_gen != params_gen_ ||
+                 it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get()) ||
                  it->second.clamp_bits != clamp_bits ||
                  it->second.roles != roles)) {
+            if (it->second.persistent_plan != nullptr) {
+                ggml_backend_graph_plan_free(backend_.get(), it->second.persistent_plan);
+                it->second.persistent_plan = nullptr;
+            }
             arena_graph_cache_.erase(it);
             it = arena_graph_cache_.end();
         }
@@ -11005,6 +11113,10 @@ private:
                         victim = j;
                     }
                 }
+                if (victim->second.persistent_plan != nullptr) {
+                    ggml_backend_graph_plan_free(backend_.get(), victim->second.persistent_plan);
+                    victim->second.persistent_plan = nullptr;
+                }
                 arena_graph_cache_.erase(victim);
             }
             it = arena_graph_cache_.emplace(key, ArenaGraphEntry{}).first;
@@ -11013,6 +11125,7 @@ private:
             entry.clamp_bits = clamp_bits;
             entry.io_gen = io_gen_;
             entry.params_gen = params_gen_;
+            entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
             ++request_stats.n_arena_build;
 
             const auto build_started = std::chrono::steady_clock::now();
@@ -11114,6 +11227,7 @@ private:
             entry.blob = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) params_span);
             attach_weight(entry.blob, params_buffer_.get(),
                           ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            entry.persistent_plan = create_persistent_plan(graph);
             entry.graph = graph;
             request_stats.ns_graph_build +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -11153,8 +11267,13 @@ private:
         if (measure_vk) {
             request_stats.ns_vk_params_set += params_elapsed;
         }
-        const enum ggml_status status = submit_graph(entry.graph, request_stats);
+        const enum ggml_status status = submit_graph(
+            entry.graph, request_stats, entry.persistent_plan);
         if (status != GGML_STATUS_SUCCESS) {
+            if (entry.persistent_plan != nullptr) {
+                ggml_backend_graph_plan_free(backend_.get(), entry.persistent_plan);
+                entry.persistent_plan = nullptr;
+            }
             entry.graph = nullptr;
             throw std::runtime_error("multi-arena expert backend graph compute failed");
         }
@@ -11285,11 +11404,15 @@ private:
         // (n-1) ggml_add nodes; hip_graph_replay additionally requires
         // fold_collapse and opts this bucket's graph into HIP graph
         // capture/replay (see the capture-then-replay state machine below).
-        static const bool fold_collapse = [] {
+        static const bool fold_collapse_env = [] {
             const char * e = std::getenv("WP_ARENA_FOLD_COLLAPSE");
             return e != nullptr && e[0] == '1';
         }();
+        const bool fold_collapse = !wp_persistent_graphs_enabled() && fold_collapse_env;
         static const bool hip_graph_replay = [] {
+            if (wp_persistent_graphs_enabled()) {
+                return false;
+            }
             const char * fold = std::getenv("WP_ARENA_FOLD_COLLAPSE");
             const char * graph = std::getenv("WP_ARENA_HIP_GRAPH");
             return fold != nullptr && fold[0] == '1' &&
@@ -11304,8 +11427,13 @@ private:
                 (it->second.graph == nullptr ||
                  it->second.io_gen != io_gen_ ||
                  it->second.params_gen != params_gen_ ||
+                 it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get()) ||
                  it->second.clamp_bits != clamp_bits ||
                  it->second.roles != roles)) {
+            if (it->second.persistent_plan != nullptr) {
+                ggml_backend_graph_plan_free(backend_.get(), it->second.persistent_plan);
+                it->second.persistent_plan = nullptr;
+            }
             arena_graph_cache_.erase(it);
             it = arena_graph_cache_.end();
         }
@@ -11323,6 +11451,10 @@ private:
                         victim = j;
                     }
                 }
+                if (victim->second.persistent_plan != nullptr) {
+                    ggml_backend_graph_plan_free(backend_.get(), victim->second.persistent_plan);
+                    victim->second.persistent_plan = nullptr;
+                }
                 arena_graph_cache_.erase(victim);
             }
             it = arena_graph_cache_.emplace(key, ArenaGraphEntry{}).first;
@@ -11331,6 +11463,7 @@ private:
             entry.clamp_bits = clamp_bits;
             entry.io_gen = io_gen_;
             entry.params_gen = params_gen_;
+            entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
             ++request_stats.n_arena_build;
 
             const auto build_started = std::chrono::steady_clock::now();
@@ -11436,6 +11569,7 @@ private:
             entry.blob = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) params_span);
             attach_weight(entry.blob, params_buffer_.get(),
                           ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            entry.persistent_plan = create_persistent_plan(graph);
             entry.graph = graph;
             request_stats.ns_graph_build +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -11465,99 +11599,100 @@ private:
             request_stats.ns_vk_params_set += params_elapsed;
         }
 
-        // *** ONLY TOUCH THE ENVIRONMENT WHEN HIP GRAPH REPLAY IS ARMED. ***
-        // This block used to run on EVERY arena submit: two getenv, two
-        // std::string constructions, and -- inside graph_compute() below --
-        // an unconditional restore_graph_env() doing setenv/unsetenv, which
-        // take a process-global lock and can reallocate `environ`. On Vulkan
-        // (and on any worker without WP_ARENA_HIP_GRAPH) hip_graph_replay is
-        // false and none of it can change anything, yet the setenv pair sat
-        // INSIDE the ns_submit / ns_vk_graph_compute timer on the decode
-        // critical path. Guarded now; hip_graph_replay is a static, so the
-        // whole block folds away for a worker that never arms replay.
-        const bool hip_env_active = hip_graph_replay;
-        const char * const saved_hip_graphs =
-            hip_env_active ? std::getenv("WP_HIP_GRAPHS") : nullptr;
-        const bool saved_hip_graphs_set = saved_hip_graphs != nullptr;
-        const std::string saved_hip_graphs_value =
-            saved_hip_graphs_set ? saved_hip_graphs : "";
-        const char * const saved_disable_graphs =
-            hip_env_active ? std::getenv("GGML_CUDA_DISABLE_GRAPHS") : nullptr;
-        const bool saved_disable_graphs_set = saved_disable_graphs != nullptr;
-        const std::string saved_disable_graphs_value =
-            saved_disable_graphs_set ? saved_disable_graphs : "";
-        const bool hip_graph_attempt = hip_graph_replay &&
-            !entry.hip_graph_failed && !saved_disable_graphs_set;
-        const auto restore_graph_env = [&]() {
-            if (!hip_env_active) {
-                return;
-            }
-            if (saved_hip_graphs_set) {
-                setenv("WP_HIP_GRAPHS", saved_hip_graphs_value.c_str(), 1);
-            } else {
-                unsetenv("WP_HIP_GRAPHS");
-            }
-            if (saved_disable_graphs_set) {
-                setenv("GGML_CUDA_DISABLE_GRAPHS", saved_disable_graphs_value.c_str(), 1);
-            } else {
-                unsetenv("GGML_CUDA_DISABLE_GRAPHS");
-            }
-        };
-        const auto graph_compute = [&](bool use_hip_graph) {
-            if (hip_graph_replay) {
-                if (use_hip_graph) {
-                    setenv("WP_HIP_GRAPHS", "1", 1);
-                } else {
-                    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+        enum ggml_status status;
+        if (entry.persistent_plan != nullptr) {
+            status = submit_graph(entry.graph, request_stats, entry.persistent_plan);
+        } else {
+            // *** ONLY TOUCH THE ENVIRONMENT WHEN HIP GRAPH REPLAY IS ARMED. ***
+            // The eager path remains unchanged when the persistent flag is off.
+            const bool hip_env_active = hip_graph_replay;
+            const char * const saved_hip_graphs =
+                hip_env_active ? std::getenv("WP_HIP_GRAPHS") : nullptr;
+            const bool saved_hip_graphs_set = saved_hip_graphs != nullptr;
+            const std::string saved_hip_graphs_value =
+                saved_hip_graphs_set ? saved_hip_graphs : "";
+            const char * const saved_disable_graphs =
+                hip_env_active ? std::getenv("GGML_CUDA_DISABLE_GRAPHS") : nullptr;
+            const bool saved_disable_graphs_set = saved_disable_graphs != nullptr;
+            const std::string saved_disable_graphs_value =
+                saved_disable_graphs_set ? saved_disable_graphs : "";
+            const bool hip_graph_attempt = hip_graph_replay &&
+                !entry.hip_graph_failed && !saved_disable_graphs_set;
+            const auto restore_graph_env = [&]() {
+                if (!hip_env_active) {
+                    return;
                 }
-            }
-            const auto result = ggml_backend_graph_compute(backend_.get(), entry.graph);
-            restore_graph_env();
-            return result;
-        };
-        const auto submit_started = std::chrono::steady_clock::now();
-        enum ggml_status status = graph_compute(hip_graph_attempt);
-        const uint64_t submit_elapsed =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - submit_started).count();
-        request_stats.ns_submit += submit_elapsed;
-        if (measure_vk) {
-            request_stats.ns_vk_graph_compute += submit_elapsed;
-        }
-        ++request_stats.n_graph_submits;
-        if (status != GGML_STATUS_SUCCESS && hip_graph_attempt) {
-            // Graph capture is an optional optimization. Retry this bucket
-            // eagerly and keep it on the eager path for the process lifetime.
-            entry.hip_graph_failed = true;
-            entry.hip_graph_submits = 0;
-            std::fprintf(stderr,
-                         "WARN wp expert worker: HIP graph disabled for arena bucket "
-                         "tokens=%u assignments=%u clamp_bits=%u\n",
-                         request.n_tokens, (unsigned) n, clamp_bits);
-            const auto fallback_started = std::chrono::steady_clock::now();
-            status = graph_compute(false);
-            const uint64_t fallback_elapsed =
+                if (saved_hip_graphs_set) {
+                    setenv("WP_HIP_GRAPHS", saved_hip_graphs_value.c_str(), 1);
+                } else {
+                    unsetenv("WP_HIP_GRAPHS");
+                }
+                if (saved_disable_graphs_set) {
+                    setenv("GGML_CUDA_DISABLE_GRAPHS", saved_disable_graphs_value.c_str(), 1);
+                } else {
+                    unsetenv("GGML_CUDA_DISABLE_GRAPHS");
+                }
+            };
+            const auto graph_compute = [&](bool use_hip_graph) {
+                if (hip_graph_replay) {
+                    if (use_hip_graph) {
+                        setenv("WP_HIP_GRAPHS", "1", 1);
+                    } else {
+                        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+                    }
+                }
+                const auto result = ggml_backend_graph_compute(backend_.get(), entry.graph);
+                restore_graph_env();
+                return result;
+            };
+            const auto submit_started = std::chrono::steady_clock::now();
+            status = graph_compute(hip_graph_attempt);
+            const uint64_t submit_elapsed =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - fallback_started).count();
-            request_stats.ns_submit += fallback_elapsed;
+                    std::chrono::steady_clock::now() - submit_started).count();
+            request_stats.ns_submit += submit_elapsed;
             if (measure_vk) {
-                request_stats.ns_vk_graph_compute += fallback_elapsed;
+                request_stats.ns_vk_graph_compute += submit_elapsed;
             }
             ++request_stats.n_graph_submits;
+            if (status != GGML_STATUS_SUCCESS && hip_graph_attempt) {
+                // Graph capture is an optional optimization. Retry this bucket
+                // eagerly and keep it on the eager path for the process lifetime.
+                entry.hip_graph_failed = true;
+                entry.hip_graph_submits = 0;
+                std::fprintf(stderr,
+                             "WARN wp expert worker: HIP graph disabled for arena bucket "
+                             "tokens=%u assignments=%u clamp_bits=%u\n",
+                             request.n_tokens, (unsigned) n, clamp_bits);
+                const auto fallback_started = std::chrono::steady_clock::now();
+                status = graph_compute(false);
+                const uint64_t fallback_elapsed =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - fallback_started).count();
+                request_stats.ns_submit += fallback_elapsed;
+                if (measure_vk) {
+                    request_stats.ns_vk_graph_compute += fallback_elapsed;
+                }
+                ++request_stats.n_graph_submits;
+            }
+            if (status == GGML_STATUS_SUCCESS && hip_graph_attempt) {
+                if (entry.hip_graph_submits == 0) {
+                    entry.hip_graph_submits = 1;
+                } else if (entry.hip_graph_submits == 1) {
+                    ++request_stats.n_hipgraph_capture;
+                    entry.hip_graph_submits = 2;
+                } else {
+                    ++request_stats.n_hipgraph_replay;
+                }
+            }
         }
         if (status != GGML_STATUS_SUCCESS) {
+            if (entry.persistent_plan != nullptr) {
+                ggml_backend_graph_plan_free(backend_.get(), entry.persistent_plan);
+                entry.persistent_plan = nullptr;
+            }
             entry.graph = nullptr;
             throw std::runtime_error("arena expert backend graph compute failed");
-        }
-        if (hip_graph_attempt) {
-            if (entry.hip_graph_submits == 0) {
-                entry.hip_graph_submits = 1;
-            } else if (entry.hip_graph_submits == 1) {
-                ++request_stats.n_hipgraph_capture;
-                entry.hip_graph_submits = 2;
-            } else {
-                ++request_stats.n_hipgraph_replay;
-            }
         }
         ++request_stats.n_arena_hit;
         request_stats.n_arena_groups += groups.size();
@@ -11857,7 +11992,9 @@ private:
         context_ptr                 ctx;
         galloc_ptr                  galloc;
         ggml_cgraph *               graph = nullptr;
+        ggml_backend_graph_plan_t   persistent_plan = nullptr;
         ggml_tensor *               blob = nullptr;
+        ggml_backend_buffer_t       io_buffer = nullptr;
         std::array<ArenaRoleKey, 3> roles;
         uint32_t                    clamp_bits = 0;
         uint64_t                    io_gen = 0;
@@ -11896,22 +12033,31 @@ private:
         uint32_t type_gate = 0;
         uint32_t type_up   = 0;
         uint32_t type_down = 0;
+        int64_t  ne0_gate = 0, ne1_gate = 0;
+        int64_t  ne0_up = 0, ne1_up = 0;
+        int64_t  ne0_down = 0, ne1_down = 0;
         // WP_EXPERT_FUSE_GATE_UP: a fused graph has ONE [ne0, 2*ne1] weight per
         // expert where an unfused one has two, so the two shapes must never
         // share a cache entry (same failure mode as the type fields above).
         bool     fused_gate_up = false;
         bool operator<(const GraphKey & o) const {
             return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
-                            type_gate, type_up, type_down, fused_gate_up) <
+                            type_gate, type_up, type_down,
+                            ne0_gate, ne1_gate, ne0_up, ne1_up, ne0_down, ne1_down,
+                            fused_gate_up) <
                    std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits,
-                            o.type_gate, o.type_up, o.type_down, o.fused_gate_up);
+                            o.type_gate, o.type_up, o.type_down,
+                            o.ne0_gate, o.ne1_gate, o.ne0_up, o.ne1_up,
+                            o.ne0_down, o.ne1_down, o.fused_gate_up);
         }
     };
     struct GraphCacheEntry {
         context_ptr   ctx;
         galloc_ptr    galloc;
         ggml_cgraph * graph = nullptr;
+        ggml_backend_graph_plan_t persistent_plan = nullptr;
         ggml_tensor * blob  = nullptr;
+        ggml_backend_buffer_t io_buffer = nullptr;
         // gate,up,down per expert, flat. When fused_gate_up is set the slot
         // for `up` holds nullptr and slot `gate` holds the [ne0, 2*ne1] view.
         std::vector<ggml_tensor *> expert_w;
@@ -11977,6 +12123,24 @@ private:
     // for why this must not be a single Worker-wide std::optional.
     std::unordered_map<int, split_pending> split_pending_by_conn_;
 };
+
+DeviceWorker::~DeviceWorker() {
+    if (backend_ == nullptr) {
+        return;
+    }
+    for (auto & kv : graph_cache_) {
+        if (kv.second.persistent_plan != nullptr) {
+            ggml_backend_graph_plan_free(backend_.get(), kv.second.persistent_plan);
+            kv.second.persistent_plan = nullptr;
+        }
+    }
+    for (auto & kv : arena_graph_cache_) {
+        if (kv.second.persistent_plan != nullptr) {
+            ggml_backend_graph_plan_free(backend_.get(), kv.second.persistent_plan);
+            kv.second.persistent_plan = nullptr;
+        }
+    }
+}
 
 static void accumulate_request_stats(RequestStats & dst, const RequestStats & src) {
     dst.ns_lookup += src.ns_lookup;
@@ -14745,7 +14909,8 @@ int run(const Options & options) {
     // Capture stays available only when WP_HIP_GRAPHS=1 selects the stable-key path.
     {
         const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
-        if (wp_graphs == nullptr || wp_graphs[0] != '1') {
+        if ((wp_graphs == nullptr || wp_graphs[0] != '1') &&
+                !wp_persistent_graphs_enabled()) {
             if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
                 setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
             }
@@ -15132,7 +15297,8 @@ make_inproc_backend(const pipe_expert_dispatcher::endpoint & target) {
         }
         {
             const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
-            if (wp_graphs == nullptr || wp_graphs[0] != '1') {
+            if ((wp_graphs == nullptr || wp_graphs[0] != '1') &&
+                    !wp_persistent_graphs_enabled()) {
                 if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
                     setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
                 }
