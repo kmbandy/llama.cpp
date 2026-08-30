@@ -2230,7 +2230,6 @@ struct ggml_backend_vk_graph_plan {
     ggml_backend_vk_context * owner = nullptr;
     vk_command_pool command_pool;
     std::vector<vk_context> contexts;
-    std::vector<vk_buffer> retained_buffers;
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;
     std::vector<descriptor_update> descriptor_updates;
@@ -8653,6 +8652,11 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         ggml_backend_vk_graph_plan::descriptor_update update;
         update.descriptor_set = descriptor_set;
         update.sources.assign(descriptor_buffers.begin(), descriptor_buffers.end());
+        for (vk_subbuffer & source : update.sources) {
+            if (source.tensor != nullptr) {
+                source.buffer.reset();
+            }
+        }
         ctx->recording_plan->descriptor_updates.push_back(std::move(update));
     }
 
@@ -19554,29 +19558,6 @@ static void ggml_vk_graph_plan_release(
     plan->descriptor_sets.clear();
     plan->descriptor_updates.clear();
     plan->contexts.clear();
-    plan->retained_buffers.clear();
-}
-
-static void ggml_vk_graph_plan_retain_buffer(
-        ggml_backend_vk_graph_plan * plan, ggml_backend_buffer_t buffer) {
-    if (buffer == nullptr || !ggml_backend_buffer_is_vk(buffer)) {
-        return;
-    }
-    ggml_backend_vk_buffer_context * buffer_ctx =
-        (ggml_backend_vk_buffer_context *) buffer->context;
-    if (buffer_ctx->dev_buffer != nullptr) {
-        plan->retained_buffers.push_back(buffer_ctx->dev_buffer);
-    }
-}
-
-static void ggml_vk_graph_plan_retain_tensor(
-        ggml_backend_vk_graph_plan * plan, const ggml_tensor * tensor) {
-    if (tensor == nullptr) {
-        return;
-    }
-    ggml_vk_graph_plan_retain_buffer(plan, tensor->buffer);
-    ggml_vk_graph_plan_retain_buffer(plan,
-                                     tensor->view_src != nullptr ? tensor->view_src->buffer : nullptr);
 }
 
 static ggml_backend_graph_plan_t ggml_backend_vk_graph_plan_create(
@@ -19589,11 +19570,11 @@ static ggml_backend_graph_plan_t ggml_backend_vk_graph_plan_create(
         return nullptr;
     }
 
-    std::unique_ptr<ggml_backend_vk_graph_plan> plan(
-        new ggml_backend_vk_graph_plan);
-    plan->owner = ctx;
+    std::unique_ptr<ggml_backend_vk_graph_plan> plan;
 
     try {
+        plan.reset(new ggml_backend_vk_graph_plan);
+        plan->owner = ctx;
         plan->command_pool.init(ctx->device, ctx->device->compute_queue.get());
         ctx->recording_plan = plan.get();
         const ggml_status status = ggml_backend_vk_graph_compute(
@@ -19646,25 +19627,13 @@ static ggml_backend_graph_plan_t ggml_backend_vk_graph_plan_create(
 
         ggml_vk_graph_cleanup(ctx);
 
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            const ggml_tensor * node = cgraph->nodes[i];
-            ggml_vk_graph_plan_retain_tensor(plan.get(), node);
-            for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
-                ggml_vk_graph_plan_retain_tensor(plan.get(), node->src[j]);
-            }
-        }
-        plan->retained_buffers.push_back(ctx->prealloc_x);
-        plan->retained_buffers.push_back(ctx->prealloc_y);
-        plan->retained_buffers.push_back(ctx->prealloc_split_k);
-        plan->retained_buffers.push_back(ctx->prealloc_add_rms_partials);
-        plan->retained_buffers.push_back(ctx->sync_staging);
-        plan->retained_buffers.push_back(ctx->prealloc_wp_expert_off);
-
         return plan.release();
     } catch (...) {
         ctx->recording_plan = nullptr;
         ggml_vk_graph_cleanup(ctx);
-        ggml_vk_graph_plan_release(ctx, plan.get());
+        if (plan != nullptr) {
+            ggml_vk_graph_plan_release(ctx, plan.get());
+        }
         return nullptr;
     }
 }
@@ -19696,13 +19665,17 @@ static enum ggml_status ggml_backend_vk_graph_plan_compute(
         return GGML_STATUS_FAILED;
     }
 
-    if (!ctx->compute_ctx.expired() || ctx->submit_pending || ctx->fence_submitted) {
-        ggml_vk_synchronize(ctx);
+    try {
+        if (!ctx->compute_ctx.expired() || ctx->submit_pending || ctx->fence_submitted) {
+            ggml_vk_synchronize(ctx);
+        }
+        ggml_vk_submit_transfer_ctx(ctx);
+        ggml_vk_graph_plan_update_descriptors(ctx, plan);
+        return ggml_vk_submit_graph_plan(ctx, plan)
+            ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+    } catch (...) {
+        return GGML_STATUS_FAILED;
     }
-    ggml_vk_submit_transfer_ctx(ctx);
-    ggml_vk_graph_plan_update_descriptors(ctx, plan);
-    return ggml_vk_submit_graph_plan(ctx, plan)
-        ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 
 // Sort the graph for improved parallelism.
