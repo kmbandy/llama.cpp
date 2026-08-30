@@ -572,3 +572,159 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         } break;
     }
 }
+
+// ---------------------------------------------------------------------------
+// fused broadcast multiply-add: dst = (a * b) + c
+//
+// Replaces the {REPEAT(_4D), MUL, ADD} and {MUL, ADD} chains with a single pass
+// over dst. The repeated operand is *not* materialized: it is read straight out
+// of the small source with modulo (tiling) indexing, which is exactly what
+// ggml_repeat / ggml's implicit binary broadcast do.
+//
+// BIT-EXACTNESS: the multiply and the add stay two separately rounded IEEE-754
+// binary32 operations, in the original order, and are never contracted into an
+// FMA (see wp_bcast_mul_add). Restricted to all-F32 operands/dst so that the
+// intermediate the unfused chain wrote to memory was itself a float -- i.e. the
+// elided store/load pair was value-preserving.
+// ---------------------------------------------------------------------------
+
+// mul_first: true  -> the unfused ADD had the MUL result as src[0]  => (a*b) + c
+//            false -> the unfused ADD had the MUL result as src[1]  => c + (a*b)
+template <bool mul_first>
+static __device__ __forceinline__ float wp_bcast_mul_add(const float a, const float b, const float c) {
+#if defined(__clang__)
+    // clang (incl. hipcc / clang-CUDA) defaults to -ffp-contract=fast for device
+    // code; turn it off for these two operations so no FMA is formed. The pragma
+    // has to live in the same function body as the arithmetic to bind to it.
+#pragma clang fp contract(off)
+    const float m = a * b;
+    return mul_first ? (m + c) : (c + m);
+#else
+    // nvcc: __fmul_rn / __fadd_rn are true round-to-nearest-even intrinsics and
+    // are not contractible regardless of --fmad.
+    const float m = __fmul_rn(a, b);
+    return mul_first ? __fadd_rn(m, c) : __fadd_rn(c, m);
+#endif
+}
+
+// per-operand broadcast descriptor: the operand's own extents (as fastdiv
+// triples, for the modulo) plus its element strides
+struct wp_bcast_src {
+    uint3    ne0, ne1, ne2, ne3;
+    uint32_t s0, s1, s2, s3;
+};
+
+static __device__ __forceinline__ size_t wp_bcast_offset(const wp_bcast_src & s,
+                                                         const uint32_t i0, const uint32_t i1,
+                                                         const uint32_t i2, const uint32_t i3) {
+    return size_t(fastmodulo(i0, s.ne0)) * s.s0 +
+           size_t(fastmodulo(i1, s.ne1)) * s.s1 +
+           size_t(fastmodulo(i2, s.ne2)) * s.s2 +
+           size_t(fastmodulo(i3, s.ne3)) * s.s3;
+}
+
+template <bool mul_first>
+static __global__ void k_bcast_mul_add(const float *      a,
+                                       const float *      b,
+                                       const float *      c,
+                                       float *            dst,
+                                       const wp_bcast_src sa,
+                                       const wp_bcast_src sb,
+                                       const wp_bcast_src sc,
+                                       const uint3        ne0,
+                                       const uint3        prod_01,
+                                       const uint3        prod_012,
+                                       const uint32_t     ne_total) {
+    ggml_cuda_pdl_lc();
+
+    const uint32_t stride = blockDim.x * gridDim.x;
+
+    ggml_cuda_pdl_sync();
+
+    for (uint32_t i = blockDim.x * blockIdx.x + threadIdx.x; i < ne_total; i += stride) {
+        const uint32_t i3 = fastdiv(i, prod_012);
+        const uint32_t r3 = i - i3 * prod_012.z;
+        const uint32_t i2 = fastdiv(r3, prod_01);
+        const uint32_t r2 = r3 - i2 * prod_01.z;
+        const uint32_t i1 = fastdiv(r2, ne0);
+        const uint32_t i0 = r2 - i1 * ne0.z;
+
+        const float va = a[wp_bcast_offset(sa, i0, i1, i2, i3)];
+        const float vb = b[wp_bcast_offset(sb, i0, i1, i2, i3)];
+        const float vc = c[wp_bcast_offset(sc, i0, i1, i2, i3)];
+
+        dst[i] = wp_bcast_mul_add<mul_first>(va, vb, vc);
+    }
+}
+
+static wp_bcast_src wp_make_bcast_src(const ggml_tensor * t) {
+    wp_bcast_src s;
+
+    s.ne0 = init_fastdiv_values((uint32_t) t->ne[0]);
+    s.ne1 = init_fastdiv_values((uint32_t) t->ne[1]);
+    s.ne2 = init_fastdiv_values((uint32_t) t->ne[2]);
+    s.ne3 = init_fastdiv_values((uint32_t) t->ne[3]);
+
+    GGML_ASSERT(t->nb[0] % sizeof(float) == 0);
+    GGML_ASSERT(t->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(t->nb[2] % sizeof(float) == 0);
+    GGML_ASSERT(t->nb[3] % sizeof(float) == 0);
+
+    const size_t s0 = t->nb[0] / sizeof(float);
+    const size_t s1 = t->nb[1] / sizeof(float);
+    const size_t s2 = t->nb[2] / sizeof(float);
+    const size_t s3 = t->nb[3] / sizeof(float);
+
+    GGML_ASSERT(s0 <= std::numeric_limits<uint32_t>::max());
+    GGML_ASSERT(s1 <= std::numeric_limits<uint32_t>::max());
+    GGML_ASSERT(s2 <= std::numeric_limits<uint32_t>::max());
+    GGML_ASSERT(s3 <= std::numeric_limits<uint32_t>::max());
+
+    s.s0 = (uint32_t) s0;
+    s.s1 = (uint32_t) s1;
+    s.s2 = (uint32_t) s2;
+    s.s3 = (uint32_t) s3;
+
+    return s;
+}
+
+void ggml_cuda_op_fused_bcast_mul_add(ggml_backend_cuda_context & ctx,
+                                      const ggml_tensor *         a,
+                                      const ggml_tensor *         b,
+                                      const ggml_tensor *         c,
+                                      ggml_tensor *               dst,
+                                      const bool                  mul_first) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t ne_total_64 = ggml_nelements(dst);
+    GGML_ASSERT(ne_total_64 > 0);
+    GGML_ASSERT(ne_total_64 <= (int64_t) std::numeric_limits<uint32_t>::max());
+
+    const uint32_t ne_total = (uint32_t) ne_total_64;
+
+    const uint3 ne0      = init_fastdiv_values((uint32_t) dst->ne[0]);
+    const uint3 prod_01  = init_fastdiv_values((uint32_t) (dst->ne[0] * dst->ne[1]));
+    const uint3 prod_012 = init_fastdiv_values((uint32_t) (dst->ne[0] * dst->ne[1] * dst->ne[2]));
+
+    const wp_bcast_src sa = wp_make_bcast_src(a);
+    const wp_bcast_src sb = wp_make_bcast_src(b);
+    const wp_bcast_src sc = wp_make_bcast_src(c);
+
+    const int      block_size = 256;
+    const uint32_t block_num  = std::min<uint32_t>((ne_total + block_size - 1) / block_size, 65535u * 8u);
+
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(dim3(block_num), dim3(block_size), 0, ctx.stream());
+
+    if (mul_first) {
+        ggml_cuda_kernel_launch(k_bcast_mul_add<true>, launch_params,
+            (const float *) a->data, (const float *) b->data, (const float *) c->data, (float *) dst->data,
+            sa, sb, sc, ne0, prod_01, prod_012, ne_total);
+    } else {
+        ggml_cuda_kernel_launch(k_bcast_mul_add<false>, launch_params,
+            (const float *) a->data, (const float *) b->data, (const float *) c->data, (float *) dst->data,
+            sa, sb, sc, ne0, prod_01, prod_012, ne_total);
+    }
+}

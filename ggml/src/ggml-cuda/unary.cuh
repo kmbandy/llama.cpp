@@ -93,6 +93,10 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+// fused GGML_OP_SCALE + GGML_OP_UNARY [+ GGML_OP_SCALE]; scale2_node may be null
+void ggml_cuda_op_scale_unary_scale(ggml_backend_cuda_context & ctx,
+        ggml_tensor * scale_node, ggml_tensor * unary_node, ggml_tensor * scale2_node);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

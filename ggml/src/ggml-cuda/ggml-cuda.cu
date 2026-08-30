@@ -4683,7 +4683,168 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // scale + unary [+ scale], generalization of the softcap pattern above to other unary ops.
+    // The fused kernel carries the scale bias through, so no bias check is needed here.
+    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY
+     && (ops.size() == 2 || ops.begin()[2] == GGML_OP_SCALE) && unary_ops.size() == 1) {
+        const enum ggml_unary_op uop = unary_ops.begin()[0];
+
+        if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID && uop != GGML_UNARY_OP_TANH) {
+            return false;
+        }
+
+        const ggml_tensor * scale  = cgraph->nodes[node_idx];
+        const ggml_tensor * unary  = cgraph->nodes[node_idx+1];
+        const ggml_tensor * scale2 = ops.size() == 3 ? cgraph->nodes[node_idx+2] : nullptr;
+        const ggml_tensor * dst    = scale2 ? scale2 : unary;
+
+        if (ggml_get_unary_op(unary) != uop) {
+            return false;
+        }
+
+        // the fused kernel is f32-only and indexes both ends linearly
+        if (scale->src[0]->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+            unary->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous(scale->src[0]) || !ggml_is_contiguous(dst)) {
+            return false;
+        }
+
+        return true;
+    }
+
     return false;
+}
+
+// WP_FUSE_BCAST_MUL_ADD: 0 = off, 1 = {REPEAT,MUL,ADD} only, 2 = also {MUL,ADD}. Default 2.
+static int ggml_cuda_bcast_mul_add_level() {
+    static const int level = []() {
+        const char * e = getenv("WP_FUSE_BCAST_MUL_ADD");
+        return e == nullptr ? 2 : std::atoi(e);
+    }();
+    return level;
+}
+
+// Fuse {REPEAT(_4D), MUL, ADD} -- and the {MUL, ADD} pair where ggml's implicit
+// binary broadcast already avoids the repeat -- into a single dst = a*b + c pass.
+//
+// The win is memory traffic, not flops: the repeat's materialized intermediate
+// and the mul's intermediate both disappear, and dst is written once instead of
+// three times. The kernel keeps the multiply and the add as two separately
+// rounded F32 ops in the original operand order and never contracts them into
+// an FMA, so every output element is bit-identical to the unfused chain.
+//
+// Returns the number of *extra* nodes consumed (2 or 1), or 0 if not applicable.
+static int ggml_cuda_try_fuse_bcast_mul_add(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const int level = ggml_cuda_bcast_mul_add_level();
+    if (level <= 0) {
+        return 0;
+    }
+
+    const bool with_repeat = cgraph->nodes[i]->op == GGML_OP_REPEAT;
+
+    if (with_repeat) {
+        if (!ggml_can_fuse(cgraph, i, { GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD })) {
+            return 0;
+        }
+    } else {
+        if (level < 2 || !ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD })) {
+            return 0;
+        }
+    }
+
+    // ggml_can_fuse already guarantees: ops match, the intermediates have exactly
+    // one use and are neither views nor graph outputs, each node consumes the
+    // previous one, and all three nodes have the same shape.
+    ggml_tensor * repeat = with_repeat ? cgraph->nodes[i] : nullptr;
+    ggml_tensor * mul    = cgraph->nodes[i + (with_repeat ? 1 : 0)];
+    ggml_tensor * add    = cgraph->nodes[i + (with_repeat ? 2 : 1)];
+
+    // F32 only. This is what makes the fusion value-preserving: the intermediate
+    // that the unfused chain round-tripped through memory was already a float, so
+    // eliding the store/load pair drops no rounding step. With an F16 dst the
+    // unfused mul would have rounded to half first -- not bit-exact, so bail.
+    if (mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (with_repeat && (repeat->type != GGML_TYPE_F32 || repeat->src[0]->type != GGML_TYPE_F32)) {
+        return 0;
+    }
+
+    // resolve the three real operands, replacing the repeat by its source
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * b = mul->src[1];
+
+    if (with_repeat) {
+        if (a == repeat) {
+            a = repeat->src[0];
+        }
+        if (b == repeat) {
+            b = repeat->src[0];
+        }
+        if (a == repeat || b == repeat) {
+            return 0;
+        }
+    }
+
+    const bool mul_first = add->src[0] == mul;
+    if (!mul_first && add->src[1] != mul) {
+        return 0;
+    }
+
+    const ggml_tensor * c = mul_first ? add->src[1] : add->src[0];
+
+    // no operand may be one of the elided intermediates (e.g. add(m, m))
+    if (a == mul || b == mul || c == mul || (with_repeat && c == repeat)) {
+        return 0;
+    }
+
+    // The kernel indexes every operand with a plain modulo over its own extents.
+    // That is exactly ggml_repeat's tiling and ggml's implicit binary broadcast,
+    // but it needs the divisibility that ggml_can_repeat asserts, and it assumes
+    // contiguous operands so the strides are the canonical ones.
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(c)) {
+        return 0;
+    }
+    if (!ggml_can_repeat(a, add) || !ggml_can_repeat(b, add) || !ggml_can_repeat(c, add)) {
+        return 0;
+    }
+
+    // index space must fit the kernel's uint32 flat index / strides
+    if (ggml_nelements(add) <= 0 || ggml_nelements(add) > (int64_t) std::numeric_limits<int32_t>::max()) {
+        return 0;
+    }
+
+    // Aliasing: an operand that shares dst's shape, layout and base pointer is
+    // read and written at the identical index by the same thread, which is safe
+    // in place (this is the common residual-add case). Any other overlap with dst
+    // could be clobbered by one thread before another thread reads it.
+    auto overlaps_dst = [&](const ggml_tensor * x) {
+        const char * xs = (const char *) x->data;
+        const char * xe = xs + ggml_nbytes(x);
+        const char * ds = (const char *) add->data;
+        const char * de = ds + ggml_nbytes(add);
+        return xs < de && ds < xe;
+    };
+    auto operand_ok = [&](const ggml_tensor * x) {
+        return !overlaps_dst(x) || (x->data == add->data && ggml_are_same_shape(x, add));
+    };
+
+    if (!operand_ok(a) || !operand_ok(b) || !operand_ok(c)) {
+        return 0;
+    }
+
+    ggml_cuda_op_fused_bcast_mul_add(*cuda_ctx, a, b, c, add, mul_first);
+
+    return with_repeat ? 2 : 1;
 }
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4693,6 +4854,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (disable_fusion) {
         return 0;
     }
+
+    // escape hatch for the scale + unary [+ scale] fusion only, for A/B without a rebuild
+    static const bool disable_scale_unary_fusion =
+        getenv("GGML_CUDA_DISABLE_SCALE_UNARY_FUSION") != nullptr &&
+        std::atoi(getenv("GGML_CUDA_DISABLE_SCALE_UNARY_FUSION"));
 
     ggml_tensor * node = cgraph->nodes[i];
 
@@ -4848,6 +5014,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // broadcast multiply-add: {REPEAT(_4D), MUL, ADD} and {MUL, ADD}
+    if (node->op == GGML_OP_REPEAT || node->op == GGML_OP_MUL) {
+        const int n_skip = ggml_cuda_try_fuse_bcast_mul_add(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
         }
     }
 
@@ -5437,6 +5611,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // scale + unary [+ scale] for the remaining unary ops (softcap above keeps the tanh 3-node case).
+    // GGML_CUDA_DISABLE_SCALE_UNARY_FUSION=1 turns this off without a rebuild.
+    if (node->op == GGML_OP_SCALE && !disable_scale_unary_fusion) {
+        for (ggml_unary_op uop : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_TANH }) {
+            if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { uop })) {
+                ggml_cuda_op_scale_unary_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                return 2;
+            }
+
+            if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { uop })) {
+                ggml_cuda_op_scale_unary_scale(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr);
+                return 1;
+            }
+        }
     }
 
     return 0;

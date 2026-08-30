@@ -644,3 +644,106 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* fused scale + unary [+ scale]
+ *
+ * Per element this evaluates exactly the same float sequence, in the same order,
+ * as the unfused three-node chain:
+ *
+ *   t   = scale0 * x[i] + bias0   <- scale_f32   (scale.cu), GGML_OP_SCALE
+ *   u   = op(t)                   <- unary_op_kernel (above), GGML_OP_UNARY
+ *   dst = scale1 * u    + bias1   <- scale_f32   (scale.cu), GGML_OP_SCALE
+ *
+ * The affine expressions are written character-for-character as in scale_f32 so
+ * that the compiler makes the same FMA-contraction decision for both, and `op`
+ * is the very same __device__ function the standalone unary kernel instantiates.
+ * The intermediates are f32 in registers, which is the same precision they had
+ * in global memory when unfused, so no rounding step is added or removed.
+ *
+ * With has_scale1 == false the trailing GGML_OP_SCALE is absent and dst = u.
+ */
+
+#define MAX_GRIDDIM_X_SCALE_UNARY 0x7FFFFFFF
+
+template <float (*op)(float), bool has_scale1>
+static __global__ void scale_unary_scale_f32(const float * x, float * dst,
+        const float scale0, const float bias0,
+        const float scale1, const float bias1,
+        const int64_t nelements) {
+    ggml_cuda_pdl_lc();
+    int64_t tid    = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
+
+    ggml_cuda_pdl_sync();
+    for (int64_t i = tid; i < nelements; i += stride) {
+        const float t = scale0 * x[i] + bias0;
+        const float u = op(t);
+        if (has_scale1) {
+            dst[i] = scale1 * u + bias1;
+        } else {
+            dst[i] = u;
+        }
+    }
+}
+
+template <float (*op)(float), bool has_scale1>
+static void scale_unary_scale_f32_cuda(const float * x, float * dst,
+        const float scale0, const float bias0,
+        const float scale1, const float bias1,
+        const int64_t nelements, cudaStream_t stream) {
+    const int64_t num_blocks = (nelements + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            MIN(MAX_GRIDDIM_X_SCALE_UNARY, num_blocks), CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(scale_unary_scale_f32<op, has_scale1>, launch_params,
+            x, dst, scale0, bias0, scale1, bias1, nelements);
+}
+
+template <float (*op)(float)>
+static void ggml_cuda_op_scale_unary_scale_impl(ggml_backend_cuda_context & ctx,
+        ggml_tensor * scale_node, ggml_tensor * unary_node, ggml_tensor * scale2_node) {
+    const ggml_tensor * src = scale_node->src[0];
+    ggml_tensor *       dst = scale2_node ? scale2_node : unary_node;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(unary_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
+
+    const float scale0 = ggml_get_op_params_f32(scale_node, 0);
+    const float bias0  = ggml_get_op_params_f32(scale_node, 1);
+
+    const float scale1 = scale2_node ? ggml_get_op_params_f32(scale2_node, 0) : 1.0f;
+    const float bias1  = scale2_node ? ggml_get_op_params_f32(scale2_node, 1) : 0.0f;
+
+    const int64_t nelements = ggml_nelements(src);
+
+    if (scale2_node) {
+        scale_unary_scale_f32_cuda<op, true>((const float *) src->data, (float *) dst->data,
+                scale0, bias0, scale1, bias1, nelements, stream);
+    } else {
+        scale_unary_scale_f32_cuda<op, false>((const float *) src->data, (float *) dst->data,
+                scale0, bias0, scale1, bias1, nelements, stream);
+    }
+}
+
+// scale2_node may be null, in which case only GGML_OP_SCALE + GGML_OP_UNARY are fused
+void ggml_cuda_op_scale_unary_scale(ggml_backend_cuda_context & ctx,
+        ggml_tensor * scale_node, ggml_tensor * unary_node, ggml_tensor * scale2_node) {
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SILU:
+            ggml_cuda_op_scale_unary_scale_impl<op_silu>(ctx, scale_node, unary_node, scale2_node);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            ggml_cuda_op_scale_unary_scale_impl<op_sigmoid>(ctx, scale_node, unary_node, scale2_node);
+            break;
+        case GGML_UNARY_OP_TANH:
+            ggml_cuda_op_scale_unary_scale_impl<op_tanh>(ctx, scale_node, unary_node, scale2_node);
+            break;
+        default:
+            GGML_ABORT("Unsupported unary op for fused scale+unary[+scale]");
+    }
+}
