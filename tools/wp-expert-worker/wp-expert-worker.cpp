@@ -118,12 +118,20 @@ static bool wp_persistent_graphs_enabled() {
     return enabled;
 }
 
+static bool wp_persistent_cuda_graphs_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("WP_PERSISTENT_CUDA_GRAPHS");
+        return env != nullptr && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 static bool wp_hip_graphs_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("WP_HIP_GRAPHS");
         return env != nullptr && std::strcmp(env, "1") == 0;
     }();
-    return enabled || wp_persistent_graphs_enabled();
+    return enabled || wp_persistent_cuda_graphs_enabled();
 }
 
 bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool gather_enabled) {
@@ -2487,17 +2495,8 @@ Catalog & layout_sliced_pages(
     }
     uint64_t slot_alignment = alignment;
     const char * const arena_env = std::getenv("WP_EXPERT_ARENA_ID");
-    const ggml_backend_dev_t buft_device = ggml_backend_buft_get_device(buft);
-    const char * const buft_device_name = buft_device != nullptr
-        ? ggml_backend_dev_name(buft_device) : nullptr;
-    const bool persistent_gpu = wp_persistent_graphs_enabled() &&
-        buft_device != nullptr &&
-        buft_device_name != nullptr &&
-        (std::strstr(buft_device_name, "ROCm") != nullptr ||
-         std::strstr(buft_device_name, "CUDA") != nullptr);
     const bool arena_requested =
-        (arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1) ||
-        persistent_gpu;
+        arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1;
     if (arena_requested) {
         // CUDA/HIP converts quantized nb[2] from bytes to blocks. Keep that conversion exact.
         for (const auto & layer : catalog.descriptor.layers) {
@@ -7032,6 +7031,7 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
 ExpertSlotPool::Batch::~Batch() {
     if (copy_event_ != nullptr) {
         ggml_backend_event_free(copy_event_);
+        copy_event_ = nullptr;
     }
     if (owner_ != nullptr) {
         owner_->abandon_batch(*this);
@@ -7959,8 +7959,7 @@ public:
             const ExpertSlotPool::Batch & batch) const {
         static const bool enabled = [] {
             const char * e = std::getenv("WP_EXPERT_ARENA_ID");
-            return (e != nullptr && std::strtol(e, nullptr, 10) == 1) ||
-                   wp_persistent_graphs_enabled();
+            return e != nullptr && std::strtol(e, nullptr, 10) == 1;
         }();
         // *** ORDER MATTERS: the env gate is first and it short-circuits. ***
         // This used to evaluate ggml_backend_name(), the three strstr()s and
@@ -14939,11 +14938,9 @@ int run(const Options & options) {
     }
     // Same as WeightPager: default graph keying recaptures every submit
     // (nodes[0] is ephemeral; this worker rebinds expert data pointers).
-    // Persistent GPU mode also selects the stable slot-arena path.
+    // CUDA graph opt-in is separate from the Vulkan persistent-plan mode.
     {
-        const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
-        if ((wp_graphs == nullptr || wp_graphs[0] != '1') &&
-                !wp_persistent_graphs_enabled()) {
+        if (!wp_hip_graphs_enabled()) {
             if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
                 setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
             }
@@ -15329,9 +15326,7 @@ make_inproc_backend(const pipe_expert_dispatcher::endpoint & target) {
             continue;
         }
         {
-            const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
-            if ((wp_graphs == nullptr || wp_graphs[0] != '1') &&
-                    !wp_persistent_graphs_enabled()) {
+            if (!wp_hip_graphs_enabled()) {
                 if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
                     setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
                 }
