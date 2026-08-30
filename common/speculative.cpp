@@ -12,6 +12,7 @@
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-graph.h"
 
 #include <algorithm>
 #include <cassert>
@@ -3261,6 +3262,16 @@ common_speculative_init_result::common_speculative_init_result(
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // Draft decoding emits at most the anchor plus n_max tokens per sequence.
+    // Keep prompt processing within the same startup graph reserve.
+    if ((has_draft || spec_self) && params.speculative.draft.n_max_explicit) {
+        const uint32_t n_draft_tokens = (uint32_t) std::max<int64_t>(
+                1, (int64_t) params.speculative.draft.n_max + 1);
+        cparams.n_outputs_max_per_seq = n_draft_tokens;
+        cparams.n_ubatch = std::min(cparams.n_ubatch,
+                std::min(n_draft_tokens, llm_graph_logit_row_cap));
+    }
 
     // MAD-LAB: select the graph for an in-model DSpark context.
     if (spec_mtp) {

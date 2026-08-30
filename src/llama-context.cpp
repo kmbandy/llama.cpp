@@ -78,12 +78,19 @@ static bool is_draft_ctx(const llama_cparams & cparams) {
 }
 
 static uint32_t draft_graph_n_tokens(const llama_cparams & cparams, uint32_t n_tokens) {
-    return is_draft_ctx(cparams) ? std::min(n_tokens, k_draft_graph_tokens) : n_tokens;
+    if (!is_draft_ctx(cparams)) {
+        return n_tokens;
+    }
+
+    const uint32_t n_draft_tokens = cparams.n_outputs_max_per_seq == 0
+        ? k_draft_graph_tokens
+        : std::min(cparams.n_outputs_max_per_seq, k_draft_graph_tokens);
+    return std::min(n_tokens, n_draft_tokens);
 }
 
 static uint32_t draft_graph_n_outputs(const llama_cparams & cparams, uint32_t n_tokens) {
     const uint32_t cap = std::min(n_tokens, cparams.n_outputs_max);
-    return is_draft_ctx(cparams) ? std::min(cap, k_draft_graph_tokens) : cap;
+    return is_draft_ctx(cparams) ? std::min(cap, draft_graph_n_tokens(cparams, n_tokens)) : cap;
 }
 
 // Worst-case pp reserve used to pass n_outputs == n_ubatch. On DS4 that
