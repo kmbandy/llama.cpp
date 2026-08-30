@@ -12075,6 +12075,12 @@ private:
         // share a cache entry (same failure mode as the type fields above).
         bool     fused_gate_up = false;
         bool operator<(const GraphKey & o) const {
+            if (!wp_persistent_graphs_enabled()) {
+                return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
+                                type_gate, type_up, type_down, fused_gate_up) <
+                       std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits,
+                                o.type_gate, o.type_up, o.type_down, o.fused_gate_up);
+            }
             return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
                             type_gate, type_up, type_down,
                             ne0_gate, ne1_gate, ne0_up, ne1_up, ne0_down, ne1_down,

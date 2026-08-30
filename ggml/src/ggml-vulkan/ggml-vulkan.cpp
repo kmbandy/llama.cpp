@@ -2573,6 +2573,7 @@ struct ggml_backend_vk_context {
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;
+    std::array<vk::DescriptorBufferInfo, MAX_PARAMETER_COUNT> descriptor_buffer_infos{};
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
@@ -8637,7 +8638,8 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
     vk::DescriptorSet& descriptor_set = descriptor_sets[descriptor_set_idx++];
-    std::array<vk::DescriptorBufferInfo, MAX_PARAMETER_COUNT> descriptor_buffer_infos{};
+    std::array<vk::DescriptorBufferInfo, MAX_PARAMETER_COUNT> & descriptor_buffer_infos =
+        ctx->descriptor_buffer_infos;
     size_t descriptor_buffer_count = 0;
     for (const vk_subbuffer & buffer : descriptor_buffers) {
         descriptor_buffer_infos[descriptor_buffer_count++] = buffer;
@@ -17695,18 +17697,19 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
     VK_LOG_DEBUG("ggml_vk_compute_forward(" << tensor << ", name=" << tensor->name << ", op=" << ggml_op_name(tensor->op) << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << ", view_src=" << tensor->view_src << ", view_offs=" << tensor->view_offs << ")");
 
-    if (tensor_idx < 0 || (size_t) tensor_idx >= ctx->tensor_ctxs.size()) {
-        if (ctx->recording_plan != nullptr) {
+    vk_context subctx;
+    if (ctx->recording_plan == nullptr) {
+        subctx = ctx->tensor_ctxs[tensor_idx].lock();
+    } else {
+        if (tensor_idx < 0 || (size_t) tensor_idx >= ctx->tensor_ctxs.size()) {
             ctx->recording_plan->unsupported = true;
+            return;
         }
-        return;
-    }
-    vk_context subctx = ctx->tensor_ctxs[tensor_idx].lock();
-    if (subctx == nullptr) {
-        if (ctx->recording_plan != nullptr) {
+        subctx = ctx->tensor_ctxs[tensor_idx].lock();
+        if (subctx == nullptr) {
             ctx->recording_plan->unsupported = true;
+            return;
         }
-        return;
     }
 
     // Only run if ctx hasn't been submitted yet
