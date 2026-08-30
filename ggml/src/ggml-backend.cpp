@@ -779,6 +779,56 @@ static size_t ggml_sched_view_coalesce_max_bytes(void) {
     return max_b;
 }
 
+// ---- WP scheduler knobs (all default OFF = upstream behaviour) --------------
+//
+// Cached once: these are read from the per-split hot loop in
+// ggml_backend_sched_compute_splits(), which runs for every split of every
+// token, so a getenv() per call would itself be the cost being measured.
+
+// WP_SCHED_COPY_DEBUG=1 re-enables the "token_embd" split-input copy tracing in
+// ggml_backend_sched_compute_splits(). Default OFF. When it was unconditional
+// the predicate cost a strstr() over every split input of every split of every
+// token, and a match additionally forced a full ggml_backend_synchronize() plus
+// two device reads and three fprintf()s -- a hard GPU stall per token. Purely
+// diagnostic: it only reads and prints, so gating it cannot change any result.
+static bool wp_sched_copy_debug_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SCHED_COPY_DEBUG");
+        return (e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
+}
+
+// WP_SCHED_MERGE_WEIGHT_CUT=1 suppresses the "a weight src lives on another,
+// incompatible backend -> start a new split" heuristic in pass 5. That rule
+// exists only so ggml-alloc can reuse the memory of previously offloaded
+// weights; it cuts a split WITHOUT a backend change, so every time it fires it
+// adds one split to every token. Suppressing it merges those neighbours back
+// together: identical nodes, identical order, identical backends -- only the
+// grouping and hence the weight-staging buffer reuse changes. Default OFF
+// because the trade is more staging memory for fewer splits.
+static bool wp_sched_merge_weight_cut_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SCHED_MERGE_WEIGHT_CUT");
+        return (e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
+}
+
+// WP_SCHED_SPLIT_DUMP=1 prints the split table once per ggml_backend_sched_split_graph()
+// call: one line per split with backend, node range, input count and the op/name
+// of its first and last node. This is how you read the ACTUAL per-MoE-layer
+// backend-transition pattern (GPU -> CPU issue -> GPU shexp -> CPU wait -> GPU)
+// off a live decode instead of inferring it. Default OFF, and split_graph only
+// runs on a graph rebuild, so this is not a per-token cost even when on.
+static bool wp_sched_split_dump_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SCHED_SPLIT_DUMP");
+        return (e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
+}
+
 // Root parent + absolute byte offset for a (possibly multi-level) view.
 static const struct ggml_tensor * ggml_sched_view_root(const struct ggml_tensor * t, size_t * abs_offs) {
     size_t offs = 0;
@@ -1365,7 +1415,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if a weight is on a different and incompatible backend
                     // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    if (!wp_sched_merge_weight_cut_enabled() &&
+                        src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                             need_new_split = true;
@@ -1539,6 +1590,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+    }
+
+    // WP_SCHED_SPLIT_DUMP=1: emit the split table -- see wp_sched_split_dump_enabled().
+    if (wp_sched_split_dump_enabled()) {
+        GGML_LOG_INFO("[wp_splits] n_nodes=%d n_splits=%d\n", graph->n_nodes, sched->n_splits);
+        for (int s = 0; s < sched->n_splits; s++) {
+            const struct ggml_backend_sched_split * sp = &sched->splits[s];
+            const struct ggml_tensor * first =
+                (sp->i_start >= 0 && sp->i_start < graph->n_nodes) ? graph->nodes[sp->i_start] : NULL;
+            const struct ggml_tensor * last =
+                (sp->i_end   >  0 && sp->i_end   <= graph->n_nodes) ? graph->nodes[sp->i_end - 1] : NULL;
+            GGML_LOG_INFO("[wp_splits] %4d %-8s nodes[%5d,%5d) n=%4d inputs=%2d first=%-18s %-28s last=%-18s %s\n",
+                          s,
+                          ggml_backend_name(sched->backends[sp->backend_id]),
+                          sp->i_start, sp->i_end, sp->i_end - sp->i_start, sp->n_inputs,
+                          first ? ggml_op_name(first->op) : "-", first ? first->name : "-",
+                          last  ? ggml_op_name(last->op)  : "-", last  ? last->name  : "-");
+        }
     }
 
     if (sched->debug) {
@@ -1876,7 +1945,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    bool dbg = input && input->name[0] && strstr(input->name, "token_embd") != nullptr;
+                    // WP_SCHED_COPY_DEBUG only -- see wp_sched_copy_debug_enabled().
+                    // The cached flag is checked first so the strstr() (and, on a
+                    // match, the synchronize + device reads + fprintf) is entirely
+                    // absent from the default per-split-input hot path.
+                    bool dbg = wp_sched_copy_debug_enabled() &&
+                               input && input->name[0] && strstr(input->name, "token_embd") != nullptr;
                     if (dbg) {
                         fprintf(stderr, "[sched_copy] %s ENTER: src data=%p buf=%p host=%d -> dst data=%p buf=%p host=%d size=%zu\n",
                                 input->name, input->data, (void*)input->buffer,
