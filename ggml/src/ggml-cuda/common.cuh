@@ -1469,7 +1469,9 @@ struct ggml_backend_cuda_context {
                 p.cap = n > 0 ? (size_t) n : 0;
             }
             const char * wp_graphs = getenv("WP_HIP_GRAPHS");
-            p.track_ttl = wp_graphs != nullptr && strcmp(wp_graphs, "1") == 0;
+            const char * persistent_graphs = getenv("WP_PERSISTENT_CUDA_GRAPHS");
+            p.track_ttl = (wp_graphs != nullptr && strcmp(wp_graphs, "1") == 0) ||
+                          (persistent_graphs != nullptr && strcmp(persistent_graphs, "1") == 0);
             if (p.track_ttl) {
                 // WP_HIP_GRAPH_TTL_S and WP_HIP_GRAPH_SWEEP_S are seconds.
                 if (const char * e = getenv("WP_HIP_GRAPH_TTL_S")) {

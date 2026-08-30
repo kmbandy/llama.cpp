@@ -3640,6 +3640,17 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static bool ggml_cuda_wp_persistent_graphs_enabled() {
+    static const bool enabled = [] {
+        // Deliberately a SEPARATE knob from WP_PERSISTENT_GRAPHS (vk plans):
+        // this one overrides the sub-Volta CUDA-graph arch guard, which has
+        // historically shielded capture bugs — measure it as its own arm.
+        const char * env = getenv("WP_PERSISTENT_CUDA_GRAPHS");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_wp_hip_graphs_enabled() {
     // Cached: this is called ~6x per backend graph_compute, and the split
     // decode forward makes ~86 of those per token, so a raw getenv() here was
@@ -3648,7 +3659,7 @@ static bool ggml_cuda_wp_hip_graphs_enabled() {
         const char * env = getenv("WP_HIP_GRAPHS");
         return env != nullptr && strcmp(env, "1") == 0;
     }();
-    return enabled;
+    return enabled || ggml_cuda_wp_persistent_graphs_enabled();
 }
 
 struct ggml_cuda_wp_graph_counters {
@@ -3812,6 +3823,9 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // graphs on the SPINE only, where experts are remote -- so it may not
     // reproduce here. Prove it before changing the default.
     static const bool key_addrs = [] {
+        if (ggml_cuda_wp_persistent_graphs_enabled()) {
+            return true;
+        }
         const char * e = std::getenv("WP_HIP_GRAPH_KEY_ADDRS");
         return !(e != nullptr && e[0] == '0');
     }();
@@ -5897,7 +5911,8 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA &&
+                !ggml_cuda_wp_persistent_graphs_enabled()) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }

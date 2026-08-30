@@ -123,7 +123,7 @@ static bool wp_hip_graphs_enabled() {
         const char * env = std::getenv("WP_HIP_GRAPHS");
         return env != nullptr && std::strcmp(env, "1") == 0;
     }();
-    return enabled;
+    return enabled || wp_persistent_graphs_enabled();
 }
 
 bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool gather_enabled) {
@@ -2487,8 +2487,17 @@ Catalog & layout_sliced_pages(
     }
     uint64_t slot_alignment = alignment;
     const char * const arena_env = std::getenv("WP_EXPERT_ARENA_ID");
+    const ggml_backend_dev_t buft_device = ggml_backend_buft_get_device(buft);
+    const char * const buft_device_name = buft_device != nullptr
+        ? ggml_backend_dev_name(buft_device) : nullptr;
+    const bool persistent_gpu = wp_persistent_graphs_enabled() &&
+        buft_device != nullptr &&
+        buft_device_name != nullptr &&
+        (std::strstr(buft_device_name, "ROCm") != nullptr ||
+         std::strstr(buft_device_name, "CUDA") != nullptr);
     const bool arena_requested =
-        arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1;
+        (arena_env != nullptr && std::strtol(arena_env, nullptr, 10) == 1) ||
+        persistent_gpu;
     if (arena_requested) {
         // CUDA/HIP converts quantized nb[2] from bytes to blocks. Keep that conversion exact.
         for (const auto & layer : catalog.descriptor.layers) {
@@ -7950,7 +7959,8 @@ public:
             const ExpertSlotPool::Batch & batch) const {
         static const bool enabled = [] {
             const char * e = std::getenv("WP_EXPERT_ARENA_ID");
-            return e != nullptr && std::strtol(e, nullptr, 10) == 1;
+            return (e != nullptr && std::strtol(e, nullptr, 10) == 1) ||
+                   wp_persistent_graphs_enabled();
         }();
         // *** ORDER MATTERS: the env gate is first and it short-circuits. ***
         // This used to evaluate ggml_backend_name(), the three strstr()s and
@@ -8741,14 +8751,30 @@ public:
         if (!wp_persistent_graphs_enabled() || !is_vulkan_backend()) {
             return nullptr;
         }
-        ggml_backend_graph_plan_t plan = ggml_backend_graph_plan_create(
-            backend_.get(), graph);
+        ggml_backend_graph_plan_t plan = nullptr;
+        try {
+            synchronize_async(nullptr);
+            ggml_backend_synchronize(backend_.get());
+            plan = ggml_backend_graph_plan_create(backend_.get(), graph);
+        } catch (...) {
+            plan = nullptr;
+        }
         if (plan == nullptr) {
             std::fprintf(stderr,
                          "WARN wp expert worker: persistent Vulkan graph plan unavailable; "
                          "using graph compute\n");
         }
         return plan;
+    }
+
+    void release_persistent_plan(ggml_backend_graph_plan_t & plan,
+                                 RequestStats * request_stats = nullptr) {
+        if (plan == nullptr) {
+            return;
+        }
+        synchronize_async(request_stats);
+        ggml_backend_graph_plan_free(backend_.get(), plan);
+        plan = nullptr;
     }
 
     void record_stats(const RequestStats & request, size_t n_experts) {
@@ -9918,8 +9944,7 @@ private:
                       it->second.io_buffer !=
                           (io_active_ != nullptr ? io_active_ : io_buffer_.get())))) {
                 if (it->second.persistent_plan != nullptr) {
-                    ggml_backend_graph_plan_free(backend_.get(), it->second.persistent_plan);
-                    it->second.persistent_plan = nullptr;
+                    release_persistent_plan(it->second.persistent_plan, &request_stats);
                 }
                 graph_cache_.erase(it);
                 it = graph_cache_.end();
@@ -9936,8 +9961,7 @@ private:
                         }
                     }
                     if (victim->second.persistent_plan != nullptr) {
-                        ggml_backend_graph_plan_free(backend_.get(), victim->second.persistent_plan);
-                        victim->second.persistent_plan = nullptr;
+                        release_persistent_plan(victim->second.persistent_plan, &request_stats);
                     }
                     graph_cache_.erase(victim);
                 }
@@ -9959,7 +9983,7 @@ private:
         if (gc_hit) {
             // *** THE D2 FAST PATH: no context, no graph build, no gallocr. ***
             // Rebind this request's expert weights into the cached graph (src
-            // data ptrs only -- the backend's WP_HIP_GRAPHS=1 path handles it),
+            // data ptrs only -- the selected backend graph path handles it),
             // repack the routing blob at the SAME offsets (attach is a no-op
             // re-bind to the same place), upload once, submit the cached graph.
             // Iteration order matches the build below exactly: assignment index.
@@ -10033,8 +10057,7 @@ private:
             enum ggml_status status = submit_graph(
                 gc->graph, request_stats, gc->persistent_plan);
             if (status != GGML_STATUS_SUCCESS && gc->persistent_plan != nullptr) {
-                ggml_backend_graph_plan_free(backend_.get(), gc->persistent_plan);
-                gc->persistent_plan = nullptr;
+                release_persistent_plan(gc->persistent_plan, &request_stats);
                 std::fprintf(stderr, "WARN wp expert worker: persistent Vulkan graph replay failed; retrying normal graph compute\n");
                 status = submit_graph(gc->graph, request_stats);
             }
@@ -10440,8 +10463,8 @@ private:
         // above leaves graph == nullptr and the next lookup rebuilds it.
     }
 
-    // WP_EXPERT_ARENA_ID=1 uses persistent grouped dispatch over the slot arena.
-    // Cache hits only upload slot ids and router weights; weight pointers stay untouched.
+    // WP_EXPERT_ARENA_ID=1 and persistent GPU graphs use grouped dispatch over
+    // the slot arena. Cache hits only upload slot ids and router weights.
 
     // *** GROUPED GEMV: GROUPED mul_mat_id ACROSS EVERY SELECTED EXPERT. ***
     //
@@ -11090,8 +11113,7 @@ private:
                  it->second.clamp_bits != clamp_bits ||
                  it->second.roles != roles)) {
             if (it->second.persistent_plan != nullptr) {
-                ggml_backend_graph_plan_free(backend_.get(), it->second.persistent_plan);
-                it->second.persistent_plan = nullptr;
+                release_persistent_plan(it->second.persistent_plan, &request_stats);
             }
             arena_graph_cache_.erase(it);
             it = arena_graph_cache_.end();
@@ -11111,8 +11133,7 @@ private:
                     }
                 }
                 if (victim->second.persistent_plan != nullptr) {
-                    ggml_backend_graph_plan_free(backend_.get(), victim->second.persistent_plan);
-                    victim->second.persistent_plan = nullptr;
+                    release_persistent_plan(victim->second.persistent_plan, &request_stats);
                 }
                 arena_graph_cache_.erase(victim);
             }
@@ -11269,8 +11290,7 @@ private:
         enum ggml_status status = submit_graph(
             entry.graph, request_stats, entry.persistent_plan);
         if (status != GGML_STATUS_SUCCESS && entry.persistent_plan != nullptr) {
-            ggml_backend_graph_plan_free(backend_.get(), entry.persistent_plan);
-            entry.persistent_plan = nullptr;
+            release_persistent_plan(entry.persistent_plan, &request_stats);
             std::fprintf(stderr,
                          "WARN wp expert worker: persistent Vulkan graph replay failed; "
                          "retrying normal graph compute\n");
@@ -11278,8 +11298,7 @@ private:
         }
         if (status != GGML_STATUS_SUCCESS) {
             if (entry.persistent_plan != nullptr) {
-                ggml_backend_graph_plan_free(backend_.get(), entry.persistent_plan);
-                entry.persistent_plan = nullptr;
+                release_persistent_plan(entry.persistent_plan, &request_stats);
             }
             entry.graph = nullptr;
             throw std::runtime_error("multi-arena expert backend graph compute failed");
@@ -11441,8 +11460,7 @@ private:
                  it->second.clamp_bits != clamp_bits ||
                  it->second.roles != roles)) {
             if (it->second.persistent_plan != nullptr) {
-                ggml_backend_graph_plan_free(backend_.get(), it->second.persistent_plan);
-                it->second.persistent_plan = nullptr;
+                release_persistent_plan(it->second.persistent_plan, &request_stats);
             }
             arena_graph_cache_.erase(it);
             it = arena_graph_cache_.end();
@@ -11462,8 +11480,7 @@ private:
                     }
                 }
                 if (victim->second.persistent_plan != nullptr) {
-                    ggml_backend_graph_plan_free(backend_.get(), victim->second.persistent_plan);
-                    victim->second.persistent_plan = nullptr;
+                    release_persistent_plan(victim->second.persistent_plan, &request_stats);
                 }
                 arena_graph_cache_.erase(victim);
             }
@@ -11699,8 +11716,7 @@ private:
             }
         }
         if (status != GGML_STATUS_SUCCESS && entry.persistent_plan != nullptr) {
-            ggml_backend_graph_plan_free(backend_.get(), entry.persistent_plan);
-            entry.persistent_plan = nullptr;
+            release_persistent_plan(entry.persistent_plan, &request_stats);
             std::fprintf(stderr,
                          "WARN wp expert worker: persistent Vulkan graph replay failed; "
                          "retrying normal graph compute\n");
@@ -11708,8 +11724,7 @@ private:
         }
         if (status != GGML_STATUS_SUCCESS) {
             if (entry.persistent_plan != nullptr) {
-                ggml_backend_graph_plan_free(backend_.get(), entry.persistent_plan);
-                entry.persistent_plan = nullptr;
+                release_persistent_plan(entry.persistent_plan, &request_stats);
             }
             entry.graph = nullptr;
             throw std::runtime_error("arena expert backend graph compute failed");
@@ -11990,8 +12005,8 @@ private:
     // 87 us for a static graph). Cache one context+graph+gallocr per SHAPE
     // (n_tokens, n_selected, idx_rank, add_previous, clamp); per request only
     // the expert weight tensors rebind (attach_weight = src data ptrs only)
-    // and the routing-weight blob repacks at fixed offsets. With WP_HIP_GRAPHS=1
-    // the backend then takes its src-ptrs-only capture+ExecUpdate path instead
+    // and the routing-weight blob repacks at fixed offsets. With the graph flag
+    // enabled the backend then takes its stable-key path instead
     // of resetting warmup. Gather caches when every selected expert has the
     // same idx rank (verify). Mixed ranks skip the cache. Entries pin their
     // gallocr VRAM (~2-4 MB each); the LRU cap bounds it.
@@ -12150,14 +12165,12 @@ DeviceWorker::~DeviceWorker() {
     }
     for (auto & kv : graph_cache_) {
         if (kv.second.persistent_plan != nullptr) {
-            ggml_backend_graph_plan_free(backend_.get(), kv.second.persistent_plan);
-            kv.second.persistent_plan = nullptr;
+            release_persistent_plan(kv.second.persistent_plan);
         }
     }
     for (auto & kv : arena_graph_cache_) {
         if (kv.second.persistent_plan != nullptr) {
-            ggml_backend_graph_plan_free(backend_.get(), kv.second.persistent_plan);
-            kv.second.persistent_plan = nullptr;
+            release_persistent_plan(kv.second.persistent_plan);
         }
     }
 }
@@ -14924,12 +14937,13 @@ int run(const Options & options) {
         throw std::invalid_argument(
             "worker device and slot lists must have the same non-zero length and positive budgets");
     }
-    // Same as WeightPager: default HIP graph keying recaptures every submit
+    // Same as WeightPager: default graph keying recaptures every submit
     // (nodes[0] is ephemeral; this worker rebinds expert data pointers).
-    // Capture stays available only when WP_HIP_GRAPHS=1 selects the stable-key path.
+    // Persistent GPU mode also selects the stable slot-arena path.
     {
         const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
-        if (wp_graphs == nullptr || wp_graphs[0] != '1') {
+        if ((wp_graphs == nullptr || wp_graphs[0] != '1') &&
+                !wp_persistent_graphs_enabled()) {
             if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
                 setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
             }
@@ -15316,7 +15330,8 @@ make_inproc_backend(const pipe_expert_dispatcher::endpoint & target) {
         }
         {
             const char * wp_graphs = std::getenv("WP_HIP_GRAPHS");
-            if (wp_graphs == nullptr || wp_graphs[0] != '1') {
+            if ((wp_graphs == nullptr || wp_graphs[0] != '1') &&
+                    !wp_persistent_graphs_enabled()) {
                 if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
                     setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
                 }

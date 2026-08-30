@@ -8697,6 +8697,7 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
     } else {
         if (ctx->recording_plan != nullptr) {
             result = ggml_vk_create_temporary_context(ctx->recording_plan->command_pool);
+            ctx->gc.contexts.emplace_back(result);
         } else {
             result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
         }
@@ -17694,7 +17695,19 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
     VK_LOG_DEBUG("ggml_vk_compute_forward(" << tensor << ", name=" << tensor->name << ", op=" << ggml_op_name(tensor->op) << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << ", view_src=" << tensor->view_src << ", view_offs=" << tensor->view_offs << ")");
 
+    if (tensor_idx < 0 || (size_t) tensor_idx >= ctx->tensor_ctxs.size()) {
+        if (ctx->recording_plan != nullptr) {
+            ctx->recording_plan->unsupported = true;
+        }
+        return;
+    }
     vk_context subctx = ctx->tensor_ctxs[tensor_idx].lock();
+    if (subctx == nullptr) {
+        if (ctx->recording_plan != nullptr) {
+            ctx->recording_plan->unsupported = true;
+        }
+        return;
+    }
 
     // Only run if ctx hasn't been submitted yet
     if (!subctx->seqs.empty()) {
