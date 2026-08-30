@@ -44,6 +44,32 @@ static bool wp_dspark_debug() {
     return s_on;
 }
 
+static bool wp_spec_hash_trace() {
+    static const bool s_on = [](){
+        const char * e = std::getenv("WP_SPEC_HASH_TRACE");
+        return e && e[0] == '1';
+    }();
+    return s_on;
+}
+
+static uint64_t wp_spec_fnv1a(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void wp_spec_fnv1a_update(uint64_t & hash, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+}
+
 // MAD-LAB / verify-width padding is a separate, opt-in knob from
 // WP_DS4_CONST_SHAPE (2026-08-24 split, mirrors tools/server/server-context.cpp
 // server_spec_const_width()). WP_DS4_CONST_SHAPE=1 alone no longer defaults
@@ -2127,6 +2153,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    uint64_t hash_trace_step = 0;
+    std::vector<llama_token> hash_trace_tokens;
+    std::vector<int32_t> hash_trace_i_batch;
+
     // Per-call scratch. process() and draft() rebuild these before reading them.
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -2259,6 +2289,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+
+        if (wp_spec_hash_trace()) {
+            hash_trace_tokens.assign(batch_in.token, batch_in.token + n_tokens);
+            hash_trace_i_batch.resize(n_tokens);
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                hash_trace_i_batch[i] = i;
+            }
+        }
 
         // remember the frist and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -2396,6 +2434,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+        }
+
+        if (wp_spec_hash_trace() && n_drafting > 0) {
+            uint64_t vh = UINT64_C(14695981039346656037);
+            uint64_t ph = UINT64_C(14695981039346656037);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id]) {
+                    continue;
+                }
+                const auto & verify = verify_h[seq_id];
+                const auto & pending = pending_h[seq_id];
+                wp_spec_fnv1a_update(vh, verify.data(), verify.size() * sizeof(float));
+                wp_spec_fnv1a_update(ph, pending.data(), pending.size() * sizeof(float));
+            }
+
+            const uint64_t de = wp_spec_fnv1a(batch.embd, (size_t) batch.n_tokens * n_embd * sizeof(float));
+            std::fprintf(stderr, "SPECHASH step=%" PRIu64 " width=%d toks=", hash_trace_step++, n_tokens);
+            for (size_t i = 0; i < hash_trace_tokens.size(); ++i) {
+                std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int) hash_trace_tokens[i]);
+            }
+            std::fprintf(stderr, " spec_i_batch=");
+            for (size_t i = 0; i < hash_trace_i_batch.size(); ++i) {
+                std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", hash_trace_i_batch[i]);
+            }
+            std::fprintf(stderr, " vh=%016" PRIx64 " ph=%016" PRIx64 " de=%016" PRIx64 "\n", vh, ph, de);
+            std::fflush(stderr);
         }
 
         int i = 0;
