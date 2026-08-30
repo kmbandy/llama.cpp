@@ -427,6 +427,7 @@ class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
+static bool ggml_vk_is_empty(ggml_tensor * node);
 
 // Upper bound on the batch width the mat-vec (GEMV) path can serve, and hence
 // the size of the per-NUM_COLS pipeline arrays. The *effective* cap is per
@@ -1169,6 +1170,10 @@ struct vk_device_struct {
 
     vk::Fence fence;
     vk_buffer sync_staging;
+    vk_buffer host_read_staging;
+    vk_buffer host_read_source;
+    size_t host_read_source_offset {};
+    size_t host_read_source_size {};
 
     ggml_backend_buffer_type buffer_type;
 
@@ -1185,6 +1190,8 @@ struct vk_device_struct {
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
+        ggml_vk_destroy_buffer(host_read_staging);
+        host_read_source.reset();
 
         if (compute_queue) compute_queue->cmd_pool.destroy(device);
         if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
@@ -8673,6 +8680,23 @@ static void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, si
     }
 }
 
+static bool ggml_vk_ensure_host_read_staging_buffer(vk_device& device, size_t size) {
+    if (device->host_read_staging != nullptr) {
+        return device->host_read_staging->size >= size &&
+            (device->host_read_staging->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+    }
+
+    try {
+        device->host_read_staging = ggml_vk_create_buffer(device, size,
+            {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached});
+    } catch (const vk::SystemError&) {
+        return false;
+    }
+
+    return device->host_read_staging != nullptr &&
+        (device->host_read_staging->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+}
+
 static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_context& subctx, vk_buffer& dst, size_t offset, const ggml_tensor * tensor, bool sync_staging = false) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_nc_async(" << tensor << ")");
     GGML_ASSERT(!ggml_is_contiguous(tensor));
@@ -8975,6 +8999,8 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
     }();
     const bool host_visible =
         static_cast<bool>(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+    const bool host_cached =
+        static_cast<bool>(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
     const bool direct_host_read = host_visible &&
         (src->device->uma ||
          (direct_read_max_bytes != 0 && height != 0 && width <= direct_read_max_bytes / height));
@@ -9013,15 +9039,25 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         const char * e = getenv("WP_VK_HOST_READ_FASTPATH_MAX_BYTES");
         return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 262144;
     }();
-    if (host_read_fastpath && host_visible &&
-        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
-        height != 0 && width <= host_read_fastpath_max / height &&
+    const bool fastpath_size_ok = height != 0 && width <= host_read_fastpath_max / height;
+    const bool staged_host_read = host_read_fastpath && fastpath_size_ok && !host_cached &&
+        src == src->device->host_read_source &&
+        offset >= src->device->host_read_source_offset &&
+        offset - src->device->host_read_source_offset <= src->device->host_read_source_size &&
+        width * height <= src->device->host_read_source_size - (offset - src->device->host_read_source_offset);
+    const vk_buffer& fastpath_src = staged_host_read ? src->device->host_read_staging : src;
+    const size_t fastpath_offset = staged_host_read ? offset - src->device->host_read_source_offset : offset;
+    if (host_read_fastpath && (host_cached || staged_host_read) &&
+        (fastpath_src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+        (fastpath_src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
+        (fastpath_src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached) &&
+        fastpath_size_ok &&
         ggml_vk_queue_quiesced(*src->device->compute_queue->handle)) {
         if (width == spitch && width == dpitch) {
-            memcpy(dst, (const uint8_t *) src->ptr + offset, width * height);
+            memcpy(dst, (const uint8_t *) fastpath_src->ptr + fastpath_offset, width * height);
         } else {
             for (size_t i = 0; i < height; i++) {
-                memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width);
+                memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) fastpath_src->ptr + fastpath_offset + i * spitch, width);
             }
         }
         return;
@@ -17419,9 +17455,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, ggml_tensor * tensor, int tensor_idx, bool almost_ready = false) {
-    GGML_UNUSED(cgraph);
-    GGML_UNUSED(tensor);
-
     VK_LOG_DEBUG("ggml_vk_compute_forward(" << tensor << ", name=" << tensor->name << ", op=" << ggml_op_name(tensor->op) << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << ", view_src=" << tensor->view_src << ", view_offs=" << tensor->view_offs << ")");
 
     vk_context subctx = ctx->tensor_ctxs[tensor_idx].lock();
@@ -17439,6 +17472,47 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
         for (auto& mset : subctx->memsets) {
             memset(mset.dst, mset.val, mset.n);
+        }
+
+        static const bool host_read_fastpath = [] {
+            const char * e = getenv("WP_VK_HOST_READ_FASTPATH");
+            return e != nullptr && e[0] == '1';
+        }();
+        static const size_t host_read_fastpath_max = [] {
+            const char * e = getenv("WP_VK_HOST_READ_FASTPATH_MAX_BYTES");
+            return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 262144;
+        }();
+        if (host_read_fastpath && tensor_idx == subctx->exit_tensor_idx && cgraph != nullptr && host_read_fastpath_max != 0) {
+            int last_node = cgraph->n_nodes - 1;
+            while (last_node > 0 && (ggml_vk_is_empty(cgraph->nodes[last_node]) ||
+                                     (cgraph->nodes[last_node]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+                last_node -= 1;
+            }
+
+            ggml_tensor * output = cgraph->nodes[last_node];
+            if (output->buffer != nullptr &&
+                output->buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
+                ggml_backend_vk_buffer_context * output_ctx =
+                    (ggml_backend_vk_buffer_context *) output->buffer->context;
+                vk_buffer output_buffer = output_ctx->dev_buffer;
+                const size_t output_offset = vk_tensor_offset(output) + output->view_offs;
+                const size_t output_size = ggml_nbytes(output);
+                const bool output_host_visible =
+                    static_cast<bool>(output_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+                const bool output_host_cached =
+                    static_cast<bool>(output_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+                if (output_host_visible && !output_host_cached && output_size <= host_read_fastpath_max &&
+                    output_offset <= output_buffer->size && output_size <= output_buffer->size - output_offset &&
+                    ggml_vk_ensure_host_read_staging_buffer(ctx->device, host_read_fastpath_max)) {
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    subctx->s->buffer->buf.copyBuffer(output_buffer->buffer,
+                                                      ctx->device->host_read_staging->buffer,
+                                                      { { output_offset, 0, output_size } });
+                    ctx->device->host_read_source = output_buffer;
+                    ctx->device->host_read_source_offset = output_offset;
+                    ctx->device->host_read_source_size = output_size;
+                }
+            }
         }
 
         // *** WP_VK_FENCE_ON_LAST_SUBMIT: one vkQueueSubmit per tiny graph. ***
@@ -18710,6 +18784,16 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    static const bool host_read_fastpath = [] {
+        const char * e = getenv("WP_VK_HOST_READ_FASTPATH");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (host_read_fastpath) {
+        ctx->device->host_read_source.reset();
+        ctx->device->host_read_source_offset = 0;
+        ctx->device->host_read_source_size = 0;
+    }
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;

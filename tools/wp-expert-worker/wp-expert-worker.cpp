@@ -847,6 +847,17 @@ public:
         report();
     }
 
+    void record_wire(const RequestStats & request) {
+        if (!enabled_) {
+            return;
+        }
+
+        ns_send_ += request.ns_send;
+        ns_recv_body_ += request.ns_recv_body;
+        ns_req_decode_ += request.ns_req_decode;
+        ns_resp_send_ += request.ns_resp_send;
+    }
+
 private:
     using clock = std::chrono::steady_clock;
 
@@ -8713,6 +8724,10 @@ public:
         stats_.record(request, n_experts);
     }
 
+    void record_wire_stats(const RequestStats & request) {
+        stats_.record_wire(request);
+    }
+
 private:
     // Count demand pages for which a hint has not reached a usable slot yet.
     // The queue check includes the separate host landing queue.
@@ -12198,7 +12213,9 @@ public:
     }
 
     void record_stats(const RequestStats & request, size_t n_experts) {
-        if (!multi_device()) {
+        if (multi_device()) {
+            devices_.front()->record_wire_stats(request);
+        } else {
             devices_.front()->record_stats(request, n_experts);
         }
     }
