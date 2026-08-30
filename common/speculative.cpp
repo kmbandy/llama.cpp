@@ -2450,7 +2450,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const uint64_t de = wp_spec_fnv1a(batch.embd, (size_t) batch.n_tokens * n_embd * sizeof(float));
-            std::fprintf(stderr, "SPECHASH step=%" PRIu64 " width=%d toks=", hash_trace_step++, n_tokens);
+            std::fprintf(stderr, "SPECHASH step=%" PRIu64 " width=%d toks=", hash_trace_step++, (int) hash_trace_tokens.size());
             for (size_t i = 0; i < hash_trace_tokens.size(); ++i) {
                 std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int) hash_trace_tokens[i]);
             }
