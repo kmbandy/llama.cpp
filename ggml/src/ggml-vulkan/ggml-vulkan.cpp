@@ -319,16 +319,55 @@ static void ggml_vk_print_device_lost_info(const vk_device& device);
 struct vk_queue_handle {
     vk::Queue queue;
     vk_device_ref device;
+    // *** QUEUE QUIESCENCE EPOCHS (bookkeeping only -- inert on its own). ***
+    //
+    // submit_epoch counts every vkQueueSubmit ever issued through this handle;
+    // it is bumped BEFORE the submit so an observer never sees the two counters
+    // equal while a batch is in flight. waited_epoch is advanced (monotonically)
+    // to the submit_epoch value captured just before a fence wait that covers
+    // everything submitted to this queue so far. submit_epoch == waited_epoch
+    // therefore means "this queue has no work outstanding that anyone still has
+    // to wait for", which is what lets WP_VK_HOST_READ_FASTPATH read
+    // host-coherent memory with a plain memcpy instead of a barrier submit.
+    //
+    // Missing a publish point only makes the predicate pessimistic (the fast
+    // path stops engaging); missing a BUMP would make it unsound, which is why
+    // the bump lives in the submit overrides -- the single choke point for
+    // every vkQueueSubmit in this file -- and not at the call sites.
+    std::atomic<uint64_t> submit_epoch {0};
+    std::atomic<uint64_t> waited_epoch {0};
     virtual void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) = 0;
     virtual void lock()   {}   // no-op by default (internally synchronized case)
     virtual void unlock() {}
     virtual ~vk_queue_handle() = default;
 };
 
+// True when nothing submitted to this queue is still awaiting a wait.
+static inline bool ggml_vk_queue_quiesced(const vk_queue_handle & h) {
+    return h.waited_epoch.load(std::memory_order_acquire) ==
+           h.submit_epoch.load(std::memory_order_acquire);
+}
+
+// Capture the epoch to publish once a covering fence wait returns.
+static inline uint64_t ggml_vk_queue_epoch(const vk_queue_handle & h) {
+    return h.submit_epoch.load(std::memory_order_acquire);
+}
+
+// Publish (monotonically) that everything up to `epoch` has been waited on.
+static inline void ggml_vk_queue_mark_waited(vk_queue_handle & h, uint64_t epoch) {
+    uint64_t cur = h.waited_epoch.load(std::memory_order_relaxed);
+    while (cur < epoch &&
+           !h.waited_epoch.compare_exchange_weak(cur, epoch,
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed)) {
+    }
+}
+
 struct vk_queue_handle_synchronized : vk_queue_handle {
     std::mutex mutex;
     void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) override {
         std::lock_guard<std::mutex> guard(mutex);
+        submit_epoch.fetch_add(1, std::memory_order_acq_rel);
         try {
             queue.submit(submits, fence);
         } catch (vk::DeviceLostError &) {
@@ -345,6 +384,7 @@ struct vk_queue_handle_synchronized : vk_queue_handle {
 struct vk_queue_handle_unsynchronized : vk_queue_handle {
     void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) override {
         // Driver guarantees internal synchronization via VK_KHR_internally_synchronized_queues
+        submit_epoch.fetch_add(1, std::memory_order_acq_rel);
         try {
             queue.submit(submits, fence);
         } catch (vk::DeviceLostError &) {
@@ -2462,6 +2502,14 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // WP_VK_FENCE_ON_LAST_SUBMIT: true when ctx->fence has a pending signal that
+    // was attached to the graph's own final submit rather than to a trailing
+    // fence-only vkQueueSubmit. Invariant: while it is true, NOTHING has been
+    // submitted on this context since -- every submitter drains it first.
+    bool fence_submitted {};
+    // Compute-queue submit_epoch as of the submission ctx->fence rides on, so a
+    // later drain publishes coverage for exactly that much and no more.
+    uint64_t fence_epoch {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -8930,6 +8978,55 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
     const bool direct_host_read = host_visible &&
         (src->device->uma ||
          (direct_read_max_bytes != 0 && height != 0 && width <= direct_read_max_bytes / height));
+
+    // *** WP_VK_HOST_READ_FASTPATH -- the read half of the io-small BAR fix. ***
+    //
+    // ggml_vk_buffer_write_2d already treats a host-visible destination as a
+    // plain memcpy with no command buffer at all (see the eHostVisible branch
+    // there). The read side is not symmetric: even the direct_host_read branch
+    // below allocates a command buffer, records a single pipelineBarrier,
+    // vkQueueSubmits it and waits on a fence -- a full driver round trip for a
+    // 10 KB decode result. That asymmetry is the ~80 us/request ns_vk_readback
+    // on the RX 480.
+    //
+    // What the barrier submit actually buys is two things: (a) it makes prior
+    // device writes visible to the host, and (b) because the compute queue is
+    // in-order, its fence doubles as "wait for everything already submitted".
+    // (a) is redundant after ANY covering fence wait -- a fence signal operation
+    // carries a device->host memory domain operation, and this memory is
+    // asserted HOST_COHERENT below. (b) is redundant when the queue is already
+    // quiesced, which is exactly the wp-expert-worker's case: read_result runs
+    // after ggml_backend_synchronize has waited on ctx->fence.
+    //
+    // So when the queue epochs say nothing is outstanding, the whole round trip
+    // collapses to the same memcpy the write path uses. NO NUMERICS CHANGE --
+    // the identical bytes are copied, only the wait that precedes the copy is
+    // dropped, and only when a stronger wait has already happened.
+    //
+    // Default OFF. The byte cap keeps large prefill readbacks on the staging
+    // copy (a big PCIe read from BAR is slower than a device copy into GTT).
+    static const bool host_read_fastpath = [] {
+        const char * e = getenv("WP_VK_HOST_READ_FASTPATH");
+        return e != nullptr && e[0] == '1';
+    }();
+    static const size_t host_read_fastpath_max = [] {
+        const char * e = getenv("WP_VK_HOST_READ_FASTPATH_MAX_BYTES");
+        return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 262144;
+    }();
+    if (host_read_fastpath && host_visible &&
+        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
+        height != 0 && width <= host_read_fastpath_max / height &&
+        ggml_vk_queue_quiesced(*src->device->compute_queue->handle)) {
+        if (width == spitch && width == dpitch) {
+            memcpy(dst, (const uint8_t *) src->ptr + offset, width * height);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width);
+            }
+        }
+        return;
+    }
+
     if (direct_host_read) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
@@ -8945,9 +9042,12 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
             {}, {});
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, src->device->fence);
+        const uint64_t epoch = ggml_vk_queue_epoch(*src->device->compute_queue->handle);
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX),
                  "vk_buffer_read_2d uma waitForFences", src->device);
         src->device->device.resetFences({ src->device->fence });
+        // This fence covers every earlier compute-queue submission (in-order queue).
+        ggml_vk_queue_mark_waited(*src->device->compute_queue->handle, epoch);
         ggml_vk_queue_command_pools_cleanup(src->device);
 
         if (width == spitch && width == dpitch) {
@@ -16706,7 +16806,14 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 #endif
 
     if (subctx) {
-        // Submit and wait for any pending work before reallocating the buffers
+        // Submit and wait for any pending work before reallocating the buffers.
+        // Drain first: an unconsumed WP_VK_FENCE_ON_LAST_SUBMIT signal must not
+        // survive across a submission that ctx->fence would then no longer cover.
+        if (ctx->fence_submitted) {
+            ggml_vk_wait_for_fence(ctx);
+            ctx->fence_submitted = false;
+            ctx->submit_pending  = false;
+        }
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, {});
         ctx->submit_pending = true;
@@ -17334,11 +17441,47 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
+        // *** WP_VK_FENCE_ON_LAST_SUBMIT: one vkQueueSubmit per tiny graph. ***
+        //
+        // Upstream always submits the graph with a null fence and then has
+        // ggml_vk_synchronize append a SECOND, empty, fence-only vkQueueSubmit
+        // purely to have something to wait on. For a prefill graph that second
+        // submit is noise. For the wp-expert-worker's decode graphs -- one graph
+        // per layer per token, already forced to a single submit by
+        // GGML_VK_MIN_SPLIT_FLOPS -- it doubles the number of CS ioctls per
+        // request against ~10 us of actual shader work.
+        //
+        // A fence attached to a submission is signalled only after that
+        // submission AND all previously submitted work on the queue completes,
+        // which is the same guarantee the trailing empty submit provided. So
+        // when this is the graph's final batch and nothing else is already in
+        // flight on this context, carry ctx->fence on the real submit instead.
+        //
+        // SAFETY: same command buffers, same order, same fence semantics -- only
+        // one fewer queue submission. Bit-identical results.
+        static const bool fence_on_last_submit = [] {
+            const char * e = getenv("WP_VK_FENCE_ON_LAST_SUBMIT");
+            return e != nullptr && e[0] == '1';
+        }();
+
+        // Maintain the fence_submitted invariant: never leave an unconsumed
+        // fence signal behind while submitting more work onto the same fence.
+        if (ctx->fence_submitted) {
+            ggml_vk_wait_for_fence(ctx);
+            ctx->fence_submitted = false;
+            ctx->submit_pending  = false;
+        }
+
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(subctx, ctx->fence);
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
+        } else if (fence_on_last_submit && !ctx->submit_pending &&
+                   tensor_idx == subctx->exit_tensor_idx) {
+            ggml_vk_submit(subctx, ctx->fence);
+            ctx->fence_submitted = true;
+            ctx->fence_epoch     = ggml_vk_queue_epoch(*ctx->device->compute_queue->handle);
         } else {
             ggml_vk_submit(subctx, {});
         }
@@ -17927,6 +18070,19 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
+    // WP_VK_FENCE_ON_LAST_SUBMIT: ctx->fence was already attached to the graph's
+    // own final vkQueueSubmit, so the trailing fence-only submit below is not
+    // needed -- just consume the signal. The flag is only ever set when nothing
+    // has been submitted on this context since (ggml_vk_compute_forward and
+    // ggml_vk_preallocate_buffers drain it before they submit again), so this
+    // wait covers exactly what the fence-only submit would have covered.
+    if (ctx->fence_submitted) {
+        ggml_vk_wait_for_fence(ctx);
+        ggml_vk_queue_mark_waited(*ctx->device->compute_queue->handle, ctx->fence_epoch);
+        ctx->fence_submitted = false;
+        ctx->submit_pending  = false;
+    }
+
     bool do_transfer = !ctx->compute_ctx.expired();
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
@@ -17978,7 +18134,11 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
         if (!ctx->device->serialize_submissions) {
+            const uint64_t epoch = ggml_vk_queue_epoch(*ctx->device->compute_queue->handle);
             ggml_vk_wait_for_fence(ctx);
+            // ctx->fence was signalled by a submission on the compute queue, which
+            // is in-order, so this wait covers every earlier submission on it.
+            ggml_vk_queue_mark_waited(*ctx->device->compute_queue->handle, epoch);
         }
         ctx->submit_pending = false;
         if (cmd_buf) {
