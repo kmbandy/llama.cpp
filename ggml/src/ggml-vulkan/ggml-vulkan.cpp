@@ -17437,6 +17437,47 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 #endif
 
     if (submit || last_node) {
+        static const bool host_read_fastpath = [] {
+            const char * e = getenv("WP_VK_HOST_READ_FASTPATH");
+            return e != nullptr && e[0] == '1';
+        }();
+        static const size_t host_read_fastpath_max = [] {
+            const char * e = getenv("WP_VK_HOST_READ_FASTPATH_MAX_BYTES");
+            return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 262144;
+        }();
+        if (host_read_fastpath && last_node && host_read_fastpath_max != 0) {
+            int output_idx = cgraph->n_nodes - 1;
+            while (output_idx > 0 && (ggml_vk_is_empty(cgraph->nodes[output_idx]) ||
+                                      (cgraph->nodes[output_idx]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+                output_idx -= 1;
+            }
+
+            ggml_tensor * output = cgraph->nodes[output_idx];
+            if (output->buffer != nullptr &&
+                output->buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
+                ggml_backend_vk_buffer_context * output_ctx =
+                    (ggml_backend_vk_buffer_context *) output->buffer->context;
+                vk_buffer output_buffer = output_ctx->dev_buffer;
+                const size_t output_offset = vk_tensor_offset(output) + output->view_offs;
+                const size_t output_size = ggml_nbytes(output);
+                const bool output_host_visible =
+                    static_cast<bool>(output_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+                const bool output_host_cached =
+                    static_cast<bool>(output_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+                if (output_host_visible && !output_host_cached && output_size <= host_read_fastpath_max &&
+                    output_offset <= output_buffer->size && output_size <= output_buffer->size - output_offset &&
+                    ggml_vk_ensure_host_read_staging_buffer(ctx->device, host_read_fastpath_max)) {
+                    ggml_vk_sync_buffers(ctx, compute_ctx);
+                    compute_ctx->s->buffer->buf.copyBuffer(output_buffer->buffer,
+                                                           ctx->device->host_read_staging->buffer,
+                                                           { { output_offset, 0, output_size } });
+                    ctx->device->host_read_source = output_buffer;
+                    ctx->device->host_read_source_offset = output_offset;
+                    ctx->device->host_read_source_size = output_size;
+                }
+            }
+        }
+
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -17455,6 +17496,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, ggml_tensor * tensor, int tensor_idx, bool almost_ready = false) {
+    GGML_UNUSED(cgraph);
+
     VK_LOG_DEBUG("ggml_vk_compute_forward(" << tensor << ", name=" << tensor->name << ", op=" << ggml_op_name(tensor->op) << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << ", view_src=" << tensor->view_src << ", view_offs=" << tensor->view_offs << ")");
 
     vk_context subctx = ctx->tensor_ctxs[tensor_idx].lock();
@@ -17472,47 +17515,6 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
         for (auto& mset : subctx->memsets) {
             memset(mset.dst, mset.val, mset.n);
-        }
-
-        static const bool host_read_fastpath = [] {
-            const char * e = getenv("WP_VK_HOST_READ_FASTPATH");
-            return e != nullptr && e[0] == '1';
-        }();
-        static const size_t host_read_fastpath_max = [] {
-            const char * e = getenv("WP_VK_HOST_READ_FASTPATH_MAX_BYTES");
-            return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 262144;
-        }();
-        if (host_read_fastpath && tensor_idx == subctx->exit_tensor_idx && cgraph != nullptr && host_read_fastpath_max != 0) {
-            int last_node = cgraph->n_nodes - 1;
-            while (last_node > 0 && (ggml_vk_is_empty(cgraph->nodes[last_node]) ||
-                                     (cgraph->nodes[last_node]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
-                last_node -= 1;
-            }
-
-            ggml_tensor * output = cgraph->nodes[last_node];
-            if (output->buffer != nullptr &&
-                output->buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
-                ggml_backend_vk_buffer_context * output_ctx =
-                    (ggml_backend_vk_buffer_context *) output->buffer->context;
-                vk_buffer output_buffer = output_ctx->dev_buffer;
-                const size_t output_offset = vk_tensor_offset(output) + output->view_offs;
-                const size_t output_size = ggml_nbytes(output);
-                const bool output_host_visible =
-                    static_cast<bool>(output_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
-                const bool output_host_cached =
-                    static_cast<bool>(output_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
-                if (output_host_visible && !output_host_cached && output_size <= host_read_fastpath_max &&
-                    output_offset <= output_buffer->size && output_size <= output_buffer->size - output_offset &&
-                    ggml_vk_ensure_host_read_staging_buffer(ctx->device, host_read_fastpath_max)) {
-                    ggml_vk_sync_buffers(ctx, subctx);
-                    subctx->s->buffer->buf.copyBuffer(output_buffer->buffer,
-                                                      ctx->device->host_read_staging->buffer,
-                                                      { { output_offset, 0, output_size } });
-                    ctx->device->host_read_source = output_buffer;
-                    ctx->device->host_read_source_offset = output_offset;
-                    ctx->device->host_read_source_size = output_size;
-                }
-            }
         }
 
         // *** WP_VK_FENCE_ON_LAST_SUBMIT: one vkQueueSubmit per tiny graph. ***
