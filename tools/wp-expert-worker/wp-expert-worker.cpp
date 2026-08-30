@@ -1365,6 +1365,26 @@ static ResourcePlan plan_resources_for_backend(
         (uint64_t) ggml_backend_buft_get_alignment(buft));
 }
 
+static size_t expert_pin_class_pct_from_env() {
+    const char * env = std::getenv("WP_EXPERT_PIN_CLASS_PCT");
+    if (env == nullptr || env[0] == '\0') {
+        return 85;
+    }
+    const long parsed = std::strtol(env, nullptr, 10);
+    return parsed >= 0 ? std::min<long>(parsed, 100) : 85;
+}
+
+static size_t expert_pin_class_index(const ResourcePlan & resources, uint64_t page_size) {
+    for (size_t i = 0; i < resources.slot_classes.size(); ++i) {
+        const SlotClass & slot_class = resources.slot_classes[i];
+        if ((resources.size_classes && slot_class.size == page_size) ||
+                (!resources.size_classes && slot_class.size >= page_size)) {
+            return i;
+        }
+    }
+    return resources.slot_classes.size();
+}
+
 std::vector<DeviceMemberLayout> plan_device_member_layout(
         const std::vector<uint64_t> & sizes, uint64_t alignment) {
     if (alignment == 0) {
@@ -7111,6 +7131,15 @@ public:
             if (pin_budget > (size_t) pool_.resources().slot_count) {
                 pin_budget = (size_t) pool_.resources().slot_count;
             }
+            const size_t pin_class_pct = expert_pin_class_pct_from_env();
+            std::vector<size_t> pin_class_caps;
+            std::vector<size_t> pin_class_pinned;
+            std::vector<size_t> pin_class_skipped;
+            for (const SlotClass & slot_class : pool_.resources().slot_classes) {
+                pin_class_caps.push_back((size_t) slot_class.slots * pin_class_pct / 100);
+                pin_class_pinned.push_back(0);
+                pin_class_skipped.push_back(0);
+            }
             std::ifstream pin_file(pin_path);
             if (!pin_file) {
                 throw std::runtime_error(
@@ -7144,17 +7173,35 @@ public:
                               << layer << " " << expert << std::endl;
                     continue;
                 }
+                const size_t class_id = expert_pin_class_index(pool_.resources(), it->second.size);
+                if (class_id < pin_class_caps.size() &&
+                        pin_class_pinned[class_id] >= pin_class_caps[class_id]) {
+                    ++pin_class_skipped[class_id];
+                    continue;
+                }
                 if (pin_pages.size() >= pin_budget) {
                     truncated = true;
                     continue;
                 }
                 pin_pages.push_back(&it->second);
+                if (class_id < pin_class_pinned.size()) {
+                    ++pin_class_pinned[class_id];
+                }
             }
             const size_t loaded = pool_.pin_pages(pin_pages);
             std::cerr << "WARN wp expert worker: pin_file=" << pin_path
                       << " n_pinned=" << loaded
                       << " pin_budget=" << pin_budget
+                      << " pin_class_pct=" << pin_class_pct
                       << " demand_hits=0" << std::endl;
+            for (size_t i = 0; i < pin_class_caps.size(); ++i) {
+                const SlotClass & slot_class = pool_.resources().slot_classes[i];
+                std::cerr << "WARN wp expert worker: pin_class bytes=" << slot_class.size
+                          << " slots=" << slot_class.slots
+                          << " cap=" << pin_class_caps[i]
+                          << " pinned=" << pin_class_pinned[i]
+                          << " skipped=" << pin_class_skipped[i] << std::endl;
+            }
             if (truncated) {
                 std::cerr << "WARN wp expert worker: pin file truncated in file order"
                           << " at " << pin_budget << " slots" << std::endl;
@@ -8698,6 +8745,7 @@ private:
         std::vector<std::vector<int32_t>> ids;
         std::vector<std::vector<float>> route_weights;
         bool pending = false;
+        bool graph_pending = false;
     };
 
     // WP_SUBMIT_ASYNC is opt-in. The tensor upload and graph compute use the
@@ -8717,6 +8765,7 @@ private:
             state.ids.clear();
             state.route_weights.clear();
             state.pending = false;
+            state.graph_pending = false;
         }
         return previous;
     }
@@ -8740,6 +8789,7 @@ private:
             }
         }
         it->second.pending = false;
+        it->second.graph_pending = false;
         it->second.params.clear();
         it->second.ids.clear();
         it->second.route_weights.clear();
@@ -8756,7 +8806,15 @@ private:
 
     enum ggml_status submit_graph(ggml_cgraph * graph, RequestStats & request_stats) {
         if (submit_async_) {
-            async_submit_state().pending = true;
+            AsyncSubmitState & state = async_submit_state();
+            if (is_vulkan_backend() && state.graph_pending) {
+                // Vulkan reuses graph build state, so drain before recording the next graph.
+                synchronize_async(&request_stats);
+            }
+            state.pending = true;
+            if (is_vulkan_backend()) {
+                state.graph_pending = true;
+            }
         }
         const auto started = std::chrono::steady_clock::now();
         const enum ggml_status status = submit_async_
@@ -13099,6 +13157,14 @@ private:
             const long long parsed = std::strtoll(max_env, nullptr, 10);
             pin_budget = parsed > 0 ? (size_t) parsed : 0;
         }
+        const size_t pin_class_pct = expert_pin_class_pct_from_env();
+        std::vector<std::vector<size_t>> pin_class_pinned(devices_.size());
+        std::vector<std::vector<size_t>> pin_class_skipped(devices_.size());
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            const ResourcePlan & resources = devices_[i]->resources();
+            pin_class_pinned[i].assign(resources.slot_classes.size(), 0);
+            pin_class_skipped[i].assign(resources.slot_classes.size(), 0);
+        }
         std::ifstream pin_file(pin_path);
         if (!pin_file) {
             throw std::runtime_error(
@@ -13132,11 +13198,23 @@ private:
                           << layer << " " << expert << std::endl;
                 continue;
             }
+            const size_t device_id = owning_device_for_page(layer, expert);
+            const ResourcePlan & resources = devices_[device_id]->resources();
+            const size_t class_id = expert_pin_class_index(resources, catalog_.pages.at(key).size);
+            if (class_id < pin_class_pinned[device_id].size() &&
+                    pin_class_pinned[device_id][class_id] >=
+                        (size_t) resources.slot_classes[class_id].slots * pin_class_pct / 100) {
+                ++pin_class_skipped[device_id][class_id];
+                continue;
+            }
             if (selected >= pin_budget) {
                 truncated = true;
                 continue;
             }
-            pages[owning_device_for_page(layer, expert)].push_back(key);
+            pages[device_id].push_back(key);
+            if (class_id < pin_class_pinned[device_id].size()) {
+                ++pin_class_pinned[device_id][class_id];
+            }
             ++selected;
         }
         size_t loaded = 0;
@@ -13147,7 +13225,20 @@ private:
         std::cerr << "WARN wp expert worker: pin_file=" << pin_path
                   << " n_pinned=" << loaded
                   << " pin_budget=" << pin_budget
+                  << " pin_class_pct=" << pin_class_pct
                   << " demand_hits=0" << std::endl;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            const ResourcePlan & resources = devices_[i]->resources();
+            for (size_t j = 0; j < resources.slot_classes.size(); ++j) {
+                const SlotClass & slot_class = resources.slot_classes[j];
+                std::cerr << "WARN wp expert worker: pin_class device=" << device_names_[i]
+                          << " bytes=" << slot_class.size
+                          << " slots=" << slot_class.slots
+                          << " cap=" << (size_t) slot_class.slots * pin_class_pct / 100
+                          << " pinned=" << pin_class_pinned[i][j]
+                          << " skipped=" << pin_class_skipped[i][j] << std::endl;
+            }
+        }
         if (truncated) {
             std::cerr << "WARN wp expert worker: pin file truncated in file order"
                       << " at " << pin_budget << " slots" << std::endl;
