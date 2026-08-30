@@ -4,6 +4,8 @@
 
 #include "ggml.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdarg>
 #include <cmath>
@@ -11,8 +13,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 
 // ---------------------------------------------------------------------------
 // little-endian read/write helpers (byte-explicit; no struct memcpy, no
@@ -171,6 +175,291 @@ static void rd_u16_bulk(const uint8_t * & p, uint16_t * dst, size_t n) {
     throw pipe_protocol_error(code, buf);
 }
 
+// ---------------------------------------------------------------------------
+// optional wire compression
+
+static constexpr size_t   PIPE_WIRE_COMPRESS_MIN_SIZE = 1024;
+static constexpr size_t   PIPE_WIRE_COMPRESS_HEADER_SIZE = 8;
+static constexpr uint32_t PIPE_WIRE_COMPRESS_TAG = 0x31434C50u; // "PLC1"
+
+static uint32_t pipe_lz4_hash(const uint8_t * p) {
+    uint32_t value = 0;
+    std::memcpy(&value, p, sizeof(value));
+    return (value * 2654435761u) >> 16;
+}
+
+static void pipe_lz4_append_length(std::vector<uint8_t> & out, size_t length) {
+    while (length >= 255) {
+        out.push_back(255);
+        length -= 255;
+    }
+    out.push_back((uint8_t) length);
+}
+
+static void pipe_lz4_append_sequence(std::vector<uint8_t> & out,
+                                     const uint8_t * src, size_t anchor, size_t match,
+                                     size_t match_len, size_t offset) {
+    const size_t literal_len = match - anchor;
+    const size_t match_code  = match_len - 4;
+    uint8_t token = (uint8_t) (std::min<size_t>(literal_len, 15) << 4);
+    token |= (uint8_t) std::min<size_t>(match_code, 15);
+    out.push_back(token);
+    if (literal_len >= 15) {
+        pipe_lz4_append_length(out, literal_len - 15);
+    }
+    out.insert(out.end(), src + anchor, src + match);
+    out.push_back((uint8_t) offset);
+    out.push_back((uint8_t) (offset >> 8));
+    if (match_code >= 15) {
+        pipe_lz4_append_length(out, match_code - 15);
+    }
+}
+
+static void pipe_lz4_append_last_literals(std::vector<uint8_t> & out,
+                                          const uint8_t * src, size_t anchor, size_t size) {
+    const size_t literal_len = size - anchor;
+    out.push_back((uint8_t) (std::min<size_t>(literal_len, 15) << 4));
+    if (literal_len >= 15) {
+        pipe_lz4_append_length(out, literal_len - 15);
+    }
+    out.insert(out.end(), src + anchor, src + size);
+}
+
+static void pipe_lz4_compress(const uint8_t * src, size_t size, std::vector<uint8_t> & out) {
+    static thread_local std::array<int32_t, 1 << 16> hash_table;
+    std::fill(hash_table.begin(), hash_table.end(), -1);
+    out.reserve(size + size / 255 + 16);
+
+    size_t anchor = 0;
+    size_t pos = 0;
+    while (pos + 9 <= size) {
+        const uint32_t hash = pipe_lz4_hash(src + pos);
+        const int32_t previous = hash_table[hash];
+        hash_table[hash] = (int32_t) pos;
+        if (previous < 0 || pos - (size_t) previous > 65535 ||
+            std::memcmp(src + previous, src + pos, 4) != 0) {
+            ++pos;
+            continue;
+        }
+
+        const size_t match = pos;
+        size_t match_len = 4;
+        while (pos + match_len < size - 5 && src[previous + match_len] == src[pos + match_len]) {
+            ++match_len;
+        }
+        pipe_lz4_append_sequence(out, src, anchor, match, match_len, match - (size_t) previous);
+        pos += match_len;
+        anchor = pos;
+
+        const size_t match_start = match + 1;
+        for (size_t p = match_start; p < pos && p + 4 <= size; ++p) {
+            hash_table[pipe_lz4_hash(src + p)] = (int32_t) p;
+        }
+    }
+    pipe_lz4_append_last_literals(out, src, anchor, size);
+}
+
+static size_t pipe_lz4_read_length(const uint8_t * src, size_t size, size_t & pos,
+                                   size_t length) {
+    if (length != 15) {
+        return length;
+    }
+    for (;;) {
+        if (pos >= size) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: truncated LZ4 length");
+        }
+        const size_t extra = src[pos++];
+        if (length > std::numeric_limits<size_t>::max() - extra) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: LZ4 length overflows");
+        }
+        length += extra;
+        if (extra != 255) {
+            return length;
+        }
+    }
+}
+
+static void pipe_lz4_decompress(const uint8_t * src, size_t size,
+                                uint8_t * dst, size_t expected_size) {
+    size_t src_pos = 0;
+    size_t dst_pos = 0;
+    while (src_pos < size) {
+        const uint8_t token = src[src_pos++];
+        const size_t literal_len = pipe_lz4_read_length(src, size, src_pos, token >> 4);
+        if (literal_len > size - src_pos || literal_len > expected_size - dst_pos) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: invalid LZ4 literal length");
+        }
+        if (literal_len != 0) {
+            std::memcpy(dst + dst_pos, src + src_pos, literal_len);
+            src_pos += literal_len;
+            dst_pos += literal_len;
+        }
+        if (src_pos == size) {
+            break;
+        }
+        if (size - src_pos < 2) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: truncated LZ4 offset");
+        }
+        const size_t offset = (size_t) src[src_pos] | ((size_t) src[src_pos + 1] << 8);
+        src_pos += 2;
+        if (offset == 0 || offset > dst_pos) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: invalid LZ4 offset");
+        }
+        const size_t match_code = pipe_lz4_read_length(src, size, src_pos, token & 15);
+        if (match_code > std::numeric_limits<size_t>::max() - 4) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: LZ4 match length overflows");
+        }
+        const size_t match_len = match_code + 4;
+        if (match_len > expected_size - dst_pos) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: invalid LZ4 match length");
+        }
+        for (size_t i = 0; i < match_len; ++i) {
+            dst[dst_pos] = dst[dst_pos - offset];
+            ++dst_pos;
+        }
+    }
+    if (dst_pos != expected_size) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: LZ4 output size %zu, want %zu", dst_pos, expected_size);
+    }
+}
+
+static bool pipe_try_compress(const uint8_t * src, size_t size, std::vector<uint8_t> & out,
+                              uint64_t & elapsed_ns) {
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<uint8_t> transformed(size);
+    size_t transformed_pos = 0;
+    for (size_t plane = 0; plane < 4; ++plane) {
+        for (size_t i = plane; i < size; i += 4) {
+            transformed[transformed_pos++] = src[i];
+        }
+    }
+
+    std::vector<uint8_t> compressed;
+    pipe_lz4_compress(transformed.data(), transformed.size(), compressed);
+    const size_t wire_size = PIPE_WIRE_COMPRESS_HEADER_SIZE + compressed.size();
+    const bool worthwhile = wire_size <= size * 19 / 20;
+    if (worthwhile) {
+        out.resize(wire_size);
+        uint8_t * p = out.data();
+        wr_u32(p, PIPE_WIRE_COMPRESS_TAG);
+        wr_u32(p, (uint32_t) size);
+        std::memcpy(p, compressed.data(), compressed.size());
+    } else {
+        out.clear();
+    }
+    elapsed_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    return worthwhile;
+}
+
+static void pipe_decompress(const uint8_t * src, size_t size, std::vector<uint8_t> & out) {
+    if (size < PIPE_WIRE_COMPRESS_HEADER_SIZE) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: compressed frame is too small");
+    }
+    const uint8_t * p = src;
+    const uint32_t tag = rd_u32(p);
+    const uint32_t original_size = rd_u32(p);
+    if (tag != PIPE_WIRE_COMPRESS_TAG || original_size > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid compressed frame header");
+    }
+    out.resize(original_size);
+    std::vector<uint8_t> transformed(original_size);
+    pipe_lz4_decompress(p, size - PIPE_WIRE_COMPRESS_HEADER_SIZE,
+                        transformed.data(), transformed.size());
+    size_t transformed_pos = 0;
+    for (size_t plane = 0; plane < 4; ++plane) {
+        for (size_t i = plane; i < original_size; i += 4) {
+            out[i] = transformed[transformed_pos++];
+        }
+    }
+}
+
+static bool pipe_wire_compress_enabled() {
+    const char * value = std::getenv("WP_WIRE_COMPRESS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+struct pipe_wire_stats {
+    uint64_t frames_compressed = 0;
+    uint64_t bytes_in = 0;
+    uint64_t bytes_out = 0;
+    uint64_t ns_compress = 0;
+    uint64_t ns_decompress = 0;
+};
+
+struct pipe_wire_stats_registry {
+    std::mutex mutex;
+    std::unordered_map<const pipe_socket_t *, pipe_wire_stats> values;
+};
+
+static pipe_wire_stats_registry & pipe_wire_registry() {
+    static pipe_wire_stats_registry * registry = new pipe_wire_stats_registry;
+    return *registry;
+}
+
+static void pipe_wire_dump_stats();
+
+static void pipe_wire_register_stats_dump() {
+    static const bool registered = [] {
+        std::atexit(pipe_wire_dump_stats);
+        return true;
+    }();
+    (void) registered;
+}
+
+static void pipe_wire_record(const pipe_socket_t & sock, size_t bytes_in, size_t bytes_out,
+                             uint64_t elapsed_ns, bool decompressing) {
+    pipe_wire_register_stats_dump();
+    pipe_wire_stats_registry & registry = pipe_wire_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    pipe_wire_stats & stats = registry.values[&sock];
+    ++stats.frames_compressed;
+    stats.bytes_in += (uint64_t) bytes_in;
+    stats.bytes_out += (uint64_t) bytes_out;
+    if (decompressing) {
+        stats.ns_decompress += elapsed_ns;
+    } else {
+        stats.ns_compress += elapsed_ns;
+    }
+}
+
+static void pipe_wire_dump_socket(const pipe_socket_t & sock) {
+    pipe_wire_stats_registry & registry = pipe_wire_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    const auto it = registry.values.find(&sock);
+    if (it == registry.values.end()) {
+        return;
+    }
+    const pipe_wire_stats & stats = it->second;
+    std::fprintf(stderr,
+                 "pipe wire compression: socket=%p frames_compressed=%llu bytes_in=%llu "
+                 "bytes_out=%llu ns_compress=%llu ns_decompress=%llu\n",
+                 (const void *) &sock,
+                 (unsigned long long) stats.frames_compressed,
+                 (unsigned long long) stats.bytes_in,
+                 (unsigned long long) stats.bytes_out,
+                 (unsigned long long) stats.ns_compress,
+                 (unsigned long long) stats.ns_decompress);
+    registry.values.erase(it);
+}
+
+static void pipe_wire_dump_stats() {
+    pipe_wire_stats_registry & registry = pipe_wire_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    for (const auto & item : registry.values) {
+        const pipe_wire_stats & stats = item.second;
+        std::fprintf(stderr,
+                     "pipe wire compression: socket=%p frames_compressed=%llu bytes_in=%llu "
+                     "bytes_out=%llu ns_compress=%llu ns_decompress=%llu\n",
+                     (const void *) item.first,
+                     (unsigned long long) stats.frames_compressed,
+                     (unsigned long long) stats.bytes_in,
+                     (unsigned long long) stats.bytes_out,
+                     (unsigned long long) stats.ns_compress,
+                     (unsigned long long) stats.ns_decompress);
+    }
+}
+
 uint32_t pipe_hidden_elt_size(int32_t hidden_type) {
     switch (hidden_type) {
         case PIPE_HIDDEN_F32: return 4;
@@ -210,6 +499,9 @@ pipe_frame_header pipe_decode_header(const uint8_t in[PIPE_HEADER_SIZE]) {
     if (h.version != PIPE_VERSION) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: unsupported protocol version %u (want %u)",
              h.version, PIPE_VERSION);
+    }
+    if ((h.flags & ~PIPE_FRAME_FLAG_COMPRESSED) != 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: unsupported frame flags 0x%08x", h.flags);
     }
     if (h.length > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME,
@@ -1622,13 +1914,29 @@ void pipe_validate_hello(const pipe_hello & peer,
 
 bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id,
                      const uint8_t * payload, size_t payload_len) {
+    std::vector<uint8_t> wire_payload;
+    const uint8_t * wire_data = payload;
+    size_t wire_len = payload_len;
+    uint32_t wire_flags = 0;
+    uint64_t compress_ns = 0;
+    static const bool wire_compress = pipe_wire_compress_enabled();
+    if (wire_compress && !sock.peer_is_loopback() &&
+        payload_len >= PIPE_WIRE_COMPRESS_MIN_SIZE &&
+        payload_len <= std::numeric_limits<uint32_t>::max() &&
+        pipe_try_compress(payload, payload_len, wire_payload, compress_ns)) {
+        wire_data = wire_payload.data();
+        wire_len = wire_payload.size();
+        wire_flags = PIPE_FRAME_FLAG_COMPRESSED;
+        pipe_wire_record(sock, payload_len, wire_len, compress_ns, false);
+    }
+
     pipe_frame_header h;
     h.magic   = PIPE_MAGIC;
     h.version = PIPE_VERSION;
     h.type    = (uint32_t) type;
-    h.flags   = 0;
+    h.flags   = wire_flags;
     h.seq_id  = seq_id;
-    h.length  = (uint64_t) payload_len;
+    h.length  = (uint64_t) wire_len;
 
     uint8_t hdr[PIPE_HEADER_SIZE];
     pipe_encode_header(hdr, h);
@@ -1705,17 +2013,17 @@ bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id
 
     // peer_is_loopback() is a bool read off the socket, stamped once at
     // connect/accept -- no syscall, no lookup, per frame.
+    bool sent = false;
     if (coalesce_mode == 1 || (coalesce_mode == 2 && !sock.peer_is_loopback())) {
-        return sock.send_data2(hdr, PIPE_HEADER_SIZE, payload, payload_len);
+        sent = sock.send_data2(hdr, PIPE_HEADER_SIZE, wire_data, wire_len);
+    } else {
+        sent = sock.send_data(hdr, PIPE_HEADER_SIZE) &&
+               (wire_len == 0 || sock.send_data(wire_data, wire_len));
     }
-
-    if (!sock.send_data(hdr, PIPE_HEADER_SIZE)) {
-        return false;
+    if (!sent) {
+        pipe_wire_dump_socket(sock);
     }
-    if (payload_len > 0 && !sock.send_data(payload, payload_len)) {
-        return false;
-    }
-    return true;
+    return sent;
 }
 
 bool pipe_recv_frame(pipe_socket_t & sock, pipe_frame_type & type, uint64_t & seq_id,
@@ -1734,9 +2042,23 @@ bool pipe_recv_frame(pipe_socket_t & sock, pipe_frame_type & type, uint64_t & se
     // any allocation is made from the untrusted length field
     const pipe_frame_header h = pipe_decode_header(hdr);
 
-    payload.resize((size_t) h.length);
-    if (h.length > 0 && !sock.recv_data(payload.data(), (size_t) h.length)) {
-        return false;
+    if ((h.flags & PIPE_FRAME_FLAG_COMPRESSED) != 0) {
+        std::vector<uint8_t> wire_payload((size_t) h.length);
+        if (!sock.recv_data(wire_payload.data(), wire_payload.size())) {
+            pipe_wire_dump_socket(sock);
+            return false;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        pipe_decompress(wire_payload.data(), wire_payload.size(), payload);
+        const uint64_t decompress_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        pipe_wire_record(sock, wire_payload.size(), payload.size(), decompress_ns, true);
+    } else {
+        payload.resize((size_t) h.length);
+        if (h.length > 0 && !sock.recv_data(payload.data(), (size_t) h.length)) {
+            pipe_wire_dump_socket(sock);
+            return false;
+        }
     }
     type   = (pipe_frame_type) h.type;
     seq_id = h.seq_id;
