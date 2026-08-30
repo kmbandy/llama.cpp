@@ -509,6 +509,35 @@ struct RequestStats {
     uint64_t ns_encode_send = 0;   // encode + unlock + send + relock
     uint64_t ns_post_send   = 0;   // record_stats, req_log, spec_pagein_after_dispatch
     uint64_t ns_send    = 0;
+    // *** THE PRE-RECV BLIND SPOT (added 2026-08-29). ***
+    // The five segments above all begin at t_frame, which is stamped AFTER
+    // pipe_recv_frame returns -- i.e. after the entire body has landed. The
+    // request-carrying frame on the live split path (ACTS) carries the full
+    // activation block, so "waiting for the body to arrive" is a real,
+    // potentially large interval that sits inside the spine's wait and outside
+    // every worker counter. ns_recv is the counter that has printed
+    // "unavailable" forever; these three replace it with measured segments,
+    // recorded on the ACTS-family branches (the live path) as well as the plain
+    // DISPATCH_REQ one.
+    //
+    //   ns_recv_body  header recv returned -> pipe_recv_frame returned.
+    //                 Body transfer + the payload.resize() allocation. Does NOT
+    //                 include time the frame sat in the socket buffer before
+    //                 this thread reached the recv (that is upstream of the
+    //                 first stamp and still unmeasured).
+    //   ns_req_decode the request decode for THIS frame -- ACTS/ACTS_REF/
+    //                 ACTS_PUBLISH payload decode, or the DISPATCH_REQ decode.
+    //                 Distinct from ns_decode_req, which is only ever set on
+    //                 the plain DISPATCH_REQ branch and reads 0 on the split
+    //                 path that is actually live.
+    //   ns_resp_send  encode + unlock + send + relock, on every response-
+    //                 bearing branch. The split branches previously folded this
+    //                 into ns_send with no separate encode/send split; this is
+    //                 the same window, named for the direction it measures, and
+    //                 is the worker->spine leg the LAN coalesce is aimed at.
+    uint64_t ns_recv_body  = 0;
+    uint64_t ns_req_decode = 0;
+    uint64_t ns_resp_send  = 0;
     uint64_t n_resident      = 0;
     uint64_t n_pagein     = 0;
     uint64_t n_host_hit = 0;
@@ -773,6 +802,9 @@ public:
         ns_pre_dispatch_ += request.ns_pre_dispatch;
         ns_encode_send_  += request.ns_encode_send;
         ns_post_send_    += request.ns_post_send;
+        ns_recv_body_    += request.ns_recv_body;
+        ns_req_decode_   += request.ns_req_decode;
+        ns_resp_send_    += request.ns_resp_send;
         ns_readback_ += request.ns_readback;
         ns_prep_ += request.ns_prep;
         ns_prep_setup_ += request.ns_prep_setup;
@@ -881,6 +913,9 @@ private:
                   << " ns_pre_dispatch=" << ns_pre_dispatch_
                   << " ns_encode_send=" << ns_encode_send_
                   << " ns_post_send=" << ns_post_send_
+                  << " ns_recv_body=" << ns_recv_body_
+                  << " ns_req_decode=" << ns_req_decode_
+                  << " ns_resp_send=" << ns_resp_send_
                   << " n_graph_submits=" << n_graph_submits_
                   << " n_device_allocs=" << n_device_allocs_
                   << " ns_graph_build=" << ns_graph_build_
@@ -1038,6 +1073,9 @@ private:
     uint64_t          ns_pre_dispatch_ = 0;
     uint64_t          ns_encode_send_  = 0;
     uint64_t          ns_post_send_    = 0;
+    uint64_t          ns_recv_body_    = 0;
+    uint64_t          ns_req_decode_   = 0;
+    uint64_t          ns_resp_send_    = 0;
     uint64_t          ns_prep_ = 0;
     uint64_t          ns_prep_setup_ = 0;
     uint64_t          ns_prep_grow_ = 0;
@@ -13884,9 +13922,31 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         }
     };
 
+    // See RequestStats::ns_recv_body. `hdr_done_ns` is stamped INSIDE
+    // pipe_recv_frame the instant the 32-byte header recv returns, which is the
+    // earliest point in this process that anything knows a frame is arriving --
+    // every other worker clock starts after the whole body has landed. The
+    // pointer is null unless a consumer of the number is enabled, and
+    // pipe_recv_frame reads no clock at all in that case, so the default build
+    // is unchanged.
+    const bool     time_recv   = worker.stats_enabled() || frame_trace_enabled();
+    uint64_t       hdr_done_ns = 0;
+    // Reused response-encode buffer. One per serve_connection call, so one per
+    // connection thread -- no sharing, no thread_local, and nothing to
+    // synchronise. It removes a heap allocation AND a full zero-fill of the
+    // payload from every single response (see the note on
+    // pipe_encode_expert_partial_into); decode shape is constant across a run,
+    // so after the first response resize() stops doing any work at all. The
+    // encoded bytes are identical either way -- this changes where the bytes
+    // live, never what they are. Safe against the unlock-for-send window
+    // because the buffer is only ever read between its own encode and the send
+    // that immediately follows, inside one loop iteration on this thread.
+    std::vector<uint8_t> encode_buf;
     // Comma operator so the pump runs before EVERY recv, including after the
     // PING branch's `continue` -- appending it to the loop body would skip that.
-    while ((await_request(), pipe_recv_frame(socket, type, seq_id, payload))) {
+    while ((await_request(),
+            pipe_recv_frame(socket, type, seq_id, payload,
+                            time_recv ? &hdr_done_ns : nullptr))) {
         // Bracket this whole iteration -- see FrameResidency above. Declared
         // FIRST so it spans every branch below, including the ones that
         // `continue` (PING, PREFETCH_HINT, BEGIN) and the ones that return.
@@ -13908,6 +13968,22 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         const bool seg_trace = frame_trace_enabled();
         const std::chrono::steady_clock::time_point t_frame =
             frame_residency_scope.started;
+        // "The whole frame is in hand." Identical to t_frame when the frame
+        // trace is on (reuse the same reading so the two can never disagree);
+        // taken independently when only WP_WORKER_STATS is on, because t_frame
+        // is a default-constructed epoch value in that configuration.
+        const std::chrono::steady_clock::time_point t_recv_done =
+            seg_trace ? frame_residency_scope.started
+                      : (time_recv ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point());
+        // Header-recv-return -> body-complete, for THIS frame. Zero when the
+        // instrumentation is off, and zero-guarded against a header stamp that
+        // was never written.
+        const uint64_t ns_recv_body_frame =
+            (time_recv && hdr_done_ns != 0)
+                ? (uint64_t) ((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  t_recv_done.time_since_epoch()).count() - hdr_done_ns)
+                : 0;
         // WP_WORKER_MULTI_CONN: default-held for the whole per-request
         // handling below, same shape as the probe (RAII releases it on
         // every exit from this scope -- return, continue, or falling off
@@ -14024,8 +14100,20 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                               "expert dispatch ACTS has no BEGIN");
                 }
+                // Bracket the request decode itself. On this branch the payload
+                // is the full activation block, so this is a real bulk copy,
+                // not a header parse -- and ns_decode_req never covered it
+                // because that counter only exists on the plain DISPATCH_REQ
+                // branch, which this path never takes.
+                const auto t_acts_decode_start = time_recv
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 const pipe_expert_dispatch_acts acts = pipe_decode_expert_dispatch_acts(
                     payload.data(), payload.size(), worker.split_n_tokens(conn_index), mine.n_embd);
+                const uint64_t ns_req_decode_frame = time_recv
+                    ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t_acts_decode_start).count()
+                    : 0;
                 // BEGIN fixes assignment index order; splitting changes only when
                 // reads start, never the computation order or resulting bytes.
                 const pipe_expert_partial response = worker.finish_split_dispatch(
@@ -14033,8 +14121,10 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
-                const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
-                // Unlock for the send: `encoded` is a local byte buffer and
+                pipe_encode_expert_partial_into(encode_buf, response);
+                const std::vector<uint8_t> & encoded = encode_buf;
+                // Unlock for the send: `encoded` aliases this connection's own
+                // encode buffer (no other thread can reach it) and
                 // the socket write touches no Worker state, so this
                 // connection's network I/O can overlap another connection's
                 // GPU-lock-holding dispatch. Relock immediately after --
@@ -14045,6 +14135,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 const bool sent1 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
                                                    encoded.data(), encoded.size());
                 if (relock1) gpu_lock.lock();
+                // Stamped before the bookkeeping below so ns_resp_send is
+                // exactly encode + unlock + send + relock -- the worker->spine
+                // leg, and the last thing that is still inside the spine's wait.
+                const auto t_resp_sent = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 if (!sent1) {
                     return 1;
                 }
@@ -14055,6 +14151,14 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 if (worker.stats_enabled()) {
                     split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - split_send_started).count();
+                    // Assigned AFTER finish_split_dispatch has populated
+                    // split_log_stats, so a whole-struct write in there can
+                    // never clobber them.
+                    split_log_stats.ns_recv_body  = ns_recv_body_frame;
+                    split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.ns_resp_send  =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_resp_sent - split_send_started).count();
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
@@ -14083,8 +14187,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                                               "expert dispatch ACTS_PUBLISH has no BEGIN");
                 }
                 const int32_t layer_for_shm = split_log_begin.layer;
+                const auto t_pub_decode_start = time_recv
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 pipe_expert_dispatch_acts_publish publish = pipe_decode_expert_dispatch_acts_publish(
                     payload.data(), payload.size(), worker.split_n_tokens(conn_index), mine.n_embd);
+                // Decode only. The wp_dedup::publish() shm write below is a
+                // deliberate exclusion: it is dedup work done on behalf of the
+                // SIBLING workers, not the cost of materialising this request.
+                const uint64_t ns_req_decode_frame = time_recv
+                    ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t_pub_decode_start).count()
+                    : 0;
                 std::string publish_error;
                 const bool published = wp_dedup::publish(
                     seq_id, layer_for_shm, publish.activations, worker.split_n_tokens(conn_index),
@@ -14114,13 +14228,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
-                const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
+                pipe_encode_expert_partial_into(encode_buf, response);
+                const std::vector<uint8_t> & encoded = encode_buf;
                 // Same unlock-for-send window as the ACTS branch above.
                 const bool relock2 = gpu_lock.owns_lock();
                 if (relock2) gpu_lock.unlock();
                 const bool sent2 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
                                                    encoded.data(), encoded.size());
                 if (relock2) gpu_lock.lock();
+                // See the ACTS branch: encode + unlock + send + relock only.
+                const auto t_resp_sent = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 if (!sent2) {
                     return 1;
                 }
@@ -14139,6 +14258,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 if (worker.stats_enabled()) {
                     split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - split_send_started).count();
+                    split_log_stats.ns_recv_body  = ns_recv_body_frame;
+                    split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.ns_resp_send  =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_resp_sent - split_send_started).count();
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
@@ -14170,6 +14294,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                               "expert dispatch ACTS_REF has no BEGIN");
                 }
+                const auto t_ref_decode_start = time_recv
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 const pipe_expert_dispatch_acts_ref ref =
                     pipe_decode_expert_dispatch_acts_ref(payload.data(), payload.size());
                 if (ref.n_tokens != worker.split_n_tokens(conn_index)) {
@@ -14191,6 +14318,19 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     continue;
                 }
                 wp_dedup::release(seq_id, layer_for_shm);
+                // On THIS branch the request's activation bytes do not arrive
+                // on the frame at all -- the frame is a reference and the bytes
+                // come out of the primary's shm segment. So the comparable
+                // "materialise the request" cost is decode + subscribe + the
+                // copy out, and that is what is measured here. Read alongside
+                // ns_recv_body, which will be near-zero on this branch
+                // precisely because the payload is tiny: on ACTS_REF the bulk
+                // transfer moved from the socket to shm, and these two counters
+                // are what make that visible instead of inferred.
+                const uint64_t ns_req_decode_frame = time_recv
+                    ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t_ref_decode_start).count()
+                    : 0;
                 pipe_expert_dispatch_acts acts;
                 acts.activations = std::move(*acts_vec);
                 const pipe_expert_partial response = worker.finish_split_dispatch(
@@ -14198,13 +14338,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
-                const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
+                pipe_encode_expert_partial_into(encode_buf, response);
+                const std::vector<uint8_t> & encoded = encode_buf;
                 // Same unlock-for-send window as the ACTS branch above.
                 const bool relock3 = gpu_lock.owns_lock();
                 if (relock3) gpu_lock.unlock();
                 const bool sent3 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
                                                    encoded.data(), encoded.size());
                 if (relock3) gpu_lock.lock();
+                // See the ACTS branch: encode + unlock + send + relock only.
+                const auto t_resp_sent = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 if (!sent3) {
                     return 1;
                 }
@@ -14215,6 +14360,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 if (worker.stats_enabled()) {
                     split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - split_send_started).count();
+                    split_log_stats.ns_recv_body  = ns_recv_body_frame;
+                    split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.ns_resp_send  =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_resp_sent - split_send_started).count();
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
@@ -14241,12 +14391,23 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             return 1;
         }
         try {
+            const auto t_req_decode_start = time_recv
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
             const pipe_expert_dispatch_req request =
                 pipe_decode_expert_dispatch_req(
                     payload.data(), payload.size(), mine.n_embd);
             const std::chrono::steady_clock::time_point t_decoded =
                 seg_trace ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point();
+            // Same window ns_decode_req covers, but gated on WP_WORKER_STATS
+            // rather than WP_FRAME_TRACE so the one counter name means the same
+            // thing on every branch and the stats line is comparable across
+            // wire paths without also enabling the frame trace.
+            const uint64_t ns_req_decode_frame = time_recv
+                ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - t_req_decode_start).count()
+                : 0;
             RequestStats request_stats;
             if (seg_trace) {
                 request_stats.ns_lock_wait =
@@ -14305,11 +14466,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const std::chrono::steady_clock::time_point send_started =
                 measure ? std::chrono::steady_clock::now() :
                           std::chrono::steady_clock::time_point();
-            const std::vector<uint8_t> encoded =
-                pipe_encode_expert_partial(response);
+            pipe_encode_expert_partial_into(encode_buf, response);
+            const std::vector<uint8_t> & encoded = encode_buf;
             // Same unlock-for-send window as the split-dispatch branches
-            // above: `encoded`/`response` are local values, the socket
-            // write touches no Worker state.
+            // above: `response` is a local value and `encoded` aliases this
+            // connection's own encode buffer, so the socket write touches no
+            // Worker state and nothing another thread can observe.
             const bool relock4 = gpu_lock.owns_lock();
             if (relock4) gpu_lock.unlock();
             const bool sent4 = pipe_send_frame(
@@ -14328,6 +14490,16 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     std::chrono::steady_clock::now();
                 request_stats.ns_send =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_sent - send_started).count();
+                request_stats.ns_recv_body  = ns_recv_body_frame;
+                request_stats.ns_req_decode = ns_req_decode_frame;
+                // Same window as ns_send on this branch (t_sent is taken after
+                // the connection counter bump, so both carry that one relaxed
+                // atomic increment). Kept as its own name so ns_resp_send has
+                // identical meaning on the split branches, where ns_send is
+                // stopped at a different point.
+                request_stats.ns_resp_send =
+                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         t_sent - send_started).count();
                 if (seg_trace) {
                     // encode + unlock + send + relock. Everything between

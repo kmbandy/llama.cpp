@@ -27,8 +27,12 @@
 #ifdef _WIN32
 typedef SOCKET sockfd_t;
 using ssize_t = __int64;
+// winsock2.h alone does not necessarily declare socklen_t (it lives in
+// ws2tcpip.h); accept() takes int* here anyway.
+typedef int pipe_socklen_t;
 #else
 typedef int sockfd_t;
+typedef socklen_t pipe_socklen_t;
 #endif
 
 static int pipe_send_flags() {
@@ -47,7 +51,8 @@ static constexpr size_t PIPE_MAX_CHUNK_SIZE = 64ull * 1024ull * 1024ull; // 64 M
 #define PIPE_LOG_ERROR(...) std::fprintf(stderr, __VA_ARGS__)
 
 struct pipe_socket_t::impl {
-    explicit impl(sockfd_t fd) : fd(fd) {}
+    explicit impl(sockfd_t fd, bool peer_loopback = false)
+        : fd(fd), peer_loopback(peer_loopback) {}
     ~impl();
     bool send_data(const void * data, size_t size);
     bool send_data2(const void * a, size_t a_size, const void * b, size_t b_size);
@@ -55,7 +60,16 @@ struct pipe_socket_t::impl {
     void shutdown();
 
     sockfd_t fd;
+    // Peer is on 127.0.0.0/8. Stamped once at connect/accept; see the note on
+    // pipe_socket_t::peer_is_loopback.
+    bool     peer_loopback;
 };
+
+// IPv4 127.0.0.0/8. Takes the address in NETWORK byte order, as it sits in a
+// struct sockaddr_in.
+static bool ipv4_is_loopback(uint32_t s_addr_net) {
+    return (ntohl(s_addr_net) & 0xFF000000u) == 0x7F000000u;
+}
 
 static void close_socket_fd(sockfd_t fd) {
 #ifdef _WIN32
@@ -196,6 +210,10 @@ int pipe_socket_t::poll_fd() const {
     return pimpl ? (int) pimpl->fd : -1;
 }
 
+bool pipe_socket_t::peer_is_loopback() const {
+    return pimpl && pimpl->peer_loopback;
+}
+
 static bool is_valid_fd(sockfd_t sockfd) {
 #ifdef _WIN32
     return sockfd != INVALID_SOCKET;
@@ -229,10 +247,21 @@ static bool set_no_sigpipe(sockfd_t sockfd) {
 }
 
 pipe_socket_ptr pipe_socket_t::accept() {
-    auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
+    // Ask for the peer address purely to classify the link as loopback or not
+    // (see peer_is_loopback). Passing a buffer instead of NULL does not change
+    // accept()'s behaviour or its cost in any way that matters here, and a
+    // kernel that declines to fill it simply leaves the flag false.
+    struct sockaddr_storage peer;
+    pipe_socklen_t          peer_len = (pipe_socklen_t) sizeof(peer);
+    std::memset(&peer, 0, sizeof(peer));
+    auto client_socket_fd = ::accept(pimpl->fd, (struct sockaddr *) &peer, &peer_len);
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
     }
+    const bool peer_loopback =
+        peer_len >= (pipe_socklen_t) sizeof(struct sockaddr_in) &&
+        peer.ss_family == AF_INET &&
+        ipv4_is_loopback(((struct sockaddr_in *) &peer)->sin_addr.s_addr);
     if (!set_no_delay(client_socket_fd)) {
         PIPE_LOG_ERROR("pipe: failed to set TCP_NODELAY on accepted socket\n");
         return nullptr;
@@ -241,7 +270,7 @@ pipe_socket_ptr pipe_socket_t::accept() {
         PIPE_LOG_ERROR("pipe: failed to suppress SIGPIPE on accepted socket\n");
         return nullptr;
     }
-    return pipe_socket_ptr(new pipe_socket_t(std::make_unique<impl>(client_socket_fd)));
+    return pipe_socket_ptr(new pipe_socket_t(std::make_unique<impl>(client_socket_fd, peer_loopback)));
 }
 
 pipe_socket_ptr pipe_socket_t::create_server(const char * host, int port) {
@@ -316,7 +345,10 @@ pipe_socket_ptr pipe_socket_t::connect(const char * host, int port, bool * retry
         close_socket_fd(sockfd);
         return nullptr;
     }
-    return pipe_socket_ptr(new pipe_socket_t(std::make_unique<impl>(sockfd)));
+    // Classify from the address we actually connected to, AFTER a successful
+    // connect, so the flag can never describe a connection that failed.
+    return pipe_socket_ptr(new pipe_socket_t(
+        std::make_unique<impl>(sockfd, ipv4_is_loopback(addr.sin_addr.s_addr))));
 }
 
 #ifdef _WIN32

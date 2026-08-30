@@ -41,6 +41,24 @@ struct pipe_socket_t {
     // completion exactly as send_data does.
     bool send_data2(const void * a, size_t a_size, const void * b, size_t b_size);
 
+    // True when the peer of this connection is on the loopback interface
+    // (IPv4 127.0.0.0/8). Determined ONCE, from the peer address, at the
+    // moment the connection is established: from the resolved destination in
+    // connect(), and from accept()'s returned peer sockaddr on the server
+    // side. Never re-queried, so it costs nothing on the hot path.
+    //
+    // This exists because the header/payload coalescing decision is not
+    // uniform across the fabric: the gathered write measured as a LOSS on the
+    // loopback leg and is untested on the 1 GbE leg, so WP_SEND_COALESCE=2
+    // needs a per-socket answer to "is this the wire or the kernel?".
+    //
+    // CAVEAT for callers: this is a literal 127.0.0.0/8 test, not a
+    // "does this traverse a NIC?" test. A connection to this host's OWN LAN
+    // address (e.g. 192.168.1.33 talking to 192.168.1.33) is delivered
+    // locally by the kernel but reports false here. Listening on a server
+    // socket that never had a peer also reports false.
+    bool peer_is_loopback() const;
+
     // Interrupt blocking I/O without closing the descriptor.
     void shutdown();
 

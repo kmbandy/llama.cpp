@@ -758,6 +758,27 @@ std::vector<uint8_t> pipe_encode_expert_acts_publish_ack(const pipe_expert_acts_
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_ref(const pipe_expert_dispatch_acts_ref & p);
 std::vector<uint8_t> pipe_encode_expert_prefetch_hint(const pipe_expert_prefetch_hint & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
+
+// Same encoding, written into a caller-owned buffer instead of a fresh one.
+// `out` is resized to the exact frame length and every byte of it is written,
+// so the RESULT is byte-for-byte identical to pipe_encode_expert_partial() --
+// this is an allocation strategy, not a format change, and the two are
+// interchangeable on the wire.
+//
+// Why it exists. The worker encodes one of these per response, on every layer
+// of every token, and the vector-returning form pays twice for that: a fresh
+// heap allocation, and -- because std::vector's sized construction
+// VALUE-INITIALISES -- a full zero-fill of the payload that the very next
+// statement overwrites completely. Handing in a buffer that is already the
+// right size makes resize() a no-op: no allocation, and no zero-fill, since
+// resize only zeroes bytes it ADDS. Decode is fixed-shape across a run, so
+// after the first response the buffer stops changing size and both costs go to
+// zero.
+//
+// The caller owns the lifetime and the aliasing: `out` must not be the source
+// of anything still in flight, and a reused buffer must not be shared between
+// threads. Contents before the call are irrelevant and are not read.
+void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expert_partial & p);
 std::vector<uint8_t> pipe_encode_segment_hello(const pipe_segment_hello & p);
 std::vector<uint8_t> pipe_encode_segment_hello_ack(const pipe_segment_hello_ack & p);
 std::vector<uint8_t> pipe_encode_segment_fwd_req(const pipe_segment_fwd_req & p, int32_t n_embd);
@@ -843,8 +864,27 @@ bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id
 // transport error. Throws pipe_protocol_error on a malformed frame (bad
 // magic/version/oversized length) -- the caller should send PIPE_ERROR and
 // close. Never allocates before the header's length field is validated.
+//
+// `hdr_done_ns` (optional) closes the ONE gap in the pipeline's timing that no
+// counter has ever bracketed. Every worker-side clock starts at or after
+// pipe_recv_frame RETURNS -- i.e. after the whole body has landed -- so the
+// interval between "the peer's bytes woke this thread" and "the frame is
+// complete" is invisible to both ends: it is inside the requester's measured
+// wait and outside the responder's service clock. When non-null, this is
+// stamped the instant the 32-byte header recv returns, BEFORE the header is
+// decoded and before the payload recv is issued, giving callers
+//     body transfer = (time after pipe_recv_frame returns) - *hdr_done_ns
+// The value is steady_clock nanoseconds since its epoch; compare it only
+// against another steady_clock reading taken in the same process. Pass nullptr
+// (the default) and NO clock is read at all -- the instrumentation is
+// genuinely absent, not merely discarded, so a build with stats off is
+// unchanged.
+//
+// Note this brackets header-recv-RETURN to body-complete, not NIC arrival to
+// body-complete: time the frame spent in the socket buffer before this thread
+// got to the recv is upstream of the first stamp and still not measured here.
 bool pipe_recv_frame(pipe_socket_t & sock, pipe_frame_type & type, uint64_t & seq_id,
-                     std::vector<uint8_t> & payload);
+                     std::vector<uint8_t> & payload, uint64_t * hdr_done_ns = nullptr);
 
 // Convenience: send a PIPE_ERROR frame. Best-effort; returns false if the
 // transport is already broken.

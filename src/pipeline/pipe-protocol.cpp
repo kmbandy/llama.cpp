@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 
+#include <chrono>
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
@@ -792,7 +793,7 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
 // ---------------------------------------------------------------------------
 // expert partial response
 
-std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
+void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expert_partial & p) {
     // `dtype` is still self-describing on the wire as of PIPE_VERSION 13 (see the
     // version history and the struct comment in pipe-protocol.h), and
     // pipe_decode_expert_partial() below still accepts PIPE_HIDDEN_F16 from a
@@ -815,7 +816,7 @@ std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
     if (p.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial response");
     }
-    std::vector<uint8_t> out((size_t) total);
+    out.resize((size_t) total);
     uint8_t * w = out.data();
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
@@ -823,6 +824,11 @@ std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
     // Bit-for-bit the same f32 encoding this frame has always used -- only the
     // 4-byte dtype tag ahead of it (added in PIPE_VERSION 13) is new.
     wr_f32_bulk(w, p.partial.data(), p.partial.size());
+}
+
+std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
+    std::vector<uint8_t> out;
+    pipe_encode_expert_partial_into(out, p);
     return out;
 }
 
@@ -1627,8 +1633,8 @@ bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id
     uint8_t hdr[PIPE_HEADER_SIZE];
     pipe_encode_header(hdr, h);
 
-    // WP_SEND_COALESCE=1: put the header and the payload on the wire with a
-    // single gathered write instead of two sends.
+    // WP_SEND_COALESCE: put the header and the payload on the wire with a
+    // single gathered write instead of two sends. See the mode table below.
     //
     // Why this is not cosmetic. Every pipeline socket has TCP_NODELAY set
     // (pipe-transport.cpp set_no_delay, applied on connect AND on accept), so
@@ -1643,20 +1649,63 @@ bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id
     // responder's own after-recv-to-result-ready service clock. That is exactly
     // the shape of an unattributed requester/responder timing gap.
     //
-    // Bit-exactness: the byte STREAM is unchanged -- same header bytes, same
-    // payload bytes, same order. Only the segmentation the kernel chooses
-    // changes. The receive side is untouched and cannot tell the difference, so
-    // no decoded value anywhere can differ. Default OFF only so it can be
-    // A/B'd against the current numbers; there is no correctness reason to
-    // leave it off. NOTE: pipe_send_frame is linked by the worker too, so both
+    // That reasoning is sound about the WIRE and was WRONG about loopback --
+    // the mode table below records what the A/B actually said.
+    //
+    // WP_SEND_COALESCE is a MODE, not a flag, because the measurement came back
+    // split (2026-08-29):
+    //   0  off              -- two sends, the long-standing behaviour (DEFAULT)
+    //   1  all sockets      -- what the original flag did
+    //   2  non-loopback only-- gathered write on wire legs, two sends on 127.x
+    // Any other value parses as 0. Legacy "=1" therefore keeps its old meaning
+    // exactly, so an existing A/B script does not silently change behaviour.
+    //
+    // WHY A MODE. Turning this on GLOBALLY measured as a LOSS on the spine's
+    // loopback leg: 0.79 -> 0.95 ms/req. That is a real result and it is not
+    // evidence against coalescing on the wire -- loopback and 1 GbE are
+    // different machines to optimise for. On loopback there is no wire, no
+    // segmentation, and no per-packet cost worth saving: a send() is a memcpy
+    // into the peer's receive queue plus a wakeup, and the peer's blocked
+    // recv_data(hdr, 32) is very often ALREADY RUNNABLE on another core by the
+    // time the payload send starts. The two-send shape hands the receiver its
+    // 32 bytes early, so header decode overlaps the payload copy; the gathered
+    // shape serialises them and hands over one larger buffer at the end, and
+    // pays sendmsg's iovec setup on top of it. Coalescing converts a pipelined
+    // pair into one bigger critical section -- on loopback there was never a
+    // packet to save, so only the serialisation is left, and it shows up as a
+    // loss.
+    //
+    // On a real 1 GbE leg the trade reverses: the lone 32-byte header becomes a
+    // genuine standalone Ethernet frame with its own ~1.2 us serialisation plus
+    // interrupt/NAPI wakeup at the far end, and the receiver cannot start on
+    // the payload until a SECOND wakeup arrives. That is the cost the gathered
+    // write removes, and it is per frame per direction. Mode 2 keeps the
+    // measured loopback loss avoidable while letting the LAN legs take it.
+    //
+    // Bit-exactness (unchanged from the original note): the byte STREAM is
+    // identical in every mode -- same header bytes, same payload bytes, same
+    // order. Only the segmentation the kernel chooses differs. The receive side
+    // is untouched and cannot tell the difference, so no decoded value anywhere
+    // can differ. NOTE: pipe_send_frame is linked by the worker too, so both
     // the spine and the workers must be rebuilt for the response direction to
     // benefit.
-    static const bool coalesce = [] {
+    static const int coalesce_mode = [] {
         const char * value = std::getenv("WP_SEND_COALESCE");
-        return value != nullptr && value[0] != '0';
+        if (value == nullptr) {
+            return 0;
+        }
+        if (value[0] == '1' && value[1] == '\0') {
+            return 1;
+        }
+        if (value[0] == '2' && value[1] == '\0') {
+            return 2;
+        }
+        return 0;
     }();
 
-    if (coalesce) {
+    // peer_is_loopback() is a bool read off the socket, stamped once at
+    // connect/accept -- no syscall, no lookup, per frame.
+    if (coalesce_mode == 1 || (coalesce_mode == 2 && !sock.peer_is_loopback())) {
         return sock.send_data2(hdr, PIPE_HEADER_SIZE, payload, payload_len);
     }
 
@@ -1670,10 +1719,16 @@ bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id
 }
 
 bool pipe_recv_frame(pipe_socket_t & sock, pipe_frame_type & type, uint64_t & seq_id,
-                     std::vector<uint8_t> & payload) {
+                     std::vector<uint8_t> & payload, uint64_t * hdr_done_ns) {
     uint8_t hdr[PIPE_HEADER_SIZE];
     if (!sock.recv_data(hdr, PIPE_HEADER_SIZE)) {
         return false;
+    }
+    // Stamped here and nowhere else: after the header bytes are in hand, before
+    // decode and before the body recv. See the note on the declaration.
+    if (hdr_done_ns != nullptr) {
+        *hdr_done_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     // throws pipe_protocol_error on bad magic/version/oversized length, before
     // any allocation is made from the untrusted length field
