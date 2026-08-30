@@ -10459,7 +10459,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // compute
     ggml_vk_matmul(
         ctx, subctx, pipeline,
-        d_X_buf, d_Y_buf, d_D_buf, { ctx->prealloc_split_k, 0, d_sz * split_k },
+        std::move(d_X_buf), std::move(d_Y_buf), std::move(d_D_buf), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
