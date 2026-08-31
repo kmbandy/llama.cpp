@@ -102,6 +102,13 @@ static bool wp_worker_hash_trace_enabled() {
     return enabled;
 }
 
+static bool wp_worker_cuda_async_hash_trace_enabled(ggml_backend_t backend) {
+    const char * submit = std::getenv("WP_SUBMIT_ASYNC");
+    const char * name = backend != nullptr ? ggml_backend_name(backend) : nullptr;
+    return wp_worker_hash_trace_enabled() && submit != nullptr && submit[0] == '1' &&
+        name != nullptr && std::strstr(name, "CUDA") != nullptr;
+}
+
 static uint64_t wp_worker_hash_fnv1a(const void * data, size_t size) {
     const auto * bytes = static_cast<const uint8_t *>(data);
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -119,29 +126,6 @@ static uint64_t wp_worker_hash_fnv1a_update(uint64_t hash, const void * data, si
         hash *= UINT64_C(1099511628211);
     }
     return hash;
-}
-
-static void wp_worker_hash_device_bytes(
-        uint64_t & hash, ggml_backend_buffer_t buffer, void * data, size_t size) {
-    if (buffer == nullptr || data == nullptr || size == 0) {
-        return;
-    }
-    const ggml_init_params params = {
-        /* .mem_size = */ ggml_tensor_overhead(),
-        /* .mem_base = */ nullptr,
-        /* .no_alloc = */ true,
-    };
-    ggml_context * ctx = ggml_init(params);
-    if (ctx == nullptr) {
-        throw std::runtime_error("failed to allocate hash metadata");
-    }
-    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) size);
-    tensor->buffer = buffer;
-    tensor->data = data;
-    std::vector<uint8_t> host(size);
-    ggml_backend_tensor_get(tensor, host.data(), 0, size);
-    hash = wp_worker_hash_fnv1a_update(hash, host.data(), host.size());
-    ggml_free(ctx);
 }
 
 static void wp_worker_hash_emit(uint64_t req, int32_t layer, const char * device,
@@ -1552,6 +1536,8 @@ struct ExpertPage {
     bool                              is_resident = false;
     ggml_backend_buffer_t             resident_buffer = nullptr;
     void *                            resident_base = nullptr;
+    uint64_t                          upload_hash = 0;
+    bool                              upload_hash_valid = false;
 };
 
 struct Catalog {
@@ -2691,6 +2677,24 @@ void zero_quantized_member_padding(ggml_tensor * slot_raw, const ExpertPage & pa
     }
 }
 
+uint64_t hash_page_upload(const ExpertPage & page, const void * source) {
+    uint64_t hash = wp_worker_hash_fnv1a(nullptr, 0);
+    static const std::array<uint8_t, 4096> zeros = {};
+    for (const auto & role : page.roles) {
+        const MemberSpan & member = role.second;
+        hash = wp_worker_hash_fnv1a_update(
+            hash, (const char *) source + member.offset, (size_t) member.size);
+        uint64_t padding = member.device_bytes > member.size ?
+            member.device_bytes - member.size : 0;
+        while (padding != 0) {
+            const size_t n = (size_t) std::min<uint64_t>(padding, zeros.size());
+            hash = wp_worker_hash_fnv1a_update(hash, zeros.data(), n);
+            padding -= n;
+        }
+    }
+    return hash;
+}
+
 void tensor_set_page_range(
         ggml_tensor * tensor, const ExpertPage & page, const void * source,
         size_t page_offset, size_t size) {
@@ -3244,6 +3248,10 @@ public:
                 read_once(page, host);
                 tensor_set_page_range(
                     allocation.raw, page, host, 0, (size_t) page.size);
+                if (wp_worker_cuda_async_hash_trace_enabled(backend_)) {
+                    page.upload_hash = hash_page_upload(page, host);
+                    page.upload_hash_valid = true;
+                }
             } catch (...) {
                 std::free(host);
                 throw;
@@ -3742,6 +3750,14 @@ public:
             return entry.loaded;
         }
 
+        uint64_t upload_hash(size_t index) const {
+            const Entry & entry = entries_.at(index);
+            if (!entry.upload_hash_valid) {
+                throw std::logic_error("expert batch entry has no upload hash");
+            }
+            return entry.upload_hash;
+        }
+
         void complete();
 
         void wait_copy_event(ggml_backend_t backend) const {
@@ -3850,6 +3866,8 @@ public:
             bool   ready      = false;
             bool   cpu_on_arrival = false;
             std::shared_ptr<StagingPool::Lease> cpu_staging;
+            uint64_t upload_hash = 0;
+            bool upload_hash_valid = false;
         };
 
         explicit Batch(ExpertSlotPool * owner, size_t count) :
@@ -4108,6 +4126,8 @@ public:
                             true,
                             true,
                         };
+                        batch.entries_[i].upload_hash = page.upload_hash;
+                        batch.entries_[i].upload_hash_valid = page.upload_hash_valid;
                         ++batch.n_resident_;
                         continue;
                     }
@@ -4155,6 +4175,8 @@ public:
                     true,
                     true,
                 };
+                batch.entries_[i].upload_hash = slot.upload_hash;
+                batch.entries_[i].upload_hash_valid = slot.upload_hash_valid;
                 ++batch.n_resident_;
             }
 
@@ -4378,6 +4400,10 @@ public:
                                       std::chrono::steady_clock::time_point();
                         tensor_set_page_range(
                             slot.raw, page, host_hit.src, 0, (size_t) page.size);
+                        if (wp_worker_cuda_async_hash_trace_enabled(backend_)) {
+                            slot.upload_hash = hash_page_upload(page, host_hit.src);
+                            slot.upload_hash_valid = true;
+                        }
                         host_tier_->release(page.cache_id, host_hit.borrow);
                         host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
                         if (!fill_host_on_read_ || demote_d2h_) {
@@ -4400,6 +4426,8 @@ public:
                         batch.entries_[entry_index].loaded = {
                             slot.buffer, slot.raw->data
                         };
+                        batch.entries_[entry_index].upload_hash = slot.upload_hash;
+                        batch.entries_[entry_index].upload_hash_valid = slot.upload_hash_valid;
                         batch.entries_[entry_index].hit   = true;
                         batch.entries_[entry_index].ready = true;
                         ++batch.n_host_hit_;
@@ -5241,6 +5269,8 @@ private:
         int                 cache_id  = -1;
         uint64_t            capacity  = 0;
         uint64_t            size      = 0;
+        uint64_t            upload_hash = 0;
+        bool                upload_hash_valid = false;
         uint64_t            tick      = 0;
         // How many times this page has been asked for. Ranking by USE COUNT is
         // the whole policy; tick is only the tie-break. Offline on the reference
@@ -5941,6 +5971,11 @@ private:
                 // half-uploaded slot becomes visible, and the page-in log and LRU
                 // tick would fire once per stripe.
                 if (result->last) {
+                    if (wp_worker_cuda_async_hash_trace_enabled(backend_)) {
+                        slot.upload_hash = hash_page_upload(
+                            *pagein.page, result->staging->get());
+                        slot.upload_hash_valid = true;
+                    }
                     // WP_PAGEIN_LOG=path: append "<layer> <expert>" for every page
                     // actually READ from disk. Intersecting the two 2026 workers'
                     // logs measures whether residency-affinity routing keeps their
@@ -5994,6 +6029,8 @@ private:
                     entry.loaded = {
                         slot.buffer, slot.raw->data
                     };
+                    entry.upload_hash = slot.upload_hash;
+                    entry.upload_hash_valid = slot.upload_hash_valid;
                     entry.ready = true;
                 }
             }
@@ -8887,19 +8924,19 @@ private:
         }
     }
 
-    struct AsyncSubmitState {
-        // Keep one host vector per upload: several submits can be in flight.
-        std::vector<std::vector<uint8_t>> params;
-        std::vector<std::vector<int32_t>> ids;
-        std::vector<std::vector<float>> route_weights;
-        bool pending = false;
-        bool graph_pending = false;
-    };
-
     struct WorkInputBytes {
         ggml_backend_buffer_t buffer = nullptr;
         void * data = nullptr;
         size_t size = 0;
+        size_t observed_offset = 0;
+        const void * expected = nullptr;
+    };
+
+    struct WorkInputSlot {
+        std::vector<WorkInputBytes> members;
+        uint64_t expected_hash = 0;
+        size_t observed_begin = 0;
+        size_t observed_end = 0;
     };
 
     struct WorkInputTrace {
@@ -8912,7 +8949,24 @@ private:
         bool use_gather = false;
         WorkInputBytes input;
         std::vector<WorkInputBytes> params;
-        std::vector<WorkInputBytes> slots;
+        std::vector<WorkInputSlot> slots;
+        std::vector<uint8_t> observed;
+        uint64_t input_expected = 0;
+        uint64_t params_expected = 0;
+        uint64_t slots_expected = 0;
+        bool expected_ready = false;
+        size_t params_observed_begin = 0;
+        size_t params_observed_end = 0;
+    };
+
+    struct AsyncSubmitState {
+        // Keep one host vector per upload: several submits can be in flight.
+        std::vector<std::vector<uint8_t>> params;
+        std::vector<std::vector<int32_t>> ids;
+        std::vector<std::vector<float>> route_weights;
+        std::vector<WorkInputTrace> work_input_traces;
+        bool pending = false;
+        bool graph_pending = false;
     };
 
     // WP_SUBMIT_ASYNC is opt-in. The tensor upload and graph compute use the
@@ -8933,6 +8987,7 @@ private:
             state.params.clear();
             state.ids.clear();
             state.route_weights.clear();
+            state.work_input_traces.clear();
             state.pending = false;
             state.graph_pending = false;
         }
@@ -8950,17 +9005,22 @@ private:
         ggml_backend_synchronize(backend_.get());
         const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
+        finalize_work_input_expected();
         if (request_stats != nullptr) {
             request_stats->ns_final_sync += elapsed;
             if (stats_.enabled() && is_vulkan_backend()) {
                 request_stats->ns_vk_sync += elapsed;
             }
         }
+        for (const WorkInputTrace & trace : it->second.work_input_traces) {
+            emit_work_input_trace(trace);
+        }
         it->second.pending = false;
         it->second.graph_pending = false;
         it->second.params.clear();
         it->second.ids.clear();
         it->second.route_weights.clear();
+        it->second.work_input_traces.clear();
     }
 
     void end_async_dispatch(int previous_conn_index, uint64_t previous_trace_req) {
@@ -8992,76 +9052,176 @@ private:
         work_input_trace_.gcache = gcache;
         work_input_trace_.use_gather = use_gather;
         const size_t input_size = request.activations.size() * sizeof(float);
+        work_input_trace_.params_expected = wp_worker_hash_fnv1a(nullptr, 0);
+        work_input_trace_.slots_expected = wp_worker_hash_fnv1a(nullptr, 0);
         const ggml_backend_buffer_t io_buffer =
             io_active_ != nullptr ? io_active_ : io_buffer_.get();
         work_input_trace_.input = {
             io_buffer,
             io_buffer == nullptr ? nullptr : ggml_backend_buffer_get_base(io_buffer),
             input_size,
+            0,
+            request.activations.data(),
         };
         work_input_trace_.slots.reserve(selected.size());
         for (size_t i : selected) {
             const ExpertSlotPool::Loaded loaded = batch.loaded(i);
-            work_input_trace_.slots.push_back({
-                loaded.buffer, loaded.base, pages[i]->device_size,
-            });
+            WorkInputSlot slot;
+            slot.expected_hash = batch.upload_hash(i);
+            work_input_trace_.slots_expected = wp_worker_hash_fnv1a_update(
+                work_input_trace_.slots_expected,
+                &slot.expected_hash, sizeof(slot.expected_hash));
+            for (const auto & role : pages[i]->roles) {
+                const MemberSpan & member = role.second;
+                slot.members.push_back({
+                    loaded.buffer,
+                    (char *) loaded.base + member.device_offset,
+                    (size_t) member.device_bytes,
+                    0,
+                    nullptr,
+                });
+            }
+            work_input_trace_.slots.push_back(std::move(slot));
         }
     }
 
-    void add_work_input_trace_tensor(const ggml_tensor * tensor) {
+    void add_work_input_trace_tensor(
+            const ggml_tensor * tensor, const void * expected, size_t expected_size) {
         if (!work_input_trace_.active || tensor == nullptr) {
             return;
         }
+        if (expected == nullptr || expected_size != ggml_nbytes(tensor)) {
+            throw std::logic_error("WORKIN parameter source size mismatch");
+        }
         work_input_trace_.params.push_back({
-            tensor->buffer, tensor->data, ggml_nbytes(tensor),
+            tensor->buffer, tensor->data, ggml_nbytes(tensor), 0, expected,
         });
     }
 
     void add_work_input_trace_buffer(
-            ggml_backend_buffer_t buffer, void * data, size_t size) {
+            ggml_backend_buffer_t buffer, void * data, size_t size,
+            const void * expected) {
         if (!work_input_trace_.active) {
             return;
         }
-        work_input_trace_.params.push_back({buffer, data, size});
+        if (expected == nullptr) {
+            throw std::logic_error("WORKIN parameter source is null");
+        }
+        work_input_trace_.params.push_back({buffer, data, size, 0, expected});
     }
 
-    void emit_work_input_trace() {
+    void enqueue_work_input_bytes(
+            WorkInputTrace & trace, WorkInputBytes & bytes, size_t & offset) {
+        bytes.observed_offset = offset;
+        if (bytes.buffer == nullptr || bytes.data == nullptr || bytes.size == 0) {
+            return;
+        }
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead(),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate WORKIN metadata");
+        }
+        ggml_tensor * tensor = ggml_new_tensor_1d(
+            ctx.get(), GGML_TYPE_I8, (int64_t) bytes.size);
+        tensor->buffer = bytes.buffer;
+        tensor->data = bytes.data;
+        ggml_backend_tensor_get_async(
+            backend_.get(), tensor, trace.observed.data() + offset, 0, bytes.size);
+        offset += bytes.size;
+    }
+
+    void finalize_work_input_expected() {
+        if (!work_input_trace_.active || work_input_trace_.expected_ready) {
+            return;
+        }
+        work_input_trace_.input_expected = wp_worker_hash_fnv1a(
+            work_input_trace_.input.expected, work_input_trace_.input.size);
+        work_input_trace_.params_expected = wp_worker_hash_fnv1a(nullptr, 0);
+        for (const WorkInputBytes & bytes : work_input_trace_.params) {
+            work_input_trace_.params_expected = wp_worker_hash_fnv1a_update(
+                work_input_trace_.params_expected, bytes.expected, bytes.size);
+        }
+        work_input_trace_.expected_ready = true;
+    }
+
+    void enqueue_work_input_trace() {
         if (!work_input_trace_.active) {
             return;
         }
-        ggml_backend_synchronize(backend_.get());
-        uint64_t input_hash = wp_worker_hash_fnv1a(nullptr, 0);
-        uint64_t params_hash = wp_worker_hash_fnv1a(nullptr, 0);
-        uint64_t slots_hash = wp_worker_hash_fnv1a(nullptr, 0);
-        wp_worker_hash_device_bytes(
-            input_hash, work_input_trace_.input.buffer,
-            work_input_trace_.input.data, work_input_trace_.input.size);
+        finalize_work_input_expected();
+        size_t observed_size = work_input_trace_.input.size;
         for (const WorkInputBytes & bytes : work_input_trace_.params) {
-            wp_worker_hash_device_bytes(
-                params_hash, bytes.buffer, bytes.data, bytes.size);
+            observed_size += bytes.size;
         }
-        for (const WorkInputBytes & bytes : work_input_trace_.slots) {
-            wp_worker_hash_device_bytes(
-                slots_hash, bytes.buffer, bytes.data, bytes.size);
+        for (const WorkInputSlot & slot : work_input_trace_.slots) {
+            for (const WorkInputBytes & bytes : slot.members) {
+                observed_size += bytes.size;
+            }
         }
-        const char * gcache = work_input_trace_.gcache == 1 ? "hit" :
-            work_input_trace_.gcache == 0 ? "miss" : "none";
-        const int gcache_hit = work_input_trace_.gcache == 1;
-        const int gcache_miss = work_input_trace_.gcache == 0;
+        work_input_trace_.observed.resize(observed_size);
+        size_t offset = 0;
+        enqueue_work_input_bytes(
+            work_input_trace_, work_input_trace_.input, offset);
+        work_input_trace_.params_observed_begin = offset;
+        for (WorkInputBytes & bytes : work_input_trace_.params) {
+            enqueue_work_input_bytes(work_input_trace_, bytes, offset);
+        }
+        work_input_trace_.params_observed_end = offset;
+        for (WorkInputSlot & slot : work_input_trace_.slots) {
+            slot.observed_begin = offset;
+            for (WorkInputBytes & bytes : slot.members) {
+                enqueue_work_input_bytes(work_input_trace_, bytes, offset);
+            }
+            slot.observed_end = offset;
+        }
+        AsyncSubmitState & state = async_submit_state();
+        state.pending = true;
+        state.graph_pending = true;
+        state.work_input_traces.push_back(std::move(work_input_trace_));
+        work_input_trace_ = {};
+    }
+
+    void emit_work_input_trace(const WorkInputTrace & trace) {
+        const uint64_t input_observed = wp_worker_hash_fnv1a(
+            trace.observed.data() + trace.input.observed_offset,
+            trace.input.size);
+        const uint64_t params_observed = wp_worker_hash_fnv1a(
+            trace.observed.data() + trace.params_observed_begin,
+            trace.params_observed_end - trace.params_observed_begin);
+        uint64_t slots_observed = wp_worker_hash_fnv1a(nullptr, 0);
+        for (const WorkInputSlot & slot : trace.slots) {
+            const uint64_t slot_hash = wp_worker_hash_fnv1a(
+                trace.observed.data() + slot.observed_begin,
+                slot.observed_end - slot.observed_begin);
+            slots_observed = wp_worker_hash_fnv1a_update(
+                slots_observed, &slot_hash, sizeof(slot_hash));
+        }
+        const char * gcache = trace.gcache == 1 ? "hit" :
+            trace.gcache == 0 ? "miss" : "none";
+        const int gcache_hit = trace.gcache == 1;
+        const int gcache_miss = trace.gcache == 0;
         std::fprintf(
             stderr,
             "WORKIN req=%llu layer=%d dev=%s n_pagein=%zu chunks=%zu "
             "gcache=%s gcache_hit=%d gcache_miss=%d use_gather=%d n_slots=%zu "
-            "input_h=%llu params_h=%llu slots_h=%llu\n",
-            (unsigned long long) work_input_trace_.req,
-            work_input_trace_.layer, device_name_.c_str(),
-            work_input_trace_.n_pagein, work_input_trace_.chunks,
+            "in_exp=%llu in_obs=%llu params_exp=%llu params_obs=%llu "
+            "slots_exp=%llu slots_obs=%llu\n",
+            (unsigned long long) trace.req,
+            trace.layer, device_name_.c_str(),
+            trace.n_pagein, trace.chunks,
             gcache, gcache_hit, gcache_miss,
-            work_input_trace_.use_gather ? 1 : 0,
-            work_input_trace_.slots.size(),
-            (unsigned long long) input_hash,
-            (unsigned long long) params_hash,
-            (unsigned long long) slots_hash);
+            trace.use_gather ? 1 : 0,
+            trace.slots.size(),
+            (unsigned long long) trace.input_expected,
+            (unsigned long long) input_observed,
+            (unsigned long long) trace.params_expected,
+            (unsigned long long) params_observed,
+            (unsigned long long) trace.slots_expected,
+            (unsigned long long) slots_observed);
     }
 
     enum ggml_status submit_graph(
@@ -9073,9 +9233,6 @@ private:
                 // Reusing graph/galloc state while the prior async graph runs
                 // can rewrite its live allocation; drain before the next submit.
                 synchronize_async(&request_stats);
-            }
-            if (is_cuda_backend()) {
-                emit_work_input_trace();
             }
             state.pending = true;
             if (is_vulkan_backend() || is_cuda_backend()) {
@@ -9093,6 +9250,9 @@ private:
             status = submit_async_
                 ? ggml_backend_graph_compute_async(backend_.get(), graph)
                 : ggml_backend_graph_compute(backend_.get(), graph);
+        }
+        if (submit_async_ && is_cuda_backend() && status == GGML_STATUS_SUCCESS) {
+            enqueue_work_input_trace();
         }
         const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
@@ -9728,11 +9888,14 @@ private:
         //    ggml_backend_synchronize + sync set, which is strictly WORSE than
         //    what we do today. Vulkan and CPU are gated out by name.
         //
-        // Lifetime: the pinned buffer must not be rewritten before the copy
-        // lands. Requests on a device are serialised by the blocking
-        // batch.complete(), so the next prepare_io cannot run until this
-        // request's compute -- and therefore this copy -- has finished.
-        if (io_set_async_ && pinned) {
+        // CUDA async submission must use the compute stream even when the
+        // source is pageable. The synchronous CUDA setter issues cudaMemcpy
+        // on the legacy stream, which does not order a non-blocking compute
+        // stream. cudaMemcpy can return after staging pageable input while the
+        // H2D is still running, so the graph can otherwise read old/new input.
+        // The request owns activation until read_result completes.
+        if ((submit_async_ && is_cuda_backend()) ||
+                (io_set_async_ && pinned)) {
             ggml_backend_tensor_set_async(
                 backend_.get(), input, src, 0, act_bytes);
         } else {
@@ -10244,6 +10407,8 @@ private:
             begin_work_input_trace(
                 request, pages, batch, selected_indices, use_gather, 1);
             if (params_span > 0) {
+                add_work_input_trace_tensor(
+                    gc->blob, params_host.data(), params_span);
                 const auto params_started = std::chrono::steady_clock::now();
                 if (submit_async_) {
                     AsyncSubmitState & state = async_submit_state();
@@ -10261,7 +10426,6 @@ private:
                 if (measure_vk) {
                     request_stats.ns_vk_params_set += params_elapsed;
                 }
-                add_work_input_trace_tensor(gc->blob);
             }
             enum ggml_status status = submit_graph(
                 gc->graph, request_stats, gc->persistent_plan);
@@ -10602,8 +10766,10 @@ private:
                     if (measure_vk) {
                         request_stats.ns_vk_params_set += params_elapsed;
                     }
-                    add_work_input_trace_tensor(item.first);
-                    add_work_input_trace_tensor(gather_idx[k].first);
+                    add_work_input_trace_tensor(
+                        item.first, compact.data(), compact.size() * sizeof(float));
+                    add_work_input_trace_tensor(
+                        gather_idx[k].first, idx.data(), idx.size() * sizeof(int32_t));
                 }
             } else {
                 request_stats.n_weight_total += wv.size();
@@ -10618,7 +10784,8 @@ private:
                     if (measure_vk) {
                         request_stats.ns_vk_params_set += params_elapsed;
                     }
-                    add_work_input_trace_tensor(item.first);
+                    add_work_input_trace_tensor(
+                        item.first, wv.data(), wv.size() * sizeof(float));
                 }
             }
         }
@@ -10635,6 +10802,9 @@ private:
             if (gc != nullptr) {
                 gc->blob = blob;
             }
+            add_work_input_trace_buffer(
+                params_buffer_.get(), ggml_backend_buffer_get_base(params_buffer_.get()),
+                params_span, params_host.data());
             const auto params_started = std::chrono::steady_clock::now();
             if (submit_async_) {
                 AsyncSubmitState & state = async_submit_state();
@@ -10652,8 +10822,6 @@ private:
             if (measure_vk) {
                 request_stats.ns_vk_params_set += params_elapsed;
             }
-            add_work_input_trace_buffer(
-                params_buffer_.get(), ggml_backend_buffer_get_base(params_buffer_.get()), params_span);
         }
         // Warm the first request through the normal path. Vulkan may need to
         // allocate prealloc buffers while it records a graph; recording a plan
@@ -11213,6 +11381,10 @@ private:
                 std::chrono::steady_clock::now() - build_started).count();
 
         uint64_t params_elapsed = 0;
+        add_work_input_trace_tensor(
+            ids, ids_host.data(), ids_host.size() * sizeof(int32_t));
+        add_work_input_trace_tensor(
+            route_w, route_w_host.data(), route_w_host.size() * sizeof(float));
         if (submit_async_) {
             AsyncSubmitState & state = async_submit_state();
             state.ids.emplace_back(std::move(ids_host));
@@ -11238,9 +11410,6 @@ private:
         if (measure_vk) {
             request_stats.ns_vk_params_set += params_elapsed;
         }
-        add_work_input_trace_tensor(ids);
-        add_work_input_trace_tensor(route_w);
-
         const enum ggml_status status = submit_graph(graph, request_stats);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("grouped expert backend graph compute failed");
@@ -11513,7 +11682,8 @@ private:
         if (measure_vk) {
             request_stats.ns_vk_params_set += params_elapsed;
         }
-        add_work_input_trace_tensor(entry.blob);
+        add_work_input_trace_tensor(
+            entry.blob, params_host.data(), params_span);
         enum ggml_status status = submit_graph(
             entry.graph, request_stats, entry.persistent_plan);
         if (status != GGML_STATUS_SUCCESS && entry.persistent_plan != nullptr) {
@@ -11858,7 +12028,8 @@ private:
         std::iota(trace_selected.begin(), trace_selected.end(), 0);
         begin_work_input_trace(
             request, pages, batch, trace_selected, /* use_gather = */ false, -1);
-        add_work_input_trace_tensor(entry.blob);
+        add_work_input_trace_tensor(
+            entry.blob, params_host.data(), params_span);
 
         enum ggml_status status;
         if (entry.persistent_plan != nullptr) {
@@ -11895,9 +12066,6 @@ private:
                 }
             };
             const auto graph_compute = [&](bool use_hip_graph) {
-                if (submit_async_ && is_cuda_backend()) {
-                    emit_work_input_trace();
-                }
                 if (hip_graph_replay) {
                     if (use_hip_graph) {
                         setenv("WP_HIP_GRAPHS", "1", 1);
@@ -11907,6 +12075,9 @@ private:
                 }
                 const auto result = ggml_backend_graph_compute(backend_.get(), entry.graph);
                 restore_graph_env();
+                if (submit_async_ && is_cuda_backend() && result == GGML_STATUS_SUCCESS) {
+                    enqueue_work_input_trace();
+                }
                 return result;
             };
             const auto submit_started = std::chrono::steady_clock::now();
