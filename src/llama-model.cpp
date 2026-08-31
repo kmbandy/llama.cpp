@@ -3361,6 +3361,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
 
+                uint32_t mtp_draft_swa = 0;
+                if (mtp_on_hybrid_qwen) {
+                    const char * env = std::getenv("WP_MTP_DRAFT_SWA");
+                    if (env != nullptr && env[0] != '\0') {
+                        char * end = nullptr;
+                        const long value = std::strtol(env, &end, 10);
+                        if (value > 0 && end != env && *end == '\0') {
+                            mtp_draft_swa = (uint32_t) std::min<uint64_t>(
+                                    cparams.n_ctx_seq, std::max<uint64_t>(256, (uint64_t) value));
+                        }
+                    }
+                }
+
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
@@ -3708,6 +3721,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        const uint32_t mtp_draft_kv_size = mtp_draft_swa > 0
+                                ? GGML_PAD(std::min(cparams.n_ctx_seq,
+                                        mtp_draft_swa * (cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch), 256)
+                                : cparams.n_ctx_seq;
+
+                        if (mtp_draft_swa > 0) {
+                            LLAMA_LOG_INFO("create_memory: MTP draft KV window (WP_MTP_DRAFT_SWA) n_swa=%u, size=%u cells\n",
+                                           mtp_draft_swa, mtp_draft_kv_size);
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3716,11 +3739,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                mtp_draft_kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                mtp_draft_swa > 0 ? mtp_draft_swa : hparams.n_swa,
+                                mtp_draft_swa > 0 ? LLAMA_SWA_TYPE_STANDARD : hparams.swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
