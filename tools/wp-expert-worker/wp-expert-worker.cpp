@@ -382,6 +382,17 @@ static uint64_t lfu_hysteresis_pct_from_env() {
     return std::min<uint64_t>(parsed, 100);
 }
 
+// WP_EXPERT_LFU_INIT_OWNER seeds the startup owner map from warm-start
+// hotness data (the "# count" hints in WP_EXPERT_PIN_FILE, itself produced by
+// WP_EXPERT_COUNTS_DUMP) instead of the slot-count-proportional static map.
+// DEFAULT OFF for the same reason as WP_EXPERT_LFU_PLACEMENT above: unmeasured
+// on hardware. Only meaningful when WP_EXPERT_LFU_PLACEMENT is also on.
+// WP_EXPERT_LFU_INIT_OWNER=1 enables it; anything else keeps the static map.
+static bool lfu_init_owner_from_env() {
+    const char * env = std::getenv("WP_EXPERT_LFU_INIT_OWNER");
+    return env != nullptr && env[0] == '1';
+}
+
 static uint64_t placement_now_ns() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -14125,16 +14136,34 @@ private:
             std::atomic_flag & flag;
             ~RefreshGuard() { flag.clear(std::memory_order_release); }
         } refresh_guard{placement_refreshing_};
+        const size_t n_pages = page_static_owners_.size();
+        std::vector<uint64_t> counts(n_pages, 0);
+        for (size_t id = 0; id < n_pages; ++id) {
+            counts[id] = page_access_counts_[id].load(std::memory_order_relaxed);
+        }
+        std::shared_ptr<PlacementSnapshot> snapshot = build_placement_snapshot(counts);
+        std::atomic_store_explicit(
+            &placement_snapshot_, std::shared_ptr<const PlacementSnapshot>(snapshot),
+            std::memory_order_release);
+    }
+
+    // Ranking core shared by the runtime refresh (refresh_placement_snapshot,
+    // which ranks from the live page_access_counts_) and the startup seed
+    // (seed_lfu_initial_owner_map, which ranks from a local pin-file-derived
+    // vector so the result is a pure function of the pin file and does not
+    // race the spine's warmup traffic). `counts` must be sized to
+    // page_static_owners_.size(); pages missing from the caller's data simply
+    // read as 0. Per-page-size-class hottest-first ranking, assigned into
+    // each device's slot capacity in device-list order, same as before this
+    // was pulled out of refresh_placement_snapshot().
+    std::shared_ptr<PlacementSnapshot> build_placement_snapshot(
+            const std::vector<uint64_t> & counts) const {
         std::shared_ptr<PlacementSnapshot> snapshot =
             std::make_shared<PlacementSnapshot>();
         const size_t n_pages = page_static_owners_.size();
         snapshot->owner.resize(n_pages);
         snapshot->promotion_floor.resize(n_pages);
         snapshot->demotion_ceiling.resize(n_pages);
-        std::vector<uint64_t> counts(n_pages, 0);
-        for (size_t id = 0; id < n_pages; ++id) {
-            counts[id] = page_access_counts_[id].load(std::memory_order_relaxed);
-        }
         for (size_t class_id = 0; class_id < placement_pages_by_class_.size(); ++class_id) {
             std::vector<size_t> pages = placement_pages_by_class_[class_id];
             std::sort(pages.begin(), pages.end(), [&](size_t a, size_t b) {
@@ -14198,13 +14227,100 @@ private:
                 }
             }
         }
-        std::atomic_store_explicit(
-            &placement_snapshot_, std::shared_ptr<const PlacementSnapshot>(snapshot),
-            std::memory_order_release);
+        return snapshot;
     }
 
     bool placement_enabled() const {
         return placement_enabled_;
+    }
+
+    // WP_EXPERT_LFU_INIT_OWNER=1: called once from load_pin_file(), with
+    // `pin_counts` a LOCAL vector parsed from that same pin file's "# count"
+    // hints (never page_access_counts_), to replace the slot-proportional
+    // static owner map in page_current_owner_ with the LFU ranking that
+    // build_placement_snapshot() (shared with the runtime refresh path)
+    // computes from those counts -- so a fresh worker starts with hot
+    // experts GPU-first instead of waiting for the (rate-limited) runtime
+    // migration path to catch up.
+    //
+    // The seed MUST be a pure function of the pin file, not of live counters:
+    // by the time load_pin_file() finishes pinning thousands of pages, the
+    // spine may already be sending warmup traffic, so page_access_counts_ is
+    // accumulating concurrently and its value at any given instant is
+    // run-to-run nondeterministic. Ranking from a snapshot read of live
+    // counts (as an earlier version of this function did via
+    // refresh_placement_snapshot()) reproduced that nondeterminism in the
+    // startup owner map itself. Ranking from `pin_counts` instead makes two
+    // fresh launches with the same pin file produce the same owner map.
+    //
+    // Only called when placement_ready_ is already true (initialize_placement_
+    // policy runs before load_pin_file in the constructor). This does not
+    // touch placement_snapshot_ or placement_ready_, so the runtime refresh/
+    // migration path is untouched and keeps working exactly as before on top
+    // of whatever this leaves in page_current_owner_.
+    //
+    // Pages with no warm-start count fall through that same ranking
+    // untouched: they sort to the back of their size class (count 0) and land
+    // in whatever band is left after hot pages claim capacity -- typically
+    // the coldest/overflow device, but not forced there; there is no separate
+    // hardcoded fallback map for them.
+    void seed_lfu_initial_owner_map(const std::vector<uint64_t> & pin_counts) {
+        const size_t n_pages = page_static_owners_.size();
+        size_t with_counts = 0;
+        for (size_t id = 0; id < n_pages && id < pin_counts.size(); ++id) {
+            if (pin_counts[id] != 0) {
+                ++with_counts;
+            }
+        }
+        if (with_counts == 0) {
+            std::cerr << "WARN wp expert worker: WP_EXPERT_LFU_INIT_OWNER=1 but "
+                          "WP_EXPERT_PIN_FILE carried no warm-start counts; "
+                          "keeping static owner map" << std::endl;
+            return;
+        }
+        if (!placement_ready_) {
+            // Defensive only: the constructor always calls
+            // initialize_placement_policy() (which sets placement_ready_)
+            // before load_pin_file(), so this should be unreachable.
+            std::cerr << "WARN wp expert worker: WP_EXPERT_LFU_INIT_OWNER=1 but "
+                          "placement policy was not ready; keeping static owner map"
+                      << std::endl;
+            return;
+        }
+        const std::shared_ptr<PlacementSnapshot> snapshot =
+            build_placement_snapshot(pin_counts);
+        if (!snapshot || snapshot->owner.size() != n_pages) {
+            std::cerr << "WARN wp expert worker: WP_EXPERT_LFU_INIT_OWNER=1 but the "
+                          "LFU snapshot was not available; keeping static owner map"
+                      << std::endl;
+            return;
+        }
+        for (size_t id = 0; id < n_pages; ++id) {
+            page_current_owner_[id].store(snapshot->owner[id], std::memory_order_relaxed);
+        }
+        // Also warm the live LFU counters from the pin counts, so the
+        // runtime path's first real refresh (every placement_refresh_period_
+        // references) ranks from a hot start rather than from zero. Only
+        // when the live counter is still exactly 0: by this point the spine
+        // may already be adding real references concurrently via
+        // note_dispatch_references(), and adding pin_counts on top of that
+        // would be racy (order-dependent, double counting); CAS-if-zero
+        // instead prefers whatever real traffic has already recorded and
+        // otherwise deterministically seeds from the pin file.
+        for (size_t id = 0; id < n_pages && id < pin_counts.size(); ++id) {
+            if (pin_counts[id] == 0) {
+                continue;
+            }
+            uint64_t expected = 0;
+            page_access_counts_[id].compare_exchange_strong(
+                expected, pin_counts[id], std::memory_order_relaxed,
+                std::memory_order_relaxed);
+        }
+        std::fprintf(stderr,
+                     "wp expert worker WP_EXPERT_LFU_INIT_OWNER=1 lfu_initialized=%zu "
+                     "static_fallback=%zu total_pages=%zu\n",
+                     with_counts, n_pages - with_counts, n_pages);
+        std::fflush(stderr);
     }
 
     void maybe_report_placement_stats() const {
@@ -14374,6 +14490,11 @@ private:
     void load_pin_file() {
         const char * const pin_path = std::getenv("WP_EXPERT_PIN_FILE");
         if (pin_path == nullptr || pin_path[0] == '\0') {
+            if (lfu_init_owner_ && placement_enabled_) {
+                std::cerr << "WARN wp expert worker: WP_EXPERT_LFU_INIT_OWNER=1 but no "
+                              "WP_EXPERT_PIN_FILE warm-start data; keeping static owner map"
+                          << std::endl;
+            }
             return;
         }
         size_t pin_budget = 0;
@@ -14403,6 +14524,14 @@ private:
         size_t line_number = 0;
         size_t selected = 0;
         bool truncated = false;
+        // Local, pin-file-only counts for WP_EXPERT_LFU_INIT_OWNER -- kept
+        // separate from page_access_counts_ so the startup ranking is a pure
+        // function of the file and cannot race live traffic. See
+        // seed_lfu_initial_owner_map() for why that matters.
+        std::vector<uint64_t> pin_counts;
+        if (lfu_init_owner_ && placement_enabled_) {
+            pin_counts.assign(page_static_owners_.size(), 0);
+        }
         while (std::getline(pin_file, line)) {
             ++line_number;
             if (line.empty() || line[0] == '#') {
@@ -14424,6 +14553,26 @@ private:
                 std::cerr << "WARN wp expert worker: ignoring unknown pin "
                           << layer << " " << expert << std::endl;
                 continue;
+            }
+            // WP_EXPERT_LFU_INIT_OWNER warm start: dump_access_counts() writes
+            // pin lines as "layer expert  # count"; pick the count back up
+            // here (input already consumed "layer expert" above) into the
+            // LOCAL pin_counts vector (never page_access_counts_ -- see
+            // seed_lfu_initial_owner_map()) so the startup LFU ranking is a
+            // pure function of this file. A missing/unparsable count just
+            // leaves the page at its default 0, i.e. no warm-start data for it.
+            if (!pin_counts.empty()) {
+                const size_t hash_pos = line.find('#');
+                if (hash_pos != std::string::npos) {
+                    std::istringstream count_input(line.substr(hash_pos + 1));
+                    uint64_t count = 0;
+                    if (count_input >> count) {
+                        const size_t cid = (size_t) catalog_.pages.at(key).cache_id;
+                        if (cid < pin_counts.size()) {
+                            pin_counts[cid] = count;
+                        }
+                    }
+                }
             }
             const size_t device_id = owning_device_for_page(layer, expert);
             const ResourcePlan & resources = devices_[device_id]->resources();
@@ -14470,6 +14619,9 @@ private:
             std::cerr << "WARN wp expert worker: pin file truncated in file order"
                       << " at " << pin_budget << " slots" << std::endl;
         }
+        if (lfu_init_owner_ && placement_enabled_) {
+            seed_lfu_initial_owner_map(pin_counts);
+        }
     }
 
     Catalog catalog_;
@@ -14478,6 +14630,7 @@ private:
     WorkerLogFiles logs_;
     wp::HostTier host_tier_;
     const bool placement_enabled_ = lfu_placement_from_env();
+    const bool lfu_init_owner_ = lfu_init_owner_from_env();
     const size_t migration_cap_ = lfu_migration_cap_from_env();
     const uint64_t hysteresis_pct_ = lfu_hysteresis_pct_from_env();
     static constexpr uint64_t placement_refresh_period_ = 256;
