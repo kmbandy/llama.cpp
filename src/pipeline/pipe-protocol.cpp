@@ -1124,6 +1124,40 @@ std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
     return out;
 }
 
+static constexpr uint32_t PIPE_EXPERT_PARTIAL_STREAM_TAG = 0x31505357u; // "WSP1"
+
+void pipe_encode_expert_partial_stream_into(
+        std::vector<uint8_t> & out, uint32_t part_index, uint32_t part_count,
+        const pipe_expert_partial & partial) {
+    if (part_count == 0 || part_index >= part_count) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid streamed expert partial index");
+    }
+    if (partial.dtype != PIPE_HIDDEN_F32) {
+        fail(PIPE_ERR_BAD_FRAME,
+             "pipe: streamed expert partial encode only supports PIPE_HIDDEN_F32");
+    }
+    const uint64_t total = 24ull + (uint64_t) partial.partial.size() * sizeof(float);
+    if (partial.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid streamed expert partial response");
+    }
+    out.resize((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, PIPE_EXPERT_PARTIAL_STREAM_TAG);
+    wr_u32(w, part_index);
+    wr_u32(w, part_count);
+    wr_i32(w, partial.layer);
+    wr_u32(w, partial.n_tokens);
+    wr_i32(w, partial.dtype);
+    wr_f32_bulk(w, partial.partial.data(), partial.partial.size());
+}
+
+std::vector<uint8_t> pipe_encode_expert_partial_stream(
+        const pipe_expert_partial_stream & p) {
+    std::vector<uint8_t> out;
+    pipe_encode_expert_partial_stream_into(out, p.part_index, p.part_count, p.partial);
+    return out;
+}
+
 pipe_expert_partial pipe_decode_expert_partial(
         const uint8_t * buf, size_t len, int32_t n_embd) {
     if (n_embd <= 0 || len < 12) {
@@ -1169,6 +1203,25 @@ pipe_expert_partial pipe_decode_expert_partial(
         rd_f32_bulk(p, r.partial.data(), (size_t) n_values);
     }
     return r;
+}
+
+pipe_expert_partial_stream pipe_decode_expert_partial_stream(
+        const uint8_t * buf, size_t len, int32_t n_embd) {
+    if (len < 24) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: streamed expert partial payload is too small");
+    }
+    const uint8_t * p = buf;
+    if (rd_u32(p) != PIPE_EXPERT_PARTIAL_STREAM_TAG) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: streamed expert partial has the wrong payload tag");
+    }
+    pipe_expert_partial_stream result;
+    result.part_index = rd_u32(p);
+    result.part_count = rd_u32(p);
+    if (result.part_count == 0 || result.part_index >= result.part_count) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: streamed expert partial has an invalid index");
+    }
+    result.partial = pipe_decode_expert_partial(p, len - 12, n_embd);
+    return result;
 }
 
 // ---------------------------------------------------------------------------

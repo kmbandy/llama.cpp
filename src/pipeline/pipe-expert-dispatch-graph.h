@@ -194,11 +194,20 @@ class graph_dispatcher {
     std::string failure_message() const;
     void begin_decode() noexcept;
     void end_decode() noexcept;
+    uint64_t decode_dispatch_ns() const noexcept { return decode_ns_total_; }
 
-    // Scheduler callbacks in llama-context.cpp delimit the dense interval
-    // between the split dispatch issue and wait nodes.
-    void layer_trace_dense_begin(int32_t layer) noexcept;
-    void layer_trace_dense_end(int32_t layer) noexcept;
+    struct spine_profile_stats {
+        uint64_t ns_dispatch_issue_total = 0;
+        uint64_t ns_dispatch_wait_total = 0;
+        uint64_t ns_between_issue_and_wait_total = 0;
+        uint64_t ns_before_first_issue = 0;
+        uint64_t ns_after_last_wait = 0;
+        uint64_t ns_gaps = 0;
+        size_t n_layers = 0;
+    };
+
+    void spine_profile_begin(std::chrono::steady_clock::time_point begin) noexcept;
+    spine_profile_stats spine_profile_end(std::chrono::steady_clock::time_point end) noexcept;
 
   private:
     struct op_context;
@@ -209,6 +218,12 @@ class graph_dispatcher {
     };
 
     void latch_failure(const char * message) noexcept;
+    void layer_trace_issue_return(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
+    void layer_trace_wait_entry(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
+    void spine_profile_issue_begin(std::chrono::steady_clock::time_point time) noexcept;
+    void spine_profile_issue_end(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
+    void spine_profile_wait_begin(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
+    void spine_profile_wait_end(std::chrono::steady_clock::time_point time) noexcept;
     void write_layer_trace(int32_t layer) noexcept;
     bool is_phantom_row(int64_t token) const noexcept;
     void zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd) const noexcept;
@@ -447,6 +462,19 @@ class graph_dispatcher {
         bool dense_active = false;
     };
     std::map<int32_t, layer_trace_record>          layer_traces_;
+    struct spine_profile_record {
+        std::chrono::steady_clock::time_point begin{};
+        std::chrono::steady_clock::time_point issue_started{};
+        std::chrono::steady_clock::time_point first_issue{};
+        std::chrono::steady_clock::time_point last_wait_end{};
+        std::map<int32_t, std::chrono::steady_clock::time_point> issue_ended;
+        spine_profile_stats stats{};
+        bool active = false;
+        bool issue_active = false;
+        bool have_first_issue = false;
+        bool have_last_wait = false;
+    };
+    spine_profile_record                            spine_profile_;
     std::chrono::steady_clock::time_point          decode_t0_{};
     bool                                           decode_active_ = false;
     size_t                                         decode_layers_ = 0;
@@ -455,6 +483,8 @@ class graph_dispatcher {
     uint64_t                                       decode_ns_wait_ = 0;
     uint64_t                                       decode_ns_unpack_ = 0;
     uint64_t                                       decode_ns_total_ = 0;
+    uint64_t                                       decode_ns_fold_overlapped_ = 0;
+    uint64_t                                       decode_n_partials_folded_early_ = 0;
     uint64_t                                       decode_first_await_in_flight_ = 0;
     // Max over the decode's layers of dispatch_stats::max_in_flight -- see the
     // comment on that field. Distinct from decode_first_await_in_flight_'s

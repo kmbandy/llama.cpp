@@ -1,0 +1,178 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "types.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint expert_index;
+} p;
+
+layout(binding = 0) readonly buffer GateBuffer {
+    block_q4_K gate[];
+};
+layout(binding = 1) readonly buffer UpBuffer {
+    block_q4_K up[];
+};
+#if defined(DOWN_Q8_0)
+layout(binding = 2) readonly buffer DownBuffer {
+    block_q8_0 down[];
+};
+#else
+layout(binding = 2) readonly buffer DownBuffer {
+    block_q5_1 down[];
+};
+#endif
+layout(binding = 3) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(binding = 4) buffer OutputBuffer {
+    float output_values[];
+};
+layout(binding = 5) readonly buffer ParameterBuffer {
+    uint params[];
+};
+
+const uint PARAM_N_TOKENS       = 0;
+const uint PARAM_N_EMBD         = 1;
+const uint PARAM_N_FF            = 2;
+const uint PARAM_N_EXPERTS      = 3;
+const uint PARAM_GATE_BLOCKS    = 4;
+const uint PARAM_DOWN_BLOCKS    = 5;
+const uint PARAM_ADD_PREVIOUS   = 6;
+const uint PARAM_SWIGLU_LIMIT   = 7;
+const uint PARAM_ROUTE_WEIGHTS  = 8;
+
+const uint MAX_FF = 256;
+
+shared float hidden_gate[MAX_FF];
+shared float hidden_up[MAX_FF];
+
+float q4k_value(const block_q4_K b, uint i) {
+    const uint n = i / 64;
+    const uint half_v = (i % 64) / 32;
+    const uint is = 2 * n + half_v;
+    const uint qsi = 2 * (((i & 0xC0) >> 2) + ((i & 0x1E) >> 1)) + (i & 1);
+
+    const uint scidx0 = is < 4 ? is : is + 4;
+    const uint scidx1 = is < 4 ? is : is - 4;
+    const uint scidxmask1 = is < 4 ? 0x30 : 0xC0;
+    const uint scidxshift1 = is < 4 ? 0 : 2;
+    const uint mbidx0 = is + 4;
+    const uint mbidx1 = is < 4 ? is + 4 : is;
+    const uint mbidxmask0 = is < 4 ? 0xF : 0xF0;
+    const uint mbidxshift0 = is < 4 ? 0 : 4;
+    const uint mbidxmask1 = is < 4 ? 0x30 : 0xC0;
+    const uint mbidxshift1 = is < 4 ? 0 : 2;
+
+    const uint sc = (uint(b.scales[scidx0]) & 0xF) |
+        ((uint(b.scales[scidx1]) & scidxmask1) >> scidxshift1);
+    const uint mbyte = ((uint(b.scales[mbidx0]) & mbidxmask0) >> mbidxshift0) |
+        ((uint(b.scales[mbidx1]) & mbidxmask1) >> mbidxshift1);
+    const uint qshift = half_v * 4;
+    const uint q = (uint(b.qs[qsi]) >> qshift) & 0xF;
+    return fma(float(b.dm.x) * float(sc), float(q), -float(b.dm.y) * float(mbyte));
+}
+
+// gate/up/down are each bound as their OWN sub-buffer at the selected
+// expert's byte offset for that role (see ggml_backend_vk_wp_fused_expert()
+// in ggml-vulkan.cpp) -- so every expert's role data starts at LOCAL block
+// index 0 in its own binding, regardless of where the expert's slot actually
+// lives inside the pool buffer. No per-expert base is needed here.
+float gate_value(uint i) {
+    return q4k_value(gate[i / 256], i % 256);
+}
+
+float up_value(uint i) {
+    return q4k_value(up[i / 256], i % 256);
+}
+
+#if defined(DOWN_Q8_0)
+float down_value(uint i) {
+    const block_q8_0 b = down[i / 32];
+    return float(b.qs[i % 32]) * float(b.d);
+}
+#else
+float down_value(uint i) {
+    const block_q5_1 b = down[i / 32];
+    const uint in_block = i % 32;
+    const uint j = in_block % 16;
+    const bool upper = in_block >= 16;
+    const uint qh_bit = upper ? j + 16 : j;
+    const uint q = ((uint(b.qs[j]) >> (upper ? 4 : 0)) & 0xF) |
+        (((b.qh >> qh_bit) & 1) << 4);
+    return fma(float(b.d), float(q), float(b.m));
+}
+#endif
+
+uint param(uint index) {
+    return params[index];
+}
+
+float route_weight(uint expert, uint token) {
+    return uintBitsToFloat(param(param(PARAM_ROUTE_WEIGHTS) +
+        expert * param(PARAM_N_TOKENS) + token));
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x & 63;
+    const uint subgroup = gl_LocalInvocationID.x / 64;
+    const uint expert = p.expert_index;
+    const uint n_tokens = param(PARAM_N_TOKENS);
+    const uint n_embd = param(PARAM_N_EMBD);
+    const uint n_ff = param(PARAM_N_FF);
+    const uint gate_blocks = param(PARAM_GATE_BLOCKS);
+    const uint down_blocks = param(PARAM_DOWN_BLOCKS);
+    const float swiglu_limit = uintBitsToFloat(param(PARAM_SWIGLU_LIMIT));
+    const uint token = gl_WorkGroupID.x;
+    if (token >= n_tokens) {
+        return;
+    }
+
+    for (uint h = subgroup; h < n_ff; h += 8) {
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        for (uint k = lane; k < n_embd; k += 64) {
+            const float x = input_values[token * n_embd + k];
+            gate_sum = fma(gate_value(h * gate_blocks * 256 + k), x, gate_sum);
+            up_sum = fma(up_value(h * gate_blocks * 256 + k), x, up_sum);
+        }
+        gate_sum = subgroupAdd(gate_sum);
+        up_sum = subgroupAdd(up_sum);
+        if (lane == 0) {
+            if (swiglu_limit > 0.000001f) {
+                gate_sum = min(gate_sum, swiglu_limit);
+                up_sum = clamp(up_sum, -swiglu_limit, swiglu_limit);
+            }
+            hidden_gate[h] = gate_sum;
+            hidden_up[h] = up_sum;
+        }
+    }
+    barrier();
+
+    for (uint row = subgroup; row < n_embd; row += 8) {
+        float down_sum = 0.0f;
+        for (uint k = lane; k < n_ff; k += 64) {
+            const float gate = hidden_gate[k];
+            const float silu = gate / (1.0f + exp(-gate));
+            const float hidden = silu * hidden_up[k];
+            down_sum = fma(down_value(row * down_blocks * 32 + k), hidden, down_sum);
+        }
+        down_sum = subgroupAdd(down_sum);
+        if (lane == 0) {
+            const uint output_index = token * n_embd + row;
+            float value = 0.0f;
+            if (param(PARAM_ADD_PREVIOUS) != 0 || expert != 0) {
+                value = output_values[output_index];
+            }
+            output_values[output_index] = fma(route_weight(expert, token), down_sum, value);
+        }
+    }
+}

@@ -74,6 +74,59 @@ GGML_BACKEND_API void ggml_backend_vk_wp_set_expert_offsets(ggml_backend_buffer_
                                                             const uint32_t * block_offsets,
                                                             int n_experts);
 
+// Fused worker request. gate/up/down_byte_offsets are BYTE offsets of each
+// selected expert's role data relative to the corresponding weights_buffers
+// entry (not quant-block indices) -- an expert slot's position inside the
+// pool buffer is only guaranteed aligned to minStorageBufferOffsetAlignment,
+// not to the much coarser quant block size (144 B for Q4_K, 24/34 B for
+// Q5_1/Q8_0), so the host binds each role at its own byte-offset sub-buffer
+// (see ggml_backend_vk_wp_fused_expert) and the shader always indexes
+// starting from local block 0 within that sub-buffer. All buffers must
+// belong to one device.
+struct ggml_backend_vk_wp_fused_expert_params {
+    ggml_backend_buffer_t io_buffer;
+    ggml_backend_buffer_t params_buffer;
+    const ggml_backend_buffer_t * weights_buffers;
+    size_t input_offset;
+    size_t output_offset;
+    size_t params_offset;
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_ff;
+    uint32_t n_experts;
+    uint32_t down_type;
+    uint32_t add_previous;
+    uint32_t submit_async;
+    float swiglu_limit;
+    const uint64_t * gate_byte_offsets;
+    const uint64_t * up_byte_offsets;
+    const uint64_t * down_byte_offsets;
+    const float * route_weights;
+};
+
+struct ggml_backend_vk_wp_fused_expert_stats {
+    uint64_t ns_dispatch;
+    // Real pipeline dispatch count. Was always == n_experts (one dispatch per
+    // expert). The batched fast path (see ggml_backend_vk_wp_fused_expert's
+    // "WP_VK_FUSED_EXPERT_BATCH" comment) issues exactly 2 -- one dispatch
+    // for ALL experts' gate/up, one for ALL experts' down+fold -- whenever
+    // every selected expert's weights live in one VkBuffer; callers that
+    // derive a per-dispatch cost from this field need to know the meaning
+    // changed, not just the count.
+    uint64_t n_pipeline_dispatches;
+    uint64_t n_fence_waits;
+    uint64_t bytes_uploaded;
+    // Total compute workgroups actually launched across this call's
+    // dispatch(es). 0 is not a valid count on success; left at 0 only when
+    // the call itself failed (stats reset to {} on entry).
+    uint64_t n_workgroups;
+};
+
+GGML_BACKEND_API bool ggml_backend_vk_wp_fused_expert(
+        ggml_backend_t backend,
+        const struct ggml_backend_vk_wp_fused_expert_params * params,
+        struct ggml_backend_vk_wp_fused_expert_stats * stats);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
 #ifdef  __cplusplus

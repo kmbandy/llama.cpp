@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <atomic>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -25,6 +26,7 @@
 // Optional HIP multi-input stage flush (defined in ggml-cuda.cu when ROCm linked).
 // Weak so CPU-only builds still link.
 extern "C" void ggml_backend_cuda_xdev_batch_flush(void) __attribute__((weak));
+extern "C" bool ggml_backend_cuda_synchronize_compute(ggml_backend_t backend) __attribute__((weak));
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -827,6 +829,211 @@ static bool wp_sched_split_dump_enabled(void) {
         return (e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
     }();
     return on != 0;
+}
+
+// WP_SPLIT_STATS=1 measures scheduler work for a complete split compute. The
+// disabled path only checks this cached flag. WP_SPLIT_STATS_EVERY controls
+// the print period in forwards (default 256, 0 disables periodic prints).
+static bool wp_sched_split_stats_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SPLIT_STATS");
+        return (e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
+}
+
+// WP_SCHED_PINNED_D2H=0 restores the generic blocking GPU-to-host copy for
+// scheduler inputs. Default ON uses the producer compute stream when the CPU
+// input copy is allocated in that GPU's pinned host buffer.
+static bool wp_sched_pinned_d2h_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SCHED_PINNED_D2H");
+        return (e == nullptr || e[0] == '\0' || strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
+}
+
+static uint64_t wp_sched_split_stats_every(void) {
+    static const uint64_t every = []() {
+        const char * e = getenv("WP_SPLIT_STATS_EVERY");
+        if (e == nullptr) {
+            return (uint64_t) 256;
+        }
+        const long v = atol(e);
+        return v >= 0 ? (uint64_t) v : (uint64_t) 256;
+    }();
+    return every;
+}
+
+static uint64_t wp_sched_time_ns(void) {
+    return (uint64_t) ggml_time_us() * 1000;
+}
+
+struct wp_sched_split_stats {
+    uint64_t n_splits;
+    uint64_t n_backend_switches;
+    uint64_t n_sync_calls;
+    uint64_t ns_sync_total;
+    uint64_t n_event_waits;
+    uint64_t ns_event_wait_total;
+    uint64_t n_copy_tensors;
+    uint64_t ns_copy_total;
+    uint64_t n_copy_pinned_d2h;
+    uint64_t ns_copy_pinned_d2h;
+    uint64_t n_copy_pageable_d2h;
+    uint64_t ns_copy_pageable_d2h;
+    uint64_t n_syncs_elided;
+    uint64_t n_graph_entries;
+    uint64_t ns_graph_entry_total;
+};
+
+struct wp_sched_split_stats_totals {
+    std::atomic<uint64_t> n_forwards{0};
+    std::atomic<uint64_t> n_splits{0};
+    std::atomic<uint64_t> n_backend_switches{0};
+    std::atomic<uint64_t> n_sync_calls{0};
+    std::atomic<uint64_t> ns_sync_total{0};
+    std::atomic<uint64_t> n_event_waits{0};
+    std::atomic<uint64_t> ns_event_wait_total{0};
+    std::atomic<uint64_t> n_copy_tensors{0};
+    std::atomic<uint64_t> ns_copy_total{0};
+    std::atomic<uint64_t> n_copy_pinned_d2h{0};
+    std::atomic<uint64_t> ns_copy_pinned_d2h{0};
+    std::atomic<uint64_t> n_copy_pageable_d2h{0};
+    std::atomic<uint64_t> ns_copy_pageable_d2h{0};
+    std::atomic<uint64_t> n_syncs_elided{0};
+    std::atomic<uint64_t> n_graph_entries{0};
+    std::atomic<uint64_t> ns_graph_entry_total{0};
+};
+
+static wp_sched_split_stats_totals g_wp_sched_split_stats;
+
+static void wp_sched_split_stats_print(void) {
+    const uint64_t n_forwards = g_wp_sched_split_stats.n_forwards.load(std::memory_order_relaxed);
+    const uint64_t n_splits = g_wp_sched_split_stats.n_splits.load(std::memory_order_relaxed);
+    const uint64_t n_backend_switches = g_wp_sched_split_stats.n_backend_switches.load(std::memory_order_relaxed);
+    const uint64_t n_sync_calls = g_wp_sched_split_stats.n_sync_calls.load(std::memory_order_relaxed);
+    const uint64_t ns_sync_total = g_wp_sched_split_stats.ns_sync_total.load(std::memory_order_relaxed);
+    const uint64_t n_event_waits = g_wp_sched_split_stats.n_event_waits.load(std::memory_order_relaxed);
+    const uint64_t ns_event_wait_total = g_wp_sched_split_stats.ns_event_wait_total.load(std::memory_order_relaxed);
+    const uint64_t n_copy_tensors = g_wp_sched_split_stats.n_copy_tensors.load(std::memory_order_relaxed);
+    const uint64_t ns_copy_total = g_wp_sched_split_stats.ns_copy_total.load(std::memory_order_relaxed);
+    const uint64_t n_copy_pinned_d2h = g_wp_sched_split_stats.n_copy_pinned_d2h.load(std::memory_order_relaxed);
+    const uint64_t ns_copy_pinned_d2h = g_wp_sched_split_stats.ns_copy_pinned_d2h.load(std::memory_order_relaxed);
+    const uint64_t n_copy_pageable_d2h = g_wp_sched_split_stats.n_copy_pageable_d2h.load(std::memory_order_relaxed);
+    const uint64_t ns_copy_pageable_d2h = g_wp_sched_split_stats.ns_copy_pageable_d2h.load(std::memory_order_relaxed);
+    const uint64_t n_syncs_elided = g_wp_sched_split_stats.n_syncs_elided.load(std::memory_order_relaxed);
+    const uint64_t n_graph_entries = g_wp_sched_split_stats.n_graph_entries.load(std::memory_order_relaxed);
+    const uint64_t ns_graph_entry_total = g_wp_sched_split_stats.ns_graph_entry_total.load(std::memory_order_relaxed);
+
+    static std::atomic<uint64_t> last_n_forwards{0};
+    static std::atomic<uint64_t> last_n_splits{0};
+    static std::atomic<uint64_t> last_n_backend_switches{0};
+    static std::atomic<uint64_t> last_n_sync_calls{0};
+    static std::atomic<uint64_t> last_ns_sync_total{0};
+    static std::atomic<uint64_t> last_n_event_waits{0};
+    static std::atomic<uint64_t> last_ns_event_wait_total{0};
+    static std::atomic<uint64_t> last_n_copy_tensors{0};
+    static std::atomic<uint64_t> last_ns_copy_total{0};
+    static std::atomic<uint64_t> last_n_copy_pinned_d2h{0};
+    static std::atomic<uint64_t> last_ns_copy_pinned_d2h{0};
+    static std::atomic<uint64_t> last_n_copy_pageable_d2h{0};
+    static std::atomic<uint64_t> last_ns_copy_pageable_d2h{0};
+    static std::atomic<uint64_t> last_n_syncs_elided{0};
+    static std::atomic<uint64_t> last_n_graph_entries{0};
+    static std::atomic<uint64_t> last_ns_graph_entry_total{0};
+
+    const uint64_t interval_n_forwards = n_forwards - last_n_forwards.exchange(n_forwards, std::memory_order_relaxed);
+    const uint64_t interval_n_splits = n_splits - last_n_splits.exchange(n_splits, std::memory_order_relaxed);
+    const uint64_t interval_n_backend_switches = n_backend_switches - last_n_backend_switches.exchange(n_backend_switches, std::memory_order_relaxed);
+    const uint64_t interval_n_sync_calls = n_sync_calls - last_n_sync_calls.exchange(n_sync_calls, std::memory_order_relaxed);
+    const uint64_t interval_ns_sync_total = ns_sync_total - last_ns_sync_total.exchange(ns_sync_total, std::memory_order_relaxed);
+    const uint64_t interval_n_event_waits = n_event_waits - last_n_event_waits.exchange(n_event_waits, std::memory_order_relaxed);
+    const uint64_t interval_ns_event_wait_total = ns_event_wait_total - last_ns_event_wait_total.exchange(ns_event_wait_total, std::memory_order_relaxed);
+    const uint64_t interval_n_copy_tensors = n_copy_tensors - last_n_copy_tensors.exchange(n_copy_tensors, std::memory_order_relaxed);
+    const uint64_t interval_ns_copy_total = ns_copy_total - last_ns_copy_total.exchange(ns_copy_total, std::memory_order_relaxed);
+    const uint64_t interval_n_copy_pinned_d2h = n_copy_pinned_d2h - last_n_copy_pinned_d2h.exchange(n_copy_pinned_d2h, std::memory_order_relaxed);
+    const uint64_t interval_ns_copy_pinned_d2h = ns_copy_pinned_d2h - last_ns_copy_pinned_d2h.exchange(ns_copy_pinned_d2h, std::memory_order_relaxed);
+    const uint64_t interval_n_copy_pageable_d2h = n_copy_pageable_d2h - last_n_copy_pageable_d2h.exchange(n_copy_pageable_d2h, std::memory_order_relaxed);
+    const uint64_t interval_ns_copy_pageable_d2h = ns_copy_pageable_d2h - last_ns_copy_pageable_d2h.exchange(ns_copy_pageable_d2h, std::memory_order_relaxed);
+    const uint64_t interval_n_syncs_elided = n_syncs_elided - last_n_syncs_elided.exchange(n_syncs_elided, std::memory_order_relaxed);
+    const uint64_t interval_n_graph_entries = n_graph_entries - last_n_graph_entries.exchange(n_graph_entries, std::memory_order_relaxed);
+    const uint64_t interval_ns_graph_entry_total = ns_graph_entry_total - last_ns_graph_entry_total.exchange(ns_graph_entry_total, std::memory_order_relaxed);
+
+    fprintf(stderr, "wp split-stats: forwards=%llu splits=%llu switches=%llu sync_calls=%llu ns_sync_total=%llu "
+            "event_waits=%llu ns_event_wait_total=%llu copy_tensors=%llu ns_copy_total=%llu "
+            "copy_pinned_d2h=%llu ns_copy_pinned_d2h=%llu copy_pageable_d2h=%llu ns_copy_pageable_d2h=%llu syncs_elided=%llu "
+            "graph_entries=%llu ns_graph_entry_total=%llu interval(forwards=%llu splits=%llu switches=%llu "
+            "sync_calls=%llu ns_sync_total=%llu event_waits=%llu ns_event_wait_total=%llu "
+            "copy_tensors=%llu ns_copy_total=%llu copy_pinned_d2h=%llu ns_copy_pinned_d2h=%llu "
+            "copy_pageable_d2h=%llu ns_copy_pageable_d2h=%llu syncs_elided=%llu graph_entries=%llu ns_graph_entry_total=%llu)\n",
+            (unsigned long long) n_forwards, (unsigned long long) n_splits,
+            (unsigned long long) n_backend_switches, (unsigned long long) n_sync_calls,
+            (unsigned long long) ns_sync_total, (unsigned long long) n_event_waits,
+            (unsigned long long) ns_event_wait_total, (unsigned long long) n_copy_tensors,
+            (unsigned long long) ns_copy_total, (unsigned long long) n_copy_pinned_d2h,
+            (unsigned long long) ns_copy_pinned_d2h, (unsigned long long) n_copy_pageable_d2h,
+            (unsigned long long) ns_copy_pageable_d2h, (unsigned long long) n_syncs_elided,
+            (unsigned long long) n_graph_entries,
+            (unsigned long long) ns_graph_entry_total,
+            (unsigned long long) interval_n_forwards, (unsigned long long) interval_n_splits,
+            (unsigned long long) interval_n_backend_switches, (unsigned long long) interval_n_sync_calls,
+            (unsigned long long) interval_ns_sync_total, (unsigned long long) interval_n_event_waits,
+            (unsigned long long) interval_ns_event_wait_total, (unsigned long long) interval_n_copy_tensors,
+            (unsigned long long) interval_ns_copy_total, (unsigned long long) interval_n_copy_pinned_d2h,
+            (unsigned long long) interval_ns_copy_pinned_d2h, (unsigned long long) interval_n_copy_pageable_d2h,
+            (unsigned long long) interval_ns_copy_pageable_d2h, (unsigned long long) interval_n_syncs_elided,
+            (unsigned long long) interval_n_graph_entries,
+            (unsigned long long) interval_ns_graph_entry_total);
+}
+
+static void wp_sched_split_stats_add(const wp_sched_split_stats & stats) {
+    g_wp_sched_split_stats.n_splits.fetch_add(stats.n_splits, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_backend_switches.fetch_add(stats.n_backend_switches, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_sync_calls.fetch_add(stats.n_sync_calls, std::memory_order_relaxed);
+    g_wp_sched_split_stats.ns_sync_total.fetch_add(stats.ns_sync_total, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_event_waits.fetch_add(stats.n_event_waits, std::memory_order_relaxed);
+    g_wp_sched_split_stats.ns_event_wait_total.fetch_add(stats.ns_event_wait_total, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_copy_tensors.fetch_add(stats.n_copy_tensors, std::memory_order_relaxed);
+    g_wp_sched_split_stats.ns_copy_total.fetch_add(stats.ns_copy_total, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_copy_pinned_d2h.fetch_add(stats.n_copy_pinned_d2h, std::memory_order_relaxed);
+    g_wp_sched_split_stats.ns_copy_pinned_d2h.fetch_add(stats.ns_copy_pinned_d2h, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_copy_pageable_d2h.fetch_add(stats.n_copy_pageable_d2h, std::memory_order_relaxed);
+    g_wp_sched_split_stats.ns_copy_pageable_d2h.fetch_add(stats.ns_copy_pageable_d2h, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_syncs_elided.fetch_add(stats.n_syncs_elided, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_graph_entries.fetch_add(stats.n_graph_entries, std::memory_order_relaxed);
+    g_wp_sched_split_stats.ns_graph_entry_total.fetch_add(stats.ns_graph_entry_total, std::memory_order_relaxed);
+
+    const uint64_t every = wp_sched_split_stats_every();
+    const uint64_t n_forwards = g_wp_sched_split_stats.n_forwards.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (every != 0 && n_forwards % every == 0) {
+        wp_sched_split_stats_print();
+    }
+}
+
+static bool wp_sched_copy_uses_pinned_host(
+        ggml_backend_t producer,
+        const struct ggml_tensor * src,
+        const struct ggml_tensor * dst) {
+    if (ggml_backend_dev_type(ggml_backend_get_device(producer)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+
+    ggml_backend_buffer_t src_buffer = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buffer = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(producer));
+
+    return src_buffer != NULL && dst_buffer != NULL && host_buft != NULL &&
+           ggml_backend_supports_buft(producer, ggml_backend_buffer_get_type(src_buffer)) &&
+           ggml_backend_buffer_get_type(dst_buffer) == host_buft;
+}
+
+static bool wp_sched_copy_to_pinned_host_async(
+        ggml_backend_t producer,
+        const struct ggml_tensor * src,
+        const struct ggml_tensor * dst) {
+    return wp_sched_pinned_d2h_enabled() && producer->iface.get_tensor_async != NULL &&
+           wp_sched_copy_uses_pinned_host(producer, src, dst);
 }
 
 // Root parent + absolute byte offset for a (possibly multi-level) view.
@@ -1777,9 +1984,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+template<bool collect_split_stats>
+static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    wp_sched_split_stats split_stats;
+    if constexpr (collect_split_stats) {
+        memset(&split_stats, 0, sizeof(split_stats));
+        split_stats.n_splits = sched->n_splits;
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1792,10 +2005,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (backend_id < 0) {
             return;
         }
+        uint64_t sync_start;
+        if constexpr (collect_split_stats) {
+            sync_start = wp_sched_time_ns();
+        }
         if (sched->events[backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[backend_id][sched->cur_copy]);
         } else {
             ggml_backend_synchronize(sched->backends[backend_id]);
+        }
+        if constexpr (collect_split_stats) {
+            ++split_stats.n_sync_calls;
+            split_stats.ns_sync_total += wp_sched_time_ns() - sync_start;
+        }
+    };
+
+    auto synchronize_backend = [&](ggml_backend_t backend) {
+        uint64_t sync_start;
+        if constexpr (collect_split_stats) {
+            sync_start = wp_sched_time_ns();
+        }
+        ggml_backend_synchronize(backend);
+        if constexpr (collect_split_stats) {
+            ++split_stats.n_sync_calls;
+            split_stats.ns_sync_total += wp_sched_time_ns() - sync_start;
+        }
+    };
+
+    auto synchronize_compute_stream = [&](ggml_backend_t backend) {
+        uint64_t sync_start;
+        if constexpr (collect_split_stats) {
+            sync_start = wp_sched_time_ns();
+        }
+        if (!ggml_backend_cuda_synchronize_compute || !ggml_backend_cuda_synchronize_compute(backend)) {
+            ggml_backend_synchronize(backend);
+        }
+        if constexpr (collect_split_stats) {
+            ++split_stats.n_sync_calls;
+            split_stats.ns_sync_total += wp_sched_time_ns() - sync_start;
         }
     };
 
@@ -1803,6 +2050,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        bool split_backend_ready_for_input_copies = false;
+
+        if constexpr (collect_split_stats) {
+            if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+                ++split_stats.n_backend_switches;
+            }
+        }
 
         // HIP graph capture needs an idle stream. Overlap wait with shexp, then
         // drain the GPU before the next split that actually uses that backend.
@@ -1837,24 +2091,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            uint64_t copy_start;
+            bool copy_pinned_d2h = false;
+            bool copy_pageable_d2h = false;
+            if constexpr (collect_split_stats) {
+                copy_start = wp_sched_time_ns();
+                ++split_stats.n_copy_tensors;
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
-                }
+                sync_backend(split_backend_id);
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    uint64_t event_wait_start;
+                    if constexpr (collect_split_stats) {
+                        event_wait_start = wp_sched_time_ns();
+                    }
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                    if constexpr (collect_split_stats) {
+                        ++split_stats.n_event_waits;
+                        split_stats.ns_event_wait_total += wp_sched_time_ns() - event_wait_start;
+                    }
+                } else if (!split_backend_ready_for_input_copies) {
+                    synchronize_backend(split_backend);
+                    split_backend_ready_for_input_copies = true;
+                } else if constexpr (collect_split_stats) {
+                    ++split_stats.n_syncs_elided;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1869,7 +2137,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    ggml_backend_synchronize(input_backend);
+                    synchronize_backend(input_backend);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1888,7 +2156,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        synchronize_backend(ids_backend);
 
                         // find the used experts
                         used_ids.clear();
@@ -1959,20 +2227,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 input_cpy->buffer ? (int)ggml_backend_buffer_is_host(input_cpy->buffer) : -1,
                                 ggml_nbytes(input));
                     }
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    if (wp_sched_copy_to_pinned_host_async(input_backend, input, input_cpy)) {
+                        ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                        synchronize_compute_stream(input_backend);
+                        copy_pinned_d2h = true;
+                        if constexpr (collect_split_stats) {
+                            ++split_stats.n_syncs_elided;
+                        }
+                    } else if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         if (dbg) fprintf(stderr, "[sched_copy] %s: SYNC path\n", input->name);
-                        ggml_backend_synchronize(input_backend);
+                        synchronize_backend(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
-                            ggml_backend_synchronize(split_backend);
+                            sync_backend(split_backend_id);
+                        } else if constexpr (collect_split_stats) {
+                            ++split_stats.n_syncs_elided;
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                        copy_pageable_d2h =
+                            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                            !wp_sched_copy_uses_pinned_host(input_backend, input, input_cpy);
                     } else if (dbg) {
                         fprintf(stderr, "[sched_copy] %s: ASYNC submitted\n", input->name);
                     }
                     if (dbg) {
-                        ggml_backend_synchronize(split_backend);
+                        synchronize_backend(split_backend);
                         unsigned char sb[16] = {0}, db[16] = {0};
                         ggml_backend_tensor_get(input,     sb, 0, 16);
                         ggml_backend_tensor_get(input_cpy, db, 0, 16);
@@ -1982,6 +2261,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", db[i]);
                         fprintf(stderr, "\n");
                     }
+                }
+            }
+            if constexpr (collect_split_stats) {
+                const uint64_t copy_elapsed = wp_sched_time_ns() - copy_start;
+                split_stats.ns_copy_total += copy_elapsed;
+                if (copy_pinned_d2h) {
+                    ++split_stats.n_copy_pinned_d2h;
+                    split_stats.ns_copy_pinned_d2h += copy_elapsed;
+                }
+                if (copy_pageable_d2h) {
+                    ++split_stats.n_copy_pageable_d2h;
+                    split_stats.ns_copy_pageable_d2h += copy_elapsed;
                 }
             }
         }
@@ -1994,7 +2285,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            bool measure_graph_entry = false;
+            uint64_t graph_entry_start;
+            if constexpr (collect_split_stats) {
+                measure_graph_entry = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (measure_graph_entry) {
+                    graph_entry_start = wp_sched_time_ns();
+                }
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if constexpr (collect_split_stats) {
+                if (measure_graph_entry) {
+                    ++split_stats.n_graph_entries;
+                    split_stats.ns_graph_entry_total += wp_sched_time_ns() - graph_entry_start;
+                }
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -2022,7 +2327,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                synchronize_backend(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -2040,7 +2345,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if constexpr (collect_split_stats) {
+        wp_sched_split_stats_add(split_stats);
+    }
+
     return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+    return wp_sched_split_stats_enabled()
+        ? ggml_backend_sched_compute_splits_impl<true>(sched)
+        : ggml_backend_sched_compute_splits_impl<false>(sched);
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(

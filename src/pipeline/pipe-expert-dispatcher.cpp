@@ -2005,7 +2005,6 @@ struct dispatcher::impl {
         // Surface that now instead of blocking on a dead socket.
         if (value.inproc) {
             const pipe_expert_partial partial = value.inproc->dispatch(request.inproc_wire);
-            note_in_flight_delta(-1);
             payload = pipe_encode_expert_partial(partial);
             return PIPE_EXPERT_PARTIAL;
         }
@@ -2028,7 +2027,6 @@ struct dispatcher::impl {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " died while computing expert(s) " + assignment_experts(request.assignments));
         }
-        note_in_flight_delta(-1);
         if (seq_id != wanted_seq_id) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint + " returned sequence " +
                                      std::to_string(seq_id) + " while awaiting " + std::to_string(wanted_seq_id));
@@ -2682,6 +2680,11 @@ struct dispatcher::impl {
             layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
         uint64_t         wanted_seq_id = seq_id;
         pipe_frame_type  type          = await_response(request, wanted_seq_id, payload);
+        const bool       streamed      = type == PIPE_EXPERT_PARTIAL_STREAM;
+        if (!streamed) {
+            note_in_flight_delta(-1);
+        }
+        dispatch_clock::time_point response_received_at = dispatch_clock::now();
         // WP_DISPATCH_DEDUP_ACTIVATIONS FALLBACK. A secondary sent
         // PIPE_EXPERT_DISPATCH_ACTS_REF answers PIPE_ERR_ACTS_UNAVAILABLE,
         // never a partial, when its bounded local wait on the shm segment came
@@ -2724,17 +2727,18 @@ struct dispatcher::impl {
                 }
                 wanted_seq_id = retry_seq;
                 type = await_response(request, wanted_seq_id, payload);
+                if (type != PIPE_EXPERT_PARTIAL_STREAM) {
+                    note_in_flight_delta(-1);
+                }
+                response_received_at = dispatch_clock::now();
             }
         }
-        if (layer_trace_enabled()) {
-            add_layer_trace(layer, &layer_trace_stats::recv_ns,
-                            elapsed_ns(recv_started, dispatch_clock::now()));
-        }
-        request.await_finished_at = req_log_ != nullptr ? dispatch_clock::now()
+        request.await_finished_at = req_log_ != nullptr ? response_received_at
                                                          : dispatch_clock::time_point();
-        request.response_bytes = req_log_ != nullptr ? payload.size() : 0;
+        request.response_bytes = req_log_ != nullptr && type != PIPE_EXPERT_PARTIAL_STREAM
+            ? payload.size() : 0;
         if (collect_stats && last_response != nullptr) {
-            *last_response = dispatch_clock::now();
+            *last_response = response_received_at;
             // per-request wait is only tracked for the primary wait loop via stats.workers
         }
         if (speed_split) {
@@ -2748,12 +2752,149 @@ struct dispatcher::impl {
                                      " on layer " + std::to_string(layer) + " with code " +
                                      std::to_string(error.code) + ": " + error.msg);
         }
-        if (type != PIPE_EXPERT_PARTIAL) {
+        if (type != PIPE_EXPERT_PARTIAL && type != PIPE_EXPERT_PARTIAL_STREAM) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " returned frame type " + std::to_string((uint32_t) type) +
                                      " for expert(s) " + assignment_experts(request.assignments));
         }
 
+        if (type == PIPE_EXPERT_PARTIAL_STREAM) {
+            std::vector<std::vector<float>> partials;
+            std::vector<uint8_t> received;
+            uint32_t part_count = 0;
+            size_t n_received = 0;
+            size_t next_fold = 0;
+            dispatch_clock::time_point first_fold_at;
+            dispatch_clock::time_point last_ready_at = response_received_at;
+            const uint32_t want_rows = request.token_ids.empty()
+                ? n_tokens : (uint32_t) request.token_ids.size();
+            const size_t want_vals = (size_t) want_rows * (size_t) n_embd;
+            out.assign(want_vals, 0.0f);
+            for (;;) {
+                const dispatch_clock::time_point frame_ready_at = response_received_at;
+                if (type != PIPE_EXPERT_PARTIAL_STREAM) {
+                    note_in_flight_delta(-1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " interleaved a non-stream frame while sending partials");
+                }
+                pipe_expert_partial_stream stream_partial;
+                try {
+                    const dispatch_clock::time_point decode_started =
+                        layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+                    stream_partial = pipe_decode_expert_partial_stream(
+                        payload.data(), payload.size(), n_embd);
+                    if (layer_trace_enabled()) {
+                        add_layer_trace(layer, &layer_trace_stats::decode_ns,
+                                        elapsed_ns(decode_started, dispatch_clock::now()));
+                    }
+                } catch (const std::exception & error) {
+                    note_in_flight_delta(-1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned an invalid streamed partial for expert(s) " +
+                                             assignment_experts(request.assignments) + ": " + error.what());
+                }
+                if (stream_partial.part_count > 64) {
+                    note_in_flight_delta(-1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned too many streamed partials");
+                }
+                if (part_count == 0) {
+                    part_count = stream_partial.part_count;
+                    partials.resize(part_count);
+                    received.assign(part_count, 0);
+                } else if (stream_partial.part_count != part_count) {
+                    note_in_flight_delta(-1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " changed streamed partial count");
+                }
+                const size_t part_index = stream_partial.part_index;
+                if (received[part_index] != 0) {
+                    note_in_flight_delta(-1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " repeated a streamed partial");
+                }
+                const pipe_expert_partial & partial = stream_partial.partial;
+                if (partial.layer != layer || partial.n_tokens != want_rows ||
+                    partial.partial.size() != want_vals) {
+                    note_in_flight_delta(-1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned the wrong streamed partial shape for expert(s) " +
+                                             assignment_experts(request.assignments));
+                }
+                for (size_t i = 0; i < partial.partial.size(); ++i) {
+                    if (std::isfinite(partial.partial[i])) {
+                        continue;
+                    }
+                    note_in_flight_delta(-1);
+                    const size_t row = i / (size_t) n_embd;
+                    const uint32_t token = request.token_ids.empty()
+                        ? (uint32_t) row : request.token_ids[row];
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned a NON-FINITE streamed partial at layer " +
+                                             std::to_string(layer) + " row " + std::to_string(row) +
+                                             " (token " + std::to_string(token) + ") dim " +
+                                             std::to_string(i % (size_t) n_embd) + " for expert(s) " +
+                                             assignment_experts(request.assignments));
+                }
+                partials[part_index] = std::move(stream_partial.partial.partial);
+                received[part_index] = 1;
+                ++n_received;
+                request.response_bytes += payload.size();
+                last_ready_at = frame_ready_at;
+                while (next_fold < part_count && received[next_fold] != 0) {
+                    const bool early = n_received < part_count;
+                    if (collect_stats && first_fold_at == dispatch_clock::time_point()) {
+                        first_fold_at = dispatch_clock::now();
+                    }
+                    scatter_add(out, partials[next_fold], request);
+                    if (collect_stats && early) {
+                        ++stats.n_partials_folded_early;
+                    }
+                    ++next_fold;
+                }
+                if (n_received == part_count) {
+                    note_in_flight_delta(-1);
+                    if (collect_stats && first_fold_at != dispatch_clock::time_point() &&
+                        last_ready_at > first_fold_at) {
+                        stats.ns_fold_overlapped += elapsed_ns(first_fold_at, last_ready_at);
+                    }
+                    break;
+                }
+                type = await_response(request, wanted_seq_id, payload);
+                response_received_at = dispatch_clock::now();
+            }
+            request.await_finished_at = req_log_ != nullptr ? response_received_at
+                                                             : dispatch_clock::time_point();
+            if (collect_stats && last_response != nullptr) {
+                *last_response = response_received_at;
+            }
+            if (layer_trace_enabled()) {
+                add_layer_trace(layer, &layer_trace_stats::recv_ns,
+                                elapsed_ns(recv_started, dispatch_clock::now()));
+            }
+            if (dispatch_hash_trace_enabled()) {
+                const uint64_t hash = dispatch_hash_fnv1a(out.data(), out.size() * sizeof(float));
+                if (value.inproc) {
+                    std::fprintf(stderr,
+                                 "DISPPART seq=%llu layer=%d worker=inproc h=%llu\n",
+                                 (unsigned long long) dispatch_hash_seq_, layer,
+                                 (unsigned long long) hash);
+                } else {
+                    std::fprintf(stderr,
+                                 "DISPPART seq=%llu layer=%d worker=%zu h=%llu\n",
+                                 (unsigned long long) dispatch_hash_seq_, layer,
+                                 request.worker_index, (unsigned long long) hash);
+                }
+            }
+            GGML_ASSERT(out.size() == want_vals);
+            GGML_UNUSED(n_values);
+            return;
+        }
+
+        if (layer_trace_enabled()) {
+            add_layer_trace(layer, &layer_trace_stats::recv_ns,
+                            elapsed_ns(recv_started, dispatch_clock::now()));
+        }
         pipe_expert_partial partial;
         try {
             const dispatch_clock::time_point decode_started =

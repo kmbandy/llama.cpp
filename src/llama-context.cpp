@@ -26,6 +26,7 @@
 #include <cinttypes>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -33,7 +34,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 
 // WP ubatch-width hint into ggml-cuda's graph-capture prefill classifier
 // (defined in ggml-cuda.cu; weak so CPU/Vulkan-only builds link clean).
@@ -119,258 +119,49 @@ static uint32_t reserve_graph_n_outputs(const llama_cparams & cparams, uint32_t 
     return n == 0 ? 1 : n;
 }
 
-// WP_DS4_LAYER_TRACE observes the split MoE graph boundaries without changing
-// its scheduling: ffn_moe_issued has completed the request issue, while
-// ffn_moe_out is about to run the wait custom op.  The interval between them is
-// the layer's dense spine graph work.  The scheduler callback is composed with
-// the pager/user callback so the existing callback's ask/observe contract is
-// preserved.
-struct ds4_layer_trace_eval_state {
-    ggml_backend_sched_eval_callback inner = nullptr;
-    void * user_data = nullptr;
-    pipe_expert_dispatcher::graph_dispatcher * dispatcher = nullptr;
-    std::unordered_set<ggml_tensor *> inner_observed;
-};
-
-static std::mutex ds4_layer_trace_eval_mutex;
-static std::map<ggml_backend_sched_t, ds4_layer_trace_eval_state> ds4_layer_trace_eval_states;
-
-static int ds4_layer_trace_marker(const ggml_tensor * tensor) {
-    if (tensor == nullptr) {
-        return 0;
-    }
-    const char * name = tensor->name;
-    static constexpr const char issued[] = "ffn_moe_issued-";
-    static constexpr const char out[] = "ffn_moe_out-";
-    const char * suffix = nullptr;
-    int sign = 0;
-    if (std::strncmp(name, issued, sizeof(issued) - 1) == 0) {
-        suffix = name + sizeof(issued) - 1;
-        sign = 1;
-    } else if (std::strncmp(name, out, sizeof(out) - 1) == 0) {
-        suffix = name + sizeof(out) - 1;
-        sign = -1;
-    } else {
-        return 0;
-    }
-    char * end = nullptr;
-    const long layer = std::strtol(suffix, &end, 10);
-    if (end == suffix || *end != '\0' || layer < 0 || layer > std::numeric_limits<int>::max()) {
-        return 0;
-    }
-    return sign * ((int) layer + 1);
-}
-
-static bool ds4_layer_trace_eval_cb(ggml_tensor * tensor, bool ask, void * user_data) {
-    const ggml_backend_sched_t sched = static_cast<ggml_backend_sched_t>(user_data);
-    ggml_backend_sched_eval_callback inner = nullptr;
-    void * inner_user_data = nullptr;
-    pipe_expert_dispatcher::graph_dispatcher * dispatcher = nullptr;
-    if (ask) {
-        std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
-        const auto it = ds4_layer_trace_eval_states.find(sched);
-        if (it == ds4_layer_trace_eval_states.end()) {
-            return true;
-        }
-        inner = it->second.inner;
-        inner_user_data = it->second.user_data;
-        dispatcher = it->second.dispatcher;
-    }
-
-    if (ask) {
-        const int marker = ds4_layer_trace_marker(tensor);
-        if (marker < 0 && dispatcher != nullptr) {
-            dispatcher->layer_trace_dense_end(-marker - 1);
-        }
-        const bool inner_need = inner != nullptr && inner(tensor, true, inner_user_data);
-        {
-            std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
-            const auto it = ds4_layer_trace_eval_states.find(sched);
-            if (it != ds4_layer_trace_eval_states.end() && inner_need) {
-                it->second.inner_observed.insert(tensor);
-            }
-        }
-        return inner_need || marker != 0;
-    }
-
-    bool inner_needed_observe = false;
-    {
-        std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
-        const auto it = ds4_layer_trace_eval_states.find(sched);
-        if (it == ds4_layer_trace_eval_states.end()) {
-            return true;
-        }
-        inner = it->second.inner;
-        inner_user_data = it->second.user_data;
-        dispatcher = it->second.dispatcher;
-        inner_needed_observe = it->second.inner_observed.erase(tensor) != 0;
-    }
-    const bool keep_going = !inner_needed_observe || inner(tensor, false, inner_user_data);
-    const int marker = ds4_layer_trace_marker(tensor);
-    if (marker > 0 && dispatcher != nullptr) {
-        dispatcher->layer_trace_dense_begin(marker - 1);
-    }
-    return keep_going;
-}
-
-static bool ds4_layer_trace_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("WP_DS4_LAYER_TRACE");
-        return value != nullptr && value[0] != '\0';
+static const char * wp_spine_profile_trace_path() {
+    static const char * const path = [] {
+        const char * value = std::getenv("WP_SPINE_PROFILE_TRACE");
+        return value != nullptr && value[0] != '\0' ? value : nullptr;
     }();
-    return enabled;
+    return path;
 }
 
-// WP_SPINE_PROFILE=1: WP_SPINE_STATS times the whole spine graph_compute() call;
-// the expert-dispatch custom op reports its own pack/issue/wait/unpack from
-// inside that same call. Subtracting the two leaves ~70-90 ms/token of "dense"
-// time that neither number explains, and a bandwidth estimate says the raw
-// matmuls should cost ~5 ms -- so the rest is suspected HOST OVERHEAD (graph
-// splits / GPU syncs forced by the per-layer CPU dispatch op), not GPU compute.
-// This buckets WALL TIME by graph section via a per-node ggml_backend_sched eval
-// callback so we can see where it actually goes, plus n_nodes/n_sched_splits --
-// the number that says whether the CPU dispatch op is forcing ~43+ syncs/token.
-//
-// Composes with whatever eval callback is already chosen for this sched (pager
-// / ds4 layer trace / caller-supplied cb_eval) using the same inner-callback
-// chaining pattern as ds4_layer_trace_eval_cb above: WP_SPINE_PROFILE, when
-// enabled, is installed as the OUTERMOST callback and forwards ask/observe to
-// whatever was going to be installed otherwise, preserving that callback's own
-// ask/observe contract via the same inner_observed bookkeeping.
-enum class wp_spine_section {
-    ATTN = 0,
-    SHEXP,
-    MOE_ISSUE,
-    MOE_WAIT,
-    FFN_NORM,
-    OTHER,
-    N_SECTIONS,
-};
-
-// Op type is the ONLY reliable signal for the dispatch issue/wait nodes: their
-// tensor NAMES collide. build_moe_ffn() (llama-graph.cpp:2256) cb()s the issued
-// tensor "ffn_moe_issued-<il>", but deepseek4.cpp:1844 immediately cb()s that
-// same tensor pointer again as "ffn_moe_out-<il>" before complete_moe_dispatch()
-// ever runs -- and complete_moe_dispatch() (llama-graph.cpp:1625) separately
-// cb()s the actual wait-output tensor "ffn_moe_out-<il>" too. So two distinct
-// tensors end up named "ffn_moe_out-<il>" and "ffn_moe_issued-<il>" never
-// survives on the graph node. build_issue() is ggml_map_custom3 (3 inputs:
-// activations, selected_experts, weights) and build_wait() is ggml_map_custom2
-// (2 inputs: issued, issued) -- pipeline/pipe-expert-dispatch-graph.cpp --
-// so GGML_OP_MAP_CUSTOM3 vs GGML_OP_MAP_CUSTOM2 cleanly disambiguates them
-// regardless of the name collision.
-static wp_spine_section wp_spine_classify(const ggml_tensor * t) {
-    if (t == nullptr) {
-        return wp_spine_section::OTHER;
-    }
-    if (t->op == GGML_OP_MAP_CUSTOM3) {
-        return wp_spine_section::MOE_ISSUE;
-    }
-    if (t->op == GGML_OP_MAP_CUSTOM2) {
-        return wp_spine_section::MOE_WAIT;
-    }
-    const char * name = t->name;
-    if (name == nullptr || name[0] == '\0') {
-        return wp_spine_section::OTHER;
-    }
-    if (std::strstr(name, "shexp") != nullptr) {
-        return wp_spine_section::SHEXP;
-    }
-    // src/models/deepseek4.cpp: hc_attn_pre/attn_norm/build_attention(qr, q_pe,
-    // q_norm, q, kv_pe, kv_norm, kv, hca_*, csa_*, lid_*, attn_raw, attn_derope,
-    // attn_wo_a, attn_out)/hc_attn_post.
-    static const char * const attn_prefixes[] = {
-        "attn", "hc_attn", "qr", "q_pe", "q_norm", "kv_pe", "kv_norm",
-        "hca_", "csa_", "lid_",
-    };
-    for (const char * p : attn_prefixes) {
-        if (std::strncmp(name, p, std::strlen(p)) == 0) {
-            return wp_spine_section::ATTN;
-        }
-    }
-    if (std::strcmp(name, "q") == 0 || std::strcmp(name, "kv") == 0) {
-        return wp_spine_section::ATTN;
-    }
-    // src/models/deepseek4.cpp: hc_ffn_pre/ffn_norm/ffn_moe_*/ffn_out/l_last,
-    // plus the hyper-connections and layer-boundary bookkeeping nodes.
-    static const char * const ffn_norm_prefixes[] = {
-        "ffn_", "hc_ffn", "hc_init", "hc_mixes", "hc_pre", "hc_post", "hc_comb",
-        "norm", "l_last", "layer_inp", "result_", "h_nextn", "mtp_",
-    };
-    for (const char * p : ffn_norm_prefixes) {
-        if (std::strncmp(name, p, std::strlen(p)) == 0) {
-            return wp_spine_section::FFN_NORM;
-        }
-    }
-    return wp_spine_section::OTHER;
+static bool wp_spine_profile_trace_enabled() {
+    return wp_spine_profile_trace_path() != nullptr;
 }
 
-struct wp_spine_profile_state {
-    ggml_backend_sched_eval_callback inner = nullptr;
-    void * user_data = nullptr;
-    std::chrono::steady_clock::time_point last_ts;
-    bool have_last = false;
-    std::unordered_set<ggml_tensor *> inner_observed;
-    uint64_t section_ns[(size_t) wp_spine_section::N_SECTIONS] = {};
-    uint64_t calls = 0;
-};
+static void wp_spine_profile_trace_write(
+        uint32_t n_tokens,
+        uint64_t ns_graph,
+        const pipe_expert_dispatcher::graph_dispatcher::spine_profile_stats & stats) {
+    static std::mutex mutex;
+    static FILE * file = nullptr;
+    static bool opened = false;
 
-static std::mutex wp_spine_profile_mutex;
-static std::map<ggml_backend_sched_t, wp_spine_profile_state> wp_spine_profile_states;
-
-static bool wp_spine_profile_eval_cb(ggml_tensor * tensor, bool ask, void * user_data) {
-    const ggml_backend_sched_t sched = static_cast<ggml_backend_sched_t>(user_data);
-    const auto now = std::chrono::steady_clock::now();
-
-    std::lock_guard<std::mutex> lock(wp_spine_profile_mutex);
-    const auto it = wp_spine_profile_states.find(sched);
-    if (it == wp_spine_profile_states.end()) {
-        return true;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!opened) {
+        file = std::fopen(wp_spine_profile_trace_path(), "w");
+        opened = true;
     }
-    auto & st = it->second;
-
-    // Attribute the wall time since the PREVIOUS callback (ask or observe, on
-    // any node) to the section of THIS node. This is exhaustive: the sum of
-    // every bucket equals the total wall time spanned by the eval-callback-
-    // covered part of graph_compute, whether that time was spent inside the
-    // node's own op or in the scheduler's per-node host/sync bookkeeping
-    // immediately around it (exactly the host-overhead hypothesis this is for).
-    if (st.have_last) {
-        const uint64_t dt = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now - st.last_ts).count();
-        st.section_ns[(size_t) wp_spine_classify(tensor)] += dt;
-    }
-    st.last_ts   = now;
-    st.have_last = true;
-
-    if (ask) {
-        const bool inner_need = st.inner != nullptr && st.inner(tensor, true, st.user_data);
-        if (inner_need) {
-            st.inner_observed.insert(tensor);
-        }
-        // Always report "need" so ggml_backend_sched gives this node its own
-        // single-node subgraph and its own ggml_backend_synchronize() before the
-        // matching ask==false call (ggml-backend.cpp: compute_splits(), the
-        // `need` flag controls exactly this batching). That per-node sync is
-        // what makes "wall time between consecutive callbacks" a real per-node
-        // measurement instead of a blurred multi-node batch average -- and it is
-        // the entire WP_SPINE_PROFILE cost, which is why this is strictly
-        // opt-in and never installed when the env var is unset.
-        return true;
+    if (file == nullptr) {
+        return;
     }
 
-    const bool inner_needed_observe = st.inner_observed.erase(tensor) != 0;
-    const bool keep_going = !inner_needed_observe || st.inner == nullptr ||
-                             st.inner(tensor, false, st.user_data);
-    return keep_going;
-}
-
-static bool wp_spine_profile_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("WP_SPINE_PROFILE");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    return enabled;
+    std::fprintf(file,
+                 "WP_SPINE_FORWARD target n_tokens=%u ns_graph=%llu ns_dispatch_issue_total=%llu "
+                 "ns_dispatch_wait_total=%llu ns_between_issue_and_wait_total=%llu "
+                 "ns_before_first_issue=%llu ns_after_last_wait=%llu ns_gaps=%llu n_layers=%zu\n",
+                 n_tokens,
+                 (unsigned long long) ns_graph,
+                 (unsigned long long) stats.ns_dispatch_issue_total,
+                 (unsigned long long) stats.ns_dispatch_wait_total,
+                 (unsigned long long) stats.ns_between_issue_and_wait_total,
+                 (unsigned long long) stats.ns_before_first_issue,
+                 (unsigned long long) stats.ns_after_last_wait,
+                 (unsigned long long) stats.ns_gaps,
+                 stats.n_layers);
+    std::fflush(file);
 }
 
 class expert_dispatch_decode_scope {
@@ -2424,34 +2215,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             eval_cb = wp::weight_pager_eval_cb;
             eval_cb_user_data = model.wp_pager.get();
         }
-        if (ds4_layer_trace_enabled() && model.arch == LLM_ARCH_DEEPSEEK4 && expert_dispatch != nullptr) {
-            {
-                std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
-                ds4_layer_trace_eval_states[sched.get()] = {
-                    eval_cb, eval_cb_user_data, expert_dispatch, {}
-                };
-            }
-            eval_cb = ds4_layer_trace_eval_cb;
-            eval_cb_user_data = sched.get();
-        }
-        // WP_SPINE_PROFILE=1: install as the OUTERMOST eval callback, wrapping
-        // whatever was just chosen (pager / ds4 layer trace / caller cb_eval) as
-        // its "inner" callback. See wp_spine_profile_eval_cb above for why this
-        // has to be a real per-node callback rather than a cheaper alternative.
-        if (wp_spine_profile_enabled()) {
-            {
-                std::lock_guard<std::mutex> lock(wp_spine_profile_mutex);
-                auto & st = wp_spine_profile_states[sched.get()];
-                st.inner       = eval_cb;
-                st.user_data   = eval_cb_user_data;
-                st.have_last   = false;
-                st.inner_observed.clear();
-                // section_ns / calls persist across rebuilds so the periodic
-                // (every-64-decode-tokens) log below keeps a continuous window.
-            }
-            eval_cb = wp_spine_profile_eval_cb;
-            eval_cb_user_data = sched.get();
-        }
         ggml_backend_sched_set_eval_callback(sched.get(), eval_cb, eval_cb_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -2495,6 +2258,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // concealed a 60% run-to-run swing in dense time (76.8-122.8 ms/token), and
     // a mean cannot distinguish "a few huge outliers" from "everything shifted".
     static const bool wp_spine_each = wp_spine_stats && wp_spine_env[0] == '2';
+    const bool wp_spine_profile_trace = wp_spine_profile_trace_enabled() && !is_draft_ctx(cparams);
     // PREFILL AND DECODE ARE ACCUMULATED SEPARATELY (2026-08-03). They were folded
     // into ONE running mean, which is worse than useless here: a prefill ubatch and
     // a decode step differ by up to n_ubatch (512) in token count and by orders of
@@ -2522,9 +2286,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_cuda_wp_set_ubatch_width_hint((int32_t) ubatch.n_tokens);
     }
     const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
-    const auto wp_gc_t0 = wp_spine_stats ? std::chrono::steady_clock::now()
-                                         : std::chrono::steady_clock::time_point();
+    const auto wp_gc_t0 = (wp_spine_stats || wp_spine_profile_trace) ? std::chrono::steady_clock::now()
+                                                                      : std::chrono::steady_clock::time_point();
+    if (wp_spine_profile_trace && expert_dispatch != nullptr) {
+        expert_dispatch->spine_profile_begin(wp_gc_t0);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (wp_spine_profile_trace) {
+        const auto wp_gc_t1 = std::chrono::steady_clock::now();
+        const uint64_t ns_graph = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(wp_gc_t1 - wp_gc_t0).count();
+        const auto stats = expert_dispatch == nullptr
+            ? pipe_expert_dispatcher::graph_dispatcher::spine_profile_stats{}
+            : expert_dispatch->spine_profile_end(wp_gc_t1);
+        wp_spine_profile_trace_write(ubatch.n_tokens, ns_graph, stats);
+    }
     if (wp_spine_stats) {
         const uint64_t wp_call_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wp_gc_t0).count();
@@ -2551,45 +2326,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                wp_gc_ns[ph] / 1e6 / (double) wp_gc_n [ph],
                                wp_gc_ns[ph] / 1e6 / (double) std::max<uint64_t>(1, wp_gc_tok[ph]));
             }
-        }
-    }
-    // WP_SPINE_PROFILE=1: log the per-section wall-time breakdown accumulated by
-    // wp_spine_profile_eval_cb (installed above), plus n_nodes / n_sched_splits.
-    // Decode-only (n_tokens==1): "per token" means the spine's steady-state
-    // single-token forward, not a prefill ubatch or a speculative verify batch.
-    if (wp_spine_profile_enabled() && ubatch.n_tokens == 1) {
-        static constexpr uint64_t wp_spine_profile_window = 64;
-        bool     do_log = false;
-        uint64_t section_ns_snap[(size_t) wp_spine_section::N_SECTIONS] = {};
-        const int n_nodes   = ggml_graph_n_nodes(res->get_gf());
-        const int n_splits  = ggml_backend_sched_get_n_splits(sched.get());
-        {
-            std::lock_guard<std::mutex> lock(wp_spine_profile_mutex);
-            const auto it = wp_spine_profile_states.find(sched.get());
-            if (it != wp_spine_profile_states.end()) {
-                auto & st = it->second;
-                ++st.calls;
-                if (st.calls % wp_spine_profile_window == 0) {
-                    std::memcpy(section_ns_snap, st.section_ns, sizeof(section_ns_snap));
-                    std::fill(std::begin(st.section_ns), std::end(st.section_ns), (uint64_t) 0);
-                    do_log = true;
-                }
-            }
-        }
-        if (do_log) {
-            const double denom = (double) wp_spine_profile_window;
-            LLAMA_LOG_WARN(
-                "spine dense profile (per token, mean over %llu): attn=%.1f ms  shexp=%.1f ms  "
-                "moe_issue=%.1f ms  moe_wait=%.1f ms  ffn/norm=%.1f ms  other=%.1f ms  "
-                "n_nodes=%d  n_sched_splits=%d\n",
-                (unsigned long long) wp_spine_profile_window,
-                section_ns_snap[(size_t) wp_spine_section::ATTN]      / 1e6 / denom,
-                section_ns_snap[(size_t) wp_spine_section::SHEXP]     / 1e6 / denom,
-                section_ns_snap[(size_t) wp_spine_section::MOE_ISSUE] / 1e6 / denom,
-                section_ns_snap[(size_t) wp_spine_section::MOE_WAIT]  / 1e6 / denom,
-                section_ns_snap[(size_t) wp_spine_section::FFN_NORM]  / 1e6 / denom,
-                section_ns_snap[(size_t) wp_spine_section::OTHER]     / 1e6 / denom,
-                n_nodes, n_splits);
         }
     }
     if (status != GGML_STATUS_SUCCESS) {

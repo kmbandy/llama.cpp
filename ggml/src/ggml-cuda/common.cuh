@@ -1459,19 +1459,16 @@ struct ggml_backend_cuda_context {
 
         static const ggml_cuda_graph_cache_policy cache_pol = [] {
             ggml_cuda_graph_cache_policy p;
-            // Default 256: enough for the split-decode working set (~86
-            // segments × 2 shapes) and a hard stop so a prefill-shaped miss
-            // cannot stack GB of captured graphs. 0/16 were both wrong
-            // (unbounded vs evict-before-warmup). GGML_CUDA_GRAPH_MAX overrides.
             p.cap = 256;
-            if (const char * e = getenv("GGML_CUDA_GRAPH_MAX")) {
-                const int n = atoi(e);
-                p.cap = n > 0 ? (size_t) n : 0;
-            }
             const char * wp_graphs = getenv("WP_HIP_GRAPHS");
             const char * persistent_graphs = getenv("WP_PERSISTENT_CUDA_GRAPHS");
-            p.track_ttl = (wp_graphs != nullptr && strcmp(wp_graphs, "1") == 0) ||
+            const bool wp_hip_graphs = wp_graphs != nullptr && strcmp(wp_graphs, "1") == 0;
+            p.track_ttl = wp_hip_graphs ||
                           (persistent_graphs != nullptr && strcmp(persistent_graphs, "1") == 0);
+            if (wp_hip_graphs) {
+                // Four decode token counts x about 196 GPU fragments need 784 entries; keep the opt-in HIP working set resident.
+                p.cap = 1024;
+            }
             if (p.track_ttl) {
                 // WP_HIP_GRAPH_TTL_S and WP_HIP_GRAPH_SWEEP_S are seconds.
                 if (const char * e = getenv("WP_HIP_GRAPH_TTL_S")) {
@@ -1486,6 +1483,10 @@ struct ggml_backend_cuda_context {
                         p.sweep_us = seconds * 1'000'000;
                     }
                 }
+            }
+            if (const char * e = getenv("GGML_CUDA_GRAPH_MAX")) {
+                const int n = atoi(e);
+                p.cap = n > 0 ? (size_t) n : 0;
             }
             return p;
         }();

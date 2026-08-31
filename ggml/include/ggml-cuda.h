@@ -54,6 +54,9 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 // Call before WP eval_cb / any consumer that must see staged activations.
 GGML_BACKEND_API void ggml_backend_cuda_xdev_batch_flush(void);
 
+// Wait only for work queued on the backend compute stream.
+GGML_BACKEND_API bool ggml_backend_cuda_synchronize_compute(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif

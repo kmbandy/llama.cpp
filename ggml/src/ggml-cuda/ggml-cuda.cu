@@ -3634,6 +3634,16 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+bool ggml_backend_cuda_synchronize_compute(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    return true;
+}
+
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
@@ -3692,10 +3702,20 @@ static void ggml_cuda_wp_graph_print_counts() {
         recap += ggml_cuda_wp_graph_counts[i].cap_recapture.load(std::memory_order_relaxed);
         live += ggml_cuda_wp_graph_counts[i].live_graphs.load(std::memory_order_relaxed);
     }
-    fprintf(stderr, "wp hip-graphs: captures=%llu replays=%llu fallbacks=%llu "
+    static std::atomic<uint64_t> last_captures{0};
+    static std::atomic<uint64_t> last_replays{0};
+    static std::atomic<uint64_t> last_fallbacks{0};
+    const uint64_t interval_captures = captures - last_captures.exchange(captures, std::memory_order_relaxed);
+    const uint64_t interval_replays  = replays  - last_replays.exchange(replays, std::memory_order_relaxed);
+    const uint64_t interval_fallbacks = fallbacks - last_fallbacks.exchange(fallbacks, std::memory_order_relaxed);
+    fprintf(stderr, "wp hip-graphs: hits=%llu captures=%llu fallbacks=%llu "
+            "interval(hits=%llu captures=%llu fallbacks=%llu) "
             "(newkey=%llu lru_evicted=%llu ttl_evicted=%llu recapture=%llu live=%llu)\n",
-            (unsigned long long) captures, (unsigned long long) replays,
-            (unsigned long long) fallbacks, (unsigned long long) newkey,
+            (unsigned long long) replays, (unsigned long long) captures,
+            (unsigned long long) fallbacks,
+            (unsigned long long) interval_replays, (unsigned long long) interval_captures,
+            (unsigned long long) interval_fallbacks,
+            (unsigned long long) newkey,
             (unsigned long long) lru, (unsigned long long) ttl,
             (unsigned long long) recap, (unsigned long long) live);
 }
@@ -3805,29 +3825,17 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // in-graph CPU dispatch op, then throws the split cgraph away. Keying on
     // nodes[0] (a fresh pointer) makes the capture cache a 100% miss.
     //
-    // Key on structural fingerprint (name/op/type/ne/nb) PLUS resolved device
-    // addresses. Topology-only keys made every expert on the worker look like
-    // "same graph, new src ptrs" and took hipGraphExecUpdate — which SIGSEGV'd
-    // (2026-08-20 s0, SEGV_MAPERR, 17-expert verify union). A resident expert
-    // in the same slot now hashes to the same key and is a pure Launch.
-    // WP_HIP_GRAPH_KEY_ADDRS=0 drops the resolved device addresses from the key,
-    // leaving a topology-only fingerprint. Addresses are what make the key space
-    // unbounded: any buffer that lands somewhere new mints a fresh key and a
-    // fresh capture, which is why the cache pegs at its cap and 78% of captures
-    // were LRU re-captures (measured 2026-08-28).
+    // Key on the structural fingerprint; the post-lookup property check compares resolved device addresses before replay.
+    // Including pointers here turns moving activation or KV views into new entries, so the recurring split is never found.
     //
-    // DEFAULT 1 (addresses in), because topology-only was tried on 2026-08-20 and
-    // SIGSEGV'd: on the WORKER every expert shares a topology, so distinct
-    // experts collided on one key and the differing src pointers routed into
-    // hipGraphExecUpdate. That collision is worker-shaped -- this rig enables
-    // graphs on the SPINE only, where experts are remote -- so it may not
-    // reproduce here. Prove it before changing the default.
+    // WP_HIP_GRAPH_KEY_ADDRS=1 restores address-keyed entries for a diagnostic
+    // run. Persistent worker graphs keep their existing address-keyed behavior.
     static const bool key_addrs = [] {
         if (ggml_cuda_wp_persistent_graphs_enabled()) {
             return true;
         }
         const char * e = std::getenv("WP_HIP_GRAPH_KEY_ADDRS");
-        return !(e != nullptr && e[0] == '0');
+        return e != nullptr && e[0] == '1';
     }();
 
     uint64_t h = 1469598103934665603ULL;

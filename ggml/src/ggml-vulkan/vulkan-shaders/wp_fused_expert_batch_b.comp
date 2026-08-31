@@ -1,0 +1,202 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Batched fast path for the fused MoE expert path, PHASE B ONLY -- down-
+// projection + weighted fold across experts. See wp_fused_expert_batch_a.comp
+// for phase A (gate/up -> hidden scratch) and the top-of-file comment there
+// for why this pair of shaders replaces the old single-shader,
+// phase-push-constant design (wp_fused_expert_batch.comp, now unused/removed
+// from the pipeline table): that version hung the RX 480 (RADV/ACO, GCN4
+// Polaris, wave64) via ErrorDeviceLost even after replacing an
+// early-return-before-barrier with a clamp.
+//
+// The fix applied here structurally, not by further inspection:
+//   - No barrier() anywhere. Phase B previously cooperatively staged one
+//     token's hidden values for every expert into a `shared float
+//     hidden_cache[MAX_EXPERTS * MAX_FF]` array (16 KiB) via all 512
+//     invocations, then barrier()'d before the 8 row-subgroups read out of
+//     it -- a real workgroup-wide sync point that depended on EVERY
+//     invocation, including any masked "out of range" ones, reaching it.
+//     That is gone: each row-subgroup below reads hidden_scratch[e][t][k]
+//     straight out of the (L2-resident-sized: 192 floats per expert-token)
+//     SSBO scratch buffer instead, at the cost of each of a workgroup's 8
+//     subgroups re-reading the same values independently rather than
+//     sharing one cooperative staging pass -- an acceptable trade against a
+//     device hang.
+//   - No `if (phase == ...)`: this shader IS phase B, unconditionally.
+//   - No subgroup operations under divergent control flow: every
+//     subgroupAdd() below is executed by all 64 lanes of every invocation of
+//     this shader, with out-of-range lanes contributing an already-zeroed
+//     accumulator rather than skipping the call.
+//   - Every loop has a compile-time upper bound (MAX_FF, MAX_EXPERTS) in
+//     addition to its runtime bound.
+//
+// Grid = n_tokens * ceil(n_embd / 8) workgroups. Each of a workgroup's 8
+// subgroups owns ONE output row; each row loops experts e = 0..n_experts-1
+// IN INDEX ORDER (the fixed, deterministic fold order), doing a
+// down-projection dot product against that expert's cached hidden slice
+// (read directly from wp_fused_expert_batch_a.comp's scratch output) and
+// accumulating route_weight(e,t) * dot into a register from the
+// add_previous seed, then writes the output row once.
+#include "types.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// No `phase` field -- see wp_fused_expert_batch_a.comp's identical comment.
+layout(push_constant) uniform parameter {
+    uint reserved;
+} p;
+
+layout(binding = 0) readonly buffer DownBuffer {
+    uint down_words[];
+};
+layout(binding = 1) buffer OutputBuffer {
+    float output_values[];
+};
+layout(binding = 2) readonly buffer ParameterBuffer {
+    uint params[];
+};
+layout(binding = 3) readonly buffer ScratchBuffer {
+    float hidden_scratch[];
+};
+
+// Batch-shader params header (10 words) -- shared layout with
+// wp_fused_expert_batch_a.comp.
+const uint PARAM_N_TOKENS         = 0;
+const uint PARAM_N_EMBD           = 1;
+const uint PARAM_N_FF             = 2;
+const uint PARAM_N_EXPERTS        = 3;
+const uint PARAM_ADD_PREVIOUS     = 4;
+const uint PARAM_SWIGLU_LIMIT     = 5; // unused here
+const uint PARAM_ROUTE_WEIGHTS    = 6; // pointer to n_experts*n_tokens floats
+const uint PARAM_GATE_OFFSETS     = 7; // unused here
+const uint PARAM_UP_OFFSETS       = 8; // unused here
+const uint PARAM_DOWN_OFFSETS     = 9; // pointer to n_experts uint32 byte offsets
+
+// See wp_fused_expert_batch_a.comp: same compile-time caps, same "clamp
+// every loop bound and index derived from params[] on top of the host-side
+// gate" policy.
+const uint MAX_EXPERTS = 16;
+const uint MAX_FF = 256;
+const uint MAX_TOKENS = 8;
+const uint MAX_EMBD = 4096;
+
+uint param(uint index) {
+    return params[index];
+}
+
+uint down_base(uint e) {
+    return param(param(PARAM_DOWN_OFFSETS) + e);
+}
+
+float route_weight(uint expert, uint token, uint n_tokens) {
+    return uintBitsToFloat(param(param(PARAM_ROUTE_WEIGHTS) +
+        expert * n_tokens + token));
+}
+
+// Reconstruct one IEEE-754 binary16 value from its 2 raw bytes -- identical
+// helper to wp_fused_expert_batch_a.comp's (duplicated, not shared, since
+// each phase is now its own translation unit/SPIR-V module).
+float half_from_bytes(uint b0, uint b1) {
+    return unpackHalf2x16(b0 | (b1 << 8)).x;
+}
+
+uint down_byte(uint byte_offset) {
+    const uint word = down_words[byte_offset >> 2u];
+    return (word >> ((byte_offset & 3u) << 3u)) & 0xffu;
+}
+
+#if defined(DOWN_Q8_0)
+// block_q8_0 byte layout (34 B total): float16_t d (bytes 0-1), int8_t
+// qs[32] (bytes 2-33). Matches wp_fused_expert.comp's down_value(), byte-
+// addressed the same way as gate_q4k_value() in wp_fused_expert_batch_a.comp.
+float down_value(uint base, uint i) {
+    const uint blk = i / 32u;
+    const uint blk_base = base + blk * 34u;
+    const uint in_block = i % 32u;
+    const uint q = down_byte(blk_base + 2u + in_block);
+    const int qv = q < 128u ? int(q) : int(q) - 256;
+    const float d = half_from_bytes(down_byte(blk_base), down_byte(blk_base + 1u));
+    return float(qv) * d;
+}
+#else
+// block_q5_1 byte layout (24 B total): float16_t d (0-1), float16_t m
+// (2-3), uint qh (4-7), uint8_t qs[16] (8-23). qh bit indexing matches
+// ggml-quants.c dequantize_row_q5_1: low 16 values of the 32-value block
+// use bit j, high 16 use bit j+16.
+float down_value(uint base, uint i) {
+    const uint blk = i / 32u;
+    const uint blk_base = base + blk * 24u;
+    const uint in_block = i % 32u;
+    const uint j = in_block % 16u;
+    const bool upper = in_block >= 16u;
+    const uint qh_bit = upper ? j + 16u : j;
+    const uint qh = down_byte(blk_base + 4u) |
+        (down_byte(blk_base + 5u) << 8) |
+        (down_byte(blk_base + 6u) << 16) |
+        (down_byte(blk_base + 7u) << 24);
+    const uint q = ((down_byte(blk_base + 8u + j) >> (upper ? 4u : 0u)) & 0xFu) |
+        (((qh >> qh_bit) & 1u) << 4);
+    const float d = half_from_bytes(down_byte(blk_base), down_byte(blk_base + 1u));
+    const float m = half_from_bytes(down_byte(blk_base + 2u), down_byte(blk_base + 3u));
+    return fma(d, float(q), m);
+}
+#endif
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x & 63u;
+    const uint subgroup = gl_LocalInvocationID.x >> 6u; // 512/64 = 8 subgroups
+
+    const uint n_tokens  = min(param(PARAM_N_TOKENS), MAX_TOKENS);
+    const uint n_embd    = min(param(PARAM_N_EMBD), MAX_EMBD);
+    const uint n_ff      = min(param(PARAM_N_FF), MAX_FF);
+    const uint n_experts = min(param(PARAM_N_EXPERTS), MAX_EXPERTS);
+    const uint down_blocks = (n_ff + 31u) / 32u;
+
+    const uint rgroups = max((n_embd + 7u) / 8u, 1u);
+    const uint group_id = gl_WorkGroupID.x;
+    const uint rowgroup = group_id % rgroups;
+    const uint token_raw = group_id / rgroups;
+
+    // Validity is workgroup/subgroup uniform -- see the identical comment in
+    // wp_fused_expert_batch_a.comp's main(). No early `return` guards any
+    // subgroup op or barrier; out-of-range work is masked at the write and
+    // at the dot-product loop body, both of which every lane of a subgroup
+    // agrees on identically.
+    const bool token_valid = token_raw < n_tokens;
+    const uint token = token_valid ? token_raw : 0u;
+    const uint row_raw = rowgroup * 8u + subgroup;
+    const bool row_valid = row_raw < n_embd;
+    const uint row = row_valid ? row_raw : 0u;
+    const bool valid = token_valid && row_valid;
+
+    float value = 0.0f;
+    if (lane == 0u && valid && param(PARAM_ADD_PREVIOUS) != 0u) {
+        value = output_values[token * n_embd + row];
+    }
+    for (uint e = 0u; e < n_experts && e < MAX_EXPERTS; ++e) {
+        const uint dbase = down_base(e);
+        float down_sum = 0.0f;
+        if (valid) {
+            for (uint k = lane; k < n_ff && k < MAX_FF; k += 64u) {
+                down_sum = fma(down_value(dbase, row * down_blocks * 32u + k),
+                                hidden_scratch[(e * n_tokens + token) * n_ff + k],
+                                down_sum);
+            }
+        }
+        down_sum = subgroupAdd(down_sum);
+        if (lane == 0u && valid) {
+            value = fma(route_weight(e, token, n_tokens), down_sum, value);
+        }
+    }
+    if (lane == 0u && valid) {
+        const uint output_index = token * n_embd + row;
+        output_values[output_index] = value;
+    }
+}

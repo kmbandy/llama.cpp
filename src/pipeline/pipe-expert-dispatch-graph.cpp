@@ -242,17 +242,17 @@ graph_dispatcher::~graph_dispatcher() {
     }
 }
 
-void graph_dispatcher::layer_trace_dense_begin(int32_t layer) noexcept {
+void graph_dispatcher::layer_trace_issue_return(int32_t layer, dispatch_clock::time_point time) noexcept {
     if (layer_trace_ == nullptr) {
         return;
     }
     layer_trace_record & record = layer_traces_[layer];
     record.dense_ns = 0;
-    record.dense_started = dispatch_clock::now();
+    record.dense_started = time;
     record.dense_active = true;
 }
 
-void graph_dispatcher::layer_trace_dense_end(int32_t layer) noexcept {
+void graph_dispatcher::layer_trace_wait_entry(int32_t layer, dispatch_clock::time_point time) noexcept {
     if (layer_trace_ == nullptr) {
         return;
     }
@@ -260,8 +260,78 @@ void graph_dispatcher::layer_trace_dense_end(int32_t layer) noexcept {
     if (it == layer_traces_.end() || !it->second.dense_active) {
         return;
     }
-    it->second.dense_ns += elapsed_ns(it->second.dense_started, dispatch_clock::now());
+    it->second.dense_ns += elapsed_ns(it->second.dense_started, time);
     it->second.dense_active = false;
+}
+
+void graph_dispatcher::spine_profile_begin(dispatch_clock::time_point begin) noexcept {
+    spine_profile_ = {};
+    spine_profile_.begin = begin;
+    spine_profile_.active = true;
+}
+
+graph_dispatcher::spine_profile_stats graph_dispatcher::spine_profile_end(dispatch_clock::time_point end) noexcept {
+    spine_profile_stats stats;
+    if (!spine_profile_.active) {
+        return stats;
+    }
+    stats = spine_profile_.stats;
+    if (spine_profile_.have_first_issue) {
+        stats.ns_before_first_issue = elapsed_ns(spine_profile_.begin, spine_profile_.first_issue);
+    }
+    if (spine_profile_.have_last_wait) {
+        stats.ns_after_last_wait = elapsed_ns(spine_profile_.last_wait_end, end);
+    }
+    const uint64_t accounted = stats.ns_dispatch_issue_total + stats.ns_dispatch_wait_total +
+        stats.ns_between_issue_and_wait_total + stats.ns_before_first_issue + stats.ns_after_last_wait;
+    const uint64_t ns_graph = elapsed_ns(spine_profile_.begin, end);
+    stats.ns_gaps = ns_graph > accounted ? ns_graph - accounted : 0;
+    spine_profile_.active = false;
+    return stats;
+}
+
+void graph_dispatcher::spine_profile_issue_begin(dispatch_clock::time_point time) noexcept {
+    if (!spine_profile_.active) {
+        return;
+    }
+    spine_profile_.issue_started = time;
+    spine_profile_.issue_active = true;
+    if (!spine_profile_.have_first_issue) {
+        spine_profile_.first_issue = time;
+        spine_profile_.have_first_issue = true;
+    }
+}
+
+void graph_dispatcher::spine_profile_issue_end(int32_t layer, dispatch_clock::time_point time) noexcept {
+    if (!spine_profile_.active || !spine_profile_.issue_active) {
+        return;
+    }
+    spine_profile_.stats.ns_dispatch_issue_total += elapsed_ns(spine_profile_.issue_started, time);
+    spine_profile_.issue_ended[layer] = time;
+    ++spine_profile_.stats.n_layers;
+    spine_profile_.issue_active = false;
+}
+
+void graph_dispatcher::spine_profile_wait_begin(int32_t layer, dispatch_clock::time_point time) noexcept {
+    if (!spine_profile_.active) {
+        return;
+    }
+    const auto it = spine_profile_.issue_ended.find(layer);
+    if (it != spine_profile_.issue_ended.end()) {
+        spine_profile_.stats.ns_between_issue_and_wait_total += elapsed_ns(it->second, time);
+    }
+    spine_profile_.issue_started = time;
+    spine_profile_.issue_active = true;
+}
+
+void graph_dispatcher::spine_profile_wait_end(dispatch_clock::time_point time) noexcept {
+    if (!spine_profile_.active || !spine_profile_.issue_active) {
+        return;
+    }
+    spine_profile_.stats.ns_dispatch_wait_total += elapsed_ns(spine_profile_.issue_started, time);
+    spine_profile_.last_wait_end = time;
+    spine_profile_.have_last_wait = true;
+    spine_profile_.issue_active = false;
 }
 
 void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
@@ -1175,6 +1245,8 @@ void graph_dispatcher::begin_decode() noexcept {
     decode_ns_wait_                      = 0;
     decode_ns_unpack_                    = 0;
     decode_ns_total_                     = 0;
+    decode_ns_fold_overlapped_            = 0;
+    decode_n_partials_folded_early_       = 0;
     decode_first_await_in_flight_        = 0;
     decode_max_in_flight_                = 0;
     decode_n_tokens_                     = 0;
@@ -1309,7 +1381,8 @@ void graph_dispatcher::end_decode() noexcept {
     // ms/tok is the cross-phase-comparable column: prefill amortises, decode does not.
     LLAMA_LOG_WARN(
         "expert dispatch: phase=%s n_tokens=%u layers=%zu pack=%.2f ms issue=%.2f ms wait=%.2f ms "
-        "unpack=%.2f ms total=%.2f ms (%.3f ms/tok) first_await_in_flight avg=%.1f max_in_flight=%zu "
+        "unpack=%.2f ms total=%.2f ms (%.3f ms/tok) ns_fold_overlapped=%.2f ms "
+        "n_partials_folded_early=%llu first_await_in_flight avg=%.1f max_in_flight=%zu "
         "(workers=%zu)\n",
         // 3-way: n_tokens > 1 alone would call every speculative-verify batch a
         // prefill, and with DSpark on that is ~97% of them by count.
@@ -1322,6 +1395,8 @@ void graph_dispatcher::end_decode() noexcept {
         decode_ns_unpack_ * ns_to_ms,
         decode_ns_total_ * ns_to_ms,
         decode_ns_total_ * ns_to_ms / (double) std::max<uint32_t>(1, decode_n_tokens_),
+        decode_ns_fold_overlapped_ * ns_to_ms,
+        (unsigned long long) decode_n_partials_folded_early_,
         (double) decode_first_await_in_flight_ / (double) decode_layers_,
         decode_max_in_flight_,
         n_workers());
@@ -1512,6 +1587,8 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             owner->decode_ns_wait_ += layer_stats.ns_wait;
             owner->decode_ns_unpack_ += elapsed_ns(unpack_start, total_end);
             owner->decode_ns_total_ += elapsed_ns(total_start, total_end);
+            owner->decode_ns_fold_overlapped_ += layer_stats.ns_fold_overlapped;
+            owner->decode_n_partials_folded_early_ += layer_stats.n_partials_folded_early;
             owner->decode_first_await_in_flight_ += layer_stats.first_await_in_flight;
             owner->decode_max_in_flight_ = std::max(owner->decode_max_in_flight_, layer_stats.max_in_flight);
             for (const worker_dispatch_stats & worker : layer_stats.workers) {
@@ -1556,6 +1633,11 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
         }
         owner = context->owner;
+        const bool trace_layer = owner->layer_trace_ != nullptr;
+        const bool trace_profile = owner->spine_profile_.active;
+        if (trace_profile) {
+            owner->spine_profile_issue_begin(dispatch_clock::now());
+        }
         // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
         std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
         if (owner->failed()) {
@@ -1645,6 +1727,15 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             owner->decode_ns_pack_ += elapsed_ns(pack_start, pack_end);
             owner->decode_ns_issue_ += layer_stats.ns_issue;
         }
+        if (trace_layer || trace_profile) {
+            const auto issue_return = dispatch_clock::now();
+            if (trace_layer) {
+                owner->layer_trace_issue_return(context->layer, issue_return);
+            }
+            if (trace_profile) {
+                owner->spine_profile_issue_end(context->layer, issue_return);
+            }
+        }
     } catch (const std::exception & error) {
         if (owner != nullptr) {
             owner->latch_failure(error.what());
@@ -1680,6 +1771,17 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch wait op has no dispatcher");
         }
         owner = context->owner;
+        const bool trace_layer = owner->layer_trace_ != nullptr;
+        const bool trace_profile = owner->spine_profile_.active;
+        if (trace_layer || trace_profile) {
+            const auto wait_entry = dispatch_clock::now();
+            if (trace_layer) {
+                owner->layer_trace_wait_entry(context->layer, wait_entry);
+            }
+            if (trace_profile) {
+                owner->spine_profile_wait_begin(context->layer, wait_entry);
+            }
+        }
         // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
         std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
         if (owner->failed()) {
@@ -1701,6 +1803,9 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
                 ggml_set_f32_1d(dst, (int) i, result[i]);
             }
         }
+        if (trace_profile) {
+            owner->spine_profile_wait_end(dispatch_clock::now());
+        }
         owner->write_layer_trace(context->layer);
         if (collect_stats) {
             const dispatch_clock::time_point total_end = dispatch_clock::now();
@@ -1709,6 +1814,8 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             owner->decode_ns_unpack_ += elapsed_ns(unpack_start, total_end);
             owner->decode_ns_total_ += layer_stats.ns_issue + layer_stats.ns_wait +
                                        elapsed_ns(unpack_start, total_end);
+            owner->decode_ns_fold_overlapped_ += layer_stats.ns_fold_overlapped;
+            owner->decode_n_partials_folded_early_ += layer_stats.n_partials_folded_early;
             owner->decode_first_await_in_flight_ += layer_stats.first_await_in_flight;
             owner->decode_max_in_flight_ = std::max(owner->decode_max_in_flight_, layer_stats.max_in_flight);
             for (const worker_dispatch_stats & worker : layer_stats.workers) {

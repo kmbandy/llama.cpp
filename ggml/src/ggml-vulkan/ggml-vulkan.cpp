@@ -1,7 +1,7 @@
 #include "ggml-vulkan.h"
 #include <vulkan/vulkan_core.h>
-#if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
+#if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include "ggml-cpu.h"
 #endif
 
@@ -977,6 +977,22 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
+    vk_pipeline pipeline_wp_fused_expert_q5_1;
+    vk_pipeline pipeline_wp_fused_expert_q8_0;
+    // Batched fast path (see ggml_backend_vk_wp_fused_expert): TWO shaders,
+    // one dispatch each, covering every selected expert of one request
+    // instead of one dispatch per expert. Deliberately two separate
+    // pipelines/shader modules (not one shader branching on a `phase` push
+    // constant, as an earlier version did) so phase B contains no
+    // barrier()/shared-memory staging that depended on every invocation of
+    // the workgroup -- including masked-out ones -- reaching it; that
+    // design hung the RX 480 (RADV/ACO) even after replacing an
+    // early-return-before-barrier with a clamp. Phase A never touches the
+    // down buffer, so it has no down-type variant; phase B does.
+    vk_pipeline pipeline_wp_fused_expert_batch_a;
+    vk_pipeline pipeline_wp_fused_expert_batch_b_q5_1;
+    vk_pipeline pipeline_wp_fused_expert_batch_b_q8_0;
+
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
@@ -1174,6 +1190,11 @@ struct vk_device_struct {
     vk_buffer host_read_source;
     size_t host_read_source_offset {};
     size_t host_read_source_size {};
+    // Device-local scratch for the fused-expert batch fast path's Phase A
+    // output (silu(gate)*up per expert/token/hidden-unit), consumed by
+    // Phase B in the same command buffer. Grows on demand, never shrinks --
+    // mirrors host_read_staging's ensure_*() pattern below.
+    vk_buffer wp_fused_batch_scratch;
 
     ggml_backend_buffer_type buffer_type;
 
@@ -1191,6 +1212,7 @@ struct vk_device_struct {
 
         ggml_vk_destroy_buffer(sync_staging);
         ggml_vk_destroy_buffer(host_read_staging);
+        ggml_vk_destroy_buffer(wp_fused_batch_scratch);
         host_read_source.reset();
 
         if (compute_queue) compute_queue->cmd_pool.destroy(device);
@@ -1481,6 +1503,22 @@ struct vk_op_push_constants {
     float param2;
     float param3;
     float param4;
+};
+
+struct vk_wp_fused_expert_push_constants {
+    uint32_t expert_index;
+};
+
+// No `phase` field: phase A (gate/up -> hidden scratch) and phase B (down +
+// weighted fold across experts) are now separate shaders/pipelines (see
+// wp_fused_expert_batch_a.comp / wp_fused_expert_batch_b.comp) selected by
+// which pipeline is dispatched, not by a runtime branch on a push constant.
+// This struct is kept only as an unused placeholder so the generic
+// ggml_vk_create_pipeline/ggml_vk_dispatch_pipeline plumbing (which threads a
+// push_constant_size through every pipeline uniformly) needs no special case
+// for a phase-less pipeline.
+struct vk_wp_fused_expert_batch_push_constants {
+    uint32_t reserved;
 };
 
 struct vk_op_fwht_push_constants {
@@ -2206,6 +2244,7 @@ struct vk_staging_memset {
 
 struct vk_context_struct {
     vk_submission * s;
+    vk_command_buffer * submitted_cmd_buf = nullptr;
     std::vector<vk_sequence> seqs;
 
     int exit_tensor_idx;
@@ -6542,6 +6581,36 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_wp_fused_expert_q5_1,
+        "wp_fused_expert_q5_1", wp_fused_expert_q5_1_len,
+        wp_fused_expert_q5_1_data, "main", 6,
+        sizeof(vk_wp_fused_expert_push_constants), {1, 1, 1}, {}, 1,
+        true, true, 64);
+    ggml_vk_create_pipeline(device, device->pipeline_wp_fused_expert_q8_0,
+        "wp_fused_expert_q8_0", wp_fused_expert_q8_0_len,
+        wp_fused_expert_q8_0_data, "main", 6,
+        sizeof(vk_wp_fused_expert_push_constants), {1, 1, 1}, {}, 1,
+        true, true, 64);
+    // Phase A: 5 bindings -- gate, up, input, params, scratch (no down
+    // buffer, no output buffer; it only ever writes the scratch buffer).
+    ggml_vk_create_pipeline(device, device->pipeline_wp_fused_expert_batch_a,
+        "wp_fused_expert_batch_a", wp_fused_expert_batch_a_len,
+        wp_fused_expert_batch_a_data, "main", 5,
+        sizeof(vk_wp_fused_expert_batch_push_constants), {1, 1, 1}, {}, 1,
+        true, true, 64);
+    // Phase B: 4 bindings -- down, output, params, scratch (no gate/up/input
+    // buffer; it only ever reads the scratch buffer phase A wrote).
+    ggml_vk_create_pipeline(device, device->pipeline_wp_fused_expert_batch_b_q5_1,
+        "wp_fused_expert_batch_b_q5_1", wp_fused_expert_batch_b_q5_1_len,
+        wp_fused_expert_batch_b_q5_1_data, "main", 4,
+        sizeof(vk_wp_fused_expert_batch_push_constants), {1, 1, 1}, {}, 1,
+        true, true, 64);
+    ggml_vk_create_pipeline(device, device->pipeline_wp_fused_expert_batch_b_q8_0,
+        "wp_fused_expert_batch_b_q8_0", wp_fused_expert_batch_b_q8_0_len,
+        wp_fused_expert_batch_b_q8_0_data, "main", 4,
+        sizeof(vk_wp_fused_expert_batch_push_constants), {1, 1, 1}, {}, 1,
+        true, true, 64);
+
     // Drop compile_mutex so other threads can walk while we compile.
     compile_lock.unlock();
 
@@ -8873,6 +8942,25 @@ static bool ggml_vk_ensure_host_read_staging_buffer(vk_device& device, size_t si
         (device->host_read_staging->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
 }
 
+// Device-local (no host-visible requirement -- only Phase A writes it and
+// only Phase B reads it, both on-device, in the same command buffer) growable
+// scratch buffer for the fused-expert batch fast path. Returns false (leaving
+// the fast path unusable for this call) only on an actual allocation failure;
+// callers must fall back to the per-expert dispatch loop in that case.
+static bool ggml_vk_ensure_wp_fused_batch_scratch_buffer(vk_device& device, size_t size) {
+    if (device->wp_fused_batch_scratch != nullptr && device->wp_fused_batch_scratch->size >= size) {
+        return true;
+    }
+    try {
+        ggml_vk_destroy_buffer(device->wp_fused_batch_scratch);
+        device->wp_fused_batch_scratch = ggml_vk_create_buffer_check(
+            device, size, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    } catch (const vk::SystemError&) {
+        return false;
+    }
+    return device->wp_fused_batch_scratch != nullptr;
+}
+
 static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_context& subctx, vk_buffer& dst, size_t offset, const ggml_tensor * tensor, bool sync_staging = false) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_nc_async(" << tensor << ")");
     GGML_ASSERT(!ggml_is_contiguous(tensor));
@@ -9045,6 +9133,31 @@ static bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t
 
 static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
+
+    // Invalidate the WP_VK_HOST_READ_FASTPATH read-side cache. This is a
+    // direct host->device write outside ggml_backend_vk_graph_compute()'s
+    // per-graph reset/republish dance (see the reset at the top of that
+    // function and the republish in its "submit || last_node" block), so if
+    // device->host_read_source still points at (a superset of) [offset,
+    // offset+width*height) in dst, a later ggml_vk_buffer_read_2d() would
+    // take the staged_host_read/host_cached fastpath and hand back bytes
+    // that predate THIS write. Concretely this bit wp-expert-worker's fused
+    // self-check: write_io_partial()'s ggml_backend_tensor_set() -> here ->
+    // left host_read_source pointing at the just-overwritten region, so the
+    // caller's next read_result() served the stale cached snapshot instead
+    // of the value this write just landed. Reset unconditionally rather than
+    // checking for overlap -- cheap (three field writes, no Vulkan calls)
+    // and always correct.
+    static const bool host_read_fastpath = [] {
+        const char * e = getenv("WP_VK_HOST_READ_FASTPATH");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (host_read_fastpath) {
+        dst->device->host_read_source.reset();
+        dst->device->host_read_source_offset = 0;
+        dst->device->host_read_source_size = 0;
+    }
+
     // Buffer is already mapped
     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -9671,6 +9784,535 @@ void ggml_backend_vk_wp_set_expert_offsets(ggml_backend_buffer_t pool_buffer,
     tls_wp_expert_offsets.pool_buffer = pool_buffer;
     tls_wp_expert_offsets.offsets.assign(block_offsets, block_offsets + n_experts);
     tls_wp_expert_offsets.valid = true;
+}
+
+bool ggml_backend_vk_wp_fused_expert(
+        ggml_backend_t backend,
+        const struct ggml_backend_vk_wp_fused_expert_params * params,
+        struct ggml_backend_vk_wp_fused_expert_stats * stats) {
+    if (stats != nullptr) {
+        *stats = {};
+    }
+    if (backend == nullptr || !ggml_backend_is_vk(backend) ||
+            params == nullptr || stats == nullptr ||
+            params->io_buffer == nullptr || params->weights_buffers == nullptr ||
+            params->params_buffer == nullptr || params->gate_byte_offsets == nullptr ||
+            params->up_byte_offsets == nullptr || params->down_byte_offsets == nullptr ||
+            params->route_weights == nullptr || params->n_tokens == 0 ||
+            params->n_tokens > 8 || params->n_experts == 0 || params->n_ff == 0 ||
+            params->n_ff > 256 || params->n_embd == 0 ||
+            (params->down_type != GGML_TYPE_Q5_1 && params->down_type != GGML_TYPE_Q8_0)) {
+        return false;
+    }
+
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    auto * io_ctx = (ggml_backend_vk_buffer_context *) params->io_buffer->context;
+    auto * params_ctx = (ggml_backend_vk_buffer_context *) params->params_buffer->context;
+    if (ctx == nullptr || io_ctx == nullptr ||
+            params_ctx == nullptr || io_ctx->dev_buffer == nullptr ||
+            params_ctx->dev_buffer == nullptr ||
+            io_ctx->dev_buffer->device != ctx->device ||
+            params_ctx->dev_buffer->device != ctx->device ||
+            params->n_experts > 4096) {
+        return false;
+    }
+
+    const size_t n_values = (size_t) params->n_tokens * params->n_embd;
+    if (n_values > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        return false;
+    }
+    const size_t io_bytes = n_values * sizeof(float);
+    const size_t io_size = io_ctx->dev_buffer->size;
+    if (params->input_offset > io_size || io_bytes > io_size - params->input_offset ||
+            params->output_offset > io_size || io_bytes > io_size - params->output_offset) {
+        return false;
+    }
+
+    const size_t gate_blocks = ((size_t) params->n_embd + 255) / 256;
+    const size_t down_blocks = ((size_t) params->n_ff + 31) / 32;
+    if (gate_blocks == 0 || down_blocks == 0 ||
+            (size_t) params->n_ff > std::numeric_limits<size_t>::max() / gate_blocks ||
+            (size_t) params->n_embd > std::numeric_limits<size_t>::max() / down_blocks) {
+        return false;
+    }
+    const size_t gate_block_bytes = 144;
+    const size_t down_block_bytes = params->down_type == GGML_TYPE_Q8_0 ? 34 : 24;
+    // Bytes spanned by one expert's gate/up role (they share a shape) and by
+    // one expert's down role. Each role is bound as its OWN sub-buffer at
+    // its own byte offset in the dispatch loop below, so these are also the
+    // descriptor ranges -- NOT the whole weights buffer.
+    if ((uint64_t) params->n_ff > std::numeric_limits<uint64_t>::max() / gate_blocks ||
+            (uint64_t) params->n_ff * gate_blocks >
+                std::numeric_limits<uint64_t>::max() / gate_block_bytes) {
+        return false;
+    }
+    const uint64_t gate_role_bytes = (uint64_t) params->n_ff * gate_blocks * gate_block_bytes;
+    if ((uint64_t) params->n_embd > std::numeric_limits<uint64_t>::max() / down_blocks ||
+            (uint64_t) params->n_embd * down_blocks >
+                std::numeric_limits<uint64_t>::max() / down_block_bytes) {
+        return false;
+    }
+    const uint64_t down_role_bytes = (uint64_t) params->n_embd * down_blocks * down_block_bytes;
+
+    // An expert slot's position inside the pool buffer is only guaranteed
+    // aligned to this value (see layout_sliced_pages()/arena_slot_stride()
+    // in wp-expert-worker.cpp, both of which key off
+    // ggml_backend_buft_get_alignment() == minStorageBufferOffsetAlignment
+    // for the Vulkan buffer type), not to the coarser quant block size.
+    const VkDeviceSize align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+
+    std::vector<vk_buffer> weight_buffers(params->n_experts);
+    std::vector<size_t> weight_sizes(params->n_experts);
+    for (uint32_t e = 0; e < params->n_experts; ++e) {
+        if (params->weights_buffers[e] == nullptr) {
+            return false;
+        }
+        auto * weights_ctx = (ggml_backend_vk_buffer_context *)
+            params->weights_buffers[e]->context;
+        if (weights_ctx == nullptr || weights_ctx->dev_buffer == nullptr ||
+                weights_ctx->dev_buffer->device != ctx->device) {
+            return false;
+        }
+        weight_buffers[e] = weights_ctx->dev_buffer;
+        weight_sizes[e] = weights_ctx->dev_buffer->size;
+        const uint64_t gate_off = params->gate_byte_offsets[e];
+        const uint64_t up_off = params->up_byte_offsets[e];
+        const uint64_t down_off = params->down_byte_offsets[e];
+        // The real alignment gate: binding a role's sub-buffer at a
+        // misaligned offset is a Vulkan validity violation, not merely
+        // slow. gate/up/down are validated separately since nothing
+        // guarantees they share a phase.
+        if (align == 0 || gate_off % align != 0 || up_off % align != 0 ||
+                down_off % align != 0) {
+            return false;
+        }
+        if (gate_off > weight_sizes[e] || gate_role_bytes > weight_sizes[e] - gate_off ||
+                up_off > weight_sizes[e] || gate_role_bytes > weight_sizes[e] - up_off ||
+                down_off > weight_sizes[e] || down_role_bytes > weight_sizes[e] - down_off) {
+            return false;
+        }
+    }
+
+    const size_t header_words = 9;
+    const size_t route_words = (size_t) params->n_experts >
+            std::numeric_limits<size_t>::max() / params->n_tokens
+        ? 0 : (size_t) params->n_experts * params->n_tokens;
+    if (route_words == 0 || route_words > std::numeric_limits<size_t>::max() - header_words) {
+        return false;
+    }
+    const size_t total_words = header_words + route_words;
+    const size_t upload_bytes = total_words * sizeof(uint32_t);
+    if (upload_bytes / sizeof(uint32_t) != total_words ||
+            params->params_offset > params_ctx->dev_buffer->size ||
+            upload_bytes > params_ctx->dev_buffer->size - params->params_offset) {
+        return false;
+    }
+
+    const VkDeviceSize max_storage_buffer_range =
+        ctx->device->properties.limits.maxStorageBufferRange;
+    if ((VkDeviceSize) io_bytes > max_storage_buffer_range ||
+            (VkDeviceSize) upload_bytes > max_storage_buffer_range ||
+            (VkDeviceSize) gate_role_bytes > max_storage_buffer_range ||
+            (VkDeviceSize) down_role_bytes > max_storage_buffer_range) {
+        return false;
+    }
+
+    const bool down_q8 = params->down_type == GGML_TYPE_Q8_0;
+    vk_pipeline pipeline = down_q8
+        ? ctx->device->pipeline_wp_fused_expert_q8_0
+        : ctx->device->pipeline_wp_fused_expert_q5_1;
+    // Batch fast path is now two pipelines (see the struct member comment on
+    // pipeline_wp_fused_expert_batch_a): phase A has no down-type variant,
+    // phase B does.
+    vk_pipeline batch_pipeline_a = ctx->device->pipeline_wp_fused_expert_batch_a;
+    vk_pipeline batch_pipeline_b = down_q8
+        ? ctx->device->pipeline_wp_fused_expert_batch_b_q8_0
+        : ctx->device->pipeline_wp_fused_expert_batch_b_q5_1;
+    if (ctx->device->subgroup_size != 64 || !ctx->device->subgroup_arithmetic ||
+            ctx->device->properties.limits.maxComputeWorkGroupInvocations < 512 ||
+            pipeline == nullptr) {
+        return false;
+    }
+
+    // *** WP_VK_FUSED_EXPERT_BATCH: single-request, whole-GPU fast path. ***
+    //
+    // The per-expert loop below launches n_tokens (1-4 at decode) workgroups
+    // PER EXPERT -- one CU busy, the other 35 idle on this 36-CU part, and
+    // experts run one after another because each dispatch folds into the
+    // SAME output range the previous one wrote (a real RAW hazard, hence the
+    // barrier at the bottom of that loop). wp_fused_expert_batch_a.comp /
+    // wp_fused_expert_batch_b.comp fix both problems at once: phase A
+    // computes silu(gate)*up for every selected expert/token/hidden-unit in
+    // ONE dispatch (grid = n_experts * n_tokens * ceil(n_ff/8), i.e. ~200+
+    // workgroups at 9 experts instead of 1), phase B then does the
+    // down-projection and folds across experts INSIDE one shader invocation
+    // per output row (grid = n_tokens * ceil(n_embd/8)) instead of across
+    // dispatches, so there is only one inter-phase barrier total (the
+    // ggml_vk_sync_buffers call between the two dispatches below), not one
+    // per expert. Unlike the earlier single-shader design, phase B contains
+    // no barrier() of its own and no shared-memory staging -- see
+    // wp_fused_expert_batch_b.comp's top-of-file comment for why that
+    // mattered (it hung this device via ErrorDeviceLost).
+    //
+    // The catch: these shaders bind gate/up/down as ONE whole-arena storage
+    // buffer per role and compute each expert's byte base in-shader (see
+    // FUSED_BATCH_MAX_EXPERTS below), so every selected expert must live in
+    // the SAME VkBuffer. That is NOT guaranteed in general -- Vulkan's
+    // allocate_slot_arenas() (wp-expert-worker.cpp) caps each arena at
+    // ggml_backend_buft_get_max_size() and splits any bigger pool across
+    // several arenas, and a request's selected experts can land in
+    // different ones -- so this is checked per call, not assumed, and falls
+    // through to the unchanged per-expert loop whenever it doesn't hold.
+    constexpr uint32_t FUSED_BATCH_MAX_EXPERTS = 16;
+    // Must match wp_fused_expert_batch_a.comp/wp_fused_expert_batch_b.comp's
+    // compile-time MAX_FF / MAX_TOKENS / MAX_EMBD caps -- every shader loop
+    // is bounded by these IN ADDITION TO its runtime count, and every value
+    // read from the params buffer that feeds a loop bound is clamped to the
+    // matching MAX_* again in-shader. FUSED_BATCH_MAX_FF/MAX_EXPERTS also
+    // size the scratch buffer below (n_experts * n_tokens * n_ff floats),
+    // which phase B now reads directly (no more shared-memory hidden cache,
+    // so there is no maxComputeSharedMemorySize gate to check here any
+    // more).
+    constexpr size_t FUSED_BATCH_MAX_FF = 256;
+    constexpr uint32_t FUSED_BATCH_MAX_TOKENS = 8;
+    constexpr uint32_t FUSED_BATCH_MAX_EMBD = 4096;
+    // Kill switch for the batch geometry only, independent of the other
+    // WP_VK_* env reads above: default on (1), set to 0 to force every
+    // request through the unchanged per-expert dispatch loop below without
+    // a rebuild, so the two geometries can be A/B'd against each other.
+    static const bool batch_geometry_enabled = [] {
+        const char * e = getenv("WP_VK_FUSED_EXPERT_BATCH");
+        return e == nullptr || e[0] != '0';
+    }();
+    bool batch_fast_path = batch_geometry_enabled &&
+        batch_pipeline_a != nullptr && batch_pipeline_b != nullptr &&
+        params->n_experts <= FUSED_BATCH_MAX_EXPERTS &&
+        params->n_tokens <= FUSED_BATCH_MAX_TOKENS &&
+        params->n_ff <= FUSED_BATCH_MAX_FF &&
+        params->n_embd <= FUSED_BATCH_MAX_EMBD &&
+        (VkDeviceSize) weight_sizes[0] <= max_storage_buffer_range;
+    for (uint32_t e = 1; batch_fast_path && e < params->n_experts; ++e) {
+        // weight_buffers[e] is a shared_ptr<vk_buffer_struct>; equality here
+        // compares the pointee, i.e. "is this the same VkBuffer" -- exactly
+        // the identity the whole-buffer binding needs.
+        if (weight_buffers[e] != weight_buffers[0]) {
+            batch_fast_path = false;
+        }
+    }
+
+    std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+    const auto started = std::chrono::steady_clock::now();
+    const bool submit_async = params->submit_async != 0 && !ctx->device->serialize_submissions;
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    uint64_t n_pipeline_dispatches = 0;
+    uint64_t n_workgroups = 0;
+    uint64_t bytes_uploaded_actual = 0;
+
+    if (batch_fast_path) {
+        // Header layout private to the batch shader (10 words): unlike the
+        // per-expert path's header, gate/up/down bases travel in the params
+        // buffer too (as BYTE offsets into the single whole-arena binding),
+        // since there is no per-expert sub-buffer rebind to carry them
+        // implicitly. n_embd/n_ff fully determine gate_blocks/down_blocks,
+        // so those are recomputed in-shader instead of uploaded.
+        const size_t batch_header_words = 10;
+        const size_t batch_route_words = route_words; // already validated != 0, no overflow
+        if (params->n_experts > std::numeric_limits<size_t>::max() -
+                (batch_header_words + batch_route_words)) {
+            return false;
+        }
+        const size_t gate_off_base = batch_header_words + batch_route_words;
+        const size_t up_off_base   = gate_off_base + params->n_experts;
+        const size_t down_off_base = up_off_base + params->n_experts;
+        const size_t batch_total_words = down_off_base + params->n_experts;
+        const size_t batch_upload_bytes = batch_total_words * sizeof(uint32_t);
+        if (batch_upload_bytes / sizeof(uint32_t) != batch_total_words ||
+                params->params_offset > params_ctx->dev_buffer->size ||
+                batch_upload_bytes > params_ctx->dev_buffer->size - params->params_offset ||
+                (VkDeviceSize) batch_upload_bytes > max_storage_buffer_range) {
+            return false;
+        }
+
+        // Per-expert BYTE offsets fit in uint32 without a lo/hi split: the
+        // whole-arena binding's range is <= max_storage_buffer_range, and
+        // VkPhysicalDeviceLimits::maxStorageBufferRange is itself a
+        // uint32_t field in the Vulkan spec, so any offset within that
+        // binding is representable in 32 bits.
+        std::vector<uint32_t> batch_upload(batch_total_words, 0);
+        batch_upload[0] = params->n_tokens;
+        batch_upload[1] = params->n_embd;
+        batch_upload[2] = params->n_ff;
+        batch_upload[3] = params->n_experts;
+        batch_upload[4] = params->add_previous != 0;
+        std::memcpy(&batch_upload[5], &params->swiglu_limit, sizeof(float));
+        batch_upload[6] = (uint32_t) batch_header_words; // route_weights_base
+        batch_upload[7] = (uint32_t) gate_off_base;
+        batch_upload[8] = (uint32_t) up_off_base;
+        batch_upload[9] = (uint32_t) down_off_base;
+        for (uint32_t e = 0; e < params->n_experts; ++e) {
+            for (uint32_t token = 0; token < params->n_tokens; ++token) {
+                std::memcpy(&batch_upload[batch_header_words + (size_t) e * params->n_tokens + token],
+                            &params->route_weights[(size_t) e * params->n_tokens + token],
+                            sizeof(float));
+            }
+            batch_upload[gate_off_base + e] = (uint32_t) params->gate_byte_offsets[e];
+            batch_upload[up_off_base + e]   = (uint32_t) params->up_byte_offsets[e];
+            batch_upload[down_off_base + e] = (uint32_t) params->down_byte_offsets[e];
+        }
+
+        const size_t scratch_floats =
+            (size_t) params->n_experts * params->n_tokens * params->n_ff;
+        const size_t scratch_bytes = scratch_floats * sizeof(float);
+        if (scratch_floats / params->n_tokens / params->n_experts != params->n_ff ||
+                !ggml_vk_ensure_wp_fused_batch_scratch_buffer(ctx->device, scratch_bytes)) {
+            return false; // scratch OOM: fail the call rather than silently mis-fusing
+        }
+
+        // One descriptor set per pipeline (phase A and phase B are now
+        // separate vk_pipeline objects with different binding layouts, so
+        // each needs its own descriptor-set request -- unlike the old
+        // single-shader design's one request(..., 2) for two dispatches of
+        // the SAME pipeline).
+        ggml_pipeline_request_descriptor_sets(ctx, batch_pipeline_a, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, batch_pipeline_b, 1);
+        if (!ggml_vk_buffer_write_async(compute_ctx, params_ctx->dev_buffer,
+                                        params->params_offset, batch_upload.data(),
+                                        batch_upload_bytes, true)) {
+            return false;
+        }
+        compute_ctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eHost,
+            vk::PipelineStageFlagBits::eComputeShader,
+            {},
+            { { vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eHostWrite,
+                vk::AccessFlagBits::eShaderRead } },
+            {}, {});
+
+        const vk_subbuffer d_input{io_ctx->dev_buffer, params->input_offset, io_bytes};
+        const vk_subbuffer d_output{io_ctx->dev_buffer, params->output_offset, io_bytes};
+        const vk_subbuffer d_params{params_ctx->dev_buffer, params->params_offset, batch_upload_bytes};
+        // The whole arena, offset 0 -- every selected expert's role data is
+        // somewhere inside it; the shader computes each block's byte
+        // address as (this base) + (per-expert offset, from the params
+        // buffer) + (local byte offset within the quant block), all at byte
+        // granularity, so no VkDescriptorBufferInfo offset
+        // alignment applies here (unlike the per-expert path's sub-buffer
+        // binds, which must satisfy minStorageBufferOffsetAlignment).
+        const vk_subbuffer d_weights{weight_buffers[0], 0, (VkDeviceSize) weight_sizes[0]};
+        const vk_subbuffer d_scratch{ctx->device->wp_fused_batch_scratch, 0, (VkDeviceSize) scratch_bytes};
+
+        // Placeholder push constants (see the struct comment): neither phase
+        // reads this value, it exists only so ggml_vk_dispatch_pipeline's
+        // push_constant_size assertion has something matching what
+        // ggml_vk_create_pipeline was told each pipeline's layout uses.
+        const vk_wp_fused_expert_batch_push_constants pc{0};
+
+        // Phase A: gate, up, input, params, scratch (5 bindings, matching
+        // wp_fused_expert_batch_a.comp's layout(binding=...) declarations
+        // and the "5" passed to ggml_vk_create_pipeline for
+        // pipeline_wp_fused_expert_batch_a above).
+        const uint32_t hgroups = (params->n_ff + 7u) / 8u;
+        const uint32_t phase_a_wgs = params->n_experts * params->n_tokens * hgroups;
+        ggml_vk_dispatch_pipeline(ctx, compute_ctx, batch_pipeline_a,
+            { d_weights, d_weights, d_input, d_params, d_scratch },
+            pc, { phase_a_wgs, 1, 1 });
+
+        // Phase B's per-row down-projection reads every expert's Phase A
+        // output for its token -- a real compute-shader-write ->
+        // compute-shader-read hazard across the whole scratch buffer, same
+        // shape as (and using the same helper as) the WP_VK_HOST_READ_FASTPATH
+        // barrier below. This is now the ONLY inter-phase synchronization:
+        // phase B's shader itself contains no barrier() (see its top-of-file
+        // comment) and reads hidden_scratch directly instead of staging
+        // through shared memory, so this single compute-to-compute buffer
+        // barrier between the two dispatches is both necessary (phase B's
+        // reads must not race phase A's writes) and sufficient (there is no
+        // further intra-phase-B ordering requirement to enforce).
+        ggml_vk_sync_buffers(ctx, compute_ctx);
+
+        // Phase B: down, output, params, scratch (4 bindings, matching
+        // wp_fused_expert_batch_b.comp's layout and the "4" passed for
+        // pipeline_wp_fused_expert_batch_b_q5_1/q8_0 above).
+        const uint32_t rgroups = (params->n_embd + 7u) / 8u;
+        const uint32_t phase_b_wgs = params->n_tokens * rgroups;
+        const vk_subbuffer d_down{weight_buffers[0], 0, (VkDeviceSize) weight_sizes[0]};
+        ggml_vk_dispatch_pipeline(ctx, compute_ctx, batch_pipeline_b,
+            { d_down, d_output, d_params, d_scratch },
+            pc, { phase_b_wgs, 1, 1 });
+
+        n_pipeline_dispatches = 2;
+        n_workgroups = (uint64_t) phase_a_wgs + phase_b_wgs;
+        bytes_uploaded_actual = batch_upload_bytes;
+    } else {
+        std::vector<uint32_t> upload(total_words, 0);
+        upload[0] = params->n_tokens;
+        upload[1] = params->n_embd;
+        upload[2] = params->n_ff;
+        upload[3] = params->n_experts;
+        upload[4] = (uint32_t) gate_blocks;
+        upload[5] = (uint32_t) down_blocks;
+        upload[6] = params->add_previous != 0;
+        std::memcpy(&upload[7], &params->swiglu_limit, sizeof(float));
+        upload[8] = (uint32_t) header_words;
+        for (uint32_t e = 0; e < params->n_experts; ++e) {
+            for (uint32_t token = 0; token < params->n_tokens; ++token) {
+                std::memcpy(&upload[upload[8] + (size_t) e * params->n_tokens + token],
+                            &params->route_weights[(size_t) e * params->n_tokens + token],
+                            sizeof(float));
+            }
+        }
+
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, params->n_experts);
+        if (!ggml_vk_buffer_write_async(compute_ctx, params_ctx->dev_buffer,
+                                        params->params_offset, upload.data(),
+                                        upload_bytes, true)) {
+            return false;
+        }
+        compute_ctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eHost,
+            vk::PipelineStageFlagBits::eComputeShader,
+            {},
+            { { vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eHostWrite,
+                vk::AccessFlagBits::eShaderRead } },
+            {}, {});
+        const vk_subbuffer d_input{io_ctx->dev_buffer, params->input_offset, io_bytes};
+        const vk_subbuffer d_output{io_ctx->dev_buffer, params->output_offset, io_bytes};
+        const vk_subbuffer d_params{params_ctx->dev_buffer, params->params_offset, upload_bytes};
+        for (uint32_t e = 0; e < params->n_experts; ++e) {
+            // Each role is its own sub-buffer at its own byte offset (see the
+            // comment on ggml_backend_vk_wp_fused_expert_params) -- the shader
+            // always indexes local block 0 upward within each, so no per-expert
+            // block-index math is needed on the device side.
+            const vk_subbuffer d_gate{weight_buffers[e],
+                (VkDeviceSize) params->gate_byte_offsets[e], (VkDeviceSize) gate_role_bytes};
+            const vk_subbuffer d_up{weight_buffers[e],
+                (VkDeviceSize) params->up_byte_offsets[e], (VkDeviceSize) gate_role_bytes};
+            const vk_subbuffer d_down{weight_buffers[e],
+                (VkDeviceSize) params->down_byte_offsets[e], (VkDeviceSize) down_role_bytes};
+            vk_wp_fused_expert_push_constants pc{e};
+            ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline,
+                { d_gate, d_up, d_down, d_input, d_output, d_params },
+                pc, { params->n_tokens, 1, 1 });
+            if (e + 1 < params->n_experts) {
+                compute_ctx->s->buffer->buf.pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    {},
+                    { { vk::AccessFlagBits::eShaderWrite,
+                        vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite } },
+                    {}, {});
+            }
+        }
+        n_pipeline_dispatches = params->n_experts;
+        n_workgroups = (uint64_t) params->n_experts * params->n_tokens;
+        bytes_uploaded_actual = upload_bytes;
+    }
+
+    // *** WP_VK_HOST_READ_FASTPATH -- populate the read-side cache. ***
+    //
+    // Mirrors the population half of ggml_backend_vk_graph_compute()'s fastpath
+    // (see the "submit || last_node" block there): copy this dispatch's output
+    // range into device->host_read_staging as part of the SAME command buffer
+    // this dispatch is already recording -- before ctx_end()/submit -- and
+    // publish host_read_source/offset/size so the next read_result() hits the
+    // cached staging read instead of a cold device read. Previously this
+    // function only invalidated the cache (see below) because it writes
+    // io_ctx->dev_buffer outside graph_compute's own fastpath machinery; that
+    // made every fused read a real device read (the WP_VK_HOST_READ_FASTPATH
+    // readback regression). When the fastpath is disabled or ineligible for
+    // this output, fall through to the same invalidation graph_compute's own
+    // top-of-function reset performs, so a stale snapshot from a prior graph
+    // (or a prior fused dispatch whose output didn't qualify) is never served.
+    {
+        static const bool host_read_fastpath = [] {
+            const char * e = getenv("WP_VK_HOST_READ_FASTPATH");
+            return e != nullptr && e[0] == '1';
+        }();
+        static const size_t host_read_fastpath_max = [] {
+            const char * e = getenv("WP_VK_HOST_READ_FASTPATH_MAX_BYTES");
+            return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 262144;
+        }();
+        const bool output_host_visible = static_cast<bool>(
+            io_ctx->dev_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+        const bool output_host_cached = static_cast<bool>(
+            io_ctx->dev_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+        if (host_read_fastpath && host_read_fastpath_max != 0 &&
+                output_host_visible && !output_host_cached && io_bytes <= host_read_fastpath_max &&
+                ggml_vk_ensure_host_read_staging_buffer(ctx->device, host_read_fastpath_max)) {
+            ggml_vk_sync_buffers(ctx, compute_ctx);
+            compute_ctx->s->buffer->buf.copyBuffer(io_ctx->dev_buffer->buffer,
+                                                   ctx->device->host_read_staging->buffer,
+                                                   { { params->output_offset, 0, io_bytes } });
+            ctx->device->host_read_source = io_ctx->dev_buffer;
+            ctx->device->host_read_source_offset = params->output_offset;
+            ctx->device->host_read_source_size = io_bytes;
+        } else {
+            ctx->device->host_read_source.reset();
+            ctx->device->host_read_source_offset = 0;
+            ctx->device->host_read_source_size = 0;
+        }
+    }
+
+    vk_command_buffer * cmd_buf = compute_ctx->s != nullptr ? compute_ctx->s->buffer : nullptr;
+    compute_ctx->submitted_cmd_buf = cmd_buf;
+    ggml_vk_ctx_end(compute_ctx);
+    for (auto & copy : compute_ctx->in_memcpys) {
+        std::memcpy(copy.dst, copy.src, copy.n);
+    }
+    compute_ctx->in_memcpys.clear();
+    if (submit_async) {
+        // Attach ctx->fence directly to this dispatch's own submission instead
+        // of a null-fence submit followed by a second, empty, fence-only
+        // vkQueueSubmit inside ggml_vk_synchronize()/ggml_backend_vk_synchronize().
+        // This is the same WP_VK_FENCE_ON_LAST_SUBMIT trick already applied to
+        // the normal graph-compute path (see the comment at its call site in
+        // ggml_vk_compute_forward): a fence signals only after ITS submission
+        // AND every earlier submission on the (in-order) queue complete, which
+        // is exactly the guarantee the separate empty submit provided. Every
+        // fused-expert call is already a single, self-contained submission (one
+        // command buffer, nothing else queued on this context before the
+        // caller's synchronize), so the fence can always ride the real submit
+        // here -- no env-var gate needed, unlike the tiny-graph case upstream.
+        // Same command buffer, same order, same fence semantics -- one fewer
+        // queue submission and one fewer wait per request.
+        //
+        // Maintain the fence_submitted invariant: never leave an unconsumed
+        // fence signal behind while submitting more work onto the same fence
+        // (mirrors the "drain first" check in ggml_vk_compute_forward).
+        if (ctx->fence_submitted) {
+            ggml_vk_wait_for_fence(ctx);
+            ggml_vk_queue_mark_waited(*ctx->device->compute_queue->handle, ctx->fence_epoch);
+            ctx->fence_submitted = false;
+            ctx->submit_pending  = false;
+        }
+        ggml_vk_submit(compute_ctx, ctx->fence);
+        ctx->fence_submitted = true;
+        ctx->fence_epoch     = ggml_vk_queue_epoch(*ctx->device->compute_queue->handle);
+        ctx->submit_pending  = true;
+    } else {
+        ggml_vk_submit(compute_ctx, ctx->fence);
+        const uint64_t epoch = ggml_vk_queue_epoch(*ctx->device->compute_queue->handle);
+        ggml_vk_wait_for_fence(ctx);
+        ggml_vk_queue_mark_waited(*ctx->device->compute_queue->handle, epoch);
+        ctx->device->device.resetFences({ ctx->fence });
+        if (cmd_buf != nullptr) {
+            cmd_buf->in_use = false;
+            cmd_buf->buf.reset();
+            compute_ctx->submitted_cmd_buf = nullptr;
+        }
+        ggml_vk_queue_command_pools_cleanup(ctx->device);
+        ctx->compute_ctx.reset();
+    }
+    // WP_VK_HOST_READ_FASTPATH cache: populated (or, when ineligible,
+    // invalidated) above, inside the same command buffer this dispatch
+    // recorded, before it was ended and submitted.
+    stats->ns_dispatch = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    stats->n_pipeline_dispatches = n_pipeline_dispatches;
+    stats->n_fence_waits = submit_async ? 0 : 1;
+    stats->bytes_uploaded = bytes_uploaded_actual;
+    stats->n_workgroups = n_workgroups;
+    return true;
 }
 
 // Take-and-clear, so a publication can never be applied to two nodes.
@@ -18392,6 +19034,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         if (compute_ctx->s) {
             cmd_buf = compute_ctx->s->buffer;
         }
+        if (cmd_buf == nullptr) {
+            cmd_buf = compute_ctx->submitted_cmd_buf;
+        }
 
         ggml_vk_ctx_end(compute_ctx);
 
@@ -18440,6 +19085,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         if (cmd_buf) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
+            compute_ctx->submitted_cmd_buf = nullptr;
         }
     }
 

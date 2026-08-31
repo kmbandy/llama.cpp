@@ -1212,6 +1212,18 @@ void process_shaders() {
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
+    string_to_spv("wp_fused_expert_q5_1", "wp_fused_expert.comp", {{"DOWN_Q5_1", "1"}});
+    string_to_spv("wp_fused_expert_q8_0", "wp_fused_expert.comp", {{"DOWN_Q8_0", "1"}});
+
+    // Split into two shaders/pipelines (phase A: gate/up -> scratch, phase B:
+    // down + fold), no runtime `phase` branch and no barrier() in either --
+    // see the top-of-file comments in wp_fused_expert_batch_a.comp /
+    // wp_fused_expert_batch_b.comp for why. Phase A never reads the down
+    // buffer, so it needs no DOWN_Q5_1/DOWN_Q8_0 variant; phase B does.
+    string_to_spv("wp_fused_expert_batch_a", "wp_fused_expert_batch_a.comp", {});
+    string_to_spv("wp_fused_expert_batch_b_q5_1", "wp_fused_expert_batch_b.comp", {{"DOWN_Q5_1", "1"}});
+    string_to_spv("wp_fused_expert_batch_b_q8_0", "wp_fused_expert_batch_b.comp", {{"DOWN_Q8_0", "1"}});
+
     for (auto &c : compiles) {
         c.wait();
     }

@@ -58,6 +58,8 @@ struct dispatch_stats {
     uint64_t                           ns_wait               = 0;
     uint64_t                           ns_unpack             = 0;
     uint64_t                           ns_total              = 0;
+    uint64_t                           ns_fold_overlapped    = 0;
+    uint64_t                           n_partials_folded_early = 0;
     std::vector<worker_dispatch_stats> workers;
 };
 

@@ -225,6 +225,9 @@ enum pipe_frame_type : uint32_t {
     // Spine -> secondary (co-located) worker: activations already published by
     // the primary are available locally; no activation bytes on this frame.
     PIPE_EXPERT_DISPATCH_ACTS_REF     = 22,
+    // Worker -> spine: one device-group partial from a streamed response.
+    // This opt-in type keeps the legacy PIPE_EXPERT_PARTIAL frame unchanged.
+    PIPE_EXPERT_PARTIAL_STREAM        = 23,
 };
 
 enum pipe_role : uint32_t {
@@ -557,6 +560,13 @@ struct pipe_expert_partial {
     std::vector<float> partial;
 };
 
+// Payload: u32 part_index, u32 part_count, then a pipe_expert_partial payload.
+struct pipe_expert_partial_stream {
+    uint32_t             part_index = 0;
+    uint32_t             part_count = 0;
+    pipe_expert_partial  partial;
+};
+
 // ---------------------------------------------------------------------------
 // dense-segment payloads
 
@@ -760,6 +770,10 @@ std::vector<uint8_t> pipe_encode_expert_acts_publish_ack(const pipe_expert_acts_
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_ref(const pipe_expert_dispatch_acts_ref & p);
 std::vector<uint8_t> pipe_encode_expert_prefetch_hint(const pipe_expert_prefetch_hint & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
+std::vector<uint8_t> pipe_encode_expert_partial_stream(const pipe_expert_partial_stream & p);
+void pipe_encode_expert_partial_stream_into(
+        std::vector<uint8_t> & out, uint32_t part_index, uint32_t part_count,
+        const pipe_expert_partial & p);
 
 // Same encoding, written into a caller-owned buffer instead of a fresh one.
 // `out` is resized to the exact frame length and every byte of it is written,
@@ -811,6 +825,8 @@ pipe_expert_dispatch_acts_ref pipe_decode_expert_dispatch_acts_ref(
 pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     const uint8_t * buf, size_t len);
 pipe_expert_partial pipe_decode_expert_partial(
+    const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_expert_partial_stream pipe_decode_expert_partial_stream(
     const uint8_t * buf, size_t len, int32_t n_embd);
 pipe_segment_hello pipe_decode_segment_hello(const uint8_t * buf, size_t len);
 pipe_segment_hello_ack pipe_decode_segment_hello_ack(const uint8_t * buf, size_t len);

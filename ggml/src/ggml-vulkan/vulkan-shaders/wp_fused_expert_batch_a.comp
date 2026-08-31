@@ -1,0 +1,292 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Batched fast path for the fused MoE expert path, PHASE A ONLY (see the
+// "WP_VK_FUSED_EXPERT_BATCH" comment in ggml_backend_vk_wp_fused_expert(),
+// ggml-vulkan.cpp). Previously phase A and phase B lived in one shader
+// (wp_fused_expert_batch.comp) selected by a `phase` push constant; that
+// version hung the RX 480 (RADV/ACO, GCN4 Polaris, wave64) even after
+// replacing an early-return-before-barrier with a clamp. This split removes
+// every possible cause the static reviews could not rule out by construction
+// rather than by inspection:
+//   - No barrier() anywhere in this TU (phase A never had one).
+//   - No `if (phase == ...)` branch: this shader IS phase A, always.
+//   - No `shared` arrays (phase A never had one either).
+//   - Every subgroupAdd() below is executed by all 64 lanes of every
+//     invocation of this shader unconditionally -- validity is applied by
+//     zero-initializing the accumulator and skipping the dot-product loop's
+//     BODY (not the subgroupAdd itself) for out-of-range work, so no lane
+//     ever takes a different control-flow path around a subgroup op than its
+//     subgroup-mates. expert/token/h are workgroup- or subgroup-uniform
+//     quantities (derived from gl_WorkGroupID and gl_LocalInvocationID.x/64,
+//     never from a value read from an SSBO index that only happens to be
+//     uniform at runtime), so this guard is also uniform control flow, not
+//     merely uniform data -- the distinction ggml_vk_sync_buffers-adjacent
+//     code elsewhere in this codebase calls out as what RADV/ACO cannot
+//     always prove for the latter.
+//   - Every loop has a compile-time upper bound (MAX_EMBD) in addition to
+//     its runtime bound (n_embd, itself clamped to MAX_EMBD before use).
+//
+// Grid = n_experts * n_tokens * ceil(n_ff / 8) workgroups. Each of a
+// workgroup's 8 subgroups computes ONE hidden unit h (gate/up q4_K dot
+// products against the token activation, clamp, silu(gate)*up) and writes
+// hidden_scratch[e][t][h]. See wp_fused_expert_batch_b.comp for phase B
+// (down-projection + fold), which reads this buffer directly -- no shared-
+// memory staging, so there is no ordering requirement between phase A
+// workgroups and no requirement that all of phase A finish before any
+// SPECIFIC phase B workgroup starts other than the whole-buffer barrier the
+// host already issues between the two dispatches (ggml_vk_sync_buffers in
+// ggml_backend_vk_wp_fused_expert).
+#include "types.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// No `phase` field (unlike the old single-shader design): this shader IS
+// phase A, unconditionally. Kept only as a placeholder push-constant block so
+// the host's generic pipeline-creation/dispatch plumbing (which threads a
+// push_constant_size through every pipeline uniformly) needs no special case
+// for a phase-less pipeline; the value is never read.
+layout(push_constant) uniform parameter {
+    uint reserved;
+} p;
+
+layout(binding = 0) readonly buffer GateBuffer {
+    uint gate_words[];
+};
+layout(binding = 1) readonly buffer UpBuffer {
+    uint up_words[];
+};
+layout(binding = 2) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(binding = 3) readonly buffer ParameterBuffer {
+    uint params[];
+};
+layout(binding = 4) buffer ScratchBuffer {
+    float hidden_scratch[];
+};
+
+// Batch-shader params header (10 words) -- shared layout with
+// wp_fused_expert_batch_b.comp; NOT compatible with wp_fused_expert.comp's
+// per-expert-dispatch layout. gate_blocks is not uploaded: it is fully
+// determined by n_embd (q4_K blocks of 256 elements), so it is recomputed
+// locally instead of round-tripped through the params buffer.
+const uint PARAM_N_TOKENS         = 0;
+const uint PARAM_N_EMBD           = 1;
+const uint PARAM_N_FF             = 2;
+const uint PARAM_N_EXPERTS        = 3;
+const uint PARAM_ADD_PREVIOUS     = 4;
+const uint PARAM_SWIGLU_LIMIT     = 5;
+const uint PARAM_ROUTE_WEIGHTS    = 6; // pointer to n_experts*n_tokens floats (unused here)
+const uint PARAM_GATE_OFFSETS     = 7; // pointer to n_experts uint32 byte offsets
+const uint PARAM_UP_OFFSETS       = 8; // pointer to n_experts uint32 byte offsets
+const uint PARAM_DOWN_OFFSETS     = 9; // pointer to n_experts uint32 byte offsets (unused here)
+
+// Compile-time caps, independent of (and in addition to) the runtime bounds
+// the host already enforces before selecting this fast path
+// (ggml_backend_vk_wp_fused_expert: n_experts <= FUSED_BATCH_MAX_EXPERTS,
+// n_ff <= 256, n_tokens <= 8, n_embd <= FUSED_BATCH_MAX_EMBD). Every loop
+// below is bounded by BOTH its runtime count AND the matching MAX_* constant,
+// and every params[] value that feeds a loop bound or index is clamp()ed to
+// its MAX_* here too, so no invocation can read or iterate past these caps
+// even if the params buffer were corrupted.
+const uint MAX_EXPERTS = 16;
+const uint MAX_FF = 256;
+const uint MAX_TOKENS = 8;
+const uint MAX_EMBD = 4096;
+
+uint param(uint index) {
+    return params[index];
+}
+
+uint gate_base(uint e) {
+    return param(param(PARAM_GATE_OFFSETS) + e);
+}
+
+uint up_base(uint e) {
+    return param(param(PARAM_UP_OFFSETS) + e);
+}
+
+// Reconstruct one IEEE-754 binary16 value from its 2 raw bytes (as stored
+// by f16vec2/float16_t block fields) via the standard GLSL unpack builtin,
+// without requiring the 2-byte source to be 2-byte aligned in the backing
+// buffer (an unaligned float16_t/uint16_t *typed* buffer access would not
+// be portable; the callers assemble its bytes from aligned uint words).
+float half_from_bytes(uint b0, uint b1) {
+    return unpackHalf2x16(b0 | (b1 << 8)).x;
+}
+
+uint gate_byte(uint byte_offset) {
+    const uint word = gate_words[byte_offset >> 2u];
+    return (word >> ((byte_offset & 3u) << 3u)) & 0xffu;
+}
+
+uint up_byte(uint byte_offset) {
+    const uint word = up_words[byte_offset >> 2u];
+    return (word >> ((byte_offset & 3u) << 3u)) & 0xffu;
+}
+
+// block_q4_K byte layout (144 B total): f16vec2 dm (bytes 0-3), scales[12]
+// (bytes 4-15), qs[128] (bytes 16-143). `base` is the arena-byte offset of
+// LOCAL block index 0 for this expert's gate/up role (see gate_base/up_base
+// above). gate_byte()/up_byte() address the uint SSBOs at byte granularity;
+// the bit-level scale/min extraction below is copied verbatim from
+// wp_fused_expert.comp's q4k_value() / the shared dequant_q4_k logic, with
+// only the addressing (typed block-array index -> raw byte offset) adapted,
+// per the arena's per-expert-offset binding (see the comment on
+// ggml_backend_vk_wp_fused_expert's batch_fast_path check in ggml-vulkan.cpp
+// for why byte-granular access, not a `block_q4_K gate[]`-style struct-array
+// index, is required here).
+float gate_q4k_value(uint base, uint i) {
+    // `i` here is the FULL flat (row, embd) index -- unlike
+    // wp_fused_expert.comp's q4k_value(), whose caller already reduces it to
+    // an intra-block index (0..255) via `i % 256` before calling in. n/is
+    // select which of the 8 sub-scale entries a value belongs to WITHIN one
+    // 256-element block, so they must be derived from the intra-block index
+    // too, or they walk off into unrelated blocks/experts (still inside the
+    // arena buffer, so no VM fault -- just silently wrong dequant values).
+    // qsi does not need this: it is built purely from bits 0-7 of `i`, which
+    // are identical whether or not the high bits are first masked off.
+    const uint ib = i % 256;
+    const uint n = ib / 64;
+    const uint half_v = (ib % 64) / 32;
+    const uint is = 2 * n + half_v;
+    const uint qsi = 2 * (((i & 0xC0) >> 2) + ((i & 0x1E) >> 1)) + (i & 1);
+
+    const uint scidx0 = is < 4 ? is : is + 4;
+    const uint scidx1 = is < 4 ? is : is - 4;
+    const uint scidxmask1 = is < 4 ? 0x30 : 0xC0;
+    const uint scidxshift1 = is < 4 ? 0 : 2;
+    const uint mbidx0 = is + 4;
+    const uint mbidx1 = is < 4 ? is + 4 : is;
+    const uint mbidxmask0 = is < 4 ? 0xF : 0xF0;
+    const uint mbidxshift0 = is < 4 ? 0 : 4;
+    const uint mbidxmask1 = is < 4 ? 0x30 : 0xC0;
+    const uint mbidxshift1 = is < 4 ? 0 : 2;
+
+    const uint blk = i / 256;
+    const uint blk_base = base + blk * 144u;
+
+    const uint sc = (gate_byte(blk_base + 4u + scidx0) & 0xF) |
+        ((gate_byte(blk_base + 4u + scidx1) & scidxmask1) >> scidxshift1);
+    const uint mbyte = ((gate_byte(blk_base + 4u + mbidx0) & mbidxmask0) >> mbidxshift0) |
+        ((gate_byte(blk_base + 4u + mbidx1) & mbidxmask1) >> mbidxshift1);
+    const uint qshift = half_v * 4;
+    const uint q = (gate_byte(blk_base + 16u + qsi) >> qshift) & 0xF;
+    const float dmx = half_from_bytes(gate_byte(blk_base), gate_byte(blk_base + 1u));
+    const float dmy = half_from_bytes(gate_byte(blk_base + 2u), gate_byte(blk_base + 3u));
+    return fma(dmx * float(sc), float(q), -dmy * float(mbyte));
+}
+
+// Identical decode to gate_q4k_value(), against the UpBuffer binding.
+float up_q4k_value(uint base, uint i) {
+    // See gate_q4k_value() above: n/is must come from the intra-block index.
+    const uint ib = i % 256;
+    const uint n = ib / 64;
+    const uint half_v = (ib % 64) / 32;
+    const uint is = 2 * n + half_v;
+    const uint qsi = 2 * (((i & 0xC0) >> 2) + ((i & 0x1E) >> 1)) + (i & 1);
+
+    const uint scidx0 = is < 4 ? is : is + 4;
+    const uint scidx1 = is < 4 ? is : is - 4;
+    const uint scidxmask1 = is < 4 ? 0x30 : 0xC0;
+    const uint scidxshift1 = is < 4 ? 0 : 2;
+    const uint mbidx0 = is + 4;
+    const uint mbidx1 = is < 4 ? is + 4 : is;
+    const uint mbidxmask0 = is < 4 ? 0xF : 0xF0;
+    const uint mbidxshift0 = is < 4 ? 0 : 4;
+    const uint mbidxmask1 = is < 4 ? 0x30 : 0xC0;
+    const uint mbidxshift1 = is < 4 ? 0 : 2;
+
+    const uint blk = i / 256;
+    const uint blk_base = base + blk * 144u;
+
+    const uint sc = (up_byte(blk_base + 4u + scidx0) & 0xF) |
+        ((up_byte(blk_base + 4u + scidx1) & scidxmask1) >> scidxshift1);
+    const uint mbyte = ((up_byte(blk_base + 4u + mbidx0) & mbidxmask0) >> mbidxshift0) |
+        ((up_byte(blk_base + 4u + mbidx1) & mbidxmask1) >> mbidxshift1);
+    const uint qshift = half_v * 4;
+    const uint q = (up_byte(blk_base + 16u + qsi) >> qshift) & 0xF;
+    const float dmx = half_from_bytes(up_byte(blk_base), up_byte(blk_base + 1u));
+    const float dmy = half_from_bytes(up_byte(blk_base + 2u), up_byte(blk_base + 3u));
+    return fma(dmx * float(sc), float(q), -dmy * float(mbyte));
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x & 63u;
+    const uint subgroup = gl_LocalInvocationID.x >> 6u; // 512/64 = 8 subgroups
+
+    // Clamp every params[] value that feeds a loop bound, index, or grid
+    // decomposition to its compile-time cap BEFORE use, on top of the
+    // host-side gates (n_experts <= 16, n_ff <= 256, n_tokens <= 8, n_embd <=
+    // 4096) that already hold before this shader is ever dispatched. min(x,1)
+    // is not needed for a lower bound: the host rejects n_tokens/n_ff/n_embd
+    // == 0 and n_experts == 0 before selecting this path.
+    const uint n_tokens  = min(param(PARAM_N_TOKENS), MAX_TOKENS);
+    const uint n_embd    = min(param(PARAM_N_EMBD), MAX_EMBD);
+    const uint n_ff      = min(param(PARAM_N_FF), MAX_FF);
+    const uint n_experts = min(param(PARAM_N_EXPERTS), MAX_EXPERTS);
+    const uint gate_blocks = (n_embd + 255u) / 256u;
+    const float swiglu_limit = uintBitsToFloat(param(PARAM_SWIGLU_LIMIT));
+
+    // Every (e, t, h) triple is written by exactly one subgroup, so phase A
+    // has no cross-workgroup dependency and its dispatch order does not
+    // affect the result -- determinism here comes entirely from the FIXED-
+    // order subgroup reduction (subgroupAdd) inside one (e, t, h) triple's
+    // own dot product, same as the per-expert shader already relies on.
+    const uint hgroups = max((n_ff + 7u) / 8u, 1u);
+    const uint group_id = gl_WorkGroupID.x;
+    const uint hgroup = group_id % hgroups;
+    const uint rest = group_id / hgroups;
+    const uint n_tokens_nz = max(n_tokens, 1u);
+    const uint token_raw = rest % n_tokens_nz;
+    const uint expert_raw = rest / n_tokens_nz;
+
+    // Validity is workgroup/subgroup UNIFORM (derived only from
+    // gl_WorkGroupID and gl_LocalInvocationID.x, both uniform by
+    // definition), never from a data-dependent SSBO read, so guarding the
+    // dot-product loop body with it below does not put subgroupAdd() under
+    // divergent control flow: every lane of a subgroup sees the same
+    // `valid`, so either all 64 run the loop or none do, and subgroupAdd()
+    // itself is called by all 64 either way with the skipped lanes' partial
+    // sums already zero-initialized.
+    const bool expert_valid = expert_raw < n_experts;
+    const bool token_valid  = token_raw < n_tokens;
+    const uint expert = expert_valid ? expert_raw : 0u;
+    const uint token  = token_valid  ? token_raw  : 0u;
+    const uint h_raw = hgroup * 8u + subgroup;
+    const bool h_valid = h_raw < n_ff;
+    const uint h = h_valid ? h_raw : 0u;
+    const bool valid = expert_valid && token_valid && h_valid;
+
+    const uint gbase = gate_base(expert);
+    const uint ubase = up_base(expert);
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    if (valid) {
+        for (uint k = lane; k < n_embd && k < MAX_EMBD; k += 64u) {
+            const float x = input_values[token * n_embd + k];
+            gate_sum = fma(gate_q4k_value(gbase, h * gate_blocks * 256u + k), x, gate_sum);
+            up_sum = fma(up_q4k_value(ubase, h * gate_blocks * 256u + k), x, up_sum);
+        }
+    }
+    gate_sum = subgroupAdd(gate_sum);
+    up_sum = subgroupAdd(up_sum);
+    if (lane == 0u && valid) {
+        float g = gate_sum;
+        float u = up_sum;
+        if (swiglu_limit > 0.000001f) {
+            g = min(g, swiglu_limit);
+            u = clamp(u, -swiglu_limit, swiglu_limit);
+        }
+        const float silu = g / (1.0f + exp(-g));
+        const uint scratch_index = (expert * n_tokens + token) * n_ff + h;
+        hidden_scratch[scratch_index] = silu * u;
+    }
+}

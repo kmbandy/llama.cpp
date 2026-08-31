@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-vulkan.h"
 #include "pipe-expert-dispatcher.h"
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
@@ -91,12 +92,41 @@ bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t,
 bool ggml_backend_cuda_wp_reader_copy(ggml_backend_t, ggml_tensor *,
                                       const void *, size_t, size_t)
     __attribute__((weak));
+bool ggml_backend_vk_wp_fused_expert(
+        ggml_backend_t,
+        const struct ggml_backend_vk_wp_fused_expert_params *,
+        struct ggml_backend_vk_wp_fused_expert_stats *)
+    __attribute__((weak));
 
 namespace wp_expert_worker {
 
 static bool wp_worker_hash_trace_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_WORKER_HASH_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool wp_worker_stream_partials_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_STREAM_PARTIALS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool wp_vulkan_fused_expert_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_VK_FUSED_EXPERT");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool wp_vulkan_fused_expert_selfcheck_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_VK_FUSED_EXPERT_SELFCHECK");
         return value != nullptr && value[0] == '1';
     }();
     return enabled;
@@ -597,6 +627,8 @@ struct RequestStats {
     uint64_t ns_recv_body  = 0;
     uint64_t ns_req_decode = 0;
     uint64_t ns_resp_send  = 0;
+    uint64_t n_stream_partials_sent = 0;
+    uint64_t ns_stream_overlap = 0;
     uint64_t n_resident      = 0;
     uint64_t n_pagein     = 0;
     uint64_t n_host_hit = 0;
@@ -623,6 +655,25 @@ struct RequestStats {
     uint64_t ns_vk_fold = 0;
     uint64_t ns_vk_sync = 0;
     uint64_t ns_vk_readback = 0;
+    uint64_t ns_vk_fused_dispatch = 0;
+    uint64_t n_vk_fused_dispatches = 0;
+    uint64_t n_vk_fused_fence_waits = 0;
+    uint64_t bytes_vk_fused_upload = 0;
+    // *** WP_VK_FUSED_EXPERT ROUTING PROOF (2026-08-30). ***
+    // Per-reason counters for why a Vulkan-eligible request did NOT reach
+    // compute_batch_fused, so a live run can show the routing instead of it
+    // being inferred from throughput. Incremented only when WP_VK_FUSED_EXPERT=1
+    // and the request is on the Vulkan backend. See the check sites in
+    // compute_batch() (the real gate, ~10360) and compute_batch_fused() (the
+    // shape/alignment bail-outs, ~9986) for exactly which reason maps to which
+    // `return false`.
+    uint64_t n_vk_fused_skip_force_fallback = 0;  // caller passed force_fallback (selfcheck reference only)
+    uint64_t n_vk_fused_skip_ntokens = 0;          // request.n_tokens outside [1,8]
+    uint64_t n_vk_fused_skip_type_shape = 0;       // gate/up not Q4_K, down not Q5_1/Q8_0, ne mismatch, n_ff==0 or >256, weights vector shape
+    uint64_t n_vk_fused_skip_offset_align = 0;     // a role's byte offset (slot_offset + device_offset) is not a multiple of the Vulkan buffer type's alignment (minStorageBufferOffsetAlignment) -- should not happen by construction, see the comment at the block_offset lambda
+    uint64_t n_vk_fused_skip_missing_buffer = 0;   // a selected expert has no loaded device buffer/base, or slot_base < weights_base
+    uint64_t n_vk_fused_skip_n_selected = 0;       // n_selected == 0, > 4096, or an overflow guard on n_selected/n_tokens tripped
+    uint64_t n_vk_fused_skip_dispatch_fail = 0;    // ggml_backend_vk_wp_fused_expert() itself returned false (device/pipeline reasons)
     // *** ACCOUNTING TIMERS ADDED 2026-08-29 (Vulkan decode gap). ***
     // The 51cae31f9 banner explained only ~64% of the RX 480's ns_compute
     // (dispatch 839 us; graph_compute 274 + readback 62 + cache_lookup 1 the
@@ -693,6 +744,10 @@ struct RequestStats {
     uint64_t ns_cpu_on_arrival = 0;
     uint64_t n_cpu_on_arrival_fallback = 0;
 };
+
+using worker_stream_callback = std::function<void(
+        size_t, size_t, const pipe_expert_partial &,
+        std::chrono::steady_clock::time_point, RequestStats &)>;
 
 // Forward declarations: the probe itself is defined further down, next to
 // run_self_bench, but WorkerStats::report() needs to read it.
@@ -824,6 +879,17 @@ public:
         ns_vk_fold_ += request.ns_vk_fold;
         ns_vk_sync_ += request.ns_vk_sync;
         ns_vk_readback_ += request.ns_vk_readback;
+        ns_vk_fused_dispatch_ += request.ns_vk_fused_dispatch;
+        n_vk_fused_dispatches_ += request.n_vk_fused_dispatches;
+        n_vk_fused_fence_waits_ += request.n_vk_fused_fence_waits;
+        bytes_vk_fused_upload_ += request.bytes_vk_fused_upload;
+        n_vk_fused_skip_force_fallback_ += request.n_vk_fused_skip_force_fallback;
+        n_vk_fused_skip_ntokens_ += request.n_vk_fused_skip_ntokens;
+        n_vk_fused_skip_type_shape_ += request.n_vk_fused_skip_type_shape;
+        n_vk_fused_skip_offset_align_ += request.n_vk_fused_skip_offset_align;
+        n_vk_fused_skip_missing_buffer_ += request.n_vk_fused_skip_missing_buffer;
+        n_vk_fused_skip_n_selected_ += request.n_vk_fused_skip_n_selected;
+        n_vk_fused_skip_dispatch_fail_ += request.n_vk_fused_skip_dispatch_fail;
         ns_prologue_ += request.ns_prologue;
         ns_arena_probe_ += request.ns_arena_probe;
         ns_vk_arena_probe_ += request.ns_vk_arena_probe;
@@ -864,6 +930,8 @@ public:
         ns_recv_body_    += request.ns_recv_body;
         ns_req_decode_   += request.ns_req_decode;
         ns_resp_send_    += request.ns_resp_send;
+        n_stream_partials_sent_ += request.n_stream_partials_sent;
+        ns_stream_overlap_ += request.ns_stream_overlap;
         ns_readback_ += request.ns_readback;
         ns_prep_ += request.ns_prep;
         ns_prep_setup_ += request.ns_prep_setup;
@@ -915,6 +983,8 @@ public:
         ns_recv_body_ += request.ns_recv_body;
         ns_req_decode_ += request.ns_req_decode;
         ns_resp_send_ += request.ns_resp_send;
+        n_stream_partials_sent_ += request.n_stream_partials_sent;
+        ns_stream_overlap_ += request.ns_stream_overlap;
     }
 
 private:
@@ -986,6 +1056,8 @@ private:
                   << " ns_recv_body=" << ns_recv_body_
                   << " ns_req_decode=" << ns_req_decode_
                   << " ns_resp_send=" << ns_resp_send_
+                  << " n_stream_partials_sent=" << n_stream_partials_sent_
+                  << " ns_stream_overlap=" << ns_stream_overlap_
                   << " n_graph_submits=" << n_graph_submits_
                   << " n_device_allocs=" << n_device_allocs_
                   << " ns_graph_build=" << ns_graph_build_
@@ -1000,6 +1072,17 @@ private:
                   << " ns_vk_fold=" << ns_vk_fold_
                   << " ns_vk_sync=" << ns_vk_sync_
                   << " ns_vk_readback=" << ns_vk_readback_
+                  << " ns_vk_fused_dispatch=" << ns_vk_fused_dispatch_
+                  << " n_vk_fused_dispatches=" << n_vk_fused_dispatches_
+                  << " n_vk_fused_fence_waits=" << n_vk_fused_fence_waits_
+                  << " bytes_vk_fused_upload=" << bytes_vk_fused_upload_
+                  << " n_vk_fused_skip_force_fallback=" << n_vk_fused_skip_force_fallback_
+                  << " n_vk_fused_skip_ntokens=" << n_vk_fused_skip_ntokens_
+                  << " n_vk_fused_skip_type_shape=" << n_vk_fused_skip_type_shape_
+                  << " n_vk_fused_skip_offset_align=" << n_vk_fused_skip_offset_align_
+                  << " n_vk_fused_skip_missing_buffer=" << n_vk_fused_skip_missing_buffer_
+                  << " n_vk_fused_skip_n_selected=" << n_vk_fused_skip_n_selected_
+                  << " n_vk_fused_skip_dispatch_fail=" << n_vk_fused_skip_dispatch_fail_
                   << " ns_prologue=" << ns_prologue_
                   << " ns_arena_probe=" << ns_arena_probe_
                   << " ns_vk_arena_probe=" << ns_vk_arena_probe_
@@ -1120,6 +1203,17 @@ private:
     uint64_t          ns_vk_fold_ = 0;
     uint64_t          ns_vk_sync_ = 0;
     uint64_t          ns_vk_readback_ = 0;
+    uint64_t          ns_vk_fused_dispatch_ = 0;
+    uint64_t          n_vk_fused_dispatches_ = 0;
+    uint64_t          n_vk_fused_fence_waits_ = 0;
+    uint64_t          bytes_vk_fused_upload_ = 0;
+    uint64_t          n_vk_fused_skip_force_fallback_ = 0;
+    uint64_t          n_vk_fused_skip_ntokens_ = 0;
+    uint64_t          n_vk_fused_skip_type_shape_ = 0;
+    uint64_t          n_vk_fused_skip_offset_align_ = 0;
+    uint64_t          n_vk_fused_skip_missing_buffer_ = 0;
+    uint64_t          n_vk_fused_skip_n_selected_ = 0;
+    uint64_t          n_vk_fused_skip_dispatch_fail_ = 0;
     uint64_t          ns_prologue_ = 0;
     uint64_t          ns_arena_probe_ = 0;
     uint64_t          ns_vk_arena_probe_ = 0;
@@ -1146,6 +1240,8 @@ private:
     uint64_t          ns_recv_body_    = 0;
     uint64_t          ns_req_decode_   = 0;
     uint64_t          ns_resp_send_    = 0;
+    uint64_t          n_stream_partials_sent_ = 0;
+    uint64_t          ns_stream_overlap_ = 0;
     uint64_t          ns_prep_ = 0;
     uint64_t          ns_prep_setup_ = 0;
     uint64_t          ns_prep_grow_ = 0;
@@ -8414,6 +8510,11 @@ public:
             !request.assignments.empty() &&
             request.n_tokens <= s_resident_first_max_tokens &&
             have_pageins;
+        const bool fused_expert_request =
+            !cpu_on_arrival_request && !grouped_gemv_request &&
+            !resident_first_eligible && !effective_overlap &&
+            is_vulkan_backend() && wp_vulkan_fused_expert_enabled() &&
+            request.n_tokens >= 1 && request.n_tokens <= 8;
         size_t resident_first_base_offset = 0;
         size_t resident_first_slot_size   = 0;
         size_t cpu_on_arrival_base_offset = 0;
@@ -8466,7 +8567,8 @@ public:
                             resident_first_base_offset + i * resident_first_slot_size);
                     }
                 }
-            } else if (effective_overlap && have_hits && !cpu_on_arrival_request) {
+            } else if (effective_overlap && have_hits && !cpu_on_arrival_request &&
+                    !fused_expert_request) {
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ false, request_stats);
@@ -8506,9 +8608,10 @@ public:
             // 40.8 s of the 74.0 s decode dispatch wait, so this is not a rounding
             // error. n_pagein == 0 means every expert is already resident and the
             // serial path is strictly better.
-            const size_t chunks   = grouped_gemv_request || batch.n_pagein() == 0
+            const size_t chunks   = fused_expert_request ? 1 :
+                (grouped_gemv_request || batch.n_pagein() == 0
                 ? 1
-                : std::max<size_t>(1, std::min(s_compute_chunks, n_assign));
+                : std::max<size_t>(1, std::min(s_compute_chunks, n_assign)));
             active_work_chunks_ = chunks;
             for (size_t c = 0; c < chunks; ++c) {
                 const size_t beg = n_assign * c / chunks;
@@ -8967,6 +9070,7 @@ private:
         std::vector<WorkInputTrace> work_input_traces;
         bool pending = false;
         bool graph_pending = false;
+        uint64_t fused_fence_waits = 0;
     };
 
     // WP_SUBMIT_ASYNC is opt-in. The tensor upload and graph compute use the
@@ -8990,6 +9094,7 @@ private:
             state.work_input_traces.clear();
             state.pending = false;
             state.graph_pending = false;
+            state.fused_fence_waits = 0;
         }
     }
 
@@ -9011,12 +9116,14 @@ private:
             if (stats_.enabled() && is_vulkan_backend()) {
                 request_stats->ns_vk_sync += elapsed;
             }
+            request_stats->n_vk_fused_fence_waits += it->second.fused_fence_waits;
         }
         for (const WorkInputTrace & trace : it->second.work_input_traces) {
             emit_work_input_trace(trace);
         }
         it->second.pending = false;
         it->second.graph_pending = false;
+        it->second.fused_fence_waits = 0;
         it->second.params.clear();
         it->second.ids.clear();
         it->second.route_weights.clear();
@@ -9904,15 +10011,322 @@ private:
         sublap(request_stats.ns_prep_set);
     }
 
-    // all_experts=true builds ONE graph over every assignment in index order,
-    // ignoring residency. See the determinism note on handle_request: splitting
-    // by residency makes the floating-point ASSOCIATION depend on I/O timing.
+    // Build one fused dispatch for the selected assignment indices. The caller
+    // may select all assignments, a residency subset, or one output slot.
     //
     // ArenaGraphKey/ArenaRoleKey/ArenaGraphEntry/ArenaGroup are defined below,
     // near compute_batch_arena_multi -- nested-class member order doesn't
     // matter in C++, and keeping the arena-cache types together with the
     // arena compute functions that use them is clearer than splitting them
     // across the file.
+    bool compute_batch_fused(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            bool hits,
+            bool all_experts,
+            size_t sel_begin,
+            size_t sel_end,
+            size_t n_selected,
+            bool add_previous,
+            size_t result_offset,
+            RequestStats & request_stats) {
+        if (ggml_backend_vk_wp_fused_expert == nullptr) {
+            request_stats.n_vk_fused_skip_dispatch_fail++;
+            return false;
+        }
+        if (request.n_tokens == 0 || request.n_tokens > 8) {
+            request_stats.n_vk_fused_skip_ntokens++;
+            return false;
+        }
+        if (n_selected == 0 || n_selected > 4096) {
+            request_stats.n_vk_fused_skip_n_selected++;
+            return false;
+        }
+
+        const auto & specs = catalog_.descriptor.layers.at(request.layer);
+        const RoleSpec & gate = specs.at("gate");
+        const RoleSpec & up = specs.at("up");
+        const RoleSpec & down = specs.at("down");
+        const uint32_t n_embd = (uint32_t) catalog_.descriptor.hparams.n_embd;
+        const uint32_t n_ff = (uint32_t) gate.ne1;
+        if (gate.type != GGML_TYPE_Q4_K || up.type != GGML_TYPE_Q4_K ||
+                (down.type != GGML_TYPE_Q5_1 && down.type != GGML_TYPE_Q8_0) ||
+                gate.ne0 != n_embd || up.ne0 != n_embd || down.ne0 != n_ff ||
+                gate.ne1 != up.ne1 || down.ne1 != n_embd || n_ff == 0 ||
+                n_ff > 256) {
+            request_stats.n_vk_fused_skip_type_shape++;
+            return false;
+        }
+
+        // Byte offsets (NOT quant-block indices) of each selected expert's
+        // gate/up/down role data relative to that expert's weights buffer
+        // base. An expert slot's position inside the pool buffer is only
+        // guaranteed aligned to the Vulkan buffer type's alignment
+        // (minStorageBufferOffsetAlignment) -- see layout_sliced_pages() and
+        // arena_slot_stride() above, both of which key off exactly that
+        // value -- NOT to the much coarser quant block size (144 B for
+        // Q4_K, 24/34 B for Q5_1/Q8_0). Requiring the OLD block-index
+        // encoding (byte_offset % block_bytes == 0) rejected nearly every
+        // expert slot; the host now binds each role at its own byte-offset
+        // sub-buffer instead, so only the device's real alignment matters.
+        const uint64_t vk_align = (uint64_t) ggml_backend_buft_get_alignment(
+            ggml_backend_get_default_buffer_type(backend_.get()));
+        std::vector<uint64_t> gate_offsets(n_selected);
+        std::vector<uint64_t> up_offsets(n_selected);
+        std::vector<uint64_t> down_offsets(n_selected);
+        std::vector<ggml_backend_buffer_t> weights_buffers(n_selected);
+        std::vector<size_t> selected_indices;
+        selected_indices.reserve(n_selected);
+        uint64_t fused_nonzero = 0;
+        uint64_t fused_total = 0;
+        // WP_VK_FUSED_EXPERT_SELFCHECK diagnostic: slot/role byte offsets of
+        // the first up-to-4 selected experts, filled in below regardless of
+        // whether selfcheck is enabled (cheap -- 4 uint64s each).
+        uint64_t selfcheck_slot_offset[4] = {0, 0, 0, 0};
+        uint64_t selfcheck_gate_offset[4] = {0, 0, 0, 0};
+        uint64_t selfcheck_up_offset[4]   = {0, 0, 0, 0};
+        uint64_t selfcheck_down_offset[4] = {0, 0, 0, 0};
+        if (n_selected > std::numeric_limits<size_t>::max() /
+                (size_t) request.n_tokens) {
+            request_stats.n_vk_fused_skip_n_selected++;
+            return false;
+        }
+        std::vector<float> route_weights(
+            n_selected * (size_t) request.n_tokens, 0.0f);
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (i < sel_begin || i >= sel_end ||
+                    (!all_experts && batch.is_resident(i) != hits)) {
+                continue;
+            }
+            selected_indices.push_back(i);
+        }
+        if (selected_indices.size() != n_selected) {
+            request_stats.n_vk_fused_skip_n_selected++;
+            return false;
+        }
+        for (size_t k = 0; k < n_selected; ++k) {
+            const size_t i = selected_indices[k];
+            const ExpertSlotPool::Loaded loaded = batch.loaded(i);
+            if (loaded.buffer == nullptr || loaded.base == nullptr) {
+                request_stats.n_vk_fused_skip_missing_buffer++;
+                return false;
+            }
+            weights_buffers[k] = loaded.buffer;
+            const uintptr_t weights_base =
+                (uintptr_t) ggml_backend_buffer_get_base(loaded.buffer);
+            if (weights_base == 0) {
+                request_stats.n_vk_fused_skip_missing_buffer++;
+                return false;
+            }
+            if (request.assignments[i].weights.size() != request.n_tokens) {
+                request_stats.n_vk_fused_skip_type_shape++;
+                return false;
+            }
+            const uintptr_t slot_base = (uintptr_t) loaded.base;
+            if (slot_base < weights_base) {
+                request_stats.n_vk_fused_skip_missing_buffer++;
+                return false;
+            }
+            const uint64_t slot_offset = (uint64_t) (slot_base - weights_base);
+            const auto role_byte_offset = [&](const char * role, uint64_t & out) {
+                const uint64_t byte_offset = slot_offset +
+                    pages[i]->roles.at(role).device_offset;
+                // Sanity backstop, not the real gate: byte_offset is a sum of
+                // two values (slot_offset from arena_slot_stride() and the
+                // role's device_offset from plan_device_member_layout()) that
+                // are BOTH constructed as multiples of
+                // ggml_backend_buft_get_alignment(), so this should never
+                // trip. If it ever does, the host's own alignment check
+                // (against the live minStorageBufferOffsetAlignment) is the
+                // authoritative gate and will also reject it.
+                if (vk_align != 0 && byte_offset % vk_align != 0) {
+                    return false;
+                }
+                out = byte_offset;
+                return true;
+            };
+            if (!role_byte_offset("gate", gate_offsets[k]) ||
+                    !role_byte_offset("up", up_offsets[k]) ||
+                    !role_byte_offset("down", down_offsets[k])) {
+                request_stats.n_vk_fused_skip_offset_align++;
+                return false;
+            }
+            if (k < 4) {
+                selfcheck_slot_offset[k] = slot_offset;
+                selfcheck_gate_offset[k] = gate_offsets[k];
+                selfcheck_up_offset[k]   = up_offsets[k];
+                selfcheck_down_offset[k] = down_offsets[k];
+            }
+            for (uint32_t token = 0; token < request.n_tokens; ++token) {
+                route_weights[k * request.n_tokens + token] =
+                    request.assignments[i].weights[token];
+                fused_nonzero +=
+                    route_weights[k * request.n_tokens + token] != 0.0f;
+                ++fused_total;
+            }
+        }
+
+        // Size for the batch layout too. The Vulkan entry point uploads this
+        // layout when every selected expert is in one arena.
+        const size_t batch_header_words = 10;
+        if (route_weights.size() >
+                std::numeric_limits<size_t>::max() - batch_header_words ||
+                n_selected > (std::numeric_limits<size_t>::max() -
+                    batch_header_words - route_weights.size()) / 3) {
+            request_stats.n_vk_fused_skip_n_selected++;
+            return false;
+        }
+        const size_t words = batch_header_words + route_weights.size() + 3 * n_selected;
+        if (words > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+            request_stats.n_vk_fused_skip_n_selected++;
+            return false;
+        }
+        grow_params_buffer(words * sizeof(uint32_t), request_stats);
+
+        ggml_backend_vk_wp_fused_expert_params fused = {};
+        fused.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
+        fused.params_buffer = params_buffer_.get();
+        fused.weights_buffers = weights_buffers.data();
+        fused.input_offset = 0;
+        const size_t effective_result_offset = result_offset ==
+            std::numeric_limits<size_t>::max() ? io_result_offset_ : result_offset;
+        fused.output_offset = effective_result_offset;
+        fused.params_offset = 0;
+        fused.n_tokens = request.n_tokens;
+        fused.n_embd = n_embd;
+        fused.n_ff = n_ff;
+        fused.n_experts = (uint32_t) n_selected;
+        fused.down_type = (uint32_t) down.type;
+        fused.add_previous = add_previous ? 1u : 0u;
+        fused.submit_async = submit_async_ ? 1u : 0u;
+        fused.swiglu_limit = request.swiglu_clamp;
+        fused.gate_byte_offsets = gate_offsets.data();
+        fused.up_byte_offsets = up_offsets.data();
+        fused.down_byte_offsets = down_offsets.data();
+        fused.route_weights = route_weights.data();
+
+        const size_t output_size = (size_t) request.n_tokens * n_embd;
+        const bool selfcheck = wp_vulkan_fused_expert_selfcheck_enabled();
+        std::vector<float> previous;
+        if (selfcheck && add_previous) {
+            previous.resize(output_size);
+            read_result(previous, request_stats, effective_result_offset);
+        }
+
+        ggml_backend_vk_wp_fused_expert_stats fused_stats = {};
+        if (!ggml_backend_vk_wp_fused_expert(
+                    backend_.get(), &fused, &fused_stats)) {
+            request_stats.n_vk_fused_skip_dispatch_fail++;
+            return false;
+        }
+        request_stats.ns_vk_fused_dispatch += fused_stats.ns_dispatch;
+        request_stats.n_vk_fused_dispatches += fused_stats.n_pipeline_dispatches;
+        request_stats.bytes_vk_fused_upload += fused_stats.bytes_uploaded;
+        request_stats.n_vk_fused_fence_waits += fused_stats.n_fence_waits;
+        request_stats.n_weight_nonzero += fused_nonzero;
+        request_stats.n_weight_total += fused_total;
+        if (submit_async_) {
+            AsyncSubmitState & state = async_submit_state();
+            state.pending = true;
+            state.graph_pending = true;
+            state.fused_fence_waits += 1;
+        }
+
+        if (selfcheck) {
+            std::vector<float> fused_result(output_size);
+            read_result(fused_result, request_stats, effective_result_offset);
+            std::vector<float> reference(fused_result.size(), 0.0f);
+            if (add_previous) {
+                write_io_partial(previous, effective_result_offset);
+            }
+            compute_batch(
+                request, pages, batch, hits, add_previous, request_stats,
+                all_experts, /* force_dense = */ true,
+                sel_begin, sel_end, result_offset,
+                /* force_fallback = */ true);
+            read_result(reference, request_stats, effective_result_offset);
+            double max_abs = 0.0;
+            double max_rel = 0.0;
+            double sum_abs = 0.0;
+            size_t worst_i = 0;
+            uint64_t n_sign_disagree = 0;
+            uint64_t n_fused_zero = 0;
+            double dot = 0.0;
+            double norm_fused = 0.0;
+            double norm_ref = 0.0;
+            for (size_t i = 0; i < fused_result.size(); ++i) {
+                const double a = fused_result[i];
+                const double b = reference[i];
+                const double d = std::fabs(a - b);
+                if (d >= max_abs) {
+                    max_abs = d;
+                    worst_i = i;
+                }
+                sum_abs += d;
+                const double den = std::max(std::fabs(a), std::fabs(b));
+                if (den > 1e-6) {
+                    max_rel = std::max(max_rel, d / den);
+                }
+                if (a * b < 0.0 && std::fabs(a) > 1e-6 && std::fabs(b) > 1e-6) {
+                    ++n_sign_disagree;
+                }
+                if (std::fabs(a) < 1e-9 && std::fabs(b) > 1e-6) {
+                    ++n_fused_zero;
+                }
+                dot += a * b;
+                norm_fused += a * a;
+                norm_ref += b * b;
+            }
+            const double corr = (norm_fused > 0.0 && norm_ref > 0.0)
+                ? dot / (std::sqrt(norm_fused) * std::sqrt(norm_ref))
+                : 0.0;
+            write_io_partial(fused_result, effective_result_offset);
+            // First up-to-4 selected experts' slot/role byte offsets, and the
+            // first up-to-4 (fused, ref) output pairs -- enough for the next
+            // run to classify the failure (global negation / zeros /
+            // partial-row corruption / offset-by-one-expert) without another
+            // guess.
+            char offsets_buf[512] = {0};
+            size_t offsets_len = 0;
+            const size_t n_offsets_shown = std::min<size_t>(n_selected, 4);
+            for (size_t k = 0; k < n_offsets_shown; ++k) {
+                offsets_len += (size_t) std::snprintf(
+                    offsets_buf + offsets_len,
+                    offsets_len < sizeof(offsets_buf) ? sizeof(offsets_buf) - offsets_len : 0,
+                    "%s[%zu]slot=%llu,g=%llu,u=%llu,d=%llu", k == 0 ? "" : " ", k,
+                    (unsigned long long) selfcheck_slot_offset[k],
+                    (unsigned long long) selfcheck_gate_offset[k],
+                    (unsigned long long) selfcheck_up_offset[k],
+                    (unsigned long long) selfcheck_down_offset[k]);
+            }
+            char pairs_buf[512] = {0};
+            size_t pairs_len = 0;
+            const size_t n_pairs_shown = std::min<size_t>(fused_result.size(), 4);
+            for (size_t i = 0; i < n_pairs_shown; ++i) {
+                pairs_len += (size_t) std::snprintf(
+                    pairs_buf + pairs_len,
+                    pairs_len < sizeof(pairs_buf) ? sizeof(pairs_buf) - pairs_len : 0,
+                    "%s(%.6g,%.6g)", i == 0 ? "" : " ",
+                    (double) fused_result[i], (double) reference[i]);
+            }
+            std::fprintf(stderr,
+                         "WP_VK_FUSED_EXPERT_SELFCHECK layer=%d n_tokens=%u "
+                         "n_exp=%zu max_abs=%.6g max_rel=%.6g mean_abs=%.6g "
+                         "worst_i=%zu fused[worst_i]=%.6g ref[worst_i]=%.6g "
+                         "n_sign_disagree=%llu n_fused_zero=%llu corr=%.6g "
+                         "offsets={%s} pairs={%s}\n",
+                         request.layer, request.n_tokens, n_selected, max_abs,
+                         max_rel, sum_abs / (double) fused_result.size(),
+                         worst_i, (double) fused_result[worst_i],
+                         (double) reference[worst_i],
+                         (unsigned long long) n_sign_disagree,
+                         (unsigned long long) n_fused_zero, corr,
+                         offsets_buf, pairs_buf);
+        }
+        return true;
+    }
+
     void compute_batch(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -9947,7 +10361,8 @@ private:
             // one. D3 (compute_batch_grouped) is hardwired to
             // io_result_offset_ the same way. Both are disabled below
             // whenever this is overridden; see the two guards further down.
-            size_t result_offset = std::numeric_limits<size_t>::max()) {
+            size_t result_offset = std::numeric_limits<size_t>::max(),
+            bool force_fallback = false) {
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::chrono::steady_clock::time_point vk_compute_started =
             measure_vk ? std::chrono::steady_clock::now() :
@@ -9967,6 +10382,10 @@ private:
             request_stats.ns_vk_wait +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - vk_wait_started).count();
+        }
+        if (!force_fallback && submit_async_ && is_vulkan_backend() &&
+                async_submit_state().graph_pending) {
+            synchronize_async(&request_stats);
         }
         if (submit_async_ && is_cuda_backend() &&
                 async_submit_state().graph_pending) {
@@ -10082,6 +10501,69 @@ private:
         // worker, so this must be decided per request and never cached.
         const bool use_gather = use_expert_gather(
             request.n_tokens, force_dense, s_gather_min_tokens, s_gather);
+
+        // *** THE REAL WP_VK_FUSED_EXPERT GATE. ***
+        // compute_batch_fused() computes the FULL dense FFN for every selected
+        // expert directly (route_weight is applied per token, zero for a token
+        // not routed to that expert) -- it does not need gather's token
+        // compaction to be correct, only to be worth trying. So `use_gather`
+        // being true must NOT exclude fused: it used to (`&& !use_gather`
+        // below), which silently routed every n_tokens in [2,8] -- i.e. every
+        // speculative-decode VERIFY-width request, since WP_EXPERT_GATHER
+        // defaults on and WP_EXPERT_GATHER_MIN_TOKENS defaults to 2 -- straight
+        // into the gather/dense graph path and never gave fused a chance. Only
+        // n_tokens==1 (bare decode) was ever eligible before this fix.
+        // compute_batch_fused() itself still bails (returns false) on any
+        // shape/alignment mismatch and falls through to the exact same
+        // gather/dense path below unchanged, so this costs nothing when fused
+        // cannot actually handle the request -- see the skip counters there.
+        static const bool s_vk_fused_enabled = wp_vulkan_fused_expert_enabled();
+        const bool vk_fused_armed = s_vk_fused_enabled && is_vulkan_backend();
+        if (vk_fused_armed) {
+            if (force_fallback) {
+                request_stats.n_vk_fused_skip_force_fallback++;
+            }
+            if (request.n_tokens == 0 || request.n_tokens > 8) {
+                request_stats.n_vk_fused_skip_ntokens++;
+            }
+            // *** ONCE-PER-DISTINCT-SHAPE ROUTING LOG (max 20/process). ***
+            // Proves what shape actually reaches compute_batch on Vulkan0 with
+            // the flag on, instead of asserting it from throughput deltas.
+            static std::mutex s_shape_mu;
+            static std::set<std::string> s_seen_shapes;
+            static int s_shape_logged = 0;
+            if (s_shape_logged < 20) {
+                char key[256];
+                std::snprintf(key, sizeof(key),
+                    "layer=%d n_tokens=%u n_exp=%zu add_previous=%d "
+                    "result_offset_custom=%d use_gather=%d sel=[%zu,%zu)/%zu",
+                    request.layer, request.n_tokens, n_selected,
+                    add_previous ? 1 : 0,
+                    result_offset != std::numeric_limits<size_t>::max() ? 1 : 0,
+                    use_gather ? 1 : 0, sel_begin, sel_end,
+                    request.assignments.size());
+                std::lock_guard<std::mutex> lock(s_shape_mu);
+                if (s_shape_logged < 20 && s_seen_shapes.insert(key).second) {
+                    std::fprintf(stderr, "WP_VK_FUSED_EXPERT_SHAPE %s\n", key);
+                    ++s_shape_logged;
+                }
+            }
+        }
+        const bool fused_expert_request =
+            !force_fallback && is_vulkan_backend() &&
+            s_vk_fused_enabled &&
+            request.n_tokens >= 1 && request.n_tokens <= 8;
+        if (fused_expert_request) {
+            record_vk_setup();
+            if (compute_batch_fused(
+                        request, pages, batch, hits, all_experts,
+                        sel_begin, sel_end, n_selected, add_previous,
+                        result_offset, request_stats)) {
+                record_vk_compute();
+                return;
+            }
+        }
+
         // Default ON: one tensor_set for routing weights (+ gather idx).
         // Byte-identical to the per-tensor path. Decode graph-cache requires it.
         static const bool s_params_coalesce =
@@ -12146,7 +12628,8 @@ private:
         return true;
     }
 
-    void read_result(std::vector<float> & result, RequestStats & request_stats) {
+    void read_result(std::vector<float> & result, RequestStats & request_stats,
+                     size_t result_offset = std::numeric_limits<size_t>::max()) {
         synchronize_async(&request_stats);
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead(),
@@ -12159,7 +12642,10 @@ private:
         }
         const uint32_t n_tokens = (uint32_t) (
             result.size() / (size_t) catalog_.descriptor.hparams.n_embd);
-        ggml_tensor * output = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
+        const size_t effective_result_offset = result_offset ==
+            std::numeric_limits<size_t>::max() ? io_result_offset_ : result_offset;
+        ggml_tensor * output = make_io_tensor(ctx.get(), n_tokens,
+                                              effective_result_offset);
         const auto readback_started = std::chrono::steady_clock::now();
         ggml_backend_tensor_get(
             output, result.data(), 0, result.size() * sizeof(float));
@@ -12629,6 +13115,8 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.ns_vk_fold += src.ns_vk_fold;
     dst.ns_vk_sync += src.ns_vk_sync;
     dst.ns_vk_readback += src.ns_vk_readback;
+    dst.n_stream_partials_sent += src.n_stream_partials_sent;
+    dst.ns_stream_overlap += src.ns_stream_overlap;
     dst.ns_prologue += src.ns_prologue;
     dst.ns_arena_probe += src.ns_arena_probe;
     dst.ns_vk_arena_probe += src.ns_vk_arena_probe;
@@ -12986,7 +13474,8 @@ public:
             RequestStats & request_stats,
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
             int conn_index = -1,
-            uint64_t trace_req = 0) {
+            uint64_t trace_req = 0,
+            const worker_stream_callback & stream_callback = {}) {
         if (prepared.has_value() || !multi_device()) {
             std::lock_guard<std::mutex> lock(device_mutexes_.front());
             return devices_.front()->dispatch(
@@ -13018,6 +13507,15 @@ public:
             for (size_t gi = 0; gi < groups.size(); ++gi) {
                 by_device[groups[gi].device].push_back(gi);
             }
+            struct stream_ready_item {
+                size_t group = 0;
+                std::chrono::steady_clock::time_point ready_at{};
+            };
+            const bool streaming = static_cast<bool>(stream_callback) && groups.size() > 1;
+            std::mutex stream_mutex;
+            std::condition_variable stream_cv;
+            std::deque<stream_ready_item> stream_ready;
+            std::exception_ptr stream_error;
             // *** STRICT THREAD AFFINITY: A DEVICE IS ALWAYS DRIVEN BY ITS OWN
             // EXECUTOR THREAD, NEVER BY THE CALLING THREAD. ***
             // An earlier revision ran the HEAVIEST group inline on the caller to
@@ -13033,23 +13531,46 @@ public:
             // The handoff cost is real but is paid down by join_one()'s spin,
             // NOT by moving work onto the caller.
             const auto run_device = [this, &by_device, &groups, &request,
-                                     &partials, &sub_stats, conn_index, trace_req](size_t d) {
-                for (const size_t gi : by_device[d]) {
-                    const AssignmentGroup & group = groups[gi];
-                    pipe_expert_dispatch_req sub =
-                        make_subrequest(request, group.begin, group.end);
-                    std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
-                    partials[gi] = devices_[group.device]->dispatch(
-                        sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
-                    if (wp_worker_hash_trace_enabled()) {
-                        wp_worker_hash_emit(trace_req, request.layer,
-                                            device_names_[group.device].c_str(),
-                                            partials[gi].partial);
+                                     &partials, &sub_stats, &stream_mutex, &stream_cv,
+                                     &stream_ready, &stream_error, streaming,
+                                     conn_index, trace_req](size_t d) {
+                try {
+                    for (const size_t gi : by_device[d]) {
+                        const AssignmentGroup & group = groups[gi];
+                        pipe_expert_dispatch_req sub =
+                            make_subrequest(request, group.begin, group.end);
+                        std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                        partials[gi] = devices_[group.device]->dispatch(
+                            sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
+                        const auto ready_at = std::chrono::steady_clock::now();
+                        if (wp_worker_hash_trace_enabled()) {
+                            wp_worker_hash_emit(trace_req, request.layer,
+                                                device_names_[group.device].c_str(),
+                                                partials[gi].partial);
+                        }
+                        if (devices_[group.device]->stats_enabled()) {
+                            devices_[group.device]->record_stats(
+                                sub_stats[gi], group.end - group.begin);
+                        }
+                        if (streaming) {
+                            {
+                                std::lock_guard<std::mutex> stream_lock(stream_mutex);
+                                stream_ready.push_back({ gi, ready_at });
+                            }
+                            stream_cv.notify_one();
+                        }
                     }
-                    if (devices_[group.device]->stats_enabled()) {
-                        devices_[group.device]->record_stats(
-                            sub_stats[gi], group.end - group.begin);
+                } catch (...) {
+                    if (streaming) {
+                        {
+                            std::lock_guard<std::mutex> stream_lock(stream_mutex);
+                            if (!stream_error) {
+                                stream_error = std::current_exception();
+                            }
+                        }
+                        stream_cv.notify_all();
                     }
+                    throw;
                 }
             };
             // *** THE CPU EXPERT DEVICE RUNS OUTSIDE THE CONCURRENT WINDOW. ***
@@ -13139,6 +13660,36 @@ public:
                     if (!first_error) { first_error = std::current_exception(); }
                 }
             };
+            size_t n_ready = 0;
+            const auto drain_stream_ready = [&](size_t target) {
+                while (streaming && n_ready < target && !first_error) {
+                    stream_ready_item ready;
+                    {
+                        std::unique_lock<std::mutex> stream_lock(stream_mutex);
+                        stream_cv.wait(stream_lock, [&] {
+                            return !stream_ready.empty() || stream_error != nullptr;
+                        });
+                        if (stream_ready.empty()) {
+                            first_error = stream_error;
+                            break;
+                        }
+                        ready = stream_ready.front();
+                        stream_ready.pop_front();
+                    }
+                    try {
+                        stream_callback(ready.group, groups.size(), partials[ready.group],
+                                        ready.ready_at, request_stats);
+                        ++n_ready;
+                    } catch (...) {
+                        first_error = std::current_exception();
+                    }
+                }
+            };
+            if (streaming) {
+                const size_t deferred_cpu_groups = !cpu_overlap && cpu_device != SIZE_MAX
+                    ? by_device[cpu_device].size() : 0;
+                drain_stream_ready(groups.size() - deferred_cpu_groups);
+            }
             for (const size_t d : launched) {
                 if (d == cpu_device) { continue; }
                 join(d);
@@ -13153,6 +13704,9 @@ public:
                         [run_device, cpu_device] { run_device(cpu_device); });
                 }
                 join(cpu_device);
+            }
+            if (streaming) {
+                drain_stream_ready(groups.size());
             }
             if (first_error) { std::rethrow_exception(first_error); }
         } else {
@@ -13169,6 +13723,10 @@ public:
                 }
                 if (devices_[group.device]->stats_enabled()) {
                     devices_[group.device]->record_stats(sub_stats[gi], group.end - group.begin);
+                }
+                if (stream_callback && groups.size() > 1) {
+                    stream_callback(gi, groups.size(), partials[gi],
+                                    std::chrono::steady_clock::now(), request_stats);
                 }
             }
         }
@@ -13228,7 +13786,8 @@ public:
     pipe_expert_partial finish_split_dispatch(
             const pipe_expert_dispatch_acts & acts, uint64_t seq_id,
             RequestStats & request_stats, int conn_index = -1,
-            uint64_t trace_req = 0) {
+            uint64_t trace_req = 0,
+            const worker_stream_callback & stream_callback = {}) {
         if (!multi_device()) {
             std::lock_guard<std::mutex> lock(device_mutexes_.front());
             return devices_.front()->finish_split_dispatch(
@@ -13255,7 +13814,8 @@ public:
         result.dtype = PIPE_HIDDEN_F32;
         result.partial.assign(
             (size_t) result.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
-        for (const AssignmentGroup & group : pending.groups) {
+        for (size_t group_index = 0; group_index < pending.groups.size(); ++group_index) {
+            const AssignmentGroup & group = pending.groups[group_index];
             pipe_expert_dispatch_req sub_request;
             sub_request.layer = pending.begin.layer;
             sub_request.n_tokens = pending.begin.n_tokens;
@@ -13301,6 +13861,10 @@ public:
             accumulate_request_stats(request_stats, sub_stats);
             if (partial.partial.size() != result.partial.size()) {
                 throw std::runtime_error("expert device partial sizes disagree");
+            }
+            if (stream_callback && pending.groups.size() > 1) {
+                stream_callback(group_index, pending.groups.size(), partial,
+                                std::chrono::steady_clock::now(), request_stats);
             }
             for (size_t i = 0; i < result.partial.size(); ++i) {
                 result.partial[i] += partial.partial[i];
@@ -14763,6 +15327,68 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         if (g_worker_gpu_mutex != nullptr) {
             gpu_lock = std::unique_lock<std::mutex>(*g_worker_gpu_mutex);
         }
+        const bool stream_partials = wp_worker_stream_partials_enabled();
+        size_t stream_sent_count = 0;
+        std::chrono::steady_clock::time_point stream_first_sent;
+        std::chrono::steady_clock::time_point stream_last_ready;
+        worker_stream_callback stream_callback;
+        if (stream_partials) {
+            stream_callback = [&](size_t part_index, size_t part_count,
+                                   const pipe_expert_partial & partial,
+                                   std::chrono::steady_clock::time_point ready_at,
+                                   RequestStats & request_stats) {
+                const bool measure_stream = worker.stats_enabled();
+                if (measure_stream &&
+                    (stream_last_ready == std::chrono::steady_clock::time_point() ||
+                     ready_at > stream_last_ready)) {
+                    stream_last_ready = ready_at;
+                }
+                const std::chrono::steady_clock::time_point send_started =
+                    measure_stream ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point();
+                if (measure_stream && stream_first_sent == std::chrono::steady_clock::time_point()) {
+                    stream_first_sent = send_started;
+                }
+                pipe_encode_expert_partial_stream_into(
+                    encode_buf, (uint32_t) part_index, (uint32_t) part_count, partial);
+                const std::vector<uint8_t> & stream_encoded = encode_buf;
+                const bool relock = gpu_lock.owns_lock();
+                if (relock) {
+                    gpu_lock.unlock();
+                }
+                const bool sent = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL_STREAM, seq_id,
+                                                  stream_encoded.data(), stream_encoded.size());
+                if (relock) {
+                    gpu_lock.lock();
+                }
+                if (!sent) {
+                    throw std::runtime_error("worker failed to send streamed expert partial");
+                }
+                ++stream_sent_count;
+                ++request_stats.n_stream_partials_sent;
+                if (measure_stream) {
+                    const uint64_t ns_send = (uint64_t) std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - send_started).count();
+                    request_stats.ns_send += ns_send;
+                    request_stats.ns_resp_send += ns_send;
+                    request_stats.ns_stream_overlap =
+                        (stream_last_ready > stream_first_sent)
+                            ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  stream_last_ready - stream_first_sent).count()
+                            : 0;
+                }
+            };
+        }
+        const auto send_legacy_response = [&](const pipe_expert_partial & response) {
+            pipe_encode_expert_partial_into(encode_buf, response);
+            const std::vector<uint8_t> & encoded = encode_buf;
+            const bool relock = gpu_lock.owns_lock();
+            if (relock) gpu_lock.unlock();
+            const bool sent = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                              encoded.data(), encoded.size());
+            if (relock) gpu_lock.lock();
+            return sent;
+        };
         const std::chrono::steady_clock::time_point t_locked =
             seg_trace ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point();
@@ -14848,10 +15474,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                             ? worker.device_name(0).c_str() : "fold";
                         wp_worker_hash_emit(seq_id, znull.layer, device, znull.partial);
                     }
-                    const std::vector<uint8_t> zenc = pipe_encode_expert_partial(znull);
-                    if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                         zenc.data(), zenc.size())) {
-                        return 1;
+                    if (stream_callback) {
+                        stream_callback(0, 1, znull, std::chrono::steady_clock::now(),
+                                        split_log_stats);
+                    } else {
+                        const std::vector<uint8_t> zenc = pipe_encode_expert_partial(znull);
+                        if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                             zenc.data(), zenc.size())) {
+                            return 1;
+                        }
                     }
                     continue;
                 }
@@ -14876,7 +15507,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 // BEGIN fixes assignment index order; splitting changes only when
                 // reads start, never the computation order or resulting bytes.
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats, conn_index, seq_id);
+                    acts, seq_id, split_log_stats, conn_index, seq_id, stream_callback);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
@@ -14885,20 +15516,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         ? worker.device_name(0).c_str() : "fold";
                     wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
                 }
-                pipe_encode_expert_partial_into(encode_buf, response);
-                const std::vector<uint8_t> & encoded = encode_buf;
-                // Unlock for the send: `encoded` aliases this connection's own
-                // encode buffer (no other thread can reach it) and
-                // the socket write touches no Worker state, so this
-                // connection's network I/O can overlap another connection's
-                // GPU-lock-holding dispatch. Relock immediately after --
-                // record_stats()/spec_pagein_after_dispatch() below both
-                // touch pool_/stats_ and must stay serialized.
-                const bool relock1 = gpu_lock.owns_lock();
-                if (relock1) gpu_lock.unlock();
-                const bool sent1 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                                   encoded.data(), encoded.size());
-                if (relock1) gpu_lock.lock();
+                const bool sent1 = stream_sent_count != 0 || send_legacy_response(response);
                 // Stamped before the bookkeeping below so ns_resp_send is
                 // exactly encode + unlock + send + relock -- the worker->spine
                 // leg, and the last thing that is still inside the spine's wait.
@@ -14913,16 +15531,20 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         1, std::memory_order_relaxed);
                 }
                 if (worker.stats_enabled()) {
-                    split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - split_send_started).count();
+                    if (stream_sent_count == 0) {
+                        split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - split_send_started).count();
+                    }
                     // Assigned AFTER finish_split_dispatch has populated
                     // split_log_stats, so a whole-struct write in there can
                     // never clobber them.
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
-                    split_log_stats.ns_resp_send  =
-                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            t_resp_sent - split_send_started).count();
+                    if (stream_sent_count == 0) {
+                        split_log_stats.ns_resp_send  =
+                            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                t_resp_sent - split_send_started).count();
+                    }
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
@@ -14988,7 +15610,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 pipe_expert_dispatch_acts acts;
                 acts.activations = std::move(publish.activations);
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats, conn_index, seq_id);
+                    acts, seq_id, split_log_stats, conn_index, seq_id, stream_callback);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
@@ -14997,14 +15619,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         ? worker.device_name(0).c_str() : "fold";
                     wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
                 }
-                pipe_encode_expert_partial_into(encode_buf, response);
-                const std::vector<uint8_t> & encoded = encode_buf;
-                // Same unlock-for-send window as the ACTS branch above.
-                const bool relock2 = gpu_lock.owns_lock();
-                if (relock2) gpu_lock.unlock();
-                const bool sent2 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                                   encoded.data(), encoded.size());
-                if (relock2) gpu_lock.lock();
+                const bool sent2 = stream_sent_count != 0 || send_legacy_response(response);
                 // See the ACTS branch: encode + unlock + send + relock only.
                 const auto t_resp_sent = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
@@ -15025,13 +15640,17 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     wp_dedup::release(seq_id, layer_for_shm);
                 }
                 if (worker.stats_enabled()) {
-                    split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - split_send_started).count();
+                    if (stream_sent_count == 0) {
+                        split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - split_send_started).count();
+                    }
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
-                    split_log_stats.ns_resp_send  =
-                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            t_resp_sent - split_send_started).count();
+                    if (stream_sent_count == 0) {
+                        split_log_stats.ns_resp_send  =
+                            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                t_resp_sent - split_send_started).count();
+                    }
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
@@ -15103,7 +15722,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 pipe_expert_dispatch_acts acts;
                 acts.activations = std::move(*acts_vec);
                 const pipe_expert_partial response = worker.finish_split_dispatch(
-                    acts, seq_id, split_log_stats, conn_index, seq_id);
+                    acts, seq_id, split_log_stats, conn_index, seq_id, stream_callback);
                 const auto split_send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
@@ -15112,14 +15731,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         ? worker.device_name(0).c_str() : "fold";
                     wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
                 }
-                pipe_encode_expert_partial_into(encode_buf, response);
-                const std::vector<uint8_t> & encoded = encode_buf;
-                // Same unlock-for-send window as the ACTS branch above.
-                const bool relock3 = gpu_lock.owns_lock();
-                if (relock3) gpu_lock.unlock();
-                const bool sent3 = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                                   encoded.data(), encoded.size());
-                if (relock3) gpu_lock.lock();
+                const bool sent3 = stream_sent_count != 0 || send_legacy_response(response);
                 // See the ACTS branch: encode + unlock + send + relock only.
                 const auto t_resp_sent = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
@@ -15132,13 +15744,17 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         1, std::memory_order_relaxed);
                 }
                 if (worker.stats_enabled()) {
-                    split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - split_send_started).count();
+                    if (stream_sent_count == 0) {
+                        split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - split_send_started).count();
+                    }
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
-                    split_log_stats.ns_resp_send  =
-                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            t_resp_sent - split_send_started).count();
+                    if (stream_sent_count == 0) {
+                        split_log_stats.ns_resp_send  =
+                            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                t_resp_sent - split_send_started).count();
+                    }
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
@@ -15232,7 +15848,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         t_pre_dispatch - t_decoded).count();
             }
             const pipe_expert_partial response = worker.dispatch(
-                request, request_stats, std::nullopt, conn_index, seq_id);
+                request, request_stats, std::nullopt, conn_index, seq_id, stream_callback);
             const std::chrono::steady_clock::time_point t_dispatched =
                 seg_trace ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point();
@@ -15245,18 +15861,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     ? worker.device_name(0).c_str() : "fold";
                 wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
             }
-            pipe_encode_expert_partial_into(encode_buf, response);
-            const std::vector<uint8_t> & encoded = encode_buf;
-            // Same unlock-for-send window as the split-dispatch branches
-            // above: `response` is a local value and `encoded` aliases this
-            // connection's own encode buffer, so the socket write touches no
-            // Worker state and nothing another thread can observe.
-            const bool relock4 = gpu_lock.owns_lock();
-            if (relock4) gpu_lock.unlock();
-            const bool sent4 = pipe_send_frame(
-                    socket, PIPE_EXPERT_PARTIAL, seq_id,
-                    encoded.data(), encoded.size());
-            if (relock4) gpu_lock.lock();
+            const bool sent4 = stream_sent_count != 0 || send_legacy_response(response);
             if (!sent4) {
                 return 1;
             }
@@ -15267,9 +15872,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             if (measure) {
                 const std::chrono::steady_clock::time_point t_sent =
                     std::chrono::steady_clock::now();
-                request_stats.ns_send =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        t_sent - send_started).count();
+                if (stream_sent_count == 0) {
+                    request_stats.ns_send =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_sent - send_started).count();
+                }
                 request_stats.ns_recv_body  = ns_recv_body_frame;
                 request_stats.ns_req_decode = ns_req_decode_frame;
                 // Same window as ns_send on this branch (t_sent is taken after
@@ -15277,10 +15884,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 // atomic increment). Kept as its own name so ns_resp_send has
                 // identical meaning on the split branches, where ns_send is
                 // stopped at a different point.
-                request_stats.ns_resp_send =
-                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        t_sent - send_started).count();
-                if (seg_trace) {
+                if (stream_sent_count == 0) {
+                    request_stats.ns_resp_send =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_sent - send_started).count();
+                }
+                if (seg_trace && stream_sent_count == 0) {
                     // encode + unlock + send + relock. Everything between
                     // dispatch() returning and the bytes being on the wire --
                     // the last segment that can still be inside the spine's wait.
