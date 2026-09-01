@@ -765,6 +765,21 @@ void llama_model_qwen4exp::graph::build_trunk_staged(int64_t hc, int * sections,
         (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) ||
         expert_dispatch != nullptr;
 
+    // FIX 2b (adversarial review 2026-09-01): every non-terminal stage always
+    // produces n_tokens rows (build_trunk_layer only drops rows early when
+    // il == n_layer-1 && !keep_all_rows), and this stage's t_stage_in below is
+    // always allocated [n_embd, hc, n_tokens] -- so the terminal stage's input
+    // is only the right shape for what the last trunk stage actually wrote if
+    // keep_all_rows was true THERE too. That currently holds only because
+    // llama_context::layer_cut_eligible() requires expert_dispatch != nullptr
+    // (llama-context.cpp), which is the same condition that makes
+    // keep_all_rows true here -- two independently-written formulas that
+    // happen to agree, not a single shared source of truth. Assert it rather
+    // than silently mis-shape the boundary if either one ever changes alone.
+    GGML_ASSERT(keep_all_rows &&
+            "layer_cut requires keep_all_rows (expert_dispatch != nullptr); "
+            "see llama_context::layer_cut_eligible()");
+
     if (stage_il == (int32_t) n_layer) {
         // terminal head stage: read the boundary the last trunk-layer stage produced
         ggml_tensor * res_hc_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, hc, n_tokens);

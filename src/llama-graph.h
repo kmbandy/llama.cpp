@@ -1093,9 +1093,38 @@ struct llm_graph_stage_slot {
     // (t_logits/t_embd/t_h_nextn/...); llama_context::process_ubatch_staged returns it
     llm_graph_result * res_terminal = nullptr;
 
+    // FIX 5 (adversarial review 2026-09-01): true from the moment any stage in
+    // the current walk fails (build/alloc/compute/dispatch error) until the
+    // NEXT reset(). This is the documented stage-4 seam (plan item 8) -- a
+    // future ready-queue reader must be able to tell "this slot's last walk
+    // did not complete" from the slot alone, not by noticing res_terminal is
+    // stale/dangling. process_ubatch_staged sets this (and clears
+    // res_terminal) on every early-failure return, not just the final one.
+    bool failed = false;
+
+    // Containment for the torn-recurrent-state gap (2026-09-01 review):
+    // per-layer rollback of recurrent conv/SSM state is out of scope (see
+    // llama-memory-recurrent.cpp:182-183 -- these models "can't have a state
+    // partially erased" mid-sequence), so a staged failure that occurred at or
+    // after the FIRST stage's graph_compute (i.e. any persistent per-layer
+    // cache write may already have landed) cannot be trusted to leave a
+    // recoverable partial state. true means: decode()'s failure cleanup must
+    // remove this ubatch's sequences OUTRIGHT (seq_rm with p0=0) instead of
+    // the normal pos_min partial removal, because layers that already
+    // computed for this token and layers that never got to run are now
+    // mutually inconsistent and nothing here can tell them apart per layer.
+    // false (a failure strictly before stage 0's graph_compute, e.g.
+    // mctx->apply() or stage 0's own build/alloc) means nothing was written
+    // yet, so no special handling is needed. Cleared on every reset(), so a
+    // later successful walk (or one that fails before compute) never leaves a
+    // stale true behind.
+    bool state_torn = false;
+
     void reset() {
         cur = 0;
         res_terminal = nullptr;
+        failed      = false;
+        state_torn  = false;
     }
 };
 

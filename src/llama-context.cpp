@@ -2206,6 +2206,31 @@ bool llama_context::set_adapter_cvec(
 //     build_wait/HC-combine exactly as item 2 requires ("stay within one layer
 //     stage"), which only makes sense when a dispatcher is actually attached;
 //     without one there is no reason to pay the stage-boundary host round trip.
+//
+// Adversarial-review additions (2026-09-01), also flagged rather than silent:
+//   - cparams.pipeline_parallel: pipeline parallelism gives the scheduler
+//     multiple copies/events per backend so ggml_backend_sched_graph_compute_async
+//     calls can overlap; process_ubatch_staged calls ggml_backend_sched_reset()
+//     49 times per token, once per stage, and nothing in this codebase
+//     exercises that against pipeline-parallel's multi-copy/event bookkeeping.
+//     A locally layer-split dense trunk plus expert dispatch would otherwise
+//     pass every other check here, so this is excluded explicitly rather than
+//     left as an assumption.
+//   - spec-verify batches: n_seq_tokens is also the verify-block width during
+//     speculative decoding (draft length + 1). If a deployment ever ran
+//     n_draft+1 >= 64 -- far above any sane draft length today -- a verify
+//     step, not just a prefill, would stage and pay 48 serial round trips on
+//     what is supposed to be the latency-critical path. This gate assumes
+//     draft length stays far below 64 and does not special-case gtype/verify
+//     shape beyond the width check; if draft lengths ever grow into that
+//     range this assumption needs revisiting.
+//   - multi-slot continuous batching: this gate has no notion of "other slots
+//     are ready to decode right now". One slot's staged prefill still
+//     serializes all 49 stage computes before this llama_context can move on,
+//     so other slots' ready decodes wait behind it exactly as they would
+//     behind a slow whole-graph prefill -- an accepted stage-3 trade-off, not
+//     a regression this gate tries to avoid (stage 4's seam is where
+//     interleaving across slots/ubatches would actually help).
 bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_type gtype) const {
     static const bool wp_layer_cut_env = [] {
         const char * e = getenv("WP_QWEN4EXP_LAYER_CUT");
@@ -2215,6 +2240,30 @@ bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_ty
     if (!wp_layer_cut_env) {
         return false;
     }
+
+    // FIX 7 (adversarial review 2026-09-01): one-time, process-wide warning
+    // (C++ static init is thread-safe and runs exactly once) rather than
+    // reserve-aware sizing. WP_QWEN4EXP_LAYER_CUT_TRACE's whole-graph
+    // retention (qwen4exp.cpp: 48 res_hc outputs marked ggml_set_output and
+    // held until process_ubatch reads them back) is never simulated by
+    // sched_reserve()/graph_reserve() -- those size compute buffers for the
+    // untraced shape -- so a traced run can legitimately ALLOC_FAIL on a
+    // short prompt that would otherwise fit. Teaching graph_reserve about a
+    // diagnostic-only, env-gated retention pattern felt like the wrong amount
+    // of permanent machinery for a bring-up tool; a loud warning that this is
+    // a known, accepted rough edge of the trace path is the cheap honest fix.
+    static const bool wp_layer_cut_trace_warned = [] {
+        const char * e = getenv("WP_QWEN4EXP_LAYER_CUT_TRACE");
+        if (e != nullptr && e[0] == '1') {
+            LLAMA_LOG_WARN("layer_cut: WP_QWEN4EXP_LAYER_CUT_TRACE=1 -- diagnostic-only, retains "
+                           "per-layer res_hc outputs that sched_reserve() does not account for; "
+                           "a traced run may fail graph allocation on a short prompt even though "
+                           "the same prompt untraced would not. Use small prompts (a few hundred "
+                           "tokens) when tracing.\n");
+        }
+        return true;
+    }();
+    (void) wp_layer_cut_trace_warned;
 
     if (model.arch != LLM_ARCH_QWEN4EXP || gtype != LLM_GRAPH_TYPE_DEFAULT) {
         return false;
@@ -2236,6 +2285,11 @@ bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_ty
         return false;
     }
 
+    // FIX 3 (adversarial review 2026-09-01): see the pipeline_parallel note above.
+    if (cparams.pipeline_parallel) {
+        return false;
+    }
+
     for (bool b : cparams.embeddings_layer_inp) {
         if (b) {
             return false;
@@ -2254,6 +2308,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (layer_cut_eligible(ubatch, gtype)) {
         return process_ubatch_staged(ubatch, gtype, mctx, ret);
     }
+
+    // The whole-graph path never sets layer_cut_slot.state_torn/failed (it
+    // is atomic -- one graph_compute, no partial per-layer advancement to
+    // contain), but it must still clear them here: decode()'s failure
+    // cleanup consults state_torn whenever THIS call's res comes back null,
+    // and without this a stale true left by an EARLIER, unrelated staged
+    // failure (a different ubatch, possibly a different llama_decode() call
+    // entirely) would wrongly trigger full-sequence removal on a whole-graph
+    // failure that has nothing to do with torn recurrent state.
+    layer_cut_slot.failed     = false;
+    layer_cut_slot.state_torn = false;
 
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -2481,14 +2546,53 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 //   - the res_hc boundary between stages is a host round trip
 //     (ggml_backend_tensor_get/set) through layer_cut_slot.boundary_host,
 //     not an allocator-managed device ping-pong.
-//   - non-terminal stages get a throwaway llm_graph_result each (no attempt at
-//     graph reuse between stages); only the terminal stage reuses gf_res_prev,
+//   - non-terminal stages reuse one scratch llm_graph_result (reset each stage;
+//     no attempt at graph reuse between stages); only the terminal stage reuses gf_res_prev,
 //     so callers of process_ubatch keep reading the object they always have.
 //   - graph_reserve() is untouched: it still reserves for the full 48-layer
 //     shape, a safe superset of any single stage's footprint, rather than the
 //     "max simultaneous stage" sizing item 5 describes.
 llm_graph_result * llama_context::process_ubatch_staged(
         const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const uint32_t n_layer = model.hparams.n_layer();
+
+    // FIX 5 (adversarial review 2026-09-01): every early-failure return in
+    // this function goes through this instead of a bare `return nullptr`, so
+    // the slot never observably holds a stale res_terminal/cur from a walk
+    // that didn't finish -- see llm_graph_stage_slot::failed's comment. reset()
+    // runs first so a walk that fails before reaching the stage loop (e.g. the
+    // mctx->apply() check below) still leaves the slot in a clean, explicitly-
+    // invalid state rather than whatever the PREVIOUS successful walk left.
+    layer_cut_slot.reset();
+    layer_cut_slot.ubatch   = &ubatch;
+    layer_cut_slot.mctx     = mctx;
+    layer_cut_slot.n_stages = n_layer + 1; // + terminal head stage
+
+    // Containment for the torn-recurrent-state gap (2026-09-01 review): set
+    // true right before the FIRST call to graph_compute for any stage (below,
+    // inside the loop) and never cleared for the rest of this walk. A failure
+    // recorded through fail() while this is still false happened strictly
+    // before any stage's graph_compute -- e.g. mctx->apply() or stage 0's own
+    // build/alloc -- so nothing was written to persistent per-layer state and
+    // no special cleanup is needed. Once true, fail() marks the slot
+    // state_torn: see llm_graph_stage_slot::state_torn for why (per-layer
+    // recurrent rollback is out of scope, so a partially-advanced token must
+    // be treated as unrecoverable, not partially undone).
+    bool computed_any = false;
+
+    auto fail = [this, &computed_any]() -> llm_graph_result * {
+        // The per-stage failed() check runs before the boundary readback sync
+        // that used to provide this barrier. Synchronize before decode()'s
+        // sequence removal so it cannot race in-flight writes.
+        if (computed_any) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        layer_cut_slot.res_terminal = nullptr;
+        layer_cut_slot.failed       = true;
+        layer_cut_slot.state_torn   = computed_any;
+        return nullptr;
+    };
+
     // applied exactly once, before any stage graph is built -- the per-stage
     // graphs below only read the already-applied mctx, so recurrent/KV writes
     // (which live as nodes inside whichever single stage's graph owns them)
@@ -2496,22 +2600,29 @@ llm_graph_result * llama_context::process_ubatch_staged(
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
-        return nullptr;
+        return fail();
     }
-
-    const uint32_t n_layer = model.hparams.n_layer();
 
     // one line per staged ubatch: enough to attribute WHICH batches run staged
     // (a gate that cannot see its engagements in the log is not a gate)
     LLAMA_LOG_WARN("layer_cut: staged ubatch n_tokens=%u n_seqs=%u n_seq_tokens=%u gtype=%d\n",
                    ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens, (int) gtype);
 
-    layer_cut_slot.reset();
-    layer_cut_slot.ubatch   = &ubatch;
-    layer_cut_slot.mctx     = mctx;
-    layer_cut_slot.n_stages = n_layer + 1; // + terminal head stage
+    // FIX 6 (adversarial review 2026-09-01): one scratch llm_graph_result,
+    // reset() and reused for every non-terminal stage, instead of 48 separate
+    // ones all held alive until the loop ends -- only boundary_host (already
+    // a small host buffer) needs to survive past the stage that produced it,
+    // so there is nothing to gain from keeping 48 distinct llm_graph_result
+    // objects (and their ctx_compute buffers) around at once.
+    //
+    // The original sin was 48 simultaneous full-size scratch objects. One
+    // reused full-size object fixes that, and a provably sufficient budget is
+    // safer than a tuned fraction that hard-aborts when a stage is wider than
+    // average (stage 0 embedding+PLE, or full-attention layers with dispatch
+    // custom ops).
+    const int64_t stage_max_nodes = gf_res_prev->get_max_nodes();
+    auto scratch_res = std::make_unique<llm_graph_result>(stage_max_nodes);
 
-    std::vector<llm_graph_result_ptr> scratch_results;
     llm_graph_result * res_terminal = nullptr;
 
     for (uint32_t stage_il = 0; stage_il <= n_layer; ++stage_il) {
@@ -2524,8 +2635,8 @@ llm_graph_result * llama_context::process_ubatch_staged(
             res = gf_res_prev.get();
             res->reset();
         } else {
-            scratch_results.push_back(std::make_unique<llm_graph_result>(gf_res_prev->get_max_nodes()));
-            res = scratch_results.back().get();
+            scratch_res->reset();
+            res = scratch_res.get();
         }
 
         auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -2548,13 +2659,13 @@ llm_graph_result * llama_context::process_ubatch_staged(
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize stage %u graph\n", __func__, stage_il);
             ret = GGML_STATUS_FAILED;
-            return nullptr;
+            return fail();
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph returned false (stage %u)\n", __func__, stage_il);
             ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+            return fail();
         }
 
         // the ordinary per-ubatch inputs (positions, masks, QSA, hybrid-memory
@@ -2565,15 +2676,60 @@ llm_graph_result * llama_context::process_ubatch_staged(
         // every later stage reads the previous stage's boundary here
         if (res->t_stage_in != nullptr) {
             GGML_ASSERT(!layer_cut_slot.boundary_host.empty() && "layer_cut boundary read before write");
+            // FIX 2a (adversarial review 2026-09-01): ggml_backend_tensor_set
+            // silently accepts an undersized write (it just copies `size`
+            // bytes), so a shape mismatch between the producing stage's
+            // t_stage_out and this stage's t_stage_in would leave the tensor's
+            // tail uninitialized instead of failing loudly. Both are built
+            // from the same [n_embd, hc, n_tokens] shape (qwen4exp.cpp), so
+            // this should never fire -- assert it instead of trusting that.
+            GGML_ASSERT(layer_cut_slot.boundary_host.size() == (size_t) ggml_nelements(res->t_stage_in) &&
+                    "layer_cut boundary size does not match this stage's t_stage_in");
             ggml_backend_tensor_set(res->t_stage_in, layer_cut_slot.boundary_host.data(),
                     0, layer_cut_slot.boundary_host.size() * sizeof(float));
         }
+
+        // FIX 1 (adversarial review 2026-09-01, highest priority): symmetric
+        // with the whole-graph path's hint immediately before ITS
+        // graph_compute (above, in process_ubatch). Staged mode has 49
+        // graph_compute calls per token instead of one; without a hint before
+        // EVERY one of them, the CUDA graph-capture layer's prefill-shape
+        // heuristic keeps reading whatever the last unrelated decode step (or
+        // stage) left behind -- typically 1 -- and mis-keys its capture
+        // cache for the rest of the process (measured: sustained 35% decode
+        // regression after any staged prefill, plus fallback-kernel
+        // acceptance drift). ubatch.n_tokens is identical across all 49
+        // stages, so this is cheap and correct to repeat every iteration.
+        if (ggml_cuda_wp_set_ubatch_width_hint) {
+            ggml_cuda_wp_set_ubatch_width_hint((int32_t) ubatch.n_tokens);
+        }
+
+        // Containment for the torn-recurrent-state gap: from this point on
+        // (this stage's graph_compute may write persistent per-layer conv/SSM
+        // state), any failure -- this stage's own compute, a later stage's
+        // build/alloc/compute, or a dispatch failure caught after this
+        // compute -- must be treated as leaving torn per-layer state. Set
+        // BEFORE the call, not after, so even a failure inside graph_compute
+        // itself is covered (we cannot know how much of that stage's graph
+        // executed before it errored).
+        computed_any = true;
 
         const auto status = graph_compute(gf, ubatch.n_tokens > 1);
         if (status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: failed to compute stage %u graph, status: %d\n", __func__, stage_il, status);
             ret = status;
-            return nullptr;
+            return fail();
+        }
+
+        // FIX 4 (adversarial review 2026-09-01): check per stage, not just
+        // once after the loop -- otherwise a worker timeout on, say, stage 5
+        // silently burns 43 more stage computes (each paying its own RPC
+        // round trip) before process_ubatch_staged ever reports the failure.
+        if (expert_dispatch && expert_dispatch->failed()) {
+            const std::string message = expert_dispatch->failure_message();
+            LLAMA_LOG_ERROR("%s: expert dispatch failed at stage %u: %s\n", __func__, stage_il, message.c_str());
+            ret = GGML_STATUS_FAILED;
+            return fail();
         }
 
         // capture the boundary this stage produced, for the next stage to read;
@@ -2606,13 +2762,6 @@ llm_graph_result * llama_context::process_ubatch_staged(
         if (is_terminal) {
             res_terminal = res;
         }
-    }
-
-    if (expert_dispatch && expert_dispatch->failed()) {
-        const std::string message = expert_dispatch->failure_message();
-        LLAMA_LOG_ERROR("%s: expert dispatch failed: %s\n", __func__, message.c_str());
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
     }
 
     // WP_QWEN4EXP_LAYER_CUT_TRACE endpoint check, matching the whole-graph
@@ -3226,14 +3375,65 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
             }
 
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
+            // Containment for the torn-recurrent-state gap (WP_QWEN4EXP_LAYER_CUT,
+            // 2026-09-01 review): layer_cut_slot.state_torn is true only when the
+            // process_ubatch() call that just failed was a staged walk that had
+            // already reached at least one stage's graph_compute -- i.e. some
+            // trunk layer's persistent conv/SSM state may have advanced for this
+            // token while later layers' never ran. llama-memory-recurrent.cpp:182-183
+            // states plainly that these models "can't have a state partially
+            // erased" mid-sequence -- there is no per-layer undo -- so the only
+            // sound containment is to stop trusting this sequence's recurrent
+            // state at all: remove it OUTRIGHT (p0=0) instead of the normal
+            // pos_min partial removal. The caller still just sees a failed
+            // decode either way; the difference is that a retry/continuation
+            // re-prefills this sequence from scratch instead of silently
+            // resuming on torn per-layer state. process_ubatch()'s whole-graph
+            // branch always clears this flag (see its comment), so it is only
+            // ever true here immediately after a staged failure.
+            const bool state_torn = layer_cut_slot.state_torn;
+
+            if (state_torn) {
+                // Coupled sequence IDs share the torn recurrent state, so remove every ID in the failed set.
+                bool seq_seen[LLAMA_MAX_SEQ] = {};
+                if (ubatch.n_seqs_unq > 0 && ubatch.seq_id_unq != nullptr) {
+                    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+                        if (seq_seen[seq_id]) {
+                            continue;
+                        }
+
+                        seq_seen[seq_id] = true;
+                        LLAMA_LOG_WARN("%s: layer_cut: staged decode left recurrent state torn (seq_id = %d) -- "
+                                       "removing memory module entries for seq_id = %d, pos = [0, +inf) (full sequence)\n",
+                                       __func__, seq_id, seq_id);
+                        memory->seq_rm(seq_id, 0, -1);
+                    }
+                } else {
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+                            if (seq_seen[seq_id]) {
+                                continue;
+                            }
+
+                            seq_seen[seq_id] = true;
+                            LLAMA_LOG_WARN("%s: layer_cut: staged decode left recurrent state torn (seq_id = %d) -- "
+                                           "removing memory module entries for seq_id = %d, pos = [0, +inf) (full sequence)\n",
+                                           __func__, seq_id, seq_id);
+                            memory->seq_rm(seq_id, 0, -1);
+                        }
+                    }
                 }
+            } else {
+                for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                        continue;
+                    }
 
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
+                    LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+                    memory->seq_rm(s, pos_min[s], -1);
+                }
             }
 
             switch (status) {
