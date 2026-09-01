@@ -11801,6 +11801,25 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     }
 }
 
+static constexpr uint32_t GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS = 512;
+
+static bool ggml_vk_mul_mat_id_force_mm(const uint64_t total_tokens) {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_MUL_MAT_ID_FORCE_MM");
+        return env != nullptr && std::strtol(env, nullptr, 10) != 0;
+    }();
+    static const uint64_t min_tokens = [] {
+        const char * env = std::getenv("GGML_MUL_MAT_ID_FORCE_MM_MIN_TOKENS");
+        if (env == nullptr) {
+            return uint64_t(64);
+        }
+        char * end = nullptr;
+        const long value = std::strtol(env, &end, 10);
+        return end != env && *end == '\0' && value >= 0 ? uint64_t(value) : uint64_t(64);
+    }();
+    return enabled && total_tokens >= min_tokens;
+}
+
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -11821,6 +11840,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const uint64_t nei0 = ids->ne[0];
     const uint64_t nei1 = ids->ne[1];
+    const bool force_mm = ggml_vk_mul_mat_id_force_mm(ne12);
+    const uint32_t pipeline_n = force_mm ? GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS : (uint32_t) nei1;
 
     const uint32_t nbi0 = ids->nb[0];
     const uint32_t nbi1 = ids->nb[1];
@@ -11912,10 +11933,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, pipeline_n, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && pipeline_n > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, pipeline_n, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -12710,7 +12731,11 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
+    if (ggml_vk_mul_mat_id_force_mm(src1->ne[2])) {
+        return false;
+    }
     const uint64_t type_size = ggml_type_size(src0->type);
     const uint64_t block_size = ggml_blck_size(src0->type);
     const uint64_t canonical_nb2 =
