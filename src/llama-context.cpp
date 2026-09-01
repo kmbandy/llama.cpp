@@ -23,6 +23,7 @@
 #include "pipeline/pipe-expert-dispatch-graph.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <chrono>
 #include <cstdlib>
@@ -129,6 +130,28 @@ static const char * wp_spine_profile_trace_path() {
 
 static bool wp_spine_profile_trace_enabled() {
     return wp_spine_profile_trace_path() != nullptr;
+}
+
+static bool wp_spine_layer_profile_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_SPINE_LAYER_PROFILE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static void wp_spine_layer_profile_split_cb(
+        const char * backend_name,
+        const ggml_cgraph * graph,
+        int split_id,
+        int n_splits,
+        bool before,
+        void * user_data) {
+    auto * dispatcher = static_cast<pipe_expert_dispatcher::graph_dispatcher *>(user_data);
+    if (dispatcher != nullptr) {
+        dispatcher->spine_layer_profile_split(
+            backend_name, graph, split_id, n_splits, before, std::chrono::steady_clock::now());
+    }
 }
 
 static void wp_spine_profile_trace_write(
@@ -2417,6 +2440,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // a mean cannot distinguish "a few huge outliers" from "everything shifted".
     static const bool wp_spine_each = wp_spine_stats && wp_spine_env[0] == '2';
     const bool wp_spine_profile_trace = wp_spine_profile_trace_enabled() && !is_draft_ctx(cparams);
+    const bool wp_spine_layer_profile = wp_spine_layer_profile_enabled() &&
+                                        ubatch.n_tokens >= 64 &&
+                                        !is_draft_ctx(cparams) &&
+                                        expert_dispatch != nullptr;
+    static std::atomic<uint64_t> wp_spine_layer_profile_ubatch_index{ 0 };
+    const uint64_t wp_spine_layer_profile_index = wp_spine_layer_profile
+        ? wp_spine_layer_profile_ubatch_index.fetch_add(1, std::memory_order_relaxed) : 0;
     // PREFILL AND DECODE ARE ACCUMULATED SEPARATELY (2026-08-03). They were folded
     // into ONE running mean, which is worse than useless here: a prefill ubatch and
     // a decode step differ by up to n_ubatch (512) in token count and by orders of
@@ -2444,12 +2474,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_cuda_wp_set_ubatch_width_hint((int32_t) ubatch.n_tokens);
     }
     const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
-    const auto wp_gc_t0 = (wp_spine_stats || wp_spine_profile_trace) ? std::chrono::steady_clock::now()
-                                                                      : std::chrono::steady_clock::time_point();
+    const auto wp_gc_t0 = (wp_spine_stats || wp_spine_profile_trace || wp_spine_layer_profile)
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     if (wp_spine_profile_trace && expert_dispatch != nullptr) {
         expert_dispatch->spine_profile_begin(wp_gc_t0);
     }
+    if (wp_spine_layer_profile) {
+        expert_dispatch->spine_layer_profile_begin(
+            wp_spine_layer_profile_index, ubatch.n_tokens, wp_gc_t0);
+        ggml_backend_sched_set_split_callback(
+            sched.get(), wp_spine_layer_profile_split_cb, expert_dispatch);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (wp_spine_layer_profile) {
+        expert_dispatch->spine_layer_profile_end(std::chrono::steady_clock::now());
+        ggml_backend_sched_set_split_callback(sched.get(), nullptr, nullptr);
+    }
     if (wp_spine_profile_trace) {
         const auto wp_gc_t1 = std::chrono::steady_clock::now();
         const uint64_t ns_graph = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(wp_gc_t1 - wp_gc_t0).count();

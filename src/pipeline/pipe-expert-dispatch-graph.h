@@ -18,6 +18,7 @@
 #include <vector>
 
 struct ggml_context;
+struct ggml_cgraph;
 struct ggml_tensor;
 
 namespace pipe_expert_dispatcher {
@@ -225,6 +226,26 @@ class graph_dispatcher {
     void spine_profile_begin(std::chrono::steady_clock::time_point begin) noexcept;
     spine_profile_stats spine_profile_end(std::chrono::steady_clock::time_point end) noexcept;
 
+    void mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index) noexcept;
+    void mark_wait_tensor(ggml_tensor * tensor, int32_t layer) noexcept;
+
+    void spine_layer_profile_begin(uint64_t ubatch_index,
+                                   uint32_t n_tokens,
+                                   std::chrono::steady_clock::time_point begin) noexcept;
+    void spine_layer_profile_split(const char * backend_name,
+                                   const ggml_cgraph * graph,
+                                   int split_id,
+                                   int n_splits,
+                                   bool before,
+                                   std::chrono::steady_clock::time_point time) noexcept;
+    void spine_layer_profile_issue(int32_t layer, uint64_t ns_issue) noexcept;
+    void spine_layer_profile_wait(int32_t layer, uint64_t ns_wait) noexcept;
+    void spine_layer_profile_issue_begin(int32_t layer,
+                                         std::chrono::steady_clock::time_point time) noexcept;
+    void spine_layer_profile_post_begin(int32_t layer,
+                                        std::chrono::steady_clock::time_point time) noexcept;
+    void spine_layer_profile_end(std::chrono::steady_clock::time_point end) noexcept;
+
   private:
     struct op_context;
 
@@ -241,6 +262,7 @@ class graph_dispatcher {
     void spine_profile_wait_begin(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
     void spine_profile_wait_end(std::chrono::steady_clock::time_point time) noexcept;
     void write_layer_trace(int32_t layer) noexcept;
+    void write_spine_layer_profile() noexcept;
     bool is_phantom_row(int64_t token) const noexcept;
     void zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd,
                            int64_t token_offset = 0) const noexcept;
@@ -496,6 +518,31 @@ class graph_dispatcher {
         bool have_last_wait = false;
     };
     spine_profile_record                            spine_profile_;
+    struct spine_layer_profile_record {
+        uint64_t ns_pre = 0;
+        uint64_t ns_issue = 0;
+        uint64_t ns_wait = 0;
+        uint64_t ns_post = 0;
+        std::chrono::steady_clock::time_point start{};
+        std::chrono::steady_clock::time_point issue_begin{};
+        std::chrono::steady_clock::time_point post_begin{};
+        std::chrono::steady_clock::time_point end{};
+        std::vector<std::string> split_backends;
+        int last_split_id = -1;
+        bool have_start = false;
+        bool have_issue = false;
+        bool have_post = false;
+        bool have_end = false;
+    };
+    struct spine_layer_profile_state {
+        uint64_t ubatch_index = 0;
+        uint32_t n_tokens = 0;
+        std::chrono::steady_clock::time_point begin{};
+        std::map<int32_t, spine_layer_profile_record> layers;
+        std::map<int32_t, std::chrono::steady_clock::time_point> layer_boundaries;
+        bool active = false;
+    };
+    spine_layer_profile_state                       spine_layer_profile_;
     std::chrono::steady_clock::time_point          decode_t0_{};
     bool                                           decode_active_ = false;
     size_t                                         decode_layers_ = 0;

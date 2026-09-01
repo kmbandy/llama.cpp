@@ -1116,6 +1116,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    ggml_backend_sched_split_callback callback_split;
+    void * callback_split_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -2284,6 +2286,12 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             ggml_backend_cuda_xdev_batch_flush();
         }
 
+        if (sched->callback_split) {
+            sched->callback_split(ggml_backend_name(split_backend), &split->graph,
+                                  split_id, sched->n_splits, true,
+                                  sched->callback_split_user_data);
+        }
+
         if (!sched->callback_eval) {
             bool measure_graph_entry = false;
             uint64_t graph_entry_start;
@@ -2335,6 +2343,12 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
                 j0 = j1;
             }
+        }
+
+        if (sched->callback_split) {
+            sched->callback_split(ggml_backend_name(split_backend), &split->graph,
+                                  split_id, sched->n_splits, false,
+                                  sched->callback_split_user_data);
         }
 
         // record the event of this split
@@ -2559,6 +2573,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_split = callback;
+    sched->callback_split_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

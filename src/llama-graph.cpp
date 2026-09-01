@@ -1674,6 +1674,7 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
         moe_or_issued = expert_dispatch->build_wait(ctx0, il);
         ggml_backend_sched_set_tensor_backend(sched, moe_or_issued, backend_cpu);
         cb(moe_or_issued, "ffn_moe_out", il);
+        expert_dispatch->mark_wait_tensor(moe_or_issued, il);
         expert_dispatch->note_wait_expanded(ctx0, il);
     }
     // shexp first so expand visits the GPU FFN split before CPU wait. The
@@ -2351,6 +2352,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
         cb(moe_out, split_shexp ? "ffn_moe_issued" : "ffn_moe_out", il);
+        if (moe_out->op == GGML_OP_MAP_CUSTOM3) {
+            expert_dispatch->mark_issue_tensor(moe_out, il, 0);
+        }
         return moe_out;
     }
 

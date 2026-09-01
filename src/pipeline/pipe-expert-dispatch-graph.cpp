@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <climits>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -56,6 +57,77 @@ bool layer_trace_enabled() {
 
 uint64_t elapsed_ns(dispatch_clock::time_point begin, dispatch_clock::time_point end) {
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+}
+
+bool parse_layer_suffix(const char * name, int32_t & layer) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const char * dash = std::strrchr(name, '-');
+    if (dash == nullptr || dash[1] == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    const long value = std::strtol(dash + 1, &end, 10);
+    if (end == dash + 1 || *end != '\0' || value < 0 || value > INT32_MAX) {
+        return false;
+    }
+    layer = (int32_t) value;
+    return true;
+}
+
+bool parse_issue_marker(const char * name, int32_t & layer) {
+    static constexpr const char * prefix = "wp_spine_dispatch_issue-";
+    constexpr size_t prefix_len = sizeof("wp_spine_dispatch_issue-") - 1;
+    if (name == nullptr || std::strncmp(name, prefix, prefix_len) != 0) {
+        return false;
+    }
+    char * end = nullptr;
+    const long value = std::strtol(name + prefix_len, &end, 10);
+    if (end == name + prefix_len || *end != '-' || value < 0 || value > INT32_MAX) {
+        return false;
+    }
+    layer = (int32_t) value;
+    return true;
+}
+
+bool parse_wait_marker(const char * name, int32_t & layer) {
+    static constexpr const char * prefix = "wp_spine_dispatch_wait-";
+    constexpr size_t prefix_len = sizeof("wp_spine_dispatch_wait-") - 1;
+    if (name == nullptr || std::strncmp(name, prefix, prefix_len) != 0) {
+        return false;
+    }
+    char * end = nullptr;
+    const long value = std::strtol(name + prefix_len, &end, 10);
+    if (end == name + prefix_len || *end != '\0' || value < 0 || value > INT32_MAX) {
+        return false;
+    }
+    layer = (int32_t) value;
+    return true;
+}
+
+FILE * spine_layer_profile_log() {
+    static std::mutex mutex;
+    static FILE * file = nullptr;
+    static bool opened = false;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!opened) {
+        const char * path = std::getenv("WP_SPINE_LAYER_PROFILE_LOG");
+        file = path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : stderr;
+        if (file == nullptr) {
+            file = stderr;
+        }
+        opened = true;
+        if (file != nullptr) {
+            std::fprintf(file, "# WP_SPINE_LAYER_PROFILE ubatch_index\tn_tokens\tlayer\tms_pre\tms_issue\tms_wait\tms_post\tms_total\n");
+            std::fprintf(file, "# split timestamps are host-side submission boundaries; no extra backend synchronization is added\n");
+        }
+    }
+    return file;
+}
+
+double profile_ms(uint64_t ns) {
+    return (double) ns / 1000000.0;
 }
 
 int parse_port(const std::string & text) {
@@ -347,6 +419,178 @@ void graph_dispatcher::spine_profile_wait_end(dispatch_clock::time_point time) n
     spine_profile_.issue_active = false;
 }
 
+void graph_dispatcher::mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index) noexcept {
+    if (tensor != nullptr) {
+        ggml_format_name(tensor, "wp_spine_dispatch_issue-%d-%d", layer, chunk_index);
+    }
+}
+
+void graph_dispatcher::mark_wait_tensor(ggml_tensor * tensor, int32_t layer) noexcept {
+    if (tensor != nullptr) {
+        ggml_format_name(tensor, "wp_spine_dispatch_wait-%d", layer);
+    }
+}
+
+void graph_dispatcher::spine_layer_profile_begin(
+        uint64_t ubatch_index, uint32_t n_tokens, dispatch_clock::time_point begin) noexcept {
+    spine_layer_profile_ = {};
+    spine_layer_profile_.ubatch_index = ubatch_index;
+    spine_layer_profile_.n_tokens = n_tokens;
+    spine_layer_profile_.begin = begin;
+    spine_layer_profile_.active = true;
+}
+
+void graph_dispatcher::spine_layer_profile_split(
+        const char * backend_name,
+        const ggml_cgraph * graph,
+        int split_id,
+        int n_splits,
+        bool before,
+        dispatch_clock::time_point time) noexcept {
+    if (!spine_layer_profile_.active || graph == nullptr) {
+        return;
+    }
+    // This observes the split that the scheduler already built. It never adds
+    // a node, changes a backend assignment, or synchronizes a backend.
+    GGML_UNUSED(n_splits);
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        int32_t layer = -1;
+        const bool issue_marker = parse_issue_marker(node->name, layer);
+        const bool wait_marker = parse_wait_marker(node->name, layer);
+        if (before && (issue_marker || (!wait_marker && parse_layer_suffix(node->name, layer)))) {
+            spine_layer_profile_record & record = spine_layer_profile_.layers[layer];
+            if (record.last_split_id != split_id) {
+                record.last_split_id = split_id;
+                record.split_backends.emplace_back(backend_name != nullptr ? backend_name : "unknown");
+            }
+        }
+
+        if (!before && std::strncmp(node->name, "l_last-", sizeof("l_last-") - 1) == 0 &&
+            parse_layer_suffix(node->name, layer)) {
+            spine_layer_profile_.layer_boundaries[layer] = time;
+            spine_layer_profile_record & record = spine_layer_profile_.layers[layer];
+            record.end = time;
+            record.have_end = true;
+        }
+    }
+}
+
+void graph_dispatcher::spine_layer_profile_issue(int32_t layer, uint64_t ns_issue) noexcept {
+    if (spine_layer_profile_.active) {
+        spine_layer_profile_.layers[layer].ns_issue += ns_issue;
+    }
+}
+
+void graph_dispatcher::spine_layer_profile_wait(int32_t layer, uint64_t ns_wait) noexcept {
+    if (spine_layer_profile_.active) {
+        spine_layer_profile_.layers[layer].ns_wait += ns_wait;
+    }
+}
+
+void graph_dispatcher::spine_layer_profile_post_begin(int32_t layer, dispatch_clock::time_point time) noexcept {
+    if (!spine_layer_profile_.active) {
+        return;
+    }
+    spine_layer_profile_record & record = spine_layer_profile_.layers[layer];
+    record.post_begin = time;
+    record.have_post = true;
+}
+
+void graph_dispatcher::write_spine_layer_profile() noexcept {
+    FILE * file = spine_layer_profile_log();
+    if (file == nullptr) {
+        return;
+    }
+
+    uint64_t sum_pre = 0;
+    uint64_t sum_issue = 0;
+    uint64_t sum_wait = 0;
+    uint64_t sum_post = 0;
+    for (const auto & entry : spine_layer_profile_.layers) {
+        const int32_t layer = entry.first;
+        const spine_layer_profile_record & record = entry.second;
+        const uint64_t total = record.ns_pre + record.ns_issue + record.ns_wait + record.ns_post;
+        std::fprintf(file, "%llu\t%u\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+                     (unsigned long long) spine_layer_profile_.ubatch_index,
+                     spine_layer_profile_.n_tokens,
+                     layer,
+                     profile_ms(record.ns_pre), profile_ms(record.ns_issue),
+                     profile_ms(record.ns_wait), profile_ms(record.ns_post),
+                     profile_ms(total));
+        std::fprintf(file, "SPLITS\t%llu\t%u\t%d\t%zu\t",
+                     (unsigned long long) spine_layer_profile_.ubatch_index,
+                     spine_layer_profile_.n_tokens, layer, record.split_backends.size());
+        for (size_t i = 0; i < record.split_backends.size(); ++i) {
+            if (i != 0) {
+                std::fputc(',', file);
+            }
+            std::fputs(record.split_backends[i].c_str(), file);
+        }
+        std::fputc('\n', file);
+        sum_pre += record.ns_pre;
+        sum_issue += record.ns_issue;
+        sum_wait += record.ns_wait;
+        sum_post += record.ns_post;
+    }
+    std::fprintf(file, "%llu\t%u\tSUMMARY\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+                 (unsigned long long) spine_layer_profile_.ubatch_index,
+                 spine_layer_profile_.n_tokens,
+                 profile_ms(sum_pre), profile_ms(sum_issue), profile_ms(sum_wait),
+                 profile_ms(sum_post), profile_ms(sum_pre + sum_issue + sum_wait + sum_post));
+    std::fflush(file);
+}
+
+void graph_dispatcher::spine_layer_profile_end(dispatch_clock::time_point end) noexcept {
+    if (!spine_layer_profile_.active) {
+        return;
+    }
+    for (auto & entry : spine_layer_profile_.layers) {
+        const int32_t layer = entry.first;
+        spine_layer_profile_record & record = entry.second;
+        const auto previous = spine_layer_profile_.layer_boundaries.find(layer - 1);
+        if (previous != spine_layer_profile_.layer_boundaries.end()) {
+            record.start = previous->second;
+            record.have_start = true;
+        } else if (!record.have_start) {
+            record.start = spine_layer_profile_.begin;
+            record.have_start = true;
+        }
+        if (!record.have_end) {
+            record.end = end;
+            record.have_end = true;
+        }
+        if (record.have_issue && record.issue_begin > record.start) {
+            record.ns_pre = elapsed_ns(record.start, record.issue_begin);
+        }
+        if (record.have_post && record.end > record.post_begin) {
+            record.ns_post = elapsed_ns(record.post_begin, record.end);
+        }
+    }
+    write_spine_layer_profile();
+    spine_layer_profile_.active = false;
+}
+
+void graph_dispatcher::spine_layer_profile_issue_begin(int32_t layer, dispatch_clock::time_point time) noexcept {
+    if (!spine_layer_profile_.active) {
+        return;
+    }
+    spine_layer_profile_record & record = spine_layer_profile_.layers[layer];
+    if (!record.have_start) {
+        const auto previous = spine_layer_profile_.layer_boundaries.find(layer - 1);
+        record.start = previous != spine_layer_profile_.layer_boundaries.end()
+            ? previous->second : time;
+        record.have_start = true;
+    }
+    record.issue_begin = time;
+    record.have_issue = true;
+}
+
 void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
     if (layer_trace_ == nullptr) {
         return;
@@ -488,6 +732,7 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
     context->full_weights        = full_weights;
     ggml_tensor * issued =
         ggml_map_custom3(ctx, activations, selected_experts, weights, compute_issue, 1, context.get());
+    mark_issue_tensor(issued, layer, chunk_index);
     context->issued = issued;
     return issued;
 }
@@ -528,6 +773,7 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     ggml_tensor * wait = nullptr;
     if (it->second->chunk_count == 1) {
         wait = ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
+        mark_wait_tensor(wait, layer);
     } else {
         const auto next = op_contexts.find(layer * 2 + 1);
         if (next == op_contexts.end() || next->second == nullptr || next->second->issued == nullptr) {
@@ -537,6 +783,8 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
                                                 compute_wait, 1, it->second.get());
         ggml_tensor * wait_b = ggml_map_custom2(ctx, next->second->issued, wait_a,
                                                 compute_wait, 1, next->second.get());
+        mark_wait_tensor(wait_a, layer);
+        mark_wait_tensor(wait_b, layer);
         wait = ggml_concat(ctx, wait_a, wait_b, 1);
     }
     wait_tensors_[layer] = wait;
@@ -1789,6 +2037,9 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                                  (context->chunk_count == 1 || context->chunk_index == 0);
         const bool trace_profile = owner->spine_profile_.active &&
                                    (context->chunk_count == 1 || context->chunk_index == 0);
+        const bool layer_profile = owner->spine_layer_profile_.active;
+        const bool layer_profile_span = layer_profile &&
+                                        (context->chunk_count == 1 || context->chunk_index == 0);
         // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
         std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
         if (owner->failed()) {
@@ -1803,8 +2054,14 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             }
             return;
         }
-        if (trace_profile) {
-            owner->spine_profile_issue_begin(dispatch_clock::now());
+        if (trace_profile || layer_profile_span) {
+            const auto issue_begin = dispatch_clock::now();
+            if (trace_profile) {
+                owner->spine_profile_issue_begin(issue_begin);
+            }
+            if (layer_profile_span) {
+                owner->spine_layer_profile_issue_begin(context->layer, issue_begin);
+            }
         }
         const bool collect_stats = owner->decode_active_;
 
@@ -1936,12 +2193,17 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
         if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
             *static_cast<float *>(dst->data) = 0.0f;
         }
-        if (collect_stats) {
+        if (collect_stats || layer_profile) {
             const dispatch_stats layer_stats = owner->remote.stats_for(context->handle);
-            owner->decode_n_tokens_ = context->full_activations != nullptr
-                ? (uint32_t) context->full_activations->ne[1] : (uint32_t) n_tokens;
-            owner->decode_ns_pack_ += elapsed_ns(pack_start, pack_end);
-            owner->decode_ns_issue_ += layer_stats.ns_issue;
+            if (collect_stats) {
+                owner->decode_n_tokens_ = context->full_activations != nullptr
+                    ? (uint32_t) context->full_activations->ne[1] : (uint32_t) n_tokens;
+                owner->decode_ns_pack_ += elapsed_ns(pack_start, pack_end);
+                owner->decode_ns_issue_ += layer_stats.ns_issue;
+            }
+            if (layer_profile) {
+                owner->spine_layer_profile_issue(context->layer, layer_stats.ns_issue);
+            }
         }
         if (trace_layer || trace_profile) {
             const auto issue_return = dispatch_clock::now();
@@ -1998,6 +2260,7 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
                                  (context->chunk_count == 1 || context->chunk_index == 0);
         const bool trace_profile = owner->spine_profile_.active &&
                                    (context->chunk_count == 1 || context->chunk_index == 0);
+        const bool layer_profile = owner->spine_layer_profile_.active;
         if (trace_layer || trace_profile) {
             const auto wait_entry = dispatch_clock::now();
             if (trace_layer) {
@@ -2025,8 +2288,8 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             return;
         }
         const bool collect_stats = owner->decode_active_;
-        // finish_dispatch() includes the worker wait. Time unpack after it so
-        // unpack is the host memcpy into dst, not a second copy of ns_wait.
+        // finish_dispatch() reports the worker wait. Layer post timing starts
+        // before the result unpack so that memcpy is outside dispatch wait.
         dispatch_stats layer_stats;
         std::vector<float> result = owner->remote.finish_dispatch(context->handle, &layer_stats);
         if (wait_trace && context->layer < 4) {
@@ -2039,6 +2302,9 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         }
         owner->zero_phantom_rows(result, dst->ne[1], owner->remote.n_embd(), context->token_offset);
         context->stats = layer_stats;
+        if (layer_profile) {
+            owner->spine_layer_profile_wait(context->layer, layer_stats.ns_wait);
+        }
         dispatch_stats layer_stats_total = layer_stats;
         if (context->chunk_count > 1 && context->chunk_index == 1) {
             const auto first = owner->op_contexts.find(context->layer * 2);
@@ -2071,6 +2337,9 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
                     }
                 }
             }
+        }
+        if (layer_profile && context->chunk_index == context->chunk_count - 1) {
+            owner->spine_layer_profile_post_begin(context->layer, dispatch_clock::now());
         }
         const dispatch_clock::time_point unpack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
