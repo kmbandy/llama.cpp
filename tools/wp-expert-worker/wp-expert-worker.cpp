@@ -116,6 +116,16 @@ static bool wp_worker_stream_partials_enabled() {
     return enabled;
 }
 
+static bool wp_worker_dispatch_stream_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_STREAM");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    return end != value && *end == '\0' && parsed >= 2;
+}
+
 static bool wp_vulkan_fused_expert_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_VK_FUSED_EXPERT");
@@ -15305,6 +15315,7 @@ const char * frame_type_name(int t) {
         case PIPE_EXPERT_DISPATCH_ACTS:         return "ACTS";
         case PIPE_EXPERT_DISPATCH_ACTS_PUBLISH: return "ACTS_PUBLISH";
         case PIPE_EXPERT_DISPATCH_ACTS_REF:     return "ACTS_REF";
+        case PIPE_EXPERT_DISPATCH_CHUNK:        return "DISPATCH_CHUNK";
         default:                                return "other";
     }
 }
@@ -15609,7 +15620,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     //   ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit
     //   ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end
     //   ns_params_set n_host_hit n_host_demote ns_host_get ns_demote ns_ensure_post
-    //   ns_final_sync
+    //   ns_final_sync [chunk_index for WP_DISPATCH_STREAM rows]
     // epoch_end (added 2026-08-06) is the request's wall-clock END in epoch
     // seconds; start = epoch_end - ns_wall/1e9.
     // ns_params_set (added 2026-08-07): the coalesced D1 blob upload; 0 when
@@ -15617,7 +15628,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // is positional-from-the-left, so trailing additions never move existing
     // columns, but anything indexing epoch_end as [-1] must switch to [21].
     // ns_final_sync is the deferred backend sync when WP_SUBMIT_ASYNC=1.
-    // It is appended as the final column and is zero on the default path.
+    // chunk_index is appended only for WP_DISPATCH_STREAM rows; legacy rows
+    // retain the original column count and formatting.
     // Segment into tokens by watching request.layer wrap back to its minimum.
     //
     // n_tokens (added 2026-08-03) IS THE PREFILL/DECODE LABEL, and it is the whole
@@ -15637,7 +15649,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     }();
     auto write_req_log = [req_log](int32_t layer, uint32_t n_tokens, size_t n_assignments,
                                    const RequestStats & s,
-                                   std::chrono::steady_clock::time_point started) {
+                                   std::chrono::steady_clock::time_point started,
+                                   uint32_t chunk_index) {
         if (req_log == nullptr || started == std::chrono::steady_clock::time_point{}) {
             return;
         }
@@ -15645,10 +15658,14 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             std::chrono::steady_clock::now() - started).count();
         const double epoch_end = (double) std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
+        char chunk_suffix[32] = {};
+        if (chunk_index != UINT32_MAX) {
+            std::snprintf(chunk_suffix, sizeof(chunk_suffix), " %u", chunk_index);
+        }
         fprintf(req_log,
                 "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
                 "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu "
-                "%llu %llu %llu %llu %llu %llu\n",
+                "%llu %llu %llu %llu %llu %llu%s\n",
                 layer, n_tokens, n_assignments,
                 (unsigned long long) s.n_resident, (unsigned long long) s.n_pagein,
                 (unsigned long long) s.bytes_read, (unsigned long long) ns_wall,
@@ -15666,13 +15683,22 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 (unsigned long long) s.ns_host_get,
                 (unsigned long long) s.ns_demote,
                 (unsigned long long) s.ns_ensure_post,
-                (unsigned long long) s.ns_final_sync);
+                (unsigned long long) s.ns_final_sync, chunk_suffix);
         fflush(req_log);
     };
     pipe_expert_dispatch_begin split_log_begin;
     RequestStats split_log_stats;
     std::chrono::steady_clock::time_point split_log_started;
     bool null_split_active = false;   // §8.25 WP_WORKER_NULL split-path flag
+    struct StreamDispatchState {
+        bool     active = false;
+        uint64_t seq_id = 0;
+        int32_t  layer = -1;
+        uint32_t chunk_count = 0;
+        uint32_t total_tokens = 0;
+        uint32_t next_index = 0;
+        uint32_t next_start = 0;
+    } stream_dispatch;
 
     // WP_REF_LOG=path -- the full REFERENCE stream: "<layer> <expert> <expert> ..."
     // one line per request, every expert asked for whether it was resident or paged in.
@@ -15806,7 +15832,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // unconditionally (cheap: empty deque, no allocation) so the teardown
     // path below is the same code whether or not the knob is on; only
     // starting the threads is gated.
-    const bool pipeline_on = wp_worker_pipeline_enabled();
+    const bool pipeline_on = wp_worker_pipeline_enabled() ||
+                             wp_worker_dispatch_stream_enabled();
     WpPipelineQueue<WpPipelineFrame>    pipeline_frames(WP_WORKER_PIPELINE_QUEUE_DEPTH);
     WpPipelineQueue<WpPipelineResponse> pipeline_responses(WP_WORKER_PIPELINE_QUEUE_DEPTH);
     pipeline_frames.set_byte_cap(WP_WORKER_PIPELINE_MAX_QUEUED_BYTES);
@@ -16008,7 +16035,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         if (g_worker_gpu_mutex != nullptr) {
             gpu_lock = std::unique_lock<std::mutex>(*g_worker_gpu_mutex);
         }
-        const bool stream_partials = wp_worker_stream_partials_enabled() && type != PIPE_EXPERT_SHM_DISPATCH_REQ;
+        if (stream_dispatch.active &&
+            (type != PIPE_EXPERT_DISPATCH_CHUNK || seq_id != stream_dispatch.seq_id)) {
+            send_response_error(seq_id, PIPE_ERR_BAD_FRAME,
+                                "frame is not legal between streamed dispatch chunks");
+            return 1;
+        }
+        const bool stream_partials = wp_worker_stream_partials_enabled() &&
+                                     type != PIPE_EXPERT_DISPATCH_CHUNK &&
+                                     type != PIPE_EXPERT_SHM_DISPATCH_REQ;
         size_t stream_sent_count = 0;
         std::chrono::steady_clock::time_point stream_first_sent;
         std::chrono::steady_clock::time_point stream_last_ready;
@@ -16266,7 +16301,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
-                              split_log_begin.assignments.size(), split_log_stats, split_log_started);
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX);
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
@@ -16374,7 +16409,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
-                              split_log_begin.assignments.size(), split_log_stats, split_log_started);
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX);
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
@@ -16480,7 +16515,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
-                              split_log_begin.assignments.size(), split_log_stats, split_log_started);
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX);
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
@@ -16493,6 +16528,143 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             continue;
         }
 #endif // __linux__
+        if (type == PIPE_EXPERT_DISPATCH_CHUNK) {
+            try {
+                const auto t_chunk_decode_start = time_recv
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                const pipe_expert_dispatch_chunk chunk =
+                    pipe_decode_expert_dispatch_chunk(payload.data(), payload.size(), mine.n_embd);
+                const uint64_t ns_req_decode_frame = time_recv
+                    ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t_chunk_decode_start).count()
+                    : 0;
+                if (!stream_dispatch.active) {
+                    if (chunk.chunk_index != 0 || chunk.token_start != 0) {
+                        throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                                  "streamed dispatch must start at chunk 0");
+                    }
+                    stream_dispatch.active = true;
+                    stream_dispatch.seq_id = seq_id;
+                    stream_dispatch.layer = chunk.request.layer;
+                    stream_dispatch.chunk_count = chunk.chunk_count;
+                    stream_dispatch.total_tokens = chunk.total_tokens;
+                    stream_dispatch.next_index = 0;
+                    stream_dispatch.next_start = 0;
+                }
+                const uint32_t base = stream_dispatch.total_tokens /
+                    stream_dispatch.chunk_count;
+                const uint32_t want_start = stream_dispatch.next_index * base;
+                const uint32_t want_end = stream_dispatch.next_index + 1 ==
+                    stream_dispatch.chunk_count
+                    ? stream_dispatch.total_tokens : want_start + base;
+                if (seq_id != stream_dispatch.seq_id ||
+                    chunk.request.layer != stream_dispatch.layer ||
+                    chunk.chunk_count != stream_dispatch.chunk_count ||
+                    chunk.total_tokens != stream_dispatch.total_tokens ||
+                    chunk.chunk_index != stream_dispatch.next_index ||
+                    chunk.token_start != stream_dispatch.next_start ||
+                    chunk.token_start != want_start || chunk.token_end != want_end) {
+                    throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                              "streamed dispatch chunks are out of order");
+                }
+
+                RequestStats request_stats;
+                if (seg_trace) {
+                    request_stats.ns_lock_wait =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_locked - t_frame).count();
+                    request_stats.ns_req_decode =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t_chunk_decode_start).count();
+                }
+                if (ref_log != nullptr) {
+                    fprintf(ref_log, "%d", chunk.request.layer);
+                    for (const pipe_expert_assignment & a : chunk.request.assignments) {
+                        fprintf(ref_log, " %d", a.expert_id);
+                    }
+                    fprintf(ref_log, " nt=%u\n", chunk.request.n_tokens);
+                    fflush(ref_log);
+                }
+                worker.log_reference(chunk.request.layer, chunk.request.assignments);
+                const auto req_started = req_log != nullptr ? std::chrono::steady_clock::now()
+                                                             : std::chrono::steady_clock::time_point{};
+                const auto t_pre_dispatch = seg_trace ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+                if (seg_trace) {
+                    request_stats.ns_pre_dispatch =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_pre_dispatch - t_chunk_decode_start).count();
+                }
+                const pipe_expert_partial partial = worker.dispatch(
+                    chunk.request, request_stats, std::nullopt, conn_index, seq_id, {});
+                if (wp_worker_hash_trace_enabled()) {
+                    const char * device = worker.device_count() == 1
+                        ? worker.device_name(0).c_str() : "fold";
+                    wp_worker_hash_emit(seq_id, partial.layer, device, partial.partial);
+                }
+                pipe_expert_partial_chunk response;
+                response.chunk_index = chunk.chunk_index;
+                response.chunk_count = chunk.chunk_count;
+                response.total_tokens = chunk.total_tokens;
+                response.token_start = chunk.token_start;
+                response.token_end = chunk.token_end;
+                response.partial = partial;
+                const std::vector<uint8_t> encoded = pipe_encode_expert_partial_chunk(response);
+                const auto send_started = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                if (gpu_lock.owns_lock()) {
+                    gpu_lock.unlock();
+                }
+                const bool sent = send_response_frame(PIPE_EXPERT_PARTIAL_CHUNK, seq_id,
+                                                      encoded.data(), encoded.size());
+                if (g_worker_gpu_mutex != nullptr) {
+                    gpu_lock.lock();
+                }
+                if (!sent) {
+                    return 1;
+                }
+                const auto t_sent = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                if (conn_index >= 0) {
+                    g_worker_conn_request_counts[(size_t) conn_index].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (worker.stats_enabled()) {
+                    request_stats.ns_recv_body = ns_recv_body_frame;
+                    request_stats.ns_req_decode = ns_req_decode_frame;
+                    request_stats.ns_send = (uint64_t) std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(t_sent - send_started).count();
+                    request_stats.ns_resp_send = request_stats.ns_send;
+                    request_stats.n_frames_queued_max = pipeline_on
+                        ? pipeline_frames.high_water() : 0;
+                    worker.record_stats(request_stats, chunk.request.assignments.size());
+                }
+                if (worker.stats_enabled() && req_log != nullptr) {
+                    write_req_log(chunk.request.layer, chunk.request.n_tokens,
+                                  chunk.request.assignments.size(), request_stats,
+                                  req_started, chunk.chunk_index);
+                }
+                worker.spec_pagein_after_dispatch();
+                ++stream_dispatch.next_index;
+                stream_dispatch.next_start = chunk.token_end;
+                if (stream_dispatch.next_index == stream_dispatch.chunk_count) {
+                    stream_dispatch = {};
+                }
+            } catch (const pipe_protocol_error & error) {
+                std::fprintf(stderr, "wp expert worker: protocol error (code %d): %s\n",
+                             (int) error.code, error.what());
+                send_response_error(seq_id, error.code, error.what());
+                return 1;
+            } catch (const std::exception & error) {
+                std::fprintf(stderr, "wp expert worker: compute error: %s\n", error.what());
+                send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                return 1;
+            }
+            continue;
+        }
         if (worker.has_split_dispatch(conn_index)) {
             send_response_error(seq_id, PIPE_ERR_BAD_FRAME,
                                 "frame is not legal between dispatch BEGIN and ACTS");
@@ -16646,7 +16818,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             // unflushed stdio buffer produced 0-byte files the first time.
             if (measure && req_log != nullptr) {
                 write_req_log(request.layer, request.n_tokens, request.assignments.size(),
-                              request_stats, req_started);
+                              request_stats, req_started, UINT32_MAX);
             }
             worker.spec_pagein_after_dispatch();
         } catch (const pipe_protocol_error & error) {
