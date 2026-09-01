@@ -3803,6 +3803,12 @@ public:
     }
 
     size_t pin_pages(const std::vector<const ExpertPage *> & pages);
+    // WP_EXPERT_PIN_MODE=seed counterpart to pin_pages: lands the same pages
+    // but seeds LFU heat instead of setting slot.pinned. See pin_seed_enabled_.
+    size_t seed_pages(const std::vector<std::pair<const ExpertPage *, uint64_t>> & pages_with_counts);
+    // Whether WP_EXPERT_PIN_MODE=seed was requested -- callers loading the pin
+    // file use this to route into seed_pages() instead of pin_pages().
+    bool pin_seed_enabled() const { return pin_seed_enabled_; }
 
     struct Loaded {
         ggml_backend_buffer_t buffer = nullptr;
@@ -7173,6 +7179,18 @@ private:
     // whose runtime value cannot be seen in the log is not a gate; see
     // soft_pin_enabled_'s startup print in the constructor.
     uint64_t                    n_soft_pin_evictions_ = 0;
+    // WP_EXPERT_PIN_MODE=seed: preload the hot-expert set like pin mode does,
+    // but leave slot.pinned false and instead seed slot.uses (and, when history
+    // mode is on, lfu_history_) so the frequency-ranked evictor protects the
+    // preload on merit rather than by fiat. Permanent pinning manufactures a
+    // starvation failure -- deep prefill can find zero evictable slots in a
+    // size class -- so this is the replacement. Unset or "pin" is the exact
+    // pre-existing pin-forever behavior; read once at startup, same pattern as
+    // soft_pin_enabled_ above, so the unset path is byte-identical to before.
+    const bool                 pin_seed_enabled_ = [] {
+        const char * e = std::getenv("WP_EXPERT_PIN_MODE");
+        return e != nullptr && std::strcmp(e, "seed") == 0;
+    }();
     // Victim ordering: is `a` a strictly BETTER victim than `b`? With LFU off
     // this is pure LRU, byte for byte what shipped before, so a control arm
     // needs no separate build.
@@ -7257,6 +7275,51 @@ size_t ExpertSlotPool::pin_pages(const std::vector<const ExpertPage *> & pages) 
         }
     }
     return n_pinned;
+}
+
+// WP_EXPERT_PIN_MODE=seed: same land-the-page dance as pin_pages, but the
+// slot is left evictable. Its uses (and, under WP_EXPERT_LFU_HISTORY, its
+// history count) are bumped to at least the requested count, so rank_less
+// -- the ordinary frequency-ranked victim comparison, unmodified -- protects
+// it on merit instead of by a pinned flag that select_victim cannot override.
+// No separate decay/cap is introduced here: history mode ages seeded counts
+// via the existing halflife folding in note_demand_reference, and plain LFU
+// mode ages them via evict_age_, the admission floor that rises with every
+// eviction. Both are pre-existing mechanisms; seeding just sets the starting
+// value they operate on.
+size_t ExpertSlotPool::seed_pages(const std::vector<std::pair<const ExpertPage *, uint64_t>> & pages_with_counts) {
+    size_t n_seeded = 0;
+    for (const auto & entry : pages_with_counts) {
+        const ExpertPage * page = entry.first;
+        const uint64_t     count = entry.second;
+        if (page == nullptr || page->is_resident) {
+            continue;
+        }
+        size_t slot_index = find_slot(*page);
+        if (slot_index == slots_.size()) {
+            std::vector<const ExpertPage *> one{page};
+            Batch batch = ensure_batch(one, false, {}, 0, -1, nullptr, false);
+            batch.complete();
+            slot_index = find_slot(*page);
+        }
+        if (slot_index == slots_.size()) {
+            throw std::runtime_error("seeded expert did not land in a slot");
+        }
+        Slot & slot = slots_[slot_index];
+        // A missing "# count" hint (already defaulted to 1 by the caller)
+        // beats a never-used page without squatting forever on merit alone.
+        slot.uses = std::max(slot.uses, count);
+        slot.tick = ++tick_;
+        if (lfu_history_enabled_ && page->cache_id >= 0) {
+            const size_t index = (size_t) page->cache_id;
+            if (index >= lfu_history_.size()) {
+                lfu_history_.resize(index + 1, 0);
+            }
+            lfu_history_[index] = std::max(lfu_history_[index], count);
+        }
+        ++n_seeded;
+    }
+    return n_seeded;
 }
 
 ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
@@ -7457,7 +7520,10 @@ public:
                 throw std::runtime_error(
                     "failed to open WP_EXPERT_PIN_FILE: " + std::string(pin_path));
             }
+            const bool seed_mode = pool_.pin_seed_enabled();
             std::vector<const ExpertPage *> pin_pages;
+            // Only populated in seed mode; parallel to pin_pages by index.
+            std::vector<uint64_t> pin_counts;
             std::set<std::pair<int, int>> seen_pins;
             std::string line;
             size_t line_number = 0;
@@ -7496,16 +7562,46 @@ public:
                     continue;
                 }
                 pin_pages.push_back(&it->second);
+                if (seed_mode) {
+                    // dump_access_counts() writes pin lines as "layer expert  #
+                    // count"; a missing/unparsable count seeds the default 1 --
+                    // enough to beat a never-used page, not enough to squat.
+                    uint64_t count = 1;
+                    const size_t hash_pos = line.find('#');
+                    if (hash_pos != std::string::npos) {
+                        std::istringstream count_input(line.substr(hash_pos + 1));
+                        uint64_t parsed_count = 0;
+                        if (count_input >> parsed_count) {
+                            count = parsed_count;
+                        }
+                    }
+                    pin_counts.push_back(count);
+                }
                 if (class_id < pin_class_pinned.size()) {
                     ++pin_class_pinned[class_id];
                 }
             }
-            const size_t loaded = pool_.pin_pages(pin_pages);
-            std::cerr << "WARN wp expert worker: pin_file=" << pin_path
-                      << " n_pinned=" << loaded
-                      << " pin_budget=" << pin_budget
-                      << " pin_class_pct=" << pin_class_pct
-                      << " demand_hits=0" << std::endl;
+            size_t loaded = 0;
+            if (seed_mode) {
+                std::vector<std::pair<const ExpertPage *, uint64_t>> pages_with_counts;
+                pages_with_counts.reserve(pin_pages.size());
+                for (size_t i = 0; i < pin_pages.size(); ++i) {
+                    pages_with_counts.emplace_back(pin_pages[i], pin_counts[i]);
+                }
+                loaded = pool_.seed_pages(pages_with_counts);
+                std::cerr << "WARN wp expert worker: WP_EXPERT_PIN_MODE=seed pin_file="
+                          << pin_path << " n_seeded=" << loaded
+                          << " pin_budget=" << pin_budget
+                          << " pin_class_pct=" << pin_class_pct
+                          << " demand_hits=0" << std::endl;
+            } else {
+                loaded = pool_.pin_pages(pin_pages);
+                std::cerr << "WARN wp expert worker: pin_file=" << pin_path
+                          << " n_pinned=" << loaded
+                          << " pin_budget=" << pin_budget
+                          << " pin_class_pct=" << pin_class_pct
+                          << " demand_hits=0" << std::endl;
+            }
             for (size_t i = 0; i < pin_class_caps.size(); ++i) {
                 const SlotClass & slot_class = pool_.resources().slot_classes[i];
                 std::cerr << "WARN wp expert worker: pin_class bytes=" << slot_class.size
@@ -9026,6 +9122,28 @@ public:
             }
         }
         return pool_.pin_pages(pages);
+    }
+
+    // WP_EXPERT_PIN_MODE=seed counterpart to pin_pages above: keys carry their
+    // pin-file hotness count alongside the (layer, expert) key.
+    size_t seed_pages(const std::vector<std::pair<std::pair<int, int>, uint64_t>> & keys_with_counts,
+                       size_t budget) {
+        std::vector<std::pair<const ExpertPage *, uint64_t>> pages;
+        pages.reserve(std::min(keys_with_counts.size(), budget));
+        for (const auto & entry : keys_with_counts) {
+            const auto it = catalog_.pages.find(entry.first);
+            if (it != catalog_.pages.end()) {
+                pages.emplace_back(&it->second, entry.second);
+            }
+            if (pages.size() == budget) {
+                break;
+            }
+        }
+        return pool_.seed_pages(pages);
+    }
+
+    bool pin_seed_enabled() const {
+        return pool_.pin_seed_enabled();
     }
 
     bool stats_enabled() const {
@@ -14591,7 +14709,13 @@ private:
             throw std::runtime_error(
                 "failed to open WP_EXPERT_PIN_FILE: " + std::string(pin_path));
         }
+        // WP_EXPERT_PIN_MODE=seed: read from any device's ExpertSlotPool -- the
+        // env is read once at process startup and every pool_ agrees, so any
+        // one of them is the canonical answer.
+        const bool seed_mode = !devices_.empty() && devices_[0]->pin_seed_enabled();
         std::vector<std::vector<std::pair<int, int>>> pages(devices_.size());
+        // Parallel to `pages` by device and index; only populated in seed mode.
+        std::vector<std::vector<uint64_t>> pages_counts(devices_.size());
         std::set<std::pair<int, int>> seen;
         std::string line;
         size_t line_number = 0;
@@ -14627,22 +14751,29 @@ private:
                           << layer << " " << expert << std::endl;
                 continue;
             }
-            // WP_EXPERT_LFU_INIT_OWNER warm start: dump_access_counts() writes
-            // pin lines as "layer expert  # count"; pick the count back up
-            // here (input already consumed "layer expert" above) into the
-            // LOCAL pin_counts vector (never page_access_counts_ -- see
-            // seed_lfu_initial_owner_map()) so the startup LFU ranking is a
-            // pure function of this file. A missing/unparsable count just
-            // leaves the page at its default 0, i.e. no warm-start data for it.
-            if (!pin_counts.empty()) {
+            // dump_access_counts() writes pin lines as "layer expert  #
+            // count"; pick the count back up here (input already consumed
+            // "layer expert" above). Feeds two independent consumers:
+            // WP_EXPERT_LFU_INIT_OWNER's pin_counts (never page_access_counts_
+            // -- see seed_lfu_initial_owner_map()) so the startup LFU ranking
+            // is a pure function of this file, and WP_EXPERT_PIN_MODE=seed's
+            // per-page seed count below. A missing/unparsable count leaves
+            // pin_counts at its default 0 (no warm-start data) and seed_count
+            // at its default 1 (enough to beat a never-used page, not enough
+            // to squat forever).
+            uint64_t seed_count = 1;
+            if (!pin_counts.empty() || seed_mode) {
                 const size_t hash_pos = line.find('#');
                 if (hash_pos != std::string::npos) {
                     std::istringstream count_input(line.substr(hash_pos + 1));
                     uint64_t count = 0;
                     if (count_input >> count) {
-                        const size_t cid = (size_t) catalog_.pages.at(key).cache_id;
-                        if (cid < pin_counts.size()) {
-                            pin_counts[cid] = count;
+                        seed_count = count;
+                        if (!pin_counts.empty()) {
+                            const size_t cid = (size_t) catalog_.pages.at(key).cache_id;
+                            if (cid < pin_counts.size()) {
+                                pin_counts[cid] = count;
+                            }
                         }
                     }
                 }
@@ -14661,21 +14792,41 @@ private:
                 continue;
             }
             pages[device_id].push_back(key);
+            if (seed_mode) {
+                pages_counts[device_id].push_back(seed_count);
+            }
             if (class_id < pin_class_pinned[device_id].size()) {
                 ++pin_class_pinned[device_id][class_id];
             }
             ++selected;
         }
         size_t loaded = 0;
-        for (size_t i = 0; i < pages.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
-            loaded += devices_[i]->pin_pages(pages[i], pages[i].size());
+        if (seed_mode) {
+            for (size_t i = 0; i < pages.size(); ++i) {
+                std::vector<std::pair<std::pair<int, int>, uint64_t>> keys_with_counts;
+                keys_with_counts.reserve(pages[i].size());
+                for (size_t j = 0; j < pages[i].size(); ++j) {
+                    keys_with_counts.emplace_back(pages[i][j], pages_counts[i][j]);
+                }
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                loaded += devices_[i]->seed_pages(keys_with_counts, keys_with_counts.size());
+            }
+            std::cerr << "WARN wp expert worker: WP_EXPERT_PIN_MODE=seed pin_file=" << pin_path
+                      << " n_seeded=" << loaded
+                      << " pin_budget=" << pin_budget
+                      << " pin_class_pct=" << pin_class_pct
+                      << " demand_hits=0" << std::endl;
+        } else {
+            for (size_t i = 0; i < pages.size(); ++i) {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                loaded += devices_[i]->pin_pages(pages[i], pages[i].size());
+            }
+            std::cerr << "WARN wp expert worker: pin_file=" << pin_path
+                      << " n_pinned=" << loaded
+                      << " pin_budget=" << pin_budget
+                      << " pin_class_pct=" << pin_class_pct
+                      << " demand_hits=0" << std::endl;
         }
-        std::cerr << "WARN wp expert worker: pin_file=" << pin_path
-                  << " n_pinned=" << loaded
-                  << " pin_budget=" << pin_budget
-                  << " pin_class_pct=" << pin_class_pct
-                  << " demand_hits=0" << std::endl;
         for (size_t i = 0; i < devices_.size(); ++i) {
             const ResourcePlan & resources = devices_[i]->resources();
             for (size_t j = 0; j < resources.slot_classes.size(); ++j) {
