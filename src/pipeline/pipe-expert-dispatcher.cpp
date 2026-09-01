@@ -456,6 +456,27 @@ uint32_t dispatch_stream_chunks_enabled() {
     return (uint32_t) std::min(parsed, 64L);
 }
 
+// WP_DISPATCH_STREAM_MIN_TOKENS: narrowest request that gets chunked. Default
+// 64. Measured 2026-09-01 (gates54 arm C): without this floor the spec-verify
+// batches during decode (a handful of tokens, n_tokens > 1) were chunked into
+// single-token requests and decode fell 13.1 -> 10.1 t/s. Same width-vs-decode
+// conflation as WP_DEFER_MAX_WIDTH below.
+uint32_t dispatch_stream_min_tokens() {
+    static const uint32_t cached = [] {
+        const char * value = std::getenv("WP_DISPATCH_STREAM_MIN_TOKENS");
+        if (value == nullptr || value[0] == '\0') {
+            return (uint32_t) 64;
+        }
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 2) {
+            return (uint32_t) 64;
+        }
+        return (uint32_t) parsed;
+    }();
+    return cached;
+}
+
 // WP_DEFER_MAX_WIDTH = upper bound on n_tokens for a dispatch to be eligible
 // for WP_DEFER_K deferral. Default 32.
 //
@@ -2346,7 +2367,7 @@ struct dispatcher::impl {
                 requests.push_back(std::move(request));
                 continue;
             }
-            if (dispatch_stream_chunks_ > 1 && wire_request.n_tokens > 1 &&
+            if (dispatch_stream_chunks_ > 1 && wire_request.n_tokens >= dispatch_stream_min_tokens() &&
                 workers[request.worker_index].shm == nullptr) {
                 const uint32_t total_tokens = wire_request.n_tokens;
                 const uint32_t chunk_count = std::min(dispatch_stream_chunks_, total_tokens);
