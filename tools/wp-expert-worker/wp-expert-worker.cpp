@@ -97,6 +97,10 @@ bool ggml_backend_vk_wp_fused_expert(
         const struct ggml_backend_vk_wp_fused_expert_params *,
         struct ggml_backend_vk_wp_fused_expert_stats *)
     __attribute__((weak));
+bool ggml_backend_vk_wp_host_register(ggml_backend_buffer_t, void *, size_t)
+    __attribute__((weak));
+void ggml_backend_vk_wp_host_unregister(ggml_backend_buffer_t, void *)
+    __attribute__((weak));
 
 namespace wp_expert_worker {
 
@@ -775,6 +779,53 @@ struct RequestStats {
 using worker_stream_callback = std::function<void(
         size_t, size_t, const pipe_expert_partial &,
         std::chrono::steady_clock::time_point, RequestStats &)>;
+
+static size_t wp_result_fold_threads(size_t n_values) {
+    static const size_t configured = [] {
+        const char * env = std::getenv("WP_RESULT_FOLD_THREADS");
+        if (env != nullptr && env[0] != '\0') {
+            const long parsed = std::strtol(env, nullptr, 10);
+            return parsed > 0 ? (size_t) parsed : (size_t) 1;
+        }
+        const unsigned count = std::thread::hardware_concurrency();
+        return count > 0 ? std::min<size_t>(count, 8) : (size_t) 2;
+    }();
+    return std::min(configured, std::max<size_t>(1, n_values / (1u << 16)));
+}
+
+// Each output element is independent. Keep the assignment/group loop inside
+// one worker so every element has the same left-to-right f32 additions.
+static void fold_result_partials_ordered(
+        std::vector<float> & result,
+        const std::vector<pipe_expert_partial> & partials,
+        uint32_t n_tokens) {
+    if (partials.empty() || result.empty()) {
+        return;
+    }
+    const size_t n_threads = n_tokens >= 64 ? wp_result_fold_threads(result.size()) : 1;
+    const auto fold_range = [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            for (const pipe_expert_partial & partial : partials) {
+                result[i] += partial.partial[i];
+            }
+        }
+    };
+    if (n_threads <= 1) {
+        fold_range(0, result.size());
+        return;
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads - 1);
+    for (size_t worker = 0; worker + 1 < n_threads; ++worker) {
+        const size_t begin = result.size() * worker / n_threads;
+        const size_t end = result.size() * (worker + 1) / n_threads;
+        workers.emplace_back(fold_range, begin, end);
+    }
+    fold_range(result.size() * (n_threads - 1) / n_threads, result.size());
+    for (std::thread & worker : workers) {
+        worker.join();
+    }
+}
 
 // Forward declarations: the probe itself is defined further down, next to
 // run_self_bench, but WorkerStats::report() needs to read it.
@@ -2901,25 +2952,11 @@ struct free_deleter {
     }
 };
 
-// WP_STAGING_PINNED=1 opts IN to page-locked staging via
-// ggml_backend_dev_host_buffer_type. DEFAULT IS OFF (posix_memalign) because
-// measurement on 2026-07-31 showed pinning is INERT AND UNSAFE:
-//   - inert: 1070 gb_s_h2d 2.971 pinned vs 3.006 pageable; R9700 14.99 vs
-//     16.10; throughput 0.865 vs 0.889 tok/s. All inside the +/-3% band. The
-//     "1.29 GB/s H2D" that motivated this was DERIVED from a subtraction, never
-//     measured; the first real ns_h2d says the 1070 was always at ~85% of its
-//     gen3 x4 ceiling. There was no bounce-copy cost to recover.
-//   - unsafe: Vulkan's host buffer type returns memory that is 4096-aligned but
-//     NOT O_DIRECT-readable (host-visible device/BAR memory, not host RAM).
-//     read() returns -1 and prefill dies at layer 3. The alignment and
-//     buffer-type checks below both PASS on it, so the pool reports
-//     staging_kind=pinned truthfully and then fails on first read.
-// Read at startup only (not a struct Options field) so it cannot reintroduce
-// the ABI mismatch that broke every worker on 2026-07-30 -- and so it stays
-// settable per worker process, which is what made the A/B above possible.
+// WP_STAGING_PINNED=0 disables page-locked staging. It is enabled by default
+// for backends that provide a safe host allocation or host-pointer import.
 bool staging_pinned_env_enabled() {
     const char * env = std::getenv("WP_STAGING_PINNED");
-    return env != nullptr && std::strcmp(env, "1") == 0;
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
 }
 
 class StagingPool {
@@ -2931,10 +2968,19 @@ public:
         host_buffers_.reserve((size_t) resources.staging_buffers);
         available_.reserve((size_t) resources.staging_buffers);
 
+        backend_ = backend;
+        device_  = backend_ != nullptr ? ggml_backend_get_device(backend_) : nullptr;
+        const char * backend_name = backend_ != nullptr ? ggml_backend_name(backend_) : nullptr;
+        const bool vulkan = backend_name != nullptr &&
+            std::strstr(backend_name, "Vulkan") != nullptr;
+        const bool cuda_family = backend_name != nullptr &&
+            (std::strstr(backend_name, "CUDA") != nullptr ||
+             std::strstr(backend_name, "ROCm") != nullptr);
+
         ggml_backend_buffer_type_t host_buft = nullptr;
-        bool try_pinned = staging_pinned_env_enabled();
-        if (try_pinned && backend != nullptr) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        bool try_pinned = staging_pinned_env_enabled() && (cuda_family || vulkan);
+        if (try_pinned && !vulkan && backend_ != nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
             if (dev != nullptr) {
                 // Portable entry point (ggml-backend.h:187). Never call a
                 // backend-specific host-alloc symbol here: this worker binary
@@ -2963,7 +3009,30 @@ public:
         // we would report staging_kind=pinned while actually running
         // pageable, and derive gb_s_h2d against a mechanism that never ran.
         bool pinned = try_pinned && host_buft != nullptr;
-        if (pinned) {
+        if (try_pinned && vulkan && ggml_backend_vk_wp_host_register != nullptr) {
+            pinned = true;
+            for (int i = 0; i < resources.staging_buffers; ++i) {
+                void * raw = nullptr;
+                if (posix_memalign(&raw, DIRECT_ALIGNMENT, (size_t) buffer_bytes_) != 0 ||
+                        !ggml_backend_vk_wp_host_register(backend_, raw,
+                                                          (size_t) buffer_bytes_)) {
+                    if (raw != nullptr) {
+                        std::free(raw);
+                    }
+                    pinned = false;
+                    break;
+                }
+                buffers_.emplace_back(raw);
+                registered_host_buffers_.push_back(raw);
+            }
+            if (!pinned) {
+                for (void * raw : registered_host_buffers_) {
+                    ggml_backend_vk_wp_host_unregister(backend_, raw);
+                }
+                registered_host_buffers_.clear();
+                buffers_.clear();
+            }
+        } else if (pinned) {
             for (int i = 0; i < resources.staging_buffers; ++i) {
                 buffer_ptr buf(ggml_backend_buft_alloc_buffer(
                     host_buft, (size_t) buffer_bytes_));
@@ -2999,8 +3068,6 @@ public:
         }
 
         pinned_ = pinned;
-        backend_ = backend;
-        device_  = backend_ != nullptr ? ggml_backend_get_device(backend_) : nullptr;
         copy_stream_h2d_ = backend_ != nullptr && device_ != nullptr &&
             ggml_backend_cuda_wp_copy_stream_enabled != nullptr &&
             ggml_backend_cuda_wp_copy_stream_enabled(backend_);
@@ -3042,6 +3109,11 @@ public:
     ~StagingPool() {
         for (auto & kv : events_) {
             ggml_backend_event_free(kv.second);
+        }
+        if (ggml_backend_vk_wp_host_unregister != nullptr) {
+            for (void * raw : registered_host_buffers_) {
+                ggml_backend_vk_wp_host_unregister(backend_, raw);
+            }
         }
     }
 
@@ -3290,6 +3362,7 @@ private:
     bool                                             pinned_ = false;
     std::vector<std::unique_ptr<void, free_deleter>> buffers_;
     std::vector<buffer_ptr>                         host_buffers_;
+    std::vector<void *>                             registered_host_buffers_;
     std::vector<void *>                             available_;
     std::mutex                                      mutex_;
     std::condition_variable                         available_cv_;
@@ -7651,19 +7724,22 @@ public:
             grow_io_buffer(want, warmup);
         }
         alloc_io_small();
-        // Pinned staging is INDEPENDENT of io-small: io-small fixes the
-        // DESTINATION (Vulkan BAR), this fixes the SOURCE, and a worker can
-        // want one without the other.
-        if (const char * e = std::getenv("WP_IO_SRC_PINNED")) {
-            if (e[0] == '1') {
-                unsigned long tokens = 8;
-                if (const char * t = std::getenv("WP_IO_SRC_TOKENS")) {
-                    if (t[0] != '\0') { tokens = std::strtoul(t, nullptr, 10); }
-                }
-                const size_t one = (size_t) catalog_.descriptor.hparams.n_embd *
-                                   (size_t) tokens * sizeof(float);
-                alloc_io_src_pinned(std::max<size_t>(1u << 20, one + 65536));
+        // Pinned staging is independent of io-small: io-small fixes the
+        // destination, this fixes the source and readback buffers.
+        io_src_pinned_enabled_ = parse_env_default_on(std::getenv("WP_IO_SRC_PINNED")) &&
+            (is_cuda_backend() || is_vulkan_backend() ||
+             (ggml_backend_name(backend_.get()) != nullptr &&
+              std::strstr(ggml_backend_name(backend_.get()), "ROCm") != nullptr));
+        if (io_src_pinned_enabled_) {
+            unsigned long tokens = 512;
+            if (const char * t = std::getenv("WP_IO_SRC_TOKENS")) {
+                if (t[0] != '\0') { tokens = std::strtoul(t, nullptr, 10); }
+            } else if (const char * t = std::getenv("WP_IO_PREALLOC_TOKENS")) {
+                if (t[0] != '\0') { tokens = std::strtoul(t, nullptr, 10); }
             }
+            const size_t one = (size_t) catalog_.descriptor.hparams.n_embd *
+                               (size_t) tokens * sizeof(float);
+            alloc_io_src_pinned(std::max<size_t>(1u << 20, one + 65536));
         }
         if (const char * e = std::getenv("WP_IO_SET_ASYNC")) {
             const bool want_async = e[0] == '1';
@@ -9937,6 +10013,9 @@ private:
     // backend, which is the point -- the rig runs at the speed of its slowest
     // device, so a Vulkan-only fix is worth nothing.
     void alloc_io_src_pinned(size_t bytes) {
+        if (io_src_base_ != nullptr && io_src_size_ >= bytes) {
+            return;
+        }
         ggml_backend_dev_t dev = ggml_backend_get_device(backend_.get());
         ggml_backend_buffer_type_t host_buft =
             dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
@@ -9958,7 +10037,13 @@ private:
         io_src_pinned_ = std::move(buf);
         io_src_base_   = base;
         io_src_size_   = bytes;
-        fprintf(stderr, "wp io-src: %zu bytes pinned host staging for activation uploads\n", bytes);
+        fprintf(stderr, "wp io-src: %zu bytes pinned host staging for activation and readback\n", bytes);
+    }
+
+    void ensure_io_src_pinned(size_t bytes) {
+        if (io_src_pinned_enabled_ && bytes > io_src_size_) {
+            alloc_io_src_pinned(bytes + 65536);
+        }
     }
 
     void grow_io_buffer(size_t size, RequestStats & request_stats) {
@@ -10068,15 +10153,13 @@ private:
             size_t activation_count,
             uint32_t n_tokens,
             RequestStats & request_stats) {
-        const ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead(),
-            /* .mem_base = */ nullptr,
-            /* .no_alloc = */ true,
-        };
-        context_ptr ctx(ggml_init(params));
-        if (!ctx) {
-            throw std::runtime_error("failed to allocate expert IO metadata");
-        }
+        // WP_PREP_METADATA_CACHE=0 restores a fresh context and tensor for
+        // every request. The cached object carries no data; attach_weight below
+        // still rebinds it to the active buffer on every request.
+        static const bool metadata_cache =
+            parse_env_default_on(std::getenv("WP_PREP_METADATA_CACHE"));
+        context_ptr local_ctx;
+        ggml_context * ctx = nullptr;
         // Sub-timers: prepare_io measured 1.53 ms/req on the RX 480 vs 0.07 on
         // the 1070, and the io buffer is CONFIRMED host-visible (memcpy writes)
         // under the size-split policy -- so the cost is not the upload. Split
@@ -10087,12 +10170,48 @@ private:
             dst += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(now - sub).count();
             sub = now;
         };
-        ggml_tensor * input = ggml_new_tensor_2d(
-            ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
         const ggml_backend_buffer_type_t buft =
             ggml_backend_get_default_buffer_type(backend_.get());
-        const size_t input_size = ggml_backend_buft_get_alloc_size(buft, input);
-        const size_t alignment = ggml_backend_buft_get_alignment(buft);
+        ggml_tensor * input = nullptr;
+        size_t input_size = 0;
+        size_t alignment = 0;
+        if (metadata_cache) {
+            if (io_prepare_input_ == nullptr || io_prepare_tokens_ != n_tokens) {
+                io_prepare_ctx_.reset(ggml_init({
+                    /* .mem_size = */ ggml_tensor_overhead(),
+                    /* .mem_base = */ nullptr,
+                    /* .no_alloc = */ true,
+                }));
+                if (!io_prepare_ctx_) {
+                    throw std::runtime_error("failed to allocate expert IO metadata");
+                }
+                io_prepare_input_ = ggml_new_tensor_2d(
+                    io_prepare_ctx_.get(), GGML_TYPE_F32,
+                    catalog_.descriptor.hparams.n_embd, n_tokens);
+                io_prepare_tokens_ = n_tokens;
+                io_prepare_input_size_ = ggml_backend_buft_get_alloc_size(
+                    buft, io_prepare_input_);
+                io_prepare_alignment_ = ggml_backend_buft_get_alignment(buft);
+            }
+            ctx = io_prepare_ctx_.get();
+            input = io_prepare_input_;
+            input_size = io_prepare_input_size_;
+            alignment = io_prepare_alignment_;
+        } else {
+            local_ctx.reset(ggml_init({
+                /* .mem_size = */ ggml_tensor_overhead(),
+                /* .mem_base = */ nullptr,
+                /* .no_alloc = */ true,
+            }));
+            if (!local_ctx) {
+                throw std::runtime_error("failed to allocate expert IO metadata");
+            }
+            ctx = local_ctx.get();
+            input = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
+            input_size = ggml_backend_buft_get_alloc_size(buft, input);
+            alignment = ggml_backend_buft_get_alignment(buft);
+        }
         io_result_offset_ = GGML_PAD(input_size, alignment);
         const size_t result_size = ggml_backend_buft_get_alloc_size(buft, input);
         sublap(request_stats.ns_prep_setup);
@@ -10114,6 +10233,7 @@ private:
         sublap(request_stats.ns_prep_attach);
         const size_t act_bytes = activation_count * sizeof(float);
         const void * src = activation;
+        ensure_io_src_pinned(act_bytes);
         const bool pinned =
             io_src_base_ != nullptr && act_bytes <= io_src_size_;
         if (pinned) {
@@ -12795,9 +12915,18 @@ private:
             std::numeric_limits<size_t>::max() ? io_result_offset_ : result_offset;
         ggml_tensor * output = make_io_tensor(ctx.get(), n_tokens,
                                               effective_result_offset);
+        const size_t result_bytes = result.size() * sizeof(float);
+        ensure_io_src_pinned(result_bytes);
+        void * result_dst = result.data();
+        if (io_src_base_ != nullptr && result_bytes <= io_src_size_) {
+            result_dst = io_src_base_;
+        }
         const auto readback_started = std::chrono::steady_clock::now();
         ggml_backend_tensor_get(
-            output, result.data(), 0, result.size() * sizeof(float));
+            output, result_dst, 0, result_bytes);
+        if (result_dst != result.data()) {
+            std::memcpy(result.data(), result_dst, result_bytes);
+        }
         const uint64_t readback_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - readback_started).count();
@@ -13185,11 +13314,17 @@ private:
     // decode-sized requests. See the block comment on alloc_io_small().
     buffer_ptr     io_small_;
     size_t         io_small_size_ = 0;
-    // Pinned HOST staging for the activation SOURCE (all backends). Never a
-    // graph tensor -- only the src pointer handed to ggml_backend_tensor_set.
+    // Pinned HOST staging for activation uploads and result readbacks. Never a
+    // graph tensor -- only a transfer source or destination.
     buffer_ptr     io_src_pinned_;
     void *         io_src_base_ = nullptr;
     size_t         io_src_size_ = 0;
+    bool           io_src_pinned_enabled_ = false;
+    context_ptr    io_prepare_ctx_;
+    ggml_tensor *  io_prepare_input_ = nullptr;
+    uint32_t       io_prepare_tokens_ = 0;
+    size_t         io_prepare_input_size_ = 0;
+    size_t         io_prepare_alignment_ = 0;
     std::string    device_name_;
     bool           io_set_async_ = false;
     size_t         io_reserved_hint_ = 0;
@@ -13893,16 +14028,15 @@ public:
             }
         }
         // FOLD IN GROUP ORDER -- identical association to the serial loop, so
-        // the output stays bit-for-bit what it was. Only compute is reordered.
+        // the output stays bit-for-bit what it was. Only output elements are
+        // processed concurrently.
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             accumulate_request_stats(request_stats, sub_stats[gi]);
             if (partials[gi].partial.size() != result.partial.size()) {
                 throw std::runtime_error("expert device partial sizes disagree");
             }
-            for (size_t i = 0; i < result.partial.size(); ++i) {
-                result.partial[i] += partials[gi].partial[i];
-            }
         }
+        fold_result_partials_ordered(result.partial, partials, result.n_tokens);
         return result;
     }
 
@@ -13976,6 +14110,7 @@ public:
         result.dtype = PIPE_HIDDEN_F32;
         result.partial.assign(
             (size_t) result.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
+        std::vector<pipe_expert_partial> partials(pending.groups.size());
         for (size_t group_index = 0; group_index < pending.groups.size(); ++group_index) {
             const AssignmentGroup & group = pending.groups[group_index];
             pipe_expert_dispatch_req sub_request;
@@ -14028,10 +14163,9 @@ public:
                 stream_callback(group_index, pending.groups.size(), partial,
                                 std::chrono::steady_clock::now(), request_stats);
             }
-            for (size_t i = 0; i < result.partial.size(); ++i) {
-                result.partial[i] += partial.partial[i];
-            }
+            partials[group_index] = std::move(partial);
         }
+        fold_result_partials_ordered(result.partial, partials, result.n_tokens);
         return result;
     }
 
