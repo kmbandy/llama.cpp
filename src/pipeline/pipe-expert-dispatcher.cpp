@@ -1951,7 +1951,10 @@ struct dispatcher::impl {
         in_flight = 0;
         gap_at_zero = false;
         pending_def = {};
-        open_disp = {};
+        {
+            std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+            dispatch_slots_ = {};
+        }
         // D1 async: stop and join the writer threads first, then drop sockets.
         // A writer blocked in send() unblocks when the peer's connection breaks
         // (the reason we are poisoning) or once it sees the stop flag; joining
@@ -2027,7 +2030,15 @@ struct dispatcher::impl {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " died while computing expert(s) " + assignment_experts(request.assignments));
         }
-        if (seq_id != wanted_seq_id) {
+        // Demultiplex the response to its owning handle before trusting it.
+        // demux_seq_id() failing (unknown seq_id) and the direct seq_id !=
+        // wanted_seq_id compare below are the same fact whenever
+        // k_max_open_dispatches == 1 -- wanted_seq_id was always read off the
+        // one open slot's own seq_id (or that value's dedup-retry variant) --
+        // but keeping the explicit compare means this throws on exactly the
+        // conditions it always did, byte for byte, while the lookup is what
+        // stage 4 uses to route a response when a second handle is open.
+        if (demux_seq_id(seq_id) == k_invalid_handle || seq_id != wanted_seq_id) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint + " returned sequence " +
                                      std::to_string(seq_id) + " while awaiting " + std::to_string(wanted_seq_id));
         }
@@ -3221,8 +3232,30 @@ struct dispatcher::impl {
         return fold;
     }
 
-    struct open_dispatch_state {
-        bool                         open = false;
+    // Opaque id for one in-flight begin_dispatch/finish_dispatch pair (stage 2
+    // of the pipelined-prefill plan). Internal only: it never crosses the
+    // public API, which still has no handle parameter anywhere. begin_dispatch
+    // allocates one and finish_dispatch consumes it; because
+    // k_max_open_dispatches == 1 below, there is still at most one handle
+    // alive between any begin_dispatch/finish_dispatch pair, so the public
+    // entry points keep their exact current signatures and behaviour.
+    using dispatch_handle = uint64_t;
+    static constexpr dispatch_handle k_invalid_handle = 0;  // 0 never issued
+
+    // Stage 4 raises this to 2 so a second dispatch (the next prefill ubatch)
+    // can be begun before the first is finished. This stage only makes the
+    // bookkeeping keyed by handle instead of a bare singleton, so that later
+    // change is a capacity bump plus wiring rather than a data-structure
+    // rewrite. Kept at 1 for now: every existing caller opens at most one
+    // dispatch, awaits/finishes it, then opens the next, so this constant
+    // gates the whole refactor to a no-op.
+    static constexpr size_t k_max_open_dispatches = 1;
+
+    // Per-handle version of what used to be the single open_dispatch_state.
+    // Field-for-field identical to that struct; only the container changed
+    // shape (a bare singleton -> a fixed array keyed by handle).
+    struct dispatch_state {
+        dispatch_handle              handle = k_invalid_handle;  // k_invalid_handle == free slot
         int32_t                      layer = -1;
         uint32_t                     n_tokens = 0;
         uint64_t                     seq_id = 0;
@@ -3236,7 +3269,120 @@ struct dispatcher::impl {
         std::vector<size_t>          assigned_counts;
         dispatch_clock::time_point   wait_start{};
     };
-    open_dispatch_state open_disp;
+
+    // Guards dispatch_slots_ occupancy (allocate / look up / release) and
+    // next_dispatch_handle_ only -- NOT the blocking wait in finish_dispatch()
+    // (await_response() and friends), which runs after a handle's requests
+    // are already on the wire. With k_max_open_dispatches == 1 there is only
+    // ever one caller touching this today, so the lock is uncontended; the
+    // split exists so stage 4's second handle can begin (mutate the map)
+    // while the first handle's finish is parked in a blocking recv, instead
+    // of one mutex forcing that recv to also block out a concurrent begin.
+    std::mutex                                        dispatch_map_mutex_;
+    std::array<dispatch_state, k_max_open_dispatches> dispatch_slots_{};
+    dispatch_handle                                   next_dispatch_handle_ = 1;
+
+    // Peek at slot availability WITHOUT claiming one. Throws the exact same
+    // "already open" error the old singleton's `if (open_disp.open)` check
+    // threw when every slot is taken -- with capacity 1 that IS the
+    // one-open-dispatch rule. Called at the very top of begin_dispatch,
+    // mirroring the old check's position before any of begin_dispatch's own
+    // validation (route lookup, activation shape, assignment sanity) or its
+    // try block: this must not mutate dispatch_slots_, because those
+    // validation throws are OUTSIDE the try/catch(poison) below and must
+    // leave the dispatcher exactly as reusable as they always did -- if this
+    // peek instead claimed a slot up front, one of those unrelated throws
+    // would leak a permanently "open" slot that nothing ever releases.
+    void check_dispatch_capacity() {
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        for (const dispatch_state & slot : dispatch_slots_) {
+            if (slot.handle == k_invalid_handle) {
+                return;
+            }
+        }
+        throw std::runtime_error("expert dispatcher begin_dispatch called while a dispatch is already open");
+    }
+
+    // Actually claim a free slot. Called only once begin_dispatch's own
+    // validation and planning have fully succeeded, at the same point the
+    // old singleton was set open (right before returning) -- so a handle
+    // only exists once a dispatch is truly in flight, exactly as `open_disp
+    // .open` only ever became true there. Unreachable in practice (capacity
+    // was already confirmed by check_dispatch_capacity(), and calls on one
+    // dispatcher are serialized), but throws rather than asserts so a future
+    // concurrent caller fails loudly instead of corrupting a slot.
+    dispatch_handle acquire_dispatch_slot() {
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        for (dispatch_state & slot : dispatch_slots_) {
+            if (slot.handle == k_invalid_handle) {
+                slot.handle = next_dispatch_handle_++;
+                return slot.handle;
+            }
+        }
+        throw std::runtime_error("expert dispatcher begin_dispatch called while a dispatch is already open");
+    }
+
+    // dispatch_slots_ is fixed-size and tiny (k_max_open_dispatches stays a
+    // handful even at stage 4), so a linear scan is simpler than a real map
+    // and just as cheap at this size.
+    dispatch_state * find_dispatch_slot(dispatch_handle handle) {
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        for (dispatch_state & slot : dispatch_slots_) {
+            if (slot.handle == handle) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    void release_dispatch_slot(dispatch_handle handle) {
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        for (dispatch_state & slot : dispatch_slots_) {
+            if (slot.handle == handle) {
+                slot = dispatch_state{};
+                return;
+            }
+        }
+    }
+
+    // Legacy no-arg finish_dispatch()/has_open_dispatch() need to know WHICH
+    // handle is open without being told. Valid only because
+    // k_max_open_dispatches == 1 guarantees at most one candidate; stage 4's
+    // two-handle API replaces every caller of this with an explicit handle
+    // and this helper goes away.
+    dispatch_handle only_open_handle() {
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        for (const dispatch_state & slot : dispatch_slots_) {
+            if (slot.handle != k_invalid_handle) {
+                return slot.handle;
+            }
+        }
+        return k_invalid_handle;
+    }
+
+    bool has_open_dispatch_slot() {
+        return only_open_handle() != k_invalid_handle;
+    }
+
+    // Demultiplex a received frame's seq_id to the handle it belongs to. The
+    // dedup-retry path (see receive_partial's retry_seq) resends with the
+    // same seq_id OR'd with the high bit, so mask that off before matching a
+    // slot's registered seq_id -- otherwise a retried response would demux to
+    // "unknown" even though it answers the same handle's request. Returns
+    // k_invalid_handle when no open slot claims it. With k_max_open_dispatches
+    // == 1 this is the same "wrong sequence" fact the old strict equality
+    // check caught, just phrased as a lookup so stage 4's second handle plugs
+    // in here without touching await_response's call sites.
+    dispatch_handle demux_seq_id(uint64_t received_seq_id) {
+        const uint64_t masked = received_seq_id & ~(uint64_t(1) << 63);
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        for (const dispatch_state & slot : dispatch_slots_) {
+            if (slot.handle != k_invalid_handle && slot.seq_id == masked) {
+                return slot.handle;
+            }
+        }
+        return k_invalid_handle;
+    }
 
     void begin_dispatch(int32_t                                     layer,
                         uint64_t                                    seq_id,
@@ -3248,9 +3394,7 @@ struct dispatcher::impl {
         if (poisoned) {
             throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
         }
-        if (open_disp.open) {
-            throw std::runtime_error("expert dispatcher begin_dispatch called while a dispatch is already open");
-        }
+        check_dispatch_capacity();
         if (req_log_ != nullptr) {
             req_dispatch_start_ = dispatch_clock::now();
         }
@@ -3394,20 +3538,21 @@ struct dispatcher::impl {
             // throws on mismatch — do not weaken that check.
             std::vector<float> folded_prev = collect_pending_deferred(/*mark_fold_open=*/true);
 
-            open_disp.open             = true;
-            open_disp.layer            = layer;
-            open_disp.n_tokens         = n_tokens;
-            open_disp.seq_id           = seq_id;
-            open_disp.activation_count = activation_count;
-            open_disp.hash_seq         = hash_seq;
-            open_disp.hash_pre         = hash_pre;
-            open_disp.hash_reqs        = imm_requests.size() + def_requests.size();
-            open_disp.imm_requests     = std::move(imm_requests);
-            open_disp.def_requests     = std::move(def_requests);
-            open_disp.folded_prev      = std::move(folded_prev);
-            open_disp.assigned_counts  = std::move(assigned_counts);
-            open_disp.wait_start       = collect_stats ? dispatch_clock::now()
-                                                       : dispatch_clock::time_point{};
+            const dispatch_handle handle = acquire_dispatch_slot();
+            dispatch_state &      slot   = *find_dispatch_slot(handle);
+            slot.layer             = layer;
+            slot.n_tokens          = n_tokens;
+            slot.seq_id            = seq_id;
+            slot.activation_count  = activation_count;
+            slot.hash_seq          = hash_seq;
+            slot.hash_pre          = hash_pre;
+            slot.hash_reqs         = imm_requests.size() + def_requests.size();
+            slot.imm_requests      = std::move(imm_requests);
+            slot.def_requests      = std::move(def_requests);
+            slot.folded_prev       = std::move(folded_prev);
+            slot.assigned_counts   = std::move(assigned_counts);
+            slot.wait_start        = collect_stats ? dispatch_clock::now()
+                                                    : dispatch_clock::time_point{};
             return;
         } catch (...) {
             poison();
@@ -3419,22 +3564,31 @@ struct dispatcher::impl {
         if (poisoned) {
             throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
         }
-        if (!open_disp.open) {
+        const dispatch_handle handle = only_open_handle();
+        if (handle == k_invalid_handle) {
             throw std::runtime_error("expert dispatcher finish_dispatch called with no open dispatch");
         }
-        const int32_t  layer            = open_disp.layer;
-        const uint32_t n_tokens         = open_disp.n_tokens;
-        const uint64_t seq_id           = open_disp.seq_id;
-        const uint64_t activation_count = open_disp.activation_count;
-        const uint64_t hash_seq         = open_disp.hash_seq;
-        const uint64_t hash_pre         = open_disp.hash_pre;
-        const size_t   hash_reqs        = open_disp.hash_reqs;
-        std::vector<planned_request> imm_requests    = std::move(open_disp.imm_requests);
-        std::vector<planned_request> def_requests    = std::move(open_disp.def_requests);
-        std::vector<float>           folded_prev     = std::move(open_disp.folded_prev);
-        std::vector<size_t>          assigned_counts = std::move(open_disp.assigned_counts);
-        const dispatch_clock::time_point wait_start  = open_disp.wait_start;
-        open_disp = {};
+        dispatch_state & slot            = *find_dispatch_slot(handle);
+        const int32_t  layer            = slot.layer;
+        const uint32_t n_tokens         = slot.n_tokens;
+        const uint64_t seq_id           = slot.seq_id;
+        const uint64_t activation_count = slot.activation_count;
+        const uint64_t hash_seq         = slot.hash_seq;
+        const uint64_t hash_pre         = slot.hash_pre;
+        const size_t   hash_reqs        = slot.hash_reqs;
+        std::vector<planned_request> imm_requests    = std::move(slot.imm_requests);
+        std::vector<planned_request> def_requests    = std::move(slot.def_requests);
+        std::vector<float>           folded_prev     = std::move(slot.folded_prev);
+        std::vector<size_t>          assigned_counts = std::move(slot.assigned_counts);
+        const dispatch_clock::time_point wait_start  = slot.wait_start;
+        // Release now, before the blocking wait below: with capacity 1 this
+        // is observationally identical to releasing after (has_open_dispatch()
+        // was already going to see the local `open_disp = {}` copy either
+        // way), but it means the handle map itself is not held "in use" for
+        // the duration of the wait -- stage 4's second handle needs exactly
+        // that so its own begin_dispatch is never blocked on the first
+        // handle's finish_dispatch actually returning.
+        release_dispatch_slot(handle);
 
         try {
             std::vector<float> result((size_t) activation_count, 0.0f);
@@ -3626,7 +3780,7 @@ std::vector<float> dispatcher::finish_dispatch() {
 }
 
 bool dispatcher::has_open_dispatch() const {
-    return pimpl->open_disp.open;
+    return pimpl->has_open_dispatch_slot();
 }
 
 layer_trace_stats dispatcher::layer_trace(int32_t layer) const {

@@ -638,6 +638,12 @@ struct RequestStats {
     uint64_t ns_recv_body  = 0;
     uint64_t ns_req_decode = 0;
     uint64_t ns_resp_send  = 0;
+    // WP_WORKER_PIPELINE=1: the reader/writer frame queue's high-water item
+    // count for THIS connection, as of this request. 0 (and meaningless) with
+    // the knob off -- see WorkerStats::n_frames_queued_max_'s max-merge,
+    // which is the only thing that makes a single number out of many
+    // requests' worth of these.
+    uint64_t n_frames_queued_max = 0;
     uint64_t n_stream_partials_sent = 0;
     uint64_t ns_stream_overlap = 0;
     uint64_t n_resident      = 0;
@@ -963,6 +969,7 @@ public:
         ns_demote_ += request.ns_demote;
         ns_ensure_post_ += request.ns_ensure_post;
         n_read_inflight_max_ = std::max(n_read_inflight_max_, request.n_read_inflight_max);
+        n_frames_queued_max_ = std::max(n_frames_queued_max_, request.n_frames_queued_max);
         ns_read_issue_ += request.ns_read_issue;
         ns_read_complete_ += request.ns_read_complete;
         n_cpu_on_arrival_ += request.n_cpu_on_arrival;
@@ -1045,6 +1052,7 @@ private:
                   << " ns_read_issue=" << ns_read_issue_
                   << " ns_read_complete=" << ns_read_complete_
                   << " n_read_inflight_max=" << n_read_inflight_max_
+                  << " n_frames_queued_max=" << n_frames_queued_max_
                   << " n_cpu_on_arrival=" << n_cpu_on_arrival_
                   << " ns_cpu_on_arrival=" << ns_cpu_on_arrival_
                   << " n_cpu_on_arrival_fallback=" << n_cpu_on_arrival_fallback_
@@ -1275,6 +1283,7 @@ private:
     uint64_t          ns_demote_ = 0;
     uint64_t          ns_ensure_post_ = 0;
     uint64_t          n_read_inflight_max_ = 0;
+    uint64_t          n_frames_queued_max_ = 0;   // WP_WORKER_PIPELINE=1 high-water
     uint64_t          ns_read_issue_ = 0;
     uint64_t          ns_read_complete_ = 0;
     uint64_t          n_cpu_on_arrival_ = 0;
@@ -15227,6 +15236,204 @@ void note_frame_residency(int type, uint64_t ns) {
     std::fprintf(stderr, "%s\n", line.c_str());
 }
 
+// *** WP_WORKER_PIPELINE=1 -- READER/WRITER THREADS PER CONNECTION. ***
+//
+// Stage 2 of the pipelined-prefill plan: this only builds the threading
+// infrastructure, DEFAULT OFF, so it lands as a no-op. A later stage will let
+// TWO requests be in flight per connection (consecutive prefill ubatches);
+// today the compute loop still processes exactly one frame at a time, in the
+// exact order the reader delivered it, so this stage cannot change any
+// observable behaviour with the knob on, and changes nothing at all with it
+// off (serve_connection's while loop calls pipe_recv_frame / pipe_send_frame
+// directly, same as before this patch, whenever wp_worker_pipeline_enabled()
+// is false).
+//
+// READER is TRANSPORT ONLY: it calls pipe_recv_frame (which already does the
+// frame-header decode) and pushes the whole frame onto a queue. It never
+// touches ensure_batch, pool_, or any residency structure -- see
+// g_worker_gpu_mutex's comment block above for why that is not safe without
+// the slot-pool redesign this task is explicitly not doing.
+//
+// WRITER drains a response queue the compute loop enqueues into, in the
+// order it enqueued, and calls pipe_send_frame itself. Since the compute
+// loop still runs strictly serially (one frame in, one response out, in
+// order), the queue's FIFO order is exactly the order the single-threaded
+// path would have sent responses in.
+//
+// BOUNDS: WP_WORKER_PIPELINE_QUEUE_DEPTH (2) caps both queues by ITEM COUNT.
+// The frame queue additionally caps total queued PAYLOAD BYTES at
+// WP_WORKER_PIPELINE_MAX_QUEUED_BYTES -- pipe_recv_frame allocates a buffer
+// sized to the frame's length, so an item-count-only bound would still let a
+// fast reader race ahead of a slow compute loop on back-to-back large
+// prefill frames and multiply peak memory by the queue depth. The reader
+// blocks on a full queue rather than dropping a frame (dropping would break
+// FIFO ordering and silently desync the wire).
+constexpr size_t WP_WORKER_PIPELINE_QUEUE_DEPTH      = 2;
+constexpr size_t WP_WORKER_PIPELINE_MAX_QUEUED_BYTES = 256ull * 1024 * 1024;
+
+bool wp_worker_pipeline_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_WORKER_PIPELINE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// One frame handed from the reader to the compute loop, or (ok == false) the
+// EOF/error sentinel standing in for what pipe_recv_frame returning false
+// means on the direct path -- the compute loop's while-condition treats the
+// two identically.
+struct WpPipelineFrame {
+    bool                  ok = false;
+    pipe_frame_type       type = PIPE_PING;
+    uint64_t              seq_id = 0;
+    std::vector<uint8_t>  payload;
+    uint64_t              hdr_done_ns = 0;
+    // Header-recv-return -> body-complete, measured IN THE READER (the
+    // thread that actually did the recv) rather than left for the compute
+    // loop to reconstruct from hdr_done_ns -- once frames can sit in the
+    // queue, "when the compute loop got around to this frame" and "when the
+    // body actually finished arriving" are different instants, and only the
+    // latter is what RequestStats::ns_recv_body has ever meant. 0 when
+    // time_recv is false, same as the direct path.
+    uint64_t              ns_recv_body = 0;
+};
+
+// One response frame handed from the compute loop to the writer.
+struct WpPipelineResponse {
+    pipe_frame_type       type = PIPE_PING;
+    uint64_t              seq_id = 0;
+    std::vector<uint8_t>  payload;
+};
+
+// Bounded blocking queue, exactly one producer thread and one consumer
+// thread per instance (reader->compute for frames, compute->writer for
+// responses) -- both threads belong to the same connection, so this mutex is
+// never contended by any other connection's threads.
+template <typename T>
+class WpPipelineQueue {
+public:
+    explicit WpPipelineQueue(size_t max_depth) : max_depth_(max_depth) {}
+
+    void set_byte_cap(size_t cap) { byte_cap_ = cap; }
+
+    // Blocks while the queue is at max_depth_ items, or (byte_cap_ != 0) at
+    // or over the byte cap -- UNLESS the queue is currently empty, in which
+    // case the push always proceeds regardless of the byte cap. That carve-
+    // out is what stops a single frame bigger than the cap from deadlocking
+    // the reader against itself: an empty queue must always accept one item.
+    // Returns immediately, without pushing, once closed.
+    void push(T item, size_t item_bytes = 0) {
+        std::unique_lock<std::mutex> lock(mu_);
+        not_full_.wait(lock, [&] {
+            return closed_ || items_.empty() ||
+                   (items_.size() < max_depth_ &&
+                    (byte_cap_ == 0 || bytes_queued_ + item_bytes <= byte_cap_));
+        });
+        if (closed_) {
+            return;
+        }
+        items_.push_back(PendingItem{ std::move(item), item_bytes });
+        bytes_queued_ += item_bytes;
+        if (items_.size() > high_water_.load(std::memory_order_relaxed)) {
+            high_water_.store(items_.size(), std::memory_order_relaxed);
+        }
+        lock.unlock();
+        not_empty_.notify_one();
+    }
+
+    // Returns false once the queue is closed AND drained -- exactly the
+    // pipe_recv_frame(...) == false contract the compute loop already
+    // handles on every existing exit path.
+    bool pop(T & out) {
+        std::unique_lock<std::mutex> lock(mu_);
+        not_empty_.wait(lock, [&] { return !items_.empty() || closed_; });
+        if (items_.empty()) {
+            return false;
+        }
+        out = std::move(items_.front().item);
+        bytes_queued_ -= items_.front().bytes;
+        items_.pop_front();
+        lock.unlock();
+        not_full_.notify_one();
+        return true;
+    }
+
+    // Wakes any thread blocked in push()/pop() so it can exit instead of
+    // outliving the connection. Idempotent; safe to call from teardown even
+    // if the queue was never used.
+    void close() {
+        std::lock_guard<std::mutex> lock(mu_);
+        closed_ = true;
+        not_empty_.notify_all();
+        not_full_.notify_all();
+    }
+
+    size_t high_water() const { return high_water_.load(std::memory_order_relaxed); }
+
+private:
+    struct PendingItem { T item; size_t bytes; };
+    const size_t             max_depth_;
+    size_t                   byte_cap_ = 0;
+    std::mutex               mu_;
+    std::condition_variable  not_empty_;
+    std::condition_variable  not_full_;
+    std::deque<PendingItem>  items_;
+    size_t                   bytes_queued_ = 0;
+    bool                     closed_ = false;
+    std::atomic<size_t>      high_water_{ 0 };
+};
+
+// Exclusively calls pipe_recv_frame and pushes the result (frame or EOF/error
+// sentinel) onto `frames`. Stops after the first sentinel -- nothing more can
+// ever arrive once pipe_recv_frame has returned false once.
+void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv,
+                                      WpPipelineQueue<WpPipelineFrame> & frames) {
+    for (;;) {
+        WpPipelineFrame f;
+        uint64_t hdr_done_ns = 0;
+        f.ok = pipe_recv_frame(socket, f.type, f.seq_id, f.payload,
+                               time_recv ? &hdr_done_ns : nullptr);
+        f.hdr_done_ns = hdr_done_ns;
+        if (time_recv && hdr_done_ns != 0) {
+            const uint64_t now_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            f.ns_recv_body = now_ns - hdr_done_ns;
+        }
+        const bool eof = !f.ok;
+        const size_t bytes = f.payload.size();
+        frames.push(std::move(f), bytes);
+        if (eof) {
+            return;
+        }
+    }
+}
+
+// Drains `responses` in order and calls pipe_send_frame for each. On the
+// first send failure the peer connection is broken -- byte streams cannot
+// recover a partial frame -- so this closes `responses` (unblocking the
+// compute loop if it is waiting to enqueue) and stops sending, but keeps
+// popping (without sending) until the queue is closed and drained, so the
+// compute loop's teardown push (if any) cannot block forever on a writer
+// that has already given up.
+void wp_worker_pipeline_writer_thread(pipe_socket_t & socket,
+                                      WpPipelineQueue<WpPipelineResponse> & responses,
+                                      std::atomic<bool> & write_failed) {
+    for (;;) {
+        WpPipelineResponse r;
+        if (!responses.pop(r)) {
+            return;
+        }
+        if (write_failed.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (!pipe_send_frame(socket, r.type, r.seq_id, r.payload.data(), r.payload.size())) {
+            write_failed.store(true, std::memory_order_release);
+            responses.close();
+        }
+    }
+}
+
 int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -1) {
     struct PendingCleanup {
         Worker & worker;
@@ -15466,6 +15673,10 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // is unchanged.
     const bool     time_recv   = worker.stats_enabled() || frame_trace_enabled();
     uint64_t       hdr_done_ns = 0;
+    // WP_WORKER_PIPELINE=1: ns_recv_body for the current frame, as measured
+    // by the reader thread (see WpPipelineFrame::ns_recv_body) -- unused on
+    // the direct path.
+    uint64_t       pipeline_ns_recv_body = 0;
     // Reused response-encode buffer. One per serve_connection call, so one per
     // connection thread -- no sharing, no thread_local, and nothing to
     // synchronise. It removes a heap allocation AND a full zero-fill of the
@@ -15477,11 +15688,140 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // because the buffer is only ever read between its own encode and the send
     // that immediately follows, inside one loop iteration on this thread.
     std::vector<uint8_t> encode_buf;
+
+    // WP_WORKER_PIPELINE=1: see the WpPipeline* definitions above this
+    // function for the design. Queues and the guard are constructed
+    // unconditionally (cheap: empty deque, no allocation) so the teardown
+    // path below is the same code whether or not the knob is on; only
+    // starting the threads is gated.
+    const bool pipeline_on = wp_worker_pipeline_enabled();
+    WpPipelineQueue<WpPipelineFrame>    pipeline_frames(WP_WORKER_PIPELINE_QUEUE_DEPTH);
+    WpPipelineQueue<WpPipelineResponse> pipeline_responses(WP_WORKER_PIPELINE_QUEUE_DEPTH);
+    pipeline_frames.set_byte_cap(WP_WORKER_PIPELINE_MAX_QUEUED_BYTES);
+    std::atomic<bool> pipeline_write_failed{ false };
+
+    // Declared AFTER pending_cleanup (top of this function) so it destructs
+    // BEFORE it -- both threads are joined before worker.abandon_split_dispatch()
+    // runs. Neither thread touches worker/pool state (transport only), so this
+    // ordering isn't required for correctness against that call, but it does
+    // guarantee no thread of this connection is still running by the time ANY
+    // of the rest of teardown executes, which is the simplest invariant to
+    // reason about and costs nothing extra.
+    struct PipelineThreadGuard {
+        pipe_socket_t                        & socket;
+        WpPipelineQueue<WpPipelineFrame>     & frames;
+        WpPipelineQueue<WpPipelineResponse>  & responses;
+        bool                                   started = false;
+        std::thread                            reader;
+        std::thread                            writer;
+        ~PipelineThreadGuard() {
+            if (!started) {
+                return;   // pipeline off: no threads were ever created.
+            }
+            // socket.shutdown() interrupts whichever of the two threads is
+            // currently blocked in a recv/send syscall (see its doc comment
+            // on pipe_socket_t); frames/responses.close() wakes whichever one
+            // is instead blocked on a full/empty queue. Between the two, no
+            // thread can be left blocked, so join() below cannot hang and no
+            // thread can outlive this connection object.
+            socket.shutdown();
+            frames.close();
+            responses.close();
+            if (reader.joinable()) { reader.join(); }
+            if (writer.joinable()) { writer.join(); }
+        }
+    } pipeline_threads{ socket, pipeline_frames, pipeline_responses };
+
+    if (pipeline_on) {
+        // House rule: a gate whose runtime value cannot be seen in the log is
+        // not a gate. Printed once per process (function-local static, same
+        // pattern as soft_pin_enabled_'s constructor print) rather than once
+        // per connection, so WP_WORKER_MULTI_CONN doesn't spam one line per
+        // accepted connection.
+        static const bool pipeline_announced = [] {
+            std::cout << "wp expert worker WP_WORKER_PIPELINE=1 (reader/writer threads, "
+                         "queue depth " << WP_WORKER_PIPELINE_QUEUE_DEPTH << ")" << std::endl;
+            return true;
+        }();
+        (void) pipeline_announced;
+        pipeline_threads.reader = std::thread(wp_worker_pipeline_reader_thread,
+            std::ref(socket), time_recv, std::ref(pipeline_frames));
+        pipeline_threads.writer = std::thread(wp_worker_pipeline_writer_thread,
+            std::ref(socket), std::ref(pipeline_responses), std::ref(pipeline_write_failed));
+        pipeline_threads.started = true;
+    }
+
+    // Routes an already-encoded response frame through the writer queue when
+    // the pipeline is engaged (ownership of the bytes moves to the queue, so
+    // this always makes its own copy -- encode_buf above is reused on the
+    // very next loop iteration, before the writer thread is guaranteed to
+    // have read it), or sends it inline exactly as before otherwise. Every
+    // response-bearing call site below goes through this, so response order
+    // is the compute loop's enqueue order -- which, because the compute loop
+    // still processes frames strictly one at a time, is identical to the
+    // order the single-threaded path would have sent them in.
+    const auto send_response_frame = [&](pipe_frame_type resp_type, uint64_t resp_seq,
+                                         const uint8_t * data, size_t len) -> bool {
+        if (!pipeline_on) {
+            return pipe_send_frame(socket, resp_type, resp_seq, data, len);
+        }
+        if (pipeline_write_failed.load(std::memory_order_acquire)) {
+            return false;
+        }
+        WpPipelineResponse r;
+        r.type   = resp_type;
+        r.seq_id = resp_seq;
+        r.payload.assign(data, data + len);
+        pipeline_responses.push(std::move(r), 0);
+        return !pipeline_write_failed.load(std::memory_order_acquire);
+    };
+    // Same routing for PIPE_ERROR: pipe_send_error itself is transport-layer
+    // code this task must not touch (no wire-format/protocol changes), so
+    // this calls the same pipe_encode_error it uses internally and hands the
+    // encoded bytes to send_response_frame instead of sending them directly.
+    const auto send_response_error = [&](uint64_t resp_seq, pipe_error_code code,
+                                         const std::string & msg) -> bool {
+        if (!pipeline_on) {
+            return pipe_send_error(socket, resp_seq, code, msg);
+        }
+        pipe_error e;
+        e.code = (uint32_t) code;
+        e.msg  = msg;
+        std::vector<uint8_t> encoded;
+        try {
+            encoded = pipe_encode_error(e);
+        } catch (const pipe_protocol_error &) {
+            return false;
+        }
+        return send_response_frame(PIPE_ERROR, resp_seq, encoded.data(), encoded.size());
+    };
+
     // Comma operator so the pump runs before EVERY recv, including after the
-    // PING branch's `continue` -- appending it to the loop body would skip that.
-    while ((await_request(),
-            pipe_recv_frame(socket, type, seq_id, payload,
-                            time_recv ? &hdr_done_ns : nullptr))) {
+    // PING branch's `continue` -- appending it to the loop body would skip
+    // that. With the pipeline engaged the pump is skipped entirely (see
+    // await_request()'s own multi-conn precedent: it already backs off
+    // whenever something else owns deciding when to read next) -- the
+    // reader thread now owns the socket's recv exclusively, and the pump's
+    // ppoll() is a readability check, not a read, but the queue itself is
+    // already the correct signal for "is a request pending", so there is no
+    // reason for the compute thread to also poll the fd. Popping the frame
+    // queue directly waits on exactly the right condition instead.
+    while (pipeline_on
+               ? [&] {
+                     WpPipelineFrame f;
+                     if (!pipeline_frames.pop(f) || !f.ok) {
+                         return false;
+                     }
+                     type        = f.type;
+                     seq_id      = f.seq_id;
+                     payload     = std::move(f.payload);
+                     hdr_done_ns = f.hdr_done_ns;
+                     pipeline_ns_recv_body = f.ns_recv_body;
+                     return true;
+                 }()
+               : (await_request(),
+                  pipe_recv_frame(socket, type, seq_id, payload,
+                                  time_recv ? &hdr_done_ns : nullptr))) {
         // Bracket this whole iteration -- see FrameResidency above. Declared
         // FIRST so it spans every branch below, including the ones that
         // `continue` (PING, PREFETCH_HINT, BEGIN) and the ones that return.
@@ -15513,12 +15853,20 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                                    : std::chrono::steady_clock::time_point());
         // Header-recv-return -> body-complete, for THIS frame. Zero when the
         // instrumentation is off, and zero-guarded against a header stamp that
-        // was never written.
+        // was never written. WP_WORKER_PIPELINE=1: t_recv_done above is when
+        // the COMPUTE loop dequeued the frame, not when its body actually
+        // finished arriving -- those differ once a frame can sit in the
+        // queue -- so this reuses the value the reader thread measured
+        // directly around its own recv instead (WpPipelineFrame::ns_recv_body,
+        // copied out to pipeline_ns_recv_body above) rather than reconstruct
+        // a wrong number from hdr_done_ns/t_recv_done here.
         const uint64_t ns_recv_body_frame =
-            (time_recv && hdr_done_ns != 0)
-                ? (uint64_t) ((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  t_recv_done.time_since_epoch()).count() - hdr_done_ns)
-                : 0;
+            pipeline_on
+                ? pipeline_ns_recv_body
+                : ((time_recv && hdr_done_ns != 0)
+                       ? (uint64_t) ((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         t_recv_done.time_since_epoch()).count() - hdr_done_ns)
+                       : 0);
         // WP_WORKER_MULTI_CONN: default-held for the whole per-request
         // handling below, same shape as the probe (RAII releases it on
         // every exit from this scope -- return, continue, or falling off
@@ -15573,8 +15921,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 if (relock) {
                     gpu_lock.unlock();
                 }
-                const bool sent = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL_STREAM, seq_id,
-                                                  stream_encoded.data(), stream_encoded.size());
+                const bool sent = send_response_frame(PIPE_EXPERT_PARTIAL_STREAM, seq_id,
+                                                      stream_encoded.data(), stream_encoded.size());
                 if (relock) {
                     gpu_lock.lock();
                 }
@@ -15601,8 +15949,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const std::vector<uint8_t> & encoded = encode_buf;
             const bool relock = gpu_lock.owns_lock();
             if (relock) gpu_lock.unlock();
-            const bool sent = pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                              encoded.data(), encoded.size());
+            const bool sent = send_response_frame(PIPE_EXPERT_PARTIAL, seq_id,
+                                                  encoded.data(), encoded.size());
             if (relock) gpu_lock.lock();
             return sent;
         };
@@ -15611,7 +15959,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                       : std::chrono::steady_clock::time_point();
         last_request_at = std::chrono::steady_clock::now();
         if (type == PIPE_PING) {
-            if (!pipe_send_frame(socket, PIPE_PONG, seq_id, nullptr, 0)) {
+            if (!send_response_frame(PIPE_PONG, seq_id, nullptr, 0)) {
                 return 1;
             }
             continue;
@@ -15668,10 +16016,10 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 // there is no separate gate to keep in sync with that one.
                 worker.begin_split_dispatch(split_log_begin, seq_id, conn_index, &gpu_lock);
             } catch (const pipe_protocol_error & error) {
-                pipe_send_error(socket, seq_id, error.code, error.what());
+                send_response_error(seq_id, error.code, error.what());
                 return 1;
             } catch (const std::exception & error) {
-                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
                 return 1;
             }
             continue;
@@ -15696,8 +16044,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                                         split_log_stats);
                     } else {
                         const std::vector<uint8_t> zenc = pipe_encode_expert_partial(znull);
-                        if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
-                                             zenc.data(), zenc.size())) {
+                        if (!send_response_frame(PIPE_EXPERT_PARTIAL, seq_id,
+                                                 zenc.data(), zenc.size())) {
                             return 1;
                         }
                     }
@@ -15757,6 +16105,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     // never clobber them.
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.n_frames_queued_max =
+                        pipeline_on ? pipeline_frames.high_water() : 0;
                     if (stream_sent_count == 0) {
                         split_log_stats.ns_resp_send  =
                             (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -15769,10 +16119,10 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
-                pipe_send_error(socket, seq_id, error.code, error.what());
+                send_response_error(seq_id, error.code, error.what());
                 return 1;
             } catch (const std::exception & error) {
-                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
                 return 1;
             }
             continue;
@@ -15817,8 +16167,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 }
                 const std::vector<uint8_t> ack_payload =
                     pipe_encode_expert_acts_publish_ack({ published });
-                if (!pipe_send_frame(socket, PIPE_EXPERT_ACTS_PUBLISH_ACK, seq_id,
-                                     ack_payload.data(), ack_payload.size())) {
+                if (!send_response_frame(PIPE_EXPERT_ACTS_PUBLISH_ACK, seq_id,
+                                         ack_payload.data(), ack_payload.size())) {
                     return 1;
                 }
                 // Compute from the inline bytes already in hand. This is the
@@ -15863,6 +16213,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     }
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.n_frames_queued_max =
+                        pipeline_on ? pipeline_frames.high_water() : 0;
                     if (stream_sent_count == 0) {
                         split_log_stats.ns_resp_send  =
                             (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -15875,10 +16227,10 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
-                pipe_send_error(socket, seq_id, error.code, error.what());
+                send_response_error(seq_id, error.code, error.what());
                 return 1;
             } catch (const std::exception & error) {
-                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
                 return 1;
             }
             continue;
@@ -15917,7 +16269,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                                  "wp-expert-worker: dedup subscribe failed (seq=%llu layer=%d): %s\n",
                                  (unsigned long long) seq_id, layer_for_shm, sub_error.c_str());
                     worker.abandon_split_dispatch(conn_index);
-                    if (!pipe_send_error(socket, seq_id, PIPE_ERR_ACTS_UNAVAILABLE, sub_error)) {
+                    if (!send_response_error(seq_id, PIPE_ERR_ACTS_UNAVAILABLE, sub_error)) {
                         return 1;
                     }
                     continue;
@@ -15967,6 +16319,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     }
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.n_frames_queued_max =
+                        pipeline_on ? pipeline_frames.high_water() : 0;
                     if (stream_sent_count == 0) {
                         split_log_stats.ns_resp_send  =
                             (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -15979,22 +16333,22 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
-                pipe_send_error(socket, seq_id, error.code, error.what());
+                send_response_error(seq_id, error.code, error.what());
                 return 1;
             } catch (const std::exception & error) {
-                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
                 return 1;
             }
             continue;
         }
 #endif // __linux__
         if (worker.has_split_dispatch(conn_index)) {
-            pipe_send_error(socket, seq_id, PIPE_ERR_BAD_FRAME,
-                            "frame is not legal between dispatch BEGIN and ACTS");
+            send_response_error(seq_id, PIPE_ERR_BAD_FRAME,
+                                "frame is not legal between dispatch BEGIN and ACTS");
             return 1;
         }
         if (type != PIPE_EXPERT_DISPATCH_REQ) {
-            pipe_send_error(socket, seq_id, PIPE_ERR_BAD_FRAME, "expected expert dispatch request");
+            send_response_error(seq_id, PIPE_ERR_BAD_FRAME, "expected expert dispatch request");
             return 1;
         }
         try {
@@ -16096,6 +16450,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 }
                 request_stats.ns_recv_body  = ns_recv_body_frame;
                 request_stats.ns_req_decode = ns_req_decode_frame;
+                request_stats.n_frames_queued_max =
+                    pipeline_on ? pipeline_frames.high_water() : 0;
                 // Same window as ns_send on this branch (t_sent is taken after
                 // the connection counter bump, so both carry that one relaxed
                 // atomic increment). Kept as its own name so ns_resp_send has
@@ -16143,12 +16499,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             // about to close.
             std::fprintf(stderr, "wp expert worker: protocol error (code %d): %s\n",
                          (int) error.code, error.what());
-            if (!pipe_send_error(socket, seq_id, error.code, error.what())) {
+            if (!send_response_error(seq_id, error.code, error.what())) {
                 return 1;
             }
         } catch (const std::exception & error) {
             std::fprintf(stderr, "wp expert worker: compute error: %s\n", error.what());
-            pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+            send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
             return 1;
         }
     }
