@@ -552,36 +552,86 @@ static void test_split_shexp_wait_before_next_issue(const std::vector<int> & por
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ false,
     };
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
-    require(ctx != nullptr, "failed to create issue-order ggml context");
-
-    ggml_tensor * inp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, N_EMBD, N_TOKENS);
-    ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, N_TOKENS);
-    ggml_tensor * w   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, 1, N_TOKENS);
 
     pipe_expert_dispatcher::graph_dispatcher dispatcher(
         endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
-    dispatcher.begin_graph_build(ctx.get());
-    ggml_tensor * issue0 = dispatcher.build_issue(ctx.get(), inp, ids, w, LAYER, TEST_SWIGLU_CLAMP);
-    ggml_tensor * wait0  = dispatcher.build_wait(ctx.get(), LAYER);
-    ggml_cgraph * graph  = ggml_new_graph_custom(ctx.get(), 32, false);
-    ggml_build_forward_expand(graph, wait0);
 
-    ggml_tensor * issue1 = dispatcher.build_issue(ctx.get(), inp, ids, w, LAYER + 1, TEST_SWIGLU_CLAMP);
+    struct chunked_layer {
+        ggml_tensor * inp;
+        ggml_tensor * ids;
+        ggml_tensor * weights;
+        ggml_tensor * issue_a;
+        ggml_tensor * issue_b;
+        ggml_tensor * wait;
+    };
+    const auto build_chunked_layer = [&](ggml_context * ctx, int32_t layer) {
+        chunked_layer result = {
+            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N_EMBD, N_TOKENS),
+            ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, N_TOKENS),
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, N_TOKENS),
+            nullptr,
+            nullptr,
+            nullptr,
+        };
+        const int64_t n_first = N_TOKENS / 2;
+        const int64_t n_second = N_TOKENS - n_first;
+        ggml_tensor * inp_a = ggml_view_2d(ctx, result.inp, N_EMBD, n_first, result.inp->nb[1], 0);
+        ggml_tensor * inp_b = ggml_view_2d(ctx, result.inp, N_EMBD, n_second, result.inp->nb[1], n_first * result.inp->nb[1]);
+        ggml_tensor * ids_a = ggml_view_2d(ctx, result.ids, 1, n_first, result.ids->nb[1], 0);
+        ggml_tensor * ids_b = ggml_view_2d(ctx, result.ids, 1, n_second, result.ids->nb[1], n_first * result.ids->nb[1]);
+        ggml_tensor * weights_a = ggml_view_3d(ctx, result.weights, 1, 1, n_first,
+                                                result.weights->nb[1], result.weights->nb[2], 0);
+        ggml_tensor * weights_b = ggml_view_3d(ctx, result.weights, 1, 1, n_second,
+                                                result.weights->nb[1], result.weights->nb[2], n_first * result.weights->nb[2]);
+        result.issue_a = dispatcher.build_issue(ctx, inp_a, ids_a, weights_a, layer, TEST_SWIGLU_CLAMP,
+                                                0, 2, nullptr, result.inp, result.ids, result.weights, 0);
+        result.issue_b = dispatcher.build_issue(ctx, inp_b, ids_b, weights_b, layer, TEST_SWIGLU_CLAMP,
+                                                1, 2, result.issue_a, result.inp, result.ids, result.weights, n_first);
+        result.wait = dispatcher.build_wait(ctx, layer);
+        return result;
+    };
+
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> reserve_ctx(ggml_init(params), ggml_free);
+    require(reserve_ctx != nullptr, "failed to create reserve ggml context");
+    dispatcher.begin_graph_build(reserve_ctx.get());
+    const chunked_layer reserve = build_chunked_layer(reserve_ctx.get(), LAYER);
+    ggml_cgraph * reserve_graph = ggml_new_graph_custom(reserve_ctx.get(), 32, false);
+    ggml_build_forward_expand(reserve_graph, reserve.wait);
+
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> real_ctx(ggml_init(params), ggml_free);
+    require(real_ctx != nullptr, "failed to create real ggml context");
+    dispatcher.begin_graph_build(real_ctx.get());
+    const chunked_layer real = build_chunked_layer(real_ctx.get(), LAYER);
+    ggml_cgraph * graph = ggml_new_graph_custom(real_ctx.get(), 32, false);
+    ggml_build_forward_expand(graph, real.wait);
+
+    ggml_tensor * wait_a = real.wait->src[0];
+    ggml_tensor * wait_b = real.wait->src[1];
+    require(wait_a != nullptr && wait_b != nullptr,
+            "chunked wait did not retain both wait nodes");
+    require(graph_node_index(graph, real.issue_a) >= 0 && graph_node_index(graph, real.issue_b) >= 0 &&
+            graph_node_index(graph, wait_a) >= 0 && graph_node_index(graph, wait_b) >= 0,
+            "second graph dropped a chunk issue or wait node");
+
+    ggml_tensor * issue1 = dispatcher.build_issue(real_ctx.get(), real.inp, real.ids, real.weights,
+                                                   LAYER + 1, TEST_SWIGLU_CLAMP);
     ggml_build_forward_expand(graph, issue1);
 
-    require(issue1->src[2] != w && issue1->src[2]->op == GGML_OP_ADD,
+    require(issue1->src[2] != real.weights && issue1->src[2]->op == GGML_OP_ADD,
             "next issue did not receive the wait-gated weights input");
-    require(has_source(issue1->src[2], wait0),
+    require(has_source(issue1->src[2], real.wait),
             "next issue weights do not depend on the previous wait");
 
-    const int issue0_index = graph_node_index(graph, issue0);
-    const int wait0_index  = graph_node_index(graph, wait0);
+    const int issue_a_index = graph_node_index(graph, real.issue_a);
+    const int issue_b_index = graph_node_index(graph, real.issue_b);
+    const int wait_a_index  = graph_node_index(graph, wait_a);
+    const int wait_b_index  = graph_node_index(graph, wait_b);
     const int issue1_index = graph_node_index(graph, issue1);
-    require(issue0_index >= 0 && wait0_index >= 0 && issue1_index >= 0,
+    require(issue_a_index >= 0 && issue_b_index >= 0 && wait_a_index >= 0 && wait_b_index >= 0 && issue1_index >= 0,
             "issue/wait graph nodes are missing");
-    require(issue0_index < wait0_index && wait0_index < issue1_index,
-            "graph node order is not issue(L), wait(L), issue(L+1)");
+    require(issue_a_index < issue_b_index && issue_b_index < wait_a_index && wait_a_index < wait_b_index &&
+            wait_b_index < issue1_index,
+            "graph node order is not issue_A, issue_B, wait_A, wait_B, issue(L+1)");
     if (had_previous_chunks) {
         require(setenv("WP_DISPATCH_CHUNKS", previous_chunks_value.c_str(), 1) == 0,
                 "failed to restore dispatch chunks");
