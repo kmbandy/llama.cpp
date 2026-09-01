@@ -38,6 +38,9 @@ size_t record_span(size_t length) {
     return align_up(RECORD_HEADER_SIZE + length, RECORD_ALIGNMENT);
 }
 
+} // namespace
+
+// A nested class member cannot be defined inside an unnamed namespace.
 #if defined(__linux__)
 struct alignas(HEADER_ALIGNMENT) pipe_expert_shm_ring::Header {
     uint32_t magic = SHM_MAGIC;
@@ -56,7 +59,11 @@ struct alignas(HEADER_ALIGNMENT) pipe_expert_shm_ring::Header {
 
 static_assert(sizeof(pipe_expert_shm_ring::Header) <= HEADER_ALIGNMENT,
               "shm header must fit in the reserved header page");
+#endif
 
+namespace {
+
+#if defined(__linux__)
 char g_cleanup_name[256] = {};
 
 void shm_cleanup_signal(int) {

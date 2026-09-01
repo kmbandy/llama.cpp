@@ -8673,7 +8673,7 @@ public:
         const bool measure_vk = measure && is_vulkan_backend();
         std::chrono::steady_clock::time_point vk_dispatch_started;
         if (!request.assignments.empty()) {
-            prepare_io(activation, request.n_tokens, request_stats);
+            prepare_io(activation, request.activation_size(), request.n_tokens, request_stats);
             request_stats.ns_prep = lap();
             if (measure_vk) {
                 vk_dispatch_started = std::chrono::steady_clock::now();
@@ -10064,7 +10064,8 @@ private:
     }
 
     void prepare_io(
-            const std::vector<float> & activation,
+            const float * activation,
+            size_t activation_count,
             uint32_t n_tokens,
             RequestStats & request_stats) {
         const ggml_init_params params = {
@@ -10111,7 +10112,7 @@ private:
         attach_weight(
             input, io_active_, ggml_backend_buffer_get_base(io_active_), 0);
         sublap(request_stats.ns_prep_attach);
-        const size_t act_bytes = request.activation_size() * sizeof(float);
+        const size_t act_bytes = activation_count * sizeof(float);
         const void * src = activation;
         const bool pinned =
             io_src_base_ != nullptr && act_bytes <= io_src_size_;
@@ -13424,6 +13425,10 @@ public:
             throw std::overflow_error("expert worker slot count overflows HELLO");
         }
         result.n_slots = (uint32_t) slots;
+        if (local_shm_ != nullptr) {
+            result.shm_name = local_shm_->name();
+            result.shm_tokens = local_shm_tokens_;
+        }
         return result;
     }
 
@@ -13463,10 +13468,6 @@ public:
         int result = 0;
         for (const std::unique_ptr<DeviceWorker> & device : devices_) {
             result += device->pinned_pages();
-        }
-        if (local_shm_ != nullptr) {
-            result.shm_name = local_shm_->name();
-            result.shm_tokens = local_shm_tokens_;
         }
         return result;
     }
