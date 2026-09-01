@@ -2030,15 +2030,16 @@ struct dispatcher::impl {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " died while computing expert(s) " + assignment_experts(request.assignments));
         }
-        // Demultiplex the response to its owning handle before trusting it.
-        // demux_seq_id() failing (unknown seq_id) and the direct seq_id !=
-        // wanted_seq_id compare below are the same fact whenever
-        // k_max_open_dispatches == 1 -- wanted_seq_id was always read off the
-        // one open slot's own seq_id (or that value's dedup-retry variant) --
-        // but keeping the explicit compare means this throws on exactly the
-        // conditions it always did, byte for byte, while the lookup is what
-        // stage 4 uses to route a response when a second handle is open.
-        if (demux_seq_id(seq_id) == k_invalid_handle || seq_id != wanted_seq_id) {
+        // The throw condition is EXACTLY the original strict compare. It must
+        // not also require demux_seq_id() to resolve: deferred-request
+        // responses (WP_DEFER_K) are legitimately awaited AFTER their
+        // dispatch's slot is released, and gates49 (2026-08-31) showed even
+        // the immediate path awaits after release depending on call order --
+        // gating the throw on the slot map made every await fail with
+        // "returned sequence N while awaiting N". demux_seq_id() stays as the
+        // routing lookup stage 4 will use to steer a response to one of two
+        // open handles; until then it is not a validity check.
+        if (seq_id != wanted_seq_id) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint + " returned sequence " +
                                      std::to_string(seq_id) + " while awaiting " + std::to_string(wanted_seq_id));
         }
@@ -3581,14 +3582,15 @@ struct dispatcher::impl {
         std::vector<float>           folded_prev     = std::move(slot.folded_prev);
         std::vector<size_t>          assigned_counts = std::move(slot.assigned_counts);
         const dispatch_clock::time_point wait_start  = slot.wait_start;
-        // Release now, before the blocking wait below: with capacity 1 this
-        // is observationally identical to releasing after (has_open_dispatch()
-        // was already going to see the local `open_disp = {}` copy either
-        // way), but it means the handle map itself is not held "in use" for
-        // the duration of the wait -- stage 4's second handle needs exactly
-        // that so its own begin_dispatch is never blocked on the first
-        // handle's finish_dispatch actually returning.
-        release_dispatch_slot(handle);
+        // The slot must stay registered through the awaits below: demux_seq_id
+        // resolves an incoming response to its owning handle by looking the
+        // seq_id up in dispatch_slots_, so releasing before the response has
+        // been consumed orphans the seq_id and every await throws "returned
+        // sequence N while awaiting N" (gates49, 2026-08-31). Release happens
+        // just before the successful return; the failure path is covered by
+        // poison() clearing all slots. Stage 4's requirement that a second
+        // begin_dispatch not wait on this finish is met by capacity, not by
+        // early release.
 
         try {
             std::vector<float> result((size_t) activation_count, 0.0f);
@@ -3682,6 +3684,7 @@ struct dispatcher::impl {
                              (unsigned long long) hash_pre,
                              (unsigned long long) hash_post, hash_reqs);
             }
+            release_dispatch_slot(handle);
             return result;
         } catch (...) {
             poison();
