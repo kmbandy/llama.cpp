@@ -1562,18 +1562,22 @@ std::vector<uint8_t> pipe_encode_expert_partial_chunk(
     if (p.partial.dtype != PIPE_HIDDEN_F32) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk encode only supports PIPE_HIDDEN_F32");
     }
-    const std::vector<uint8_t> partial = pipe_encode_expert_partial(p.partial);
-    if (partial.size() > PIPE_MAX_PAYLOAD - 20ull) {
+    if (p.partial.n_tokens == 0 || p.partial.partial.size() >
+            (PIPE_MAX_PAYLOAD - 20ull - 12ull) / sizeof(float)) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk exceeds max payload");
     }
-    std::vector<uint8_t> out(20ull + partial.size());
+    const size_t partial_size = 12ull + p.partial.partial.size() * sizeof(float);
+    std::vector<uint8_t> out(20ull + partial_size);
     uint8_t * w = out.data();
     wr_u32(w, p.chunk_index);
     wr_u32(w, p.chunk_count);
     wr_u32(w, p.total_tokens);
     wr_u32(w, p.token_start);
     wr_u32(w, p.token_end);
-    std::memcpy(w, partial.data(), partial.size());
+    wr_i32(w, p.partial.layer);
+    wr_u32(w, p.partial.n_tokens);
+    wr_i32(w, p.partial.dtype);
+    wr_f32_bulk(w, p.partial.partial.data(), p.partial.partial.size());
     return out;
 }
 
