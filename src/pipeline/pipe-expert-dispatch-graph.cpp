@@ -1321,13 +1321,10 @@ std::string graph_dispatcher::failure_message() const {
 }
 
 void graph_dispatcher::begin_decode() noexcept {
-    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
-    // begin_decode()/end_decode() bracket a whole llama_decode() call for
-    // this dispatcher's context (expert_dispatch_decode_scope in
-    // llama-context.cpp) and touch `remote`'s deferral-window/workers
-    // state, so they need the same exclusivity as compute()/compute_issue()/
-    // compute_wait() -- which nest inside this same call, hence recursive.
-    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
+    // Hold the dispatcher lock across the whole llama_decode() call. A draft
+    // context can borrow this dispatcher, so per-callback locking still allows
+    // it to issue while the target's chunk handles are open.
+    io_mutex_.lock();
     phantom_rows_.clear();
     router2_pages_this_decode_ = 0;
     pred_snapshot_taken_       = false;
@@ -1355,9 +1352,8 @@ void graph_dispatcher::begin_decode() noexcept {
 }
 
 void graph_dispatcher::end_decode() noexcept {
-    // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration and
-    // begin_decode()'s comment.
-    std::lock_guard<std::recursive_mutex> io_lock(io_mutex_);
+    // begin_decode() holds this recursive lock for the decode scope.
+    std::unique_lock<std::recursive_mutex> io_lock(io_mutex_, std::adopt_lock);
     // PREDICTION CADENCE. Emitted once per decode so a run's log says how often
     // the predictor actually ran, rather than how often it was asked to. See the
     // latest-wins comment in enqueue_prediction.

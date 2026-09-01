@@ -1817,22 +1817,29 @@ void run_test() {
         }
         require(finish_empty, "finish_dispatch with nothing open must throw");
 
-        dispatcher.begin_dispatch(LAYER, 43, N_TOKENS, activation, assignments, TEST_SWIGLU_CLAMP);
-        require(dispatcher.has_open_dispatch(), "begin_dispatch must leave a dispatch open");
+        const pipe_expert_dispatcher::dispatcher::dispatch_handle first_handle =
+            dispatcher.begin_dispatch(LAYER, 43, N_TOKENS, activation, assignments, TEST_SWIGLU_CLAMP);
+        require(dispatcher.has_open_dispatch(first_handle), "begin_dispatch must leave a dispatch open");
         require(dispatcher.in_flight_requests() > 0, "begin_dispatch must have issued worker requests");
 
-        bool double_begin = false;
+        const pipe_expert_dispatcher::dispatcher::dispatch_handle second_handle =
+            dispatcher.begin_dispatch(LAYER, 44, N_TOKENS, activation, assignments, TEST_SWIGLU_CLAMP);
+        require(dispatcher.has_open_dispatch(second_handle), "second begin_dispatch must leave a dispatch open");
+
+        bool triple_begin = false;
         try {
             dispatcher.begin_dispatch(LAYER, 44, N_TOKENS, activation, assignments, TEST_SWIGLU_CLAMP);
         } catch (const std::runtime_error & error) {
-            double_begin = std::string(error.what()).find("already open") != std::string::npos;
+            triple_begin = std::string(error.what()).find("already open") != std::string::npos;
         }
-        require(double_begin, "a second begin_dispatch must throw while one is open");
+        require(triple_begin, "a third begin_dispatch must throw while two are open");
 
-        const std::vector<float> split = dispatcher.finish_dispatch();
-        require(!dispatcher.has_open_dispatch(), "finish_dispatch must close the open dispatch");
+        const std::vector<float> split = dispatcher.finish_dispatch(first_handle);
+        const std::vector<float> second = dispatcher.finish_dispatch(second_handle);
+        require(!dispatcher.has_open_dispatch(), "finish_dispatch must close the open dispatches");
         require(dispatcher.in_flight_requests() == 0, "in-flight requests remain after finish_dispatch");
         require(split.size() == expected.size(), "split dispatch output shape mismatch");
+        require(second.size() == expected.size(), "second dispatch output shape mismatch");
         for (size_t i = 0; i < expected.size(); ++i) {
             const float tolerance = 0.003f + 0.02f * std::fabs(expected[i]);
             if (std::fabs(split[i] - expected[i]) > tolerance) {

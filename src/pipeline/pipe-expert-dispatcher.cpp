@@ -979,12 +979,9 @@ struct dispatcher::impl {
                              "expert dispatch: WP_EXPERT_OVERLAP=1 is incompatible with chunked dispatch; "
                              "worker launch must set WP_EXPERT_OVERLAP=0\n");
             }
-            if (const char * pipeline = std::getenv("WP_WORKER_PIPELINE");
-                pipeline == nullptr || pipeline[0] != '1') {
-                LLAMA_LOG_WARN(
-                             "expert dispatch: WP_WORKER_PIPELINE is not set to 1; "
-                             "chunked dispatch requires the worker pipeline reader\n");
-            }
+            LLAMA_LOG_WARN(
+                         "expert dispatch: chunked dispatch requires WP_WORKER_PIPELINE=1 "
+                         "in the worker launch environment; the spine cannot verify that setting\n");
         }
         decode_prefer_port_ = decode_prefer_port_enabled();
         if (unpack_overlap) {
