@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -510,6 +511,83 @@ static void test_graph_op_split_shexp(const weight_map & weights,
         }
     }
     (void) issued;
+}
+
+bool has_source(const ggml_tensor * node, const ggml_tensor * needle) {
+    if (node == needle) {
+        return true;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (node->src[i] != nullptr && has_source(node->src[i], needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int graph_node_index(ggml_cgraph * graph, const ggml_tensor * node) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        if (ggml_graph_node(graph, i) == node) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void test_split_shexp_wait_before_next_issue(const std::vector<int> & ports) {
+    std::string endpoints;
+    for (size_t i = 0; i < ports.size(); ++i) {
+        if (i != 0) {
+            endpoints += ",";
+        }
+        endpoints += "127.0.0.1:" + std::to_string(ports[i]);
+    }
+
+    const char * previous_chunks = std::getenv("WP_DISPATCH_CHUNKS");
+    const bool had_previous_chunks = previous_chunks != nullptr;
+    const std::string previous_chunks_value = had_previous_chunks ? previous_chunks : "";
+    require(setenv("WP_DISPATCH_CHUNKS", "2", 1) == 0, "failed to enable dispatch chunks");
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    require(ctx != nullptr, "failed to create issue-order ggml context");
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, N_EMBD, N_TOKENS);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, N_TOKENS);
+    ggml_tensor * w   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, 1, N_TOKENS);
+
+    pipe_expert_dispatcher::graph_dispatcher dispatcher(
+        endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
+    dispatcher.begin_graph_build(ctx.get());
+    ggml_tensor * issue0 = dispatcher.build_issue(ctx.get(), inp, ids, w, LAYER, TEST_SWIGLU_CLAMP);
+    ggml_tensor * wait0  = dispatcher.build_wait(ctx.get(), LAYER);
+    ggml_cgraph * graph  = ggml_new_graph_custom(ctx.get(), 32, false);
+    ggml_build_forward_expand(graph, wait0);
+
+    ggml_tensor * issue1 = dispatcher.build_issue(ctx.get(), inp, ids, w, LAYER + 1, TEST_SWIGLU_CLAMP);
+    ggml_build_forward_expand(graph, issue1);
+
+    require(issue1->src[2] != w && issue1->src[2]->op == GGML_OP_ADD,
+            "next issue did not receive the wait-gated weights input");
+    require(has_source(issue1->src[2], wait0),
+            "next issue weights do not depend on the previous wait");
+
+    const int issue0_index = graph_node_index(graph, issue0);
+    const int wait0_index  = graph_node_index(graph, wait0);
+    const int issue1_index = graph_node_index(graph, issue1);
+    require(issue0_index >= 0 && wait0_index >= 0 && issue1_index >= 0,
+            "issue/wait graph nodes are missing");
+    require(issue0_index < wait0_index && wait0_index < issue1_index,
+            "graph node order is not issue(L), wait(L), issue(L+1)");
+    if (had_previous_chunks) {
+        require(setenv("WP_DISPATCH_CHUNKS", previous_chunks_value.c_str(), 1) == 0,
+                "failed to restore dispatch chunks");
+    } else {
+        require(unsetenv("WP_DISPATCH_CHUNKS") == 0, "failed to disable dispatch chunks");
+    }
 }
 
 pipe_expert_hello fault_hello() {
@@ -1852,6 +1930,7 @@ void run_test() {
 
     test_graph_op(weights, activation, assignments, { port_a0, port_a1, port_b0, port_b1 });
     test_graph_op_split_shexp(weights, activation, assignments, { port_a0, port_a1, port_b0, port_b1 });
+    test_split_shexp_wait_before_next_issue({ port_a0, port_a1, port_b0, port_b1 });
     std::cout << "begin/finish dispatch and split-shexp graph matched the combined path\n";
 
     test_decode_prefer_port();

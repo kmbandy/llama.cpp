@@ -21,6 +21,7 @@
 #include "llama-memory-recurrent.h"
 #include "pipeline/pipe-expert-dispatch-graph.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2307,6 +2308,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         const float dispatch_swiglu_clamp = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
         const bool chunked = expert_dispatch->dispatch_chunks() == 2 && n_tokens >= 64;
         const bool split_shexp = moe_dispatch_split_shexp && il >= 0;
+        static std::atomic<int> dispatch_gate_logged{ 0 };
+        if (il == 0 && n_tokens >= 64 &&
+            dispatch_gate_logged.fetch_add(1, std::memory_order_relaxed) < 6) {
+            LLAMA_LOG_WARN(
+                "expert dispatch gate: dispatcher=%p dispatch_chunks=%d n_tokens=%lld n_seqs=%u split_shexp=%d il=%d chunked=%d\n",
+                (void *) expert_dispatch, expert_dispatch->dispatch_chunks(), (long long) n_tokens,
+                ubatch.n_seqs, split_shexp, il, chunked);
+        }
         ggml_tensor * moe_out = nullptr;
         if (split_shexp) {
             if (expert_dispatch->dispatch_chunks() == 2) {
