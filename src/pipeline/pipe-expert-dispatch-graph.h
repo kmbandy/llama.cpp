@@ -81,7 +81,7 @@ class graph_dispatcher {
     ggml_tensor * build_wait(ggml_context * ctx, int32_t layer);
 
     void begin_graph_build(ggml_context * ctx);
-    bool begin_chunked_issue_build(ggml_context * ctx, int32_t layer);
+    bool begin_issue_build(ggml_context * ctx, int32_t layer);
     void note_wait_expanded(ggml_context * ctx, int32_t layer);
 
     // ---- hash-layer prefetch ------------------------------------------------
@@ -467,8 +467,9 @@ class graph_dispatcher {
     FILE *                                         capture_file_ = nullptr;
     std::atomic<uint64_t>                          next_seq_id{ 1 };
     std::map<int32_t, std::unique_ptr<op_context>> op_contexts;
+    std::map<int32_t, ggml_tensor *>                wait_tensors_;
     ggml_context *                                 graph_build_ctx_ = nullptr;
-    int32_t                                         last_chunked_issue_layer_ = -1;
+    int32_t                                         last_issue_layer_ = -1;
     int32_t                                         last_expanded_wait_layer_ = -1;
     std::atomic<bool>                              failed_{ false };
     mutable std::mutex                             failure_mutex_;

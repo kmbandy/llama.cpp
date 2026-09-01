@@ -466,6 +466,14 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
         ggml_tensor * gate = ggml_scale(ctx, ggml_view_1d(ctx, issue_dependency, 1, 0), 0.0f);
         weights = ggml_add(ctx, weights, gate);
     }
+    if (remote.dispatch_chunks() == 2) {
+        // Do not rely on the model residual path to order this recv before the next issue.
+        const auto previous_wait = wait_tensors_.find(layer - 1);
+        if (previous_wait != wait_tensors_.end()) {
+            ggml_tensor * gate = ggml_scale(ctx, ggml_view_1d(ctx, previous_wait->second, 1, 0), 0.0f);
+            weights = ggml_add(ctx, weights, gate);
+        }
+    }
     const int32_t key = layer * 2 + chunk_index;
     auto & context = op_contexts[key];
     if (!context) {
@@ -517,40 +525,45 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     // both srcs are the CPU issue node. A GPU shexp src here made wait a
     // GPU→CPU split input and serialized recv behind shexp.
     ggml_tensor * issued = it->second->issued;
+    ggml_tensor * wait = nullptr;
     if (it->second->chunk_count == 1) {
-        return ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
+        wait = ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
+    } else {
+        const auto next = op_contexts.find(layer * 2 + 1);
+        if (next == op_contexts.end() || next->second == nullptr || next->second->issued == nullptr) {
+            throw std::runtime_error("build_wait has incomplete chunk issues for layer " + std::to_string(layer));
+        }
+        ggml_tensor * wait_a = ggml_map_custom2(ctx, issued, next->second->issued,
+                                                compute_wait, 1, it->second.get());
+        ggml_tensor * wait_b = ggml_map_custom2(ctx, next->second->issued, wait_a,
+                                                compute_wait, 1, next->second.get());
+        wait = ggml_concat(ctx, wait_a, wait_b, 1);
     }
-    const auto next = op_contexts.find(layer * 2 + 1);
-    if (next == op_contexts.end() || next->second == nullptr || next->second->issued == nullptr) {
-        throw std::runtime_error("build_wait has incomplete chunk issues for layer " + std::to_string(layer));
-    }
-    ggml_tensor * wait_a = ggml_map_custom2(ctx, issued, next->second->issued,
-                                            compute_wait, 1, it->second.get());
-    ggml_tensor * wait_b = ggml_map_custom2(ctx, next->second->issued, wait_a,
-                                            compute_wait, 1, next->second.get());
-    return ggml_concat(ctx, wait_a, wait_b, 1);
+    wait_tensors_[layer] = wait;
+    return wait;
 }
 
 void graph_dispatcher::begin_graph_build(ggml_context * ctx) {
     graph_build_ctx_ = ctx;
-    last_chunked_issue_layer_ = -1;
+    wait_tensors_.clear();
+    last_issue_layer_ = -1;
     last_expanded_wait_layer_ = -1;
 }
 
-bool graph_dispatcher::begin_chunked_issue_build(ggml_context * ctx, int32_t layer) {
+bool graph_dispatcher::begin_issue_build(ggml_context * ctx, int32_t layer) {
     if (graph_build_ctx_ != ctx) {
         begin_graph_build(ctx);
     }
 
     const int32_t previous_layer = layer - 1;
-    const bool ordered = last_chunked_issue_layer_ != previous_layer ||
+    const bool ordered = last_issue_layer_ != previous_layer ||
                          last_expanded_wait_layer_ >= previous_layer;
     if (!ordered) {
         std::fprintf(stderr,
                      "expert dispatch graph order: layer %d issue created before layer %d wait expanded\n",
                      layer, previous_layer);
     }
-    last_chunked_issue_layer_ = layer;
+    last_issue_layer_ = layer;
     return ordered;
 }
 

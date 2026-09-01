@@ -2305,13 +2305,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // path returns before the switch, so passing it on is the ONLY way the
         // limit reaches the expert FFN at all.
         const float dispatch_swiglu_clamp = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-        const bool chunked = expert_dispatch->dispatch_chunks() == 2 &&
-                             n_tokens >= 64 && ubatch.n_seqs == 1;
+        const bool chunked = expert_dispatch->dispatch_chunks() == 2 && n_tokens >= 64;
         const bool split_shexp = moe_dispatch_split_shexp && il >= 0;
         ggml_tensor * moe_out = nullptr;
         if (split_shexp) {
+            if (expert_dispatch->dispatch_chunks() == 2) {
+                GGML_ASSERT(expert_dispatch->begin_issue_build(ctx0, il));
+            }
             if (chunked) {
-                GGML_ASSERT(expert_dispatch->begin_chunked_issue_build(ctx0, il));
                 const int64_t n_first = n_tokens / 2;
                 const int64_t n_second = n_tokens - n_first;
                 const int64_t n_expert_used_i = selected_experts->ne[0];
