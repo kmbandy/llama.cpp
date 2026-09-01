@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -3100,6 +3101,34 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+
+    // WP_RESERVE_N_KV=<cells>: cap the n_kv the RESERVE graph is planned at.
+    // This context only ever backs sched_reserve()/memory_update() worst-case
+    // graphs, and every [n_kv, n_tokens] input they carry (attn_inp_kq_mask in
+    // F16 under flash-attn, the QSA cell/bias inputs) is sized off it: at
+    // n_ubatch=2048 and a 262144-cell cache the mask alone is 1 GiB of VRAM
+    // plus its pinned host mirror, parked for the process lifetime for a
+    // context depth prefill never reaches on this rig (2026-09-01: that 1 GiB
+    // is exactly the 429 -> 1442 MiB ROCm0 compute-buffer growth that spilled
+    // the R9700 into GTT). Live graphs size n_kv from the real slot info; if
+    // one ever exceeds the cap, ggml_backend_sched_alloc_splits re-reserves
+    // and grows the buffers once (see the "failed to allocate graph,
+    // reserving" path), so this trades a lifetime allocation for a one-time
+    // reallocation at depth. Default 0 = upstream behaviour.
+    static const uint32_t reserve_n_kv_cap = [] {
+        const char * e = std::getenv("WP_RESERVE_N_KV");
+        if (e == nullptr || e[0] == '\0') {
+            return (uint32_t) 0;
+        }
+        const long v = std::strtol(e, nullptr, 10);
+        return v > 0 ? (uint32_t) v : (uint32_t) 0;
+    }();
+    if (reserve_n_kv_cap > 0 && reserve_n_kv_cap < n_kv) {
+        const uint32_t capped = GGML_PAD(reserve_n_kv_cap, 256);
+        LLAMA_LOG_WARN("%s: WP_RESERVE_N_KV=%u -- reserve graph planned at n_kv=%u instead of %u\n",
+                       __func__, reserve_n_kv_cap, capped, n_kv);
+        n_kv = capped;
+    }
 
     const uint32_t n_stream = kv->get_n_stream();
 
