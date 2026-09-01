@@ -2178,8 +2178,21 @@ bool llama_context::set_adapter_cvec(
 // WP_QWEN4EXP_LAYER_CUT (Stage 3, pipelined-prefill): gate for the staged
 // (49-explicit-stage) decode path. Plan item 1's required conditions:
 //   arch == QWEN4EXP, gtype == DEFAULT, non-draft context, pooling_type NONE,
-//   ubatch.n_tokens >= 64. LLM_GRAPH_TYPE_DECODER_MTP is excluded by the gtype
-//   check alone (graph_mtp keeps its own separate whole graph -- plan item 3).
+//   a real prefill-shaped ubatch (>= 64 tokens in ONE sequence). LLM_GRAPH_TYPE_DECODER_MTP
+//   is excluded by the gtype check alone (graph_mtp keeps its own separate whole graph --
+//   plan item 3).
+//
+// BUGFIX 2026-09-01 (spine crash, gdb-confirmed): this used to check
+// ubatch.n_tokens >= 64. n_tokens is n_seq_tokens * n_seqs (llama-batch.h), so
+// a batched CONTINUOUS-BATCHING decode step -- many concurrent sequences, one
+// new token each -- can have n_tokens >= 64 while every sequence is
+// contributing exactly one token (n_seq_tokens == 1). That is not a prefill
+// shape at all: it is what "host logits rows = 4" (a handful of sequences
+// wanting output out of a large multi-sequence decode ubatch) looked like in
+// the crash. process_ubatch_staged's stage bodies (QSA block budgeting,
+// keep_all_rows dispatch sizing, the single res_hc boundary buffer) all
+// assume one growing causal prefix, not N independent one-token sequences.
+// The correct discriminator is tokens PER sequence, not the flattened total.
 //
 // Two exclusions beyond the architect's list, both flagged in the Stage 3
 // summary rather than silently added:
@@ -2211,7 +2224,11 @@ bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_ty
         return false;
     }
 
-    if (ubatch.n_tokens < 64) {
+    // n_seq_tokens, not n_tokens: see the bugfix note above. Also require a
+    // single sequence set -- the staged path's res_hc boundary is one flat
+    // [n_embd, hc, n_tokens] buffer with no per-sequence structure, which is
+    // only sound for the one-growing-prefix shape real prefill has.
+    if (ubatch.n_seq_tokens < 64 || ubatch.n_seqs != 1) {
         return false;
     }
 

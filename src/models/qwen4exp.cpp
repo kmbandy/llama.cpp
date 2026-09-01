@@ -687,6 +687,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_trunk_head(
 void llama_model_qwen4exp::graph::build_trunk_staged(int64_t hc, int * sections, int32_t stage_il) {
     auto * inp = build_inp_mem_hybrid();
 
+    // BUGFIX 2026-09-01 (spine crash, gdb-confirmed):
+    // build_inp_mem_hybrid() unconditionally creates BOTH the attention-cache
+    // side (self_k_idxs/self_v_idxs/self_kq_mask/self_k_rot/self_v_rot or the
+    // paged_* equivalents) and the recurrent-cache side (s_copy), and
+    // llm_graph_input_mem_hybrid::set_input() unconditionally fills both every
+    // ubatch, regardless of which side this graph's ops actually reference.
+    // On the whole-graph path that is always safe: 48 layers guarantee SOME
+    // layer uses each side, so every one of these tensors is reachable from an
+    // output and gets a real scheduler-allocated buffer before set_inputs()
+    // runs. A single staged layer is not guaranteed that: a recurrent
+    // (is_recr) layer's build_layer_attn_linear never touches the attention
+    // side, and a full-attention layer never touches the recurrent side, so
+    // whichever side goes unused here is never added to gf via
+    // ggml_build_forward_expand, the scheduler leaves its buffer null, and
+    // set_inputs() -> llm_graph_input_mem_hybrid::set_input() ->
+    // llama_kv_cache::set_input_k_idxs crashes on
+    // GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer)) with buffer ==
+    // nullptr. Force both sides into gf here, unconditionally, as inert extra
+    // leaves before this stage's real ops are built below: cheap (index/mask
+    // tensors, not activations) and harmless when a stage's own compute does
+    // not end up consuming them.
+    {
+        auto * inp_attn = inp->get_attn();
+        if (inp_attn->is_paged) {
+            if (inp_attn->paged_block_table)  ggml_build_forward_expand(gf, inp_attn->paged_block_table);
+            if (inp_attn->paged_context_lens) ggml_build_forward_expand(gf, inp_attn->paged_context_lens);
+            if (inp_attn->paged_q_lens)       ggml_build_forward_expand(gf, inp_attn->paged_q_lens);
+            if (inp_attn->paged_slot_mapping) ggml_build_forward_expand(gf, inp_attn->paged_slot_mapping);
+        } else {
+            if (inp_attn->self_k_idxs)  ggml_build_forward_expand(gf, inp_attn->self_k_idxs);
+            if (inp_attn->self_v_idxs)  ggml_build_forward_expand(gf, inp_attn->self_v_idxs);
+            if (inp_attn->self_kq_mask) ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
+            if (inp_attn->self_k_rot)   ggml_build_forward_expand(gf, inp_attn->self_k_rot);
+            if (inp_attn->self_v_rot)   ggml_build_forward_expand(gf, inp_attn->self_v_rot);
+        }
+
+        auto * inp_rs = inp->get_recr();
+        if (inp_rs->s_copy) {
+            ggml_build_forward_expand(gf, inp_rs->s_copy);
+        }
+    }
+
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
 
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
