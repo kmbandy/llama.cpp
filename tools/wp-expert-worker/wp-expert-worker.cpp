@@ -3009,12 +3009,16 @@ public:
         // we would report staging_kind=pinned while actually running
         // pageable, and derive gb_s_h2d against a mechanism that never ran.
         bool pinned = try_pinned && host_buft != nullptr;
-        if (try_pinned && vulkan && ggml_backend_vk_wp_host_register != nullptr) {
+        // Vulkan host registration needs the DEVICE POOL buffer
+        // (ggml_backend_vk_wp_host_register(pool_buffer, ...)), which this
+        // staging pool does not own at construction. Vulkan tiers keep the
+        // unpinned staging path; CUDA/ROCm use the host buffer type above.
+        if (false && try_pinned && vulkan && ggml_backend_vk_wp_host_register != nullptr) {
             pinned = true;
             for (int i = 0; i < resources.staging_buffers; ++i) {
                 void * raw = nullptr;
                 if (posix_memalign(&raw, DIRECT_ALIGNMENT, (size_t) buffer_bytes_) != 0 ||
-                        !ggml_backend_vk_wp_host_register(backend_, raw,
+                        !ggml_backend_vk_wp_host_register((ggml_backend_buffer_t) nullptr, raw,
                                                           (size_t) buffer_bytes_)) {
                     if (raw != nullptr) {
                         std::free(raw);
@@ -3027,7 +3031,7 @@ public:
             }
             if (!pinned) {
                 for (void * raw : registered_host_buffers_) {
-                    ggml_backend_vk_wp_host_unregister(backend_, raw);
+                    ggml_backend_vk_wp_host_unregister((ggml_backend_buffer_t) nullptr, raw);
                 }
                 registered_host_buffers_.clear();
                 buffers_.clear();
@@ -3112,7 +3116,7 @@ public:
         }
         if (ggml_backend_vk_wp_host_unregister != nullptr) {
             for (void * raw : registered_host_buffers_) {
-                ggml_backend_vk_wp_host_unregister(backend_, raw);
+                ggml_backend_vk_wp_host_unregister((ggml_backend_buffer_t) nullptr, raw);
             }
         }
     }

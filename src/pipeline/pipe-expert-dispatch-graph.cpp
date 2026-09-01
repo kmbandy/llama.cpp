@@ -454,8 +454,10 @@ void graph_dispatcher::spine_layer_profile_split(
     // a node, changes a backend assignment, or synchronizes a backend.
     GGML_UNUSED(n_splits);
 
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * node = graph->nodes[i];
+    ggml_cgraph * mutable_graph = const_cast<ggml_cgraph *>(graph);
+    const int n_nodes = ggml_graph_n_nodes(mutable_graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(mutable_graph, i);
         if (node == nullptr) {
             continue;
         }
