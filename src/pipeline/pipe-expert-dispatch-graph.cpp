@@ -1659,7 +1659,7 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         // into the returned block (residual path for layer N+1).
         const dispatcher::dispatch_handle handle = owner->remote.begin_dispatch(
             context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
-            context->swiglu_clamp);
+            context->swiglu_clamp, 0, nullptr, 0, "graph_dispatcher::compute");
         dispatch_stats layer_stats;
         std::vector<float> result = owner->remote.finish_dispatch(handle, &layer_stats);
         owner->zero_phantom_rows(result, n_tokens, n_embd);
@@ -1732,9 +1732,6 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                                  (context->chunk_count == 1 || context->chunk_index == 0);
         const bool trace_profile = owner->spine_profile_.active &&
                                    (context->chunk_count == 1 || context->chunk_index == 0);
-        if (trace_profile) {
-            owner->spine_profile_issue_begin(dispatch_clock::now());
-        }
         // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
         std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
         if (owner->failed()) {
@@ -1742,6 +1739,15 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                 *static_cast<float *>(dst->data) = 0.0f;
             }
             return;
+        }
+        if (context->handle != 0 && owner->remote.has_open_dispatch(context->handle)) {
+            if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
+                *static_cast<float *>(dst->data) = 0.0f;
+            }
+            return;
+        }
+        if (trace_profile) {
+            owner->spine_profile_issue_begin(dispatch_clock::now());
         }
         const bool collect_stats = owner->decode_active_;
 
@@ -1849,7 +1855,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
         context->handle = owner->remote.begin_dispatch(context->layer, seq_id, (uint32_t) n_tokens,
                                                        wire_activations, assignments, context->swiglu_clamp,
                                                        (uint32_t) context->chunk_index, layer_assignments,
-                                                       layer_n_tokens);
+                                                       layer_n_tokens, "graph_dispatcher::compute_issue");
         if (context->chunk_count > 1 && context->chunk_index == 1) {
             static const bool trace = [] {
                 const char * e = std::getenv("WP_DISPATCH_CHUNKS_TRACE");

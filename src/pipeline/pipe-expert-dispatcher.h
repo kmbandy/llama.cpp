@@ -176,7 +176,8 @@ class dispatcher {
                                    float                             swiglu_clamp,
                                    uint32_t                          chunk_index = 0,
                                    const std::vector<pipe_expert_assignment> * layer_assignments = nullptr,
-                                   uint32_t                          layer_n_tokens = 0);
+                                   uint32_t                          layer_n_tokens = 0,
+                                   const char *                      caller_tag = "dispatcher::begin_dispatch");
     std::vector<float> finish_dispatch();
     std::vector<float> finish_dispatch(dispatch_handle handle);
     std::vector<float> finish_dispatch(dispatch_handle handle, dispatch_stats * stats);

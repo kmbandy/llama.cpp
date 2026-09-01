@@ -68,6 +68,14 @@ bool dispatch_stats_enabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+bool dispatch_chunks_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_DISPATCH_CHUNKS_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 bool speed_split_enabled() {
     const char * value = std::getenv("WP_DISPATCH_SPEED_SPLIT");
     return value != nullptr && std::strcmp(value, "1") == 0;
@@ -3409,6 +3417,15 @@ struct dispatcher::impl {
         return only_open_handle() != k_invalid_handle;
     }
 
+    size_t open_dispatch_slots() {
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        size_t result = 0;
+        for (const dispatch_state & slot : dispatch_slots_) {
+            result += slot.handle != k_invalid_handle;
+        }
+        return result;
+    }
+
     // Demultiplex a received frame's seq_id to the handle it belongs to. The
     // dedup-retry path (see receive_partial's retry_seq) resends with the
     // same seq_id OR'd with the high bit, so mask that off before matching a
@@ -3435,7 +3452,12 @@ struct dispatcher::impl {
                         float                                       swiglu_clamp,
                         uint32_t                                    chunk_index,
                         const std::vector<pipe_expert_assignment> * layer_assignments,
-                        uint32_t                                    layer_n_tokens) {
+                        uint32_t                                    layer_n_tokens,
+                        const char *                                caller_tag) {
+        if (dispatch_chunks_trace_enabled()) {
+            LLAMA_LOG_WARN("expert dispatch chunks trace: begin_dispatch caller=%s layer=%d chunk=%u open_slots=%zu\n",
+                           caller_tag != nullptr ? caller_tag : "unknown", layer, chunk_index, open_dispatch_slots());
+        }
         if (!has_open_dispatch_slot()) {
             reset_layer_trace(layer);
         }
@@ -3843,7 +3865,7 @@ std::vector<float> dispatcher::dispatch(int32_t                                 
                                         uint32_t                                    chunk_index) {
     const dispatch_handle handle =
         pimpl->begin_dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp, chunk_index,
-                              nullptr, 0);
+                              nullptr, 0, "dispatcher::dispatch");
     return pimpl->finish_dispatch(handle);
 }
 
@@ -3852,9 +3874,10 @@ dispatcher::dispatch_handle dispatcher::begin_dispatch(
         const std::vector<float> & activations,
         const std::vector<pipe_expert_assignment> & assignments,
         float swiglu_clamp, uint32_t chunk_index,
-        const std::vector<pipe_expert_assignment> * layer_assignments, uint32_t layer_n_tokens) {
+        const std::vector<pipe_expert_assignment> * layer_assignments, uint32_t layer_n_tokens,
+        const char * caller_tag) {
     return pimpl->begin_dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp, chunk_index,
-                                 layer_assignments, layer_n_tokens);
+                                 layer_assignments, layer_n_tokens, caller_tag);
 }
 
 std::vector<float> dispatcher::finish_dispatch() {
