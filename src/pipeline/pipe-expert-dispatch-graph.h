@@ -41,12 +41,17 @@ class graph_dispatcher {
     graph_dispatcher(const graph_dispatcher &)             = delete;
     graph_dispatcher & operator=(const graph_dispatcher &) = delete;
 
+    // WP_DISPATCH_CHUNKS as the dispatcher resolved it (1 = single dispatch);
+    // the graph builder decides per-layer chunking from this.
+    int dispatch_chunks() const { return remote.dispatch_chunks(); }
+
     ggml_tensor * build(ggml_context * ctx,
                         ggml_tensor *  activations,
                         ggml_tensor *  selected_experts,
                         ggml_tensor *  weights,
                         int32_t        layer,
-                        float          swiglu_clamp);
+                        float          swiglu_clamp,
+                        bool            chunked = false);
 
     // Split of build() so a sibling GPU op (shared expert) can sit between
     // the worker send and the worker recv. build_issue sends; after_issue
@@ -64,7 +69,14 @@ class graph_dispatcher {
                               ggml_tensor *  selected_experts,
                               ggml_tensor *  weights,
                               int32_t        layer,
-                              float          swiglu_clamp);
+                              float          swiglu_clamp,
+                              int32_t        chunk_index = 0,
+                              int32_t        chunk_count = 1,
+                              ggml_tensor *  issue_dependency = nullptr,
+                              ggml_tensor *  full_activations = nullptr,
+                              ggml_tensor *  full_selected_experts = nullptr,
+                              ggml_tensor *  full_weights = nullptr,
+                              int64_t        token_offset = 0);
     ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer);
     ggml_tensor * build_wait(ggml_context * ctx, int32_t layer);
 
@@ -226,7 +238,8 @@ class graph_dispatcher {
     void spine_profile_wait_end(std::chrono::steady_clock::time_point time) noexcept;
     void write_layer_trace(int32_t layer) noexcept;
     bool is_phantom_row(int64_t token) const noexcept;
-    void zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd) const noexcept;
+    void zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd,
+                           int64_t token_offset = 0) const noexcept;
 
     // Predicted-hint pipeline, two halves so the router GEMM never touches the
     // dispatch critical path (measured 2026-08-07: synchronous scoring cost

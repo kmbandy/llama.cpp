@@ -2241,6 +2241,20 @@ bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_ty
         return false;
     }
 
+    static const bool wp_dispatch_chunks_env = [] {
+        const char * e = getenv("WP_DISPATCH_CHUNKS");
+        return e != nullptr && std::atoi(e) == 2;
+    }();
+    if (wp_dispatch_chunks_env) {
+        static const bool wp_layer_cut_chunks_warned = [] {
+            LLAMA_LOG_WARN("layer_cut: WP_QWEN4EXP_LAYER_CUT refused while "
+                           "WP_DISPATCH_CHUNKS=2 is active; dispatch chunks win\n");
+            return true;
+        }();
+        (void) wp_layer_cut_chunks_warned;
+        return false;
+    }
+
     // FIX 7 (adversarial review 2026-09-01): one-time, process-wide warning
     // (C++ static init is thread-safe and runs exactly once) rather than
     // reserve-aware sizing. WP_QWEN4EXP_LAYER_CUT_TRACE's whole-graph

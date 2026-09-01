@@ -126,12 +126,21 @@ ngram_env_config get_ngram_env_config() {
 struct graph_dispatcher::op_context {
     graph_dispatcher * owner = nullptr;
     int32_t            layer = -1;
+    int32_t            chunk_index = 0;
+    int32_t            chunk_count = 1;
+    int64_t            token_offset = 0;
     // hparams.swiglu_clamp_exp[layer]; <= 0 means no clamp. See the note on
     // pipe_expert_dispatch_req::swiglu_clamp -- the spine's own clamped SwiGLU
     // is unreachable on the dispatch path, so the worker must apply it and the
     // limit has to travel with every request.
     float              swiglu_clamp = 0.0f;
     ggml_tensor *      issued = nullptr;
+    ggml_tensor *      full_activations = nullptr;
+    ggml_tensor *      full_selected_experts = nullptr;
+    ggml_tensor *      full_weights = nullptr;
+    dispatcher::dispatch_handle handle = 0;
+    uint64_t           seq_id = 0;
+    dispatch_stats     stats;
 };
 
 graph_dispatcher::graph_dispatcher(const std::string & endpoints,
@@ -144,6 +153,10 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
     remote(parse_endpoints(endpoints)),
     phantom_token_(phantom_token),
     collect_stats_(dispatch_stats_enabled()) {
+    static std::once_flag chunks_log_once;
+    std::call_once(chunks_log_once, [this] {
+        LLAMA_LOG_WARN("expert dispatch: wp dispatch chunks=%d\n", remote.dispatch_chunks());
+    });
     if (layer_trace_enabled()) {
         const char * p = std::getenv("WP_DS4_LAYER_TRACE");
         layer_trace_ = std::fopen(p, "w");
@@ -211,7 +224,7 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
 graph_dispatcher::~graph_dispatcher() {
     // Best-effort drain so a short-lived context does not leave workers hanging.
     try {
-        if (remote.has_open_dispatch()) {
+        while (remote.has_open_dispatch()) {
             (void) remote.finish_dispatch();
         }
         (void) remote.drain_deferred();
@@ -344,8 +357,21 @@ void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
         record.dense_active = false;
     }
     const layer_trace_stats transport = remote.layer_trace(layer);
-    std::fprintf(layer_trace_, "DS4 layer=%d dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu\n",
+    const auto first = op_contexts.find(layer * 2);
+    const auto second = op_contexts.find(layer * 2 + 1);
+    const bool chunked = second != op_contexts.end() && second->second != nullptr &&
+                         second->second->chunk_count > 1;
+    std::string labels = "(" + std::to_string(layer) + ",0," +
+                         std::to_string(first != op_contexts.end() && first->second != nullptr
+                                            ? first->second->seq_id : 0) + ")";
+    if (chunked) {
+        labels += " (" + std::to_string(layer) + ",1," +
+                  std::to_string(second->second->seq_id) + ")";
+    }
+    std::fprintf(layer_trace_, "DS4 layer=%d chunks=%d labels=%s dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu\n",
                  layer,
+                 chunked ? 2 : 1,
+                 labels.c_str(),
                  (unsigned long long) record.dense_ns,
                  (unsigned long long) transport.encode_ns,
                  (unsigned long long) transport.send_ns,
@@ -360,7 +386,8 @@ ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
                                       ggml_tensor *  selected_experts,
                                       ggml_tensor *  weights,
                                       int32_t        layer,
-                                      float          swiglu_clamp) {
+                                      float          swiglu_clamp,
+                                      bool            chunked) {
     if (layer < 0) {
         throw std::invalid_argument("expert dispatch requires a non-negative layer");
     }
@@ -369,10 +396,41 @@ ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
         throw std::invalid_argument("expert dispatch requires F32 activations, I32 expert ids, and F32 weights");
     }
 
-    auto & context = op_contexts[layer];
+    if (chunked) {
+        const int64_t n_tokens = activations->ne[1];
+        const int64_t n_first = n_tokens / 2;
+        const int64_t n_second = n_tokens - n_first;
+        const int64_t n_expert_used = selected_experts->ne[0];
+        ggml_tensor * activations_a = ggml_view_2d(ctx, activations, activations->ne[0], n_first,
+                                                   activations->nb[1], 0);
+        ggml_tensor * activations_b = ggml_view_2d(ctx, activations, activations->ne[0], n_second,
+                                                   activations->nb[1], n_first * activations->nb[1]);
+        ggml_tensor * selected_a = ggml_view_2d(ctx, selected_experts, n_expert_used, n_first,
+                                                selected_experts->nb[1], 0);
+        ggml_tensor * selected_b = ggml_view_2d(ctx, selected_experts, n_expert_used, n_second,
+                                                selected_experts->nb[1], n_first * selected_experts->nb[1]);
+        ggml_tensor * weights_a = ggml_view_3d(ctx, weights, weights->ne[0], weights->ne[1], n_first,
+                                               weights->nb[1], weights->nb[2], 0);
+        ggml_tensor * weights_b = ggml_view_3d(ctx, weights, weights->ne[0], weights->ne[1], n_second,
+                                               weights->nb[1], weights->nb[2], n_first * weights->nb[2]);
+        ggml_tensor * issue_a = build_issue(ctx, activations_a, selected_a, weights_a, layer, swiglu_clamp,
+                                            0, 2, nullptr, activations, selected_experts, weights, 0);
+        ggml_tensor * issue_b = build_issue(ctx, activations_b, selected_b, weights_b, layer, swiglu_clamp,
+                                            1, 2, issue_a, activations, selected_experts, weights, n_first);
+        GGML_UNUSED(issue_b);
+        return build_wait(ctx, layer);
+    }
+
+    auto & context = op_contexts[layer * 2];
     if (!context) {
         context.reset(new op_context{ this, layer });
     }
+    context->chunk_index = 0;
+    context->chunk_count = 1;
+    context->token_offset = 0;
+    context->full_activations = nullptr;
+    context->full_selected_experts = nullptr;
+    context->full_weights = nullptr;
     // Assign every call, not just on creation: op_contexts is cached per layer
     // for the lifetime of the dispatcher, so a create-only assignment would pin
     // whatever value the first graph build happened to see.
@@ -385,7 +443,14 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
                                             ggml_tensor *  selected_experts,
                                             ggml_tensor *  weights,
                                             int32_t        layer,
-                                            float          swiglu_clamp) {
+                                            float          swiglu_clamp,
+                                            int32_t        chunk_index,
+                                            int32_t        chunk_count,
+                                            ggml_tensor *  issue_dependency,
+                                            ggml_tensor *  full_activations,
+                                            ggml_tensor *  full_selected_experts,
+                                            ggml_tensor *  full_weights,
+                                            int64_t        token_offset) {
     if (layer < 0) {
         throw std::invalid_argument("expert dispatch requires a non-negative layer");
     }
@@ -394,11 +459,25 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
         throw std::invalid_argument("expert dispatch requires F32 activations, I32 expert ids, and F32 weights");
     }
 
-    auto & context = op_contexts[layer];
+    if (chunk_count < 1 || chunk_index < 0 || chunk_index >= chunk_count) {
+        throw std::invalid_argument("expert dispatch has an invalid chunk index");
+    }
+    if (issue_dependency != nullptr) {
+        ggml_tensor * gate = ggml_scale(ctx, ggml_view_1d(ctx, issue_dependency, 1, 0), 0.0f);
+        weights = ggml_add(ctx, weights, gate);
+    }
+    const int32_t key = layer * 2 + chunk_index;
+    auto & context = op_contexts[key];
     if (!context) {
         context.reset(new op_context{ this, layer });
     }
+    context->chunk_index         = chunk_index;
+    context->chunk_count         = chunk_count;
+    context->token_offset        = token_offset;
     context->swiglu_clamp = swiglu_clamp;
+    context->full_activations    = full_activations;
+    context->full_selected_experts = full_selected_experts;
+    context->full_weights        = full_weights;
     ggml_tensor * issued =
         ggml_map_custom3(ctx, activations, selected_experts, weights, compute_issue, 1, context.get());
     context->issued = issued;
@@ -409,7 +488,7 @@ ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * te
     if (tensor == nullptr) {
         throw std::invalid_argument("after_issue requires a tensor");
     }
-    const auto it = op_contexts.find(layer);
+    const auto it = op_contexts.find(layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("after_issue has no issue node for layer " + std::to_string(layer));
     }
@@ -418,12 +497,19 @@ ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * te
     // the shexp *input* (a scale/view of the residual), not the issue
     // activations themselves — issue has already copied those to the CPU.
     ggml_tensor * gate = ggml_view_1d(ctx, it->second->issued, 1, 0);
+    if (it->second->chunk_count > 1) {
+        const auto next = op_contexts.find(layer * 2 + 1);
+        if (next == op_contexts.end() || next->second == nullptr || next->second->issued == nullptr) {
+            throw std::runtime_error("after_issue has incomplete chunk issues for layer " + std::to_string(layer));
+        }
+        gate = ggml_add(ctx, gate, ggml_view_1d(ctx, next->second->issued, 1, 0));
+    }
     ggml_tensor * zero = ggml_scale(ctx, gate, 0.0f);
     return ggml_acc_inplace(ctx, tensor, zero, tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
 }
 
 ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
-    const auto it = op_contexts.find(layer);
+    const auto it = op_contexts.find(layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("build_wait has no issue node for layer " + std::to_string(layer));
     }
@@ -431,7 +517,18 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     // both srcs are the CPU issue node. A GPU shexp src here made wait a
     // GPU→CPU split input and serialized recv behind shexp.
     ggml_tensor * issued = it->second->issued;
-    return ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
+    if (it->second->chunk_count == 1) {
+        return ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
+    }
+    const auto next = op_contexts.find(layer * 2 + 1);
+    if (next == op_contexts.end() || next->second == nullptr || next->second->issued == nullptr) {
+        throw std::runtime_error("build_wait has incomplete chunk issues for layer " + std::to_string(layer));
+    }
+    ggml_tensor * wait_a = ggml_map_custom2(ctx, issued, next->second->issued,
+                                            compute_wait, 1, it->second.get());
+    ggml_tensor * wait_b = ggml_map_custom2(ctx, next->second->issued, wait_a,
+                                            compute_wait, 1, next->second.get());
+    return ggml_concat(ctx, wait_a, wait_b, 1);
 }
 
 size_t graph_dispatcher::n_workers() const {
@@ -1192,9 +1289,10 @@ bool graph_dispatcher::is_phantom_row(int64_t token) const noexcept {
     return token >= 0 && (size_t) token < phantom_rows_.size() && phantom_rows_[(size_t) token] != 0;
 }
 
-void graph_dispatcher::zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd) const noexcept {
+void graph_dispatcher::zero_phantom_rows(std::vector<float> & result, int64_t n_tokens, int64_t n_embd,
+                                         int64_t token_offset) const noexcept {
     for (int64_t token = 0; token < n_tokens; ++token) {
-        if (is_phantom_row(token)) {
+        if (is_phantom_row(token + token_offset)) {
             std::fill(result.begin() + token*n_embd, result.begin() + (token + 1)*n_embd, 0.0f);
         }
     }
@@ -1563,11 +1661,12 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         // dispatch() issues deferred reads before returning, waits only for
         // immediate experts, and folds the previous layer's deferred partials
         // into the returned block (residual path for layer N+1).
-        std::vector<float> result =
-            owner->remote.dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
-                                   context->swiglu_clamp);
+        const dispatcher::dispatch_handle handle = owner->remote.begin_dispatch(
+            context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
+            context->swiglu_clamp);
+        dispatch_stats layer_stats;
+        std::vector<float> result = owner->remote.finish_dispatch(handle, &layer_stats);
         owner->zero_phantom_rows(result, n_tokens, n_embd);
-        const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
         const dispatch_clock::time_point unpack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
         if (ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32) {
@@ -1633,8 +1732,10 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
         }
         owner = context->owner;
-        const bool trace_layer = owner->layer_trace_ != nullptr;
-        const bool trace_profile = owner->spine_profile_.active;
+        const bool trace_layer = owner->layer_trace_ != nullptr &&
+                                 (context->chunk_count == 1 || context->chunk_index == 0);
+        const bool trace_profile = owner->spine_profile_.active &&
+                                   (context->chunk_count == 1 || context->chunk_index == 0);
         if (trace_profile) {
             owner->spine_profile_issue_begin(dispatch_clock::now());
         }
@@ -1676,54 +1777,110 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
         const dispatch_clock::time_point pack_end =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
 
-        std::map<int32_t, pipe_expert_assignment> by_expert;
-        for (int64_t token = 0; token < n_tokens; ++token) {
-            if (owner->is_phantom_row(token)) {
-                continue;
-            }
-            std::set<int32_t> token_experts;
-            for (int64_t slot = 0; slot < n_expert_used; ++slot) {
-                const int     index  = (int) (token * n_expert_used + slot);
-                const int32_t expert = ggml_get_i32_1d(selected_experts, index);
-                if (!token_experts.insert(expert).second) {
-                    throw std::runtime_error("expert dispatch received a repeated expert for one token");
+        const auto make_assignments = [&](const ggml_tensor * selected,
+                                          const ggml_tensor * route_weights,
+                                          int64_t             route_tokens,
+                                          int64_t             token_offset) {
+            std::map<int32_t, pipe_expert_assignment> by_expert;
+            for (int64_t token = 0; token < route_tokens; ++token) {
+                if (owner->is_phantom_row(token + token_offset)) {
+                    continue;
                 }
-                auto inserted = by_expert.emplace(expert, pipe_expert_assignment{});
-                if (inserted.second) {
-                    inserted.first->second.expert_id = expert;
-                    inserted.first->second.weights.resize((size_t) n_tokens, 0.0f);
+                std::set<int32_t> token_experts;
+                for (int64_t slot = 0; slot < n_expert_used; ++slot) {
+                    const int     index  = (int) (token * n_expert_used + slot);
+                    const int32_t expert = ggml_get_i32_1d(selected, index);
+                    if (!token_experts.insert(expert).second) {
+                        throw std::runtime_error("expert dispatch received a repeated expert for one token");
+                    }
+                    auto inserted = by_expert.emplace(expert, pipe_expert_assignment{});
+                    if (inserted.second) {
+                        inserted.first->second.expert_id = expert;
+                        inserted.first->second.weights.resize((size_t) route_tokens, 0.0f);
+                    }
+                    inserted.first->second.weights[(size_t) token] = ggml_get_f32_1d(route_weights, index);
                 }
-                inserted.first->second.weights[(size_t) token] = ggml_get_f32_1d(weights, index);
             }
-        }
+            std::vector<pipe_expert_assignment> result;
+            result.reserve(by_expert.size());
+            for (auto & entry : by_expert) {
+                result.push_back(std::move(entry.second));
+            }
+            return result;
+        };
 
-        std::vector<pipe_expert_assignment> assignments;
-        assignments.reserve(by_expert.size());
-        for (auto & entry : by_expert) {
-            assignments.push_back(std::move(entry.second));
-        }
+        std::vector<pipe_expert_assignment> assignments =
+            make_assignments(selected_experts, weights, n_tokens, context->token_offset);
 
-        if (owner->router2_topm() > 0) {
-            owner->flush_predicted_hints();
-            owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
+        std::vector<pipe_expert_assignment> full_assignments;
+        const std::vector<pipe_expert_assignment> * layer_assignments = nullptr;
+        uint32_t layer_n_tokens = 0;
+        if (context->chunk_index == 0) {
+            const ggml_tensor * full_activations = context->full_activations != nullptr
+                ? context->full_activations : activations;
+            const ggml_tensor * full_selected = context->full_selected_experts != nullptr
+                ? context->full_selected_experts : selected_experts;
+            const ggml_tensor * full_weights = context->full_weights != nullptr
+                ? context->full_weights : weights;
+            const int64_t full_tokens = full_activations->ne[1];
+            std::vector<float> full_wire_activations((size_t) n_embd * (size_t) full_tokens);
+            if (ggml_is_contiguous(full_activations)) {
+                std::memcpy(full_wire_activations.data(), full_activations->data,
+                            full_wire_activations.size() * sizeof(float));
+            } else {
+                for (size_t i = 0; i < full_wire_activations.size(); ++i) {
+                    full_wire_activations[i] = ggml_get_f32_1d(full_activations, (int) i);
+                }
+            }
+            full_assignments = make_assignments(full_selected, full_weights, full_tokens, 0);
+            layer_assignments = &full_assignments;
+            layer_n_tokens = (uint32_t) full_tokens;
+            if (owner->router2_topm() > 0) {
+                owner->flush_predicted_hints();
+                owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
+            }
+            owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
+            if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
+                capture_prefix != nullptr && capture_prefix[0] != '\0') {
+                owner->capture_routing(capture_prefix, context->layer, full_wire_activations,
+                                       full_selected, full_tokens, n_expert_used);
+            }
+            owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
         }
-        owner->note_dispatched_experts(context->layer, assignments, (uint32_t) n_tokens);
-        if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
-            capture_prefix != nullptr && capture_prefix[0] != '\0') {
-            owner->capture_routing(capture_prefix, context->layer, wire_activations,
-                                   selected_experts, n_tokens, n_expert_used);
-        }
-        owner->prefetch_layer_ahead(context->layer, (uint32_t) n_tokens);
 
         const uint64_t seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
-        owner->remote.begin_dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
-                                     context->swiglu_clamp);
+        context->seq_id = seq_id;
+        context->handle = owner->remote.begin_dispatch(context->layer, seq_id, (uint32_t) n_tokens,
+                                                       wire_activations, assignments, context->swiglu_clamp,
+                                                       (uint32_t) context->chunk_index, layer_assignments,
+                                                       layer_n_tokens);
+        if (context->chunk_count > 1 && context->chunk_index == 1) {
+            static const bool trace = [] {
+                const char * e = std::getenv("WP_DISPATCH_CHUNKS_TRACE");
+                return e != nullptr && e[0] == '1';
+            }();
+            static const int trace_layers = [] {
+                const char * e = std::getenv("WP_DISPATCH_CHUNKS_TRACE_LAYERS");
+                return e != nullptr && e[0] != '\0' ? std::max(1, std::atoi(e)) : 4;
+            }();
+            const auto first = owner->op_contexts.find(context->layer * 2);
+            if (trace && context->layer < trace_layers && first != owner->op_contexts.end() && first->second != nullptr) {
+                std::fprintf(stderr,
+                             "expert dispatch chunks trace: layer=%d chunk_widths=%lld,%lld "
+                             "seq_ids=%llu,%llu order=issue_A issue_B wait_A wait_B\n",
+                             context->layer,
+                             (long long) first->second->issued->ne[1], (long long) n_tokens,
+                             (unsigned long long) first->second->seq_id,
+                             (unsigned long long) context->seq_id);
+            }
+        }
         if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
             *static_cast<float *>(dst->data) = 0.0f;
         }
         if (collect_stats) {
-            const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
-            owner->decode_n_tokens_ = (uint32_t) n_tokens;
+            const dispatch_stats layer_stats = owner->remote.stats_for(context->handle);
+            owner->decode_n_tokens_ = context->full_activations != nullptr
+                ? (uint32_t) context->full_activations->ne[1] : (uint32_t) n_tokens;
             owner->decode_ns_pack_ += elapsed_ns(pack_start, pack_end);
             owner->decode_ns_issue_ += layer_stats.ns_issue;
         }
@@ -1771,8 +1928,10 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch wait op has no dispatcher");
         }
         owner = context->owner;
-        const bool trace_layer = owner->layer_trace_ != nullptr;
-        const bool trace_profile = owner->spine_profile_.active;
+        const bool trace_layer = owner->layer_trace_ != nullptr &&
+                                 (context->chunk_count == 1 || context->chunk_index == 0);
+        const bool trace_profile = owner->spine_profile_.active &&
+                                   (context->chunk_count == 1 || context->chunk_index == 0);
         if (trace_layer || trace_profile) {
             const auto wait_entry = dispatch_clock::now();
             if (trace_layer) {
@@ -1791,9 +1950,43 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         const bool collect_stats = owner->decode_active_;
         // finish_dispatch() includes the worker wait. Time unpack after it so
         // unpack is the host memcpy into dst, not a second copy of ns_wait.
-        std::vector<float> result = owner->remote.finish_dispatch();
-        owner->zero_phantom_rows(result, dst->ne[1], owner->remote.n_embd());
-        const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
+        dispatch_stats layer_stats;
+        std::vector<float> result = owner->remote.finish_dispatch(context->handle, &layer_stats);
+        owner->zero_phantom_rows(result, dst->ne[1], owner->remote.n_embd(), context->token_offset);
+        context->stats = layer_stats;
+        dispatch_stats layer_stats_total = layer_stats;
+        if (context->chunk_count > 1 && context->chunk_index == 1) {
+            const auto first = owner->op_contexts.find(context->layer * 2);
+            if (first != owner->op_contexts.end() && first->second != nullptr) {
+                const dispatch_stats & first_stats = first->second->stats;
+                layer_stats_total.requests_issued += first_stats.requests_issued;
+                layer_stats_total.workers_used += first_stats.workers_used;
+                layer_stats_total.ns_pack += first_stats.ns_pack;
+                layer_stats_total.ns_issue += first_stats.ns_issue;
+                layer_stats_total.ns_wait += first_stats.ns_wait;
+                layer_stats_total.ns_unpack += first_stats.ns_unpack;
+                layer_stats_total.ns_total += first_stats.ns_total;
+                layer_stats_total.ns_fold_overlapped += first_stats.ns_fold_overlapped;
+                layer_stats_total.n_partials_folded_early += first_stats.n_partials_folded_early;
+                layer_stats_total.first_await_in_flight =
+                    std::max(layer_stats_total.first_await_in_flight, first_stats.first_await_in_flight);
+                layer_stats_total.first_await_recorded =
+                    layer_stats_total.first_await_recorded || first_stats.first_await_recorded;
+                layer_stats_total.max_in_flight = std::max(layer_stats_total.max_in_flight,
+                                                           first_stats.max_in_flight);
+                for (const worker_dispatch_stats & first_worker : first_stats.workers) {
+                    for (worker_dispatch_stats & total_worker : layer_stats_total.workers) {
+                        if (total_worker.endpoint != first_worker.endpoint) {
+                            continue;
+                        }
+                        total_worker.ns_wait += first_worker.ns_wait;
+                        total_worker.n_requests += first_worker.n_requests;
+                        total_worker.n_experts_total += first_worker.n_experts_total;
+                        break;
+                    }
+                }
+            }
+        }
         const dispatch_clock::time_point unpack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
         if (ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32) {
@@ -1806,18 +1999,23 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         if (trace_profile) {
             owner->spine_profile_wait_end(dispatch_clock::now());
         }
-        owner->write_layer_trace(context->layer);
+        if (context->chunk_count == 1 || context->chunk_index == context->chunk_count - 1) {
+            owner->write_layer_trace(context->layer);
+        }
         if (collect_stats) {
             const dispatch_clock::time_point total_end = dispatch_clock::now();
-            ++owner->decode_layers_;
             owner->decode_ns_wait_ += layer_stats.ns_wait;
             owner->decode_ns_unpack_ += elapsed_ns(unpack_start, total_end);
             owner->decode_ns_total_ += layer_stats.ns_issue + layer_stats.ns_wait +
                                        elapsed_ns(unpack_start, total_end);
-            owner->decode_ns_fold_overlapped_ += layer_stats.ns_fold_overlapped;
-            owner->decode_n_partials_folded_early_ += layer_stats.n_partials_folded_early;
-            owner->decode_first_await_in_flight_ += layer_stats.first_await_in_flight;
-            owner->decode_max_in_flight_ = std::max(owner->decode_max_in_flight_, layer_stats.max_in_flight);
+            if (context->chunk_count == 1 || context->chunk_index == context->chunk_count - 1) {
+                ++owner->decode_layers_;
+                owner->decode_ns_fold_overlapped_ += layer_stats_total.ns_fold_overlapped;
+                owner->decode_n_partials_folded_early_ += layer_stats_total.n_partials_folded_early;
+                owner->decode_first_await_in_flight_ += layer_stats_total.first_await_in_flight;
+                owner->decode_max_in_flight_ = std::max(owner->decode_max_in_flight_,
+                                                        layer_stats_total.max_in_flight);
+            }
             for (const worker_dispatch_stats & worker : layer_stats.workers) {
                 for (worker_dispatch_stats & decode_worker : owner->decode_workers_) {
                     if (decode_worker.endpoint != worker.endpoint) {

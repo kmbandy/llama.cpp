@@ -133,6 +133,8 @@ void set_inproc_backend_factory(inproc_backend_factory factory);
 
 class dispatcher {
   public:
+    using dispatch_handle = uint64_t;
+
     explicit dispatcher(const std::vector<endpoint> & endpoints);
     ~dispatcher();
 
@@ -157,22 +159,34 @@ class dispatcher {
                                 uint32_t                                    n_tokens,
                                 const std::vector<float> &                  activations,
                                 const std::vector<pipe_expert_assignment> & assignments,
-                                float                                       swiglu_clamp);
+                                float                                       swiglu_clamp,
+                                uint32_t                                    chunk_index = 0);
 
     // Split of dispatch() so a sibling GPU op (shared expert) can run after
     // the sends and before the recvs. begin_dispatch issues every worker
     // request and returns with those requests in flight. finish_dispatch
     // awaits them and returns the folded partial. dispatch() is
-    // begin+finish. One open begin at a time; a second begin or a finish
-    // with nothing open throws.
-    void begin_dispatch(int32_t                                     layer,
-                        uint64_t                                    seq_id,
-                        uint32_t                                    n_tokens,
-                        const std::vector<float> &                  activations,
-                        const std::vector<pipe_expert_assignment> & assignments,
-                        float                                       swiglu_clamp);
+    // begin+finish. Up to two explicit handles may be open; a third begin or
+    // a finish with no matching handle throws.
+    dispatch_handle begin_dispatch(int32_t                           layer,
+                                   uint64_t                          seq_id,
+                                   uint32_t                          n_tokens,
+                                   const std::vector<float> &        activations,
+                                   const std::vector<pipe_expert_assignment> & assignments,
+                                   float                             swiglu_clamp,
+                                   uint32_t                          chunk_index = 0,
+                                   const std::vector<pipe_expert_assignment> * layer_assignments = nullptr,
+                                   uint32_t                          layer_n_tokens = 0);
     std::vector<float> finish_dispatch();
+    std::vector<float> finish_dispatch(dispatch_handle handle);
+    std::vector<float> finish_dispatch(dispatch_handle handle, dispatch_stats * stats);
     bool               has_open_dispatch() const;
+    bool               has_open_dispatch(dispatch_handle handle) const;
+
+    // K=2 is the only supported chunking mode. The graph uses this latched
+    // value to decide whether to emit the two-handle dispatch topology.
+    int dispatch_chunks() const;
+    dispatch_stats stats_for(dispatch_handle handle) const;
 
     // Snapshot the transport timings for `layer`'s current dispatch. Zero when
     // WP_DS4_LAYER_TRACE is unset.

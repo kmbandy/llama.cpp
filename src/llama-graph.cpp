@@ -2300,10 +2300,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // path returns before the switch, so passing it on is the ONLY way the
         // limit reaches the expert FFN at all.
         const float dispatch_swiglu_clamp = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-        const bool  split_shexp = moe_dispatch_split_shexp && il >= 0;
-        ggml_tensor * moe_out = split_shexp
-            ? expert_dispatch->build_issue(ctx0, cur, selected_experts, weights, il, dispatch_swiglu_clamp)
-            : expert_dispatch->build(ctx0, cur, selected_experts, weights, il, dispatch_swiglu_clamp);
+        const bool chunked = expert_dispatch->dispatch_chunks() == 2 &&
+                             n_tokens >= 64 && ubatch.n_seqs == 1;
+        const bool split_shexp = moe_dispatch_split_shexp && il >= 0;
+        ggml_tensor * moe_out = nullptr;
+        if (split_shexp) {
+            if (chunked) {
+                const int64_t n_first = n_tokens / 2;
+                const int64_t n_second = n_tokens - n_first;
+                const int64_t n_expert_used_i = selected_experts->ne[0];
+                ggml_tensor * cur_a = ggml_view_2d(ctx0, cur, n_embd, n_first, cur->nb[1], 0);
+                ggml_tensor * cur_b = ggml_view_2d(ctx0, cur, n_embd, n_second, cur->nb[1], n_first * cur->nb[1]);
+                ggml_tensor * selected_a = ggml_view_2d(ctx0, selected_experts, n_expert_used_i, n_first,
+                                                        selected_experts->nb[1], 0);
+                ggml_tensor * selected_b = ggml_view_2d(ctx0, selected_experts, n_expert_used_i, n_second,
+                                                        selected_experts->nb[1], n_first * selected_experts->nb[1]);
+                ggml_tensor * weights_a = ggml_view_3d(ctx0, weights, weights->ne[0], weights->ne[1], n_first,
+                                                       weights->nb[1], weights->nb[2], 0);
+                ggml_tensor * weights_b = ggml_view_3d(ctx0, weights, weights->ne[0], weights->ne[1], n_second,
+                                                       weights->nb[1], weights->nb[2], n_first * weights->nb[2]);
+                ggml_tensor * issue_a = expert_dispatch->build_issue(
+                    ctx0, cur_a, selected_a, weights_a, il, dispatch_swiglu_clamp, 0, 2, nullptr,
+                    cur, selected_experts, weights, 0);
+                ggml_tensor * issue_b = expert_dispatch->build_issue(
+                    ctx0, cur_b, selected_b, weights_b, il, dispatch_swiglu_clamp, 1, 2, issue_a,
+                    cur, selected_experts, weights, n_first);
+                moe_out = ggml_concat(ctx0, issue_a, issue_b, 1);
+            } else {
+                moe_out = expert_dispatch->build_issue(ctx0, cur, selected_experts, weights, il,
+                                                       dispatch_swiglu_clamp);
+            }
+        } else {
+            moe_out = expert_dispatch->build(ctx0, cur, selected_experts, weights, il, dispatch_swiglu_clamp,
+                                             chunked);
+        }
         ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
         cb(moe_out, split_shexp ? "ffn_moe_issued" : "ffn_moe_out", il);
         return moe_out;

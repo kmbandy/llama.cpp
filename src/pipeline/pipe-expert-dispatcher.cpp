@@ -416,6 +416,15 @@ int parse_wp_defer_k() {
     return (int) parsed;
 }
 
+int dispatch_chunks_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_CHUNKS");
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+    const int parsed = std::atoi(value);
+    return parsed == 2 ? 2 : 1;
+}
+
 // WP_DEFER_MAX_WIDTH = upper bound on n_tokens for a dispatch to be eligible
 // for WP_DEFER_K deferral. Default 32.
 //
@@ -761,6 +770,28 @@ struct dispatcher::impl {
         pipe_expert_dispatch_req            inproc_wire;
     };
 
+    using dispatch_handle = dispatcher::dispatch_handle;
+    static constexpr dispatch_handle k_invalid_handle = 0;
+
+    struct dispatch_state {
+        dispatch_handle              handle = k_invalid_handle;
+        int32_t                      layer = -1;
+        uint32_t                     chunk_index = 0;
+        uint32_t                     n_tokens = 0;
+        uint64_t                     seq_id = 0;
+        uint64_t                     activation_count = 0;
+        uint64_t                     dispatch_hash_seq_ = 0;
+        uint64_t                     hash_pre = 0;
+        size_t                       hash_reqs = 0;
+        dispatch_stats                stats;
+        std::vector<planned_request>  imm_requests;
+        std::vector<planned_request>  def_requests;
+        std::vector<float>            folded_prev;
+        std::vector<size_t>           assigned_counts;
+        dispatch_clock::time_point    wait_start{};
+        dispatch_clock::time_point    req_dispatch_start_{};
+    };
+
     struct temporal_layer_stats {
         std::vector<int32_t>           previous_experts;
         uint64_t                       n_pairs = 0;
@@ -817,12 +848,11 @@ struct dispatcher::impl {
     std::map<int32_t, std::vector<std::vector<size_t>>> routes;
     std::map<std::string, size_t>                       machine_cursor;
     std::map<int32_t, temporal_layer_stats>              temporal_layers;
-    dispatch_stats                                      stats;
+    dispatch_stats                                      last_stats;
     deferral_stats                                      deferral;
     prefetch_hint_stats                                 hint_stats;
     pending_deferred_batch                              pending_def;
     size_t                                              in_flight     = 0;
-    uint64_t                                            dispatch_hash_seq_ = 0;
     int32_t                                             n_embd        = 0;
     int32_t                                             n_ff_exp      = 0;
     int32_t                                             n_expert      = 0;
@@ -880,6 +910,7 @@ struct dispatcher::impl {
     // constructor, so a request never has to re-check them.
     bool                                                dedup_activations = false;
     uint32_t                                            dedup_min_tokens_ = 32;
+    int                                                 dispatch_chunks_ = 1;
     // machine -> indices into `workers` sharing that machine, precomputed once
     // (machine membership is a property of the worker set, not of any one
     // dispatch). Only machines with >= 2 workers matter to dedup; kept as a
@@ -911,7 +942,6 @@ struct dispatcher::impl {
         return (p != nullptr && p[0] != '\0') ? fopen((std::string(p) + ".writer").c_str(), "w") : (FILE *) nullptr;
     }();
     std::mutex                                          writer_log_mutex_;
-    dispatch_clock::time_point                          req_dispatch_start_{};
 
     // Gap accounting: time spent with in_flight == 0.
     bool                       gap_at_zero = false;
@@ -926,7 +956,36 @@ struct dispatcher::impl {
                 static_assign(static_assign_enabled()),
                 hint_inflight(hint_inflight_enabled()),
                 async_issue(async_issue_enabled()),
-                unpack_overlap(unpack_overlap_enabled()) {
+                unpack_overlap(unpack_overlap_enabled()),
+                dispatch_chunks_(dispatch_chunks_enabled()) {
+        if (dispatch_chunks_ > 1) {
+            if (!static_assign) {
+                static_assign = true;
+                LLAMA_LOG_WARN(
+                             "expert dispatch: WP_DISPATCH_STATIC_ASSIGN=0 disabled while dispatch chunks are active\n");
+            }
+            if (async_issue) {
+                async_issue = false;
+                LLAMA_LOG_WARN(
+                             "expert dispatch: WP_ASYNC_ISSUE=1 disabled while dispatch chunks are active\n");
+            }
+            if (s_dedup_activations) {
+                LLAMA_LOG_WARN(
+                             "expert dispatch: WP_DISPATCH_DEDUP_ACTIVATIONS=1 disabled while dispatch chunks are active\n");
+            }
+            if (const char * overlap = std::getenv("WP_EXPERT_OVERLAP");
+                overlap != nullptr && overlap[0] == '1') {
+                LLAMA_LOG_WARN(
+                             "expert dispatch: WP_EXPERT_OVERLAP=1 is incompatible with chunked dispatch; "
+                             "worker launch must set WP_EXPERT_OVERLAP=0\n");
+            }
+            if (const char * pipeline = std::getenv("WP_WORKER_PIPELINE");
+                pipeline == nullptr || pipeline[0] != '1') {
+                LLAMA_LOG_WARN(
+                             "expert dispatch: WP_WORKER_PIPELINE is not set to 1; "
+                             "chunked dispatch requires the worker pipeline reader\n");
+            }
+        }
         decode_prefer_port_ = decode_prefer_port_enabled();
         if (unpack_overlap) {
             std::fprintf(stderr,
@@ -947,16 +1006,21 @@ struct dispatcher::impl {
         // See the field comment: dedup requires split_frame and is mutually
         // exclusive with async_issue by construction, not by a runtime check
         // on the dispatch path.
-        dedup_activations = s_dedup_activations && split_frame && !async_issue;
+        dedup_activations = dispatch_chunks_ > 1 ? false : s_dedup_activations && split_frame && !async_issue;
         dedup_min_tokens_ = s_dedup_min_tokens;
         if (s_dedup_activations && !dedup_activations) {
-            std::fprintf(stderr,
+            LLAMA_LOG_WARN(
                          "expert dispatch: WP_DISPATCH_DEDUP_ACTIVATIONS requested but disabled "
                          "(requires WP_SPLIT_FRAME=1 and WP_ASYNC_ISSUE unset)\n");
         }
         stats_logging = dispatch_stats_enabled();
         collect_stats = stats_logging || speed_split;
         defer_k_value     = parse_wp_defer_k();
+        if (dispatch_chunks_ > 1 && defer_k_value > 0) {
+            defer_k_value = 0;
+            std::fprintf(stderr,
+                         "expert dispatch: WP_DEFER_K disabled while dispatch chunks are active\n");
+        }
         deferral.defer_k  = defer_k_value;
         defer_max_width_  = defer_max_width_enabled();
 
@@ -1534,15 +1598,21 @@ struct dispatcher::impl {
         }
     }
 
-    void note_in_flight_delta(int delta) {
+    void note_in_flight_delta(dispatch_state & state, int delta) {
         if (delta > 0) {
             if (gap_at_zero) {
                 deferral.ns_gap += elapsed_ns(gap_zero_since, dispatch_clock::now());
                 gap_at_zero = false;
             }
             in_flight += (size_t) delta;
-            if (in_flight > stats.max_in_flight) {
-                stats.max_in_flight = in_flight;
+            if (in_flight > state.stats.max_in_flight) {
+                state.stats.max_in_flight = in_flight;
+            }
+            std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+            for (dispatch_state & slot : dispatch_slots_) {
+                if (slot.handle != k_invalid_handle && in_flight > slot.stats.max_in_flight) {
+                    slot.stats.max_in_flight = in_flight;
+                }
             }
             return;
         }
@@ -1995,10 +2065,11 @@ struct dispatcher::impl {
         } while (dispatch_clock::now() < deadline);
     }
 
-    pipe_frame_type await_response(planned_request & request, uint64_t wanted_seq_id, std::vector<uint8_t> & payload) {
-        if (!stats.first_await_recorded) {
-            stats.first_await_recorded  = true;
-            stats.first_await_in_flight = in_flight;
+    pipe_frame_type await_response(planned_request & request, uint64_t wanted_seq_id,
+                                   std::vector<uint8_t> & payload, dispatch_state & state) {
+        if (!state.stats.first_await_recorded) {
+            state.stats.first_await_recorded  = true;
+            state.stats.first_await_in_flight = in_flight;
         }
         pipe_frame_type type;
         uint64_t        seq_id = 0;
@@ -2404,7 +2475,7 @@ struct dispatcher::impl {
     // fires there, but this is not the place to assume that silently).
     void dedup_publish_and_ref(std::vector<planned_request> & requests, uint64_t seq_id,
                                int32_t layer, uint32_t n_tokens,
-                               const std::vector<float> & activations) {
+                               const std::vector<float> & activations, dispatch_state & state) {
         if (!dedup_activations || n_tokens <= dedup_min_tokens_ || !layer_slice_mode.at(layer)) {
             return;
         }
@@ -2443,8 +2514,8 @@ struct dispatcher::impl {
                 throw std::runtime_error("expert dispatcher failed to send dedup publish to worker " +
                                          primary_worker.info.endpoint);
             }
-            note_in_flight_delta(+1);
-            ++stats.requests_issued;
+            note_in_flight_delta(state, +1);
+            ++state.stats.requests_issued;
             primary.already_issued = true;
 
             // Synchronous: block on the primary's own ack before touching any
@@ -2496,14 +2567,14 @@ struct dispatcher::impl {
                     throw std::runtime_error("expert dispatcher failed to send dedup request to worker " +
                                              secondary_worker.info.endpoint);
                 }
-                note_in_flight_delta(+1);
-                ++stats.requests_issued;
+                note_in_flight_delta(state, +1);
+                ++state.stats.requests_issued;
                 secondary.already_issued = true;
             }
         }
     }
 
-    void issue_requests(std::vector<planned_request> & requests, uint64_t seq_id) {
+    void issue_requests(std::vector<planned_request> & requests, uint64_t seq_id, dispatch_state & state) {
         // WP_ISSUE_WIDEST_FIRST: walk `requests` in issue_order (widest slice
         // first) so the long-pole worker's bytes hit the wire earliest. requests
         // is not necessarily one-per-worker (a non-slice layer skips workers with
@@ -2546,8 +2617,8 @@ struct dispatcher::impl {
                 if (collect_stats || req_log_ != nullptr) {
                     request.issued_at = dispatch_clock::now();
                 }
-                note_in_flight_delta(+1);
-                ++stats.requests_issued;
+                note_in_flight_delta(state, +1);
+                ++state.stats.requests_issued;
                 continue;
             }
             const auto send_frame = [&](pipe_frame_type type, const std::vector<uint8_t> & payload) {
@@ -2612,8 +2683,8 @@ struct dispatcher::impl {
                                          assignment_experts(request.assignments) + " to worker " +
                                          value.info.endpoint);
             }
-            note_in_flight_delta(+1);
-            ++stats.requests_issued;
+            note_in_flight_delta(state, +1);
+            ++state.stats.requests_issued;
         }
         // Join pass: block on each posted job in the same fixed order the
         // requests were posted (== issue_order), so a failure surfaces against
@@ -2630,22 +2701,23 @@ struct dispatcher::impl {
                                          assignment_experts(request_ptr->assignments) + " to worker " +
                                          worker_ptr->info.endpoint);
             }
-            note_in_flight_delta(+1);
-            ++stats.requests_issued;
+            note_in_flight_delta(state, +1);
+            ++state.stats.requests_issued;
         }
     }
 
     // Receive ONE partial and decode it into `out` (does NOT accumulate). Split
     // out of accumulate_partial so the caller can harvest partials in ARRIVAL
     // order while still summing them in a FIXED order -- see harvest_partials.
-    void write_request_log(const planned_request & request, int32_t layer, uint32_t n_tokens) {
+    void write_request_log(const planned_request & request, int32_t layer, uint32_t n_tokens,
+                           const dispatch_state & state) {
         if (req_log_ == nullptr) {
             return;
         }
         // Column order: layer n_tokens worker_index n_experts ns_before_await
         // ns_blocked ns_issue_done ns_await_recv resp_bytes ns_unpack
-        // await_start_ns await_end_ns.
-        fprintf(req_log_, "%d %u %zu %zu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+        // await_start_ns await_end_ns seq_id chunk_index.
+        fprintf(req_log_, "%d %u %zu %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %u\n",
                 layer, n_tokens, request.worker_index, request.assignments.size(),
                 (unsigned long long) elapsed_ns(request.issued_at, request.await_started_at),
                 (unsigned long long) elapsed_ns(request.await_started_at, request.await_finished_at),
@@ -2653,8 +2725,9 @@ struct dispatcher::impl {
                 (unsigned long long) elapsed_ns(request.await_started_at, request.await_finished_at),
                 (unsigned long long) request.response_bytes,
                 (unsigned long long) request.unpack_ns,
-                (unsigned long long) elapsed_ns(req_dispatch_start_, request.await_started_at),
-                (unsigned long long) elapsed_ns(req_dispatch_start_, request.await_finished_at));
+                (unsigned long long) elapsed_ns(state.req_dispatch_start_, request.await_started_at),
+                (unsigned long long) elapsed_ns(state.req_dispatch_start_, request.await_finished_at),
+                (unsigned long long) state.seq_id, state.chunk_index);
         fflush(req_log_);
     }
 
@@ -2664,7 +2737,8 @@ struct dispatcher::impl {
                          uint64_t                         seq_id,
                          int32_t                          layer,
                          uint32_t                         n_tokens,
-                         dispatch_clock::time_point *     last_response) {
+                         dispatch_clock::time_point *     last_response,
+                         dispatch_state &                 state) {
         std::vector<uint8_t>  payload;
         // WP_DISPATCH_REQ_LOG=path: one line per request. The complete column
         // order is documented at write_request_log below.
@@ -2691,10 +2765,10 @@ struct dispatcher::impl {
         const dispatch_clock::time_point recv_started =
             layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
         uint64_t         wanted_seq_id = seq_id;
-        pipe_frame_type  type          = await_response(request, wanted_seq_id, payload);
+        pipe_frame_type  type          = await_response(request, wanted_seq_id, payload, state);
         const bool       streamed      = type == PIPE_EXPERT_PARTIAL_STREAM;
         if (!streamed) {
-            note_in_flight_delta(-1);
+            note_in_flight_delta(state, -1);
         }
         dispatch_clock::time_point response_received_at = dispatch_clock::now();
         // WP_DISPATCH_DEDUP_ACTIVATIONS FALLBACK. A secondary sent
@@ -2725,7 +2799,7 @@ struct dispatcher::impl {
                 // this mechanism exists to make available. See
                 // dedup_publish_and_ref() for where it is populated.
                 const uint64_t retry_seq = wanted_seq_id | (1ull << 63);
-                note_in_flight_delta(+1);
+                note_in_flight_delta(state, +1);
                 const bool sent =
                     pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_BEGIN, retry_seq,
                                     request.begin_payload.data(), request.begin_payload.size()) &&
@@ -2738,9 +2812,9 @@ struct dispatcher::impl {
                                              assignment_experts(request.assignments));
                 }
                 wanted_seq_id = retry_seq;
-                type = await_response(request, wanted_seq_id, payload);
+                type = await_response(request, wanted_seq_id, payload, state);
                 if (type != PIPE_EXPERT_PARTIAL_STREAM) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                 }
                 response_received_at = dispatch_clock::now();
             }
@@ -2785,7 +2859,7 @@ struct dispatcher::impl {
             for (;;) {
                 const dispatch_clock::time_point frame_ready_at = response_received_at;
                 if (type != PIPE_EXPERT_PARTIAL_STREAM) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                              " interleaved a non-stream frame while sending partials");
                 }
@@ -2800,13 +2874,13 @@ struct dispatcher::impl {
                                         elapsed_ns(decode_started, dispatch_clock::now()));
                     }
                 } catch (const std::exception & error) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                              " returned an invalid streamed partial for expert(s) " +
                                              assignment_experts(request.assignments) + ": " + error.what());
                 }
                 if (stream_partial.part_count > 64) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                              " returned too many streamed partials");
                 }
@@ -2815,20 +2889,20 @@ struct dispatcher::impl {
                     partials.resize(part_count);
                     received.assign(part_count, 0);
                 } else if (stream_partial.part_count != part_count) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                              " changed streamed partial count");
                 }
                 const size_t part_index = stream_partial.part_index;
                 if (received[part_index] != 0) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                              " repeated a streamed partial");
                 }
                 const pipe_expert_partial & partial = stream_partial.partial;
                 if (partial.layer != layer || partial.n_tokens != want_rows ||
                     partial.partial.size() != want_vals) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                              " returned the wrong streamed partial shape for expert(s) " +
                                              assignment_experts(request.assignments));
@@ -2837,7 +2911,7 @@ struct dispatcher::impl {
                     if (std::isfinite(partial.partial[i])) {
                         continue;
                     }
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     const size_t row = i / (size_t) n_embd;
                     const uint32_t token = request.token_ids.empty()
                         ? (uint32_t) row : request.token_ids[row];
@@ -2860,19 +2934,19 @@ struct dispatcher::impl {
                     }
                     scatter_add(out, partials[next_fold], request);
                     if (collect_stats && early) {
-                        ++stats.n_partials_folded_early;
+                        ++state.stats.n_partials_folded_early;
                     }
                     ++next_fold;
                 }
                 if (n_received == part_count) {
-                    note_in_flight_delta(-1);
+                    note_in_flight_delta(state, -1);
                     if (collect_stats && first_fold_at != dispatch_clock::time_point() &&
                         last_ready_at > first_fold_at) {
-                        stats.ns_fold_overlapped += elapsed_ns(first_fold_at, last_ready_at);
+                        state.stats.ns_fold_overlapped += elapsed_ns(first_fold_at, last_ready_at);
                     }
                     break;
                 }
-                type = await_response(request, wanted_seq_id, payload);
+                type = await_response(request, wanted_seq_id, payload, state);
                 response_received_at = dispatch_clock::now();
             }
             request.await_finished_at = req_log_ != nullptr ? response_received_at
@@ -2889,12 +2963,12 @@ struct dispatcher::impl {
                 if (value.inproc) {
                     std::fprintf(stderr,
                                  "DISPPART seq=%llu layer=%d worker=inproc h=%llu\n",
-                                 (unsigned long long) dispatch_hash_seq_, layer,
+                    (unsigned long long) state.dispatch_hash_seq_, layer,
                                  (unsigned long long) hash);
                 } else {
                     std::fprintf(stderr,
                                  "DISPPART seq=%llu layer=%d worker=%zu h=%llu\n",
-                                 (unsigned long long) dispatch_hash_seq_, layer,
+                                 (unsigned long long) state.dispatch_hash_seq_, layer,
                                  request.worker_index, (unsigned long long) hash);
                 }
             }
@@ -2946,12 +3020,12 @@ struct dispatcher::impl {
             if (value.inproc) {
                 std::fprintf(stderr,
                              "DISPPART seq=%llu layer=%d worker=inproc h=%llu\n",
-                             (unsigned long long) dispatch_hash_seq_, layer,
+                             (unsigned long long) state.dispatch_hash_seq_, layer,
                              (unsigned long long) hash);
             } else {
                 std::fprintf(stderr,
                              "DISPPART seq=%llu layer=%d worker=%zu h=%llu\n",
-                             (unsigned long long) dispatch_hash_seq_, layer,
+                             (unsigned long long) state.dispatch_hash_seq_, layer,
                              request.worker_index, (unsigned long long) hash);
             }
         }
@@ -2997,15 +3071,16 @@ struct dispatcher::impl {
                             uint64_t                         seq_id,
                             int32_t                          layer,
                             uint32_t                         n_tokens,
-                            dispatch_clock::time_point *     last_response) {
+                            dispatch_clock::time_point *     last_response,
+                            dispatch_state &                 state) {
         std::vector<float> one;
-        receive_partial(one, result.size(), request, seq_id, layer, n_tokens, last_response);
+        receive_partial(one, result.size(), request, seq_id, layer, n_tokens, last_response, state);
         const auto unpack_t0 = req_log_ != nullptr ? dispatch_clock::now()
                                                    : dispatch_clock::time_point();
         scatter_add(result, one, request);
         if (req_log_ != nullptr) {
             request.unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
-            write_request_log(request, layer, n_tokens);
+            write_request_log(request, layer, n_tokens, state);
         }
     }
 
@@ -3058,7 +3133,8 @@ struct dispatcher::impl {
                                                           uint64_t                       seq_id,
                                                           int32_t                        layer,
                                                           uint32_t                       n_tokens,
-                                                          dispatch_clock::time_point *   last_response) {
+                                                          dispatch_clock::time_point *   last_response,
+                                                          dispatch_state &               state) {
         const size_t n = requests.size();
         std::vector<std::vector<float>> partials(n);
         if (n == 0) {
@@ -3108,7 +3184,7 @@ struct dispatcher::impl {
                         continue;
                     }
                     receive_partial(partials[i], 0, requests[i], seq_id,
-                                    layer, n_tokens, last_response);
+                                    layer, n_tokens, last_response, state);
                     done[i] = 1;
                     --remaining;
                 }
@@ -3128,7 +3204,7 @@ struct dispatcher::impl {
                 }
                 const size_t i = idx[k];
                 receive_partial(partials[i], 0, requests[i], seq_id,
-                                layer, n_tokens, last_response);
+                                layer, n_tokens, last_response, state);
                 done[i] = 1;
                 --remaining;
             }
@@ -3158,13 +3234,14 @@ struct dispatcher::impl {
                           uint64_t                         seq_id,
                           int32_t                          layer,
                           uint32_t                         n_tokens,
-                          dispatch_clock::time_point *     last_response) {
+                          dispatch_clock::time_point *     last_response,
+                          dispatch_state &                 state) {
         const size_t n = requests.size();
         if (n == 0) {
             return;
         }
         std::vector<std::vector<float>> partials =
-            poll_harvest_receive(requests, seq_id, layer, n_tokens, last_response);
+                poll_harvest_receive(requests, seq_id, layer, n_tokens, last_response, state);
 
         // Fixed request order, not arrival order -- see the note above on why the
         // sum must not depend on network timing. scatter_add keeps that property:
@@ -3175,7 +3252,7 @@ struct dispatcher::impl {
             scatter_add(result, partials[i], requests[i]);
             if (req_log_ != nullptr) {
                 requests[i].unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
-                write_request_log(requests[i], layer, n_tokens);
+                write_request_log(requests[i], layer, n_tokens, state);
             }
         }
     }
@@ -3183,7 +3260,7 @@ struct dispatcher::impl {
     // Collect previously-issued deferred partials and sum them. Caller must
     // already have issued the current layer's requests so N-1 deferred overlaps
     // N's in-flight reads. Marks late if the fold point was already closed.
-    std::vector<float> collect_pending_deferred(bool mark_fold_open) {
+    std::vector<float> collect_pending_deferred(bool mark_fold_open, dispatch_state & state) {
         if (pending_def.requests.empty()) {
             return {};
         }
@@ -3207,7 +3284,7 @@ struct dispatcher::impl {
         // loop's prior behaviour untouched.
         if (harvest_enabled() || unpack_overlap) {
             std::vector<std::vector<float>> partials =
-                poll_harvest_receive(requests, seq_id, layer, n_tok, nullptr);
+                poll_harvest_receive(requests, seq_id, layer, n_tok, nullptr, state);
             for (size_t i = 0; i < requests.size(); ++i) {
                 planned_request & request = requests[i];
                 // If the successor layer already returned without this partial, it is late.
@@ -3224,7 +3301,7 @@ struct dispatcher::impl {
                 if (pending_def.fold_closed) {
                     ++deferral.n_deferred_late;
                 }
-                accumulate_partial(fold, request, seq_id, layer, n_tok, nullptr);
+                accumulate_partial(fold, request, seq_id, layer, n_tok, nullptr, state);
                 update_speed_estimate(request);
                 update_residency(request.worker_index, layer, request.assignments);
             }
@@ -3233,60 +3310,22 @@ struct dispatcher::impl {
         return fold;
     }
 
-    // Opaque id for one in-flight begin_dispatch/finish_dispatch pair (stage 2
-    // of the pipelined-prefill plan). Internal only: it never crosses the
-    // public API, which still has no handle parameter anywhere. begin_dispatch
-    // allocates one and finish_dispatch consumes it; because
-    // k_max_open_dispatches == 1 below, there is still at most one handle
-    // alive between any begin_dispatch/finish_dispatch pair, so the public
-    // entry points keep their exact current signatures and behaviour.
-    using dispatch_handle = uint64_t;
-    static constexpr dispatch_handle k_invalid_handle = 0;  // 0 never issued
-
-    // Stage 4 raises this to 2 so a second dispatch (the next prefill ubatch)
-    // can be begun before the first is finished. This stage only makes the
-    // bookkeeping keyed by handle instead of a bare singleton, so that later
-    // change is a capacity bump plus wiring rather than a data-structure
-    // rewrite. Kept at 1 for now: every existing caller opens at most one
-    // dispatch, awaits/finishes it, then opens the next, so this constant
-    // gates the whole refactor to a no-op.
-    static constexpr size_t k_max_open_dispatches = 1;
-
-    // Per-handle version of what used to be the single open_dispatch_state.
-    // Field-for-field identical to that struct; only the container changed
-    // shape (a bare singleton -> a fixed array keyed by handle).
-    struct dispatch_state {
-        dispatch_handle              handle = k_invalid_handle;  // k_invalid_handle == free slot
-        int32_t                      layer = -1;
-        uint32_t                     n_tokens = 0;
-        uint64_t                     seq_id = 0;
-        uint64_t                     activation_count = 0;
-        uint64_t                     hash_seq = 0;
-        uint64_t                     hash_pre = 0;
-        size_t                       hash_reqs = 0;
-        std::vector<planned_request> imm_requests;
-        std::vector<planned_request> def_requests;
-        std::vector<float>           folded_prev;
-        std::vector<size_t>          assigned_counts;
-        dispatch_clock::time_point   wait_start{};
-    };
+    static constexpr size_t k_max_open_dispatches = 2;
 
     // Guards dispatch_slots_ occupancy (allocate / look up / release) and
     // next_dispatch_handle_ only -- NOT the blocking wait in finish_dispatch()
     // (await_response() and friends), which runs after a handle's requests
-    // are already on the wire. With k_max_open_dispatches == 1 there is only
-    // ever one caller touching this today, so the lock is uncontended; the
-    // split exists so stage 4's second handle can begin (mutate the map)
+    // are already on the wire. The lock is held only for slot metadata; the
+    // split exists so a second handle can begin (mutate the map)
     // while the first handle's finish is parked in a blocking recv, instead
     // of one mutex forcing that recv to also block out a concurrent begin.
     std::mutex                                        dispatch_map_mutex_;
     std::array<dispatch_state, k_max_open_dispatches> dispatch_slots_{};
     dispatch_handle                                   next_dispatch_handle_ = 1;
 
-    // Peek at slot availability WITHOUT claiming one. Throws the exact same
-    // "already open" error the old singleton's `if (open_disp.open)` check
-    // threw when every slot is taken -- with capacity 1 that IS the
-    // one-open-dispatch rule. Called at the very top of begin_dispatch,
+    // Peek at slot availability WITHOUT claiming one. Throws the same
+    // "already open" error when every slot is taken. Called at the very top
+    // of begin_dispatch,
     // mirroring the old check's position before any of begin_dispatch's own
     // validation (route lookup, activation shape, assignment sanity) or its
     // try block: this must not mutate dispatch_slots_, because those
@@ -3336,6 +3375,16 @@ struct dispatcher::impl {
         return nullptr;
     }
 
+    dispatch_stats stats_for(dispatch_handle handle) {
+        std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
+        for (const dispatch_state & slot : dispatch_slots_) {
+            if (slot.handle == handle) {
+                return slot.stats;
+            }
+        }
+        return {};
+    }
+
     void release_dispatch_slot(dispatch_handle handle) {
         std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
         for (dispatch_state & slot : dispatch_slots_) {
@@ -3347,10 +3396,8 @@ struct dispatcher::impl {
     }
 
     // Legacy no-arg finish_dispatch()/has_open_dispatch() need to know WHICH
-    // handle is open without being told. Valid only because
-    // k_max_open_dispatches == 1 guarantees at most one candidate; stage 4's
-    // two-handle API replaces every caller of this with an explicit handle
-    // and this helper goes away.
+    // handle is open without being told. The graph uses explicit handles when
+    // two dispatches are live.
     dispatch_handle only_open_handle() {
         std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
         for (const dispatch_state & slot : dispatch_slots_) {
@@ -3370,10 +3417,8 @@ struct dispatcher::impl {
     // same seq_id OR'd with the high bit, so mask that off before matching a
     // slot's registered seq_id -- otherwise a retried response would demux to
     // "unknown" even though it answers the same handle's request. Returns
-    // k_invalid_handle when no open slot claims it. With k_max_open_dispatches
-    // == 1 this is the same "wrong sequence" fact the old strict equality
-    // check caught, just phrased as a lookup so stage 4's second handle plugs
-    // in here without touching await_response's call sites.
+    // k_invalid_handle when no open slot claims it. The strict sequence check
+    // in await_response remains the final ordering check for each handle.
     dispatch_handle demux_seq_id(uint64_t received_seq_id) {
         const uint64_t masked = received_seq_id & ~(uint64_t(1) << 63);
         std::lock_guard<std::mutex> lock(dispatch_map_mutex_);
@@ -3385,19 +3430,24 @@ struct dispatcher::impl {
         return k_invalid_handle;
     }
 
-    void begin_dispatch(int32_t                                     layer,
+    dispatch_handle begin_dispatch(int32_t                          layer,
                         uint64_t                                    seq_id,
                         uint32_t                                    n_tokens,
                         const std::vector<float> &                  activations,
                         const std::vector<pipe_expert_assignment> & assignments,
-                        float                                       swiglu_clamp) {
-        reset_layer_trace(layer);
+                        float                                       swiglu_clamp,
+                        uint32_t                                    chunk_index,
+                        const std::vector<pipe_expert_assignment> * layer_assignments,
+                        uint32_t                                    layer_n_tokens) {
+        if (!has_open_dispatch_slot()) {
+            reset_layer_trace(layer);
+        }
         if (poisoned) {
             throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
         }
         check_dispatch_capacity();
-        if (req_log_ != nullptr) {
-            req_dispatch_start_ = dispatch_clock::now();
+        if (chunk_index >= (uint32_t) dispatch_chunks_) {
+            throw std::invalid_argument("expert dispatcher has an invalid chunk index");
         }
         const auto route_it = routes.find(layer);
         if (route_it == routes.end()) {
@@ -3416,9 +3466,6 @@ struct dispatcher::impl {
             ? g_dispatch_hash_seq.fetch_add(1, std::memory_order_relaxed) : 0;
         const uint64_t hash_pre = hash_trace
             ? dispatch_hash_fnv1a(activations.data(), activations.size() * sizeof(float)) : 0;
-        if (hash_trace) {
-            dispatch_hash_seq_ = hash_seq;
-        }
 
         std::set<int32_t> seen_experts;
         for (const pipe_expert_assignment & assignment : assignments) {
@@ -3427,10 +3474,26 @@ struct dispatcher::impl {
                 throw std::invalid_argument("expert dispatcher has an invalid or repeated expert assignment");
             }
         }
-        add_temporal_locality(layer, n_tokens, assignments);
-        dump_routing(layer, n_tokens, assignments);
+        if (chunk_index == 0) {
+            const std::vector<pipe_expert_assignment> & routed =
+                layer_assignments != nullptr ? *layer_assignments : assignments;
+            const uint32_t routed_tokens = layer_n_tokens != 0 ? layer_n_tokens : n_tokens;
+            add_temporal_locality(layer, routed_tokens, routed);
+            dump_routing(layer, routed_tokens, routed);
+        }
 
         try {
+            const dispatch_handle handle = acquire_dispatch_slot();
+            dispatch_state & state = *find_dispatch_slot(handle);
+            state.layer              = layer;
+            state.chunk_index        = chunk_index;
+            state.n_tokens           = n_tokens;
+            state.seq_id             = seq_id;
+            state.activation_count   = activation_count;
+            state.dispatch_hash_seq_ = hash_seq;
+            state.hash_pre           = hash_pre;
+            state.req_dispatch_start_ = req_log_ != nullptr ? dispatch_clock::now()
+                                                             : dispatch_clock::time_point{};
             // Decide whether this layer may leave experts deferred.
             // The last main-graph MoE layer has no successor to fold into — do
             // not defer it. Prefer the host-provided last_no_defer_layer
@@ -3490,10 +3553,10 @@ struct dispatcher::impl {
                     : plan_requests(layer, n_tokens, activations, deferred, route_it->second, assigned_counts,
                                     swiglu_clamp);
 
-            stats              = {};
-            stats.workers_used = imm_requests.size() + def_requests.size();
+            state.stats              = {};
+            state.stats.workers_used = imm_requests.size() + def_requests.size();
             for (const planned_request & request : imm_requests) {
-                stats.workers.push_back({
+                state.stats.workers.push_back({
                     workers[request.worker_index].info.endpoint,
                     request.assignments.size(),
                     0,
@@ -3523,13 +3586,13 @@ struct dispatcher::impl {
             // (default 32) -- the two windows do not overlap in practice, and
             // folding dedup into the deferred-fold's own cross-layer bookkeeping
             // is not a safe thing to do without its own dedicated design.
-            dedup_publish_and_ref(imm_requests, seq_id, layer, n_tokens, activations);
-            issue_requests(imm_requests, seq_id);
+            dedup_publish_and_ref(imm_requests, seq_id, layer, n_tokens, activations, state);
+            issue_requests(imm_requests, seq_id, state);
             if (!def_requests.empty()) {
-                issue_requests(def_requests, seq_id);
+                issue_requests(def_requests, seq_id, state);
             }
             if (collect_stats) {
-                stats.ns_issue = elapsed_ns(issue_start, dispatch_clock::now());
+                state.stats.ns_issue = elapsed_ns(issue_start, dispatch_clock::now());
             }
 
             // Drain previous layer's deferred partials now that layer N is in
@@ -3537,24 +3600,17 @@ struct dispatcher::impl {
             // carries both, N-1 deferred frames were SENT before N's frames, so
             // they ARRIVE first (TCP FIFO). await_response validates seq_id and
             // throws on mismatch — do not weaken that check.
-            std::vector<float> folded_prev = collect_pending_deferred(/*mark_fold_open=*/true);
+            std::vector<float> folded_prev = collect_pending_deferred(/*mark_fold_open=*/true, state);
 
-            const dispatch_handle handle = acquire_dispatch_slot();
-            dispatch_state &      slot   = *find_dispatch_slot(handle);
-            slot.layer             = layer;
-            slot.n_tokens          = n_tokens;
-            slot.seq_id            = seq_id;
-            slot.activation_count  = activation_count;
-            slot.hash_seq          = hash_seq;
-            slot.hash_pre          = hash_pre;
-            slot.hash_reqs         = imm_requests.size() + def_requests.size();
-            slot.imm_requests      = std::move(imm_requests);
-            slot.def_requests      = std::move(def_requests);
-            slot.folded_prev       = std::move(folded_prev);
-            slot.assigned_counts   = std::move(assigned_counts);
-            slot.wait_start        = collect_stats ? dispatch_clock::now()
-                                                    : dispatch_clock::time_point{};
-            return;
+            state.hash_reqs       = imm_requests.size() + def_requests.size();
+            state.imm_requests    = std::move(imm_requests);
+            state.def_requests    = std::move(def_requests);
+            state.folded_prev     = std::move(folded_prev);
+            state.assigned_counts = std::move(assigned_counts);
+            state.wait_start      = collect_stats ? dispatch_clock::now()
+                                                   : dispatch_clock::time_point{};
+            last_stats = state.stats;
+            return handle;
         } catch (...) {
             poison();
             throw;
@@ -3562,19 +3618,33 @@ struct dispatcher::impl {
     }
 
     std::vector<float> finish_dispatch() {
-        if (poisoned) {
-            throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
-        }
         const dispatch_handle handle = only_open_handle();
         if (handle == k_invalid_handle) {
             throw std::runtime_error("expert dispatcher finish_dispatch called with no open dispatch");
         }
-        dispatch_state & slot            = *find_dispatch_slot(handle);
+        return finish_dispatch(handle, nullptr);
+    }
+
+    std::vector<float> finish_dispatch(dispatch_handle handle) {
+        return finish_dispatch(handle, nullptr);
+    }
+
+    std::vector<float> finish_dispatch(dispatch_handle handle, dispatch_stats * completed_stats) {
+        if (poisoned) {
+            throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
+        }
+        if (handle == k_invalid_handle) {
+            throw std::runtime_error("expert dispatcher finish_dispatch called with no open dispatch");
+        }
+        dispatch_state * state_ptr       = find_dispatch_slot(handle);
+        if (state_ptr == nullptr) {
+            throw std::runtime_error("expert dispatcher finish_dispatch called with an invalid handle");
+        }
+        dispatch_state & slot            = *state_ptr;
         const int32_t  layer            = slot.layer;
         const uint32_t n_tokens         = slot.n_tokens;
         const uint64_t seq_id           = slot.seq_id;
         const uint64_t activation_count = slot.activation_count;
-        const uint64_t hash_seq         = slot.hash_seq;
         const uint64_t hash_pre         = slot.hash_pre;
         const size_t   hash_reqs        = slot.hash_reqs;
         std::vector<planned_request> imm_requests    = std::move(slot.imm_requests);
@@ -3630,11 +3700,11 @@ struct dispatcher::impl {
             // effect for a given run.
             const bool harvest = harvest_enabled() || unpack_overlap;
             if (harvest) {
-                harvest_partials(result, imm_requests, seq_id, layer, n_tokens, &last_response);
+                harvest_partials(result, imm_requests, seq_id, layer, n_tokens, &last_response, slot);
                 for (size_t request_index = 0; request_index < imm_requests.size(); ++request_index) {
                     planned_request & request = imm_requests[request_index];
                     if (collect_stats) {
-                        stats.workers[request_index].ns_wait =
+                        slot.stats.workers[request_index].ns_wait =
                             elapsed_ns(request.issued_at, last_response);
                     }
                     update_residency(request.worker_index, layer, request.assignments);
@@ -3643,16 +3713,16 @@ struct dispatcher::impl {
             for (size_t request_index = 0; request_index < imm_requests.size(); ++request_index) {
                 planned_request & request = imm_requests[request_index];
                 const dispatch_clock::time_point before = collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
-                accumulate_partial(result, request, seq_id, layer, n_tokens, &last_response);
+                accumulate_partial(result, request, seq_id, layer, n_tokens, &last_response, slot);
                 if (collect_stats) {
-                    stats.workers[request_index].ns_wait = elapsed_ns(request.issued_at, last_response);
+                    slot.stats.workers[request_index].ns_wait = elapsed_ns(request.issued_at, last_response);
                     (void) before;
                 }
                 update_residency(request.worker_index, layer, request.assignments);
             }
             }
             if (collect_stats && !imm_requests.empty()) {
-                stats.ns_wait = elapsed_ns(wait_start, last_response);
+                slot.stats.ns_wait = elapsed_ns(wait_start, last_response);
             }
             update_speed_estimates(imm_requests);
             log_speed_state(assigned_counts);
@@ -3664,7 +3734,7 @@ struct dispatcher::impl {
                 // here is a bug — force-collect and mark late before overwriting.
                 if (!pending_def.requests.empty()) {
                     pending_def.fold_closed = true;
-                    (void) collect_pending_deferred(/*mark_fold_open=*/false);
+                    (void) collect_pending_deferred(/*mark_fold_open=*/false, slot);
                 }
                 pending_def.layer       = layer;
                 pending_def.seq_id      = seq_id;
@@ -3679,11 +3749,15 @@ struct dispatcher::impl {
                     result.data(), result.size() * sizeof(float));
                 std::fprintf(stderr,
                              "DISPHASH seq=%llu layer=%d n=%llu pre=%llu post=%llu reqs=%zu\n",
-                             (unsigned long long) hash_seq, layer,
+                             (unsigned long long) slot.dispatch_hash_seq_, layer,
                              (unsigned long long) activation_count,
                              (unsigned long long) hash_pre,
                              (unsigned long long) hash_post, hash_reqs);
             }
+            if (completed_stats != nullptr) {
+                *completed_stats = slot.stats;
+            }
+            last_stats = slot.stats;
             release_dispatch_slot(handle);
             return result;
         } catch (...) {
@@ -3743,7 +3817,11 @@ struct dispatcher::impl {
         }
         // Anything still pending at drain has missed its fold point.
         pending_def.fold_closed = true;
-        return collect_pending_deferred(/*mark_fold_open=*/false);
+        dispatch_state state;
+        state.layer   = pending_def.layer;
+        state.seq_id  = pending_def.seq_id;
+        state.n_tokens = pending_def.n_tokens;
+        return collect_pending_deferred(/*mark_fold_open=*/false, state);
     }
 };
 
@@ -3764,26 +3842,50 @@ std::vector<float> dispatcher::dispatch(int32_t                                 
                                         uint32_t                                    n_tokens,
                                         const std::vector<float> &                  activations,
                                         const std::vector<pipe_expert_assignment> & assignments,
-                                        float                                       swiglu_clamp) {
-    pimpl->begin_dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp);
-    return pimpl->finish_dispatch();
+                                        float                                       swiglu_clamp,
+                                        uint32_t                                    chunk_index) {
+    const dispatch_handle handle =
+        pimpl->begin_dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp, chunk_index,
+                              nullptr, 0);
+    return pimpl->finish_dispatch(handle);
 }
 
-void dispatcher::begin_dispatch(int32_t                                     layer,
-                                uint64_t                                    seq_id,
-                                uint32_t                                    n_tokens,
-                                const std::vector<float> &                  activations,
-                                const std::vector<pipe_expert_assignment> & assignments,
-                                float                                       swiglu_clamp) {
-    pimpl->begin_dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp);
+dispatcher::dispatch_handle dispatcher::begin_dispatch(
+        int32_t layer, uint64_t seq_id, uint32_t n_tokens,
+        const std::vector<float> & activations,
+        const std::vector<pipe_expert_assignment> & assignments,
+        float swiglu_clamp, uint32_t chunk_index,
+        const std::vector<pipe_expert_assignment> * layer_assignments, uint32_t layer_n_tokens) {
+    return pimpl->begin_dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp, chunk_index,
+                                 layer_assignments, layer_n_tokens);
 }
 
 std::vector<float> dispatcher::finish_dispatch() {
     return pimpl->finish_dispatch();
 }
 
+std::vector<float> dispatcher::finish_dispatch(dispatch_handle handle) {
+    return pimpl->finish_dispatch(handle);
+}
+
+std::vector<float> dispatcher::finish_dispatch(dispatch_handle handle, dispatch_stats * stats) {
+    return pimpl->finish_dispatch(handle, stats);
+}
+
 bool dispatcher::has_open_dispatch() const {
     return pimpl->has_open_dispatch_slot();
+}
+
+bool dispatcher::has_open_dispatch(dispatch_handle handle) const {
+    return pimpl->find_dispatch_slot(handle) != nullptr;
+}
+
+int dispatcher::dispatch_chunks() const {
+    return pimpl->dispatch_chunks_;
+}
+
+dispatch_stats dispatcher::stats_for(dispatch_handle handle) const {
+    return pimpl->stats_for(handle);
 }
 
 layer_trace_stats dispatcher::layer_trace(int32_t layer) const {
@@ -3828,7 +3930,7 @@ size_t dispatcher::in_flight_requests() const {
 }
 
 const dispatch_stats & dispatcher::last_dispatch_stats() const {
-    return pimpl->stats;
+    return pimpl->last_stats;
 }
 
 const deferral_stats & dispatcher::get_deferral_stats() const {
