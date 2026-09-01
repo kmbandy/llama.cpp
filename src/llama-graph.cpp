@@ -1461,6 +1461,7 @@ void llm_graph_result::reset() {
     t_h_nextn     = nullptr;
     t_stage_out   = nullptr;
     t_stage_in    = nullptr;
+    t_trace_layer_out.clear();
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);

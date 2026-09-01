@@ -562,8 +562,38 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
 
+    // WP_QWEN4EXP_LAYER_CUT_TRACE diagnostic (default off, zero cost when
+    // unset): mirror the staged path's per-stage boundary trace so the two
+    // are directly diffable. Retaining 48 wide res_hc outputs as graph
+    // outputs (protecting them from allocator reuse) is VRAM-real for a wide
+    // ubatch, so this only engages for a small diagnostic prompt -- capped at
+    // trace_max_tokens, matching the coordinator's "I'll run it on a ~70-token
+    // prompt". llama_context::process_ubatch does the actual readback+print
+    // after compute (this constructor only marks/collects the tensors).
+    static const bool wp_layer_cut_trace = [] {
+        const char * e = std::getenv("WP_QWEN4EXP_LAYER_CUT_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    static constexpr uint32_t trace_max_tokens = 256;
+    const bool trace_this_build = wp_layer_cut_trace && (uint32_t) n_tokens <= trace_max_tokens;
+
+    if (trace_this_build) {
+        res->t_trace_layer_out.assign(n_layer, nullptr);
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         res_hc = build_trunk_layer(inp, mctx_hyb, inp_pos, inp_out_ids, sections, hc, keep_all_rows, res_hc, il);
+
+        if (trace_this_build) {
+            // res_hc is already reachable transitively (next iteration's
+            // build_hc_mix, or h_nextn at the last layer), but set_output
+            // protects it from being freed/reused before process_ubatch's
+            // post-compute readback -- the explicit forward_expand is belt
+            // and suspenders, matching the staged path's t_stage_out handling.
+            ggml_build_forward_expand(gf, res_hc);
+            ggml_set_output(res_hc);
+            res->t_trace_layer_out[il] = res_hc;
+        }
     }
 
     build_trunk_head(res_hc, hc, keep_all_rows, inp_out_ids);

@@ -1022,6 +1022,14 @@ public:
     ggml_tensor * t_stage_out = nullptr;
     ggml_tensor * t_stage_in  = nullptr;
 
+    // WP_QWEN4EXP_LAYER_CUT_TRACE diagnostic only (default empty, zero cost
+    // when the env var is unset): the whole-graph path's per-layer res_hc
+    // outputs, indexed by il, for a direct apples-to-apples diff against the
+    // staged path's per-stage boundary sums. Populated (and each entry marked
+    // ggml_set_output) only when llama_context::process_ubatch detects the
+    // trace env var; read back and printed after compute, then discarded.
+    std::vector<ggml_tensor *> t_trace_layer_out;
+
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_sampled;

@@ -2419,6 +2419,47 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // WP_QWEN4EXP_LAYER_CUT_TRACE diagnostic (default off, zero cost when
+    // unset): whole-graph counterpart to process_ubatch_staged's per-stage
+    // boundary trace, so the two are directly diffable against the same
+    // prompt. qwen4exp's build_trunk_layer loop only populates
+    // res->t_trace_layer_out when the env var is set AND the ubatch is small
+    // (see the VRAM note there), so this is a no-op for every other arch/call.
+    {
+        static const bool wp_layer_cut_trace = [] {
+            const char * e = getenv("WP_QWEN4EXP_LAYER_CUT_TRACE");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (wp_layer_cut_trace && !res->t_trace_layer_out.empty()) {
+            ggml_backend_sched_synchronize(sched.get());
+            std::vector<float> host;
+            for (uint32_t il = 0; il < res->t_trace_layer_out.size(); ++il) {
+                ggml_tensor * t = res->t_trace_layer_out[il];
+                if (t == nullptr) {
+                    continue;
+                }
+                const size_t n_elem = ggml_nelements(t);
+                host.resize(n_elem);
+                ggml_backend_tensor_get(t, host.data(), 0, n_elem * sizeof(float));
+                double sum = 0.0;
+                for (float v : host) {
+                    sum += v;
+                }
+                LLAMA_LOG_WARN("layer_cut: wholegraph layer %u res_hc sum=%.6f n=%zu\n", il, sum, n_elem);
+            }
+            if (res->t_logits != nullptr) {
+                const size_t n_elem = ggml_nelements(res->t_logits);
+                host.resize(n_elem);
+                ggml_backend_tensor_get(res->t_logits, host.data(), 0, n_elem * sizeof(float));
+                double sum = 0.0;
+                for (float v : host) {
+                    sum += v;
+                }
+                LLAMA_LOG_WARN("layer_cut: wholegraph logits sum=%.6f n=%zu\n", sum, n_elem);
+            }
+        }
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2459,6 +2500,11 @@ llm_graph_result * llama_context::process_ubatch_staged(
     }
 
     const uint32_t n_layer = model.hparams.n_layer();
+
+    // one line per staged ubatch: enough to attribute WHICH batches run staged
+    // (a gate that cannot see its engagements in the log is not a gate)
+    LLAMA_LOG_WARN("layer_cut: staged ubatch n_tokens=%u n_seqs=%u n_seq_tokens=%u gtype=%d\n",
+                   ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens, (int) gtype);
 
     layer_cut_slot.reset();
     layer_cut_slot.ubatch   = &ubatch;
@@ -2567,6 +2613,29 @@ llm_graph_result * llama_context::process_ubatch_staged(
         LLAMA_LOG_ERROR("%s: expert dispatch failed: %s\n", __func__, message.c_str());
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // WP_QWEN4EXP_LAYER_CUT_TRACE endpoint check, matching the whole-graph
+    // path's logits print (llama_context::process_ubatch) for a direct diff.
+    // The terminal stage has no t_stage_out (nothing downstream reads its
+    // res_hc further), so unlike every other stage, nothing has synchronized
+    // its compute yet -- do that first.
+    {
+        static const bool wp_layer_cut_trace = [] {
+            const char * e = getenv("WP_QWEN4EXP_LAYER_CUT_TRACE");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (wp_layer_cut_trace && res_terminal != nullptr && res_terminal->t_logits != nullptr) {
+            ggml_backend_sched_synchronize(sched.get());
+            const size_t n_elem = ggml_nelements(res_terminal->t_logits);
+            std::vector<float> host(n_elem);
+            ggml_backend_tensor_get(res_terminal->t_logits, host.data(), 0, n_elem * sizeof(float));
+            double sum = 0.0;
+            for (float v : host) {
+                sum += v;
+            }
+            LLAMA_LOG_WARN("layer_cut: stage logits sum=%.6f n=%zu\n", sum, n_elem);
+        }
     }
 
     layer_cut_slot.res_terminal = res_terminal;
