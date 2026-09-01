@@ -193,6 +193,12 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    // WP_QWEN4EXP_LAYER_CUT (Stage 3): true only for LLM_ARCH_QWEN4EXP,
+    // LLM_GRAPH_TYPE_DEFAULT, a normal (non-draft) context, pooling_type NONE,
+    // and ubatch.n_tokens >= 64 -- see the .cpp for the full gate, including the
+    // exclusions this file adds beyond the architect's list (output_layer_inp).
+    bool layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_type gtype) const;
+
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
@@ -313,6 +319,18 @@ private:
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
+    // WP_QWEN4EXP_LAYER_CUT (Stage 3) serial stage-list executor: replaces only
+    // the whole-graph execution decision at the graph_compute(res->get_gf(), ...)
+    // seam. Each of the 49 stages goes through the existing scheduler/
+    // graph_compute path, one at a time, before the next stage is built --
+    // no second outstanding dispatch (stage-2's k_max_open_dispatches=1 is
+    // unaffected: every stage waits before the next issues).
+    llm_graph_result * process_ubatch_staged(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+
     llm_graph_cb graph_get_cb() const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
@@ -430,6 +448,10 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // WP_QWEN4EXP_LAYER_CUT (Stage 3): the one live logical execution slot
+    // (plan item 4) -- see llama_context::process_ubatch_staged().
+    llm_graph_stage_slot layer_cut_slot;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

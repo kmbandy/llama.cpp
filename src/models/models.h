@@ -2406,6 +2406,41 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * input,
                             int   il);
 
+        // WP_QWEN4EXP_LAYER_CUT (Stage 3, pipelined-prefill): the trunk-layer body
+        // (post-FFN res_hc boundary) and the terminal head, factored out of the
+        // whole-graph constructor so the staged driver (build_trunk_staged) can
+        // build one at a time without duplicating either. The whole-graph
+        // constructor calls these from its loop too, so the default-off path is
+        // byte-identical -- only the call site moved, the code did not change.
+        ggml_tensor * build_trunk_layer(
+              llm_graph_input_mem_hybrid * inp,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * inp_pos,
+                    ggml_tensor * inp_out_ids,
+                            int * sections,
+                        int64_t   hc,
+                           bool   keep_all_rows,
+                    ggml_tensor * res_hc,
+                            int   il);
+
+        // lines that used to run once after the loop: h_nextn publication, final
+        // HC mixer, output-row selection, result norm, embeddings, logits. No cut
+        // inside this stage (plan item 3).
+        ggml_tensor * build_trunk_head(
+                    ggml_tensor * res_hc,
+                        int64_t   hc,
+                           bool   keep_all_rows,
+                    ggml_tensor * inp_out_ids);
+
+        // WP_QWEN4EXP_LAYER_CUT driver: builds exactly ONE stage (stage_il in
+        // [0, n_layer) is a trunk layer, stage_il == n_layer is the terminal
+        // head) into this llm_graph_context's ctx0/gf. Shared QSA/hybrid-memory
+        // inputs are rebuilt within this call (not cached across stages, since
+        // each stage is produced by a separate model.build_graph() call from
+        // llama_context::process_ubatch_staged) -- see the "not rebound per
+        // stage" deviation noted in the Stage 3 summary.
+        void build_trunk_staged(int64_t hc, int * sections, int32_t stage_il);
+
         const llama_model & model;
     };
 

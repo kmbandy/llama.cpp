@@ -1459,6 +1459,8 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_stage_out   = nullptr;
+    t_stage_in    = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1504,6 +1506,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_stage_out != nullptr) {
+        ggml_set_output(t_stage_out);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -1624,6 +1629,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     expert_dispatch  (params.expert_dispatch),
+    layer_cut        (params.layer_cut),
+    stage_il         (params.stage_il),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

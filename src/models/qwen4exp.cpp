@@ -519,6 +519,16 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
+    // WP_QWEN4EXP_LAYER_CUT (Stage 3): params.layer_cut builds exactly one of
+    // the 49 stages instead of the whole trunk below. build_trunk_layer/
+    // build_trunk_head hold the actual per-layer/head bodies, shared verbatim
+    // by both paths, so the default-off (layer_cut == false) path below is
+    // untouched code, not a parallel reimplementation.
+    if (params.layer_cut) {
+        build_trunk_staged(hc, sections, params.stage_il);
+        return;
+    }
+
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
     cb(inpL, "model.input_embed", -1);
 
@@ -553,58 +563,89 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(res_hc, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = res_hc;
-
-        if (hparams.is_ple(il)) {
-            res_hc = build_ple(inp->get_recr(), mctx_hyb, res_hc, il);
-        }
-
-        ggml_tensor * inject = nullptr;
-        ggml_tensor * cur = build_hc_mix(res_hc,
-                model.layers[il].hc_attn_norm,
-                model.layers[il].hc_attn_down,
-                model.layers[il].hc_attn_up,
-                model.layers[il].hc_attn_inject,
-                &inject, il);
-
-        ggml_build_forward_expand(gf, cur);
-
-        if (hparams.is_recr(il)) {
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
-        } else {
-            cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
-        }
-
-        // when unmasked nextn embeddings are requested, t_h_nextn must keep all rows,
-        // so the early output masking is skipped and applied after the final mixer instead
-        if (il == n_layer - 1 && inp_out_ids && !keep_all_rows) {
-            // everything below is per token, so drop the rows that produce no output
-            cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-            inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-
-            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
-            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
-            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
-        }
-
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
-
-        cur = build_hc_mix(res_hc,
-                model.layers[il].hc_ffn_norm,
-                model.layers[il].hc_ffn_down,
-                model.layers[il].hc_ffn_up,
-                model.layers[il].hc_ffn_inject,
-                &inject, il);
-
-        cur = build_layer_ffn(cur, il);
-        cb(cur, "ffn_out", il);
-
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
-
-        // "l_last" is the layer output name that build_cvec and imatrix look for
-        cb(res_hc, "l_last", il);
+        res_hc = build_trunk_layer(inp, mctx_hyb, inp_pos, inp_out_ids, sections, hc, keep_all_rows, res_hc, il);
     }
 
+    build_trunk_head(res_hc, hc, keep_all_rows, inp_out_ids);
+}
+
+// The per-layer body: HC pre-mix, attention (recurrent or full per is_recr),
+// last-layer row masking, HC combine, FFN, HC combine again. This is the
+// semantic boundary the plan cuts on (the post-FFN res_hc produced here).
+// Identical to the code this replaced in the loop above; called once per
+// layer from there, or once total from build_trunk_staged.
+ggml_tensor * llama_model_qwen4exp::graph::build_trunk_layer(
+        llm_graph_input_mem_hybrid * inp,
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        ggml_tensor * inp_pos,
+        ggml_tensor * inp_out_ids,
+        int * sections,
+        int64_t hc,
+        bool keep_all_rows,
+        ggml_tensor * res_hc,
+        int il) {
+    res->t_layer_inp[il] = res_hc;
+
+    if (hparams.is_ple(il)) {
+        res_hc = build_ple(inp->get_recr(), mctx_hyb, res_hc, il);
+    }
+
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = build_hc_mix(res_hc,
+            model.layers[il].hc_attn_norm,
+            model.layers[il].hc_attn_down,
+            model.layers[il].hc_attn_up,
+            model.layers[il].hc_attn_inject,
+            &inject, il);
+
+    ggml_build_forward_expand(gf, cur);
+
+    if (hparams.is_recr(il)) {
+        cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+    } else {
+        cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+    }
+
+    // when unmasked nextn embeddings are requested, t_h_nextn must keep all rows,
+    // so the early output masking is skipped and applied after the final mixer instead
+    if (il == n_layer - 1 && inp_out_ids && !keep_all_rows) {
+        // everything below is per token, so drop the rows that produce no output
+        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+    }
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+    cur = build_hc_mix(res_hc,
+            model.layers[il].hc_ffn_norm,
+            model.layers[il].hc_ffn_down,
+            model.layers[il].hc_ffn_up,
+            model.layers[il].hc_ffn_inject,
+            &inject, il);
+
+    cur = build_layer_ffn(cur, il);
+    cb(cur, "ffn_out", il);
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+    // "l_last" is the layer output name that build_cvec and imatrix look for
+    cb(res_hc, "l_last", il);
+
+    return res_hc;
+}
+
+// Terminal head (plan item 3): h_nextn publication, final HC mixer,
+// output-row selection, result norm, embeddings, logits projection. No cut
+// inside this stage. Identical to the code this replaced after the loop.
+ggml_tensor * llama_model_qwen4exp::graph::build_trunk_head(
+        ggml_tensor * res_hc,
+        int64_t hc,
+        bool keep_all_rows,
+        ggml_tensor * inp_out_ids) {
     // Sidecar MTP (graph_mtp) consumes the hyper-connection STREAMS, not the
     // collapsed mixer output. Width is hc*n_embd. Leave this unmasked so
     // draft-mtp can index by raw token position.
@@ -632,6 +673,78 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
+// WP_QWEN4EXP_LAYER_CUT driver (Stage 3): builds exactly one stage into this
+// (fresh, per-call) llm_graph_context's ctx0/gf. Shared inputs (hybrid-memory
+// handle, positions, output ids) are rebuilt here every call rather than
+// cached across stages -- see the "not rebound per stage" deviation in the
+// Stage 3 summary. The res_hc boundary crosses stages via
+// res->t_stage_in/t_stage_out, which llama_context::process_ubatch_staged
+// copies through a host buffer between stage computations.
+void llama_model_qwen4exp::graph::build_trunk_staged(int64_t hc, int * sections, int32_t stage_il) {
+    auto * inp = build_inp_mem_hybrid();
+
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
+
+    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+    if (mctx_idx) {
+        GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
+                "the indexer cache must track the attention cache cell for cell");
+    }
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    const bool keep_all_rows =
+        (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) ||
+        expert_dispatch != nullptr;
+
+    if (stage_il == (int32_t) n_layer) {
+        // terminal head stage: read the boundary the last trunk-layer stage produced
+        ggml_tensor * res_hc_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_input(res_hc_in);
+        ggml_set_name(res_hc_in, "layer_cut_stage_in");
+        res->t_stage_in = res_hc_in;
+
+        build_trunk_head(res_hc_in, hc, keep_all_rows, inp_out_ids);
+        return;
+    }
+
+    ggml_tensor * res_hc_in;
+    if (stage_il == 0) {
+        // stage 0 includes embedding setup and the initial wide residual --
+        // no cross-stage boundary needed for its input
+        ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+        cb(inpL, "model.input_embed", -1);
+
+        res_hc_in = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(res_hc_in, "hc_init", -1);
+    } else {
+        res_hc_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_input(res_hc_in);
+        ggml_set_name(res_hc_in, "layer_cut_stage_in");
+        res->t_stage_in = res_hc_in;
+    }
+
+    // build_trunk_layer already names this via cb(res_hc, "l_last", il) --
+    // leave that name alone (build_cvec/imatrix look for it), just mark it as
+    // this stage's graph output
+    ggml_tensor * res_hc_out = build_trunk_layer(
+            inp, mctx_hyb, inp_pos, inp_out_ids, sections, hc, keep_all_rows, res_hc_in, stage_il);
+
+    // unlike the whole-graph loop, nothing downstream in THIS stage's graph
+    // depends on res_hc_out (the whole-graph path relies on the next
+    // iteration's build_hc_mix, or h_nextn at the last layer, to pull it in
+    // transitively) -- so it needs an explicit forward_expand or it is silently
+    // dropped from gf and never computed.
+    ggml_build_forward_expand(gf, res_hc_out);
+
+    res->t_stage_out = res_hc_out;
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(

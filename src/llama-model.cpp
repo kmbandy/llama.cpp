@@ -3890,17 +3890,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
-    // add on pooling layer
-    llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+    // WP_QWEN4EXP_LAYER_CUT (Stage 3): a non-terminal stage (stage_il in
+    // [0, n_layer)) has no t_embd yet -- build_pooling/build_dense_out assert on
+    // that when cparams.embeddings is set, so skip both until the terminal head
+    // stage (stage_il == n_layer) actually publishes it. build_sampling is safe
+    // to call unconditionally: it no-ops itself when res->t_logits is null.
+    const bool is_staged_non_terminal =
+        params.layer_cut && params.stage_il >= 0 && params.stage_il < (int32_t) hparams.n_layer();
+
+    if (!is_staged_non_terminal) {
+        // add on pooling layer
+        llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+    }
 
     // add backend sampling layers (if any)
     llm->build_sampling();
 
-    // if the gguf model was converted with --sentence-transformers-dense-modules
-    // there will be two additional dense projection layers
-    // dense linear projections are applied after pooling
-    // TODO: move reranking logic here and generalize
-    llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+    if (!is_staged_non_terminal) {
+        // if the gguf model was converted with --sentence-transformers-dense-modules
+        // there will be two additional dense projection layers
+        // dense linear projections are applied after pooling
+        // TODO: move reranking logic here and generalize
+        llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+    }
 
     llm->res->set_outputs(params);
 

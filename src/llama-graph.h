@@ -868,6 +868,19 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // WP_QWEN4EXP_LAYER_CUT (Stage 3, pipelined-prefill): when true, the arch's
+    // build_arch_graph() builds a single explicit stage instead of the whole
+    // decode graph -- see llama_context::layer_cut_eligible() for the gate
+    // (arch/gtype/pooling/ubatch-width conditions) and
+    // llama_context::process_ubatch_staged() for the serial stage-list driver.
+    // Default false: the whole-graph path below is structurally untouched.
+    bool layer_cut = false;
+
+    // valid only when layer_cut is true: [0, n_layer) selects one trunk layer,
+    // n_layer selects the terminal head (plan item 3 -- MTP/NextN keeps its own
+    // separate whole graph and is never staged).
+    int32_t stage_il = -1;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -940,7 +953,11 @@ struct llm_graph_params {
             loras   == other.loras   &&
             ml8_reg == other.ml8_reg &&
             expert_dispatch == other.expert_dispatch &&
-            cross   == other.cross;
+            cross   == other.cross   &&
+            // toggling WP_QWEN4EXP_LAYER_CUT or moving to a different stage changes the
+            // graph topology entirely (plan item 1), so either difference forces a rebuild
+            layer_cut == other.layer_cut &&
+            stage_il  == other.stage_il;
     }
 };
 
@@ -998,6 +1015,13 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
+    // WP_QWEN4EXP_LAYER_CUT: the post-FFN res_hc boundary tensor for a single staged
+    // trunk-layer or trunk-layer-input stage (llama_context::process_ubatch_staged
+    // marks it as a graph output/input via ggml_set_output/ggml_set_input and copies
+    // it across stages). Unused (stays null) on the whole-graph path.
+    ggml_tensor * t_stage_out = nullptr;
+    ggml_tensor * t_stage_in  = nullptr;
+
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_sampled;
@@ -1028,6 +1052,44 @@ private:
 };
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
+
+// WP_QWEN4EXP_LAYER_CUT (Stage 3) logical execution slot (plan item 4): one
+// ubatch's walk through the 49 stage descriptors (48 trunk layers + terminal
+// head), owned by llama_context, not a second ggml scheduler/arena. Boundary
+// activations are a single reused host buffer (see boundary_host below),
+// never all 48 intermediates.
+//
+// Stage 4 seam (plan item 8): a second slot would carry its own ubatch/mctx,
+// cursor, boundary state and dispatch handle key without changing this shape --
+// the executor becomes one-stage/ready-queue scheduling across slots instead of
+// the single-slot serial loop Stage 3 implements in
+// llama_context::process_ubatch_staged().
+struct llm_graph_stage_slot {
+    const llama_ubatch           * ubatch = nullptr; // borrowed, valid for the slot's lifetime
+    const llama_memory_context_i * mctx   = nullptr; // already applied by the caller before staging starts
+
+    uint32_t n_stages = 0; // n_layer trunk stages + 1 terminal head stage
+    uint32_t cur      = 0; // next stage index to build/execute, in [0, n_stages)
+
+    // the post-FFN res_hc boundary handed from stage il to stage il+1, held as a
+    // single reused HOST buffer between the two independently-allocated/scheduled
+    // stage graphs: stage il's t_stage_out is read back here
+    // (ggml_backend_tensor_get) right after that stage computes, then written
+    // into stage il+1's t_stage_in (ggml_backend_tensor_set) once it is
+    // allocated. One live copy at a time -- never all 48 intermediates (plan
+    // item 4). This is a deliberately simpler, easier-to-verify-by-inspection
+    // stand-in for "allocator-managed ping-pong": see the Stage 3 summary.
+    std::vector<float> boundary_host;
+
+    // the terminal stage's own llm_graph_result carries the real output tensors
+    // (t_logits/t_embd/t_h_nextn/...); llama_context::process_ubatch_staged returns it
+    llm_graph_result * res_terminal = nullptr;
+
+    void reset() {
+        cur = 0;
+        res_terminal = nullptr;
+    }
+};
 
 // Vocab lm_head rows materialized in a reserved or live graph. Prefill
 // embeddings / nextn stay full-width; the lm_head does not. Shared with
@@ -1094,6 +1156,12 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     pipe_expert_dispatcher::graph_dispatcher * expert_dispatch;
+
+    // WP_QWEN4EXP_LAYER_CUT (Stage 3): see llm_graph_params::layer_cut/stage_il.
+    // Always false/-1 unless the gate in llama_context::layer_cut_eligible() enabled it.
+    const bool    layer_cut;
+    const int32_t stage_il;
+
     // When true, build_moe_ffn's dispatch branch returns the ISSUE node and
     // the caller must shexp_after_issue() the shared-expert *input* (so the
     // GPU FFN cannot start before send) then complete_moe_dispatch() after

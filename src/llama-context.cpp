@@ -2175,7 +2175,69 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// WP_QWEN4EXP_LAYER_CUT (Stage 3, pipelined-prefill): gate for the staged
+// (49-explicit-stage) decode path. Plan item 1's required conditions:
+//   arch == QWEN4EXP, gtype == DEFAULT, non-draft context, pooling_type NONE,
+//   ubatch.n_tokens >= 64. LLM_GRAPH_TYPE_DECODER_MTP is excluded by the gtype
+//   check alone (graph_mtp keeps its own separate whole graph -- plan item 3).
+//
+// Two exclusions beyond the architect's list, both flagged in the Stage 3
+// summary rather than silently added:
+//   - cparams.embeddings_layer_inp[*]/embeddings_layer_inp_external[*]: a
+//     staged trunk-layer stage is a separate llm_graph_result per layer, so
+//     t_layer_inp[il] does not survive past that stage's llm_graph_result the
+//     way plan item 6 requires. Retaining all 48 t_layer_inp tensors would
+//     violate item 4's "never retain all 48 intermediates", so instead this
+//     combination simply falls back to the whole-graph path.
+//   - expert_dispatch == nullptr: the staged driver reuses build_issue/
+//     build_wait/HC-combine exactly as item 2 requires ("stay within one layer
+//     stage"), which only makes sense when a dispatcher is actually attached;
+//     without one there is no reason to pay the stage-boundary host round trip.
+bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_type gtype) const {
+    static const bool wp_layer_cut_env = [] {
+        const char * e = getenv("WP_QWEN4EXP_LAYER_CUT");
+        return e != nullptr && e[0] == '1';
+    }();
+
+    if (!wp_layer_cut_env) {
+        return false;
+    }
+
+    if (model.arch != LLM_ARCH_QWEN4EXP || gtype != LLM_GRAPH_TYPE_DEFAULT) {
+        return false;
+    }
+
+    if (is_draft_ctx(cparams) || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return false;
+    }
+
+    if (ubatch.n_tokens < 64) {
+        return false;
+    }
+
+    if (expert_dispatch == nullptr) {
+        return false;
+    }
+
+    for (bool b : cparams.embeddings_layer_inp) {
+        if (b) {
+            return false;
+        }
+    }
+    for (bool b : cparams.embeddings_layer_inp_external) {
+        if (b) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (layer_cut_eligible(ubatch, gtype)) {
+        return process_ubatch_staged(ubatch, gtype, mctx, ret);
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2343,6 +2405,158 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+// WP_QWEN4EXP_LAYER_CUT (Stage 3) serial stage-list executor. Replaces only the
+// execution decision at process_ubatch's graph_compute(res->get_gf(), ...) seam
+// (plan item 5): each of the n_layer+1 stages is built and computed, in order,
+// through the SAME sched/graph_compute path process_ubatch already uses, and
+// fully completes (including the host readback below) before the next stage's
+// model.build_graph() is even called. No second outstanding dispatch.
+//
+// Deviations from the plan, flagged here (see the Stage 3 summary for the full
+// rationale on each):
+//   - shared QSA/hybrid-memory/position/output-id inputs are rebuilt by every
+//     stage's fresh llm_graph_context rather than cached once on the slot and
+//     reused -- correctness-safe (same ubatch every time) but not the
+//     "not rebound per stage" the plan asked for.
+//   - the res_hc boundary between stages is a host round trip
+//     (ggml_backend_tensor_get/set) through layer_cut_slot.boundary_host,
+//     not an allocator-managed device ping-pong.
+//   - non-terminal stages get a throwaway llm_graph_result each (no attempt at
+//     graph reuse between stages); only the terminal stage reuses gf_res_prev,
+//     so callers of process_ubatch keep reading the object they always have.
+//   - graph_reserve() is untouched: it still reserves for the full 48-layer
+//     shape, a safe superset of any single stage's footprint, rather than the
+//     "max simultaneous stage" sizing item 5 describes.
+llm_graph_result * llama_context::process_ubatch_staged(
+        const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // applied exactly once, before any stage graph is built -- the per-stage
+    // graphs below only read the already-applied mctx, so recurrent/KV writes
+    // (which live as nodes inside whichever single stage's graph owns them)
+    // cannot be double-applied by re-entering apply() per stage (plan item 9).
+    if (mctx && !mctx->apply()) {
+        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    const uint32_t n_layer = model.hparams.n_layer();
+
+    layer_cut_slot.reset();
+    layer_cut_slot.ubatch   = &ubatch;
+    layer_cut_slot.mctx     = mctx;
+    layer_cut_slot.n_stages = n_layer + 1; // + terminal head stage
+
+    std::vector<llm_graph_result_ptr> scratch_results;
+    llm_graph_result * res_terminal = nullptr;
+
+    for (uint32_t stage_il = 0; stage_il <= n_layer; ++stage_il) {
+        const bool is_terminal = (stage_il == n_layer);
+
+        llm_graph_result * res;
+        if (is_terminal) {
+            // the terminal stage's result becomes process_ubatch's return value,
+            // exactly as gf_res_prev does on the whole-graph path (plan item 6)
+            res = gf_res_prev.get();
+            res->reset();
+        } else {
+            scratch_results.push_back(std::make_unique<llm_graph_result>(gf_res_prev->get_max_nodes()));
+            res = scratch_results.back().get();
+        }
+
+        auto gparams = graph_params(res, ubatch, mctx, gtype);
+        gparams.layer_cut = true;
+        gparams.stage_il  = (int32_t) stage_il;
+
+        ggml_backend_sched_reset(sched.get());
+
+        // matches process_ubatch's rebuild branch: re-set after every reset,
+        // not just once, in case reset drops it
+        ggml_backend_sched_eval_callback eval_cb = cparams.cb_eval;
+        void * eval_cb_user_data = cparams.cb_eval_user_data;
+        if (model.wp_pager) {
+            eval_cb = wp::weight_pager_eval_cb;
+            eval_cb_user_data = model.wp_pager.get();
+        }
+        ggml_backend_sched_set_eval_callback(sched.get(), eval_cb, eval_cb_user_data);
+
+        ggml_cgraph * gf = model.build_graph(gparams);
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to initialize stage %u graph\n", __func__, stage_il);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph returned false (stage %u)\n", __func__, stage_il);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        // the ordinary per-ubatch inputs (positions, masks, QSA, hybrid-memory
+        // handles) this stage rebuilt for itself
+        res->set_inputs(&ubatch);
+
+        // stage 0 builds its own input from the embedding and has no t_stage_in;
+        // every later stage reads the previous stage's boundary here
+        if (res->t_stage_in != nullptr) {
+            GGML_ASSERT(!layer_cut_slot.boundary_host.empty() && "layer_cut boundary read before write");
+            ggml_backend_tensor_set(res->t_stage_in, layer_cut_slot.boundary_host.data(),
+                    0, layer_cut_slot.boundary_host.size() * sizeof(float));
+        }
+
+        const auto status = graph_compute(gf, ubatch.n_tokens > 1);
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute stage %u graph, status: %d\n", __func__, stage_il, status);
+            ret = status;
+            return nullptr;
+        }
+
+        // capture the boundary this stage produced, for the next stage to read;
+        // this and the tensor_set above are the whole cross-stage handoff -- no
+        // intermediate stage's activations are retained beyond this one copy
+        if (res->t_stage_out != nullptr) {
+            ggml_backend_sched_synchronize(sched.get());
+            const size_t n_elem = ggml_nelements(res->t_stage_out);
+            layer_cut_slot.boundary_host.resize(n_elem);
+            ggml_backend_tensor_get(res->t_stage_out, layer_cut_slot.boundary_host.data(), 0, n_elem * sizeof(float));
+
+            // plan item 7: hooks only, the identity gate itself is the controller's
+            // job. A running sum is not a real hash, but it is cheap and enough to
+            // catch a stage boundary going NaN/zero/wildly-off during bring-up.
+            static const bool wp_layer_cut_trace = [] {
+                const char * e = getenv("WP_QWEN4EXP_LAYER_CUT_TRACE");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (wp_layer_cut_trace) {
+                double sum = 0.0;
+                for (float v : layer_cut_slot.boundary_host) {
+                    sum += v;
+                }
+                LLAMA_LOG_WARN("layer_cut: stage %u boundary sum=%.6f n=%zu\n", stage_il, sum, n_elem);
+            }
+        }
+
+        layer_cut_slot.cur = stage_il + 1;
+
+        if (is_terminal) {
+            res_terminal = res;
+        }
+    }
+
+    if (expert_dispatch && expert_dispatch->failed()) {
+        const std::string message = expert_dispatch->failure_message();
+        LLAMA_LOG_ERROR("%s: expert dispatch failed: %s\n", __func__, message.c_str());
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    layer_cut_slot.res_terminal = res_terminal;
+
+    ret = GGML_STATUS_SUCCESS;
+
+    return res_terminal;
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
