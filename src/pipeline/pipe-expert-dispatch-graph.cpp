@@ -1576,9 +1576,16 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
                                void *              userdata) {
     graph_dispatcher * owner = nullptr;
     try {
-        if (ith != 0 || nth != 1) {
-            throw std::runtime_error("expert dispatch custom op must run as one CPU task");
+        // The op is registered with n_tasks=1, but ggml_graph_plan sizes the
+        // split's thread pool from its WIDEST op: when the two chunk waits
+        // share a split with their CONCAT (K=2), every pool thread calls in
+        // with nth>1. Thread 0 does the work; the rest return to the barrier.
+        // Throwing here (as before) fired before `owner` was set, so the
+        // failure was never latched and the dispatch slots leaked silently.
+        if (ith != 0) {
+            return;
         }
+        GGML_UNUSED(nth);
         op_context * context = static_cast<op_context *>(userdata);
         if (context == nullptr || context->owner == nullptr) {
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
@@ -1763,9 +1770,16 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                                      void *              userdata) {
     graph_dispatcher * owner = nullptr;
     try {
-        if (ith != 0 || nth != 1) {
-            throw std::runtime_error("expert dispatch custom op must run as one CPU task");
+        // The op is registered with n_tasks=1, but ggml_graph_plan sizes the
+        // split's thread pool from its WIDEST op: when the two chunk waits
+        // share a split with their CONCAT (K=2), every pool thread calls in
+        // with nth>1. Thread 0 does the work; the rest return to the barrier.
+        // Throwing here (as before) fired before `owner` was set, so the
+        // failure was never latched and the dispatch slots leaked silently.
+        if (ith != 0) {
+            return;
         }
+        GGML_UNUSED(nth);
         op_context * context = static_cast<op_context *>(userdata);
         if (context == nullptr || context->owner == nullptr) {
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
@@ -1965,9 +1979,16 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
     GGML_UNUSED(shexp);
     graph_dispatcher * owner = nullptr;
     try {
-        if (ith != 0 || nth != 1) {
-            throw std::runtime_error("expert dispatch custom op must run as one CPU task");
+        // The op is registered with n_tasks=1, but ggml_graph_plan sizes the
+        // split's thread pool from its WIDEST op: when the two chunk waits
+        // share a split with their CONCAT (K=2), every pool thread calls in
+        // with nth>1. Thread 0 does the work; the rest return to the barrier.
+        // Throwing here (as before) fired before `owner` was set, so the
+        // failure was never latched and the dispatch slots leaked silently.
+        if (ith != 0) {
+            return;
         }
+        GGML_UNUSED(nth);
         op_context * context = static_cast<op_context *>(userdata);
         if (context == nullptr || context->owner == nullptr) {
             throw std::runtime_error("expert dispatch wait op has no dispatcher");
@@ -1988,6 +2009,17 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         }
         // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
         std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
+        static const bool wait_trace = [] {
+            const char * e = std::getenv("WP_DISPATCH_CHUNKS_TRACE");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (wait_trace && context->layer < 4) {
+            std::fprintf(stderr,
+                         "expert dispatch chunks trace: compute_wait ENTER layer=%d chunk=%d/%d handle=%llu failed=%d open=%d\n",
+                         context->layer, context->chunk_index, context->chunk_count,
+                         (unsigned long long) context->handle, owner->failed() ? 1 : 0,
+                         owner->remote.has_open_dispatch(context->handle) ? 1 : 0);
+        }
         if (owner->failed()) {
             ggml_set_zero(dst);
             return;
@@ -1997,6 +2029,14 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         // unpack is the host memcpy into dst, not a second copy of ns_wait.
         dispatch_stats layer_stats;
         std::vector<float> result = owner->remote.finish_dispatch(context->handle, &layer_stats);
+        if (wait_trace && context->layer < 4) {
+            std::fprintf(stderr,
+                         "expert dispatch chunks trace: compute_wait DONE layer=%d chunk=%d/%d handle=%llu still_open=%d any_open=%d\n",
+                         context->layer, context->chunk_index, context->chunk_count,
+                         (unsigned long long) context->handle,
+                         owner->remote.has_open_dispatch(context->handle) ? 1 : 0,
+                         owner->remote.has_open_dispatch() ? 1 : 0);
+        }
         owner->zero_phantom_rows(result, dst->ne[1], owner->remote.n_embd(), context->token_offset);
         context->stats = layer_stats;
         dispatch_stats layer_stats_total = layer_stats;
