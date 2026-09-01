@@ -929,6 +929,52 @@ pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
     return r;
 }
 
+std::vector<uint8_t> pipe_encode_expert_dispatch_chunk(
+        const pipe_expert_dispatch_chunk & p) {
+    if (p.chunk_count == 0 || p.chunk_count > 64 || p.chunk_index >= p.chunk_count ||
+        p.total_tokens == 0 || p.token_start >= p.token_end ||
+        p.token_end > p.total_tokens || p.request.n_tokens != p.token_end - p.token_start) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert dispatch chunk range");
+    }
+    const std::vector<uint8_t> request = pipe_encode_expert_dispatch_req(p.request);
+    if (request.size() > PIPE_MAX_PAYLOAD - 20ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk exceeds max payload");
+    }
+    std::vector<uint8_t> out(20ull + request.size());
+    uint8_t * w = out.data();
+    wr_u32(w, p.chunk_index);
+    wr_u32(w, p.chunk_count);
+    wr_u32(w, p.total_tokens);
+    wr_u32(w, p.token_start);
+    wr_u32(w, p.token_end);
+    std::memcpy(w, request.data(), request.size());
+    return out;
+}
+
+pipe_expert_dispatch_chunk pipe_decode_expert_dispatch_chunk(
+        const uint8_t * buf, size_t len, int32_t n_embd) {
+    if (len < 20) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk is too small");
+    }
+    const uint8_t * p = buf;
+    pipe_expert_dispatch_chunk r;
+    r.chunk_index  = rd_u32(p);
+    r.chunk_count  = rd_u32(p);
+    r.total_tokens = rd_u32(p);
+    r.token_start  = rd_u32(p);
+    r.token_end    = rd_u32(p);
+    if (r.chunk_count == 0 || r.chunk_count > 64 || r.chunk_index >= r.chunk_count ||
+        r.total_tokens == 0 || r.token_start >= r.token_end ||
+        r.token_end > r.total_tokens) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert dispatch chunk range");
+    }
+    r.request = pipe_decode_expert_dispatch_req(p, len - 20, n_embd);
+    if (r.request.n_tokens != r.token_end - r.token_start) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk token count does not match range");
+    }
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // WP_DISPATCH_DEDUP_ACTIVATIONS (PIPE_VERSION 14)
 
@@ -1222,6 +1268,58 @@ pipe_expert_partial_stream pipe_decode_expert_partial_stream(
     }
     result.partial = pipe_decode_expert_partial(p, len - 12, n_embd);
     return result;
+}
+
+std::vector<uint8_t> pipe_encode_expert_partial_chunk(
+        const pipe_expert_partial_chunk & p) {
+    if (p.chunk_count == 0 || p.chunk_count > 64 || p.chunk_index >= p.chunk_count ||
+        p.total_tokens == 0 || p.token_start >= p.token_end ||
+        p.token_end > p.total_tokens || p.partial.n_tokens != p.token_end - p.token_start) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial chunk range");
+    }
+    if (p.partial.dtype != PIPE_HIDDEN_F32) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk encode only supports PIPE_HIDDEN_F32");
+    }
+    const std::vector<uint8_t> partial = pipe_encode_expert_partial(p.partial);
+    if (partial.size() > PIPE_MAX_PAYLOAD - 20ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk exceeds max payload");
+    }
+    std::vector<uint8_t> out(20ull + partial.size());
+    uint8_t * w = out.data();
+    wr_u32(w, p.chunk_index);
+    wr_u32(w, p.chunk_count);
+    wr_u32(w, p.total_tokens);
+    wr_u32(w, p.token_start);
+    wr_u32(w, p.token_end);
+    std::memcpy(w, partial.data(), partial.size());
+    return out;
+}
+
+pipe_expert_partial_chunk pipe_decode_expert_partial_chunk(
+        const uint8_t * buf, size_t len, int32_t n_embd) {
+    if (len < 20) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk is too small");
+    }
+    const uint8_t * p = buf;
+    pipe_expert_partial_chunk r;
+    r.chunk_index  = rd_u32(p);
+    r.chunk_count  = rd_u32(p);
+    r.total_tokens = rd_u32(p);
+    r.token_start  = rd_u32(p);
+    r.token_end    = rd_u32(p);
+    if (r.chunk_count == 0 || r.chunk_count > 64 || r.chunk_index >= r.chunk_count ||
+        r.total_tokens == 0 || r.token_start >= r.token_end ||
+        r.token_end > r.total_tokens) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial chunk range");
+    }
+    r.partial = pipe_decode_expert_partial(p, len - 20, n_embd);
+    if (r.partial.dtype != PIPE_HIDDEN_F32) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: streamed expert partial chunk is not f32");
+    }
+    if (r.partial.n_tokens != r.token_end - r.token_start) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk token count does not match range");
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------------------

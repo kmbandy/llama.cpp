@@ -228,6 +228,15 @@ enum pipe_frame_type : uint32_t {
     // Worker -> spine: one device-group partial from a streamed response.
     // This opt-in type keeps the legacy PIPE_EXPERT_PARTIAL frame unchanged.
     PIPE_EXPERT_PARTIAL_STREAM        = 23,
+    // WP_DISPATCH_STREAM: payload is five u32 values (chunk_index,
+    // chunk_count, total_tokens, token_start, token_end), followed by the
+    // regular pipe_expert_dispatch_req payload. These opt-in frame types use
+    // PIPE_VERSION 14; an older worker rejects the unknown type instead of
+    // decoding it as a legacy request.
+    PIPE_EXPERT_DISPATCH_CHUNK        = 24,
+    // WP_DISPATCH_STREAM: payload has the same five-u32 prefix, followed by a
+    // regular f32 pipe_expert_partial payload.
+    PIPE_EXPERT_PARTIAL_CHUNK         = 25,
 };
 
 enum pipe_role : uint32_t {
@@ -426,6 +435,17 @@ struct pipe_expert_dispatch_acts {
     std::vector<float> activations;
 };
 
+// WP_DISPATCH_STREAM. The token range is half-open [token_start, token_end).
+// The embedded request carries the assignments and activations for that range.
+struct pipe_expert_dispatch_chunk {
+    uint32_t                 chunk_index = 0;
+    uint32_t                 chunk_count = 0;
+    uint32_t                 total_tokens = 0;
+    uint32_t                 token_start = 0;
+    uint32_t                 token_end = 0;
+    pipe_expert_dispatch_req request;
+};
+
 // WP_DISPATCH_DEDUP_ACTIVATIONS. Payload: u32 n_subscribers, f32
 // activations[n_tokens * n_embd] (n_tokens from the matching BEGIN, same
 // validation as pipe_expert_dispatch_acts). n_subscribers is the number of
@@ -564,6 +584,17 @@ struct pipe_expert_partial {
 struct pipe_expert_partial_stream {
     uint32_t             part_index = 0;
     uint32_t             part_count = 0;
+    pipe_expert_partial  partial;
+};
+
+// WP_DISPATCH_STREAM. The partial contains only the rows in
+// [token_start, token_end).
+struct pipe_expert_partial_chunk {
+    uint32_t             chunk_index = 0;
+    uint32_t             chunk_count = 0;
+    uint32_t             total_tokens = 0;
+    uint32_t             token_start = 0;
+    uint32_t             token_end = 0;
     pipe_expert_partial  partial;
 };
 
@@ -765,12 +796,14 @@ std::vector<uint8_t> pipe_encode_expert_hello_ack(const pipe_expert_hello_ack & 
 std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_begin(const pipe_expert_dispatch_begin & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts(const pipe_expert_dispatch_acts & p);
+std::vector<uint8_t> pipe_encode_expert_dispatch_chunk(const pipe_expert_dispatch_chunk & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_publish(const pipe_expert_dispatch_acts_publish & p);
 std::vector<uint8_t> pipe_encode_expert_acts_publish_ack(const pipe_expert_acts_publish_ack & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_ref(const pipe_expert_dispatch_acts_ref & p);
 std::vector<uint8_t> pipe_encode_expert_prefetch_hint(const pipe_expert_prefetch_hint & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
 std::vector<uint8_t> pipe_encode_expert_partial_stream(const pipe_expert_partial_stream & p);
+std::vector<uint8_t> pipe_encode_expert_partial_chunk(const pipe_expert_partial_chunk & p);
 void pipe_encode_expert_partial_stream_into(
         std::vector<uint8_t> & out, uint32_t part_index, uint32_t part_count,
         const pipe_expert_partial & p);
@@ -816,6 +849,8 @@ pipe_expert_dispatch_begin pipe_decode_expert_dispatch_begin(
     const uint8_t * buf, size_t len);
 pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
     const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd);
+pipe_expert_dispatch_chunk pipe_decode_expert_dispatch_chunk(
+    const uint8_t * buf, size_t len, int32_t n_embd);
 pipe_expert_dispatch_acts_publish pipe_decode_expert_dispatch_acts_publish(
     const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd);
 pipe_expert_acts_publish_ack pipe_decode_expert_acts_publish_ack(
@@ -827,6 +862,8 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
 pipe_expert_partial pipe_decode_expert_partial(
     const uint8_t * buf, size_t len, int32_t n_embd);
 pipe_expert_partial_stream pipe_decode_expert_partial_stream(
+    const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_expert_partial_chunk pipe_decode_expert_partial_chunk(
     const uint8_t * buf, size_t len, int32_t n_embd);
 pipe_segment_hello pipe_decode_segment_hello(const uint8_t * buf, size_t len);
 pipe_segment_hello_ack pipe_decode_segment_hello_ack(const uint8_t * buf, size_t len);

@@ -698,6 +698,92 @@ static void test_expert_partial_dtype_rejects() {
     }
 }
 
+static void test_expert_dispatch_chunk_roundtrip() {
+    constexpr int32_t n_embd = 3;
+    constexpr uint32_t total_tokens = 7;
+    constexpr uint32_t chunk_count = 3;
+    pipe_expert_dispatch_req full;
+    full.layer = 4;
+    full.n_tokens = total_tokens;
+    full.swiglu_clamp = 7.5f;
+    full.assignments = {
+        { 1, { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f } },
+        { 3, { -0.1f, -0.2f, -0.3f, -0.4f, -0.5f, -0.6f, -0.7f } },
+    };
+    full.activations = {
+        1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f,
+        10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f, 17.0f, 18.0f,
+        19.0f, 20.0f, 21.0f,
+    };
+    std::vector<float> rebuilt_activations(full.activations.size());
+    std::vector<std::vector<float>> rebuilt_weights(full.assignments.size(),
+                                                     std::vector<float>(total_tokens));
+    for (uint32_t i = 0; i < chunk_count; ++i) {
+        const uint32_t base = total_tokens / chunk_count;
+        const uint32_t start = i * base;
+        const uint32_t end = i + 1 == chunk_count ? total_tokens : start + base;
+        pipe_expert_dispatch_chunk chunk;
+        chunk.chunk_index = i;
+        chunk.chunk_count = chunk_count;
+        chunk.total_tokens = total_tokens;
+        chunk.token_start = start;
+        chunk.token_end = end;
+        chunk.request.layer = full.layer;
+        chunk.request.n_tokens = end - start;
+        chunk.request.swiglu_clamp = full.swiglu_clamp;
+        for (const pipe_expert_assignment & assignment : full.assignments) {
+            chunk.request.assignments.push_back({
+                assignment.expert_id,
+                std::vector<float>(assignment.weights.begin() + start,
+                                   assignment.weights.begin() + end),
+            });
+        }
+        chunk.request.activations.assign(
+            full.activations.begin() + (size_t) start * n_embd,
+            full.activations.begin() + (size_t) end * n_embd);
+        const std::vector<uint8_t> encoded = pipe_encode_expert_dispatch_chunk(chunk);
+        const pipe_expert_dispatch_chunk decoded =
+            pipe_decode_expert_dispatch_chunk(encoded.data(), encoded.size(), n_embd);
+        CHECK(decoded.chunk_index == i && decoded.chunk_count == chunk_count);
+        CHECK(decoded.total_tokens == total_tokens && decoded.token_start == start &&
+              decoded.token_end == end);
+        CHECK(decoded.request.layer == full.layer && decoded.request.n_tokens == end - start);
+        std::memcpy(rebuilt_activations.data() + (size_t) start * n_embd,
+                    decoded.request.activations.data(),
+                    decoded.request.activations.size() * sizeof(float));
+        for (size_t a = 0; a < decoded.request.assignments.size(); ++a) {
+            std::memcpy(rebuilt_weights[a].data() + start,
+                        decoded.request.assignments[a].weights.data(),
+                        decoded.request.assignments[a].weights.size() * sizeof(float));
+        }
+
+        pipe_expert_partial_chunk partial;
+        partial.chunk_index = i;
+        partial.chunk_count = chunk_count;
+        partial.total_tokens = total_tokens;
+        partial.token_start = start;
+        partial.token_end = end;
+        partial.partial.layer = full.layer;
+        partial.partial.n_tokens = end - start;
+        partial.partial.partial.resize((size_t) (end - start) * n_embd);
+        for (size_t j = 0; j < partial.partial.partial.size(); ++j) {
+            partial.partial.partial[j] = (float) (100 + start * n_embd + j);
+        }
+        const std::vector<uint8_t> partial_encoded = pipe_encode_expert_partial_chunk(partial);
+        const pipe_expert_partial_chunk partial_decoded = pipe_decode_expert_partial_chunk(
+            partial_encoded.data(), partial_encoded.size(), n_embd);
+        CHECK(partial_decoded.chunk_index == i && partial_decoded.token_start == start &&
+              partial_decoded.token_end == end);
+        CHECK(partial_decoded.partial.partial == partial.partial.partial);
+    }
+    CHECK(std::memcmp(rebuilt_activations.data(), full.activations.data(),
+                      full.activations.size() * sizeof(float)) == 0);
+    for (size_t i = 0; i < full.assignments.size(); ++i) {
+        CHECK(std::memcmp(rebuilt_weights[i].data(), full.assignments[i].weights.data(),
+                          total_tokens * sizeof(float)) == 0);
+    }
+}
+
 static void test_expert_dispatch_non_finite_rejected() {
     pipe_expert_dispatch_req request;
     request.layer = 1;
@@ -1339,6 +1425,7 @@ int main() {
     test_expert_partial_f32_default_bit_identical();
     test_expert_partial_f16_roundtrip_tolerance();
     test_expert_partial_dtype_rejects();
+    test_expert_dispatch_chunk_roundtrip();
     test_expert_dispatch_non_finite_rejected();
     test_token_roundtrip();
     test_error_roundtrip();

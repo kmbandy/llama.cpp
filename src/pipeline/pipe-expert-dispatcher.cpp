@@ -433,6 +433,21 @@ int dispatch_chunks_enabled() {
     return parsed == 2 ? 2 : 1;
 }
 
+// WP_DISPATCH_STREAM: transport-level token pipelining. Zero means the legacy
+// one-frame request; the worker caps the active value at 64 as well.
+uint32_t dispatch_stream_chunks_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_STREAM");
+    if (value == nullptr || value[0] == '\0') {
+        return 0;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 2) {
+        return 0;
+    }
+    return (uint32_t) std::min(parsed, 64L);
+}
+
 // WP_DEFER_MAX_WIDTH = upper bound on n_tokens for a dispatch to be eligible
 // for WP_DEFER_K deferral. Default 32.
 //
@@ -709,6 +724,10 @@ struct dispatcher::impl {
         std::vector<uint8_t>                payload;
         std::vector<uint8_t>                begin_payload;
         std::vector<uint8_t>                acts_payload;
+        // WP_DISPATCH_STREAM: complete token-range frames sent in order on
+        // this request's socket. The vector is empty on the legacy path.
+        std::vector<std::vector<uint8_t>>  stream_payloads;
+        bool                                stream_wire = false;
         // PER-REQUEST split-frame decision (2026-08-27). WP_SPLIT_FRAME used to
         // be a connection-lifetime latch, so EVERY request paid two frames --
         // but split-frame exists only to carry WP_DISPATCH_DEDUP_ACTIVATIONS,
@@ -918,6 +937,7 @@ struct dispatcher::impl {
     // constructor, so a request never has to re-check them.
     bool                                                dedup_activations = false;
     uint32_t                                            dedup_min_tokens_ = 32;
+    uint32_t                                            dispatch_stream_chunks_ = 0;
     int                                                 dispatch_chunks_ = 1;
     // machine -> indices into `workers` sharing that machine, precomputed once
     // (machine membership is a property of the worker set, not of any one
@@ -965,6 +985,7 @@ struct dispatcher::impl {
                 hint_inflight(hint_inflight_enabled()),
                 async_issue(async_issue_enabled()),
                 unpack_overlap(unpack_overlap_enabled()),
+                dispatch_stream_chunks_(dispatch_stream_chunks_enabled()),
                 dispatch_chunks_(dispatch_chunks_enabled()) {
         if (dispatch_chunks_ > 1) {
             if (!static_assign) {
@@ -1011,12 +1032,13 @@ struct dispatcher::impl {
         // See the field comment: dedup requires split_frame and is mutually
         // exclusive with async_issue by construction, not by a runtime check
         // on the dispatch path.
-        dedup_activations = dispatch_chunks_ > 1 ? false : s_dedup_activations && split_frame && !async_issue;
+        dedup_activations = dispatch_chunks_ > 1 ? false :
+            s_dedup_activations && split_frame && !async_issue && dispatch_stream_chunks_ == 0;
         dedup_min_tokens_ = s_dedup_min_tokens;
         if (s_dedup_activations && !dedup_activations) {
             LLAMA_LOG_WARN(
                          "expert dispatch: WP_DISPATCH_DEDUP_ACTIVATIONS requested but disabled "
-                         "(requires WP_SPLIT_FRAME=1 and WP_ASYNC_ISSUE unset)\n");
+                         "(requires WP_SPLIT_FRAME=1, WP_ASYNC_ISSUE unset, and WP_DISPATCH_STREAM unset)\n");
         }
         stats_logging = dispatch_stats_enabled();
         collect_stats = stats_logging || speed_split;
@@ -2156,13 +2178,15 @@ struct dispatcher::impl {
         // per-worker diagnostic still runs, and only for n_tokens>1 (the encode
         // cost this targets is a prefill cost).
         const bool slice_encode_once =
-            layer_is_slice && s_slice_encode_once && !s_union_stats && n_tokens > 1;
+            layer_is_slice && s_slice_encode_once && !s_union_stats && n_tokens > 1 &&
+            dispatch_stream_chunks_ == 0;
         // See planned_request::split_wire. Split the frame only at a width where
         // dedup can actually engage; below it the second frame buys nothing and
         // costs a packet per request on a TCP_NODELAY socket. Uniform across a
         // layer's workers (n_tokens is a property of the ubatch), so the
         // slice_encode_once shared-payload cache below stays coherent.
-        const bool split_wire = split_frame && n_tokens > dedup_min_tokens_;
+        const bool split_wire = split_frame && n_tokens > dedup_min_tokens_ &&
+                                dispatch_stream_chunks_ == 0;
         std::vector<uint8_t>  shared_payload, shared_begin_payload, shared_acts_payload;
         std::vector<uint32_t> shared_token_ids;
         bool have_shared = false;
@@ -2277,6 +2301,44 @@ struct dispatcher::impl {
             }
             if (workers[request.worker_index].inproc) {
                 request.inproc_wire = std::move(wire_request);
+                requests.push_back(std::move(request));
+                continue;
+            }
+            if (dispatch_stream_chunks_ > 1 && wire_request.n_tokens > 1) {
+                const uint32_t total_tokens = wire_request.n_tokens;
+                const uint32_t chunk_count = std::min(dispatch_stream_chunks_, total_tokens);
+                const uint32_t chunk_rows = total_tokens / chunk_count;
+                request.stream_payloads.reserve(chunk_count);
+                for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+                    const uint32_t token_start = chunk_index * chunk_rows;
+                    const uint32_t token_end = chunk_index + 1 == chunk_count
+                        ? total_tokens : token_start + chunk_rows;
+                    pipe_expert_dispatch_chunk chunk;
+                    chunk.chunk_index  = chunk_index;
+                    chunk.chunk_count  = chunk_count;
+                    chunk.total_tokens = total_tokens;
+                    chunk.token_start  = token_start;
+                    chunk.token_end    = token_end;
+                    chunk.request.layer = wire_request.layer;
+                    chunk.request.n_tokens = token_end - token_start;
+                    chunk.request.swiglu_clamp = wire_request.swiglu_clamp;
+                    chunk.request.assignments.reserve(wire_request.assignments.size());
+                    for (const pipe_expert_assignment & assignment : wire_request.assignments) {
+                        pipe_expert_assignment sliced;
+                        sliced.expert_id = assignment.expert_id;
+                        sliced.weights.assign(assignment.weights.begin() + token_start,
+                                              assignment.weights.begin() + token_end);
+                        chunk.request.assignments.push_back(std::move(sliced));
+                    }
+                    chunk.request.activations.resize(
+                        (size_t) (token_end - token_start) * (size_t) n_embd);
+                    std::copy(
+                        wire_request.activations.begin() + (size_t) token_start * (size_t) n_embd,
+                        wire_request.activations.begin() + (size_t) token_end * (size_t) n_embd,
+                        chunk.request.activations.begin());
+                    request.stream_payloads.push_back(pipe_encode_expert_dispatch_chunk(chunk));
+                }
+                request.stream_wire = true;
                 requests.push_back(std::move(request));
                 continue;
             }
@@ -2639,7 +2701,15 @@ struct dispatcher::impl {
             if (collect_stats || req_log_ != nullptr) {
                 request.issued_at = dispatch_clock::now();
             }
-            if (request.split_wire && async_issue) {
+            if (request.stream_wire) {
+                for (const std::vector<uint8_t> & payload : request.stream_payloads) {
+                    if (!send_frame(PIPE_EXPERT_DISPATCH_CHUNK, payload)) {
+                        throw std::runtime_error(
+                            "expert dispatcher failed to send streamed expert request to worker " +
+                            value.info.endpoint);
+                    }
+                }
+            } else if (request.split_wire && async_issue) {
                 wire_frame begin;
                 begin.type = PIPE_EXPERT_DISPATCH_BEGIN;
                 begin.seq_id = seq_id;
@@ -2715,7 +2785,8 @@ struct dispatcher::impl {
     // out of accumulate_partial so the caller can harvest partials in ARRIVAL
     // order while still summing them in a FIXED order -- see harvest_partials.
     void write_request_log(const planned_request & request, int32_t layer, uint32_t n_tokens,
-                           const dispatch_state & state) {
+                           const dispatch_state & state,
+                           uint32_t transport_chunk = UINT32_MAX) {
         if (req_log_ == nullptr) {
             return;
         }
@@ -2732,7 +2803,8 @@ struct dispatcher::impl {
                 (unsigned long long) request.unpack_ns,
                 (unsigned long long) elapsed_ns(state.req_dispatch_start_, request.await_started_at),
                 (unsigned long long) elapsed_ns(state.req_dispatch_start_, request.await_finished_at),
-                (unsigned long long) state.seq_id, state.chunk_index);
+                (unsigned long long) state.seq_id,
+                transport_chunk == UINT32_MAX ? state.chunk_index : transport_chunk);
         fflush(req_log_);
     }
 
@@ -2771,7 +2843,8 @@ struct dispatcher::impl {
             layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
         uint64_t         wanted_seq_id = seq_id;
         pipe_frame_type  type          = await_response(request, wanted_seq_id, payload, state);
-        const bool       streamed      = type == PIPE_EXPERT_PARTIAL_STREAM;
+        const bool       streamed      = type == PIPE_EXPERT_PARTIAL_STREAM ||
+                                         type == PIPE_EXPERT_PARTIAL_CHUNK;
         if (!streamed) {
             note_in_flight_delta(state, -1);
         }
@@ -2843,10 +2916,93 @@ struct dispatcher::impl {
                                      " on layer " + std::to_string(layer) + " with code " +
                                      std::to_string(error.code) + ": " + error.msg);
         }
-        if (type != PIPE_EXPERT_PARTIAL && type != PIPE_EXPERT_PARTIAL_STREAM) {
+        if (request.stream_wire && type != PIPE_EXPERT_PARTIAL_CHUNK) {
+            if (streamed) {
+                note_in_flight_delta(state, -1);
+            }
+            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                     " returned a non-chunk partial for a streamed request");
+        }
+        if (!request.stream_wire && type != PIPE_EXPERT_PARTIAL &&
+            type != PIPE_EXPERT_PARTIAL_STREAM) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " returned frame type " + std::to_string((uint32_t) type) +
                                      " for expert(s) " + assignment_experts(request.assignments));
+        }
+
+        if (request.stream_wire) {
+            const uint32_t total_rows = request.token_ids.empty()
+                ? n_tokens : (uint32_t) request.token_ids.size();
+            const uint32_t chunk_count = (uint32_t) request.stream_payloads.size();
+            const size_t total_values = (size_t) total_rows * (size_t) n_embd;
+            out.assign(total_values, 0.0f);
+            for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+                if (chunk_index != 0) {
+                    type = await_response(request, wanted_seq_id, payload, state);
+                    response_received_at = dispatch_clock::now();
+                    if (type != PIPE_EXPERT_PARTIAL_CHUNK) {
+                        note_in_flight_delta(state, -1);
+                        throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                                 " interleaved a non-chunk frame while sending partials");
+                    }
+                }
+                pipe_expert_partial_chunk response;
+                const dispatch_clock::time_point decode_started =
+                    layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+                try {
+                    response = pipe_decode_expert_partial_chunk(payload.data(), payload.size(), n_embd);
+                } catch (const std::exception & error) {
+                    note_in_flight_delta(state, -1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned an invalid streamed partial: " + error.what());
+                }
+                if (layer_trace_enabled()) {
+                    add_layer_trace(layer, &layer_trace_stats::decode_ns,
+                                    elapsed_ns(decode_started, dispatch_clock::now()));
+                }
+                const uint32_t base = total_rows / chunk_count;
+                const uint32_t want_start = chunk_index * base;
+                const uint32_t want_end = chunk_index + 1 == chunk_count
+                    ? total_rows : want_start + base;
+                const size_t chunk_values = (size_t) (want_end - want_start) * (size_t) n_embd;
+                if (response.chunk_index != chunk_index || response.chunk_count != chunk_count ||
+                    response.total_tokens != total_rows || response.token_start != want_start ||
+                    response.token_end != want_end || response.partial.layer != layer ||
+                    response.partial.n_tokens != want_end - want_start ||
+                    response.partial.partial.size() != chunk_values) {
+                    note_in_flight_delta(state, -1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned the wrong streamed partial range");
+                }
+                for (size_t i = 0; i < response.partial.partial.size(); ++i) {
+                    if (std::isfinite(response.partial.partial[i])) {
+                        continue;
+                    }
+                    note_in_flight_delta(state, -1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned a NON-FINITE streamed partial");
+                }
+                std::copy(response.partial.partial.begin(), response.partial.partial.end(),
+                          out.begin() + (size_t) want_start * (size_t) n_embd);
+                request.response_bytes = payload.size();
+                request.await_finished_at = req_log_ != nullptr ? response_received_at
+                                                                 : dispatch_clock::time_point();
+                request.unpack_ns = elapsed_ns(decode_started, dispatch_clock::now());
+                if (req_log_ != nullptr) {
+                    write_request_log(request, layer, want_end - want_start, state, chunk_index);
+                }
+                if (collect_stats && last_response != nullptr) {
+                    *last_response = response_received_at;
+                }
+            }
+            note_in_flight_delta(state, -1);
+            if (layer_trace_enabled()) {
+                add_layer_trace(layer, &layer_trace_stats::recv_ns,
+                                elapsed_ns(recv_started, dispatch_clock::now()));
+            }
+            GGML_ASSERT(out.size() == total_values);
+            GGML_UNUSED(n_values);
+            return;
         }
 
         if (type == PIPE_EXPERT_PARTIAL_STREAM) {
@@ -3255,7 +3411,7 @@ struct dispatcher::impl {
             const auto unpack_t0 = req_log_ != nullptr ? dispatch_clock::now()
                                                        : dispatch_clock::time_point();
             scatter_add(result, partials[i], requests[i]);
-            if (req_log_ != nullptr) {
+            if (req_log_ != nullptr && !requests[i].stream_wire) {
                 requests[i].unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
                 write_request_log(requests[i], layer, n_tokens, state);
             }
