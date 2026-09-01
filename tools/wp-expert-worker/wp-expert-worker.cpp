@@ -8422,7 +8422,7 @@ public:
         // Already f32 on the wire as of PIPE_VERSION 4; this used to widen a
         // f16 value back to f32, which recovered the storage type but NOT the
         // ~3e-4 of precision the spine had already thrown away.
-        const std::vector<float> & activation = request.activations;
+        const float * activation = request.activation_data();
         const bool measure = stats_.enabled();
         const std::chrono::steady_clock::time_point lookup_started =
             measure ? std::chrono::steady_clock::now() :
@@ -9296,7 +9296,7 @@ private:
         work_input_trace_.chunks = active_work_chunks_;
         work_input_trace_.gcache = gcache;
         work_input_trace_.use_gather = use_gather;
-        const size_t input_size = request.activations.size() * sizeof(float);
+        const size_t input_size = request.activation_size() * sizeof(float);
         work_input_trace_.params_expected = wp_worker_hash_fnv1a(nullptr, 0);
         work_input_trace_.slots_expected = wp_worker_hash_fnv1a(nullptr, 0);
         const ggml_backend_buffer_t io_buffer =
@@ -9306,7 +9306,7 @@ private:
             io_buffer == nullptr ? nullptr : ggml_backend_buffer_get_base(io_buffer),
             input_size,
             0,
-            request.activations.data(),
+            request.activation_data(),
         };
         work_input_trace_.slots.reserve(selected.size());
         for (size_t i : selected) {
@@ -10101,12 +10101,12 @@ private:
         attach_weight(
             input, io_active_, ggml_backend_buffer_get_base(io_active_), 0);
         sublap(request_stats.ns_prep_attach);
-        const size_t act_bytes = activation.size() * sizeof(float);
-        const void * src = activation.data();
+        const size_t act_bytes = request.activation_size() * sizeof(float);
+        const void * src = activation;
         const bool pinned =
             io_src_base_ != nullptr && act_bytes <= io_src_size_;
         if (pinned) {
-            std::memcpy(io_src_base_, activation.data(), act_bytes);
+            std::memcpy(io_src_base_, activation, act_bytes);
             src = io_src_base_;
         }
         // *** WP_IO_SET_ASYNC: the 6900XT's prep is a STALL, not a transfer. ***
@@ -12818,9 +12818,9 @@ private:
 
         const auto started = std::chrono::steady_clock::now();
         const auto & specs = catalog_.descriptor.layers.at(page.layer);
-        const size_t activation_bytes = request.activations.size() * sizeof(float);
+        const size_t activation_bytes = request.activation_size() * sizeof(float);
         buffer_ptr input_buffer(ggml_backend_cpu_buffer_from_ptr(
-            const_cast<float *>(request.activations.data()), activation_bytes));
+            const_cast<float *>(request.activation_data()), activation_bytes));
         buffer_ptr weight_buffer(ggml_backend_cpu_buffer_from_ptr(
             const_cast<void *>(batch.cpu_staging(assignment_index)), (size_t) page.size));
         if (!input_buffer || !weight_buffer) {
@@ -13454,7 +13454,20 @@ public:
         for (const std::unique_ptr<DeviceWorker> & device : devices_) {
             result += device->pinned_pages();
         }
+        if (local_shm_ != nullptr) {
+            result.shm_name = local_shm_->name();
+            result.shm_tokens = local_shm_tokens_;
+        }
         return result;
+    }
+
+    void set_local_shm(std::unique_ptr<pipe_expert_shm_ring> ring, uint32_t tokens) {
+        local_shm_ = std::move(ring);
+        local_shm_tokens_ = tokens;
+    }
+
+    pipe_expert_shm_ring * local_shm() const {
+        return local_shm_.get();
     }
 
     bool stats_enabled() const {
@@ -14581,7 +14594,12 @@ private:
         result.swiglu_clamp = request.swiglu_clamp;
         result.assignments.assign(request.assignments.begin() + (ptrdiff_t) begin,
                                   request.assignments.begin() + (ptrdiff_t) end);
-        result.activations = request.activations;
+        if (request.activations_view != nullptr) {
+            result.activations_view = request.activations_view;
+            result.activations_view_size = request.activations_view_size;
+        } else {
+            result.activations = request.activations;
+        }
         return result;
     }
 
@@ -14815,6 +14833,8 @@ private:
     bool placement_ready_ = false;
     std::vector<std::unique_ptr<DeviceWorker>> devices_;
     mutable std::vector<std::mutex> device_mutexes_;
+    std::unique_ptr<pipe_expert_shm_ring> local_shm_;
+    uint32_t local_shm_tokens_ = 0;
 
     // *** WP_DEVICE_PARALLEL -- RUN THE DEVICES CONCURRENTLY (DEFAULT ON). ***
     //
@@ -15775,6 +15795,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // because the buffer is only ever read between its own encode and the send
     // that immediately follows, inside one loop iteration on this thread.
     std::vector<uint8_t> encode_buf;
+    bool                  shm_request = false;
+    bool                  shm_request_consumed = false;
+    pipe_expert_shm_ref   shm_request_ref;
+    const uint8_t *       shm_request_data = nullptr;
+    size_t                shm_request_length = 0;
 
     // WP_WORKER_PIPELINE=1: see the WpPipeline* definitions above this
     // function for the design. Queues and the guard are constructed
@@ -15953,6 +15978,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                        ? (uint64_t) ((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          t_recv_done.time_since_epoch()).count() - hdr_done_ns)
                        : 0);
+        shm_request = false;
+        shm_request_consumed = false;
+        shm_request_ref = {};
+        shm_request_data = nullptr;
+        shm_request_length = 0;
         // WP_WORKER_MULTI_CONN: default-held for the whole per-request
         // handling below, same shape as the probe (RAII releases it on
         // every exit from this scope -- return, continue, or falling off
@@ -15978,7 +16008,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         if (g_worker_gpu_mutex != nullptr) {
             gpu_lock = std::unique_lock<std::mutex>(*g_worker_gpu_mutex);
         }
-        const bool stream_partials = wp_worker_stream_partials_enabled();
+        const bool stream_partials = wp_worker_stream_partials_enabled() && type != PIPE_EXPERT_SHM_DISPATCH_REQ;
         size_t stream_sent_count = 0;
         std::chrono::steady_clock::time_point stream_first_sent;
         std::chrono::steady_clock::time_point stream_last_ready;
@@ -16033,6 +16063,20 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         const auto send_legacy_response = [&](const pipe_expert_partial & response) {
             pipe_encode_expert_partial_into(encode_buf, response);
             const std::vector<uint8_t> & encoded = encode_buf;
+            if (shm_request) {
+                pipe_expert_shm_ref ref;
+                if (worker.local_shm() == nullptr ||
+                    !worker.local_shm()->write_response(encoded.data(), encoded.size(), ref)) {
+                    if (worker.local_shm() != nullptr) {
+                        (void) send_response_error(seq_id, PIPE_ERR_GENERIC,
+                                                   worker.local_shm()->error());
+                    }
+                    return false;
+                }
+                const std::vector<uint8_t> control = pipe_encode_expert_shm_ref(ref);
+                return send_response_frame(PIPE_EXPERT_SHM_PARTIAL, seq_id,
+                                            control.data(), control.size());
+            }
             const bool relock = gpu_lock.owns_lock();
             if (relock) gpu_lock.unlock();
             const bool sent = send_response_frame(PIPE_EXPERT_PARTIAL, seq_id,
@@ -16073,6 +16117,27 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                              error.what());
             }
             continue;
+        }
+        if (type == PIPE_EXPERT_SHM_DISPATCH_REQ) {
+            try {
+                if (worker.local_shm() == nullptr) {
+                    throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                              "shared-memory request received without a local ring");
+                }
+                const pipe_expert_shm_ref ref =
+                    pipe_decode_expert_shm_ref(payload.data(), payload.size());
+                if (!worker.local_shm()->read_request(ref, &shm_request_data)) {
+                    throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                              worker.local_shm()->error());
+                }
+                shm_request_ref = ref;
+                shm_request_length = (size_t) ref.length;
+                shm_request = true;
+                type = PIPE_EXPERT_DISPATCH_REQ;
+            } catch (const pipe_protocol_error & error) {
+                send_response_error(seq_id, error.code, error.what());
+                return 1;
+            }
         }
         if (type == PIPE_EXPERT_DISPATCH_BEGIN) {
             try {
@@ -16441,9 +16506,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const auto t_req_decode_start = time_recv
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
-            const pipe_expert_dispatch_req request =
-                pipe_decode_expert_dispatch_req(
-                    payload.data(), payload.size(), mine.n_embd);
+            const uint8_t * request_data = shm_request ? shm_request_data : payload.data();
+            const size_t request_length = shm_request ? shm_request_length : payload.size();
+            const pipe_expert_dispatch_req request = shm_request
+                ? pipe_decode_expert_dispatch_req_view(request_data, request_length, mine.n_embd)
+                : pipe_decode_expert_dispatch_req(request_data, request_length, mine.n_embd);
             const std::chrono::steady_clock::time_point t_decoded =
                 seg_trace ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point();
@@ -16506,6 +16573,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             }
             const pipe_expert_partial response = worker.dispatch(
                 request, request_stats, std::nullopt, conn_index, seq_id, stream_callback);
+            if (shm_request && !worker.local_shm()->consume_request(shm_request_ref)) {
+                throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                          worker.local_shm()->error());
+            }
+            shm_request_consumed = true;
             const std::chrono::steady_clock::time_point t_dispatched =
                 seg_trace ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point();
@@ -16578,6 +16650,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             }
             worker.spec_pagein_after_dispatch();
         } catch (const pipe_protocol_error & error) {
+            if (shm_request && !shm_request_consumed && worker.local_shm() != nullptr) {
+                (void) worker.local_shm()->consume_request(shm_request_ref);
+            }
             // LOG LOCALLY as well as replying. The spine renders a dropped or
             // errored connection as "worker died while computing <experts>",
             // which names the symptom and never the cause; without this the
@@ -16589,6 +16664,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 return 1;
             }
         } catch (const std::exception & error) {
+            if (shm_request && !shm_request_consumed && worker.local_shm() != nullptr) {
+                (void) worker.local_shm()->consume_request(shm_request_ref);
+            }
             std::fprintf(stderr, "wp expert worker: compute error: %s\n", error.what());
             send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
             return 1;
@@ -16700,6 +16778,30 @@ int run(const Options & options) {
         options.test_hooks,
         options.resident_expert_blocks, options.expert_reserve_blocks,
         options.expert_reserve_bytes);
+    if (const char * shm = std::getenv("WP_LOCAL_SHM"); shm != nullptr && std::strcmp(shm, "1") == 0) {
+        uint32_t shm_tokens = 2048;
+        if (const char * env = std::getenv("WP_IO_PREALLOC_TOKENS");
+            env != nullptr && env[0] != '\0') {
+            const unsigned long parsed = std::strtoul(env, nullptr, 10);
+            if (parsed > 0 && parsed <= UINT32_MAX) {
+                shm_tokens = (uint32_t) parsed;
+            }
+        }
+        const pipe_expert_hello base_hello = worker.hello();
+        const std::string shm_name = "/llama_wp_expert_" + std::to_string(options.listen_port);
+        std::unique_ptr<pipe_expert_shm_ring> ring = pipe_expert_shm_ring::create(
+            shm_name, shm_tokens, (uint32_t) base_hello.n_embd,
+            (uint32_t) base_hello.n_expert);
+        if (ring == nullptr) {
+            std::fprintf(stderr,
+                         "wp-expert-worker: local shm create failed for %s; using TCP\n",
+                         shm_name.c_str());
+        } else {
+            worker.set_local_shm(std::move(ring), shm_tokens);
+            std::cout << "wp expert worker: WP_LOCAL_SHM=1 name=" << shm_name
+                      << " tokens=" << shm_tokens << std::endl;
+        }
+    }
     const pipe_expert_hello advertised = worker.hello();
     const ResourcePlan & resources = worker.resources();
 

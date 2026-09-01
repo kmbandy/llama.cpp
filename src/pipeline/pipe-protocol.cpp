@@ -780,16 +780,20 @@ pipe_hello pipe_decode_hello(const uint8_t * buf, size_t len) {
 //   u8  model_identity[model_identity_len]
 //   u32 shard_identity_len
 //   u8  shard_identity[shard_identity_len]
+//   u32 shm_tokens
+//   u32 shm_name_len
+//   u8  shm_name[shm_name_len]
 
 static constexpr uint32_t PIPE_EXPERT_HELLO_TAG = 0x32505845u; // "EXP2"
 
 std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p) {
     if (p.model_identity.size() > std::numeric_limits<uint32_t>::max() ||
-        p.shard_identity.size() > std::numeric_limits<uint32_t>::max()) {
+        p.shard_identity.size() > std::numeric_limits<uint32_t>::max() ||
+        p.shm_name.size() > std::numeric_limits<uint32_t>::max()) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO identity is too long");
     }
-    const uint64_t total = 13 * 4ull + (uint64_t) p.layers.size() * 4ull +
-                           p.model_identity.size() + p.shard_identity.size();
+    const uint64_t total = 15 * 4ull + (uint64_t) p.layers.size() * 4ull +
+                           p.model_identity.size() + p.shard_identity.size() + p.shm_name.size();
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO encode size %llu exceeds max payload",
              (unsigned long long) total);
@@ -819,12 +823,18 @@ std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p) {
     wr_u32(w, (uint32_t) p.shard_identity.size());
     if (!p.shard_identity.empty()) {
         std::memcpy(w, p.shard_identity.data(), p.shard_identity.size());
+        w += p.shard_identity.size();
+    }
+    wr_u32(w, p.shm_tokens);
+    wr_u32(w, (uint32_t) p.shm_name.size());
+    if (!p.shm_name.empty()) {
+        std::memcpy(w, p.shm_name.data(), p.shm_name.size());
     }
     return out;
 }
 
 pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len) {
-    if (len < 13 * 4ull) {
+    if (len < 15 * 4ull) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO payload %zu bytes too small", len);
     }
     const uint8_t * p   = buf;
@@ -875,11 +885,19 @@ pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len) {
     h.model_identity.assign((const char *) p, identity_len);
     p += identity_len;
     const uint32_t shard_identity_len = rd_u32(p);
-    if ((uint64_t) (end - p) != shard_identity_len) {
+    if ((uint64_t) (end - p) < (uint64_t) shard_identity_len + 8ull) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO shard identity bytes %lld, want %u",
              (long long) (end - p), shard_identity_len);
     }
     h.shard_identity.assign((const char *) p, shard_identity_len);
+    p += shard_identity_len;
+    h.shm_tokens = rd_u32(p);
+    const uint32_t shm_name_len = rd_u32(p);
+    if ((uint64_t) (end - p) != shm_name_len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO shared-memory name bytes %lld, want %u",
+             (long long) (end - p), shm_name_len);
+    }
+    h.shm_name.assign((const char *) p, shm_name_len);
     if (h.model_identity.empty()) {
         fail(PIPE_ERR_HELLO, "pipe: expert HELLO model identity is empty");
     }
@@ -983,7 +1001,7 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
         total += 4ull + (uint64_t) assignment.weights.size() * 4ull;
     }
     // 4 bytes per value: request activations are f32 as of PIPE_VERSION 4.
-    total += (uint64_t) p.activations.size() * 4ull;
+    total += (uint64_t) p.activation_size() * 4ull;
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch encode size %llu exceeds max payload",
              (unsigned long long) total);
@@ -1001,12 +1019,37 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
             wr_f32(w, weight);
         }
     }
-    wr_f32_bulk(w, p.activations.data(), p.activations.size());
+    wr_f32_bulk(w, p.activation_data(), p.activation_size());
     return out;
 }
 
-pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
-        const uint8_t * buf, size_t len, int32_t n_embd) {
+std::vector<uint8_t> pipe_encode_expert_shm_ref(const pipe_expert_shm_ref & p) {
+    if (p.length == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: shared-memory reference has zero length");
+    }
+    std::vector<uint8_t> out(16);
+    uint8_t * w = out.data();
+    wr_u64(w, p.offset);
+    wr_u64(w, p.length);
+    return out;
+}
+
+pipe_expert_shm_ref pipe_decode_expert_shm_ref(const uint8_t * buf, size_t len) {
+    if (len != 16) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: shared-memory reference has the wrong size");
+    }
+    const uint8_t * p = buf;
+    pipe_expert_shm_ref result;
+    result.offset = rd_u64(p);
+    result.length = rd_u64(p);
+    if (result.length == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: shared-memory reference has zero length");
+    }
+    return result;
+}
+
+static pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_impl(
+        const uint8_t * buf, size_t len, int32_t n_embd, bool borrow_activations) {
     if (n_embd <= 0 || len < 16) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch payload is too small");
     }
@@ -1055,10 +1098,34 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     }
 
     const size_t n_activations = (size_t) r.n_tokens * (size_t) n_embd;
+#if PIPE_F32_WIRE_IS_HOST
+    if (borrow_activations) {
+        r.activations_view = reinterpret_cast<const float *>(p);
+        r.activations_view_size = n_activations;
+        for (size_t i = 0; i < n_activations; ++i) {
+            if (!std::isfinite(r.activations_view[i])) {
+                fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has a non-finite activation");
+            }
+        }
+        return r;
+    }
+#else
+    (void) borrow_activations;
+#endif
     r.activations.reserve(n_activations);
     r.activations.resize(n_activations);
     rd_f32_bulk(p, r.activations.data(), n_activations);
     return r;
+}
+
+pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
+        const uint8_t * buf, size_t len, int32_t n_embd) {
+    return pipe_decode_expert_dispatch_req_impl(buf, len, n_embd, false);
+}
+
+pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_view(
+        const uint8_t * buf, size_t len, int32_t n_embd) {
+    return pipe_decode_expert_dispatch_req_impl(buf, len, n_embd, true);
 }
 
 std::vector<uint8_t> pipe_encode_expert_dispatch_begin(
