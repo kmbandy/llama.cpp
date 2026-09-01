@@ -8,7 +8,7 @@
 //   u32  magic   = 0x4C4C5050 ("LLPP")
 //   u32  version = 1
 //   u32  type    (pipe_frame_type)
-//   u32  flags   (bit 0 = LZ4/byte-plane compressed payload; other bits 0)
+//   u32  flags   (bit 0 = compressed; bits 1-2 = byte-shuffle mode for modes 2/3)
 //   u64  seq_id
 //   u64  length  (payload bytes following the header)
 //   u8[] payload
@@ -180,6 +180,19 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 static constexpr uint32_t PIPE_VERSION = 14u;
 
 static constexpr uint32_t PIPE_FRAME_FLAG_COMPRESSED = 1u << 0;
+static constexpr uint32_t PIPE_FRAME_FLAG_COMPRESS_MODE_SHIFT = 1;
+static constexpr uint32_t PIPE_FRAME_FLAG_COMPRESS_MODE_MASK = 3u << PIPE_FRAME_FLAG_COMPRESS_MODE_SHIFT;
+static constexpr uint32_t PIPE_FRAME_FLAG_SUPPORTED =
+    PIPE_FRAME_FLAG_COMPRESSED | PIPE_FRAME_FLAG_COMPRESS_MODE_MASK;
+
+// Mode 1 keeps the original compressed-frame flag form. Modes 2 and 3 add
+// their value to the frame flags so receivers can select the inverse exactly.
+enum pipe_wire_compress_mode : uint32_t {
+    PIPE_WIRE_COMPRESS_OFF       = 0,
+    PIPE_WIRE_COMPRESS_RAW_LZ4   = 1,
+    PIPE_WIRE_COMPRESS_SHUFFLE   = 2,
+    PIPE_WIRE_COMPRESS_SELECTIVE = 3,
+};
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
 // (4x u32 + u64 seq_id + u64 length = 16 + 8 + 8) sums to 32 bytes. The field
@@ -865,6 +878,16 @@ void pipe_validate_hello(const pipe_hello & peer,
 // element size in bytes for a hidden_type (4 for F32, 2 for F16). Throws on
 // an unknown type.
 uint32_t pipe_hidden_elt_size(int32_t hidden_type);
+
+// Encode/decode one compressed payload. The payload includes the PLC1 header
+// and is independent of the frame header, which lets offline tools exercise
+// the same codec as pipe_send_frame/pipe_recv_frame.
+void pipe_wire_compress_payload(const uint8_t * src, size_t size,
+                                pipe_wire_compress_mode mode,
+                                std::vector<uint8_t> & out);
+void pipe_wire_decompress_payload(const uint8_t * src, size_t size,
+                                  pipe_wire_compress_mode mode,
+                                  std::vector<uint8_t> & out);
 
 // ---------------------------------------------------------------------------
 // connection-level frame IO (needs pipe-transport; declared here so callers

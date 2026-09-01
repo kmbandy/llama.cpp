@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -149,6 +150,62 @@ static void test_header_rejects() {
     }
     // truncated header: only testable via the socket path, but decode of a
     // short logical frame is covered by the payload decoders below
+    {
+        pipe_frame_header h{PIPE_MAGIC, PIPE_VERSION, 2,
+                            PIPE_FRAME_FLAG_COMPRESS_MODE_MASK, 0, 0};
+        pipe_encode_header(buf, h);
+        CHECK_THROWS_PROTO(pipe_decode_header(buf), PIPE_ERR_BAD_FRAME);
+    }
+}
+
+static void test_wire_compression_roundtrips() {
+    const pipe_wire_compress_mode modes[] = {
+        PIPE_WIRE_COMPRESS_RAW_LZ4,
+        PIPE_WIRE_COMPRESS_SHUFFLE,
+        PIPE_WIRE_COMPRESS_SELECTIVE,
+    };
+    auto check = [&](const std::vector<uint8_t> & input) {
+        for (const pipe_wire_compress_mode mode : modes) {
+            std::vector<uint8_t> encoded;
+            std::vector<uint8_t> decoded;
+            pipe_wire_compress_payload(input.data(), input.size(), mode, encoded);
+            if (mode == PIPE_WIRE_COMPRESS_SELECTIVE && input.size() % 4 == 0) {
+                const uint32_t compressed_mask =
+                    (uint32_t) encoded[8] | ((uint32_t) encoded[9] << 8) |
+                    ((uint32_t) encoded[10] << 16) | ((uint32_t) encoded[11] << 24);
+                CHECK((compressed_mask & 0x3u) == 0);
+            }
+            pipe_wire_decompress_payload(encoded.data(), encoded.size(), mode, decoded);
+            CHECK(decoded == input);
+        }
+    };
+
+    std::mt19937 rng(0x5EEDu);
+    std::vector<uint8_t> random_f32(32768 * sizeof(float));
+    for (size_t i = 0; i < random_f32.size(); i += sizeof(uint32_t)) {
+        const uint32_t bits = rng();
+        std::memcpy(random_f32.data() + i, &bits, sizeof(bits));
+    }
+    check(random_f32);
+
+    std::normal_distribution<float> gaussian(0.0f, 1.0f);
+    std::vector<float> activations(16384);
+    double sum_squares = 0.0;
+    for (float & value : activations) {
+        value = gaussian(rng);
+        sum_squares += (double) value * value;
+    }
+    const float scale = (float) (1.0 / std::sqrt(sum_squares / activations.size()));
+    for (float & value : activations) {
+        value *= scale;
+    }
+    std::vector<uint8_t> activation_bytes(activations.size() * sizeof(float));
+    std::memcpy(activation_bytes.data(), activations.data(), activation_bytes.size());
+    check(activation_bytes);
+
+    check(std::vector<uint8_t>{});
+    check(std::vector<uint8_t>{0xA5});
+    check(std::vector<uint8_t>{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07});
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,6 +1384,7 @@ static void test_segment_roundtrip() {
 int main() {
     test_header_roundtrip();
     test_header_rejects();
+    test_wire_compression_roundtrips();
     test_hello_roundtrip();
     test_expert_hello_roundtrip();
 #ifndef _WIN32

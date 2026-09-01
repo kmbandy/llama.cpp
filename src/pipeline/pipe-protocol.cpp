@@ -16,6 +16,7 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,7 @@ static void rd_u16_bulk(const uint8_t * & p, uint16_t * dst, size_t n) {
 // optional wire compression
 
 static constexpr size_t   PIPE_WIRE_COMPRESS_MIN_SIZE = 1024;
+static constexpr size_t   PIPE_WIRE_SHUFFLE_MIN_SIZE = 64 * 1024;
 static constexpr size_t   PIPE_WIRE_COMPRESS_HEADER_SIZE = 8;
 static constexpr uint32_t PIPE_WIRE_COMPRESS_TAG = 0x31434C50u; // "PLC1"
 
@@ -222,12 +224,15 @@ static void pipe_lz4_append_last_literals(std::vector<uint8_t> & out,
     if (literal_len >= 15) {
         pipe_lz4_append_length(out, literal_len - 15);
     }
-    out.insert(out.end(), src + anchor, src + size);
+    if (literal_len != 0) {
+        out.insert(out.end(), src + anchor, src + size);
+    }
 }
 
 static void pipe_lz4_compress(const uint8_t * src, size_t size, std::vector<uint8_t> & out) {
     static thread_local std::array<int32_t, 1 << 16> hash_table;
     std::fill(hash_table.begin(), hash_table.end(), -1);
+    out.clear();
     out.reserve(size + size / 255 + 16);
 
     size_t anchor = 0;
@@ -323,36 +328,109 @@ static void pipe_lz4_decompress(const uint8_t * src, size_t size,
     }
 }
 
-static bool pipe_try_compress(const uint8_t * src, size_t size, std::vector<uint8_t> & out,
-                              uint64_t & elapsed_ns) {
-    const auto start = std::chrono::steady_clock::now();
-    std::vector<uint8_t> transformed(size);
-    size_t transformed_pos = 0;
+static void pipe_wire_shuffle(const uint8_t * src, size_t size, uint8_t * dst) {
+    const size_t n = size / 4;
+    size_t dst_pos = 0;
     for (size_t plane = 0; plane < 4; ++plane) {
-        for (size_t i = plane; i < size; i += 4) {
-            transformed[transformed_pos++] = src[i];
+        for (size_t i = 0; i < n; ++i) {
+            dst[dst_pos++] = src[4 * i + plane];
         }
     }
-
-    std::vector<uint8_t> compressed;
-    pipe_lz4_compress(transformed.data(), transformed.size(), compressed);
-    const size_t wire_size = PIPE_WIRE_COMPRESS_HEADER_SIZE + compressed.size();
-    const bool worthwhile = wire_size <= size * 19 / 20;
-    if (worthwhile) {
-        out.resize(wire_size);
-        uint8_t * p = out.data();
-        wr_u32(p, PIPE_WIRE_COMPRESS_TAG);
-        wr_u32(p, (uint32_t) size);
-        std::memcpy(p, compressed.data(), compressed.size());
-    } else {
-        out.clear();
-    }
-    elapsed_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - start).count();
-    return worthwhile;
 }
 
-static void pipe_decompress(const uint8_t * src, size_t size, std::vector<uint8_t> & out) {
+static void pipe_wire_unshuffle(const uint8_t * src, size_t size, uint8_t * dst) {
+    const size_t n = size / 4;
+    size_t src_pos = 0;
+    for (size_t plane = 0; plane < 4; ++plane) {
+        for (size_t i = 0; i < n; ++i) {
+            dst[4 * i + plane] = src[src_pos++];
+        }
+    }
+}
+
+static void pipe_wire_write_header(std::vector<uint8_t> & out, size_t original_size) {
+    out.resize(PIPE_WIRE_COMPRESS_HEADER_SIZE);
+    uint8_t * p = out.data();
+    wr_u32(p, PIPE_WIRE_COMPRESS_TAG);
+    wr_u32(p, (uint32_t) original_size);
+}
+
+static void pipe_wire_compress_impl(const uint8_t * src, size_t size,
+                                    pipe_wire_compress_mode mode,
+                                    std::vector<uint8_t> & out) {
+    if (size > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: compressed payload is too large");
+    }
+    if (mode != PIPE_WIRE_COMPRESS_RAW_LZ4 &&
+        mode != PIPE_WIRE_COMPRESS_SHUFFLE &&
+        mode != PIPE_WIRE_COMPRESS_SELECTIVE) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: unsupported compression mode %u", (unsigned) mode);
+    }
+
+    if (size % 4 != 0 && mode != PIPE_WIRE_COMPRESS_RAW_LZ4) {
+        mode = PIPE_WIRE_COMPRESS_RAW_LZ4;
+    }
+
+    if (mode == PIPE_WIRE_COMPRESS_RAW_LZ4) {
+        std::vector<uint8_t> compressed;
+        pipe_lz4_compress(src, size, compressed);
+        pipe_wire_write_header(out, size);
+        out.insert(out.end(), compressed.begin(), compressed.end());
+        return;
+    }
+
+    const size_t n = size / 4;
+    if (mode == PIPE_WIRE_COMPRESS_SHUFFLE) {
+        std::vector<uint8_t> shuffled(size);
+        pipe_wire_shuffle(src, size, shuffled.data());
+        std::vector<uint8_t> compressed;
+        pipe_lz4_compress(shuffled.data(), shuffled.size(), compressed);
+        pipe_wire_write_header(out, size);
+        out.insert(out.end(), compressed.begin(), compressed.end());
+        return;
+    }
+
+    std::array<std::vector<uint8_t>, 4> planes;
+    std::array<uint32_t, 4> plane_sizes = {};
+    uint32_t compressed_mask = 0;
+    for (size_t plane = 0; plane < 4; ++plane) {
+        planes[plane].resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            planes[plane][i] = src[4 * i + plane];
+        }
+        if (plane >= 2) {
+            std::vector<uint8_t> compressed;
+            pipe_lz4_compress(planes[plane].data(), n, compressed);
+            if (compressed.size() < n) {
+                planes[plane] = std::move(compressed);
+                compressed_mask |= 1u << plane;
+            }
+        }
+        plane_sizes[plane] = (uint32_t) planes[plane].size();
+    }
+
+    pipe_wire_write_header(out, size);
+    const size_t old_size = out.size();
+    out.resize(old_size + 4 + 4 * 4);
+    uint8_t * p = out.data() + old_size;
+    wr_u32(p, compressed_mask);
+    for (size_t plane = 0; plane < 4; ++plane) {
+        wr_u32(p, plane_sizes[plane]);
+    }
+    for (const auto & plane : planes) {
+        out.insert(out.end(), plane.begin(), plane.end());
+    }
+}
+
+void pipe_wire_compress_payload(const uint8_t * src, size_t size,
+                                pipe_wire_compress_mode mode,
+                                std::vector<uint8_t> & out) {
+    pipe_wire_compress_impl(src, size, mode, out);
+}
+
+void pipe_wire_decompress_payload(const uint8_t * src, size_t size,
+                                  pipe_wire_compress_mode mode,
+                                  std::vector<uint8_t> & out) {
     if (size < PIPE_WIRE_COMPRESS_HEADER_SIZE) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: compressed frame is too small");
     }
@@ -362,29 +440,107 @@ static void pipe_decompress(const uint8_t * src, size_t size, std::vector<uint8_
     if (tag != PIPE_WIRE_COMPRESS_TAG || original_size > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid compressed frame header");
     }
+    if (mode != PIPE_WIRE_COMPRESS_RAW_LZ4 &&
+        mode != PIPE_WIRE_COMPRESS_SHUFFLE &&
+        mode != PIPE_WIRE_COMPRESS_SELECTIVE) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: unsupported compression mode %u", (unsigned) mode);
+    }
     out.resize(original_size);
-    std::vector<uint8_t> transformed(original_size);
-    pipe_lz4_decompress(p, size - PIPE_WIRE_COMPRESS_HEADER_SIZE,
-                        transformed.data(), transformed.size());
-    size_t transformed_pos = 0;
+    if (mode == PIPE_WIRE_COMPRESS_RAW_LZ4 || original_size % 4 != 0) {
+        pipe_lz4_decompress(p, size - PIPE_WIRE_COMPRESS_HEADER_SIZE,
+                            out.data(), out.size());
+        return;
+    }
+    if (mode == PIPE_WIRE_COMPRESS_SHUFFLE) {
+        std::vector<uint8_t> shuffled(original_size);
+        pipe_lz4_decompress(p, size - PIPE_WIRE_COMPRESS_HEADER_SIZE,
+                            shuffled.data(), shuffled.size());
+        pipe_wire_unshuffle(shuffled.data(), shuffled.size(), out.data());
+        return;
+    }
+    const size_t n = original_size / 4;
+    if (size - PIPE_WIRE_COMPRESS_HEADER_SIZE < 20) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: truncated selective compression header");
+    }
+    const uint32_t compressed_mask = rd_u32(p);
+    if ((compressed_mask & ~0xFu) != 0 || (compressed_mask & 0x3u) != 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid selective compression mask");
+    }
+    std::array<uint32_t, 4> plane_sizes;
     for (size_t plane = 0; plane < 4; ++plane) {
-        for (size_t i = plane; i < original_size; i += 4) {
-            out[i] = transformed[transformed_pos++];
+        plane_sizes[plane] = rd_u32(p);
+    }
+    size_t remaining = size - (size_t) (p - src);
+    std::array<std::vector<uint8_t>, 4> planes;
+    for (size_t plane = 0; plane < 4; ++plane) {
+        if (plane_sizes[plane] > remaining) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: selective plane exceeds payload");
+        }
+        planes[plane].resize(n);
+        if ((compressed_mask & (1u << plane)) != 0) {
+            pipe_lz4_decompress(p, plane_sizes[plane], planes[plane].data(), n);
+        } else {
+            if (plane_sizes[plane] != n) {
+                fail(PIPE_ERR_BAD_FRAME, "pipe: invalid raw selective plane size");
+            }
+            if (n != 0) {
+                std::memcpy(planes[plane].data(), p, n);
+            }
+        }
+        p += plane_sizes[plane];
+        remaining -= plane_sizes[plane];
+    }
+    if (remaining != 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: trailing selective compression data");
+    }
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t plane = 0; plane < 4; ++plane) {
+            out[4 * i + plane] = planes[plane][i];
         }
     }
 }
 
-static bool pipe_wire_compress_enabled() {
+static bool pipe_try_compress(const uint8_t * src, size_t size,
+                              pipe_wire_compress_mode requested_mode,
+                              pipe_wire_compress_mode & actual_mode,
+                              std::vector<uint8_t> & out, uint64_t & elapsed_ns) {
+    const auto start = std::chrono::steady_clock::now();
+    actual_mode = requested_mode;
+    if (requested_mode != PIPE_WIRE_COMPRESS_RAW_LZ4 &&
+        (size <= PIPE_WIRE_SHUFFLE_MIN_SIZE || size % 4 != 0)) {
+        actual_mode = PIPE_WIRE_COMPRESS_RAW_LZ4;
+    }
+    pipe_wire_compress_payload(src, size, actual_mode, out);
+    const bool worthwhile = out.size() <= size * 19 / 20;
+    if (!worthwhile) {
+        out.clear();
+    }
+    elapsed_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    return worthwhile;
+}
+
+static pipe_wire_compress_mode pipe_wire_compress_enabled() {
     const char * value = std::getenv("WP_WIRE_COMPRESS");
-    return value != nullptr && std::strcmp(value, "1") == 0;
+    if (value == nullptr || value[0] == '\0' || value[1] != '\0') {
+        return PIPE_WIRE_COMPRESS_OFF;
+    }
+    switch (value[0]) {
+        case '1': return PIPE_WIRE_COMPRESS_RAW_LZ4;
+        case '2': return PIPE_WIRE_COMPRESS_SHUFFLE;
+        case '3': return PIPE_WIRE_COMPRESS_SELECTIVE;
+        default:  return PIPE_WIRE_COMPRESS_OFF;
+    }
 }
 
 struct pipe_wire_stats {
-    uint64_t frames_compressed = 0;
-    uint64_t bytes_in = 0;
-    uint64_t bytes_out = 0;
-    uint64_t ns_compress = 0;
-    uint64_t ns_decompress = 0;
+    struct mode_stats {
+        uint64_t frames_compressed = 0;
+        uint64_t bytes_in = 0;
+        uint64_t bytes_out = 0;
+        uint64_t ns_compress = 0;
+        uint64_t ns_decompress = 0;
+    } modes[4];
 };
 
 struct pipe_wire_stats_registry {
@@ -407,12 +563,16 @@ static void pipe_wire_register_stats_dump() {
     (void) registered;
 }
 
-static void pipe_wire_record(const pipe_socket_t & sock, size_t bytes_in, size_t bytes_out,
-                             uint64_t elapsed_ns, bool decompressing) {
+static void pipe_wire_record(const pipe_socket_t & sock, pipe_wire_compress_mode mode,
+                             size_t bytes_in, size_t bytes_out, uint64_t elapsed_ns,
+                             bool decompressing) {
     pipe_wire_register_stats_dump();
     pipe_wire_stats_registry & registry = pipe_wire_registry();
     std::lock_guard<std::mutex> lock(registry.mutex);
-    pipe_wire_stats & stats = registry.values[&sock];
+    if (mode <= PIPE_WIRE_COMPRESS_OFF || mode > PIPE_WIRE_COMPRESS_SELECTIVE) {
+        return;
+    }
+    pipe_wire_stats::mode_stats & stats = registry.values[&sock].modes[mode];
     ++stats.frames_compressed;
     stats.bytes_in += (uint64_t) bytes_in;
     stats.bytes_out += (uint64_t) bytes_out;
@@ -431,15 +591,22 @@ static void pipe_wire_dump_socket(const pipe_socket_t & sock) {
         return;
     }
     const pipe_wire_stats & stats = it->second;
-    std::fprintf(stderr,
-                 "pipe wire compression: socket=%p frames_compressed=%llu bytes_in=%llu "
-                 "bytes_out=%llu ns_compress=%llu ns_decompress=%llu\n",
-                 (const void *) &sock,
-                 (unsigned long long) stats.frames_compressed,
-                 (unsigned long long) stats.bytes_in,
-                 (unsigned long long) stats.bytes_out,
-                 (unsigned long long) stats.ns_compress,
-                 (unsigned long long) stats.ns_decompress);
+    for (uint32_t mode = PIPE_WIRE_COMPRESS_RAW_LZ4;
+         mode <= PIPE_WIRE_COMPRESS_SELECTIVE; ++mode) {
+        const pipe_wire_stats::mode_stats & mode_stats = stats.modes[mode];
+        if (mode_stats.frames_compressed == 0) {
+            continue;
+        }
+        std::fprintf(stderr,
+                     "pipe wire compression: socket=%p mode=%u frames_compressed=%llu "
+                     "bytes_in=%llu bytes_out=%llu ns_compress=%llu ns_decompress=%llu\n",
+                     (const void *) &sock, mode,
+                     (unsigned long long) mode_stats.frames_compressed,
+                     (unsigned long long) mode_stats.bytes_in,
+                     (unsigned long long) mode_stats.bytes_out,
+                     (unsigned long long) mode_stats.ns_compress,
+                     (unsigned long long) mode_stats.ns_decompress);
+    }
     registry.values.erase(it);
 }
 
@@ -448,15 +615,59 @@ static void pipe_wire_dump_stats() {
     std::lock_guard<std::mutex> lock(registry.mutex);
     for (const auto & item : registry.values) {
         const pipe_wire_stats & stats = item.second;
-        std::fprintf(stderr,
-                     "pipe wire compression: socket=%p frames_compressed=%llu bytes_in=%llu "
-                     "bytes_out=%llu ns_compress=%llu ns_decompress=%llu\n",
-                     (const void *) item.first,
-                     (unsigned long long) stats.frames_compressed,
-                     (unsigned long long) stats.bytes_in,
-                     (unsigned long long) stats.bytes_out,
-                     (unsigned long long) stats.ns_compress,
-                     (unsigned long long) stats.ns_decompress);
+        for (uint32_t mode = PIPE_WIRE_COMPRESS_RAW_LZ4;
+             mode <= PIPE_WIRE_COMPRESS_SELECTIVE; ++mode) {
+            const pipe_wire_stats::mode_stats & mode_stats = stats.modes[mode];
+            if (mode_stats.frames_compressed == 0) {
+                continue;
+            }
+            std::fprintf(stderr,
+                         "pipe wire compression: socket=%p mode=%u frames_compressed=%llu "
+                         "bytes_in=%llu bytes_out=%llu ns_compress=%llu ns_decompress=%llu\n",
+                         (const void *) item.first, mode,
+                         (unsigned long long) mode_stats.frames_compressed,
+                         (unsigned long long) mode_stats.bytes_in,
+                         (unsigned long long) mode_stats.bytes_out,
+                         (unsigned long long) mode_stats.ns_compress,
+                         (unsigned long long) mode_stats.ns_decompress);
+        }
+    }
+}
+
+static void pipe_wire_dump_payload(const char * direction, const uint8_t * payload, size_t size) {
+    if (size <= PIPE_WIRE_SHUFFLE_MIN_SIZE) {
+        return;
+    }
+
+    struct dump_state {
+        std::mutex mutex;
+        std::string prefix;
+        uint32_t counts[2] = {};
+        bool initialized = false;
+    };
+    static dump_state state;
+    const size_t direction_index = direction[0] == 'i' ? 1 : 0;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.initialized) {
+        const char * value = std::getenv("WP_WIRE_DUMP");
+        state.prefix = value == nullptr ? "" : value;
+        state.initialized = true;
+    }
+    if (state.prefix.empty() || state.counts[direction_index] >= 4) {
+        return;
+    }
+
+    const uint32_t index = state.counts[direction_index]++;
+    const std::string path = state.prefix + "-" + direction + "-" + std::to_string(index) + ".bin";
+    std::FILE * file = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "pipe wire dump: cannot open %s\n", path.c_str());
+        return;
+    }
+    const size_t written = std::fwrite(payload, 1, size, file);
+    std::fclose(file);
+    if (written != size) {
+        std::fprintf(stderr, "pipe wire dump: short write to %s\n", path.c_str());
     }
 }
 
@@ -500,8 +711,12 @@ pipe_frame_header pipe_decode_header(const uint8_t in[PIPE_HEADER_SIZE]) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: unsupported protocol version %u (want %u)",
              h.version, PIPE_VERSION);
     }
-    if ((h.flags & ~PIPE_FRAME_FLAG_COMPRESSED) != 0) {
+    if ((h.flags & ~PIPE_FRAME_FLAG_SUPPORTED) != 0) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: unsupported frame flags 0x%08x", h.flags);
+    }
+    if ((h.flags & PIPE_FRAME_FLAG_COMPRESS_MODE_MASK) != 0 &&
+        (h.flags & PIPE_FRAME_FLAG_COMPRESSED) == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: compression mode set without compressed flag");
     }
     if (h.length > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME,
@@ -1967,20 +2182,26 @@ void pipe_validate_hello(const pipe_hello & peer,
 
 bool pipe_send_frame(pipe_socket_t & sock, pipe_frame_type type, uint64_t seq_id,
                      const uint8_t * payload, size_t payload_len) {
+    pipe_wire_dump_payload("out", payload, payload_len);
     std::vector<uint8_t> wire_payload;
     const uint8_t * wire_data = payload;
     size_t wire_len = payload_len;
     uint32_t wire_flags = 0;
     uint64_t compress_ns = 0;
-    static const bool wire_compress = pipe_wire_compress_enabled();
-    if (wire_compress && !sock.peer_is_loopback() &&
+    pipe_wire_compress_mode actual_mode = PIPE_WIRE_COMPRESS_OFF;
+    static const pipe_wire_compress_mode wire_compress = pipe_wire_compress_enabled();
+    if (wire_compress != PIPE_WIRE_COMPRESS_OFF && !sock.peer_is_loopback() &&
         payload_len >= PIPE_WIRE_COMPRESS_MIN_SIZE &&
         payload_len <= std::numeric_limits<uint32_t>::max() &&
-        pipe_try_compress(payload, payload_len, wire_payload, compress_ns)) {
+        pipe_try_compress(payload, payload_len, wire_compress, actual_mode,
+                          wire_payload, compress_ns)) {
         wire_data = wire_payload.data();
         wire_len = wire_payload.size();
         wire_flags = PIPE_FRAME_FLAG_COMPRESSED;
-        pipe_wire_record(sock, payload_len, wire_len, compress_ns, false);
+        if (actual_mode != PIPE_WIRE_COMPRESS_RAW_LZ4) {
+            wire_flags |= (uint32_t) actual_mode << PIPE_FRAME_FLAG_COMPRESS_MODE_SHIFT;
+        }
+        pipe_wire_record(sock, actual_mode, payload_len, wire_len, compress_ns, false);
     }
 
     pipe_frame_header h;
@@ -2102,10 +2323,15 @@ bool pipe_recv_frame(pipe_socket_t & sock, pipe_frame_type & type, uint64_t & se
             return false;
         }
         const auto start = std::chrono::steady_clock::now();
-        pipe_decompress(wire_payload.data(), wire_payload.size(), payload);
+        const uint32_t mode_bits =
+            (h.flags & PIPE_FRAME_FLAG_COMPRESS_MODE_MASK) >> PIPE_FRAME_FLAG_COMPRESS_MODE_SHIFT;
+        const pipe_wire_compress_mode mode = mode_bits == 0
+            ? PIPE_WIRE_COMPRESS_RAW_LZ4
+            : (pipe_wire_compress_mode) mode_bits;
+        pipe_wire_decompress_payload(wire_payload.data(), wire_payload.size(), mode, payload);
         const uint64_t decompress_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count();
-        pipe_wire_record(sock, wire_payload.size(), payload.size(), decompress_ns, true);
+        pipe_wire_record(sock, mode, wire_payload.size(), payload.size(), decompress_ns, true);
     } else {
         payload.resize((size_t) h.length);
         if (h.length > 0 && !sock.recv_data(payload.data(), (size_t) h.length)) {
@@ -2113,6 +2339,7 @@ bool pipe_recv_frame(pipe_socket_t & sock, pipe_frame_type & type, uint64_t & se
             return false;
         }
     }
+    pipe_wire_dump_payload("in", payload.data(), payload.size());
     type   = (pipe_frame_type) h.type;
     seq_id = h.seq_id;
     return true;
