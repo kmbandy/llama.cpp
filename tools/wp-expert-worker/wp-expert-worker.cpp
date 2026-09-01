@@ -849,9 +849,10 @@ public:
         n_layerahead_hits_    = hits;
     }
 
-    void set_pin_stats(size_t n_pinned, uint64_t demand_hits) {
+    void set_pin_stats(size_t n_pinned, uint64_t demand_hits, uint64_t soft_pin_evictions) {
         n_pinned_ = n_pinned;
         n_pinned_demand_hits_ = demand_hits;
+        n_soft_pin_evictions_ = soft_pin_evictions;
     }
 
     ~WorkerStats() {
@@ -1034,6 +1035,7 @@ private:
                   << " n_layerahead_hits=" << n_layerahead_hits_
                   << " n_pinned=" << n_pinned_
                   << " n_pinned_demand_hits=" << n_pinned_demand_hits_
+                  << " n_soft_pin_evictions=" << n_soft_pin_evictions_
                   << " n_host_hit=" << n_host_hit_
                   << " n_host_demote=" << n_host_demote_
                   << " bytes_read=" << bytes_read_
@@ -1195,6 +1197,10 @@ private:
     uint64_t          n_layerahead_hits_    = 0;
     size_t             n_pinned_ = 0;
     uint64_t           n_pinned_demand_hits_ = 0;
+    // WP_EXPERT_PIN_SOFT=1: how many times select_victim's last-resort pass
+    // took a pinned slot (pin_count==0) because no unpinned candidate existed.
+    // Snapshot from ExpertSlotPool::n_soft_pin_evictions(), same as n_pinned_.
+    uint64_t           n_soft_pin_evictions_ = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          n_host_demote_ = 0;
     uint64_t          bytes_read_ = 0;
@@ -3597,6 +3603,13 @@ public:
         logs_ = logs;
         pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
         std::sort(reserve_blocks_.begin(), reserve_blocks_.end());
+        // House rule: a gate whose runtime value cannot be seen in the log has
+        // cost this project retracted measurement sets -- print it, to stdout,
+        // once per pool.
+        if (soft_pin_enabled_) {
+            std::cout << "wp expert worker WP_EXPERT_PIN_SOFT=1 "
+                         "(pinned slots evictable as last resort)" << std::endl;
+        }
         if (lfu_history_enabled_) {
             lfu_history_.assign(page_count, 0);
         }
@@ -4424,6 +4437,17 @@ public:
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
                     if (slot.valid) {
+                        // WP_EXPERT_PIN_SOFT=1 soft-pin eviction: select_victim's
+                        // last-resort pass only ever returns a pinned slot here
+                        // (pin_count==0 was required to pick it), so unpin it and
+                        // keep n_pinned_ matching the slots actually still pinned
+                        // before demote_slot runs -- demote_slot itself refuses a
+                        // still-`pinned` slot, and this one is being overwritten
+                        // regardless, so it should demote like any other victim.
+                        if (slot.pinned) {
+                            slot.pinned = false;
+                            --n_pinned_;
+                        }
                         const auto demote_t0 = measure ? std::chrono::steady_clock::now()
                                                        : std::chrono::steady_clock::time_point{};
                         if (demote_slot(slot)) {
@@ -5228,6 +5252,7 @@ public:
     uint64_t n_shield_exhausted() const { return n_shield_exhausted_; }
     size_t n_pinned() const { return n_pinned_; }
     uint64_t n_pinned_demand_hits() const { return n_pinned_demand_hits_; }
+    uint64_t n_soft_pin_evictions() const { return n_soft_pin_evictions_; }
 
     // Hint frames and victim selection are both owned by the dispatch thread.
     // Keep only the configured number of hint frames, with counts so a page
@@ -5491,14 +5516,21 @@ private:
             hint_shield_counts_.count(slot_key(slot.key.first, slot.key.second)) != 0;
     }
 
+    // allow_pinned_soft: WP_EXPERT_PIN_SOFT=1's last-resort pass. Slots with
+    // pin_count!=0 are STILL excluded unconditionally below -- an in-flight
+    // request's pin is never soft-evictable, only the sticky `pinned` flag
+    // (pin-file residency) is. Every candidate examined with this true is
+    // therefore already slot.valid, so it can only ever match the two "valid"
+    // scans further down; the two "!valid" scans above them are unaffected.
     size_t select_victim_impl(
-            const ExpertPage & page, bool skip_shielded, bool * shielded_seen) const {
+            const ExpertPage & page, bool skip_shielded, bool * shielded_seen,
+            bool allow_pinned_soft = false) const {
         const uint64_t page_size = page.size;
         const bool wants_reserved = std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer);
         size_t victim = slots_.size();
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
-            if (slot.pinned || slot.pin_count != 0 || slot.valid ||
+            if ((!allow_pinned_soft && slot.pinned) || slot.pin_count != 0 || slot.valid ||
                 (!wants_reserved && slot.reserved) ||
                 (wants_reserved && !slot.reserved) ||
                 page_size > slot.capacity) {
@@ -5522,7 +5554,7 @@ private:
         if (wants_reserved) {
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
-                if (slot.pinned || slot.pin_count != 0 || slot.valid ||
+                if ((!allow_pinned_soft && slot.pinned) || slot.pin_count != 0 || slot.valid ||
                     slot.reserved || page_size > slot.capacity) continue;
                 if (skip_shielded && hint_shielded(slot)) {
                     if (shielded_seen != nullptr) {
@@ -5537,7 +5569,7 @@ private:
 
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
-            if (slot.pinned || slot.pin_count != 0 || !slot.valid ||
+            if ((!allow_pinned_soft && slot.pinned) || slot.pin_count != 0 || !slot.valid ||
                 (!wants_reserved && slot.reserved) ||
                 (wants_reserved && !slot.reserved) ||
                 page_size > slot.capacity) {
@@ -5559,7 +5591,7 @@ private:
         if (wants_reserved && victim == slots_.size()) {
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
-                if (slot.pinned || slot.pin_count != 0 || !slot.valid ||
+                if ((!allow_pinned_soft && slot.pinned) || slot.pin_count != 0 || !slot.valid ||
                     page_size > slot.capacity) continue;
                 if (skip_shielded && hint_shielded(slot)) {
                     if (shielded_seen != nullptr) {
@@ -5576,22 +5608,39 @@ private:
     }
 
     size_t select_victim(const ExpertPage & page) {
+        size_t victim;
         if (hint_shield_depth_ == 0) {
-            return select_victim_impl(page, false, nullptr);
-        }
-        bool shielded_seen = false;
-        const size_t victim = select_victim_impl(page, true, &shielded_seen);
-        if (victim != slots_.size()) {
-            if (shielded_seen) {
-                ++n_shield_hits_;
+            victim = select_victim_impl(page, false, nullptr);
+        } else {
+            bool shielded_seen = false;
+            victim = select_victim_impl(page, true, &shielded_seen);
+            if (victim != slots_.size()) {
+                if (shielded_seen) {
+                    ++n_shield_hits_;
+                }
+                return victim;
             }
+            victim = select_victim_impl(page, false, nullptr);
+            if (victim != slots_.size() && shielded_seen) {
+                ++n_shield_exhausted_;
+            }
+        }
+        if (victim != slots_.size() || !soft_pin_enabled_) {
             return victim;
         }
-        const size_t fallback = select_victim_impl(page, false, nullptr);
-        if (fallback != slots_.size() && shielded_seen) {
-            ++n_shield_exhausted_;
+        // WP_EXPERT_PIN_SOFT=1 last resort: nothing evictable among unpinned
+        // slots (pin file has pinned the pool down to the point where a deep
+        // prefill's sustained demand starves it). Re-run with pinned slots
+        // eligible -- same size-class fit and same coldest-first ordering
+        // (capacity, then rank_less's lease/uses/tick, index as final
+        // tie-break) as every other pass, just without the `pinned` exclusion.
+        // pin_count!=0 stays excluded either way: this never touches a slot an
+        // in-flight request is holding.
+        const size_t soft_victim = select_victim_impl(page, false, nullptr, true);
+        if (soft_victim != slots_.size()) {
+            ++n_soft_pin_evictions_;
         }
-        return fallback;
+        return soft_victim;
     }
 
     // Stripe-claiming reader (WP_EXPERT_STRIPE_PARALLEL=1). Work unit = one
@@ -7101,6 +7150,20 @@ private:
     uint64_t                    lfu_history_references_ = 0;
     size_t                      n_pinned_ = 0;
     uint64_t                    n_pinned_demand_hits_ = 0;
+    // WP_EXPERT_PIN_SOFT=1: when select_victim finds no evictable slot among
+    // unpinned candidates, allow a second pass over pinned slots with
+    // pin_count==0 (never a slot an in-flight request holds). DEFAULT OFF --
+    // read once at startup, same pattern as lfu_/hint_shield_depth_ above, so
+    // the =0/unset path is the exact byte-identical code that shipped before.
+    const bool                 soft_pin_enabled_ = [] {
+        const char * e = std::getenv("WP_EXPERT_PIN_SOFT");
+        return e != nullptr && e[0] == '1';
+    }();
+    // Count of last-resort evictions taken via the soft-pin pass above --
+    // printed in "wp expert worker stats" as n_soft_pin_evictions. A gate
+    // whose runtime value cannot be seen in the log is not a gate; see
+    // soft_pin_enabled_'s startup print in the constructor.
+    uint64_t                    n_soft_pin_evictions_ = 0;
     // Victim ordering: is `a` a strictly BETTER victim than `b`? With LFU off
     // this is pure LRU, byte for byte what shipped before, so a control arm
     // needs no separate build.
@@ -9002,7 +9065,8 @@ public:
 
     void record_stats(const RequestStats & request, size_t n_experts) {
         stats_.set_shield_stats(pool_.n_shield_hits(), pool_.n_shield_exhausted());
-        stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
+        stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits(),
+            pool_.n_soft_pin_evictions());
         stats_.set_layerahead_stats(
             n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits());
         stats_.record(request, n_experts);
