@@ -1690,10 +1690,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     layer.ffn_exp_probs_b, n_expert, ds4_n_expert_used(hparams, il),
                     LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func, il);
-            ggml_tensor * shared = build_ffn(cur,
+            ggml_tensor * shared = build_ffn(shexp_after_issue(cur, il),
                     layer.ffn_up_shexp, nullptr, nullptr, layer.ffn_gate_shexp, nullptr, nullptr,
                     layer.ffn_down_shexp, nullptr, nullptr, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cur = build_hc_post(ggml_add(ctx0, moe, shared), residual, post, comb, il);
+            cur = build_hc_post(complete_moe_dispatch(moe, shared, il), residual, post, comb, il);
         }
 
         const auto & last = model.layers[hparams.n_layer_all - 1];

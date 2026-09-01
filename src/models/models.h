@@ -2318,8 +2318,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     protected:
         // The MTP block reuses the builders below, so graph_mtp chains to this ctor
         // (which does NOT build the trunk graph) and then builds its own.
-        graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/)
-            : llm_build_delta_net_base(params), model(model) {}
+        graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/);
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(

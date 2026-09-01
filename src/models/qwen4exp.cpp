@@ -284,6 +284,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/) :
+    llm_build_delta_net_base(params), model(model) {
+    const char * e = std::getenv("WP_DISPATCH_SPLIT_SHEXP");
+    const bool split_on = (e == nullptr) || (e[0] != '0');
+    moe_dispatch_split_shexp = (expert_dispatch != nullptr) && split_on;
+}
+
 // The MTP block predicts the next-next token from the target's hyper-connection
 // streams and the embedding of the token the target just produced. One layer, run
 // DENSE (no PLE, no QSA, no linear attention).
@@ -506,11 +513,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // worker RPC. Combined (default for this file until now) finishes the
     // wait, then runs shexp — spine idle on 2026. WP_DISPATCH_SPLIT_SHEXP=0
     // restores combined.
-    {
-        const char * e = std::getenv("WP_DISPATCH_SPLIT_SHEXP");
-        const bool split_on = (e == nullptr) || (e[0] != '0');
-        moe_dispatch_split_shexp = (expert_dispatch != nullptr) && split_on;
-    }
+    const char * e = std::getenv("WP_DISPATCH_SPLIT_SHEXP");
+    const bool split_on = (e == nullptr) || (e[0] != '0');
+    moe_dispatch_split_shexp = (expert_dispatch != nullptr) && split_on;
 
     const int64_t hc = hparams.dsv4_hc_mult;
 

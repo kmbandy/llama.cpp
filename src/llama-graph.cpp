@@ -1638,6 +1638,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+        if (expert_dispatch != nullptr) {
+            expert_dispatch->begin_graph_build(ctx0);
+        }
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -1670,6 +1673,8 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
         moe_or_issued = expert_dispatch->build_wait(ctx0, il);
         ggml_backend_sched_set_tensor_backend(sched, moe_or_issued, backend_cpu);
         cb(moe_or_issued, "ffn_moe_out", il);
+        ggml_build_forward_expand(gf, moe_or_issued);
+        expert_dispatch->note_wait_expanded(ctx0, il);
     }
     // shexp first so expand visits the GPU FFN split before CPU wait. The
     // scheduler leaves MAP_CUSTOM2 wait splits unsynced against the previous
@@ -2306,6 +2311,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * moe_out = nullptr;
         if (split_shexp) {
             if (chunked) {
+                GGML_ASSERT(expert_dispatch->begin_chunked_issue_build(ctx0, il));
                 const int64_t n_first = n_tokens / 2;
                 const int64_t n_second = n_tokens - n_first;
                 const int64_t n_expert_used_i = selected_experts->ne[0];

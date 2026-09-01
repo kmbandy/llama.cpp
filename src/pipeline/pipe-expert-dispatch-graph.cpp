@@ -531,6 +531,36 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     return ggml_concat(ctx, wait_a, wait_b, 1);
 }
 
+void graph_dispatcher::begin_graph_build(ggml_context * ctx) {
+    graph_build_ctx_ = ctx;
+    last_chunked_issue_layer_ = -1;
+    last_expanded_wait_layer_ = -1;
+}
+
+bool graph_dispatcher::begin_chunked_issue_build(ggml_context * ctx, int32_t layer) {
+    if (graph_build_ctx_ != ctx) {
+        begin_graph_build(ctx);
+    }
+
+    const int32_t previous_layer = layer - 1;
+    const bool ordered = last_chunked_issue_layer_ != previous_layer ||
+                         last_expanded_wait_layer_ >= previous_layer;
+    if (!ordered) {
+        std::fprintf(stderr,
+                     "expert dispatch graph order: layer %d issue created before layer %d wait expanded\n",
+                     layer, previous_layer);
+    }
+    last_chunked_issue_layer_ = layer;
+    return ordered;
+}
+
+void graph_dispatcher::note_wait_expanded(ggml_context * ctx, int32_t layer) {
+    if (graph_build_ctx_ != ctx) {
+        begin_graph_build(ctx);
+    }
+    last_expanded_wait_layer_ = std::max(last_expanded_wait_layer_, layer);
+}
+
 size_t graph_dispatcher::n_workers() const {
     return remote.workers().size();
 }
