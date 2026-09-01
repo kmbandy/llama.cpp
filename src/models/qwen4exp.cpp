@@ -685,49 +685,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_trunk_head(
 // res->t_stage_in/t_stage_out, which llama_context::process_ubatch_staged
 // copies through a host buffer between stage computations.
 void llama_model_qwen4exp::graph::build_trunk_staged(int64_t hc, int * sections, int32_t stage_il) {
+    // BUGFIX 2026-09-01 (spine crash, gdb-confirmed, twice):
+    // llm_graph_result::set_inputs() unconditionally binds EVERY registered
+    // input object, so every input TENSOR any builder created for this stage
+    // must be allocator-reachable in THIS stage's graph, whether or not this
+    // stage's own compute happens to consume it. On the whole-graph path that
+    // is automatic: 48 layers guarantee something downstream references each
+    // input eventually. A single staged layer is not guaranteed that -- the
+    // first fix here handled build_inp_mem_hybrid()'s two sides one class at
+    // a time (self_k_idxs/self_v_idxs/self_kq_mask/s_copy/...), and the crash
+    // promptly moved to inp_pos (llm_graph_input_pos), proving the bug is
+    // structural, not per-class: ANY input the builder registers -- inp_pos,
+    // inp_out_ids, PLE inputs, indexer/QSA inputs, whatever gets added later
+    // -- has the same failure mode if this stage's ops don't happen to use
+    // it. Fixed generically instead: sweep every tensor this llm_graph_context
+    // created (ggml_get_first_tensor/ggml_get_next_tensor over ctx0, the
+    // context this stage's graph lives in) and forward-expand every one that
+    // carries GGML_TENSOR_FLAG_INPUT -- the exact flag ggml_set_input() sets
+    // (ggml.h) and every build_inp_* helper in this file goes through
+    // (build_inp_embd/build_inp_pos/build_inp_out_ids/build_inp_mem_hybrid's
+    // sub-builders/build_qsa_top_k's llm_graph_input_qsa -- all create their
+    // tensors via ggml_new_tensor_* + ggml_set_input(), no exceptions found).
+    // Called once at the very end of this function, after every builder call
+    // that might register an input has run (including the ones lazily
+    // created deep inside build_trunk_layer/build_trunk_head, e.g. QSA), so
+    // nothing added after an earlier sweep point could be missed.
+    auto sweep_stage_inputs = [this]() {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx0); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+            if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+    };
+
     auto * inp = build_inp_mem_hybrid();
-
-    // BUGFIX 2026-09-01 (spine crash, gdb-confirmed):
-    // build_inp_mem_hybrid() unconditionally creates BOTH the attention-cache
-    // side (self_k_idxs/self_v_idxs/self_kq_mask/self_k_rot/self_v_rot or the
-    // paged_* equivalents) and the recurrent-cache side (s_copy), and
-    // llm_graph_input_mem_hybrid::set_input() unconditionally fills both every
-    // ubatch, regardless of which side this graph's ops actually reference.
-    // On the whole-graph path that is always safe: 48 layers guarantee SOME
-    // layer uses each side, so every one of these tensors is reachable from an
-    // output and gets a real scheduler-allocated buffer before set_inputs()
-    // runs. A single staged layer is not guaranteed that: a recurrent
-    // (is_recr) layer's build_layer_attn_linear never touches the attention
-    // side, and a full-attention layer never touches the recurrent side, so
-    // whichever side goes unused here is never added to gf via
-    // ggml_build_forward_expand, the scheduler leaves its buffer null, and
-    // set_inputs() -> llm_graph_input_mem_hybrid::set_input() ->
-    // llama_kv_cache::set_input_k_idxs crashes on
-    // GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer)) with buffer ==
-    // nullptr. Force both sides into gf here, unconditionally, as inert extra
-    // leaves before this stage's real ops are built below: cheap (index/mask
-    // tensors, not activations) and harmless when a stage's own compute does
-    // not end up consuming them.
-    {
-        auto * inp_attn = inp->get_attn();
-        if (inp_attn->is_paged) {
-            if (inp_attn->paged_block_table)  ggml_build_forward_expand(gf, inp_attn->paged_block_table);
-            if (inp_attn->paged_context_lens) ggml_build_forward_expand(gf, inp_attn->paged_context_lens);
-            if (inp_attn->paged_q_lens)       ggml_build_forward_expand(gf, inp_attn->paged_q_lens);
-            if (inp_attn->paged_slot_mapping) ggml_build_forward_expand(gf, inp_attn->paged_slot_mapping);
-        } else {
-            if (inp_attn->self_k_idxs)  ggml_build_forward_expand(gf, inp_attn->self_k_idxs);
-            if (inp_attn->self_v_idxs)  ggml_build_forward_expand(gf, inp_attn->self_v_idxs);
-            if (inp_attn->self_kq_mask) ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
-            if (inp_attn->self_k_rot)   ggml_build_forward_expand(gf, inp_attn->self_k_rot);
-            if (inp_attn->self_v_rot)   ggml_build_forward_expand(gf, inp_attn->self_v_rot);
-        }
-
-        auto * inp_rs = inp->get_recr();
-        if (inp_rs->s_copy) {
-            ggml_build_forward_expand(gf, inp_rs->s_copy);
-        }
-    }
 
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
 
@@ -752,6 +743,7 @@ void llama_model_qwen4exp::graph::build_trunk_staged(int64_t hc, int * sections,
         res->t_stage_in = res_hc_in;
 
         build_trunk_head(res_hc_in, hc, keep_all_rows, inp_out_ids);
+        sweep_stage_inputs();
         return;
     }
 
@@ -787,6 +779,8 @@ void llama_model_qwen4exp::graph::build_trunk_staged(int64_t hc, int * sections,
     ggml_build_forward_expand(gf, res_hc_out);
 
     res->t_stage_out = res_hc_out;
+
+    sweep_stage_inputs();
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
