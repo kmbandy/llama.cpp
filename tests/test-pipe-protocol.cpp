@@ -190,6 +190,8 @@ static void test_expert_hello_roundtrip() {
     h.role           = PIPE_EXPERT_ROLE_WORKER;
     h.hidden_type    = PIPE_HIDDEN_F16;
     h.n_embd         = 6144;
+    h.shm_tokens     = 2048;
+    h.shm_name       = "/llama_test_pipe_expert_shm";
     h.n_ff_exp       = 2048;
     h.n_expert       = 256;
     h.n_expert_used  = 8;
@@ -206,6 +208,8 @@ static void test_expert_hello_roundtrip() {
     CHECK(d.layers         == h.layers);
     CHECK(d.model_identity == h.model_identity);
     CHECK(d.shard_identity == h.shard_identity);
+    CHECK(d.shm_tokens     == h.shm_tokens);
+    CHECK(d.shm_name       == h.shm_name);
 
     const pipe_expert_hello_ack accepted{ true, "" };
     const std::vector<uint8_t> accepted_enc =

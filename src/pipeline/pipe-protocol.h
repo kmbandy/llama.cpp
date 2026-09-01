@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "llama-pipeline.h"
+#include "pipe-expert-shm.h"
 
 // ---------------------------------------------------------------------------
 // wire constants
@@ -177,7 +178,10 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // upgraded and the env var flipped on before every worker in the fleet has been
 // rebuilt -- exactly the "spine and workers cycle independently" scenario this
 // whole file exists to make safe.
-static constexpr uint32_t PIPE_VERSION = 14u;
+// 14 -> 15 (2026-09-01): WP_LOCAL_SHM. A worker HELLO now carries the name of
+// its per-worker POSIX shared-memory ring. The version bump prevents an older
+// peer from treating the new trailing field as malformed identity bytes.
+static constexpr uint32_t PIPE_VERSION = 15u;
 
 static constexpr uint32_t PIPE_FRAME_FLAG_COMPRESSED = 1u << 0;
 
@@ -228,6 +232,12 @@ enum pipe_frame_type : uint32_t {
     // Worker -> spine: one device-group partial from a streamed response.
     // This opt-in type keeps the legacy PIPE_EXPERT_PARTIAL frame unchanged.
     PIPE_EXPERT_PARTIAL_STREAM        = 23,
+    // WP_LOCAL_SHM: TCP carries only this control frame. The request payload
+    // is a record in the worker-advertised shared-memory ring.
+    PIPE_EXPERT_SHM_DISPATCH_REQ     = 24,
+    // WP_LOCAL_SHM: the response payload is a ring reference to the existing
+    // PIPE_EXPERT_PARTIAL payload bytes.
+    PIPE_EXPERT_SHM_PARTIAL          = 25,
 };
 
 enum pipe_role : uint32_t {
@@ -358,6 +368,9 @@ struct pipe_expert_hello {
     std::vector<int32_t> layers;
     std::string          model_identity;
     std::string          shard_identity;
+    uint32_t             shm_tokens   = 0;
+    // Empty for clients and workers with WP_LOCAL_SHM disabled.
+    std::string          shm_name;
 };
 
 struct pipe_expert_hello_ack {
@@ -393,6 +406,17 @@ struct pipe_expert_dispatch_req {
     // Costs 2x bytes on the request path; decode is page-in bound, so measure
     // rather than assume that costs anything.
     std::vector<float>                  activations;
+    // Set only by the local shm decoder on little-endian hosts. The ring owns
+    // this storage until the worker finishes the request.
+    const float *                       activations_view = nullptr;
+    size_t                              activations_view_size = 0;
+
+    const float * activation_data() const {
+        return activations_view != nullptr ? activations_view : activations.data();
+    }
+    size_t activation_size() const {
+        return activations_view != nullptr ? activations_view_size : activations.size();
+    }
 
     // *** ADDED 2026-08-05 -- THIS WAS A CORRECTNESS BUG. ***
     // hparams.swiglu_clamp_exp[layer] for this layer; <= 0 means "no clamp".
@@ -763,6 +787,7 @@ std::vector<uint8_t> pipe_encode_error     (const pipe_error    & p);
 std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p);
 std::vector<uint8_t> pipe_encode_expert_hello_ack(const pipe_expert_hello_ack & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p);
+std::vector<uint8_t> pipe_encode_expert_shm_ref(const pipe_expert_shm_ref & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_begin(const pipe_expert_dispatch_begin & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts(const pipe_expert_dispatch_acts & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_publish(const pipe_expert_dispatch_acts_publish & p);
@@ -812,6 +837,9 @@ pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len);
 pipe_expert_hello_ack pipe_decode_expert_hello_ack(const uint8_t * buf, size_t len);
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_view(
+    const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_expert_shm_ref pipe_decode_expert_shm_ref(const uint8_t * buf, size_t len);
 pipe_expert_dispatch_begin pipe_decode_expert_dispatch_begin(
     const uint8_t * buf, size_t len);
 pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(

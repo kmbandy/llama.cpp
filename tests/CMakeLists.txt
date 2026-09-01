@@ -373,6 +373,19 @@ target_link_libraries(test-wp-expert-worker PRIVATE
 target_compile_features(test-wp-expert-worker PRIVATE cxx_std_17)
 llama_test(test-wp-expert-worker)
 
+# POSIX expert shared-memory ring: pure byte-ring and wraparound coverage.
+add_executable(
+    test-pipe-expert-shm
+    test-pipe-expert-shm.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-expert-shm.cpp
+)
+target_include_directories(test-pipe-expert-shm PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_link_libraries(test-pipe-expert-shm PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-pipe-expert-shm PRIVATE cxx_std_17)
+llama_test(test-pipe-expert-shm)
+
 # CPU-only expert dispatcher: four real worker processes over real TCP, two
 # disjoint synthetic shards, issue-before-await instrumentation, reduction,
 # balancing, coverage rejection, worker rejection, and worker death.

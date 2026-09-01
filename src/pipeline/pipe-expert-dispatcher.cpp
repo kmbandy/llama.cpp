@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "pipe-transport.h"
 #include "pipe-reduce-simd.h"
+#include "pipe-expert-shm.h"
 
 #include <algorithm>
 #include <numeric>
@@ -140,6 +141,13 @@ bool async_issue_enabled() {
 bool split_frame_enabled() {
     const char * value = std::getenv("WP_SPLIT_FRAME");
     return value != nullptr && value[0] != '0';
+}
+
+// WP_LOCAL_SHM=1 enables the per-worker shared-memory transport. It is only
+// selected after HELLO and only for an exact 127.0.0.1 endpoint.
+bool local_shm_enabled() {
+    const char * value = std::getenv("WP_LOCAL_SHM");
+    return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
 // WP_CONCURRENT_ISSUE -- default OFF. Independent of, and deliberately NOT
@@ -686,6 +694,7 @@ struct dispatcher::impl {
         pipe_expert_hello                        hello;
         std::unique_ptr<inproc_backend>          inproc;
         pipe_socket_ptr                          socket;
+        std::unique_ptr<pipe_expert_shm_ring>    shm;
         std::unique_ptr<socket_writer>           writer;
         std::unique_ptr<concurrent_sender>       sender;
         // D9: residency LRU as std::list + unordered_map (key = layer<<32|expert)
@@ -1137,6 +1146,8 @@ struct dispatcher::impl {
             client.expert_last       = -1;
             client.n_slots           = 0;
             client.layers.clear();
+            client.shm_name.clear();
+            client.shm_tokens         = 0;
             std::vector<uint8_t> payload = pipe_encode_expert_hello(client);
             if (!pipe_send_frame(*connected.socket, PIPE_HELLO, 0, payload.data(), payload.size())) {
                 throw std::runtime_error("expert dispatcher failed to send HELLO to worker " + label);
@@ -1162,6 +1173,16 @@ struct dispatcher::impl {
                 throw std::runtime_error("expert dispatcher worker " + label +
                                          " rejected HELLO: " + ack.reason);
             }
+            }
+
+            if (local_shm_enabled() && target.host == "127.0.0.1" &&
+                !connected.hello.shm_name.empty()) {
+                connected.shm = pipe_expert_shm_ring::attach(connected.hello.shm_name);
+                if (!connected.shm) {
+                    std::fprintf(stderr,
+                                 "expert dispatch: local shm attach failed for %s; using TCP\n",
+                                 label.c_str());
+                }
             }
 
             public_workers.push_back(connected.info);
@@ -2119,6 +2140,24 @@ struct dispatcher::impl {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint + " returned sequence " +
                                      std::to_string(seq_id) + " while awaiting " + std::to_string(wanted_seq_id));
         }
+        if (type == PIPE_EXPERT_SHM_PARTIAL) {
+            if (value.shm == nullptr) {
+                throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                         " returned a shared-memory partial without an attached ring");
+            }
+            const pipe_expert_shm_ref ref = pipe_decode_expert_shm_ref(payload.data(), payload.size());
+            const uint8_t * shm_payload = nullptr;
+            if (!value.shm->read_response(ref, &shm_payload)) {
+                throw std::runtime_error("expert dispatcher local shm response failed for " +
+                                         value.info.endpoint + ": " + value.shm->error());
+            }
+            payload.assign(shm_payload, shm_payload + ref.length);
+            if (!value.shm->consume_response(ref)) {
+                throw std::runtime_error("expert dispatcher local shm response consume failed for " +
+                                         value.info.endpoint + ": " + value.shm->error());
+            }
+            type = PIPE_EXPERT_PARTIAL;
+        }
         return type;
     }
 
@@ -2156,13 +2195,16 @@ struct dispatcher::impl {
         // per-worker diagnostic still runs, and only for n_tokens>1 (the encode
         // cost this targets is a prefill cost).
         const bool slice_encode_once =
-            layer_is_slice && s_slice_encode_once && !s_union_stats && n_tokens > 1;
+            layer_is_slice && s_slice_encode_once && !s_union_stats && n_tokens > 1 &&
+            std::none_of(workers.begin(), workers.end(), [](const worker & value) {
+                return value.shm != nullptr;
+            });
         // See planned_request::split_wire. Split the frame only at a width where
         // dedup can actually engage; below it the second frame buys nothing and
         // costs a packet per request on a TCP_NODELAY socket. Uniform across a
         // layer's workers (n_tokens is a property of the ubatch), so the
         // slice_encode_once shared-payload cache below stays coherent.
-        const bool split_wire = split_frame && n_tokens > dedup_min_tokens_;
+        const bool split_wire_requested = split_frame && n_tokens > dedup_min_tokens_;
         std::vector<uint8_t>  shared_payload, shared_begin_payload, shared_acts_payload;
         std::vector<uint32_t> shared_token_ids;
         bool have_shared = false;
@@ -2173,8 +2215,8 @@ struct dispatcher::impl {
             if (slice_encode_once && have_shared) {
                 // Identical-frame fast path: copy the already-encoded bytes.
                 request.token_ids = shared_token_ids;
-                request.split_wire = split_wire;
-                if (split_wire) {
+                request.split_wire = split_wire_requested;
+                if (request.split_wire) {
                     request.begin_payload = shared_begin_payload;
                     request.acts_payload  = shared_acts_payload;
                 } else {
@@ -2282,8 +2324,9 @@ struct dispatcher::impl {
             }
             const dispatch_clock::time_point encode_started =
                 layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
-            request.split_wire = split_wire;
-            if (split_wire) {
+            request.split_wire = split_wire_requested &&
+                                 workers[request.worker_index].shm == nullptr;
+            if (request.split_wire) {
                 pipe_expert_dispatch_begin begin;
                 begin.layer = wire_request.layer;
                 begin.n_tokens = wire_request.n_tokens;
@@ -2303,7 +2346,7 @@ struct dispatcher::impl {
             if (slice_encode_once) {
                 // Stash the first covering worker's encoded frame for reuse.
                 shared_token_ids = request.token_ids;
-                if (split_wire) {
+                if (request.split_wire) {
                     shared_begin_payload = request.begin_payload;
                     shared_acts_payload  = request.acts_payload;
                 } else {
@@ -2639,7 +2682,18 @@ struct dispatcher::impl {
             if (collect_stats || req_log_ != nullptr) {
                 request.issued_at = dispatch_clock::now();
             }
-            if (request.split_wire && async_issue) {
+            if (value.shm != nullptr) {
+                pipe_expert_shm_ref ref;
+                if (!value.shm->write_request(request.payload.data(), request.payload.size(), ref)) {
+                    throw std::runtime_error("expert dispatcher local shm request failed for " +
+                                             value.info.endpoint + ": " + value.shm->error());
+                }
+                const std::vector<uint8_t> control = pipe_encode_expert_shm_ref(ref);
+                if (!send_frame(PIPE_EXPERT_SHM_DISPATCH_REQ, control)) {
+                    throw std::runtime_error("expert dispatcher failed to signal local shm request to worker " +
+                                             value.info.endpoint);
+                }
+            } else if (request.split_wire && async_issue) {
                 wire_frame begin;
                 begin.type = PIPE_EXPERT_DISPATCH_BEGIN;
                 begin.seq_id = seq_id;

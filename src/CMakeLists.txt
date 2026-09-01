@@ -16,6 +16,7 @@ add_library(llama-expert-dispatch STATIC
             pipeline/pipe-dense-segment-manifest.cpp
             pipeline/pipe-expert-dispatch-graph.cpp
             pipeline/pipe-expert-dispatcher.cpp
+            pipeline/pipe-expert-shm.cpp
             pipeline/pipe-hash-oracle.cpp
             pipeline/pipe-prefetch-hints.cpp
             pipeline/pipe-protocol.cpp
