@@ -204,6 +204,28 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// GGML_MMQ_DEBUG_SYNC=1: synchronize and check after every stage of the MUL_MAT_ID MMQ path and
+// print the launch geometry, to localize device faults on GPUs the sanitizers no longer support
+bool ggml_cuda_mmq_debug_sync_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_MMQ_DEBUG_SYNC");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void ggml_cuda_mmq_debug_sync(const char * stage, cudaStream_t stream) {
+    if (!ggml_cuda_mmq_debug_sync_enabled()) {
+        return;
+    }
+    const cudaError_t err = cudaStreamSynchronize(stream);
+    const cudaError_t last = cudaGetLastError();
+    fprintf(stderr, "[mmq-debug] stage %s: sync=%s last=%s\n", stage, cudaGetErrorString(err), cudaGetErrorString(last));
+    if (err != cudaSuccess || last != cudaSuccess) {
+        GGML_ABORT("mmq debug: device fault after stage %s", stage);
+    }
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         bool force_mm_id) {
@@ -379,6 +401,7 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_mmq_debug_sync("mm_ids_helper", stream);
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
@@ -416,6 +439,7 @@ void ggml_cuda_mul_mat_q(
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_mmq_debug_sync("quantize", stream);
     }
 
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
@@ -435,6 +459,7 @@ void ggml_cuda_mul_mat_q(
     args.expert_ptrs = routed_expert_ptrs;
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    ggml_cuda_mmq_debug_sync("mul_mat_q(ids)", stream);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, bool force_mm_id) {

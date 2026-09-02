@@ -108,8 +108,11 @@ std::vector<float> compute_id(
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "failed to create MUL_MAT_ID pin context");
 
+    // WP_PIN_TEST_ID_EXPAND=1: give every (k, token) its own activation row ([K, N_USED, n])
+    // instead of the broadcast [K, 1, n] shape, which selects the launcher's dedup/scatter path
+    static const bool expand = std::getenv("WP_PIN_TEST_ID_EXPAND") != nullptr;
     ggml_tensor * as    = ggml_new_tensor_3d(ctx, type, K, M, N_SLOTS);
-    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, expand ? N_USED : 1, n);
     ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_USED, n);
     ggml_tensor * output = ggml_mul_mat_id(ctx, as, input, ids);
     if (std::getenv("WP_PIN_TEST_NOHINT") == nullptr) {
@@ -127,7 +130,19 @@ std::vector<float> compute_id(
         }
     }
     ggml_backend_tensor_set_async(backend, as, quantized_slots.data(), 0, quantized_slots.size());
-    ggml_backend_tensor_set_async(backend, input, activations.data(), 0, (size_t) (K * n) * sizeof(float));
+    if (expand) {
+        std::vector<float> expanded((size_t) (K * N_USED * n));
+        for (int64_t t = 0; t < n; ++t) {
+            for (int64_t k = 0; k < N_USED; ++k) {
+                std::copy(activations.begin() + t * K, activations.begin() + (t + 1) * K,
+                          expanded.begin() + (t * N_USED + k) * K);
+            }
+        }
+        ggml_backend_tensor_set_async(backend, input, expanded.data(), 0, expanded.size() * sizeof(float));
+        ggml_backend_synchronize(backend);
+    } else {
+        ggml_backend_tensor_set_async(backend, input, activations.data(), 0, (size_t) (K * n) * sizeof(float));
+    }
     ggml_backend_tensor_set_async(backend, ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
     ggml_backend_synchronize(backend);
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,

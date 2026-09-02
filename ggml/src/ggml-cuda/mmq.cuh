@@ -4,6 +4,10 @@
 
 #include <climits>
 #include <cstdlib>
+
+// GGML_MMQ_DEBUG_SYNC=1 (mmq.cu): per-stage synchronize + launch geometry print for MUL_MAT_ID
+bool ggml_cuda_mmq_debug_sync_enabled();
+void ggml_cuda_mmq_debug_sync(const char * stage, cudaStream_t stream);
 #include <cstdint>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
@@ -1483,6 +1487,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    if (ggml_cuda_mmq_debug_sync_enabled()) {
+        fprintf(stderr, "[mmq-debug] launch type=%d J=%d I=%d nthreads=%d fallback=%d force_no_stream_k=%d stream_k=%d shared=%d "
+                "grid=(%d,%d,%d) nrows_x=%lld ncols_dst=%lld ncols_max=%lld ids=%d nchannels_x=%lld nchannels_y=%lld\n",
+                (int) type, config.J, config.I, config.nthreads, (int) fallback, (int) force_no_stream_k,
+                (int) ggml_cuda_mmq_get_stream_k(type, J, fallback, cc), nbytes_shared, nty, ntx, ntzw,
+                (long long) args.nrows_x, (long long) args.ncols_dst, (long long) args.ncols_max, args.ids_dst != nullptr,
+                (long long) args.nchannels_x, (long long) args.nchannels_y);
+    }
     if (force_no_stream_k || !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback, force_no_stream_k><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
@@ -1680,6 +1692,7 @@ void ggml_cuda_mul_mat_q(
         bool force_mm_id = false);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, bool force_mm_id = false);
+
 
 // Routing-aware MMQ side channel (MAD-88). Set the per-expert weight
 // pointer array just before a MUL_MAT_ID op runs; the dispatcher reads
