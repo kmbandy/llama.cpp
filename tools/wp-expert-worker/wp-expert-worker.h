@@ -172,6 +172,13 @@ bool parse_env_default_on(const char * env);
 bool parse_env_default_off(const char * env);
 bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool gather_enabled);
 
+// WP_EXPERT_ARENA_PREFILL policy, per device: unset/"" and "0" are off, "1"
+// is on for every device, a comma-separated device-name list ("ROCm0,CUDA0")
+// is on only for those devices (exact match), and the same list prefixed
+// with "!" ("!Vulkan0") is on for every device except those named. Whitespace
+// around the whole value and around each comma-separated name is ignored.
+bool parse_arena_prefill_enabled(const char * env, const std::string & device_name);
+
 // Compact a router-weight row to the tokens that actually route here.
 // Empty (all-zero) rows keep a single dummy index 0 / weight 0 so the
 // gather graph still has one row — same contract as compute_batch.

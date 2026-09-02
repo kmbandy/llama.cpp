@@ -280,6 +280,58 @@ bool parse_env_default_off(const char * env) {
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// WP_EXPERT_ARENA_PREFILL policy, per device. Accepts everything the plain
+// on/off switch does ("" / unset = off, "0" = off, "1" = on for every
+// device) plus a device selector: a comma-separated allow-list of exact
+// device names ("ROCm0,ROCm1,CUDA0"), or the same list prefixed with "!" to
+// mean "every device except these" ("!Vulkan0"). Whitespace around the value
+// and around each comma-separated name is ignored. Pure function of its
+// inputs so tests can exercise every branch without touching getenv.
+static void wp_trim_ascii_whitespace(std::string & s) {
+    const size_t begin = s.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        s.clear();
+        return;
+    }
+    const size_t end = s.find_last_not_of(" \t\r\n");
+    s = s.substr(begin, end - begin + 1);
+}
+
+bool parse_arena_prefill_enabled(const char * env, const std::string & device_name) {
+    if (env == nullptr) {
+        return false;
+    }
+    std::string value(env);
+    wp_trim_ascii_whitespace(value);
+    if (value.empty() || value == "0") {
+        return false;
+    }
+    if (value == "1") {
+        return true;
+    }
+    bool negate = false;
+    if (value[0] == '!') {
+        negate = true;
+        value.erase(0, 1);
+    }
+    bool listed = false;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        std::string name = (comma == std::string::npos) ?
+            value.substr(start) : value.substr(start, comma - start);
+        wp_trim_ascii_whitespace(name);
+        if (!name.empty() && name == device_name) {
+            listed = true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return negate ? !listed : listed;
+}
+
 static bool wp_persistent_graphs_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("WP_PERSISTENT_GRAPHS");
@@ -8069,6 +8121,15 @@ public:
                         have_async ? "has async" : "NO async iface");
             }
         }
+        {
+            const char * e = std::getenv("WP_EXPERT_ARENA_PREFILL");
+            arena_prefill_enabled_ = parse_arena_prefill_enabled(e, device_name_);
+            std::fprintf(stderr,
+                         "wp expert worker: grouped prefill (WP_EXPERT_ARENA_PREFILL=%s) "
+                         "device=%s enabled=%d\n",
+                         e != nullptr ? e : "", device_name_.c_str(),
+                         (int) arena_prefill_enabled_);
+        }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
                        catalog_.descriptor.hparams.n_embd,
@@ -9685,8 +9746,10 @@ private:
         const char * e = std::getenv("WP_SUBMIT_ASYNC");
         return e != nullptr && e[0] == '1';
     }();
-    const bool arena_prefill_enabled_ =
-        parse_env_default_off(std::getenv("WP_EXPERT_ARENA_PREFILL"));
+    // Set in the constructor, once device_name_ is known: see
+    // parse_arena_prefill_enabled() for the accepted WP_EXPERT_ARENA_PREFILL
+    // values (plain 0/1, or a per-device allow/deny list).
+    bool arena_prefill_enabled_ = false;
 
     void begin_async_dispatch(int conn_index, uint64_t trace_req) {
         active_async_conn_index_ = conn_index;

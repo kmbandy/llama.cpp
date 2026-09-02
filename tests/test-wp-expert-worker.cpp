@@ -2569,6 +2569,53 @@ static void test_decode_prefill_compute_profile() {
             "compact weights must follow idx");
 }
 
+static void test_arena_prefill_device_policy() {
+    // Unset / missing must default OFF, same as parse_env_default_off.
+    require(!wp_expert_worker::parse_arena_prefill_enabled(nullptr, "ROCm0"),
+            "unset WP_EXPERT_ARENA_PREFILL must default off");
+    require(!wp_expert_worker::parse_arena_prefill_enabled("", "ROCm0"),
+            "empty WP_EXPERT_ARENA_PREFILL must default off");
+
+    // Plain 0/1 apply to every device.
+    require(!wp_expert_worker::parse_arena_prefill_enabled("0", "ROCm0"),
+            "WP_EXPERT_ARENA_PREFILL=0 must disable grouped prefill everywhere");
+    require(!wp_expert_worker::parse_arena_prefill_enabled("0", "Vulkan0"),
+            "WP_EXPERT_ARENA_PREFILL=0 must disable grouped prefill everywhere");
+    require(wp_expert_worker::parse_arena_prefill_enabled("1", "ROCm0"),
+            "WP_EXPERT_ARENA_PREFILL=1 must enable grouped prefill everywhere");
+    require(wp_expert_worker::parse_arena_prefill_enabled("1", "Vulkan0"),
+            "WP_EXPERT_ARENA_PREFILL=1 must enable grouped prefill everywhere");
+
+    // Allow-list: only the named devices are enabled.
+    require(wp_expert_worker::parse_arena_prefill_enabled("ROCm0,CUDA0", "ROCm0"),
+            "device allow-list must enable a listed device");
+    require(wp_expert_worker::parse_arena_prefill_enabled("ROCm0,CUDA0", "CUDA0"),
+            "device allow-list must enable a listed device");
+    require(!wp_expert_worker::parse_arena_prefill_enabled("ROCm0,CUDA0", "Vulkan0"),
+            "device allow-list must not enable an unlisted device");
+
+    // Exclusion list: every device except the named ones is enabled.
+    require(!wp_expert_worker::parse_arena_prefill_enabled("!Vulkan0", "Vulkan0"),
+            "exclusion list must disable the named device");
+    require(wp_expert_worker::parse_arena_prefill_enabled("!Vulkan0", "ROCm0"),
+            "exclusion list must enable devices not named");
+    require(wp_expert_worker::parse_arena_prefill_enabled("!Vulkan0", "ROCm1"),
+            "exclusion list must enable devices not named");
+
+    // Whitespace around the value and around each comma-separated name must
+    // be tolerated.
+    require(wp_expert_worker::parse_arena_prefill_enabled(" ROCm0 , CUDA0 ", "ROCm0"),
+            "whitespace around list entries must be tolerated");
+    require(wp_expert_worker::parse_arena_prefill_enabled(" ROCm0 , CUDA0 ", "CUDA0"),
+            "whitespace around list entries must be tolerated");
+    require(!wp_expert_worker::parse_arena_prefill_enabled(" ROCm0 , CUDA0 ", "Vulkan0"),
+            "whitespace-tolerant list must still exclude unlisted devices");
+    require(wp_expert_worker::parse_arena_prefill_enabled(" ! Vulkan0 ", "ROCm0"),
+            "whitespace around an exclusion list must be tolerated");
+    require(!wp_expert_worker::parse_arena_prefill_enabled(" ! Vulkan0 ", "Vulkan0"),
+            "whitespace around an exclusion list must be tolerated");
+}
+
 // Records every ExpertSlotPool::stripe_plan() call so a test can see how
 // many stripes a given (page_size, n_pageins) actually produced. This is
 // independent of the read_started/read_finished hooks, which fire once per
@@ -4050,12 +4097,13 @@ int main() {
         require(setenv("WP_EXPERT_GATHER", "1", 1) == 0 &&
                     setenv("WP_EXPERT_GATHER_MIN_TOKENS", "2", 1) == 0,
                 "failed to enable expert gather");
+        test_decode_prefill_compute_profile();
+        test_arena_prefill_device_policy();
         test_prefill_arena_grouped_production_geometry();
         test_prefill_arena_grouped_placement_independent();
         test_prefill_arena_grouped_chunk_byte_identical();
         test_prefill_arena_grouped_matches_gather();
         test_prefill_mul_mat_pin_chunk_byte_identical();
-        test_decode_prefill_compute_profile();
         test_scatter_compact_rows_matches_get_rows_back();
         test_scatter_add_compact_rows_accumulates();
         test_partial_last_column_round_trip();
