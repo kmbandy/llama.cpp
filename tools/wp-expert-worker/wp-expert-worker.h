@@ -27,6 +27,12 @@ struct SlotClass {
     int      slots     = 0;
     int      pin_floor = 0;
     int      pages     = 0;
+    // PAD slots actually reserved per arena of THIS class, filled in by
+    // ExpertSlotPool's constructor after allocate_slot_arenas() runs (0 until
+    // then). May differ class-to-class from ResourcePlan::pad_slots_per_arena
+    // in principle, though in practice every class gets the full reservation
+    // -- see the class_pad_plan() note on wp-expert-worker.cpp.
+    int      pad_slots = 0;
 };
 
 struct ResourcePlan {

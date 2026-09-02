@@ -532,7 +532,17 @@ void test_fixture_arena_stride_alignment() {
         }
         arena_bytes += slot_class.stride * (uint64_t) slot_class.slots;
     }
-    require(arena_bytes == resources.device_bytes &&
+    // device_bytes is the TRUE footprint: usable slots plus each arena's
+    // reserved PAD tail (n_expert_used slots per arena, bought as extra
+    // bytes when a class cannot spare them). The planned slots must fit the
+    // budget; the excess must be no more than the pad tails could account for.
+    uint64_t pad_bytes_max = 0;
+    for (const wp_expert_worker::SlotClass & slot_class : resources.slot_classes) {
+        pad_bytes_max += slot_class.stride * (uint64_t) slot_class.pad_slots *
+            wp_expert_worker::test_pool_arena_count();
+    }
+    require(arena_bytes <= resources.device_bytes &&
+                resources.device_bytes - arena_bytes <= pad_bytes_max &&
                 arena_bytes <= resources.slot_budget_bytes,
             "arena slot classes do not fit their resource budget");
 

@@ -911,6 +911,16 @@ struct RequestStats {
     uint64_t n_cpu_on_arrival = 0;
     uint64_t ns_cpu_on_arrival = 0;
     uint64_t n_cpu_on_arrival_fallback = 0;
+    // WP_WORKER_CHECK_FINITE=1 diagnostics (default off, see
+    // DeviceWorker::scan_finite). Non-finite floats found in this request's
+    // host-side partials, across every read_result() call that scanned.
+    uint64_t n_nonfinite = 0;
+    // Network chunk index of a WP_DISPATCH_STREAM PIPE_EXPERT_PARTIAL_CHUNK
+    // request (set before worker.dispatch() at the send site), UINT32_MAX for
+    // an ordinary (non-chunked) request. Logged on the NON-FINITE line so a
+    // bad value can be tied back to which chunk of a streamed request it came
+    // from -- see scan_finite().
+    uint32_t chunk_index = UINT32_MAX;
 };
 
 using worker_stream_callback = std::function<void(
@@ -1174,6 +1184,7 @@ public:
         n_cpu_on_arrival_ += request.n_cpu_on_arrival;
         ns_cpu_on_arrival_ += request.ns_cpu_on_arrival;
         n_cpu_on_arrival_fallback_ += request.n_cpu_on_arrival_fallback;
+        n_nonfinite_ += request.n_nonfinite;
         ++n_requests_;
         n_experts_ += n_experts;
 
@@ -1254,6 +1265,7 @@ private:
                   << " n_cpu_on_arrival=" << n_cpu_on_arrival_
                   << " ns_cpu_on_arrival=" << ns_cpu_on_arrival_
                   << " n_cpu_on_arrival_fallback=" << n_cpu_on_arrival_fallback_
+                  << " n_nonfinite=" << n_nonfinite_
                   << " read_bytes_per_s=" << (ns_read_complete_ == 0 ? 0.0 :
                         (double) bytes_read_ * 1000000000.0 / (double) ns_read_complete_)
                   << " ns_h2d=" << ns_h2d_
@@ -1487,6 +1499,8 @@ private:
     uint64_t          n_cpu_on_arrival_ = 0;
     uint64_t          ns_cpu_on_arrival_ = 0;
     uint64_t          n_cpu_on_arrival_fallback_ = 0;
+    // WP_WORKER_CHECK_FINITE=1 diagnostic total -- see DeviceWorker::scan_finite.
+    uint64_t          n_nonfinite_ = 0;
     std::string       device_;
     uint64_t          bytes_h2d_  = 0;
     uint64_t          n_reader_h2d_ = 0;
@@ -3915,7 +3929,7 @@ public:
         std::vector<int> actual_reserved;
         for (size_t class_index = 0;
                 class_index < resources_.slot_classes.size(); ++class_index) {
-            const SlotClass & slot_class = resources_.slot_classes[class_index];
+            SlotClass & slot_class = resources_.slot_classes[class_index];
             const uint64_t need = arena_slot_stride(slot_class.size);
             size_t arena_begin = 0;
             size_t arena_end   = arenas_.size();
@@ -3926,6 +3940,15 @@ public:
             }
             if (arena_begin > arena_end || arena_end > arenas_.size()) {
                 throw std::runtime_error("expert slot arenas exhausted");
+            }
+            // What THIS class actually got reserved, for the per-class
+            // "expert slot class" report line -- see the run() print below.
+            // All arenas of a class carry the same pad count (class_pad_plan
+            // is computed once per class), so any arena in range answers it;
+            // max() is defensive if that ever stops being true.
+            for (size_t arena_index = arena_begin; arena_index < arena_end; ++arena_index) {
+                slot_class.pad_slots = std::max(
+                    slot_class.pad_slots, (int) arena_pad_slots_.at(arena_index));
             }
             // Reserved indices were planned as (class start + i) over PLANNED
             // class sizes (plan_resources). Pads shrink every class, so map
@@ -3976,9 +3999,11 @@ public:
         if (effective_pads > 0) {
             std::fprintf(stderr,
                          "wp expert worker: expert slot arenas=%zu pad_slots=%d per arena "
-                         "(reserved, never pageable) planned_slots=%d usable_slots=%d\n",
+                         "(reserved, never pageable) planned_slots=%d usable_slots=%d "
+                         "extra_pad_bytes=%llu\n",
                          arenas_.size(), effective_pads,
-                         resources_.planned_slot_count, resources_.slot_count);
+                         resources_.planned_slot_count, resources_.slot_count,
+                         (unsigned long long) pad_extra_bytes_);
         }
         g_test_pool_pad_slots.store((uint64_t) effective_pads, std::memory_order_relaxed);
         g_test_pool_arena_count.store((uint64_t) arenas_.size(), std::memory_order_relaxed);
@@ -6671,18 +6696,47 @@ private:
     // full n_expert_used is reserved; on a toy fixture whose slot count IS the
     // floor this returns 0 and the pool behaves exactly as it did before pads
     // existed (grouped prefill then declines, and the gather path answers).
-    int class_pad_slots(const SlotClass & slot_class, size_t n_arenas) const {
+    // A class's pad reservation is ALWAYS the full pad_slots_per_arena_
+    // (n_expert_used) per arena -- see the ResourcePlan::pad_slots_per_arena
+    // comment. What varies is where the bytes for it come from:
+    //   - pads_from_spare: taken OUT of the class's planned slot count, same
+    //     as before pads existed as a concept -- the class loses a little
+    //     usable capacity (the "big classes lose ~2%" case), but the arena
+    //     buffer is exactly the planned byte size.
+    //   - pads_extra: when the class does not have n_expert_used slots of
+    //     SPARE above its pin_floor to give away per arena (e.g. a class
+    //     whose planned count EQUALS its pin_floor has spare == 0), the pads
+    //     are instead bought as EXTRA bytes beyond the planned class
+    //     allocation, so usable stays at the planned count.
+    // Deliberately binary, not a partial blend of the two: a class either has
+    // enough spare to fund the WHOLE reservation without touching usable, or
+    // it funds none of it from spare and every pad slot is extra. That keeps
+    // "usable == planned" an exact invariant whenever pads_from_spare == 0,
+    // which is what the pin-floor test below checks.
+    struct PadPlan {
+        int pads_from_spare = 0;
+        int pads_extra      = 0;
+        int total() const { return pads_from_spare + pads_extra; }
+    };
+
+    PadPlan class_pad_plan(const SlotClass & slot_class, size_t n_arenas) const {
+        PadPlan plan;
         if (n_arenas == 0 || pad_slots_per_arena_ <= 0) {
-            return 0;
+            return plan;
         }
         const long long spare =
             (long long) slot_class.slots - (long long) std::max(0, slot_class.pin_floor);
         if (spare <= 0) {
-            return 0;
+            plan.pads_extra = pad_slots_per_arena_;
+            return plan;
         }
         const long long allowed = spare / (long long) n_arenas;
-        return (int) std::min<long long>((long long) pad_slots_per_arena_,
-                                         std::max<long long>(0, allowed));
+        if (allowed >= (long long) pad_slots_per_arena_) {
+            plan.pads_from_spare = pad_slots_per_arena_;
+        } else {
+            plan.pads_extra = pad_slots_per_arena_;
+        }
+        return plan;
     }
 
     // How many arenas a class of `class_total` bytes will be split into at
@@ -6728,20 +6782,24 @@ private:
         // buffer would exceed maxStorageBufferRange on Polaris anyway).
         size_t max_buf = ggml_backend_buft_get_max_size(buft);
         if (single_id_arena) {
-            if (max_buf == 0 || max_buf == SIZE_MAX || total <= max_buf) {
-                buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) total));
+            const SlotClass & only_class = resources_.slot_classes.front();
+            const uint64_t only_stride = arena_slot_stride(only_class.size);
+            const PadPlan pad_plan = class_pad_plan(only_class, 1);
+            const uint64_t alloc_total =
+                total + (uint64_t) pad_plan.pads_extra * only_stride;
+            if (max_buf == 0 || max_buf == SIZE_MAX || alloc_total <= max_buf) {
+                buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) alloc_total));
                 if (buf) {
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     // see the zeroing note on the resident-page allocation above
                     // -- and see push_arena(): this is also what makes the PAD
                     // slots at the end of the arena finite zeros forever.
                     ggml_backend_buffer_clear(buf.get(), 0);
-                    const SlotClass & only_class = resources_.slot_classes.front();
-                    if (!push_arena(std::move(buf), arena_slot_stride(only_class.size),
-                                    class_pad_slots(only_class, 1))) {
+                    if (!push_arena(std::move(buf), only_stride, pad_plan.total())) {
                         throw std::runtime_error(
                             "expert slot arena is too small to reserve pad slots");
                     }
+                    pad_extra_bytes_ += (uint64_t) pad_plan.pads_extra * only_stride;
                     return;
                 }
             }
@@ -6793,30 +6851,41 @@ private:
                 if (arena_bytes == 0) {
                     arena_bytes = stride;
                 }
-                const int class_pads = class_pad_slots(
+                const PadPlan pad_plan = class_pad_plan(
                     slot_class, planned_arena_count(class_total, arena_bytes, stride));
+                const int pad_total = pad_plan.total();
+                const uint64_t extra_bytes = (uint64_t) pad_plan.pads_extra * stride;
                 uint64_t remaining = class_total;
                 while (remaining > 0) {
+                    // `want` -- and everything charged against the slot budget
+                    // (`allocated` above) -- is the PLANNED byte size only; any
+                    // pads_extra bytes are bought on top of it below and never
+                    // counted against the budget invariant.
                     const uint64_t want = std::min(arena_bytes, remaining);
                     // FOLD AWAY a tail too small to hold even one usable slot
-                    // once the pads are taken out: allocating it would give
-                    // compute_arena_layout an arena with zero slots (which it
-                    // rejects outright) and would spend budget on nothing.
-                    if (want / stride <= (uint64_t) class_pads) {
+                    // once the spare-funded pads are taken out: allocating it
+                    // would give compute_arena_layout an arena with zero slots
+                    // (which it rejects outright) and would spend budget on
+                    // nothing. Extra-funded pads never shrink usable, so they
+                    // never fold a tail away.
+                    if (want / stride <= (uint64_t) pad_plan.pads_from_spare) {
                         remaining -= want;
                         continue;
                     }
-                    buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) want));
+                    buffer_ptr buf(ggml_backend_buft_alloc_buffer(
+                        buft, (size_t) (want + extra_bytes)));
                     if (!buf) {
                         throw std::runtime_error(
-                            "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
+                            "failed to allocate expert slot arena of " +
+                            std::to_string(want + extra_bytes) + " bytes");
                     }
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     // see the zeroing note on the resident-page allocation above
                     ggml_backend_buffer_clear(buf.get(), 0);
-                    push_arena(std::move(buf), stride, class_pads);
+                    push_arena(std::move(buf), stride, pad_total);
                     remaining -= want;
                     allocated += want;
+                    pad_extra_bytes_ += extra_bytes;
                 }
             }
             return;
@@ -6833,27 +6902,32 @@ private:
         if (arena_bytes == 0) {
             arena_bytes = max_stride;
         }
-        const int class_pads = resources_.slot_classes.empty() ? 0 : class_pad_slots(
+        const PadPlan pad_plan = resources_.slot_classes.empty() ? PadPlan{} : class_pad_plan(
             resources_.slot_classes.front(),
             planned_arena_count(total, arena_bytes, max_stride));
+        const int pad_total = pad_plan.total();
+        const uint64_t extra_bytes = (uint64_t) pad_plan.pads_extra * max_stride;
         uint64_t remaining = total;
         while (remaining > 0) {
             const uint64_t want = std::min(arena_bytes, remaining);
             // see the fold-away note on the size-class path above
-            if (want / max_stride <= (uint64_t) class_pads) {
+            if (want / max_stride <= (uint64_t) pad_plan.pads_from_spare) {
                 remaining -= want;
                 continue;
             }
-            buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) want));
+            buffer_ptr buf(ggml_backend_buft_alloc_buffer(
+                buft, (size_t) (want + extra_bytes)));
             if (!buf) {
                 throw std::runtime_error(
-                    "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
+                    "failed to allocate expert slot arena of " +
+                    std::to_string(want + extra_bytes) + " bytes");
             }
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // see the zeroing note on the resident-page allocation above
             ggml_backend_buffer_clear(buf.get(), 0);
-            push_arena(std::move(buf), max_stride, class_pads);
+            push_arena(std::move(buf), max_stride, pad_total);
             remaining -= want;
+            pad_extra_bytes_ += extra_bytes;
         }
     }
 
@@ -7604,6 +7678,10 @@ private:
     std::vector<size_t>        arena_pad_slots_;
     int                        pad_slots_per_arena_ = 0;
     std::vector<size_t>        arena_class_starts_;
+    // Bytes allocated ONLY to fund pads that a class could not spare out of
+    // its planned slot count -- see class_pad_plan(). 0 whenever every class
+    // had enough headroom above its pin_floor to fund its pads from spare.
+    uint64_t                   pad_extra_bytes_ = 0;
     std::vector<Slot>          slots_;
     // Filled once in the constructor, after slots_ is built; see the
     // memoisation note on arena_layout(). Immutable thereafter, so it is
@@ -13926,8 +14004,50 @@ private:
         return true;
     }
 
+    // WP_WORKER_CHECK_FINITE=1 (default off): scan a just-read-back partial
+    // for NaN/Inf and print ONE diagnostic line at the first bad value found,
+    // plus bump the per-device n_nonfinite counter on the "wp expert worker
+    // stats device=..." line. `path` is null to skip the scan entirely (the
+    // Vulkan-fused selfcheck's internal comparison reads, which are not the
+    // partial actually returned to a client); non-null callers pass which
+    // compute path produced this result -- "grouped" (compute_batch_arena_prefill
+    // hit), "gather" or "dense" -- so a bad value can be triaged by path.
+    // Cheap: the whole thing short-circuits to nothing when the env is unset.
+    void scan_finite(const std::vector<float> & result, RequestStats & request_stats,
+                     int layer, uint32_t n_tokens, const char * path) {
+        static const bool s_enabled = [] {
+            const char * e = std::getenv("WP_WORKER_CHECK_FINITE");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (!s_enabled || path == nullptr) {
+            return;
+        }
+        size_t first_index = SIZE_MAX;
+        size_t n_bad = 0;
+        for (size_t i = 0; i < result.size(); ++i) {
+            if (!std::isfinite(result[i])) {
+                if (first_index == SIZE_MAX) {
+                    first_index = i;
+                }
+                ++n_bad;
+            }
+        }
+        if (n_bad == 0) {
+            return;
+        }
+        request_stats.n_nonfinite += n_bad;
+        std::fprintf(stderr,
+                     "wp expert worker: NON-FINITE partial device=%s layer=%d n_tokens=%u "
+                     "chunk=%d path=%s first_index=%zu n_bad=%zu\n",
+                     device_name_.c_str(), layer, n_tokens,
+                     request_stats.chunk_index == UINT32_MAX
+                         ? -1 : (int) request_stats.chunk_index,
+                     path, first_index, n_bad);
+    }
+
     void read_result(std::vector<float> & result, RequestStats & request_stats,
-                     size_t result_offset = std::numeric_limits<size_t>::max()) {
+                     size_t result_offset = std::numeric_limits<size_t>::max(),
+                     int finite_check_layer = -1, const char * finite_check_path = nullptr) {
         synchronize_async(&request_stats);
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead(),
@@ -13963,6 +14083,7 @@ private:
         if (stats_.enabled() && is_vulkan_backend()) {
             request_stats.ns_vk_readback += readback_elapsed;
         }
+        scan_finite(result, request_stats, finite_check_layer, n_tokens, finite_check_path);
     }
 
     void compute_cpu_on_arrival(
@@ -14497,6 +14618,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_cpu_on_arrival += src.n_cpu_on_arrival;
     dst.ns_cpu_on_arrival += src.ns_cpu_on_arrival;
     dst.n_cpu_on_arrival_fallback += src.n_cpu_on_arrival_fallback;
+    dst.n_nonfinite += src.n_nonfinite;
     dst.d3_counted = dst.d3_counted || src.d3_counted;
 }
 
@@ -18310,7 +18432,7 @@ int run(const Options & options) {
                   << " slots=" << slot_class.slots
                   << " stride=" << slot_class.stride
                   << " pin_floor=" << slot_class.pin_floor
-                  << " pad_slots=" << resources.pad_slots_per_arena << " per arena"
+                  << " pad_slots=" << slot_class.pad_slots << " per arena"
                   << " pages=" << slot_class.pages << '\n';
     }
     if (worker.device_count() > 1) {
