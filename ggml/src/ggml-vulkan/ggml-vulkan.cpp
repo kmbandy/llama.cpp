@@ -10834,6 +10834,8 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
 }
 
 static constexpr uint32_t GGML_VK_MUL_MAT_FORCE_MM_REFERENCE_TOKENS = 512;
+// pinned MUL_MAT default: the mat-vec shader in fixed groups of this many columns
+static constexpr uint32_t GGML_VK_MUL_MAT_PIN_GROUP = 8;
 
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, bool force_mm) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -11216,7 +11218,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     GGML_UNUSED(m);
 }
 
-static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool pin = false) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -11255,7 +11257,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+    // pinned (GGML_HINT_MUL_MAT_PIN) groups evaluate the mmvq decision at the fixed group width, so the
+    // y-quantization choice cannot change with the real column count
+    const uint64_t ne11_decide = pin ? GGML_VK_MUL_MAT_PIN_GROUP : ne11;
+    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11_decide * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11_decide, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -11749,6 +11754,51 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, scale_buf, dst_buf }, pc, { (uint32_t)n_groups, 1, 1 });
 }
 
+// Pinned MUL_MAT through the mat-vec shader in fixed column groups. Each group is a plain
+// column window of src1/dst (same buffer, offset data pointer) dispatched as its own
+// single-node graph, so ggml_vk_mul_mat_vec_q_f16 sees ne11 <= GGML_VK_MUL_MAT_PIN_GROUP.
+static void ggml_vk_mul_mat_pinned_vec(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t ne11 = src1->ne[1];
+    const int64_t group = GGML_VK_MUL_MAT_PIN_GROUP;
+
+    const uint8_t * y_base = (const uint8_t *) (src1->view_src ? src1->view_src->data : src1->data) + (src1->view_src ? src1->view_offs : 0);
+    uint8_t *       d_base = (uint8_t *)       (dst->view_src  ? dst->view_src->data  : dst->data)  + (dst->view_src  ? dst->view_offs  : 0);
+
+    const int saved_fused = ctx->num_additional_fused_ops;
+    ctx->num_additional_fused_ops = 0;
+
+    for (int64_t c0 = 0; c0 < ne11; c0 += group) {
+        const int64_t nc = std::min(group, ne11 - c0);
+
+        ggml_tensor y = *src1;
+        ggml_tensor d = *dst;
+        y.ne[1] = nc; y.ne[2] = 1; y.ne[3] = 1;
+        d.ne[1] = nc; d.ne[2] = 1; d.ne[3] = 1;
+        y.nb[2] = y.nb[1] * nc; y.nb[3] = y.nb[2];
+        d.nb[2] = d.nb[1] * nc; d.nb[3] = d.nb[2];
+        y.data = (void *) (y_base + c0 * src1->nb[1]);
+        d.data = (void *) (d_base + c0 * dst->nb[1]);
+        y.view_src = nullptr; y.view_offs = 0; y.op = GGML_OP_NONE;
+        d.view_src = nullptr; d.view_offs = 0;
+        for (auto & sp : y.src) { sp = nullptr; }
+        for (auto & sp : d.src) { sp = nullptr; }
+        d.src[0] = src0;
+        d.src[1] = &y;
+
+        ggml_tensor * nodes[1] = { &d };
+        ggml_cgraph g = {};
+        g.n_nodes = 1;
+        g.nodes = nodes;
+
+        // the prealloc_y reuse cache is keyed on the src1 pointer; the window tensor lives on
+        // the stack at the same address every iteration, so it must be re-quantized each time
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, &g, 0, true);
+    }
+
+    ctx->num_additional_fused_ops = saved_fused;
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -11786,7 +11836,26 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
         ggml_vk_fwht(ctx, subctx, src1, dst);
     } else if (force_mm) {
-        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, true);
+        // GGML_HINT_MUL_MAT_PIN: bit-identical output regardless of ne11. Default = the mat-vec
+        // shader in fixed groups of GGML_VK_MUL_MAT_PIN_GROUP columns; every column's reduction
+        // is independent of NUM_COLS, so a shorter tail group needs no padding (verified by
+        // test-wp-mul-mat-pin). GGML_VK_PIN_KERNEL=mm keeps the matrix-pipeline pin for A/B.
+        static const bool pin_mm = [] {
+            const char * env = std::getenv("GGML_VK_PIN_KERNEL");
+            return env != nullptr && std::strcmp(env, "mm") == 0;
+        }();
+        // plan recording keeps tensor pointers for replay-time buffer resolution; the group
+        // windows below are stack tensors, so a recorded plan takes the matrix pin instead
+        const bool mmv_ok = !pin_mm && ctx->recording_plan == nullptr &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
+            src1->ne[2] * src1->ne[3] == 1 && dst->ne[2] * dst->ne[3] == 1 &&
+            ggml_vk_dim01_contiguous(src1) && ggml_is_contiguous(dst) &&
+            ctx->device->mul_mat_vec_max_cols_eff >= GGML_VK_MUL_MAT_PIN_GROUP;
+        if (!mmv_ok) {
+            ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, true);
+        } else {
+            ggml_vk_mul_mat_pinned_vec(ctx, subctx, src0, src1, dst);
+        }
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -59,6 +60,19 @@ std::vector<float> compute(
             "pinned MUL_MAT graph compute failed");
 
     ggml_backend_synchronize(backend);
+    // WP_PIN_TEST_BENCH=<reps>: time the same graph <reps> more times and print ms/iter,
+    // so the pinned vs unpinned (WP_PIN_TEST_NOHINT=1) kernel cost can be attributed per backend
+    static const int bench_reps = [] { const char * e = std::getenv("WP_PIN_TEST_BENCH"); return e ? std::atoi(e) : 0; }();
+    if (bench_reps > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < bench_reps; ++r) {
+            require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "bench compute failed");
+        }
+        ggml_backend_synchronize(backend);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / bench_reps;
+        std::printf("test-wp-mul-mat-pin: bench %s %s n=%3d hint=%d %8.3f ms/iter\n", ggml_backend_name(backend), ggml_type_name(type), (int) n,
+                    std::getenv("WP_PIN_TEST_NOHINT") == nullptr ? 1 : 0, ms);
+    }
     std::vector<float> result((size_t) (M * n));
     ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
     ggml_backend_buffer_free(buffer);
