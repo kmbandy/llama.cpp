@@ -461,6 +461,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_MUL_MAT_PIN      = 2,
     };
 
     // model file types

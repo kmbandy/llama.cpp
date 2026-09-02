@@ -2688,6 +2688,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
+    if (tensor->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(tensor, 1) == GGML_HINT_MUL_MAT_PIN) {
+        return false;
+    }
+
     bool use_mul_mat_vec_f =
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
@@ -2721,6 +2725,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+    if (tensor->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(tensor, 1) == GGML_HINT_MUL_MAT_PIN) {
+        return false;
+    }
     if (is_mul_mat_id && ggml_cuda_mul_mat_id_force_mm(src1->ne[2])) {
         return false;
     }
@@ -2754,6 +2761,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
+    const bool force_mm = hint == GGML_HINT_MUL_MAT_PIN;
 
     // MAD Task 11: scaled-fp8 (ml8-fp8) weights stay a plain GGML_OP_MUL_MAT
     // (no centroid sidecar, no load-time op-swap). Route them to the no-LUT
@@ -2787,6 +2795,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (force_mm) {
+        GGML_ASSERT(!bad_padding_clear);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0, true));
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst, true);
+        return;
+    }
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
@@ -2808,7 +2824,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {

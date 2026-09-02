@@ -290,6 +290,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-wp-mul-mat-pin.cpp)
 llama_build_and_test(test-paged-attn-vk.cpp)
 
 # MAD-392: numeric oracle for the paged decode kernels. Compares the flash-decode

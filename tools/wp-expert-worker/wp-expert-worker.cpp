@@ -189,6 +189,16 @@ int parse_gather_min_tokens(const char * env) {
     return v < 1 ? 1 : v;
 }
 
+// default 9: every gather-path request wider than a decode/verify batch is pinned,
+// including the 16-token chunks a 64-token streamed dispatch produces
+static int parse_mm_pin_min_tokens(const char * env) {
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 9;
+    }
+    const int v = std::atoi(env);
+    return v < 1 ? 1 : v;
+}
+
 bool parse_env_default_on(const char * env) {
     return env == nullptr || env[0] == '\0' || env[0] != '0';
 }
@@ -10770,10 +10780,16 @@ private:
         // Default ON: linear set_rows scatter. =0 restores get_rows_back.
         static const bool s_set_rows =
             parse_env_default_on(std::getenv("WP_EXPERT_SCATTER_SET_ROWS"));
+        static const bool s_mm_pin =
+            parse_env_default_off(std::getenv("WP_EXPERT_MM_PIN"));
+        static const int s_mm_pin_min_tokens =
+            parse_mm_pin_min_tokens(std::getenv("WP_EXPERT_MM_PIN_MIN_TOKENS"));
         // PER-REQUEST, not static: prefill and decode requests interleave in one
         // worker, so this must be decided per request and never cached.
         const bool use_gather = use_expert_gather(
             request.n_tokens, force_dense, s_gather_min_tokens, s_gather);
+        const bool pin_mul_mat = use_gather && s_mm_pin && request.n_tokens > 8 &&
+            request.n_tokens >= (uint32_t) s_mm_pin_min_tokens;
 
         // *** THE REAL WP_VK_FUSED_EXPERT GATE. ***
         // compute_batch_fused() computes the FULL dense FFN for every selected
@@ -11261,6 +11277,13 @@ private:
         // alive until after ggml_gallocr_alloc_graph so they can be uploaded.
         std::vector<std::pair<ggml_tensor *, std::vector<int32_t>>> gather_idx;
         gather_idx.reserve(n_selected);
+        const auto mul_mat = [&](ggml_tensor * weight, ggml_tensor * activation) {
+            ggml_tensor * result = ggml_mul_mat(ctx.get(), weight, activation);
+            if (pin_mul_mat) {
+                ggml_mul_mat_set_hint(result, GGML_HINT_MUL_MAT_PIN);
+            }
+            return result;
+        };
 
         for (size_t i = 0; i < request.assignments.size(); ++i) {
             if (!selected(i)) {
@@ -11321,13 +11344,13 @@ private:
                 // [2*ne1, n_rows] -> swiglu halves it: out[i] = silu(a[i]) * a[i+ne1],
                 // i.e. exactly ggml_swiglu_split(gate, up).
                 hidden = ggml_swiglu(
-                    ctx.get(), ggml_mul_mat(ctx.get(), gate_up, ffn_in));
+                    ctx.get(), mul_mat(gate_up, ffn_in));
             }
             ggml_tensor * gate = nullptr;
             ggml_tensor * up   = nullptr;
             if (hidden == nullptr) {
-                gate = ggml_mul_mat(ctx.get(), make_weight("gate"), ffn_in);
-                up   = ggml_mul_mat(ctx.get(), make_weight("up"), ffn_in);
+                gate = mul_mat(make_weight("gate"), ffn_in);
+                up   = mul_mat(make_weight("up"), ffn_in);
             }
             // *** SwiGLU CLAMP. ADDED 2026-08-05 -- ITS ABSENCE WAS A CORRECTNESS BUG. ***
             // Mirrors the LLM_ARCH_DEEPSEEK4 branch of build_moe_ffn() in
@@ -11350,7 +11373,7 @@ private:
                 }
                 hidden = ggml_swiglu_split(ctx.get(), gate, up);
             }
-            ggml_tensor * output = ggml_mul_mat(ctx.get(), make_weight("down"), hidden);
+            ggml_tensor * output = mul_mat(make_weight("down"), hidden);
             // SHAPE MATTERS: [1, n_tokens], NOT [n_tokens]. output is
             // [n_embd, n_tokens]; ggml_mul broadcasts src1 into src0 via
             // ggml_can_repeat, which only checks ne[i] % src1->ne[i] == 0. A
