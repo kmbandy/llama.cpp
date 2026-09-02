@@ -91,6 +91,12 @@ constexpr int64_t N_SLOTS = 6;
 constexpr int64_t N_USED  = 4;
 
 int32_t slot_for(int64_t k, int64_t t) {
+    // WP_PIN_TEST_ID_DUP=1: every token lists each of two slots twice ([a, a, b, b]), the shape the
+    // worker's zero-weight padding can produce when the pad slot is also a real route
+    static const bool dup = std::getenv("WP_PIN_TEST_ID_DUP") != nullptr;
+    if (dup) {
+        return (int32_t) ((t * 7 + (k / 2) * 5 + (t / 3)) % N_SLOTS);
+    }
     return (int32_t) ((t * 7 + k * 5 + (t / 3)) % N_SLOTS);
 }
 
@@ -121,6 +127,23 @@ std::vector<float> compute_id(
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4, false);
     ggml_build_forward_expand(graph, output);
 
+    // WP_PIN_TEST_ID_TIGHT=1: put the expert slab in its own buffer of exactly its byte size, so
+    // any kernel read past the last expert's last row lands outside the allocation (the worker's
+    // arena ends exactly at its last slot; 2026-09-02 R9700 page fault in the grouped prefill)
+    static const bool tight = std::getenv("WP_PIN_TEST_ID_TIGHT") != nullptr;
+    ggml_backend_buffer_t as_buffer = nullptr;
+    if (tight) {
+        // 64 MiB is a multiple of every allocator granule seen here (2 MiB on HIP/CUDA VMM), so
+        // a slab placed at the END of it ends exactly where the mapping ends
+        const size_t tight_bytes = (size_t) 64 << 20;
+        require(ggml_nbytes(as) <= tight_bytes, "expert slab larger than the tight buffer");
+        as_buffer = ggml_backend_alloc_buffer(backend, tight_bytes);
+        require(as_buffer != nullptr, "failed to allocate the tight expert slab buffer");
+        const size_t align = ggml_backend_buffer_get_alignment(as_buffer);
+        const size_t tail = ((tight_bytes - ggml_nbytes(as)) / align) * align;
+        require(ggml_backend_tensor_alloc(as_buffer, as, (char *) ggml_backend_buffer_get_base(as_buffer) + tail) == GGML_STATUS_SUCCESS,
+                "failed to place the expert slab at the end of its tight buffer");
+    }
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "failed to allocate MUL_MAT_ID pin tensors");
     std::vector<int32_t> ids_host((size_t) (N_USED * n));
@@ -151,6 +174,9 @@ std::vector<float> compute_id(
     std::vector<float> result((size_t) (M * N_USED * n));
     ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
     ggml_backend_buffer_free(buffer);
+    if (as_buffer != nullptr) {
+        ggml_backend_buffer_free(as_buffer);
+    }
     ggml_free(ctx);
     return result;
 }
