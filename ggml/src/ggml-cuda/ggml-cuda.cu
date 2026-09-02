@@ -2799,14 +2799,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (force_mm) {
         GGML_ASSERT(!bad_padding_clear);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-        // GGML_MUL_MAT_PIN_KERNEL=mmq pins to MMQ; default mmvq runs the vector kernel in
-        // fixed groups of MMVQ_MAX_BATCH_SIZE columns (tail zero-padded) so a column's
-        // arithmetic never depends on ne11
-        static const bool pin_mmq = [] {
+        // Default pin = MMQ: at 1-8 columns it costs the same as the MMVQ groups and at
+        // 64-512 columns it is 2-12x cheaper on R9700, 6900XT and GTX1070
+        // (test-wp-mul-mat-pin WP_PIN_TEST_BENCH, 2026-09-02). GGML_MUL_MAT_PIN_KERNEL=mmvq
+        // runs the vector kernel in fixed groups of MMVQ_MAX_BATCH_SIZE columns instead
+        // (tail zero-padded); both keep a column's arithmetic independent of ne11.
+        static const bool pin_mmvq = [] {
             const char * env = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
-            return env != nullptr && std::strcmp(env, "mmq") == 0;
+            return env != nullptr && std::strcmp(env, "mmvq") == 0;
         }();
-        const bool mmvq_ok = !pin_mmq && ggml_is_quantized(src0->type) && ne12 == 1 && ne13 == 1 &&
+        const bool mmvq_ok = pin_mmvq && ggml_is_quantized(src0->type) && ne12 == 1 && ne13 == 1 &&
             ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
         if (!mmvq_ok) {
             GGML_ASSERT(ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0, true));
