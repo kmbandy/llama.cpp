@@ -324,6 +324,249 @@ void test_type(ggml_backend_t backend, ggml_type type) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP_PIN_TEST_ID_BENCH=<reps>: production-shaped MUL_MAT_ID bench.
+//
+// The MoE expert worker prefills a 128-token chunk per layer either as ONE
+// ggml_mul_mat_id over a strided slab of ~499 expert slots (ids [10, 128]), or
+// as one pinned ggml_mul_mat per routed expert over that expert's gathered token
+// rows. This mode builds both graphs over the SAME slab and the SAME routing and
+// times them, so `mul_mat_id vs the equivalent gather sequence` can be compared
+// per backend and per quant type.
+//
+// Overrides: WP_PIN_TEST_ID_BENCH_SLOTS (default 499), _TOKENS (128), _USED (10),
+//            _ROUTED (180), _ROWS (expert rows M, default 640).
+// ---------------------------------------------------------------------------
+
+int env_int(const char * name, int fallback) {
+    const char * e = std::getenv(name);
+    if (e == nullptr) {
+        return fallback;
+    }
+    const int v = std::atoi(e);
+    return v > 0 ? v : fallback;
+}
+
+struct id_bench_config {
+    int64_t n_slots;
+    int64_t n_tokens;
+    int64_t n_used;
+    int64_t n_routed;
+    int64_t rows;   // M: rows of one expert matrix
+};
+
+id_bench_config id_bench_cfg() {
+    id_bench_config c;
+    c.n_slots  = env_int("WP_PIN_TEST_ID_BENCH_SLOTS",  499);
+    c.n_tokens = env_int("WP_PIN_TEST_ID_BENCH_TOKENS", 128);
+    c.n_used   = env_int("WP_PIN_TEST_ID_BENCH_USED",    10);
+    c.n_routed = env_int("WP_PIN_TEST_ID_BENCH_ROUTED", 180);
+    c.rows     = env_int("WP_PIN_TEST_ID_BENCH_ROWS",   640);
+    c.n_routed = std::min(c.n_routed, c.n_slots);
+    c.n_used   = std::min(c.n_used,   c.n_routed);
+    return c;
+}
+
+void bench_id(ggml_backend_t backend, ggml_type type) {
+    static const int reps = env_int("WP_PIN_TEST_ID_BENCH", 0);
+    if (reps <= 0) {
+        return;
+    }
+    const id_bench_config cfg = id_bench_cfg();
+    const int64_t BM = cfg.rows;
+    const bool    hint = std::getenv("WP_PIN_TEST_NOHINT") == nullptr;
+
+    // routing: 10 DISTINCT slots per token, drawn from a pool of cfg.n_routed
+    // "routed" slots spread across the slab (the worker's arena is strided, so the
+    // touched slots are not the first n_routed of the slab)
+    auto pool_slot = [&](int64_t j) { return (int32_t) ((j * cfg.n_slots) / cfg.n_routed); };
+    std::vector<int32_t> ids_host((size_t) (cfg.n_used * cfg.n_tokens));
+    std::vector<std::vector<int64_t>> rows_of_pool((size_t) cfg.n_routed);   // pool -> gathered row idx
+    std::vector<int64_t> pool_of_row;                                        // gathered row idx -> pool
+    std::vector<int64_t> pair_of_row;                                        // gathered row idx -> t*n_used + k
+    {
+        std::vector<int64_t> taken((size_t) cfg.n_routed, -1);
+        std::vector<std::vector<int64_t>> pairs_of_pool((size_t) cfg.n_routed);
+        for (int64_t t = 0; t < cfg.n_tokens; ++t) {
+            for (int64_t k = 0; k < cfg.n_used; ++k) {
+                uint32_t h = (uint32_t) (t * 2654435761u + k * 40503u + (t >> 3) * 97u);
+                h ^= h >> 13;
+                int64_t j = (int64_t) (h % (uint32_t) cfg.n_routed);
+                while (taken[(size_t) j] == t) {   // de-dup within the token
+                    j = (j + 1) % cfg.n_routed;
+                }
+                taken[(size_t) j] = t;
+                ids_host[(size_t) (t * cfg.n_used + k)] = pool_slot(j);
+                pairs_of_pool[(size_t) j].push_back(t * cfg.n_used + k);
+            }
+        }
+        for (int64_t j = 0; j < cfg.n_routed; ++j) {
+            for (const int64_t pair : pairs_of_pool[(size_t) j]) {
+                rows_of_pool[(size_t) j].push_back((int64_t) pool_of_row.size());
+                pool_of_row.push_back(j);
+                pair_of_row.push_back(pair);
+            }
+        }
+    }
+    const int64_t n_gathered = (int64_t) pool_of_row.size();   // == n_tokens * n_used
+
+    // slab: quantize slot by slot from one [K, BM] f32 buffer -- the full f32 slab
+    // would be 3.3 GB at the default shape
+    const size_t slot_bytes = ggml_row_size(type, K) * (size_t) BM;
+    std::vector<uint8_t> slab((size_t) cfg.n_slots * slot_bytes, 0);
+    {
+        std::vector<float> slot((size_t) (K * BM));
+        std::vector<float> imatrix((size_t) K, 1.0f);
+        const float * imatrix_data = ggml_quantize_requires_imatrix(type) ? imatrix.data() : nullptr;
+        for (int64_t j = 0; j < cfg.n_routed; ++j) {   // only routed slots are ever read
+            const int64_t s = pool_slot(j);
+            for (size_t i = 0; i < slot.size(); ++i) {
+                slot[i] = ((int) ((i * 31 + i / K * 5 + (size_t) s * 17) % 241) - 120) * 0.0007f;
+            }
+            require(ggml_quantize_chunk(type, slot.data(), slab.data() + (size_t) s * slot_bytes,
+                                        0, BM, K, imatrix_data) == slot_bytes,
+                    std::string("id-bench: failed to quantize expert slot for ") + ggml_type_name(type));
+        }
+    }
+    std::vector<float> act((size_t) (K * cfg.n_tokens));
+    for (size_t i = 0; i < act.size(); ++i) {
+        act[i] = ((int) ((i * 13 + i / K * 3) % 131) - 65) * 0.003f;
+    }
+
+    const size_t n_nodes_gather = (size_t) (3 * cfg.n_routed);
+    const ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (3 * n_nodes_gather + 32)
+                          + ggml_graph_overhead_custom(8, false)
+                          + ggml_graph_overhead_custom(n_nodes_gather + 8, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to create id-bench context");
+
+    // GROUPED: one mul_mat_id over the whole slab, expanded [K, n_used, n_tokens] input
+    ggml_tensor * as     = ggml_new_tensor_3d(ctx, type, K, BM, cfg.n_slots);
+    ggml_tensor * input  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, cfg.n_used, cfg.n_tokens);
+    ggml_tensor * ids    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cfg.n_used, cfg.n_tokens);
+    ggml_tensor * out_id = ggml_mul_mat_id(ctx, as, input, ids);
+    if (hint) {
+        ggml_mul_mat_id_set_hint(out_id, GGML_HINT_MUL_MAT_PIN);
+    }
+    ggml_cgraph * graph_id = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph_id, out_id);
+
+    // GATHER: same routing, one pinned mul_mat per routed expert against that
+    // expert's rows inside one [K, n_gathered] gathered activation tensor
+    ggml_tensor * gin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_gathered);
+    ggml_cgraph * graph_gather = ggml_new_graph_custom(ctx, n_nodes_gather + 8, false);
+    std::vector<ggml_tensor *> gather_out((size_t) cfg.n_routed, nullptr);
+    int gather_nodes = 0;
+    for (int64_t j = 0; j < cfg.n_routed; ++j) {
+        const int64_t n_rows_e = (int64_t) rows_of_pool[(size_t) j].size();
+        if (n_rows_e == 0) {
+            continue;
+        }
+        const int64_t s = pool_slot(j);
+        ggml_tensor * w = ggml_view_2d(ctx, as, K, BM, as->nb[1], (size_t) s * as->nb[2]);
+        ggml_tensor * x = ggml_view_2d(ctx, gin, K, n_rows_e, gin->nb[1],
+                                       (size_t) rows_of_pool[(size_t) j][0] * gin->nb[1]);
+        ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+        if (hint) {
+            ggml_mul_mat_set_hint(y, GGML_HINT_MUL_MAT_PIN);
+        }
+        ggml_build_forward_expand(graph_gather, y);
+        gather_out[(size_t) j] = y;
+        ++gather_nodes;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "failed to allocate id-bench tensors");
+
+    ggml_backend_tensor_set_async(backend, as, slab.data(), 0, slab.size());
+    ggml_backend_tensor_set_async(backend, ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
+    {
+        std::vector<float> expanded((size_t) (K * cfg.n_used * cfg.n_tokens));
+        for (int64_t t = 0; t < cfg.n_tokens; ++t) {
+            for (int64_t k = 0; k < cfg.n_used; ++k) {
+                std::copy(act.begin() + t * K, act.begin() + (t + 1) * K,
+                          expanded.begin() + (t * cfg.n_used + k) * K);
+            }
+        }
+        ggml_backend_tensor_set_async(backend, input, expanded.data(), 0, expanded.size() * sizeof(float));
+        std::vector<float> gathered((size_t) (K * n_gathered));
+        for (int64_t g = 0; g < n_gathered; ++g) {
+            const int64_t t = pair_of_row[(size_t) g] / cfg.n_used;
+            std::copy(act.begin() + t * K, act.begin() + (t + 1) * K, gathered.begin() + g * K);
+        }
+        ggml_backend_tensor_set_async(backend, gin, gathered.data(), 0, gathered.size() * sizeof(float));
+        ggml_backend_synchronize(backend);
+    }
+
+    // one warm-up + correctness pass each
+    require(ggml_backend_graph_compute(backend, graph_id) == GGML_STATUS_SUCCESS, "id-bench grouped compute failed");
+    require(ggml_backend_graph_compute(backend, graph_gather) == GGML_STATUS_SUCCESS, "id-bench gather compute failed");
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> grouped((size_t) (BM * cfg.n_used * cfg.n_tokens));
+    ggml_backend_tensor_get(out_id, grouped.data(), 0, grouped.size() * sizeof(float));
+    bool grouped_nonzero = false;
+    for (const float v : grouped) {
+        require(std::isfinite(v), std::string("id-bench: non-finite grouped result for ") + ggml_type_name(type));
+        grouped_nonzero = grouped_nonzero || v != 0.0f;
+    }
+    require(grouped_nonzero, std::string("id-bench: all-zero grouped result for ") + ggml_type_name(type));
+    size_t bad_rows = 0;
+    float  worst_rel = 0.0f;
+    std::vector<float> row((size_t) BM);
+    for (int64_t j = 0; j < cfg.n_routed; ++j) {
+        if (gather_out[(size_t) j] == nullptr) {
+            continue;
+        }
+        const int64_t n_rows_e = (int64_t) rows_of_pool[(size_t) j].size();
+        std::vector<float> got((size_t) (BM * n_rows_e));
+        ggml_backend_tensor_get(gather_out[(size_t) j], got.data(), 0, got.size() * sizeof(float));
+        for (int64_t i = 0; i < n_rows_e; ++i) {
+            const int64_t pair = pair_of_row[(size_t) rows_of_pool[(size_t) j][(size_t) i]];
+            float row_rel = 0.0f;
+            for (int64_t r = 0; r < BM; ++r) {
+                const float a = got[(size_t) (i * BM + r)];
+                const float b = grouped[(size_t) (pair * BM + r)];
+                row_rel = std::max(row_rel, std::fabs(a - b) / (std::fabs(b) + 1.0f));
+            }
+            worst_rel = std::max(worst_rel, row_rel);
+            if (row_rel > 2e-2f) {
+                ++bad_rows;
+            }
+        }
+    }
+    if (bad_rows > 0) {
+        ++failures;
+        std::printf("test-wp-mul-mat-pin: MISMATCH id-bench %s %s grouped vs gather: %zu/%lld rows differ, worst rel err %.3e\n",
+                    ggml_backend_name(backend), ggml_type_name(type), bad_rows, (long long) n_gathered, worst_rel);
+    }
+
+    auto time_graph = [&](ggml_cgraph * g) {
+        ggml_backend_synchronize(backend);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; ++r) {
+            require(ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS, "id-bench timed compute failed");
+            ggml_backend_synchronize(backend);
+        }
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+    };
+    const double grouped_ms = time_graph(graph_id);
+    const double gather_ms  = time_graph(graph_gather);
+
+    std::printf("id-bench backend=%s type=%s tokens=%lld used=%lld slots=%lld routed=%lld grouped_ms=%.3f gather_ms=%.3f gather_nodes=%d hint=%d worst_rel=%.3e\n",
+                ggml_backend_name(backend), ggml_type_name(type),
+                (long long) cfg.n_tokens, (long long) cfg.n_used, (long long) cfg.n_slots, (long long) cfg.n_routed,
+                grouped_ms, gather_ms, gather_nodes, hint ? 1 : 0, worst_rel);
+    std::fflush(stdout);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
 } // namespace
 
 int main() {
@@ -354,6 +597,7 @@ int main() {
                  GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
             test_type(backend, type);
             test_type_id(backend, type);
+            bench_id(backend, type);
         }
 
         ggml_backend_free(backend);
