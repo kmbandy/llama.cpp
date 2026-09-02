@@ -98,9 +98,19 @@ void test_type(ggml_backend_t backend, ggml_type type) {
 int main() {
     try {
         require(setenv("WP_CPU_GEMM", "1", 1) == 0, "failed to enable WP_CPU_GEMM test arm");
-        ggml_backend_t backend = ggml_backend_cpu_init();
-        require(backend != nullptr, "failed to initialize CPU backend");
-        ggml_backend_cpu_set_n_threads(backend, 4);
+        // WP_PIN_TEST_BACKEND selects a backend by name (CPU, ROCm0, CUDA0, Vulkan0)
+        const char * backend_name = std::getenv("WP_PIN_TEST_BACKEND");
+        ggml_backend_t backend = nullptr;
+        if (backend_name == nullptr || std::strcmp(backend_name, "CPU") == 0) {
+            backend = ggml_backend_cpu_init();
+            require(backend != nullptr, "failed to initialize CPU backend");
+            ggml_backend_cpu_set_n_threads(backend, 4);
+        } else {
+            ggml_backend_load_all();
+            backend = ggml_backend_init_by_name(backend_name, nullptr);
+            require(backend != nullptr, std::string("failed to initialize backend ") + backend_name);
+        }
+        std::printf("test-wp-mul-mat-pin: backend %s\n", ggml_backend_name(backend));
 
         for (const ggml_type type : {
                  GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,

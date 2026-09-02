@@ -3,6 +3,7 @@
 #include "common.cuh"
 
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
@@ -1538,7 +1539,16 @@ static void mul_mat_q_switch_J_impl(ggml_backend_cuda_context & ctx, const mmq_a
 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
-    const int64_t ncols_max = args.force_mm_id ? MMQ_FORCE_MM_REFERENCE_TOKENS : args.ncols_max;
+    // GGML_MMQ_PIN_REF_TOKENS overrides the pinned reference column count; 0 = follow the real ncols
+    static const int64_t pin_ref_tokens = [] {
+        const char * env = std::getenv("GGML_MMQ_PIN_REF_TOKENS");
+        if (env == nullptr || env[0] == '\0') {
+            return (int64_t) MMQ_FORCE_MM_REFERENCE_TOKENS;
+        }
+        const long value = std::strtol(env, nullptr, 10);
+        return value < 0 ? (int64_t) MMQ_FORCE_MM_REFERENCE_TOKENS : (int64_t) value;
+    }();
+    const int64_t ncols_max = args.force_mm_id && pin_ref_tokens > 0 ? pin_ref_tokens : args.ncols_max;
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);

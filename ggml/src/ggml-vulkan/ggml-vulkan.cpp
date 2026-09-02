@@ -10895,7 +10895,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
-    const uint32_t pipeline_n = force_mm ? GGML_VK_MUL_MAT_FORCE_MM_REFERENCE_TOKENS : (uint32_t) ne11;
+    // GGML_VK_PIN_REF_TOKENS overrides the pinned reference column count; 0 = follow the real ne11
+    static const uint32_t pin_ref_tokens = [] {
+        const char * env = std::getenv("GGML_VK_PIN_REF_TOKENS");
+        if (env == nullptr || env[0] == '\0') {
+            return GGML_VK_MUL_MAT_FORCE_MM_REFERENCE_TOKENS;
+        }
+        const long value = std::strtol(env, nullptr, 10);
+        return value < 0 ? GGML_VK_MUL_MAT_FORCE_MM_REFERENCE_TOKENS : (uint32_t) value;
+    }();
+    const uint32_t pipeline_n = force_mm && pin_ref_tokens > 0 ? pin_ref_tokens : (uint32_t) ne11;
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, pipeline_n, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && pipeline_n > 8;
