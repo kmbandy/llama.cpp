@@ -2799,6 +2799,13 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!task.params.cache_prompt && slot.can_speculate() && slot.ctx_dft) {
+            if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.stream_slot_idx, -1, -1)) {
+                GGML_ABORT("failed to reset draft sequence %d\n", slot.stream_slot_idx);
+            }
+            common_speculative_reset(slot.spec, slot.stream_slot_idx);
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);

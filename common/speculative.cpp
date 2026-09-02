@@ -265,6 +265,8 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
+    virtual void reset(llama_seq_id /*seq_id*/) {}
+
     virtual bool process(const llama_batch & batch) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
@@ -2278,6 +2280,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_last[seq_id] = -1;
+        i_batch_beg[seq_id] = -1;
+        i_batch_end[seq_id] = -1;
+        if (chain_heads) {
+            chain_h[seq_id].clear();
+        }
+        common_sampler_reset(smpls[seq_id].get());
+        if (backend_chains[seq_id]) {
+            llama_sampler_reset(backend_chains[seq_id]);
+        }
+    }
+
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
@@ -3660,6 +3682,19 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->dparams.size()) {
+        return;
+    }
+
+    spec->dparams[seq_id] = {};
+    spec->impl_last[seq_id] = nullptr;
+
+    for (auto & impl : spec->impls) {
+        impl->reset(seq_id);
     }
 }
 
