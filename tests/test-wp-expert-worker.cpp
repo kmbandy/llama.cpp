@@ -2855,6 +2855,276 @@ static void test_prefill_mul_mat_pin_chunk_byte_identical() {
     require(server_result == 0, "chunk-pin worker returned failure");
 }
 
+static pipe_expert_dispatch_req make_sparse_arena_prefill_request() {
+    static constexpr uint32_t TOKENS = 256;
+    pipe_expert_dispatch_req request;
+    request.layer = LAYER;
+    request.n_tokens = TOKENS;
+    request.activations.resize((size_t) TOKENS * N_EMBD);
+    for (size_t i = 0; i < request.activations.size(); ++i) {
+        request.activations[i] =
+            ((int) ((i * 17 + i / N_EMBD) % 31) - 15) * 0.013f;
+    }
+    for (int expert = 0; expert < 4; ++expert) {
+        pipe_expert_assignment assignment;
+        assignment.expert_id = expert;
+        assignment.weights.resize(TOKENS, 0.0f);
+        for (uint32_t token = 0; token < TOKENS; ++token) {
+            const int first = (int) token % 4;
+            const int second = (first + 2) % 4;
+            if (expert == first || expert == second) {
+                assignment.weights[token] =
+                    (1 + (int) ((token * 5 + expert * 3) % 17)) * 0.03125f;
+            }
+        }
+        request.assignments.push_back(std::move(assignment));
+    }
+    return request;
+}
+
+static std::vector<float> run_sparse_arena_prefill(
+        const Fixture & fixture,
+        const pipe_expert_dispatch_req & request,
+        const char * arena_prefill) {
+    const ScopedEnv arena_env("WP_EXPERT_ARENA_PREFILL", arena_prefill);
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = reserve_port();
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    std::vector<float> result;
+    try {
+        pipe_socket_ptr socket = connect_with_retry(options.listen_port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive arena-prefill HELLO");
+        require(type == PIPE_HELLO && seq_id == 0,
+                "arena-prefill worker did not send HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send arena-prefill client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive arena-prefill HELLO acknowledgement");
+        require(type == PIPE_EXPERT_HELLO_ACK && seq_id == 0 &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "arena-prefill worker rejected matching HELLO");
+
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, 710,
+                                payload.data(), payload.size()),
+                "failed to send arena-prefill dispatch");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive arena-prefill partial");
+        require(type == PIPE_EXPERT_PARTIAL && seq_id == 710,
+                "arena-prefill dispatch returned the wrong frame");
+        const pipe_expert_partial partial =
+            pipe_decode_expert_partial(payload.data(), payload.size(), N_EMBD);
+        require(partial.n_tokens == request.n_tokens,
+                "arena-prefill token count mismatch");
+        result = partial.partial;
+        socket.reset();
+    } catch (...) {
+        server.join();
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "arena-prefill worker returned failure");
+    return result;
+}
+
+static void test_prefill_arena_grouped_chunk_byte_identical() {
+    static constexpr uint32_t TOKENS = 256;
+    static constexpr uint32_t CHUNKS = 4;
+
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const pipe_expert_dispatch_req request = make_sparse_arena_prefill_request();
+    const ScopedEnv arena_env("WP_EXPERT_ARENA_PREFILL", "1");
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = reserve_port();
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(options.listen_port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive grouped-prefill HELLO");
+        require(type == PIPE_HELLO && seq_id == 0,
+                "grouped-prefill worker did not send HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send grouped-prefill client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive grouped-prefill HELLO acknowledgement");
+        require(type == PIPE_EXPERT_HELLO_ACK && seq_id == 0 &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "grouped-prefill worker rejected matching HELLO");
+
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, 711,
+                                payload.data(), payload.size()),
+                "failed to send monolithic grouped-prefill dispatch");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive monolithic grouped-prefill partial");
+        require(type == PIPE_EXPERT_PARTIAL && seq_id == 711,
+                "monolithic grouped-prefill dispatch returned the wrong frame");
+        const pipe_expert_partial whole =
+            pipe_decode_expert_partial(payload.data(), payload.size(), N_EMBD);
+        require(whole.n_tokens == TOKENS,
+                "monolithic grouped-prefill token count mismatch");
+
+        std::vector<float> assembled((size_t) TOKENS * N_EMBD);
+        const uint32_t chunk_rows = TOKENS / CHUNKS;
+        for (uint32_t chunk_index = 0; chunk_index < CHUNKS; ++chunk_index) {
+            const uint32_t token_start = chunk_index * chunk_rows;
+            const uint32_t token_end = chunk_index + 1 == CHUNKS
+                ? TOKENS : token_start + chunk_rows;
+            pipe_expert_dispatch_chunk chunk;
+            chunk.chunk_index = chunk_index;
+            chunk.chunk_count = CHUNKS;
+            chunk.total_tokens = TOKENS;
+            chunk.token_start = token_start;
+            chunk.token_end = token_end;
+            chunk.request.layer = request.layer;
+            chunk.request.n_tokens = token_end - token_start;
+            chunk.request.swiglu_clamp = request.swiglu_clamp;
+            for (const pipe_expert_assignment & assignment : request.assignments) {
+                pipe_expert_assignment sliced;
+                sliced.expert_id = assignment.expert_id;
+                sliced.weights.assign(assignment.weights.begin() + token_start,
+                                      assignment.weights.begin() + token_end);
+                chunk.request.assignments.push_back(std::move(sliced));
+            }
+            chunk.request.activations.assign(
+                request.activations.begin() + (size_t) token_start * N_EMBD,
+                request.activations.begin() + (size_t) token_end * N_EMBD);
+
+            payload = pipe_encode_expert_dispatch_chunk(chunk);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_CHUNK, 712,
+                                    payload.data(), payload.size()),
+                    "failed to send grouped-prefill dispatch chunk");
+            require(pipe_recv_frame(*socket, type, seq_id, payload),
+                    "failed to receive grouped-prefill partial chunk");
+            require(type == PIPE_EXPERT_PARTIAL_CHUNK && seq_id == 712,
+                    "grouped-prefill chunk returned the wrong frame");
+            const pipe_expert_partial_chunk partial = pipe_decode_expert_partial_chunk(
+                payload.data(), payload.size(), N_EMBD);
+            require(partial.chunk_index == chunk_index &&
+                        partial.chunk_count == CHUNKS &&
+                        partial.total_tokens == TOKENS &&
+                        partial.token_start == token_start &&
+                        partial.token_end == token_end,
+                    "grouped-prefill partial range mismatch");
+            std::copy(partial.partial.partial.begin(), partial.partial.partial.end(),
+                      assembled.begin() + (size_t) token_start * N_EMBD);
+        }
+
+        require(whole.partial.size() == assembled.size(),
+                "grouped-prefill result shape mismatch");
+        for (size_t i = 0; i < assembled.size(); ++i) {
+            if (std::memcmp(&whole.partial[i], &assembled[i], sizeof(float)) != 0) {
+                throw std::runtime_error(
+                    "grouped prefill changed when split into token chunks at " +
+                    std::to_string(i) + ": whole=" + std::to_string(whole.partial[i]) +
+                    " chunked=" + std::to_string(assembled[i]));
+            }
+        }
+        socket.reset();
+    } catch (...) {
+        server.join();
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "grouped-prefill worker returned failure");
+}
+
+static void test_prefill_arena_grouped_matches_gather() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const pipe_expert_dispatch_req request = make_sparse_arena_prefill_request();
+    const std::vector<float> gather =
+        run_sparse_arena_prefill(fixture, request, "0");
+    const std::vector<float> grouped =
+        run_sparse_arena_prefill(fixture, request, "1");
+
+    require(gather.size() == grouped.size(),
+            "grouped and gather prefill result shapes differ");
+    double max_abs_diff = 0.0;
+    double max_abs_gather = 0.0;
+    for (size_t i = 0; i < gather.size(); ++i) {
+        max_abs_diff = std::max(
+            max_abs_diff, std::fabs((double) gather[i] - (double) grouped[i]));
+        max_abs_gather = std::max(max_abs_gather, std::fabs((double) gather[i]));
+    }
+    const double tolerance = 1e-4 * max_abs_gather + 1e-6;
+    if (max_abs_diff > tolerance) {
+        throw std::runtime_error(
+            "grouped prefill differs from gather: max_abs_diff=" +
+            std::to_string(max_abs_diff) + " tolerance=" +
+            std::to_string(tolerance));
+    }
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -2864,6 +3134,8 @@ int main() {
         require(setenv("WP_EXPERT_GATHER", "1", 1) == 0 &&
                     setenv("WP_EXPERT_GATHER_MIN_TOKENS", "2", 1) == 0,
                 "failed to enable expert gather");
+        test_prefill_arena_grouped_chunk_byte_identical();
+        test_prefill_arena_grouped_matches_gather();
         test_prefill_mul_mat_pin_chunk_byte_identical();
         test_decode_prefill_compute_profile();
         test_scatter_compact_rows_matches_get_rows_back();

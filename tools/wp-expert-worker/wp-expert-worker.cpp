@@ -760,6 +760,8 @@ struct RequestStats {
     uint64_t n_arena_hit   = 0;
     uint64_t n_arena_groups = 0;
     uint64_t n_arena_build = 0;
+    uint64_t n_arena_prefill_hit = 0;
+    uint64_t n_arena_prefill_fallback = 0;
     uint64_t n_hipgraph_capture = 0;
     uint64_t n_hipgraph_replay  = 0;
     uint64_t n_d3_collapse = 0;
@@ -989,6 +991,8 @@ public:
         n_arena_hit_ += request.n_arena_hit;
         n_arena_groups_ += request.n_arena_groups;
         n_arena_build_ += request.n_arena_build;
+        n_arena_prefill_hit_ += request.n_arena_prefill_hit;
+        n_arena_prefill_fallback_ += request.n_arena_prefill_fallback;
         n_hipgraph_capture_ += request.n_hipgraph_capture;
         n_hipgraph_replay_ += request.n_hipgraph_replay;
         n_d3_collapse_ += request.n_d3_collapse;
@@ -1184,6 +1188,8 @@ private:
                   << " n_arena_hit=" << n_arena_hit_
                   << " n_arena_groups=" << n_arena_groups_
                   << " n_arena_build=" << n_arena_build_
+                  << " n_arena_prefill_hit=" << n_arena_prefill_hit_
+                  << " n_arena_prefill_fallback=" << n_arena_prefill_fallback_
                   << " n_hipgraph_capture=" << n_hipgraph_capture_
                   << " n_hipgraph_replay=" << n_hipgraph_replay_
                   << " n_d3_collapse=" << n_d3_collapse_
@@ -1315,6 +1321,8 @@ private:
     uint64_t          n_arena_hit_ = 0;
     uint64_t          n_arena_groups_ = 0;
     uint64_t          n_arena_build_ = 0;
+    uint64_t          n_arena_prefill_hit_ = 0;
+    uint64_t          n_arena_prefill_fallback_ = 0;
     uint64_t          n_hipgraph_capture_ = 0;
     uint64_t          n_hipgraph_replay_ = 0;
     uint64_t          n_d3_collapse_ = 0;
@@ -8368,6 +8376,65 @@ public:
             request.assignments.size() <= (size_t) 16 * request.n_tokens;
     }
 
+    bool arena_assignments_eligible(
+            const pipe_expert_dispatch_req & request,
+            const ExpertSlotPool::Batch & batch,
+            const ExpertSlotPool::ArenaLayout & layout) const {
+        if (request.assignments.empty()) {
+            return false;
+        }
+        static const char * k_roles[3] = {"gate", "up", "down"};
+        const auto & specs = catalog_.descriptor.layers.at(request.layer);
+        const auto stride_ok = [](uint64_t stride, ggml_type type) {
+            const uint64_t type_size = ggml_type_size(type);
+            const uint64_t block_size = ggml_blck_size(type);
+            return type_size != 0 && block_size != 0 && stride % type_size == 0 &&
+                stride / type_size <= UINT32_MAX / block_size;
+        };
+        const ExpertPage & first = catalog_.pages.at({
+            request.layer, request.assignments[0].expert_id
+        });
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            const std::vector<float> & weights = request.assignments[i].weights;
+            if (weights.size() != request.n_tokens ||
+                    std::any_of(weights.begin(), weights.end(), [](float weight) {
+                        return !std::isfinite(weight);
+                    })) {
+                return false;
+            }
+            const size_t slot = batch.slot_index(i);
+            if (slot == std::numeric_limits<size_t>::max() || slot >= layout.n_slots) {
+                return false;
+            }
+            const ExpertSlotPool::ArenaLayout::Arena * arena =
+                layout.arena_for_slot(slot);
+            const ExpertPage & page = catalog_.pages.at({
+                request.layer, request.assignments[i].expert_id
+            });
+            if (arena == nullptr || arena->stride == 0 || page.device_size > arena->stride) {
+                return false;
+            }
+            for (const char * role : k_roles) {
+                if (!stride_ok(arena->stride, specs.at(role).type) ||
+                        page.roles.at(role).device_offset !=
+                            first.roles.at(role).device_offset) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool arena_prefill_eligible(
+            const pipe_expert_dispatch_req & request,
+            const ExpertSlotPool::Batch & batch) const {
+        if (!arena_prefill_enabled_ || request.n_tokens <= 8) {
+            return false;
+        }
+        const std::optional<ExpertSlotPool::ArenaLayout> & layout = pool_.arena_layout();
+        return layout.has_value() && arena_assignments_eligible(request, batch, *layout);
+    }
+
     bool arena_id_eligible(
             const pipe_expert_dispatch_req & request,
             const ExpertSlotPool::Batch & batch) const {
@@ -8404,56 +8471,7 @@ public:
         if (!backend_supported || !layout_opt.has_value()) {
             return false;
         }
-        for (size_t i = 0; i < request.assignments.size(); ++i) {
-            const std::vector<float> & weights = request.assignments[i].weights;
-            if (weights.size() != request.n_tokens ||
-                    std::any_of(weights.begin(), weights.end(), [](float weight) {
-                        return !std::isfinite(weight);
-                    })) {
-                return false;
-            }
-            if (batch.slot_index(i) == std::numeric_limits<size_t>::max()) {
-                return false;
-            }
-        }
-        const ExpertSlotPool::ArenaLayout & layout = *layout_opt;
-        static const char * k_roles[3] = {"gate", "up", "down"};
-        const auto & specs = catalog_.descriptor.layers.at(request.layer);
-        auto stride_ok = [](uint64_t stride, ggml_type type) {
-            const uint64_t type_size = ggml_type_size(type);
-            const uint64_t block_size = ggml_blck_size(type);
-            return type_size != 0 && block_size != 0 && stride % type_size == 0 &&
-                stride / type_size <= UINT32_MAX / block_size;
-        };
-        const ExpertPage & first = catalog_.pages.at({
-            request.layer, request.assignments[0].expert_id
-        });
-        for (size_t i = 0; i < request.assignments.size(); ++i) {
-            const ExpertPage & page = catalog_.pages.at({
-                request.layer, request.assignments[i].expert_id
-            });
-            if (batch.slot_index(i) >= layout.n_slots) {
-                return false;
-            }
-            const ExpertSlotPool::ArenaLayout::Arena * arena =
-                layout.arena_for_slot(batch.slot_index(i));
-            if (arena == nullptr || arena->stride == 0 ||
-                    page.device_size > arena->stride) {
-                return false;
-            }
-            for (const char * role : k_roles) {
-                if (!stride_ok(arena->stride, specs.at(role).type)) {
-                    return false;
-                }
-            }
-            for (const char * role : k_roles) {
-                if (page.roles.at(role).device_offset !=
-                        first.roles.at(role).device_offset) {
-                    return false;
-                }
-            }
-        }
-        return true;
+        return arena_assignments_eligible(request, batch, *layout_opt);
     }
 
     pipe_expert_partial dispatch(
@@ -8599,9 +8617,11 @@ public:
         const bool persistent_graphs = wp_persistent_graphs_enabled();
         const bool arena_request = persistent_graphs &&
             !cpu_on_arrival_request && arena_id_eligible(request, batch);
+        const bool arena_prefill_request =
+            !cpu_on_arrival_request && arena_prefill_eligible(request, batch);
         const bool grouped_gemv_request =
             !cpu_on_arrival_request &&
-            (grouped_gemv_eligible(request) ||
+            (arena_prefill_request || grouped_gemv_eligible(request) ||
              (persistent_graphs ? arena_request : arena_id_eligible(request, batch)));
         if (measure) {
             const uint64_t probe_ns =
@@ -8652,7 +8672,7 @@ public:
             return e != nullptr && e[0] == '1';   // default OFF = deterministic
         }();
         const bool effective_overlap = overlap &&
-            !(persistent_graphs && arena_request);
+            !(persistent_graphs && arena_request) && !arena_prefill_request;
         // WP_EXPERT_COMPUTE_CHUNKS=<n>: split the expert compute into n fixed
         // index chunks so all but the last can run while the tail of the page-in
         // reads is still in flight. 1 = the original strictly-serial path.
@@ -9318,6 +9338,8 @@ private:
         const char * e = std::getenv("WP_SUBMIT_ASYNC");
         return e != nullptr && e[0] == '1';
     }();
+    const bool arena_prefill_enabled_ =
+        parse_env_default_off(std::getenv("WP_EXPERT_ARENA_PREFILL"));
 
     void begin_async_dispatch(int conn_index, uint64_t trace_req) {
         active_async_conn_index_ = conn_index;
@@ -10715,6 +10737,21 @@ private:
             record_vk_setup();
             record_vk_compute();
             return;
+        }
+
+        const bool arena_prefill_ok = arena_prefill_eligible(request, batch);
+        if (arena_prefill_ok) {
+            if (!add_previous && sel_begin == 0 &&
+                    sel_end >= request.assignments.size() &&
+                    n_selected == request.assignments.size() &&
+                    result_offset == std::numeric_limits<size_t>::max() &&
+                    compute_batch_arena_prefill(
+                        request, pages, batch, request_stats)) {
+                record_vk_setup();
+                record_vk_compute();
+                return;
+            }
+            ++request_stats.n_arena_prefill_fallback;
         }
 
         const std::chrono::steady_clock::time_point probe_started =
@@ -12205,6 +12242,7 @@ private:
     struct ArenaGroup {
         size_t arena_index = 0;
         std::vector<size_t> assignments;
+        size_t n_used = 0;
     };
 
     struct ArenaRoleKey {
@@ -12218,6 +12256,328 @@ private:
                    offset == o.offset;
         }
     };
+
+    // WP_EXPERT_ARENA_PREFILL (2026-09-02): a 128-token gather request
+    // launches one get_rows and three matmuls per expert, about 1100 kernels
+    // at production routing width. Pack only the real routes into arena-local
+    // IDs so each arena needs three matmul launches regardless of expert count.
+    bool compute_batch_arena_prefill(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            RequestStats & request_stats) {
+        const bool measure_vk = stats_.enabled() && is_vulkan_backend();
+        const std::optional<ExpertSlotPool::ArenaLayout> & layout_opt = pool_.arena_layout();
+        if (!layout_opt.has_value()) {
+            return false;
+        }
+        const ExpertSlotPool::ArenaLayout & layout = *layout_opt;
+        const size_t n = request.assignments.size();
+        if (n == 0 || n > (size_t) INT32_MAX ||
+                layout.n_slots > (size_t) INT32_MAX ||
+                !arena_assignments_eligible(request, batch, layout)) {
+            return false;
+        }
+
+        static const char * k_roles[3] = {"gate", "up", "down"};
+        const auto & specs = catalog_.descriptor.layers.at(request.layer);
+        std::array<ArenaRoleKey, 3> roles;
+        for (size_t j = 0; j < roles.size(); ++j) {
+            const RoleSpec & spec = specs.at(k_roles[j]);
+            roles[j] = {spec.type, spec.ne0, spec.ne1,
+                        pages[0]->roles.at(k_roles[j]).device_offset};
+        }
+
+        std::vector<ArenaGroup> groups;
+        for (size_t arena_index = 0; arena_index < layout.arenas.size(); ++arena_index) {
+            ArenaGroup group;
+            group.arena_index = arena_index;
+            for (size_t i = 0; i < n; ++i) {
+                const ExpertSlotPool::ArenaLayout::Arena * arena =
+                    layout.arena_for_slot(batch.slot_index(i));
+                if (arena == nullptr) {
+                    return false;
+                }
+                if ((size_t) (arena - layout.arenas.data()) == arena_index) {
+                    group.assignments.push_back(i);
+                }
+            }
+            if (group.assignments.empty()) {
+                continue;
+            }
+            for (uint32_t t = 0; t < request.n_tokens; ++t) {
+                size_t token_used = 0;
+                for (size_t assignment : group.assignments) {
+                    token_used += request.assignments[assignment].weights[t] != 0.0f;
+                }
+                group.n_used = std::max(group.n_used, token_used);
+            }
+            if (group.n_used == 0 ||
+                    group.n_used > (size_t) catalog_.descriptor.hparams.n_expert_used ||
+                    group.n_used > (size_t) INT32_MAX) {
+                return false;
+            }
+            groups.push_back(std::move(group));
+        }
+        if (groups.empty()) {
+            return false;
+        }
+
+        const size_t params_align = ggml_backend_buft_get_alignment(
+            ggml_backend_get_default_buffer_type(backend_.get()));
+        if (params_align == 0) {
+            throw std::runtime_error("invalid arena prefill parameter alignment");
+        }
+        std::vector<size_t> ids_offsets;
+        std::vector<size_t> route_offsets;
+        ids_offsets.reserve(groups.size());
+        route_offsets.reserve(groups.size());
+        size_t total_used = 0;
+        size_t ids_bytes = 0;
+        for (const ArenaGroup & group : groups) {
+            ids_offsets.push_back(ids_bytes);
+            ids_bytes += group.n_used * (size_t) request.n_tokens * sizeof(int32_t);
+            total_used += group.n_used;
+        }
+        const size_t route_offset = GGML_PAD(ids_bytes, params_align);
+        size_t route_bytes = 0;
+        for (const ArenaGroup & group : groups) {
+            route_offsets.push_back(route_offset + route_bytes);
+            route_bytes += group.n_used * (size_t) request.n_tokens * sizeof(float);
+        }
+        const size_t params_span = route_offset + route_bytes;
+        grow_params_buffer(params_span, request_stats);
+
+        ArenaGraphKey key{request.n_tokens, (uint32_t) total_used};
+        for (const ArenaGroup & group : groups) {
+            key.group_arenas.push_back((uint32_t) group.arena_index);
+            key.group_sizes.push_back((uint32_t) group.n_used);
+        }
+        uint32_t clamp_bits = 0;
+        std::memcpy(&clamp_bits, &request.swiglu_clamp, sizeof(clamp_bits));
+        static const size_t cache_max = [] {
+            const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE_MAX");
+            const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
+            const size_t requested = v > 0 ? (size_t) v : (size_t) 16;
+            return wp_persistent_graphs_enabled()
+                ? std::min(requested, (size_t) 2) : requested;
+        }();
+
+        const std::chrono::steady_clock::time_point vk_cache_started =
+            measure_vk ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
+        auto it = arena_graph_cache_.find(key);
+        if (it != arena_graph_cache_.end() &&
+                (it->second.graph == nullptr ||
+                 it->second.io_gen != io_gen_ ||
+                 it->second.params_gen != params_gen_ ||
+                 (wp_persistent_graphs_enabled() &&
+                  it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get())) ||
+                 it->second.clamp_bits != clamp_bits ||
+                 it->second.roles != roles)) {
+            if (it->second.persistent_plan != nullptr) {
+                release_persistent_plan(it->second.persistent_plan, &request_stats);
+            }
+            arena_graph_cache_.erase(it);
+            it = arena_graph_cache_.end();
+        }
+        const bool hit = it != arena_graph_cache_.end();
+        if (measure_vk) {
+            request_stats.ns_vk_cache_lookup +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - vk_cache_started).count();
+        }
+        if (!hit) {
+            if (arena_graph_cache_.size() >= cache_max) {
+                auto victim = arena_graph_cache_.begin();
+                for (auto j = arena_graph_cache_.begin(); j != arena_graph_cache_.end(); ++j) {
+                    if (j->second.last_used < victim->second.last_used) {
+                        victim = j;
+                    }
+                }
+                if (victim->second.persistent_plan != nullptr) {
+                    release_persistent_plan(victim->second.persistent_plan, &request_stats);
+                }
+                arena_graph_cache_.erase(victim);
+            }
+            it = arena_graph_cache_.emplace(key, ArenaGraphEntry{}).first;
+            ArenaGraphEntry & entry = it->second;
+            entry.roles = roles;
+            entry.clamp_bits = clamp_bits;
+            entry.io_gen = io_gen_;
+            entry.params_gen = params_gen_;
+            if (wp_persistent_graphs_enabled()) {
+                entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
+            }
+            ++request_stats.n_arena_build;
+
+            const auto build_started = std::chrono::steady_clock::now();
+            const size_t tensor_count = 16 * groups.size() + 4 * total_used + 64;
+            const size_t graph_nodes = 12 * groups.size() + 4 * total_used + 32;
+            entry.ctx.reset(ggml_init({
+                /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                                  ggml_graph_overhead_custom(graph_nodes, false),
+                /* .mem_base = */ nullptr,
+                /* .no_alloc = */ true,
+            }));
+            if (!entry.ctx) {
+                throw std::runtime_error("failed to allocate arena prefill graph metadata");
+            }
+            ggml_context * ctx = entry.ctx.get();
+            const auto make_role = [&](const ArenaGroup & group,
+                                       const ArenaRoleKey & role) {
+                const ExpertSlotPool::ArenaLayout::Arena & arena =
+                    layout.arenas[group.arena_index];
+                ggml_tensor * tensor = ggml_new_tensor_3d(
+                    ctx, role.type, role.ne0, role.ne1, (int64_t) arena.n_slots);
+                tensor->nb[2] = arena.stride;
+                attach_weight(tensor, arena.buffer, arena.base, role.offset);
+                return tensor;
+            };
+            const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
+            ggml_tensor * input2d = make_io_tensor(ctx, request.n_tokens, 0);
+            ggml_set_input(input2d);
+            ggml_tensor * input3d = ggml_reshape_3d(
+                ctx, input2d, n_embd, 1, request.n_tokens);
+            ggml_tensor * sum = nullptr;
+            for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+                const ArenaGroup & group = groups[group_index];
+                ggml_tensor * as_gate = make_role(group, roles[0]);
+                ggml_tensor * as_up   = make_role(group, roles[1]);
+                ggml_tensor * as_down = make_role(group, roles[2]);
+                ggml_tensor * ids = ggml_new_tensor_2d(
+                    ctx, GGML_TYPE_I32, (int64_t) group.n_used, request.n_tokens);
+                ggml_set_input(ids);
+                attach_weight(ids, params_buffer_.get(),
+                              ggml_backend_buffer_get_base(params_buffer_.get()),
+                              ids_offsets[group_index]);
+                ggml_tensor * route_w = ggml_new_tensor_3d(
+                    ctx, GGML_TYPE_F32, 1, (int64_t) group.n_used, request.n_tokens);
+                ggml_set_input(route_w);
+                attach_weight(route_w, params_buffer_.get(),
+                              ggml_backend_buffer_get_base(params_buffer_.get()),
+                              route_offsets[group_index]);
+                ggml_tensor * gate_out = ggml_mul_mat_id(ctx, as_gate, input3d, ids);
+                ggml_mul_mat_id_set_hint(gate_out, GGML_HINT_MUL_MAT_PIN);
+                ggml_tensor * up_out = ggml_mul_mat_id(ctx, as_up, input3d, ids);
+                ggml_mul_mat_id_set_hint(up_out, GGML_HINT_MUL_MAT_PIN);
+                if (request.swiglu_clamp > 1e-6f) {
+                    up_out = ggml_clamp(
+                        ctx, up_out, -request.swiglu_clamp, request.swiglu_clamp);
+                    gate_out = ggml_clamp(
+                        ctx, gate_out, -INFINITY, request.swiglu_clamp);
+                }
+                ggml_tensor * hidden = ggml_swiglu_split(ctx, gate_out, up_out);
+                ggml_tensor * down_out = ggml_mul_mat_id(ctx, as_down, hidden, ids);
+                ggml_mul_mat_id_set_hint(down_out, GGML_HINT_MUL_MAT_PIN);
+                ggml_tensor * weighted = ggml_mul(ctx, down_out, route_w);
+                ggml_tensor * group_sum = nullptr;
+                for (size_t k = 0; k < group.n_used; ++k) {
+                    ggml_tensor * contribution = ggml_view_2d(
+                        ctx, weighted, n_embd, request.n_tokens,
+                        weighted->nb[2], k * weighted->nb[1]);
+                    group_sum = group_sum != nullptr
+                        ? ggml_add(ctx, group_sum, contribution) : contribution;
+                }
+                sum = sum != nullptr ? ggml_add(ctx, sum, group_sum) : group_sum;
+            }
+            ggml_tensor * result = make_io_tensor(ctx, request.n_tokens, io_result_offset_);
+            ggml_tensor * copy = ggml_cpy(ctx, sum, result);
+            ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_nodes, false);
+            ggml_build_forward_expand(graph, copy);
+            entry.galloc.reset(ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend_.get())));
+            if (!entry.galloc || !ggml_gallocr_alloc_graph(entry.galloc.get(), graph)) {
+                throw std::runtime_error("failed to allocate arena prefill graph");
+            }
+            if (ggml_gallocr_get_buffer_size(entry.galloc.get(), 0) > 0) {
+                ++request_stats.n_device_allocs;
+            }
+            entry.blob = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) params_span);
+            attach_weight(entry.blob, params_buffer_.get(),
+                          ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            entry.persistent_plan = create_persistent_plan(graph);
+            entry.graph = graph;
+            request_stats.ns_graph_build +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - build_started).count();
+        }
+
+        ArenaGraphEntry & entry = it->second;
+        entry.last_used = ++arena_graph_cache_tick_;
+        std::vector<uint8_t> params_host(params_span, 0);
+        for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+            const ArenaGroup & group = groups[group_index];
+            const ExpertSlotPool::ArenaLayout::Arena & arena =
+                layout.arenas[group.arena_index];
+            const size_t pad_slot =
+                batch.slot_index(group.assignments[0]) - arena.first_slot;
+            for (uint32_t t = 0; t < request.n_tokens; ++t) {
+                size_t used = 0;
+                for (size_t assignment : group.assignments) {
+                    const float weight = request.assignments[assignment].weights[t];
+                    if (weight == 0.0f) {
+                        continue;
+                    }
+                    const size_t slot = batch.slot_index(assignment);
+                    const int32_t local_slot = (int32_t) (slot - arena.first_slot);
+                    const size_t index = (size_t) t * group.n_used + used++;
+                    std::memcpy(params_host.data() + ids_offsets[group_index] +
+                                    index * sizeof(int32_t),
+                                &local_slot, sizeof(local_slot));
+                    std::memcpy(params_host.data() + route_offsets[group_index] +
+                                    index * sizeof(float),
+                                &weight, sizeof(weight));
+                }
+                const int32_t local_pad_slot = (int32_t) pad_slot;
+                while (used < group.n_used) {
+                    const size_t index = (size_t) t * group.n_used + used++;
+                    std::memcpy(params_host.data() + ids_offsets[group_index] +
+                                    index * sizeof(int32_t),
+                                &local_pad_slot, sizeof(local_pad_slot));
+                }
+            }
+        }
+        std::vector<size_t> trace_selected(n);
+        std::iota(trace_selected.begin(), trace_selected.end(), 0);
+        begin_work_input_trace(
+            request, pages, batch, trace_selected, /* use_gather = */ false, -1);
+        const auto params_started = std::chrono::steady_clock::now();
+        ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
+        const uint64_t params_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - params_started).count();
+        request_stats.ns_params_set += params_elapsed;
+        if (measure_vk) {
+            request_stats.ns_vk_params_set += params_elapsed;
+        }
+        add_work_input_trace_tensor(entry.blob, params_host.data(), params_span);
+        enum ggml_status status = submit_graph(
+            entry.graph, request_stats, entry.persistent_plan);
+        if (status != GGML_STATUS_SUCCESS && entry.persistent_plan != nullptr) {
+            release_persistent_plan(entry.persistent_plan, &request_stats);
+            std::fprintf(stderr,
+                         "WARN wp expert worker: persistent arena prefill graph replay failed; "
+                         "retrying normal graph compute\n");
+            status = submit_graph(entry.graph, request_stats);
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            if (entry.persistent_plan != nullptr) {
+                release_persistent_plan(entry.persistent_plan, &request_stats);
+            }
+            entry.graph = nullptr;
+            throw std::runtime_error("arena prefill backend graph compute failed");
+        }
+        ++request_stats.n_arena_prefill_hit;
+        request_stats.n_arena_groups += groups.size();
+        for (const pipe_expert_assignment & assignment : request.assignments) {
+            for (float weight : assignment.weights) {
+                request_stats.n_weight_nonzero += weight != 0.0f;
+                ++request_stats.n_weight_total;
+            }
+        }
+        return true;
+    }
 
     bool compute_batch_arena_multi(
             const pipe_expert_dispatch_req & request,
@@ -12502,7 +12862,9 @@ private:
         }
         const ExpertSlotPool::ArenaLayout & layout = *layout_opt;
         const size_t n = request.assignments.size();
-        if (n == 0 || n > (size_t) INT32_MAX || layout.n_slots > (size_t) INT32_MAX) {
+        if (n == 0 || n > (size_t) INT32_MAX ||
+                layout.n_slots > (size_t) INT32_MAX ||
+                !arena_assignments_eligible(request, batch, layout)) {
             return false;
         }
 
@@ -12513,37 +12875,6 @@ private:
             const RoleSpec & spec = specs.at(k_roles[j]);
             roles[j] = {spec.type, spec.ne0, spec.ne1,
                         pages[0]->roles.at(k_roles[j]).device_offset};
-            const size_t type_size = ggml_type_size(spec.type);
-            const size_t block_size = ggml_blck_size(spec.type);
-            if (type_size == 0 || block_size == 0) {
-                return false;
-            }
-        }
-        for (size_t i = 0; i < pages.size(); ++i) {
-            const ExpertSlotPool::ArenaLayout::Arena * arena =
-                layout.arena_for_slot(batch.slot_index(i));
-            const uint64_t stride = arena != nullptr && arena->stride != 0
-                ? arena->stride : layout.slot_stride;
-            if (stride == 0 || pages[i]->device_size > stride) {
-                return false;
-            }
-            for (size_t j = 0; j < roles.size(); ++j) {
-                const size_t type_size = ggml_type_size(roles[j].type);
-                const size_t block_size = ggml_blck_size(roles[j].type);
-                if (type_size == 0 || block_size == 0 ||
-                        stride % type_size != 0 ||
-                        stride / type_size > UINT32_MAX / block_size) {
-                    return false;
-                }
-            }
-            for (size_t j = 0; j < roles.size(); ++j) {
-                if (pages[i]->roles.at(k_roles[j]).device_offset != roles[j].offset) {
-                    return false;
-                }
-            }
-            if (batch.slot_index(i) >= layout.n_slots) {
-                return false;
-            }
         }
 
         std::vector<ArenaGroup> groups;
@@ -13455,6 +13786,8 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_arena_hit += src.n_arena_hit;
     dst.n_arena_groups += src.n_arena_groups;
     dst.n_arena_build += src.n_arena_build;
+    dst.n_arena_prefill_hit += src.n_arena_prefill_hit;
+    dst.n_arena_prefill_fallback += src.n_arena_prefill_fallback;
     dst.n_hipgraph_capture += src.n_hipgraph_capture;
     dst.n_hipgraph_replay += src.n_hipgraph_replay;
     dst.n_d3_collapse += src.n_d3_collapse;
