@@ -2799,8 +2799,49 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (force_mm) {
         GGML_ASSERT(!bad_padding_clear);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0, true));
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst, true);
+        // GGML_MUL_MAT_PIN_KERNEL=mmq pins to MMQ; default mmvq runs the vector kernel in
+        // fixed groups of MMVQ_MAX_BATCH_SIZE columns (tail zero-padded) so a column's
+        // arithmetic never depends on ne11
+        static const bool pin_mmq = [] {
+            const char * env = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
+            return env != nullptr && std::strcmp(env, "mmq") == 0;
+        }();
+        const bool mmvq_ok = !pin_mmq && ggml_is_quantized(src0->type) && ne12 == 1 && ne13 == 1 &&
+            ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+        if (!mmvq_ok) {
+            GGML_ASSERT(ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0, true));
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst, true);
+            return;
+        }
+        constexpr int64_t group = MMVQ_MAX_BATCH_SIZE;
+        cudaStream_t stream = ctx.stream();
+        ggml_cuda_pool_alloc<float> y_pad(ctx.pool());
+        ggml_cuda_pool_alloc<float> d_pad(ctx.pool());
+        for (int64_t c0 = 0; c0 < ne11; c0 += group) {
+            const int64_t nc = std::min(group, ne11 - c0);
+            ggml_tensor y = *src1;
+            ggml_tensor d = *dst;
+            y.ne[1] = group; y.ne[2] = 1; y.ne[3] = 1;
+            y.nb[1] = ne10 * sizeof(float); y.nb[2] = y.nb[1] * group; y.nb[3] = y.nb[2];
+            d.ne[1] = group; d.ne[2] = 1; d.ne[3] = 1;
+            d.nb[1] = ne0 * sizeof(float); d.nb[2] = d.nb[1] * group; d.nb[3] = d.nb[2];
+            y.data = (char *) src1->data + c0 * nb11;
+            d.data = (char *) dst->data + c0 * nb1;
+            if (nc < group) {
+                y_pad.alloc((size_t) (ne10 * group));
+                d_pad.alloc((size_t) (ne0 * group));
+                CUDA_CHECK(cudaMemsetAsync(y_pad.get(), 0, (size_t) (ne10 * group) * sizeof(float), stream));
+                CUDA_CHECK(cudaMemcpyAsync(y_pad.get(), y.data, (size_t) (ne10 * nc) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                y.data = y_pad.get();
+                d.data = d_pad.get();
+            }
+            y.src[0] = nullptr; y.view_src = nullptr; y.op = GGML_OP_NONE;
+            d.src[0] = nullptr; d.src[1] = nullptr; d.view_src = nullptr;
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &y, nullptr, &d);
+            if (nc < group) {
+                CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + c0 * nb1, d_pad.get(), (size_t) (ne0 * nc) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            }
+        }
         return;
     }
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
