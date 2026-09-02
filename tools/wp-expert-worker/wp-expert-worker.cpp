@@ -109,10 +109,56 @@ namespace wp_expert_worker {
 // two can never drift: both are bumped at the same two call sites.
 static std::atomic<uint64_t> g_test_arena_prefill_hits{0};
 static std::atomic<uint64_t> g_test_arena_prefill_fallbacks{0};
+// Graph BUILDS on the grouped path. Shadows RequestStats::n_arena_build, but
+// only for ArenaGraphKind::PREFILL, so a test can assert the graph cache
+// stabilises (build count stops rising) once the shapes repeat.
+static std::atomic<uint64_t> g_test_arena_prefill_builds{0};
+// Fingerprint of WHERE the pager put the last grouped request's pages
+// (assignment index -> pool slot). Two runs whose fingerprints differ really
+// did place the same experts differently, which is what keeps the
+// placement-independence test from passing vacuously.
+static std::atomic<uint64_t> g_test_arena_prefill_placement{0};
+
+// PAD-SLOT bookkeeping of the most recently constructed ExpertSlotPool, plus a
+// tripwire that must never fire: a bound page whose arena-local slot index
+// landed in the pad region.
+static std::atomic<uint64_t> g_test_pool_pad_slots{0};
+static std::atomic<uint64_t> g_test_pool_arena_count{0};
+static std::atomic<uint64_t> g_test_pool_planned_slots{0};
+static std::atomic<uint64_t> g_test_pool_usable_slots{0};
+static std::atomic<uint64_t> g_test_arena_prefill_pad_bound{0};
 
 void test_reset_arena_prefill_counters() {
     g_test_arena_prefill_hits.store(0, std::memory_order_relaxed);
     g_test_arena_prefill_fallbacks.store(0, std::memory_order_relaxed);
+    g_test_arena_prefill_builds.store(0, std::memory_order_relaxed);
+    g_test_arena_prefill_placement.store(0, std::memory_order_relaxed);
+    // NOT reset here: the four g_test_pool_* values are construction FACTS of
+    // the most recently built pool, not per-run counters, and tests call this
+    // mid-connection (after the warm-up request) -- zeroing them would erase
+    // the pool geometry the connection is still running on. g_test_..._pad_bound
+    // is a tripwire that must be zero for the whole process, so leaving it
+    // cumulative is strictly stronger than resetting it.
+}
+
+uint64_t test_pool_pad_slots_per_arena() {
+    return g_test_pool_pad_slots.load(std::memory_order_relaxed);
+}
+
+uint64_t test_pool_arena_count() {
+    return g_test_pool_arena_count.load(std::memory_order_relaxed);
+}
+
+uint64_t test_pool_planned_slots() {
+    return g_test_pool_planned_slots.load(std::memory_order_relaxed);
+}
+
+uint64_t test_pool_usable_slots() {
+    return g_test_pool_usable_slots.load(std::memory_order_relaxed);
+}
+
+uint64_t test_arena_prefill_pad_bound() {
+    return g_test_arena_prefill_pad_bound.load(std::memory_order_relaxed);
 }
 
 uint64_t test_arena_prefill_hits() {
@@ -121,6 +167,14 @@ uint64_t test_arena_prefill_hits() {
 
 uint64_t test_arena_prefill_fallbacks() {
     return g_test_arena_prefill_fallbacks.load(std::memory_order_relaxed);
+}
+
+uint64_t test_arena_prefill_builds() {
+    return g_test_arena_prefill_builds.load(std::memory_order_relaxed);
+}
+
+uint64_t test_arena_prefill_placement() {
+    return g_test_arena_prefill_placement.load(std::memory_order_relaxed);
 }
 
 static bool wp_worker_hash_trace_enabled() {
@@ -3780,6 +3834,9 @@ public:
         resources_.device_bytes = 0;
         std::set<int> reserved_indices(resources_.reserved_slot_indices.begin(),
                                        resources_.reserved_slot_indices.end());
+        // n_expert_used pad slots per arena; see ResourcePlan::pad_slots_per_arena.
+        pad_slots_per_arena_ = std::max(0, resources_.pad_slots_per_arena);
+        resources_.planned_slot_count = resources_.slot_count;
         allocate_slot_arenas();
         // *** PIN THE CPU EXPERT TIER INTO RAM -- NEVER SWAP IT. ***
         // The CPU device's slot arenas ARE host RAM (a CPU backend buffer is a
@@ -3794,40 +3851,89 @@ public:
         // and only mlock is a hard guarantee the pages stay resident. Applied
         // to CPU backends only -- a GPU arena is VRAM and mlock does not apply.
         mlock_cpu_arenas();
-        size_t arena_index  = 0;
-        uint64_t arena_used = 0;
+        // *** CARVE THE USABLE SLOTS; SKIP EACH ARENA'S PAD TAIL. ***
+        // Driven by the per-arena usable counts push_arena() recorded rather
+        // than by the planned slot count: the pads come OUT of the plan, so a
+        // pool ends up with planned - pads*arenas slots and the arena byte
+        // budget is unchanged. Every arena is filled to its usable count and
+        // no further, which keeps compute_arena_layout()'s run-length scan
+        // (offset == i*stride, every arena non-empty, slots_ fully consumed)
+        // exactly as it was.
+        int planned_slot_index = 0;
+        std::vector<int> actual_reserved;
         for (size_t class_index = 0;
                 class_index < resources_.slot_classes.size(); ++class_index) {
             const SlotClass & slot_class = resources_.slot_classes[class_index];
+            const uint64_t need = arena_slot_stride(slot_class.size);
+            size_t arena_begin = 0;
+            size_t arena_end   = arenas_.size();
             if (resources_.slot_classes.size() > 1) {
-                arena_index = arena_class_starts_.at(class_index);
-                arena_used = 0;
+                arena_begin = arena_class_starts_.at(class_index);
+                arena_end   = class_index + 1 < arena_class_starts_.size()
+                    ? arena_class_starts_.at(class_index + 1) : arenas_.size();
             }
-            for (int i = 0; i < slot_class.slots; ++i) {
-                const uint64_t need = arena_slot_stride(slot_class.size);
-                if (arena_index >= arenas_.size()) {
-                    throw std::runtime_error("expert slot arenas exhausted");
-                }
-                uint64_t cap = (uint64_t) ggml_backend_buffer_get_size(arenas_[arena_index].get());
-                if (arena_used + need > cap) {
-                    ++arena_index;
-                    arena_used = 0;
-                    if (arena_index >= arenas_.size()) {
+            if (arena_begin > arena_end || arena_end > arenas_.size()) {
+                throw std::runtime_error("expert slot arenas exhausted");
+            }
+            // Reserved indices were planned as (class start + i) over PLANNED
+            // class sizes (plan_resources). Pads shrink every class, so map
+            // them class-relative: slot i of this class is reserved iff the
+            // plan reserved index planned_class_start + i.
+            const int planned_class_start = planned_slot_index;
+            planned_slot_index += slot_class.slots;
+            int carved = 0;
+            for (size_t arena_index = arena_begin;
+                    arena_index < arena_end && carved < slot_class.slots; ++arena_index) {
+                const uint64_t cap =
+                    (uint64_t) ggml_backend_buffer_get_size(arenas_[arena_index].get());
+                uint64_t arena_used = 0;
+                const size_t usable = arena_usable_slots_.at(arena_index);
+                for (size_t i = 0; i < usable && carved < slot_class.slots; ++i) {
+                    if (need > cap || arena_used > cap - need) {
                         throw std::runtime_error("expert slot arenas exhausted");
                     }
-                    cap = (uint64_t) ggml_backend_buffer_get_size(arenas_[arena_index].get());
+                    slots_.push_back(
+                        make_slot_in(arenas_[arena_index].get(), arena_used, slot_class.size));
+                    arena_used += need;
+                    slots_.back().reserved =
+                        reserved_indices.count(planned_class_start + carved) != 0;
+                    if (slots_.back().reserved) {
+                        actual_reserved.push_back((int) slots_.size() - 1);
+                    }
+                    ++carved;
                 }
-                if (resources_.slot_classes.size() > 1 &&
-                        (need > cap || arena_used > cap - need)) {
-                    throw std::runtime_error("expert slot arenas exhausted");
-                }
-                slots_.push_back(
-                    make_slot_in(arenas_[arena_index].get(), arena_used, slot_class.size));
-                arena_used += need;
-                slots_.back().reserved = reserved_indices.count((int) slots_.size() - 1) != 0;
-                resources_.device_bytes += need;
+                // device_bytes stays the TRUE arena footprint: the pad tail is
+                // allocated device memory even though it is not a slot.
+                resources_.device_bytes +=
+                    need * (uint64_t) (usable + arena_pad_slots_.at(arena_index));
             }
         }
+        // HELLO, the pin budget and every "how many pages fit" number the spine
+        // sees are driven by slot_count, so it must be the USABLE count.
+        resources_.slot_count = (int) slots_.size();
+        resources_.reserved_slot_indices = std::move(actual_reserved);
+        resources_.reserved_slot_count = (int) resources_.reserved_slot_indices.size();
+        resources_.general_slot_count =
+            resources_.slot_count - resources_.reserved_slot_count;
+        // What was ACTUALLY reserved, which class_pad_slots() may have cut below
+        // the model's n_expert_used on a pool too small to give it away.
+        const int effective_pads = arena_pad_slots_.empty()
+            ? 0
+            : (int) *std::max_element(arena_pad_slots_.begin(), arena_pad_slots_.end());
+        resources_.pad_slots_per_arena = effective_pads;
+        if (effective_pads > 0) {
+            std::fprintf(stderr,
+                         "wp expert worker: expert slot arenas=%zu pad_slots=%d per arena "
+                         "(reserved, never pageable) planned_slots=%d usable_slots=%d\n",
+                         arenas_.size(), effective_pads,
+                         resources_.planned_slot_count, resources_.slot_count);
+        }
+        g_test_pool_pad_slots.store((uint64_t) effective_pads, std::memory_order_relaxed);
+        g_test_pool_arena_count.store((uint64_t) arenas_.size(), std::memory_order_relaxed);
+        g_test_pool_planned_slots.store(
+            (uint64_t) resources_.planned_slot_count, std::memory_order_relaxed);
+        g_test_pool_usable_slots.store(
+            (uint64_t) resources_.slot_count, std::memory_order_relaxed);
         // Every input to compute_arena_layout() is now final and never changes
         // again (slot.buffer/offset/capacity are write-once in make_slot_in()).
         // Compute it here, once, instead of rescanning ~6700 slots two to three
@@ -3952,7 +4058,16 @@ public:
             uint64_t              capacity = 0;
             uint64_t              stride = 0;
             size_t                first_slot = 0;
+            // USABLE slots only: n_slots slots carved from this arena, pool
+            // slot indices [first_slot, first_slot + n_slots).
             size_t                n_slots = 0;
+            // PAD slots reserved at the END of this arena, arena-local ids
+            // [n_slots, n_slots + n_pad_slots). They have NO pool slot index --
+            // arena_for_slot() can never return one -- are never bound, never
+            // evicted and never a DMA target, and were zero-filled by the
+            // ggml_backend_buffer_clear at allocation. A strided view over the
+            // arena addresses n_slots + n_pad_slots slots.
+            size_t                n_pad_slots = 0;
         };
 
         ggml_backend_buffer_t buffer = nullptr;
@@ -4222,7 +4337,8 @@ public:
         size_t first_slot = 0;
         uint64_t common_stride = 0;
         bool stride_uniform = true;
-        for (const buffer_ptr & buffer : arenas_) {
+        for (size_t arena_index = 0; arena_index < arenas_.size(); ++arena_index) {
+            const buffer_ptr & buffer = arenas_[arena_index];
             const uint64_t capacity = (uint64_t) ggml_backend_buffer_get_size(buffer.get());
             if (capacity == 0 || first_slot >= slots_.size()) {
                 return std::nullopt;
@@ -4261,6 +4377,14 @@ public:
             arena.stride = stride;
             arena.first_slot = first_slot;
             arena.n_slots = n_slots;
+            // Pads are not slots, so the scan above cannot see them; take the
+            // count from the allocator's per-arena record. Clamped to what the
+            // buffer can still address beyond the usable run.
+            arena.n_pad_slots = arena_index < arena_pad_slots_.size()
+                ? arena_pad_slots_[arena_index] : 0;
+            if (arena.n_slots + arena.n_pad_slots > (size_t) (capacity / stride)) {
+                return std::nullopt;
+            }
             layout.arenas.push_back(arena);
             first_slot += n_slots;
         }
@@ -6484,6 +6608,47 @@ private:
 #endif
     }
 
+    // *** THE RESERVATION MUST NEVER STARVE THE POOL. ***
+    // Pads are a performance feature (they keep grouped prefill on the fast
+    // path); holding a layer's working set is a correctness one. plan_resources
+    // already refuses a plan whose slot budget cannot cover pin_floor -- the
+    // largest number of pages any single layer needs at once -- so the same
+    // floor bounds the reservation here: never take a class below it. On
+    // production geometry the floor is a tiny fraction of the class (Qwen3:
+    // ~128 pages per layer against thousands of slots over ~19 arenas) and the
+    // full n_expert_used is reserved; on a toy fixture whose slot count IS the
+    // floor this returns 0 and the pool behaves exactly as it did before pads
+    // existed (grouped prefill then declines, and the gather path answers).
+    int class_pad_slots(const SlotClass & slot_class, size_t n_arenas) const {
+        if (n_arenas == 0 || pad_slots_per_arena_ <= 0) {
+            return 0;
+        }
+        const long long spare =
+            (long long) slot_class.slots - (long long) std::max(0, slot_class.pin_floor);
+        if (spare <= 0) {
+            return 0;
+        }
+        const long long allowed = spare / (long long) n_arenas;
+        return (int) std::min<long long>((long long) pad_slots_per_arena_,
+                                         std::max<long long>(0, allowed));
+    }
+
+    // How many arenas a class of `class_total` bytes will be split into at
+    // `arena_bytes` per arena, counting only arenas that can hold a slot.
+    static size_t planned_arena_count(uint64_t class_total, uint64_t arena_bytes,
+                                      uint64_t stride) {
+        size_t count = 0;
+        uint64_t remaining = class_total;
+        while (remaining > 0 && arena_bytes > 0) {
+            const uint64_t want = std::min(arena_bytes, remaining);
+            if (stride != 0 && want / stride >= 1) {
+                ++count;
+            }
+            remaining -= want;
+        }
+        return count;
+    }
+
     void allocate_slot_arenas() {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
         uint64_t total = 0;
@@ -6516,8 +6681,15 @@ private:
                 if (buf) {
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     // see the zeroing note on the resident-page allocation above
+                    // -- and see push_arena(): this is also what makes the PAD
+                    // slots at the end of the arena finite zeros forever.
                     ggml_backend_buffer_clear(buf.get(), 0);
-                    arenas_.push_back(std::move(buf));
+                    const SlotClass & only_class = resources_.slot_classes.front();
+                    if (!push_arena(std::move(buf), arena_slot_stride(only_class.size),
+                                    class_pad_slots(only_class, 1))) {
+                        throw std::runtime_error(
+                            "expert slot arena is too small to reserve pad slots");
+                    }
                     return;
                 }
             }
@@ -6569,9 +6741,19 @@ private:
                 if (arena_bytes == 0) {
                     arena_bytes = stride;
                 }
+                const int class_pads = class_pad_slots(
+                    slot_class, planned_arena_count(class_total, arena_bytes, stride));
                 uint64_t remaining = class_total;
                 while (remaining > 0) {
                     const uint64_t want = std::min(arena_bytes, remaining);
+                    // FOLD AWAY a tail too small to hold even one usable slot
+                    // once the pads are taken out: allocating it would give
+                    // compute_arena_layout an arena with zero slots (which it
+                    // rejects outright) and would spend budget on nothing.
+                    if (want / stride <= (uint64_t) class_pads) {
+                        remaining -= want;
+                        continue;
+                    }
                     buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) want));
                     if (!buf) {
                         throw std::runtime_error(
@@ -6580,7 +6762,7 @@ private:
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     // see the zeroing note on the resident-page allocation above
                     ggml_backend_buffer_clear(buf.get(), 0);
-                    arenas_.push_back(std::move(buf));
+                    push_arena(std::move(buf), stride, class_pads);
                     remaining -= want;
                     allocated += want;
                 }
@@ -6599,9 +6781,17 @@ private:
         if (arena_bytes == 0) {
             arena_bytes = max_stride;
         }
+        const int class_pads = resources_.slot_classes.empty() ? 0 : class_pad_slots(
+            resources_.slot_classes.front(),
+            planned_arena_count(total, arena_bytes, max_stride));
         uint64_t remaining = total;
         while (remaining > 0) {
             const uint64_t want = std::min(arena_bytes, remaining);
+            // see the fold-away note on the size-class path above
+            if (want / max_stride <= (uint64_t) class_pads) {
+                remaining -= want;
+                continue;
+            }
             buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) want));
             if (!buf) {
                 throw std::runtime_error(
@@ -6610,9 +6800,31 @@ private:
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // see the zeroing note on the resident-page allocation above
             ggml_backend_buffer_clear(buf.get(), 0);
-            arenas_.push_back(std::move(buf));
+            push_arena(std::move(buf), max_stride, class_pads);
             remaining -= want;
         }
+    }
+
+    // *** PAD SLOTS: RESERVED, NEVER PAGEABLE. ***
+    // Record one arena and split its slot positions into USABLE (carved into
+    // slots_ by the constructor) and PAD (the last pad_slots_per_arena_ of
+    // them). A pad exists only as an arena-local id in ArenaLayout; it has no
+    // pool slot index, so free_slot_for/select_victim/ensure_batch can never
+    // reach it and no DMA can ever land in it. Grouped prefill uses pads as
+    // the weight-0 filler ids that let every arena group carry the same
+    // canonical route width -- see compute_batch_arena_prefill. Returns false
+    // (and does NOT keep the buffer) if the arena cannot hold a usable slot.
+    bool push_arena(buffer_ptr buf, uint64_t stride, int pad_slots) {
+        const uint64_t capacity = (uint64_t) ggml_backend_buffer_get_size(buf.get());
+        const uint64_t positions = stride == 0 ? 0 : capacity / stride;
+        const uint64_t pads = std::min<uint64_t>((uint64_t) std::max(0, pad_slots), positions);
+        if (positions <= pads) {
+            return false;
+        }
+        arenas_.push_back(std::move(buf));
+        arena_usable_slots_.push_back((size_t) (positions - pads));
+        arena_pad_slots_.push_back((size_t) pads);
+        return true;
     }
 
     // Carve one slot out of an already-allocated arena buffer at `offset`.
@@ -7332,6 +7544,13 @@ private:
     // The large backing allocations every slot is carved from. Declared BEFORE
     // slots_ so it outlives them: Slot::buffer points in here and does not own.
     std::vector<buffer_ptr>    arenas_;
+    // Parallel to arenas_, filled by push_arena(): usable slot positions and
+    // reserved PAD positions of each arena. compute_arena_layout() cannot
+    // recover the pad count by scanning slots_ (pads are not slots), so it
+    // learns it from here.
+    std::vector<size_t>        arena_usable_slots_;
+    std::vector<size_t>        arena_pad_slots_;
+    int                        pad_slots_per_arena_ = 0;
     std::vector<size_t>        arena_class_starts_;
     std::vector<Slot>          slots_;
     // Filled once in the constructor, after slots_ is built; see the
@@ -7536,6 +7755,15 @@ public:
             worker.end_async_dispatch(previous_conn_index, previous_trace_req);
         }
     };
+    // PAD SLOTS come from the MODEL, not from the resource plan: the grouped
+    // prefill path needs exactly n_expert_used weight-0 filler ids per arena
+    // group (one per canonical route position). plan_resources_for_backend()
+    // knows nothing about hparams, so stamp it on the plan on the way past.
+    static ResourcePlan plan_with_pad_slots(ResourcePlan plan, int n_expert_used) {
+        plan.pad_slots_per_arena = std::max(0, n_expert_used);
+        return plan;
+    }
+
     DeviceWorker(
             Catalog catalog,
             const std::string & device,
@@ -7560,10 +7788,12 @@ public:
                   resident_expert_blocks, page_owner_),
         pool_(
             backend_.get(),
-            plan_resources_for_backend(
-                resource_pages(catalog_, page_owner_), slots, host_budget_bytes,
-                resident_.pinned_bytes(), expert_reserve_blocks,
-                expert_reserve_bytes, backend_.get()),
+            plan_with_pad_slots(
+                plan_resources_for_backend(
+                    resource_pages(catalog_, page_owner_), slots, host_budget_bytes,
+                    resident_.pinned_bytes(), expert_reserve_blocks,
+                    expert_reserve_bytes, backend_.get()),
+                catalog_.descriptor.hparams.n_expert_used),
             host_victim_bytes,
             test_hooks, expert_reserve_blocks, catalog_.pages.size(),
             shared_host_tier, logs),
@@ -11273,6 +11503,11 @@ private:
                     std::chrono::steady_clock::now() - vk_cache_started).count();
         }
 
+        // Where this call's answer lands: the shared result slot, or the
+        // per-assignment partial slot a resident-first caller named.
+        const size_t effective_result_offset =
+            result_offset == std::numeric_limits<size_t>::max()
+                ? io_result_offset_ : result_offset;
         if (gc_hit) {
             // *** THE D2 FAST PATH: no context, no graph build, no gallocr. ***
             // Rebind this request's expert weights into the cached graph (src
@@ -11397,8 +11632,6 @@ private:
 
         ggml_tensor * input = make_io_tensor(ctx.get(), request.n_tokens, 0);
         ggml_set_input(input);
-        const size_t effective_result_offset =
-            result_offset == std::numeric_limits<size_t>::max() ? io_result_offset_ : result_offset;
         ggml_tensor * result = make_io_tensor(
             ctx.get(), request.n_tokens, effective_result_offset);
         // *** SEED THE FOLD, DO NOT ADD AT THE END. ***
@@ -11417,8 +11650,15 @@ private:
         //
         // Gather+set_rows writes into `result` (the io buffer). Zero it on the
         // first chunk so scatter-add starts from 0; later chunks keep the seed.
+        // ggml_fill_inplace, NOT ggml_scale_inplace(result, 0): 0 * NaN is NaN,
+        // and the slot's first use reads whatever the allocator handed out
+        // (2026-09-02: recycled host heap gave 8315/327680 NaNs on a 128-token
+        // production-geometry prefill, and later chunks added onto them). An
+        // in-graph fill stays stream-ordered and runs on cached replays too;
+        // ggml_backend_tensor_memset would cost a stream synchronize per
+        // request on CUDA/HIP.
         if (use_gather && s_set_rows && !add_previous) {
-            result = ggml_scale_inplace(ctx.get(), result, 0.0f);
+            result = ggml_fill_inplace(ctx.get(), result, 0.0f);
         }
         ggml_tensor * sum = (add_previous || (use_gather && s_set_rows)) ? result : nullptr;
         std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
@@ -12377,6 +12617,21 @@ private:
     // launches one get_rows and three matmuls per expert, about 1100 kernels
     // at production routing width. Pack only the real routes into arena-local
     // IDs so each arena needs three matmul launches regardless of expert count.
+    // TEMP DIAG (WP_EXPERT_ARENA_PREFILL_DIAG=1): which line of the grouped
+    // prefill path sent this request back to the gather path.
+    static void arena_prefill_reject_diag(const char * reason) {
+        static const bool diag = [] {
+            const char * e = std::getenv("WP_EXPERT_ARENA_PREFILL_DIAG");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (diag) {
+            static std::atomic<int> printed{0};
+            if (printed.fetch_add(1) < 12) {
+                std::fprintf(stderr, "wp expert worker: grouped prefill rejected: %s\n", reason);
+            }
+        }
+    }
+
     bool compute_batch_arena_prefill(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -12385,14 +12640,14 @@ private:
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::optional<ExpertSlotPool::ArenaLayout> & layout_opt = pool_.arena_layout();
         if (!layout_opt.has_value()) {
-            return false;
+            { arena_prefill_reject_diag("no-arena-layout"); return false; }
         }
         const ExpertSlotPool::ArenaLayout & layout = *layout_opt;
         const size_t n = request.assignments.size();
         if (n == 0 || n > (size_t) INT32_MAX ||
                 layout.n_slots > (size_t) INT32_MAX ||
                 !arena_assignments_eligible(request, batch, layout)) {
-            return false;
+            { arena_prefill_reject_diag("ineligible-assignments"); return false; }
         }
 
         static const char * k_roles[3] = {"gate", "up", "down"};
@@ -12412,7 +12667,7 @@ private:
                 const ExpertSlotPool::ArenaLayout::Arena * arena =
                     layout.arena_for_slot(batch.slot_index(i));
                 if (arena == nullptr) {
-                    return false;
+                    { arena_prefill_reject_diag("slot-outside-any-arena"); return false; }
                 }
                 if ((size_t) (arena - layout.arenas.data()) == arena_index) {
                     group.assignments.push_back(i);
@@ -12441,12 +12696,98 @@ private:
             }
             if (group.n_used > (size_t) catalog_.descriptor.hparams.n_expert_used ||
                     group.n_used > (size_t) INT32_MAX) {
-                return false;
+                { arena_prefill_reject_diag("group-n-used-over-n-expert-used"); return false; }
             }
             groups.push_back(std::move(group));
         }
         if (groups.empty()) {
-            return false;
+            { arena_prefill_reject_diag("no-nonempty-group"); return false; }
+        }
+        // Assignment -> (graph group, arena-local slot). Both are functions of
+        // where the pager placed the page and therefore change from request to
+        // request; nothing downstream of here may let them reach the FOLD ORDER.
+        std::vector<size_t>  group_of(n, SIZE_MAX);
+        std::vector<int32_t> local_slot(n, 0);
+        for (size_t g = 0; g < groups.size(); ++g) {
+            const ExpertSlotPool::ArenaLayout::Arena & arena =
+                layout.arenas[groups[g].arena_index];
+            for (size_t i : groups[g].assignments) {
+                group_of[i]   = g;
+                const size_t local = batch.slot_index(i) - arena.first_slot;
+                // TRIPWIRE. A pool slot index can never resolve into the pad
+                // region -- pads are not slots and arena_for_slot() only spans
+                // [first_slot, first_slot + n_slots). If it ever did, this
+                // request would page over a pad and the weight-0 filler rows
+                // would stop being exact zeros.
+                if (local >= arena.n_slots) {
+                    g_test_arena_prefill_pad_bound.fetch_add(1, std::memory_order_relaxed);
+                    arena_prefill_reject_diag("bound-page-inside-pad-region");
+                    return false;
+                }
+                local_slot[i] = (int32_t) local;
+            }
+        }
+
+        // *** THE ROUTE WIDTH IS REQUEST-WIDE, NOT PER-GROUP. ***
+        // 2026-09-02: the old layout packed each group's ids to that group's own
+        // n_used and folded group-by-group, so a token's routes were summed in
+        // "arena order, then packing order" -- which arena a slot lands in is
+        // the pager's business and changes between requests as pages churn.
+        // FP addition is not associative, so the same prompt produced three
+        // different output md5s on three identical requests. Every group now
+        // carries the SAME k_width positions, position k being the token's k-th
+        // CANONICAL route (assignment index ascending, restricted to nonzero
+        // weights -- exactly the order the gather path folds in; see
+        // scatter_add_compact_rows and "SEED THE FOLD, DO NOT ADD AT THE END").
+        // A group that does not own position k pads it at route weight 0, so
+        // its output is an EXACT zero there and the elementwise group sum is
+        // exact; the fold then runs over k ascending. Bits now depend only on
+        // the routing.
+        size_t k_needed = 0;
+        for (uint32_t t = 0; t < request.n_tokens; ++t) {
+            size_t routes = 0;
+            for (size_t i = 0; i < n; ++i) {
+                routes += request.assignments[i].weights[t] != 0.0f;
+            }
+            k_needed = std::max(k_needed, routes);
+        }
+        if (k_needed == 0) {
+            { arena_prefill_reject_diag("no-routed-token"); return false; }
+        }
+        // *** PADS ARE RESERVED SLOTS, NOT SPARE FREE ONES. ***
+        // A pad must be a DISTINCT slot of its own arena (the CUDA/HIP
+        // quantize_mmq_q8_1<..., scatter=true> path faults on duplicate ids per
+        // token) whose dequantised rows are guaranteed FINITE, because the
+        // contribution is row * 0 and NaN*0 is NaN, not 0.
+        //
+        // The first version of this drew pads from the arena's lowest FREE
+        // slots. Two things were wrong with that. (1) Under WP_WORKER_PIPELINE
+        // a "free" slot is exactly what the NEXT request's page-in DMAs into
+        // while this compute runs, so the pad row could be a half-written page
+        // whose fp16 block scales are NaN/Inf -- and NaN*0 poisons the token.
+        // (2) It pinned k_width to the SMALLEST arena in the request, so the
+        // route width -- and with it the graph cache key -- depended on arena
+        // geometry rather than on the model, and any arena with fewer slots
+        // than the token's route count failed the whole request back to the
+        // ~1100-launch gather path.
+        //
+        // Every arena now reserves n_expert_used PAD slots at its END (see
+        // ExpertSlotPool::push_arena). They are inside the arena at the normal
+        // stride, so the strided [K, M, n_slots + n_pad_slots] view below
+        // addresses them; they were zero-filled once by the allocation-time
+        // ggml_backend_buffer_clear and nothing can ever write them again --
+        // they have no pool slot index at all, so no page-in, eviction or DMA
+        // can reach them. k_width is therefore n_expert_used, a MODEL CONSTANT,
+        // which is what makes the graph cache key stable from chunk to chunk.
+        const size_t n_expert_used = (size_t) catalog_.descriptor.hparams.n_expert_used;
+        const size_t k_width = n_expert_used;
+        if (k_width == 0 || k_width < k_needed || k_width > (size_t) INT32_MAX) {
+            { arena_prefill_reject_diag("k-width-unavailable"); return false; }
+        }
+        for (const ArenaGroup & group : groups) {
+            if (layout.arenas[group.arena_index].n_pad_slots < k_width) {
+                { arena_prefill_reject_diag("arena-has-too-few-pad-slots"); return false; }
+            }
         }
 
         const size_t params_align = ggml_backend_buft_get_alignment(
@@ -12470,28 +12811,45 @@ private:
         // path or in the toy fixture -- but grouped prefill runs 19 groups on
         // ROCm0 and 16 on ROCm1, and group g's ids offset is only
         // n_used*n_tokens*4, e.g. 3*100*4 = 1200, which is not 256-aligned.
-        size_t total_used = 0;
         size_t ids_bytes = 0;
-        for (const ArenaGroup & group : groups) {
+        for (size_t g = 0; g < groups.size(); ++g) {
             ids_bytes = GGML_PAD(ids_bytes, params_align);
             ids_offsets.push_back(ids_bytes);
-            ids_bytes += group.n_used * (size_t) request.n_tokens * sizeof(int32_t);
-            total_used += group.n_used;
+            ids_bytes += k_width * (size_t) request.n_tokens * sizeof(int32_t);
         }
         const size_t route_offset = GGML_PAD(ids_bytes, params_align);
         size_t route_bytes = 0;
-        for (const ArenaGroup & group : groups) {
+        for (size_t g = 0; g < groups.size(); ++g) {
             route_bytes = GGML_PAD(route_bytes, params_align);
             route_offsets.push_back(route_offset + route_bytes);
-            route_bytes += group.n_used * (size_t) request.n_tokens * sizeof(float);
+            route_bytes += k_width * (size_t) request.n_tokens * sizeof(float);
         }
         const size_t params_span = route_offset + route_bytes;
         grow_params_buffer(params_span, request_stats);
 
-        ArenaGraphKey key{(uint32_t) ArenaGraphKind::PREFILL, request.n_tokens, (uint32_t) total_used};
+        // *** THE KEY MUST NOT NAME **WHICH** ARENAS ARE IN THE REQUEST. ***
+        // 2026-09-02: keying on (arena index, n_used) per group rebuilt the
+        // graph on nearly every chunk (986 builds for 1013 hits on ROCm0), each
+        // paying a graph build + ggml_gallocr_alloc_graph. Both varied chunk to
+        // chunk purely because of paging. What the GRAPH actually depends on is
+        // the SHAPES: n_tokens, k_width, the group count, and each group tensor's
+        // ne[2]/nb[2] (its arena's slot count and stride). The arena a group is
+        // bound to is re-pointed with attach_weight on a hit -- see the rebind
+        // below -- so it stays out of the key.
+        ArenaGraphKey key{(uint32_t) ArenaGraphKind::PREFILL, request.n_tokens, (uint32_t) k_width};
         for (const ArenaGroup & group : groups) {
-            key.group_arenas.push_back((uint32_t) group.arena_index);
-            key.group_sizes.push_back((uint32_t) group.n_used);
+            const ExpertSlotPool::ArenaLayout::Arena & arena =
+                layout.arenas[group.arena_index];
+            // ne[2] spans the USABLE slots AND the pad tail -- exactly what
+            // make_role() below builds. The two must not drift or a cache hit
+            // would rebind a differently shaped view.
+            const size_t view_slots = arena.n_slots + arena.n_pad_slots;
+            if (view_slots > (size_t) UINT32_MAX ||
+                    arena.stride > (uint64_t) UINT32_MAX) {
+                { arena_prefill_reject_diag("arena-shape-overflows-key"); return false; }
+            }
+            key.group_arenas.push_back((uint32_t) view_slots);      // ne[2]
+            key.group_sizes.push_back((uint32_t) arena.stride);     // nb[2]
         }
         uint32_t clamp_bits = 0;
         std::memcpy(&clamp_bits, &request.swiglu_clamp, sizeof(clamp_bits));
@@ -12551,10 +12909,11 @@ private:
             entry.params_gen = params_gen_;
             entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
             ++request_stats.n_arena_build;
+            g_test_arena_prefill_builds.fetch_add(1, std::memory_order_relaxed);
 
             const auto build_started = std::chrono::steady_clock::now();
-            const size_t tensor_count = 16 * groups.size() + 4 * total_used + 64;
-            const size_t graph_nodes = 12 * groups.size() + 4 * total_used + 32;
+            const size_t tensor_count = 20 * groups.size() + 4 * k_width + 64;
+            const size_t graph_nodes = 14 * groups.size() + 4 * k_width + 32;
             entry.ctx.reset(ggml_init({
                 /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
                                   ggml_graph_overhead_custom(graph_nodes, false),
@@ -12569,8 +12928,11 @@ private:
                                        const ArenaRoleKey & role) {
                 const ExpertSlotPool::ArenaLayout::Arena & arena =
                     layout.arenas[group.arena_index];
+                // n_slots + n_pad_slots: the pad tail must be ADDRESSABLE by
+                // this view, because the weight-0 filler ids point into it.
                 ggml_tensor * tensor = ggml_new_tensor_3d(
-                    ctx, role.type, role.ne0, role.ne1, (int64_t) arena.n_slots);
+                    ctx, role.type, role.ne0, role.ne1,
+                    (int64_t) (arena.n_slots + arena.n_pad_slots));
                 tensor->nb[2] = arena.stride;
                 attach_weight(tensor, arena.buffer, arena.base, role.offset);
                 return tensor;
@@ -12581,19 +12943,23 @@ private:
             ggml_tensor * input3d = ggml_reshape_3d(
                 ctx, input2d, n_embd, 1, request.n_tokens);
             ggml_tensor * sum = nullptr;
+            entry.group_weights.resize(groups.size());
+            entry.group_arena_index.assign(groups.size(), SIZE_MAX);
             for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
                 const ArenaGroup & group = groups[group_index];
                 ggml_tensor * as_gate = make_role(group, roles[0]);
                 ggml_tensor * as_up   = make_role(group, roles[1]);
                 ggml_tensor * as_down = make_role(group, roles[2]);
+                entry.group_weights[group_index]    = {as_gate, as_up, as_down};
+                entry.group_arena_index[group_index] = group.arena_index;
                 ggml_tensor * ids = ggml_new_tensor_2d(
-                    ctx, GGML_TYPE_I32, (int64_t) group.n_used, request.n_tokens);
+                    ctx, GGML_TYPE_I32, (int64_t) k_width, request.n_tokens);
                 ggml_set_input(ids);
                 attach_weight(ids, params_buffer_.get(),
                               ggml_backend_buffer_get_base(params_buffer_.get()),
                               ids_offsets[group_index]);
                 ggml_tensor * route_w = ggml_new_tensor_3d(
-                    ctx, GGML_TYPE_F32, 1, (int64_t) group.n_used, request.n_tokens);
+                    ctx, GGML_TYPE_F32, 1, (int64_t) k_width, request.n_tokens);
                 ggml_set_input(route_w);
                 attach_weight(route_w, params_buffer_.get(),
                               ggml_backend_buffer_get_base(params_buffer_.get()),
@@ -12612,18 +12978,25 @@ private:
                 ggml_tensor * down_out = ggml_mul_mat_id(ctx, as_down, hidden, ids);
                 ggml_mul_mat_id_set_hint(down_out, GGML_HINT_MUL_MAT_PIN);
                 ggml_tensor * weighted = ggml_mul(ctx, down_out, route_w);
-                ggml_tensor * group_sum = nullptr;
-                for (size_t k = 0; k < group.n_used; ++k) {
-                    ggml_tensor * contribution = ggml_view_2d(
-                        ctx, weighted, n_embd, request.n_tokens,
-                        weighted->nb[2], k * weighted->nb[1]);
-                    group_sum = group_sum != nullptr
-                        ? ggml_add(ctx, group_sum, contribution) : contribution;
-                }
-                sum = sum != nullptr ? ggml_add(ctx, sum, group_sum) : group_sum;
+                // ELEMENTWISE across groups, [n_embd, k_width, n_tokens]: every
+                // group holds an exact zero at the positions it does not own, so
+                // this is x + 0 and the group order (arena index ascending) is
+                // numerically irrelevant. It is fixed only so the graph SHAPE is
+                // stable for the cache.
+                sum = sum != nullptr ? ggml_add(ctx, sum, weighted) : weighted;
+            }
+            // ... and only THEN fold over the canonical route index, ascending.
+            // This is the left fold in assignment order the gather path runs.
+            ggml_tensor * folded = nullptr;
+            for (size_t k = 0; k < k_width; ++k) {
+                ggml_tensor * contribution = ggml_view_2d(
+                    ctx, sum, n_embd, request.n_tokens,
+                    sum->nb[2], k * sum->nb[1]);
+                folded = folded != nullptr
+                    ? ggml_add(ctx, folded, contribution) : contribution;
             }
             ggml_tensor * result = make_io_tensor(ctx, request.n_tokens, io_result_offset_);
-            ggml_tensor * copy = ggml_cpy(ctx, sum, result);
+            ggml_tensor * copy = ggml_cpy(ctx, folded, result);
             ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_nodes, false);
             ggml_build_forward_expand(graph, copy);
             entry.galloc.reset(ggml_gallocr_new(
@@ -12646,69 +13019,114 @@ private:
 
         ArenaGraphEntry & entry = it->second;
         entry.last_used = ++arena_graph_cache_tick_;
-        std::vector<uint8_t> params_host(params_span, 0);
+
+        // *** REBIND, DO NOT REBUILD. ***
+        // as_gate/as_up/as_down were bound with attach_weight, which sets
+        // ->buffer and ->data by hand; ggml_gallocr never allocated them
+        // (ggml_gallocr_is_allocated: "t->data != NULL // tensor data already
+        // set externally"), so re-pointing them at THIS request's arenas is
+        // safe and leaves every allocated intermediate untouched. The key
+        // already pins ne[2] (slot count) and nb[2] (stride), so only the
+        // buffer/base move.
+        if (entry.group_weights.size() != groups.size() ||
+                entry.group_arena_index.size() != groups.size()) {
+            { arena_prefill_reject_diag("cache-entry-group-count-mismatch"); return false; }
+        }
+        bool rebound = false;
         for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
-            const ArenaGroup & group = groups[group_index];
+            if (entry.group_arena_index[group_index] == groups[group_index].arena_index) {
+                continue;
+            }
             const ExpertSlotPool::ArenaLayout::Arena & arena =
-                layout.arenas[group.arena_index];
-            std::vector<int32_t> token_slots;
-            token_slots.reserve(group.n_used);
-            for (uint32_t t = 0; t < request.n_tokens; ++t) {
-                token_slots.clear();
-                size_t used = 0;
-                for (size_t assignment : group.assignments) {
-                    const float weight = request.assignments[assignment].weights[t];
-                    if (weight == 0.0f) {
-                        continue;
-                    }
-                    const size_t slot = batch.slot_index(assignment);
-                    const int32_t local_slot = (int32_t) (slot - arena.first_slot);
-                    token_slots.push_back(local_slot);
-                    const size_t index = (size_t) t * group.n_used + used++;
-                    std::memcpy(params_host.data() + ids_offsets[group_index] +
-                                    index * sizeof(int32_t),
-                                &local_slot, sizeof(local_slot));
-                    std::memcpy(params_host.data() + route_offsets[group_index] +
-                                    index * sizeof(float),
-                                &weight, sizeof(weight));
+                layout.arenas[groups[group_index].arena_index];
+            for (size_t j = 0; j < roles.size(); ++j) {
+                attach_weight(entry.group_weights[group_index][j],
+                              arena.buffer, arena.base, roles[j].offset);
+            }
+            entry.group_arena_index[group_index] = groups[group_index].arena_index;
+            rebound = true;
+        }
+        if (rebound && entry.persistent_plan != nullptr) {
+            // A captured plan may hold the OLD device addresses. Drop it; the
+            // next build for this bucket re-creates one.
+            release_persistent_plan(entry.persistent_plan, &request_stats);
+        }
+
+        std::vector<uint8_t> params_host(params_span, 0);
+        // Route weights default to 0 with the zero-fill above: that is what
+        // makes a pad position contribute an EXACT zero.
+        std::vector<size_t>  routes;
+        std::vector<uint8_t> owned(groups.size() * k_width, 0);
+        std::vector<std::vector<int32_t>> taken(groups.size());
+        routes.reserve(k_width);
+        for (std::vector<int32_t> & slots : taken) {
+            slots.reserve(k_width);
+        }
+        const auto put_id = [&](size_t group_index, uint32_t t, size_t k, int32_t slot) {
+            const size_t index = (size_t) t * k_width + k;
+            std::memcpy(params_host.data() + ids_offsets[group_index] +
+                            index * sizeof(int32_t),
+                        &slot, sizeof(slot));
+        };
+        for (uint32_t t = 0; t < request.n_tokens; ++t) {
+            // Canonical route order for this token: assignment index ascending.
+            routes.clear();
+            for (size_t i = 0; i < n; ++i) {
+                if (request.assignments[i].weights[t] != 0.0f) {
+                    routes.push_back(i);
                 }
-                // 2026-09-02: quantize_mmq_q8_1<..., scatter=true> forbids duplicate IDs per token.
-                for (size_t assignment : group.assignments) {
-                    if (used == group.n_used) {
-                        break;
-                    }
-                    if (request.assignments[assignment].weights[t] != 0.0f) {
-                        continue;
-                    }
-                    const size_t slot = batch.slot_index(assignment);
-                    const int32_t local_slot = (int32_t) (slot - arena.first_slot);
-                    if (std::find(token_slots.begin(), token_slots.end(), local_slot) != token_slots.end()) {
-                        continue;
-                    }
-                    token_slots.push_back(local_slot);
-                    const size_t index = (size_t) t * group.n_used + used++;
-                    std::memcpy(params_host.data() + ids_offsets[group_index] +
-                                    index * sizeof(int32_t),
-                                &local_slot, sizeof(local_slot));
+            }
+            if (routes.size() > k_width) {
+                { arena_prefill_reject_diag("token-routes-over-k-width"); return false; }
+            }
+            std::fill(owned.begin(), owned.end(), (uint8_t) 0);
+            for (std::vector<int32_t> & slots : taken) {
+                slots.clear();
+            }
+            for (size_t k = 0; k < routes.size(); ++k) {
+                const size_t i = routes[k];
+                const size_t group_index = group_of[i];
+                if (group_index == SIZE_MAX) {
+                    { arena_prefill_reject_diag("assignment-has-no-group"); return false; }
                 }
+                const int32_t slot = local_slot[i];
                 // *** RECOVER, DO NOT ABORT. ***
-                // Both invariants hold whenever the assignments in a group map
-                // to DISTINCT slots, which is what the pool guarantees for
-                // distinct (layer, expert) pages. A request that names the same
-                // expert twice breaks both: `used` cannot reach n_used, and the
-                // padded row would carry a duplicate id, which is exactly what
-                // crashes the CUDA/HIP scatter-quantize path. GGML_ASSERT would
-                // take the whole worker down mid-prefill for a malformed
-                // request; falling back to the gather path answers it correctly.
-                if (used != group.n_used) {
-                    return false;
+                // Distinct (layer, expert) pages occupy distinct slots, so this
+                // only fires when a request names the same expert twice -- which
+                // is exactly what crashes the CUDA/HIP scatter-quantize path
+                // (quantize_mmq_q8_1<..., scatter=true> forbids duplicate ids
+                // per token). GGML_ASSERT would take the worker down mid-prefill;
+                // the gather path answers a malformed request correctly.
+                if (std::find(taken[group_index].begin(), taken[group_index].end(), slot) !=
+                        taken[group_index].end()) {
+                    { arena_prefill_reject_diag("duplicate-slot-in-token-row"); return false; }
                 }
-                for (size_t i = 0; i < token_slots.size(); ++i) {
-                    for (size_t j = i + 1; j < token_slots.size(); ++j) {
-                        if (token_slots[i] == token_slots[j]) {
-                            return false;
-                        }
+                taken[group_index].push_back(slot);
+                owned[group_index * k_width + k] = 1;
+                put_id(group_index, t, k, slot);
+                const float weight = request.assignments[i].weights[t];
+                const size_t index = (size_t) t * k_width + k;
+                std::memcpy(params_host.data() + route_offsets[group_index] +
+                                index * sizeof(float),
+                            &weight, sizeof(weight));
+            }
+            // Every position this group does not own gets one of the arena's
+            // RESERVED pad slots at route weight 0, handed out in order:
+            // n_slots + 0, +1, ... At most k_width of them are needed and the
+            // arena has k_width (checked above), so they are distinct from each
+            // other; they are distinct from every real id because a real id is
+            // < n_slots. No search, no dependence on which slots are free, and
+            // nothing here can be a live DMA target.
+            for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+                const size_t n_slots =
+                    layout.arenas[groups[group_index].arena_index].n_slots;
+                size_t pad = 0;
+                for (size_t k = 0; k < k_width; ++k) {
+                    if (owned[group_index * k_width + k] != 0) {
+                        continue;
                     }
+                    put_id(group_index, t, k, (int32_t) (n_slots + pad));
+                    ++pad;
                 }
             }
         }
@@ -12744,6 +13162,14 @@ private:
         }
         ++request_stats.n_arena_prefill_hit;
         g_test_arena_prefill_hits.fetch_add(1, std::memory_order_relaxed);
+        {
+            uint64_t placement = 1469598103934665603ull;   // FNV-1a offset
+            for (size_t i = 0; i < n; ++i) {
+                placement = (placement ^ (uint64_t) (i + 1)) * 1099511628211ull;
+                placement = (placement ^ (uint64_t) batch.slot_index(i)) * 1099511628211ull;
+            }
+            g_test_arena_prefill_placement.store(placement, std::memory_order_relaxed);
+        }
         request_stats.n_arena_groups += groups.size();
         for (const pipe_expert_assignment & assignment : request.assignments) {
             for (float weight : assignment.weights) {
@@ -13744,7 +14170,13 @@ private:
     struct ArenaGraphKey {
         uint32_t kind = 0;
         uint32_t n_tokens = 0;
+        // SINGLE/MULTI: the assignment count. PREFILL: the canonical route
+        // width k_width (every group carries exactly k_width positions).
         uint32_t n_assignments = 0;
+        // SINGLE/MULTI: (arena index, assignment count) per group.
+        // PREFILL: (arena slot count, arena stride) per group -- i.e. the group
+        // tensors' ne[2]/nb[2]. Naming the arena INDEX here would rebuild the
+        // graph every time the pager moved a page; a hit rebinds instead.
         std::vector<uint32_t> group_arenas;
         std::vector<uint32_t> group_sizes;
 
@@ -13775,6 +14207,13 @@ private:
         // eager for this bucket once a captured replay fails.
         uint8_t                     hip_graph_submits = 0;
         bool                        hip_graph_failed = false;
+        // ArenaGraphKind::PREFILL only: the as_gate/as_up/as_down tensors of
+        // each group, in graph order, and the arena each is currently bound to.
+        // They carry data/buffer set by attach_weight (ggml_gallocr skips
+        // tensors with data != NULL), so a cache hit re-points them at this
+        // request's arenas instead of rebuilding the graph.
+        std::vector<std::array<ggml_tensor *, 3>> group_weights;
+        std::vector<size_t>                       group_arena_index;
     };
 
     struct GraphKey {
@@ -17808,6 +18247,7 @@ int run(const Options & options) {
                   << " slots=" << slot_class.slots
                   << " stride=" << slot_class.stride
                   << " pin_floor=" << slot_class.pin_floor
+                  << " pad_slots=" << resources.pad_slots_per_arena << " per arena"
                   << " pages=" << slot_class.pages << '\n';
     }
     if (worker.device_count() > 1) {

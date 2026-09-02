@@ -47,6 +47,20 @@ struct ResourcePlan {
     uint64_t               staging_bytes        = 0;
     int                    staging_buffers      = 0;
     bool                   size_classes         = false;
+    // PAD SLOTS. Every arena reserves this many slots at its END. They exist
+    // in the arena buffer at the normal stride -- so a strided mul_mat_id view
+    // over an arena can address them -- are zero-filled once at allocation and
+    // are never bound to a page, never handed out, never evicted and never a
+    // DMA target. The grouped prefill path uses them as the weight-0 filler
+    // ids that make every arena group carry the SAME canonical route width;
+    // the CUDA/HIP scatter-quantize path requires the ids of one token row to
+    // be distinct, so the filler must be a real, distinct slot of that arena.
+    // Set from the model's n_expert_used by DeviceWorker. Taken OUT of each
+    // arena's usable slot count, so the slot budget is unchanged.
+    int                    pad_slots_per_arena  = 0;
+    // Slots the plan asked for, BEFORE pad reservation. slot_count is what the
+    // pool actually carved (and what HELLO reports).
+    int                    planned_slot_count   = 0;
     std::vector<SlotClass> slot_classes;
 };
 
@@ -131,6 +145,22 @@ void install_inproc_factory();
 void     test_reset_arena_prefill_counters();
 uint64_t test_arena_prefill_hits();
 uint64_t test_arena_prefill_fallbacks();
+// Grouped-prefill graph BUILDS (cache misses). Rises once per distinct
+// (n_tokens, route width, group shape) bucket; a stable cache stops it rising.
+uint64_t test_arena_prefill_builds();
+// Fingerprint of the pool slots the last grouped prefill's assignments landed
+// in. Only meaningful as "same" vs "different" between two runs.
+uint64_t test_arena_prefill_placement();
+// Pad-slot bookkeeping of the most recently constructed ExpertSlotPool:
+// slots reserved per arena, arenas allocated, planned slots before the
+// reservation, and the slots actually carved (== HELLO n_slots).
+uint64_t test_pool_pad_slots_per_arena();
+uint64_t test_pool_arena_count();
+uint64_t test_pool_planned_slots();
+uint64_t test_pool_usable_slots();
+// Times the grouped prefill saw a bound page whose arena-local slot index fell
+// inside its arena's PAD region. Must stay 0: pads have no pool slot index.
+uint64_t test_arena_prefill_pad_bound();
 
 // Decode/prefill compute-profile policy. Pure functions of the env string so
 // tests can pin defaults without latching process-lifetime getenv statics.

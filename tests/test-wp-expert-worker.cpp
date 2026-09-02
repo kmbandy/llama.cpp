@@ -2952,7 +2952,13 @@ static std::vector<float> run_sparse_arena_prefill(
     options.device            = "CPU";
     options.listen_host       = "127.0.0.1";
     options.listen_port       = reserve_port();
-    options.slots             = 4;
+    // 8, not 4: every arena reserves n_expert_used PAD slots for the grouped
+    // path's weight-0 filler ids, and the pool refuses to reserve them below a
+    // class's pin_floor (4 here, the pages of one layer). A 4-slot pool is all
+    // floor, gets no pads, and the grouped path would decline every request --
+    // which is exactly what this test exists to exercise. 8 slots leave room
+    // for the 2 pads AND all four pages.
+    options.slots             = 8;
     options.host_budget_bytes = 2 * PAGE_BYTES;
     options.once              = true;
 
@@ -3035,7 +3041,8 @@ static void test_prefill_arena_grouped_chunk_byte_identical() {
     options.device            = "CPU";
     options.listen_host       = "127.0.0.1";
     options.listen_port       = reserve_port();
-    options.slots             = 4;
+    // 8, not 4: see the pad-slot note in run_sparse_arena_prefill.
+    options.slots             = 8;
     options.host_budget_bytes = 2 * PAGE_BYTES;
     options.once              = true;
 
@@ -3228,9 +3235,23 @@ static constexpr int      PROD_WIDTHS[2] = { 448, 192 };
 // Production runs ~180 assignments per 128-token chunk against ~8150 slots.
 // Scaled to 16 here purely for CPU wall time; what the geometry has to keep is
 // (a) several arenas per size class and (b) at least one arena with no route in
-// the chunk. PROD_EXPERTS/4 arenas (see WP_EXPERT_ARENA_MAX_BYTES below) and
+// the chunk. The arena split (see WP_EXPERT_ARENA_MAX_BYTES below) and
 // PROD_UNROUTED_FIRST give both.
-static constexpr int      PROD_EXPERTS = 16;
+//
+// *** WHY THERE ARE FOUR LAYERS WHEN ONLY ONE IS EVER DISPATCHED. ***
+// Every arena reserves n_expert_used == PROD_N_EXPERT_USED == 10 PAD slots at
+// its end (never bound, never a DMA target -- they are the weight-0 filler ids
+// the grouped path needs), so an arena's USABLE slots are its positions minus
+// 10. plan_resources caps a class at one slot per PAGE and the pool refuses to
+// reserve pads below a class's pin_floor (the largest per-layer page count), so
+// a one-layer fixture with 16 pages could never reserve anything. Four layers
+// of PROD_EXPERTS give 64 pages with a pin_floor of 16: four arenas, ten pads
+// each, and 24 usable slots -- comfortably more than the 16 pages layer
+// PROD_LAYER actually demands. Layers 1..3 are never dispatched to, so they are
+// never paged in; they exist purely to widen the pool the way production's
+// forty-odd layers do.
+static constexpr int      PROD_EXPERTS = 16;          // experts per layer
+static constexpr int      PROD_LAYERS  = 4;           // pages = experts * layers
 static constexpr int      PROD_UNROUTED_FIRST = 12;   // experts 12..15 draw no route
 static constexpr int      PROD_LAYER   = 0;
 static constexpr uint32_t PROD_TOKENS  = 128;
@@ -3314,96 +3335,144 @@ static ProdFixture make_production_fixture(
         { "retained_expert_range", { { "first", 0 }, { "last", PROD_EXPERTS - 1 } } },
         { "hparams",
           {
-              { "n_layer", 1 },
+              { "n_layer", PROD_LAYERS },
               { "n_embd", PROD_N_EMBD },
               { "n_ff_exp", width },
               { "n_expert", PROD_EXPERTS },
               { "n_expert_used", PROD_N_EXPERT_USED },
               { "activation", "silu" },
           } },
-        { "layers",
-          json::array({ json{
-              { "layer", PROD_LAYER },
-              { "roles",
-                {
-                    { "gate", role_desc(geometry.gate_up, PROD_N_EMBD, width, gate_bytes, "gate") },
-                    { "up",   role_desc(geometry.gate_up, PROD_N_EMBD, width, up_bytes,   "up") },
-                    { "down", role_desc(geometry.down,    width, PROD_N_EMBD, down_bytes, "down") },
-                } },
-          } }) },
+        { "layers", [&]() {
+              json layers = json::array();
+              for (int layer = PROD_LAYER; layer < PROD_LAYER + PROD_LAYERS; ++layer) {
+                  layers.push_back({
+                      { "layer", layer },
+                      { "roles",
+                        {
+                            { "gate", role_desc(geometry.gate_up, PROD_N_EMBD, width, gate_bytes, "gate") },
+                            { "up",   role_desc(geometry.gate_up, PROD_N_EMBD, width, up_bytes,   "up") },
+                            { "down", role_desc(geometry.down,    width, PROD_N_EMBD, down_bytes, "down") },
+                        } },
+                  });
+              }
+              return layers;
+          }() },
     });
 
-    const std::string stem = "prod-00001-of-00001";
-    const fs::path sidecar = dir / (stem + ".wpi.json");
-    const fs::path blob    = dir / (stem + ".wpb");
-
-    std::ofstream blob_output(blob, std::ios::binary);
-    if (!blob_output) {
-        throw std::runtime_error("failed to create production blob");
-    }
+    // ONE SHARD PER LAYER: load_catalog rejects a shard index whose
+    // layer_first != layer_last, so the pool-widening layers each get their own
+    // blob + sidecar exactly as the real slicer emits them.
     const std::vector<uint8_t> zero_pad((size_t) padding, 0);
-    json groups = json::array();
-    uint64_t offset = 0;
-    for (int expert = 0; expert < PROD_EXPERTS; ++expert) {
-        json members = json::array();
-        // Blob order is up (mask 1), gate (mask 2), down (mask 4) -- the same
-        // order the real slicer writes and the same order load_catalog walks.
-        struct RoleLayout { const char * name; uint64_t mask; ggml_type type;
-                            int64_t ne0; int64_t ne1; uint64_t bytes; int role_index; };
-        const RoleLayout layout[3] = {
-            { "up",   1, geometry.gate_up, PROD_N_EMBD, width, up_bytes,   0 },
-            { "gate", 2, geometry.gate_up, PROD_N_EMBD, width, gate_bytes, 1 },
-            { "down", 4, geometry.down,    width, PROD_N_EMBD, down_bytes, 2 },
-        };
-        for (const RoleLayout & role : layout) {
-            const std::vector<uint8_t> bytes = prod_role_bytes(
-                role.type, role.ne0, role.ne1, expert, role.role_index);
-            require(bytes.size() == role.bytes, "production role byte count mismatch");
-            blob_output.write(reinterpret_cast<const char *>(bytes.data()),
-                              (std::streamsize) bytes.size());
-            members.push_back({
-                { "role_mask", role.mask },
-                { "size", role.bytes },
-                { "offset", offset },
-                { "catalog_name",
-                  "blk." + std::to_string(PROD_LAYER) + ".ffn_" +
-                  std::string(role.name) + "." + std::to_string(expert) + ".weight" },
-                { "source_tensor_name", std::string("prod.") + role.name },
-                { "source_file_idx", 0 },
-                { "source_file_offset", offset },
-            });
-            offset += role.bytes;
-        }
-        if (padding > 0) {
-            blob_output.write(reinterpret_cast<const char *>(zero_pad.data()),
-                              (std::streamsize) zero_pad.size());
-            offset += padding;
-        }
-        groups.push_back({
-            { "block_idx", PROD_LAYER },
-            { "expert_idx", expert },
-            { "member_count", 3 },
-            { "padding_bytes", padding },
-            { "members", std::move(members) },
-        });
-    }
-    blob_output.close();
-    require(offset == padded * (uint64_t) PROD_EXPERTS, "production blob size mismatch");
+    std::vector<uint8_t> filler[3];
+    json shards = json::array();
+    uint64_t total_blob_bytes = 0;
+    for (int layer = PROD_LAYER; layer < PROD_LAYER + PROD_LAYERS; ++layer) {
+        const int shard_index = layer - PROD_LAYER;
+        char stem_buf[64];
+        std::snprintf(stem_buf, sizeof(stem_buf), "prod-%05d-of-%05d",
+                      shard_index + 1, PROD_LAYERS);
+        const std::string stem = stem_buf;
+        const fs::path sidecar = dir / (stem + ".wpi.json");
+        const fs::path blob    = dir / (stem + ".wpb");
 
-    write_json(sidecar, {
-        { "format", "llama.cpp.weight-pager.expert-shard-index" },
-        { "version", 1 },
-        { "blob_file", blob.filename().string() },
-        { "shard_index", 0 },
-        { "shard_count", 1 },
-        { "layer_first", PROD_LAYER },
-        { "layer_last", PROD_LAYER },
-        { "group_count", PROD_EXPERTS },
-        { "blob_bytes", offset },
-        { "content_hash", identity },
-        { "model_files", { "prod.gguf" } },
-        { "groups", std::move(groups) },
-    });
+        std::ofstream blob_output(blob, std::ios::binary);
+        if (!blob_output) {
+            throw std::runtime_error("failed to create production blob");
+        }
+        json groups = json::array();
+        uint64_t offset = 0;
+        for (int expert = 0; expert < PROD_EXPERTS; ++expert) {
+            json members = json::array();
+            // Blob order is up (mask 1), gate (mask 2), down (mask 4) -- the
+            // same order the real slicer writes and load_catalog walks.
+            struct RoleLayout { const char * name; uint64_t mask; ggml_type type;
+                                int64_t ne0; int64_t ne1; uint64_t bytes; int role_index; };
+            const RoleLayout layout[3] = {
+                { "up",   1, geometry.gate_up, PROD_N_EMBD, width, up_bytes,   0 },
+                { "gate", 2, geometry.gate_up, PROD_N_EMBD, width, gate_bytes, 1 },
+                { "down", 4, geometry.down,    width, PROD_N_EMBD, down_bytes, 2 },
+            };
+            for (const RoleLayout & role : layout) {
+                // Only PROD_LAYER is ever dispatched to, so the CONTENT of the
+                // pool-widening layers is irrelevant: quantise PROD_LAYER for
+                // real and reuse one filler set for the rest instead of paying
+                // for (PROD_LAYERS-1)*PROD_EXPERTS more quantisations.
+                std::vector<uint8_t> & cached = filler[role.role_index];
+                std::vector<uint8_t> bytes;
+                const uint8_t * data = nullptr;
+                if (layer != PROD_LAYER) {
+                    if (cached.empty()) {
+                        cached = prod_role_bytes(role.type, role.ne0, role.ne1,
+                                                 PROD_EXPERTS, role.role_index);
+                    }
+                    require(cached.size() == role.bytes,
+                            "production role byte count mismatch");
+                    data = cached.data();
+                } else {
+                    bytes = prod_role_bytes(role.type, role.ne0, role.ne1,
+                                            expert, role.role_index);
+                    require(bytes.size() == role.bytes,
+                            "production role byte count mismatch");
+                    data = bytes.data();
+                }
+                blob_output.write(reinterpret_cast<const char *>(data),
+                                  (std::streamsize) role.bytes);
+                members.push_back({
+                    { "role_mask", role.mask },
+                    { "size", role.bytes },
+                    { "offset", offset },
+                    { "catalog_name",
+                      "blk." + std::to_string(layer) + ".ffn_" +
+                      std::string(role.name) + "." + std::to_string(expert) + ".weight" },
+                    { "source_tensor_name", std::string("prod.") + role.name },
+                    { "source_file_idx", 0 },
+                    { "source_file_offset", offset },
+                });
+                offset += role.bytes;
+            }
+            if (padding > 0) {
+                blob_output.write(reinterpret_cast<const char *>(zero_pad.data()),
+                                  (std::streamsize) zero_pad.size());
+                offset += padding;
+            }
+            groups.push_back({
+                { "block_idx", layer },
+                { "expert_idx", expert },
+                { "member_count", 3 },
+                { "padding_bytes", padding },
+                { "members", std::move(members) },
+            });
+        }
+        blob_output.close();
+        require(offset == padded * (uint64_t) PROD_EXPERTS,
+                "production blob size mismatch");
+
+        write_json(sidecar, {
+            { "format", "llama.cpp.weight-pager.expert-shard-index" },
+            { "version", 1 },
+            { "blob_file", blob.filename().string() },
+            { "shard_index", shard_index },
+            { "shard_count", PROD_LAYERS },
+            { "layer_first", layer },
+            { "layer_last", layer },
+            { "group_count", PROD_EXPERTS },
+            { "blob_bytes", offset },
+            { "content_hash", identity },
+            { "model_files", { "prod.gguf" } },
+            { "groups", std::move(groups) },
+        });
+        shards.push_back({
+            { "blob_file", blob.filename().string() },
+            { "index_file", sidecar.filename().string() },
+            { "shard_index", shard_index },
+            { "layer_first", layer },
+            { "layer_last", layer },
+            { "group_count", PROD_EXPERTS },
+            { "blob_bytes", offset },
+            { "content_hash", identity },
+        });
+        total_blob_bytes += offset;
+    }
 
     write_json(fixture.manifest, {
         { "format", "llama.cpp.weight-pager.expert-shard-manifest" },
@@ -3412,21 +3481,11 @@ static ProdFixture make_production_fixture(
         { "model_files", { "prod.gguf" } },
         { "sharding_mode", "expert-index-range" },
         { "retained_expert_range", { { "first", 0 }, { "last", PROD_EXPERTS - 1 } } },
-        { "total_group_count", PROD_EXPERTS },
-        { "total_blob_bytes", offset },
-        { "shard_count", 1 },
+        { "total_group_count", PROD_EXPERTS * PROD_LAYERS },
+        { "total_blob_bytes", total_blob_bytes },
+        { "shard_count", PROD_LAYERS },
         { "content_hash", identity },
-        { "shards",
-          json::array({ json{
-              { "blob_file", blob.filename().string() },
-              { "index_file", sidecar.filename().string() },
-              { "shard_index", 0 },
-              { "layer_first", PROD_LAYER },
-              { "layer_last", PROD_LAYER },
-              { "group_count", PROD_EXPERTS },
-              { "blob_bytes", offset },
-              { "content_hash", identity },
-          } }) },
+        { "shards", std::move(shards) },
     });
     return fixture;
 }
@@ -3484,22 +3543,44 @@ struct ProdRun {
     std::vector<float> chunked;
     uint64_t           hits = 0;
     uint64_t           fallbacks = 0;
+    // Grouped graph builds charged to the 128-token bucket only: sampled after
+    // the whole request and its repeats, BEFORE the 32-token chunks (which are
+    // a different n_tokens and legitimately build their own graph).
+    uint64_t           builds = 0;
+    // Slot fingerprint of the last 128-token grouped request.
+    uint64_t           placement = 0;
+    // PAD-SLOT accounting, sampled from the worker after it shut down.
+    uint32_t           hello_slots   = 0;   // what the spine was told it has
+    uint64_t           pad_slots     = 0;   // reserved per arena
+    uint64_t           arena_count   = 0;
+    uint64_t           planned_slots = 0;   // before the reservation
+    uint64_t           usable_slots  = 0;   // after it
+    uint64_t           pad_bound     = 0;   // must stay 0
 };
 
-// One worker lifetime: the whole 128-token request, then the same request as
-// four 32-token streamed chunks over the same connection.
+// One worker lifetime: an optional priming request (whose ASSIGNMENT ORDER
+// decides the order pages are demanded, and therefore which slot -- and which
+// arena -- each expert lands in), the whole 128-token request repeated
+// `repeats` extra times, then the same request as four 32-token streamed
+// chunks over the same connection.
 static ProdRun run_production_prefill(
         const ProdFixture & fixture,
         const pipe_expert_dispatch_req & request,
         const std::string & device,
-        bool grouped) {
+        bool grouped,
+        const pipe_expert_dispatch_req * prime = nullptr,
+        int repeats = 0) {
     const ScopedEnv arena_env("WP_EXPERT_ARENA_PREFILL", grouped ? "1" : "0");
     // Force several arenas per size class: arena_bytes is floor(cap/stride)*stride
-    // and stride >= page_bytes, so a cap of 4 pages can never put more than four
-    // of the 16 slots in one buffer. Production reaches the same shape through
-    // the backend's own max-allocation cap (19 arenas on ROCm0, 16 on ROCm1).
+    // and stride >= page_bytes (role-type alignment pads it), so a cap of 18
+    // pages puts 17 or 18 of the PROD_EXPERTS*PROD_LAYERS slots in one buffer
+    // -- four arenas. Each then reserves PROD_N_EXPERT_USED == 10 PAD slots and
+    // still keeps six or so USABLE ones, comfortably more than the PROD_EXPERTS
+    // pages layer PROD_LAYER actually demands. Production reaches the same
+    // shape through the backend's own max-allocation cap (19 arenas on ROCm0,
+    // 16 on ROCm1).
     const ScopedEnv arena_cap(
-        "WP_EXPERT_ARENA_MAX_BYTES", std::to_string(fixture.page_bytes * 4));
+        "WP_EXPERT_ARENA_MAX_BYTES", std::to_string(fixture.page_bytes * 18));
 
     wp_expert_worker::Options options;
     options.shard_manifest    = fixture.manifest;
@@ -3507,12 +3588,17 @@ static ProdRun run_production_prefill(
     options.device            = device;
     options.listen_host       = "127.0.0.1";
     options.listen_port       = reserve_port();
-    // Headroom over PROD_EXPERTS on purpose: every page must stay resident for
-    // the whole connection. If a page were evicted and re-paged between the
-    // 128-token whole request and the 32-token chunks it could land in a
-    // DIFFERENT arena, which reorders the across-arena fold and would fail the
-    // byte-identity check for a reason that has nothing to do with chunking.
-    options.slots             = PROD_EXPERTS + 4;
+    // Headroom over PROD_EXPERTS on purpose: plan_resources caps a class at one
+    // slot per page but needs the byte budget to cover stride*pages (stride is
+    // padded above page_bytes), so ask for a few more max-page equivalents than
+    // there are pages. What matters downstream is that the USABLE slots after
+    // the pad reservation still exceed PROD_EXPERTS: every requested
+    // page must stay resident for the whole connection. If a page were evicted
+    // and re-paged between the 128-token whole request and the 32-token chunks
+    // it could land in a DIFFERENT arena, which reorders the across-arena fold
+    // and would fail the byte-identity check for a reason that has nothing to
+    // do with chunking.
+    options.slots             = PROD_EXPERTS * PROD_LAYERS + 8;
     options.host_budget_bytes = 4 * fixture.page_bytes;
     options.once              = true;
 
@@ -3537,6 +3623,8 @@ static ProdRun run_production_prefill(
         require(pipe_recv_frame(*socket, type, seq_id, payload) && type == PIPE_HELLO,
                 "production-geometry worker did not send HELLO");
         pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        // What the SPINE is told the pool holds. Pads must not be in it.
+        run.hello_slots     = client.n_slots;
         client.role         = PIPE_EXPERT_ROLE_CLIENT;
         client.expert_first = -1;
         client.expert_last  = -1;
@@ -3549,6 +3637,20 @@ static ProdRun run_production_prefill(
                     type == PIPE_EXPERT_HELLO_ACK &&
                     pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
                 "production-geometry worker rejected HELLO");
+
+        // PRIME. Sent before anything is resident, so the pool hands out slots
+        // in THIS request's assignment order. Reversing that order moves every
+        // expert to a different slot -- and, with 4-slot arenas, to a different
+        // arena -- without changing the request under test at all.
+        if (prime != nullptr) {
+            payload = pipe_encode_expert_dispatch_req(*prime);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, 718,
+                                    payload.data(), payload.size()),
+                    "failed to send production-geometry priming dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                        type == PIPE_EXPERT_PARTIAL && seq_id == 718,
+                    "production-geometry priming returned the wrong frame");
+        }
 
         // WARM-UP. The counters must measure a steady-state chunk, not the
         // cold one: on the very first request the pages are still being read,
@@ -3577,6 +3679,35 @@ static ProdRun run_production_prefill(
             pipe_decode_expert_partial(payload.data(), payload.size(), (uint32_t) PROD_N_EMBD);
         require(whole.n_tokens == PROD_TOKENS, "production-geometry token count mismatch");
         run.whole = whole.partial;
+
+        // REPEATS. Same n_tokens, same routing, same placement: the grouped
+        // graph cache must serve every one of these without a rebuild, and the
+        // answer must not move by a single bit between identical requests.
+        for (int repeat = 0; repeat < repeats; ++repeat) {
+            payload = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ,
+                                    (uint64_t) (730 + repeat),
+                                    payload.data(), payload.size()),
+                    "failed to send production-geometry repeat dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                        type == PIPE_EXPERT_PARTIAL &&
+                        seq_id == (uint64_t) (730 + repeat),
+                    "production-geometry repeat returned the wrong frame");
+            const pipe_expert_partial again = pipe_decode_expert_partial(
+                payload.data(), payload.size(), (uint32_t) PROD_N_EMBD);
+            require(again.partial.size() == run.whole.size(),
+                    "production-geometry repeat shape mismatch");
+            for (size_t i = 0; i < run.whole.size(); ++i) {
+                if (std::memcmp(&run.whole[i], &again.partial[i], sizeof(float)) != 0) {
+                    throw std::runtime_error(
+                        "production-geometry repeat " + std::to_string(repeat) +
+                        " changed the answer at " + std::to_string(i));
+                }
+            }
+        }
+        // Safe here: the worker is blocked reading the next frame.
+        run.builds    = wp_expert_worker::test_arena_prefill_builds();
+        run.placement = wp_expert_worker::test_arena_prefill_placement();
 
         run.chunked.assign((size_t) PROD_TOKENS * (size_t) PROD_N_EMBD, 0.0f);
         const uint32_t chunk_rows = PROD_TOKENS / PROD_CHUNKS;
@@ -3635,7 +3766,68 @@ static ProdRun run_production_prefill(
     require(server_result == 0, "production-geometry worker returned failure");
     run.hits      = wp_expert_worker::test_arena_prefill_hits();
     run.fallbacks = wp_expert_worker::test_arena_prefill_fallbacks();
+    run.pad_slots     = wp_expert_worker::test_pool_pad_slots_per_arena();
+    run.arena_count   = wp_expert_worker::test_pool_arena_count();
+    run.planned_slots = wp_expert_worker::test_pool_planned_slots();
+    run.usable_slots  = wp_expert_worker::test_pool_usable_slots();
+    run.pad_bound     = wp_expert_worker::test_arena_prefill_pad_bound();
     return run;
+}
+
+// ---------------------------------------------------------------------------
+// PAD SLOTS ARE INVISIBLE TO EVERYTHING BUT THE GROUPED GRAPH.
+//
+// Every arena reserves n_expert_used slots at its end so the grouped prefill
+// path always has n_expert_used DISTINCT, never-written, never-DMA'd filler
+// ids per arena to pad a token row with at route weight 0. They must not show
+// up as capacity anywhere: not in the pool's slot vector, not in the HELLO
+// slot count the spine plans residency against, and never as the home of a
+// paged-in expert.
+// ---------------------------------------------------------------------------
+static void check_prod_pool_pads(const ProdRun & run, const std::string & label) {
+    if (run.pad_slots != (uint64_t) PROD_N_EXPERT_USED) {
+        throw std::runtime_error(
+            label + "arenas reserved " + std::to_string(run.pad_slots) +
+            " pad slots, expected n_expert_used=" + std::to_string(PROD_N_EXPERT_USED));
+    }
+    if (run.arena_count < 2) {
+        throw std::runtime_error(
+            label + "only " + std::to_string(run.arena_count) +
+            " arena(s): the multi-arena grouping this fixture exists to exercise "
+            "is not happening");
+    }
+    // The reservation comes OUT of the plan: usable == planned - pads*arenas.
+    const uint64_t reserved = run.pad_slots * run.arena_count;
+    if (run.planned_slots < reserved ||
+            run.usable_slots != run.planned_slots - reserved) {
+        throw std::runtime_error(
+            label + "pad reservation does not balance: planned=" +
+            std::to_string(run.planned_slots) + " pads=" +
+            std::to_string(run.pad_slots) + "x" + std::to_string(run.arena_count) +
+            " usable=" + std::to_string(run.usable_slots));
+    }
+    // HELLO must advertise the USABLE slots only.
+    if ((uint64_t) run.hello_slots != run.usable_slots) {
+        throw std::runtime_error(
+            label + "HELLO advertised " + std::to_string(run.hello_slots) +
+            " slots but the pool carved " + std::to_string(run.usable_slots) +
+            " (pads must not be advertised)");
+    }
+    // ... and there must be room for every requested page, or a page would be
+    // evicted mid-connection and the byte-identity checks would be measuring
+    // re-paging, not chunking.
+    if (run.usable_slots <= (uint64_t) PROD_EXPERTS) {
+        throw std::runtime_error(
+            label + "only " + std::to_string(run.usable_slots) +
+            " usable slots for " + std::to_string(PROD_EXPERTS) +
+            " requested pages");
+    }
+    // No request may ever be handed a pad slot.
+    if (run.pad_bound != 0) {
+        throw std::runtime_error(
+            label + "a paged-in expert landed in an arena's PAD region (" +
+            std::to_string(run.pad_bound) + " times)");
+    }
 }
 
 static void test_prefill_arena_grouped_production_geometry() {
@@ -3671,6 +3863,10 @@ static void test_prefill_arena_grouped_production_geometry() {
                 run_production_prefill(fixture, request, device, /* grouped = */ true);
             const ProdRun gather =
                 run_production_prefill(fixture, request, device, /* grouped = */ false);
+
+            // (0) the pad reservation is real and invisible to the spine.
+            check_prod_pool_pads(grouped, label);
+            check_prod_pool_pads(gather, label);
 
             // (c) the grouped arm actually took the grouped path, every time.
             if (grouped.hits == 0 || grouped.fallbacks != 0) {
@@ -3741,6 +3937,110 @@ static void test_prefill_arena_grouped_production_geometry() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PLACEMENT INDEPENDENCE.
+//
+// 2026-09-02, gates68: the same 1326-token prompt sent three times to a fresh
+// spine produced three different output md5s on the grouped path (the gather
+// path is stable). The grouped fold summed per ARENA GROUP in arena order and
+// then over k in packing order, so which arena the pager happened to put a
+// slot in decided the association of an FP sum -- and page-ins land in
+// whatever slot is free, which differs between requests.
+//
+// This test computes the SAME request under two genuinely different slot
+// placements (achieved by priming one worker with the assignments in reverse
+// order, which is the order the pool hands out slots) and demands the two
+// partials be byte-identical. The placement fingerprints are asserted to
+// DIFFER first, so the test cannot pass by both runs getting the same layout.
+// It also asserts the graph cache stabilises: repeats of one shape must not
+// keep rebuilding the graph (n_arena_build was 986 for 1013 hits on ROCm0).
+// ---------------------------------------------------------------------------
+static void test_prefill_arena_grouped_placement_independent() {
+    const char * backend_env = std::getenv("WP_WORKER_TEST_BACKEND");
+    const std::string device =
+        (backend_env != nullptr && backend_env[0] != '\0') ? backend_env : "CPU";
+    // One geometry, the narrow width: this test is about ordering, not about
+    // quantisation coverage, and it pays for two extra worker lifetimes.
+    const ProdGeometry & geometry = PROD_GEOMETRIES[0];
+    const int width = PROD_WIDTHS[1];
+    const std::string label =
+        std::string("[") + device + " placement " + geometry.name + "] ";
+    std::cout << "test-wp-expert-worker: grouped prefill placement independence "
+              << label << std::endl;
+
+    const pipe_expert_dispatch_req request = make_production_request();
+    pipe_expert_dispatch_req prime = request;
+    std::reverse(prime.assignments.begin(), prime.assignments.end());
+
+    TempDir temp;
+    const ProdFixture fixture = make_production_fixture(temp.path, geometry, width);
+
+    const int repeats = 3;
+    const ProdRun forward = run_production_prefill(
+        fixture, request, device, /* grouped = */ true,
+        /* prime = */ nullptr, repeats);
+    const ProdRun reversed = run_production_prefill(
+        fixture, request, device, /* grouped = */ true,
+        /* prime = */ &prime, /* repeats = */ 0);
+
+    check_prod_pool_pads(forward, label);
+    check_prod_pool_pads(reversed, label);
+
+    if (forward.hits == 0 || forward.fallbacks != 0 ||
+            reversed.hits == 0 || reversed.fallbacks != 0) {
+        throw std::runtime_error(
+            label + "a placement arm did not take the grouped path: forward hits=" +
+            std::to_string(forward.hits) + "/fallbacks=" +
+            std::to_string(forward.fallbacks) + " reversed hits=" +
+            std::to_string(reversed.hits) + "/fallbacks=" +
+            std::to_string(reversed.fallbacks));
+    }
+
+    // NON-VACUITY: the two runs must really have placed the experts differently.
+    if (forward.placement == reversed.placement) {
+        throw std::runtime_error(
+            label + "both runs got the SAME slot placement (fingerprint " +
+            std::to_string(forward.placement) +
+            "); the placement-independence assertion below would be vacuous");
+    }
+
+    require(forward.whole.size() == reversed.whole.size(),
+            (label + "placement arms disagree on shape").c_str());
+    for (size_t i = 0; i < forward.whole.size(); ++i) {
+        if (std::memcmp(&forward.whole[i], &reversed.whole[i], sizeof(float)) != 0) {
+            throw std::runtime_error(
+                label + "grouped prefill changed with slot placement at " +
+                std::to_string(i) + ": forward=" +
+                std::to_string(forward.whole[i]) + " reversed=" +
+                std::to_string(reversed.whole[i]));
+        }
+    }
+
+    std::cout << "test-wp-expert-worker: " << label
+              << "forward hits=" << forward.hits
+              << " fallbacks=" << forward.fallbacks
+              << " builds=" << forward.builds
+              << " | reversed hits=" << reversed.hits
+              << " fallbacks=" << reversed.fallbacks
+              << " | pads=" << forward.pad_slots
+              << " arenas=" << forward.arena_count
+              << " planned=" << forward.planned_slots
+              << " usable=" << forward.usable_slots
+              << " hello_slots=" << forward.hello_slots
+              << " pad_bound=" << forward.pad_bound
+              << " placements " << forward.placement << " vs " << reversed.placement
+              << std::endl;
+
+    // GRAPH CACHE STABILITY: warm-up already built the 128-token bucket, so the
+    // measured request plus its repeats may add at most one build.
+    if (forward.builds > 1) {
+        throw std::runtime_error(
+            label + "grouped graph cache did not stabilise: " +
+            std::to_string(repeats + 1) + " identical 128-token requests caused " +
+            std::to_string(forward.builds) + " graph builds");
+    }
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -3751,6 +4051,7 @@ int main() {
                     setenv("WP_EXPERT_GATHER_MIN_TOKENS", "2", 1) == 0,
                 "failed to enable expert gather");
         test_prefill_arena_grouped_production_geometry();
+        test_prefill_arena_grouped_placement_independent();
         test_prefill_arena_grouped_chunk_byte_identical();
         test_prefill_arena_grouped_matches_gather();
         test_prefill_mul_mat_pin_chunk_byte_identical();
