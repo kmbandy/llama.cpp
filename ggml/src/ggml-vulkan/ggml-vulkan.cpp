@@ -11909,6 +11909,78 @@ static bool ggml_vk_mul_mat_id_hint_pinned(const ggml_tensor * dst) {
     return dst->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(dst, 1) == GGML_HINT_MUL_MAT_PIN;
 }
 
+// The MoE expert worker's grouped prefill shape: one activation row per
+// (route, token) pair, so src1 is [K, nei0, nei1] rather than the usual
+// [K, 1, n_tokens] decode shape. Detected structurally (src1->ne[1] == nei0 > 1
+// and src1->ne[2] == nei1), never assumed from the hint alone.
+static bool ggml_vk_mul_mat_id_expanded_rows(const ggml_tensor * dst) {
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    return ids->ne[0] > 1 &&
+           src1->ne[1] == ids->ne[0] &&
+           src1->ne[2] == ids->ne[1] &&
+           src1->ne[3] == 1;
+}
+
+// GGML_VK_MUL_MAT_ID_PIN_KERNEL = mm | vec.  Which implementation a *pinned*
+// (GGML_HINT_MUL_MAT_PIN) MUL_MAT_ID takes.  "mm" (default) keeps the matmul-id
+// tile shader; "vec" lets the expanded prefill shape go through
+// ggml_vk_mul_mat_vec_id_q_f16 instead.  Ignored for unpinned ops.
+enum vk_mul_mat_id_pin_kernel { VK_MUL_MAT_ID_PIN_KERNEL_MM, VK_MUL_MAT_ID_PIN_KERNEL_VEC };
+
+static vk_mul_mat_id_pin_kernel ggml_vk_mul_mat_id_pin_kernel() {
+    static const vk_mul_mat_id_pin_kernel kernel = [] {
+        const char * env = std::getenv("GGML_VK_MUL_MAT_ID_PIN_KERNEL");
+        if (env != nullptr && std::strcmp(env, "vec") == 0) {
+            return VK_MUL_MAT_ID_PIN_KERNEL_VEC;
+        }
+        return VK_MUL_MAT_ID_PIN_KERNEL_MM;
+    }();
+    return kernel;
+}
+
+// GGML_VK_MUL_MAT_ID_PIN_TOKENS: the N handed to ggml_vk_guess_matmul_id_pipeline
+// for a pinned MUL_MAT_ID, i.e. which matmul-id tile gets picked.  0 or unset =
+// "auto" (the estimate below).  512 reproduces the pre-change behaviour exactly.
+// Only consulted when the pin hint is set.
+static uint32_t ggml_vk_mul_mat_id_pin_tokens_override() {
+    static const uint32_t value = [] {
+        const char * env = std::getenv("GGML_VK_MUL_MAT_ID_PIN_TOKENS");
+        if (env == nullptr) {
+            return uint32_t(0);
+        }
+        char * end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        return (end != env && *end == '\0' && parsed > 0) ? (uint32_t) parsed : uint32_t(0);
+    }();
+    return value;
+}
+
+// How many B rows one expert actually gets, which is what the matmul-id tile's N
+// dimension should be sized for -- NOT the token count.  The pin hint used to
+// force N = GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS (512), which always
+// selects the large 128x128 tile; with ~7 rows per expert that spends 121/128 of
+// every tile column on padding.  Total selected rows is nei0*nei1, spread over at
+// most n_as experts, so nei0*nei1/n_as is a lower bound on the average.  It is a
+// lower bound (an arena slab has more slots than are routed to), which biases
+// towards the smaller tile; sweep GGML_VK_MUL_MAT_ID_PIN_TOKENS to check.
+static uint32_t ggml_vk_mul_mat_id_pin_pipeline_n(uint64_t nei0, uint64_t nei1, uint64_t n_as) {
+    const uint32_t override_n = ggml_vk_mul_mat_id_pin_tokens_override();
+    if (override_n != 0) {
+        return override_n;
+    }
+    if (n_as == 0) {
+        return GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS;
+    }
+    const uint64_t rows_per_expert = CEIL_DIV(nei0 * nei1, n_as);
+    // Floor of 9, not 1: ggml_vk_mul_mat_id_q_f16 only takes the *aligned*
+    // pipeline variant when pipeline_n > 8, and dropping to the unaligned
+    // shader is a separate (slower) change that would confound the tile-size
+    // measurement. 9..32 all select the small 32x32 tile anyway.
+    return (uint32_t) std::min<uint64_t>(std::max<uint64_t>(rows_per_expert, 9),
+                                         GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS);
+}
+
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -11929,8 +12001,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const uint64_t nei0 = ids->ne[0];
     const uint64_t nei1 = ids->ne[1];
-    const bool force_mm = ggml_vk_mul_mat_id_force_mm(ne12) || ggml_vk_mul_mat_id_hint_pinned(dst);
-    const uint32_t pipeline_n = force_mm ? GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS : (uint32_t) nei1;
+    const bool pinned   = ggml_vk_mul_mat_id_hint_pinned(dst);
+    const bool force_mm = ggml_vk_mul_mat_id_force_mm(ne12) || pinned;
+    // A pinned op sizes the tile from the per-expert row count, not from the
+    // token count: see ggml_vk_mul_mat_id_pin_pipeline_n. GGML_MUL_MAT_ID_FORCE_MM
+    // (the env-driven pin) keeps its 512-token reference so its behaviour is
+    // untouched; so does every unpinned op.
+    const uint32_t pipeline_n = pinned  ? ggml_vk_mul_mat_id_pin_pipeline_n(nei0, nei1, ne02) :
+                                force_mm ? GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS : (uint32_t) nei1;
 
     const uint32_t nbi0 = ids->nb[0];
     const uint32_t nbi1 = ids->nb[1];
@@ -12030,6 +12108,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
+
+    // GGML_VK_MUL_MAT_ID_PIN_TRACE=1: which tile a pinned mul_mat_id actually got.
+    static const bool pin_trace = std::getenv("GGML_VK_MUL_MAT_ID_PIN_TRACE") != nullptr;
+    if (pin_trace && pinned) {
+        static int n_traced = 0;
+        if (n_traced < 8) {
+            ++n_traced;
+            fprintf(stderr, "[vk-mmid-pin] mm pipeline=%s wg_denoms={%u,%u} pipeline_n=%u aligned=%d "
+                            "m=%u nei0=%u nei1=%u n_as=%u\n",
+                    pipeline->name.c_str(), pipeline->wg_denoms[0], pipeline->wg_denoms[1],
+                    pipeline_n, (int) aligned, (uint32_t) ne01,
+                    (uint32_t) nei0, (uint32_t) nei1, (uint32_t) ne02);
+        }
+    }
+
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
     const uint64_t x_ne = ggml_nelements(src0);
@@ -12822,8 +12915,24 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
-    if (ggml_vk_mul_mat_id_force_mm(src1->ne[2]) || ggml_vk_mul_mat_id_hint_pinned(dst)) {
+    if (ggml_vk_mul_mat_id_force_mm(src1->ne[2])) {
         return false;
+    }
+    // A pinned op normally takes the matmul-id path (that is what the hint was
+    // introduced for). GGML_VK_MUL_MAT_ID_PIN_KERNEL=vec opts the *expanded
+    // prefill* shape into the mat-vec-id path instead: that shader already
+    // addresses src1 as (route, token) -- b_offset = (expert_i0 % ne11)*stride_b
+    // + expert_i1*batch_stride_b in mul_mat_vec_base.glsl -- and already honours
+    // an arena-strided src0 through stride_batch_x, so no copy and no shader
+    // change is needed. The <= 8 token cap below is a batch-size heuristic for
+    // the unpinned decode path and does not apply here.
+    bool pinned_vec = false;
+    if (ggml_vk_mul_mat_id_hint_pinned(dst)) {
+        if (ggml_vk_mul_mat_id_pin_kernel() != VK_MUL_MAT_ID_PIN_KERNEL_VEC ||
+            !ggml_vk_mul_mat_id_expanded_rows(dst)) {
+            return false;
+        }
+        pinned_vec = true;
     }
     const uint64_t type_size = ggml_type_size(src0->type);
     const uint64_t block_size = ggml_blck_size(src0->type);
@@ -12835,7 +12944,7 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
         (src0->nb[2] / type_size) <= UINT32_MAX / block_size;
     const bool supported_type =
         src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type);
-    return supported_type && src2->ne[1] <= 8 &&
+    return supported_type && (pinned_vec || src2->ne[1] <= 8) &&
         (!strided || stride_representable);
 }
 
@@ -12847,7 +12956,8 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
     const bool use_vec = ggml_vk_use_mul_mat_vec_id(cgraph, node_idx);
     // GGML_VK_WP_FORK=1: which mul_mat_id implementation is actually running.
-    // The vec path serves batches of <= 8 tokens. MM handles wider batches and
+    // The vec path serves batches of <= 8 tokens (plus a pinned expanded-prefill
+    // op under GGML_VK_MUL_MAT_ID_PIN_KERNEL=vec). MM handles wider batches and
     // strided arena weights whose stride cannot be represented by batch_stride_a.
     static const bool wp_fork = getenv("GGML_VK_WP_FORK") != nullptr;
     if (wp_fork) {
