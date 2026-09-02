@@ -2664,6 +2664,13 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+// GGML_HINT_MUL_MAT_PIN on a MUL_MAT_ID op pins it to the matrix kernel regardless of
+// token count (the worker's grouped prefill sets it); the env below is the older
+// token-count-driven form of the same pin
+static bool ggml_cuda_mul_mat_id_hint_pinned(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(dst, 1) == GGML_HINT_MUL_MAT_PIN;
+}
+
 static bool ggml_cuda_mul_mat_id_force_mm(const int64_t total_tokens) {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_MUL_MAT_ID_FORCE_MM");
@@ -2697,7 +2704,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (is_mul_mat_id && ggml_cuda_mul_mat_id_force_mm(src1->ne[2])) {
+    if (is_mul_mat_id && (ggml_cuda_mul_mat_id_force_mm(src1->ne[2]) || ggml_cuda_mul_mat_id_hint_pinned(tensor))) {
         return false;
     }
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
@@ -2728,7 +2735,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (tensor->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(tensor, 1) == GGML_HINT_MUL_MAT_PIN) {
         return false;
     }
-    if (is_mul_mat_id && ggml_cuda_mul_mat_id_force_mm(src1->ne[2])) {
+    if (is_mul_mat_id && (ggml_cuda_mul_mat_id_force_mm(src1->ne[2]) || ggml_cuda_mul_mat_id_hint_pinned(tensor))) {
         return false;
     }
 
@@ -2912,7 +2919,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    const bool force_mm = ggml_cuda_mul_mat_id_force_mm(src1->ne[2]);
+    const bool force_mm = ggml_cuda_mul_mat_id_force_mm(src1->ne[2]) || ggml_cuda_mul_mat_id_hint_pinned(dst);
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
@@ -2956,7 +2963,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool force_mm = ggml_cuda_mul_mat_id_force_mm(ne12);
+    const bool force_mm = ggml_cuda_mul_mat_id_force_mm(ne12) || ggml_cuda_mul_mat_id_hint_pinned(dst);
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)

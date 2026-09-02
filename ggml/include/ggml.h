@@ -1525,6 +1525,11 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
 
+    // same op-hint slot for GGML_OP_MUL_MAT_ID (GGML_HINT_MUL_MAT_PIN pins the kernel choice)
+    GGML_API void ggml_mul_mat_id_set_hint(
+            struct ggml_tensor * a,
+            enum ggml_op_hint    hint);
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,

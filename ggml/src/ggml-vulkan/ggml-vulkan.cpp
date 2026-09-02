@@ -11904,6 +11904,11 @@ static bool ggml_vk_mul_mat_id_force_mm(const uint64_t total_tokens) {
     return enabled && total_tokens >= min_tokens;
 }
 
+// GGML_HINT_MUL_MAT_PIN on a MUL_MAT_ID op: same pin as GGML_MUL_MAT_ID_FORCE_MM, op-driven
+static bool ggml_vk_mul_mat_id_hint_pinned(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(dst, 1) == GGML_HINT_MUL_MAT_PIN;
+}
+
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -11924,7 +11929,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const uint64_t nei0 = ids->ne[0];
     const uint64_t nei1 = ids->ne[1];
-    const bool force_mm = ggml_vk_mul_mat_id_force_mm(ne12);
+    const bool force_mm = ggml_vk_mul_mat_id_force_mm(ne12) || ggml_vk_mul_mat_id_hint_pinned(dst);
     const uint32_t pipeline_n = force_mm ? GGML_VK_MUL_MAT_ID_FORCE_MM_REFERENCE_TOKENS : (uint32_t) nei1;
 
     const uint32_t nbi0 = ids->nb[0];
@@ -12817,7 +12822,7 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
-    if (ggml_vk_mul_mat_id_force_mm(src1->ne[2])) {
+    if (ggml_vk_mul_mat_id_force_mm(src1->ne[2]) || ggml_vk_mul_mat_id_hint_pinned(dst)) {
         return false;
     }
     const uint64_t type_size = ggml_type_size(src0->type);

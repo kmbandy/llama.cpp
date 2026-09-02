@@ -3480,6 +3480,16 @@ void ggml_mul_mat_set_hint(
     ggml_set_op_params_i32(a, 1, hint_i32);
 }
 
+void ggml_mul_mat_id_set_hint(
+        struct ggml_tensor * a,
+        enum ggml_op_hint    hint) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+
+    const int32_t hint_i32 = (int32_t) hint;
+
+    ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
 // ggml_mul_mat_id
 
 /*
