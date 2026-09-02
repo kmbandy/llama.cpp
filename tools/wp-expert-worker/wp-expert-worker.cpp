@@ -9430,7 +9430,9 @@ public:
                     std::chrono::steady_clock::now() - vk_dispatch_started).count();
         }
         if (!request.assignments.empty()) {
-            read_result(sum, request_stats);
+            read_result(sum, request_stats, std::numeric_limits<size_t>::max(),
+                        (int) request.layer, last_compute_path_);
+            last_compute_path_ = "none";
         }
         request_stats.ns_result = lap();
 
@@ -11244,6 +11246,7 @@ private:
         const std::chrono::steady_clock::time_point probe_started =
             measure_vk ? std::chrono::steady_clock::now() :
                           std::chrono::steady_clock::time_point();
+        last_compute_path_ = "gather";
         const bool arena_ok = arena_id_eligible(request, batch);
         if (measure_vk) {
             const uint64_t probe_ns =
@@ -13285,6 +13288,13 @@ private:
             request_stats.ns_vk_params_set += params_elapsed;
         }
         add_work_input_trace_tensor(entry.blob, params_host.data(), params_span);
+        // *** WAIT FOR THE COPY STREAM, EXACTLY AS compute_batch DOES. ***
+        // With WP_EXPERT_COPY_STREAM (default on for CUDA/HIP) page-ins land
+        // on a dedicated stream; the compute stream must wait on the batch's
+        // copy event or the mul_mat_id reads slots whose bytes are still in
+        // flight. 2026-09-02: the grouped path skipped this and the GTX 1070
+        // produced a different text md5 on every shot (and NaNs on some).
+        batch.wait_copy_event(backend_.get());
         enum ggml_status status = submit_graph(
             entry.graph, request_stats, entry.persistent_plan);
         if (status != GGML_STATUS_SUCCESS && entry.persistent_plan != nullptr) {
@@ -13303,6 +13313,7 @@ private:
         }
         ++request_stats.n_arena_prefill_hit;
         g_test_arena_prefill_hits.fetch_add(1, std::memory_order_relaxed);
+        last_compute_path_ = "grouped";
         {
             uint64_t placement = 1469598103934665603ull;   // FNV-1a offset
             for (size_t i = 0; i < n; ++i) {
@@ -14500,6 +14511,8 @@ private:
     size_t         io_prepare_input_size_ = 0;
     size_t         io_prepare_alignment_ = 0;
     std::string    device_name_;
+    // Which compute path answered the request being read back (WP_WORKER_CHECK_FINITE label).
+    const char *   last_compute_path_ = "none";
     bool           io_set_async_ = false;
     size_t         io_reserved_hint_ = 0;
     ggml_backend_buffer_t io_active_ = nullptr;
