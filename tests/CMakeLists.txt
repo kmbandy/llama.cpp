@@ -604,6 +604,10 @@ llama_build_and_test(test-mt-quant.cpp)
 llama_build_and_test(test-ml8-dequant.cpp)
 target_include_directories(test-ml8-dequant PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 
+# CPU-only numerical audit for the non-paged turbo4 KV representation.
+llama_build_and_test(test-turbo4-kv.cpp)
+target_include_directories(test-turbo4-kv PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+
 # MAD-223 Phase G.3: ml8 graph-level matmul test (via ggml_ml8_mul_mat helper)
 llama_build_and_test(test-ml8-mul-mat.cpp)
 target_include_directories(test-ml8-mul-mat PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
