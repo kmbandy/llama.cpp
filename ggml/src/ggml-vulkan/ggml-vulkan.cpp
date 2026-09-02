@@ -12044,11 +12044,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool src0_stride_representable = src0_type_size != 0 &&
         src0_blck_size != 0 && src0->nb[2] % src0_type_size == 0 &&
         (src0->nb[2] / src0_type_size) <= UINT32_MAX / src0_blck_size;
-    static const bool arena_id_enabled = [] {
-        const char * e = std::getenv("WP_EXPERT_ARENA_ID");
-        return e != nullptr && std::strtol(e, nullptr, 10) == 1;
-    }();
-    const bool src0_arena_stride = arena_id_enabled && src0_strided && src0_stride_representable;
+    const bool src0_arena_stride = src0_strided && src0_stride_representable;
+    // The A-dequant staging step below (qx_needs_dequant) flattens src0 with
+    // ggml_nelements()/x_ne and writes a DENSE fp16 copy: it has no notion of
+    // nb[2], so for an arena slab it would decode the wrong bytes for every
+    // slot past the first, and size prealloc_x by the whole slab. Fail loudly
+    // instead. This cannot fire while a native mul_mat_id pipeline exists for
+    // (src0->type, f32/f16), which is the case for every expert weight type.
+    GGML_ASSERT((!src0_arena_stride || !qx_needs_dequant) &&
+                "arena-strided src0 requires a native mul_mat_id pipeline");
     const uint64_t qx_sz = src0_arena_stride ? ggml_nbytes(src0) :
         src0_type_size * x_ne / src0_blck_size;
     const uint64_t qy_sz = ggml_type_size(src1->type) * ggml_nelements(src1) / ggml_blck_size(src1->type);
@@ -12341,11 +12345,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool src0_stride_representable = src0_type_size != 0 &&
         src0_blck_size != 0 && src0->nb[2] % src0_type_size == 0 &&
         (src0->nb[2] / src0_type_size) <= UINT32_MAX / src0_blck_size;
-    static const bool arena_id_enabled = [] {
-        const char * e = std::getenv("WP_EXPERT_ARENA_ID");
-        return e != nullptr && std::strtol(e, nullptr, 10) == 1;
-    }();
-    const bool src0_arena_stride = arena_id_enabled && src0_strided && src0_stride_representable;
+    const bool src0_arena_stride = src0_strided && src0_stride_representable;
     uint32_t stride_batch_x = (uint32_t)(ne00 * ne01);
     if (src0_arena_stride) {
         const uint64_t stride_batch_x64 =
@@ -12833,14 +12833,10 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
     const bool stride_representable = type_size != 0 && block_size != 0 &&
         src0->nb[2] % type_size == 0 &&
         (src0->nb[2] / type_size) <= UINT32_MAX / block_size;
-    static const bool arena_id_enabled = [] {
-        const char * e = std::getenv("WP_EXPERT_ARENA_ID");
-        return e != nullptr && std::strtol(e, nullptr, 10) == 1;
-    }();
     const bool supported_type =
         src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type);
     return supported_type && src2->ne[1] <= 8 &&
-        (!arena_id_enabled || !strided || stride_representable);
+        (!strided || stride_representable);
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {

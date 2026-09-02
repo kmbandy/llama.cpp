@@ -122,6 +122,16 @@ int run(const Options & options);
 // No-op if the env flag is off; TCP workers are unchanged.
 void install_inproc_factory();
 
+// Test-only observability for the grouped arena prefill path
+// (WP_EXPERT_ARENA_PREFILL=1). Cumulative across every device tier of every
+// worker in this process; the worker runs in a thread inside the CPU
+// integration test, so a counter is the only way a test can tell a grouped
+// hit from a silent fall-back to the per-expert gather path. Both counters
+// are process-wide atomics; reset before a run and read after it.
+void     test_reset_arena_prefill_counters();
+uint64_t test_arena_prefill_hits();
+uint64_t test_arena_prefill_fallbacks();
+
 // Decode/prefill compute-profile policy. Pure functions of the env string so
 // tests can pin defaults without latching process-lifetime getenv statics.
 //

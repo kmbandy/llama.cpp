@@ -104,6 +104,25 @@ void ggml_backend_vk_wp_host_unregister(ggml_backend_buffer_t, void *)
 
 namespace wp_expert_worker {
 
+// Test-only grouped-prefill counters -- see wp-expert-worker.h. Kept next to
+// the RequestStats fields they shadow (n_arena_prefill_hit/fallback) so the
+// two can never drift: both are bumped at the same two call sites.
+static std::atomic<uint64_t> g_test_arena_prefill_hits{0};
+static std::atomic<uint64_t> g_test_arena_prefill_fallbacks{0};
+
+void test_reset_arena_prefill_counters() {
+    g_test_arena_prefill_hits.store(0, std::memory_order_relaxed);
+    g_test_arena_prefill_fallbacks.store(0, std::memory_order_relaxed);
+}
+
+uint64_t test_arena_prefill_hits() {
+    return g_test_arena_prefill_hits.load(std::memory_order_relaxed);
+}
+
+uint64_t test_arena_prefill_fallbacks() {
+    return g_test_arena_prefill_fallbacks.load(std::memory_order_relaxed);
+}
+
 static bool wp_worker_hash_trace_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_WORKER_HASH_TRACE");
@@ -6507,6 +6526,29 @@ private:
         if (max_buf == 0 || max_buf > SIZE_MAX / 2) {
             max_buf = (size_t) 1 << 30;
         }
+        // WP_EXPERT_ARENA_MAX_BYTES: cap the per-arena allocation below what
+        // the backend allows. Production already splits a device into 16-19
+        // arenas per size class because the backend cap forces it; on CPU the
+        // cap is 1 GiB, so a test would otherwise get exactly one arena per
+        // class and never exercise the MULTI-ARENA grouping that grouped
+        // prefill exists to do. Bounded by the backend cap; 0/unset = no cap.
+        {
+            // Deliberately NOT a function-local static: allocate_slot_arenas()
+            // runs once per worker construction, and a test that builds several
+            // workers in one process must be able to change the cap between
+            // them. Latching it would make the first worker's value stick.
+            const uint64_t arena_max_env = [] {
+                const char * e = std::getenv("WP_EXPERT_ARENA_MAX_BYTES");
+                if (e == nullptr || e[0] == '\0') {
+                    return (uint64_t) 0;
+                }
+                const long long v = std::strtoll(e, nullptr, 10);
+                return v > 0 ? (uint64_t) v : (uint64_t) 0;
+            }();
+            if (arena_max_env != 0 && arena_max_env < (uint64_t) max_buf) {
+                max_buf = (size_t) arena_max_env;
+            }
+        }
         if (resources_.slot_classes.size() > 1) {
             // Keep each size class in its own arena set. Invariant: the sum of
             // allocated arena bytes must not exceed the requested slot budget,
@@ -10825,6 +10867,7 @@ private:
                 return;
             }
             ++request_stats.n_arena_prefill_fallback;
+            g_test_arena_prefill_fallbacks.fetch_add(1, std::memory_order_relaxed);
         }
 
         const std::chrono::steady_clock::time_point probe_started =
@@ -12385,8 +12428,18 @@ private:
                 }
                 group.n_used = std::max(group.n_used, token_used);
             }
-            if (group.n_used == 0 ||
-                    group.n_used > (size_t) catalog_.descriptor.hparams.n_expert_used ||
+            // 2026-09-02 PRODUCTION: n_used == 0 is NORMAL, not a rejection.
+            // The spine streams 512-token ubatches as four 128-token chunks
+            // against a resident set of ~180 experts per device, so an arena
+            // whose resident pages happen to draw no route in THIS chunk is
+            // routine. Returning false here sent the entire request back to
+            // the per-expert gather path (~1100 launches) whenever any one of
+            // the 19 arenas came up empty. Such a group contributes exactly
+            // zero to every token, so drop it and keep the rest.
+            if (group.n_used == 0) {
+                continue;
+            }
+            if (group.n_used > (size_t) catalog_.descriptor.hparams.n_expert_used ||
                     group.n_used > (size_t) INT32_MAX) {
                 return false;
             }
@@ -12405,9 +12458,22 @@ private:
         std::vector<size_t> route_offsets;
         ids_offsets.reserve(groups.size());
         route_offsets.reserve(groups.size());
+        // *** EVERY per-group tensor offset must satisfy the buffer type's
+        // alignment, not just the ids/route split. ***
+        // 2026-09-02: these offsets are bound with attach_weight(), which
+        // bypasses ggml_gallocr and therefore bypasses the only place that
+        // normally enforces ggml_backend_buft_get_alignment(). On Vulkan the
+        // offset goes straight into a VkDescriptorBufferInfo, which the spec
+        // requires to be a multiple of minStorageBufferOffsetAlignment (16 on
+        // RADV, up to 256 elsewhere). With ONE group the offsets are 0 and the
+        // padded route base, so this never showed on the decode single-arena
+        // path or in the toy fixture -- but grouped prefill runs 19 groups on
+        // ROCm0 and 16 on ROCm1, and group g's ids offset is only
+        // n_used*n_tokens*4, e.g. 3*100*4 = 1200, which is not 256-aligned.
         size_t total_used = 0;
         size_t ids_bytes = 0;
         for (const ArenaGroup & group : groups) {
+            ids_bytes = GGML_PAD(ids_bytes, params_align);
             ids_offsets.push_back(ids_bytes);
             ids_bytes += group.n_used * (size_t) request.n_tokens * sizeof(int32_t);
             total_used += group.n_used;
@@ -12415,13 +12481,14 @@ private:
         const size_t route_offset = GGML_PAD(ids_bytes, params_align);
         size_t route_bytes = 0;
         for (const ArenaGroup & group : groups) {
+            route_bytes = GGML_PAD(route_bytes, params_align);
             route_offsets.push_back(route_offset + route_bytes);
             route_bytes += group.n_used * (size_t) request.n_tokens * sizeof(float);
         }
         const size_t params_span = route_offset + route_bytes;
         grow_params_buffer(params_span, request_stats);
 
-        ArenaGraphKey key{request.n_tokens, (uint32_t) total_used};
+        ArenaGraphKey key{(uint32_t) ArenaGraphKind::PREFILL, request.n_tokens, (uint32_t) total_used};
         for (const ArenaGroup & group : groups) {
             key.group_arenas.push_back((uint32_t) group.arena_index);
             key.group_sizes.push_back((uint32_t) group.n_used);
@@ -12444,8 +12511,11 @@ private:
                 (it->second.graph == nullptr ||
                  it->second.io_gen != io_gen_ ||
                  it->second.params_gen != params_gen_ ||
-                 (wp_persistent_graphs_enabled() &&
-                  it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get())) ||
+                 // ALWAYS, not only under persistent graphs: prepare_io picks
+                 // io_small_ or io_buffer_ per request by SIZE, and that switch
+                 // does not bump io_gen_. A graph whose input/result tensors were
+                 // bound into one buffer must never be replayed against the other.
+                 it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get()) ||
                  it->second.clamp_bits != clamp_bits ||
                  it->second.roles != roles)) {
             if (it->second.persistent_plan != nullptr) {
@@ -12479,9 +12549,7 @@ private:
             entry.clamp_bits = clamp_bits;
             entry.io_gen = io_gen_;
             entry.params_gen = params_gen_;
-            if (wp_persistent_graphs_enabled()) {
-                entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
-            }
+            entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
             ++request_stats.n_arena_build;
 
             const auto build_started = std::chrono::steady_clock::now();
@@ -12623,10 +12691,23 @@ private:
                                     index * sizeof(int32_t),
                                 &local_slot, sizeof(local_slot));
                 }
-                GGML_ASSERT(token_slots.size() == group.n_used);
+                // *** RECOVER, DO NOT ABORT. ***
+                // Both invariants hold whenever the assignments in a group map
+                // to DISTINCT slots, which is what the pool guarantees for
+                // distinct (layer, expert) pages. A request that names the same
+                // expert twice breaks both: `used` cannot reach n_used, and the
+                // padded row would carry a duplicate id, which is exactly what
+                // crashes the CUDA/HIP scatter-quantize path. GGML_ASSERT would
+                // take the whole worker down mid-prefill for a malformed
+                // request; falling back to the gather path answers it correctly.
+                if (used != group.n_used) {
+                    return false;
+                }
                 for (size_t i = 0; i < token_slots.size(); ++i) {
                     for (size_t j = i + 1; j < token_slots.size(); ++j) {
-                        GGML_ASSERT(token_slots[i] != token_slots[j]);
+                        if (token_slots[i] == token_slots[j]) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -12662,6 +12743,7 @@ private:
             throw std::runtime_error("arena prefill backend graph compute failed");
         }
         ++request_stats.n_arena_prefill_hit;
+        g_test_arena_prefill_hits.fetch_add(1, std::memory_order_relaxed);
         request_stats.n_arena_groups += groups.size();
         for (const pipe_expert_assignment & assignment : request.assignments) {
             for (float weight : assignment.weights) {
@@ -12691,8 +12773,12 @@ private:
         std::vector<size_t> route_offsets;
         ids_offsets.reserve(groups.size());
         route_offsets.reserve(groups.size());
+        // Per-group offsets must honour the buffer alignment -- attach_weight
+        // bypasses ggml_gallocr, and Vulkan feeds the raw offset to a
+        // VkDescriptorBufferInfo. Same defect as the grouped-prefill path.
         size_t ids_bytes = 0;
         for (const ArenaGroup & group : groups) {
+            ids_bytes = GGML_PAD(ids_bytes, params_align);
             ids_offsets.push_back(ids_bytes);
             ids_bytes += group.assignments.size() * (size_t) request.n_tokens *
                          sizeof(int32_t);
@@ -12700,6 +12786,7 @@ private:
         const size_t route_offset = GGML_PAD(ids_bytes, params_align);
         size_t route_bytes = 0;
         for (const ArenaGroup & group : groups) {
+            route_bytes = GGML_PAD(route_bytes, params_align);
             route_offsets.push_back(route_offset + route_bytes);
             route_bytes += group.assignments.size() * (size_t) request.n_tokens *
                            sizeof(float);
@@ -12707,7 +12794,7 @@ private:
         const size_t params_span = route_offset + route_bytes;
         grow_params_buffer(params_span, request_stats);
 
-        ArenaGraphKey key{request.n_tokens, (uint32_t) n};
+        ArenaGraphKey key{(uint32_t) ArenaGraphKind::MULTI, request.n_tokens, (uint32_t) n};
         for (const ArenaGroup & group : groups) {
             key.group_arenas.push_back((uint32_t) group.arena_index);
             key.group_sizes.push_back((uint32_t) group.assignments.size());
@@ -12730,8 +12817,11 @@ private:
                 (it->second.graph == nullptr ||
                  it->second.io_gen != io_gen_ ||
                  it->second.params_gen != params_gen_ ||
-                 (wp_persistent_graphs_enabled() &&
-                  it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get())) ||
+                 // ALWAYS, not only under persistent graphs: prepare_io picks
+                 // io_small_ or io_buffer_ per request by SIZE, and that switch
+                 // does not bump io_gen_. A graph whose input/result tensors were
+                 // bound into one buffer must never be replayed against the other.
+                 it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get()) ||
                  it->second.clamp_bits != clamp_bits ||
                  it->second.roles != roles)) {
             if (it->second.persistent_plan != nullptr) {
@@ -12765,9 +12855,7 @@ private:
             entry.clamp_bits = clamp_bits;
             entry.io_gen = io_gen_;
             entry.params_gen = params_gen_;
-            if (wp_persistent_graphs_enabled()) {
-                entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
-            }
+            entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
             ++request_stats.n_arena_build;
 
             const auto build_started = std::chrono::steady_clock::now();
@@ -13015,7 +13103,7 @@ private:
         const size_t params_span = route_offset + route_bytes;
         grow_params_buffer(params_span, request_stats);
 
-        ArenaGraphKey key{request.n_tokens, (uint32_t) n};
+        ArenaGraphKey key{(uint32_t) ArenaGraphKind::SINGLE, request.n_tokens, (uint32_t) n};
         uint32_t clamp_bits = 0;
         std::memcpy(&clamp_bits, &request.swiglu_clamp, sizeof(clamp_bits));
         static const size_t cache_max = [] {
@@ -13054,8 +13142,11 @@ private:
                 (it->second.graph == nullptr ||
                  it->second.io_gen != io_gen_ ||
                  it->second.params_gen != params_gen_ ||
-                 (wp_persistent_graphs_enabled() &&
-                  it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get())) ||
+                 // ALWAYS, not only under persistent graphs: prepare_io picks
+                 // io_small_ or io_buffer_ per request by SIZE, and that switch
+                 // does not bump io_gen_. A graph whose input/result tensors were
+                 // bound into one buffer must never be replayed against the other.
+                 it->second.io_buffer != (io_active_ != nullptr ? io_active_ : io_buffer_.get()) ||
                  it->second.clamp_bits != clamp_bits ||
                  it->second.roles != roles)) {
             if (it->second.persistent_plan != nullptr) {
@@ -13089,9 +13180,7 @@ private:
             entry.clamp_bits = clamp_bits;
             entry.io_gen = io_gen_;
             entry.params_gen = params_gen_;
-            if (wp_persistent_graphs_enabled()) {
-                entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
-            }
+            entry.io_buffer = io_active_ != nullptr ? io_active_ : io_buffer_.get();
             ++request_stats.n_arena_build;
 
             const auto build_started = std::chrono::steady_clock::now();
@@ -13642,15 +13731,26 @@ private:
     // of resetting warmup. Gather caches when every selected expert has the
     // same idx rank (verify). Mixed ranks skip the cache. Entries pin their
     // gallocr VRAM (~2-4 MB each); the LRU cap bounds it.
+    // Which builder produced the entry. compute_batch_arena (SINGLE),
+    // compute_batch_arena_multi (MULTI) and compute_batch_arena_prefill
+    // (PREFILL) all share arena_graph_cache_ but build STRUCTURALLY DIFFERENT
+    // graphs from the same (n_tokens, count, arenas, sizes) tuple -- MULTI's
+    // group_sizes are assignment counts folded per assignment, PREFILL's are
+    // per-token route counts folded over k. Today they cannot collide only
+    // because n_tokens <= 8 gates one and n_tokens > 8 the other; that is a
+    // coincidence of two unrelated predicates, not an invariant. Make it one.
+    enum class ArenaGraphKind : uint32_t { SINGLE = 0, MULTI = 1, PREFILL = 2 };
+
     struct ArenaGraphKey {
+        uint32_t kind = 0;
         uint32_t n_tokens = 0;
         uint32_t n_assignments = 0;
         std::vector<uint32_t> group_arenas;
         std::vector<uint32_t> group_sizes;
 
         bool operator<(const ArenaGraphKey & o) const {
-            return std::tie(n_tokens, n_assignments, group_arenas, group_sizes) <
-                   std::tie(o.n_tokens, o.n_assignments, o.group_arenas, o.group_sizes);
+            return std::tie(kind, n_tokens, n_assignments, group_arenas, group_sizes) <
+                   std::tie(o.kind, o.n_tokens, o.n_assignments, o.group_arenas, o.group_sizes);
         }
     };
 

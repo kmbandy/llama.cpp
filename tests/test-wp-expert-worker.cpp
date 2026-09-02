@@ -17,6 +17,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -278,7 +279,7 @@ int reserve_port() {
 }
 
 pipe_socket_ptr connect_with_retry(int port) {
-    for (int attempt = 0; attempt < 200; ++attempt) {
+    for (int attempt = 0; attempt < 6000; ++attempt) { // 30 s: a ROCm worker needs ~1 s just to load libggml-hip (2026-09-02, R9700), and a miss deadlocks the test in server.join()
         pipe_socket_ptr socket = pipe_socket_t::connect("127.0.0.1", port);
         if (socket) {
             return socket;
@@ -3183,6 +3184,563 @@ static void test_prefill_arena_grouped_matches_gather() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRODUCTION-GEOMETRY GROUPED PREFILL (2026-09-02)
+//
+// Every other grouped-prefill test in this file runs the toy fixture: 4 f32
+// experts, n_embd 32, one arena, CPU. That fixture cannot see any of the three
+// defects the rig probes found -- a slot stride that is not a multiple of a
+// role's quant block size, duplicate slot ids inside a token's id row, or a
+// backend that ignores the slab stride -- because it has one arena, one type
+// and no quantisation. These tests build the real thing instead:
+//
+//   qwen38-next, n_embd 2560, n_ff_exp 640 width-sliced 7:3, so the per-worker
+//   slice widths are 448 (main box) and 192 (2026 box); the three geometry
+//   variants from
+//   ~/models/qwen38-eslice-v2/q38-eslice-slice-00000-experts-manifest.json
+//   (expert_slicing.geometry_variants[*].role_geometry):
+//       0: gate/up q4_K, down q5_1
+//       1: gate/up q5_K, down q8_0
+//       2: gate/up q4_K, down q8_0
+//   128-token requests (the spine streams 512-token ubatches in four chunks),
+//   sparse top-k routing, several arenas per size class, and a block of
+//   resident-but-unrouted experts so at least one arena draws no route at all.
+//
+// Selected by env:
+//   WP_WORKER_TEST_BACKEND   CPU (default) / ROCm0 / CUDA0 / Vulkan0 ...
+//   WP_WORKER_TEST_GEOMETRY  0 / 1 / 2, unset = all three
+// ---------------------------------------------------------------------------
+
+struct ProdGeometry {
+    const char * name;
+    ggml_type    gate_up;
+    ggml_type    down;
+};
+
+static const ProdGeometry PROD_GEOMETRIES[3] = {
+    { "gate/up q4_K + down q5_1", GGML_TYPE_Q4_K, GGML_TYPE_Q5_1 },
+    { "gate/up q5_K + down q8_0", GGML_TYPE_Q5_K, GGML_TYPE_Q8_0 },
+    { "gate/up q4_K + down q8_0", GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 },
+};
+
+static constexpr int64_t  PROD_N_EMBD  = 2560;
+static constexpr int      PROD_WIDTHS[2] = { 448, 192 };
+// Production runs ~180 assignments per 128-token chunk against ~8150 slots.
+// Scaled to 16 here purely for CPU wall time; what the geometry has to keep is
+// (a) several arenas per size class and (b) at least one arena with no route in
+// the chunk. PROD_EXPERTS/4 arenas (see WP_EXPERT_ARENA_MAX_BYTES below) and
+// PROD_UNROUTED_FIRST give both.
+static constexpr int      PROD_EXPERTS = 16;
+static constexpr int      PROD_UNROUTED_FIRST = 12;   // experts 12..15 draw no route
+static constexpr int      PROD_LAYER   = 0;
+static constexpr uint32_t PROD_TOKENS  = 128;
+static constexpr uint32_t PROD_CHUNKS  = 4;
+static constexpr int      PROD_TOP_K   = 3;           // routes per token
+static constexpr int      PROD_N_EXPERT_USED = 10;    // top-10, as in production
+
+struct ProdFixture {
+    fs::path descriptor;
+    fs::path manifest;
+    uint64_t page_bytes = 0;
+};
+
+static float prod_weight_value(int expert, int role, int64_t row, int64_t col) {
+    const int64_t pattern =
+        (row * 31 + col * 17 + (int64_t) expert * 13 + (int64_t) role * 7) % 23;
+    return 0.02f * (float) (pattern - 11);
+}
+
+// Quantise one [n_per_row, nrows] role matrix for one expert.
+static std::vector<uint8_t> prod_role_bytes(
+        ggml_type type, int64_t n_per_row, int64_t nrows, int expert, int role) {
+    std::vector<float> src((size_t) n_per_row * (size_t) nrows);
+    for (int64_t row = 0; row < nrows; ++row) {
+        for (int64_t col = 0; col < n_per_row; ++col) {
+            src[(size_t) row * (size_t) n_per_row + (size_t) col] =
+                prod_weight_value(expert, role, row, col);
+        }
+    }
+    const size_t bytes = (size_t) ggml_row_size(type, n_per_row) * (size_t) nrows;
+    std::vector<uint8_t> dst(bytes);
+    const size_t written = ggml_quantize_chunk(
+        type, src.data(), dst.data(), 0, nrows, n_per_row, nullptr);
+    require(written == bytes, "production fixture quantisation size mismatch");
+    return dst;
+}
+
+static ProdFixture make_production_fixture(
+        const fs::path & dir, const ProdGeometry & geometry, int width) {
+    ProdFixture fixture;
+    fixture.descriptor = dir / "prod.expert-descriptor.json";
+    fixture.manifest   = dir / "prod-experts-manifest.json";
+
+    const json identity = {
+        { "algorithm", "sha256" },
+        { "value", "wp-expert-worker-production-geometry" },
+    };
+
+    const uint64_t gate_bytes =
+        (uint64_t) ggml_row_size(geometry.gate_up, PROD_N_EMBD) * (uint64_t) width;
+    const uint64_t up_bytes   = gate_bytes;
+    const uint64_t down_bytes =
+        (uint64_t) ggml_row_size(geometry.down, width) * (uint64_t) PROD_N_EMBD;
+    const uint64_t payload    = up_bytes + gate_bytes + down_bytes;
+    const uint64_t padded     = GGML_PAD(payload, (uint64_t) 4096);
+    const uint64_t padding    = padded - payload;
+    fixture.page_bytes = padded;
+
+    const auto role_desc = [&](ggml_type type, int64_t ne0, int64_t ne1,
+                               uint64_t bytes, const char * role) {
+        return json{
+            { "ggml_type", (int) type },
+            { "ggml_type_name", ggml_type_name(type) },
+            { "shape", json::array({ ne0, ne1 }) },
+            { "bytes_per_expert", bytes },
+            { "source_tensor_name", std::string("prod.") + role },
+        };
+    };
+
+    write_json(fixture.descriptor, {
+        { "format", "llama.cpp.weight-pager.expert-descriptor" },
+        { "version", 1 },
+        { "source_model",
+          {
+              { "input_model", "prod.gguf" },
+              { "model_files", { "prod.gguf" } },
+              { "architecture", "qwen38next" },
+              { "name", "qwen38-next" },
+          } },
+        { "shard_manifest_identity", identity },
+        { "retained_expert_range", { { "first", 0 }, { "last", PROD_EXPERTS - 1 } } },
+        { "hparams",
+          {
+              { "n_layer", 1 },
+              { "n_embd", PROD_N_EMBD },
+              { "n_ff_exp", width },
+              { "n_expert", PROD_EXPERTS },
+              { "n_expert_used", PROD_N_EXPERT_USED },
+              { "activation", "silu" },
+          } },
+        { "layers",
+          json::array({ json{
+              { "layer", PROD_LAYER },
+              { "roles",
+                {
+                    { "gate", role_desc(geometry.gate_up, PROD_N_EMBD, width, gate_bytes, "gate") },
+                    { "up",   role_desc(geometry.gate_up, PROD_N_EMBD, width, up_bytes,   "up") },
+                    { "down", role_desc(geometry.down,    width, PROD_N_EMBD, down_bytes, "down") },
+                } },
+          } }) },
+    });
+
+    const std::string stem = "prod-00001-of-00001";
+    const fs::path sidecar = dir / (stem + ".wpi.json");
+    const fs::path blob    = dir / (stem + ".wpb");
+
+    std::ofstream blob_output(blob, std::ios::binary);
+    if (!blob_output) {
+        throw std::runtime_error("failed to create production blob");
+    }
+    const std::vector<uint8_t> zero_pad((size_t) padding, 0);
+    json groups = json::array();
+    uint64_t offset = 0;
+    for (int expert = 0; expert < PROD_EXPERTS; ++expert) {
+        json members = json::array();
+        // Blob order is up (mask 1), gate (mask 2), down (mask 4) -- the same
+        // order the real slicer writes and the same order load_catalog walks.
+        struct RoleLayout { const char * name; uint64_t mask; ggml_type type;
+                            int64_t ne0; int64_t ne1; uint64_t bytes; int role_index; };
+        const RoleLayout layout[3] = {
+            { "up",   1, geometry.gate_up, PROD_N_EMBD, width, up_bytes,   0 },
+            { "gate", 2, geometry.gate_up, PROD_N_EMBD, width, gate_bytes, 1 },
+            { "down", 4, geometry.down,    width, PROD_N_EMBD, down_bytes, 2 },
+        };
+        for (const RoleLayout & role : layout) {
+            const std::vector<uint8_t> bytes = prod_role_bytes(
+                role.type, role.ne0, role.ne1, expert, role.role_index);
+            require(bytes.size() == role.bytes, "production role byte count mismatch");
+            blob_output.write(reinterpret_cast<const char *>(bytes.data()),
+                              (std::streamsize) bytes.size());
+            members.push_back({
+                { "role_mask", role.mask },
+                { "size", role.bytes },
+                { "offset", offset },
+                { "catalog_name",
+                  "blk." + std::to_string(PROD_LAYER) + ".ffn_" +
+                  std::string(role.name) + "." + std::to_string(expert) + ".weight" },
+                { "source_tensor_name", std::string("prod.") + role.name },
+                { "source_file_idx", 0 },
+                { "source_file_offset", offset },
+            });
+            offset += role.bytes;
+        }
+        if (padding > 0) {
+            blob_output.write(reinterpret_cast<const char *>(zero_pad.data()),
+                              (std::streamsize) zero_pad.size());
+            offset += padding;
+        }
+        groups.push_back({
+            { "block_idx", PROD_LAYER },
+            { "expert_idx", expert },
+            { "member_count", 3 },
+            { "padding_bytes", padding },
+            { "members", std::move(members) },
+        });
+    }
+    blob_output.close();
+    require(offset == padded * (uint64_t) PROD_EXPERTS, "production blob size mismatch");
+
+    write_json(sidecar, {
+        { "format", "llama.cpp.weight-pager.expert-shard-index" },
+        { "version", 1 },
+        { "blob_file", blob.filename().string() },
+        { "shard_index", 0 },
+        { "shard_count", 1 },
+        { "layer_first", PROD_LAYER },
+        { "layer_last", PROD_LAYER },
+        { "group_count", PROD_EXPERTS },
+        { "blob_bytes", offset },
+        { "content_hash", identity },
+        { "model_files", { "prod.gguf" } },
+        { "groups", std::move(groups) },
+    });
+
+    write_json(fixture.manifest, {
+        { "format", "llama.cpp.weight-pager.expert-shard-manifest" },
+        { "version", 1 },
+        { "input_model", "prod.gguf" },
+        { "model_files", { "prod.gguf" } },
+        { "sharding_mode", "expert-index-range" },
+        { "retained_expert_range", { { "first", 0 }, { "last", PROD_EXPERTS - 1 } } },
+        { "total_group_count", PROD_EXPERTS },
+        { "total_blob_bytes", offset },
+        { "shard_count", 1 },
+        { "content_hash", identity },
+        { "shards",
+          json::array({ json{
+              { "blob_file", blob.filename().string() },
+              { "index_file", sidecar.filename().string() },
+              { "shard_index", 0 },
+              { "layer_first", PROD_LAYER },
+              { "layer_last", PROD_LAYER },
+              { "group_count", PROD_EXPERTS },
+              { "blob_bytes", offset },
+              { "content_hash", identity },
+          } }) },
+    });
+    return fixture;
+}
+
+// Sparse top-3-of-12 routing over 128 tokens, with experts
+// [PROD_UNROUTED_FIRST, PROD_EXPERTS) resident but never routed. Every 16th
+// token routes to three CONSECUTIVE expert ids so at least one arena sees
+// n_used == 3 and every other arena that token touches pads to it at weight 0.
+static pipe_expert_dispatch_req make_production_request() {
+    pipe_expert_dispatch_req request;
+    request.layer = PROD_LAYER;
+    request.n_tokens = PROD_TOKENS;
+    request.swiglu_clamp = 0.0f;
+    request.activations.resize((size_t) PROD_TOKENS * (size_t) PROD_N_EMBD);
+    for (size_t i = 0; i < request.activations.size(); ++i) {
+        request.activations[i] = ((int) ((i * 19 + i / PROD_N_EMBD) % 37) - 18) * 0.011f;
+    }
+
+    std::vector<std::vector<float>> weights(
+        PROD_EXPERTS, std::vector<float>(PROD_TOKENS, 0.0f));
+    for (uint32_t t = 0; t < PROD_TOKENS; ++t) {
+        std::vector<int> routed;
+        if (t % 16 == 0) {
+            const int base = (int) ((t / 16) * 4) % PROD_UNROUTED_FIRST;
+            for (int k = 0; k < PROD_TOP_K; ++k) {
+                routed.push_back((base + k) % PROD_UNROUTED_FIRST);
+            }
+        } else {
+            for (int k = 0; k < PROD_TOP_K; ++k) {
+                routed.push_back(
+                    (int) ((t * (uint32_t) (7 * k + 1) + 5 * (uint32_t) k) % PROD_UNROUTED_FIRST));
+            }
+        }
+        std::sort(routed.begin(), routed.end());
+        routed.erase(std::unique(routed.begin(), routed.end()), routed.end());
+        for (size_t k = 0; k < routed.size(); ++k) {
+            // Non-zero, well away from zero: `weight == 0.0f` is the wire's
+            // "this expert is not in this token's top-k" marker (weights are
+            // f32 on the wire, see pipe_expert_assignment), and the grouped
+            // path uses exactly that test to split routes from pads.
+            weights[routed[k]][t] = 0.125f + 0.03125f * (float) ((t + k) % 9);
+        }
+    }
+    for (int expert = 0; expert < PROD_EXPERTS; ++expert) {
+        pipe_expert_assignment assignment;
+        assignment.expert_id = expert;
+        assignment.weights = weights[expert];
+        request.assignments.push_back(std::move(assignment));
+    }
+    return request;
+}
+
+struct ProdRun {
+    std::vector<float> whole;
+    std::vector<float> chunked;
+    uint64_t           hits = 0;
+    uint64_t           fallbacks = 0;
+};
+
+// One worker lifetime: the whole 128-token request, then the same request as
+// four 32-token streamed chunks over the same connection.
+static ProdRun run_production_prefill(
+        const ProdFixture & fixture,
+        const pipe_expert_dispatch_req & request,
+        const std::string & device,
+        bool grouped) {
+    const ScopedEnv arena_env("WP_EXPERT_ARENA_PREFILL", grouped ? "1" : "0");
+    // Force several arenas per size class: arena_bytes is floor(cap/stride)*stride
+    // and stride >= page_bytes, so a cap of 4 pages can never put more than four
+    // of the 16 slots in one buffer. Production reaches the same shape through
+    // the backend's own max-allocation cap (19 arenas on ROCm0, 16 on ROCm1).
+    const ScopedEnv arena_cap(
+        "WP_EXPERT_ARENA_MAX_BYTES", std::to_string(fixture.page_bytes * 4));
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = device;
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = reserve_port();
+    // Headroom over PROD_EXPERTS on purpose: every page must stay resident for
+    // the whole connection. If a page were evicted and re-paged between the
+    // 128-token whole request and the 32-token chunks it could land in a
+    // DIFFERENT arena, which reorders the across-arena fold and would fail the
+    // byte-identity check for a reason that has nothing to do with chunking.
+    options.slots             = PROD_EXPERTS + 4;
+    options.host_budget_bytes = 4 * fixture.page_bytes;
+    options.once              = true;
+
+    wp_expert_worker::test_reset_arena_prefill_counters();
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    ProdRun run;
+    try {
+        pipe_socket_ptr socket = connect_with_retry(options.listen_port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload) && type == PIPE_HELLO,
+                "production-geometry worker did not send HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send production-geometry client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "production-geometry worker rejected HELLO");
+
+        // WARM-UP. The counters must measure a steady-state chunk, not the
+        // cold one: on the very first request the pages are still being read,
+        // and if a slot is not yet bound the dispatcher splits the compute into
+        // WP_EXPERT_COMPUTE_CHUNKS index ranges, each of which is correctly
+        // refused by the whole-request guard in compute_batch and counted as a
+        // fall-back. Production sees the same thing exactly once per layer.
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, 719,
+                                payload.data(), payload.size()),
+                "failed to send production-geometry warm-up dispatch");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_PARTIAL && seq_id == 719,
+                "production-geometry warm-up returned the wrong frame");
+        // Safe here: the worker is blocked reading the next frame.
+        wp_expert_worker::test_reset_arena_prefill_counters();
+
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, 720,
+                                payload.data(), payload.size()),
+                "failed to send production-geometry dispatch");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_PARTIAL && seq_id == 720,
+                "production-geometry dispatch returned the wrong frame");
+        const pipe_expert_partial whole =
+            pipe_decode_expert_partial(payload.data(), payload.size(), (uint32_t) PROD_N_EMBD);
+        require(whole.n_tokens == PROD_TOKENS, "production-geometry token count mismatch");
+        run.whole = whole.partial;
+
+        run.chunked.assign((size_t) PROD_TOKENS * (size_t) PROD_N_EMBD, 0.0f);
+        const uint32_t chunk_rows = PROD_TOKENS / PROD_CHUNKS;
+        for (uint32_t chunk_index = 0; chunk_index < PROD_CHUNKS; ++chunk_index) {
+            const uint32_t token_start = chunk_index * chunk_rows;
+            const uint32_t token_end = chunk_index + 1 == PROD_CHUNKS
+                ? PROD_TOKENS : token_start + chunk_rows;
+            pipe_expert_dispatch_chunk chunk;
+            chunk.chunk_index  = chunk_index;
+            chunk.chunk_count  = PROD_CHUNKS;
+            chunk.total_tokens = PROD_TOKENS;
+            chunk.token_start  = token_start;
+            chunk.token_end    = token_end;
+            chunk.request.layer         = request.layer;
+            chunk.request.n_tokens      = token_end - token_start;
+            chunk.request.swiglu_clamp  = request.swiglu_clamp;
+            for (const pipe_expert_assignment & assignment : request.assignments) {
+                pipe_expert_assignment sliced;
+                sliced.expert_id = assignment.expert_id;
+                sliced.weights.assign(assignment.weights.begin() + token_start,
+                                      assignment.weights.begin() + token_end);
+                chunk.request.assignments.push_back(std::move(sliced));
+            }
+            chunk.request.activations.assign(
+                request.activations.begin() + (size_t) token_start * PROD_N_EMBD,
+                request.activations.begin() + (size_t) token_end * PROD_N_EMBD);
+
+            payload = pipe_encode_expert_dispatch_chunk(chunk);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_CHUNK, 721,
+                                    payload.data(), payload.size()),
+                    "failed to send production-geometry dispatch chunk");
+            require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                        type == PIPE_EXPERT_PARTIAL_CHUNK && seq_id == 721,
+                    "production-geometry chunk returned the wrong frame");
+            const pipe_expert_partial_chunk partial = pipe_decode_expert_partial_chunk(
+                payload.data(), payload.size(), (uint32_t) PROD_N_EMBD);
+            require(partial.chunk_index == chunk_index &&
+                        partial.token_start == token_start &&
+                        partial.token_end == token_end,
+                    "production-geometry partial range mismatch");
+            std::copy(partial.partial.partial.begin(), partial.partial.partial.end(),
+                      run.chunked.begin() + (size_t) token_start * PROD_N_EMBD);
+        }
+        socket.reset();
+    } catch (...) {
+        server.join();
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "production-geometry worker returned failure");
+    run.hits      = wp_expert_worker::test_arena_prefill_hits();
+    run.fallbacks = wp_expert_worker::test_arena_prefill_fallbacks();
+    return run;
+}
+
+static void test_prefill_arena_grouped_production_geometry() {
+    const char * backend_env = std::getenv("WP_WORKER_TEST_BACKEND");
+    const std::string device =
+        (backend_env != nullptr && backend_env[0] != '\0') ? backend_env : "CPU";
+    const char * geometry_env = std::getenv("WP_WORKER_TEST_GEOMETRY");
+    int only_geometry = -1;
+    if (geometry_env != nullptr && geometry_env[0] != '\0') {
+        only_geometry = (int) std::strtol(geometry_env, nullptr, 10);
+        require(only_geometry >= 0 && only_geometry < 3,
+                "WP_WORKER_TEST_GEOMETRY must be 0, 1 or 2");
+    }
+
+    const pipe_expert_dispatch_req request = make_production_request();
+
+    for (int g = 0; g < 3; ++g) {
+        if (only_geometry >= 0 && g != only_geometry) {
+            continue;
+        }
+        for (const int width : PROD_WIDTHS) {
+            const ProdGeometry & geometry = PROD_GEOMETRIES[g];
+            const std::string label = std::string("[") + device + " variant " +
+                std::to_string(g) + " " + geometry.name + " width " +
+                std::to_string(width) + "] ";
+            std::cout << "test-wp-expert-worker: production geometry " << label << std::endl;
+
+            TempDir temp;
+            const ProdFixture fixture =
+                make_production_fixture(temp.path, geometry, width);
+
+            const ProdRun grouped =
+                run_production_prefill(fixture, request, device, /* grouped = */ true);
+            const ProdRun gather =
+                run_production_prefill(fixture, request, device, /* grouped = */ false);
+
+            // (c) the grouped arm actually took the grouped path, every time.
+            if (grouped.hits == 0 || grouped.fallbacks != 0) {
+                throw std::runtime_error(
+                    label + "grouped prefill did not take the arena path: hits=" +
+                    std::to_string(grouped.hits) + " fallbacks=" +
+                    std::to_string(grouped.fallbacks));
+            }
+            require(gather.hits == 0 && gather.fallbacks == 0,
+                    (label + "gather reference unexpectedly used the arena path").c_str());
+
+            require(grouped.whole.size() == gather.whole.size() &&
+                        grouped.whole.size() ==
+                            (size_t) PROD_TOKENS * (size_t) PROD_N_EMBD,
+                    (label + "result shape mismatch").c_str());
+
+            // (a) every value finite, and grouped within 1e-3 relative of gather.
+            double max_rel = 0.0;
+            double max_abs_gather = 0.0;
+            size_t worst = 0;
+            for (size_t i = 0; i < gather.whole.size(); ++i) {
+                if (!std::isfinite(grouped.whole[i])) {
+                    throw std::runtime_error(
+                        label + "grouped prefill produced a non-finite value at " +
+                        std::to_string(i));
+                }
+                if (!std::isfinite(gather.whole[i])) {
+                    throw std::runtime_error(
+                        label + "gather prefill produced a non-finite value at " +
+                        std::to_string(i));
+                }
+                max_abs_gather = std::max(max_abs_gather, std::fabs((double) gather.whole[i]));
+            }
+            for (size_t i = 0; i < gather.whole.size(); ++i) {
+                const double diff =
+                    std::fabs((double) grouped.whole[i] - (double) gather.whole[i]);
+                const double rel = diff / (max_abs_gather > 0.0 ? max_abs_gather : 1.0);
+                if (rel > max_rel) {
+                    max_rel = rel;
+                    worst = i;
+                }
+            }
+            if (max_rel > 1e-3) {
+                throw std::runtime_error(
+                    label + "grouped prefill differs from gather: max_rel=" +
+                    std::to_string(max_rel) + " at " + std::to_string(worst) +
+                    " grouped=" + std::to_string(grouped.whole[worst]) +
+                    " gather=" + std::to_string(gather.whole[worst]));
+            }
+
+            // (b) four 32-token chunks must be BIT-identical to the 128-token
+            // whole under the grouped path. This is the whole point of
+            // GGML_HINT_MUL_MAT_PIN plus the fixed-order fold: a (token, slot)
+            // row's bits must not depend on how the ubatch was cut.
+            require(grouped.chunked.size() == grouped.whole.size(),
+                    (label + "chunked result shape mismatch").c_str());
+            for (size_t i = 0; i < grouped.whole.size(); ++i) {
+                if (std::memcmp(&grouped.whole[i], &grouped.chunked[i], sizeof(float)) != 0) {
+                    throw std::runtime_error(
+                        label + "grouped prefill changed when split into " +
+                        std::to_string(PROD_CHUNKS) + " token chunks at " +
+                        std::to_string(i) + ": whole=" +
+                        std::to_string(grouped.whole[i]) + " chunked=" +
+                        std::to_string(grouped.chunked[i]));
+                }
+            }
+        }
+    }
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -3192,6 +3750,7 @@ int main() {
         require(setenv("WP_EXPERT_GATHER", "1", 1) == 0 &&
                     setenv("WP_EXPERT_GATHER_MIN_TOKENS", "2", 1) == 0,
                 "failed to enable expert gather");
+        test_prefill_arena_grouped_production_geometry();
         test_prefill_arena_grouped_chunk_byte_identical();
         test_prefill_arena_grouped_matches_gather();
         test_prefill_mul_mat_pin_chunk_byte_identical();
