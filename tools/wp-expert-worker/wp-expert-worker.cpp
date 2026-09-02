@@ -12583,9 +12583,10 @@ private:
             const ArenaGroup & group = groups[group_index];
             const ExpertSlotPool::ArenaLayout::Arena & arena =
                 layout.arenas[group.arena_index];
-            const size_t pad_slot =
-                batch.slot_index(group.assignments[0]) - arena.first_slot;
+            std::vector<int32_t> token_slots;
+            token_slots.reserve(group.n_used);
             for (uint32_t t = 0; t < request.n_tokens; ++t) {
+                token_slots.clear();
                 size_t used = 0;
                 for (size_t assignment : group.assignments) {
                     const float weight = request.assignments[assignment].weights[t];
@@ -12594,6 +12595,7 @@ private:
                     }
                     const size_t slot = batch.slot_index(assignment);
                     const int32_t local_slot = (int32_t) (slot - arena.first_slot);
+                    token_slots.push_back(local_slot);
                     const size_t index = (size_t) t * group.n_used + used++;
                     std::memcpy(params_host.data() + ids_offsets[group_index] +
                                     index * sizeof(int32_t),
@@ -12602,12 +12604,30 @@ private:
                                     index * sizeof(float),
                                 &weight, sizeof(weight));
                 }
-                const int32_t local_pad_slot = (int32_t) pad_slot;
-                while (used < group.n_used) {
+                // 2026-09-02: quantize_mmq_q8_1<..., scatter=true> forbids duplicate IDs per token.
+                for (size_t assignment : group.assignments) {
+                    if (used == group.n_used) {
+                        break;
+                    }
+                    if (request.assignments[assignment].weights[t] != 0.0f) {
+                        continue;
+                    }
+                    const size_t slot = batch.slot_index(assignment);
+                    const int32_t local_slot = (int32_t) (slot - arena.first_slot);
+                    if (std::find(token_slots.begin(), token_slots.end(), local_slot) != token_slots.end()) {
+                        continue;
+                    }
+                    token_slots.push_back(local_slot);
                     const size_t index = (size_t) t * group.n_used + used++;
                     std::memcpy(params_host.data() + ids_offsets[group_index] +
                                     index * sizeof(int32_t),
-                                &local_pad_slot, sizeof(local_pad_slot));
+                                &local_slot, sizeof(local_slot));
+                }
+                GGML_ASSERT(token_slots.size() == group.n_used);
+                for (size_t i = 0; i < token_slots.size(); ++i) {
+                    for (size_t j = i + 1; j < token_slots.size(); ++j) {
+                        GGML_ASSERT(token_slots[i] != token_slots[j]);
+                    }
                 }
             }
         }

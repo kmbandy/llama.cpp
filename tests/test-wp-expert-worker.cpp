@@ -2930,7 +2930,7 @@ static pipe_expert_dispatch_req make_sparse_arena_prefill_request() {
         for (uint32_t token = 0; token < TOKENS; ++token) {
             const int first = (int) token % 4;
             const int second = (first + 2) % 4;
-            if (expert == first || expert == second) {
+            if (expert == first || (token % 3 != 0 && expert == second)) {
                 assignment.weights[token] =
                     (1 + (int) ((token * 5 + expert * 3) % 17)) * 0.03125f;
             }
