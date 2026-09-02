@@ -1385,8 +1385,27 @@ static ResourcePlan plan_resources_impl(
         throw std::invalid_argument("invalid expert resource plan dimensions");
     }
 
+    const auto checked_lcm = [](uint64_t a, uint64_t b) {
+        if (a == 0 || b == 0) {
+            throw std::invalid_argument("invalid expert role type size");
+        }
+        const uint64_t factor = b / std::gcd(a, b);
+        if (a > UINT64_MAX / factor) {
+            throw std::overflow_error("expert arena slot alignment overflows");
+        }
+        return a * factor;
+    };
+    const auto aligned_size = [](uint64_t size, uint64_t alignment) {
+        if (size > UINT64_MAX - (alignment - 1)) {
+            throw std::overflow_error("expert arena size overflows");
+        }
+        return (size + alignment - 1) / alignment * alignment;
+    };
+
     std::map<uint64_t, int> histogram;
     std::map<uint64_t, std::map<int, int>> layer_counts;
+    std::map<uint64_t, uint64_t> class_alignments;
+    uint64_t uniform_alignment = arena_alignment;
     uint64_t max_page_size = 0;
     uint64_t max_staging_size = 0;
     for (const ResourcePage & page : pages) {
@@ -1398,6 +1417,14 @@ static ResourcePlan plan_resources_impl(
         if (!page.pinned) {
             ++histogram[page.size];
             ++layer_counts[page.size][page.layer];
+            uint64_t & class_alignment = class_alignments[page.size];
+            if (class_alignment == 0) {
+                class_alignment = arena_alignment;
+            }
+            for (const uint64_t type_size : page.role_type_sizes) {
+                class_alignment = checked_lcm(class_alignment, type_size);
+                uniform_alignment = checked_lcm(uniform_alignment, type_size);
+            }
         }
         max_page_size = std::max(max_page_size, page.size);
         max_staging_size = std::max(
@@ -1434,15 +1461,17 @@ static ResourcePlan plan_resources_impl(
         for (const auto & layer : layer_counts.at(item.first)) {
             floor = std::max(floor, layer.second);
         }
+        const uint64_t stride = aligned_size(
+            item.first, class_alignments.at(item.first));
         if ((uint64_t) floor >
-            (std::numeric_limits<uint64_t>::max() - floor_bytes) / item.first) {
+            (std::numeric_limits<uint64_t>::max() - floor_bytes) / stride) {
             throw std::overflow_error("expert pin floor overflows");
         }
-        floor_bytes += item.first * (uint64_t) floor;
+        floor_bytes += stride * (uint64_t) floor;
         total_pages += (uint64_t) item.second;
         weighted_bytes +=
-            (long double) item.first * (long double) item.second;
-        classes.push_back({ item.first, 0, floor, item.second });
+            (long double) stride * (long double) item.second;
+        classes.push_back({ item.first, stride, 0, floor, item.second });
     }
 
     bool use_size_classes = floor_bytes <= result.slot_budget_bytes;
@@ -1464,39 +1493,24 @@ static ResourcePlan plan_resources_impl(
             slot_class.slots = (int) count;
         }
 
-        auto planned_bytes = [&]() {
-            uint64_t bytes = 0;
-            for (const SlotClass & slot_class : classes) {
-                bytes += slot_class.size * (uint64_t) slot_class.slots;
-            }
-            return bytes;
-        };
-
         auto planned_arena_bytes = [&]() {
             uint64_t bytes = 0;
             for (const SlotClass & slot_class : classes) {
-                if (slot_class.size > UINT64_MAX - (arena_alignment - 1)) {
+                if ((uint64_t) slot_class.slots > UINT64_MAX / slot_class.stride ||
+                        bytes > UINT64_MAX - slot_class.stride * (uint64_t) slot_class.slots) {
                     throw std::overflow_error("expert arena size overflows");
                 }
-                const uint64_t stride =
-                    (slot_class.size + arena_alignment - 1) / arena_alignment * arena_alignment;
-                if ((uint64_t) slot_class.slots > UINT64_MAX / stride ||
-                        bytes > UINT64_MAX - stride * (uint64_t) slot_class.slots) {
-                    throw std::overflow_error("expert arena size overflows");
-                }
-                bytes += stride * (uint64_t) slot_class.slots;
+                bytes += slot_class.stride * (uint64_t) slot_class.slots;
             }
             return bytes;
         };
 
-        while (planned_bytes() > result.slot_budget_bytes ||
-                (classes.size() > 1 &&
-                 planned_arena_bytes() > result.slot_budget_bytes)) {
+        while (planned_arena_bytes() > result.slot_budget_bytes) {
             SlotClass * trim = nullptr;
             for (SlotClass & slot_class : classes) {
                 const int keep = std::max(1, slot_class.pin_floor);
                 if (slot_class.slots > keep &&
-                    (trim == nullptr || slot_class.size > trim->size)) {
+                    (trim == nullptr || slot_class.stride > trim->stride)) {
                     trim = &slot_class;
                 }
             }
@@ -1518,13 +1532,14 @@ static ResourcePlan plan_resources_impl(
             max_layer_pages =
                 std::max(max_layer_pages, ++pages_by_layer[page.layer]);
         }
-        if (result.slot_budget_bytes / max_page_size < (uint64_t) max_layer_pages) {
+        const uint64_t stride = aligned_size(max_page_size, uniform_alignment);
+        if (result.slot_budget_bytes / stride < (uint64_t) max_layer_pages) {
             throw std::invalid_argument(
                 "expert slot budget is smaller than the largest layer request");
         }
         classes.clear();
         classes.push_back({
-            max_page_size, (int) (result.slot_budget_bytes / max_page_size),
+            max_page_size, stride, (int) (result.slot_budget_bytes / stride),
             max_layer_pages, (int) total_pages
         });
     }
@@ -1538,7 +1553,7 @@ static ResourcePlan plan_resources_impl(
         }
         result.slot_count += slot_class.slots;
         result.device_bytes +=
-            slot_class.size * (uint64_t) slot_class.slots;
+            slot_class.stride * (uint64_t) slot_class.slots;
     }
     if (reserve_bytes != 0 && !reserve_blocks.empty()) {
         result.requested_reserved_bytes = reserve_bytes;
@@ -2715,8 +2730,15 @@ std::vector<ResourcePage> resource_pages(
     result.reserve(catalog.pages.size());
     for (const auto & item : catalog.pages) {
         if (!page_owner || page_owner(item.second.layer, item.second.expert)) {
-            result.push_back({ item.second.layer, item.second.device_size,
-                               item.second.is_resident, item.second.size });
+            ResourcePage page = {
+                item.second.layer, item.second.device_size,
+                item.second.is_resident, item.second.size, {}
+            };
+            const auto & specs = catalog.descriptor.layers.at(item.second.layer);
+            for (const auto & role : item.second.roles) {
+                page.role_type_sizes.push_back(ggml_type_size(specs.at(role.first).type));
+            }
+            result.push_back(std::move(page));
         }
     }
     return result;
@@ -3784,10 +3806,7 @@ public:
                     make_slot_in(arenas_[arena_index].get(), arena_used, slot_class.size));
                 arena_used += need;
                 slots_.back().reserved = reserved_indices.count((int) slots_.size() - 1) != 0;
-                // Keep uniform-page accounting byte-identical; class-local
-                // arenas report the allocated stride.
-                resources_.device_bytes += resources_.slot_classes.size() == 1
-                    ? slot_class.size : need;
+                resources_.device_bytes += need;
             }
         }
         // Every input to compute_arena_layout() is now final and never changes
@@ -4194,7 +4213,7 @@ public:
                 return std::nullopt;
             }
             // Slot::size is bytes currently occupied (0 until a page lands).
-            // Stride is the allocated capacity, padded to backend alignment.
+            // Stride is padded to the backend and role-type alignments.
             const uint64_t stride = arena_slot_stride(head.capacity);
             if (common_stride == 0) {
                 common_stride = stride;
@@ -6389,16 +6408,14 @@ private:
     FILE * spec_log_ = nullptr;
     std::mutex * log_mutex_ = nullptr;
 
-    // Per-slot stride inside an arena. layout_sliced_pages also makes the page
-    // divisible by each role's type size when arena ids are requested.
+    // Per-slot stride inside an arena.
     uint64_t arena_slot_stride(uint64_t size) const {
-        const size_t align =
-            ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(backend_));
-        const uint64_t a = align == 0 ? 1 : (uint64_t) align;
-        if (size > UINT64_MAX - (a - 1)) {
-            throw std::overflow_error("expert arena slot stride overflows");
+        for (const SlotClass & slot_class : resources_.slot_classes) {
+            if (slot_class.size == size) {
+                return slot_class.stride;
+            }
         }
-        return ((size + a - 1) / a) * a;
+        throw std::runtime_error("expert arena slot size has no resource class");
     }
 
     // Allocate the arena buffers that back every slot. A few large allocations
@@ -8425,6 +8442,42 @@ public:
         return true;
     }
 
+    // WP_EXPERT_ARENA_PREFILL_DIAG=1: print the first few ineligible prefill requests with the
+    // check that rejected them (2026-09-02: gates68 ran zero hits and zero fallbacks on every
+    // device, i.e. this predicate was false before compute_batch ever saw the request)
+    const char * arena_assignments_reject_reason(
+            const pipe_expert_dispatch_req & request,
+            const ExpertSlotPool::Batch & batch,
+            const ExpertSlotPool::ArenaLayout & layout,
+            size_t & which) const {
+        static const char * k_roles[3] = {"gate", "up", "down"};
+        const auto & specs = catalog_.descriptor.layers.at(request.layer);
+        const ExpertPage & first = catalog_.pages.at({request.layer, request.assignments[0].expert_id});
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            which = i;
+            const std::vector<float> & weights = request.assignments[i].weights;
+            if (weights.size() != request.n_tokens) { return "weights.size != n_tokens"; }
+            if (std::any_of(weights.begin(), weights.end(), [](float w) { return !std::isfinite(w); })) { return "non-finite weight"; }
+            const size_t slot = batch.slot_index(i);
+            if (slot == std::numeric_limits<size_t>::max()) { return "slot_index unassigned"; }
+            if (slot >= layout.n_slots) { return "slot >= layout.n_slots"; }
+            const ExpertSlotPool::ArenaLayout::Arena * arena = layout.arena_for_slot(slot);
+            if (arena == nullptr) { return "no arena for slot"; }
+            if (arena->stride == 0) { return "arena stride 0"; }
+            const ExpertPage & page = catalog_.pages.at({request.layer, request.assignments[i].expert_id});
+            if (page.device_size > arena->stride) { return "page.device_size > arena stride"; }
+            for (const char * role : k_roles) {
+                const uint64_t type_size = ggml_type_size(specs.at(role).type);
+                const uint64_t block_size = ggml_blck_size(specs.at(role).type);
+                if (type_size == 0 || block_size == 0 || arena->stride % type_size != 0 ||
+                        arena->stride / type_size > UINT32_MAX / block_size) { return "stride not representable"; }
+                if (page.roles.at(role).device_offset != first.roles.at(role).device_offset) { return "role offset differs from first page"; }
+            }
+        }
+        which = 0;
+        return "none";
+    }
+
     bool arena_prefill_eligible(
             const pipe_expert_dispatch_req & request,
             const ExpertSlotPool::Batch & batch) const {
@@ -8432,7 +8485,29 @@ public:
             return false;
         }
         const std::optional<ExpertSlotPool::ArenaLayout> & layout = pool_.arena_layout();
-        return layout.has_value() && arena_assignments_eligible(request, batch, *layout);
+        const bool ok = layout.has_value() && arena_assignments_eligible(request, batch, *layout);
+        static const bool diag = [] {
+            const char * e = std::getenv("WP_EXPERT_ARENA_PREFILL_DIAG");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (!ok && diag) {
+            static std::atomic<int> printed{0};
+            if (printed.fetch_add(1) < 6) {
+                size_t which = 0;
+                const char * reason = !layout.has_value() ? "no arena layout"
+                    : arena_assignments_reject_reason(request, batch, *layout, which);
+                std::fprintf(stderr,
+                             "wp expert worker: arena prefill ineligible device=%s layer=%d n_tokens=%u n_assign=%zu "
+                             "reason=%s assignment=%zu expert=%d slot=%zu n_slots=%zu arenas=%zu\n",
+                             ggml_backend_name(backend_.get()), request.layer, request.n_tokens,
+                             request.assignments.size(), reason, which,
+                             request.assignments.empty() ? -1 : request.assignments[which].expert_id,
+                             request.assignments.empty() ? (size_t) 0 : batch.slot_index(which),
+                             layout.has_value() ? layout->n_slots : (size_t) 0,
+                             layout.has_value() ? layout->arenas.size() : (size_t) 0);
+            }
+        }
+        return ok;
     }
 
     bool arena_id_eligible(
@@ -10367,11 +10442,9 @@ private:
         // Byte offsets (NOT quant-block indices) of each selected expert's
         // gate/up/down role data relative to that expert's weights buffer
         // base. An expert slot's position inside the pool buffer is only
-        // guaranteed aligned to the Vulkan buffer type's alignment
+        // always aligned to the Vulkan buffer type's alignment
         // (minStorageBufferOffsetAlignment) -- see layout_sliced_pages() and
-        // arena_slot_stride() above, both of which key off exactly that
-        // value -- NOT to the much coarser quant block size (144 B for
-        // Q4_K, 24/34 B for Q5_1/Q8_0). Requiring the OLD block-index
+        // arena_slot_stride() above. Requiring the OLD block-index
         // encoding (byte_offset % block_bytes == 0) rejected nearly every
         // expert slot; the host now binds each role at its own byte-offset
         // sub-buffer instead, so only the device's real alignment matters.
@@ -17613,6 +17686,7 @@ int run(const Options & options) {
     for (const SlotClass & slot_class : resources.slot_classes) {
         std::cout << "expert slot class bytes=" << slot_class.size
                   << " slots=" << slot_class.slots
+                  << " stride=" << slot_class.stride
                   << " pin_floor=" << slot_class.pin_floor
                   << " pages=" << slot_class.pages << '\n';
     }

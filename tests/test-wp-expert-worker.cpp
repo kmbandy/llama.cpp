@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -440,7 +441,7 @@ void test_slice_device_member_layout() {
 
     const wp_expert_worker::ResourcePlan resources =
         wp_expert_worker::plan_resources(
-            { { LAYER, slot_bytes, false, 3 * up_gate_bytes } }, 1,
+            { { LAYER, slot_bytes, false, 3 * up_gate_bytes, {} } }, 1,
             3 * up_gate_bytes);
     require(resources.slot_classes.size() == 1 &&
                 resources.slot_classes[0].size >= slot_bytes,
@@ -464,7 +465,7 @@ void test_glm_size_class_plan() {
             (layer >= 75 && layer <= 77) ? MID :
             layer == 78 ? TAIL : SMALL;
         for (int expert = 0; expert < EXPERTS; ++expert) {
-            pages.push_back({ layer, size });
+            pages.push_back({ layer, size, false, 0, {} });
         }
     }
 
@@ -499,6 +500,63 @@ void test_glm_size_class_plan() {
         require(slot_class->slots >= slot_class->pin_floor,
                 "size-class allocation fell below its pin floor");
     }
+}
+
+void test_fixture_arena_stride_alignment() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+
+    const wp_expert_worker::ResourcePlan resources =
+        wp_expert_worker::inspect_resources(options);
+    const uint64_t backend_alignment =
+        ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+    require(backend_alignment != 0, "CPU backend returned zero arena alignment");
+    require(!resources.slot_classes.empty(), "fixture worker has no slot classes");
+    uint64_t arena_bytes = 0;
+    for (const wp_expert_worker::SlotClass & slot_class : resources.slot_classes) {
+        require(slot_class.stride >= slot_class.size,
+                "arena stride is smaller than its slot class");
+        require(slot_class.stride % backend_alignment == 0,
+                "arena stride is not a multiple of the backend alignment");
+        for (const ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32 }) {
+            require(slot_class.stride % ggml_type_size(type) == 0,
+                    "arena stride is not a multiple of a role type size");
+        }
+        arena_bytes += slot_class.stride * (uint64_t) slot_class.slots;
+    }
+    require(arena_bytes == resources.device_bytes &&
+                arena_bytes <= resources.slot_budget_bytes,
+            "arena slot classes do not fit their resource budget");
+
+    const uint64_t q5_k_size = ggml_type_size(GGML_TYPE_Q5_K);
+    const uint64_t q8_0_size = ggml_type_size(GGML_TYPE_Q8_0);
+    const uint64_t type_alignment =
+        q5_k_size / std::gcd(q5_k_size, q8_0_size) * q8_0_size;
+    const uint64_t expected_stride =
+        (3000 + type_alignment - 1) / type_alignment * type_alignment;
+    const wp_expert_worker::ResourcePlan quantized =
+        wp_expert_worker::plan_resources({
+            { LAYER, 3000, false, 0, { q5_k_size } },
+            { OTHER_LAYER, 3000, false, 0, { q8_0_size } },
+            { OTHER_LAYER + 1, 3000, false, 0, { q5_k_size } },
+            { OTHER_LAYER + 2, 3000, false, 0, { q8_0_size } },
+        }, 4);
+    require(quantized.slot_classes.size() == 1,
+            "mixed-role fixture did not produce one slot class");
+    require(quantized.slot_classes[0].stride == expected_stride &&
+                quantized.slot_classes[0].stride % q5_k_size == 0 &&
+                quantized.slot_classes[0].stride % q8_0_size == 0,
+            "arena stride did not combine role type sizes across pages");
+    require(quantized.slot_count == 2 &&
+                quantized.device_bytes <= quantized.slot_budget_bytes,
+            "arena stride did not reduce slots to fit the resource budget");
 }
 
 void run_test() {
@@ -3144,6 +3202,7 @@ int main() {
         test_q5_1_down_proj_prefill_last_column();
         test_slice_device_member_layout();
         test_glm_size_class_plan();
+        test_fixture_arena_stride_alignment();
         run_test();
         test_default_off_multi_expert_request();
         test_prefetch_hint_without_spec_reads_nothing();

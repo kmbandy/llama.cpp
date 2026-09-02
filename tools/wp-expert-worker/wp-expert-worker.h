@@ -16,10 +16,14 @@ struct ResourcePage {
     uint64_t size  = 0;
     bool     pinned = false;
     uint64_t staging_size = 0;
+    // Role type bytes that the arena stride must represent exactly.
+    std::vector<uint64_t> role_type_sizes;
 };
 
 struct SlotClass {
     uint64_t size      = 0;
+    // Allocated bytes per slot, including backend and role-type alignment.
+    uint64_t stride    = 0;
     int      slots     = 0;
     int      pin_floor = 0;
     int      pages     = 0;
