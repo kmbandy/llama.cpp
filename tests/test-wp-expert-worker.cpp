@@ -2783,9 +2783,108 @@ static void test_batch_mmid_ids() {
     require(wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0", "ROCm1"),
             "BATCH_MMID allow-list must enable a named HIP/CUDA device");
     require(!wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0", "Vulkan0"),
-            "BATCH_MMID allow-list must not enable Vulkan");
+            "BATCH_MMID allow-list must not enable an unlisted Vulkan device");
+    require(wp_expert_worker::parse_arena_prefill_enabled("Vulkan0", "Vulkan0"),
+            "BATCH_MMID allow-list must enable a named Vulkan device");
     require(!wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0", "CPU"),
             "BATCH_MMID allow-list must not enable CPU");
+}
+
+static void test_batch_mmid_arena_pack() {
+    // 2026 slice geometry: gate/up q4_K [2560 x 192], down q5_1 [192 x 2560].
+    // Gate/up ne0 is a multiple of 512 so they have no row slack. Down ne0=192
+    // does, and the arena stride must carry that slack because ggml-vulkan
+    // reserves none.
+    wp_expert_worker::BatchMmidArenaRole in[3] = {
+        { GGML_TYPE_Q4_K, 2560, 192 },
+        { GGML_TYPE_Q4_K, 2560, 192 },
+        { GGML_TYPE_Q5_1,  192, 2560 },
+    };
+    const size_t gate_nbytes =
+        ggml_row_size(GGML_TYPE_Q4_K, 2560) * (size_t) 192;
+    const size_t down_nbytes =
+        ggml_row_size(GGML_TYPE_Q5_1, 192) * (size_t) 2560;
+    require(wp_expert_worker::batch_mmid_quant_row_slack(GGML_TYPE_Q4_K, 2560) == 0,
+            "gate/up q4_K ne0=2560 needs no MATRIX_ROW_PADDING slack");
+    const size_t down_slack =
+        wp_expert_worker::batch_mmid_quant_row_slack(GGML_TYPE_Q5_1, 192);
+    require(down_slack == ggml_row_size(GGML_TYPE_Q5_1, 512 - 192),
+            "down q5_1 ne0=192 must reserve 320-element quantized slack");
+    require(wp_expert_worker::batch_mmid_arena_role_stride(
+                GGML_TYPE_Q5_1, 192, 2560, 256) >= down_nbytes + down_slack,
+            "down stride must be at least payload plus slack");
+
+    const std::vector<std::vector<float>> gather = {
+        { 0.5f, 0.0f },
+        { 0.3f, 0.0f },
+        { 0.1f, 0.2f },
+    };
+    const auto ids = wp_expert_worker::build_batch_mmid_ids(gather, true);
+    require(ids.used_pad_expert && wp_expert_worker::batch_mmid_n_as(ids) == 4,
+            "fixture ids use a pad expert so n_as is n_experts+1");
+    require(wp_expert_worker::batch_mmid_ids_valid(ids),
+            "fixture ids must stay unique per token");
+
+    const size_t alignment = 256;
+    const auto pack = wp_expert_worker::plan_batch_mmid_arena(
+        in, ids.n_experts, ids.used_pad_expert, alignment);
+    require(pack.n_experts == 3 && pack.used_pad_expert && pack.n_as == 4,
+            "arena n_as must match batch_mmid_n_as");
+    require(pack.roles[0].nbytes == gate_nbytes &&
+                pack.roles[1].nbytes == gate_nbytes &&
+                pack.roles[2].nbytes == down_nbytes,
+            "role nbytes must match ggml_row_size * ne1");
+    require(pack.roles[0].slack == 0 && pack.roles[1].slack == 0 &&
+                pack.roles[2].slack == down_slack,
+            "only down carries quantized row slack");
+    require(pack.roles[0].offset == 0, "gate region starts at 0");
+    require(pack.roles[1].offset >= pack.roles[0].stride * pack.n_as,
+            "up region follows the whole gate slab");
+    require(pack.roles[2].offset >= pack.roles[1].offset +
+                pack.roles[1].stride * pack.n_as,
+            "down region follows the whole up slab");
+    require(pack.roles[0].offset % alignment == 0 &&
+                pack.roles[1].offset % alignment == 0 &&
+                pack.roles[2].offset % alignment == 0,
+            "each role slab must satisfy buffer alignment");
+    require(pack.roles[0].stride % ggml_type_size(GGML_TYPE_Q4_K) == 0 &&
+                pack.roles[2].stride % ggml_type_size(GGML_TYPE_Q5_1) == 0,
+            "nb[2] must be a multiple of type_size for Vulkan batch_stride");
+    require(pack.total_bytes ==
+                pack.roles[2].offset + pack.roles[2].stride * pack.n_as,
+            "total_bytes is the end of the last role slab");
+    require(pack.copy_bytes ==
+                (pack.roles[0].copy_bytes + pack.roles[1].copy_bytes +
+                 pack.roles[2].copy_bytes) * pack.n_as,
+            "copy volume is n_as times the three role copy sizes");
+
+    for (int r = 0; r < 3; ++r) {
+        require(wp_expert_worker::batch_mmid_arena_expert_offset(pack, r, 0) ==
+                    pack.roles[r].offset,
+                "expert 0 is at the role origin");
+        require(wp_expert_worker::batch_mmid_arena_expert_offset(pack, r, 1) ==
+                    pack.roles[r].offset + pack.roles[r].stride,
+                "expert 1 is one stride after expert 0");
+        const size_t pad = wp_expert_worker::batch_mmid_arena_expert_offset(
+            pack, r, pack.n_experts);
+        require(pad == pack.roles[r].offset + pack.roles[r].stride * pack.n_experts,
+                "pad expert is slot n_experts");
+        require(pad + pack.roles[r].copy_bytes <=
+                    pack.roles[r].offset + pack.roles[r].stride * pack.n_as,
+                "pad copy fits in the role slab");
+    }
+    for (int32_t id : ids.ids) {
+        require(id >= 0 && (size_t) id < pack.n_as,
+                "every ids value must address an arena expert slot");
+    }
+
+    const auto even = wp_expert_worker::plan_batch_mmid_arena(
+        in, 2, false, alignment);
+    require(even.n_as == 2 && !even.used_pad_expert &&
+                even.copy_bytes ==
+                    (even.roles[0].copy_bytes + even.roles[1].copy_bytes +
+                     even.roles[2].copy_bytes) * 2,
+            "uniform rank does not add a pad slot");
 }
 
 static void test_batch_mmid_association() {
@@ -5476,6 +5575,7 @@ int main() {
         test_assignment_groups_bucket_by_device();
         test_decode_prefill_compute_profile();
         test_batch_mmid_ids();
+        test_batch_mmid_arena_pack();
         test_batch_mmid_association();
         test_arena_prefill_device_policy();
         test_prefill_arena_grouped_production_geometry();

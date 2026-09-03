@@ -1108,6 +1108,92 @@ void fill_batch_mmid_expert_ptrs(
     }
 }
 
+size_t batch_mmid_quant_row_slack(enum ggml_type type, int64_t ne0) {
+    // Same 512 as layout_sliced_pages. Vulkan get_alloc_size is ggml_nbytes.
+    if (!ggml_is_quantized(type) || ne0 <= 0 || ne0 % 512 == 0) {
+        return 0;
+    }
+    return ggml_row_size(type, 512 - (ne0 % 512));
+}
+
+static size_t batch_mmid_lcm_align(size_t alignment, size_t type_size) {
+    const size_t a = alignment != 0 ? alignment : 1;
+    const size_t ts = type_size != 0 ? type_size : 1;
+    const size_t g = std::gcd(a, ts);
+    if (g == 0 || a / g > (std::numeric_limits<size_t>::max() / ts)) {
+        return a;
+    }
+    return (a / g) * ts;
+}
+
+size_t batch_mmid_arena_role_stride(
+        enum ggml_type type, int64_t ne0, int64_t ne1, size_t alignment) {
+    if (ne0 <= 0 || ne1 <= 0) {
+        return 0;
+    }
+    const size_t nbytes = ggml_row_size(type, ne0) * (size_t) ne1;
+    const size_t need = nbytes + batch_mmid_quant_row_slack(type, ne0);
+    return GGML_PAD(need, batch_mmid_lcm_align(alignment, ggml_type_size(type)));
+}
+
+size_t batch_mmid_arena_expert_offset(
+        const BatchMmidArenaPack & pack, int role, size_t expert) {
+    if (role < 0 || role >= 3) {
+        return 0;
+    }
+    return pack.roles[role].offset + expert * pack.roles[role].stride;
+}
+
+BatchMmidArenaPack plan_batch_mmid_arena(
+        const BatchMmidArenaRole roles_in[3],
+        size_t n_experts, bool used_pad_expert, size_t alignment) {
+    BatchMmidArenaPack out;
+    out.n_experts = n_experts;
+    out.used_pad_expert = used_pad_expert && n_experts > 0;
+    out.n_as = n_experts + (out.used_pad_expert ? 1 : 0);
+    if (roles_in == nullptr || out.n_as == 0) {
+        return out;
+    }
+    const size_t a = alignment != 0 ? alignment : 1;
+    size_t cursor = 0;
+    bool any = false;
+    for (int r = 0; r < 3; ++r) {
+        BatchMmidArenaRole role = roles_in[r];
+        if (role.type == GGML_TYPE_COUNT || role.ne0 <= 0 || role.ne1 <= 0) {
+            out.roles[r] = {};
+            continue;
+        }
+        role.nbytes = ggml_row_size(role.type, role.ne0) * (size_t) role.ne1;
+        role.slack = batch_mmid_quant_row_slack(role.type, role.ne0);
+        size_t need = role.nbytes + role.slack;
+        if (role.copy_bytes > need) {
+            need = role.copy_bytes;
+        }
+        role.stride = GGML_PAD(need, batch_mmid_lcm_align(a, ggml_type_size(role.type)));
+        if (role.stride == 0) {
+            return BatchMmidArenaPack{};
+        }
+        role.copy_bytes = role.copy_bytes != 0 ? role.copy_bytes : (role.nbytes + role.slack);
+        if (role.copy_bytes > role.stride) {
+            return BatchMmidArenaPack{};
+        }
+        cursor = GGML_PAD(cursor, a);
+        role.offset = cursor;
+        if (role.stride > (std::numeric_limits<size_t>::max() / out.n_as)) {
+            return BatchMmidArenaPack{};
+        }
+        cursor = role.offset + role.stride * out.n_as;
+        out.roles[r] = role;
+        out.copy_bytes += role.copy_bytes * out.n_as;
+        any = true;
+    }
+    if (!any) {
+        return BatchMmidArenaPack{};
+    }
+    out.total_bytes = cursor;
+    return out;
+}
+
 const char * batch_mmid_ineligible_reason_name(batch_mmid_ineligible_reason r) {
     switch (r) {
         case batch_mmid_ineligible_reason::cpu_on_arrival: return "cpu_on_arrival";
@@ -1767,6 +1853,7 @@ struct RequestStats {
     uint64_t n_batch_mmid_hit = 0;
     uint64_t n_batch_mmid_fallback = 0;
     uint64_t n_batch_mmid_ineligible = 0;
+    uint64_t n_batch_mmid_arena_bytes = 0;
     int      batch_mmid_ineligible_reason = 0;
     uint64_t n_mmid_ptrs_set = 0;
     uint64_t n_mmid_ptrs_consumed = 0;
@@ -2046,6 +2133,7 @@ public:
         n_batch_mmid_hit_ += request.n_batch_mmid_hit;
         n_batch_mmid_fallback_ += request.n_batch_mmid_fallback;
         n_batch_mmid_ineligible_ += request.n_batch_mmid_ineligible;
+        n_batch_mmid_arena_bytes_ += request.n_batch_mmid_arena_bytes;
         if (request.batch_mmid_ineligible_reason != 0) {
             batch_mmid_ineligible_reason_ = request.batch_mmid_ineligible_reason;
         }
@@ -2298,6 +2386,7 @@ private:
                   << " n_batch_mmid_hit=" << n_batch_mmid_hit_
                   << " n_batch_mmid_fallback=" << n_batch_mmid_fallback_
                   << " n_batch_mmid_ineligible=" << n_batch_mmid_ineligible_
+                  << " n_batch_mmid_arena_bytes=" << n_batch_mmid_arena_bytes_
                   << " ineligible_reason="
                   << batch_mmid_ineligible_reason_name(
                          (batch_mmid_ineligible_reason) batch_mmid_ineligible_reason_)
@@ -2453,6 +2542,7 @@ private:
     uint64_t          n_batch_mmid_hit_ = 0;
     uint64_t          n_batch_mmid_fallback_ = 0;
     uint64_t          n_batch_mmid_ineligible_ = 0;
+    uint64_t          n_batch_mmid_arena_bytes_ = 0;
     int               batch_mmid_ineligible_reason_ = 0;
     uint64_t          n_mmid_ptrs_set_ = 0;
     uint64_t          n_mmid_ptrs_consumed_ = 0;
@@ -9979,17 +10069,62 @@ public:
             const char * const backend_name = ggml_backend_name(backend_.get());
             const bool backend_ok = backend_name != nullptr &&
                 (std::strstr(backend_name, "ROCm") != nullptr ||
-                 std::strstr(backend_name, "CUDA") != nullptr);
+                 std::strstr(backend_name, "CUDA") != nullptr ||
+                 std::strstr(backend_name, "Vulkan") != nullptr);
             if (batch_mmid_enabled_ && !backend_ok) {
                 batch_mmid_enabled_ = false;
             }
             std::fprintf(stderr,
                          "wp expert worker: batch mmid (WP_EXPERT_BATCH_MMID=%s) "
                          "device=%s enabled=%d backend=%s "
-                         "(FORCE_MM min_tokens default 64)\n",
+                         "(FORCE_MM min_tokens default 64)%s\n",
                          be != nullptr ? be : "", device_name_.c_str(),
                          (int) batch_mmid_enabled_,
-                         backend_name != nullptr ? backend_name : "?");
+                         backend_name != nullptr ? backend_name : "?",
+                         is_vulkan_backend() && batch_mmid_enabled_
+                             ? " arena-copy" : "");
+            if (batch_mmid_enabled_ && is_vulkan_backend()) {
+                const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
+                const size_t alignment = std::max<size_t>(
+                    1, ggml_backend_buft_get_alignment(buft));
+                size_t n_as_max = 64;
+                const int n_used = catalog_.descriptor.hparams.n_expert_used;
+                if (n_used > 0) {
+                    n_as_max = std::max(n_as_max, (size_t) n_used * 16);
+                }
+                if (catalog_.descriptor.expert_first >= 0 &&
+                        catalog_.descriptor.expert_last >=
+                            catalog_.descriptor.expert_first) {
+                    const size_t shard =
+                        (size_t) (catalog_.descriptor.expert_last -
+                                  catalog_.descriptor.expert_first + 1) + 1;
+                    n_as_max = std::min(n_as_max, shard);
+                }
+                size_t want = 0;
+                for (const auto & layer : catalog_.descriptor.layers) {
+                    const auto & specs = layer.second;
+                    if (!specs.count("gate") || !specs.count("up") ||
+                            !specs.count("down")) {
+                        continue;
+                    }
+                    BatchMmidArenaRole in[3] = {
+                        { specs.at("gate").type, specs.at("gate").ne0, specs.at("gate").ne1 },
+                        { specs.at("up").type,   specs.at("up").ne0,   specs.at("up").ne1 },
+                        { specs.at("down").type, specs.at("down").ne0, specs.at("down").ne1 },
+                    };
+                    const BatchMmidArenaPack pack = plan_batch_mmid_arena(
+                        in, n_as_max, true, alignment);
+                    want = std::max(want, pack.total_bytes);
+                }
+                if (want > 0) {
+                    RequestStats warmup;
+                    grow_batch_scratch(want, warmup);
+                    std::fprintf(stderr,
+                                 "wp expert worker: batch mmid arena scratch "
+                                 "prealloc=%zu n_as<=%zu\n",
+                                 batch_scratch_size_, n_as_max);
+                }
+            }
         }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
@@ -10588,12 +10723,16 @@ public:
     }
 
     bool batch_mmid_eligible(const pipe_expert_dispatch_req & request) const {
-        return batch_mmid_enabled_ &&
-            is_hip_or_cuda_backend() &&
+        if (!batch_mmid_enabled_ || request.n_tokens < 1 ||
+                request.assignments.empty()) {
+            return false;
+        }
+        if (is_vulkan_backend()) {
+            return true;
+        }
+        return is_hip_or_cuda_backend() &&
             ggml_cuda_queue_routed_expert_ptrs != nullptr &&
-            ggml_cuda_discard_routed_expert_ptrs != nullptr &&
-            request.n_tokens >= 1 &&
-            !request.assignments.empty();
+            ggml_cuda_discard_routed_expert_ptrs != nullptr;
     }
 
     bool arena_assignments_eligible(
@@ -12537,6 +12676,7 @@ private:
             throw std::runtime_error("failed to allocate expert batch scratch buffer");
         }
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        ggml_backend_buffer_clear(buffer.get(), 0);
         batch_scratch_ = std::move(buffer);
         batch_scratch_size_ = want;
         ++request_stats.n_device_allocs;
@@ -14291,11 +14431,13 @@ private:
     // never taught about). Integrating D2 here -- caching the graph and only
     // reissuing the 3N copies + two small uploads per request -- is a
     // reasonable follow-up once this path is validated on real hardware.
-    // 3 mul_mat_id (gate, up, down) or fused gate||up + down. Weights stay in
-    // their slots: expert_ptrs[c] is the slot+role address, queued in
-    // assignment order and consumed once per MUL_MAT_ID. Fold is a left fold
-    // over ids-slot k (assignment order per token). Gather pads uneven rank
-    // with unique ids (dummy expert n once, then unused real experts).
+    // 3 mul_mat_id (gate, up, down) or fused gate||up + down. HIP/CUDA keep
+    // weights in their slots via expert_ptrs. Vulkan has no routed-expert
+    // pointer channel: copy each selected role into a scratch [ne0,ne1,n_as]
+    // arena (row slack from layout_sliced_pages) and run the same graph over
+    // that. Fold is a left fold over ids-slot k (assignment order per token).
+    // Gather pads uneven rank with unique ids (dummy expert n once, then
+    // unused real experts).
     bool compute_batch_mmid(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -14365,11 +14507,77 @@ private:
             }
         }
 
+        const bool vk_arena = is_vulkan_backend();
+        const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
+        const size_t params_align = std::max<size_t>(
+            1, ggml_backend_buft_get_alignment(buft));
+        BatchMmidArenaPack arena_pack;
+        void * scratch_base = nullptr;
+        if (vk_arena) {
+            BatchMmidArenaRole in[3] = {};
+            const ExpertPage & page0 = *pages[sel[0]];
+            auto fill_role = [&](int r, const RoleSpec & spec, const char * name,
+                                 int64_t ne1) {
+                BatchMmidArenaRole role;
+                role.type = spec.type;
+                role.ne0 = spec.ne0;
+                role.ne1 = ne1;
+                role.copy_bytes = (size_t) page0.roles.at(name).device_bytes;
+                in[r] = role;
+            };
+            static const char * k_roles[3] = { "gate", "up", "down" };
+            for (size_t k = 1; k < n; ++k) {
+                const ExpertPage & page = *pages[sel[k]];
+                for (const char * role : k_roles) {
+                    if (page.roles.at(role).device_offset !=
+                            page0.roles.at(role).device_offset ||
+                            page.roles.at(role).device_bytes !=
+                                page0.roles.at(role).device_bytes) {
+                        return false;
+                    }
+                }
+            }
+            if (fuse_gate_up) {
+                const uint64_t fused = page0.roles.at("up").device_offset +
+                    page0.roles.at("up").device_bytes -
+                    page0.roles.at("gate").device_offset;
+                fill_role(0, gate_spec, "gate", 2 * gate_spec.ne1);
+                in[0].copy_bytes = (size_t) fused;
+                fill_role(2, down_spec, "down", down_spec.ne1);
+            } else {
+                fill_role(0, gate_spec, "gate", gate_spec.ne1);
+                fill_role(1, up_spec, "up", up_spec.ne1);
+                fill_role(2, down_spec, "down", down_spec.ne1);
+            }
+            arena_pack = plan_batch_mmid_arena(in, n, plan.used_pad_expert, params_align);
+            if (arena_pack.n_as != n_as || arena_pack.total_bytes == 0) {
+                return false;
+            }
+            for (int r = 0; r < 3; ++r) {
+                if (arena_pack.roles[r].stride == 0) {
+                    continue;
+                }
+                const uint64_t ts = ggml_type_size(arena_pack.roles[r].type);
+                const uint64_t bs = ggml_blck_size(arena_pack.roles[r].type);
+                if (ts == 0 || bs == 0 || arena_pack.roles[r].stride % ts != 0 ||
+                        arena_pack.roles[r].stride / ts > UINT32_MAX / bs) {
+                    return false;
+                }
+            }
+            grow_batch_scratch(arena_pack.total_bytes, request_stats);
+            scratch_base = ggml_backend_buffer_get_base(batch_scratch_.get());
+            if (scratch_base == nullptr) {
+                return false;
+            }
+        }
+
         const auto build_started = std::chrono::steady_clock::now();
         begin_work_input_trace(request, pages, batch, sel, use_gather, -1);
 
-        const size_t tensor_count = 40 + 2 * (size_t) k_width;
-        const size_t graph_nodes  = 24 + 2 * (size_t) k_width;
+        const size_t n_copies = vk_arena
+            ? (fuse_gate_up ? 2 : 3) * n_as : 0;
+        const size_t tensor_count = 80 + 3 * (size_t) k_width + 4 * n_copies;
+        const size_t graph_nodes  = 64 + 3 * (size_t) k_width + 2 * n_copies;
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
                               ggml_graph_overhead_custom(graph_nodes, false),
@@ -14382,27 +14590,31 @@ private:
         }
         ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
 
-        const auto make_role_as = [&](const RoleSpec & spec, const char * role) {
+        const auto make_role_as = [&](const RoleSpec & spec, const char * role, int ri,
+                                      int64_t ne1) {
             ggml_tensor * t = ggml_new_tensor_3d(
-                ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n_as);
-            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[0]);
-            t->buffer = loaded.buffer;
-            t->data = (uint8_t *) loaded.base + pages[sel[0]]->roles.at(role).device_offset;
+                ctx.get(), spec.type, spec.ne0, ne1, (int64_t) n_as);
+            if (vk_arena) {
+                t->nb[2] = arena_pack.roles[ri].stride;
+                t->nb[3] = arena_pack.roles[ri].stride * n_as;
+                attach_weight(t, batch_scratch_.get(), scratch_base,
+                              arena_pack.roles[ri].offset);
+            } else {
+                const ExpertSlotPool::Loaded loaded = batch.loaded(sel[0]);
+                t->buffer = loaded.buffer;
+                t->data = (uint8_t *) loaded.base +
+                    pages[sel[0]]->roles.at(role).device_offset;
+            }
             return t;
         };
         ggml_tensor * as_gate = nullptr;
         ggml_tensor * as_up = nullptr;
-        ggml_tensor * as_down = make_role_as(down_spec, "down");
+        ggml_tensor * as_down = make_role_as(down_spec, "down", 2, down_spec.ne1);
         if (fuse_gate_up) {
-            ggml_tensor * t = ggml_new_tensor_3d(
-                ctx.get(), gate_spec.type, gate_spec.ne0, 2 * gate_spec.ne1, (int64_t) n_as);
-            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[0]);
-            t->buffer = loaded.buffer;
-            t->data = (uint8_t *) loaded.base + pages[sel[0]]->roles.at("gate").device_offset;
-            as_gate = t;
+            as_gate = make_role_as(gate_spec, "gate", 0, 2 * gate_spec.ne1);
         } else {
-            as_gate = make_role_as(gate_spec, "gate");
-            as_up   = make_role_as(up_spec, "up");
+            as_gate = make_role_as(gate_spec, "gate", 0, gate_spec.ne1);
+            as_up   = make_role_as(up_spec, "up", 1, up_spec.ne1);
         }
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k_width, (int64_t) n_tokens);
@@ -14458,15 +14670,49 @@ private:
             throw std::runtime_error("batch-mmid compute produced no contribution");
         }
         ggml_tensor * copy = ggml_cpy(ctx.get(), sum, result);
+        if (vk_arena) {
+            const auto copy_role = [&](const char * role, int ri) {
+                const BatchMmidArenaRole & packed = arena_pack.roles[ri];
+                if (packed.stride == 0 || packed.copy_bytes == 0) {
+                    return;
+                }
+                const enum ggml_type copy_type =
+                    packed.copy_bytes % sizeof(uint32_t) == 0 ? GGML_TYPE_I32 :
+                    packed.copy_bytes % sizeof(uint16_t) == 0 ? GGML_TYPE_F16 :
+                    GGML_TYPE_I8;
+                const size_t copy_count = packed.copy_bytes / ggml_type_size(copy_type);
+                auto emit = [&](size_t src_k, size_t dst_e) {
+                    ggml_tensor * src = ggml_new_tensor_1d(
+                        ctx.get(), copy_type, (int64_t) copy_count);
+                    const ExpertSlotPool::Loaded loaded = batch.loaded(sel[src_k]);
+                    attach_weight(src, loaded.buffer, loaded.base,
+                                  pages[sel[src_k]]->roles.at(role).device_offset);
+                    ggml_tensor * dst = ggml_new_tensor_1d(
+                        ctx.get(), copy_type, (int64_t) copy_count);
+                    attach_weight(dst, batch_scratch_.get(), scratch_base,
+                                  packed.offset + dst_e * packed.stride);
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), src, dst));
+                };
+                for (size_t k = 0; k < n; ++k) {
+                    emit(k, k);
+                }
+                if (plan.used_pad_expert) {
+                    emit(0, n);
+                }
+            };
+            copy_role("gate", 0);
+            if (!fuse_gate_up) {
+                copy_role("up", 1);
+            }
+            copy_role("down", 2);
+            request_stats.n_batch_mmid_arena_bytes += arena_pack.copy_bytes;
+        }
         if (!fuse_gate_up) {
             ggml_build_forward_expand(graph, gate_out);
             ggml_build_forward_expand(graph, up_out);
         }
         ggml_build_forward_expand(graph, copy);
 
-        const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
-        const size_t params_align = std::max<size_t>(
-            1, ggml_backend_buft_get_alignment(buft));
         const auto pad_off = [&](size_t off) {
             return GGML_PAD(off, params_align);
         };
@@ -14475,15 +14721,19 @@ private:
         params_span = ids_off + plan.ids.size() * sizeof(int32_t);
         const size_t route_off = pad_off(params_span);
         params_span = route_off + plan.route_w.size() * sizeof(float);
-        const size_t gate_ptr_off = pad_off(params_span);
-        params_span = gate_ptr_off + n_as * sizeof(int64_t);
+        size_t gate_ptr_off = 0;
         size_t up_ptr_off = 0;
-        if (!fuse_gate_up) {
-            up_ptr_off = pad_off(params_span);
-            params_span = up_ptr_off + n_as * sizeof(int64_t);
+        size_t down_ptr_off = 0;
+        if (!vk_arena) {
+            gate_ptr_off = pad_off(params_span);
+            params_span = gate_ptr_off + n_as * sizeof(int64_t);
+            if (!fuse_gate_up) {
+                up_ptr_off = pad_off(params_span);
+                params_span = up_ptr_off + n_as * sizeof(int64_t);
+            }
+            down_ptr_off = pad_off(params_span);
+            params_span = down_ptr_off + n_as * sizeof(int64_t);
         }
-        const size_t down_ptr_off = pad_off(params_span);
-        params_span = down_ptr_off + n_as * sizeof(int64_t);
         grow_params_buffer(params_span + params_align * 8 + 4096, request_stats);
         void * params_base = ggml_backend_buffer_get_base(params_buffer_.get());
         if (params_base == nullptr) {
@@ -14492,15 +14742,19 @@ private:
 
         attach_weight(ids, params_buffer_.get(), params_base, ids_off);
         attach_weight(route_w, params_buffer_.get(), params_base, route_off);
-        ggml_tensor * gate_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
-        attach_weight(gate_ptr_t, params_buffer_.get(), params_base, gate_ptr_off);
+        ggml_tensor * gate_ptr_t = nullptr;
         ggml_tensor * up_ptr_t = nullptr;
-        if (!fuse_gate_up) {
-            up_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
-            attach_weight(up_ptr_t, params_buffer_.get(), params_base, up_ptr_off);
+        ggml_tensor * down_ptr_t = nullptr;
+        if (!vk_arena) {
+            gate_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
+            attach_weight(gate_ptr_t, params_buffer_.get(), params_base, gate_ptr_off);
+            if (!fuse_gate_up) {
+                up_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
+                attach_weight(up_ptr_t, params_buffer_.get(), params_base, up_ptr_off);
+            }
+            down_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
+            attach_weight(down_ptr_t, params_buffer_.get(), params_base, down_ptr_off);
         }
-        ggml_tensor * down_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
-        attach_weight(down_ptr_t, params_buffer_.get(), params_base, down_ptr_off);
 
         ggml_gallocr_t galloc = compute_galloc_.get();
         const size_t old_compute_size = ggml_gallocr_get_buffer_size(galloc, 0);
@@ -14519,22 +14773,24 @@ private:
                     plan.ids.size() * sizeof(int32_t));
         std::memcpy(params_host.data() + route_off, plan.route_w.data(),
                     plan.route_w.size() * sizeof(float));
-        const auto fill_ptrs = [&](const char * role, size_t off) {
-            int64_t * dst = (int64_t *) (params_host.data() + off);
-            std::vector<int64_t> bases(n);
-            for (size_t k = 0; k < n; ++k) {
-                const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
-                bases[k] = (int64_t) (uintptr_t) (
-                    (uint8_t *) loaded.base + pages[sel[k]]->roles.at(role).device_offset);
+        if (!vk_arena) {
+            const auto fill_ptrs = [&](const char * role, size_t off) {
+                int64_t * dst = (int64_t *) (params_host.data() + off);
+                std::vector<int64_t> bases(n);
+                for (size_t k = 0; k < n; ++k) {
+                    const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
+                    bases[k] = (int64_t) (uintptr_t) (
+                        (uint8_t *) loaded.base + pages[sel[k]]->roles.at(role).device_offset);
+                }
+                fill_batch_mmid_expert_ptrs(
+                    dst, n_as, bases.data(), n, plan.used_pad_expert);
+            };
+            fill_ptrs("gate", gate_ptr_off);
+            if (!fuse_gate_up) {
+                fill_ptrs("up", up_ptr_off);
             }
-            fill_batch_mmid_expert_ptrs(
-                dst, n_as, bases.data(), n, plan.used_pad_expert);
-        };
-        fill_ptrs("gate", gate_ptr_off);
-        if (!fuse_gate_up) {
-            fill_ptrs("up", up_ptr_off);
+            fill_ptrs("down", down_ptr_off);
         }
-        fill_ptrs("down", down_ptr_off);
 
         ggml_tensor * blob = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) params_span);
         attach_weight(blob, params_buffer_.get(), params_base, 0);
@@ -14567,33 +14823,36 @@ private:
             std::chrono::steady_clock::now() - params_started).count();
         request_stats.ns_params_set += params_elapsed;
 
-        ggml_mul_mat_id_set_expert_ptrs(
-            gate_mmid, gate_ptr_t->data, (int32_t) n_as);
-        if (up_mmid != nullptr) {
+        if (!vk_arena) {
             ggml_mul_mat_id_set_expert_ptrs(
-                up_mmid, up_ptr_t->data, (int32_t) n_as);
-        }
-        ggml_mul_mat_id_set_expert_ptrs(
-            down_mmid, down_ptr_t->data, (int32_t) n_as);
+                gate_mmid, gate_ptr_t->data, (int32_t) n_as);
+            if (up_mmid != nullptr) {
+                ggml_mul_mat_id_set_expert_ptrs(
+                    up_mmid, up_ptr_t->data, (int32_t) n_as);
+            }
+            ggml_mul_mat_id_set_expert_ptrs(
+                down_mmid, down_ptr_t->data, (int32_t) n_as);
 
-        ggml_cuda_queue_routed_expert_ptrs((const void * const *) gate_ptr_t->data);
-        if (!fuse_gate_up) {
-            ggml_cuda_queue_routed_expert_ptrs((const void * const *) up_ptr_t->data);
+            ggml_cuda_queue_routed_expert_ptrs((const void * const *) gate_ptr_t->data);
+            if (!fuse_gate_up) {
+                ggml_cuda_queue_routed_expert_ptrs((const void * const *) up_ptr_t->data);
+            }
+            ggml_cuda_queue_routed_expert_ptrs((const void * const *) down_ptr_t->data);
         }
-        ggml_cuda_queue_routed_expert_ptrs((const void * const *) down_ptr_t->data);
-        last_compute_path_ = "batch-mmid";
+        last_compute_path_ = vk_arena ? "batch-mmid-arena" : "batch-mmid";
         enum ggml_status status = GGML_STATUS_FAILED;
         {
             struct DiscardQueuedPtrs {
+                const bool armed;
                 ~DiscardQueuedPtrs() {
-                    if (ggml_cuda_discard_routed_expert_ptrs != nullptr) {
+                    if (armed && ggml_cuda_discard_routed_expert_ptrs != nullptr) {
                         ggml_cuda_discard_routed_expert_ptrs();
                     }
                 }
-            } discard_queued_ptrs;
+            } discard_queued_ptrs{ !vk_arena };
             status = submit_graph(graph, request_stats);
         }
-        if (ggml_cuda_get_routed_expert_ptrs_stats != nullptr) {
+        if (!vk_arena && ggml_cuda_get_routed_expert_ptrs_stats != nullptr) {
             uint64_t set1 = 0;
             uint64_t cons1 = 0;
             uint64_t disc1 = 0;
@@ -16907,14 +17166,9 @@ private:
     uint64_t            io_grow_count_ = 0;
     buffer_ptr     params_buffer_;
     size_t         params_buffer_size_ = 0;
-    // WP_EXPERT_BATCH_MOE / WP_EXPERT_GROUPED_GEMV (D3): scratch VRAM for the
-    // grouped mul_mat_id path (see compute_batch_grouped). The normal grouped
-    // path holds N page-sized role slots. WP_WORKER_COLLAPSE uses role-major
-    // contiguous regions when the selected slot span permits three batched
-    // copies; both layouts expose [n_embd, n_ff_slice, n_selected] batched
-    // weight tensors.
-    // Content never outlives one compute_batch_grouped call (same invariant
-    // as params_buffer_), so growing it here is always safe.
+    // WP_EXPERT_BATCH_MOE / WP_EXPERT_GROUPED_GEMV / Vulkan BATCH_MMID:
+    // scratch VRAM for packed [ne0,ne1,n_as] role arenas. Not a slot budget.
+    // Grown geometrically; Vulkan BATCH_MMID pre-allocates at startup.
     buffer_ptr     batch_scratch_;
     size_t         batch_scratch_size_ = 0;
     size_t         io_result_offset_ = 0;
@@ -17031,6 +17285,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_batch_mmid_hit += src.n_batch_mmid_hit;
     dst.n_batch_mmid_fallback += src.n_batch_mmid_fallback;
     dst.n_batch_mmid_ineligible += src.n_batch_mmid_ineligible;
+    dst.n_batch_mmid_arena_bytes += src.n_batch_mmid_arena_bytes;
     if (src.batch_mmid_ineligible_reason != 0) {
         dst.batch_mmid_ineligible_reason = src.batch_mmid_ineligible_reason;
     }
