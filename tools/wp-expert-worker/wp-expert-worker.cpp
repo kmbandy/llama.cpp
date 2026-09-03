@@ -56,6 +56,7 @@ extern "C" {
 #include <poll.h>            // ppoll needs _GNU_SOURCE, which glibc sets via -std=gnu++
 
 #if defined(__linux__)
+#  include <dlfcn.h>
 #  include <fcntl.h>
 #  include <sys/stat.h>
 #  include <sys/types.h>
@@ -885,6 +886,73 @@ static size_t read_inflight_from_env() {
     return (size_t) parsed;
 }
 
+// WP_READ_INFLIGHT_CPU=<n>: inflight cap for the CPU ExpertSlotPool only.
+// Unset/0/invalid: this pool uses WP_READ_INFLIGHT like every other device.
+// Do not lower the process-wide WP_READ_INFLIGHT to starve the CPU tier --
+// that also shrinks GPU QD.
+static size_t read_inflight_cpu_from_env() {
+    const char * env = std::getenv("WP_READ_INFLIGHT_CPU");
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 0;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' || parsed == 0 ||
+            parsed > std::numeric_limits<size_t>::max()) {
+        return 0;
+    }
+    return (size_t) parsed;
+}
+
+static bool cpu_direct_pagein_from_env() {
+    const char * e = std::getenv("WP_CPU_DIRECT_PAGEIN");
+    return e != nullptr && std::strcmp(e, "0") != 0 && e[0] != '\0';
+}
+
+static bool backend_is_cpu(ggml_backend_t backend) {
+    const char * name = backend != nullptr ? ggml_backend_name(backend) : nullptr;
+    return name != nullptr && std::strstr(name, "CPU") != nullptr;
+}
+
+// Print which OpenMP runtime this binary actually linked and the wait-policy
+// env the launch script must set. libgomp latches GOMP_SPINCOUNT /
+// OMP_WAIT_POLICY in a constructor before main(); in-process setenv is too
+// late. Do not setenv from here.
+void log_openmp_runtime_once() {
+    static const bool logged = [] {
+#if defined(__linux__)
+        void * const kmp  = dlsym(RTLD_DEFAULT, "__kmpc_fork_call");
+        void * const kmp2 = kmp != nullptr ? kmp : dlsym(RTLD_DEFAULT, "kmp_set_blocktime");
+        void * const gomp = dlsym(RTLD_DEFAULT, "GOMP_parallel");
+        const char * kind = "none";
+        if (kmp2 != nullptr && gomp != nullptr) {
+            kind = "libomp+libgomp";
+        } else if (kmp2 != nullptr) {
+            kind = "libomp";
+        } else if (gomp != nullptr) {
+            kind = "libgomp";
+        }
+        auto env_or = [](const char * key) -> const char * {
+            const char * v = std::getenv(key);
+            return (v == nullptr || v[0] == '\0') ? "<unset>" : v;
+        };
+        std::fprintf(stderr,
+            "wp: OpenMP runtime=%s (kmp=%s gomp=%s) KMP_BLOCKTIME=%s "
+            "OMP_WAIT_POLICY=%s GOMP_SPINCOUNT=%s "
+            "(wait policy must come from the launch env; in-process setenv is too late)\n",
+            kind,
+            kmp2 != nullptr ? "yes" : "no",
+            gomp != nullptr ? "yes" : "no",
+            env_or("KMP_BLOCKTIME"),
+            env_or("OMP_WAIT_POLICY"),
+            env_or("GOMP_SPINCOUNT"));
+#endif
+        return true;
+    }();
+    (void) logged;
+}
+
 static size_t read_chunk_bytes_from_env() {
     const char * env = std::getenv("WP_READ_CHUNK_BYTES");
     if (env == nullptr || env[0] == '\0' || env[0] == '-') {
@@ -1319,6 +1387,10 @@ struct RequestStats {
     uint64_t ns_h2d = 0;
     uint64_t bytes_h2d = 0;
     uint64_t n_reader_h2d = 0;  // WP_READER_H2D: pages uploaded by a reader thread
+    // WP_CPU_DIRECT_PAGEIN: O_DIRECT pread into the CPU slot vs staging memcpy.
+    // 0 on GPU pools and when the knob is off.
+    uint64_t n_cpu_direct_pagein = 0;
+    uint64_t n_cpu_direct_pagein_fallback = 0;
     // ROUTING DENSITY (2026-08-04). compute_batch runs the FULL FFN for every
     // assigned expert over ALL request.n_tokens and then multiplies by a
     // per-token router weight that is ZERO for tokens not routed to that expert
@@ -1625,6 +1697,8 @@ public:
         ns_h2d_ += request.ns_h2d;
         bytes_h2d_ += request.bytes_h2d;
         n_reader_h2d_ += request.n_reader_h2d;
+        n_cpu_direct_pagein_ += request.n_cpu_direct_pagein;
+        n_cpu_direct_pagein_fallback_ += request.n_cpu_direct_pagein_fallback;
         ns_demote_ += request.ns_demote;
         ns_ensure_post_ += request.ns_ensure_post;
         n_read_inflight_max_ = std::max(n_read_inflight_max_, request.n_read_inflight_max);
@@ -1723,6 +1797,8 @@ private:
                   << " gb_s_h2d=" << (ns_h2d_ == 0 ? 0.0 :
                         (double) bytes_h2d_ / (double) ns_h2d_)
                   << " n_reader_h2d=" << n_reader_h2d_
+                  << " n_cpu_direct_pagein=" << n_cpu_direct_pagein_
+                  << " n_cpu_direct_pagein_fallback=" << n_cpu_direct_pagein_fallback_
                   << " staging_kind=" << staging_kind_
                   << " ns_host_get=" << ns_host_get_
                   << " ns_demote=" << ns_demote_
@@ -1954,6 +2030,8 @@ private:
     std::string       device_;
     uint64_t          bytes_h2d_  = 0;
     uint64_t          n_reader_h2d_ = 0;
+    uint64_t          n_cpu_direct_pagein_ = 0;
+    uint64_t          n_cpu_direct_pagein_fallback_ = 0;
     std::string       staging_kind_ = "unknown";
     uint64_t          n_requests_ = 0;
     uint64_t          n_experts_  = 0;
@@ -2906,6 +2984,117 @@ bool parse_cpu_list(const char * spec, bool * mask /* GGML_MAX_N_THREADS */) {
     return any;
 }
 
+#if defined(__linux__)
+// WP_READER_CPUS=<cpulist>
+//   "6-11,18-23"            -- every reader thread of this pool
+//   "ROCm0:6-11,CPU:18-23"  -- per device; unmatched devices stay unpinned
+// A device label is [A-Za-z][A-Za-z0-9]*: so "CPU:18-23" is a label, "6-11"
+// is a raw CPU list. Unset: no affinity, same as today.
+bool parse_reader_cpu_spec(const char * spec, const char * device_name, cpu_set_t * out) {
+    CPU_ZERO(out);
+    if (spec == nullptr || spec[0] == '\0' || device_name == nullptr || device_name[0] == '\0') {
+        return false;
+    }
+    auto is_label = [](const char * p) -> bool {
+        if (p == nullptr || !std::isalpha((unsigned char) *p)) {
+            return false;
+        }
+        const char * q = p;
+        while (std::isalnum((unsigned char) *q)) {
+            ++q;
+        }
+        return *q == ':';
+    };
+    auto label_eq = [](const char * label, size_t n, const char * device) -> bool {
+        if (std::strlen(device) != n) {
+            return false;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (std::tolower((unsigned char) label[i]) !=
+                    std::tolower((unsigned char) device[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto fill_from_list = [&](const char * list) -> bool {
+        bool mask[GGML_MAX_N_THREADS];
+        std::memset(mask, 0, sizeof(mask));
+        if (!parse_cpu_list(list, mask)) {
+            return false;
+        }
+        int n = 0;
+        for (int c = 0; c < GGML_MAX_N_THREADS && c < CPU_SETSIZE; ++c) {
+            if (mask[c]) {
+                CPU_SET(c, out);
+                ++n;
+            }
+        }
+        return n > 0;
+    };
+
+    bool saw_label = false;
+    for (const char * p = spec; *p != '\0'; ++p) {
+        if ((p == spec || p[-1] == ',') && is_label(p)) {
+            saw_label = true;
+            break;
+        }
+    }
+    if (!saw_label) {
+        return fill_from_list(spec);
+    }
+
+    const char * p = spec;
+    while (*p != '\0') {
+        while (*p == ',' || *p == ' ') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        if (!is_label(p)) {
+            while (*p != '\0' && *p != ',') {
+                ++p;
+            }
+            continue;
+        }
+        const char * label = p;
+        while (std::isalnum((unsigned char) *p)) {
+            ++p;
+        }
+        const size_t nlab = (size_t) (p - label);
+        if (*p != ':') {
+            break;
+        }
+        ++p;
+        const char * list = p;
+        while (*p != '\0') {
+            if (*p == ',' && is_label(p + 1)) {
+                break;
+            }
+            ++p;
+        }
+        if (!label_eq(label, nlab, device_name)) {
+            continue;
+        }
+        const std::string list_str(list, p);
+        return fill_from_list(list_str.c_str());
+    }
+    return false;
+}
+
+void apply_reader_cpu_affinity(const cpu_set_t * set, bool enabled) {
+    if (!enabled || set == nullptr) {
+        return;
+    }
+    if (sched_setaffinity(0, sizeof(*set), set) != 0) {
+        std::fprintf(stderr,
+            "wp: WP_READER_CPUS: sched_setaffinity failed: %s\n",
+            std::strerror(errno));
+    }
+}
+#endif
+
 // The CPU set the overlapped tier is confined to.
 //
 // WP_CPU_TIER_CPUS takes a CPU list and is the knob you actually want to set
@@ -2983,10 +3172,9 @@ enum ggml_sched_priority cpu_tier_prio() {
 // graphs -- the threadpool's cpumask and SCHED_BATCH are DEAD CONFIG. This
 // applies them directly to the tier's own DeviceExecutor thread instead.
 //
-// It is also cheaper where both paths work: ggml re-applies affinity and
-// priority on EVERY graph, for every thread in the team (two syscalls per
-// thread per graph, and this worker runs 48 layer RPCs per token). This is two
-// syscalls for the process lifetime.
+// At n_threads > 1 ggml still applies the mask inside the OpenMP region, then
+// leaves the executor SCHED_OTHER/unconfined between graphs. Re-apply after
+// each job so the idle executor stays on the mask.
 //
 // Safe to combine with the threadpool path: at n_threads > 1 ggml will simply
 // re-apply the same mask and priority over the top of ours.
@@ -3001,7 +3189,9 @@ bool cpu_tier_pin_enabled() {
     return on;
 }
 
-// Called ON the tier's executor thread, once, at thread start.
+// Called ON the tier's executor thread at thread start, and again after every
+// graph so OpenMP cannot leave the executor SCHED_OTHER/unconfined between
+// regions. Log once: re-apply is two syscalls per graph and must stay quiet.
 void wp_cpu_tier_pin_self() {
 #if defined(__linux__)
     if (!cpu_tier_pin_enabled()) {
@@ -3048,11 +3238,15 @@ void wp_cpu_tier_pin_self() {
         }
     }
 
-    std::fprintf(stderr,
-        "wp: WP_CPU_TIER_PIN=1: CPU expert tier executor thread pinned; "
-        "cpus=[%s] prio=%s\n",
-        n > 0 ? cpus.c_str() : "unpinned",
-        cpu_tier_prio() == GGML_SCHED_PRIO_LOW ? "low(SCHED_BATCH)" : "normal");
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::fprintf(stderr,
+            "wp: WP_CPU_TIER_PIN=1: CPU expert tier executor thread pinned; "
+            "cpus=[%s] prio=%s (re-applied between graphs)\n",
+            n > 0 ? cpus.c_str() : "unpinned",
+            cpu_tier_prio() == GGML_SCHED_PRIO_LOW ? "low(SCHED_BATCH)" : "normal");
+    }
 #endif
 }
 
@@ -3067,6 +3261,7 @@ void wp_cpu_tier_pin_self() {
 // cores and dropping it to SCHED_BATCH -- permanently, from a fallback path --
 // is exactly the starvation we are trying to remove.
 void configure_cpu_backend(ggml_backend_t backend, bool tier) {
+    log_openmp_runtime_once();
     if (backend == nullptr) { return; }
     if (!tier || !cpu_tier_overlap_enabled()) {
         ggml_backend_cpu_set_n_threads(backend, cpu_worker_n_threads());
@@ -4205,6 +4400,9 @@ private:
         // silently under-uploading a page that still gets marked valid.
         bool               reader_h2d  = false;
         bool               cpu_on_arrival = false;
+        // WP_CPU_DIRECT_PAGEIN: this page-in's dest/offset/size are 4096-aligned
+        // so the reader preads O_DIRECT into slot.raw and drain skips memcpy.
+        bool               cpu_direct  = false;
     };
 
     // One STRIPE of one page-in. A page is read in WP_EXPERT_READ_STRIPES
@@ -4239,6 +4437,9 @@ private:
         bool                                uploaded = false;
         uint64_t                            h2d_ns    = 0;
         uint64_t                            h2d_bytes = 0;
+        // This stripe landed in slot.raw, not staging. drain_one_read must not
+        // memcpy it. Independent of uploaded (GPU reader H2D).
+        bool                                cpu_direct = false;
     };
 
     // WP_EXPERT_STRIPE_PARALLEL=1: the read work unit becomes the STRIPE, not
@@ -4308,7 +4509,8 @@ public:
             uint64_t host_victim_bytes, TestHooks * test_hooks,
             const std::vector<int> & reserve_blocks, size_t page_count = 0,
             wp::HostTier * shared_host_tier = nullptr,
-            WorkerLogFiles * logs = nullptr) :
+            WorkerLogFiles * logs = nullptr,
+            const std::string & device_name = {}) :
         backend_(backend),
         resources_(std::move(resources)),
         staging_(resources_, backend),
@@ -4321,6 +4523,47 @@ public:
         reserve_blocks_ = reserve_blocks;
         logs_ = logs;
         pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
+        device_name_ = device_name.empty()
+            ? (ggml_backend_name(backend_) ? ggml_backend_name(backend_) : "")
+            : device_name;
+        cpu_direct_pagein_ = cpu_direct_pagein_from_env() && backend_is_cpu(backend_);
+        if (backend_is_cpu(backend_)) {
+            const size_t cpu_inflight = read_inflight_cpu_from_env();
+            if (cpu_inflight != 0) {
+                read_inflight_ = cpu_inflight;
+                std::fprintf(stderr,
+                    "wp: WP_READ_INFLIGHT_CPU=%zu device=%s (GPUs stay at WP_READ_INFLIGHT)\n",
+                    cpu_inflight, device_name_.c_str());
+            }
+        }
+#if defined(__linux__)
+        {
+            const char * reader_cpus = std::getenv("WP_READER_CPUS");
+            if (reader_cpus != nullptr && reader_cpus[0] != '\0') {
+                reader_cpus_enabled_ = parse_reader_cpu_spec(
+                    reader_cpus, device_name_.c_str(), &reader_cpu_set_);
+                if (reader_cpus_enabled_) {
+                    std::string cpus;
+                    for (int c = 0; c < CPU_SETSIZE; ++c) {
+                        if (CPU_ISSET(c, &reader_cpu_set_)) {
+                            if (!cpus.empty()) { cpus += ","; }
+                            cpus += std::to_string(c);
+                        }
+                    }
+                    std::fprintf(stderr,
+                        "wp: WP_READER_CPUS device=%s cpus=[%s]\n",
+                        device_name_.c_str(), cpus.c_str());
+                }
+            }
+        }
+#endif
+        if (cpu_direct_pagein_) {
+            std::fprintf(stderr,
+                "wp: WP_CPU_DIRECT_PAGEIN=1 device=%s: CPU slot arenas "
+                "posix_memalign(%d); O_DIRECT pread into slot.raw "
+                "(memcpy fallback if dest/offset/len unaligned)\n",
+                device_name_.c_str(), (int) DIRECT_ALIGNMENT);
+        }
         std::sort(reserve_blocks_.begin(), reserve_blocks_.end());
         if (lfu_history_enabled_) {
             lfu_history_.assign(page_count, 0);
@@ -4367,6 +4610,15 @@ public:
         // and only mlock is a hard guarantee the pages stay resident. Applied
         // to CPU backends only -- a GPU arena is VRAM and mlock does not apply.
         mlock_cpu_arenas();
+        if (cpu_direct_pagein_ && !arenas_.empty()) {
+            void * const base = ggml_backend_buffer_get_base(arenas_.front().get());
+            if (base != nullptr && ((uintptr_t) base % DIRECT_ALIGNMENT) != 0) {
+                std::fprintf(stderr,
+                    "wp: WP_CPU_DIRECT_PAGEIN: arena base %p is not %d-aligned; "
+                    "page-ins will memcpy-fallback\n",
+                    base, (int) DIRECT_ALIGNMENT);
+            }
+        }
         // *** CARVE THE USABLE SLOTS; SKIP EACH ARENA'S PAD TAIL. ***
         // Driven by the per-arena usable counts push_arena() recorded rather
         // than by the planned slot count: the pads come OUT of the plan, so a
@@ -4708,6 +4960,14 @@ public:
             return n_reader_h2d_;
         }
 
+        uint64_t n_cpu_direct_pagein() const {
+            return n_cpu_direct_pagein_;
+        }
+
+        uint64_t n_cpu_direct_pagein_fallback() const {
+            return n_cpu_direct_pagein_fallback_;
+        }
+
         uint64_t n_read_inflight_max() const {
             return n_read_inflight_max_;
         }
@@ -4806,6 +5066,8 @@ public:
         uint64_t                   ns_h2d_    = 0;
         uint64_t                   bytes_h2d_ = 0;
         uint64_t                   n_reader_h2d_ = 0;
+        uint64_t                   n_cpu_direct_pagein_ = 0;
+        uint64_t                   n_cpu_direct_pagein_fallback_ = 0;
         uint64_t                   n_read_inflight_max_ = 0;
         uint64_t                   ns_read_issue_ = 0;
         uint64_t                   ns_read_complete_ = 0;
@@ -5359,7 +5621,8 @@ public:
                     } else {
                         batch.state_->pageins.push_back({
                             entry_index, slot_index, &page, fd_for(page.blob),
-                            slot.raw, reader_h2d_this_batch
+                            slot.raw, reader_h2d_this_batch, false,
+                            cpu_direct_ok(slot.raw, page)
                         });
                         ++batch.n_pagein_;
                         if (std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer)) {
@@ -6502,34 +6765,52 @@ private:
                 demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
             }
             try {
-                // The lease pointer must be COPIED UNDER THE MUTEX: another
-                // thread may be assigning shared.lease inside its own critical
-                // section, and a concurrent unguarded read of a shared_ptr is a
-                // data race (this exact line, read outside the lock, hung the
-                // 1070 worker on its first stripe-parallel page-in batch,
-                // 2026-08-07 sp1).
-                std::shared_ptr<StagingPool::Lease> lease_local;
-                {
-                    std::lock_guard<std::mutex> lock(shared.lease_mutex);
-                    if (!shared.lease) {
-                        shared.lease = std::make_shared<StagingPool::Lease>(
-                            staging_.borrow(state->conn_index));
-                        if (test_hooks_ != nullptr && test_hooks_->staging_borrowed) {
-                            test_hooks_->staging_borrowed();
-                        }
-                        if (test_hooks_ != nullptr && test_hooks_->read_started) {
-                            test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
-                        }
+                const bool page_direct = pagein.cpu_direct &&
+                    pagein.raw != nullptr && pagein.raw->data != nullptr;
+                void * dst = nullptr;
+                if (page_direct) {
+                    dst = (char *) pagein.raw->data + job.offset;
+                    if (cpu_direct_range_ok(
+                            dst, pagein.page->offset + (uint64_t) job.offset, job.len)) {
+                        result->cpu_direct = true;
+                    } else {
+                        dst = nullptr;
                     }
-                    lease_local = shared.lease;
                 }
-                result->staging = std::move(lease_local);
+                if (dst == nullptr) {
+                    // The lease pointer must be COPIED UNDER THE MUTEX: another
+                    // thread may be assigning shared.lease inside its own critical
+                    // section, and a concurrent unguarded read of a shared_ptr is a
+                    // data race (this exact line, read outside the lock, hung the
+                    // 1070 worker on its first stripe-parallel page-in batch,
+                    // 2026-08-07 sp1).
+                    std::shared_ptr<StagingPool::Lease> lease_local;
+                    {
+                        std::lock_guard<std::mutex> lock(shared.lease_mutex);
+                        if (!shared.lease) {
+                            shared.lease = std::make_shared<StagingPool::Lease>(
+                                staging_.borrow(state->conn_index));
+                            if (test_hooks_ != nullptr && test_hooks_->staging_borrowed) {
+                                test_hooks_->staging_borrowed();
+                            }
+                            if (test_hooks_ != nullptr && test_hooks_->read_started) {
+                                test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
+                            }
+                        }
+                        lease_local = shared.lease;
+                    }
+                    result->staging = std::move(lease_local);
+                    dst = (char *) result->staging->get() + job.offset;
+                } else if (job.offset == 0 && test_hooks_ != nullptr &&
+                        test_hooks_->read_started) {
+                    test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
+                }
                 if (state->measure) {
                     result->read_started = std::chrono::steady_clock::now();
                     result->read_timed   = true;
                 }
                 read_page_range(*pagein.page, pagein.fd,
-                                (char *) result->staging->get() + job.offset,
+                                dst,
                                 job.offset, job.len,
                                 state->measure ? state.get() : nullptr);
                 if (state->measure && result->read_timed) {
@@ -6608,6 +6889,9 @@ private:
     }
 
     void read_worker(const std::shared_ptr<BatchState> & state) {
+#if defined(__linux__)
+        apply_reader_cpu_affinity(&reader_cpu_set_, reader_cpus_enabled_);
+#endif
         {
             std::unique_lock<std::mutex> lock(state->mutex);
             state->cv.wait(lock, [&]() {
@@ -6641,12 +6925,16 @@ private:
             bool read_started = false;
             std::shared_ptr<StagingPool::Lease> staging;
             std::exception_ptr fatal;
+            const bool page_direct = pagein.cpu_direct &&
+                pagein.raw != nullptr && pagein.raw->data != nullptr;
             try {
-                staging = std::make_shared<StagingPool::Lease>(
-                    staging_.borrow(state->conn_index));
-                if (test_hooks_ != nullptr &&
-                    test_hooks_->staging_borrowed) {
-                    test_hooks_->staging_borrowed();
+                if (!page_direct) {
+                    staging = std::make_shared<StagingPool::Lease>(
+                        staging_.borrow(state->conn_index));
+                    if (test_hooks_ != nullptr &&
+                        test_hooks_->staging_borrowed) {
+                        test_hooks_->staging_borrowed();
+                    }
                 }
                 read_started = true;
                 if (test_hooks_ != nullptr &&
@@ -6679,9 +6967,29 @@ private:
                             result->read_started = std::chrono::steady_clock::now();
                             result->read_timed = true;
                         }
+                        void * dst = nullptr;
+                        if (page_direct) {
+                            dst = (char *) pagein.raw->data + result->offset;
+                            if (cpu_direct_range_ok(
+                                    dst,
+                                    pagein.page->offset + (uint64_t) result->offset,
+                                    result->len)) {
+                                result->cpu_direct = true;
+                            } else {
+                                dst = nullptr;
+                            }
+                        }
+                        if (dst == nullptr) {
+                            if (!staging) {
+                                staging = std::make_shared<StagingPool::Lease>(
+                                    staging_.borrow(state->conn_index));
+                                result->staging = staging;
+                            }
+                            dst = (char *) staging->get() + result->offset;
+                        }
                         read_page_range(
                             *pagein.page, pagein.fd,
-                            (char *) staging->get() + result->offset,
+                            dst,
                             result->offset, result->len,
                             state->measure ? state.get() : nullptr);
                     } catch (...) {
@@ -6822,6 +7130,10 @@ private:
                         }
                         ++batch.n_reader_h2d_;
                     }
+                } else if (result->cpu_direct) {
+                    // WP_CPU_DIRECT_PAGEIN: bytes already in slot.raw. Skip the
+                    // staging->slot memcpy. n_reader_h2d stays 0 -- that counter
+                    // is the GPU reader-thread H2D path.
                 } else {
                 const bool measure_h2d = batch.state_->measure;
                 const std::chrono::steady_clock::time_point h2d_started =
@@ -6891,7 +7203,16 @@ private:
                 // half-uploaded slot becomes visible, and the page-in log and LRU
                 // tick would fire once per stripe.
                 if (result->last) {
-                    if (wp_worker_cuda_async_hash_trace_enabled(backend_)) {
+                    if (cpu_direct_pagein_ && !pagein.cpu_on_arrival &&
+                            !result->uploaded) {
+                        if (pagein.cpu_direct && result->cpu_direct) {
+                            ++batch.n_cpu_direct_pagein_;
+                        } else {
+                            ++batch.n_cpu_direct_pagein_fallback_;
+                        }
+                    }
+                    if (wp_worker_cuda_async_hash_trace_enabled(backend_) &&
+                            result->staging) {
                         slot.upload_hash = hash_page_upload(
                             *pagein.page, result->staging->get());
                         slot.upload_hash_valid = true;
@@ -7209,6 +7530,61 @@ private:
         return count;
     }
 
+    bool cpu_direct_ok(ggml_tensor * raw, const ExpertPage & page) const {
+        if (!cpu_direct_pagein_ || raw == nullptr || raw->data == nullptr) {
+            return false;
+        }
+        // A chunk size that is not a 4096 multiple makes stripe offsets/lens
+        // illegal for O_DIRECT even when the page itself is aligned.
+        if (read_chunk_bytes_ != 0 &&
+                (read_chunk_bytes_ % DIRECT_ALIGNMENT) != 0) {
+            return false;
+        }
+        const uintptr_t dest = (uintptr_t) raw->data;
+        return dest % DIRECT_ALIGNMENT == 0 &&
+            page.offset % DIRECT_ALIGNMENT == 0 &&
+            page.size % DIRECT_ALIGNMENT == 0 &&
+            page.size > 0;
+    }
+
+    static bool cpu_direct_range_ok(const void * dest, uint64_t file_off, size_t len) {
+        return dest != nullptr &&
+            ((uintptr_t) dest % DIRECT_ALIGNMENT) == 0 &&
+            (file_off % DIRECT_ALIGNMENT) == 0 &&
+            (len % DIRECT_ALIGNMENT) == 0 &&
+            len > 0;
+    }
+
+    buffer_ptr alloc_arena_buffer(ggml_backend_buffer_type_t buft, size_t bytes) {
+        if (!cpu_direct_pagein_ || bytes == 0) {
+            return buffer_ptr(ggml_backend_buft_alloc_buffer(buft, bytes));
+        }
+#if defined(__linux__)
+        size_t alloc = bytes;
+        if ((alloc % DIRECT_ALIGNMENT) != 0) {
+            if (alloc > std::numeric_limits<size_t>::max() - (DIRECT_ALIGNMENT - 1)) {
+                throw std::overflow_error("expert slot arena alignment overflows");
+            }
+            alloc += DIRECT_ALIGNMENT - (alloc % DIRECT_ALIGNMENT);
+        }
+        void * raw = nullptr;
+        if (posix_memalign(&raw, DIRECT_ALIGNMENT, alloc) != 0 || raw == nullptr) {
+            throw std::runtime_error(
+                "failed to posix_memalign CPU expert slot arena of " +
+                std::to_string(alloc) + " bytes");
+        }
+        ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(raw, bytes);
+        if (buf == nullptr) {
+            std::free(raw);
+            throw std::runtime_error("failed to wrap CPU expert slot arena");
+        }
+        cpu_arena_owned_.emplace_back(raw);
+        return buffer_ptr(buf);
+#else
+        return buffer_ptr(ggml_backend_buft_alloc_buffer(buft, bytes));
+#endif
+    }
+
     void allocate_slot_arenas() {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
         uint64_t total = 0;
@@ -7242,7 +7618,7 @@ private:
             const uint64_t alloc_total =
                 total + (uint64_t) pad_plan.pads_extra * only_stride;
             if (max_buf == 0 || max_buf == SIZE_MAX || alloc_total <= max_buf) {
-                buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) alloc_total));
+                buffer_ptr buf(alloc_arena_buffer(buft, (size_t) alloc_total));
                 if (buf) {
                     ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     // see the zeroing note on the resident-page allocation above
@@ -7326,7 +7702,7 @@ private:
                         remaining -= want;
                         continue;
                     }
-                    buffer_ptr buf(ggml_backend_buft_alloc_buffer(
+                    buffer_ptr buf(alloc_arena_buffer(
                         buft, (size_t) (want + extra_bytes)));
                     if (!buf) {
                         throw std::runtime_error(
@@ -7369,7 +7745,7 @@ private:
                 remaining -= want;
                 continue;
             }
-            buffer_ptr buf(ggml_backend_buft_alloc_buffer(
+            buffer_ptr buf(alloc_arena_buffer(
                 buft, (size_t) (want + extra_bytes)));
             if (!buf) {
                 throw std::runtime_error(
@@ -7725,6 +8101,12 @@ private:
     size_t                     read_inflight_ = read_inflight_from_env();
     size_t                     read_chunk_bytes_ = read_chunk_bytes_from_env();
     const bool                 read_direct_ = read_direct_from_env();
+    std::string                device_name_;
+    bool                       cpu_direct_pagein_ = false;
+#if defined(__linux__)
+    cpu_set_t                  reader_cpu_set_{};
+    bool                       reader_cpus_enabled_ = false;
+#endif
     // WP_EXPERT_STRIPE_PARALLEL=1 -- stripes of one page are claimed by
     // MULTIPLE reader threads concurrently (QD>1 per page) instead of read
     // serially by the page's claimer. Default off: bare runs stay on the
@@ -8121,6 +8503,26 @@ private:
     uint64_t                   spec_pageins_  = 0;
     uint64_t                   spec_bytes_  = 0;
     uint64_t                   spec_errors_ = 0;
+    // WP_CPU_DIRECT_PAGEIN posix_memalign(4096) bases. Declared BEFORE
+    // arenas_ so from_ptr wrappers die first, then these free the memory.
+    struct CpuArenaMem {
+        void * p = nullptr;
+        ~CpuArenaMem() { std::free(p); }
+        CpuArenaMem() = default;
+        explicit CpuArenaMem(void * ptr) : p(ptr) {}
+        CpuArenaMem(const CpuArenaMem &) = delete;
+        CpuArenaMem & operator=(const CpuArenaMem &) = delete;
+        CpuArenaMem(CpuArenaMem && o) noexcept : p(o.p) { o.p = nullptr; }
+        CpuArenaMem & operator=(CpuArenaMem && o) noexcept {
+            if (this != &o) {
+                std::free(p);
+                p = o.p;
+                o.p = nullptr;
+            }
+            return *this;
+        }
+    };
+    std::vector<CpuArenaMem>   cpu_arena_owned_;
     // The large backing allocations every slot is carved from. Declared BEFORE
     // slots_ so it outlives them: Slot::buffer points in here and does not own.
     std::vector<buffer_ptr>    arenas_;
@@ -8248,6 +8650,8 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     ns_h2d_(other.ns_h2d_),
     bytes_h2d_(other.bytes_h2d_),
     n_reader_h2d_(other.n_reader_h2d_),
+    n_cpu_direct_pagein_(other.n_cpu_direct_pagein_),
+    n_cpu_direct_pagein_fallback_(other.n_cpu_direct_pagein_fallback_),
     n_read_inflight_max_(other.n_read_inflight_max_),
     ns_read_issue_(other.ns_read_issue_),
     ns_read_complete_(other.ns_read_complete_),
@@ -8397,7 +8801,7 @@ public:
                 catalog_.descriptor.hparams.n_expert_used, device),
             host_victim_bytes,
             test_hooks, expert_reserve_blocks, catalog_.pages.size(),
-            shared_host_tier, logs),
+            shared_host_tier, logs, device),
         compute_galloc_(ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend_.get()))),
         slots_(pool_.resources().slot_count) {
@@ -9839,6 +10243,8 @@ public:
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
             request_stats.n_reader_h2d = batch.n_reader_h2d();
+            request_stats.n_cpu_direct_pagein = batch.n_cpu_direct_pagein();
+            request_stats.n_cpu_direct_pagein_fallback = batch.n_cpu_direct_pagein_fallback();
             request_stats.n_cpu_on_arrival = batch.n_cpu_on_arrival();
             request_stats.n_cpu_on_arrival_fallback = batch.n_cpu_on_arrival_fallback();
         }
@@ -15118,6 +15524,8 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.ns_h2d += src.ns_h2d;
     dst.bytes_h2d += src.bytes_h2d;
     dst.n_reader_h2d += src.n_reader_h2d;
+    dst.n_cpu_direct_pagein += src.n_cpu_direct_pagein;
+    dst.n_cpu_direct_pagein_fallback += src.n_cpu_direct_pagein_fallback;
     dst.n_weight_nonzero += src.n_weight_nonzero;
     dst.n_weight_total += src.n_weight_total;
     dst.n_gcache_hit += src.n_gcache_hit;
@@ -17125,6 +17533,12 @@ private:
                         job();
                     } catch (...) {
                         caught = std::current_exception();
+                    }
+                    // OpenMP applies affinity/SCHED_BATCH only inside the
+                    // parallel region. Between graphs the executor is
+                    // SCHED_OTHER and unconfined unless we put the pin back.
+                    if (pin) {
+                        wp_cpu_tier_pin_self();
                     }
                     {
                         std::lock_guard<std::mutex> lock(mu);
@@ -19148,6 +19562,7 @@ int run(const Options & options) {
         options.test_hooks,
         options.resident_expert_blocks, options.expert_reserve_blocks,
         options.expert_reserve_bytes);
+    log_openmp_runtime_once();
     if (const char * shm = std::getenv("WP_LOCAL_SHM"); shm != nullptr && std::strcmp(shm, "1") == 0) {
         uint32_t shm_tokens = 2048;
         if (const char * env = std::getenv("WP_IO_PREALLOC_TOKENS");
