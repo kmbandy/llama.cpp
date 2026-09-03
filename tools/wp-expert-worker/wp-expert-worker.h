@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ggml.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -478,6 +480,41 @@ void fill_batch_mmid_expert_ptrs(
         int64_t * dst, size_t n_as,
         const int64_t * bases, size_t n,
         bool used_pad_expert);
+
+// Vulkan BATCH_MMID scratch packing. One contiguous [ne0, ne1, n_as] slab
+// per role. Quantized rows keep the MATRIX_ROW_PADDING slack
+// layout_sliced_pages reserves (Vulkan's alloc_size does not). Stride is
+// lcm(alignment, type_size) so nb[2] is a representable batch_stride.
+// Expert e is at roles[r].offset + e * roles[r].stride. The pad expert, if
+// used, is slot n_experts and copies expert 0.
+struct BatchMmidArenaRole {
+    enum ggml_type type = GGML_TYPE_COUNT;
+    int64_t ne0 = 0;
+    int64_t ne1 = 0;
+    size_t  nbytes = 0;
+    size_t  slack = 0;
+    size_t  stride = 0;
+    size_t  offset = 0;
+    size_t  copy_bytes = 0;
+};
+
+struct BatchMmidArenaPack {
+    BatchMmidArenaRole roles[3];
+    size_t n_as = 0;
+    size_t n_experts = 0;
+    bool   used_pad_expert = false;
+    size_t total_bytes = 0;
+    size_t copy_bytes = 0;
+};
+
+size_t batch_mmid_quant_row_slack(enum ggml_type type, int64_t ne0);
+size_t batch_mmid_arena_role_stride(
+        enum ggml_type type, int64_t ne0, int64_t ne1, size_t alignment);
+size_t batch_mmid_arena_expert_offset(
+        const BatchMmidArenaPack & pack, int role, size_t expert);
+BatchMmidArenaPack plan_batch_mmid_arena(
+        const BatchMmidArenaRole roles_in[3],
+        size_t n_experts, bool used_pad_expert, size_t alignment);
 
 // Path + fold for WP_EXPERT_BATCH_MMID. Must not read residency / n_pagein:
 // a request that takes mmid on a hit and per-expert on a miss changes the
