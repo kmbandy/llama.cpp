@@ -2758,12 +2758,17 @@ static bool ggml_cuda_parse_pin_kernel_mmvq(const char * env, const char * devic
     return negate ? !listed : listed;
 }
 
-static bool ggml_cuda_pin_kernel_mmvq(const ggml_backend_cuda_context & ctx) {
-    const char * env = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
-    if (env != nullptr && env[0] != '\0') {
-        return ggml_cuda_parse_pin_kernel_mmvq(env, ctx.name.c_str());
+static bool ggml_cuda_pin_kernel_mmvq(ggml_backend_cuda_context & ctx) {
+    if (ctx.wp_pin_mmvq < 0) {
+        const char * env = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
+        if (env != nullptr && env[0] != '\0') {
+            ctx.wp_pin_mmvq = ggml_cuda_parse_pin_kernel_mmvq(env, ctx.name.c_str()) ? 1 : 0;
+        } else {
+            ctx.wp_pin_mmvq = ggml_cuda_parse_pin_kernel_mmvq(
+                std::getenv("WP_EXPERT_MM_PIN_KERNEL"), ctx.name.c_str()) ? 1 : 0;
+        }
     }
-    return ggml_cuda_parse_pin_kernel_mmvq(std::getenv("WP_EXPERT_MM_PIN_KERNEL"), ctx.name.c_str());
+    return ctx.wp_pin_mmvq == 1;
 }
 
 static bool ggml_cuda_mul_mat_id_force_mm(const int64_t total_tokens) {
