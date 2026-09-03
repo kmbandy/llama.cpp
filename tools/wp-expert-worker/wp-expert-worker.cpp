@@ -5327,6 +5327,8 @@ public:
 
         uint64_t n_pagein_sorted() const {
             return n_pagein_sorted_;
+        }
+
         uint64_t n_cpu_direct_pagein() const {
             return n_cpu_direct_pagein_;
         }
