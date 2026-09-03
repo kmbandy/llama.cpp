@@ -106,6 +106,12 @@ bool ggml_backend_vk_wp_host_register(ggml_backend_buffer_t, void *, size_t)
     __attribute__((weak));
 void ggml_backend_vk_wp_host_unregister(ggml_backend_buffer_t, void *)
     __attribute__((weak));
+void ggml_cuda_set_routed_expert_ptrs(const void * const *)
+    __attribute__((weak));
+void ggml_cuda_queue_routed_expert_ptrs(const void * const *)
+    __attribute__((weak));
+void ggml_cuda_discard_routed_expert_ptrs()
+    __attribute__((weak));
 
 namespace wp_expert_worker {
 
@@ -982,6 +988,68 @@ static void pad_mmvq_routing(std::vector<int32_t> & idx, std::vector<float> * we
     }
 }
 
+BatchMmidIds build_batch_mmid_ids(
+        const std::vector<std::vector<float>> & weights,
+        bool use_gather) {
+    BatchMmidIds out;
+    out.n_experts = weights.size();
+    if (weights.empty()) {
+        return out;
+    }
+    out.n_tokens = (uint32_t) weights[0].size();
+    for (const auto & row : weights) {
+        if (row.size() != weights[0].size()) {
+            return BatchMmidIds{};
+        }
+    }
+    const size_t n = out.n_experts;
+    const uint32_t n_tokens = out.n_tokens;
+    out.expert_rows.resize(n);
+    if (!use_gather) {
+        out.k_width = (uint32_t) n;
+        out.ids.resize((size_t) n_tokens * n);
+        out.route_w.resize((size_t) n_tokens * n);
+        for (size_t e = 0; e < n; ++e) {
+            out.expert_rows[e].resize(n_tokens);
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                out.expert_rows[e][t] = (int32_t) t;
+                out.ids[(size_t) t * n + e] = (int32_t) e;
+                out.route_w[(size_t) t * n + e] = weights[e][t];
+            }
+        }
+        return out;
+    }
+    std::vector<std::vector<int32_t>> per_token(n_tokens);
+    uint32_t k_width = 1;
+    for (size_t e = 0; e < n; ++e) {
+        out.expert_rows[e] = compact_routing_rows(weights[e]).idx;
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            if (weights[e][t] != 0.0f) {
+                per_token[t].push_back((int32_t) e);
+            }
+        }
+    }
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        if ((uint32_t) per_token[t].size() > k_width) {
+            k_width = (uint32_t) per_token[t].size();
+        }
+    }
+    out.k_width = k_width;
+    out.ids.assign((size_t) n_tokens * k_width, (int32_t) n);
+    out.route_w.assign((size_t) n_tokens * k_width, 0.0f);
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        if ((uint32_t) per_token[t].size() < k_width) {
+            out.used_pad_expert = true;
+        }
+        for (size_t k = 0; k < per_token[t].size(); ++k) {
+            const int32_t e = per_token[t][k];
+            out.ids[(size_t) t * k_width + k] = e;
+            out.route_w[(size_t) t * k_width + k] = weights[(size_t) e][t];
+        }
+    }
+    return out;
+}
+
 ggml_tensor * scatter_add_compact_rows(
         struct ggml_context * ctx,
         struct ggml_tensor * dest,
@@ -1582,6 +1650,8 @@ struct RequestStats {
     uint64_t n_d3_collapse = 0;
     uint64_t n_d3_typed    = 0;
     uint64_t n_d3_bounce   = 0;
+    uint64_t n_batch_mmid_hit = 0;
+    uint64_t n_batch_mmid_fallback = 0;
     bool d3_counted = false;
     // D1 (2026-08-07): the coalesced routing-weight/gather-idx blob upload.
     // The per-tensor uploads it replaces were never timed anywhere -- they sat
@@ -1850,6 +1920,8 @@ public:
         n_d3_collapse_ += request.n_d3_collapse;
         n_d3_typed_ += request.n_d3_typed;
         n_d3_bounce_ += request.n_d3_bounce;
+        n_batch_mmid_hit_ += request.n_batch_mmid_hit;
+        n_batch_mmid_fallback_ += request.n_batch_mmid_fallback;
         // PER-REQUEST DISTRIBUTION, not just the total. The cumulative ns_submit
         // cannot distinguish "every request costs 2.1 ms" from "most cost 0.2 ms
         // and a few cost 50 ms", and those have completely different fixes. An
@@ -2082,6 +2154,8 @@ private:
                   << " n_d3_collapse=" << n_d3_collapse_
                   << " n_d3_typed=" << n_d3_typed_
                   << " n_d3_bounce=" << n_d3_bounce_
+                  << " n_batch_mmid_hit=" << n_batch_mmid_hit_
+                  << " n_batch_mmid_fallback=" << n_batch_mmid_fallback_
                   << " ns_readback=" << ns_readback_
                   << " ns_send=" << ns_send_
                   << " host_bytes=" << host_bytes_
@@ -2220,6 +2294,8 @@ private:
     uint64_t          n_d3_collapse_ = 0;
     uint64_t          n_d3_typed_ = 0;
     uint64_t          n_d3_bounce_ = 0;
+    uint64_t          n_batch_mmid_hit_ = 0;
+    uint64_t          n_batch_mmid_fallback_ = 0;
     uint64_t          ns_readback_ = 0;
     uint64_t          ns_dispatch_total_ = 0;
     uint64_t          ns_lock_wait_    = 0;
@@ -9605,6 +9681,22 @@ public:
                          mm_pin_mode_ == mm_pin_mode::on ? "on" : "off",
                          mm_pin_kernel_mmvq_ ? "mmvq" : "mmq",
                          (int) mm_pin_pad_mmvq_);
+            const char * be = std::getenv("WP_EXPERT_BATCH_MMID");
+            batch_mmid_enabled_ = parse_arena_prefill_enabled(be, device_name_);
+            const char * const backend_name = ggml_backend_name(backend_.get());
+            const bool backend_ok = backend_name != nullptr &&
+                (std::strstr(backend_name, "ROCm") != nullptr ||
+                 std::strstr(backend_name, "CUDA") != nullptr);
+            if (batch_mmid_enabled_ && !backend_ok) {
+                batch_mmid_enabled_ = false;
+            }
+            std::fprintf(stderr,
+                         "wp expert worker: batch mmid (WP_EXPERT_BATCH_MMID=%s) "
+                         "device=%s enabled=%d backend=%s "
+                         "(FORCE_MM min_tokens default 64)\n",
+                         be != nullptr ? be : "", device_name_.c_str(),
+                         (int) batch_mmid_enabled_,
+                         backend_name != nullptr ? backend_name : "?");
         }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
@@ -10200,6 +10292,15 @@ public:
             request.n_tokens >= 1 && request.n_tokens <= 8 &&
             request.assignments.size() >= 1 &&
             request.assignments.size() <= (size_t) 16 * request.n_tokens;
+    }
+
+    bool batch_mmid_eligible(const pipe_expert_dispatch_req & request) const {
+        return batch_mmid_enabled_ &&
+            is_hip_or_cuda_backend() &&
+            ggml_cuda_queue_routed_expert_ptrs != nullptr &&
+            ggml_cuda_discard_routed_expert_ptrs != nullptr &&
+            request.n_tokens >= 1 &&
+            !request.assignments.empty();
     }
 
     bool arena_assignments_eligible(
@@ -11157,6 +11258,13 @@ public:
                std::strstr(name, "HIP") != nullptr;
     }
 
+    bool is_hip_or_cuda_backend() const {
+        const char * name = ggml_backend_name(backend_.get());
+        return name != nullptr &&
+            (std::strstr(name, "CUDA") != nullptr ||
+             std::strstr(name, "ROCm") != nullptr);
+    }
+
     ggml_backend_graph_plan_t create_persistent_plan(ggml_cgraph * graph) {
         if (!wp_persistent_graphs_enabled() || !is_vulkan_backend()) {
             return nullptr;
@@ -11280,7 +11388,7 @@ private:
     }();
     // Set in the constructor, once device_name_ is known: see
     // parse_arena_prefill_enabled() for the accepted WP_EXPERT_ARENA_PREFILL
-    // values (plain 0/1, or a per-device allow/deny list).
+    // and WP_EXPERT_BATCH_MMID values (plain 0/1, or a per-device allow/deny list).
     bool arena_prefill_enabled_ = false;
     // Same parser as arena prefill. "1" on CUDA disables {MUL,ADD} fusion;
     // HIP has no multi_add so the emission reorder is a no-op there.
@@ -11290,6 +11398,7 @@ private:
     int         mm_pin_max_tokens_ = 8;
     bool        mm_pin_kernel_mmvq_ = false;
     bool        mm_pin_pad_mmvq_ = false;
+    bool batch_mmid_enabled_ = false;
 
     void begin_async_dispatch(int conn_index, uint64_t trace_req) {
         active_async_conn_index_ = conn_index;
@@ -12903,6 +13012,29 @@ private:
                   ggml_backend_get_default_buffer_type(backend_.get()))
             : 1;
 
+        // WP_EXPERT_BATCH_MMID: 3 mul_mat_id (or fused gate||up + down) over
+        // the selected experts, weights left in their slots via expert_ptrs.
+        // Default OFF. Vulkan/CPU have no expert_ptrs channel and never enter.
+        // force_dense (WP_SELFCHECK reference) stays on the per-expert path.
+        const bool batch_mmid =
+            !force_fallback && !force_dense &&
+            batch_mmid_eligible(request) &&
+            sel_begin == 0 &&
+            sel_end >= request.assignments.size() &&
+            n_selected == request.assignments.size() &&
+            result_offset == std::numeric_limits<size_t>::max();
+        if (batch_mmid) {
+            record_vk_setup();
+            if (compute_batch_mmid(
+                    request, pages, batch, selected, n_selected, add_previous,
+                    use_gather, request_stats)) {
+                ++request_stats.n_batch_mmid_hit;
+                record_vk_compute();
+                return;
+            }
+            ++request_stats.n_batch_mmid_fallback;
+        }
+
         // *** GROUPED GEMV: GROUPED mul_mat_id ACROSS ALL SELECTED EXPERTS. ***
         // Collapses the per-expert loop's 3 ggml_mul_mat (gate/up/down) into 3
         // ggml_mul_mat_id calls total, batched over every selected expert. See
@@ -13804,6 +13936,286 @@ private:
     // never taught about). Integrating D2 here -- caching the graph and only
     // reissuing the 3N copies + two small uploads per request -- is a
     // reasonable follow-up once this path is validated on real hardware.
+    // 3 mul_mat_id (gate, up, down) or fused gate||up + down. Weights stay in
+    // their slots: expert_ptrs[c] is the slot+role address, queued in
+    // assignment order and consumed once per MUL_MAT_ID. Fold is a left fold
+    // over ids-slot k (assignment order per token). Gather uses padded-rank
+    // ids: uneven tokens pad with expert index n and route weight 0.
+    bool compute_batch_mmid(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            const std::function<bool(size_t)> & selected,
+            size_t n_selected,
+            bool add_previous,
+            bool use_gather,
+            RequestStats & request_stats) {
+        std::vector<size_t> sel;
+        sel.reserve(n_selected);
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (selected(i)) {
+                sel.push_back(i);
+            }
+        }
+        const size_t n = sel.size();
+        if (n == 0) {
+            return false;
+        }
+        for (size_t k = 0; k < n; ++k) {
+            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
+            if (loaded.buffer == nullptr || loaded.base == nullptr) {
+                return false;
+            }
+        }
+
+        std::vector<std::vector<float>> weight_rows(n);
+        for (size_t k = 0; k < n; ++k) {
+            weight_rows[k] = request.assignments[sel[k]].weights;
+        }
+        const BatchMmidIds plan = build_batch_mmid_ids(weight_rows, use_gather);
+        if (plan.k_width == 0 || plan.n_tokens != request.n_tokens ||
+                plan.ids.size() != (size_t) plan.k_width * plan.n_tokens) {
+            return false;
+        }
+        const size_t n_as = n + (plan.used_pad_expert ? 1 : 0);
+        const uint32_t n_tokens = request.n_tokens;
+        const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
+        const int64_t k_width = (int64_t) plan.k_width;
+        const auto & specs = catalog_.descriptor.layers.at(pages[sel[0]]->layer);
+        const RoleSpec & gate_spec = specs.at("gate");
+        const RoleSpec & up_spec   = specs.at("up");
+        const RoleSpec & down_spec = specs.at("down");
+
+        static const bool s_fuse_gate_up = [] {
+            const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
+            return e != nullptr && e[0] == '1';
+        }();
+        bool fuse_gate_up = s_fuse_gate_up && !use_gather && request.swiglu_clamp <= 1e-6f &&
+            gate_spec.type == up_spec.type && gate_spec.ne0 == up_spec.ne0 &&
+            gate_spec.ne1 == up_spec.ne1;
+        if (fuse_gate_up) {
+            const size_t gate_bytes =
+                ggml_row_size(gate_spec.type, (int64_t) gate_spec.ne0) * (size_t) gate_spec.ne1;
+            for (size_t k = 0; k < n; ++k) {
+                const ExpertPage & page = *pages[sel[k]];
+                if (page.roles.at("up").device_offset !=
+                        page.roles.at("gate").device_offset + (uint64_t) gate_bytes) {
+                    fuse_gate_up = false;
+                    break;
+                }
+            }
+        }
+
+        const auto build_started = std::chrono::steady_clock::now();
+        begin_work_input_trace(request, pages, batch, sel, use_gather, -1);
+
+        const size_t tensor_count = 40 + 2 * (size_t) k_width;
+        const size_t graph_nodes  = 24 + 2 * (size_t) k_width;
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                              ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate batch-mmid graph metadata");
+        }
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+
+        const auto make_role_as = [&](const RoleSpec & spec, const char * role) {
+            ggml_tensor * t = ggml_new_tensor_3d(
+                ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n_as);
+            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[0]);
+            t->buffer = loaded.buffer;
+            t->data = (uint8_t *) loaded.base + pages[sel[0]]->roles.at(role).device_offset;
+            return t;
+        };
+        ggml_tensor * as_gate = nullptr;
+        ggml_tensor * as_up = nullptr;
+        ggml_tensor * as_down = make_role_as(down_spec, "down");
+        if (fuse_gate_up) {
+            ggml_tensor * t = ggml_new_tensor_3d(
+                ctx.get(), gate_spec.type, gate_spec.ne0, 2 * gate_spec.ne1, (int64_t) n_as);
+            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[0]);
+            t->buffer = loaded.buffer;
+            t->data = (uint8_t *) loaded.base + pages[sel[0]]->roles.at("gate").device_offset;
+            as_gate = t;
+        } else {
+            as_gate = make_role_as(gate_spec, "gate");
+            as_up   = make_role_as(up_spec, "up");
+        }
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k_width, (int64_t) n_tokens);
+        ggml_set_input(ids);
+        ggml_tensor * input2d = make_io_tensor(ctx.get(), n_tokens, 0);
+        ggml_set_input(input2d);
+        ggml_tensor * input3d = ggml_reshape_3d(ctx.get(), input2d, n_embd, 1, (int64_t) n_tokens);
+
+        ggml_tensor * hidden = nullptr;
+        ggml_tensor * gate_out = nullptr;
+        ggml_tensor * up_out = nullptr;
+        if (fuse_gate_up) {
+            hidden = ggml_swiglu(ctx.get(), ggml_mul_mat_id(ctx.get(), as_gate, input3d, ids));
+        } else {
+            gate_out = ggml_mul_mat_id(ctx.get(), as_gate, input3d, ids);
+            up_out   = ggml_mul_mat_id(ctx.get(), as_up,   input3d, ids);
+            const float swiglu_limit = request.swiglu_clamp;
+            if (swiglu_limit > 1e-6f) {
+                up_out   = ggml_clamp(ctx.get(), up_out,   -swiglu_limit, swiglu_limit);
+                gate_out = ggml_clamp(ctx.get(), gate_out, -INFINITY,     swiglu_limit);
+            }
+            hidden = ggml_swiglu_split(ctx.get(), gate_out, up_out);
+        }
+        ggml_tensor * down_out = ggml_mul_mat_id(ctx.get(), as_down, hidden, ids);
+
+        ggml_tensor * route_w =
+            ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, k_width, (int64_t) n_tokens);
+        ggml_set_input(route_w);
+        ggml_tensor * weighted = ggml_mul(ctx.get(), down_out, route_w);
+
+        ggml_tensor * result = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
+        ggml_tensor * sum = add_previous ? result : nullptr;
+        for (size_t k = 0; k < (size_t) k_width; ++k) {
+            ggml_tensor * contrib = ggml_view_2d(
+                ctx.get(), weighted, n_embd, (int64_t) n_tokens,
+                weighted->nb[2], (size_t) k * weighted->nb[1]);
+            sum = sum ? ggml_add(ctx.get(), sum, contrib) : contrib;
+        }
+        if (sum == nullptr) {
+            throw std::runtime_error("batch-mmid compute produced no contribution");
+        }
+        ggml_tensor * copy = ggml_cpy(ctx.get(), sum, result);
+        if (!fuse_gate_up) {
+            ggml_build_forward_expand(graph, gate_out);
+            ggml_build_forward_expand(graph, up_out);
+        }
+        ggml_build_forward_expand(graph, copy);
+
+        const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
+        const size_t params_align = std::max<size_t>(
+            1, ggml_backend_buft_get_alignment(buft));
+        const auto pad_off = [&](size_t off) {
+            return GGML_PAD(off, params_align);
+        };
+        size_t params_span = 0;
+        const size_t ids_off = pad_off(params_span);
+        params_span = ids_off + plan.ids.size() * sizeof(int32_t);
+        const size_t route_off = pad_off(params_span);
+        params_span = route_off + plan.route_w.size() * sizeof(float);
+        const size_t gate_ptr_off = pad_off(params_span);
+        params_span = gate_ptr_off + n_as * sizeof(int64_t);
+        size_t up_ptr_off = 0;
+        if (!fuse_gate_up) {
+            up_ptr_off = pad_off(params_span);
+            params_span = up_ptr_off + n_as * sizeof(int64_t);
+        }
+        const size_t down_ptr_off = pad_off(params_span);
+        params_span = down_ptr_off + n_as * sizeof(int64_t);
+        grow_params_buffer(params_span + params_align * 8 + 4096, request_stats);
+        void * params_base = ggml_backend_buffer_get_base(params_buffer_.get());
+        if (params_base == nullptr) {
+            return false;
+        }
+
+        attach_weight(ids, params_buffer_.get(), params_base, ids_off);
+        attach_weight(route_w, params_buffer_.get(), params_base, route_off);
+        ggml_tensor * gate_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
+        attach_weight(gate_ptr_t, params_buffer_.get(), params_base, gate_ptr_off);
+        ggml_tensor * up_ptr_t = nullptr;
+        if (!fuse_gate_up) {
+            up_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
+            attach_weight(up_ptr_t, params_buffer_.get(), params_base, up_ptr_off);
+        }
+        ggml_tensor * down_ptr_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t) n_as);
+        attach_weight(down_ptr_t, params_buffer_.get(), params_base, down_ptr_off);
+
+        ggml_gallocr_t galloc = compute_galloc_.get();
+        const size_t old_compute_size = ggml_gallocr_get_buffer_size(galloc, 0);
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+            throw std::runtime_error("failed to allocate batch-mmid compute graph");
+        }
+        if (ggml_gallocr_get_buffer_size(galloc, 0) > old_compute_size) {
+            ++request_stats.n_device_allocs;
+        }
+        request_stats.ns_graph_build +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - build_started).count();
+
+        std::vector<uint8_t> params_host(params_span, 0);
+        std::memcpy(params_host.data() + ids_off, plan.ids.data(),
+                    plan.ids.size() * sizeof(int32_t));
+        std::memcpy(params_host.data() + route_off, plan.route_w.data(),
+                    plan.route_w.size() * sizeof(float));
+        const auto fill_ptrs = [&](const char * role, size_t off) {
+            int64_t * dst = (int64_t *) (params_host.data() + off);
+            for (size_t k = 0; k < n; ++k) {
+                const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
+                dst[k] = (int64_t) (uintptr_t) (
+                    (uint8_t *) loaded.base + pages[sel[k]]->roles.at(role).device_offset);
+            }
+            if (plan.used_pad_expert) {
+                dst[n] = dst[0];
+            }
+        };
+        fill_ptrs(fuse_gate_up ? "gate" : "gate", gate_ptr_off);
+        if (!fuse_gate_up) {
+            fill_ptrs("up", up_ptr_off);
+        }
+        fill_ptrs("down", down_ptr_off);
+
+        ggml_tensor * blob = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) params_span);
+        attach_weight(blob, params_buffer_.get(), params_base, 0);
+        add_work_input_trace_tensor(ids, plan.ids.data(), plan.ids.size() * sizeof(int32_t));
+        add_work_input_trace_tensor(
+            route_w, plan.route_w.data(), plan.route_w.size() * sizeof(float));
+
+        uint64_t params_elapsed = 0;
+        if (submit_async_) {
+            AsyncSubmitState & state = async_submit_state();
+            state.params.emplace_back(std::move(params_host));
+            state.pending = true;
+            const auto params_started = std::chrono::steady_clock::now();
+            ggml_backend_tensor_set_async(
+                backend_.get(), blob, state.params.back().data(), 0, params_span);
+            params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - params_started).count();
+        } else {
+            const auto params_started = std::chrono::steady_clock::now();
+            ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
+            params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - params_started).count();
+        }
+        request_stats.ns_params_set += params_elapsed;
+
+        ggml_cuda_queue_routed_expert_ptrs((const void * const *) gate_ptr_t->data);
+        if (!fuse_gate_up) {
+            ggml_cuda_queue_routed_expert_ptrs((const void * const *) up_ptr_t->data);
+        }
+        ggml_cuda_queue_routed_expert_ptrs((const void * const *) down_ptr_t->data);
+        struct DiscardQueuedPtrs {
+            ~DiscardQueuedPtrs() {
+                if (ggml_cuda_discard_routed_expert_ptrs != nullptr) {
+                    ggml_cuda_discard_routed_expert_ptrs();
+                }
+            }
+        } discard_queued_ptrs;
+
+        last_compute_path_ = "batch-mmid";
+        const enum ggml_status status = submit_graph(graph, request_stats);
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("batch-mmid backend graph compute failed");
+        }
+        for (size_t k = 0; k < n; ++k) {
+            const auto & wv = request.assignments[sel[k]].weights;
+            uint64_t nz = 0;
+            for (float f : wv) { nz += (f != 0.0f); }
+            request_stats.n_weight_nonzero += nz;
+        }
+        request_stats.n_weight_total += (size_t) plan.k_width * plan.n_tokens;
+        return true;
+    }
+
     void compute_batch_grouped(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -16212,6 +16624,8 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_d3_collapse += src.n_d3_collapse;
     dst.n_d3_typed += src.n_d3_typed;
     dst.n_d3_bounce += src.n_d3_bounce;
+    dst.n_batch_mmid_hit += src.n_batch_mmid_hit;
+    dst.n_batch_mmid_fallback += src.n_batch_mmid_fallback;
     dst.ns_params_set += src.ns_params_set;
     dst.ns_demote += src.ns_demote;
     dst.ns_ensure_post += src.ns_ensure_post;

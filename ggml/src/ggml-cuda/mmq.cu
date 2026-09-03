@@ -22,6 +22,8 @@ namespace {
 // MUL_MAT (no MoE) op uses the default nullptr (legacy path,
 // bit-identical to pre-MAD-88).
 thread_local const void * const * tls_routed_expert_ptrs = nullptr;
+thread_local std::vector<const void * const *> tls_routed_expert_ptrs_queue;
+thread_local size_t tls_routed_expert_ptrs_queue_i = 0;
 std::atomic<uint64_t> g_routed_expert_ptrs_set{0};
 std::atomic<uint64_t> g_routed_expert_ptrs_consumed{0};
 std::atomic<uint64_t> g_routed_expert_ptrs_discarded_unconsumed{0};
@@ -50,7 +52,25 @@ void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr) {
     tls_routed_expert_ptrs = ptr;
 }
 
+void ggml_cuda_queue_routed_expert_ptrs(const void * const * ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    if (tls_routed_expert_ptrs_queue_i > 0 &&
+            tls_routed_expert_ptrs_queue_i == tls_routed_expert_ptrs_queue.size()) {
+        tls_routed_expert_ptrs_queue.clear();
+        tls_routed_expert_ptrs_queue_i = 0;
+    }
+    g_routed_expert_ptrs_set.fetch_add(1, std::memory_order_relaxed);
+    tls_routed_expert_ptrs_queue.push_back(ptr);
+}
+
 const void * const * ggml_cuda_take_routed_expert_ptrs() {
+    if (tls_routed_expert_ptrs_queue_i < tls_routed_expert_ptrs_queue.size()) {
+        const void * const * p = tls_routed_expert_ptrs_queue[tls_routed_expert_ptrs_queue_i++];
+        g_routed_expert_ptrs_consumed.fetch_add(1, std::memory_order_relaxed);
+        return p;
+    }
     const void * const * p = tls_routed_expert_ptrs;
     if (p != nullptr) {
         g_routed_expert_ptrs_consumed.fetch_add(1, std::memory_order_relaxed);
@@ -63,10 +83,18 @@ bool ggml_cuda_has_routed_expert_ptrs() {
     // Non-consuming peek. The MUL_MAT_ID dispatcher uses this to decide
     // whether to bypass kernel paths (mmvq, mmvf, mmf) that don't support
     // routing-aware paging and force the MMQ path which does.
-    return tls_routed_expert_ptrs != nullptr;
+    return tls_routed_expert_ptrs != nullptr ||
+        tls_routed_expert_ptrs_queue_i < tls_routed_expert_ptrs_queue.size();
 }
 
 void ggml_cuda_discard_routed_expert_ptrs() {
+    const size_t queued = tls_routed_expert_ptrs_queue.size() - tls_routed_expert_ptrs_queue_i;
+    if (queued > 0) {
+        g_routed_expert_ptrs_discarded_unconsumed.fetch_add(
+            queued, std::memory_order_relaxed);
+    }
+    tls_routed_expert_ptrs_queue.clear();
+    tls_routed_expert_ptrs_queue_i = 0;
     if (tls_routed_expert_ptrs != nullptr) {
         g_routed_expert_ptrs_discarded_unconsumed.fetch_add(1, std::memory_order_relaxed);
     }

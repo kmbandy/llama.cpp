@@ -298,6 +298,7 @@ uint32_t mm_pin_pad_cols(uint32_t n_tokens);
 // with "!" ("!Vulkan0") is on for every device except those named. Whitespace
 // around the whole value and around each comma-separated name is ignored.
 // WP_EXPERT_FOLD_LAST uses the same parser (CUDA "1" kills {MUL,ADD} fusion).
+// WP_EXPERT_BATCH_MMID uses the same parser.
 bool parse_arena_prefill_enabled(const char * env, const std::string & device_name);
 
 // ---------------------------------------------------------------------------
@@ -465,6 +466,30 @@ struct CompactRouting {
     std::vector<float>   weights;
 };
 CompactRouting compact_routing_rows(const std::vector<float> & wv);
+
+// Build ggml_mul_mat_id ids + route weights from per-expert router rows.
+// weights[e][t] is selected expert e's router weight for token t.
+//
+// Dense (!use_gather): ids[k,t] = k, k_width = n_experts. Fold over k is
+// assignment-index left-fold of the full [n_embd, n_tokens] slices.
+//
+// Gather: invert per-expert compacted rows onto ids' [k_width, n_tokens]
+// layout, packing each token's experts in assignment order. Uneven rank is
+// padded with expert index n_experts and route weight 0 (a dummy slot whose
+// weight pointer is a copy of expert 0). Duplicate ids per token are never
+// produced.
+struct BatchMmidIds {
+    std::vector<std::vector<int32_t>> expert_rows;
+    std::vector<int32_t> ids;
+    std::vector<float>   route_w;
+    uint32_t k_width = 0;
+    uint32_t n_tokens = 0;
+    size_t   n_experts = 0;
+    bool     used_pad_expert = false;
+};
+BatchMmidIds build_batch_mmid_ids(
+        const std::vector<std::vector<float>> & weights,
+        bool use_gather);
 
 // Scatter compacted [n_embd, n_sel] rows onto a zeroed [n_embd, n_tokens]
 // dest. idx is I32 [n_sel] and MUST be unique (ggml_set_rows overwrites;
