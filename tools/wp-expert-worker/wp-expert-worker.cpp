@@ -942,9 +942,61 @@ void fill_batch_mmid_expert_ptrs(
     for (size_t i = 0; i < n; ++i) {
         dst[i] = bases[i];
     }
+    // Dummy expert n copies expert 0 so the pad FFN is finite. route_w is 0,
+    // so the fold adds 0 * finite = 0. A dummy with empty weights can be NaN.
     if (used_pad_expert && n_as == n + 1 && n > 0) {
         dst[n] = dst[0];
     }
+}
+
+const char * batch_mmid_ineligible_reason_name(batch_mmid_ineligible_reason r) {
+    switch (r) {
+        case batch_mmid_ineligible_reason::cpu_on_arrival: return "cpu_on_arrival";
+        case batch_mmid_ineligible_reason::force_dense:    return "force_dense";
+        case batch_mmid_ineligible_reason::subrange:       return "subrange";
+        default: return "none";
+    }
+}
+
+BatchMmidAssociation plan_batch_mmid_association(
+        bool enabled,
+        size_t n_assign,
+        bool cpu_on_arrival,
+        bool force_dense,
+        bool subrange) {
+    BatchMmidAssociation out;
+    out.fold_order.resize(n_assign);
+    for (size_t i = 0; i < n_assign; ++i) {
+        out.fold_order[i] = i;
+    }
+    if (!enabled || n_assign == 0) {
+        return out;
+    }
+    if (cpu_on_arrival) {
+        out.reason = batch_mmid_ineligible_reason::cpu_on_arrival;
+        return out;
+    }
+    if (force_dense) {
+        out.reason = batch_mmid_ineligible_reason::force_dense;
+        return out;
+    }
+    if (subrange) {
+        out.reason = batch_mmid_ineligible_reason::subrange;
+        return out;
+    }
+    out.use_mmid = true;
+    return out;
+}
+
+size_t batch_mmid_compute_chunks(
+        bool enabled, size_t n_assign, size_t n_pagein, size_t compute_chunks) {
+    if (enabled || n_assign == 0 || n_pagein == 0) {
+        return 1;
+    }
+    if (compute_chunks == 0) {
+        return 1;
+    }
+    return compute_chunks < n_assign ? compute_chunks : n_assign;
 }
 
 ggml_tensor * scatter_add_compact_rows(
@@ -1468,6 +1520,8 @@ struct RequestStats {
     uint64_t n_d3_bounce   = 0;
     uint64_t n_batch_mmid_hit = 0;
     uint64_t n_batch_mmid_fallback = 0;
+    uint64_t n_batch_mmid_ineligible = 0;
+    int      batch_mmid_ineligible_reason = 0;
     uint64_t n_mmid_ptrs_set = 0;
     uint64_t n_mmid_ptrs_consumed = 0;
     uint64_t n_mmid_ptrs_discarded = 0;
@@ -1714,6 +1768,10 @@ public:
         n_d3_bounce_ += request.n_d3_bounce;
         n_batch_mmid_hit_ += request.n_batch_mmid_hit;
         n_batch_mmid_fallback_ += request.n_batch_mmid_fallback;
+        n_batch_mmid_ineligible_ += request.n_batch_mmid_ineligible;
+        if (request.batch_mmid_ineligible_reason != 0) {
+            batch_mmid_ineligible_reason_ = request.batch_mmid_ineligible_reason;
+        }
         n_mmid_ptrs_set_ += request.n_mmid_ptrs_set;
         n_mmid_ptrs_consumed_ += request.n_mmid_ptrs_consumed;
         n_mmid_ptrs_discarded_ += request.n_mmid_ptrs_discarded;
@@ -1924,6 +1982,10 @@ private:
                   << " n_d3_bounce=" << n_d3_bounce_
                   << " n_batch_mmid_hit=" << n_batch_mmid_hit_
                   << " n_batch_mmid_fallback=" << n_batch_mmid_fallback_
+                  << " n_batch_mmid_ineligible=" << n_batch_mmid_ineligible_
+                  << " ineligible_reason="
+                  << batch_mmid_ineligible_reason_name(
+                         (batch_mmid_ineligible_reason) batch_mmid_ineligible_reason_)
                   << " n_mmid_ptrs_set=" << n_mmid_ptrs_set_
                   << " n_mmid_ptrs_consumed=" << n_mmid_ptrs_consumed_
                   << " n_mmid_ptrs_discarded=" << n_mmid_ptrs_discarded_
@@ -2065,6 +2127,8 @@ private:
     uint64_t          n_d3_bounce_ = 0;
     uint64_t          n_batch_mmid_hit_ = 0;
     uint64_t          n_batch_mmid_fallback_ = 0;
+    uint64_t          n_batch_mmid_ineligible_ = 0;
+    int               batch_mmid_ineligible_reason_ = 0;
     uint64_t          n_mmid_ptrs_set_ = 0;
     uint64_t          n_mmid_ptrs_consumed_ = 0;
     uint64_t          n_mmid_ptrs_discarded_ = 0;
@@ -9766,6 +9830,16 @@ public:
             !cpu_on_arrival_request &&
             (arena_prefill_request || grouped_gemv_eligible(request) ||
              (persistent_graphs ? arena_request : arena_id_eligible(request, batch)));
+        // BATCH_MMID: one mul_mat_id over the full assignment set after
+        // complete(). n_pagein / residency must not pick per-expert vs mmid.
+        const bool batch_mmid_request =
+            !cpu_on_arrival_request && batch_mmid_eligible(request);
+        if (batch_mmid_eligible(request) && cpu_on_arrival_request &&
+                request_stats.n_batch_mmid_ineligible == 0) {
+            ++request_stats.n_batch_mmid_ineligible;
+            request_stats.batch_mmid_ineligible_reason =
+                (int) batch_mmid_ineligible_reason::cpu_on_arrival;
+        }
         if (measure) {
             const uint64_t probe_ns =
                 (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -9815,12 +9889,15 @@ public:
             return e != nullptr && e[0] == '1';   // default OFF = deterministic
         }();
         const bool effective_overlap = overlap &&
-            !(persistent_graphs && arena_request) && !arena_prefill_request;
+            !(persistent_graphs && arena_request) && !arena_prefill_request &&
+            !batch_mmid_request;
         // WP_EXPERT_COMPUTE_CHUNKS=<n>: split the expert compute into n fixed
         // index chunks so all but the last can run while the tail of the page-in
         // reads is still in flight. 1 = the original strictly-serial path.
-        // Unlike WP_EXPERT_OVERLAP this does NOT trade determinism -- see the
-        // note at the compute loop below.
+        // Unlike WP_EXPERT_OVERLAP this does NOT trade determinism on the
+        // per-expert path -- see the note at the compute loop below.
+        // BATCH_MMID must not use this split: n_pagein>0 used to force chunks>1
+        // and drop those requests onto per-expert, which is the 2026-08-03 class.
         // NOTE: this is clamped to the assignment count AND gated on n_pagein > 0
         // at the loop. Clamping alone was NOT enough and the earlier comment here
         // claiming "decode is unaffected" was wrong -- min(4, 2) is 2, so 2-expert
@@ -9885,7 +9962,8 @@ public:
         // nothing to overlap and the plain serial path is strictly better
         // (no extra per-expert graph submits, no fold pass).
         const bool resident_first_eligible =
-            !cpu_on_arrival_request && !grouped_gemv_request && s_resident_first &&
+            !cpu_on_arrival_request && !grouped_gemv_request && !batch_mmid_request &&
+            s_resident_first &&
             !request.assignments.empty() &&
             request.n_tokens <= s_resident_first_max_tokens &&
             have_pageins;
@@ -9988,9 +10066,11 @@ public:
             // error. n_pagein == 0 means every expert is already resident and the
             // serial path is strictly better.
             const size_t chunks   = fused_expert_request ? 1 :
-                (grouped_gemv_request || batch.n_pagein() == 0
+                (grouped_gemv_request
                 ? 1
-                : std::max<size_t>(1, std::min(s_compute_chunks, n_assign)));
+                : batch_mmid_compute_chunks(
+                      batch_mmid_request, n_assign, batch.n_pagein(),
+                      s_compute_chunks));
             active_work_chunks_ = chunks;
             for (size_t c = 0; c < chunks; ++c) {
                 const size_t beg = n_assign * c / chunks;
@@ -11923,8 +12003,25 @@ private:
             return;
         }
 
+        const bool mmid_subrange =
+            sel_begin != 0 ||
+            sel_end < request.assignments.size() ||
+            n_selected != request.assignments.size() ||
+            result_offset != std::numeric_limits<size_t>::max();
+        const BatchMmidAssociation mmid_assoc = plan_batch_mmid_association(
+            batch_mmid_eligible(request) && !force_fallback,
+            request.assignments.size(),
+            /* cpu_on_arrival = */ false,
+            force_dense,
+            mmid_subrange);
+        if (mmid_assoc.reason != batch_mmid_ineligible_reason::none &&
+                request_stats.n_batch_mmid_ineligible == 0) {
+            ++request_stats.n_batch_mmid_ineligible;
+            request_stats.batch_mmid_ineligible_reason = (int) mmid_assoc.reason;
+        }
+
         const bool arena_prefill_ok = arena_prefill_eligible(request, batch);
-        if (arena_prefill_ok) {
+        if (arena_prefill_ok && !mmid_assoc.use_mmid) {
             if (!add_previous && sel_begin == 0 &&
                     sel_end >= request.assignments.size() &&
                     n_selected == request.assignments.size() &&
@@ -11951,7 +12048,7 @@ private:
             request_stats.ns_arena_probe += probe_ns;
             request_stats.ns_vk_arena_probe += probe_ns;
         }
-        if (arena_ok &&
+        if (arena_ok && !mmid_assoc.use_mmid &&
                 sel_begin == 0 && sel_end >= request.assignments.size() &&
                 n_selected == request.assignments.size() &&
                 result_offset == std::numeric_limits<size_t>::max() &&
@@ -12098,17 +12195,9 @@ private:
             : 1;
 
         // WP_EXPERT_BATCH_MMID: 3 mul_mat_id (or fused gate||up + down) over
-        // the selected experts, weights left in their slots via expert_ptrs.
-        // Default OFF. Vulkan/CPU have no expert_ptrs channel and never enter.
-        // force_dense (WP_SELFCHECK reference) stays on the per-expert path.
-        const bool batch_mmid =
-            !force_fallback && !force_dense &&
-            batch_mmid_eligible(request) &&
-            sel_begin == 0 &&
-            sel_end >= request.assignments.size() &&
-            n_selected == request.assignments.size() &&
-            result_offset == std::numeric_limits<size_t>::max();
-        if (batch_mmid) {
+        // the full assignment set. Path is plan_batch_mmid_association: residency
+        // and n_pagein must not pick per-expert vs mmid.
+        if (mmid_assoc.use_mmid) {
             record_vk_setup();
             if (compute_batch_mmid(
                     request, pages, batch, selected, n_selected, add_previous,
@@ -12148,6 +12237,7 @@ private:
             return e != nullptr && e[0] != '\0' && e[0] != '0';
         }();
         const bool d3_grouped =
+            !mmid_assoc.use_mmid &&
             !persistent_graphs &&
             (grouped_gemv || (s_batch_moe && !use_gather) || (s_worker_collapse && !use_gather)) &&
                 sel_begin == 0 &&
@@ -13118,6 +13208,9 @@ private:
 
         ggml_tensor * result = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
         ggml_tensor * sum = add_previous ? result : nullptr;
+        // Left fold over ids-slot k in assignment order. Host sequential add,
+        // not a tree and not an atomic reduction. Pad slots have route_w 0 and
+        // dummy weights copied from expert 0, so 0 * finite = 0.
         for (size_t k = 0; k < (size_t) k_width; ++k) {
             ggml_tensor * contrib = ggml_view_2d(
                 ctx.get(), weighted, n_embd, (int64_t) n_tokens,
@@ -15669,6 +15762,10 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_d3_bounce += src.n_d3_bounce;
     dst.n_batch_mmid_hit += src.n_batch_mmid_hit;
     dst.n_batch_mmid_fallback += src.n_batch_mmid_fallback;
+    dst.n_batch_mmid_ineligible += src.n_batch_mmid_ineligible;
+    if (src.batch_mmid_ineligible_reason != 0) {
+        dst.batch_mmid_ineligible_reason = src.batch_mmid_ineligible_reason;
+    }
     dst.n_mmid_ptrs_set += src.n_mmid_ptrs_set;
     dst.n_mmid_ptrs_consumed += src.n_mmid_ptrs_consumed;
     dst.n_mmid_ptrs_discarded += src.n_mmid_ptrs_discarded;
