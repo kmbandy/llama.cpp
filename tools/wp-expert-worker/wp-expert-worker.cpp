@@ -45,6 +45,7 @@ extern "C" {
 #include <sstream>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1322,6 +1323,11 @@ struct RequestStats {
     uint64_t ns_h2d = 0;
     uint64_t bytes_h2d = 0;
     uint64_t n_reader_h2d = 0;  // WP_READER_H2D: pages uploaded by a reader thread
+    uint64_t n_copy_stream_ok = 0;
+    uint64_t n_copy_stream_fallback = 0;
+    uint64_t ns_h2d_issue = 0;
+    uint64_t ns_h2d_complete = 0;
+    uint64_t n_pagein_sorted = 0;
     // ROUTING DENSITY (2026-08-04). compute_batch runs the FULL FFN for every
     // assigned expert over ALL request.n_tokens and then multiplies by a
     // per-token router weight that is ZERO for tokens not routed to that expert
@@ -1535,6 +1541,14 @@ public:
         n_pinned_demand_hits_ = demand_hits;
     }
 
+    void note_distinct_page(int layer, int expert) {
+        if (!enabled_) {
+            return;
+        }
+        distinct_pages_.insert(
+            ((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert);
+    }
+
     ~WorkerStats() {
         report();
     }
@@ -1645,6 +1659,11 @@ public:
         ns_h2d_ += request.ns_h2d;
         bytes_h2d_ += request.bytes_h2d;
         n_reader_h2d_ += request.n_reader_h2d;
+        n_copy_stream_ok_ += request.n_copy_stream_ok;
+        n_copy_stream_fallback_ += request.n_copy_stream_fallback;
+        ns_h2d_issue_ += request.ns_h2d_issue;
+        ns_h2d_complete_ += request.ns_h2d_complete;
+        n_pagein_sorted_ += request.n_pagein_sorted;
         ns_demote_ += request.ns_demote;
         ns_ensure_post_ += request.ns_ensure_post;
         n_read_inflight_max_ = std::max(n_read_inflight_max_, request.n_read_inflight_max);
@@ -1743,6 +1762,12 @@ private:
                   << " gb_s_h2d=" << (ns_h2d_ == 0 ? 0.0 :
                         (double) bytes_h2d_ / (double) ns_h2d_)
                   << " n_reader_h2d=" << n_reader_h2d_
+                  << " n_copy_stream_ok=" << n_copy_stream_ok_
+                  << " n_copy_stream_fallback=" << n_copy_stream_fallback_
+                  << " ns_h2d_issue=" << ns_h2d_issue_
+                  << " ns_h2d_complete=" << ns_h2d_complete_
+                  << " n_pagein_sorted=" << n_pagein_sorted_
+                  << " n_distinct_pages=" << distinct_pages_.size()
                   << " staging_kind=" << staging_kind_
                   << " ns_host_get=" << ns_host_get_
                   << " ns_demote=" << ns_demote_
@@ -1993,6 +2018,12 @@ private:
     std::string       device_;
     uint64_t          bytes_h2d_  = 0;
     uint64_t          n_reader_h2d_ = 0;
+    uint64_t          n_copy_stream_ok_ = 0;
+    uint64_t          n_copy_stream_fallback_ = 0;
+    uint64_t          ns_h2d_issue_ = 0;
+    uint64_t          ns_h2d_complete_ = 0;
+    uint64_t          n_pagein_sorted_ = 0;
+    std::unordered_set<uint64_t> distinct_pages_;
     std::string       staging_kind_ = "unknown";
     uint64_t          n_requests_ = 0;
     uint64_t          n_experts_  = 0;
@@ -3627,6 +3658,34 @@ bool staging_pinned_env_enabled() {
     return env == nullptr || env[0] == '\0' || env[0] != '0';
 }
 
+static bool wp_copy_stream_events_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_EXPERT_COPY_STREAM_EVENTS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool wp_pagein_sort_offset() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_PAGEIN_SORT");
+        if (e != nullptr && std::strcmp(e, "offset") == 0) {
+            return true;
+        }
+        const char * old = std::getenv("WP_EXPERT_OFFSET_SORT");
+        return old != nullptr && old[0] != '\0' && old[0] != '0';
+    }();
+    return enabled;
+}
+
+static bool wp_hip_is_cuda_backend() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_HIP_IS_CUDA_BACKEND");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
 class StagingPool {
 public:
     StagingPool(const ResourcePlan & resources, ggml_backend_t backend) :
@@ -3775,7 +3834,9 @@ public:
         std::cerr << "wp expert worker: staging_kind="
                   << (pinned_ ? "pinned" : "pageable")
                   << " async_h2d=" << (async_h2d_ ? "on" : "off")
-                  << " copy_stream=" << (copy_stream_h2d_ ? "on" : "off") << std::endl;
+                  << " copy_stream=" << (copy_stream_h2d_ ? "on" : "off")
+                  << " copy_stream_events="
+                  << (wp_copy_stream_events_enabled() ? "on" : "off") << std::endl;
     }
 
     ~StagingPool() {
@@ -4711,6 +4772,14 @@ public:
         void complete();
 
         void wait_copy_event(ggml_backend_t backend) const {
+            // Per-page copy-stream events first (WP_EXPERT_COPY_STREAM_EVENTS).
+            // Host event_synchronize is not enough on gfx1201 (MAD-114):
+            // S_compute must wait on E_page before any kernel reads the slot.
+            for (ggml_backend_event_t event : copy_wait_events_) {
+                if (event != nullptr) {
+                    ggml_backend_event_wait(backend, event);
+                }
+            }
             if (copy_event_ != nullptr) {
                 ggml_backend_event_wait(backend, copy_event_);
             }
@@ -4745,6 +4814,26 @@ public:
         // the backend doesn't support it), same as every other WP_* stat.
         uint64_t n_reader_h2d() const {
             return n_reader_h2d_;
+        }
+
+        uint64_t n_copy_stream_ok() const {
+            return n_copy_stream_ok_;
+        }
+
+        uint64_t n_copy_stream_fallback() const {
+            return n_copy_stream_fallback_;
+        }
+
+        uint64_t ns_h2d_issue() const {
+            return ns_h2d_issue_;
+        }
+
+        uint64_t ns_h2d_complete() const {
+            return ns_h2d_complete_;
+        }
+
+        uint64_t n_pagein_sorted() const {
+            return n_pagein_sorted_;
         }
 
         uint64_t n_read_inflight_max() const {
@@ -4814,8 +4903,19 @@ public:
             size_t slot_index = std::numeric_limits<size_t>::max();
             bool   hit        = false;
             bool   ready      = false;
+            bool   copy_pending = false;
             bool   cpu_on_arrival = false;
             std::shared_ptr<StagingPool::Lease> cpu_staging;
+            uint64_t upload_hash = 0;
+            bool upload_hash_valid = false;
+        };
+
+        struct PendingCopy {
+            size_t entry_index = 0;
+            size_t slot_index = 0;
+            const ExpertPage * page = nullptr;
+            ggml_backend_event_t event = nullptr;
+            std::chrono::steady_clock::time_point issued{};
             uint64_t upload_hash = 0;
             bool upload_hash_valid = false;
         };
@@ -4845,12 +4945,19 @@ public:
         uint64_t                   ns_h2d_    = 0;
         uint64_t                   bytes_h2d_ = 0;
         uint64_t                   n_reader_h2d_ = 0;
+        uint64_t                   n_copy_stream_ok_ = 0;
+        uint64_t                   n_copy_stream_fallback_ = 0;
+        uint64_t                   ns_h2d_issue_ = 0;
+        uint64_t                   ns_h2d_complete_ = 0;
+        uint64_t                   n_pagein_sorted_ = 0;
         uint64_t                   n_read_inflight_max_ = 0;
         uint64_t                   ns_read_issue_ = 0;
         uint64_t                   ns_read_complete_ = 0;
         uint64_t                   n_cpu_on_arrival_ = 0;
         uint64_t                   n_cpu_on_arrival_fallback_ = 0;
         ggml_backend_event_t       copy_event_ = nullptr;
+        std::vector<PendingCopy>   pending_copies_;
+        std::vector<ggml_backend_event_t> copy_wait_events_;
         // Drain state. Lives on the Batch rather than in complete_batch's frame
         // so a drain can stop part-way (complete_upto) and be resumed. A read
         // that FAILED never sets entry.ready, so every drain loop is bounded by
@@ -5205,17 +5312,10 @@ public:
                 }
             };
 
-            // WP_EXPERT_OFFSET_SORT=1 -- read page-ins in (blob, offset) order
-            // instead of assignment order. Slots are already assigned above and
-            // compute order stays assignment order regardless of read order, so
-            // output is byte-identical by construction. Prefill batches average
-            // ~31 page-ins; sequentializing the seeks is Kimi's prefill lever,
-            // aimed at the 2026 SN750 (3.1 GB/s, the slower shard) most of all.
-            static const bool s_offset_sort = [] {
-                const char * e = std::getenv("WP_EXPERT_OFFSET_SORT");
-                return e != nullptr && e[0] != '\0' && e[0] != '0';
-            }();
-            if (s_offset_sort) {
+            // WP_PAGEIN_SORT=offset -- issue this request's misses in file
+            // offset order. Same bytes, same slots, only reader issue order.
+            // WP_EXPERT_OFFSET_SORT=1 is the older alias. Default off.
+            if (wp_pagein_sort_offset() && !pageins.empty()) {
                 std::sort(pageins.begin(), pageins.end(),
                           [&pages](size_t a, size_t b) {
                               const ExpertPage & pa = *pages[a];
@@ -5223,6 +5323,7 @@ public:
                               if (pa.blob != pb.blob) { return pa.blob < pb.blob; }
                               return pa.offset < pb.offset;
                           });
+                batch.n_pagein_sorted_ = pageins.size();
             }
             batch.state_ = std::make_shared<BatchState>();
             batch.state_->conn_index = conn_index;
@@ -6781,6 +6882,62 @@ private:
         }
     }
 
+    void publish_pagein_slot(Batch & batch, size_t entry_index, size_t slot_index,
+                             const ExpertPage & page,
+                             uint64_t upload_hash, bool upload_hash_valid) {
+        Slot & slot = slots_[slot_index];
+        slot.valid = true;
+        slot.key   = { page.layer, page.expert };
+        slot_index_[slot_key(page.layer, page.expert)] = slot_index;
+        slot.cache_id = page.cache_id;
+        slot.page     = &page;
+        slot.size     = page.size;
+        slot.tick     = ++tick_;
+        slot.uses     = lfu_history_enabled_ ? history_uses(page) : evict_age_ + 1;
+        slot.upload_hash = upload_hash;
+        slot.upload_hash_valid = upload_hash_valid;
+        Batch::Entry & entry = batch.entries_[entry_index];
+        entry.loaded = { slot.buffer, slot.raw->data };
+        entry.upload_hash = upload_hash;
+        entry.upload_hash_valid = upload_hash_valid;
+        entry.copy_pending = false;
+        entry.ready = true;
+    }
+
+    // Host-sync copy-stream events for entries below entry_end, then mark
+    // those slots valid. Issue-vs-complete is ns_h2d_issue (API) vs
+    // ns_h2d_complete (event_synchronize - issue). S_compute still waits
+    // on the harvested events in wait_copy_event (MAD-114).
+    void harvest_copy_events(Batch & batch, size_t entry_end) {
+        if (batch.pending_copies_.empty()) {
+            return;
+        }
+        const bool measure = batch.state_ != nullptr && batch.state_->measure;
+        auto it = batch.pending_copies_.begin();
+        while (it != batch.pending_copies_.end()) {
+            if (it->entry_index >= entry_end) {
+                ++it;
+                continue;
+            }
+            if (it->event != nullptr) {
+                ggml_backend_event_synchronize(it->event);
+                if (measure) {
+                    batch.ns_h2d_complete_ += (uint64_t) std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - it->issued).count();
+                }
+                batch.copy_wait_events_.push_back(it->event);
+                it->event = nullptr;
+            }
+            if (it->page != nullptr) {
+                publish_pagein_slot(
+                    batch, it->entry_index, it->slot_index, *it->page,
+                    it->upload_hash, it->upload_hash_valid);
+            }
+            it = batch.pending_copies_.erase(it);
+        }
+    }
+
     // Process exactly ONE completed read: H2D it into its slot and mark the
     // entry ready. Split out of complete_batch so a drain can stop part-way.
     void drain_one_read(Batch & batch) {
@@ -6845,6 +7002,7 @@ private:
                 }
             } else {
                 Slot & slot = slots_[pagein.slot_index];
+                bool copy_stream_async = false;
                 if (result->uploaded) {
                     // WP_READER_H2D already performed this page's H2D on the
                     // reader thread (the last-stripe branch in
@@ -6868,12 +7026,13 @@ private:
                                   std::chrono::steady_clock::time_point();
                 // Upload ONLY this stripe, at its own offset. With one stripe
                 // this is the original whole-page (0, page.size) call.
-                // Async mode: issue on the compute stream and fence the staging
-                // buffer (see StagingPool::mark_in_flight). Compute correctness
-                // needs no fence -- the graph runs on the same stream, after
-                // this copy. NOTE ns_h2d then measures ISSUE time, not copy
-                // time; the copy overlaps reads/submit and the A/B metric is
-                // the request wall.
+                // Copy-stream path: issue on S_copy. Default still publishes
+                // immediately after the API returns. WP_EXPERT_COPY_STREAM_EVENTS
+                // delays slot.valid until E_page completes (see harvest).
+                const bool wanted_copy_stream =
+                    !batch.state_->speculative && staging_.copy_stream_h2d();
+                bool used_copy_stream = false;
+                bool used_fallback = false;
                 if (pagein.page->device_size != pagein.page->size) {
                     // The copy-stream event does not order cudaStreamPerThread.
                     // Clear the tail before issuing the H2D so the event covers
@@ -6885,44 +7044,61 @@ private:
                         [&](size_t source_offset, size_t device_offset, size_t n) {
                         const char * source =
                             (const char *) result->staging->get() + result->offset + source_offset;
-                        if (!batch.state_->speculative && staging_.copy_stream_h2d() &&
+                        if (wanted_copy_stream &&
                             ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
                             ggml_backend_cuda_wp_copy_tensor_async(
                                 backend_, slot.raw, source, device_offset, n)) {
+                            used_copy_stream = true;
                             async_copy = true;
                         } else if (!batch.state_->speculative && staging_.async_h2d()) {
+                            used_fallback = wanted_copy_stream;
                             ggml_backend_tensor_set_async(
                                 backend_, slot.raw, source, device_offset, n);
                             async_copy = true;
                         } else {
+                            used_fallback = wanted_copy_stream;
                             ggml_backend_tensor_set(slot.raw, source, device_offset, n);
                         }
                     });
                     if (async_copy) {
                         staging_.mark_in_flight(result->staging->get());
                     }
-                } else if (!batch.state_->speculative && staging_.copy_stream_h2d() &&
+                } else if (wanted_copy_stream &&
                            ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
                            ggml_backend_cuda_wp_copy_tensor_async(
                                backend_, slot.raw, (const char *) result->staging->get() + result->offset,
                                result->offset, result->len)) {
+                    used_copy_stream = true;
                     staging_.mark_in_flight(result->staging->get());
                 } else if (!batch.state_->speculative && staging_.async_h2d()) {
+                    used_fallback = wanted_copy_stream;
                     ggml_backend_tensor_set_async(
                         backend_,
                         slot.raw, (const char *) result->staging->get() + result->offset,
                         result->offset, result->len);
                     staging_.mark_in_flight(result->staging->get());
                 } else {
+                    used_fallback = wanted_copy_stream;
                     ggml_backend_tensor_set(
                         slot.raw, (const char *) result->staging->get() + result->offset,
                         result->offset, result->len);
                 }
+                const uint64_t h2d_issue_ns = measure_h2d
+                    ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - h2d_started).count()
+                    : 0;
                 if (measure_h2d) {
-                    batch.ns_h2d_ +=
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - h2d_started).count();
+                    batch.ns_h2d_ += h2d_issue_ns;
+                    batch.ns_h2d_issue_ += h2d_issue_ns;
                     batch.bytes_h2d_ += result->len;
+                }
+                copy_stream_async = used_copy_stream && !used_fallback;
+                if (result->last) {
+                    if (copy_stream_async) {
+                        ++batch.n_copy_stream_ok_;
+                    } else if (wanted_copy_stream) {
+                        ++batch.n_copy_stream_fallback_;
+                    }
                 }
                 }
                 // Everything below publishes the page to the compute path and so
@@ -6971,26 +7147,37 @@ private:
                                          result->staging->get(),
                                          (size_t) pagein.page->size);
                     }
-                    slot.valid = true;
-                    slot.key   = {
-                        pagein.page->layer, pagein.page->expert
-                    };
-                    slot_index_[slot_key(pagein.page->layer, pagein.page->expert)] =
-                        pagein.slot_index;
-                    slot.cache_id = pagein.page->cache_id;
-                    slot.page     = pagein.page;
-                    slot.size     = pagein.page->size;
-                    slot.tick  = ++tick_;
-                    slot.uses  = lfu_history_enabled_ ? history_uses(*pagein.page) :
-                                  evict_age_ + 1;
-                    Batch::Entry & entry =
-                        batch.entries_[pagein.entry_index];
-                    entry.loaded = {
-                        slot.buffer, slot.raw->data
-                    };
-                    entry.upload_hash = slot.upload_hash;
-                    entry.upload_hash_valid = slot.upload_hash_valid;
-                    entry.ready = true;
+                    const bool delay_valid =
+                        wp_copy_stream_events_enabled() && copy_stream_async;
+                    if (delay_valid) {
+                        ggml_backend_event_t ev = staging_.new_copy_event();
+                        if (ev != nullptr && staging_.record_copy_event(ev)) {
+                            Batch::PendingCopy pending;
+                            pending.entry_index = pagein.entry_index;
+                            pending.slot_index = pagein.slot_index;
+                            pending.page = pagein.page;
+                            pending.event = ev;
+                            pending.issued = std::chrono::steady_clock::now();
+                            pending.upload_hash = slot.upload_hash;
+                            pending.upload_hash_valid = slot.upload_hash_valid;
+                            batch.pending_copies_.push_back(pending);
+                            batch.entries_[pagein.entry_index].copy_pending = true;
+                        } else {
+                            if (ev != nullptr) {
+                                ggml_backend_event_free(ev);
+                            }
+                            publish_pagein_slot(
+                                batch, pagein.entry_index, pagein.slot_index,
+                                *pagein.page, slot.upload_hash, slot.upload_hash_valid);
+                            if (batch.copy_event_ != nullptr) {
+                                staging_.record_copy_event(batch.copy_event_);
+                            }
+                        }
+                    } else {
+                        publish_pagein_slot(
+                            batch, pagein.entry_index, pagein.slot_index,
+                            *pagein.page, slot.upload_hash, slot.upload_hash_valid);
+                    }
                 }
             }
             // received_ counts PAGES, not stripes -- complete_batch's loop is
@@ -7013,8 +7200,11 @@ private:
         }
         const auto range_pending = [&]() {
             for (const PageIn & pagein : batch.state_->pageins) {
-                if (pagein.entry_index < entry_end &&
-                    !batch.entries_[pagein.entry_index].ready) {
+                if (pagein.entry_index >= entry_end) {
+                    continue;
+                }
+                const Batch::Entry & entry = batch.entries_[pagein.entry_index];
+                if (!entry.ready && !entry.copy_pending) {
                     return true;
                 }
             }
@@ -7025,10 +7215,14 @@ private:
         while (batch.received_ < batch.state_->pageins.size() && range_pending()) {
             drain_one_read(batch);
         }
+        harvest_copy_events(batch, entry_end);
         // A partial drain may have issued H2D copies on the dedicated copy
         // stream. Fence those copies before compute starts; complete() records
         // the final fence too, but that is after the overlapped compute point.
-        if (batch.copy_event_ != nullptr &&
+        // With WP_EXPERT_COPY_STREAM_EVENTS the per-page events in
+        // copy_wait_events_ are the fence; skip a covering record that would
+        // also wait later pages issued during this drain.
+        if (!wp_copy_stream_events_enabled() && batch.copy_event_ != nullptr &&
                 !staging_.record_copy_event(batch.copy_event_)) {
             ggml_backend_event_free(batch.copy_event_);
             batch.copy_event_ = nullptr;
@@ -7054,13 +7248,15 @@ private:
         while (batch.received_ < batch.state_->pageins.size()) {
             drain_one_read(batch);
         }
+        harvest_copy_events(batch, std::numeric_limits<size_t>::max());
 
         for (std::thread & worker : batch.workers_) {
             worker.join();
         }
         batch.workers_.clear();
         batch.completed_ = true;
-        if (batch.copy_event_ != nullptr && !staging_.record_copy_event(batch.copy_event_)) {
+        if (!wp_copy_stream_events_enabled() &&
+                batch.copy_event_ != nullptr && !staging_.record_copy_event(batch.copy_event_)) {
             ggml_backend_event_free(batch.copy_event_);
             batch.copy_event_ = nullptr;
         }
@@ -8312,12 +8508,19 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     ns_h2d_(other.ns_h2d_),
     bytes_h2d_(other.bytes_h2d_),
     n_reader_h2d_(other.n_reader_h2d_),
+    n_copy_stream_ok_(other.n_copy_stream_ok_),
+    n_copy_stream_fallback_(other.n_copy_stream_fallback_),
+    ns_h2d_issue_(other.ns_h2d_issue_),
+    ns_h2d_complete_(other.ns_h2d_complete_),
+    n_pagein_sorted_(other.n_pagein_sorted_),
     n_read_inflight_max_(other.n_read_inflight_max_),
     ns_read_issue_(other.ns_read_issue_),
     ns_read_complete_(other.ns_read_complete_),
     n_cpu_on_arrival_(other.n_cpu_on_arrival_),
     n_cpu_on_arrival_fallback_(other.n_cpu_on_arrival_fallback_),
     copy_event_(other.copy_event_),
+    pending_copies_(std::move(other.pending_copies_)),
+    copy_wait_events_(std::move(other.copy_wait_events_)),
     // Drain state travels with the batch. It was omitted here originally --
     // harmless while every move ran before the first drain (NRVO covered the
     // return paths), but spec_pagein_submit now moves a live batch into a
@@ -8334,15 +8537,30 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     have_read_time_(other.have_read_time_) {
     other.owner_ = nullptr;
     other.copy_event_ = nullptr;
+    other.copy_wait_events_.clear();
 }
 
 ExpertSlotPool::Batch::~Batch() {
+    if (owner_ != nullptr) {
+        owner_->abandon_batch(*this);
+        owner_ = nullptr;
+    }
+    for (Batch::PendingCopy & pending : pending_copies_) {
+        if (pending.event != nullptr) {
+            ggml_backend_event_free(pending.event);
+            pending.event = nullptr;
+        }
+    }
+    pending_copies_.clear();
+    for (ggml_backend_event_t event : copy_wait_events_) {
+        if (event != nullptr) {
+            ggml_backend_event_free(event);
+        }
+    }
+    copy_wait_events_.clear();
     if (copy_event_ != nullptr) {
         ggml_backend_event_free(copy_event_);
         copy_event_ = nullptr;
-    }
-    if (owner_ != nullptr) {
-        owner_->abandon_batch(*this);
     }
 }
 
@@ -8476,6 +8694,15 @@ public:
         stats_.set_staging_kind(pool_.staging_kind());
         stats_.set_device(device);
         device_name_ = device;
+        {
+            const char * bname = ggml_backend_name(backend_.get());
+            std::cerr << "wp expert worker: backend_name="
+                      << (bname != nullptr ? bname : "?")
+                      << " is_cuda_backend=" << (is_cuda_backend() ? 1 : 0)
+                      << " pagein_sort="
+                      << (wp_pagein_sort_offset() ? "offset" : "off")
+                      << std::endl;
+        }
         for (auto & kv : catalog_.pages) {
             if (page_owner_ && !page_owner_(kv.second.layer, kv.second.expert)) {
                 continue;
@@ -9612,6 +9839,7 @@ public:
             pages.push_back(&catalog_.pages.at({
                 request.layer, assignment.expert_id
             }));
+            stats_.note_distinct_page(request.layer, assignment.expert_id);
         }
         if (!prepared.has_value()) {
             note_demand_prefetch_lateness(pages);
@@ -9635,6 +9863,7 @@ public:
             request_stats.ns_demote = batch.ns_demote();
             request_stats.ns_ensure_post = batch.ns_ensure_post();
             request_stats.host_bytes = batch.host_bytes();
+            request_stats.n_pagein_sorted = batch.n_pagein_sorted();
         }
         const bool cpu_on_arrival_request = batch.n_cpu_on_arrival() != 0;
 
@@ -9939,6 +10168,11 @@ public:
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
             request_stats.n_reader_h2d = batch.n_reader_h2d();
+            request_stats.n_copy_stream_ok = batch.n_copy_stream_ok();
+            request_stats.n_copy_stream_fallback = batch.n_copy_stream_fallback();
+            request_stats.ns_h2d_issue = batch.ns_h2d_issue();
+            request_stats.ns_h2d_complete = batch.ns_h2d_complete();
+            request_stats.n_pagein_sorted = batch.n_pagein_sorted();
             request_stats.n_cpu_on_arrival = batch.n_cpu_on_arrival();
             request_stats.n_cpu_on_arrival_fallback = batch.n_cpu_on_arrival_fallback();
         }
@@ -10311,7 +10545,17 @@ public:
 
     bool is_cuda_backend() const {
         const char * name = ggml_backend_name(backend_.get());
-        return name != nullptr && std::strstr(name, "CUDA") != nullptr;
+        if (name == nullptr) {
+            return false;
+        }
+        if (std::strstr(name, "CUDA") != nullptr) {
+            return true;
+        }
+        if (!wp_hip_is_cuda_backend()) {
+            return false;
+        }
+        return std::strstr(name, "ROCm") != nullptr ||
+               std::strstr(name, "HIP") != nullptr;
     }
 
     ggml_backend_graph_plan_t create_persistent_plan(ggml_cgraph * graph) {
@@ -15245,6 +15489,11 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.ns_h2d += src.ns_h2d;
     dst.bytes_h2d += src.bytes_h2d;
     dst.n_reader_h2d += src.n_reader_h2d;
+    dst.n_copy_stream_ok += src.n_copy_stream_ok;
+    dst.n_copy_stream_fallback += src.n_copy_stream_fallback;
+    dst.ns_h2d_issue += src.ns_h2d_issue;
+    dst.ns_h2d_complete += src.ns_h2d_complete;
+    dst.n_pagein_sorted += src.n_pagein_sorted;
     dst.n_weight_nonzero += src.n_weight_nonzero;
     dst.n_weight_total += src.n_weight_total;
     dst.n_gcache_hit += src.n_gcache_hit;
