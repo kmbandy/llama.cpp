@@ -27,6 +27,13 @@ struct SlotClass {
     int      slots     = 0;
     int      pin_floor = 0;
     int      pages     = 0;
+    // Slots of this class the pool ACTUALLY carved, i.e. `slots` minus the pad
+    // tail of every arena of the class (and minus anything an exhausted arena
+    // run could not carve). 0 until ExpertSlotPool's constructor fills it in;
+    // plan_resources() leaves it 0 because pads are only known once the arenas
+    // exist. This -- not `slots` -- is how many pages of this class a device
+    // can hold resident, so it is what the ownership policy budgets against.
+    int      usable_slots = 0;
     // PAD slots actually reserved per arena of THIS class, filled in by
     // ExpertSlotPool's constructor after allocate_slot_arenas() runs (0 until
     // then). May differ class-to-class from ResourcePlan::pad_slots_per_arena
@@ -208,6 +215,100 @@ bool use_mm_pin(uint32_t n_tokens, bool use_gather, mm_pin_mode mode,
 // with "!" ("!Vulkan0") is on for every device except those named. Whitespace
 // around the whole value and around each comma-separated name is ignored.
 bool parse_arena_prefill_enabled(const char * env, const std::string & device_name);
+
+// ---------------------------------------------------------------------------
+// WP_EXPERT_OWNER_POLICY -- which device OWNS (and therefore pages in) an
+// expert page on a multi-device worker.
+//
+// Whatever the policy, the map MUST be static for the life of the process and
+// a pure function of (pin file, device list, slot counts). Measured 2026-09-02:
+// gfx1030 and gfx1201 are each self-deterministic but never bit-identical to
+// each other, so a page that moves from one to the other between runs changes
+// the output md5. No timing, no hash order, no live counters may reach it.
+enum class owner_policy {
+    // Today's behaviour, and the default: the expert-id range is cut into
+    // contiguous bands proportional to each device's slot count, in
+    // device-list order. Every device then takes the same miss rate per owned
+    // expert -- which is why the slow-link device (ROCm1 behind a 2.78 GB/s
+    // Thunderbolt x4 link, measured 2026-09-02) paged 61.7 GB over one run and
+    // became the rig's straggler.
+    proportional,
+    // Hot-set first. Pages are ranked by their WP_EXPERT_PIN_FILE warm-start
+    // counts and packed, hottest first, into the highest-priority device up to
+    // its USABLE slot capacity in that page's size class, then the next
+    // device, and so on. The top-priority device therefore owns exactly a hot
+    // set it can hold FULLY RESIDENT, and stops paging over its slow link.
+    hot,
+};
+
+// unset / "" / "proportional" -> proportional. "hot" -> hot. Anything else
+// warns on stderr and falls back to proportional. Leading/trailing whitespace
+// is ignored.
+owner_policy parse_owner_policy(const char * env);
+
+// WP_EXPERT_OWNER_PRIORITY: comma-separated device names, HIGHEST priority
+// first. Returns indices into `device_names`. Names that are not in
+// `device_names` are ignored (with a warning); devices the list does not name
+// are appended in device-list order. The result is always a permutation of
+// [0, device_names.size()), so an unset/empty env yields the device-list order
+// itself -- the documented default.
+std::vector<size_t> parse_owner_priority(
+        const char * env, const std::vector<std::string> & device_names);
+
+// The proportional split, factored out of the worker so a test can pin it.
+// Byte-for-byte the pre-WP_EXPERT_OWNER_POLICY behaviour.
+size_t proportional_owner_for_expert(
+        int expert, int expert_first, int expert_last,
+        const std::vector<int> & device_slots);
+
+// Sentinel page class for a page the placement policy does not manage (a
+// resident-layer page). Such pages always keep their proportional owner.
+constexpr size_t HOT_OWNER_NO_CLASS = (size_t) -1;
+
+struct HotOwnerInput {
+    size_t n_devices = 0;
+    // Per page id. page_class[i] is the placement size class of page i, or
+    // HOT_OWNER_NO_CLASS.
+    std::vector<size_t> page_class;
+    // Per page id: the proportional owner, used as the last-resort fallback.
+    std::vector<size_t> page_static_owner;
+    // capacity[class][device] -- USABLE owner slots (SlotClass::usable_slots,
+    // so pad slots are already excluded).
+    std::vector<std::vector<size_t>> capacity;
+    // Page ids, hottest first. Duplicates and out-of-range ids are skipped.
+    std::vector<size_t> ranked;
+    // Device indices, highest priority first.
+    std::vector<size_t> priority;
+};
+
+struct HotOwnerPlan {
+    std::vector<size_t> owner;        // per page id
+    std::vector<char>   from_ranked;  // per page id: came off `ranked`, not the fallback
+};
+
+// Pure core of WP_EXPERT_OWNER_POLICY=hot. Deterministic: it reads only its
+// argument, and every loop is over an index range or an explicitly sorted
+// vector.
+//
+//  1. Walk `ranked` in order. Assign each page to the FIRST device in
+//     `priority` order that still has free capacity in that page's class,
+//     decrementing that capacity. A page whose class has no free capacity on
+//     any device is left for the fallback (so is every page `ranked` never
+//     mentions).
+//  2. FALLBACK, per size class, over the still-unassigned pages of that class
+//     sorted by ascending page id (K of them): spread them proportionally over
+//     the devices that still have capacity left in the class, weighted by that
+//     REMAINING capacity, using the same integer-band idiom as the
+//     proportional policy (page k of K goes to the device whose cumulative
+//     weight band contains k*W/K). The spread does not consume capacity: K is
+//     normally far larger than W, and every one of these pages is a cold page
+//     that will be paged in on demand wherever it lands.
+//     If no device has remaining capacity in the class, the weights fall back
+//     to the class's TOTAL capacity, so pages still avoid a device that cannot
+//     physically hold their size class. If that is empty too, the page keeps
+//     its proportional owner.
+//  3. HOT_OWNER_NO_CLASS pages keep their proportional owner.
+HotOwnerPlan plan_hot_owner_map(const HotOwnerInput & in);
 
 // Compact a router-weight row to the tokens that actually route here.
 // Empty (all-zero) rows keep a single dummy index 0 / weight 0 so the

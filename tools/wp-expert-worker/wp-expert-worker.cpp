@@ -370,6 +370,174 @@ bool parse_arena_prefill_enabled(const char * env, const std::string & device_na
     return negate ? !listed : listed;
 }
 
+// ---------------------------------------------------------------------------
+// WP_EXPERT_OWNER_POLICY. See the contract on wp-expert-worker.h; these are
+// deliberately pure functions of their arguments so the CPU unit test can pin
+// both the pre-existing proportional map and the new hot map without standing
+// up a multi-device worker.
+
+owner_policy parse_owner_policy(const char * env) {
+    if (env == nullptr) {
+        return owner_policy::proportional;
+    }
+    std::string value(env);
+    wp_trim_ascii_whitespace(value);
+    if (value.empty() || value == "proportional") {
+        return owner_policy::proportional;
+    }
+    if (value == "hot") {
+        return owner_policy::hot;
+    }
+    std::cerr << "WARN wp expert worker: unknown WP_EXPERT_OWNER_POLICY=" << value
+              << "; using proportional" << std::endl;
+    return owner_policy::proportional;
+}
+
+std::vector<size_t> parse_owner_priority(
+        const char * env, const std::vector<std::string> & device_names) {
+    std::vector<size_t> order;
+    std::vector<char> taken(device_names.size(), 0);
+    if (env != nullptr) {
+        std::string value(env);
+        wp_trim_ascii_whitespace(value);
+        size_t start = 0;
+        while (!value.empty() && start <= value.size()) {
+            const size_t comma = value.find(',', start);
+            std::string name = comma == std::string::npos
+                ? value.substr(start) : value.substr(start, comma - start);
+            wp_trim_ascii_whitespace(name);
+            if (!name.empty()) {
+                const auto it = std::find(device_names.begin(), device_names.end(), name);
+                if (it == device_names.end()) {
+                    std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_PRIORITY names "
+                                 "unknown device " << name << "; ignoring" << std::endl;
+                } else {
+                    const size_t index = (size_t) (it - device_names.begin());
+                    if (!taken[index]) {
+                        taken[index] = 1;
+                        order.push_back(index);
+                    }
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
+    for (size_t i = 0; i < device_names.size(); ++i) {
+        if (!taken[i]) {
+            order.push_back(i);
+        }
+    }
+    return order;
+}
+
+size_t proportional_owner_for_expert(
+        int expert, int expert_first, int expert_last,
+        const std::vector<int> & device_slots) {
+    if (device_slots.empty()) {
+        return 0;
+    }
+    const uint64_t count = expert_last >= expert_first
+        ? (uint64_t) (expert_last - expert_first) + 1 : 0;
+    const uint64_t ordinal = expert >= expert_first
+        ? (uint64_t) (expert - expert_first) : 0;
+    const uint64_t total = std::accumulate(
+        device_slots.begin(), device_slots.end(), (uint64_t) 0);
+    const uint64_t point = count > 0 ? ordinal * total / count : 0;
+    uint64_t begin = 0;
+    for (size_t i = 0; i < device_slots.size(); ++i) {
+        begin += (uint64_t) device_slots[i];
+        if (point < begin) {
+            return i;
+        }
+    }
+    return device_slots.size() - 1;
+}
+
+HotOwnerPlan plan_hot_owner_map(const HotOwnerInput & in) {
+    const size_t n_pages = in.page_class.size();
+    HotOwnerPlan plan;
+    plan.owner.assign(n_pages, 0);
+    plan.from_ranked.assign(n_pages, 0);
+    for (size_t id = 0; id < n_pages; ++id) {
+        plan.owner[id] = id < in.page_static_owner.size() ? in.page_static_owner[id] : 0;
+    }
+    std::vector<char> assigned(n_pages, 0);
+    std::vector<std::vector<size_t>> remaining = in.capacity;
+
+    // 1. Hottest first into the highest-priority device that still has a free
+    //    owner slot in this page's size class.
+    for (const size_t id : in.ranked) {
+        if (id >= n_pages || assigned[id]) {
+            continue;
+        }
+        const size_t class_id = in.page_class[id];
+        if (class_id == HOT_OWNER_NO_CLASS || class_id >= remaining.size()) {
+            continue;
+        }
+        for (const size_t device : in.priority) {
+            if (device >= remaining[class_id].size() || remaining[class_id][device] == 0) {
+                continue;
+            }
+            --remaining[class_id][device];
+            plan.owner[id]       = device;
+            plan.from_ranked[id] = 1;
+            assigned[id]         = 1;
+            break;
+        }
+    }
+
+    // 2. Everything the ranked pass did not place: a proportional spread over
+    //    the capacity that is LEFT, in ascending page-id order. Weights are the
+    //    remaining capacity per device; if nothing is left anywhere in the
+    //    class they become the class's total capacity, so a page still never
+    //    lands on a device that cannot hold its size class at all. The spread
+    //    does not consume capacity -- these are cold pages that will be paged
+    //    in on demand wherever they land, and there are normally far more of
+    //    them than there are free slots.
+    for (size_t class_id = 0; class_id < remaining.size(); ++class_id) {
+        std::vector<size_t> pages;
+        for (size_t id = 0; id < n_pages; ++id) {
+            if (!assigned[id] && in.page_class[id] == class_id) {
+                pages.push_back(id);
+            }
+        }
+        if (pages.empty()) {
+            continue;
+        }
+        std::vector<size_t> weights = remaining[class_id];
+        weights.resize(in.n_devices, 0);
+        uint64_t total = std::accumulate(weights.begin(), weights.end(), (uint64_t) 0);
+        if (total == 0) {
+            weights = in.capacity[class_id];
+            weights.resize(in.n_devices, 0);
+            total = std::accumulate(weights.begin(), weights.end(), (uint64_t) 0);
+        }
+        if (total == 0) {
+            // No device can hold this class; leave the proportional owner.
+            continue;
+        }
+        const uint64_t k_total = (uint64_t) pages.size();
+        for (uint64_t k = 0; k < k_total; ++k) {
+            const uint64_t point = k * total / k_total;
+            uint64_t begin = 0;
+            size_t   device = weights.size() - 1;
+            for (size_t d = 0; d < weights.size(); ++d) {
+                begin += (uint64_t) weights[d];
+                if (point < begin) {
+                    device = d;
+                    break;
+                }
+            }
+            plan.owner[pages[(size_t) k]] = device;
+            assigned[pages[(size_t) k]]   = 1;
+        }
+    }
+    return plan;
+}
+
 static bool wp_persistent_graphs_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("WP_PERSISTENT_GRAPHS");
@@ -578,6 +746,12 @@ static uint64_t lfu_hysteresis_pct_from_env() {
 static bool lfu_init_owner_from_env() {
     const char * env = std::getenv("WP_EXPERT_LFU_INIT_OWNER");
     return env != nullptr && env[0] == '1';
+}
+
+// WP_EXPERT_OWNER_POLICY -- proportional (default, today's behaviour) or hot.
+// See the enum's contract on wp-expert-worker.h.
+static owner_policy owner_policy_from_env() {
+    return parse_owner_policy(std::getenv("WP_EXPERT_OWNER_POLICY"));
 }
 
 static uint64_t placement_now_ns() {
@@ -4020,6 +4194,10 @@ public:
                 resources_.device_bytes +=
                     need * (uint64_t) (usable + arena_pad_slots_.at(arena_index));
             }
+            // What this class could ACTUALLY carve, which is `slots` minus the
+            // pad tail of each of its arenas. The ownership policy budgets
+            // against this, not against the planned `slots`.
+            slot_class.usable_slots = carved;
         }
         // HELLO, the pin budget and every "how many pages fit" number the spine
         // sees are driven by slot_count, so it must be the USABLE count.
@@ -14770,6 +14948,25 @@ public:
                 page_owner, &logs_));
         }
         initialize_placement_policy();
+        // WP_EXPERT_OWNER_POLICY=hot rewrites the owner map here: AFTER
+        // initialize_placement_policy() (which builds the size-class tables it
+        // budgets against) and BEFORE load_pin_file() (which pins through
+        // owning_device_for_page, so the hot set ends up both owned by and
+        // pinned/seeded into the top-priority device -- intended).
+        if (!single_device) {
+            std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_POLICY="
+                      << (owner_policy_ == owner_policy::hot ? "hot" : "proportional")
+                      << std::endl;
+        }
+        if (owner_policy_ == owner_policy::hot) {
+            if (single_device) {
+                std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_POLICY=hot on a "
+                             "single-device worker has nothing to place; ignoring"
+                          << std::endl;
+            } else {
+                apply_hot_owner_policy();
+            }
+        }
         if (!single_device) {
             load_pin_file();
         }
@@ -14782,22 +14979,9 @@ public:
 
     size_t static_owner_for_page(int layer, int expert) const {
         (void) layer;
-        const int first = catalog_.descriptor.expert_first;
-        const int last = catalog_.descriptor.expert_last;
-        const uint64_t count = last >= first
-            ? (uint64_t) (last - first) + 1 : 0;
-        const uint64_t ordinal = expert >= first ? (uint64_t) (expert - first) : 0;
-        const uint64_t total = std::accumulate(
-            device_slots_.begin(), device_slots_.end(), (uint64_t) 0);
-        const uint64_t point = count > 0 ? ordinal * total / count : 0;
-        uint64_t begin = 0;
-        for (size_t i = 0; i < device_slots_.size(); ++i) {
-            begin += (uint64_t) device_slots_[i];
-            if (point < begin) {
-                return i;
-            }
-        }
-        return device_slots_.size() - 1;
+        return proportional_owner_for_expert(
+            expert, catalog_.descriptor.expert_first,
+            catalog_.descriptor.expert_last, device_slots_);
     }
 
     pipe_expert_hello hello() const {
@@ -15658,8 +15842,208 @@ private:
                 }
             }
         }
+        // The same class -> device table, but budgeted against USABLE slots
+        // (pad tails already removed) instead of the planned per-class count.
+        // Only WP_EXPERT_OWNER_POLICY=hot reads it; placement_capacity_ above
+        // is left exactly as it was so the proportional and LFU paths stay
+        // byte-for-byte unchanged.
+        placement_usable_capacity_.assign(
+            placement_class_sizes_.size(), std::vector<size_t>(devices_.size(), 0));
+        for (size_t device_id = 0; device_id < devices_.size(); ++device_id) {
+            const ResourcePlan & resources = devices_[device_id]->resources();
+            for (size_t class_id = 0; class_id < placement_class_sizes_.size(); ++class_id) {
+                for (const SlotClass & slot_class : resources.slot_classes) {
+                    if ((use_size_classes && slot_class.size == placement_class_sizes_[class_id]) ||
+                            (!use_size_classes && slot_class.size >= placement_class_sizes_[class_id])) {
+                        placement_usable_capacity_[class_id][device_id] =
+                            (size_t) std::max(0, slot_class.usable_slots);
+                        break;
+                    }
+                }
+            }
+        }
+        // Inverse of placement_pages_by_class_. Pages the placement policy does
+        // not manage (resident layers) stay HOT_OWNER_NO_CLASS and keep their
+        // proportional owner -- they were already preloaded on that device by
+        // the DeviceWorker constructor's page_owner_ filter, so moving them
+        // would strand the copy.
+        placement_page_class_.assign(page_static_owners_.size(), HOT_OWNER_NO_CLASS);
+        for (size_t class_id = 0; class_id < placement_pages_by_class_.size(); ++class_id) {
+            for (const size_t id : placement_pages_by_class_[class_id]) {
+                if (id < placement_page_class_.size()) {
+                    placement_page_class_[id] = class_id;
+                }
+            }
+        }
         placement_ready_ = true;
         refresh_placement_snapshot();
+    }
+
+    // Ranked hot list for WP_EXPERT_OWNER_POLICY=hot, parsed from
+    // WP_EXPERT_PIN_FILE with the same line grammar load_pin_file() uses:
+    // "<layer> <expert>" plus the optional "  # <count>" tail that
+    // dump_access_counts() writes. '#'-leading lines, malformed lines and
+    // pages this shard does not serve are skipped; the first occurrence of a
+    // (layer, expert) wins.
+    //
+    // The production file is already sorted hottest-first, but nothing here
+    // relies on that: entries are STABLE-sorted by descending count, so ties
+    // (and a file with no counts at all) degrade to plain file order. Both the
+    // parse and the sort are pure functions of the file's bytes, which is what
+    // makes the resulting owner map reproducible launch to launch.
+    std::vector<size_t> ranked_pages_from_pin_file() const {
+        std::vector<size_t> ranked;
+        const char * const pin_path = std::getenv("WP_EXPERT_PIN_FILE");
+        if (pin_path == nullptr || pin_path[0] == '\0') {
+            std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_POLICY=hot without "
+                         "WP_EXPERT_PIN_FILE has no hot set; every page falls back"
+                      << std::endl;
+            return ranked;
+        }
+        std::ifstream pin_file(pin_path);
+        if (!pin_file) {
+            throw std::runtime_error(
+                "failed to open WP_EXPERT_PIN_FILE: " + std::string(pin_path));
+        }
+        std::vector<std::pair<uint64_t, size_t>> entries;
+        std::set<std::pair<int, int>> seen;
+        std::string line;
+        while (std::getline(pin_file, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::istringstream input(line);
+            int layer  = -1;
+            int expert = -1;
+            if (!(input >> layer >> expert)) {
+                continue;
+            }
+            const std::pair<int, int> key = {layer, expert};
+            if (!seen.insert(key).second) {
+                continue;
+            }
+            const auto it = catalog_.pages.find(key);
+            if (it == catalog_.pages.end() || it->second.cache_id < 0) {
+                continue;
+            }
+            uint64_t count = 0;
+            const size_t hash_pos = line.find('#');
+            if (hash_pos != std::string::npos) {
+                std::istringstream count_input(line.substr(hash_pos + 1));
+                uint64_t parsed = 0;
+                if (count_input >> parsed) {
+                    count = parsed;
+                }
+            }
+            entries.emplace_back(count, (size_t) it->second.cache_id);
+        }
+        std::stable_sort(entries.begin(), entries.end(),
+                         [](const std::pair<uint64_t, size_t> & a,
+                            const std::pair<uint64_t, size_t> & b) {
+                             return a.first > b.first;
+                         });
+        ranked.reserve(entries.size());
+        for (const std::pair<uint64_t, size_t> & entry : entries) {
+            ranked.push_back(entry.second);
+        }
+        return ranked;
+    }
+
+    // WP_EXPERT_OWNER_POLICY=hot. Runs ONCE, from the constructor, and then
+    // never again: LFU placement is force-disabled under this policy (see
+    // placement_enabled_ below), so page_current_owner_ can never change after
+    // startup. That is a hard requirement, not a nicety -- gfx1030 and gfx1201
+    // are each self-deterministic but never bit-identical to each other, so a
+    // page that migrates between them changes the run's output md5.
+    //
+    // CAVEAT, deliberate. Each DeviceWorker's ResourcePlan was already planned
+    // from the PROPORTIONAL page set: page_owner_ is consulted only inside the
+    // DeviceWorker constructor, which has already run by the time we get here.
+    // Slot classes and per-class slot counts follow the device's byte budget
+    // rather than which particular pages it owns, so the capacity table stays
+    // correct; what goes stale is the plan's informational per-class `pages`
+    // count. Ownership never puts a page on a device with zero usable capacity
+    // in that page's size class, so no page can end up owned somewhere it
+    // could not be made resident.
+    void apply_hot_owner_policy() {
+        const std::vector<size_t> priority = parse_owner_priority(
+            std::getenv("WP_EXPERT_OWNER_PRIORITY"), device_names_);
+        HotOwnerInput input;
+        input.n_devices         = devices_.size();
+        input.page_class        = placement_page_class_;
+        input.page_static_owner = page_static_owners_;
+        input.capacity          = placement_usable_capacity_;
+        input.priority          = priority;
+        input.ranked            = ranked_pages_from_pin_file();
+
+        const size_t n_pages = page_static_owners_.size();
+        const HotOwnerPlan plan = plan_hot_owner_map(input);
+        if (plan.owner.size() != n_pages) {
+            std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_POLICY=hot produced a "
+                         "malformed owner map; keeping the proportional map" << std::endl;
+            return;
+        }
+        for (size_t id = 0; id < n_pages; ++id) {
+            page_static_owners_[id] = plan.owner[id];
+            page_current_owner_[id].store(
+                (uint32_t) plan.owner[id], std::memory_order_relaxed);
+        }
+
+        const size_t n_classes = placement_usable_capacity_.size();
+        std::vector<size_t> owned(devices_.size(), 0);
+        std::vector<size_t> owned_ranked(devices_.size(), 0);
+        std::vector<size_t> owned_unmanaged(devices_.size(), 0);
+        std::vector<std::vector<size_t>> owned_by_class(
+            devices_.size(), std::vector<size_t>(n_classes, 0));
+        for (size_t id = 0; id < n_pages; ++id) {
+            const size_t device = plan.owner[id];
+            if (device >= devices_.size()) {
+                continue;
+            }
+            ++owned[device];
+            if (plan.from_ranked[id]) {
+                ++owned_ranked[device];
+            }
+            const size_t class_id = placement_page_class_[id];
+            if (class_id < n_classes) {
+                ++owned_by_class[device][class_id];
+            } else {
+                ++owned_unmanaged[device];
+            }
+        }
+        std::ostringstream priority_names;
+        for (size_t i = 0; i < priority.size(); ++i) {
+            if (i != 0) {
+                priority_names << ',';
+            }
+            priority_names << device_names_.at(priority[i]);
+        }
+        std::cerr << "WARN wp expert worker: owner_policy=hot"
+                  << " priority=" << priority_names.str()
+                  << " ranked_pages=" << input.ranked.size()
+                  << " total_pages=" << n_pages
+                  << " size_classes=" << n_classes << std::endl;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            bool resident = true;
+            std::ostringstream classes;
+            for (size_t c = 0; c < n_classes; ++c) {
+                const size_t usable = placement_usable_capacity_[c][i];
+                resident = resident && owned_by_class[i][c] <= usable;
+                classes << " class[" << c << "]bytes=" << placement_class_sizes_[c]
+                        << " owned=" << owned_by_class[i][c]
+                        << " usable=" << usable;
+            }
+            std::cerr << "WARN wp expert worker: owner_policy=hot device="
+                      << device_names_[i]
+                      << " owned=" << owned[i]
+                      << " from_ranked=" << owned_ranked[i]
+                      << " from_fallback="
+                      << (owned[i] - owned_ranked[i] - owned_unmanaged[i])
+                      << " resident_layer_pages=" << owned_unmanaged[i]
+                      << classes.str()
+                      << " expected_fully_resident=" << (resident ? "yes" : "no")
+                      << std::endl;
+        }
     }
 
     void refresh_placement_snapshot() const {
@@ -16202,7 +16586,13 @@ private:
     std::vector<int> device_slots_;
     WorkerLogFiles logs_;
     wp::HostTier host_tier_;
-    const bool placement_enabled_ = lfu_placement_from_env();
+    const owner_policy owner_policy_ = owner_policy_from_env();
+    // WP_EXPERT_OWNER_POLICY=hot force-disables LFU placement: hot's whole
+    // contract is that the owner map never changes after startup, and the LFU
+    // migration path exists to change it. Declared after owner_policy_ so the
+    // member initialisers run in that order.
+    const bool placement_enabled_ =
+        lfu_placement_from_env() && owner_policy_ != owner_policy::hot;
     const bool lfu_init_owner_ = lfu_init_owner_from_env();
     const size_t migration_cap_ = lfu_migration_cap_from_env();
     const uint64_t hysteresis_pct_ = lfu_hysteresis_pct_from_env();
@@ -16224,6 +16614,10 @@ private:
     std::vector<uint64_t> placement_class_sizes_;
     std::vector<std::vector<size_t>> placement_pages_by_class_;
     std::vector<std::vector<size_t>> placement_capacity_;
+    // WP_EXPERT_OWNER_POLICY=hot only. [class][device] usable owner slots, and
+    // the per-page inverse of placement_pages_by_class_.
+    std::vector<std::vector<size_t>> placement_usable_capacity_;
+    std::vector<size_t> placement_page_class_;
     mutable std::shared_ptr<const PlacementSnapshot> placement_snapshot_;
     bool placement_ready_ = false;
     std::vector<std::unique_ptr<DeviceWorker>> devices_;

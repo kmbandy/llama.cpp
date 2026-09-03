@@ -4162,6 +4162,233 @@ static void test_prefill_arena_grouped_placement_independent() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP_EXPERT_OWNER_POLICY
+
+// Verbatim copy of the pre-WP_EXPERT_OWNER_POLICY Worker::static_owner_for_page
+// body. This is the SNAPSHOT of the old behaviour: the shipped proportional
+// path must keep agreeing with it exactly, or a rerun of an old config stops
+// reproducing its output.
+static size_t reference_proportional_owner(
+        int expert, int expert_first, int expert_last,
+        const std::vector<int> & device_slots) {
+    const int first = expert_first;
+    const int last  = expert_last;
+    const uint64_t count = last >= first ? (uint64_t) (last - first) + 1 : 0;
+    const uint64_t ordinal = expert >= first ? (uint64_t) (expert - first) : 0;
+    uint64_t total = 0;
+    for (const int slots : device_slots) {
+        total += (uint64_t) slots;
+    }
+    const uint64_t point = count > 0 ? ordinal * total / count : 0;
+    uint64_t begin = 0;
+    for (size_t i = 0; i < device_slots.size(); ++i) {
+        begin += (uint64_t) device_slots[i];
+        if (point < begin) {
+            return i;
+        }
+    }
+    return device_slots.size() - 1;
+}
+
+static void test_owner_policy_proportional_unchanged() {
+    const std::vector<std::vector<int>> slot_sets = {
+        { 1, 1 },
+        { 320, 96 },            // production-ish: R9700 + Thunderbolt RX 6900 XT
+        { 320, 96, 48 },        // ... plus the CPU tier
+        { 7, 3, 11, 1 },
+        { 5 },
+    };
+    const std::vector<std::pair<int, int>> ranges = {
+        { 0, 127 }, { 0, 0 }, { 64, 191 }, { 10, 9 },
+    };
+    for (const std::vector<int> & slots : slot_sets) {
+        for (const std::pair<int, int> & range : ranges) {
+            for (int expert = range.first - 3; expert <= range.second + 3; ++expert) {
+                const size_t expected = reference_proportional_owner(
+                    expert, range.first, range.second, slots);
+                const size_t actual = wp_expert_worker::proportional_owner_for_expert(
+                    expert, range.first, range.second, slots);
+                require(expected == actual,
+                        "proportional owner map changed against its pre-policy snapshot");
+            }
+        }
+    }
+    // A hardcoded band for the production shape, so a future refactor of BOTH
+    // implementations at once still trips.
+    const std::vector<int> production = { 320, 96, 48 };
+    const std::vector<size_t> expected_first_16 = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    };
+    for (int expert = 0; expert < 16; ++expert) {
+        require(wp_expert_worker::proportional_owner_for_expert(
+                    expert, 0, 127, production) == expected_first_16[(size_t) expert],
+                "proportional owner map moved the first expert band");
+    }
+    require(wp_expert_worker::proportional_owner_for_expert(88, 0, 127, production) == 0 &&
+                wp_expert_worker::proportional_owner_for_expert(89, 0, 127, production) == 1 &&
+                wp_expert_worker::proportional_owner_for_expert(114, 0, 127, production) == 1 &&
+                wp_expert_worker::proportional_owner_for_expert(115, 0, 127, production) == 2 &&
+                wp_expert_worker::proportional_owner_for_expert(127, 0, 127, production) == 2,
+            "proportional owner map moved a device band boundary");
+
+    require(wp_expert_worker::parse_owner_policy(nullptr) ==
+                    wp_expert_worker::owner_policy::proportional &&
+                wp_expert_worker::parse_owner_policy("") ==
+                    wp_expert_worker::owner_policy::proportional &&
+                wp_expert_worker::parse_owner_policy("proportional") ==
+                    wp_expert_worker::owner_policy::proportional &&
+                wp_expert_worker::parse_owner_policy(" hot ") ==
+                    wp_expert_worker::owner_policy::hot &&
+                wp_expert_worker::parse_owner_policy("nonsense") ==
+                    wp_expert_worker::owner_policy::proportional,
+            "WP_EXPERT_OWNER_POLICY parse is not the documented default-proportional");
+
+    const std::vector<std::string> devices = { "ROCm0", "ROCm1", "CPU" };
+    require(wp_expert_worker::parse_owner_priority(nullptr, devices) ==
+                    std::vector<size_t>({ 0, 1, 2 }),
+            "unset WP_EXPERT_OWNER_PRIORITY did not default to device-list order");
+    require(wp_expert_worker::parse_owner_priority(" ROCm1 , CPU ", devices) ==
+                    std::vector<size_t>({ 1, 2, 0 }),
+            "WP_EXPERT_OWNER_PRIORITY did not append the unnamed devices in list order");
+    require(wp_expert_worker::parse_owner_priority("Vulkan9,ROCm1,ROCm1", devices) ==
+                    std::vector<size_t>({ 1, 0, 2 }),
+            "WP_EXPERT_OWNER_PRIORITY did not drop unknown and duplicate names");
+}
+
+// The synthetic rig below stands in for the production one: three devices in
+// priority order (the slow-link GPU first), two size classes, and a class the
+// top-priority device cannot hold at all.
+//
+//   capacity[class][device]   dev0   dev1   dev2
+//     class 0                   2      3      0
+//     class 1                   0      1      2
+//
+// 12 pages: ids 0-5 in class 0, ids 6-11 in class 1, ranked in id order.
+static wp_expert_worker::HotOwnerInput make_hot_owner_input() {
+    wp_expert_worker::HotOwnerInput input;
+    input.n_devices = 3;
+    input.page_class.assign(12, 0);
+    for (size_t id = 6; id < 12; ++id) {
+        input.page_class[id] = 1;
+    }
+    input.page_static_owner.assign(12, 2);
+    input.capacity = { { 2, 3, 0 }, { 0, 1, 2 } };
+    input.priority = { 0, 1, 2 };
+    input.ranked.resize(12);
+    for (size_t id = 0; id < 12; ++id) {
+        input.ranked[id] = id;
+    }
+    return input;
+}
+
+static void test_owner_policy_hot_packs_priority_device() {
+    const wp_expert_worker::HotOwnerInput input = make_hot_owner_input();
+    const wp_expert_worker::HotOwnerPlan plan = wp_expert_worker::plan_hot_owner_map(input);
+
+    // (a) The top-priority device owns exactly its usable capacity per class,
+    //     taken off the HEAD of the ranked list; the next device gets the next
+    //     slice; the pages past both capacities fall back.
+    const std::vector<size_t> expected_owner = {
+        0, 0, 1, 1, 1, 0,   // class 0: dev0 x2, dev1 x3, then one fallback
+        1, 2, 2,            // class 1: dev0 has no capacity -> dev1 x1, dev2 x2
+        1, 2, 2,            // class 1 fallback, spread over class capacity {0,1,2}
+    };
+    const std::vector<char> expected_ranked = {
+        1, 1, 1, 1, 1, 0,
+        1, 1, 1,
+        0, 0, 0,
+    };
+    require(plan.owner == expected_owner,
+            "WP_EXPERT_OWNER_POLICY=hot did not pack the priority device from the "
+            "head of the ranked list");
+    require(plan.from_ranked == expected_ranked,
+            "WP_EXPERT_OWNER_POLICY=hot mislabelled ranked vs fallback ownership");
+
+    // Restated as the property the policy exists for: nothing is over-committed.
+    std::vector<std::vector<size_t>> ranked_owned(2, std::vector<size_t>(3, 0));
+    for (size_t id = 0; id < plan.owner.size(); ++id) {
+        if (plan.from_ranked[id]) {
+            ++ranked_owned[input.page_class[id]][plan.owner[id]];
+        }
+    }
+    require(ranked_owned[0][0] == input.capacity[0][0] &&
+                ranked_owned[0][1] == input.capacity[0][1] &&
+                ranked_owned[1][1] == input.capacity[1][1] &&
+                ranked_owned[1][2] == input.capacity[1][2],
+            "WP_EXPERT_OWNER_POLICY=hot did not fill each device to its usable capacity");
+
+    // (d) A page whose size class has zero capacity on the priority device
+    //     skips to the next device -- never lands somewhere it cannot be
+    //     resident.
+    require(ranked_owned[1][0] == 0,
+            "WP_EXPERT_OWNER_POLICY=hot placed a page on a device with no capacity "
+            "in that page's size class");
+    for (size_t id = 0; id < plan.owner.size(); ++id) {
+        require(input.capacity[input.page_class[id]][plan.owner[id]] != 0,
+                "WP_EXPERT_OWNER_POLICY=hot left a page owned by a device that cannot "
+                "hold its size class");
+    }
+
+    // The priority order, not the device-list order, decides who gets the head
+    // of the list.
+    wp_expert_worker::HotOwnerInput dev1_first = input;
+    dev1_first.priority = { 1, 0, 2 };
+    const wp_expert_worker::HotOwnerPlan dev1_plan =
+        wp_expert_worker::plan_hot_owner_map(dev1_first);
+    require(dev1_plan.owner[0] == 1 && dev1_plan.owner[1] == 1 &&
+                dev1_plan.owner[2] == 1 && dev1_plan.owner[3] == 0 &&
+                dev1_plan.owner[4] == 0,
+            "WP_EXPERT_OWNER_POLICY=hot ignored WP_EXPERT_OWNER_PRIORITY order");
+
+    // ... and a priority order that puts the zero-capacity device first for
+    // class 0 must still produce a legal map.
+    wp_expert_worker::HotOwnerInput dev2_first = input;
+    dev2_first.priority = { 2, 0, 1 };
+    const wp_expert_worker::HotOwnerPlan dev2_plan =
+        wp_expert_worker::plan_hot_owner_map(dev2_first);
+    require(dev2_plan.owner[0] == 0 && dev2_plan.owner[1] == 0 &&
+                dev2_plan.owner[2] == 1,
+            "WP_EXPERT_OWNER_POLICY=hot did not skip the zero-capacity priority device");
+    require(dev2_plan.owner[6] == 2 && dev2_plan.owner[7] == 2 &&
+                dev2_plan.owner[8] == 1,
+            "WP_EXPERT_OWNER_POLICY=hot did not honour priority within a size class");
+}
+
+static void test_owner_policy_hot_is_deterministic() {
+    // (b) Same inputs, two independent constructions, identical maps. The
+    //     policy is a pure function; a page that moved between two ROCm
+    //     devices between launches would change the run's output md5.
+    const wp_expert_worker::HotOwnerPlan first =
+        wp_expert_worker::plan_hot_owner_map(make_hot_owner_input());
+    const wp_expert_worker::HotOwnerPlan second =
+        wp_expert_worker::plan_hot_owner_map(make_hot_owner_input());
+    require(first.owner == second.owner && first.from_ranked == second.from_ranked,
+            "WP_EXPERT_OWNER_POLICY=hot is not reproducible across constructions");
+
+    // Unranked pages are placed too, deterministically, and pages the policy
+    // does not manage keep their proportional owner.
+    wp_expert_worker::HotOwnerInput unlisted = make_hot_owner_input();
+    unlisted.ranked.clear();
+    unlisted.page_class[11] = wp_expert_worker::HOT_OWNER_NO_CLASS;
+    unlisted.page_static_owner[11] = 2;
+    const wp_expert_worker::HotOwnerPlan a = wp_expert_worker::plan_hot_owner_map(unlisted);
+    const wp_expert_worker::HotOwnerPlan b = wp_expert_worker::plan_hot_owner_map(unlisted);
+    require(a.owner == b.owner, "hot fallback placement is not deterministic");
+    require(a.owner[11] == 2,
+            "hot policy moved a page it does not manage off its proportional owner");
+    for (const char ranked : a.from_ranked) {
+        require(ranked == 0, "hot policy claimed ranked ownership with an empty hot list");
+    }
+    // With no hot list every page takes the fallback: class 0 spreads over
+    // {2,3,0} and class 1 over {0,1,2}, proportional to capacity and stable in
+    // page-id order.
+    const std::vector<size_t> expected = { 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2 };
+    require(a.owner == expected,
+            "hot fallback did not spread unranked pages proportionally to remaining "
+            "capacity in page-id order");
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -4171,6 +4398,9 @@ int main() {
         require(setenv("WP_EXPERT_GATHER", "1", 1) == 0 &&
                     setenv("WP_EXPERT_GATHER_MIN_TOKENS", "2", 1) == 0,
                 "failed to enable expert gather");
+        test_owner_policy_proportional_unchanged();
+        test_owner_policy_hot_packs_priority_device();
+        test_owner_policy_hot_is_deterministic();
         test_decode_prefill_compute_profile();
         test_arena_prefill_device_policy();
         test_prefill_arena_grouped_production_geometry();
