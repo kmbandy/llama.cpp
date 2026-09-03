@@ -10,6 +10,12 @@ GGML_BACKEND_API bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t back
                                                              const void * data, size_t offset, size_t size);
 GGML_BACKEND_API bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t backend,
                                                                     ggml_backend_event_t event);
+// Live hipGraph/cudaGraph counters for this backend's CUDA device. False if
+// backend is not CUDA/HIP. Used by the worker 5s banner; atexit is SIGKILL'd.
+GGML_BACKEND_API bool ggml_backend_cuda_wp_graph_counts(
+        ggml_backend_t backend,
+        uint64_t * captures, uint64_t * replays, uint64_t * fallbacks,
+        uint64_t * cap_newkey, uint64_t * cap_lru);
 
 #ifdef  __cplusplus
 extern "C" {

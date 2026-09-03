@@ -92,6 +92,9 @@ bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t,
 bool ggml_backend_cuda_wp_reader_copy(ggml_backend_t, ggml_tensor *,
                                       const void *, size_t, size_t)
     __attribute__((weak));
+bool ggml_backend_cuda_wp_graph_counts(ggml_backend_t, uint64_t *, uint64_t *,
+                                       uint64_t *, uint64_t *, uint64_t *)
+    __attribute__((weak));
 bool ggml_backend_vk_wp_fused_expert(
         ggml_backend_t,
         const struct ggml_backend_vk_wp_fused_expert_params *,
@@ -1371,6 +1374,20 @@ struct RequestStats {
     // bad value can be tied back to which chunk of a streamed request it came
     // from -- see scan_finite().
     uint32_t chunk_index = UINT32_MAX;
+    // WP_EXPERT_FUSE_GATE_UP: fuse_gate_up_ok() re-checks adjacency every
+    // request and falls back with no other counter. Hit = fusion used.
+    uint64_t n_fuse_gate_up_hit = 0;
+    uint64_t n_fuse_gate_up_miss = 0;
+    uint64_t n_fuse_gate_up_experts = 0;
+    bool fuse_gate_up_counted = false;
+};
+
+// Last dispatch() snapshot, one row per device that ran. Used by
+// WP_REQ_LOG_PER_DEVICE; the aggregate reqlog still sums across devices.
+struct DeviceReqLog {
+    std::string  name;
+    RequestStats stats;
+    size_t       n_experts = 0;
 };
 
 using worker_stream_callback = std::function<void(
@@ -1573,6 +1590,9 @@ public:
         ns_vk_layer_ahead_ += request.ns_vk_layer_ahead;
         n_gcache_hit_ += request.n_gcache_hit;
         n_gcache_miss_ += request.n_gcache_miss;
+        n_fuse_gate_up_hit_ += request.n_fuse_gate_up_hit;
+        n_fuse_gate_up_miss_ += request.n_fuse_gate_up_miss;
+        n_fuse_gate_up_experts_ += request.n_fuse_gate_up_experts;
         n_arena_hit_ += request.n_arena_hit;
         n_arena_groups_ += request.n_arena_groups;
         n_arena_build_ += request.n_arena_build;
@@ -1772,7 +1792,23 @@ private:
                   << " ns_vk_layer_ahead=" << ns_vk_layer_ahead_
                   << " gcache_hit=" << n_gcache_hit_
                   << " gcache_miss=" << n_gcache_miss_
-                  << " n_arena_hit=" << n_arena_hit_
+                  << " n_fuse_gate_up_hit=" << n_fuse_gate_up_hit_
+                  << " n_fuse_gate_up_miss=" << n_fuse_gate_up_miss_
+                  << " n_fuse_gate_up_experts=" << n_fuse_gate_up_experts_;
+        {
+            uint64_t captures = 0, replays = 0, fallbacks = 0, cap_newkey = 0, cap_lru = 0;
+            if (ggml_backend_cuda_wp_graph_counts != nullptr && probe_backend_ != nullptr &&
+                    ggml_backend_cuda_wp_graph_counts(
+                        probe_backend_, &captures, &replays, &fallbacks,
+                        &cap_newkey, &cap_lru)) {
+                std::cout << " wp_graph_captures=" << captures
+                          << " wp_graph_replays=" << replays
+                          << " wp_graph_fallbacks=" << fallbacks
+                          << " wp_graph_cap_newkey=" << cap_newkey
+                          << " wp_graph_cap_lru=" << cap_lru;
+            }
+        }
+        std::cout << " n_arena_hit=" << n_arena_hit_
                   << " n_arena_groups=" << n_arena_groups_
                   << " n_arena_build=" << n_arena_build_
                   << " n_arena_prefill_hit=" << n_arena_prefill_hit_
@@ -1905,6 +1941,9 @@ private:
     uint64_t          ns_vk_layer_ahead_ = 0;
     uint64_t          n_gcache_hit_ = 0;
     uint64_t          n_gcache_miss_ = 0;
+    uint64_t          n_fuse_gate_up_hit_ = 0;
+    uint64_t          n_fuse_gate_up_miss_ = 0;
+    uint64_t          n_fuse_gate_up_experts_ = 0;
     uint64_t          n_arena_hit_ = 0;
     uint64_t          n_arena_groups_ = 0;
     uint64_t          n_arena_build_ = 0;
@@ -8191,6 +8230,31 @@ size_t ExpertSlotPool::pin_pages(const std::vector<const ExpertPage *> & pages) 
 // mode ages them via evict_age_, the admission floor that rises with every
 // eviction. Both are pre-existing mechanisms; seeding just sets the starting
 // value they operate on.
+static double wp_epoch_seconds() {
+    return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
+}
+
+static void wp_log_seed_start(const char * device) {
+    std::fprintf(stderr, "wp expert worker: pin-file seeding start device=%s t=%.6f\n",
+                 device != nullptr && device[0] != '\0' ? device : "*",
+                 wp_epoch_seconds());
+}
+
+static void wp_log_seed_end(
+        const char * device, size_t n_seeded, uint64_t bytes,
+        std::chrono::steady_clock::time_point started) {
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    const double gbs = seconds > 0.0 ? ((double) bytes / 1e9) / seconds : 0.0;
+    std::fprintf(stderr,
+                 "wp expert worker: pin-file seeding end device=%s n_seeded=%zu "
+                 "bytes=%llu seconds=%.6f GB/s=%.3f t=%.6f\n",
+                 device != nullptr && device[0] != '\0' ? device : "*",
+                 n_seeded, (unsigned long long) bytes, seconds, gbs,
+                 wp_epoch_seconds());
+}
+
 size_t ExpertSlotPool::seed_pages(const std::vector<std::pair<const ExpertPage *, uint64_t>> & pages_with_counts) {
     size_t n_seeded = 0;
     for (const auto & entry : pages_with_counts) {
@@ -8520,10 +8584,17 @@ public:
             if (seed_mode) {
                 std::vector<std::pair<const ExpertPage *, uint64_t>> pages_with_counts;
                 pages_with_counts.reserve(pin_pages.size());
+                uint64_t seed_bytes = 0;
                 for (size_t i = 0; i < pin_pages.size(); ++i) {
                     pages_with_counts.emplace_back(pin_pages[i], pin_counts[i]);
+                    if (pin_pages[i] != nullptr) {
+                        seed_bytes += pin_pages[i]->size;
+                    }
                 }
+                wp_log_seed_start(device_name_.c_str());
+                const auto seed_started = std::chrono::steady_clock::now();
                 loaded = pool_.seed_pages(pages_with_counts);
+                wp_log_seed_end(device_name_.c_str(), loaded, seed_bytes, seed_started);
                 std::cerr << "WARN wp expert worker: WP_EXPERT_PIN_MODE=seed pin_file="
                           << pin_path << " n_seeded=" << loaded
                           << " pin_budget=" << pin_budget
@@ -8681,6 +8752,35 @@ public:
                          "device=%s enabled=%d\n",
                          e != nullptr ? e : "", device_name_.c_str(),
                          (int) arena_prefill_enabled_);
+        }
+        {
+            const char * bname = ggml_backend_name(backend_.get());
+            const mm_pin_mode pin_mode = parse_mm_pin_mode(std::getenv("WP_EXPERT_MM_PIN"));
+            const char * pin_mode_s = pin_mode == mm_pin_mode::off ? "off" :
+                (pin_mode == mm_pin_mode::decode ? "decode" : "on");
+            const char * pin_kernel = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
+            const char * fold_e = std::getenv("WP_EXPERT_FOLD_LAST");
+            const char * fuse_e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
+            const char * grouped_e = std::getenv("WP_EXPERT_GROUPED_GEMV");
+            const char * arena_e = std::getenv("WP_EXPERT_ARENA_ID");
+            const bool mul_mat_id_path =
+                arena_prefill_enabled_ ||
+                (grouped_e != nullptr && grouped_e[0] == '1') ||
+                (arena_e != nullptr && std::strtol(arena_e, nullptr, 10) == 1);
+            std::fprintf(stderr,
+                         "wp expert worker: device=%s backend=%s is_cuda_backend=%d "
+                         "WP_EXPERT_MM_PIN=%s pin_kernel=%s WP_EXPERT_FOLD_LAST=%d "
+                         "WP_EXPERT_FUSE_GATE_UP=%d %s\n",
+                         device_name_.c_str(),
+                         bname != nullptr ? bname : "?",
+                         (int) is_cuda_backend(),
+                         pin_mode_s,
+                         (pin_kernel != nullptr && pin_kernel[0] != '\0') ? pin_kernel : "mmq",
+                         (fold_e != nullptr && fold_e[0] == '1') ? 1 : 0,
+                         (fuse_e != nullptr && fuse_e[0] == '1') ? 1 : 0,
+                         mul_mat_id_path
+                             ? "FORCE_MM: consulted on MUL_MAT_ID path"
+                             : "FORCE_MM: inert on this path");
         }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
@@ -9978,7 +10078,11 @@ public:
         // tag is still stamped (not omitted) so the frame stays self-describing
         // for a spine decoding partials from mixed-vintage workers.
         response.dtype = PIPE_HIDDEN_F32;
-        response.partial.assign(sum.begin(), sum.end());
+        if (s_selfcheck) {
+            response.partial.assign(sum.begin(), sum.end());
+        } else {
+            response.partial = std::move(sum);
+        }
         request_stats.ns_encode = lap();
         return response;
     }
@@ -12058,6 +12162,17 @@ private:
             return true;
         };
         const bool fuse_gate_up = fuse_gate_up_ok();
+        if (s_fuse_gate_up) {
+            if (fuse_gate_up) {
+                request_stats.n_fuse_gate_up_experts += n_selected;
+                if (!request_stats.fuse_gate_up_counted) {
+                    ++request_stats.n_fuse_gate_up_hit;
+                }
+            } else if (!request_stats.fuse_gate_up_counted) {
+                ++request_stats.n_fuse_gate_up_miss;
+            }
+            request_stats.fuse_gate_up_counted = true;
+        }
         uint32_t gather_rank = 0;
         bool     gather_rank_uniform = !use_gather;
         if (use_gather) {
@@ -14570,21 +14685,28 @@ private:
                      size_t result_offset = std::numeric_limits<size_t>::max(),
                      int finite_check_layer = -1, const char * finite_check_path = nullptr) {
         synchronize_async(&request_stats);
-        const ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead(),
-            /* .mem_base = */ nullptr,
-            /* .no_alloc = */ true,
-        };
-        context_ptr ctx(ggml_init(params));
-        if (!ctx) {
-            throw std::runtime_error("failed to allocate expert result metadata");
-        }
         const uint32_t n_tokens = (uint32_t) (
             result.size() / (size_t) catalog_.descriptor.hparams.n_embd);
         const size_t effective_result_offset = result_offset ==
             std::numeric_limits<size_t>::max() ? io_result_offset_ : result_offset;
-        ggml_tensor * output = make_io_tensor(ctx.get(), n_tokens,
-                                              effective_result_offset);
+        ResultIoMeta & meta = io_result_meta_[n_tokens];
+        if (meta.tensor == nullptr) {
+            meta.ctx.reset(ggml_init({
+                /* .mem_size = */ ggml_tensor_overhead(),
+                /* .mem_base = */ nullptr,
+                /* .no_alloc = */ true,
+            }));
+            if (!meta.ctx) {
+                throw std::runtime_error("failed to allocate expert result metadata");
+            }
+            meta.tensor = ggml_new_tensor_2d(
+                meta.ctx.get(), GGML_TYPE_F32,
+                catalog_.descriptor.hparams.n_embd, n_tokens);
+        }
+        ggml_backend_buffer_t buf = io_active_ != nullptr ? io_active_ : io_buffer_.get();
+        attach_weight(meta.tensor, buf, ggml_backend_buffer_get_base(buf),
+                      effective_result_offset);
+        ggml_tensor * output = meta.tensor;
         const size_t result_bytes = result.size() * sizeof(float);
         ensure_io_src_pinned(result_bytes);
         void * result_dst = result.data();
@@ -15020,6 +15142,11 @@ private:
     uint32_t       io_prepare_tokens_ = 0;
     size_t         io_prepare_input_size_ = 0;
     size_t         io_prepare_alignment_ = 0;
+    struct ResultIoMeta {
+        context_ptr   ctx;
+        ggml_tensor * tensor = nullptr;
+    };
+    std::unordered_map<uint32_t, ResultIoMeta> io_result_meta_;
     std::string    device_name_;
     // Which compute path answered the request being read back (WP_WORKER_CHECK_FINITE label).
     const char *   last_compute_path_ = "none";
@@ -15122,6 +15249,10 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_weight_total += src.n_weight_total;
     dst.n_gcache_hit += src.n_gcache_hit;
     dst.n_gcache_miss += src.n_gcache_miss;
+    dst.n_fuse_gate_up_hit += src.n_fuse_gate_up_hit;
+    dst.n_fuse_gate_up_miss += src.n_fuse_gate_up_miss;
+    dst.n_fuse_gate_up_experts += src.n_fuse_gate_up_experts;
+    dst.fuse_gate_up_counted = dst.fuse_gate_up_counted || src.fuse_gate_up_counted;
     dst.n_arena_hit += src.n_arena_hit;
     dst.n_arena_groups += src.n_arena_groups;
     dst.n_arena_build += src.n_arena_build;
@@ -15287,6 +15418,10 @@ public:
 
     size_t device_count() const {
         return devices_.size();
+    }
+
+    const std::vector<DeviceReqLog> & last_device_reqlog() const {
+        return last_device_reqlog_;
     }
 
     bool multi_device() const {
@@ -15481,8 +15616,10 @@ public:
             const worker_stream_callback & stream_callback = {}) {
         if (prepared.has_value() || !multi_device()) {
             std::lock_guard<std::mutex> lock(device_mutexes_.front());
-            return devices_.front()->dispatch(
+            pipe_expert_partial result = devices_.front()->dispatch(
                 request, request_stats, std::move(prepared), conn_index, trace_req);
+            snapshot_device_reqlog_one(request_stats, request.assignments.size());
+            return result;
         }
         validate_dispatch(request);
         note_dispatch_references(request);
@@ -15742,6 +15879,7 @@ public:
                 throw std::runtime_error("expert device partial sizes disagree");
             }
         }
+        snapshot_device_reqlog(groups, sub_stats);
         fold_result_partials_ordered(result.partial, partials, result.n_tokens);
         return result;
     }
@@ -15817,6 +15955,7 @@ public:
         result.partial.assign(
             (size_t) result.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
         std::vector<pipe_expert_partial> partials(pending.groups.size());
+        std::vector<RequestStats> split_sub_stats(pending.groups.size());
         for (size_t group_index = 0; group_index < pending.groups.size(); ++group_index) {
             const AssignmentGroup & group = pending.groups[group_index];
             pipe_expert_dispatch_req sub_request;
@@ -15828,7 +15967,7 @@ public:
                 sub_request.assignments.push_back(pending.begin.assignments[index]);
             }
             sub_request.activations = acts.activations;
-            RequestStats sub_stats;
+            RequestStats & sub_stats = split_sub_stats[group_index];
             pipe_expert_partial partial;
             const int32_t trace_layer = pending.begin.layer;
             if (hip_graph_executor_needed(group.device)) {
@@ -15872,6 +16011,7 @@ public:
             }
             partials[group_index] = std::move(partial);
         }
+        snapshot_device_reqlog(pending.groups, split_sub_stats);
         fold_result_partials_ordered(result.partial, partials, result.n_tokens);
         return result;
     }
@@ -16763,6 +16903,42 @@ private:
         return result;
     }
 
+    void snapshot_device_reqlog_one(const RequestStats & stats, size_t n_experts) {
+        last_device_reqlog_.clear();
+        if (device_names_.empty()) {
+            return;
+        }
+        last_device_reqlog_.push_back({device_names_.front(), stats, n_experts});
+    }
+
+    void snapshot_device_reqlog(
+            const std::vector<AssignmentGroup> & groups,
+            const std::vector<RequestStats> & sub_stats) {
+        last_device_reqlog_.clear();
+        if (groups.empty() || groups.size() != sub_stats.size()) {
+            return;
+        }
+        std::vector<RequestStats> acc(devices_.size());
+        std::vector<size_t> nexp(devices_.size(), 0);
+        std::vector<uint8_t> seen(devices_.size(), 0);
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const size_t d = groups[gi].device;
+            if (d >= devices_.size()) {
+                continue;
+            }
+            accumulate_request_stats(acc[d], sub_stats[gi]);
+            nexp[d] += groups[gi].indices.size();
+            seen[d] = 1;
+        }
+        last_device_reqlog_.reserve(devices_.size());
+        for (size_t d = 0; d < devices_.size(); ++d) {
+            if (!seen[d]) {
+                continue;
+            }
+            last_device_reqlog_.push_back({device_names_[d], acc[d], nexp[d]});
+        }
+    }
+
     pipe_expert_dispatch_req make_subrequest(
             const pipe_expert_dispatch_req & request, const AssignmentGroup & group) const {
         pipe_expert_dispatch_req result;
@@ -16938,6 +17114,14 @@ private:
         }
         size_t loaded = 0;
         if (seed_mode) {
+            uint64_t seed_bytes = 0;
+            for (size_t i = 0; i < pages.size(); ++i) {
+                for (const std::pair<int, int> & key : pages[i]) {
+                    seed_bytes += catalog_.pages.at(key).size;
+                }
+            }
+            wp_log_seed_start("*");
+            const auto seed_started = std::chrono::steady_clock::now();
             for (size_t i = 0; i < pages.size(); ++i) {
                 std::vector<std::pair<std::pair<int, int>, uint64_t>> keys_with_counts;
                 keys_with_counts.reserve(pages[i].size());
@@ -16947,6 +17131,7 @@ private:
                 std::lock_guard<std::mutex> lock(device_mutexes_[i]);
                 loaded += devices_[i]->seed_pages(keys_with_counts, keys_with_counts.size());
             }
+            wp_log_seed_end("*", loaded, seed_bytes, seed_started);
             std::cerr << "WARN wp expert worker: WP_EXPERT_PIN_MODE=seed pin_file=" << pin_path
                       << " n_seeded=" << loaded
                       << " pin_budget=" << pin_budget
@@ -17040,6 +17225,7 @@ private:
     mutable std::shared_ptr<const PlacementSnapshot> placement_snapshot_;
     bool placement_ready_ = false;
     std::vector<std::unique_ptr<DeviceWorker>> devices_;
+    std::vector<DeviceReqLog> last_device_reqlog_;
     mutable std::vector<std::mutex> device_mutexes_;
     std::unique_ptr<pipe_expert_shm_ring> local_shm_;
     uint32_t local_shm_tokens_ = 0;
@@ -17813,12 +17999,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         return 1;
     }
 
-    // WP_REQ_LOG=path -- one line per dispatch request. Columns:
-    //   layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep
-    //   ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit
-    //   ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end
-    //   ns_params_set n_host_hit n_host_demote ns_host_get ns_demote ns_ensure_post
-    //   ns_final_sync [chunk_index for WP_DISPATCH_STREAM rows]
+    // WP_REQ_LOG=path -- one line per dispatch request. Columns, 1-indexed:
+    //   1 layer  2 n_tokens  3 n_exp  4 n_resident  5 n_pagein
+    //   6 bytes_read  7 ns_wall  8 ns_lookup  9 ns_prep
+    //   10 ns_hits  11 ns_wait  12 ns_pagein_compute  13 ns_result
+    //   14 ns_read  15 ns_h2d  16 ns_submit  17 ns_readback
+    //   18 ns_encode  19 ns_send  20 n_weight_nonzero  21 n_weight_total
+    //   22 epoch_end  23 ns_params_set  24 n_host_hit  25 n_host_demote
+    //   26 ns_host_get  27 ns_demote  28 ns_ensure_post  29 ns_final_sync
+    //   30 chunk_index (WP_DISPATCH_STREAM rows only)
     // epoch_end (added 2026-08-06) is the request's wall-clock END in epoch
     // seconds; start = epoch_end - ns_wall/1e9.
     // ns_params_set (added 2026-08-07): the coalesced D1 blob upload; 0 when
@@ -17841,29 +18030,70 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // was to guess from n_exp. That made the 18 columns below useless for the one
     // question that matters (prefill is 33.9 ms/token and decode is 6.5 tok/s --
     // WHICH of these phases owns which?). One integer fixes it.
-    FILE * const req_log = [] {
-        const char * p = std::getenv("WP_REQ_LOG");
-        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
+    //
+    // WP_REQ_LOG_PER_DEVICE=1 writes WP_REQ_LOG.<devicename> with the same
+    // columns 1-29 using that device's values (ns_wall = ns_dispatch_total), plus:
+    //   30 n_experts_on_device  31 n_pagein_on_device
+    //   32 ns_prologue  33 ns_prep  34 ns_wait  35 ns_pagein_compute
+    //   36 ns_graph_build  37 ns_submit  38 ns_result
+    //   39 ns_final_sync  40 ns_readback
+    //   41 chunk_index (stream rows only)
+    // The aggregate file is unchanged. WP_REQ_LOG_HEADER=1 writes a commented
+    // header row as the first line of each file.
+    static const char * const k_req_log_header =
+        "layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep "
+        "ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit "
+        "ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end "
+        "ns_params_set n_host_hit n_host_demote ns_host_get ns_demote ns_ensure_post "
+        "ns_final_sync";
+    static const char * const k_req_log_header_dev =
+        " n_experts_on_device n_pagein_on_device ns_prologue ns_prep ns_wait "
+        "ns_pagein_compute ns_graph_build ns_submit ns_result ns_final_sync ns_readback";
+    const bool req_log_header = [] {
+        const char * e = std::getenv("WP_REQ_LOG_HEADER");
+        return e != nullptr && e[0] == '1';
     }();
-    auto write_req_log = [req_log](int32_t layer, uint32_t n_tokens, size_t n_assignments,
-                                   const RequestStats & s,
-                                   std::chrono::steady_clock::time_point started,
-                                   uint32_t chunk_index) {
-        if (req_log == nullptr || started == std::chrono::steady_clock::time_point{}) {
+    const char * const req_log_path = std::getenv("WP_REQ_LOG");
+    FILE * const req_log = (req_log_path != nullptr && req_log_path[0] != '\0')
+        ? fopen(req_log_path, "w") : (FILE *) nullptr;
+    if (req_log != nullptr && req_log_header) {
+        fprintf(req_log, "# %s\n", k_req_log_header);
+        fflush(req_log);
+    }
+    const bool req_log_per_device = [] {
+        const char * e = std::getenv("WP_REQ_LOG_PER_DEVICE");
+        return e != nullptr && e[0] == '1';
+    }();
+    std::unordered_map<std::string, FILE *> req_log_dev_files;
+    auto req_log_dev_file = [&](const std::string & name) -> FILE * {
+        if (!req_log_per_device || req_log_path == nullptr || req_log_path[0] == '\0' ||
+                name.empty()) {
+            return nullptr;
+        }
+        const auto it = req_log_dev_files.find(name);
+        if (it != req_log_dev_files.end()) {
+            return it->second;
+        }
+        const std::string path = std::string(req_log_path) + "." + name;
+        FILE * f = fopen(path.c_str(), "w");
+        if (f != nullptr && req_log_header) {
+            fprintf(f, "# %s%s\n", k_req_log_header, k_req_log_header_dev);
+            fflush(f);
+        }
+        req_log_dev_files.emplace(name, f);
+        return f;
+    };
+    auto write_req_log_row = [](FILE * out, int32_t layer, uint32_t n_tokens,
+                                size_t n_assignments, const RequestStats & s,
+                                uint64_t ns_wall, double epoch_end,
+                                const char * chunk_suffix, bool extra) {
+        if (out == nullptr) {
             return;
         }
-        const uint64_t ns_wall = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - started).count();
-        const double epoch_end = (double) std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
-        char chunk_suffix[32] = {};
-        if (chunk_index != UINT32_MAX) {
-            std::snprintf(chunk_suffix, sizeof(chunk_suffix), " %u", chunk_index);
-        }
-        fprintf(req_log,
+        fprintf(out,
                 "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
                 "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu "
-                "%llu %llu %llu %llu %llu %llu%s\n",
+                "%llu %llu %llu %llu %llu %llu",
                 layer, n_tokens, n_assignments,
                 (unsigned long long) s.n_resident, (unsigned long long) s.n_pagein,
                 (unsigned long long) s.bytes_read, (unsigned long long) ns_wall,
@@ -17881,8 +18111,52 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 (unsigned long long) s.ns_host_get,
                 (unsigned long long) s.ns_demote,
                 (unsigned long long) s.ns_ensure_post,
-                (unsigned long long) s.ns_final_sync, chunk_suffix);
-        fflush(req_log);
+                (unsigned long long) s.ns_final_sync);
+        if (extra) {
+            fprintf(out, " %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                    n_assignments,
+                    (unsigned long long) s.n_pagein,
+                    (unsigned long long) s.ns_prologue,
+                    (unsigned long long) s.ns_prep,
+                    (unsigned long long) s.ns_wait,
+                    (unsigned long long) s.ns_pagein_compute,
+                    (unsigned long long) s.ns_graph_build,
+                    (unsigned long long) s.ns_submit,
+                    (unsigned long long) s.ns_result,
+                    (unsigned long long) s.ns_final_sync,
+                    (unsigned long long) s.ns_readback);
+        }
+        fprintf(out, "%s\n", chunk_suffix);
+        fflush(out);
+    };
+    auto write_req_log = [&](int32_t layer, uint32_t n_tokens, size_t n_assignments,
+                             const RequestStats & s,
+                             std::chrono::steady_clock::time_point started,
+                             uint32_t chunk_index) {
+        if (started == std::chrono::steady_clock::time_point{}) {
+            return;
+        }
+        if (req_log == nullptr && !req_log_per_device) {
+            return;
+        }
+        const uint64_t ns_wall = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const double epoch_end = (double) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
+        char chunk_suffix[32] = {};
+        if (chunk_index != UINT32_MAX) {
+            std::snprintf(chunk_suffix, sizeof(chunk_suffix), " %u", chunk_index);
+        }
+        write_req_log_row(req_log, layer, n_tokens, n_assignments, s,
+                          ns_wall, epoch_end, chunk_suffix, false);
+        if (!req_log_per_device) {
+            return;
+        }
+        for (const DeviceReqLog & row : worker.last_device_reqlog()) {
+            FILE * f = req_log_dev_file(row.name);
+            write_req_log_row(f, layer, n_tokens, row.n_experts, row.stats,
+                              row.stats.ns_dispatch_total, epoch_end, chunk_suffix, true);
+        }
     };
     pipe_expert_dispatch_begin split_log_begin;
     RequestStats split_log_stats;

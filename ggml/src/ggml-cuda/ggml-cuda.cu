@@ -3812,6 +3812,36 @@ static void ggml_cuda_wp_graph_print_counts() {
             (unsigned long long) recap, (unsigned long long) live);
 }
 
+bool ggml_backend_cuda_wp_graph_counts(
+        ggml_backend_t backend,
+        uint64_t * captures, uint64_t * replays, uint64_t * fallbacks,
+        uint64_t * cap_newkey, uint64_t * cap_lru) {
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ctx->device < 0 || ctx->device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    const ggml_cuda_wp_graph_counters & c = ggml_cuda_wp_graph_counts[ctx->device];
+    if (captures) {
+        *captures = c.captures.load(std::memory_order_relaxed);
+    }
+    if (replays) {
+        *replays = c.replays.load(std::memory_order_relaxed);
+    }
+    if (fallbacks) {
+        *fallbacks = c.fallbacks.load(std::memory_order_relaxed);
+    }
+    if (cap_newkey) {
+        *cap_newkey = c.cap_newkey.load(std::memory_order_relaxed);
+    }
+    if (cap_lru) {
+        *cap_lru = c.cap_lru.load(std::memory_order_relaxed);
+    }
+    return true;
+}
+
 static void ggml_cuda_wp_graph_count_init() {
     std::call_once(ggml_cuda_wp_graph_atexit_once, []() { atexit(ggml_cuda_wp_graph_print_counts); });
 }
