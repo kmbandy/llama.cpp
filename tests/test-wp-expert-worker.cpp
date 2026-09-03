@@ -2639,6 +2639,66 @@ static void test_decode_prefill_compute_profile() {
             "compact weights must follow idx");
 }
 
+static void test_batch_mmid_ids() {
+    // Dense: identity ids, assignment-index columns, no pad expert.
+    const std::vector<std::vector<float>> dense = {
+        { 0.5f },
+        { 0.25f },
+        { 0.125f },
+    };
+    const auto d = wp_expert_worker::build_batch_mmid_ids(dense, false);
+    require(d.n_experts == 3 && d.n_tokens == 1 && d.k_width == 3,
+            "dense k_width must equal n_experts");
+    require(!d.used_pad_expert, "dense identity ids must not invent a pad expert");
+    require(d.ids.size() == 3 && d.ids[0] == 0 && d.ids[1] == 1 && d.ids[2] == 2,
+            "dense ids must be identity in assignment order");
+    require(d.route_w.size() == 3 && d.route_w[0] == 0.5f && d.route_w[2] == 0.125f,
+            "dense route_w must follow assignment order");
+    require(d.expert_rows.size() == 3 && d.expert_rows[1].size() == 1 &&
+                d.expert_rows[1][0] == 0,
+            "dense expert_rows must name every token");
+
+    // Gather: invert per-expert rows onto [k_width, n_tokens]. Token 0 sees
+    // experts 0 then 2 (assignment order); token 1 sees only expert 2 and is
+    // padded with expert index n_experts at route weight 0.
+    const std::vector<std::vector<float>> gather = {
+        { 0.5f, 0.0f },
+        { 0.0f, 0.0f },
+        { 0.1f, 0.2f },
+    };
+    const auto g = wp_expert_worker::build_batch_mmid_ids(gather, true);
+    require(g.n_experts == 3 && g.n_tokens == 2 && g.k_width == 2,
+            "gather k_width must be the max experts-per-token");
+    require(g.used_pad_expert, "uneven gather rank must pad with expert n");
+    require(g.ids.size() == 4 && g.ids[0] == 0 && g.ids[1] == 2 &&
+                g.ids[2] == 2 && g.ids[3] == 3,
+            "gather ids must pack assignment order then pad with n_experts");
+    require(g.route_w.size() == 4 && g.route_w[0] == 0.5f && g.route_w[1] == 0.1f &&
+                g.route_w[2] == 0.2f && g.route_w[3] == 0.0f,
+            "padded gather slots must have route weight 0");
+    require(g.expert_rows[0].size() == 1 && g.expert_rows[0][0] == 0,
+            "expert 0's compacted row is token 0");
+    require(g.expert_rows[1].size() == 1 && g.expert_rows[1][0] == 0 &&
+                gather[1][0] == 0.0f,
+            "all-zero expert keeps compact_routing_rows dummy idx 0");
+
+    const auto even = wp_expert_worker::build_batch_mmid_ids(
+        { { 0.5f, 0.0f }, { 0.0f, 0.3f } }, true);
+    require(even.k_width == 1 && !even.used_pad_expert &&
+                even.ids[0] == 0 && even.ids[1] == 1,
+            "uniform rank 1 must not pad");
+
+    // Same allow-list parser as WP_EXPERT_ARENA_PREFILL.
+    require(!wp_expert_worker::parse_arena_prefill_enabled(nullptr, "ROCm0"),
+            "unset WP_EXPERT_BATCH_MMID must default off");
+    require(wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0", "ROCm1"),
+            "BATCH_MMID allow-list must enable a named HIP/CUDA device");
+    require(!wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0", "Vulkan0"),
+            "BATCH_MMID allow-list must not enable Vulkan");
+    require(!wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0", "CPU"),
+            "BATCH_MMID allow-list must not enable CPU");
+}
+
 static void test_arena_prefill_device_policy() {
     // Unset / missing must default OFF, same as parse_env_default_off.
     require(!wp_expert_worker::parse_arena_prefill_enabled(nullptr, "ROCm0"),
@@ -5010,6 +5070,7 @@ int main() {
         test_pin_class_cap_resolves_by_device_size();
         test_assignment_groups_bucket_by_device();
         test_decode_prefill_compute_profile();
+        test_batch_mmid_ids();
         test_arena_prefill_device_policy();
         test_prefill_arena_grouped_production_geometry();
         test_prefill_arena_grouped_placement_independent();

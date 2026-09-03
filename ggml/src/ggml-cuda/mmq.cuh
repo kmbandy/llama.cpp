@@ -1700,6 +1700,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // owns the pointer-array memory and guarantees it stays valid until
 // the kernel completes.
 void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
+// Queue one more pointer array for a later MUL_MAT_ID in the same graph.
+// take() pops the queue first, then the single-shot set() slot. Empty queue
+// is the legacy path (eval_cb still uses set()).
+void                  ggml_cuda_queue_routed_expert_ptrs(const void * const * ptr);
 const void * const *  ggml_cuda_take_routed_expert_ptrs();
 bool                  ggml_cuda_has_routed_expert_ptrs();  // non-consuming peek
 void                  ggml_cuda_discard_routed_expert_ptrs();
