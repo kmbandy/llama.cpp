@@ -205,6 +205,21 @@ struct PlacementReport {
 void                    test_reset_placement_report();
 const PlacementReport & test_placement_report();
 
+// Test-only: exercises the exact index-bucketing algorithm
+// Worker::assignment_groups uses internally (in wp-expert-worker.cpp) to turn
+// a request's assignments into per-device sub-dispatch groups -- one group
+// per distinct owning device, ordered by device id, each group's assignment
+// indices kept in their original encounter order -- without needing a live
+// multi-device Worker. `owner_for_index[i]` is the device that owns
+// assignment i (what owning_device_for_page would have returned); pass a
+// synthetic owner sequence to test the bucketing shape directly.
+struct AssignmentGroupsTestReport {
+    std::vector<size_t>              devices;
+    std::vector<std::vector<size_t>> indices;
+};
+AssignmentGroupsTestReport test_bucket_assignment_groups(
+        const std::vector<size_t> & owner_for_index);
+
 // Decode/prefill compute-profile policy. Pure functions of the env string so
 // tests can pin defaults without latching process-lifetime getenv statics.
 //

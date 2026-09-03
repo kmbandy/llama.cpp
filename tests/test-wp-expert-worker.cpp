@@ -4788,6 +4788,112 @@ static void test_owner_policy_hot_capacity_on_two_devices() {
             "resident");
 }
 
+// ---------------------------------------------------------------------------
+// assignment_groups() bucketing (2026-09-03).
+//
+// WP_EXPERT_OWNER_POLICY=hot's owner map interleaves devices in expert-id
+// order (unlike the proportional map's contiguous ranges), and the OLD
+// assignment_groups() cut a new group every time the owner changed between
+// consecutive assignments -- so one interleaved layer fragmented into ~11x
+// the sub-requests (measured: 22.6 -> 2.0 experts/sub-request), collapsing
+// prefill 69 -> 14 t/s. The fix buckets by owning device instead of by
+// contiguous run, so group count is bounded by the number of distinct
+// devices regardless of how the owner map is ordered.
+//
+// test_bucket_assignment_groups() exercises the exact bucketing algorithm
+// Worker::assignment_groups() uses (see wp-expert-worker.cpp,
+// bucket_indices_by_owner), fed a synthetic owner-per-assignment sequence, so
+// this does not need a live multi-device Worker.
+static void test_assignment_groups_bucket_by_device() {
+    // Interleaved owner map: experts alternate device 0 / 1 / 0 / 1 ..., the
+    // exact shape WP_EXPERT_OWNER_POLICY=hot produces and that fragmented the
+    // old contiguous-run grouping.
+    const std::vector<size_t> owner_for_index = { 0, 1, 0, 1, 0, 1, 0, 1, 0 };
+
+    const wp_expert_worker::AssignmentGroupsTestReport report =
+        wp_expert_worker::test_bucket_assignment_groups(owner_for_index);
+
+    const size_t n_distinct_owners = 2;  // devices {0, 1} both appear above
+    require(report.devices.size() == n_distinct_owners,
+            "interleaved owner map did not collapse to one group per device");
+    require(report.indices.size() == report.devices.size(),
+            "assignment groups report device/indices count mismatch");
+
+    // Groups must be ordered by device index.
+    for (size_t g = 1; g < report.devices.size(); ++g) {
+        require(report.devices[g - 1] < report.devices[g],
+                "assignment groups are not ordered by device index");
+    }
+
+    // Each group's indices must be strictly increasing (original assignment
+    // order preserved within a device), and every index in a group must
+    // actually map to that group's device in owner_for_index.
+    std::vector<char> covered(owner_for_index.size(), 0);
+    size_t total_indices = 0;
+    for (size_t g = 0; g < report.devices.size(); ++g) {
+        const size_t device = report.devices[g];
+        const std::vector<size_t> & indices = report.indices[g];
+        require(!indices.empty(), "assignment group has no indices");
+        for (size_t k = 0; k < indices.size(); ++k) {
+            if (k > 0) {
+                require(indices[k - 1] < indices[k],
+                        "assignment group indices are not strictly increasing");
+            }
+            const size_t index = indices[k];
+            require(index < owner_for_index.size(),
+                    "assignment group index is out of range");
+            require(owner_for_index[index] == device,
+                    "assignment group index does not map to its group's device");
+            require(covered[index] == 0,
+                    "assignment index appears in more than one group");
+            covered[index] = 1;
+            ++total_indices;
+        }
+    }
+    require(total_indices == owner_for_index.size(),
+            "union of assignment group indices does not cover every assignment");
+    for (size_t i = 0; i < covered.size(); ++i) {
+        require(covered[i] != 0,
+                "an assignment index was dropped by the bucketing");
+    }
+
+    // Single-owner request: the existing single-device fast path (one group,
+    // covering every assignment) must still hold.
+    const std::vector<size_t> single_owner(5, /* device = */ 2);
+    const wp_expert_worker::AssignmentGroupsTestReport single =
+        wp_expert_worker::test_bucket_assignment_groups(single_owner);
+    require(single.devices.size() == 1,
+            "a single-owner request produced more than one group");
+    require(single.devices[0] == 2, "single-owner group reported the wrong device");
+    require(single.indices[0].size() == single_owner.size(),
+            "single-owner group did not cover every assignment");
+    for (size_t i = 0; i < single_owner.size(); ++i) {
+        require(single.indices[0][i] == i,
+                "single-owner group did not preserve original assignment order");
+    }
+
+    // Empty request: no groups (begin_split_dispatch is what turns this into
+    // the {device 0, no indices} fallback group).
+    const wp_expert_worker::AssignmentGroupsTestReport empty =
+        wp_expert_worker::test_bucket_assignment_groups({});
+    require(empty.devices.empty() && empty.indices.empty(),
+            "an empty owner sequence produced a group");
+
+    // A device index that recurs non-adjacently (e.g. 1,0,1,0,1) still
+    // collapses to exactly one group per device, with device 0's two
+    // occurrences kept in original relative order.
+    const std::vector<size_t> owner_alt = { 1, 0, 1, 0, 1 };
+    const wp_expert_worker::AssignmentGroupsTestReport alt =
+        wp_expert_worker::test_bucket_assignment_groups(owner_alt);
+    require(alt.devices.size() == 2, "non-adjacent recurring owners did not collapse");
+    require(alt.devices[0] == 0 && alt.devices[1] == 1,
+            "groups were not ordered by device index");
+    require((alt.indices[0] == std::vector<size_t>{ 1, 3 }),
+            "device 0's indices were not kept in original relative order");
+    require((alt.indices[1] == std::vector<size_t>{ 0, 2, 4 }),
+            "device 1's indices were not kept in original relative order");
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -4805,6 +4911,7 @@ int main() {
         test_owner_overflow_explicit_weights();
         test_owner_overflow_is_deterministic();
         test_owner_policy_hot_capacity_on_two_devices();
+        test_assignment_groups_bucket_by_device();
         test_decode_prefill_compute_profile();
         test_arena_prefill_device_policy();
         test_prefill_arena_grouped_production_geometry();

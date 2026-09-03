@@ -175,6 +175,55 @@ const PlacementReport & test_placement_report() {
     return g_test_placement_report;
 }
 
+// Buckets a per-assignment owner sequence into groups: one group per distinct
+// owner, ordered by owner id ascending, each group's original assignment
+// indices kept in encounter order. Declared here, ABOVE the anonymous
+// namespace that holds class Worker, so it has ordinary external linkage and
+// test_bucket_assignment_groups (below) can be called from outside this
+// translation unit. Worker::assignment_groups (wp-expert-worker.cpp, deep
+// inside that anonymous namespace) calls this by unqualified name -- an
+// ordinary enclosing-namespace lookup, unaffected by the anonymous namespace
+// nesting -- after computing one owner per assignment via
+// owning_device_for_page, so this function itself is a pure regrouping step.
+static std::vector<std::pair<size_t, std::vector<size_t>>> bucket_indices_by_owner(
+        const std::vector<size_t> & owner_for_index) {
+    std::vector<std::pair<size_t, std::vector<size_t>>> result;
+    std::unordered_map<size_t, size_t> group_index_by_owner;
+    group_index_by_owner.reserve(owner_for_index.size());
+    for (size_t i = 0; i < owner_for_index.size(); ++i) {
+        const size_t owner = owner_for_index[i];
+        const auto it = group_index_by_owner.find(owner);
+        size_t gi;
+        if (it == group_index_by_owner.end()) {
+            gi = result.size();
+            result.push_back({ owner, {} });
+            group_index_by_owner.emplace(owner, gi);
+        } else {
+            gi = it->second;
+        }
+        result[gi].second.push_back(i);
+    }
+    std::sort(result.begin(), result.end(),
+              [](const std::pair<size_t, std::vector<size_t>> & a,
+                 const std::pair<size_t, std::vector<size_t>> & b) {
+                  return a.first < b.first;
+              });
+    return result;
+}
+
+// Test-only: exercises bucket_indices_by_owner directly, without needing a
+// live multi-device Worker. See wp-expert-worker.h.
+AssignmentGroupsTestReport test_bucket_assignment_groups(
+        const std::vector<size_t> & owner_for_index) {
+    AssignmentGroupsTestReport report;
+    for (std::pair<size_t, std::vector<size_t>> & bucket :
+             bucket_indices_by_owner(owner_for_index)) {
+        report.devices.push_back(bucket.first);
+        report.indices.push_back(std::move(bucket.second));
+    }
+    return report;
+}
+
 uint64_t test_arena_prefill_hits() {
     return g_test_arena_prefill_hits.load(std::memory_order_relaxed);
 }
@@ -15477,7 +15526,7 @@ public:
                     for (const size_t gi : by_device[d]) {
                         const AssignmentGroup & group = groups[gi];
                         pipe_expert_dispatch_req sub =
-                            make_subrequest(request, group.begin, group.end);
+                            make_subrequest(request, group);
                         std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                         partials[gi] = devices_[group.device]->dispatch(
                             sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
@@ -15489,7 +15538,7 @@ public:
                         }
                         if (devices_[group.device]->stats_enabled()) {
                             devices_[group.device]->record_stats(
-                                sub_stats[gi], group.end - group.begin);
+                                sub_stats[gi], group.indices.size());
                         }
                         if (streaming) {
                             {
@@ -15651,7 +15700,7 @@ public:
         } else {
             for (size_t gi = 0; gi < groups.size(); ++gi) {
                 const AssignmentGroup & group = groups[gi];
-                pipe_expert_dispatch_req sub = make_subrequest(request, group.begin, group.end);
+                pipe_expert_dispatch_req sub = make_subrequest(request, group);
                 std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
                 partials[gi] = devices_[group.device]->dispatch(
                     sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
@@ -15661,7 +15710,7 @@ public:
                                         partials[gi].partial);
                 }
                 if (devices_[group.device]->stats_enabled()) {
-                    devices_[group.device]->record_stats(sub_stats[gi], group.end - group.begin);
+                    devices_[group.device]->record_stats(sub_stats[gi], group.indices.size());
                 }
                 if (stream_callback && groups.size() > 1) {
                     stream_callback(gi, groups.size(), partials[gi],
@@ -15708,7 +15757,7 @@ public:
         std::vector<AssignmentGroup> groups =
             assignment_groups(request, &migration_budget);
         if (groups.empty()) {
-            groups.push_back({0, 0, 0});
+            groups.push_back({0, {}});
         }
         {
             std::lock_guard<std::mutex> lock(split_mutex_);
@@ -15759,9 +15808,10 @@ public:
             sub_request.layer = pending.begin.layer;
             sub_request.n_tokens = pending.begin.n_tokens;
             sub_request.swiglu_clamp = pending.begin.swiglu_clamp;
-            sub_request.assignments.assign(
-                pending.begin.assignments.begin() + (ptrdiff_t) group.begin,
-                pending.begin.assignments.begin() + (ptrdiff_t) group.end);
+            sub_request.assignments.reserve(group.indices.size());
+            for (const size_t index : group.indices) {
+                sub_request.assignments.push_back(pending.begin.assignments[index]);
+            }
             sub_request.activations = acts.activations;
             RequestStats sub_stats;
             pipe_expert_partial partial;
@@ -15780,7 +15830,7 @@ public:
                     }
                     if (devices_[group.device]->stats_enabled()) {
                         devices_[group.device]->record_stats(
-                            sub_stats, group.end - group.begin);
+                            sub_stats, group.indices.size());
                     }
                 });
             } else {
@@ -15794,7 +15844,7 @@ public:
                 }
                 if (devices_[group.device]->stats_enabled()) {
                     devices_[group.device]->record_stats(
-                        sub_stats, group.end - group.begin);
+                        sub_stats, group.indices.size());
                 }
             }
             accumulate_request_stats(request_stats, sub_stats);
@@ -16652,10 +16702,14 @@ private:
         }
     }
 
+    // A group is every assignment routed to one owning device, in their
+    // original relative order. Explicit indices (not a range) because an
+    // interleaved owner map -- WP_EXPERT_OWNER_POLICY=hot alternates devices
+    // in expert-id order -- means a device's assignments are not contiguous
+    // in request.assignments.
     struct AssignmentGroup {
         size_t device = 0;
-        size_t begin = 0;
-        size_t end = 0;
+        std::vector<size_t> indices;
     };
 
     struct SplitPending {
@@ -16664,6 +16718,11 @@ private:
         std::vector<AssignmentGroup> groups;
     };
 
+    // Buckets request.assignments by owning device: exactly one group per
+    // distinct device that appears, ordered by device index, each group's
+    // indices kept in their original stable order. owning_device_for_page can
+    // mutate *migration_budget, so it is called exactly once per assignment,
+    // in original assignment order -- same as before this was bucketed.
     std::vector<AssignmentGroup> assignment_groups(
             const pipe_expert_dispatch_req & request,
             size_t * migration_budget = nullptr) const {
@@ -16671,30 +16730,34 @@ private:
         if (request.assignments.empty()) {
             return result;
         }
-        size_t begin = 0;
-        size_t owner = owning_device_for_page(
-            request.layer, request.assignments.front().expert_id, migration_budget);
-        for (size_t i = 1; i <= request.assignments.size(); ++i) {
-            const size_t next = i == request.assignments.size() ? owner :
-                owning_device_for_page(request.layer, request.assignments[i].expert_id,
-                                       migration_budget);
-            if (i == request.assignments.size() || next != owner) {
-                result.push_back({owner, begin, i});
-                begin = i;
-                owner = next;
-            }
+        // owning_device_for_page can mutate *migration_budget, so it is
+        // called exactly once per assignment, in original assignment order --
+        // same as before this was bucketed by device. The regrouping itself
+        // (bucket_indices_by_owner) is a pure function of the owners, shared
+        // with test_bucket_assignment_groups so the bucketing shape is
+        // covered by a unit test that does not need a live Worker.
+        std::vector<size_t> owner_for_index(request.assignments.size());
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            owner_for_index[i] = owning_device_for_page(
+                request.layer, request.assignments[i].expert_id, migration_budget);
+        }
+        for (std::pair<size_t, std::vector<size_t>> & bucket :
+                 bucket_indices_by_owner(owner_for_index)) {
+            result.push_back({ bucket.first, std::move(bucket.second) });
         }
         return result;
     }
 
     pipe_expert_dispatch_req make_subrequest(
-            const pipe_expert_dispatch_req & request, size_t begin, size_t end) const {
+            const pipe_expert_dispatch_req & request, const AssignmentGroup & group) const {
         pipe_expert_dispatch_req result;
         result.layer = request.layer;
         result.n_tokens = request.n_tokens;
         result.swiglu_clamp = request.swiglu_clamp;
-        result.assignments.assign(request.assignments.begin() + (ptrdiff_t) begin,
-                                  request.assignments.begin() + (ptrdiff_t) end);
+        result.assignments.reserve(group.indices.size());
+        for (const size_t index : group.indices) {
+            result.assignments.push_back(request.assignments[index]);
+        }
         if (request.activations_view != nullptr) {
             result.activations_view = request.activations_view;
             result.activations_view_size = request.activations_view_size;
