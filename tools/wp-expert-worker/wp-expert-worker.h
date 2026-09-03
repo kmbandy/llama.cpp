@@ -455,10 +455,11 @@ CompactRouting compact_routing_rows(const std::vector<float> & wv);
 // assignment-index left-fold of the full [n_embd, n_tokens] slices.
 //
 // Gather: invert per-expert compacted rows onto ids' [k_width, n_tokens]
-// layout, packing each token's experts in assignment order. Uneven rank is
-// padded with expert index n_experts and route weight 0 (a dummy slot whose
-// weight pointer is a copy of expert 0). Duplicate ids per token are never
-// produced.
+// layout, packing each token's experts in assignment order. Uneven rank
+// pads with unique ids: first pad slot is dummy expert n_experts (route
+// weight 0, pointer copies expert 0), later pad slots are unused real
+// experts (also weight 0). Duplicate ids per token are never produced --
+// MMQ scatter quantize faults on duplicates.
 struct BatchMmidIds {
     std::vector<std::vector<int32_t>> expert_rows;
     std::vector<int32_t> ids;
@@ -471,6 +472,12 @@ struct BatchMmidIds {
 BatchMmidIds build_batch_mmid_ids(
         const std::vector<std::vector<float>> & weights,
         bool use_gather);
+size_t batch_mmid_n_as(const BatchMmidIds & plan);
+bool batch_mmid_ids_valid(const BatchMmidIds & plan);
+void fill_batch_mmid_expert_ptrs(
+        int64_t * dst, size_t n_as,
+        const int64_t * bases, size_t n,
+        bool used_pad_expert);
 
 // Scatter compacted [n_embd, n_sel] rows onto a zeroed [n_embd, n_tokens]
 // dest. idx is I32 [n_sel] and MUST be unique (ggml_set_rows overwrites;

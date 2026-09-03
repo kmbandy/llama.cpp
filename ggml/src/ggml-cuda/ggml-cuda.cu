@@ -2975,7 +2975,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // it off when routing is active. The consolidated parent's
     // src0->data is a placeholder; kernels that ignore expert_ptrs and
     // dereference it with the per-expert stride will fault.
-    const bool routing_active = ggml_cuda_has_routed_expert_ptrs();
+    const bool routing_active = ggml_cuda_has_routed_expert_ptrs() ||
+        ggml_mul_mat_id_get_expert_ptrs_n_as(dst) > 0;
 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         // MMVF is instantiated at least as wide as MMVQ, so the single MMVQ-sized gate below
@@ -5185,7 +5186,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // array for the gate weight. Out of scope for tonight — let the op
     // fall through to the unfused dispatcher path which already routes
     // correctly via Phase A2.
-    const bool routing_active_for_fusion = ggml_cuda_has_routed_expert_ptrs();
+    const bool routing_active_for_fusion = ggml_cuda_has_routed_expert_ptrs() ||
+        (node->op == GGML_OP_MUL_MAT_ID && ggml_mul_mat_id_get_expert_ptrs_n_as(node) > 0);
 
     auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
         const bool scale_lhs_mm = scale_node->src[0] == mm_node;

@@ -1412,7 +1412,8 @@ void ggml_cuda_mul_mat_vec_q(
     // channel instead. Same gate we applied in mmq.cu. Decode dispatches
     // here (MMVQ for ne2<=batch); the analogous prefill path (MMQ) was
     // already gated.
-    const bool routing_was_set = ggml_cuda_has_routed_expert_ptrs();
+    const bool routing_was_set = ggml_cuda_has_routed_expert_ptrs() ||
+        ggml_mul_mat_id_get_expert_ptrs_n_as(dst) > 0;
 
     if (!routing_was_set &&
         ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -1467,7 +1468,7 @@ void ggml_cuda_mul_mat_vec_q(
     // eval callback. take_*() clears the TLS, so this op consumes it
     // exactly once. nullptr (default) is the legacy bit-identical path.
     // (MAD-88 Phase 2 part 8 = A2.)
-    const void * const * routed_expert_ptrs = ggml_cuda_take_routed_expert_ptrs();
+    const void * const * routed_expert_ptrs = ggml_cuda_resolve_mul_mat_id_expert_ptrs(dst);
     if (routing_was_set) {
         ggml_cuda_wp_routing_guard_check("MMVQ", src0, ids, dst, routed_expert_ptrs);
     }

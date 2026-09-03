@@ -107,6 +107,8 @@ void ggml_cuda_queue_routed_expert_ptrs(const void * const *)
     __attribute__((weak));
 void ggml_cuda_discard_routed_expert_ptrs()
     __attribute__((weak));
+void ggml_cuda_get_routed_expert_ptrs_stats(uint64_t *, uint64_t *, uint64_t *)
+    __attribute__((weak));
 
 namespace wp_expert_worker {
 
@@ -876,19 +878,73 @@ BatchMmidIds build_batch_mmid_ids(
         }
     }
     out.k_width = k_width;
-    out.ids.assign((size_t) n_tokens * k_width, (int32_t) n);
+    out.ids.assign((size_t) n_tokens * k_width, 0);
     out.route_w.assign((size_t) n_tokens * k_width, 0.0f);
     for (uint32_t t = 0; t < n_tokens; ++t) {
-        if ((uint32_t) per_token[t].size() < k_width) {
-            out.used_pad_expert = true;
-        }
-        for (size_t k = 0; k < per_token[t].size(); ++k) {
-            const int32_t e = per_token[t][k];
+        std::vector<uint8_t> used(n, 0);
+        size_t k = 0;
+        for (int32_t e : per_token[t]) {
             out.ids[(size_t) t * k_width + k] = e;
             out.route_w[(size_t) t * k_width + k] = weights[(size_t) e][t];
+            used[(size_t) e] = 1;
+            ++k;
+        }
+        if (k < k_width) {
+            out.used_pad_expert = true;
+            out.ids[(size_t) t * k_width + k] = (int32_t) n;
+            ++k;
+            for (size_t e = 0; e < n && k < k_width; ++e) {
+                if (used[e]) {
+                    continue;
+                }
+                out.ids[(size_t) t * k_width + k] = (int32_t) e;
+                used[e] = 1;
+                ++k;
+            }
+        }
+        if (k != k_width) {
+            return BatchMmidIds{};
         }
     }
     return out;
+}
+
+size_t batch_mmid_n_as(const BatchMmidIds & plan) {
+    return plan.n_experts + (plan.used_pad_expert ? 1 : 0);
+}
+
+bool batch_mmid_ids_valid(const BatchMmidIds & plan) {
+    const size_t n_as = batch_mmid_n_as(plan);
+    if (plan.k_width == 0 || n_as == 0 ||
+            plan.ids.size() != (size_t) plan.k_width * plan.n_tokens) {
+        return false;
+    }
+    for (uint32_t t = 0; t < plan.n_tokens; ++t) {
+        std::vector<uint8_t> seen(n_as, 0);
+        for (uint32_t k = 0; k < plan.k_width; ++k) {
+            const int32_t id = plan.ids[(size_t) t * plan.k_width + k];
+            if (id < 0 || (size_t) id >= n_as || seen[(size_t) id]) {
+                return false;
+            }
+            seen[(size_t) id] = 1;
+        }
+    }
+    return true;
+}
+
+void fill_batch_mmid_expert_ptrs(
+        int64_t * dst, size_t n_as,
+        const int64_t * bases, size_t n,
+        bool used_pad_expert) {
+    if (dst == nullptr || bases == nullptr || n_as < n) {
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = bases[i];
+    }
+    if (used_pad_expert && n_as == n + 1 && n > 0) {
+        dst[n] = dst[0];
+    }
 }
 
 ggml_tensor * scatter_add_compact_rows(
@@ -1412,6 +1468,9 @@ struct RequestStats {
     uint64_t n_d3_bounce   = 0;
     uint64_t n_batch_mmid_hit = 0;
     uint64_t n_batch_mmid_fallback = 0;
+    uint64_t n_mmid_ptrs_set = 0;
+    uint64_t n_mmid_ptrs_consumed = 0;
+    uint64_t n_mmid_ptrs_discarded = 0;
     bool d3_counted = false;
     // D1 (2026-08-07): the coalesced routing-weight/gather-idx blob upload.
     // The per-tensor uploads it replaces were never timed anywhere -- they sat
@@ -1655,6 +1714,15 @@ public:
         n_d3_bounce_ += request.n_d3_bounce;
         n_batch_mmid_hit_ += request.n_batch_mmid_hit;
         n_batch_mmid_fallback_ += request.n_batch_mmid_fallback;
+        n_mmid_ptrs_set_ += request.n_mmid_ptrs_set;
+        n_mmid_ptrs_consumed_ += request.n_mmid_ptrs_consumed;
+        n_mmid_ptrs_discarded_ += request.n_mmid_ptrs_discarded;
+        if (request.n_batch_mmid_hit > 0 || request.n_mmid_ptrs_set > 0 ||
+                request.n_mmid_ptrs_discarded > 0) {
+            n_mmid_ptrs_set_last_ = request.n_mmid_ptrs_set;
+            n_mmid_ptrs_consumed_last_ = request.n_mmid_ptrs_consumed;
+            n_mmid_ptrs_discarded_last_ = request.n_mmid_ptrs_discarded;
+        }
         // PER-REQUEST DISTRIBUTION, not just the total. The cumulative ns_submit
         // cannot distinguish "every request costs 2.1 ms" from "most cost 0.2 ms
         // and a few cost 50 ms", and those have completely different fixes. An
@@ -1856,6 +1924,12 @@ private:
                   << " n_d3_bounce=" << n_d3_bounce_
                   << " n_batch_mmid_hit=" << n_batch_mmid_hit_
                   << " n_batch_mmid_fallback=" << n_batch_mmid_fallback_
+                  << " n_mmid_ptrs_set=" << n_mmid_ptrs_set_
+                  << " n_mmid_ptrs_consumed=" << n_mmid_ptrs_consumed_
+                  << " n_mmid_ptrs_discarded=" << n_mmid_ptrs_discarded_
+                  << " mmid_ptrs_dreq=" << n_mmid_ptrs_set_last_
+                  << ',' << n_mmid_ptrs_consumed_last_
+                  << ',' << n_mmid_ptrs_discarded_last_
                   << " ns_readback=" << ns_readback_
                   << " ns_send=" << ns_send_
                   << " host_bytes=" << host_bytes_
@@ -1991,6 +2065,12 @@ private:
     uint64_t          n_d3_bounce_ = 0;
     uint64_t          n_batch_mmid_hit_ = 0;
     uint64_t          n_batch_mmid_fallback_ = 0;
+    uint64_t          n_mmid_ptrs_set_ = 0;
+    uint64_t          n_mmid_ptrs_consumed_ = 0;
+    uint64_t          n_mmid_ptrs_discarded_ = 0;
+    uint64_t          n_mmid_ptrs_set_last_ = 0;
+    uint64_t          n_mmid_ptrs_consumed_last_ = 0;
+    uint64_t          n_mmid_ptrs_discarded_last_ = 0;
     uint64_t          ns_readback_ = 0;
     uint64_t          ns_dispatch_total_ = 0;
     uint64_t          ns_lock_wait_    = 0;
@@ -12887,8 +12967,8 @@ private:
     // 3 mul_mat_id (gate, up, down) or fused gate||up + down. Weights stay in
     // their slots: expert_ptrs[c] is the slot+role address, queued in
     // assignment order and consumed once per MUL_MAT_ID. Fold is a left fold
-    // over ids-slot k (assignment order per token). Gather uses padded-rank
-    // ids: uneven tokens pad with expert index n and route weight 0.
+    // over ids-slot k (assignment order per token). Gather pads uneven rank
+    // with unique ids (dummy expert n once, then unused real experts).
     bool compute_batch_mmid(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -12922,10 +13002,14 @@ private:
         }
         const BatchMmidIds plan = build_batch_mmid_ids(weight_rows, use_gather);
         if (plan.k_width == 0 || plan.n_tokens != request.n_tokens ||
-                plan.ids.size() != (size_t) plan.k_width * plan.n_tokens) {
+                plan.ids.size() != (size_t) plan.k_width * plan.n_tokens ||
+                !batch_mmid_ids_valid(plan)) {
             return false;
         }
-        const size_t n_as = n + (plan.used_pad_expert ? 1 : 0);
+        const size_t n_as = batch_mmid_n_as(plan);
+        if (n_as == 0 || n_as > (size_t) std::numeric_limits<int32_t>::max() || n_as < n) {
+            return false;
+        }
         const uint32_t n_tokens = request.n_tokens;
         const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
         const int64_t k_width = (int64_t) plan.k_width;
@@ -13003,19 +13087,29 @@ private:
         ggml_tensor * hidden = nullptr;
         ggml_tensor * gate_out = nullptr;
         ggml_tensor * up_out = nullptr;
+        ggml_tensor * gate_mmid = nullptr;
+        ggml_tensor * up_mmid = nullptr;
         if (fuse_gate_up) {
-            hidden = ggml_swiglu(ctx.get(), ggml_mul_mat_id(ctx.get(), as_gate, input3d, ids));
+            gate_mmid = ggml_mul_mat_id(ctx.get(), as_gate, input3d, ids);
+            ggml_set_name(gate_mmid, "wp_mmid_gate");
+            hidden = ggml_swiglu(ctx.get(), gate_mmid);
         } else {
-            gate_out = ggml_mul_mat_id(ctx.get(), as_gate, input3d, ids);
-            up_out   = ggml_mul_mat_id(ctx.get(), as_up,   input3d, ids);
+            gate_mmid = ggml_mul_mat_id(ctx.get(), as_gate, input3d, ids);
+            up_mmid   = ggml_mul_mat_id(ctx.get(), as_up,   input3d, ids);
+            ggml_set_name(gate_mmid, "wp_mmid_gate");
+            ggml_set_name(up_mmid, "wp_mmid_up");
+            gate_out = gate_mmid;
+            up_out   = up_mmid;
             const float swiglu_limit = request.swiglu_clamp;
             if (swiglu_limit > 1e-6f) {
-                up_out   = ggml_clamp(ctx.get(), up_out,   -swiglu_limit, swiglu_limit);
-                gate_out = ggml_clamp(ctx.get(), gate_out, -INFINITY,     swiglu_limit);
+                up_out   = ggml_clamp(ctx.get(), up_mmid,   -swiglu_limit, swiglu_limit);
+                gate_out = ggml_clamp(ctx.get(), gate_mmid, -INFINITY,     swiglu_limit);
             }
             hidden = ggml_swiglu_split(ctx.get(), gate_out, up_out);
         }
-        ggml_tensor * down_out = ggml_mul_mat_id(ctx.get(), as_down, hidden, ids);
+        ggml_tensor * down_mmid = ggml_mul_mat_id(ctx.get(), as_down, hidden, ids);
+        ggml_set_name(down_mmid, "wp_mmid_down");
+        ggml_tensor * down_out = down_mmid;
 
         ggml_tensor * route_w =
             ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, k_width, (int64_t) n_tokens);
@@ -13097,16 +13191,16 @@ private:
                     plan.route_w.size() * sizeof(float));
         const auto fill_ptrs = [&](const char * role, size_t off) {
             int64_t * dst = (int64_t *) (params_host.data() + off);
+            std::vector<int64_t> bases(n);
             for (size_t k = 0; k < n; ++k) {
                 const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
-                dst[k] = (int64_t) (uintptr_t) (
+                bases[k] = (int64_t) (uintptr_t) (
                     (uint8_t *) loaded.base + pages[sel[k]]->roles.at(role).device_offset);
             }
-            if (plan.used_pad_expert) {
-                dst[n] = dst[0];
-            }
+            fill_batch_mmid_expert_ptrs(
+                dst, n_as, bases.data(), n, plan.used_pad_expert);
         };
-        fill_ptrs(fuse_gate_up ? "gate" : "gate", gate_ptr_off);
+        fill_ptrs("gate", gate_ptr_off);
         if (!fuse_gate_up) {
             fill_ptrs("up", up_ptr_off);
         }
@@ -13118,39 +13212,66 @@ private:
         add_work_input_trace_tensor(
             route_w, plan.route_w.data(), plan.route_w.size() * sizeof(float));
 
+        uint64_t set0 = 0;
+        uint64_t cons0 = 0;
+        uint64_t disc0 = 0;
+        if (ggml_cuda_get_routed_expert_ptrs_stats != nullptr) {
+            ggml_cuda_get_routed_expert_ptrs_stats(&set0, &cons0, &disc0);
+        }
+
+        // Compute stream, not the default stream: non-blocking compute streams
+        // do not serialize with a sync cudaMemcpy. Keep the host blob alive
+        // until graph_compute returns (sync) or until async_submit_state drains.
         uint64_t params_elapsed = 0;
+        const uint8_t * params_src = params_host.data();
         if (submit_async_) {
             AsyncSubmitState & state = async_submit_state();
             state.params.emplace_back(std::move(params_host));
             state.pending = true;
-            const auto params_started = std::chrono::steady_clock::now();
-            ggml_backend_tensor_set_async(
-                backend_.get(), blob, state.params.back().data(), 0, params_span);
-            params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - params_started).count();
-        } else {
-            const auto params_started = std::chrono::steady_clock::now();
-            ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
-            params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - params_started).count();
+            params_src = state.params.back().data();
         }
+        const auto params_started = std::chrono::steady_clock::now();
+        ggml_backend_tensor_set_async(
+            backend_.get(), blob, params_src, 0, params_span);
+        params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - params_started).count();
         request_stats.ns_params_set += params_elapsed;
+
+        ggml_mul_mat_id_set_expert_ptrs(
+            gate_mmid, gate_ptr_t->data, (int32_t) n_as);
+        if (up_mmid != nullptr) {
+            ggml_mul_mat_id_set_expert_ptrs(
+                up_mmid, up_ptr_t->data, (int32_t) n_as);
+        }
+        ggml_mul_mat_id_set_expert_ptrs(
+            down_mmid, down_ptr_t->data, (int32_t) n_as);
 
         ggml_cuda_queue_routed_expert_ptrs((const void * const *) gate_ptr_t->data);
         if (!fuse_gate_up) {
             ggml_cuda_queue_routed_expert_ptrs((const void * const *) up_ptr_t->data);
         }
         ggml_cuda_queue_routed_expert_ptrs((const void * const *) down_ptr_t->data);
-        struct DiscardQueuedPtrs {
-            ~DiscardQueuedPtrs() {
-                if (ggml_cuda_discard_routed_expert_ptrs != nullptr) {
-                    ggml_cuda_discard_routed_expert_ptrs();
-                }
-            }
-        } discard_queued_ptrs;
-
         last_compute_path_ = "batch-mmid";
-        const enum ggml_status status = submit_graph(graph, request_stats);
+        enum ggml_status status = GGML_STATUS_FAILED;
+        {
+            struct DiscardQueuedPtrs {
+                ~DiscardQueuedPtrs() {
+                    if (ggml_cuda_discard_routed_expert_ptrs != nullptr) {
+                        ggml_cuda_discard_routed_expert_ptrs();
+                    }
+                }
+            } discard_queued_ptrs;
+            status = submit_graph(graph, request_stats);
+        }
+        if (ggml_cuda_get_routed_expert_ptrs_stats != nullptr) {
+            uint64_t set1 = 0;
+            uint64_t cons1 = 0;
+            uint64_t disc1 = 0;
+            ggml_cuda_get_routed_expert_ptrs_stats(&set1, &cons1, &disc1);
+            request_stats.n_mmid_ptrs_set += set1 - set0;
+            request_stats.n_mmid_ptrs_consumed += cons1 - cons0;
+            request_stats.n_mmid_ptrs_discarded += disc1 - disc0;
+        }
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("batch-mmid backend graph compute failed");
         }
@@ -15548,6 +15669,9 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_d3_bounce += src.n_d3_bounce;
     dst.n_batch_mmid_hit += src.n_batch_mmid_hit;
     dst.n_batch_mmid_fallback += src.n_batch_mmid_fallback;
+    dst.n_mmid_ptrs_set += src.n_mmid_ptrs_set;
+    dst.n_mmid_ptrs_consumed += src.n_mmid_ptrs_consumed;
+    dst.n_mmid_ptrs_discarded += src.n_mmid_ptrs_discarded;
     dst.ns_params_set += src.ns_params_set;
     dst.ns_demote += src.ns_demote;
     dst.ns_ensure_post += src.ns_ensure_post;
