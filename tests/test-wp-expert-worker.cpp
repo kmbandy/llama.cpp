@@ -2701,6 +2701,9 @@ static void test_batch_mmid_ids() {
     require(d.expert_rows.size() == 3 && d.expert_rows[1].size() == 1 &&
                 d.expert_rows[1][0] == 0,
             "dense expert_rows must name every token");
+    require(wp_expert_worker::batch_mmid_ids_valid(d) &&
+                wp_expert_worker::batch_mmid_n_as(d) == 3,
+            "dense ids must be unique and n_as == n_experts");
 
     // Gather: invert per-expert rows onto [k_width, n_tokens]. Token 0 sees
     // experts 0 then 2 (assignment order); token 1 sees only expert 2 and is
@@ -2725,12 +2728,54 @@ static void test_batch_mmid_ids() {
     require(g.expert_rows[1].size() == 1 && g.expert_rows[1][0] == 0 &&
                 gather[1][0] == 0.0f,
             "all-zero expert keeps compact_routing_rows dummy idx 0");
+    require(wp_expert_worker::batch_mmid_ids_valid(g),
+            "one-pad gather ids must be unique and in range");
+    require(wp_expert_worker::batch_mmid_n_as(g) == 4,
+            "one-pad gather n_as is n_experts+1");
 
     const auto even = wp_expert_worker::build_batch_mmid_ids(
         { { 0.5f, 0.0f }, { 0.0f, 0.3f } }, true);
     require(even.k_width == 1 && !even.used_pad_expert &&
                 even.ids[0] == 0 && even.ids[1] == 1,
             "uniform rank 1 must not pad");
+    require(wp_expert_worker::batch_mmid_ids_valid(even) &&
+                wp_expert_worker::batch_mmid_n_as(even) == 2,
+            "uniform rank 1 n_as is n_experts");
+
+    // Two pad slots on one token: dummy expert n once, then an unused real
+    // expert. Repeating n was the scatter-quantize GPU fault.
+    const std::vector<std::vector<float>> multi_pad = {
+        { 0.5f, 0.0f },
+        { 0.3f, 0.0f },
+        { 0.1f, 0.2f },
+    };
+    const auto mp = wp_expert_worker::build_batch_mmid_ids(multi_pad, true);
+    require(mp.n_experts == 3 && mp.n_tokens == 2 && mp.k_width == 3 &&
+                mp.used_pad_expert,
+            "max rank 3 with a rank-1 token must pad");
+    require(mp.ids[0] == 0 && mp.ids[1] == 1 && mp.ids[2] == 2,
+            "full-rank token keeps assignment order");
+    require(mp.ids[3] == 2 && mp.ids[4] == 3 && mp.ids[5] == 0,
+            "rank-1 token: real expert, dummy n, unused real");
+    require(mp.route_w[3] == 0.2f && mp.route_w[4] == 0.0f && mp.route_w[5] == 0.0f,
+            "pad slots must have route weight 0");
+    require(wp_expert_worker::batch_mmid_ids_valid(mp),
+            "multi-pad ids must be unique per token and < n_as");
+    const size_t n_as = wp_expert_worker::batch_mmid_n_as(mp);
+    require(n_as == 4, "multi-pad n_as is n_experts+1");
+    for (int32_t id : mp.ids) {
+        require(id >= 0 && (size_t) id < n_as, "every ids value must be < n_as");
+    }
+    std::vector<int64_t> bases = { 0x1000, 0x2000, 0x3000 };
+    std::vector<int64_t> ptrs(n_as, 0);
+    wp_expert_worker::fill_batch_mmid_expert_ptrs(
+        ptrs.data(), n_as, bases.data(), mp.n_experts, mp.used_pad_expert);
+    require(ptrs[0] == 0x1000 && ptrs[1] == 0x2000 && ptrs[2] == 0x3000 &&
+                ptrs[3] == ptrs[0],
+            "every pointer slot filled; pad expert copies expert 0");
+    for (int64_t p : ptrs) {
+        require(p != 0, "no empty expert pointer slot");
+    }
 
     // Same allow-list parser as WP_EXPERT_ARENA_PREFILL.
     require(!wp_expert_worker::parse_arena_prefill_enabled(nullptr, "ROCm0"),

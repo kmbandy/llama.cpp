@@ -113,6 +113,20 @@ void ggml_cuda_get_routed_expert_ptrs_stats(uint64_t * set, uint64_t * consumed,
     }
 }
 
+const void * const * ggml_cuda_resolve_mul_mat_id_expert_ptrs(const ggml_tensor * dst) {
+    const void * const * p = ggml_cuda_take_routed_expert_ptrs();
+    if (p == nullptr) {
+        p = (const void * const *) ggml_mul_mat_id_get_expert_ptrs(dst);
+    }
+    const int32_t n_as = ggml_mul_mat_id_get_expert_ptrs_n_as(dst);
+    if (n_as > 0 && p == nullptr) {
+        GGML_ABORT("MUL_MAT_ID %s missing expert_ptrs n_as=%d",
+                   (dst != nullptr && dst->name[0] != '\0') ? dst->name : "<unnamed>",
+                   n_as);
+    }
+    return p;
+}
+
 static bool ggml_cuda_wp_routing_guard_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("WP_ROUTING_GUARD");
@@ -287,7 +301,8 @@ void ggml_cuda_mul_mat_q(
     // expert_ptrs side channel instead. Writing past placeholder with size_data
     // bytes faults the GPU (near-null offset since placeholder may be 0-based
     // within the pool view).
-    const bool routing_was_set = ggml_cuda_has_routed_expert_ptrs();
+    const bool routing_was_set = ggml_cuda_has_routed_expert_ptrs() ||
+        ggml_mul_mat_id_get_expert_ptrs_n_as(dst) > 0;
 
     if (!routing_was_set &&
         ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -325,7 +340,7 @@ void ggml_cuda_mul_mat_q(
     // Pull any routing-aware expert pointer array set by the weight-pager
     // eval callback. take_*() clears the TLS, so this op consumes it
     // exactly once. nullptr (default) is the legacy bit-identical path.
-    const void * const * routed_expert_ptrs = ggml_cuda_take_routed_expert_ptrs();
+    const void * const * routed_expert_ptrs = ggml_cuda_resolve_mul_mat_id_expert_ptrs(dst);
     if (routing_was_set) {
         ggml_cuda_wp_routing_guard_check("MMQ", src0, ids, dst, routed_expert_ptrs);
     }

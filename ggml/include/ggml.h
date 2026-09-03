@@ -1530,6 +1530,16 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
 
+    // Bind a device-resident expert-pointer array to a MUL_MAT_ID node.
+    // op_params[2] = n_as (>0 means the CUDA/HIP backend must have the array).
+    // op_params[4..5] = the device pointer. Missing array -> GGML_ABORT, not a GPU fault.
+    GGML_API void ggml_mul_mat_id_set_expert_ptrs(
+            struct ggml_tensor * a,
+            const void         * ptrs,
+            int32_t              n_as);
+    GGML_API const void * ggml_mul_mat_id_get_expert_ptrs(const struct ggml_tensor * a);
+    GGML_API int32_t      ggml_mul_mat_id_get_expert_ptrs_n_as(const struct ggml_tensor * a);
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,

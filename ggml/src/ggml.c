@@ -3490,6 +3490,35 @@ void ggml_mul_mat_id_set_hint(
     ggml_set_op_params_i32(a, 1, hint_i32);
 }
 
+void ggml_mul_mat_id_set_expert_ptrs(
+        struct ggml_tensor * a,
+        const void         * ptrs,
+        int32_t              n_as) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(n_as > 0);
+    GGML_ASSERT(ptrs != NULL);
+
+    ggml_set_op_params_i32(a, 2, n_as);
+    uintptr_t p = (uintptr_t) ptrs;
+    memcpy(&a->op_params[4], &p, sizeof(p));
+}
+
+const void * ggml_mul_mat_id_get_expert_ptrs(const struct ggml_tensor * a) {
+    if (ggml_mul_mat_id_get_expert_ptrs_n_as(a) <= 0) {
+        return NULL;
+    }
+    uintptr_t p = 0;
+    memcpy(&p, &a->op_params[4], sizeof(p));
+    return (const void *) p;
+}
+
+int32_t ggml_mul_mat_id_get_expert_ptrs_n_as(const struct ggml_tensor * a) {
+    if (a == NULL || a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 2);
+}
+
 // ggml_mul_mat_id
 
 /*

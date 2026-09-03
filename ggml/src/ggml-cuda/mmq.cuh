@@ -1709,6 +1709,9 @@ bool                  ggml_cuda_has_routed_expert_ptrs();  // non-consuming peek
 void                  ggml_cuda_discard_routed_expert_ptrs();
 void                  ggml_cuda_get_routed_expert_ptrs_stats(
     uint64_t * set, uint64_t * consumed, uint64_t * discarded_unconsumed);
+// TLS queue first, then the MUL_MAT_ID op-param. Aborts if the node required
+// a pointer array and neither source has one.
+const void * const *  ggml_cuda_resolve_mul_mat_id_expert_ptrs(const ggml_tensor * dst);
 void                  ggml_cuda_wp_routing_guard_check(
     const char * path, const ggml_tensor * src0, const ggml_tensor * ids, const ggml_tensor * dst,
     const void * const * expert_ptrs);
