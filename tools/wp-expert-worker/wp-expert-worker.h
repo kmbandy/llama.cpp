@@ -87,6 +87,46 @@ struct DeviceMemberLayout {
 std::vector<DeviceMemberLayout> plan_device_member_layout(
         const std::vector<uint64_t> & sizes, uint64_t alignment);
 
+// Why WP_EXPERT_FUSE_GATE_UP did not fire for one request. Checked in this
+// order: clamp, gather, type, shape, adjacency.
+enum class FuseGateUpReason {
+    Ok = 0,
+    Clamp,
+    Gather,
+    Type,
+    Shape,
+    Adjacency,
+};
+
+struct FuseGateUpCheck {
+    float    swiglu_clamp = 0.0f;
+    bool     use_gather = false;
+    bool     gather_allowed = false;
+    int      gate_type = 0;
+    int      up_type = 0;
+    int64_t  gate_ne0 = 0;
+    int64_t  gate_ne1 = 0;
+    int64_t  up_ne0 = 0;
+    int64_t  up_ne1 = 0;
+    uint64_t gate_device_offset = 0;
+    uint64_t up_device_offset = 0;
+};
+
+struct FuseGateUpDiag {
+    FuseGateUpReason reason = FuseGateUpReason::Ok;
+    uint64_t         go = 0;
+    uint64_t         uo = 0;
+    uint64_t         gate_bytes = 0;
+};
+
+FuseGateUpDiag classify_fuse_gate_up(const FuseGateUpCheck & check);
+const char *   fuse_gate_up_reason_name(FuseGateUpReason reason);
+std::string    format_fuse_gate_up_reason(const FuseGateUpDiag & diag);
+// "gate" then "up" then the other names in `names` order. Unchanged if either
+// role is missing. Used by WP_EXPERT_FUSE_GATE_UP_LAYOUT=1.
+std::vector<std::string> fuse_gate_up_layout_names(
+        const std::vector<std::string> & names);
+
 struct TestHooks {
     std::function<void(int, int)>      read_started;
     std::function<void(int, int)>      read_finished;
