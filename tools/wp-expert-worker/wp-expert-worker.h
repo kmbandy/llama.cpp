@@ -538,6 +538,32 @@ void fill_batch_mmid_expert_ptrs(
         const int64_t * bases, size_t n,
         bool used_pad_expert);
 
+// Path + fold for WP_EXPERT_BATCH_MMID. Must not read residency / n_pagein:
+// a request that takes mmid on a hit and per-expert on a miss changes the
+// FP association (2026-08-03 class). cpu_on_arrival cannot use GPU mmid.
+enum class batch_mmid_ineligible_reason : int {
+    none = 0,
+    cpu_on_arrival = 1,
+    force_dense = 2,
+    subrange = 3,
+};
+const char * batch_mmid_ineligible_reason_name(batch_mmid_ineligible_reason r);
+
+struct BatchMmidAssociation {
+    bool use_mmid = false;
+    batch_mmid_ineligible_reason reason = batch_mmid_ineligible_reason::none;
+    std::vector<size_t> fold_order;
+};
+BatchMmidAssociation plan_batch_mmid_association(
+        bool enabled,
+        size_t n_assign,
+        bool cpu_on_arrival,
+        bool force_dense,
+        bool subrange);
+// When enabled, always 1: n_pagein must not split the request.
+size_t batch_mmid_compute_chunks(
+        bool enabled, size_t n_assign, size_t n_pagein, size_t compute_chunks);
+
 // Scatter compacted [n_embd, n_sel] rows onto a zeroed [n_embd, n_tokens]
 // dest. idx is I32 [n_sel] and MUST be unique (ggml_set_rows overwrites;
 // colliding dest rows are undefined). Rows not named in idx stay 0 — the

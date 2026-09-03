@@ -4043,6 +4043,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+            // expert_ptrs live on the node. Replay skips the host dispatcher, so
+            // take() never runs and the fail-safe (n_as set, TLS miss -> op_params)
+            // never sees the node. Keep these graphs eager.
+            if (ggml_mul_mat_id_get_expert_ptrs_n_as(node) > 0) {
+                use_cuda_graph = false;
+            }
         }
         // MAD-244: ml8 MoE dispatch downloads ids host-side to bin by expert
         // (see ggml_cuda_op_ml8_mul_mat_id in ml8.cu) — incompatible with
@@ -4735,6 +4741,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ffn_up_bias   = cgraph->nodes[node_idx + 3];
         const ggml_tensor * glu           = cgraph->nodes[node_idx + 4];
 
+        if (is_equal(mul_mat_id_bias_glu_ops, ops) &&
+                (ggml_cuda_has_routed_expert_ptrs() ||
+                 ggml_mul_mat_id_get_expert_ptrs_n_as(ffn_gate) > 0 ||
+                 ggml_mul_mat_id_get_expert_ptrs_n_as(ffn_up) > 0)) {
+            return false;
+        }
+
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu, ffn_up_bias, ffn_gate_bias)) {
             int out_nodes[] = { node_idx + 4 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
@@ -4746,6 +4759,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ffn_gate = cgraph->nodes[node_idx];
         const ggml_tensor * ffn_up   = cgraph->nodes[node_idx + 1];
         const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
+
+        if (is_equal(mul_mat_id_glu_ops, ops) &&
+                (ggml_cuda_has_routed_expert_ptrs() ||
+                 ggml_mul_mat_id_get_expert_ptrs_n_as(ffn_gate) > 0 ||
+                 ggml_mul_mat_id_get_expert_ptrs_n_as(ffn_up) > 0)) {
+            return false;
+        }
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
             int out_nodes[] = { node_idx + 2 };

@@ -2788,6 +2788,58 @@ static void test_batch_mmid_ids() {
             "BATCH_MMID allow-list must not enable CPU");
 }
 
+static void test_batch_mmid_association() {
+    const size_t n = 6;
+    const size_t pageins[] = { 0, 2, n };
+    std::vector<wp_expert_worker::BatchMmidAssociation> plans;
+    std::vector<size_t> chunks;
+    for (size_t p : pageins) {
+        plans.push_back(wp_expert_worker::plan_batch_mmid_association(
+            true, n, false, false, false));
+        chunks.push_back(wp_expert_worker::batch_mmid_compute_chunks(true, n, p, 4));
+    }
+    for (size_t i = 0; i < plans.size(); ++i) {
+        require(plans[i].use_mmid,
+                "BATCH_MMID on must take mmid regardless of residency");
+        require(plans[i].reason == wp_expert_worker::batch_mmid_ineligible_reason::none,
+                "full request is eligible");
+        require(plans[i].fold_order.size() == n, "fold names every assignment");
+        require(chunks[i] == 1, "BATCH_MMID must not chunk on n_pagein");
+        require(plans[i].fold_order == plans[0].fold_order,
+                "fold order must not depend on residency");
+    }
+    for (size_t i = 0; i < n; ++i) {
+        require(plans[0].fold_order[i] == i, "fold is assignment-index order");
+    }
+
+    require(wp_expert_worker::batch_mmid_compute_chunks(false, n, 0, 4) == 1,
+            "all-resident serial path is one chunk");
+    require(wp_expert_worker::batch_mmid_compute_chunks(false, n, 2, 4) == 4,
+            "legacy chunking still splits when BATCH_MMID is off");
+
+    const auto cpu = wp_expert_worker::plan_batch_mmid_association(
+        true, n, true, false, false);
+    require(!cpu.use_mmid, "cpu_on_arrival cannot take GPU mul_mat_id");
+    require(cpu.reason == wp_expert_worker::batch_mmid_ineligible_reason::cpu_on_arrival,
+            "cpu_on_arrival is counted ineligible");
+    require(cpu.fold_order == plans[0].fold_order,
+            "ineligible still folds in assignment order");
+
+    const auto sub = wp_expert_worker::plan_batch_mmid_association(
+        true, n, false, false, true);
+    require(!sub.use_mmid, "a sub-range must not take mmid");
+    require(sub.reason == wp_expert_worker::batch_mmid_ineligible_reason::subrange,
+            "sub-range is counted ineligible");
+    require(sub.fold_order == plans[0].fold_order,
+            "sub-range ineligible still reports canonical fold order");
+
+    const auto dense = wp_expert_worker::plan_batch_mmid_association(
+        true, n, false, true, false);
+    require(!dense.use_mmid, "force_dense (selfcheck) stays per-expert");
+    require(dense.reason == wp_expert_worker::batch_mmid_ineligible_reason::force_dense,
+            "force_dense is counted ineligible");
+}
+
 static void test_arena_prefill_device_policy() {
     // Unset / missing must default OFF, same as parse_env_default_off.
     require(!wp_expert_worker::parse_arena_prefill_enabled(nullptr, "ROCm0"),
@@ -5280,6 +5332,7 @@ int main() {
         test_assignment_groups_bucket_by_device();
         test_decode_prefill_compute_profile();
         test_batch_mmid_ids();
+        test_batch_mmid_association();
         test_arena_prefill_device_policy();
         test_prefill_arena_grouped_production_geometry();
         test_prefill_arena_grouped_placement_independent();
