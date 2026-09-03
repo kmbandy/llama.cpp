@@ -261,7 +261,13 @@ bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool
 //                        n_tokens==1, spec-verify blocks are <= 8, and stream4
 //                        prefill chunks are 128 with 74-token tails, so the
 //                        wide chunks stay unpinned)
-//   anything else     -> on, the legacy wide-request pin
+//   "1"               -> on, the legacy wide-request pin
+// Per-device (same allow-list syntax as parse_arena_prefill_enabled):
+//   "decode:ROCm0,CUDA0"           -> decode on those devices, off elsewhere
+//   "ROCm0:decode,Vulkan0:decode"  -> per-device mode map
+//   "ROCm0,CUDA0"                  -> decode on the listed devices
+//   "!Vulkan0"                     -> decode on every device except those named
+//   anything else                  -> on, the legacy wide-request pin
 // The legacy "on" mode pins only gather-path requests wider than a verify
 // block (n_tokens > 8) and at least WP_EXPERT_MM_PIN_MIN_TOKENS. "decode" must
 // NOT require gather: gather is bypassed at n_tokens==1 (see
@@ -269,10 +275,22 @@ bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool
 // mul_mat lambda, so requiring it would make the decode pin a no-op.
 enum class mm_pin_mode { off, on, decode };
 mm_pin_mode parse_mm_pin_mode(const char * env);
+mm_pin_mode parse_mm_pin_mode(const char * env, const std::string & device_name);
 int  parse_mm_pin_min_tokens(const char * env);   // default 9
 int  parse_mm_pin_max_tokens(const char * env);   // default 8
 bool use_mm_pin(uint32_t n_tokens, bool use_gather, mm_pin_mode mode,
                 int min_tokens, int max_tokens);
+
+// GGML_MUL_MAT_PIN_KERNEL / WP_EXPERT_MM_PIN_KERNEL. Default is MMQ (false).
+// "mmvq" / "1" is MMVQ for every device. Per-device:
+//   "ROCm0:mmvq,ROCm1:mmvq,CUDA0:mmvq"
+//   "ROCm0,CUDA0"   -> mmvq on the listed devices
+//   "!CPU"          -> mmvq on every device except those named
+//   "mmq" / unset / "0" -> MMQ
+// Must match MMVQ_MAX_BATCH_SIZE in ggml-cuda/mmvq.cuh.
+constexpr int MM_PIN_MMVQ_COLS = 8;
+bool parse_mul_mat_pin_kernel_mmvq(const char * env, const std::string & device_name);
+uint32_t mm_pin_pad_cols(uint32_t n_tokens);
 
 // WP_EXPERT_ARENA_PREFILL policy, per device: unset/"" and "0" are off, "1"
 // is on for every device, a comma-separated device-name list ("ROCm0,CUDA0")

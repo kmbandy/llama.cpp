@@ -1434,6 +1434,9 @@ struct ggml_backend_cuda_context {
     bool wp_copy_initialized = false;
     bool wp_copy_enabled = false;
     bool wp_copy_pending = false;
+    // GGML_MUL_MAT_PIN_KERNEL / WP_EXPERT_MM_PIN_KERNEL parsed once per context
+    // (-1 = not yet parsed). Read on every pinned mul_mat, so never re-parse.
+    int wp_pin_mmvq = -1;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

@@ -2629,6 +2629,50 @@ static void test_decode_prefill_compute_profile() {
     require(!wp_expert_worker::use_mm_pin(2, false, mm_pin_mode::decode, 9, 1),
             "WP_EXPERT_MM_PIN_MAX_TOKENS=1 must narrow the pin to bare decode");
 
+    require(wp_expert_worker::parse_mm_pin_mode("decode", "Vulkan0") == mm_pin_mode::decode,
+            "WP_EXPERT_MM_PIN=decode must stay decode on every device");
+    require(wp_expert_worker::parse_mm_pin_mode("decode:ROCm0,CUDA0", "ROCm0") == mm_pin_mode::decode,
+            "decode:allow-list must pin a listed device");
+    require(wp_expert_worker::parse_mm_pin_mode("decode:ROCm0,CUDA0", "Vulkan0") == mm_pin_mode::off,
+            "decode:allow-list must not pin an unlisted device");
+    require(wp_expert_worker::parse_mm_pin_mode("ROCm0:decode,Vulkan0:decode", "Vulkan0") == mm_pin_mode::decode,
+            "per-device mode map must honour the named mode");
+    require(wp_expert_worker::parse_mm_pin_mode("ROCm0:decode,Vulkan0:decode", "CUDA0") == mm_pin_mode::off,
+            "per-device mode map must default unlisted devices off");
+    require(wp_expert_worker::parse_mm_pin_mode("ROCm0,CUDA0", "CUDA0") == mm_pin_mode::decode,
+            "allow-list without a mode prefix must mean decode");
+    require(wp_expert_worker::parse_mm_pin_mode("!Vulkan0", "ROCm0") == mm_pin_mode::decode,
+            "exclusion list must pin devices not named");
+    require(wp_expert_worker::parse_mm_pin_mode("!Vulkan0", "Vulkan0") == mm_pin_mode::off,
+            "exclusion list must not pin the named device");
+
+    require(!wp_expert_worker::parse_mul_mat_pin_kernel_mmvq(nullptr, "ROCm0"),
+            "unset PIN_KERNEL must default MMQ");
+    require(!wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("", "ROCm0"),
+            "empty PIN_KERNEL must default MMQ");
+    require(!wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("mmq", "ROCm0"),
+            "PIN_KERNEL=mmq must be MMQ");
+    require(wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("mmvq", "ROCm0"),
+            "PIN_KERNEL=mmvq must be MMVQ on every device");
+    require(wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("mmvq", "CUDA0"),
+            "PIN_KERNEL=mmvq must be MMVQ on every device");
+    require(wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("ROCm0:mmvq,ROCm1:mmvq,CUDA0:mmvq", "ROCm0"),
+            "PIN_KERNEL map must enable a listed mmvq device");
+    require(wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("ROCm0:mmvq,ROCm1:mmvq,CUDA0:mmvq", "CUDA0"),
+            "PIN_KERNEL map must enable CUDA0:mmvq");
+    require(!wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("ROCm0:mmvq,ROCm1:mmvq,CUDA0:mmvq", "Vulkan0"),
+            "PIN_KERNEL map must leave Vulkan on the MMQ default");
+    require(wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("ROCm0,CUDA0", "CUDA0"),
+            "PIN_KERNEL allow-list must mean mmvq");
+    require(!wp_expert_worker::parse_mul_mat_pin_kernel_mmvq("ROCm0,CUDA0", "Vulkan0"),
+            "PIN_KERNEL allow-list must not enable an unlisted device");
+    require(wp_expert_worker::mm_pin_pad_cols(1) == 8,
+            "pad cols at n=1 must be 8");
+    require(wp_expert_worker::mm_pin_pad_cols(8) == 8,
+            "pad cols at n=8 must stay 8");
+    require(wp_expert_worker::mm_pin_pad_cols(9) == 16,
+            "pad cols at n=9 must round up to 16");
+
     const auto empty = wp_expert_worker::compact_routing_rows({ 0.0f, 0.0f, 0.0f });
     require(empty.idx.size() == 1 && empty.idx[0] == 0 && empty.weights[0] == 0.0f,
             "all-zero routing must keep a dummy idx 0 / weight 0");

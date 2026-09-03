@@ -363,14 +363,161 @@ int parse_mm_pin_max_tokens(const char * env) {
     return v < 1 ? 1 : v;
 }
 
-mm_pin_mode parse_mm_pin_mode(const char * env) {
-    if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+static void wp_trim_ascii_whitespace(std::string & s) {
+    const size_t begin = s.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        s.clear();
+        return;
+    }
+    const size_t end = s.find_last_not_of(" \t\r\n");
+    s = s.substr(begin, end - begin + 1);
+}
+
+static mm_pin_mode parse_mm_pin_mode_token(const std::string & token) {
+    if (token.empty() || token == "0" || token == "off") {
         return mm_pin_mode::off;
     }
-    if (std::strcmp(env, "decode") == 0) {
+    if (token == "decode") {
         return mm_pin_mode::decode;
     }
     return mm_pin_mode::on;
+}
+
+mm_pin_mode parse_mm_pin_mode(const char * env) {
+    return parse_mm_pin_mode(env, std::string());
+}
+
+mm_pin_mode parse_mm_pin_mode(const char * env, const std::string & device_name) {
+    if (env == nullptr) {
+        return mm_pin_mode::off;
+    }
+    std::string value(env);
+    wp_trim_ascii_whitespace(value);
+    if (value.empty() || value == "0") {
+        return mm_pin_mode::off;
+    }
+    if (value == "decode") {
+        return mm_pin_mode::decode;
+    }
+    if (value == "1") {
+        return mm_pin_mode::on;
+    }
+    // "decode:ROCm0,CUDA0" / "1:ROCm0" / "on:!Vulkan0"
+    const size_t mode_colon = value.find(':');
+    if (mode_colon != std::string::npos &&
+            (value.compare(0, 7, "decode:") == 0 ||
+             value.compare(0, 2, "1:") == 0 ||
+             value.compare(0, 3, "on:") == 0)) {
+        const mm_pin_mode mode = value.compare(0, 7, "decode:") == 0 ?
+            mm_pin_mode::decode : mm_pin_mode::on;
+        const std::string list = value.substr(mode_colon + 1);
+        return parse_arena_prefill_enabled(list.c_str(), device_name) ?
+            mode : mm_pin_mode::off;
+    }
+    // "ROCm0:decode,Vulkan0:decode" -- a map only when every item has a colon.
+    if (mode_colon != std::string::npos) {
+        bool all_mapped = true;
+        mm_pin_mode found = mm_pin_mode::off;
+        bool hit = false;
+        size_t start = 0;
+        while (start <= value.size()) {
+            const size_t comma = value.find(',', start);
+            std::string item = (comma == std::string::npos) ?
+                value.substr(start) : value.substr(start, comma - start);
+            wp_trim_ascii_whitespace(item);
+            const size_t colon = item.find(':');
+            if (colon == std::string::npos) {
+                all_mapped = false;
+                break;
+            }
+            std::string name = item.substr(0, colon);
+            std::string mode = item.substr(colon + 1);
+            wp_trim_ascii_whitespace(name);
+            wp_trim_ascii_whitespace(mode);
+            if (!name.empty() && name == device_name) {
+                found = parse_mm_pin_mode_token(mode);
+                hit = true;
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+        if (all_mapped) {
+            return hit ? found : mm_pin_mode::off;
+        }
+    }
+    // Allow-list / exclusion list: listed devices get decode.
+    if (value[0] == '!' || value.find(',') != std::string::npos) {
+        return parse_arena_prefill_enabled(value.c_str(), device_name) ?
+            mm_pin_mode::decode : mm_pin_mode::off;
+    }
+    return mm_pin_mode::on;
+}
+
+bool parse_mul_mat_pin_kernel_mmvq(const char * env, const std::string & device_name) {
+    if (env == nullptr) {
+        return false;
+    }
+    std::string value(env);
+    wp_trim_ascii_whitespace(value);
+    if (value.empty() || value == "0" || value == "mmq") {
+        return false;
+    }
+    if (value == "mmvq" || value == "1") {
+        return true;
+    }
+    if (value.compare(0, 5, "mmvq:") == 0) {
+        return parse_arena_prefill_enabled(value.c_str() + 5, device_name);
+    }
+    if (value.compare(0, 4, "mmq:") == 0) {
+        return false;
+    }
+    const size_t first_colon = value.find(':');
+    if (first_colon != std::string::npos) {
+        bool all_mapped = true;
+        bool found = false;
+        bool hit = false;
+        size_t start = 0;
+        while (start <= value.size()) {
+            const size_t comma = value.find(',', start);
+            std::string item = (comma == std::string::npos) ?
+                value.substr(start) : value.substr(start, comma - start);
+            wp_trim_ascii_whitespace(item);
+            const size_t colon = item.find(':');
+            if (colon == std::string::npos) {
+                all_mapped = false;
+                break;
+            }
+            std::string name = item.substr(0, colon);
+            std::string kernel = item.substr(colon + 1);
+            wp_trim_ascii_whitespace(name);
+            wp_trim_ascii_whitespace(kernel);
+            if (!name.empty() && name == device_name) {
+                hit = true;
+                found = (kernel == "mmvq" || kernel == "1");
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+        if (all_mapped) {
+            return hit && found;
+        }
+    }
+    if (value[0] == '!' || value.find(',') != std::string::npos) {
+        return parse_arena_prefill_enabled(value.c_str(), device_name);
+    }
+    return false;
+}
+
+uint32_t mm_pin_pad_cols(uint32_t n_tokens) {
+    if (n_tokens == 0) {
+        return 0;
+    }
+    const uint32_t g = (uint32_t) MM_PIN_MMVQ_COLS;
+    return ((n_tokens + g - 1) / g) * g;
 }
 
 bool use_mm_pin(uint32_t n_tokens, bool use_gather, mm_pin_mode mode,
@@ -405,16 +552,6 @@ bool parse_env_default_off(const char * env) {
 // mean "every device except these" ("!Vulkan0"). Whitespace around the value
 // and around each comma-separated name is ignored. Pure function of its
 // inputs so tests can exercise every branch without touching getenv.
-static void wp_trim_ascii_whitespace(std::string & s) {
-    const size_t begin = s.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos) {
-        s.clear();
-        return;
-    }
-    const size_t end = s.find_last_not_of(" \t\r\n");
-    s = s.substr(begin, end - begin + 1);
-}
-
 bool parse_arena_prefill_enabled(const char * env, const std::string & device_name) {
     if (env == nullptr) {
         return false;
@@ -826,6 +963,23 @@ CompactRouting compact_routing_rows(const std::vector<float> & wv) {
         out.weights.push_back(0.0f);
     }
     return out;
+}
+
+static void pad_mmvq_routing(std::vector<int32_t> & idx, std::vector<float> * weights,
+                             int32_t dummy_idx, uint32_t cols) {
+    if (cols == 0) {
+        return;
+    }
+    idx.reserve(cols);
+    if (weights != nullptr) {
+        weights->reserve(cols);
+    }
+    while (idx.size() < cols) {
+        idx.push_back(dummy_idx);
+        if (weights != nullptr) {
+            weights->push_back(0.0f);
+        }
+    }
 }
 
 ggml_tensor * scatter_add_compact_rows(
@@ -1422,6 +1576,9 @@ struct RequestStats {
     uint64_t n_arena_prefill_fallback = 0;
     uint64_t n_hipgraph_capture = 0;
     uint64_t n_hipgraph_replay  = 0;
+    // Requests whose io activation was padded to a multiple of MM_PIN_MMVQ_COLS
+    // so the HIP/CUDA mmvq pin path skips per-mul_mat memset/memcpy.
+    uint64_t n_pin_mmvq_padded = 0;
     uint64_t n_d3_collapse = 0;
     uint64_t n_d3_typed    = 0;
     uint64_t n_d3_bounce   = 0;
@@ -1689,6 +1846,7 @@ public:
         n_arena_prefill_fallback_ += request.n_arena_prefill_fallback;
         n_hipgraph_capture_ += request.n_hipgraph_capture;
         n_hipgraph_replay_ += request.n_hipgraph_replay;
+        n_pin_mmvq_padded_ += request.n_pin_mmvq_padded;
         n_d3_collapse_ += request.n_d3_collapse;
         n_d3_typed_ += request.n_d3_typed;
         n_d3_bounce_ += request.n_d3_bounce;
@@ -1920,6 +2078,7 @@ private:
                   << " n_arena_prefill_fallback=" << n_arena_prefill_fallback_
                   << " n_hipgraph_capture=" << n_hipgraph_capture_
                   << " n_hipgraph_replay=" << n_hipgraph_replay_
+                  << " n_pin_mmvq_padded=" << n_pin_mmvq_padded_
                   << " n_d3_collapse=" << n_d3_collapse_
                   << " n_d3_typed=" << n_d3_typed_
                   << " n_d3_bounce=" << n_d3_bounce_
@@ -2057,6 +2216,7 @@ private:
     uint64_t          n_arena_prefill_fallback_ = 0;
     uint64_t          n_hipgraph_capture_ = 0;
     uint64_t          n_hipgraph_replay_ = 0;
+    uint64_t          n_pin_mmvq_padded_ = 0;
     uint64_t          n_d3_collapse_ = 0;
     uint64_t          n_d3_typed_ = 0;
     uint64_t          n_d3_bounce_ = 0;
@@ -9422,6 +9582,29 @@ public:
                          "device=%s enabled=%d\n",
                          e != nullptr ? e : "", device_name_.c_str(),
                          (int) fold_last_enabled_);
+            mm_pin_mode_ = parse_mm_pin_mode(
+                std::getenv("WP_EXPERT_MM_PIN"), device_name_);
+            mm_pin_min_tokens_ = parse_mm_pin_min_tokens(
+                std::getenv("WP_EXPERT_MM_PIN_MIN_TOKENS"));
+            mm_pin_max_tokens_ = parse_mm_pin_max_tokens(
+                std::getenv("WP_EXPERT_MM_PIN_MAX_TOKENS"));
+            const char * kenv = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
+            if (kenv == nullptr || kenv[0] == '\0') {
+                kenv = std::getenv("WP_EXPERT_MM_PIN_KERNEL");
+            }
+            mm_pin_kernel_mmvq_ = parse_mul_mat_pin_kernel_mmvq(kenv, device_name_);
+            const bool hip_cuda =
+                device_name_.rfind("ROCm", 0) == 0 ||
+                device_name_.rfind("CUDA", 0) == 0;
+            mm_pin_pad_mmvq_ = mm_pin_kernel_mmvq_ && hip_cuda;
+            std::fprintf(stderr,
+                         "wp expert worker: mm-pin (WP_EXPERT_MM_PIN) device=%s mode=%s "
+                         "kernel=%s pad=%d\n",
+                         device_name_.c_str(),
+                         mm_pin_mode_ == mm_pin_mode::decode ? "decode" :
+                         mm_pin_mode_ == mm_pin_mode::on ? "on" : "off",
+                         mm_pin_kernel_mmvq_ ? "mmvq" : "mmq",
+                         (int) mm_pin_pad_mmvq_);
         }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
@@ -11102,6 +11285,11 @@ private:
     // Same parser as arena prefill. "1" on CUDA disables {MUL,ADD} fusion;
     // HIP has no multi_add so the emission reorder is a no-op there.
     bool fold_last_enabled_ = false;
+    mm_pin_mode mm_pin_mode_ = mm_pin_mode::off;
+    int         mm_pin_min_tokens_ = 9;
+    int         mm_pin_max_tokens_ = 8;
+    bool        mm_pin_kernel_mmvq_ = false;
+    bool        mm_pin_pad_mmvq_ = false;
 
     void begin_async_dispatch(int conn_index, uint64_t trace_req) {
         active_async_conn_index_ = conn_index;
@@ -11935,6 +12123,23 @@ private:
         ++request_stats.n_device_allocs;
     }
 
+    uint32_t io_cols_for_request(uint32_t n_tokens, bool force_dense = false) const {
+        if (!mm_pin_pad_mmvq_ || n_tokens == 0) {
+            return n_tokens;
+        }
+        static const bool s_gather =
+            parse_env_default_on(std::getenv("WP_EXPERT_GATHER"));
+        static const int s_gather_min =
+            parse_gather_min_tokens(std::getenv("WP_EXPERT_GATHER_MIN_TOKENS"));
+        const bool use_gather = use_expert_gather(
+            n_tokens, force_dense, s_gather_min, s_gather);
+        if (!use_mm_pin(n_tokens, use_gather, mm_pin_mode_,
+                        mm_pin_min_tokens_, mm_pin_max_tokens_)) {
+            return n_tokens;
+        }
+        return mm_pin_pad_cols(n_tokens);
+    }
+
     ggml_tensor * make_io_tensor(
             ggml_context * ctx, uint32_t n_tokens, size_t offset) const {
         ggml_tensor * tensor = ggml_new_tensor_2d(
@@ -11973,8 +12178,20 @@ private:
         ggml_tensor * input = nullptr;
         size_t input_size = 0;
         size_t alignment = 0;
+        const uint32_t io_cols = io_cols_for_request(n_tokens, false);
+        if (mm_pin_pad_mmvq_ && n_tokens >= 1) {
+            static const bool s_gather =
+                parse_env_default_on(std::getenv("WP_EXPERT_GATHER"));
+            static const int s_gather_min =
+                parse_gather_min_tokens(std::getenv("WP_EXPERT_GATHER_MIN_TOKENS"));
+            if (use_mm_pin(n_tokens,
+                           use_expert_gather(n_tokens, false, s_gather_min, s_gather),
+                           mm_pin_mode_, mm_pin_min_tokens_, mm_pin_max_tokens_)) {
+                ++request_stats.n_pin_mmvq_padded;
+            }
+        }
         if (metadata_cache) {
-            if (io_prepare_input_ == nullptr || io_prepare_tokens_ != n_tokens) {
+            if (io_prepare_input_ == nullptr || io_prepare_tokens_ != io_cols) {
                 io_prepare_ctx_.reset(ggml_init({
                     /* .mem_size = */ ggml_tensor_overhead(),
                     /* .mem_base = */ nullptr,
@@ -11985,8 +12202,8 @@ private:
                 }
                 io_prepare_input_ = ggml_new_tensor_2d(
                     io_prepare_ctx_.get(), GGML_TYPE_F32,
-                    catalog_.descriptor.hparams.n_embd, n_tokens);
-                io_prepare_tokens_ = n_tokens;
+                    catalog_.descriptor.hparams.n_embd, io_cols);
+                io_prepare_tokens_ = io_cols;
                 io_prepare_input_size_ = ggml_backend_buft_get_alloc_size(
                     buft, io_prepare_input_);
                 io_prepare_alignment_ = ggml_backend_buft_get_alignment(buft);
@@ -12006,7 +12223,7 @@ private:
             }
             ctx = local_ctx.get();
             input = ggml_new_tensor_2d(
-                ctx, GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
+                ctx, GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, io_cols);
             input_size = ggml_backend_buft_get_alloc_size(buft, input);
             alignment = ggml_backend_buft_get_alignment(buft);
         }
@@ -12029,14 +12246,30 @@ private:
         attach_weight(
             input, io_active_, ggml_backend_buffer_get_base(io_active_), 0);
         sublap(request_stats.ns_prep_attach);
+        const size_t col_bytes =
+            (size_t) catalog_.descriptor.hparams.n_embd * sizeof(float);
         const size_t act_bytes = activation_count * sizeof(float);
+        const size_t full_bytes = (size_t) io_cols * col_bytes;
         const void * src = activation;
-        ensure_io_src_pinned(act_bytes);
+        size_t set_bytes = act_bytes;
+        ensure_io_src_pinned(std::max(act_bytes, full_bytes));
         const bool pinned =
-            io_src_base_ != nullptr && act_bytes <= io_src_size_;
+            io_src_base_ != nullptr && full_bytes <= io_src_size_;
         if (pinned) {
             std::memcpy(io_src_base_, activation, act_bytes);
+            if (full_bytes > act_bytes) {
+                std::memset((char *) io_src_base_ + act_bytes, 0, full_bytes - act_bytes);
+            }
             src = io_src_base_;
+            set_bytes = full_bytes;
+        } else if (full_bytes > act_bytes) {
+            // No pinned staging: one sync upload of real columns plus zero pad.
+            std::vector<uint8_t> padded(full_bytes);
+            std::memcpy(padded.data(), activation, act_bytes);
+            std::memset(padded.data() + act_bytes, 0, full_bytes - act_bytes);
+            ggml_backend_tensor_set(input, padded.data(), 0, full_bytes);
+            sublap(request_stats.ns_prep_set);
+            return;
         }
         // *** WP_IO_SET_ASYNC: the 6900XT's prep is a STALL, not a transfer. ***
         // ggml_backend_cuda_buffer_set_tensor is a SYNCHRONOUS cudaMemcpy (made
@@ -12071,9 +12304,9 @@ private:
         if ((submit_async_ && is_cuda_backend()) ||
                 (io_set_async_ && pinned)) {
             ggml_backend_tensor_set_async(
-                backend_.get(), input, src, 0, act_bytes);
+                backend_.get(), input, src, 0, set_bytes);
         } else {
-            ggml_backend_tensor_set(input, src, 0, act_bytes);
+            ggml_backend_tensor_set(input, src, 0, set_bytes);
         }
         sublap(request_stats.ns_prep_set);
     }
@@ -12580,20 +12813,17 @@ private:
         static const bool s_set_rows =
             parse_env_default_on(std::getenv("WP_EXPERT_SCATTER_SET_ROWS"));
         // Three-way: off / on (legacy wide-request pin) / "decode" (narrow
-        // requests only). See use_mm_pin in the header.
-        static const mm_pin_mode s_mm_pin_mode =
-            parse_mm_pin_mode(std::getenv("WP_EXPERT_MM_PIN"));
-        static const int s_mm_pin_min_tokens =
-            parse_mm_pin_min_tokens(std::getenv("WP_EXPERT_MM_PIN_MIN_TOKENS"));
-        static const int s_mm_pin_max_tokens =
-            parse_mm_pin_max_tokens(std::getenv("WP_EXPERT_MM_PIN_MAX_TOKENS"));
+        // requests only). Latched per device in the constructor so
+        // WP_EXPERT_MM_PIN=decode:ROCm0,CUDA0 does not leak onto Vulkan0.
         // PER-REQUEST, not static: prefill and decode requests interleave in one
         // worker, so this must be decided per request and never cached.
         const bool use_gather = use_expert_gather(
             request.n_tokens, force_dense, s_gather_min_tokens, s_gather);
         const bool pin_mul_mat = use_mm_pin(
-            request.n_tokens, use_gather, s_mm_pin_mode,
-            s_mm_pin_min_tokens, s_mm_pin_max_tokens);
+            request.n_tokens, use_gather, mm_pin_mode_,
+            mm_pin_min_tokens_, mm_pin_max_tokens_);
+        const uint32_t io_cols = io_cols_for_request(request.n_tokens, force_dense);
+        const bool pad_mmvq = mm_pin_pad_mmvq_ && pin_mul_mat;
 
         // *** THE REAL WP_VK_FUSED_EXPERT GATE. ***
         // compute_batch_fused() computes the FULL dense FFN for every selected
@@ -12856,8 +13086,11 @@ private:
                 if (!selected(i)) {
                     continue;
                 }
-                const uint32_t k =
+                uint32_t k =
                     (uint32_t) compact_routing_rows(request.assignments[i].weights).idx.size();
+                if (pad_mmvq) {
+                    k = mm_pin_pad_cols(k);
+                }
                 if (gather_rank == 0) {
                     gather_rank = k;
                 } else if (k != gather_rank) {
@@ -12876,7 +13109,7 @@ private:
         if (s_graph_cache && s_params_coalesce && gather_rank_uniform &&
                 result_offset == std::numeric_limits<size_t>::max()) {
             GraphKey key;
-            key.n_tokens     = request.n_tokens;
+            key.n_tokens     = io_cols;
             key.n_selected   = (uint32_t) n_selected;
             key.idx_rank     = gather_rank;
             key.add_previous = add_previous;
@@ -12984,11 +13217,17 @@ private:
                 }
                 const auto & wv = request.assignments[i].weights;
                 if (use_gather) {
-                    const CompactRouting compact = compact_routing_rows(wv);
+                    CompactRouting compact = compact_routing_rows(wv);
                     uint64_t nz = 0;
                     for (float f : compact.weights) { nz += (f != 0.0f); }
                     request_stats.n_weight_nonzero += nz;
                     request_stats.n_weight_total += compact.idx.size();
+                    if (pad_mmvq) {
+                        const int32_t dummy = request.n_tokens < io_cols ?
+                            (int32_t) request.n_tokens : 0;
+                        pad_mmvq_routing(compact.idx, &compact.weights, dummy,
+                                         mm_pin_pad_cols((uint32_t) compact.idx.size()));
+                    }
                     place_param(gc->gather_idx[k], compact.idx.data(),
                                 compact.idx.size() * sizeof(int32_t));
                     place_param(gc->route_w[k], compact.weights.data(),
@@ -12998,7 +13237,14 @@ private:
                     for (float f : wv) { nz += (f != 0.0f); }
                     request_stats.n_weight_nonzero += nz;
                     request_stats.n_weight_total += wv.size();
-                    place_param(gc->route_w[k], wv.data(), wv.size() * sizeof(float));
+                    if (pad_mmvq && wv.size() < io_cols) {
+                        std::vector<float> padded = wv;
+                        padded.resize(io_cols, 0.0f);
+                        place_param(gc->route_w[k], padded.data(),
+                                    padded.size() * sizeof(float));
+                    } else {
+                        place_param(gc->route_w[k], wv.data(), wv.size() * sizeof(float));
+                    }
                 }
                 ++k;
             }
@@ -13074,10 +13320,10 @@ private:
             throw std::runtime_error("failed to allocate batched expert graph metadata");
         }
 
-        ggml_tensor * input = make_io_tensor(ctx.get(), request.n_tokens, 0);
+        ggml_tensor * input = make_io_tensor(ctx.get(), io_cols, 0);
         ggml_set_input(input);
         ggml_tensor * result = make_io_tensor(
-            ctx.get(), request.n_tokens, effective_result_offset);
+            ctx.get(), io_cols, effective_result_offset);
         // *** SEED THE FOLD, DO NOT ADD AT THE END. ***
         // The accumulator below is a LEFT-FOLD in assignment-index order:
         //     sum = ((((e0 + e1) + e2) + ...))
@@ -13113,7 +13359,9 @@ private:
         // Parallel to routing_weights: the gathered token indices per expert, kept
         // alive until after ggml_gallocr_alloc_graph so they can be uploaded.
         std::vector<std::pair<ggml_tensor *, std::vector<int32_t>>> gather_idx;
+        std::vector<std::vector<float>> gather_route;
         gather_idx.reserve(n_selected);
+        gather_route.reserve(n_selected);
         const auto mul_mat = [&](ggml_tensor * weight, ggml_tensor * activation) {
             ggml_tensor * result = ggml_mul_mat(ctx.get(), weight, activation);
             if (pin_mul_mat) {
@@ -13148,10 +13396,18 @@ private:
             ggml_tensor * ffn_in = input;
             ggml_tensor * idx_t  = nullptr;
             std::vector<int32_t> idx;
+            std::vector<float> route_compact;
             if (use_gather) {
-                const CompactRouting compact =
+                CompactRouting compact =
                     compact_routing_rows(request.assignments[i].weights);
-                idx = compact.idx;
+                idx = std::move(compact.idx);
+                route_compact = std::move(compact.weights);
+                if (pad_mmvq) {
+                    const int32_t dummy = request.n_tokens < io_cols ?
+                        (int32_t) request.n_tokens : 0;
+                    pad_mmvq_routing(idx, &route_compact, dummy,
+                                     mm_pin_pad_cols((uint32_t) idx.size()));
+                }
                 idx_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) idx.size());
                 ggml_set_input(idx_t);
                 if (s_params_coalesce) {
@@ -13219,7 +13475,8 @@ private:
             // silently wrong, no assert. It is correct only at n_tokens == 1,
             // where both readings coincide, so decode looked fine while PREFILL
             // was corrupted and poisoned the KV cache.
-            const int64_t n_rows = use_gather ? (int64_t) idx.size() : request.n_tokens;
+            const int64_t n_rows = use_gather ? (int64_t) idx.size() :
+                (pad_mmvq ? (int64_t) io_cols : (int64_t) request.n_tokens);
             ggml_tensor * weights =
                 ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_rows);
             ggml_set_input(weights);
@@ -13228,10 +13485,12 @@ private:
                 // the compacted (gather) or full (dense) router weights.
                 const auto & wv = request.assignments[i].weights;
                 if (use_gather) {
-                    std::vector<float> compact;
-                    compact.reserve(idx.size());
-                    for (int32_t t : idx) { compact.push_back(wv[(size_t) t]); }
-                    place_param(weights, compact.data(), compact.size() * sizeof(float));
+                    place_param(weights, route_compact.data(),
+                                route_compact.size() * sizeof(float));
+                } else if (pad_mmvq && wv.size() < io_cols) {
+                    std::vector<float> padded = wv;
+                    padded.resize(io_cols, 0.0f);
+                    place_param(weights, padded.data(), padded.size() * sizeof(float));
                 } else {
                     place_param(weights, wv.data(), wv.size() * sizeof(float));
                 }
@@ -13266,6 +13525,7 @@ private:
             }
             routing_weights.emplace_back(weights, &request.assignments[i]);
             gather_idx.emplace_back(idx_t, std::move(idx));
+            gather_route.emplace_back(std::move(route_compact));
             fold_terms.push_back(weighted);
         }
         // (add_previous is folded in as the SEED above, not appended here.)
@@ -13361,11 +13621,9 @@ private:
             // figure even after the fix and hide whether it worked.
             if (use_gather) {
                 const auto & idx = gather_idx[k].second;
+                const auto & compact = gather_route[k];
                 request_stats.n_weight_total += idx.size();
                 if (!s_params_coalesce) {
-                    std::vector<float> compact;
-                    compact.reserve(idx.size());
-                    for (int32_t t : idx) { compact.push_back(wv[(size_t) t]); }
                     const auto params_started = std::chrono::steady_clock::now();
                     ggml_backend_tensor_set(
                         item.first, compact.data(), 0, compact.size() * sizeof(float));
@@ -13386,9 +13644,18 @@ private:
             } else {
                 request_stats.n_weight_total += wv.size();
                 if (!s_params_coalesce) {
+                    std::vector<float> padded;
+                    const float * wdata = wv.data();
+                    size_t wbytes = wv.size() * sizeof(float);
+                    if (pad_mmvq && wv.size() < io_cols) {
+                        padded = wv;
+                        padded.resize(io_cols, 0.0f);
+                        wdata = padded.data();
+                        wbytes = padded.size() * sizeof(float);
+                    }
                     const auto params_started = std::chrono::steady_clock::now();
                     ggml_backend_tensor_set(
-                        item.first, wv.data(), 0, wv.size() * sizeof(float));
+                        item.first, wdata, 0, wbytes);
                     const uint64_t params_elapsed =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - params_started).count();
@@ -13397,7 +13664,7 @@ private:
                         request_stats.ns_vk_params_set += params_elapsed;
                     }
                     add_work_input_trace_tensor(
-                        item.first, wv.data(), wv.size() * sizeof(float));
+                        item.first, wdata, wbytes);
                 }
             }
         }
@@ -15550,7 +15817,8 @@ private:
             throw std::runtime_error("failed to allocate expert IO layout metadata");
         }
         ggml_tensor * probe = ggml_new_tensor_2d(
-            ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
+            ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd,
+            io_cols_for_request(n_tokens, false));
         const ggml_backend_buffer_type_t buft =
             ggml_backend_get_default_buffer_type(backend_.get());
         const size_t input_size = ggml_backend_buft_get_alloc_size(buft, probe);
@@ -15940,6 +16208,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_arena_prefill_fallback += src.n_arena_prefill_fallback;
     dst.n_hipgraph_capture += src.n_hipgraph_capture;
     dst.n_hipgraph_replay += src.n_hipgraph_replay;
+    dst.n_pin_mmvq_padded += src.n_pin_mmvq_padded;
     dst.n_d3_collapse += src.n_d3_collapse;
     dst.n_d3_typed += src.n_d3_typed;
     dst.n_d3_bounce += src.n_d3_bounce;

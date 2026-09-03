@@ -31,7 +31,11 @@ std::vector<float> compute(
         ggml_type type,
         int64_t n,
         const std::vector<uint8_t> & quantized,
-        const std::vector<float> & activations) {
+        const std::vector<float> & activations,
+        int64_t k = K,
+        int64_t m = M,
+        int64_t pad_n = 0) {
+    const int64_t src1_n = pad_n > n ? pad_n : n;
     const ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(4, false),
         /*.mem_buffer =*/ nullptr,
@@ -40,8 +44,8 @@ std::vector<float> compute(
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "failed to create MUL_MAT pin context");
 
-    ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, K, M);
-    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, k, m);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, src1_n);
     ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
     if (std::getenv("WP_PIN_TEST_NOHINT") == nullptr) {
         ggml_mul_mat_set_hint(output, GGML_HINT_MUL_MAT_PIN);
@@ -54,7 +58,13 @@ std::vector<float> compute(
     // async on the backend stream: a plain tensor_set from pageable memory can return
     // with the CUDA copy still in flight, and synchronize() only waits on the compute stream
     ggml_backend_tensor_set_async(backend, weight, quantized.data(), 0, quantized.size());
-    ggml_backend_tensor_set_async(backend, input, activations.data(), 0, (size_t) (K * n) * sizeof(float));
+    if (src1_n == n) {
+        ggml_backend_tensor_set_async(backend, input, activations.data(), 0, (size_t) (k * n) * sizeof(float));
+    } else {
+        std::vector<float> padded((size_t) (k * src1_n), 0.0f);
+        std::copy(activations.begin(), activations.begin() + (size_t) (k * n), padded.begin());
+        ggml_backend_tensor_set_async(backend, input, padded.data(), 0, padded.size() * sizeof(float));
+    }
     ggml_backend_synchronize(backend);
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "pinned MUL_MAT graph compute failed");
@@ -70,13 +80,20 @@ std::vector<float> compute(
         }
         ggml_backend_synchronize(backend);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / bench_reps;
-        std::printf("test-wp-mul-mat-pin: bench %s %s n=%3d hint=%d %8.3f ms/iter\n", ggml_backend_name(backend), ggml_type_name(type), (int) n,
+        std::printf("test-wp-mul-mat-pin: bench %s %s n=%3d pad=%3d [%lld,%lld] hint=%d %8.3f ms/iter\n",
+                    ggml_backend_name(backend), ggml_type_name(type), (int) n, (int) src1_n,
+                    (long long) k, (long long) m,
                     std::getenv("WP_PIN_TEST_NOHINT") == nullptr ? 1 : 0, ms);
     }
-    std::vector<float> result((size_t) (M * n));
-    ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
+    std::vector<float> full((size_t) (m * src1_n));
+    ggml_backend_tensor_get(output, full.data(), 0, full.size() * sizeof(float));
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+    if (src1_n == n) {
+        return full;
+    }
+    std::vector<float> result((size_t) (m * n));
+    std::memcpy(result.data(), full.data(), result.size() * sizeof(float));
     return result;
 }
 
@@ -319,6 +336,50 @@ void test_type(ggml_backend_t backend, ggml_type type) {
         if (n_diff != 0) {
             std::printf("test-wp-mul-mat-pin: %s ne11=%lld differs: %zu/%zu values, max |diff| %.3e, first column %lld\n",
                         ggml_type_name(type), (long long) n, n_diff, actual.size(), max_diff, (long long) first_col);
+            failures = failures + 1;
+        }
+    }
+}
+
+// Padded mmvq pin path: src1 has 8 columns (tail zero) so GGML_MUL_MAT_PIN_KERNEL=mmvq
+// skips per-mul_mat memset/memcpy. ncols 1..8 must match the unpadded n=8 prefix.
+void test_padded(ggml_backend_t backend, ggml_type type, int64_t k, int64_t m) {
+    constexpr int64_t pad = 8;
+    std::vector<float> weights((size_t) (k * m));
+    std::vector<float> activations((size_t) (k * pad));
+    for (size_t i = 0; i < weights.size(); ++i) {
+        weights[i] = ((int) ((i * 29 + i / (size_t) k * 7) % 251) - 125) * 0.0007f;
+    }
+    for (size_t i = 0; i < activations.size(); ++i) {
+        activations[i] = ((int) ((i * 17 + i / (size_t) k * 11) % 127) - 63) * 0.003f;
+    }
+    std::vector<uint8_t> quantized(ggml_row_size(type, k) * (size_t) m);
+    std::vector<float> imatrix((size_t) k, 1.0f);
+    const float * imatrix_data = ggml_quantize_requires_imatrix(type) ? imatrix.data() : nullptr;
+    require(ggml_quantize_chunk(type, weights.data(), quantized.data(), 0, m, k, imatrix_data) == quantized.size(),
+            std::string("failed to quantize padded ") + ggml_type_name(type));
+
+    const std::vector<float> reference = compute(
+        backend, type, pad, quantized, activations, k, m, 0);
+    for (int64_t n = 1; n <= pad; ++n) {
+        const std::vector<float> actual = compute(
+            backend, type, n, quantized, activations, k, m, pad);
+        size_t n_diff = 0;
+        float max_diff = 0.0f;
+        int64_t first_col = -1;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (std::memcmp(&actual[i], &reference[i], sizeof(float)) != 0) {
+                if (n_diff == 0) {
+                    first_col = (int64_t) (i / (size_t) m);
+                }
+                ++n_diff;
+                max_diff = std::max(max_diff, std::fabs(actual[i] - reference[i]));
+            }
+        }
+        if (n_diff != 0) {
+            std::printf("test-wp-mul-mat-pin: padded %s [%lld,%lld] ne11=%lld vs 8: %zu/%zu values, max |diff| %.3e, first column %lld\n",
+                        ggml_type_name(type), (long long) k, (long long) m, (long long) n,
+                        n_diff, actual.size(), max_diff, (long long) first_col);
             failures = failures + 1;
         }
     }
@@ -599,6 +660,10 @@ int main() {
             test_type_id(backend, type);
             bench_id(backend, type);
         }
+        // Production FFN shapes: gate/up [2560,448] q4_K and down [448,2560] q5_1,
+        // padded path at ncols 1..8 (WP_PIN_TEST_BENCH times these too).
+        test_padded(backend, GGML_TYPE_Q4_K, 2560, 448);
+        test_padded(backend, GGML_TYPE_Q5_1, 448, 2560);
 
         ggml_backend_free(backend);
         require(failures == 0, std::to_string(failures) + " pinned MUL_MAT shape(s) differ");
