@@ -175,6 +175,18 @@ const PlacementReport & test_placement_report() {
     return g_test_placement_report;
 }
 
+// Same lifetime contract as g_test_placement_report above, for the
+// WP_EXPERT_PIN_FILE / PIN_CLASS_PCT cap table Worker::load_pin_file() builds.
+static PinClassReport g_test_pin_class_report;
+
+void test_reset_pin_class_report() {
+    g_test_pin_class_report = PinClassReport{};
+}
+
+const PinClassReport & test_pin_class_report() {
+    return g_test_pin_class_report;
+}
+
 // Buckets a per-assignment owner sequence into groups: one group per distinct
 // owner, ordered by owner id ascending, each group's original assignment
 // indices kept in encounter order. Declared here, ABOVE the anonymous
@@ -8471,7 +8483,10 @@ public:
                               << layer << " " << expert << std::endl;
                     continue;
                 }
-                const size_t class_id = expert_pin_class_index(pool_.resources(), it->second.size);
+                // Resolve through this device's own laid-out catalog, not a
+                // blob-size comparison against pool_.resources() directly --
+                // see DeviceWorker::slot_class_index_for_page().
+                const size_t class_id = slot_class_index_for_page(layer, expert);
                 if (class_id < pin_class_caps.size() &&
                         pin_class_pinned[class_id] >= pin_class_caps[class_id]) {
                     ++pin_class_skipped[class_id];
@@ -16898,7 +16913,10 @@ private:
             }
             const size_t device_id = owning_device_for_page(layer, expert);
             const ResourcePlan & resources = devices_[device_id]->resources();
-            const size_t class_id = expert_pin_class_index(resources, catalog_.pages.at(key).size);
+            // Resolve through the owning device's own laid-out catalog, not a
+            // blob-size comparison against `resources` directly -- see
+            // DeviceWorker::slot_class_index_for_page().
+            const size_t class_id = devices_[device_id]->slot_class_index_for_page(layer, expert);
             if (class_id < pin_class_pinned[device_id].size() &&
                     pin_class_pinned[device_id][class_id] >=
                         (size_t) resources.slot_classes[class_id].slots * pin_class_pct / 100) {
@@ -16945,14 +16963,30 @@ private:
                       << " pin_class_pct=" << pin_class_pct
                       << " demand_hits=0" << std::endl;
         }
+        // Test-only snapshot; see PinClassReport on wp-expert-worker.h. Mirrors
+        // exactly what the "pin_class device=... bytes=... cap=... pinned=...
+        // skipped=..." lines below print, per device per slot class.
+        g_test_pin_class_report = PinClassReport{};
+        g_test_pin_class_report.devices = device_names_;
+        g_test_pin_class_report.class_bytes.resize(devices_.size());
+        g_test_pin_class_report.class_slots.resize(devices_.size());
+        g_test_pin_class_report.class_cap.resize(devices_.size());
+        g_test_pin_class_report.class_pinned.resize(devices_.size());
+        g_test_pin_class_report.class_skipped.resize(devices_.size());
         for (size_t i = 0; i < devices_.size(); ++i) {
             const ResourcePlan & resources = devices_[i]->resources();
             for (size_t j = 0; j < resources.slot_classes.size(); ++j) {
                 const SlotClass & slot_class = resources.slot_classes[j];
+                const size_t cap = (size_t) slot_class.slots * pin_class_pct / 100;
+                g_test_pin_class_report.class_bytes[i].push_back(slot_class.size);
+                g_test_pin_class_report.class_slots[i].push_back((uint64_t) slot_class.slots);
+                g_test_pin_class_report.class_cap[i].push_back((uint64_t) cap);
+                g_test_pin_class_report.class_pinned[i].push_back((uint64_t) pin_class_pinned[i][j]);
+                g_test_pin_class_report.class_skipped[i].push_back((uint64_t) pin_class_skipped[i][j]);
                 std::cerr << "WARN wp expert worker: pin_class device=" << device_names_[i]
                           << " bytes=" << slot_class.size
                           << " slots=" << slot_class.slots
-                          << " cap=" << (size_t) slot_class.slots * pin_class_pct / 100
+                          << " cap=" << cap
                           << " pinned=" << pin_class_pinned[i][j]
                           << " skipped=" << pin_class_skipped[i][j] << std::endl;
             }

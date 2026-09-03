@@ -205,6 +205,26 @@ struct PlacementReport {
 void                    test_reset_placement_report();
 const PlacementReport & test_placement_report();
 
+// Test-only snapshot of the multi-device WP_EXPERT_PIN_FILE / PIN_CLASS_PCT
+// cap accounting the last Worker::load_pin_file() run built -- the per-class
+// {bytes, slots, cap, pinned, skipped} table the startup "pin_class device=...
+// bytes=... cap=... pinned=... skipped=..." lines print. [device][class],
+// same class order as each device's own ResourcePlan::slot_classes (NOT
+// necessarily the same order or count as PlacementReport::class_bytes, which
+// is keyed on placement classes rather than per-device slot classes). Empty
+// on a single-device worker, which pins through DeviceWorker's own path
+// instead of Worker::load_pin_file().
+struct PinClassReport {
+    std::vector<std::string> devices;
+    std::vector<std::vector<uint64_t>> class_bytes;
+    std::vector<std::vector<uint64_t>> class_slots;
+    std::vector<std::vector<uint64_t>> class_cap;
+    std::vector<std::vector<uint64_t>> class_pinned;
+    std::vector<std::vector<uint64_t>> class_skipped;
+};
+void                   test_reset_pin_class_report();
+const PinClassReport & test_pin_class_report();
+
 // Test-only: exercises the exact index-bucketing algorithm
 // Worker::assignment_groups uses internally (in wp-expert-worker.cpp) to turn
 // a request's assignments into per-device sub-dispatch groups -- one group

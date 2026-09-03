@@ -4789,6 +4789,102 @@ static void test_owner_policy_hot_capacity_on_two_devices() {
 }
 
 // ---------------------------------------------------------------------------
+// WP_EXPERT_PIN_CLASS_PCT capping the dominant class (2026-09-03).
+//
+// expert_pin_class_index() is called at both of its call sites with a page's
+// BLOB size (ExpertPage::size) while SlotClass::size is keyed on the DEVICE
+// size (ExpertPage::device_size) -- the identical confusion e805cdc1b fixed
+// for the owner-policy capacity table (see
+// DeviceWorker::slot_class_index_for_page()). Exact equality never matched
+// for PROD_GEOMETRIES[0]'s dominant class (2,150,400 blob vs 2,150,464 device
+// bytes), so both call sites resolved it to "no class" -- past the end of
+// pin_class_caps/_pinned/_skipped -- and WP_EXPERT_PIN_CLASS_PCT silently
+// never capped it: the class 0 log line always read pinned=0 skipped=0 no
+// matter how many class-0 pages were pinned.
+//
+// This drives the multi-device call site (Worker::load_pin_file(), used
+// whenever devices_.size() > 1) with WP_EXPERT_PIN_CLASS_PCT set low enough
+// that the fixture's single dominant class -- all 64 pages of
+// PROD_GEOMETRIES[0]/PROD_WIDTHS[0] are one class, see
+// test_owner_policy_hot_capacity_on_two_devices above -- has to spill some
+// pages into `skipped`. On the pre-fix matching rule every assertion below
+// fails: pinned and skipped both stay 0 because class_id never resolves.
+static void test_pin_class_cap_resolves_by_device_size() {
+    TempDir temp;
+    const ProdFixture fixture =
+        make_production_fixture(temp.path, PROD_GEOMETRIES[0], PROD_WIDTHS[0]);
+
+    const ScopedEnv arena_cap(
+        "WP_EXPERT_ARENA_MAX_BYTES", std::to_string(fixture.page_bytes * 18));
+    const ScopedEnv grouped("WP_EXPERT_ARENA_PREFILL", "1");
+    const ScopedEnv pin_mode("WP_EXPERT_PIN_MODE", "seed");
+    // Cap every class at 10% of its planned slots -- low enough that pinning
+    // every one of the fixture's 64 pages (all one class, split across two
+    // devices) has to skip some on both devices.
+    const ScopedEnv pin_pct("WP_EXPERT_PIN_CLASS_PCT", "10");
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.devices           = { "CPU", "CPU" };
+    options.device_slots      = { PROD_EXPERTS * PROD_LAYERS + 8,
+                                  PROD_EXPERTS * PROD_LAYERS + 8 };
+    options.host_budget_bytes = 4 * fixture.page_bytes;
+
+    const fs::path pin_path = temp.path / "class-cap-pins.txt";
+    {
+        std::ofstream pins(pin_path);
+        require(pins.good(), "failed to write the class-cap pin file");
+        for (int layer = PROD_LAYER; layer < PROD_LAYER + PROD_LAYERS; ++layer) {
+            for (int expert = 0; expert < PROD_EXPERTS; ++expert) {
+                pins << layer << ' ' << expert << "  # 1\n";
+            }
+        }
+    }
+    const ScopedEnv pin_file("WP_EXPERT_PIN_FILE", pin_path.string());
+
+    wp_expert_worker::test_reset_pin_class_report();
+    wp_expert_worker::inspect_resources(options);
+    const wp_expert_worker::PinClassReport report =
+        wp_expert_worker::test_pin_class_report();
+
+    require(report.devices.size() == 2,
+            "pin class report did not describe two devices");
+
+    for (size_t d = 0; d < report.devices.size(); ++d) {
+        if (report.class_bytes[d].empty()) {
+            throw std::runtime_error(
+                "pin class report has no slot classes for device " + std::to_string(d));
+        }
+        for (size_t c = 0; c < report.class_bytes[d].size(); ++c) {
+            if (report.class_slots[d][c] == 0) {
+                continue;
+            }
+            const uint64_t attributed = report.class_pinned[d][c] + report.class_skipped[d][c];
+            if (attributed == 0) {
+                throw std::runtime_error(
+                    "no page was attributed to slot class " + std::to_string(c) +
+                    " on device " + std::to_string(d) + ": expert_pin_class_index still "
+                    "resolves the dominant class's blob size to no slot class");
+            }
+            if (report.class_pinned[d][c] != report.class_cap[d][c]) {
+                throw std::runtime_error(
+                    "class " + std::to_string(c) + " on device " + std::to_string(d) +
+                    " did not pin exactly its cap (pinned=" +
+                    std::to_string(report.class_pinned[d][c]) + " cap=" +
+                    std::to_string(report.class_cap[d][c]) + ")");
+            }
+            if (report.class_skipped[d][c] == 0) {
+                throw std::runtime_error(
+                    "class " + std::to_string(c) + " on device " + std::to_string(d) +
+                    " never spilled into skipped: WP_EXPERT_PIN_CLASS_PCT is not "
+                    "actually capping the dominant class");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // assignment_groups() bucketing (2026-09-03).
 //
 // WP_EXPERT_OWNER_POLICY=hot's owner map interleaves devices in expert-id
@@ -4911,6 +5007,7 @@ int main() {
         test_owner_overflow_explicit_weights();
         test_owner_overflow_is_deterministic();
         test_owner_policy_hot_capacity_on_two_devices();
+        test_pin_class_cap_resolves_by_device_size();
         test_assignment_groups_bucket_by_device();
         test_decode_prefill_compute_profile();
         test_arena_prefill_device_policy();
