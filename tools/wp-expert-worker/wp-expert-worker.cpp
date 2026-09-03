@@ -2321,10 +2321,6 @@ FuseGateUpDiag classify_fuse_gate_up(const FuseGateUpCheck & check) {
         diag.reason = FuseGateUpReason::Clamp;
         return diag;
     }
-    if (check.use_gather && !check.gather_allowed) {
-        diag.reason = FuseGateUpReason::Gather;
-        return diag;
-    }
     if (check.gate_type != check.up_type) {
         diag.reason = FuseGateUpReason::Type;
         return diag;
@@ -2335,6 +2331,10 @@ FuseGateUpDiag classify_fuse_gate_up(const FuseGateUpCheck & check) {
     }
     if (check.up_device_offset != check.gate_device_offset + diag.gate_bytes) {
         diag.reason = FuseGateUpReason::Adjacency;
+        return diag;
+    }
+    if (check.use_gather && !check.gather_allowed) {
+        diag.reason = FuseGateUpReason::Gather;
         return diag;
     }
     diag.reason = FuseGateUpReason::Ok;
@@ -3478,7 +3478,7 @@ Catalog & layout_sliced_pages(
         }
     }
     // Slicer packs up, gate, down (role_mask 1,2,4). Fuse wants gate then up.
-    static const bool s_fuse_layout = [] {
+    const bool fuse_layout = [] {
         const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP_LAYOUT");
         return e != nullptr && e[0] == '1';
     }();
@@ -3494,7 +3494,7 @@ Catalog & layout_sliced_pages(
                   [](const auto & a, const auto & b) {
                       return a.second->offset < b.second->offset;
                   });
-        if (s_fuse_layout) {
+        if (fuse_layout) {
             std::vector<std::string> names;
             names.reserve(members.size());
             for (const auto & member : members) {
@@ -3583,6 +3583,22 @@ Catalog & layout_sliced_pages(
         page.device_size = std::max(device_size, page.size);
     }
     return catalog;
+}
+
+// Identity H2D (blob offset == device offset) is only valid when every
+// member kept its blob place. WP_EXPERT_FUSE_GATE_UP_LAYOUT=1 reorders
+// gate then up without changing device_size, so size equality is not
+// enough: that path would leave up at 0 while compute reads gate at 0.
+bool page_needs_chunked_h2d(const ExpertPage & page) {
+    if (page.device_size != page.size) {
+        return true;
+    }
+    for (const auto & role : page.roles) {
+        if (role.second.device_offset != role.second.offset) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <typename F>
@@ -6975,7 +6991,7 @@ private:
                 // this copy. NOTE ns_h2d then measures ISSUE time, not copy
                 // time; the copy overlaps reads/submit and the A/B metric is
                 // the request wall.
-                if (pagein.page->device_size != pagein.page->size) {
+                if (page_needs_chunked_h2d(*pagein.page)) {
                     // The copy-stream event does not order cudaStreamPerThread.
                     // Clear the tail before issuing the H2D so the event covers
                     // every byte the CUDA quantized kernel can read.
@@ -12185,11 +12201,11 @@ private:
         //    layout algorithm. The slicer writes up then gate then down, so
         //    this fails unless WP_EXPERT_FUSE_GATE_UP_LAYOUT=1 reorders the
         //    slot to gate then up then the rest.
-        static const bool s_fuse_gate_up = [] {
+        const bool s_fuse_gate_up = [] {
             const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
             return e != nullptr && e[0] == '1';
         }();
-        static const bool s_fuse_gate_up_gather = [] {
+        const bool s_fuse_gate_up_gather = [] {
             const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP_GATHER");
             return e != nullptr && e[0] == '1';
         }();
@@ -12247,7 +12263,9 @@ private:
                     case FuseGateUpReason::Ok:
                         break;
                 }
-                if (!fuse_gate_up_miss_logged_) {
+                if (!fuse_gate_up_miss_logged_ &&
+                        !(fuse_diag.reason == FuseGateUpReason::Gather &&
+                          chk.gather_allowed)) {
                     fuse_gate_up_miss_logged_ = true;
                     std::cerr << "wp expert worker: fuse-gate-up disabled: reason="
                               << format_fuse_gate_up_reason(fuse_diag) << std::endl;

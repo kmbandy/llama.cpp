@@ -88,7 +88,7 @@ std::vector<DeviceMemberLayout> plan_device_member_layout(
         const std::vector<uint64_t> & sizes, uint64_t alignment);
 
 // Why WP_EXPERT_FUSE_GATE_UP did not fire for one request. Checked in this
-// order: clamp, gather, type, shape, adjacency.
+// order: clamp, type, shape, adjacency, gather.
 enum class FuseGateUpReason {
     Ok = 0,
     Clamp,

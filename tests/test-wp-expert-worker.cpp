@@ -5050,6 +5050,12 @@ static void test_fuse_gate_up_reason_classifier() {
     require(classify_fuse_gate_up(gather).reason == FuseGateUpReason::Ok,
             "gather with the gather fuse flag was not classified ok");
 
+    FuseGateUpCheck gather_type = gather;
+    gather_type.gather_allowed = false;
+    gather_type.up_type = (int) GGML_TYPE_Q5_1;
+    require(classify_fuse_gate_up(gather_type).reason == FuseGateUpReason::Type,
+            "type must be reported before gather");
+
     FuseGateUpCheck type = ok;
     type.up_type = (int) GGML_TYPE_Q5_1;
     require(classify_fuse_gate_up(type).reason == FuseGateUpReason::Type,
@@ -5078,6 +5084,11 @@ static void test_fuse_gate_up_reason_classifier() {
     both.swiglu_clamp = 1.0f;
     require(classify_fuse_gate_up(both).reason == FuseGateUpReason::Clamp,
             "clamp must win over adjacency");
+
+    FuseGateUpCheck adj_gather = adj;
+    adj_gather.use_gather = true;
+    require(classify_fuse_gate_up(adj_gather).reason == FuseGateUpReason::Adjacency,
+            "adjacency must be reported before gather");
 
     const std::vector<std::string> blob_order = { "up", "gate", "down" };
     const std::vector<std::string> fused_order =
@@ -5108,6 +5119,139 @@ static void test_fuse_gate_up_reason_classifier() {
             "fuse layout changed qwen38 448-wide device_size");
     require(fused_layout[1].offset == fused_layout[0].offset + gate_bytes,
             "fuse layout did not make up adjacent after gate");
+}
+
+static int32_t float_bits(float x) {
+    int32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    return bits;
+}
+
+static bool within_one_ulp(float a, float b) {
+    if (a == b) {
+        return true;
+    }
+    const int32_t ia = float_bits(a);
+    const int32_t ib = float_bits(b);
+    if ((ia ^ ib) < 0) {
+        return false;
+    }
+    return std::abs(ia - ib) <= 1;
+}
+
+// One expert, n_tokens=1, CPU backend. Per-expert path vs LAYOUT=1 fused path.
+// Compares VALUES (1 ulp). The synthetic blob is up, gate, down.
+static std::vector<float> cpu_one_expert_partial(
+        const Fixture & fixture, bool fuse_layout) {
+    const ScopedEnv fuse("WP_EXPERT_FUSE_GATE_UP", fuse_layout ? "1" : "0");
+    const ScopedEnv layout("WP_EXPERT_FUSE_GATE_UP_LAYOUT", fuse_layout ? "1" : "0");
+    const ScopedEnv gather("WP_EXPERT_FUSE_GATE_UP_GATHER", fuse_layout ? "1" : "0");
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = reserve_port();
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    std::vector<float> partial;
+    try {
+        pipe_socket_ptr socket = connect_with_retry(options.listen_port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload) && type == PIPE_HELLO,
+                "fuse-layout CPU worker did not send HELLO");
+        pipe_expert_hello client =
+            pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(
+                    *socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send fuse-layout client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "fuse-layout CPU worker rejected HELLO");
+
+        std::vector<float> input((size_t) N_EMBD);
+        for (size_t i = 0; i < input.size(); ++i) {
+            input[i] = ((int) (i % 13) - 6) * 0.07f;
+        }
+        pipe_expert_dispatch_req request;
+        request.layer = LAYER;
+        request.n_tokens = 1;
+        request.activations = input;
+        request.assignments = { { 0, { 0.5f } } };
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(
+                    *socket, PIPE_EXPERT_DISPATCH_REQ, 70,
+                    payload.data(), payload.size()),
+                "failed to send fuse-layout dispatch");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive fuse-layout partial");
+        if (type == PIPE_ERROR) {
+            const pipe_error error =
+                pipe_decode_error(payload.data(), payload.size());
+            throw std::runtime_error(
+                "fuse-layout dispatch failed: " + error.msg);
+        }
+        require(type == PIPE_EXPERT_PARTIAL && seq_id == 70,
+                "fuse-layout worker did not return a partial");
+        const pipe_expert_partial response =
+            pipe_decode_expert_partial(payload.data(), payload.size(), N_EMBD);
+        require(response.n_tokens == 1 && response.partial.size() == (size_t) N_EMBD,
+                "fuse-layout partial shape mismatch");
+        partial = response.partial;
+        socket.reset();
+    } catch (...) {
+        server.join();
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "fuse-layout CPU worker did not exit cleanly");
+    require(!partial.empty(), "fuse-layout CPU worker returned an empty partial");
+    return partial;
+}
+
+static void test_fuse_gate_up_layout_matches_split() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const std::vector<float> split = cpu_one_expert_partial(fixture, false);
+    const std::vector<float> fused = cpu_one_expert_partial(fixture, true);
+    require(split.size() == fused.size() && split.size() == (size_t) N_EMBD,
+            "split and fused-layout partials have different shapes");
+    bool any_nonzero = false;
+    for (size_t i = 0; i < split.size(); ++i) {
+        any_nonzero = any_nonzero || split[i] != 0.0f || fused[i] != 0.0f;
+        if (!within_one_ulp(split[i], fused[i])) {
+            throw std::runtime_error(
+                "fused-layout CPU partial differs from the per-expert path at " +
+                std::to_string(i) + ": fused=" + std::to_string(fused[i]) +
+                " split=" + std::to_string(split[i]));
+        }
+    }
+    require(any_nonzero, "split and fused-layout partials were both zero");
 }
 
 int main() {
@@ -5142,6 +5286,7 @@ int main() {
         test_q5_1_down_proj_prefill_last_column();
         test_slice_device_member_layout();
         test_fuse_gate_up_reason_classifier();
+        test_fuse_gate_up_layout_matches_split();
         test_glm_size_class_plan();
         test_fixture_arena_stride_alignment();
         run_test();
