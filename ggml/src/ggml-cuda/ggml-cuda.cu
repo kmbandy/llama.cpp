@@ -2671,6 +2671,101 @@ static bool ggml_cuda_mul_mat_id_hint_pinned(const ggml_tensor * dst) {
     return dst->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(dst, 1) == GGML_HINT_MUL_MAT_PIN;
 }
 
+static void ggml_cuda_trim_ascii(std::string & s) {
+    const size_t begin = s.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        s.clear();
+        return;
+    }
+    const size_t end = s.find_last_not_of(" \t\r\n");
+    s = s.substr(begin, end - begin + 1);
+}
+
+// GGML_MUL_MAT_PIN_KERNEL / WP_EXPERT_MM_PIN_KERNEL, per device. Default MMQ.
+// "mmvq" / "1" -> mmvq on every device. "ROCm0:mmvq,CUDA0:mmvq" is a map.
+// "ROCm0,CUDA0" / "!CPU" is the same allow-list as WP_EXPERT_ARENA_PREFILL.
+static bool ggml_cuda_parse_pin_kernel_mmvq(const char * env, const char * device_name) {
+    if (env == nullptr || device_name == nullptr) {
+        return false;
+    }
+    std::string value(env);
+    ggml_cuda_trim_ascii(value);
+    if (value.empty() || value == "0" || value == "mmq") {
+        return false;
+    }
+    if (value == "mmvq" || value == "1") {
+        return true;
+    }
+    if (value.compare(0, 5, "mmvq:") == 0) {
+        value.erase(0, 5);
+        env = value.c_str();
+    } else if (value.compare(0, 4, "mmq:") == 0) {
+        return false;
+    }
+    const bool mapped = value.find(':') != std::string::npos;
+    if (mapped) {
+        bool all_mapped = true;
+        bool found = false;
+        bool hit = false;
+        size_t start = 0;
+        while (start <= value.size()) {
+            const size_t comma = value.find(',', start);
+            std::string item = (comma == std::string::npos) ?
+                value.substr(start) : value.substr(start, comma - start);
+            ggml_cuda_trim_ascii(item);
+            const size_t colon = item.find(':');
+            if (colon == std::string::npos) {
+                all_mapped = false;
+                break;
+            }
+            std::string name = item.substr(0, colon);
+            std::string kernel = item.substr(colon + 1);
+            ggml_cuda_trim_ascii(name);
+            ggml_cuda_trim_ascii(kernel);
+            if (!name.empty() && name == device_name) {
+                hit = true;
+                found = (kernel == "mmvq" || kernel == "1");
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+        if (all_mapped) {
+            return hit && found;
+        }
+    }
+    bool negate = false;
+    if (!value.empty() && value[0] == '!') {
+        negate = true;
+        value.erase(0, 1);
+    }
+    bool listed = false;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        std::string name = (comma == std::string::npos) ?
+            value.substr(start) : value.substr(start, comma - start);
+        ggml_cuda_trim_ascii(name);
+        if (!name.empty() && name == device_name) {
+            listed = true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return negate ? !listed : listed;
+}
+
+static bool ggml_cuda_pin_kernel_mmvq(const ggml_backend_cuda_context & ctx) {
+    const char * env = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
+    if (env != nullptr && env[0] != '\0') {
+        return ggml_cuda_parse_pin_kernel_mmvq(env, ctx.name.c_str());
+    }
+    return ggml_cuda_parse_pin_kernel_mmvq(std::getenv("WP_EXPERT_MM_PIN_KERNEL"), ctx.name.c_str());
+}
+
 static bool ggml_cuda_mul_mat_id_force_mm(const int64_t total_tokens) {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_MUL_MAT_ID_FORCE_MM");
@@ -2732,6 +2827,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+    // PIN stays unfused. Fusion launches only at ncols_dst=1 (mmvq.cu asserts
+    // that). The mmvq pin pads to MMVQ_MAX_BATCH_SIZE=8 so nwarps/rows_per_block
+    // do not depend on ne11; fused ncols=1 uses a different nwarps (RDNA2 Q4_K:
+    // 2 vs 1) so the last bits would depend on draft length. Same K order at
+    // equal ncols_dst, but equal ncols is 8 here, which fusion cannot take.
     if (tensor->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(tensor, 1) == GGML_HINT_MUL_MAT_PIN) {
         return false;
     }
@@ -2809,12 +2909,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // Default pin = MMQ: at 1-8 columns it costs the same as the MMVQ groups and at
         // 64-512 columns it is 2-12x cheaper on R9700, 6900XT and GTX1070
         // (test-wp-mul-mat-pin WP_PIN_TEST_BENCH, 2026-09-02). GGML_MUL_MAT_PIN_KERNEL=mmvq
-        // runs the vector kernel in fixed groups of MMVQ_MAX_BATCH_SIZE columns instead
-        // (tail zero-padded); both keep a column's arithmetic independent of ne11.
-        static const bool pin_mmvq = [] {
-            const char * env = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
-            return env != nullptr && std::strcmp(env, "mmvq") == 0;
-        }();
+        // (or WP_EXPERT_MM_PIN_KERNEL, per device) runs the vector kernel in fixed
+        // groups of MMVQ_MAX_BATCH_SIZE columns instead (tail zero-padded); both keep
+        // a column's arithmetic independent of ne11. If ne11 is already a multiple of
+        // the group, skip the per-mul_mat memset/memcpy -- the worker pads once.
+        const bool pin_mmvq = ggml_cuda_pin_kernel_mmvq(ctx);
         const bool mmvq_ok = pin_mmvq && ggml_is_quantized(src0->type) && ne12 == 1 && ne13 == 1 &&
             ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
         if (!mmvq_ok) {
@@ -2823,33 +2922,56 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
         constexpr int64_t group = MMVQ_MAX_BATCH_SIZE;
+        auto mmvq_group_view = [&](const ggml_tensor * src1_v, ggml_tensor * dst_v, int64_t c0) {
+            ggml_tensor y = *src1_v;
+            ggml_tensor d = *dst_v;
+            y.ne[1] = group; y.ne[2] = 1; y.ne[3] = 1;
+            y.nb[1] = ne10 * sizeof(float); y.nb[2] = y.nb[1] * group; y.nb[3] = y.nb[2];
+            d.ne[1] = group; d.ne[2] = 1; d.ne[3] = 1;
+            d.nb[1] = ne0 * sizeof(float); d.nb[2] = d.nb[1] * group; d.nb[3] = d.nb[2];
+            y.data = (char *) src1_v->data + c0 * nb11;
+            d.data = (char *) dst_v->data + c0 * nb1;
+            y.src[0] = nullptr; y.view_src = nullptr; y.op = GGML_OP_NONE;
+            d.src[0] = nullptr; d.src[1] = nullptr; d.view_src = nullptr;
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &y, nullptr, &d);
+        };
+        if (ne11 == group) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+        if (ne11 % group == 0) {
+            for (int64_t c0 = 0; c0 < ne11; c0 += group) {
+                mmvq_group_view(src1, dst, c0);
+            }
+            return;
+        }
         cudaStream_t stream = ctx.stream();
         ggml_cuda_pool_alloc<float> y_pad(ctx.pool());
         ggml_cuda_pool_alloc<float> d_pad(ctx.pool());
         for (int64_t c0 = 0; c0 < ne11; c0 += group) {
             const int64_t nc = std::min(group, ne11 - c0);
+            if (nc == group) {
+                mmvq_group_view(src1, dst, c0);
+                continue;
+            }
             ggml_tensor y = *src1;
             ggml_tensor d = *dst;
             y.ne[1] = group; y.ne[2] = 1; y.ne[3] = 1;
             y.nb[1] = ne10 * sizeof(float); y.nb[2] = y.nb[1] * group; y.nb[3] = y.nb[2];
             d.ne[1] = group; d.ne[2] = 1; d.ne[3] = 1;
             d.nb[1] = ne0 * sizeof(float); d.nb[2] = d.nb[1] * group; d.nb[3] = d.nb[2];
-            y.data = (char *) src1->data + c0 * nb11;
-            d.data = (char *) dst->data + c0 * nb1;
-            if (nc < group) {
-                y_pad.alloc((size_t) (ne10 * group));
-                d_pad.alloc((size_t) (ne0 * group));
-                CUDA_CHECK(cudaMemsetAsync(y_pad.get(), 0, (size_t) (ne10 * group) * sizeof(float), stream));
-                CUDA_CHECK(cudaMemcpyAsync(y_pad.get(), y.data, (size_t) (ne10 * nc) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-                y.data = y_pad.get();
-                d.data = d_pad.get();
-            }
+            y_pad.alloc((size_t) (ne10 * group));
+            d_pad.alloc((size_t) (ne0 * group));
+            CUDA_CHECK(cudaMemsetAsync(y_pad.get(), 0, (size_t) (ne10 * group) * sizeof(float), stream));
+            CUDA_CHECK(cudaMemcpyAsync(y_pad.get(), (char *) src1->data + c0 * nb11,
+                (size_t) (ne10 * nc) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            y.data = y_pad.get();
+            d.data = d_pad.get();
             y.src[0] = nullptr; y.view_src = nullptr; y.op = GGML_OP_NONE;
             d.src[0] = nullptr; d.src[1] = nullptr; d.view_src = nullptr;
             ggml_cuda_mul_mat_vec_q(ctx, src0, &y, nullptr, &d);
-            if (nc < group) {
-                CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + c0 * nb1, d_pad.get(), (size_t) (ne0 * nc) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-            }
+            CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + c0 * nb1, d_pad.get(),
+                (size_t) (ne0 * nc) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         }
         return;
     }
