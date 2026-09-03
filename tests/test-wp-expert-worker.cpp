@@ -5139,6 +5139,126 @@ static void test_assignment_groups_bucket_by_device() {
             "device 1's indices were not kept in original relative order");
 }
 
+// ---------------------------------------------------------------------------
+// WP_EXPERT_FUSE_GATE_UP reason classifier (2026-09-03).
+//
+// On qwen38 the slicer writes members as up (mask 1), gate (mask 2), down
+// (mask 4). layout_sliced_pages() follows blob offset, so up sits at 0 and
+// gate follows it. fuse_gate_up_ok() wants up at gate + ggml_row_size*ne1.
+// Gate and up are the same type (q4_K or q5_K) and the same slice shape;
+// swiglu_clamp is 0. The classifier must report adjacency for that layout,
+// not type/shape/clamp, and WP_EXPERT_FUSE_GATE_UP_LAYOUT=1 reorders to
+// gate then up then down without changing device_size on this geometry.
+static void test_fuse_gate_up_reason_classifier() {
+    using wp_expert_worker::FuseGateUpCheck;
+    using wp_expert_worker::FuseGateUpReason;
+    using wp_expert_worker::classify_fuse_gate_up;
+    using wp_expert_worker::format_fuse_gate_up_reason;
+    using wp_expert_worker::fuse_gate_up_layout_names;
+    using wp_expert_worker::plan_device_member_layout;
+
+    const int64_t ne0 = 2560;
+    const int64_t ne1 = 448;
+    const int gate_up_type = (int) GGML_TYPE_Q4_K;
+    const uint64_t gate_bytes =
+        (uint64_t) ggml_row_size(GGML_TYPE_Q4_K, ne0) * (uint64_t) ne1;
+    require(gate_bytes == 645120, "qwen38 gate/up q4_K bytes changed");
+
+    FuseGateUpCheck ok;
+    ok.swiglu_clamp = 0.0f;
+    ok.use_gather = false;
+    ok.gather_allowed = false;
+    ok.gate_type = gate_up_type;
+    ok.up_type = gate_up_type;
+    ok.gate_ne0 = ne0;
+    ok.gate_ne1 = ne1;
+    ok.up_ne0 = ne0;
+    ok.up_ne1 = ne1;
+    ok.gate_device_offset = 0;
+    ok.up_device_offset = gate_bytes;
+    require(classify_fuse_gate_up(ok).reason == FuseGateUpReason::Ok,
+            "adjacent same-type gate||up was not classified ok");
+    require(format_fuse_gate_up_reason(classify_fuse_gate_up(ok)) == "ok",
+            "ok reason string");
+
+    FuseGateUpCheck clamp = ok;
+    clamp.swiglu_clamp = 10.0f;
+    require(classify_fuse_gate_up(clamp).reason == FuseGateUpReason::Clamp,
+            "nonzero swiglu_clamp was not classified clamp");
+    require(format_fuse_gate_up_reason(classify_fuse_gate_up(clamp)) == "clamp",
+            "clamp reason string");
+
+    FuseGateUpCheck gather = ok;
+    gather.use_gather = true;
+    gather.gather_allowed = false;
+    require(classify_fuse_gate_up(gather).reason == FuseGateUpReason::Gather,
+            "gather without the gather fuse flag was not classified gather");
+    require(format_fuse_gate_up_reason(classify_fuse_gate_up(gather)) == "gather",
+            "gather reason string");
+    gather.gather_allowed = true;
+    require(classify_fuse_gate_up(gather).reason == FuseGateUpReason::Ok,
+            "gather with the gather fuse flag was not classified ok");
+
+    FuseGateUpCheck type = ok;
+    type.up_type = (int) GGML_TYPE_Q5_1;
+    require(classify_fuse_gate_up(type).reason == FuseGateUpReason::Type,
+            "mismatched gate/up ggml_type was not classified type");
+    require(format_fuse_gate_up_reason(classify_fuse_gate_up(type)) == "type",
+            "type reason string");
+
+    FuseGateUpCheck shape = ok;
+    shape.up_ne1 = 192;
+    require(classify_fuse_gate_up(shape).reason == FuseGateUpReason::Shape,
+            "mismatched gate/up ne1 was not classified shape");
+    require(format_fuse_gate_up_reason(classify_fuse_gate_up(shape)) == "shape",
+            "shape reason string");
+
+    FuseGateUpCheck adj = ok;
+    adj.gate_device_offset = gate_bytes;
+    adj.up_device_offset = 0;
+    const wp_expert_worker::FuseGateUpDiag adj_diag = classify_fuse_gate_up(adj);
+    require(adj_diag.reason == FuseGateUpReason::Adjacency,
+            "up-then-gate blob order was not classified adjacency");
+    require(format_fuse_gate_up_reason(adj_diag) ==
+                "adjacency:go=645120,uo=0,gate_bytes=645120",
+            "adjacency reason string does not match the required format");
+
+    FuseGateUpCheck both = adj;
+    both.swiglu_clamp = 1.0f;
+    require(classify_fuse_gate_up(both).reason == FuseGateUpReason::Clamp,
+            "clamp must win over adjacency");
+
+    const std::vector<std::string> blob_order = { "up", "gate", "down" };
+    const std::vector<std::string> fused_order =
+        fuse_gate_up_layout_names(blob_order);
+    require(fused_order.size() == 3 && fused_order[0] == "gate" &&
+                fused_order[1] == "up" && fused_order[2] == "down",
+            "fuse layout did not put gate immediately before up");
+    require(fuse_gate_up_layout_names({ "down" }) ==
+                std::vector<std::string>{ "down" },
+            "fuse layout changed a page with no gate/up pair");
+
+    const uint64_t down_bytes =
+        (uint64_t) ggml_row_size(GGML_TYPE_Q5_1, 448) * (uint64_t) 2560;
+    const uint64_t down_slack =
+        (uint64_t) ggml_row_size(GGML_TYPE_Q5_1, 512 - (448 % 512));
+    const uint64_t down_alloc = down_bytes + down_slack;
+    require(down_bytes == 860160 && down_slack == 48,
+            "qwen38 down q5_1 bytes/slack changed");
+    const auto blob_layout = plan_device_member_layout(
+        { gate_bytes, gate_bytes, down_alloc }, 64);
+    const auto fused_layout = plan_device_member_layout(
+        { gate_bytes, gate_bytes, down_alloc }, 64);
+    const uint64_t blob_device =
+        blob_layout.back().offset + blob_layout.back().size;
+    const uint64_t fused_device =
+        fused_layout.back().offset + fused_layout.back().size;
+    require(blob_device == fused_device && fused_device == 2150448,
+            "fuse layout changed qwen38 448-wide device_size");
+    require(fused_layout[1].offset == fused_layout[0].offset + gate_bytes,
+            "fuse layout did not make up adjacent after gate");
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -5171,6 +5291,7 @@ int main() {
         test_partial_last_column_round_trip();
         test_q5_1_down_proj_prefill_last_column();
         test_slice_device_member_layout();
+        test_fuse_gate_up_reason_classifier();
         test_glm_size_class_plan();
         test_fixture_arena_stride_alignment();
         run_test();

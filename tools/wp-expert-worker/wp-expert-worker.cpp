@@ -1693,6 +1693,12 @@ struct RequestStats {
     uint64_t n_gcache_miss = 0;
     // WP_EXPERT_FUSE_GATE_UP_GATHER: requests that fused gate||up on gather.
     uint64_t n_fuse_gate_up_gather = 0;
+    uint64_t n_fuse_gate_up_hit = 0;
+    uint64_t n_fuse_gate_up_miss_clamp = 0;
+    uint64_t n_fuse_gate_up_miss_gather = 0;
+    uint64_t n_fuse_gate_up_miss_type = 0;
+    uint64_t n_fuse_gate_up_miss_shape = 0;
+    uint64_t n_fuse_gate_up_miss_adjacency = 0;
     uint64_t n_arena_hit   = 0;
     uint64_t n_arena_groups = 0;
     uint64_t n_arena_build = 0;
@@ -1968,6 +1974,12 @@ public:
         n_fuse_gate_up_miss_ += request.n_fuse_gate_up_miss;
         n_fuse_gate_up_experts_ += request.n_fuse_gate_up_experts;
         n_fuse_gate_up_gather_ += request.n_fuse_gate_up_gather;
+        n_fuse_gate_up_hit_ += request.n_fuse_gate_up_hit;
+        n_fuse_gate_up_miss_clamp_ += request.n_fuse_gate_up_miss_clamp;
+        n_fuse_gate_up_miss_gather_ += request.n_fuse_gate_up_miss_gather;
+        n_fuse_gate_up_miss_type_ += request.n_fuse_gate_up_miss_type;
+        n_fuse_gate_up_miss_shape_ += request.n_fuse_gate_up_miss_shape;
+        n_fuse_gate_up_miss_adjacency_ += request.n_fuse_gate_up_miss_adjacency;
         n_arena_hit_ += request.n_arena_hit;
         n_arena_groups_ += request.n_arena_groups;
         n_arena_build_ += request.n_arena_build;
@@ -2197,7 +2209,12 @@ private:
                   << " n_fuse_gate_up_hit=" << n_fuse_gate_up_hit_
                   << " n_fuse_gate_up_miss=" << n_fuse_gate_up_miss_
                   << " n_fuse_gate_up_experts=" << n_fuse_gate_up_experts_
-                  << " n_fuse_gate_up_gather=" << n_fuse_gate_up_gather_;
+                  << " n_fuse_gate_up_gather=" << n_fuse_gate_up_gather_
+                  << " n_fuse_gate_up_miss_clamp=" << n_fuse_gate_up_miss_clamp_
+                  << " n_fuse_gate_up_miss_gather=" << n_fuse_gate_up_miss_gather_
+                  << " n_fuse_gate_up_miss_type=" << n_fuse_gate_up_miss_type_
+                  << " n_fuse_gate_up_miss_shape=" << n_fuse_gate_up_miss_shape_
+                  << " n_fuse_gate_up_miss_adjacency=" << n_fuse_gate_up_miss_adjacency_;
         {
             uint64_t captures = 0, replays = 0, fallbacks = 0, cap_newkey = 0, cap_lru = 0;
             if (ggml_backend_cuda_wp_graph_counts != nullptr && probe_backend_ != nullptr &&
@@ -2357,6 +2374,12 @@ private:
     uint64_t          n_fuse_gate_up_miss_ = 0;
     uint64_t          n_fuse_gate_up_experts_ = 0;
     uint64_t          n_fuse_gate_up_gather_ = 0;
+    uint64_t          n_fuse_gate_up_hit_ = 0;
+    uint64_t          n_fuse_gate_up_miss_clamp_ = 0;
+    uint64_t          n_fuse_gate_up_miss_gather_ = 0;
+    uint64_t          n_fuse_gate_up_miss_type_ = 0;
+    uint64_t          n_fuse_gate_up_miss_shape_ = 0;
+    uint64_t          n_fuse_gate_up_miss_adjacency_ = 0;
     uint64_t          n_arena_hit_ = 0;
     uint64_t          n_arena_groups_ = 0;
     uint64_t          n_arena_build_ = 0;
@@ -2744,6 +2767,90 @@ std::vector<DeviceMemberLayout> plan_device_member_layout(
         offset += size;
     }
     return result;
+}
+
+FuseGateUpDiag classify_fuse_gate_up(const FuseGateUpCheck & check) {
+    FuseGateUpDiag diag;
+    diag.go = check.gate_device_offset;
+    diag.uo = check.up_device_offset;
+    if (check.gate_type >= 0 && check.gate_type < GGML_TYPE_COUNT &&
+            check.gate_ne0 > 0 && check.gate_ne1 > 0) {
+        diag.gate_bytes =
+            (uint64_t) ggml_row_size(
+                (enum ggml_type) check.gate_type, check.gate_ne0) *
+            (uint64_t) check.gate_ne1;
+    }
+    if (check.swiglu_clamp > 1e-6f) {
+        diag.reason = FuseGateUpReason::Clamp;
+        return diag;
+    }
+    if (check.use_gather && !check.gather_allowed) {
+        diag.reason = FuseGateUpReason::Gather;
+        return diag;
+    }
+    if (check.gate_type != check.up_type) {
+        diag.reason = FuseGateUpReason::Type;
+        return diag;
+    }
+    if (check.gate_ne0 != check.up_ne0 || check.gate_ne1 != check.up_ne1) {
+        diag.reason = FuseGateUpReason::Shape;
+        return diag;
+    }
+    if (check.up_device_offset != check.gate_device_offset + diag.gate_bytes) {
+        diag.reason = FuseGateUpReason::Adjacency;
+        return diag;
+    }
+    diag.reason = FuseGateUpReason::Ok;
+    return diag;
+}
+
+const char * fuse_gate_up_reason_name(FuseGateUpReason reason) {
+    switch (reason) {
+        case FuseGateUpReason::Ok:         return "ok";
+        case FuseGateUpReason::Clamp:      return "clamp";
+        case FuseGateUpReason::Gather:     return "gather";
+        case FuseGateUpReason::Type:       return "type";
+        case FuseGateUpReason::Shape:      return "shape";
+        case FuseGateUpReason::Adjacency:  return "adjacency";
+    }
+    return "ok";
+}
+
+std::string format_fuse_gate_up_reason(const FuseGateUpDiag & diag) {
+    if (diag.reason != FuseGateUpReason::Adjacency) {
+        return fuse_gate_up_reason_name(diag.reason);
+    }
+    std::ostringstream out;
+    out << "adjacency:go=" << diag.go
+        << ",uo=" << diag.uo
+        << ",gate_bytes=" << diag.gate_bytes;
+    return out.str();
+}
+
+std::vector<std::string> fuse_gate_up_layout_names(
+        const std::vector<std::string> & names) {
+    bool have_gate = false;
+    bool have_up = false;
+    for (const std::string & name : names) {
+        if (name == "gate") {
+            have_gate = true;
+        } else if (name == "up") {
+            have_up = true;
+        }
+    }
+    if (!have_gate || !have_up) {
+        return names;
+    }
+    std::vector<std::string> ordered;
+    ordered.reserve(names.size());
+    ordered.emplace_back("gate");
+    ordered.emplace_back("up");
+    for (const std::string & name : names) {
+        if (name != "gate" && name != "up") {
+            ordered.push_back(name);
+        }
+    }
+    return ordered;
 }
 
 namespace {
@@ -3950,6 +4057,11 @@ Catalog & layout_sliced_pages(
             }
         }
     }
+    // Slicer packs up, gate, down (role_mask 1,2,4). Fuse wants gate then up.
+    static const bool s_fuse_layout = [] {
+        const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP_LAYOUT");
+        return e != nullptr && e[0] == '1';
+    }();
     for (auto & item : catalog.pages) {
         ExpertPage & page = item.second;
         const auto & specs = catalog.descriptor.layers.at(page.layer);
@@ -3962,6 +4074,28 @@ Catalog & layout_sliced_pages(
                   [](const auto & a, const auto & b) {
                       return a.second->offset < b.second->offset;
                   });
+        if (s_fuse_layout) {
+            std::vector<std::string> names;
+            names.reserve(members.size());
+            for (const auto & member : members) {
+                names.push_back(member.first);
+            }
+            const std::vector<std::string> ordered =
+                fuse_gate_up_layout_names(names);
+            std::vector<std::pair<std::string, MemberSpan *>> reordered;
+            reordered.reserve(ordered.size());
+            for (const std::string & name : ordered) {
+                for (auto & member : members) {
+                    if (member.first == name) {
+                        reordered.push_back(member);
+                        break;
+                    }
+                }
+            }
+            if (reordered.size() == members.size()) {
+                members = std::move(reordered);
+            }
+        }
 
         context_ptr ctx(ggml_init({
             /* .mem_size = */ ggml_tensor_overhead() * members.size(),
@@ -11481,6 +11615,7 @@ private:
     bool        mm_pin_kernel_mmvq_ = false;
     bool        mm_pin_pad_mmvq_ = false;
     bool batch_mmid_enabled_ = false;
+    bool fuse_gate_up_miss_logged_ = false;
 
     void begin_async_dispatch(int conn_index, uint64_t trace_req) {
         active_async_conn_index_ = conn_index;
@@ -13240,7 +13375,9 @@ private:
         //    tensor is a different function. See the clamp note below.
         //  * every selected expert must actually have up adjacent to gate.
         //    Checked against the real device offsets, not assumed from the
-        //    layout algorithm.
+        //    layout algorithm. The slicer writes up then gate then down, so
+        //    this fails unless WP_EXPERT_FUSE_GATE_UP_LAYOUT=1 reorders the
+        //    slot to gate then up then the rest.
         static const bool s_fuse_gate_up = [] {
             const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
             return e != nullptr && e[0] == '1';
@@ -13249,41 +13386,72 @@ private:
             const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP_GATHER");
             return e != nullptr && e[0] == '1';
         }();
-        const auto fuse_gate_up_ok = [&]() {
-            if (!s_fuse_gate_up || request.swiglu_clamp > 1e-6f) {
-                return false;
-            }
-            if (use_gather && !s_fuse_gate_up_gather) {
-                return false;
-            }
+        FuseGateUpDiag fuse_diag;
+        if (s_fuse_gate_up) {
+            FuseGateUpCheck chk;
+            chk.swiglu_clamp = request.swiglu_clamp;
+            chk.use_gather = use_gather;
+            chk.gather_allowed = s_fuse_gate_up_gather;
             const auto & fspecs = catalog_.descriptor.layers.at(request.layer);
             const RoleSpec & sg = fspecs.at("gate");
             const RoleSpec & su = fspecs.at("up");
-            if (sg.type != su.type || sg.ne0 != su.ne0 || sg.ne1 != su.ne1) {
-                return false;
-            }
-            const size_t gate_bytes =
-                ggml_row_size(sg.type, (int64_t) sg.ne0) * (size_t) sg.ne1;
+            chk.gate_type = (int) sg.type;
+            chk.up_type = (int) su.type;
+            chk.gate_ne0 = sg.ne0;
+            chk.gate_ne1 = sg.ne1;
+            chk.up_ne0 = su.ne0;
+            chk.up_ne1 = su.ne1;
+            bool any_selected = false;
             for (size_t i = 0; i < request.assignments.size(); ++i) {
                 if (!selected(i)) {
                     continue;
                 }
                 const ExpertPage & page = *pages[i];
-                const uint64_t go = page.roles.at("gate").device_offset;
-                const uint64_t uo = page.roles.at("up").device_offset;
-                if (uo != go + (uint64_t) gate_bytes) {
-                    return false;
+                chk.gate_device_offset = page.roles.at("gate").device_offset;
+                chk.up_device_offset = page.roles.at("up").device_offset;
+                fuse_diag = classify_fuse_gate_up(chk);
+                any_selected = true;
+                if (fuse_diag.reason != FuseGateUpReason::Ok) {
+                    break;
                 }
             }
-            return true;
-        };
-        const bool fuse_gate_up = fuse_gate_up_ok();
+            if (!any_selected) {
+                fuse_diag = classify_fuse_gate_up(chk);
+            }
+            if (fuse_diag.reason == FuseGateUpReason::Ok) {
+                ++request_stats.n_fuse_gate_up_hit;
+            } else {
+                switch (fuse_diag.reason) {
+                    case FuseGateUpReason::Clamp:
+                        ++request_stats.n_fuse_gate_up_miss_clamp;
+                        break;
+                    case FuseGateUpReason::Gather:
+                        ++request_stats.n_fuse_gate_up_miss_gather;
+                        break;
+                    case FuseGateUpReason::Type:
+                        ++request_stats.n_fuse_gate_up_miss_type;
+                        break;
+                    case FuseGateUpReason::Shape:
+                        ++request_stats.n_fuse_gate_up_miss_shape;
+                        break;
+                    case FuseGateUpReason::Adjacency:
+                        ++request_stats.n_fuse_gate_up_miss_adjacency;
+                        break;
+                    case FuseGateUpReason::Ok:
+                        break;
+                }
+                if (!fuse_gate_up_miss_logged_) {
+                    fuse_gate_up_miss_logged_ = true;
+                    std::cerr << "wp expert worker: fuse-gate-up disabled: reason="
+                              << format_fuse_gate_up_reason(fuse_diag) << std::endl;
+                }
+            }
+        }
+        const bool fuse_gate_up =
+            s_fuse_gate_up && fuse_diag.reason == FuseGateUpReason::Ok;
         if (s_fuse_gate_up) {
             if (fuse_gate_up) {
                 request_stats.n_fuse_gate_up_experts += n_selected;
-                if (!request_stats.fuse_gate_up_counted) {
-                    ++request_stats.n_fuse_gate_up_hit;
-                }
             } else if (!request_stats.fuse_gate_up_counted) {
                 ++request_stats.n_fuse_gate_up_miss;
             }
@@ -16736,6 +16904,12 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_fuse_gate_up_experts += src.n_fuse_gate_up_experts;
     dst.fuse_gate_up_counted = dst.fuse_gate_up_counted || src.fuse_gate_up_counted;
     dst.n_fuse_gate_up_gather += src.n_fuse_gate_up_gather;
+    dst.n_fuse_gate_up_hit += src.n_fuse_gate_up_hit;
+    dst.n_fuse_gate_up_miss_clamp += src.n_fuse_gate_up_miss_clamp;
+    dst.n_fuse_gate_up_miss_gather += src.n_fuse_gate_up_miss_gather;
+    dst.n_fuse_gate_up_miss_type += src.n_fuse_gate_up_miss_type;
+    dst.n_fuse_gate_up_miss_shape += src.n_fuse_gate_up_miss_shape;
+    dst.n_fuse_gate_up_miss_adjacency += src.n_fuse_gate_up_miss_adjacency;
     dst.n_arena_hit += src.n_arena_hit;
     dst.n_arena_groups += src.n_arena_groups;
     dst.n_arena_build += src.n_arena_build;
