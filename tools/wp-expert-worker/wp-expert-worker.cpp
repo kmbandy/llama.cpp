@@ -1748,7 +1748,6 @@ struct RequestStats {
     uint32_t chunk_index = UINT32_MAX;
     // WP_EXPERT_FUSE_GATE_UP: fuse_gate_up_ok() re-checks adjacency every
     // request and falls back with no other counter. Hit = fusion used.
-    uint64_t n_fuse_gate_up_hit = 0;
     uint64_t n_fuse_gate_up_miss = 0;
     uint64_t n_fuse_gate_up_experts = 0;
     bool fuse_gate_up_counted = false;
@@ -1974,7 +1973,6 @@ public:
         n_fuse_gate_up_miss_ += request.n_fuse_gate_up_miss;
         n_fuse_gate_up_experts_ += request.n_fuse_gate_up_experts;
         n_fuse_gate_up_gather_ += request.n_fuse_gate_up_gather;
-        n_fuse_gate_up_hit_ += request.n_fuse_gate_up_hit;
         n_fuse_gate_up_miss_clamp_ += request.n_fuse_gate_up_miss_clamp;
         n_fuse_gate_up_miss_gather_ += request.n_fuse_gate_up_miss_gather;
         n_fuse_gate_up_miss_type_ += request.n_fuse_gate_up_miss_type;
@@ -2374,7 +2372,6 @@ private:
     uint64_t          n_fuse_gate_up_miss_ = 0;
     uint64_t          n_fuse_gate_up_experts_ = 0;
     uint64_t          n_fuse_gate_up_gather_ = 0;
-    uint64_t          n_fuse_gate_up_hit_ = 0;
     uint64_t          n_fuse_gate_up_miss_clamp_ = 0;
     uint64_t          n_fuse_gate_up_miss_gather_ = 0;
     uint64_t          n_fuse_gate_up_miss_type_ = 0;
@@ -16904,7 +16901,6 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_fuse_gate_up_experts += src.n_fuse_gate_up_experts;
     dst.fuse_gate_up_counted = dst.fuse_gate_up_counted || src.fuse_gate_up_counted;
     dst.n_fuse_gate_up_gather += src.n_fuse_gate_up_gather;
-    dst.n_fuse_gate_up_hit += src.n_fuse_gate_up_hit;
     dst.n_fuse_gate_up_miss_clamp += src.n_fuse_gate_up_miss_clamp;
     dst.n_fuse_gate_up_miss_gather += src.n_fuse_gate_up_miss_gather;
     dst.n_fuse_gate_up_miss_type += src.n_fuse_gate_up_miss_type;
