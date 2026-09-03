@@ -2569,6 +2569,66 @@ static void test_decode_prefill_compute_profile() {
     require(wp_expert_worker::use_expert_gather(64, false, 2, false) == false,
             "WP_EXPERT_GATHER=0 must disable gather");
 
+    // WP_EXPERT_MM_PIN is three-way: off / on / "decode".
+    using wp_expert_worker::mm_pin_mode;
+    require(wp_expert_worker::parse_mm_pin_mode(nullptr) == mm_pin_mode::off,
+            "unset WP_EXPERT_MM_PIN must default off");
+    require(wp_expert_worker::parse_mm_pin_mode("") == mm_pin_mode::off,
+            "empty WP_EXPERT_MM_PIN must be off");
+    require(wp_expert_worker::parse_mm_pin_mode("0") == mm_pin_mode::off,
+            "WP_EXPERT_MM_PIN=0 must be off");
+    require(wp_expert_worker::parse_mm_pin_mode("1") == mm_pin_mode::on,
+            "WP_EXPERT_MM_PIN=1 must be the legacy wide-request pin");
+    require(wp_expert_worker::parse_mm_pin_mode("decode") == mm_pin_mode::decode,
+            "WP_EXPERT_MM_PIN=decode must select the narrow-request pin");
+
+    require(wp_expert_worker::parse_mm_pin_max_tokens(nullptr) == 8,
+            "default WP_EXPERT_MM_PIN_MAX_TOKENS must be 8");
+    require(wp_expert_worker::parse_mm_pin_max_tokens("") == 8,
+            "empty WP_EXPERT_MM_PIN_MAX_TOKENS must be 8");
+    require(wp_expert_worker::parse_mm_pin_max_tokens("1") == 1,
+            "WP_EXPERT_MM_PIN_MAX_TOKENS=1 (decode only) must be honoured");
+    require(wp_expert_worker::parse_mm_pin_max_tokens("0") == 1,
+            "non-positive pin max tokens must clamp to 1");
+    require(wp_expert_worker::parse_mm_pin_min_tokens(nullptr) == 9,
+            "default WP_EXPERT_MM_PIN_MIN_TOKENS must be 9");
+
+    // off: never pinned, whatever the shape.
+    require(!wp_expert_worker::use_mm_pin(1, false, mm_pin_mode::off, 9, 8),
+            "pin off must not pin decode");
+    require(!wp_expert_worker::use_mm_pin(128, true, mm_pin_mode::off, 9, 8),
+            "pin off must not pin a prefill chunk");
+
+    // on: legacy behaviour, gather-path requests wider than a verify block.
+    require(!wp_expert_worker::use_mm_pin(1, false, mm_pin_mode::on, 9, 8),
+            "pin=1 must not pin decode (n_tokens<=8 was never pinned)");
+    require(!wp_expert_worker::use_mm_pin(8, true, mm_pin_mode::on, 9, 8),
+            "pin=1 must not pin a verify block");
+    require(wp_expert_worker::use_mm_pin(128, true, mm_pin_mode::on, 9, 8),
+            "pin=1 must pin a 128-token gather prefill chunk");
+    require(wp_expert_worker::use_mm_pin(74, true, mm_pin_mode::on, 9, 8),
+            "pin=1 must pin the stream4 74-token tail chunk");
+    require(!wp_expert_worker::use_mm_pin(128, false, mm_pin_mode::on, 9, 8),
+            "pin=1 only applies on the gather path");
+    require(!wp_expert_worker::use_mm_pin(32, true, mm_pin_mode::on, 64, 8),
+            "WP_EXPERT_MM_PIN_MIN_TOKENS must still gate the legacy pin");
+
+    // decode: the complement -- narrow requests only, gather irrelevant.
+    require(wp_expert_worker::use_mm_pin(1, false, mm_pin_mode::decode, 9, 8),
+            "pin=decode must pin decode even though decode never gathers");
+    require(wp_expert_worker::use_mm_pin(8, true, mm_pin_mode::decode, 9, 8),
+            "pin=decode must pin a full 8-token spec-verify block");
+    require(!wp_expert_worker::use_mm_pin(9, true, mm_pin_mode::decode, 9, 8),
+            "pin=decode must not pin past the max at the default of 8");
+    require(!wp_expert_worker::use_mm_pin(74, true, mm_pin_mode::decode, 9, 8),
+            "pin=decode must leave the stream4 74-token tail unpinned");
+    require(!wp_expert_worker::use_mm_pin(128, true, mm_pin_mode::decode, 9, 8),
+            "pin=decode must leave a 128-token prefill chunk unpinned");
+    require(!wp_expert_worker::use_mm_pin(0, false, mm_pin_mode::decode, 9, 8),
+            "an empty request is not a decode");
+    require(!wp_expert_worker::use_mm_pin(2, false, mm_pin_mode::decode, 9, 1),
+            "WP_EXPERT_MM_PIN_MAX_TOKENS=1 must narrow the pin to bare decode");
+
     const auto empty = wp_expert_worker::compact_routing_rows({ 0.0f, 0.0f, 0.0f });
     require(empty.idx.size() == 1 && empty.idx[0] == 0 && empty.weights[0] == 0.0f,
             "all-zero routing must keep a dummy idx 0 / weight 0");
@@ -3841,11 +3901,15 @@ static ProdRun run_production_prefill(
 // slot count the spine plans residency against, and never as the home of a
 // paged-in expert.
 // ---------------------------------------------------------------------------
-static void check_prod_pool_pads(const ProdRun & run, const std::string & label) {
-    if (run.pad_slots != (uint64_t) PROD_N_EXPERT_USED) {
+// `expect_pads` is n_expert_used on an arm that enabled grouped prefill for the
+// device and 0 on one that did not: the reservation follows WP_EXPERT_ARENA_PREFILL
+// (see plan_with_pad_slots), so a gather-only device keeps every slot pageable.
+static void check_prod_pool_pads(const ProdRun & run, const std::string & label,
+                                 uint64_t expect_pads) {
+    if (run.pad_slots != expect_pads) {
         throw std::runtime_error(
             label + "arenas reserved " + std::to_string(run.pad_slots) +
-            " pad slots, expected n_expert_used=" + std::to_string(PROD_N_EXPERT_USED));
+            " pad slots, expected " + std::to_string(expect_pads));
     }
     if (run.arena_count < 2) {
         throw std::runtime_error(
@@ -3922,8 +3986,8 @@ static void test_prefill_arena_grouped_production_geometry() {
                 run_production_prefill(fixture, request, device, /* grouped = */ false);
 
             // (0) the pad reservation is real and invisible to the spine.
-            check_prod_pool_pads(grouped, label);
-            check_prod_pool_pads(gather, label);
+            check_prod_pool_pads(grouped, label, (uint64_t) PROD_N_EXPERT_USED);
+            check_prod_pool_pads(gather, label, 0);
 
             // (c) the grouped arm actually took the grouped path, every time.
             if (grouped.hits == 0 || grouped.fallbacks != 0) {
@@ -4040,8 +4104,8 @@ static void test_prefill_arena_grouped_placement_independent() {
         fixture, request, device, /* grouped = */ true,
         /* prime = */ &prime, /* repeats = */ 0);
 
-    check_prod_pool_pads(forward, label);
-    check_prod_pool_pads(reversed, label);
+    check_prod_pool_pads(forward, label, (uint64_t) PROD_N_EXPERT_USED);
+    check_prod_pool_pads(reversed, label, (uint64_t) PROD_N_EXPERT_USED);
 
     if (forward.hits == 0 || forward.fallbacks != 0 ||
             reversed.hits == 0 || reversed.fallbacks != 0) {

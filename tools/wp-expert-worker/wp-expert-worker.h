@@ -178,6 +178,30 @@ bool parse_env_default_on(const char * env);
 bool parse_env_default_off(const char * env);
 bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool gather_enabled);
 
+// WP_EXPERT_MM_PIN policy. One flag has to serve two phases with opposite
+// needs: the GGML_HINT_MUL_MAT_PIN hint forces MMQ on CUDA/HIP (and the
+// mat-vec path on Vulkan) regardless of shape, which MEASURED 2026-09-02 costs
+// ~16% of per-128-token-chunk kernel wall in PREFILL but buys ~3-4 tok/s in
+// DECODE. So the value is a three-way policy, not a boolean:
+//   unset / "" / "0"  -> off
+//   "decode"          -> pin ONLY requests with n_tokens <= max_tokens
+//                        (WP_EXPERT_MM_PIN_MAX_TOKENS, default 8: decode is
+//                        n_tokens==1, spec-verify blocks are <= 8, and stream4
+//                        prefill chunks are 128 with 74-token tails, so the
+//                        wide chunks stay unpinned)
+//   anything else     -> on, the legacy wide-request pin
+// The legacy "on" mode pins only gather-path requests wider than a verify
+// block (n_tokens > 8) and at least WP_EXPERT_MM_PIN_MIN_TOKENS. "decode" must
+// NOT require gather: gather is bypassed at n_tokens==1 (see
+// WP_EXPERT_GATHER_MIN_TOKENS above), and the dense path shares the same
+// mul_mat lambda, so requiring it would make the decode pin a no-op.
+enum class mm_pin_mode { off, on, decode };
+mm_pin_mode parse_mm_pin_mode(const char * env);
+int  parse_mm_pin_min_tokens(const char * env);   // default 9
+int  parse_mm_pin_max_tokens(const char * env);   // default 8
+bool use_mm_pin(uint32_t n_tokens, bool use_gather, mm_pin_mode mode,
+                int min_tokens, int max_tokens);
+
 // WP_EXPERT_ARENA_PREFILL policy, per device: unset/"" and "0" are off, "1"
 // is on for every device, a comma-separated device-name list ("ROCm0,CUDA0")
 // is on only for those devices (exact match), and the same list prefixed

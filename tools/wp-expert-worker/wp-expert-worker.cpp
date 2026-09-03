@@ -264,12 +264,50 @@ int parse_gather_min_tokens(const char * env) {
 
 // default 9: every gather-path request wider than a decode/verify batch is pinned,
 // including the 16-token chunks a 64-token streamed dispatch produces
-static int parse_mm_pin_min_tokens(const char * env) {
+int parse_mm_pin_min_tokens(const char * env) {
     if (env == nullptr || env[0] == '\0' || env[0] == '-') {
         return 9;
     }
     const int v = std::atoi(env);
     return v < 1 ? 1 : v;
+}
+
+// default 8: decode is n_tokens==1 and a speculative VERIFY block is <= 8, so
+// the whole narrow-request family is pinned while stream4's 128-token prefill
+// chunks (and their 74-token tails) are not.
+int parse_mm_pin_max_tokens(const char * env) {
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return 8;
+    }
+    const int v = std::atoi(env);
+    return v < 1 ? 1 : v;
+}
+
+mm_pin_mode parse_mm_pin_mode(const char * env) {
+    if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+        return mm_pin_mode::off;
+    }
+    if (std::strcmp(env, "decode") == 0) {
+        return mm_pin_mode::decode;
+    }
+    return mm_pin_mode::on;
+}
+
+bool use_mm_pin(uint32_t n_tokens, bool use_gather, mm_pin_mode mode,
+                int min_tokens, int max_tokens) {
+    switch (mode) {
+        case mm_pin_mode::off:
+            return false;
+        case mm_pin_mode::decode:
+            // Narrow requests only, and deliberately independent of gather:
+            // decode (n_tokens==1) never gathers, and it is exactly the case
+            // this mode exists to pin.
+            return n_tokens >= 1 && n_tokens <= (uint32_t) max_tokens;
+        case mm_pin_mode::on:
+            return use_gather && n_tokens > 8 &&
+                   n_tokens >= (uint32_t) min_tokens;
+    }
+    return false;
 }
 
 bool parse_env_default_on(const char * env) {
@@ -7889,8 +7927,25 @@ public:
     // prefill path needs exactly n_expert_used weight-0 filler ids per arena
     // group (one per canonical route position). plan_resources_for_backend()
     // knows nothing about hparams, so stamp it on the plan on the way past.
-    static ResourcePlan plan_with_pad_slots(ResourcePlan plan, int n_expert_used) {
-        plan.pad_slots_per_arena = std::max(0, n_expert_used);
+    // *** PADS ARE ONLY FREE WHERE GROUPED PREFILL CAN USE THEM. ***
+    // MEASURED 2026-09-02 (gates g70 vs g71/g72, arm A, 128-token ubatches):
+    // reserving n_expert_used pads on every arena took 370 of ROCm0+ROCm1+CPU's
+    // 16923 usable slots (2.2%) and cost the DEFAULT gather path 11.5% more
+    // page-ins per ubatch (12.24 -> 13.65) for nothing, because grouped prefill
+    // is off unless WP_EXPERT_ARENA_PREFILL names the device. So the
+    // reservation now follows that switch: a device that cannot run grouped
+    // prefill keeps every slot pageable, exactly as it did before pads existed.
+    // WP_EXPERT_PAD_SLOTS=<n> still forces a count either way (A/B switch).
+    static ResourcePlan plan_with_pad_slots(
+            ResourcePlan plan, int n_expert_used, const std::string & device_name) {
+        const char * e = std::getenv("WP_EXPERT_PAD_SLOTS");
+        if (e != nullptr && e[0] != '\0') {
+            plan.pad_slots_per_arena = std::max(0, std::atoi(e));
+            return plan;
+        }
+        const bool grouped =
+            parse_arena_prefill_enabled(std::getenv("WP_EXPERT_ARENA_PREFILL"), device_name);
+        plan.pad_slots_per_arena = grouped ? std::max(0, n_expert_used) : 0;
         return plan;
     }
 
@@ -7923,7 +7978,7 @@ public:
                     resource_pages(catalog_, page_owner_), slots, host_budget_bytes,
                     resident_.pinned_bytes(), expert_reserve_blocks,
                     expert_reserve_bytes, backend_.get()),
-                catalog_.descriptor.hparams.n_expert_used),
+                catalog_.descriptor.hparams.n_expert_used, device),
             host_victim_bytes,
             test_hooks, expert_reserve_blocks, catalog_.pages.size(),
             shared_host_tier, logs),
@@ -11307,16 +11362,21 @@ private:
         // Default ON: linear set_rows scatter. =0 restores get_rows_back.
         static const bool s_set_rows =
             parse_env_default_on(std::getenv("WP_EXPERT_SCATTER_SET_ROWS"));
-        static const bool s_mm_pin =
-            parse_env_default_off(std::getenv("WP_EXPERT_MM_PIN"));
+        // Three-way: off / on (legacy wide-request pin) / "decode" (narrow
+        // requests only). See use_mm_pin in the header.
+        static const mm_pin_mode s_mm_pin_mode =
+            parse_mm_pin_mode(std::getenv("WP_EXPERT_MM_PIN"));
         static const int s_mm_pin_min_tokens =
             parse_mm_pin_min_tokens(std::getenv("WP_EXPERT_MM_PIN_MIN_TOKENS"));
+        static const int s_mm_pin_max_tokens =
+            parse_mm_pin_max_tokens(std::getenv("WP_EXPERT_MM_PIN_MAX_TOKENS"));
         // PER-REQUEST, not static: prefill and decode requests interleave in one
         // worker, so this must be decided per request and never cached.
         const bool use_gather = use_expert_gather(
             request.n_tokens, force_dense, s_gather_min_tokens, s_gather);
-        const bool pin_mul_mat = use_gather && s_mm_pin && request.n_tokens > 8 &&
-            request.n_tokens >= (uint32_t) s_mm_pin_min_tokens;
+        const bool pin_mul_mat = use_mm_pin(
+            request.n_tokens, use_gather, s_mm_pin_mode,
+            s_mm_pin_min_tokens, s_mm_pin_max_tokens);
 
         // *** THE REAL WP_VK_FUSED_EXPERT GATE. ***
         // compute_batch_fused() computes the FULL dense FFN for every selected
