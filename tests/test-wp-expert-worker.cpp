@@ -4290,20 +4290,31 @@ static void test_owner_policy_hot_packs_priority_device() {
     //     taken off the HEAD of the ranked list; the next device gets the next
     //     slice; the pages past both capacities fall back.
     const std::vector<size_t> expected_owner = {
-        0, 0, 1, 1, 1, 0,   // class 0: dev0 x2, dev1 x3, then one fallback
+        0, 0, 1, 1, 1, 1,   // class 0: dev0 x2, dev1 x3, then one OVERFLOW page
         1, 2, 2,            // class 1: dev0 has no capacity -> dev1 x1, dev2 x2
-        1, 2, 2,            // class 1 fallback, spread over class capacity {0,1,2}
+        1, 2, 2,            // class 1 overflow, spread over {dev1:1, dev2:2}
     };
     const std::vector<char> expected_ranked = {
         1, 1, 1, 1, 1, 0,
         1, 1, 1,
         0, 0, 0,
     };
+    // Page 5 is the one the 2026-09-02 production log was about: class 0 is
+    // full everywhere, so it overflows. It used to land back on dev0 -- the
+    // fully-resident priority device, which cannot hold it -- because the old
+    // fallback weighted by TOTAL capacity. It now goes to dev1.
+    const std::vector<char> expected_overflow = {
+        0, 0, 0, 0, 0, 1,
+        0, 0, 0,
+        1, 1, 1,
+    };
     require(plan.owner == expected_owner,
             "WP_EXPERT_OWNER_POLICY=hot did not pack the priority device from the "
             "head of the ranked list");
     require(plan.from_ranked == expected_ranked,
             "WP_EXPERT_OWNER_POLICY=hot mislabelled ranked vs fallback ownership");
+    require(plan.from_overflow == expected_overflow,
+            "WP_EXPERT_OWNER_POLICY=hot mislabelled overflow vs residual-fill ownership");
 
     // Restated as the property the policy exists for: nothing is over-committed.
     std::vector<std::vector<size_t>> ranked_owned(2, std::vector<size_t>(3, 0));
@@ -4380,6 +4391,10 @@ static void test_owner_policy_hot_is_deterministic() {
     for (const char ranked : a.from_ranked) {
         require(ranked == 0, "hot policy claimed ranked ownership with an empty hot list");
     }
+    for (const char overflowed : a.from_overflow) {
+        require(overflowed == 0,
+                "hot policy called a residual fill an overflow while capacity was free");
+    }
     // With no hot list every page takes the fallback: class 0 spreads over
     // {2,3,0} and class 1 over {0,1,2}, proportional to capacity and stable in
     // page-id order.
@@ -4387,6 +4402,229 @@ static void test_owner_policy_hot_is_deterministic() {
     require(a.owner == expected,
             "hot fallback did not spread unranked pages proportionally to remaining "
             "capacity in page-id order");
+}
+
+// ---------------------------------------------------------------------------
+// WP_EXPERT_OWNER_OVERFLOW -- who absorbs the pages that fit NOWHERE.
+//
+// Production shape, 2026-09-02: 24576 pages, ~16600 usable slots, priority
+// ROCm1,ROCm0,CPU. ~8000 pages must overflow, and the old "spread over TOTAL
+// capacity" fallback handed 3197 of them to ROCm1 -- the 2.78 GB/s Thunderbolt
+// device the policy exists to keep fully resident and page-in free.
+//
+// The rig below is that in miniature: one size class, three devices in
+// priority order, capacity {10, 6, 2} = 18 usable against 100 pages, every
+// page ranked. So 18 pages fit and 82 must overflow.
+static const std::vector<std::string> & overflow_device_names() {
+    static const std::vector<std::string> names = { "ROCm1", "ROCm0", "CPU" };
+    return names;
+}
+
+static wp_expert_worker::HotOwnerInput make_overflow_input() {
+    wp_expert_worker::HotOwnerInput input;
+    input.n_devices = 3;
+    input.page_class.assign(100, 0);
+    input.page_static_owner.assign(100, 0);   // proportional map: everyone on ROCm1
+    input.capacity = { { 10, 6, 2 } };
+    input.priority = { 0, 1, 2 };
+    input.ranked.resize(100);
+    for (size_t id = 0; id < 100; ++id) {
+        input.ranked[id] = id;
+    }
+    return input;
+}
+
+// Per-device owned counts, and per-device overflow counts, from a plan.
+static void tally_owner_plan(const wp_expert_worker::HotOwnerPlan & plan,
+                             size_t n_devices,
+                             std::vector<size_t> & owned,
+                             std::vector<size_t> & overflowed) {
+    owned.assign(n_devices, 0);
+    overflowed.assign(n_devices, 0);
+    for (size_t id = 0; id < plan.owner.size(); ++id) {
+        ++owned[plan.owner[id]];
+        if (plan.from_overflow[id]) {
+            ++overflowed[plan.owner[id]];
+        }
+    }
+}
+
+static void test_owner_overflow_parse() {
+    const std::vector<std::string> & devices = overflow_device_names();
+
+    require(!wp_expert_worker::parse_owner_overflow(nullptr, devices).from_env &&
+                !wp_expert_worker::parse_owner_overflow("", devices).from_env &&
+                !wp_expert_worker::parse_owner_overflow("   ", devices).from_env,
+            "unset WP_EXPERT_OWNER_OVERFLOW did not fall back to the default list");
+
+    const wp_expert_worker::HotOwnerOverflow weighted =
+        wp_expert_worker::parse_owner_overflow(" ROCm0 : 4 , CPU:1 ", devices);
+    require(weighted.from_env &&
+                weighted.devices == std::vector<size_t>({ 1, 2 }) &&
+                weighted.weights == std::vector<uint64_t>({ 4, 1 }),
+            "WP_EXPERT_OWNER_OVERFLOW did not parse names, weights and whitespace");
+
+    // A bare name means "weight me by my usable capacity" (weight 0), and so
+    // does a weight that is not an integer. Duplicates keep the first entry.
+    const wp_expert_worker::HotOwnerOverflow mixed =
+        wp_expert_worker::parse_owner_overflow("CPU,ROCm0:oops,CPU:9", devices);
+    require(mixed.from_env &&
+                mixed.devices == std::vector<size_t>({ 2, 1 }) &&
+                mixed.weights == std::vector<uint64_t>({ 0, 0 }),
+            "WP_EXPERT_OWNER_OVERFLOW mishandled bare names, bad weights or duplicates");
+
+    // Unknown names are dropped; a value that is ONLY unknown names is a typo,
+    // not a list, and must fall back to the default rather than to nobody.
+    const wp_expert_worker::HotOwnerOverflow partly =
+        wp_expert_worker::parse_owner_overflow("Vulkan9,CPU:3", devices);
+    require(partly.from_env && partly.devices == std::vector<size_t>({ 2 }) &&
+                partly.weights == std::vector<uint64_t>({ 3 }),
+            "WP_EXPERT_OWNER_OVERFLOW did not drop an unknown device name");
+    require(!wp_expert_worker::parse_owner_overflow("Vulkan9,Nope", devices).from_env,
+            "WP_EXPERT_OWNER_OVERFLOW of only-unknown names did not fall back to default");
+}
+
+static void test_owner_overflow_spares_priority_device() {
+    const wp_expert_worker::HotOwnerInput input = make_overflow_input();
+    const wp_expert_worker::HotOwnerPlan plan = wp_expert_worker::plan_hot_owner_map(input);
+
+    std::vector<size_t> owned, overflowed;
+    tally_owner_plan(plan, 3, owned, overflowed);
+
+    // (a) THE POINT OF THE POLICY: the priority device ends EXACTLY full --
+    //     its usable capacity, no more -- and every page it owns came off the
+    //     head of the ranked list. Zero overflow, so zero page-ins.
+    require(owned[0] == input.capacity[0][0],
+            "overflow policy did not leave the priority device exactly full");
+    require(overflowed[0] == 0,
+            "overflow policy handed the fully-resident priority device overflow pages");
+    for (size_t id = 0; id < plan.owner.size(); ++id) {
+        require(plan.owner[id] != 0 || plan.from_ranked[id],
+                "a page reached the priority device other than off the ranked list");
+    }
+    for (size_t id = 0; id < 10; ++id) {
+        require(plan.owner[id] == 0 && plan.from_ranked[id],
+                "the priority device did not take the HEAD of the ranked list");
+    }
+
+    // Ranked pass fills dev1 then dev2; 100 - 18 = 82 pages overflow.
+    require(overflowed[1] + overflowed[2] == 82,
+            "overflow policy did not overflow every page past total capacity");
+
+    // (b) The overflow is spread over the DEFAULT list -- every device except
+    //     the priority one -- in proportion to usable capacity in the class,
+    //     6:2. The integer bands put page k on dev1 while k*8/82 < 6, i.e.
+    //     k < 61.5, so 62 pages to ROCm0 and 20 to CPU.
+    require(overflowed[1] == 62 && overflowed[2] == 20,
+            "overflow was not spread over the default devices in capacity proportion");
+    require(owned[1] == 6 + 62 && owned[2] == 2 + 20,
+            "overflow tally does not add up to the owner map");
+
+    // Ascending page id, contiguous bands: no interleaving, no hash order.
+    for (size_t id = 18; id < 100; ++id) {
+        require(plan.from_overflow[id] == 1, "a page past capacity was not marked overflow");
+        require(plan.owner[id] == (id < 80 ? (size_t) 1 : (size_t) 2),
+                "overflow bands are not contiguous in ascending page id");
+    }
+
+    // (d) INVARIANT: the priority device never owns more of a class than it
+    //     has usable slots for.
+    require(owned[0] <= input.capacity[0][0],
+            "INVARIANT: priority device over-committed in its size class");
+}
+
+static void test_owner_overflow_explicit_weights() {
+    const std::vector<std::string> & devices = overflow_device_names();
+
+    // (b) Explicit list with weights: ROCm0 takes 4 for every 1 the CPU takes,
+    //     regardless of their usable capacity (6:2 would be 3:1).
+    wp_expert_worker::HotOwnerInput input = make_overflow_input();
+    input.overflow = wp_expert_worker::parse_owner_overflow("ROCm0:4,CPU:1", devices);
+    const wp_expert_worker::HotOwnerPlan plan = wp_expert_worker::plan_hot_owner_map(input);
+
+    std::vector<size_t> owned, overflowed;
+    tally_owner_plan(plan, 3, owned, overflowed);
+    // k*5/82 < 4  <=>  k < 65.6, so 66 pages to ROCm0 and 16 to the CPU.
+    require(overflowed[0] == 0 && overflowed[1] == 66 && overflowed[2] == 16,
+            "WP_EXPERT_OWNER_OVERFLOW weights were not honoured");
+    require(owned[0] == 10, "an explicit overflow list disturbed the ranked pass");
+
+    // A single-device list sends the whole overflow there.
+    wp_expert_worker::HotOwnerInput cpu_only = make_overflow_input();
+    cpu_only.overflow = wp_expert_worker::parse_owner_overflow("CPU", devices);
+    const wp_expert_worker::HotOwnerPlan cpu_plan =
+        wp_expert_worker::plan_hot_owner_map(cpu_only);
+    tally_owner_plan(cpu_plan, 3, owned, overflowed);
+    require(overflowed[2] == 82 && overflowed[0] == 0 && overflowed[1] == 0,
+            "a single-device WP_EXPERT_OWNER_OVERFLOW did not absorb the whole overflow");
+
+    // The priority device is dropped from a list that names other devices...
+    wp_expert_worker::HotOwnerInput with_priority = make_overflow_input();
+    with_priority.overflow =
+        wp_expert_worker::parse_owner_overflow("ROCm1:9,ROCm0:1", devices);
+    const wp_expert_worker::HotOwnerPlan dropped =
+        wp_expert_worker::plan_hot_owner_map(with_priority);
+    tally_owner_plan(dropped, 3, owned, overflowed);
+    require(overflowed[0] == 0 && overflowed[1] == 82,
+            "the priority device was not dropped from a multi-device overflow list");
+    require(owned[0] == 10, "INVARIANT: priority device over-committed via overflow list");
+
+    // ... but is honoured when it is the ONLY device listed. That is an
+    // operator asking for it explicitly, and it is the one case where the
+    // fully-resident invariant is allowed to break.
+    wp_expert_worker::HotOwnerInput only_priority = make_overflow_input();
+    only_priority.overflow = wp_expert_worker::parse_owner_overflow("ROCm1", devices);
+    const wp_expert_worker::HotOwnerPlan on_priority =
+        wp_expert_worker::plan_hot_owner_map(only_priority);
+    tally_owner_plan(on_priority, 3, owned, overflowed);
+    require(overflowed[0] == 82,
+            "a lone-priority WP_EXPERT_OWNER_OVERFLOW was not honoured literally");
+
+    // A list whose devices have NO capacity in the class still avoids the
+    // priority device: the weights fall back to total class capacity minus
+    // the priority device, so everything lands on ROCm0.
+    wp_expert_worker::HotOwnerInput no_capacity = make_overflow_input();
+    no_capacity.capacity = { { 10, 6, 0 } };
+    no_capacity.overflow = wp_expert_worker::parse_owner_overflow("CPU:5", devices);
+    const wp_expert_worker::HotOwnerPlan salvaged =
+        wp_expert_worker::plan_hot_owner_map(no_capacity);
+    tally_owner_plan(salvaged, 3, owned, overflowed);
+    require(overflowed[0] == 0 && overflowed[1] == 100 - 16 && overflowed[2] == 0,
+            "overflow onto a zero-capacity device did not fall back off the priority "
+            "device");
+
+    // Only the priority device can hold the class at all -> better an
+    // over-committed resident device than a page with nowhere to live.
+    wp_expert_worker::HotOwnerInput priority_only_capacity = make_overflow_input();
+    priority_only_capacity.capacity = { { 10, 0, 0 } };
+    const wp_expert_worker::HotOwnerPlan last_resort =
+        wp_expert_worker::plan_hot_owner_map(priority_only_capacity);
+    tally_owner_plan(last_resort, 3, owned, overflowed);
+    require(overflowed[0] == 90 && owned[0] == 100,
+            "a class only the priority device can hold was not left on it");
+}
+
+static void test_owner_overflow_is_deterministic() {
+    // (c) Two independent constructions, identical maps -- default list and
+    //     explicit list alike. A page that moved between two ROCm devices
+    //     between launches would change the run's output md5.
+    const wp_expert_worker::HotOwnerPlan a =
+        wp_expert_worker::plan_hot_owner_map(make_overflow_input());
+    const wp_expert_worker::HotOwnerPlan b =
+        wp_expert_worker::plan_hot_owner_map(make_overflow_input());
+    require(a.owner == b.owner && a.from_ranked == b.from_ranked &&
+                a.from_overflow == b.from_overflow,
+            "the overflow spread is not reproducible across constructions");
+
+    wp_expert_worker::HotOwnerInput weighted = make_overflow_input();
+    weighted.overflow = wp_expert_worker::parse_owner_overflow(
+        "ROCm0:4,CPU:1", overflow_device_names());
+    wp_expert_worker::HotOwnerInput weighted_again = make_overflow_input();
+    weighted_again.overflow = wp_expert_worker::parse_owner_overflow(
+        "ROCm0:4,CPU:1", overflow_device_names());
+    require(wp_expert_worker::plan_hot_owner_map(weighted).owner ==
+                wp_expert_worker::plan_hot_owner_map(weighted_again).owner,
+            "a weighted overflow spread is not reproducible across constructions");
 }
 
 // ---------------------------------------------------------------------------
@@ -4562,6 +4800,10 @@ int main() {
         test_owner_policy_proportional_unchanged();
         test_owner_policy_hot_packs_priority_device();
         test_owner_policy_hot_is_deterministic();
+        test_owner_overflow_parse();
+        test_owner_overflow_spares_priority_device();
+        test_owner_overflow_explicit_weights();
+        test_owner_overflow_is_deterministic();
         test_owner_policy_hot_capacity_on_two_devices();
         test_decode_prefill_compute_profile();
         test_arena_prefill_device_policy();

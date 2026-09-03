@@ -295,6 +295,43 @@ size_t proportional_owner_for_expert(
 // resident-layer page). Such pages always keep their proportional owner.
 constexpr size_t HOT_OWNER_NO_CLASS = (size_t) -1;
 
+// WP_EXPERT_OWNER_OVERFLOW -- which devices absorb the pages that do NOT fit
+// anywhere once every device's usable capacity in their size class is gone.
+//
+// Measured 2026-09-02 in production: 24576 pages against ~16600 usable slots,
+// so ~8000 pages MUST overflow. Spreading that overflow proportionally to
+// total capacity handed ROCm1 -- the 2.78 GB/s Thunderbolt device the `hot`
+// policy exists to keep fully resident -- 3197 pages it can never hold, which
+// is the exact page-in traffic the policy was supposed to remove. Dumping all
+// of it on the lowest-priority device instead would bury the 1200-slot CPU
+// tier, so the split is a policy, not a rule of thumb.
+//
+// Value: comma-separated device names, each with an optional ":<weight>"
+// non-negative integer, e.g. "ROCm0:4,CPU:1". A device with no weight (or a
+// weight of 0, or an unparseable one) is weighted by its USABLE CAPACITY in
+// the size class being spread. Unknown names warn and are ignored; duplicates
+// keep the first spelling. Whitespace around the value, each name and each
+// weight is ignored.
+//
+// Unset/empty (`from_env == false`) means the documented default: every
+// device EXCEPT the first-priority one, weighted by usable capacity in the
+// class. Either way the first-priority device never receives overflow unless
+// it is the ONLY device on the list -- that is the whole point of the policy.
+struct HotOwnerOverflow {
+    // Device indices, in the order the list named them (or device-list order
+    // for the default). Parallel to `weights`.
+    std::vector<size_t>   devices;
+    // 0 means "use this device's usable capacity in the class as the weight".
+    std::vector<uint64_t> weights;
+    // True when WP_EXPERT_OWNER_OVERFLOW named at least one KNOWN device. A
+    // value that names only unknown devices is not a list, it is a typo, and
+    // falls back to the default rather than silently owning nothing.
+    bool from_env = false;
+};
+
+HotOwnerOverflow parse_owner_overflow(
+        const char * env, const std::vector<std::string> & device_names);
+
 struct HotOwnerInput {
     size_t n_devices = 0;
     // Per page id. page_class[i] is the placement size class of page i, or
@@ -309,11 +346,20 @@ struct HotOwnerInput {
     std::vector<size_t> ranked;
     // Device indices, highest priority first.
     std::vector<size_t> priority;
+    // Which devices absorb pages that fit nowhere. Default-constructed (no
+    // `from_env`) means the documented default: everyone but priority[0].
+    HotOwnerOverflow overflow;
 };
 
 struct HotOwnerPlan {
     std::vector<size_t> owner;        // per page id
-    std::vector<char>   from_ranked;  // per page id: came off `ranked`, not the fallback
+    std::vector<char>   from_ranked;  // per page id: came off `ranked` into real capacity
+    // Per page id: placed by the OVERFLOW spread, i.e. its size class had no
+    // free capacity left on any device. Distinct from a page that is merely
+    // absent from `ranked` -- one of those still lands in real, free capacity
+    // (from_ranked == 0 && from_overflow == 0), and the two categories are
+    // logged separately because only the overflow count is page-in traffic.
+    std::vector<char>   from_overflow;
 };
 
 // Pure core of WP_EXPERT_OWNER_POLICY=hot. Deterministic: it reads only its
@@ -325,19 +371,36 @@ struct HotOwnerPlan {
 //     decrementing that capacity. A page whose class has no free capacity on
 //     any device is left for the fallback (so is every page `ranked` never
 //     mentions).
-//  2. FALLBACK, per size class, over the still-unassigned pages of that class
-//     sorted by ascending page id (K of them): spread them proportionally over
-//     the devices that still have capacity left in the class, weighted by that
-//     REMAINING capacity, using the same integer-band idiom as the
-//     proportional policy (page k of K goes to the device whose cumulative
-//     weight band contains k*W/K). The spread does not consume capacity: K is
-//     normally far larger than W, and every one of these pages is a cold page
-//     that will be paged in on demand wherever it lands.
-//     If no device has remaining capacity in the class, the weights fall back
-//     to the class's TOTAL capacity, so pages still avoid a device that cannot
-//     physically hold their size class. If that is empty too, the page keeps
+//  2. RESIDUAL FILL, per size class, over the still-unassigned pages of that
+//     class sorted by ascending page id (K of them), WHEN capacity is left in
+//     the class: spread them proportionally over the devices that still have
+//     capacity, weighted by that REMAINING capacity, using the integer-band
+//     idiom of the proportional policy (page k of K goes to the device whose
+//     cumulative weight band contains k*W/K). The spread does not consume
+//     capacity: K is normally far larger than W, and every one of these pages
+//     is a cold page that will be paged in on demand wherever it lands. These
+//     pages are `from_ranked == 0 && from_overflow == 0`.
+//  3. OVERFLOW, per size class, when NO device has capacity left in the class:
+//     the same ascending-page-id integer-band spread, but only over the
+//     devices `overflow` allows (default: every device except priority[0]),
+//     weighted by `overflow.weights` -- with a 0 weight meaning "this
+//     device's usable capacity in this class". priority[0] is dropped from
+//     the list unless it is the only device on it. These pages are
+//     `from_overflow == 1`.
+//     If NO allowed device has usable capacity in this class -- even an
+//     explicitly weighted one, since a weight must not park a page on a
+//     device with no slot of its size -- the weights fall back to the class's
+//     TOTAL capacity across every device EXCEPT
+//     priority[0]; if that is empty too, to the class's total capacity across
+//     ALL devices (so a page still never lands on a device that cannot
+//     physically hold its size class); and if THAT is empty the page keeps
 //     its proportional owner.
-//  3. HOT_OWNER_NO_CLASS pages keep their proportional owner.
+//  4. HOT_OWNER_NO_CLASS pages keep their proportional owner.
+//
+// INVARIANT (warned about at runtime, asserted in the unit test): the
+// first-priority device's owned count in a class is never more than its usable
+// capacity in that class, so `expected_fully_resident` is `yes` for it
+// whenever `ranked` holds at least that many pages of the class.
 HotOwnerPlan plan_hot_owner_map(const HotOwnerInput & in);
 
 // Compact a router-weight row to the tokens that actually route here.

@@ -447,6 +447,70 @@ std::vector<size_t> parse_owner_priority(
     return order;
 }
 
+HotOwnerOverflow parse_owner_overflow(
+        const char * env, const std::vector<std::string> & device_names) {
+    HotOwnerOverflow overflow;
+    if (env == nullptr) {
+        return overflow;
+    }
+    std::string value(env);
+    wp_trim_ascii_whitespace(value);
+    if (value.empty()) {
+        return overflow;
+    }
+    std::vector<char> taken(device_names.size(), 0);
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        std::string entry = comma == std::string::npos
+            ? value.substr(start) : value.substr(start, comma - start);
+        wp_trim_ascii_whitespace(entry);
+        if (!entry.empty()) {
+            std::string name   = entry;
+            uint64_t    weight = 0;
+            const size_t colon = entry.rfind(':');
+            if (colon != std::string::npos) {
+                name = entry.substr(0, colon);
+                std::string weight_text = entry.substr(colon + 1);
+                wp_trim_ascii_whitespace(name);
+                wp_trim_ascii_whitespace(weight_text);
+                bool ok = !weight_text.empty();
+                for (const char c : weight_text) {
+                    ok = ok && c >= '0' && c <= '9';
+                }
+                if (ok) {
+                    weight = std::strtoull(weight_text.c_str(), nullptr, 10);
+                } else {
+                    std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_OVERFLOW entry "
+                              << entry << " has an unparseable weight; weighting "
+                                 "that device by its usable capacity" << std::endl;
+                }
+            }
+            wp_trim_ascii_whitespace(name);
+            const auto it = std::find(device_names.begin(), device_names.end(), name);
+            if (it == device_names.end()) {
+                std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_OVERFLOW names "
+                             "unknown device " << name << "; ignoring" << std::endl;
+            } else {
+                const size_t index = (size_t) (it - device_names.begin());
+                if (!taken[index]) {
+                    taken[index] = 1;
+                    overflow.devices.push_back(index);
+                    overflow.weights.push_back(weight);
+                }
+            }
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    // A value that named only unknown devices is a typo, not a list: fall back
+    // to the documented default rather than letting nobody take the overflow.
+    overflow.from_env = !overflow.devices.empty();
+    return overflow;
+}
+
 size_t proportional_owner_for_expert(
         int expert, int expert_first, int expert_last,
         const std::vector<int> & device_slots) {
@@ -475,6 +539,7 @@ HotOwnerPlan plan_hot_owner_map(const HotOwnerInput & in) {
     HotOwnerPlan plan;
     plan.owner.assign(n_pages, 0);
     plan.from_ranked.assign(n_pages, 0);
+    plan.from_overflow.assign(n_pages, 0);
     for (size_t id = 0; id < n_pages; ++id) {
         plan.owner[id] = id < in.page_static_owner.size() ? in.page_static_owner[id] : 0;
     }
@@ -503,14 +568,84 @@ HotOwnerPlan plan_hot_owner_map(const HotOwnerInput & in) {
         }
     }
 
-    // 2. Everything the ranked pass did not place: a proportional spread over
-    //    the capacity that is LEFT, in ascending page-id order. Weights are the
-    //    remaining capacity per device; if nothing is left anywhere in the
-    //    class they become the class's total capacity, so a page still never
-    //    lands on a device that cannot hold its size class at all. The spread
-    //    does not consume capacity -- these are cold pages that will be paged
-    //    in on demand wherever they land, and there are normally far more of
-    //    them than there are free slots.
+    // The first-priority device is the one the policy exists to keep fully
+    // resident, so it is excluded from the overflow spread -- unless it is the
+    // only device the operator allowed, in which case honour that literally.
+    const bool     have_priority = !in.priority.empty();
+    const size_t   top_device    = have_priority ? in.priority.front() : (size_t) -1;
+
+    // Resolve WP_EXPERT_OWNER_OVERFLOW (or its default) into a device list
+    // once. Weights still depend on the size class, so only the membership is
+    // decided here.
+    std::vector<size_t>   overflow_devices;
+    std::vector<uint64_t> overflow_weights;
+    if (in.overflow.from_env) {
+        for (size_t i = 0; i < in.overflow.devices.size(); ++i) {
+            const size_t device = in.overflow.devices[i];
+            if (device >= in.n_devices) {
+                continue;
+            }
+            overflow_devices.push_back(device);
+            overflow_weights.push_back(
+                i < in.overflow.weights.size() ? in.overflow.weights[i] : 0);
+        }
+    } else {
+        for (size_t device = 0; device < in.n_devices; ++device) {
+            overflow_devices.push_back(device);
+            overflow_weights.push_back(0);  // 0 == weight by usable capacity
+        }
+    }
+    if (have_priority && overflow_devices.size() > 1) {
+        for (size_t i = 0; i < overflow_devices.size(); ++i) {
+            if (overflow_devices[i] == top_device) {
+                overflow_devices.erase(overflow_devices.begin() + (long) i);
+                overflow_weights.erase(overflow_weights.begin() + (long) i);
+                break;
+            }
+        }
+    }
+
+    // Deterministic integer-band spread of `pages` (ascending page id) over
+    // `weights`, indexed by device id. Page k of K goes to the device whose
+    // cumulative weight band contains k*W/K -- the same idiom the proportional
+    // policy uses to cut the expert-id range. Returns false when every weight
+    // is zero, so the caller can try the next weighting.
+    const auto spread = [&](const std::vector<size_t> & pages,
+                            const std::vector<uint64_t> & weights,
+                            char overflowed) {
+        const uint64_t total =
+            std::accumulate(weights.begin(), weights.end(), (uint64_t) 0);
+        if (total == 0) {
+            return false;
+        }
+        const uint64_t k_total = (uint64_t) pages.size();
+        for (uint64_t k = 0; k < k_total; ++k) {
+            const uint64_t point = k * total / k_total;
+            uint64_t begin  = 0;
+            size_t   device = weights.size() - 1;
+            for (size_t d = 0; d < weights.size(); ++d) {
+                begin += weights[d];
+                if (point < begin) {
+                    device = d;
+                    break;
+                }
+            }
+            plan.owner[pages[(size_t) k]]         = device;
+            plan.from_overflow[pages[(size_t) k]] = overflowed;
+            assigned[pages[(size_t) k]]           = 1;
+        }
+        return true;
+    };
+
+    // 2/3. Everything the ranked pass did not place, per size class, in
+    //      ascending page-id order. If the class still has FREE capacity these
+    //      are residual fills and are spread over that remaining capacity
+    //      (unchanged behaviour, and they cost no page-ins). Once the class is
+    //      full they are OVERFLOW: they are spread over the overflow devices
+    //      only, so the fully-resident device never gets handed a page it
+    //      cannot hold. The spread does not consume capacity -- these are cold
+    //      pages that page in on demand wherever they land, and there are
+    //      normally far more of them than there are free slots.
     for (size_t class_id = 0; class_id < remaining.size(); ++class_id) {
         std::vector<size_t> pages;
         for (size_t id = 0; id < n_pages; ++id) {
@@ -521,33 +656,61 @@ HotOwnerPlan plan_hot_owner_map(const HotOwnerInput & in) {
         if (pages.empty()) {
             continue;
         }
-        std::vector<size_t> weights = remaining[class_id];
-        weights.resize(in.n_devices, 0);
-        uint64_t total = std::accumulate(weights.begin(), weights.end(), (uint64_t) 0);
-        if (total == 0) {
-            weights = in.capacity[class_id];
-            weights.resize(in.n_devices, 0);
-            total = std::accumulate(weights.begin(), weights.end(), (uint64_t) 0);
+        std::vector<size_t> capacity = in.capacity[class_id];
+        capacity.resize(in.n_devices, 0);
+
+        std::vector<uint64_t> weights(in.n_devices, 0);
+        for (size_t d = 0; d < remaining[class_id].size() && d < in.n_devices; ++d) {
+            weights[d] = (uint64_t) remaining[class_id][d];
         }
-        if (total == 0) {
-            // No device can hold this class; leave the proportional owner.
+        if (spread(pages, weights, 0)) {
+            continue;   // residual fill: real capacity was still free
+        }
+
+        // Overflow proper. First choice: the allowed devices, weighted as the
+        // operator asked (0 => this device's usable capacity in the class).
+        // Only usable if at least one of them can physically hold the class --
+        // an explicit weight must not park pages on a device with no slot of
+        // their size.
+        uint64_t allowed_capacity = 0;
+        for (const size_t device : overflow_devices) {
+            allowed_capacity += (uint64_t) capacity[device];
+        }
+        if (allowed_capacity != 0) {
+            std::fill(weights.begin(), weights.end(), (uint64_t) 0);
+            for (size_t i = 0; i < overflow_devices.size(); ++i) {
+                const size_t device = overflow_devices[i];
+                weights[device] = overflow_weights[i] != 0
+                    ? overflow_weights[i] : (uint64_t) capacity[device];
+            }
+            if (spread(pages, weights, 1)) {
+                continue;
+            }
+        }
+
+        // Nothing the operator allowed can hold this class. Fall back to the
+        // class's total capacity, still keeping the fully-resident device out
+        // of it while any other device can physically hold the class.
+        std::fill(weights.begin(), weights.end(), (uint64_t) 0);
+        for (size_t d = 0; d < in.n_devices; ++d) {
+            if (!have_priority || d != top_device) {
+                weights[d] = (uint64_t) capacity[d];
+            }
+        }
+        if (spread(pages, weights, 1)) {
             continue;
         }
-        const uint64_t k_total = (uint64_t) pages.size();
-        for (uint64_t k = 0; k < k_total; ++k) {
-            const uint64_t point = k * total / k_total;
-            uint64_t begin = 0;
-            size_t   device = weights.size() - 1;
-            for (size_t d = 0; d < weights.size(); ++d) {
-                begin += (uint64_t) weights[d];
-                if (point < begin) {
-                    device = d;
-                    break;
-                }
-            }
-            plan.owner[pages[(size_t) k]] = device;
-            assigned[pages[(size_t) k]]   = 1;
+
+        // Only the priority device can hold this class at all: better an
+        // over-committed fully-resident device than a page parked on a device
+        // with no slot of its size.
+        for (size_t d = 0; d < in.n_devices; ++d) {
+            weights[d] = (uint64_t) capacity[d];
         }
+        if (spread(pages, weights, 1)) {
+            continue;
+        }
+        // No device can hold this class; leave the proportional owner.
     }
     return plan;
 }
@@ -16057,6 +16220,8 @@ private:
         input.page_static_owner = page_static_owners_;
         input.capacity          = placement_usable_capacity_;
         input.priority          = priority;
+        input.overflow          = parse_owner_overflow(
+            std::getenv("WP_EXPERT_OWNER_OVERFLOW"), device_names_);
         input.ranked            = ranked_pages_from_pin_file();
 
         const size_t n_pages = page_static_owners_.size();
@@ -16075,6 +16240,7 @@ private:
         const size_t n_classes = placement_usable_capacity_.size();
         std::vector<size_t> owned(devices_.size(), 0);
         std::vector<size_t> owned_ranked(devices_.size(), 0);
+        std::vector<size_t> owned_overflow(devices_.size(), 0);
         std::vector<size_t> owned_unmanaged(devices_.size(), 0);
         std::vector<std::vector<size_t>> owned_by_class(
             devices_.size(), std::vector<size_t>(n_classes, 0));
@@ -16086,6 +16252,8 @@ private:
             ++owned[device];
             if (plan.from_ranked[id]) {
                 ++owned_ranked[device];
+            } else if (id < plan.from_overflow.size() && plan.from_overflow[id]) {
+                ++owned_overflow[device];
             }
             const size_t class_id = placement_page_class_[id];
             if (class_id < n_classes) {
@@ -16101,8 +16269,49 @@ private:
             }
             priority_names << device_names_.at(priority[i]);
         }
+        // Which devices are allowed to absorb the pages that fit nowhere. The
+        // default (everything but priority[0]) is reported explicitly so the
+        // log answers "who took the overflow" without knowing the default.
+        std::vector<size_t>   overflow_devices;
+        std::vector<uint64_t> overflow_weights;
+        if (input.overflow.from_env) {
+            overflow_devices = input.overflow.devices;
+            overflow_weights = input.overflow.weights;
+        } else {
+            for (size_t i = 0; i < devices_.size(); ++i) {
+                overflow_devices.push_back(i);
+                overflow_weights.push_back(0);
+            }
+        }
+        if (!priority.empty() && overflow_devices.size() > 1) {
+            for (size_t i = 0; i < overflow_devices.size(); ++i) {
+                if (overflow_devices[i] == priority.front()) {
+                    overflow_devices.erase(overflow_devices.begin() + (long) i);
+                    overflow_weights.erase(overflow_weights.begin() + (long) i);
+                    break;
+                }
+            }
+        }
+        std::ostringstream overflow_names;
+        for (size_t i = 0; i < overflow_devices.size(); ++i) {
+            if (i != 0) {
+                overflow_names << ',';
+            }
+            overflow_names << device_names_.at(overflow_devices[i]);
+            overflow_names << ':';
+            if (overflow_weights[i] != 0) {
+                overflow_names << overflow_weights[i];
+            } else {
+                overflow_names << "usable";
+            }
+        }
+        if (overflow_devices.empty()) {
+            overflow_names << "none";
+        }
         std::cerr << "WARN wp expert worker: owner_policy=hot"
                   << " priority=" << priority_names.str()
+                  << " overflow=" << overflow_names.str()
+                  << (input.overflow.from_env ? "" : " (default)")
                   << " ranked_pages=" << input.ranked.size()
                   << " total_pages=" << n_pages
                   << " size_classes=" << n_classes << std::endl;
@@ -16127,13 +16336,35 @@ private:
                       << device_names_[i]
                       << " owned=" << owned[i]
                       << " from_ranked=" << owned_ranked[i]
+                      << " from_overflow=" << owned_overflow[i]
                       << " from_fallback="
-                      << (owned[i] - owned_ranked[i] - owned_unmanaged[i])
+                      << (owned[i] - owned_ranked[i] - owned_overflow[i]
+                          - owned_unmanaged[i])
                       << " resident_layer_pages=" << owned_unmanaged[i]
                       << classes.str()
                       << " expected_fully_resident=" << (resident ? "yes" : "no")
                       << std::endl;
             g_test_placement_report.fully_resident[i] = resident ? 1 : 0;
+        }
+
+        // INVARIANT: the first-priority device is the one this policy exists
+        // to keep fully resident. If it ends up owning more of a size class
+        // than it has usable slots for, it will page over its slow link for
+        // the whole run -- the exact failure the policy was written to remove.
+        // Warn loudly rather than fail: a wrong owner map still computes.
+        if (!priority.empty() && priority.front() < devices_.size()) {
+            const size_t top = priority.front();
+            for (size_t c = 0; c < n_classes; ++c) {
+                const size_t usable = placement_usable_capacity_[c][top];
+                if (owned_by_class[top][c] > usable) {
+                    std::cerr << "WARN wp expert worker: owner_policy=hot INVARIANT "
+                                 "VIOLATED: priority device " << device_names_[top]
+                              << " owns " << owned_by_class[top][c]
+                              << " class[" << c << "] pages but has only " << usable
+                              << " usable slots; it will page in over its link"
+                              << std::endl;
+                }
+            }
         }
     }
 
