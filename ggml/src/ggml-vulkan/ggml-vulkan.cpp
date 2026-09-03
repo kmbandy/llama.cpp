@@ -5536,6 +5536,25 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->mul_mat_vec_max_cols_eff = (uint32_t)v;
         }
     }
+    // Escape hatch: rows per workgroup for K-quants / standard quants.
+    // rm changes workgroup ownership, not a row's k-reduction order.
+    if (const char * e = getenv("GGML_VK_MMV_ROWS_KQ")) {
+        const int v = atoi(e);
+        if (v >= 1 && v <= 64) {
+            rm_kq = (uint32_t)v;
+            rm_iq = 2 * rm_kq;
+        }
+    }
+    if (const char * e = getenv("GGML_VK_MMV_ROWS_STDQ")) {
+        const int v = atoi(e);
+        if (v >= 1 && v <= 64) {
+            rm_stdq = (uint32_t)v;
+        }
+    }
+    if (requested == nullptr) {
+        GGML_LOG_INFO("ggml_vulkan: %s mmv rows rm_kq=%u rm_stdq=%u\n",
+                      device->name.c_str(), rm_kq, rm_stdq);
+    }
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // Ensure a subgroup size >= 16 is available
@@ -5995,6 +6014,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_BINARY(add_rms, _norepeat, {1}, 4)
 #undef CREATE_BINARY
 
+    // f32 multi_add pipelines. f16 variants stay behind rte_fp16 (none today).
     if (device->multi_add) {
         for (uint32_t i = 0; i < MAX_FUSED_ADDS; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
@@ -7163,9 +7183,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->pipeline_robustness = pl_robustness_features.pipelineRobustness;
 
-        device->multi_add = vk12_props.shaderRoundingModeRTEFloat16 &&
-                            device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
-                            getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
+        // f32 multi_add needs 16-bit storage, not fp16 RTE. Default = RTE gate.
+        // GGML_VK_MULTI_ADD_F32_NO_RTE=1 creates f32 pipelines without RTE.
+        const bool multi_add_common =
+            device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
+            getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
+        const char * f32_no_rte_env = getenv("GGML_VK_MULTI_ADD_F32_NO_RTE");
+        const bool f32_no_rte =
+            f32_no_rte_env != nullptr && f32_no_rte_env[0] == '1' &&
+            vk11_features.storageBuffer16BitAccess;
+        device->multi_add = multi_add_common &&
+            (device->float_controls_rte_fp16 || f32_no_rte);
 
         device->shader_int64 = device_features2.features.shaderInt64;
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
@@ -7525,6 +7553,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
         ggml_vk_load_shaders(device);
+        GGML_LOG_INFO("ggml_vulkan: %s multi_add=%d rte_fp16=%d\n",
+                      device->name.c_str(), (int) device->multi_add,
+                      (int) device->float_controls_rte_fp16);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
         const bool prefers_transfer_queue =
