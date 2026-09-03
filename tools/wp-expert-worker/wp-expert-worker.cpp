@@ -1133,7 +1133,9 @@ size_t batch_mmid_arena_role_stride(
     }
     const size_t nbytes = ggml_row_size(type, ne0) * (size_t) ne1;
     const size_t need = nbytes + batch_mmid_quant_row_slack(type, ne0);
-    return GGML_PAD(need, batch_mmid_lcm_align(alignment, ggml_type_size(type)));
+    const size_t m = batch_mmid_lcm_align(alignment, ggml_type_size(type));
+    // GGML_PAD is a power-of-two mask; the lcm (e.g. 768, 2304) is not.
+    return ((need + m - 1) / m) * m;
 }
 
 size_t batch_mmid_arena_expert_offset(
@@ -1169,7 +1171,8 @@ BatchMmidArenaPack plan_batch_mmid_arena(
         if (role.copy_bytes > need) {
             need = role.copy_bytes;
         }
-        role.stride = GGML_PAD(need, batch_mmid_lcm_align(a, ggml_type_size(role.type)));
+        const size_t m = batch_mmid_lcm_align(a, ggml_type_size(role.type));
+        role.stride = ((need + m - 1) / m) * m;
         if (role.stride == 0) {
             return BatchMmidArenaPack{};
         }
