@@ -175,6 +175,36 @@ uint64_t test_pool_usable_slots();
 // inside its arena's PAD region. Must stay 0: pads have no pool slot index.
 uint64_t test_arena_prefill_pad_bound();
 
+// Test-only snapshot of the multi-device placement/ownership tables the last
+// Worker in this process built. Written once, from the Worker constructor, by
+// initialize_placement_policy() (the capacity half) and, under
+// WP_EXPERT_OWNER_POLICY=hot, by apply_hot_owner_policy() (the ownership
+// half). Empty on a single-device worker, which builds no tables at all.
+//
+// These are what the startup "owner_policy=hot ... class[c]bytes=... owned=...
+// usable=..." lines print, so a test can assert on the same numbers an
+// operator reads out of the log without standing up a socket.
+struct PlacementReport {
+    std::vector<std::string> devices;
+    // One entry per placement size class, in the same order as the log's
+    // class[c] index. `class_bytes` is the catalog page size of the class.
+    std::vector<uint64_t> class_bytes;
+    // [class][device]. `planned` is SlotClass::slots, `usable` is what the
+    // pool actually carved (SlotClass::usable_slots, pads removed) -- the
+    // number WP_EXPERT_OWNER_POLICY=hot budgets ownership against.
+    std::vector<std::vector<uint64_t>> planned;
+    std::vector<std::vector<uint64_t>> usable;
+    // [class][device] pages OWNED after the policy ran, and per device whether
+    // every class fits (owned <= usable). Only filled under `hot`.
+    std::vector<std::vector<uint64_t>> owned;
+    std::vector<char>                  fully_resident;
+    // Device indices, highest priority first. Only filled under `hot`.
+    std::vector<size_t> priority;
+    bool hot = false;
+};
+void                    test_reset_placement_report();
+const PlacementReport & test_placement_report();
+
 // Decode/prefill compute-profile policy. Pure functions of the env string so
 // tests can pin defaults without latching process-lifetime getenv statics.
 //

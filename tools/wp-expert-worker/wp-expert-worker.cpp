@@ -161,6 +161,20 @@ uint64_t test_arena_prefill_pad_bound() {
     return g_test_arena_prefill_pad_bound.load(std::memory_order_relaxed);
 }
 
+// Construction facts of the most recently built multi-device Worker, not a
+// counter: written once from the Worker constructor and read afterwards. The
+// Worker constructor is single-threaded, and every reader is a test that has
+// already joined (or never started) the serving thread.
+static PlacementReport g_test_placement_report;
+
+void test_reset_placement_report() {
+    g_test_placement_report = PlacementReport{};
+}
+
+const PlacementReport & test_placement_report() {
+    return g_test_placement_report;
+}
+
 uint64_t test_arena_prefill_hits() {
     return g_test_arena_prefill_hits.load(std::memory_order_relaxed);
 }
@@ -9871,6 +9885,37 @@ public:
         return pool_.resources();
     }
 
+    // *** THE SLOT CLASS A PAGE WOULD BE CARVED FROM ON *THIS* DEVICE. ***
+    //
+    // Returns an index into resources().slot_classes, or slot_classes.size()
+    // when this device plans no class that can hold the page.
+    //
+    // Callers must go through here rather than comparing a catalog page's
+    // `size` against SlotClass::size themselves. A slot class is keyed on
+    // ExpertPage::device_size -- resource_pages() feeds plan_resources the
+    // device size, not the blob size -- and the two are NOT the same number:
+    // layout_sliced_pages() reserves quantized row slack (MATRIX_ROW_PADDING,
+    // 512 elements) on every role whose ne0 is not a multiple of 512 and then
+    // aligns each member to the backend's buffer alignment, so a page whose
+    // O_DIRECT-padded blob size is 2,150,400 lays out to 2,150,464 bytes on
+    // device. device_size is also PER BACKEND (the alignment is the backend's),
+    // so there is no single device-size value the Worker could compare against
+    // for every device even in principle -- only the device itself can answer.
+    //
+    // 2026-09-02 REGRESSION THIS EXISTS TO PREVENT: the WP_EXPERT_OWNER_POLICY
+    // =hot capacity table matched placement classes (keyed on ExpertPage::size)
+    // against SlotClass::size (keyed on device_size) and silently read 0 for
+    // every class whose two sizes differed. In production that was class[0] --
+    // 22,016 of 24,576 pages -- so the ranked hot walk skipped 90% of the model
+    // and the map degraded to the proportional one it was meant to replace.
+    size_t slot_class_index_for_page(int layer, int expert) const {
+        const auto it = catalog_.pages.find({layer, expert});
+        if (it == catalog_.pages.end()) {
+            return pool_.resources().slot_classes.size();
+        }
+        return expert_pin_class_index(pool_.resources(), it->second.device_size);
+    }
+
     size_t read_inflight() const { return pool_.read_inflight(); }
     size_t read_chunk_bytes() const { return pool_.read_chunk_bytes(); }
     bool read_direct() const { return pool_.read_direct(); }
@@ -15814,6 +15859,12 @@ private:
             placement_class_sizes_.push_back(max_page_size);
         }
         placement_pages_by_class_.resize(placement_class_sizes_.size());
+        // One representative page per class. The capacity tables below resolve
+        // a class against each DEVICE's slot classes through it -- see
+        // DeviceWorker::slot_class_index_for_page for why a size comparison
+        // here cannot work.
+        std::vector<std::pair<int, int>> class_probe(
+            placement_class_sizes_.size(), std::pair<int, int>(-1, -1));
         for (const auto & item : catalog_.pages) {
             const ExpertPage & page = item.second;
             if (resident_layer(page.layer)) {
@@ -15826,40 +15877,58 @@ private:
                       page.size) - placement_class_sizes_.begin())
                 : 0;
             placement_pages_by_class_[class_id].push_back(id);
-        }
-        placement_capacity_.assign(
-            placement_class_sizes_.size(), std::vector<size_t>(devices_.size(), 0));
-        for (size_t device_id = 0; device_id < devices_.size(); ++device_id) {
-            const ResourcePlan & resources = devices_[device_id]->resources();
-            for (size_t class_id = 0; class_id < placement_class_sizes_.size(); ++class_id) {
-                for (const SlotClass & slot_class : resources.slot_classes) {
-                    if ((use_size_classes && slot_class.size == placement_class_sizes_[class_id]) ||
-                            (!use_size_classes && slot_class.size >= placement_class_sizes_[class_id])) {
-                        placement_capacity_[class_id][device_id] =
-                            (size_t) slot_class.slots;
-                        break;
-                    }
-                }
+            if (class_probe[class_id].first < 0) {
+                class_probe[class_id] = item.first;
             }
         }
-        // The same class -> device table, but budgeted against USABLE slots
-        // (pad tails already removed) instead of the planned per-class count.
-        // Only WP_EXPERT_OWNER_POLICY=hot reads it; placement_capacity_ above
-        // is left exactly as it was so the proportional and LFU paths stay
-        // byte-for-byte unchanged.
+        // *** CLASS -> DEVICE CAPACITY. ***
+        //
+        // `placement_capacity_` is the PLANNED per-class slot count (what the
+        // LFU placement path budgets migrations against);
+        // `placement_usable_capacity_` is what the pool ACTUALLY carved once
+        // each arena's reserved pad tail came out, which is what
+        // WP_EXPERT_OWNER_POLICY=hot budgets OWNERSHIP against.
+        //
+        // Both resolve the class per device via slot_class_index_for_page():
+        // matching placement_class_sizes_ (ExpertPage::size) against
+        // SlotClass::size (ExpertPage::device_size) reads 0 for every class
+        // whose device layout is larger than its blob -- the 2026-09-02
+        // production regression documented on slot_class_index_for_page().
+        placement_capacity_.assign(
+            placement_class_sizes_.size(), std::vector<size_t>(devices_.size(), 0));
         placement_usable_capacity_.assign(
             placement_class_sizes_.size(), std::vector<size_t>(devices_.size(), 0));
         for (size_t device_id = 0; device_id < devices_.size(); ++device_id) {
             const ResourcePlan & resources = devices_[device_id]->resources();
             for (size_t class_id = 0; class_id < placement_class_sizes_.size(); ++class_id) {
-                for (const SlotClass & slot_class : resources.slot_classes) {
-                    if ((use_size_classes && slot_class.size == placement_class_sizes_[class_id]) ||
-                            (!use_size_classes && slot_class.size >= placement_class_sizes_[class_id])) {
-                        placement_usable_capacity_[class_id][device_id] =
-                            (size_t) std::max(0, slot_class.usable_slots);
-                        break;
-                    }
+                if (class_probe[class_id].first < 0) {
+                    continue;
                 }
+                const size_t slot_class_id = devices_[device_id]->slot_class_index_for_page(
+                    class_probe[class_id].first, class_probe[class_id].second);
+                if (slot_class_id >= resources.slot_classes.size()) {
+                    continue;
+                }
+                const SlotClass & slot_class = resources.slot_classes[slot_class_id];
+                placement_capacity_[class_id][device_id] = (size_t) std::max(0, slot_class.slots);
+                int usable = slot_class.usable_slots;
+                // BACKSTOP. usable_slots is filled in by ExpertSlotPool's
+                // constructor; a plan that never reached a pool (or a future
+                // carve path that forgets to record it) would otherwise report
+                // zero capacity and silently degrade `hot` to the proportional
+                // map it exists to replace. Fall back to the planned count
+                // minus the pad reservation and say so, loudly.
+                if (usable <= 0 && slot_class.slots > 0) {
+                    usable = std::max(0, slot_class.slots - std::max(0, slot_class.pad_slots));
+                    std::cerr << "WARN wp expert worker: device " << device_names_[device_id]
+                              << " slot class " << slot_class.size
+                              << " bytes reports usable_slots=0 with slots="
+                              << slot_class.slots << "; assuming "
+                              << usable << " (slots - pad_slots). The pool did not"
+                                 " record what it carved -- ownership capacity is an"
+                                 " estimate" << std::endl;
+                }
+                placement_usable_capacity_[class_id][device_id] = (size_t) std::max(0, usable);
             }
         }
         // Inverse of placement_pages_by_class_. Pages the placement policy does
@@ -15876,6 +15945,20 @@ private:
             }
         }
         placement_ready_ = true;
+        // Test-only snapshot; see PlacementReport on wp-expert-worker.h.
+        g_test_placement_report = PlacementReport{};
+        g_test_placement_report.devices     = device_names_;
+        g_test_placement_report.class_bytes = placement_class_sizes_;
+        g_test_placement_report.planned.assign(
+            placement_class_sizes_.size(), std::vector<uint64_t>(devices_.size(), 0));
+        g_test_placement_report.usable.assign(
+            placement_class_sizes_.size(), std::vector<uint64_t>(devices_.size(), 0));
+        for (size_t c = 0; c < placement_class_sizes_.size(); ++c) {
+            for (size_t d = 0; d < devices_.size(); ++d) {
+                g_test_placement_report.planned[c][d] = placement_capacity_[c][d];
+                g_test_placement_report.usable[c][d]  = placement_usable_capacity_[c][d];
+            }
+        }
         refresh_placement_snapshot();
     }
 
@@ -16023,11 +16106,18 @@ private:
                   << " ranked_pages=" << input.ranked.size()
                   << " total_pages=" << n_pages
                   << " size_classes=" << n_classes << std::endl;
+        // Test-only snapshot; see PlacementReport on wp-expert-worker.h.
+        g_test_placement_report.hot      = true;
+        g_test_placement_report.priority = priority;
+        g_test_placement_report.owned.assign(
+            n_classes, std::vector<uint64_t>(devices_.size(), 0));
+        g_test_placement_report.fully_resident.assign(devices_.size(), 0);
         for (size_t i = 0; i < devices_.size(); ++i) {
             bool resident = true;
             std::ostringstream classes;
             for (size_t c = 0; c < n_classes; ++c) {
                 const size_t usable = placement_usable_capacity_[c][i];
+                g_test_placement_report.owned[c][i] = owned_by_class[i][c];
                 resident = resident && owned_by_class[i][c] <= usable;
                 classes << " class[" << c << "]bytes=" << placement_class_sizes_[c]
                         << " owned=" << owned_by_class[i][c]
@@ -16043,6 +16133,7 @@ private:
                       << classes.str()
                       << " expected_fully_resident=" << (resident ? "yes" : "no")
                       << std::endl;
+            g_test_placement_report.fully_resident[i] = resident ? 1 : 0;
         }
     }
 

@@ -4389,6 +4389,167 @@ static void test_owner_policy_hot_is_deterministic() {
             "capacity in page-id order");
 }
 
+// ---------------------------------------------------------------------------
+// WP_EXPERT_OWNER_POLICY=hot AGAINST A REAL TWO-DEVICE WORKER (2026-09-02).
+//
+// The three tests above pin plan_hot_owner_map(), which is a pure function of a
+// capacity table handed to it. They cannot see the defect that made the policy
+// a no-op in production: the CAPACITY TABLE ITSELF was zero.
+//
+// Placement size classes are keyed on ExpertPage::size (the O_DIRECT-padded
+// blob page), while a ResourcePlan's SlotClass is keyed on
+// ExpertPage::device_size -- resource_pages() feeds plan_resources the device
+// size. layout_sliced_pages() reserves quantized row slack on any role whose
+// ne0 is not a multiple of 512 and aligns each member to the backend's buffer
+// alignment, so the two numbers differ on exactly the geometries that carry
+// such a role. The old table matched the two by ==, found nothing, and left
+// usable capacity at 0; plan_hot_owner_map then skipped every page of that
+// class and the whole map fell through to the proportional fallback.
+//
+// This fixture reproduces that geometry EXACTLY. Production's dominant class is
+// 2,150,400 blob bytes; PROD_GEOMETRIES[0] at PROD_WIDTHS[0] is gate/up q4_K
+// [2560 x 448] + down q5_1 [448 x 2560] = 2,150,400 bytes, and down's ne0 of
+// 448 is not a multiple of 512, so its device layout is larger than its blob.
+// On 4ab9a0fbb every assertion below reports 0.
+//
+// inspect_resources() builds the whole Worker -- both DeviceWorkers, the
+// placement tables and the hot policy -- and returns without opening a socket,
+// so this costs a construction, not a serving run.
+static void test_owner_policy_hot_capacity_on_two_devices() {
+    TempDir temp;
+    const ProdFixture fixture =
+        make_production_fixture(temp.path, PROD_GEOMETRIES[0], PROD_WIDTHS[0]);
+
+    // Same arena split the grouped-prefill production test uses: several arenas
+    // per size class, each reserving PROD_N_EXPERT_USED pad slots, so `usable`
+    // is strictly below the planned count and the two cannot be confused.
+    const ScopedEnv arena_cap(
+        "WP_EXPERT_ARENA_MAX_BYTES", std::to_string(fixture.page_bytes * 18));
+    const ScopedEnv grouped("WP_EXPERT_ARENA_PREFILL", "1");
+    // Pin in seed mode, as production does: it seeds LFU heat instead of
+    // reading 64 pages off disk during a construction-only test.
+    const ScopedEnv pin_mode("WP_EXPERT_PIN_MODE", "seed");
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.devices           = { "CPU", "CPU" };
+    options.device_slots      = { PROD_EXPERTS * PROD_LAYERS + 8,
+                                  PROD_EXPERTS * PROD_LAYERS + 8 };
+    options.host_budget_bytes = 4 * fixture.page_bytes;
+
+    // ---- PASS 1: default (proportional) policy. Only the capacity table is
+    //      under test here, and initialize_placement_policy() builds it
+    //      whatever the ownership policy is.
+    wp_expert_worker::test_reset_placement_report();
+    const wp_expert_worker::ResourcePlan plan =
+        wp_expert_worker::inspect_resources(options);
+    const wp_expert_worker::PlacementReport report =
+        wp_expert_worker::test_placement_report();
+
+    require(report.devices.size() == 2,
+            "two-device placement report did not describe two devices");
+    require(!report.class_bytes.empty(),
+            "two-device placement report has no size classes");
+
+    for (size_t c = 0; c < report.class_bytes.size(); ++c) {
+        for (size_t d = 0; d < report.devices.size(); ++d) {
+            if (report.planned[c][d] == 0) {
+                throw std::runtime_error(
+                    "placement class[" + std::to_string(c) + "] (" +
+                    std::to_string(report.class_bytes[c]) + " bytes) resolved to NO "
+                    "slot class on device " + std::to_string(d) +
+                    ": the class -> slot-class match is broken");
+            }
+            if (report.usable[c][d] == 0) {
+                throw std::runtime_error(
+                    "placement class[" + std::to_string(c) + "] (" +
+                    std::to_string(report.class_bytes[c]) + " bytes) reports usable=0 "
+                    "on device " + std::to_string(d) + " with planned=" +
+                    std::to_string(report.planned[c][d]) +
+                    ": ownership would silently degrade to the proportional map");
+            }
+            if (report.usable[c][d] > report.planned[c][d]) {
+                throw std::runtime_error(
+                    "placement class[" + std::to_string(c) +
+                    "] reports more usable slots than the plan asked for");
+            }
+        }
+    }
+
+    // The per-class table must ACCOUNT FOR THE WHOLE POOL of device 0 --
+    // inspect_resources() returns that device's plan. planned sums to what the
+    // plan asked for before the pad reservation, usable to what it carved.
+    uint64_t planned_total = 0;
+    uint64_t usable_total  = 0;
+    for (size_t c = 0; c < report.class_bytes.size(); ++c) {
+        planned_total += report.planned[c][0];
+        usable_total  += report.usable[c][0];
+    }
+    require(planned_total == (uint64_t) plan.planned_slot_count,
+            "placement capacity table does not account for the planned pool");
+    require(usable_total == (uint64_t) plan.slot_count,
+            "placement usable-capacity table does not account for the carved pool");
+    require(usable_total < planned_total,
+            "the pad reservation did not come out of the pool: this fixture is no "
+            "longer exercising the usable-vs-planned distinction");
+
+    // ---- PASS 2: WP_EXPERT_OWNER_POLICY=hot, with a hot list sized to fill
+    //      the priority device (device 0, since WP_EXPERT_OWNER_PRIORITY is
+    //      unset and the default is device-list order) to exactly its usable
+    //      capacity in every class and no further. The fallback then has zero
+    //      remaining capacity on device 0 and spills the rest onto device 1,
+    //      so device 0 must come out owning exactly what it can hold.
+    require(report.class_bytes.size() == 1,
+            "this fixture is expected to have one size class; the hot list below "
+            "would need to be built per class otherwise");
+    const uint64_t hot_pages = report.usable[0][0];
+
+    const fs::path pin_path = temp.path / "hot-pins.txt";
+    {
+        std::ofstream pins(pin_path);
+        require(pins.good(), "failed to write the hot-set pin file");
+        uint64_t written = 0;
+        uint64_t count   = 1000000;
+        for (int layer = PROD_LAYER;
+                layer < PROD_LAYER + PROD_LAYERS && written < hot_pages; ++layer) {
+            for (int expert = 0;
+                    expert < PROD_EXPERTS && written < hot_pages; ++expert) {
+                pins << layer << ' ' << expert << "  # " << count-- << '\n';
+                ++written;
+            }
+        }
+        require(written == hot_pages,
+                "the fixture has fewer pages than the priority device has slots");
+    }
+
+    const ScopedEnv policy("WP_EXPERT_OWNER_POLICY", "hot");
+    const ScopedEnv pin_file("WP_EXPERT_PIN_FILE", pin_path.string());
+
+    wp_expert_worker::test_reset_placement_report();
+    wp_expert_worker::inspect_resources(options);
+    const wp_expert_worker::PlacementReport hot =
+        wp_expert_worker::test_placement_report();
+
+    require(hot.hot, "WP_EXPERT_OWNER_POLICY=hot did not run on a two-device worker");
+    require(!hot.priority.empty(), "hot policy reported no priority order");
+    const size_t top = hot.priority.front();
+    require(top == 0, "the default priority order is not the device-list order");
+
+    for (size_t c = 0; c < hot.class_bytes.size(); ++c) {
+        if (hot.owned[c][top] != hot.usable[c][top]) {
+            throw std::runtime_error(
+                "WP_EXPERT_OWNER_POLICY=hot left the priority device holding " +
+                std::to_string(hot.owned[c][top]) + " pages of class[" +
+                std::to_string(c) + "] against " + std::to_string(hot.usable[c][top]) +
+                " usable slots: the ranked walk did not fill it exactly");
+        }
+    }
+    require(hot.fully_resident.at(top) != 0,
+            "WP_EXPERT_OWNER_POLICY=hot did not leave the priority device fully "
+            "resident");
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -4401,6 +4562,7 @@ int main() {
         test_owner_policy_proportional_unchanged();
         test_owner_policy_hot_packs_priority_device();
         test_owner_policy_hot_is_deterministic();
+        test_owner_policy_hot_capacity_on_two_devices();
         test_decode_prefill_compute_profile();
         test_arena_prefill_device_policy();
         test_prefill_arena_grouped_production_geometry();
