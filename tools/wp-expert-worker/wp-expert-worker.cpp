@@ -1413,6 +1413,8 @@ struct RequestStats {
     // D2 (2026-08-07): shape-keyed graph cache traffic.
     uint64_t n_gcache_hit  = 0;
     uint64_t n_gcache_miss = 0;
+    // WP_EXPERT_FUSE_GATE_UP_GATHER: requests that fused gate||up on gather.
+    uint64_t n_fuse_gate_up_gather = 0;
     uint64_t n_arena_hit   = 0;
     uint64_t n_arena_groups = 0;
     uint64_t n_arena_build = 0;
@@ -1679,6 +1681,7 @@ public:
         n_fuse_gate_up_hit_ += request.n_fuse_gate_up_hit;
         n_fuse_gate_up_miss_ += request.n_fuse_gate_up_miss;
         n_fuse_gate_up_experts_ += request.n_fuse_gate_up_experts;
+        n_fuse_gate_up_gather_ += request.n_fuse_gate_up_gather;
         n_arena_hit_ += request.n_arena_hit;
         n_arena_groups_ += request.n_arena_groups;
         n_arena_build_ += request.n_arena_build;
@@ -1895,7 +1898,8 @@ private:
                   << " gcache_miss=" << n_gcache_miss_
                   << " n_fuse_gate_up_hit=" << n_fuse_gate_up_hit_
                   << " n_fuse_gate_up_miss=" << n_fuse_gate_up_miss_
-                  << " n_fuse_gate_up_experts=" << n_fuse_gate_up_experts_;
+                  << " n_fuse_gate_up_experts=" << n_fuse_gate_up_experts_
+                  << " n_fuse_gate_up_gather=" << n_fuse_gate_up_gather_;
         {
             uint64_t captures = 0, replays = 0, fallbacks = 0, cap_newkey = 0, cap_lru = 0;
             if (ggml_backend_cuda_wp_graph_counts != nullptr && probe_backend_ != nullptr &&
@@ -2045,6 +2049,7 @@ private:
     uint64_t          n_fuse_gate_up_hit_ = 0;
     uint64_t          n_fuse_gate_up_miss_ = 0;
     uint64_t          n_fuse_gate_up_experts_ = 0;
+    uint64_t          n_fuse_gate_up_gather_ = 0;
     uint64_t          n_arena_hit_ = 0;
     uint64_t          n_arena_groups_ = 0;
     uint64_t          n_arena_build_ = 0;
@@ -9410,6 +9415,13 @@ public:
                          mul_mat_id_path
                              ? "FORCE_MM: consulted on MUL_MAT_ID path"
                              : "FORCE_MM: inert on this path");
+            const char * e = std::getenv("WP_EXPERT_FOLD_LAST");
+            fold_last_enabled_ = parse_arena_prefill_enabled(e, device_name_);
+            std::fprintf(stderr,
+                         "wp expert worker: fold-last (WP_EXPERT_FOLD_LAST=%s) "
+                         "device=%s enabled=%d\n",
+                         e != nullptr ? e : "", device_name_.c_str(),
+                         (int) fold_last_enabled_);
         }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
@@ -11087,6 +11099,9 @@ private:
     // parse_arena_prefill_enabled() for the accepted WP_EXPERT_ARENA_PREFILL
     // values (plain 0/1, or a per-device allow/deny list).
     bool arena_prefill_enabled_ = false;
+    // Same parser as arena prefill. "1" on CUDA disables {MUL,ADD} fusion;
+    // HIP has no multi_add so the emission reorder is a no-op there.
+    bool fold_last_enabled_ = false;
 
     void begin_async_dispatch(int conn_index, uint64_t trace_req) {
         active_async_conn_index_ = conn_index;
@@ -12772,8 +12787,10 @@ private:
         // argument is sound but UNVERIFIED on hardware here, hence default OFF.
         //
         // THREE HARD GUARDS, all checked per request, all falling back silently:
-        //  * dense only. gather rebuilds ffn_in per expert; the fusion is
-        //    orthogonal but untested there.
+        //  * gather is off unless WP_EXPERT_FUSE_GATE_UP_GATHER=1. Gather only
+        //    rewrites ffn_in; weight layout is unchanged. ggml_swiglu on the
+        //    fused [.., 2*ne1] layout is silu(gate)*up, same operand order as
+        //    swiglu_split.
         //  * swiglu_clamp must be off. The clamp is ASYMMETRIC -- up gets
         //    [-L, L] and gate gets [-INF, L] -- so a single clamp on the fused
         //    tensor is a different function. See the clamp note below.
@@ -12784,8 +12801,15 @@ private:
             const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
             return e != nullptr && e[0] == '1';
         }();
+        static const bool s_fuse_gate_up_gather = [] {
+            const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP_GATHER");
+            return e != nullptr && e[0] == '1';
+        }();
         const auto fuse_gate_up_ok = [&]() {
-            if (!s_fuse_gate_up || use_gather || request.swiglu_clamp > 1e-6f) {
+            if (!s_fuse_gate_up || request.swiglu_clamp > 1e-6f) {
+                return false;
+            }
+            if (use_gather && !s_fuse_gate_up_gather) {
                 return false;
             }
             const auto & fspecs = catalog_.descriptor.layers.at(request.layer);
@@ -12820,6 +12844,9 @@ private:
                 ++request_stats.n_fuse_gate_up_miss;
             }
             request_stats.fuse_gate_up_counted = true;
+        }
+        if (fuse_gate_up && use_gather) {
+            ++request_stats.n_fuse_gate_up_gather;
         }
         uint32_t gather_rank = 0;
         bool     gather_rank_uniform = !use_gather;
@@ -13277,18 +13304,15 @@ private:
         // pairwise adds. That is the same set of values in the same order, but
         // it is a different sequence of roundings, and this fold's association
         // is exactly what moved draft acceptance 0.84286 -> 0.77966 once
-        // before (see the SEED THE FOLD note above). Two more preconditions
-        // are outside this file's control and must be checked on the box:
-        // vk_device::multi_add requires shaderRoundingModeRTEFloat16, and
-        // MAX_FUSED_ADDS caps the run length.
+        // before (see the SEED THE FOLD note above). MAX_FUSED_ADDS caps the
+        // run length. On Vulkan, multi_add is RTE-gated unless
+        // GGML_VK_MULTI_ADD_F32_NO_RTE=1. Per-device allow-list (same parser
+        // as WP_EXPERT_ARENA_PREFILL): "1" on CUDA disables the {MUL,ADD}
+        // fusion; HIP has no multi_add so this reorder does nothing there.
         //
         // Dense only: the gather arm folds with scatter_add_compact_rows, not
         // ggml_add, so there is no run to make consecutive.
-        static const bool s_fold_last = [] {
-            const char * e = std::getenv("WP_EXPERT_FOLD_LAST");
-            return e != nullptr && e[0] == '1';
-        }();
-        if (s_fold_last && !use_gather) {
+        if (fold_last_enabled_ && !use_gather) {
             for (ggml_tensor * term : fold_terms) {
                 ggml_build_forward_expand(graph, term);
             }
@@ -15908,6 +15932,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_fuse_gate_up_miss += src.n_fuse_gate_up_miss;
     dst.n_fuse_gate_up_experts += src.n_fuse_gate_up_experts;
     dst.fuse_gate_up_counted = dst.fuse_gate_up_counted || src.fuse_gate_up_counted;
+    dst.n_fuse_gate_up_gather += src.n_fuse_gate_up_gather;
     dst.n_arena_hit += src.n_arena_hit;
     dst.n_arena_groups += src.n_arena_groups;
     dst.n_arena_build += src.n_arena_build;

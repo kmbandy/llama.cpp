@@ -279,6 +279,7 @@ bool use_mm_pin(uint32_t n_tokens, bool use_gather, mm_pin_mode mode,
 // is on only for those devices (exact match), and the same list prefixed
 // with "!" ("!Vulkan0") is on for every device except those named. Whitespace
 // around the whole value and around each comma-separated name is ignored.
+// WP_EXPERT_FOLD_LAST uses the same parser (CUDA "1" kills {MUL,ADD} fusion).
 bool parse_arena_prefill_enabled(const char * env, const std::string & device_name);
 
 // ---------------------------------------------------------------------------
