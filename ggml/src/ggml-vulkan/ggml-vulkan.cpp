@@ -2253,6 +2253,11 @@ struct vk_context_struct {
     std::vector<vk_staging_memcpy> out_memcpys;
     std::vector<vk_staging_memset> memsets;
 
+    // Pending contiguous same-type CPY regions, flushed as one vkCmdCopyBuffer.
+    vk_buffer cpy_src;
+    vk_buffer cpy_dst;
+    std::vector<vk::BufferCopy> cpy_regions;
+
     vk_command_pool * p {};
 };
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -2285,6 +2290,7 @@ struct ggml_vk_garbage_collector {
 };
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
+static void ggml_vk_flush_cpy_regions(vk_context& ctx);
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
 static bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint32_t lower_major, uint32_t lower_minor, uint32_t upper_major, uint32_t upper_minor);
@@ -3937,6 +3943,8 @@ static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const 
 
 static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
+
+    ggml_vk_flush_cpy_regions(subctx);
 
     const bool transfer_queue = subctx->p->q->transfer_only;
 
@@ -8772,12 +8780,25 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
 }
 
+static void ggml_vk_flush_cpy_regions(vk_context& ctx) {
+    if (ctx == nullptr || ctx->cpy_regions.empty()) {
+        return;
+    }
+    GGML_ASSERT(ctx->s != nullptr);
+    GGML_ASSERT(ctx->cpy_src != nullptr && ctx->cpy_dst != nullptr);
+    ctx->s->buffer->buf.copyBuffer(ctx->cpy_src->buffer, ctx->cpy_dst->buffer, ctx->cpy_regions);
+    ctx->cpy_regions.clear();
+    ctx->cpy_src.reset();
+    ctx->cpy_dst.reset();
+}
+
 static void ggml_vk_ctx_end(vk_context& ctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
     if (ctx->s == nullptr) {
         return;
     }
 
+    ggml_vk_flush_cpy_regions(ctx);
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
@@ -15727,6 +15748,48 @@ static void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subct
 }
 
 static void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    // Contiguous same-type device copies: vkCmdCopyBuffer. Consecutive copies
+    // that share src/dst buffers become one command with many regions.
+    if (src0->type == dst->type &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+            src0->buffer != nullptr && dst->buffer != nullptr &&
+            subctx != nullptr && subctx->s != nullptr) {
+        vk_buffer src_buf = nullptr;
+        vk_buffer dst_buf = nullptr;
+        size_t src_off = 0;
+        size_t dst_off = 0;
+        if (ctx->device->uma) {
+            ggml_vk_host_get(ctx->device, src0->data, src_buf, src_off);
+            ggml_vk_host_get(ctx->device, dst->data, dst_buf, dst_off);
+        }
+        if (src_buf == nullptr) {
+            auto * src_ctx = (ggml_backend_vk_buffer_context *) src0->buffer->context;
+            src_buf = src_ctx->dev_buffer;
+            src_off = vk_tensor_offset(src0) + src0->view_offs;
+        }
+        if (dst_buf == nullptr) {
+            auto * dst_ctx = (ggml_backend_vk_buffer_context *) dst->buffer->context;
+            dst_buf = dst_ctx->dev_buffer;
+            dst_off = vk_tensor_offset(dst) + dst->view_offs;
+        }
+        const size_t nbytes = ggml_nbytes(src0);
+        if (src_buf != nullptr && dst_buf != nullptr && src_buf != dst_buf &&
+                nbytes > 0 && nbytes == ggml_nbytes(dst) &&
+                src_off + nbytes <= src_buf->size &&
+                dst_off + nbytes <= dst_buf->size) {
+            if (subctx->cpy_src != src_buf || subctx->cpy_dst != dst_buf) {
+                ggml_vk_flush_cpy_regions(subctx);
+                subctx->cpy_src = src_buf;
+                subctx->cpy_dst = dst_buf;
+            }
+            subctx->cpy_regions.push_back(vk::BufferCopy{
+                (vk::DeviceSize) src_off, (vk::DeviceSize) dst_off, (vk::DeviceSize) nbytes });
+            return;
+        }
+    }
+
+    ggml_vk_flush_cpy_regions(subctx);
+
     uint32_t ne = (uint32_t)ggml_nelements(src0);
     if (ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
         // Convert from number of logical elements to 2- or 4-byte units.
