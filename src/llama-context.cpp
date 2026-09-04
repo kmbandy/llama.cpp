@@ -638,12 +638,29 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    // MAD-LAB (2026-09-04): upstream 866322481 "context : disable non-fused GDN and
+    // LID ops" sets auto_fgdn/auto_flid to false, because upstream deleted the
+    // reason to probe. THIS FORK STILL HAS THE NON-FUSED FALLBACKS
+    // (src/models/deepseek4.cpp:1010-1029 for the lightning indexer) and probes
+    // them for backend+device support in resolve_fused_ops(). The b10816 merge
+    // (e4872bc6d) silently took upstream's values through a clean merge, so the
+    // Lightning Indexer probe stopped running entirely -- visible as the missing
+    // "resolving fused Lightning Indexer support:" banner in spine-ds4.log while
+    // the DSV4-HC banner is still there. Restored, with an env escape hatch:
+    //   WP_AUTO_FLID=0 / WP_AUTO_FGDN=0 -> upstream behaviour (forced on, no probe)
+    static const bool s_auto_fgdn = [] {
+        const char * v = std::getenv("WP_AUTO_FGDN"); return v == nullptr || v[0] != '0';
+    }();
+    static const bool s_auto_flid = [] {
+        const char * v = std::getenv("WP_AUTO_FLID"); return v == nullptr || v[0] != '0';
+    }();
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
-    cparams.auto_fgdn    = false;
+    cparams.auto_fgdn    = s_auto_fgdn;
 
     cparams.fused_lid = true;
-    cparams.auto_flid = false;
+    cparams.auto_flid = s_auto_flid;
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;

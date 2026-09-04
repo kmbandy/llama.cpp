@@ -1909,13 +1909,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
 
-        // may apply exp_probs_b_vl is input is from mtmd
+        // vision variant only: routing bias for image tokens
         const bool is_media = ubatch.embd != nullptr;
-        if (is_media) {
-            if (layer.ffn_exp_probs_b_vl) {
-                exp_probs_b = layer.ffn_exp_probs_b_vl;
-            }
-        } else if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+        if (is_media && layer.ffn_exp_probs_b_vl) {
+            exp_probs_b = layer.ffn_exp_probs_b_vl;
+        }
+
+        // MAD-LAB: hash-routed layers are NOT optional in this fork -- they own no
+        // ffn_exp_probs_b at all (load_arch_tensors only creates it in the non-hash
+        // branch), so falling through to the softmax router routes them to garbage.
+        // The b10816 merge turned this into an `else if` behind upstream's DS4-VL
+        // is_media check, which silently softmax-routes layers 0..2 for any embd
+        // batch. Assert instead of routing wrong.
+        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+            GGML_ASSERT(res->t_inp_tokens &&
+                    "DS4 hash layers route by token id; an embd batch cannot be hash-routed");
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
         }
