@@ -11819,9 +11819,13 @@ public:
     // share a process, see the w8803 topology), so a static would leak the
     // first instance's device value onto every other device's queries.
     uint32_t vk_mul_mat_vec_max_cols() const {
+#ifdef GGML_USE_VULKAN
         return is_vulkan_backend()
             ? ggml_backend_vk_get_mul_mat_vec_max_cols(backend_.get())
             : 0;
+#else
+        return 0;
+#endif
     }
 
     bool is_cuda_backend() const {
