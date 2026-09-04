@@ -2650,7 +2650,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
     if (wp_draft_active && !wp_draft_shape_logged) {
         wp_draft_shape_logged = true;
-        const int n_nodes  = gf ? gf->n_nodes : -1;
+        const int n_nodes  = gf ? ggml_graph_n_nodes(gf) : -1;
         const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
         LLAMA_LOG_WARN("wp draft-stats: graph shape (first call) n_nodes=%d n_splits=%d n_tokens=%u\n",
                        n_nodes, n_splits, ubatch.n_tokens);
