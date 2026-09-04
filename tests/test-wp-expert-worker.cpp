@@ -2787,7 +2787,9 @@ static void test_batch_mmid_ids() {
     require(wp_expert_worker::parse_arena_prefill_enabled("Vulkan0", "Vulkan0"),
             "BATCH_MMID allow-list must enable a named Vulkan device");
     require(!wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0", "CPU"),
-            "BATCH_MMID allow-list must not enable CPU");
+            "BATCH_MMID allow-list must not enable CPU unless named");
+    require(wp_expert_worker::parse_arena_prefill_enabled("ROCm0,ROCm1,CUDA0,CPU", "CPU"),
+            "BATCH_MMID allow-list must enable a named CPU device");
 }
 
 static void test_batch_mmid_arena_pack() {
