@@ -1511,8 +1511,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather target features per extract layer; the fused decode encodes and
-                // injects them into the K/V cache at the target positions
+                // gather this chunk's target features, interleaved by extract layer.
+                // (2026-09-04 merge fix: upstream #27310 fuses the encoder into the draft
+                // decode and dropped this resize; this fork still runs the encoder as a
+                // separate llama_encode over features_buf, so the buffer must be sized here.)
+                features_buf.resize((size_t) n_chunk * n_embd_enc);
                 batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
