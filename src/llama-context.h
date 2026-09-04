@@ -523,18 +523,6 @@ private:
     // the scheduler the CURRENT process_ubatch/graph_compute call must drive.
     // Always sched.get() in single-slot mode.
     ggml_backend_sched_t sched_active = nullptr;
-
-    // The scheduler that owns whatever graph result is currently live. EVERY
-    // lookup of a tensor produced by a graph result -- ggml_backend_sched_get_
-    // tensor_backend() for t_logits / t_embd / t_h_nextn, and every build-time
-    // ggml_backend_sched_set_tensor_backend() pin -- must go through this, not
-    // through `sched`. Asking the context's scheduler about a tensor that an
-    // extra slot's scheduler allocated returns nullptr, which is what tripped
-    // GGML_ASSERT(backend_h != nullptr) at the first decode under
-    // WP_GRAPH_RESULT_SLOTS=2. Falls back to `sched` before any slot is chosen.
-    ggml_backend_sched_t sched_cur() const {
-        return sched_active != nullptr ? sched_active : sched.get();
-    }
     uint64_t                   gf_slot_clock     = 0;
     int32_t                    gf_slot_hits      = 0;
     int32_t                    gf_slot_misses    = 0;

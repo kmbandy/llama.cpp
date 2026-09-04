@@ -3179,7 +3179,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract logits
     if (logits.data && t_logits) {
-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_cur(), t_logits);
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
@@ -3193,7 +3193,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract embeddings
     if (embd.data && t_embd) {
-        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_cur(), t_embd);
+        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
         switch (cparams.pooling_type) {
@@ -3248,7 +3248,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract nextn embeddings (hidden state before the final output norm)
     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_cur(), t_h_nextn);
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
         // MAD-LAB: use the width produced by this graph, not a model-wide width.
@@ -3736,7 +3736,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_cur(), t_logits);
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
@@ -3755,7 +3755,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_cur(), t_embd);
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
             switch (cparams.pooling_type) {
@@ -3823,7 +3823,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_cur(), t_h_nextn);
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
                 // MAD-LAB: use the width produced by this graph, not a model-wide width.
@@ -4140,7 +4140,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         // backend; walk view_src to the tensor that owns the buffer.
         ggml_backend_t backend = nullptr;
         for (ggml_tensor * cur = t; cur != nullptr; cur = cur->view_src) {
-            backend = ggml_backend_sched_get_tensor_backend(sched_cur(), cur);
+            backend = ggml_backend_sched_get_tensor_backend(sched.get(), cur);
             if (backend != nullptr) {
                 break;
             }
@@ -4365,10 +4365,6 @@ ggml_cgraph * llama_context::graph_reserve(
         n_outputs = n_tokens;
     }
 
-    // reserve always drives THIS context's scheduler, never a slot's; pin it so
-    // sched_cur() cannot hand a stale slot scheduler to graph_params/pins below
-    sched_active = sched.get();
-
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
@@ -4422,7 +4418,7 @@ llm_graph_params llama_context::graph_params(
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched_cur(),
+        /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
@@ -4539,7 +4535,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     strncmp(name, "hc_ffn", 6) == 0;
 
                 if (ffn_island && ggml_backend_supports_op(backend_paging, cur)) {
-                    ggml_backend_sched_set_tensor_backend(sched_cur(), cur, backend_paging);
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_paging);
                 }
                 // Deliberately skip the generic "norm" -> layer-home pin.
                 return;
@@ -4550,7 +4546,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched_cur(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                         }
                     }
                 }
@@ -5439,9 +5435,6 @@ void llama_context::opt_epoch_iter(
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
                 break;
             }
-
-            // borrows gf_res_prev (slot 0), which belongs to the context scheduler
-            sched_active = sched.get();
 
             auto * res = gf_res_prev.get();
 
