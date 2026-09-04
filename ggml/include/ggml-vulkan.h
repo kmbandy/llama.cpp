@@ -18,6 +18,18 @@ GGML_BACKEND_API int  ggml_backend_vk_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_vk_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total);
 
+// The device's effective mat-vec column cap (mul_mat_vec_max_cols_eff):
+// ggml_vk_mul_mat takes the mat-vec (DMMV) dispatch for GGML_OP_MUL_MAT
+// whenever dst->ne[1] is at or below this value, and the mul_mm (matrix)
+// dispatch otherwise. mul_mm's pipeline/tile and split_k selection are a
+// function of src0's row count (m = ne01), so two mul_mats over the same
+// activation width but a different m (e.g. a fused [2*ne1] weight vs its two
+// unfused [ne1] halves) can pick different split_k and diverge bit-for-bit
+// once both cross into mul_mm; below the cap both take the same per-row-
+// independent mat-vec shader and match exactly regardless of m. Returns 0 if
+// `backend` is not a Vulkan backend.
+GGML_BACKEND_API uint32_t ggml_backend_vk_get_mul_mat_vec_max_cols(ggml_backend_t backend);
+
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);

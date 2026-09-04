@@ -1863,6 +1863,13 @@ struct RequestStats {
     uint64_t n_fuse_gate_up_miss_type = 0;
     uint64_t n_fuse_gate_up_miss_shape = 0;
     uint64_t n_fuse_gate_up_miss_adjacency = 0;
+    // WP_EXPERT_FUSE_GATE_UP_VK_SAFE (default on): a fused mul_mat and the
+    // two mul_mats it replaces must select the SAME Vulkan dispatch kind
+    // (mat-vec vs mul_mm) or their split_k/tile choice can diverge (see the
+    // comment at the call site). Counts requests where fusion was otherwise
+    // eligible but skipped because some selected expert's activation width
+    // exceeded the device's safe mat-vec column cap.
+    uint64_t n_fuse_gate_up_miss_vk_wide = 0;
     uint64_t n_arena_hit   = 0;
     uint64_t n_arena_groups = 0;
     uint64_t n_arena_build = 0;
@@ -2153,6 +2160,7 @@ public:
         n_fuse_gate_up_miss_type_ += request.n_fuse_gate_up_miss_type;
         n_fuse_gate_up_miss_shape_ += request.n_fuse_gate_up_miss_shape;
         n_fuse_gate_up_miss_adjacency_ += request.n_fuse_gate_up_miss_adjacency;
+        n_fuse_gate_up_miss_vk_wide_ += request.n_fuse_gate_up_miss_vk_wide;
         n_arena_hit_ += request.n_arena_hit;
         n_arena_groups_ += request.n_arena_groups;
         n_arena_build_ += request.n_arena_build;
@@ -2400,7 +2408,8 @@ private:
                   << " n_fuse_gate_up_miss_gather=" << n_fuse_gate_up_miss_gather_
                   << " n_fuse_gate_up_miss_type=" << n_fuse_gate_up_miss_type_
                   << " n_fuse_gate_up_miss_shape=" << n_fuse_gate_up_miss_shape_
-                  << " n_fuse_gate_up_miss_adjacency=" << n_fuse_gate_up_miss_adjacency_;
+                  << " n_fuse_gate_up_miss_adjacency=" << n_fuse_gate_up_miss_adjacency_
+                  << " n_fuse_gate_up_miss_vk_wide=" << n_fuse_gate_up_miss_vk_wide_;
         {
             uint64_t captures = 0, replays = 0, fallbacks = 0, cap_newkey = 0, cap_lru = 0;
             if (ggml_backend_cuda_wp_graph_counts != nullptr && probe_backend_ != nullptr &&
@@ -2578,6 +2587,7 @@ private:
     uint64_t          n_fuse_gate_up_miss_type_ = 0;
     uint64_t          n_fuse_gate_up_miss_shape_ = 0;
     uint64_t          n_fuse_gate_up_miss_adjacency_ = 0;
+    uint64_t          n_fuse_gate_up_miss_vk_wide_ = 0;
     uint64_t          n_arena_hit_ = 0;
     uint64_t          n_arena_groups_ = 0;
     uint64_t          n_arena_build_ = 0;
@@ -11798,6 +11808,22 @@ public:
         return name != nullptr && std::strstr(name, "Vulkan") != nullptr;
     }
 
+    // See the comment on ggml_backend_vk_get_mul_mat_vec_max_cols: the device's
+    // mat-vec-vs-mul_mm crossover for a plain GGML_OP_MUL_MAT. A fused
+    // gate|up mul_mat (m = 2*gate_ne1) and its two unfused halves (m =
+    // gate_ne1 each) only compute the same result once the activation width
+    // exceeds this and BOTH sides cross into mul_mm, whose pipeline/split_k
+    // is chosen from m; below it, both take the row-independent mat-vec
+    // shader regardless of m. NOT cached with a function-local static: this
+    // worker process hosts one instance per device (CUDA0/Vulkan0/CPU can
+    // share a process, see the w8803 topology), so a static would leak the
+    // first instance's device value onto every other device's queries.
+    uint32_t vk_mul_mat_vec_max_cols() const {
+        return is_vulkan_backend()
+            ? ggml_backend_vk_get_mul_mat_vec_max_cols(backend_.get())
+            : 0;
+    }
+
     bool is_cuda_backend() const {
         const char * name = ggml_backend_name(backend_.get());
         if (name == nullptr) {
@@ -13859,21 +13885,13 @@ private:
                 }
             }
         }
-        const bool fuse_gate_up =
-            s_fuse_gate_up && fuse_diag.reason == FuseGateUpReason::Ok;
-        if (s_fuse_gate_up) {
-            if (fuse_gate_up) {
-                request_stats.n_fuse_gate_up_experts += n_selected;
-            } else if (!request_stats.fuse_gate_up_counted) {
-                ++request_stats.n_fuse_gate_up_miss;
-            }
-            request_stats.fuse_gate_up_counted = true;
-        }
-        if (fuse_gate_up && use_gather) {
-            ++request_stats.n_fuse_gate_up_gather;
-        }
         uint32_t gather_rank = 0;
         bool     gather_rank_uniform = !use_gather;
+        // Widest per-expert activation this request will actually run a
+        // mul_mat over -- io_cols for the dense path, the largest gathered
+        // idx count (post mmvq padding) for gather. Needed before deciding
+        // fuse_gate_up below: see WP_EXPERT_FUSE_GATE_UP_VK_SAFE.
+        uint32_t max_expert_width = use_gather ? 0 : io_cols;
         if (use_gather) {
             gather_rank_uniform = true;
             for (size_t i = 0; i < request.assignments.size(); ++i) {
@@ -13885,14 +13903,72 @@ private:
                 if (pad_mmvq) {
                     k = mm_pin_pad_cols(k);
                 }
+                max_expert_width = std::max(max_expert_width, k);
                 if (gather_rank == 0) {
                     gather_rank = k;
                 } else if (k != gather_rank) {
                     gather_rank_uniform = false;
                     gather_rank = 0;
-                    break;
                 }
+                // NOTE: cannot break early on the first non-uniform width
+                // (as the pre-VK_SAFE version did) -- max_expert_width needs
+                // every selected expert's width, not just the first mismatch.
             }
+        }
+        // *** WP_EXPERT_FUSE_GATE_UP_VK_SAFE (default ON). ***
+        // ggml_vk_mul_mat (ggml-vulkan.cpp) dispatches GGML_OP_MUL_MAT as a
+        // per-row-independent mat-vec (DMMV) shader when the activation width
+        // (dst->ne[1]) is <= the device's mul_mat_vec_max_cols_eff, and as a
+        // mul_mm (matrix) shader above that. mul_mm's pipeline tile and
+        // split_k are chosen from src0's row count m (ggml_vk_guess_split_k,
+        // ggml_vk_guess_matmul_pipeline): m = 2*gate_ne1 for the fused
+        // [gate|up] weight vs m = gate_ne1 for each unfused half. Below the
+        // cap, fused and unfused both take the same mat-vec shader and are
+        // bit-identical regardless of m (each row's own reduction never
+        // depends on how many total rows/columns the dispatch has -- see the
+        // fuse_gate_up comment above and the DMMV shader itself). Above the
+        // cap, fused (m=896 for this model) and unfused (m=448) can pick
+        // DIFFERENT split_k for the SAME K reduction, and FP addition is not
+        // associative, so the two paths diverge bit-for-bit even though the
+        // math is "the same". This only bites on wide gathered activations,
+        // which happens in PREFILL when one expert receives more than
+        // mul_mat_vec_max_cols_eff routed tokens out of a chunk -- decode
+        // (1-8 tokens/expert) is always within the cap and unaffected.
+        // Measured 2026-09-04 (arm g141, RX480/RADV/GCN, cap=16): fusing
+        // unconditionally changed the model's prose output vs the unfused
+        // reference (md5 3149253a vs f53b0214) while leaving prompts whose
+        // widest expert stayed <=16 unchanged (code prompt md5 5787b02d
+        // identical either way) -- exactly the mat-vec/mul_mm split above.
+        // Fix: skip fusion for a request whenever ANY selected expert's
+        // activation width would exceed the cap, so the whole request's
+        // fused-vs-unfused choice is uniform (matches the D2/gather_rank
+        // cache key, which is keyed per request, not per expert) and every
+        // mul_mat this worker issues on Vulkan stays on the side of the
+        // mat-vec/mul_mm split that the unfused path would also take.
+        // vk_mul_mat_vec_max_cols() returns 0 off-Vulkan, so this is a no-op
+        // there; WP_EXPERT_FUSE_GATE_UP_VK_SAFE=0 restores the unconditional
+        // (unsafe on Vulkan) behavior for A/B measurement.
+        static const bool s_fuse_gate_up_vk_safe =
+            parse_env_default_on(std::getenv("WP_EXPERT_FUSE_GATE_UP_VK_SAFE"));
+        const uint32_t vk_mmv_cap = s_fuse_gate_up_vk_safe ? vk_mul_mat_vec_max_cols() : 0;
+        const bool fuse_gate_up_vk_wide =
+            vk_mmv_cap > 0 && max_expert_width > vk_mmv_cap;
+        const bool fuse_gate_up =
+            s_fuse_gate_up && fuse_diag.reason == FuseGateUpReason::Ok &&
+            !fuse_gate_up_vk_wide;
+        if (s_fuse_gate_up) {
+            if (fuse_gate_up_vk_wide && fuse_diag.reason == FuseGateUpReason::Ok) {
+                ++request_stats.n_fuse_gate_up_miss_vk_wide;
+            }
+            if (fuse_gate_up) {
+                request_stats.n_fuse_gate_up_experts += n_selected;
+            } else if (!request_stats.fuse_gate_up_counted) {
+                ++request_stats.n_fuse_gate_up_miss;
+            }
+            request_stats.fuse_gate_up_counted = true;
+        }
+        if (fuse_gate_up && use_gather) {
+            ++request_stats.n_fuse_gate_up_gather;
         }
         record_vk_setup();
         GraphCacheEntry * gc = nullptr;
@@ -17474,6 +17550,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_fuse_gate_up_miss_type += src.n_fuse_gate_up_miss_type;
     dst.n_fuse_gate_up_miss_shape += src.n_fuse_gate_up_miss_shape;
     dst.n_fuse_gate_up_miss_adjacency += src.n_fuse_gate_up_miss_adjacency;
+    dst.n_fuse_gate_up_miss_vk_wide += src.n_fuse_gate_up_miss_vk_wide;
     dst.n_arena_hit += src.n_arena_hit;
     dst.n_arena_groups += src.n_arena_groups;
     dst.n_arena_build += src.n_arena_build;
