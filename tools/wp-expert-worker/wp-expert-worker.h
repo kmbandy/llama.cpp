@@ -125,7 +125,7 @@ FuseGateUpDiag classify_fuse_gate_up(const FuseGateUpCheck & check);
 const char *   fuse_gate_up_reason_name(FuseGateUpReason reason);
 std::string    format_fuse_gate_up_reason(const FuseGateUpDiag & diag);
 // "gate" then "up" then the other names in `names` order. Unchanged if either
-// role is missing. Used by WP_EXPERT_FUSE_GATE_UP_LAYOUT=1.
+// role is missing. Used by WP_EXPERT_FUSE_GATE_UP_LAYOUT (per-device allow-list).
 std::vector<std::string> fuse_gate_up_layout_names(
         const std::vector<std::string> & names);
 
@@ -341,6 +341,9 @@ uint32_t mm_pin_pad_cols(uint32_t n_tokens);
 // around the whole value and around each comma-separated name is ignored.
 // WP_EXPERT_FOLD_LAST uses the same parser (CUDA "1" kills {MUL,ADD} fusion).
 // WP_EXPERT_BATCH_MMID uses the same parser.
+// WP_EXPERT_FUSE_GATE_UP_LAYOUT uses the same parser: "1" reorders every
+// device's slot to gate then up then the rest; a list (e.g. "Vulkan0,CPU")
+// reorders only those devices so CUDA H2D does not chunk.
 bool parse_arena_prefill_enabled(const char * env, const std::string & device_name);
 
 // ---------------------------------------------------------------------------
