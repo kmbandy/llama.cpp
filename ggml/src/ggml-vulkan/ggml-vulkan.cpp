@@ -426,6 +426,7 @@ class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static void ggml_vk_node_ts_harvest(ggml_backend_vk_context * ctx);
 static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
 static bool ggml_vk_is_empty(ggml_tensor * node);
 
@@ -2337,7 +2338,12 @@ std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
+static bool vk_node_ts_enabled = false;
 static bool vk_enable_sync_logger = false;
+
+static bool vk_want_timestamps() {
+    return vk_perf_logger_enabled || vk_node_ts_enabled;
+}
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -2635,15 +2641,18 @@ struct ggml_backend_vk_context {
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
 
-    // for GGML_VK_PERF_LOGGER
+    // for GGML_VK_PERF_LOGGER and WP_VK_NODE_TS
     std::unique_ptr<vk_perf_logger> perf_logger;
     vk::QueryPool query_pool;
     std::vector<const char *> query_fusion_names;
     std::vector<int> query_fusion_node_count;
     std::vector<ggml_tensor *> query_nodes;
     std::vector<int> query_node_idx;
+    std::vector<ggml_op> query_ops;
     int32_t num_queries {};
     int32_t query_idx {};
+    bool node_ts_pending {};
+    ggml_backend_vk_node_ts node_ts {};
 };
 
 static std::vector<vk::DescriptorPool> & ggml_vk_descriptor_pools(ggml_backend_vk_context * ctx) {
@@ -7946,6 +7955,13 @@ static void ggml_vk_instance_init() {
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+    {
+        const char * e = getenv("WP_VK_NODE_TS");
+        vk_node_ts_enabled = e != nullptr && e[0] == '1';
+        if (vk_node_ts_enabled) {
+            GGML_LOG_INFO("ggml_vulkan: WP_VK_NODE_TS=1 timestamps harvested at synchronize\n");
+        }
+    }
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -18154,7 +18170,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ctx->unsynced_nodes_read.clear();
             ggml_vk_sync_buffers(ctx, compute_ctx);
 
-            if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
+            if (vk_perf_logger_enabled && vk_perf_logger_concurrent && !vk_node_ts_enabled) {
                 ctx->query_node_idx[ctx->query_idx] = node_idx;
                 compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
@@ -18842,6 +18858,11 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
     }
+    if (ctx->query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->query_pool);
+        ctx->query_pool = vk::QueryPool{};
+        ctx->num_queries = 0;
+    }
 }
 
 static int ggml_vk_get_device_count() {
@@ -19319,6 +19340,59 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
+static void ggml_vk_node_ts_attribute(ggml_backend_vk_context * ctx, ggml_op op, uint64_t ns) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            ctx->node_ts.ns_mul_mat += ns;
+            break;
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_GET_ROWS_BACK:
+        case GGML_OP_SET_ROWS:
+            ctx->node_ts.ns_get_rows += ns;
+            break;
+        case GGML_OP_GLU:
+            ctx->node_ts.ns_swiglu += ns;
+            break;
+        case GGML_OP_ADD:
+        case GGML_OP_ADD1:
+            ctx->node_ts.ns_add += ns;
+            break;
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+            ctx->node_ts.ns_cpy += ns;
+            break;
+        default:
+            ctx->node_ts.ns_other += ns;
+            break;
+    }
+    ctx->node_ts.n_dispatches += 1;
+}
+
+static void ggml_vk_node_ts_harvest(ggml_backend_vk_context * ctx) {
+    if (!vk_node_ts_enabled || !ctx->node_ts_pending) {
+        ctx->node_ts_pending = false;
+        return;
+    }
+    ctx->node_ts_pending = false;
+    if (!ctx->query_pool || ctx->query_idx <= 1) {
+        return;
+    }
+    std::vector<uint64_t> timestamps((size_t) ctx->query_idx);
+    VK_CHECK(ctx->device->device.getQueryPoolResults(
+                 ctx->query_pool, 0, ctx->query_idx,
+                 (size_t) ctx->query_idx * sizeof(uint64_t), timestamps.data(),
+                 sizeof(uint64_t),
+                 vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+             "WP_VK_NODE_TS getQueryPoolResults", ctx->device);
+    const double period = ctx->device->properties.limits.timestampPeriod;
+    for (int32_t i = 1; i < ctx->query_idx; ++i) {
+        const uint64_t ns = (uint64_t) ((timestamps[i] - timestamps[i - 1]) * period);
+        const ggml_op op = (i < (int32_t) ctx->query_ops.size()) ? ctx->query_ops[i] : GGML_OP_NONE;
+        ggml_vk_node_ts_attribute(ctx, op, ns);
+    }
+}
+
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
@@ -19409,6 +19483,8 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+
+    ggml_vk_node_ts_harvest(ctx);
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -19418,6 +19494,23 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
+}
+
+bool ggml_backend_vk_node_ts_enabled(void) {
+    return vk_node_ts_enabled;
+}
+
+void ggml_backend_vk_node_ts_take(ggml_backend_t backend, struct ggml_backend_vk_node_ts * out) {
+    if (out == nullptr) {
+        return;
+    }
+    *out = ggml_backend_vk_node_ts{};
+    if (!vk_node_ts_enabled || backend == nullptr || !ggml_backend_is_vk(backend)) {
+        return;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    *out = ctx->node_ts;
+    ctx->node_ts = ggml_backend_vk_node_ts{};
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -20020,7 +20113,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_submit_transfer_ctx(ctx);
 
     vk_context compute_ctx;
-    if (vk_perf_logger_enabled) {
+    if (vk_want_timestamps()) {
+        if (ctx->node_ts_pending) {
+            ggml_vk_node_ts_harvest(ctx);
+        }
         // allocate/resize the query pool
         if (ctx->num_queries < cgraph->n_nodes + 1) {
             if (ctx->query_pool) {
@@ -20035,6 +20131,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->query_fusion_node_count.resize(ctx->num_queries);
             ctx->query_nodes.resize(ctx->num_queries);
             ctx->query_node_idx.resize(ctx->num_queries);
+            ctx->query_ops.resize(ctx->num_queries, GGML_OP_NONE);
         }
 
         ctx->device->device.resetQueryPool(ctx->query_pool, 0, cgraph->n_nodes+1);
@@ -20042,10 +20139,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_fusion_node_count.begin(), ctx->query_fusion_node_count.end(), 0);
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
+        std::fill(ctx->query_ops.begin(), ctx->query_ops.end(), GGML_OP_NONE);
 
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
+        ctx->query_ops[0] = GGML_OP_NONE;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
@@ -20418,16 +20517,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
-        if (vk_perf_logger_enabled && enqueued) {
+        if (vk_want_timestamps() && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
-            if (!vk_perf_logger_concurrent) {
-                // track a single node/fusion for the current query
+            const bool per_node = vk_node_ts_enabled || !vk_perf_logger_concurrent;
+            if (per_node) {
                 ctx->query_nodes[ctx->query_idx] = cgraph->nodes[i];
                 ctx->query_fusion_names[ctx->query_idx] = fusion_string;
+                ctx->query_ops[ctx->query_idx] = cgraph->nodes[i]->op;
                 compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
             } else {
-                // track a fusion string and number of fused ops for the current node_idx
                 ctx->query_fusion_names[i] = fusion_string;
                 ctx->query_fusion_node_count[i] = ctx->num_additional_fused_ops;
             }
@@ -20453,7 +20552,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->last_total_flops = total_flops;
 
-    if (vk_perf_logger_enabled) {
+    if (vk_node_ts_enabled) {
+        // Flush any timestamp writes sitting in an open command buffer. No fence:
+        // the existing synchronize wait covers this submit.
+        if (!ctx->compute_ctx.expired()) {
+            compute_ctx = ctx->compute_ctx.lock();
+            ggml_vk_ctx_end(compute_ctx);
+            ggml_vk_submit(compute_ctx, {});
+            ctx->submit_pending = true;
+            ctx->compute_ctx.reset();
+        }
+        ctx->node_ts_pending = ctx->query_idx > 1;
+    } else if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
         GGML_ASSERT(!ctx->compute_ctx.expired());
         compute_ctx = ctx->compute_ctx.lock();
@@ -20541,7 +20651,7 @@ static ggml_backend_graph_plan_t ggml_backend_vk_graph_plan_create(
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
     if (cgraph == nullptr || ctx->recording_plan != nullptr ||
             !ctx->device->support_async || ctx->device->serialize_submissions ||
-            vk_perf_logger_enabled || !ctx->compute_ctx.expired() ||
+            vk_perf_logger_enabled || vk_node_ts_enabled || !ctx->compute_ctx.expired() ||
             ctx->submit_pending || ctx->fence_submitted) {
         return nullptr;
     }
