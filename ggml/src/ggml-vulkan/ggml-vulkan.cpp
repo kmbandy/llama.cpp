@@ -21141,6 +21141,14 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
     ggml_vk_get_device_description(dev_idx, description, description_size);
 }
 
+uint32_t ggml_backend_vk_get_mul_mat_vec_max_cols(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_vk(backend)) {
+        return 0;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    return ctx->device->mul_mat_vec_max_cols_eff;
+}
+
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
