@@ -4053,11 +4053,34 @@ static bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
                 return true;
             }
         }
-        if (ggml_cuda_is_view_or_noop(node)) {
-            continue;
-        }
-        if (node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] > 32) {
-            return true;
+        // Token-width rules per op. A blanket "any 2-D node wider than 32"
+        // test also caught decode fragments (recurrent-state copies are 2-D
+        // and wide), which halved graph replays on decode; scope it to ops
+        // whose 2-D output is [n, n_tokens].
+        switch (node->op) {
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_NORM:
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_GLU:
+            case GGML_OP_ADD:
+            case GGML_OP_MUL:
+            case GGML_OP_SCALE:
+                if (node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] > 32) {
+                    return true;
+                }
+                break;
+            case GGML_OP_ROPE:
+                if (node->ne[2] > 32) {
+                    return true;
+                }
+                break;
+            case GGML_OP_SSM_CONV:
+                if (node->ne[1] > 32) {
+                    return true;
+                }
+                break;
+            default:
+                break;
         }
     }
     return false;
@@ -6177,16 +6200,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 auto & c = ggml_cuda_wp_graph_counts[cuda_ctx->device];
                 c.captures.fetch_add(1, std::memory_order_relaxed);
                 if (wp_alloc_log_enabled()) {
-                    int64_t max_ne1_2d = 0; int n_mm = 0, n_mmid = 0;
+                    int64_t max_ne1_2d = 0; int n_mm = 0, n_mmid = 0; const ggml_tensor * widest = nullptr;
+                    int64_t max_ne1_2d_op = 0; const ggml_tensor * widest_op = nullptr;
                     for (int i = 0; i < cgraph->n_nodes; ++i) {
                         const ggml_tensor * t = cgraph->nodes[i];
                         if (t->op == GGML_OP_MUL_MAT) { ++n_mm; }
                         if (t->op == GGML_OP_MUL_MAT_ID) { ++n_mmid; }
-                        if (t->ne[2] == 1 && t->ne[3] == 1 && t->ne[1] > max_ne1_2d) { max_ne1_2d = t->ne[1]; }
+                        if (t->ne[2] == 1 && t->ne[3] == 1 && t->ne[1] > max_ne1_2d) { max_ne1_2d = t->ne[1]; widest = t; }
+                        if (!ggml_cuda_is_view_or_noop(t) && t->ne[2] == 1 && t->ne[3] == 1 && t->ne[1] > max_ne1_2d_op) { max_ne1_2d_op = t->ne[1]; widest_op = t; }
                     }
                     wp_alloc_log("graph_capture", cuda_ctx->device, (size_t) cgraph->n_nodes, (size_t) max_ne1_2d);
-                    fprintf(stderr, "wp alloc-log   capture detail: n_nodes=%d n_mul_mat=%d n_mul_mat_id=%d max_ne1_2d=%lld\n",
-                            cgraph->n_nodes, n_mm, n_mmid, (long long) max_ne1_2d);
+                    fprintf(stderr, "wp alloc-log   capture detail: n_nodes=%d n_mul_mat=%d n_mul_mat_id=%d max_ne1_2d=%lld op=%s name=%s | widest non-view: %lld op=%s name=%s ne0=%lld\n",
+                            cgraph->n_nodes, n_mm, n_mmid, (long long) max_ne1_2d,
+                            widest ? ggml_op_name(widest->op) : "-", widest ? widest->name : "-",
+                            (long long) max_ne1_2d_op, widest_op ? ggml_op_name(widest_op->op) : "-",
+                            widest_op ? widest_op->name : "-", widest_op ? (long long) widest_op->ne[0] : 0);
                 }
                 // Consume the reason: it is assigned on INSERT and must be
                 // counted exactly once, by the capture that the insert caused.
