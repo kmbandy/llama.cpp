@@ -20139,9 +20139,17 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     //   32 ns_prologue  33 ns_prep  34 ns_wait  35 ns_pagein_compute
     //   36 ns_graph_build  37 ns_submit  38 ns_result
     //   39 ns_final_sync  40 ns_readback
-    //   41 chunk_index (stream rows only)
-    // The aggregate file is unchanged. WP_REQ_LOG_HEADER=1 writes a commented
-    // header row as the first line of each file.
+    //   41 ns_leg_unique
+    //   42 chunk_index (stream rows only)
+    // NESTED COLUMNS (do not sum 32-40 as a device-leg wall):
+    //   ns_pagein_compute (35) already contains ns_graph_build (36) + ns_submit (37)
+    //     and, when a prior async graph is drained mid-chunk, some ns_final_sync (39).
+    //   ns_result (38) already contains the last ns_final_sync (39) + ns_readback (40)
+    //     because read_result() calls synchronize_async then tensor_get.
+    // ns_leg_unique (41) is the unique sequential wall:
+    //   prologue + prep + wait + pagein_compute + result (cols 32,33,34,35,38).
+    // Columns 1-40 keep their positions. The aggregate file is unchanged.
+    // WP_REQ_LOG_HEADER=1 writes a commented header row as the first line of each file.
     static const char * const k_req_log_header =
         "layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep "
         "ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit "
@@ -20150,7 +20158,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         "ns_final_sync";
     static const char * const k_req_log_header_dev =
         " n_experts_on_device n_pagein_on_device ns_prologue ns_prep ns_wait "
-        "ns_pagein_compute ns_graph_build ns_submit ns_result ns_final_sync ns_readback";
+        "ns_pagein_compute ns_graph_build ns_submit ns_result ns_final_sync ns_readback "
+        "ns_leg_unique";
     const bool req_log_header = [] {
         const char * e = std::getenv("WP_REQ_LOG_HEADER");
         return e != nullptr && e[0] == '1';
@@ -20215,7 +20224,13 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 (unsigned long long) s.ns_ensure_post,
                 (unsigned long long) s.ns_final_sync);
         if (extra) {
-            fprintf(out, " %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+            const unsigned long long ns_leg_unique =
+                (unsigned long long) s.ns_prologue +
+                (unsigned long long) s.ns_prep +
+                (unsigned long long) s.ns_wait +
+                (unsigned long long) s.ns_pagein_compute +
+                (unsigned long long) s.ns_result;
+            fprintf(out, " %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
                     n_assignments,
                     (unsigned long long) s.n_pagein,
                     (unsigned long long) s.ns_prologue,
@@ -20226,7 +20241,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     (unsigned long long) s.ns_submit,
                     (unsigned long long) s.ns_result,
                     (unsigned long long) s.ns_final_sync,
-                    (unsigned long long) s.ns_readback);
+                    (unsigned long long) s.ns_readback,
+                    ns_leg_unique);
         }
         fprintf(out, "%s\n", chunk_suffix);
         fflush(out);
