@@ -127,6 +127,21 @@ GGML_BACKEND_API bool ggml_backend_vk_wp_fused_expert(
         const struct ggml_backend_vk_wp_fused_expert_params * params,
         struct ggml_backend_vk_wp_fused_expert_stats * stats);
 
+// WP_VK_NODE_TS=1: per-node GPU timestamps recorded in graph_compute without
+// a fence there, harvested at the existing synchronize fence wait. Default off.
+struct ggml_backend_vk_node_ts {
+    uint64_t ns_mul_mat;
+    uint64_t ns_get_rows;
+    uint64_t ns_swiglu;
+    uint64_t ns_add;
+    uint64_t ns_cpy;
+    uint64_t ns_other;
+    uint64_t n_dispatches;
+};
+
+GGML_BACKEND_API bool ggml_backend_vk_node_ts_enabled(void);
+GGML_BACKEND_API void ggml_backend_vk_node_ts_take(ggml_backend_t backend, struct ggml_backend_vk_node_ts * out);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
 #ifdef  __cplusplus

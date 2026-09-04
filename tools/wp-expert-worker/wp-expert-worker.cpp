@@ -1812,6 +1812,13 @@ struct RequestStats {
     uint64_t ns_vk_setup = 0;      // compute_batch entry -> D2 cache lookup
     uint64_t ns_vk_rebind = 0;     // D2 hit: attach_weight + routing repack
     uint64_t ns_vk_layer_ahead = 0;// submit_prefill_layer_ahead
+    uint64_t ns_vk_op_mul_mat = 0;
+    uint64_t ns_vk_op_get_rows = 0;
+    uint64_t ns_vk_op_swiglu = 0;
+    uint64_t ns_vk_op_add = 0;
+    uint64_t ns_vk_op_cpy = 0;
+    uint64_t ns_vk_op_other = 0;
+    uint64_t n_vk_dispatches = 0;
     uint64_t ns_prep = 0;
     uint64_t ns_prep_setup = 0;   // ggml_init + new_tensor + buft queries
     uint64_t ns_prep_grow = 0;    // grow_io_buffer (device alloc when it grows)
@@ -2126,6 +2133,13 @@ public:
         ns_vk_setup_ += request.ns_vk_setup;
         ns_vk_rebind_ += request.ns_vk_rebind;
         ns_vk_layer_ahead_ += request.ns_vk_layer_ahead;
+        ns_vk_op_mul_mat_ += request.ns_vk_op_mul_mat;
+        ns_vk_op_get_rows_ += request.ns_vk_op_get_rows;
+        ns_vk_op_swiglu_ += request.ns_vk_op_swiglu;
+        ns_vk_op_add_ += request.ns_vk_op_add;
+        ns_vk_op_cpy_ += request.ns_vk_op_cpy;
+        ns_vk_op_other_ += request.ns_vk_op_other;
+        n_vk_dispatches_ += request.n_vk_dispatches;
         n_gcache_hit_ += request.n_gcache_hit;
         n_gcache_miss_ += request.n_gcache_miss;
         n_fuse_gate_up_hit_ += request.n_fuse_gate_up_hit;
@@ -2366,6 +2380,13 @@ private:
                   << " ns_vk_setup=" << ns_vk_setup_
                   << " ns_vk_rebind=" << ns_vk_rebind_
                   << " ns_vk_layer_ahead=" << ns_vk_layer_ahead_
+                  << " ns_vk_op_mul_mat=" << ns_vk_op_mul_mat_
+                  << " ns_vk_op_get_rows=" << ns_vk_op_get_rows_
+                  << " ns_vk_op_swiglu=" << ns_vk_op_swiglu_
+                  << " ns_vk_op_add=" << ns_vk_op_add_
+                  << " ns_vk_op_cpy=" << ns_vk_op_cpy_
+                  << " ns_vk_op_other=" << ns_vk_op_other_
+                  << " n_vk_dispatches=" << n_vk_dispatches_
                   << " gcache_hit=" << n_gcache_hit_
                   << " gcache_miss=" << n_gcache_miss_
                   << " n_fuse_gate_up_hit=" << n_fuse_gate_up_hit_
@@ -2535,6 +2556,13 @@ private:
     uint64_t          ns_vk_setup_ = 0;
     uint64_t          ns_vk_rebind_ = 0;
     uint64_t          ns_vk_layer_ahead_ = 0;
+    uint64_t          ns_vk_op_mul_mat_ = 0;
+    uint64_t          ns_vk_op_get_rows_ = 0;
+    uint64_t          ns_vk_op_swiglu_ = 0;
+    uint64_t          ns_vk_op_add_ = 0;
+    uint64_t          ns_vk_op_cpy_ = 0;
+    uint64_t          ns_vk_op_other_ = 0;
+    uint64_t          n_vk_dispatches_ = 0;
     uint64_t          n_gcache_hit_ = 0;
     uint64_t          n_gcache_miss_ = 0;
     uint64_t          n_fuse_gate_up_hit_ = 0;
@@ -10068,6 +10096,14 @@ public:
                          "(WP_EXPERT_FUSE_GATE_UP_LAYOUT=%s) device=%s enabled=%d\n",
                          layout_e != nullptr ? layout_e : "", device_name_.c_str(),
                          (int) fuse_layout);
+            if (is_vulkan_backend()) {
+                const char * ts_e = std::getenv("WP_VK_NODE_TS");
+                std::fprintf(stderr,
+                             "wp expert worker: node-ts (WP_VK_NODE_TS=%s) "
+                             "device=%s enabled=%d\n",
+                             ts_e != nullptr ? ts_e : "", device_name_.c_str(),
+                             (int) ggml_backend_vk_node_ts_enabled());
+            }
             mm_pin_mode_ = parse_mm_pin_mode(
                 std::getenv("WP_EXPERT_MM_PIN"), device_name_);
             mm_pin_min_tokens_ = parse_mm_pin_min_tokens(
@@ -11915,6 +11951,24 @@ private:
         }
     }
 
+    void take_vk_node_ts(RequestStats * request_stats) {
+        if (!is_vulkan_backend() || !ggml_backend_is_vk(backend_.get())) {
+            return;
+        }
+        ggml_backend_vk_node_ts ts{};
+        ggml_backend_vk_node_ts_take(backend_.get(), &ts);
+        if (request_stats == nullptr) {
+            return;
+        }
+        request_stats->ns_vk_op_mul_mat += ts.ns_mul_mat;
+        request_stats->ns_vk_op_get_rows += ts.ns_get_rows;
+        request_stats->ns_vk_op_swiglu += ts.ns_swiglu;
+        request_stats->ns_vk_op_add += ts.ns_add;
+        request_stats->ns_vk_op_cpy += ts.ns_cpy;
+        request_stats->ns_vk_op_other += ts.ns_other;
+        request_stats->n_vk_dispatches += ts.n_dispatches;
+    }
+
     void synchronize_async(RequestStats * request_stats) {
         if (!submit_async_) {
             return;
@@ -11925,6 +11979,7 @@ private:
         }
         const auto started = std::chrono::steady_clock::now();
         ggml_backend_synchronize(backend_.get());
+        take_vk_node_ts(request_stats);
         const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
         finalize_work_input_expected();
@@ -12183,6 +12238,9 @@ private:
         request_stats.ns_submit += elapsed;
         if (stats_.enabled() && is_vulkan_backend()) {
             request_stats.ns_vk_graph_compute += elapsed;
+        }
+        if (!submit_async_) {
+            take_vk_node_ts(&request_stats);
         }
         ++request_stats.n_graph_submits;
         return status;
@@ -14388,6 +14446,7 @@ private:
             }
             throw std::runtime_error("batched expert backend graph compute failed");
         }
+        record_vk_compute();
         if (gc != nullptr) {
             gc->graph = graph;
             if (wp_persistent_graphs_enabled() && is_vulkan_backend()) {
@@ -17312,6 +17371,13 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.ns_vk_setup += src.ns_vk_setup;
     dst.ns_vk_rebind += src.ns_vk_rebind;
     dst.ns_vk_layer_ahead += src.ns_vk_layer_ahead;
+    dst.ns_vk_op_mul_mat += src.ns_vk_op_mul_mat;
+    dst.ns_vk_op_get_rows += src.ns_vk_op_get_rows;
+    dst.ns_vk_op_swiglu += src.ns_vk_op_swiglu;
+    dst.ns_vk_op_add += src.ns_vk_op_add;
+    dst.ns_vk_op_cpy += src.ns_vk_op_cpy;
+    dst.ns_vk_op_other += src.ns_vk_op_other;
+    dst.n_vk_dispatches += src.n_vk_dispatches;
     dst.ns_readback += src.ns_readback;
     dst.ns_prep += src.ns_prep;
     dst.ns_prep_setup += src.ns_prep_setup;
