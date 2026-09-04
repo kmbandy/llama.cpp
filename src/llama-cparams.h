@@ -73,6 +73,7 @@ struct llama_cparams {
     std::vector<bool> embeddings_layer_inp_external;
 
     enum llama_context_type ctx_type;
+    enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

@@ -29,7 +29,7 @@ static bool dsv4_has_dspark_head(const llama_model_loader & ml) {
 // WP_N_EXPERT_USED: softmax-layer top-k override (default = trained k). Hash
 // layers keep the tid2eid width so HELLO/worker hparams stay matched.
 static int32_t ds4_n_expert_used(const llama_hparams & hparams, int il) {
-    const int32_t trained = (int32_t) hparams.n_expert_used;
+    const int32_t trained = (int32_t) hparams.n_expert_used();
     if (il >= 0 && (uint32_t) il < hparams.dsv4_hash_layer_count) {
         return trained;
     }
@@ -104,7 +104,7 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
 
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
@@ -182,6 +182,9 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     }
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
+    // tokens of an image span attend bidirectionally to the whole span, the window only applies to older tokens
+    // ref: get_window_topk_idxs_visible in the reference impl
+    hparams.non_causal_type = LLAMA_NON_CAUSAL_TYPE_SWA_FULL;
     for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
         hparams.is_swa_impl[il] = true;
     }
@@ -203,7 +206,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
-    const int64_t n_ff_exp        = hparams.n_ff_exp;
+    const int64_t n_ff_exp        = hparams.n_ff_exp();
     const int64_t n_expert_shared = hparams.n_expert_shared;
 
     const int64_t n_embd_head = hparams.n_embd_head_k();
@@ -283,6 +286,8 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         } else {
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, flags);
         }
+        // vision variant only: routing bias for image tokens
+        layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, flags | TENSOR_NOT_REQUIRED);
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
         // expert_flags is OURS: with cross-machine dispatch the routed experts live
@@ -1131,7 +1136,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     q = dsv4_turbo_rotate_q(ctx0, q, k_all, mctx_raw->get_turbo_innerq_scale_inv());
 
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -1188,7 +1194,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
 
     q = dsv4_turbo_rotate_q(ctx0, q, k_all, mctx_raw->get_turbo_innerq_scale_inv());
 
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -1226,7 +1232,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
 
     q = dsv4_turbo_rotate_q(ctx0, q, k, mctx_cur->get_turbo_innerq_scale_inv());
 
-    ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -1902,7 +1908,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+
+        // may apply exp_probs_b_vl is input is from mtmd
+        const bool is_media = ubatch.embd != nullptr;
+        if (is_media) {
+            if (layer.ffn_exp_probs_b_vl) {
+                exp_probs_b = layer.ffn_exp_probs_b_vl;
+            }
+        } else if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
         }

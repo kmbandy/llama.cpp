@@ -54,6 +54,7 @@
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
+#define GGML_CUDA_CC_ORIN            870
 #define GGML_CUDA_CC_ADA_LOVELACE    890
 #define GGML_CUDA_CC_HOPPER          900
 // While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
@@ -1638,6 +1639,7 @@ struct ggml_cuda_mm_fusion_args_host {
     float gate_clamp_max = 0.0f;
     bool use_clamp = false;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1651,6 +1653,7 @@ struct ggml_cuda_mm_fusion_args_device {
     float gate_clamp_max = 0.0f;
     bool use_clamp = false;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {

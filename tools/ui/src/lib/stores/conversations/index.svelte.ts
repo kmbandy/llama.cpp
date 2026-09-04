@@ -168,15 +168,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		if (convIds.length === 0) return;
 
 		try {
-			const fetched = await DatabaseService.getConversationsWithMessages(convIds);
-			const activeId = this.activeConversation?.id;
-			const overridden = fetched.get(activeId ?? '');
-
-			if (overridden && activeId) {
-				overridden.conv = { ...this.activeConversation! };
-			}
-
-			const exported = [...fetched.values()];
+			const exported = await this.getConversationsForExport(convIds);
 
 			if (exported.length === 0) {
 				toast.error('No conversations to export');
@@ -251,12 +243,15 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	 */
 	async createConversation(name?: string): Promise<string> {
 		const conversationName = name || `Chat ${new Date().toLocaleString()}`;
-		// Working directory and reasoning effort picked on the new-chat screen
-		// get threaded into the new conversation here, then cleared so they
-		// don't bleed onto subsequent new chats.
+		// The tool policy is seeded from the current defaults: edits made inside
+		// the conversation afterwards live on its row and do not flow back into
+		// the defaults. Working directory picked on the new-chat screen gets
+		// threaded in here too, then cleared so it doesn't bleed onto subsequent
+		// new chats.
 		const conversation = await DatabaseService.createConversation(conversationName, {
 			cwd: this.preferences.pendingCwd ?? undefined,
-			reasoningEffort: this.preferences.pendingReasoningEffort
+			reasoningEffort: this.preferences.pendingReasoningEffort,
+			...this.preferences.getToolPolicySnapshot()
 		});
 
 		this.preferences.pendingCwd = null;
@@ -362,16 +357,11 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	 * @param convId - The conversation ID to download
 	 */
 	async downloadConversation(convId: string): Promise<void> {
-		const conversation =
-			this.activeConversation?.id === convId
-				? this.activeConversation
-				: await DatabaseService.getConversation(convId);
+		const [exportedConversation] = await this.getConversationsForExport([convId]);
 
-		if (!conversation) return;
+		if (!exportedConversation) return;
 
-		const messages = await DatabaseService.getConversationMessages(convId);
-
-		ConversationTransferService.downloadConversationFile({ conv: conversation, messages });
+		ConversationTransferService.downloadConversationFile(exportedConversation);
 	}
 
 	/**
@@ -448,6 +438,19 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	 */
 	async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
 		return await DatabaseService.getConversationMessages(convId);
+	}
+
+	/**
+	 * Gets conversations and their messages from the database for export.
+	 * @param convIds - Conversation IDs
+	 * @returns List of conversations with messages, ordered by the input IDs
+	 */
+	async getConversationsForExport(convIds: string[]): Promise<ExportedConversation[]> {
+		const fetched = await DatabaseService.getConversationsWithMessages(convIds);
+
+		return convIds
+			.map((id) => fetched.get(id))
+			.filter((entry): entry is ExportedConversation => entry !== undefined);
 	}
 
 	/**
