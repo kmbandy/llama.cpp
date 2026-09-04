@@ -992,7 +992,8 @@ static void pad_mmvq_routing(std::vector<int32_t> & idx, std::vector<float> * we
 
 BatchMmidIds build_batch_mmid_ids(
         const std::vector<std::vector<float>> & weights,
-        bool use_gather) {
+        bool use_gather,
+        bool sparse_pad) {
     BatchMmidIds out;
     out.n_experts = weights.size();
     if (weights.empty()) {
@@ -1049,16 +1050,27 @@ BatchMmidIds build_batch_mmid_ids(
             ++k;
         }
         if (k < k_width) {
-            out.used_pad_expert = true;
-            out.ids[(size_t) t * k_width + k] = (int32_t) n;
-            ++k;
-            for (size_t e = 0; e < n && k < k_width; ++e) {
-                if (used[e]) {
-                    continue;
+            if (sparse_pad) {
+                // CPU: remaining k slots stay -1 / route_w 0. Do not insert
+                // dummy expert n or unused real experts -- those GEMM the
+                // full FFN for tokens that did not route here (g126: 146
+                // routed pairs became 430 computed pairs, 3.6x slower).
+                while (k < k_width) {
+                    out.ids[(size_t) t * k_width + k] = -1;
+                    ++k;
                 }
-                out.ids[(size_t) t * k_width + k] = (int32_t) e;
-                used[e] = 1;
+            } else {
+                out.used_pad_expert = true;
+                out.ids[(size_t) t * k_width + k] = (int32_t) n;
                 ++k;
+                for (size_t e = 0; e < n && k < k_width; ++e) {
+                    if (used[e]) {
+                        continue;
+                    }
+                    out.ids[(size_t) t * k_width + k] = (int32_t) e;
+                    used[e] = 1;
+                    ++k;
+                }
             }
         }
         if (k != k_width) {
@@ -1082,6 +1094,9 @@ bool batch_mmid_ids_valid(const BatchMmidIds & plan) {
         std::vector<uint8_t> seen(n_as, 0);
         for (uint32_t k = 0; k < plan.k_width; ++k) {
             const int32_t id = plan.ids[(size_t) t * plan.k_width + k];
+            if (id == -1) {
+                continue;
+            }
             if (id < 0 || (size_t) id >= n_as || seen[(size_t) id]) {
                 return false;
             }
@@ -14460,11 +14475,13 @@ private:
     // weights in their slots via expert_ptrs. CPU uses the same packed
     // [n_embd, ff, n_as] as_* tensors and the same host expert_ptrs into the
     // CPU slot arena (ggml-cpu indexes src0_cur from the array; no scratch
-    // copy). Vulkan has no routed-expert pointer channel: copy each selected
-    // role into a scratch [ne0,ne1,n_as] arena (row slack from
-    // layout_sliced_pages) and run the same graph over that. Fold is a left
-    // fold over ids-slot k (assignment order per token). Gather pads uneven
-    // rank with unique ids (dummy expert n once, then unused real experts).
+    // copy). CPU gather pads with -1 (not dummy/unused-real experts) so
+    // ggml-cpu GEMMs only routed (expert, token) pairs. Vulkan has no
+    // routed-expert pointer channel: copy each selected role into a scratch
+    // [ne0,ne1,n_as] arena (row slack from layout_sliced_pages) and run the
+    // same graph over that. Fold is a left fold over ids-slot k (assignment
+    // order per token). HIP/CUDA gather pads uneven rank with unique ids
+    // (dummy expert n once, then unused real experts).
     bool compute_batch_mmid(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -14496,7 +14513,9 @@ private:
         for (size_t k = 0; k < n; ++k) {
             weight_rows[k] = request.assignments[sel[k]].weights;
         }
-        const BatchMmidIds plan = build_batch_mmid_ids(weight_rows, use_gather);
+        const bool cpu_mmid = is_cpu_backend();
+        const BatchMmidIds plan = build_batch_mmid_ids(
+            weight_rows, use_gather, /* sparse_pad = */ cpu_mmid);
         if (plan.k_width == 0 || plan.n_tokens != request.n_tokens ||
                 plan.ids.size() != (size_t) plan.k_width * plan.n_tokens ||
                 !batch_mmid_ids_valid(plan)) {
@@ -14535,7 +14554,6 @@ private:
         }
 
         const bool vk_arena = is_vulkan_backend();
-        const bool cpu_mmid = is_cpu_backend();
         const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
         const size_t params_align = std::max<size_t>(
             1, ggml_backend_buft_get_alignment(buft));
@@ -14792,6 +14810,18 @@ private:
         if (ggml_gallocr_get_buffer_size(galloc, 0) > old_compute_size) {
             ++request_stats.n_device_allocs;
         }
+        if (cpu_mmid) {
+            // sparse_pad leaves -1 ids uncomputed; dest must be 0 so
+            // route_w 0 * dest is 0, not 0 * uninitialized.
+            auto zero_mmid = [](ggml_tensor * t) {
+                if (t != nullptr && t->data != nullptr) {
+                    ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+                }
+            };
+            zero_mmid(gate_mmid);
+            zero_mmid(up_mmid);
+            zero_mmid(down_mmid);
+        }
         request_stats.ns_graph_build +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - build_started).count();
@@ -14901,7 +14931,13 @@ private:
             for (float f : wv) { nz += (f != 0.0f); }
             request_stats.n_weight_nonzero += nz;
         }
-        request_stats.n_weight_total += (size_t) plan.k_width * plan.n_tokens;
+        {
+            uint64_t n_computed = 0;
+            for (int32_t id : plan.ids) {
+                n_computed += id >= 0;
+            }
+            request_stats.n_weight_total += n_computed;
+        }
         return true;
     }
 

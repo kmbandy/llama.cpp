@@ -2777,6 +2777,24 @@ static void test_batch_mmid_ids() {
         require(p != 0, "no empty expert pointer slot");
     }
 
+    // CPU sparse_pad: same gather packing, pad with -1, no dummy expert.
+    const auto sp = wp_expert_worker::build_batch_mmid_ids(gather, true, true);
+    require(sp.n_experts == 3 && sp.k_width == 2 && !sp.used_pad_expert,
+            "CPU sparse_pad must not invent a dummy expert");
+    require(sp.ids[0] == 0 && sp.ids[1] == 2 && sp.ids[2] == 2 && sp.ids[3] == -1,
+            "CPU sparse_pad keeps routed ids and pads with -1");
+    require(sp.route_w[3] == 0.0f, "CPU pad slot must have route weight 0");
+    require(wp_expert_worker::batch_mmid_ids_valid(sp) &&
+                wp_expert_worker::batch_mmid_n_as(sp) == 3,
+            "CPU sparse_pad n_as is n_experts, -1 is not an expert");
+    const auto spm = wp_expert_worker::build_batch_mmid_ids(multi_pad, true, true);
+    require(!spm.used_pad_expert && spm.ids[3] == 2 &&
+                spm.ids[4] == -1 && spm.ids[5] == -1,
+            "CPU multi-pad is -1, not dummy n plus unused real 0");
+    require(wp_expert_worker::batch_mmid_ids_valid(spm) &&
+                wp_expert_worker::batch_mmid_n_as(spm) == 3,
+            "CPU multi-pad n_as stays n_experts");
+
     // Same allow-list parser as WP_EXPERT_ARENA_PREFILL.
     require(!wp_expert_worker::parse_arena_prefill_enabled(nullptr, "ROCm0"),
             "unset WP_EXPERT_BATCH_MMID must default off");

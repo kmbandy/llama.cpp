@@ -521,6 +521,10 @@ CompactRouting compact_routing_rows(const std::vector<float> & wv);
 // weight 0, pointer copies expert 0), later pad slots are unused real
 // experts (also weight 0). Duplicate ids per token are never produced --
 // MMQ scatter quantize faults on duplicates.
+//
+// sparse_pad (CPU): pad with -1 instead of dummy/unused-real experts.
+// ggml-cpu skips i02 < 0 so those (expert, token) pairs are not GEMMed.
+// HIP/CUDA must not use this -- scatter-quantize needs unique in-range ids.
 struct BatchMmidIds {
     std::vector<std::vector<int32_t>> expert_rows;
     std::vector<int32_t> ids;
@@ -532,7 +536,8 @@ struct BatchMmidIds {
 };
 BatchMmidIds build_batch_mmid_ids(
         const std::vector<std::vector<float>> & weights,
-        bool use_gather);
+        bool use_gather,
+        bool sparse_pad = false);
 size_t batch_mmid_n_as(const BatchMmidIds & plan);
 bool batch_mmid_ids_valid(const BatchMmidIds & plan);
 void fill_batch_mmid_expert_ptrs(
