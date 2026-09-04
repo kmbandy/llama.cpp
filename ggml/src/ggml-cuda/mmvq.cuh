@@ -6,6 +6,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
+// "batch" is n_tokens (dst->ne[2]/src1->ne[2] of the MUL_MAT_ID call), not
+// n_expert_used. Overridable at runtime via WP_MMVQ_MMID_MAX_BATCH (see
+// mmvq.cu); unset leaves the tuned per-(arch,type) table below untouched.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
