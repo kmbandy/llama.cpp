@@ -1781,6 +1781,48 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // Host expert_ptrs (WP_EXPERT_BATCH_MMID on CPU): src0 is a dummy
+    // [ne0,ne1,n_as] shape; each slice lives at a slot-arena address.
+    // Without this, ggml-cpu reads cur_a*nb02 from expert 0 and is wrong.
+    const void * expert_ptrs = ggml_mul_mat_id_get_expert_ptrs(dst);
+    const int32_t expert_ptrs_n_as = ggml_mul_mat_id_get_expert_ptrs_n_as(dst);
+    if (expert_ptrs != NULL) {
+        GGML_ASSERT(expert_ptrs_n_as == n_as);
+    }
+
+    // Packed MoE (n_as experts, ~6 tokens each): row-splitting one expert
+    // across nth threads keeps every thread on the same 0.6 MB matrix.
+    // Steal whole experts so each thread streams a different src0. Gated on
+    // expert_ptrs so default CPU MoE (contiguous 3D as) is unchanged.
+    if (expert_ptrs != NULL && nth > 1 && n_as > 1) {
+        if (ith == 0) {
+            atomic_int * steal = (atomic_int *) (atomic_current_chunk);
+            *steal = 0;
+        }
+        ggml_barrier(params->threadpool);
+
+        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        atomic_int * steal = (atomic_int *) (atomic_current_chunk);
+        while (true) {
+            const int cur_a = atomic_fetch_add_explicit(steal, 1, memory_order_relaxed);
+            if (cur_a >= n_as) {
+                break;
+            }
+            const int64_t cne1 = matrix_row_counts[cur_a];
+            if (cne1 == 0) {
+                continue;
+            }
+            const char * src0_cur = ((const char * const *) expert_ptrs)[cur_a];
+            GGML_ASSERT(src0_cur != NULL);
+            ggml_compute_forward_mul_mat_id_one_chunk(
+                dst, src0, src1, ids, cur_a,
+                0, ne01, 0, cne1,
+                src0_cur, matrix_rows, row_size, src1_cont, wdata);
+        }
+        return;
+    }
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1788,7 +1830,9 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = expert_ptrs != NULL
+            ? ((const char * const *) expert_ptrs)[cur_a]
+            : (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

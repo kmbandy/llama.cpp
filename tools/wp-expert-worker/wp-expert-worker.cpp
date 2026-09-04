@@ -10073,7 +10073,8 @@ public:
             const bool backend_ok = backend_name != nullptr &&
                 (std::strstr(backend_name, "ROCm") != nullptr ||
                  std::strstr(backend_name, "CUDA") != nullptr ||
-                 std::strstr(backend_name, "Vulkan") != nullptr);
+                 std::strstr(backend_name, "Vulkan") != nullptr ||
+                 backend_is_cpu(backend_.get()));
             if (batch_mmid_enabled_ && !backend_ok) {
                 batch_mmid_enabled_ = false;
             }
@@ -10085,7 +10086,9 @@ public:
                          (int) batch_mmid_enabled_,
                          backend_name != nullptr ? backend_name : "?",
                          is_vulkan_backend() && batch_mmid_enabled_
-                             ? " arena-copy" : "");
+                             ? " arena-copy"
+                             : (backend_is_cpu(backend_.get()) && batch_mmid_enabled_
+                                    ? " expert-ptrs" : ""));
             if (batch_mmid_enabled_ && is_vulkan_backend()) {
                 const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
                 const size_t alignment = std::max<size_t>(
@@ -10729,6 +10732,21 @@ public:
         if (!batch_mmid_enabled_ || request.n_tokens < 1 ||
                 request.assignments.empty()) {
             return false;
+        }
+        // CPU was silently dropped: the allow-list parser accepts "CPU" but
+        // this predicate used to require Vulkan or HIP/CUDA expert_ptrs.
+        // Prefill ~300 us/expert is not thread-count: default path is one
+        // gather-FFN chain per expert (get_rows + 3 mul_mat + swiglu + mul +
+        // scatter) in one OpenMP graph. ggml_barrier after every node; each
+        // mul_mat row-splits a ~6-token GEMV so 10 SCHED_BATCH threads share
+        // one 0.6 MB Q4_K matrix. src1 is re-quantized to vec_dot_type per
+        // mul_mat. staging_kind=pageable is the page-in memcpy, not the
+        // compute source -- weights are the slot arena. 2.15 MB / 310 us =
+        // 7 GB/s. That number is not a closed-form of one op; it is the
+        // sequential expert chain plus per-node barriers. Naming CPU in
+        // WP_EXPERT_BATCH_MMID takes compute_batch_mmid instead.
+        if (is_cpu_backend()) {
+            return true;
         }
         if (is_vulkan_backend()) {
             return true;
@@ -11714,6 +11732,10 @@ public:
         return name != nullptr &&
             (std::strstr(name, "CUDA") != nullptr ||
              std::strstr(name, "ROCm") != nullptr);
+    }
+
+    bool is_cpu_backend() const {
+        return backend_is_cpu(backend_.get());
     }
 
     ggml_backend_graph_plan_t create_persistent_plan(ggml_cgraph * graph) {
@@ -14435,12 +14457,14 @@ private:
     // reissuing the 3N copies + two small uploads per request -- is a
     // reasonable follow-up once this path is validated on real hardware.
     // 3 mul_mat_id (gate, up, down) or fused gate||up + down. HIP/CUDA keep
-    // weights in their slots via expert_ptrs. Vulkan has no routed-expert
-    // pointer channel: copy each selected role into a scratch [ne0,ne1,n_as]
-    // arena (row slack from layout_sliced_pages) and run the same graph over
-    // that. Fold is a left fold over ids-slot k (assignment order per token).
-    // Gather pads uneven rank with unique ids (dummy expert n once, then
-    // unused real experts).
+    // weights in their slots via expert_ptrs. CPU uses the same packed
+    // [n_embd, ff, n_as] as_* tensors and the same host expert_ptrs into the
+    // CPU slot arena (ggml-cpu indexes src0_cur from the array; no scratch
+    // copy). Vulkan has no routed-expert pointer channel: copy each selected
+    // role into a scratch [ne0,ne1,n_as] arena (row slack from
+    // layout_sliced_pages) and run the same graph over that. Fold is a left
+    // fold over ids-slot k (assignment order per token). Gather pads uneven
+    // rank with unique ids (dummy expert n once, then unused real experts).
     bool compute_batch_mmid(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -14511,6 +14535,7 @@ private:
         }
 
         const bool vk_arena = is_vulkan_backend();
+        const bool cpu_mmid = is_cpu_backend();
         const auto buft = ggml_backend_get_default_buffer_type(backend_.get());
         const size_t params_align = std::max<size_t>(
             1, ggml_backend_buft_get_alignment(buft));
@@ -14836,13 +14861,16 @@ private:
             ggml_mul_mat_id_set_expert_ptrs(
                 down_mmid, down_ptr_t->data, (int32_t) n_as);
 
-            ggml_cuda_queue_routed_expert_ptrs((const void * const *) gate_ptr_t->data);
-            if (!fuse_gate_up) {
-                ggml_cuda_queue_routed_expert_ptrs((const void * const *) up_ptr_t->data);
+            if (!cpu_mmid) {
+                ggml_cuda_queue_routed_expert_ptrs((const void * const *) gate_ptr_t->data);
+                if (!fuse_gate_up) {
+                    ggml_cuda_queue_routed_expert_ptrs((const void * const *) up_ptr_t->data);
+                }
+                ggml_cuda_queue_routed_expert_ptrs((const void * const *) down_ptr_t->data);
             }
-            ggml_cuda_queue_routed_expert_ptrs((const void * const *) down_ptr_t->data);
         }
-        last_compute_path_ = vk_arena ? "batch-mmid-arena" : "batch-mmid";
+        last_compute_path_ = vk_arena ? "batch-mmid-arena"
+            : (cpu_mmid ? "batch-mmid-cpu" : "batch-mmid");
         enum ggml_status status = GGML_STATUS_FAILED;
         {
             struct DiscardQueuedPtrs {
@@ -14852,10 +14880,10 @@ private:
                         ggml_cuda_discard_routed_expert_ptrs();
                     }
                 }
-            } discard_queued_ptrs{ !vk_arena };
+            } discard_queued_ptrs{ !vk_arena && !cpu_mmid };
             status = submit_graph(graph, request_stats);
         }
-        if (!vk_arena && ggml_cuda_get_routed_expert_ptrs_stats != nullptr) {
+        if (!vk_arena && !cpu_mmid && ggml_cuda_get_routed_expert_ptrs_stats != nullptr) {
             uint64_t set1 = 0;
             uint64_t cons1 = 0;
             uint64_t disc1 = 0;
