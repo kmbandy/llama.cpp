@@ -136,9 +136,33 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// WP_ALLOC_LOG=1: log every device allocation (size, device, wall clock) to
+// stderr so a VRAM->GTT eviction spike on a nearly-full card can be attributed
+// to the allocation that triggered it. Off unless set; one getenv at first use.
+static bool wp_alloc_log_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("WP_ALLOC_LOG");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+static void wp_alloc_log(const char * what, int device, size_t size, size_t extra) {
+    if (!wp_alloc_log_enabled()) {
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv;
+    localtime_r(&ts.tv_sec, &tmv);
+    fprintf(stderr, "wp alloc-log %02d:%02d:%02d.%03ld %s device=%d size=%.1fMiB extra=%.1fMiB\n",
+            tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts.tv_nsec / 1000000, what, device,
+            size / 1048576.0, extra / 1048576.0);
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
+    wp_alloc_log("device_malloc", device, size, 0);
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
@@ -493,6 +517,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        wp_alloc_log("pool_miss", device, look_ahead_size, pool_size);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
