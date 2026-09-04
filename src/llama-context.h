@@ -463,50 +463,31 @@ private:
     //
     // A slot holds a graph RESULT (the built topology), keyed by (gtype, n_tokens).
     //
-    // EACH SLOT OWNS ITS SCHEDULER. This is not an optimisation, it is the only
-    // sound design, and the first attempt (c7b8001ff) crashed the R9700 with
-    // HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION for want of it.
+    // WHAT A SLOT DOES *NOT* GIVE YOU. Slots do NOT each get a scheduler. All
+    // slots share this context's `sched`, and therefore its graph allocator, so at
+    // most one slot's tensor ADDRESSES are live at any moment: a miss calls
+    // ggml_backend_sched_reset() + ggml_backend_sched_alloc_graph(), which
+    // re-partitions the compute buffer and silently invalidates every other slot's
+    // tensor data pointers. Reusing another slot's graph without re-allocating it
+    // would compute on dangling addresses -- a correctness bug, not a slow path.
+    // See the comment above output_project() in llama-context.cpp, which reaches
+    // the same conclusion from the other direction and gives the projection head a
+    // DEDICATED sched for exactly this reason.
     //
-    // A ggml_backend_sched owns a ggml_gallocr, and BOTH of the guards that decide
-    // whether a graph must be re-allocated are POSITIONAL AND SIZE-BASED, never
-    // identity-based:
-    //   * ggml_backend_sched_alloc_splits() (ggml-backend.cpp) compares
-    //     node_backend_ids[i] against prev_node_backend_ids[i] and only flags a
-    //     change when the BUFT differs;
-    //   * ggml_gallocr_needs_realloc() (ggml-alloc.c) compares n_nodes / n_leafs
-    //     and then, per node index i, only asks `talloc->size_max >= node_size`.
-    // Neither can tell "the same graph re-run" from "a DIFFERENT graph that happens
-    // to have the same node/leaf counts and whose tensors fit the previous
-    // offsets". When both guards pass, ggml_gallocr_alloc_graph() runs
-    // ggml_gallocr_init_tensor() over the new graph using the OLD graph's
-    // node_allocs[i], assigning tensor i the offset AND buffer_id computed for a
-    // different tensor i. Going from the 4-token verify graph to the 1-token draft
-    // graph every tensor "fits", so nothing trips: tensors silently alias, and one
-    // whose true extent exceeds the recorded chunk runs off the end of its buffer.
-    // With ~96 CPU splits per layer-set, index i can even be CPU in one graph and
-    // ROCm0 in the other, handing a kernel a host pointer.
+    // So a hit on a slot that is not `gf_slot_allocated` re-runs allocation
+    // (sched_reset + alloc_graph) and only skips model.build_graph(). That is the
+    // part this saves: host-side node construction for a graph whose topology is
+    // provably identical. Split planning and address assignment are re-run, and are
+    // deterministic given the same cgraph, so the computed values are unchanged.
     //
-    // The whole reuse machinery rests on the invariant that ONE sched sees ONE
-    // graph topology at a time. Keeping two graph results against one sched breaks
-    // that invariant; a per-slot sched restores it, and lets a cross-slot hit skip
-    // allocation entirely rather than re-running it.
-    //
-    // See also the comment above output_project() in llama-context.cpp: it gives
-    // the projection head a DEDICATED sched for exactly this reason.
-    //
-    // COST. One compute buffer per extra slot. It is NOT the +429 MiB worst case:
-    // an extra sched is never graph_reserve()d, so ggml_gallocr_reserve_n() sizes
-    // it on first use for the shapes that slot actually sees, and a slot keyed to
-    // n_tokens=1 (the MTP draft head) is far smaller than the n_ubatch=512
-    // worst-case reserve. Slot 0 keeps the context's reserved sched unchanged.
+    // A future step could give each slot its own ggml_backend_sched and skip
+    // allocation too, at the cost of one extra compute buffer per slot
+    // (~429 MiB device + ~274 MiB host at ctx 262144 on the g128 spine).
     struct wp_graph_slot {
         // NON-OWNING. Slot 0 points at gf_res_prev (owned by that unique_ptr);
         // slots 1..N-1 point into gf_slots_owned below. Keeping this raw avoids
         // a second unique_ptr claiming ownership of the gf_res_prev object.
         llm_graph_result *   res      = nullptr;
-        // NON-OWNING. Slot 0 points at this context's `sched`; slots 1..N-1 point
-        // into gf_slots_sched below. Every slot MUST have its own allocator.
-        ggml_backend_sched_t sch      = nullptr;
         llm_graph_type       gtype    = LLM_GRAPH_TYPE_DEFAULT;
         uint32_t             n_tokens = 0;
         bool                 keyed    = false;
@@ -518,11 +499,9 @@ private:
     std::vector<wp_graph_slot> gf_slots;
     // owns only the EXTRA results (slots 1..N-1); slot 0's object is gf_res_prev's
     std::vector<llm_graph_result_ptr> gf_slots_owned;
-    // owns only the EXTRA schedulers (slots 1..N-1); slot 0 uses `sched`
-    std::vector<ggml_backend_sched_ptr> gf_slots_sched;
-    // the scheduler the CURRENT process_ubatch/graph_compute call must drive.
-    // Always sched.get() in single-slot mode.
-    ggml_backend_sched_t sched_active = nullptr;
+    // index into gf_slots whose graph currently owns the sched's allocation, or
+    // -1 for "none". Meaningless (and unused) when gf_slots is empty.
+    int                        gf_slot_allocated = -1;
     uint64_t                   gf_slot_clock     = 0;
     int32_t                    gf_slot_hits      = 0;
     int32_t                    gf_slot_misses    = 0;
