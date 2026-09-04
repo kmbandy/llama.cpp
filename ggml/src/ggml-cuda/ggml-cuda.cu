@@ -4030,14 +4030,33 @@ static void ggml_cuda_wp_graph_count_tick() {
 // captured. Each distinct prompt length would otherwise park a HIP graph and
 // its host-visible scratch for the process lifetime — the 2057/1136/1010 MiB
 // /dev/zero set on the sliced spine. Decode/spec stay capturable (ne <= 32).
+//
+// 2026-09-03: the MUL_MAT-only test missed most prefill fragments on the sliced
+// spine (a split of ~86 fragments per ubatch holds norms / rope / GDN / mul_mat_id
+// and often no MUL_MAT at all), so every prefill fragment was captured and
+// instantiated: ~258 captures per 1372-token prompt, ~430 MiB of runtime scratch
+// on the R9700, which on a card within 1 GB of full evicts 3-6 GB to GTT and
+// OOMs the 15 GB host. Any op node whose output is a plain 2-D activation
+// [n, n_tokens] wider than the decode/spec window is prefill-shaped, and so is
+// a MUL_MAT_ID whose activations carry more than 32 tokens.
 static bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node->op != GGML_OP_MUL_MAT || node->src[1] == nullptr) {
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+            const int64_t n_act = node->src[1]->ne[1];
+            if (n_act > 32 && node->src[1]->ne[0] <= 16384) {
+                return true;
+            }
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[1] != nullptr) {
+            if (node->src[1]->ne[2] > 32) {
+                return true;
+            }
+        }
+        if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
-        const int64_t n_act = node->src[1]->ne[1];
-        if (n_act > 32 && node->src[1]->ne[0] <= 16384) {
+        if (node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] > 32) {
             return true;
         }
     }
@@ -6157,6 +6176,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_wp_graph_count_init();
                 auto & c = ggml_cuda_wp_graph_counts[cuda_ctx->device];
                 c.captures.fetch_add(1, std::memory_order_relaxed);
+                if (wp_alloc_log_enabled()) {
+                    int64_t max_ne1_2d = 0; int n_mm = 0, n_mmid = 0;
+                    for (int i = 0; i < cgraph->n_nodes; ++i) {
+                        const ggml_tensor * t = cgraph->nodes[i];
+                        if (t->op == GGML_OP_MUL_MAT) { ++n_mm; }
+                        if (t->op == GGML_OP_MUL_MAT_ID) { ++n_mmid; }
+                        if (t->ne[2] == 1 && t->ne[3] == 1 && t->ne[1] > max_ne1_2d) { max_ne1_2d = t->ne[1]; }
+                    }
+                    wp_alloc_log("graph_capture", cuda_ctx->device, (size_t) cgraph->n_nodes, (size_t) max_ne1_2d);
+                    fprintf(stderr, "wp alloc-log   capture detail: n_nodes=%d n_mul_mat=%d n_mul_mat_id=%d max_ne1_2d=%lld\n",
+                            cgraph->n_nodes, n_mm, n_mmid, (long long) max_ne1_2d);
+                }
                 // Consume the reason: it is assigned on INSERT and must be
                 // counted exactly once, by the capture that the insert caused.
                 const auto reason = graph->capture_reason;
