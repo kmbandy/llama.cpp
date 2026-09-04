@@ -2606,7 +2606,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
     if (wp_step_stats) {
-        wp_last_gc_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        // SUM, not overwrite: llama_context::decode() resets this to 0 at
+        // entry, and one decode() call can split into several ubatches
+        // (each its own process_ubatch()/graph_compute()) -- a wide prefill
+        // batch being the common case. A caller reading this after decode()
+        // returns wants the total, not just the last ubatch's slice.
+        wp_last_gc_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wp_gc_t0).count();
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -3204,6 +3209,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    // WP_STEP_STATS=1: reset the per-decode-call graph_compute accumulator
+    // (see wp_last_graph_compute_ns() in llama-context.h) so process_ubatch()
+    // below can SUM across every ubatch this call splits into (a wide
+    // prefill batch is multiple ubatches/graph_computes per one decode()
+    // call) instead of a caller only ever seeing the last one. Cached
+    // getenv, same footprint as the other WP_* toggles in this function.
+    {
+        static const char * wp_step_env   = getenv("WP_STEP_STATS");
+        static const bool   wp_step_stats = wp_step_env != nullptr && wp_step_env[0] == '1';
+        if (wp_step_stats) {
+            wp_last_gc_ns = 0;
+        }
+    }
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);

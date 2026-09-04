@@ -312,13 +312,16 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
-    // WP_STEP_STATS=1: wall-ns of the most recently completed graph_compute()
-    // call on this context (written in process_ubatch(), llama-context.cpp).
-    // Lets a caller with only this class's public surface (e.g.
-    // tools/server/server-context.cpp, which already includes this header
-    // directly) split "trunk llama_decode total" into "graph_compute" vs
-    // "everything else in llama_decode" without re-timing graph_compute
-    // itself. 0 when WP_STEP_STATS is unset or before the first call.
+    // WP_STEP_STATS=1: SUM of graph_compute() wall-ns across every ubatch
+    // of the most recently completed decode() call on this context (reset
+    // to 0 at decode() entry, accumulated in process_ubatch() -- see
+    // llama-context.cpp). Lets a caller with only this class's public
+    // surface (e.g. tools/server/server-context.cpp, which already
+    // includes this header directly) split "trunk llama_decode total" into
+    // "graph_compute" vs "everything else in llama_decode" without
+    // re-timing graph_compute itself, and without undercounting a decode()
+    // call that splits into multiple ubatches (e.g. a wide prefill batch).
+    // 0 when WP_STEP_STATS is unset or before the first decode() call.
     uint64_t wp_last_graph_compute_ns() const { return wp_last_gc_ns; }
 
 private:
@@ -372,7 +375,8 @@ private:
     std::unique_ptr<pipe_expert_dispatcher::graph_dispatcher> expert_dispatch_owned;
     pipe_expert_dispatcher::graph_dispatcher * expert_dispatch = nullptr;
 
-    // WP_STEP_STATS (see wp_last_graph_compute_ns() above).
+    // WP_STEP_STATS (see wp_last_graph_compute_ns() above); reset to 0 at
+    // llama_context::decode() entry, summed across ubatches in process_ubatch().
     uint64_t wp_last_gc_ns = 0;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

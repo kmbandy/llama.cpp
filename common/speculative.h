@@ -76,6 +76,13 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// WP_STEP_STATS: number of llama_decode(ctx_dft) calls issued by the most
+// recent common_speculative_draft(spec) call, summed across every
+// implementation in spec->impls (only common_speculative_impl_draft_mtp
+// currently sets its own counter; every other impl contributes 0). 0 if
+// spec is null.
+size_t common_speculative_last_n_draft_decodes(const common_speculative * spec);
+
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
