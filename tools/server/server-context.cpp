@@ -87,20 +87,29 @@ static int32_t server_spec_const_width() {
 
 // WP_STEP_STATS=1: per-server-decode-step wall-clock breakdown. One "step"
 // is one non-idle update_slots() tick (pre_decode -> render -> decode ->
-// post_decode for whichever streams had work), the same granularity the
-// g128/g134 investigation measured as ~167 ms/step at the worker. Splits
-// that wall into:
-//   (a) trunk llama_decode total, and inside it, graph_compute (read back
-//       via llama_context::wp_last_graph_compute_ns(), llama-context.h/.cpp)
+// post_decode for whichever streams had work). Splits that wall into:
+//   (a) trunk llama_decode total, and inside it, graph_compute (SUM across
+//       every ubatch of that decode() call -- see
+//       llama_context::wp_last_graph_compute_ns(), llama-context.h/.cpp)
 //       vs everything else in decode() (batch prep, logits/embd/nextn
 //       readbacks, llama_synchronize)
 //   (b) speculative draft generation (the common_speculative_draft(spec)
-//       call in pre_decode())
+//       call in pre_decode()), plus how many llama_decode(ctx_dft) calls
+//       that cost (common_speculative_last_n_draft_decodes()) and how many
+//       draft tokens were accepted (accepted.size()-1 at the
+//       common_speculative_accept() call site) -- lets ms/step be
+//       normalised per accepted token
 //   (c) acceptance / token processing (the post_decode() call: trunk
 //       sampling, common_speculative_accept, slot bookkeeping, response
 //       posting)
-//   (d) everything else in the tick (residual: pre_decode's own non-draft
-//       work, render(), stream-join overhead)
+//   (d) everything else in the tick (residual)
+// g134 found the pooled mean over ALL steps unusable: prefill ticks (huge
+// trunk batches) swamped the mean of the many small verify ticks that are
+// what this was meant to characterise. So steps are bucketed by the trunk
+// batch width of the tick's LAST decode() call: <= 8 tokens = "decode"
+// (verify-sized), > 8 = "prefill" -- separate running sums, separate
+// banners, decode every 128 steps (they are frequent), prefill every 8
+// (they are rare and everyone already knows they are slow).
 // Unset: one getenv() + one bool check per call site, no timers taken --
 // same footprint as the other WP_* toggles in this file.
 static bool wp_step_stats_enabled() {
@@ -111,22 +120,31 @@ static bool wp_step_stats_enabled() {
     return enabled;
 }
 
+struct wp_step_stats_bucket {
+    uint64_t n_steps          = 0;
+    uint64_t step_ns          = 0;
+    uint64_t trunk_ns         = 0;
+    uint64_t gc_ns            = 0;
+    uint64_t draft_ns         = 0;
+    uint64_t accept_ns        = 0;
+    uint64_t other_ns         = 0;
+    uint64_t n_draft_decodes  = 0; // sum of llama_decode(ctx_dft) calls
+    uint64_t n_accepted       = 0; // sum of accepted draft tokens
+};
+
 struct wp_step_stats_state {
     // per-tick scratch, reset at the top of a counted update_slots() tick
     std::chrono::steady_clock::time_point tick_t0;
-    uint64_t tick_trunk_ns  = 0;
-    uint64_t tick_gc_ns     = 0;
-    uint64_t tick_draft_ns  = 0;
-    uint64_t tick_accept_ns = 0;
+    int32_t  tick_last_n_tokens  = 0; // trunk batch width of the last decode() this tick
+    uint64_t tick_trunk_ns       = 0;
+    uint64_t tick_gc_ns          = 0;
+    uint64_t tick_draft_ns       = 0;
+    uint64_t tick_accept_ns      = 0;
+    uint64_t tick_n_draft_decodes = 0;
+    uint64_t tick_n_accepted      = 0;
 
-    // running means across the whole arm
-    uint64_t n_steps    = 0;
-    uint64_t step_ns    = 0;
-    uint64_t trunk_ns   = 0;
-    uint64_t gc_ns      = 0;
-    uint64_t draft_ns   = 0;
-    uint64_t accept_ns  = 0;
-    uint64_t other_ns   = 0;
+    wp_step_stats_bucket decode_b;  // trunk n_tokens <= 8 (verify steps)
+    wp_step_stats_bucket prefill_b; // trunk n_tokens >  8
 };
 
 // One instance for the whole process (server_context has exactly one
@@ -4245,11 +4263,14 @@ private:
 
         if (wp_step_stats_enabled()) {
             auto & st = wp_step_stats();
-            st.tick_t0        = std::chrono::steady_clock::now();
-            st.tick_trunk_ns  = 0;
-            st.tick_gc_ns     = 0;
-            st.tick_draft_ns  = 0;
-            st.tick_accept_ns = 0;
+            st.tick_t0             = std::chrono::steady_clock::now();
+            st.tick_last_n_tokens  = 0;
+            st.tick_trunk_ns       = 0;
+            st.tick_gc_ns          = 0;
+            st.tick_draft_ns       = 0;
+            st.tick_accept_ns      = 0;
+            st.tick_n_draft_decodes = 0;
+            st.tick_n_accepted      = 0;
         }
 
         drain_paged_fingerprints(ctx_tgt);
@@ -4373,32 +4394,59 @@ private:
 
         if (wp_step_stats_enabled()) {
             auto & st = wp_step_stats();
-            const uint64_t step_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - st.tick_t0).count();
-            const uint64_t known_ns = st.tick_trunk_ns + st.tick_draft_ns + st.tick_accept_ns;
-            const uint64_t other_ns = step_ns > known_ns ? step_ns - known_ns : 0;
+            if (st.tick_last_n_tokens > 0) { // a tick with no decode() call has nothing to bucket
+                const uint64_t step_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - st.tick_t0).count();
+                const uint64_t known_ns = st.tick_trunk_ns + st.tick_draft_ns + st.tick_accept_ns;
+                const uint64_t other_ns = step_ns > known_ns ? step_ns - known_ns : 0;
 
-            st.step_ns   += step_ns;
-            st.trunk_ns  += st.tick_trunk_ns;
-            st.gc_ns     += st.tick_gc_ns;
-            st.draft_ns  += st.tick_draft_ns;
-            st.accept_ns += st.tick_accept_ns;
-            st.other_ns  += other_ns;
-            ++st.n_steps;
+                const bool is_decode = st.tick_last_n_tokens <= 8;
+                auto & b = is_decode ? st.decode_b : st.prefill_b;
 
-            if (st.n_steps % 128 == 0) {
-                const double n = (double) st.n_steps;
-                const double trunk_other_ms = (st.trunk_ns - st.gc_ns) / 1e6 / n;
-                SRV_INF("wp step-stats: n=%" PRIu64 " step=%.3f ms trunk_decode=%.3f (gc=%.3f other=%.3f) "
-                        "draft=%.3f accept=%.3f other=%.3f ms/step (means)\n",
-                        st.n_steps,
-                        st.step_ns  / 1e6 / n,
-                        st.trunk_ns / 1e6 / n,
-                        st.gc_ns    / 1e6 / n,
-                        trunk_other_ms,
-                        st.draft_ns  / 1e6 / n,
-                        st.accept_ns / 1e6 / n,
-                        st.other_ns  / 1e6 / n);
+                b.step_ns         += step_ns;
+                b.trunk_ns        += st.tick_trunk_ns;
+                b.gc_ns           += st.tick_gc_ns;
+                b.draft_ns        += st.tick_draft_ns;
+                b.accept_ns       += st.tick_accept_ns;
+                b.other_ns        += other_ns;
+                b.n_draft_decodes += st.tick_n_draft_decodes;
+                b.n_accepted      += st.tick_n_accepted;
+                ++b.n_steps;
+
+                const uint64_t period = is_decode ? 128 : 8;
+                if (b.n_steps % period == 0) {
+                    const double n = (double) b.n_steps;
+                    const double trunk_other_ms = (b.trunk_ns - b.gc_ns) / 1e6 / n;
+                    if (is_decode) {
+                        const double accept_per_step = b.n_accepted / n;
+                        const double ms_per_accepted = accept_per_step > 0.0 ? (b.step_ns / 1e6 / n) / accept_per_step : 0.0;
+                        SRV_INF("wp step-stats: decode n=%" PRIu64 " step=%.3f ms trunk_decode=%.3f "
+                                "(gc=%.3f other=%.3f) draft=%.3f accept=%.3f other=%.3f ms/step "
+                                "n_draft_calls=%.2f n_accepted=%.2f ms_per_accepted_tok=%.3f (means)\n",
+                                b.n_steps,
+                                b.step_ns   / 1e6 / n,
+                                b.trunk_ns  / 1e6 / n,
+                                b.gc_ns     / 1e6 / n,
+                                trunk_other_ms,
+                                b.draft_ns  / 1e6 / n,
+                                b.accept_ns / 1e6 / n,
+                                b.other_ns  / 1e6 / n,
+                                b.n_draft_decodes / n,
+                                accept_per_step,
+                                ms_per_accepted);
+                    } else {
+                        SRV_INF("wp step-stats: prefill n=%" PRIu64 " step=%.3f ms trunk_decode=%.3f "
+                                "(gc=%.3f other=%.3f) draft=%.3f accept=%.3f other=%.3f ms/step (means)\n",
+                                b.n_steps,
+                                b.step_ns   / 1e6 / n,
+                                b.trunk_ns  / 1e6 / n,
+                                b.gc_ns     / 1e6 / n,
+                                trunk_other_ms,
+                                b.draft_ns  / 1e6 / n,
+                                b.accept_ns / 1e6 / n,
+                                b.other_ns  / 1e6 / n);
+                    }
+                }
             }
         }
     }
@@ -4463,6 +4511,7 @@ private:
                     st.tick_trunk_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - wp_step_t0).count();
                     st.tick_gc_ns += stream.ctx_tgt->wp_last_graph_compute_ns();
+                    st.tick_last_n_tokens = n_tokens; // classifies this tick decode vs prefill
                 }
                 drain_paged_fingerprints(stream.ctx_tgt);
 #ifdef DEBUG_TIMINGS
@@ -4767,8 +4816,10 @@ private:
                 common_speculative_draft(spec); // MAD-LAB: spec is now a raw ptr
             });
             if (wp_step_stats_enabled()) {
-                wp_step_stats().tick_draft_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                auto & st = wp_step_stats();
+                st.tick_draft_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - wp_step_t0).count();
+                st.tick_n_draft_decodes += common_speculative_last_n_draft_decodes(spec);
             }
             if (spec_phase) {
                 size_t n_drafted = 0;
@@ -6121,6 +6172,9 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                if (wp_step_stats_enabled()) {
+                    wp_step_stats().tick_n_accepted += accepted.size() - 1;
+                }
                 common_speculative_accept(spec, slot.stream_slot_idx, accepted.size() - 1); // MAD-LAB: spec is a raw ptr
 
                 slot.spec_draft = std::move(accepted);

@@ -253,6 +253,14 @@ struct common_speculative_impl {
     // in the normal stats line, not just in a log grep.
     size_t n_markov_ragged_skipped = 0;
 
+    // WP_STEP_STATS: number of llama_decode(ctx_dft) calls issued by the
+    // MOST RECENT draft(dparams) call. Only common_speculative_impl_draft_mtp
+    // sets this (its draft() while(n_drafting>0) loop, one llama_decode per
+    // iteration); every other implementation leaves it at 0. Read back via
+    // common_speculative_last_n_draft_decodes() so a caller (server-context.cpp)
+    // can normalise a decode step's ms by how many draft calls it cost.
+    size_t n_decode_calls_last = 0;
+
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
@@ -2430,6 +2438,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        n_decode_calls_last = 0; // WP_STEP_STATS: see the field's declaration
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -2526,6 +2536,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
+            ++n_decode_calls_last; // WP_STEP_STATS
 
             const auto wp_t1 = wp_draft_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
             if (wp_draft_stats) {
@@ -3780,6 +3791,18 @@ bool common_speculative_need_embd_nextn(common_speculative * spec) {
     }
 
     return false;
+}
+
+size_t common_speculative_last_n_draft_decodes(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return 0;
+    }
+
+    size_t total = 0;
+    for (auto & impl : spec->impls) {
+        total += impl->n_decode_calls_last;
+    }
+    return total;
 }
 
 static void common_speculative_capture_draft(const common_speculative_impl * impl,
