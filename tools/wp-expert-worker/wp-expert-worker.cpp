@@ -10106,7 +10106,11 @@ public:
                              "wp expert worker: node-ts (WP_VK_NODE_TS=%s) "
                              "device=%s enabled=%d\n",
                              ts_e != nullptr ? ts_e : "", device_name_.c_str(),
+#ifdef GGML_USE_VULKAN
                              (int) ggml_backend_vk_node_ts_enabled());
+#else
+                             0);
+#endif
             }
             if (is_cpu_backend()) {
                 cpu_graph_n_threads_ = cpu_tier_overlap_enabled()
@@ -11976,6 +11980,10 @@ private:
     }
 
     void take_vk_node_ts(RequestStats * request_stats) {
+#ifndef GGML_USE_VULKAN
+        (void) request_stats;
+        return;
+#else
         if (!is_vulkan_backend() || !ggml_backend_is_vk(backend_.get())) {
             return;
         }
@@ -11991,6 +11999,7 @@ private:
         request_stats->ns_vk_op_cpy += ts.ns_cpy;
         request_stats->ns_vk_op_other += ts.ns_other;
         request_stats->n_vk_dispatches += ts.n_dispatches;
+#endif
     }
 
     void synchronize_async(RequestStats * request_stats) {
