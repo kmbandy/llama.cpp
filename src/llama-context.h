@@ -312,6 +312,15 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // WP_STEP_STATS=1: wall-ns of the most recently completed graph_compute()
+    // call on this context (written in process_ubatch(), llama-context.cpp).
+    // Lets a caller with only this class's public surface (e.g.
+    // tools/server/server-context.cpp, which already includes this header
+    // directly) split "trunk llama_decode total" into "graph_compute" vs
+    // "everything else in llama_decode" without re-timing graph_compute
+    // itself. 0 when WP_STEP_STATS is unset or before the first call.
+    uint64_t wp_last_graph_compute_ns() const { return wp_last_gc_ns; }
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -362,6 +371,9 @@ private:
     // MAD-LAB: the target context owns the dispatcher; speculative contexts borrow it.
     std::unique_ptr<pipe_expert_dispatcher::graph_dispatcher> expert_dispatch_owned;
     pipe_expert_dispatcher::graph_dispatcher * expert_dispatch = nullptr;
+
+    // WP_STEP_STATS (see wp_last_graph_compute_ns() above).
+    uint64_t wp_last_gc_ns = 0;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
