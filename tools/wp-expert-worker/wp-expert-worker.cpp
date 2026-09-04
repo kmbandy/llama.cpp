@@ -4196,7 +4196,8 @@ std::vector<ResourcePage> resource_pages(
 }
 
 Catalog & layout_sliced_pages(
-        Catalog & catalog, ggml_backend_buffer_type_t buft) {
+        Catalog & catalog, ggml_backend_buffer_type_t buft,
+        const std::string & device_name = {}) {
     // Whole-expert pages used to skip this and keep device_size == blob size.
     // CUDA MMQ over-reads the last quantized row (qwen4exp down Q5_1 ne0=640)
     // into MATRIX_ROW_PADDING; without slack that is the next slot and dim
@@ -4227,10 +4228,10 @@ Catalog & layout_sliced_pages(
         }
     }
     // Slicer packs up, gate, down (role_mask 1,2,4). Fuse wants gate then up.
-    const bool fuse_layout = [] {
-        const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP_LAYOUT");
-        return e != nullptr && e[0] == '1';
-    }();
+    // Per-device: "1" reorders every device; "Vulkan0,CPU" leaves CUDA packed
+    // as the blob so its H2D stays identity (page_needs_chunked_h2d).
+    const bool fuse_layout = parse_arena_prefill_enabled(
+        std::getenv("WP_EXPERT_FUSE_GATE_UP_LAYOUT"), device_name);
     for (auto & item : catalog.pages) {
         ExpertPage & page = item.second;
         const auto & specs = catalog.descriptor.layers.at(page.layer);
@@ -9711,7 +9712,8 @@ public:
         backend_(init_backend(device)),
         resident_(backend_.get(),
                   layout_sliced_pages(
-                      catalog_, ggml_backend_get_default_buffer_type(backend_.get())),
+                      catalog_, ggml_backend_get_default_buffer_type(backend_.get()),
+                      device),
                   resident_expert_blocks, page_owner_),
         pool_(
             backend_.get(),
@@ -10059,6 +10061,13 @@ public:
                          "device=%s enabled=%d\n",
                          e != nullptr ? e : "", device_name_.c_str(),
                          (int) fold_last_enabled_);
+            const char * layout_e = std::getenv("WP_EXPERT_FUSE_GATE_UP_LAYOUT");
+            const bool fuse_layout = parse_arena_prefill_enabled(layout_e, device_name_);
+            std::fprintf(stderr,
+                         "wp expert worker: fuse-gate-up-layout "
+                         "(WP_EXPERT_FUSE_GATE_UP_LAYOUT=%s) device=%s enabled=%d\n",
+                         layout_e != nullptr ? layout_e : "", device_name_.c_str(),
+                         (int) fuse_layout);
             mm_pin_mode_ = parse_mm_pin_mode(
                 std::getenv("WP_EXPERT_MM_PIN"), device_name_);
             mm_pin_min_tokens_ = parse_mm_pin_min_tokens(
@@ -13659,8 +13668,8 @@ private:
         //  * every selected expert must actually have up adjacent to gate.
         //    Checked against the real device offsets, not assumed from the
         //    layout algorithm. The slicer writes up then gate then down, so
-        //    this fails unless WP_EXPERT_FUSE_GATE_UP_LAYOUT=1 reorders the
-        //    slot to gate then up then the rest.
+        //    this fails unless WP_EXPERT_FUSE_GATE_UP_LAYOUT reorders the
+        //    slot to gate then up then the rest (per-device allow-list).
         const bool s_fuse_gate_up = [] {
             const char * e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
             return e != nullptr && e[0] == '1';
