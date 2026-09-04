@@ -2617,7 +2617,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ++wp_draft_calls;
 
                 if (wp_draft_calls % 256 == 0) {
-                    SPC_WRN("wp draft-stats: sample n=%" PRIu64 " decode=%.3f wait=%.3f sample=%.3f "
+                    // Plain LOG_WRN, not SPC_WRN: the latter's "spec %12.*s: "
+                    // prefix right-justifies __func__ in a 12-wide field
+                    // ("spec        draft: wp draft-stats: ..."), so a
+                    // straight substring grep for "wp draft-stats: sample"
+                    // still matches, but a grep anchored on "spec draft:"
+                    // (single space) does not -- likely why an earlier probe
+                    // of this line reported zero matches even though it was
+                    // firing. Dropping the prefix here removes the ambiguity
+                    // and matches the plain style of the other two
+                    // "wp draft-stats: ..." banners (llama-context.cpp).
+                    LOG_WRN("wp draft-stats: sample n=%" PRIu64 " decode=%.3f wait=%.3f sample=%.3f "
                             "ms/call (mean over %" PRIu64 " calls)\n",
                             wp_draft_calls,
                             wp_draft_decode_ns / 1e6 / (double) wp_draft_calls,

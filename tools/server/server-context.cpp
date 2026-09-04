@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cinttypes>
@@ -82,6 +83,58 @@ static int32_t server_spec_const_width() {
         return value != nullptr ? std::atoi(value) : 0;
     }();
     return width;
+}
+
+// WP_STEP_STATS=1: per-server-decode-step wall-clock breakdown. One "step"
+// is one non-idle update_slots() tick (pre_decode -> render -> decode ->
+// post_decode for whichever streams had work), the same granularity the
+// g128/g134 investigation measured as ~167 ms/step at the worker. Splits
+// that wall into:
+//   (a) trunk llama_decode total, and inside it, graph_compute (read back
+//       via llama_context::wp_last_graph_compute_ns(), llama-context.h/.cpp)
+//       vs everything else in decode() (batch prep, logits/embd/nextn
+//       readbacks, llama_synchronize)
+//   (b) speculative draft generation (the common_speculative_draft(spec)
+//       call in pre_decode())
+//   (c) acceptance / token processing (the post_decode() call: trunk
+//       sampling, common_speculative_accept, slot bookkeeping, response
+//       posting)
+//   (d) everything else in the tick (residual: pre_decode's own non-draft
+//       work, render(), stream-join overhead)
+// Unset: one getenv() + one bool check per call site, no timers taken --
+// same footprint as the other WP_* toggles in this file.
+static bool wp_step_stats_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("WP_STEP_STATS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+struct wp_step_stats_state {
+    // per-tick scratch, reset at the top of a counted update_slots() tick
+    std::chrono::steady_clock::time_point tick_t0;
+    uint64_t tick_trunk_ns  = 0;
+    uint64_t tick_gc_ns     = 0;
+    uint64_t tick_draft_ns  = 0;
+    uint64_t tick_accept_ns = 0;
+
+    // running means across the whole arm
+    uint64_t n_steps    = 0;
+    uint64_t step_ns    = 0;
+    uint64_t trunk_ns   = 0;
+    uint64_t gc_ns      = 0;
+    uint64_t draft_ns   = 0;
+    uint64_t accept_ns  = 0;
+    uint64_t other_ns   = 0;
+};
+
+// One instance for the whole process (server_context has exactly one
+// update_slots() driver); a free function + function-local static keeps
+// this out of the class definition so the hunk touching it stays small.
+static wp_step_stats_state & wp_step_stats() {
+    static wp_step_stats_state s;
+    return s;
 }
 
 // MAD-125: walk the active memory pointer chain and return the
@@ -4190,6 +4243,15 @@ private:
         }
 #endif
 
+        if (wp_step_stats_enabled()) {
+            auto & st = wp_step_stats();
+            st.tick_t0        = std::chrono::steady_clock::now();
+            st.tick_trunk_ns  = 0;
+            st.tick_gc_ns     = 0;
+            st.tick_draft_ns  = 0;
+            st.tick_accept_ns = 0;
+        }
+
         drain_paged_fingerprints(ctx_tgt);
         if (stream_b.ctx_tgt != nullptr) {
             drain_paged_fingerprints(stream_b.ctx_tgt);
@@ -4308,6 +4370,37 @@ private:
         // work for this tick is done -- see activate_parent_child_tasks()
         // for why it isn't parameterized.
         activate_parent_child_tasks();
+
+        if (wp_step_stats_enabled()) {
+            auto & st = wp_step_stats();
+            const uint64_t step_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - st.tick_t0).count();
+            const uint64_t known_ns = st.tick_trunk_ns + st.tick_draft_ns + st.tick_accept_ns;
+            const uint64_t other_ns = step_ns > known_ns ? step_ns - known_ns : 0;
+
+            st.step_ns   += step_ns;
+            st.trunk_ns  += st.tick_trunk_ns;
+            st.gc_ns     += st.tick_gc_ns;
+            st.draft_ns  += st.tick_draft_ns;
+            st.accept_ns += st.tick_accept_ns;
+            st.other_ns  += other_ns;
+            ++st.n_steps;
+
+            if (st.n_steps % 128 == 0) {
+                const double n = (double) st.n_steps;
+                const double trunk_other_ms = (st.trunk_ns - st.gc_ns) / 1e6 / n;
+                SRV_INF("wp step-stats: n=%" PRIu64 " step=%.3f ms trunk_decode=%.3f (gc=%.3f other=%.3f) "
+                        "draft=%.3f accept=%.3f other=%.3f ms/step (means)\n",
+                        st.n_steps,
+                        st.step_ns  / 1e6 / n,
+                        st.trunk_ns / 1e6 / n,
+                        st.gc_ns    / 1e6 / n,
+                        trunk_other_ms,
+                        st.draft_ns  / 1e6 / n,
+                        st.accept_ns / 1e6 / n,
+                        st.other_ns  / 1e6 / n);
+            }
+        }
     }
 
     // MAD-LAB DS4-Flash pipeline-streams (stage 2): the chunked decode()/
@@ -4363,7 +4456,14 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = sbatch.get_view(off, n_tokens);
+                const auto wp_step_t0 = wp_step_stats_enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 bool ok = decode(stream, n_batch, off, batch_view);
+                if (wp_step_stats_enabled()) {
+                    auto & st = wp_step_stats();
+                    st.tick_trunk_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - wp_step_t0).count();
+                    st.tick_gc_ns += stream.ctx_tgt->wp_last_graph_compute_ns();
+                }
                 drain_paged_fingerprints(stream.ctx_tgt);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(stream.ctx_tgt);
@@ -4387,7 +4487,12 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                const auto wp_step_t0 = wp_step_stats_enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 post_decode(stream, n_tokens, off, batch_view);
+                if (wp_step_stats_enabled()) {
+                    wp_step_stats().tick_accept_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - wp_step_t0).count();
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots(stream, "post_decode() failed: " + std::string(e.what()));
@@ -4657,9 +4762,14 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t0 = spec_phase ? ggml_time_us() : 0;
+            const auto wp_step_t0 = wp_step_stats_enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec); // MAD-LAB: spec is now a raw ptr
             });
+            if (wp_step_stats_enabled()) {
+                wp_step_stats().tick_draft_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wp_step_t0).count();
+            }
             if (spec_phase) {
                 size_t n_drafted = 0;
                 for (const auto * s : drafting) {

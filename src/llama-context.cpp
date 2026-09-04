@@ -2490,6 +2490,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static uint64_t wp_draft_hits_last  = 0;
     static uint64_t wp_draft_caps_last  = 0;
     static uint64_t wp_draft_falls_last = 0;
+    // WP_STEP_STATS=1: lets tools/server/server-context.cpp (a foreign TU
+    // with only this class's public surface) read the wall-ns of this
+    // context's most recently completed graph_compute() call, to split its
+    // own "trunk llama_decode total" timer into graph_compute vs everything
+    // else, per decode step. Separate from WP_DRAFT_STATS/WP_SPINE_STATS
+    // above: this one is not gated on is_draft_ctx(), it records for
+    // whichever context calls process_ubatch (trunk or draft).
+    static const char * wp_step_env   = getenv("WP_STEP_STATS");
+    static const bool   wp_step_stats = wp_step_env != nullptr && wp_step_env[0] == '1';
     // WP: publish the true ubatch width to the CUDA/HIP graph-capture layer.
     // Its prefill-shape heuristic misclassifies decode fragments whose wide
     // dim is context (lightning-indexer mul_mats) — with the hint it keys on
@@ -2505,7 +2514,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_WARN("wp draft-stats: graph shape (first call) n_nodes=%d n_splits=%d n_tokens=%u\n",
                        n_nodes, n_splits, ubatch.n_tokens);
     }
-    const auto wp_gc_t0 = (wp_spine_stats || wp_spine_profile_trace || wp_spine_layer_profile || wp_draft_active)
+    const auto wp_gc_t0 = (wp_spine_stats || wp_spine_profile_trace || wp_spine_layer_profile || wp_draft_active || wp_step_stats)
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     if (wp_spine_profile_trace && expert_dispatch != nullptr) {
         expert_dispatch->spine_profile_begin(wp_gc_t0);
@@ -2595,6 +2604,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                            (unsigned long long) dfalls,
                            have_counts ? "" : " (counters unavailable: non-CUDA/HIP backend)");
         }
+    }
+    if (wp_step_stats) {
+        wp_last_gc_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wp_gc_t0).count();
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
