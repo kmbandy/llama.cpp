@@ -40,6 +40,15 @@
 // (defined in ggml-cuda.cu; weak so CPU/Vulkan-only builds link clean).
 extern "C" void ggml_cuda_wp_set_ubatch_width_hint(int32_t n_tokens) __attribute__((weak));
 
+// WP_DRAFT_STATS: live hipGraph/cudaGraph counters, per backend (defined in
+// ggml-cuda.cu, already exported for the worker's 5s banner -- see
+// ggml/include/ggml-cuda.h). Same weak-symbol pattern as the hint above: null
+// on any build that doesn't link ggml-cuda's wp extensions.
+extern "C" bool ggml_backend_cuda_wp_graph_counts(
+        ggml_backend_t backend,
+        uint64_t * captures, uint64_t * replays, uint64_t * fallbacks,
+        uint64_t * cap_newkey, uint64_t * cap_lru) __attribute__((weak));
+
 //
 // llama_context
 //
@@ -2616,6 +2625,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static uint64_t wp_gc_n  [3] = {0, 0, 0};
     static uint64_t wp_gc_tok[3] = {0, 0, 0};
     static const char * const wp_ph_name[3] = { "decode ", "verify ", "PREFILL" };
+    // WP_DRAFT_STATS=1: split the MTP draft head's per-call cost instead of
+    // guessing from the pooled spine numbers above (which conflate draft and
+    // trunk calls, since these are function-local statics shared by every
+    // llama_context instance running this same code). Gated on is_draft_ctx()
+    // so it only ever fires for the draft context; unset is one getenv() plus
+    // one bool check, same footprint as WP_SPINE_STATS above.
+    static const char * wp_draft_env = getenv("WP_DRAFT_STATS");
+    static const bool   wp_draft_stats = wp_draft_env != nullptr && wp_draft_env[0] == '1';
+    const bool wp_draft_active = wp_draft_stats && is_draft_ctx(cparams);
+    static uint64_t wp_draft_decode_ns = 0;
+    static uint64_t wp_draft_n         = 0;
+    static bool     wp_draft_shape_logged = false;
+    static uint64_t wp_draft_hits_last  = 0;
+    static uint64_t wp_draft_caps_last  = 0;
+    static uint64_t wp_draft_falls_last = 0;
     // WP: publish the true ubatch width to the CUDA/HIP graph-capture layer.
     // Its prefill-shape heuristic misclassifies decode fragments whose wide
     // dim is context (lightning-indexer mul_mats) — with the hint it keys on
@@ -2624,7 +2648,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_cuda_wp_set_ubatch_width_hint((int32_t) ubatch.n_tokens);
     }
     const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
-    const auto wp_gc_t0 = (wp_spine_stats || wp_spine_profile_trace || wp_spine_layer_profile)
+    if (wp_draft_active && !wp_draft_shape_logged) {
+        wp_draft_shape_logged = true;
+        const int n_nodes  = gf ? gf->n_nodes : -1;
+        const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
+        LLAMA_LOG_WARN("wp draft-stats: graph shape (first call) n_nodes=%d n_splits=%d n_tokens=%u\n",
+                       n_nodes, n_splits, ubatch.n_tokens);
+    }
+    const auto wp_gc_t0 = (wp_spine_stats || wp_spine_profile_trace || wp_spine_layer_profile || wp_draft_active)
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     if (wp_spine_profile_trace && expert_dispatch != nullptr) {
         expert_dispatch->spine_profile_begin(wp_gc_t0);
@@ -2674,6 +2705,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                wp_gc_ns[ph] / 1e6 / (double) wp_gc_n [ph],
                                wp_gc_ns[ph] / 1e6 / (double) std::max<uint64_t>(1, wp_gc_tok[ph]));
             }
+        }
+    }
+    if (wp_draft_active) {
+        const uint64_t wp_draft_call_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wp_gc_t0).count();
+        wp_draft_decode_ns += wp_draft_call_ns;
+        ++wp_draft_n;
+
+        if (wp_draft_n % 256 == 0) {
+            uint64_t hits = 0, caps = 0, falls = 0, newkey = 0, lru = 0;
+            bool have_counts = false;
+            if (ggml_backend_cuda_wp_graph_counts != nullptr) {
+                ggml_tensor * t_logits = res ? res->get_logits() : nullptr;
+                ggml_backend_t backend_res = t_logits
+                    ? ggml_backend_sched_get_tensor_backend(sched.get(), t_logits) : nullptr;
+                have_counts = backend_res != nullptr &&
+                    ggml_backend_cuda_wp_graph_counts(backend_res, &caps, &hits, &falls, &newkey, &lru);
+            }
+            // Delta since the last banner, same idea as the "interval(...)" field
+            // in the "wp hip-graphs" line (ggml-cuda.cu) -- tells us whether the
+            // draft graph is actually being replayed, or capturing/falling back
+            // on every call, without needing to isolate it from the pooled
+            // process-wide counters that line prints.
+            const uint64_t dhits  = have_counts ? hits  - wp_draft_hits_last  : 0;
+            const uint64_t dcaps  = have_counts ? caps  - wp_draft_caps_last  : 0;
+            const uint64_t dfalls = have_counts ? falls - wp_draft_falls_last : 0;
+            if (have_counts) {
+                wp_draft_hits_last  = hits;
+                wp_draft_caps_last  = caps;
+                wp_draft_falls_last = falls;
+            }
+            LLAMA_LOG_WARN("wp draft-stats: decode n=%llu total=%.2f ms mean=%.3f ms/call "
+                           "hipgraph_delta(hits=%llu captures=%llu fallbacks=%llu)%s\n",
+                           (unsigned long long) wp_draft_n,
+                           wp_draft_decode_ns / 1e6,
+                           wp_draft_decode_ns / 1e6 / (double) wp_draft_n,
+                           (unsigned long long) dhits, (unsigned long long) dcaps,
+                           (unsigned long long) dfalls,
+                           have_counts ? "" : " (counters unavailable: non-CUDA/HIP backend)");
         }
     }
     if (status != GGML_STATUS_SUCCESS) {

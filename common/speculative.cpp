@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -2503,11 +2504,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            // WP_DRAFT_STATS=1: split "wall ms of llama_decode" from "ms spent
+            // waiting for the copy + sampling" so the 16 ms/draft-token figure
+            // can be attributed instead of guessed at. The decode-side graph
+            // shape/HIP-graph-counter half of this lives in
+            // src/llama-context.cpp (process_ubatch, same env var, gated on
+            // is_draft_ctx()) -- that is the only place with the ggml_cgraph
+            // and backend-scheduler handles needed for those two numbers.
+            // Unset: one getenv() + one bool check, no timers taken.
+            static const char * wp_draft_env    = getenv("WP_DRAFT_STATS");
+            static const bool   wp_draft_stats  = wp_draft_env != nullptr && wp_draft_env[0] == '1';
+            static uint64_t wp_draft_decode_ns  = 0;
+            static uint64_t wp_draft_wait_ns    = 0;
+            static uint64_t wp_draft_sample_ns  = 0;
+            static uint64_t wp_draft_calls      = 0;
+
+            const auto wp_t0 = wp_draft_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
+
+            const auto wp_t1 = wp_draft_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+            if (wp_draft_stats) {
+                // Isolate the "copy/wait" component explicitly: without this,
+                // that wait happens implicitly inside the first
+                // common_sampler_sample() call below (llama_synchronize() at
+                // sampling.cpp:594) and gets folded into "sampling" instead.
+                llama_synchronize(ctx_dft);
+            }
+            const auto wp_t2 = wp_draft_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -2579,6 +2607,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
+            }
+
+            if (wp_draft_stats) {
+                const auto wp_t3 = std::chrono::steady_clock::now();
+                wp_draft_decode_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(wp_t1 - wp_t0).count();
+                wp_draft_wait_ns   += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(wp_t2 - wp_t1).count();
+                wp_draft_sample_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(wp_t3 - wp_t2).count();
+                ++wp_draft_calls;
+
+                if (wp_draft_calls % 256 == 0) {
+                    SPC_WRN("wp draft-stats: sample n=%" PRIu64 " decode=%.3f wait=%.3f sample=%.3f "
+                            "ms/call (mean over %" PRIu64 " calls)\n",
+                            wp_draft_calls,
+                            wp_draft_decode_ns / 1e6 / (double) wp_draft_calls,
+                            wp_draft_wait_ns   / 1e6 / (double) wp_draft_calls,
+                            wp_draft_sample_ns / 1e6 / (double) wp_draft_calls,
+                            wp_draft_calls);
+                }
             }
 
             if (batch.n_tokens == 0) {
