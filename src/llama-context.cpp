@@ -1060,29 +1060,6 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    // WP_GRAPH_RESULT_SLOTS: see llama_context::wp_graph_slot in llama-context.h.
-    // Slot 0 ALIASES gf_res_prev (same llm_graph_result object, not a copy), so
-    // every existing gf_res_prev call site keeps operating on slot 0 and the
-    // N == 1 path allocates nothing extra and behaves byte-identically.
-    {
-        const size_t n_slots = wp_graph_result_slots();
-        if (n_slots > 1) {
-            gf_slots.clear();
-            gf_slots_owned.clear();
-            gf_slots.resize(n_slots);
-            // slot 0 points at gf_res_prev (non-owning); the rest are owned here
-            gf_slots[0].res = gf_res_prev.get();
-            for (size_t i = 1; i < n_slots; ++i) {
-                gf_slots_owned.emplace_back(new llm_graph_result(max_nodes));
-                gf_slots[i].res = gf_slots_owned.back().get();
-            }
-            gf_slot_allocated = -1;
-            LLAMA_LOG_INFO("%s: WP_GRAPH_RESULT_SLOTS = %zu graph-result slots "
-                           "(slot 0 aliases gf_res_prev; %zu extra graph buffers)\n",
-                           __func__, n_slots, n_slots - 1);
-        }
-    }
-
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
@@ -1304,8 +1281,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        // WP: must invalidate EVERY slot, not just slot 0 (see wp_reset_graph_results)
-        wp_reset_graph_results();
+        gf_res_prev->reset();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2011,7 +1987,7 @@ void llama_context::set_no_output_head(bool value) {
 
     // the graph SHAPE changes (the LM head disappears), so the reserved
     // worst-case graph and any cached graph must be rebuilt.
-    wp_reset_graph_results();
+    gf_res_prev->reset();
     sched_need_reserve = true;
 }
 
@@ -2374,80 +2350,6 @@ bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_ty
     return true;
 }
 
-// WP_GRAPH_RESULT_SLOTS=N: number of cached graph-result slots. Default 1, which
-// is exactly today's single-gf_res_prev behaviour (gf_slots stays empty and no
-// selection code runs at all). Parsed once; values < 1 clamp to 1.
-size_t llama_context::wp_graph_result_slots() const {
-    static const size_t n = []() -> size_t {
-        const char * e = getenv("WP_GRAPH_RESULT_SLOTS");
-        if (e == nullptr || e[0] == '\0') {
-            return 1;
-        }
-        const long long v = atoll(e);
-        if (v < 1) {
-            return 1;
-        }
-        // a slot costs one graph-metadata buffer; keep the knob sane
-        return (size_t) std::min<long long>(v, 8);
-    }();
-    return n;
-}
-
-// Pick the slot for (gtype, n_tokens): exact key match, else an unkeyed slot,
-// else least-recently-used. Returns nullptr in single-slot mode so the caller
-// falls through to the untouched gf_res_prev path.
-llama_context::wp_graph_slot * llama_context::wp_pick_graph_slot(llm_graph_type gtype, uint32_t n_tokens) {
-    if (gf_slots.empty()) {
-        return nullptr;
-    }
-
-    size_t best = 0;
-    for (size_t i = 0; i < gf_slots.size(); ++i) {
-        if (gf_slots[i].keyed && gf_slots[i].gtype == gtype && gf_slots[i].n_tokens == n_tokens) {
-            gf_slots[i].last_use = ++gf_slot_clock;
-            return &gf_slots[i];
-        }
-    }
-    // no key match: prefer an unused slot, else evict the LRU one
-    bool found_free = false;
-    for (size_t i = 0; i < gf_slots.size(); ++i) {
-        if (!gf_slots[i].keyed) {
-            best = i;
-            found_free = true;
-            break;
-        }
-    }
-    if (!found_free) {
-        for (size_t i = 1; i < gf_slots.size(); ++i) {
-            if (gf_slots[i].last_use < gf_slots[best].last_use) {
-                best = i;
-            }
-        }
-        // the evicted slot's cached topology no longer describes this key
-        gf_slots[best].res->reset();
-    }
-    gf_slots[best].gtype    = gtype;
-    gf_slots[best].n_tokens = n_tokens;
-    gf_slots[best].keyed    = true;
-    gf_slots[best].last_use = ++gf_slot_clock;
-    return &gf_slots[best];
-}
-
-// Invalidate every cached graph result. Callers that previously did
-// `gf_res_prev->reset()` to guarantee "this graph must not be reused" must go
-// through here, or an extra slot would keep serving a stale topology.
-void llama_context::wp_reset_graph_results() {
-    gf_res_prev->reset();
-    for (auto & slot : gf_slots) {
-        if (slot.res != nullptr && slot.res != gf_res_prev.get()) {
-            slot.res->reset();
-        }
-        slot.keyed    = false;
-        slot.last_use = 0;
-    }
-    gf_slot_allocated = -1;
-}
-
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (layer_cut_eligible(ubatch, gtype)) {
         return process_ubatch_staged(ubatch, gtype, mctx, ret);
@@ -2470,12 +2372,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    // WP_GRAPH_RESULT_SLOTS: pick the slot for this (gtype, n_tokens). Returns
-    // null in single-slot mode, in which case everything below is unchanged.
-    wp_graph_slot * slot     = wp_pick_graph_slot(gtype, ubatch.n_tokens);
-    const int       slot_idx = slot == nullptr ? -1 : (int) (slot - gf_slots.data());
-
-    auto * res = slot == nullptr ? gf_res_prev.get() : slot->res;
+    auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2492,40 +2389,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
-        // MULTI-SLOT ONLY. All slots share this context's sched and therefore its
-        // graph allocator, so only ONE slot's tensor addresses are live at a time.
-        // If the last allocation on this sched belonged to a DIFFERENT slot, this
-        // graph's topology is still valid but its tensor data pointers are stale --
-        // computing on them would read and write another graph's storage. Re-run
-        // allocation (deterministic for an unchanged cgraph) and skip only
-        // model.build_graph(), which is the part this optimisation exists to save.
-        if (slot_idx >= 0 && gf_slot_allocated != slot_idx) {
-            ggml_backend_sched_reset(sched.get());
-
-            ggml_backend_sched_eval_callback reuse_cb = cparams.cb_eval;
-            void * reuse_cb_user_data = cparams.cb_eval_user_data;
-            if (model.wp_pager) {
-                reuse_cb = wp::weight_pager_eval_cb;
-                reuse_cb_user_data = model.wp_pager.get();
-            }
-            ggml_backend_sched_set_eval_callback(sched.get(), reuse_cb, reuse_cb_user_data);
-
-            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-                LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph (slot reuse) returned false\n", __func__);
-                ret = GGML_STATUS_ALLOC_FAILED;
-                return nullptr;
-            }
-            gf_slot_allocated = slot_idx;
-        }
-
-        if (slot_idx >= 0) {
-            gf_slot_hits++;
-        }
         n_reused++;
     } else {
-        if (slot_idx >= 0) {
-            gf_slot_misses++;
-        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2559,21 +2424,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-
-        // this slot's graph now owns the sched's allocation (multi-slot only)
-        if (slot_idx >= 0) {
-            gf_slot_allocated = slot_idx;
-        }
-    }
-
-    // WP_GRAPH_RESULT_SLOTS: reuse accounting, once per 256 decisions. Same
-    // counter family as the "graphs reused" line in slot print_timing, but split
-    // hit/miss so a run says whether the extra slots actually earned their keep.
-    if (slot_idx >= 0 && ((gf_slot_hits + gf_slot_misses) % 256) == 0) {
-        const int32_t total = gf_slot_hits + gf_slot_misses;
-        LLAMA_LOG_INFO("%s: graph-result slots: n=%zu hits=%d misses=%d (%.1f%% reuse)\n",
-                       __func__, gf_slots.size(), gf_slot_hits, gf_slot_misses,
-                       total > 0 ? 100.0 * (double) gf_slot_hits / (double) total : 0.0);
     }
 
     // set the input data for the input tensors
@@ -4365,7 +4215,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    wp_reset_graph_results();
+    gf_res_prev->reset();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
