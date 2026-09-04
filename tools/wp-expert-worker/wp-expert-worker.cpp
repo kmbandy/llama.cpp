@@ -1819,6 +1819,7 @@ struct RequestStats {
     uint64_t ns_vk_op_cpy = 0;
     uint64_t ns_vk_op_other = 0;
     uint64_t n_vk_dispatches = 0;
+    uint64_t n_cpu_serial_small = 0;
     uint64_t ns_prep = 0;
     uint64_t ns_prep_setup = 0;   // ggml_init + new_tensor + buft queries
     uint64_t ns_prep_grow = 0;    // grow_io_buffer (device alloc when it grows)
@@ -2140,6 +2141,7 @@ public:
         ns_vk_op_cpy_ += request.ns_vk_op_cpy;
         ns_vk_op_other_ += request.ns_vk_op_other;
         n_vk_dispatches_ += request.n_vk_dispatches;
+        n_cpu_serial_small_ += request.n_cpu_serial_small;
         n_gcache_hit_ += request.n_gcache_hit;
         n_gcache_miss_ += request.n_gcache_miss;
         n_fuse_gate_up_hit_ += request.n_fuse_gate_up_hit;
@@ -2387,6 +2389,7 @@ private:
                   << " ns_vk_op_cpy=" << ns_vk_op_cpy_
                   << " ns_vk_op_other=" << ns_vk_op_other_
                   << " n_vk_dispatches=" << n_vk_dispatches_
+                  << " n_cpu_serial_small=" << n_cpu_serial_small_
                   << " gcache_hit=" << n_gcache_hit_
                   << " gcache_miss=" << n_gcache_miss_
                   << " n_fuse_gate_up_hit=" << n_fuse_gate_up_hit_
@@ -2563,6 +2566,7 @@ private:
     uint64_t          ns_vk_op_cpy_ = 0;
     uint64_t          ns_vk_op_other_ = 0;
     uint64_t          n_vk_dispatches_ = 0;
+    uint64_t          n_cpu_serial_small_ = 0;
     uint64_t          n_gcache_hit_ = 0;
     uint64_t          n_gcache_miss_ = 0;
     uint64_t          n_fuse_gate_up_hit_ = 0;
@@ -10104,6 +10108,24 @@ public:
                              ts_e != nullptr ? ts_e : "", device_name_.c_str(),
                              (int) ggml_backend_vk_node_ts_enabled());
             }
+            if (is_cpu_backend()) {
+                cpu_graph_n_threads_ = cpu_tier_overlap_enabled()
+                    ? cpu_tier_overlap_n_threads() : cpu_worker_n_threads();
+                const char * se = std::getenv("WP_CPU_SERIAL_SMALL");
+                if (se != nullptr && se[0] != '\0' && se[0] != '0') {
+                    const long v = std::strtol(se, nullptr, 10);
+                    if (v > 0 && v <= 65536) {
+                        cpu_serial_small_max_ = (int) v;
+                    }
+                }
+                std::fprintf(stderr,
+                             "wp expert worker: cpu-serial-small "
+                             "(WP_CPU_SERIAL_SMALL=%s) device=%s enabled=%d n=%d "
+                             "threads=%d\n",
+                             se != nullptr ? se : "", device_name_.c_str(),
+                             (int) (cpu_serial_small_max_ > 0),
+                             cpu_serial_small_max_, cpu_graph_n_threads_);
+            }
             mm_pin_mode_ = parse_mm_pin_mode(
                 std::getenv("WP_EXPERT_MM_PIN"), device_name_);
             mm_pin_min_tokens_ = parse_mm_pin_min_tokens(
@@ -11932,6 +11954,8 @@ private:
     bool        mm_pin_kernel_mmvq_ = false;
     bool        mm_pin_pad_mmvq_ = false;
     bool batch_mmid_enabled_ = false;
+    int  cpu_graph_n_threads_ = 0;
+    int  cpu_serial_small_max_ = 0;
     bool fuse_gate_up_miss_logged_ = false;
 
     void begin_async_dispatch(int conn_index, uint64_t trace_req) {
@@ -13327,6 +13351,33 @@ private:
             // whenever this is overridden; see the two guards further down.
             size_t result_offset = std::numeric_limits<size_t>::max(),
             bool force_fallback = false) {
+        struct CpuSerialSmallGuard {
+            DeviceWorker * w;
+            bool active;
+            CpuSerialSmallGuard(DeviceWorker * ww, uint32_t n_tokens, RequestStats * rs)
+                : w(ww), active(false) {
+                if (w->cpu_serial_small_max_ <= 0 || !w->is_cpu_backend()) {
+                    return;
+                }
+                if ((int) n_tokens > w->cpu_serial_small_max_) {
+                    return;
+                }
+                ggml_backend_cpu_set_n_threads(w->backend_.get(), 1);
+                active = true;
+                if (rs != nullptr) {
+                    ++rs->n_cpu_serial_small;
+                }
+            }
+            ~CpuSerialSmallGuard() {
+                if (active) {
+                    ggml_backend_cpu_set_n_threads(
+                        w->backend_.get(), w->cpu_graph_n_threads_);
+                }
+            }
+            CpuSerialSmallGuard(const CpuSerialSmallGuard &) = delete;
+            CpuSerialSmallGuard & operator=(const CpuSerialSmallGuard &) = delete;
+        };
+        const CpuSerialSmallGuard cpu_serial_small(this, request.n_tokens, &request_stats);
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::chrono::steady_clock::time_point vk_compute_started =
             measure_vk ? std::chrono::steady_clock::now() :
@@ -17378,6 +17429,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.ns_vk_op_cpy += src.ns_vk_op_cpy;
     dst.ns_vk_op_other += src.ns_vk_op_other;
     dst.n_vk_dispatches += src.n_vk_dispatches;
+    dst.n_cpu_serial_small += src.n_cpu_serial_small;
     dst.ns_readback += src.ns_readback;
     dst.ns_prep += src.ns_prep;
     dst.ns_prep_setup += src.ns_prep_setup;
