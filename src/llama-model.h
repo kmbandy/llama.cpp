@@ -650,7 +650,7 @@ struct llama_meta_device_get_split_state_userdata {
 
     // Number of leading world devices allowed to hold output.weight / the MTP LM head. Devices at
     // or beyond it get zero rows, keeping the head on rank 0 and off the wire. 0 = no restriction.
-    size_t                     n_head_devices;
+    size_t                     n_head_devices = 0;
 
     const struct llama_model * model;
 };

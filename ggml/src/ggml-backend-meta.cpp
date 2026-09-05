@@ -2684,9 +2684,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
-            bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
+        if (i < backend_ctx->n_subgraphs - 1) {
+            // Local (intra-process) reduce over this rank's own devices. With a single local
+            // device there is nothing to reduce locally - but there may still be a peer rank, so
+            // this gate must NOT also guard the cross-host reduce below. A world of two ranks with
+            // one device each (the loopback tripwire) hits exactly that case.
+            bool backend_allreduce_success = n_backends <= 1;
+            if (n_backends > 1 && backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
                 nodes.reserve(n_backends);
                 for (size_t j = 0; j < n_backends; j++) {
@@ -2722,10 +2726,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const size_t n_values = nbytes / sizeof(float);
                 float * staging = backend_ctx->cross_host_staging(nbytes);
 
-                // After the local reduce every local device holds the same values, so device 0 is
-                // as good as any; read it back once.
-                ggml_backend_tensor_get_async(backend_ctx->backend_configs[0].backend, node0, staging, 0, nbytes);
-                ggml_backend_synchronize(backend_ctx->backend_configs[0].backend);
+                if (n_backends == 1 && (node0->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    // A rank with a single local device whose slice is zero-sized never ran this
+                    // node, so its buffer holds whatever was there before. With more than one
+                    // local device allreduce_fallback has already zeroed such a node and the
+                    // butterfly has left device 0 holding the correct local total; with exactly
+                    // one there is no local reduce to do that, so contribute an explicit zero
+                    // rather than garbage. Skewed tensor_splits DO produce zero-sized attention
+                    // slices, so this is a live path, not a defensive one.
+                    memset(staging, 0, nbytes);
+                } else {
+                    // After the local reduce every local device holds the same values, so device 0
+                    // is as good as any; read it back once.
+                    ggml_backend_tensor_get_async(backend_ctx->backend_configs[0].backend, node0, staging, 0, nbytes);
+                    ggml_backend_synchronize(backend_ctx->backend_configs[0].backend);
+                }
 
                 if (!backend_ctx->cross_host_reduce(backend_ctx->cross_host_reduce_ud, staging, n_values)) {
                     return GGML_STATUS_FAILED;
@@ -2738,6 +2753,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     ggml_tensor * node_j    = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
                     GGML_ASSERT(ggml_nbytes(node_j) == nbytes);
+                    // The tensor is MIRRORED from here on, so every local device gets the total,
+                    // including one whose own slice was zero-sized: downstream nodes read it.
                     ggml_backend_tensor_set_async(bcj.backend, node_j, staging, 0, nbytes);
                 }
                 for (size_t j = 0; j < n_backends; j++) {
