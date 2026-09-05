@@ -1130,6 +1130,36 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    //
+    // Cross-host tensor parallelism: the FOLLOWER loop (rank != 0).
+    //
+    // Rank 0 is an ordinary llama-server / llama-cli: it samples, it serves HTTP, and every
+    // llama_decode() it performs and every llama_memory_* mutation it makes is mirrored to the
+    // follower over the connection opened by llama_context_params::tp_peer. The follower runs no
+    // sampler and no HTTP; it does nothing but apply those messages, so that both ranks call
+    // llama_decode() with identical batches against identical memory state and their graphs -
+    // and therefore their per-layer reduce exchanges - line up.
+    //
+    // Usage on the follower, after building the model and context exactly as rank 0 does:
+    //
+    //     while (llama_tp_follower_step(ctx) == LLAMA_TP_STEP_OK) { }
+    //
+    // A non-OK return is terminal: SHUTDOWN means the leader closed the world cleanly, ERROR
+    // means the ranks diverged or the connection died and the reason has already been logged.
+
+    enum llama_tp_step_status {
+        LLAMA_TP_STEP_ERROR    = -1,
+        LLAMA_TP_STEP_OK       =  0,
+        LLAMA_TP_STEP_SHUTDOWN =  1,
+    };
+
+    // True when this context is a tensor-parallel FOLLOWER (tp_peer set and this rank does not own
+    // world device 0). False for every non-TP run and for the leader.
+    LLAMA_API bool llama_tp_is_follower(const struct llama_context * ctx);
+
+    // Receive and apply exactly one message from the leader. See llama_tp_step_status.
+    LLAMA_API int32_t llama_tp_follower_step(struct llama_context * ctx);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

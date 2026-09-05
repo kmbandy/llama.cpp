@@ -43,6 +43,7 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-tp-lockstep.cpp
             pipeline/pipe-tp-msg.cpp
             llama-cparams.cpp
             llama-grammar.cpp

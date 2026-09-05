@@ -357,6 +357,35 @@ private:
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
+public:
+    //
+    // cross-host tensor parallelism, lockstep control channel (M3)
+    // implementation: src/llama-tp-lockstep.cpp
+    //
+
+    bool tp_enabled()   const { return tp_comm != nullptr; }
+    bool tp_is_leader() const { return tp_comm != nullptr &&  tp_is_rank0; }
+    bool tp_is_follower() const { return tp_comm != nullptr && !tp_is_rank0; }
+
+    // Startup equality gate. Both ranks send their own HELLO and compare the peer's; a mismatch
+    // is a startup failure, never a silent divergence (spec D.2). Returns false with the reason
+    // already logged.
+    bool tp_hello_exchange(uint32_t n_world, uint32_t rank_first, uint32_t n_local,
+                           uint32_t type_k, uint32_t type_v);
+
+    // Leader side. Mirror one batch / one memory mutation to the follower before performing it
+    // locally. Returns false when the peer connection is gone, which the caller turns into a
+    // failed decode rather than a hang.
+    bool tp_mirror_batch(const llama_batch & batch, bool is_encode);
+    bool tp_mirror_ctrl (uint8_t op, int32_t a, int32_t b, int32_t c, int32_t d, uint8_t b0);
+
+    // Follower side. Receive and apply exactly one message. Returns a llama_tp_step_status.
+    int tp_follower_step();
+
+    llama_memory_i * tp_memory() const { return memory.get(); }
+
+private:
+
     //
     // members
     //
@@ -453,6 +482,15 @@ private:
     bool                          tp_is_rank0 = false;
     static bool tp_cross_host_reduce(void * ud, float * data, size_t n_values);
 
+    // The shared lockstep counter: one increment per MIRRORED OPERATION (decode or control),
+    // stamped by the leader and checked by the follower. A dropped, duplicated or reordered
+    // mirror is caught at the very next frame instead of a hundred layers later inside a reduce.
+    uint32_t tp_op_seq = 0;
+    // Set once the peer connection has failed. Every subsequent decode fails immediately rather
+    // than blocking on a socket nobody is on the other end of.
+    bool tp_dead = false;
+    std::vector<uint8_t> tp_msg_buf; // reused frame staging, leader and follower alike
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
@@ -501,3 +539,15 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
+
+// The one context in this process that is the LEADER of a cross-host tensor-parallel world, or
+// null - which is every run without --tp-world, and the only state the non-TP path pays for: a
+// single null check inside each llama_memory_* entry point. Defined in src/llama-tp-lockstep.cpp.
+extern llama_context * g_llama_tp_leader;
+
+// Mirror one memory mutation to the follower rank. A no-op unless `mem` is the leader context's
+// own memory (a draft context's memory is deliberately NOT mirrored: the follower has no draft
+// context, spec E.3 Option B). Declared here so the llama_memory_* C entry points, which only
+// ever see a llama_memory_t, can reach it.
+void llama_tp_mirror_memory(llama_memory_t mem, uint8_t op,
+                            int32_t a, int32_t b, int32_t c, int32_t d, uint8_t b0);

@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "pipeline/pipe-tp-comm.h"
+#include "pipeline/pipe-tp-msg.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -825,8 +826,31 @@ llama_context::llama_context(
             if (!tp_comm) {
                 throw std::runtime_error(format("cross-host tensor parallelism: failed to establish the peer connection to %s:%d", host.c_str(), port));
             }
-            ggml_backend_meta_set_cross_host_reduce(backend.get(), llama_context::tp_cross_host_reduce, this);
             LLAMA_LOG_INFO("%s: cross-host TP: peer connection established\n", __func__);
+
+            // Startup equality gate (spec D.2). Anything that would make the two ranks build
+            // different graphs or different row maps has to fail HERE, loudly, and not a hundred
+            // layers into the first token.
+            if (!tp_hello_exchange((uint32_t) n_world, (uint32_t) rank_first, (uint32_t) n_local,
+                                   (uint32_t) params.type_k, (uint32_t) params.type_v)) {
+                throw std::runtime_error("cross-host tensor parallelism: the HELLO handshake with the peer rank failed");
+            }
+
+            ggml_backend_meta_set_cross_host_reduce(backend.get(), llama_context::tp_cross_host_reduce, this);
+
+            if (tp_is_rank0) {
+                // NOTE: the process-wide leader registration happens in llama_init_from_model,
+                // AFTER this constructor has returned successfully. Doing it here would leave
+                // g_llama_tp_leader pointing at a half-built object if any later step of the
+                // constructor threw - and ~llama_context, which is what clears it, does not run
+                // for a constructor that threw.
+                if (g_llama_tp_leader != nullptr) {
+                    throw std::runtime_error("cross-host tensor parallelism: a second leader context in one process is not supported");
+                }
+            } else {
+                LLAMA_LOG_INFO("%s: cross-host TP: this rank is a FOLLOWER - no sampler, no HTTP; "
+                               "it decodes only what the leader mirrors to it\n", __func__);
+            }
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -986,6 +1010,13 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // Close the tensor-parallel world cleanly: without this the follower's next recv sees a socket
+    // error and exits 1, which looks like a fault in the logs when it was an ordinary shutdown.
+    if (g_llama_tp_leader == this) {
+        tp_mirror_ctrl(PIPE_TP_CTRL_SHUTDOWN, 0, 0, 0, 0, 0);
+        g_llama_tp_leader = nullptr;
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -3019,6 +3050,15 @@ int llama_context::encode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // Cross-host tensor parallelism: mirror this batch to the follower rank BEFORE anything is
+    // derived from it. The follower runs the identical batch through the identical batch allocator
+    // and ubatch split, so the two ranks' graphs - and therefore their per-layer reduce exchanges -
+    // line up without the split itself ever going on the wire. A leader whose peer is gone fails
+    // the batch here rather than blocking on the first reduce.
+    if (tp_is_leader() && !tp_mirror_batch(batch_inp, true)) {
+        return -1;
+    }
+
     const auto & hparams = model.hparams;
 
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
@@ -3304,6 +3344,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+        return -1;
+    }
+
+    // Cross-host tensor parallelism: mirror this batch to the follower rank BEFORE anything is
+    // derived from it. The follower runs the identical batch through the identical batch allocator
+    // and ubatch split, so the two ranks' graphs - and therefore their per-layer reduce exchanges -
+    // line up without the split itself ever going on the wire. A leader whose peer is gone fails
+    // the batch here rather than blocking on the first reduce.
+    if (tp_is_leader() && !tp_mirror_batch(batch_inp, false)) {
         return -1;
     }
 
@@ -5779,6 +5828,14 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+
+        // Cross-host tensor parallelism: this context is now fully built, so it is safe to publish
+        // it as the process's leader. Every llama_memory_* entry point mirrors through this one
+        // pointer, and ~llama_context clears it.
+        if (ctx->tp_is_leader()) {
+            g_llama_tp_leader = ctx;
+        }
+
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -6091,6 +6148,16 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
         return;
     }
 
+    // Cross-host tensor parallelism: these six functions are the ONE place every KV/SSM mutation
+    // in the tree bottoms out - common_memory::seq_rm/seq_cp/seq_add, llama-cli's context shift,
+    // the server's prompt-cache truncation and speculative rollback, and
+    // common_context_can_seq_rm()'s probe all arrive here. Mirroring at this seam means a new
+    // call site cannot forget to mirror. g_llama_tp_leader is null unless --tp-world is in use,
+    // so a non-TP run pays one predictable null check per call and nothing else.
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_MEM_CLEAR, 0, 0, 0, 0, data ? 1 : 0);
+    }
+
     mem->clear(data);
 }
 
@@ -6101,6 +6168,10 @@ bool llama_memory_seq_rm(
              llama_pos p1) {
     if (!mem) {
         return true;
+    }
+
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_RM, seq_id, p0, p1, 0, 0);
     }
 
     return mem->seq_rm(seq_id, p0, p1);
@@ -6116,6 +6187,10 @@ void llama_memory_seq_cp(
         return;
     }
 
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_CP, seq_id_src, seq_id_dst, p0, p1, 0);
+    }
+
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
@@ -6124,6 +6199,10 @@ void llama_memory_seq_keep(
           llama_seq_id seq_id) {
     if (!mem) {
         return;
+    }
+
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_KEEP, seq_id, 0, 0, 0, 0);
     }
 
     mem->seq_keep(seq_id);
@@ -6139,6 +6218,10 @@ void llama_memory_seq_add(
         return;
     }
 
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_ADD, seq_id, p0, p1, delta, 0);
+    }
+
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -6150,6 +6233,10 @@ void llama_memory_seq_div(
                    int d) {
     if (!mem) {
         return;
+    }
+
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_DIV, seq_id, p0, p1, d, 0);
     }
 
     mem->seq_div(seq_id, p0, p1, d);
@@ -6264,12 +6351,33 @@ size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
+    // Cross-host tensor parallelism: a state RESTORE is the one memory mutation this design does
+    // not mirror. Rank 1's KV and SSM state is a DIFFERENT SHARD of the same logical state (its
+    // own rows of cache_k/v and cache_r/s), so rank 0's blob is meaningless there - and
+    // llama-memory-recurrent's serialiser writes n_embd_s, so shipping it would be rejected
+    // rather than silently misapplied. Restoring on rank 0 alone would leave the two ranks with
+    // different KV contents and produce a plausible wrong answer, so it is refused instead.
+    // Server context checkpoints and /slots restore therefore have to be off under --tp-world.
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism: the peer rank "
+                        "holds a different shard of this state and cannot be restored from this "
+                        "blob. Run with context checkpoints and slot save/restore disabled.\n",
+                __func__);
+        return 0;
+    }
+
     ctx->synchronize();
 
     return ctx->state_set_data(src, size);
 }
 
 bool llama_state_load_file(llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism (see "
+                        "llama_state_seq_set_data_ext)\n", __func__);
+        return false;
+    }
+
     ctx->synchronize();
 
     try {
@@ -6313,6 +6421,21 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // Cross-host tensor parallelism: a state RESTORE is the one memory mutation this design does
+    // not mirror. Rank 1's KV and SSM state is a DIFFERENT SHARD of the same logical state (its
+    // own rows of cache_k/v and cache_r/s), so rank 0's blob is meaningless there - and
+    // llama-memory-recurrent's serialiser writes n_embd_s, so shipping it would be rejected
+    // rather than silently misapplied. Restoring on rank 0 alone would leave the two ranks with
+    // different KV contents and produce a plausible wrong answer, so it is refused instead.
+    // Server context checkpoints and /slots restore therefore have to be off under --tp-world.
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism: the peer rank "
+                        "holds a different shard of this state and cannot be restored from this "
+                        "blob. Run with context checkpoints and slot save/restore disabled.\n",
+                __func__);
+        return 0;
+    }
+
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
@@ -6330,6 +6453,21 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    // Cross-host tensor parallelism: a state RESTORE is the one memory mutation this design does
+    // not mirror. Rank 1's KV and SSM state is a DIFFERENT SHARD of the same logical state (its
+    // own rows of cache_k/v and cache_r/s), so rank 0's blob is meaningless there - and
+    // llama-memory-recurrent's serialiser writes n_embd_s, so shipping it would be rejected
+    // rather than silently misapplied. Restoring on rank 0 alone would leave the two ranks with
+    // different KV contents and produce a plausible wrong answer, so it is refused instead.
+    // Server context checkpoints and /slots restore therefore have to be off under --tp-world.
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism: the peer rank "
+                        "holds a different shard of this state and cannot be restored from this "
+                        "blob. Run with context checkpoints and slot save/restore disabled.\n",
+                __func__);
+        return 0;
+    }
+
     ctx->synchronize();
 
     try {
