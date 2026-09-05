@@ -68,6 +68,16 @@ pipe_tp_comm::pipe_tp_comm(std::shared_ptr<pipe_socket_t> sock, size_t max_value
     recv_buf_.reset(new float[max_values]);
     const char * env = getenv("WP_TP_STATS");
     print_stats_at_exit_ = env != nullptr && atoi(env) != 0;
+    // A peer that has DIED is detected by the socket (POLLHUP / recv 0) and needs no timeout. A
+    // peer that is merely STUCK - a follower wedged in a graph, a rank waiting for a frame the
+    // other never sends because the graphs diverged - would otherwise hang this rank forever
+    // inside poll(-1). Default 120 s: far longer than any single ubatch on this rig, short enough
+    // that a wedged run fails a request instead of a shift.
+    const char * env_to = getenv("WP_TP_TIMEOUT_MS");
+    timeout_ms_ = env_to != nullptr ? atoi(env_to) : 120000;
+    if (timeout_ms_ < 0) {
+        timeout_ms_ = 0;
+    }
 }
 
 pipe_tp_comm::~pipe_tp_comm() {
@@ -195,11 +205,17 @@ bool pipe_tp_comm::exchange_add(float * local, size_t n_values, bool local_is_ra
         if (recv_hdr_done < sizeof(hdr_in) || recv_body_done < recv_body_todo) {
             pfd.events |= POLLIN;
         }
-        const int pr = poll(&pfd, 1, -1);
+        const int pr = poll(&pfd, 1, timeout_ms_ > 0 ? timeout_ms_ : -1);
         if (pr < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            return false;
+        }
+        if (pr == 0) {
+            fprintf(stderr, "pipe-tp: peer silent for %d ms during reduce %u of %zu values - "
+                            "treating the connection as dead rather than hanging the graph\n",
+                    timeout_ms_, seq_out_, n_values);
             return false;
         }
         if (pfd.revents & (POLLERR | POLLNVAL)) {
@@ -299,6 +315,124 @@ bool pipe_tp_comm::exchange_add(float * local, size_t n_values, bool local_is_ra
         stats_.ns_blocked_max = dt;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// M3 control channel
+// ---------------------------------------------------------------------------------------------
+
+#ifndef _WIN32
+// Drive one direction of a small transfer to completion, honouring timeout_ms_. `send` selects the
+// direction. Returns false on a dead or silent peer.
+static bool pipe_tp_xfer(int fd, uint8_t * buf, size_t bytes, bool send_dir, int timeout_ms) {
+    size_t done = 0;
+    while (done < bytes) {
+        struct pollfd pfd;
+        pfd.fd      = fd;
+        pfd.events  = send_dir ? POLLOUT : POLLIN;
+        pfd.revents = 0;
+        const int pr = poll(&pfd, 1, timeout_ms > 0 ? timeout_ms : -1);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (pr == 0) {
+            return false; // silent peer
+        }
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            return false;
+        }
+        const ssize_t n = send_dir
+            ? send(fd, buf + done, bytes - done, MSG_NOSIGNAL)
+            : recv(fd, buf + done, bytes - done, 0);
+        if (n == 0) {
+            return false; // orderly shutdown mid-message
+        }
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return false;
+        }
+        done += (size_t) n;
+    }
+    return true;
+}
+#endif
+
+bool pipe_tp_comm::send_msg(uint8_t type, const void * payload, size_t bytes) {
+#ifdef _WIN32
+    (void) type; (void) payload; (void) bytes;
+    return false;
+#else
+    if (fd_ < 0 || type == PIPE_TP_MSG_REDUCE || bytes > 0xffffffffull) {
+        return false;
+    }
+    pipe_tp_frame_hdr hdr;
+    hdr.magic         = PIPE_TP_MAGIC;
+    hdr.type          = type;
+    hdr.dtype         = (uint8_t) dtype_;
+    hdr.flags         = 0;
+    hdr.seq           = ++msg_seq_out_;
+    hdr.payload_bytes = (uint32_t) bytes;
+
+    // Two writes, not a gathered one: unlike a reduce this is not on the per-layer hot path, and
+    // the peer is blocked reading rather than simultaneously writing, so there is no deadlock to
+    // avoid and no wakeup budget to protect.
+    if (!pipe_tp_xfer(fd_, (uint8_t *) &hdr, sizeof(hdr), true, timeout_ms_)) {
+        return false;
+    }
+    if (bytes > 0 && !pipe_tp_xfer(fd_, (uint8_t *) payload, bytes, true, timeout_ms_)) {
+        return false;
+    }
+    stats_.bytes_sent += sizeof(hdr) + bytes;
+    return true;
+#endif
+}
+
+bool pipe_tp_comm::recv_msg(uint8_t * type, std::vector<uint8_t> & payload) {
+#ifdef _WIN32
+    (void) type; (void) payload;
+    return false;
+#else
+    if (fd_ < 0) {
+        return false;
+    }
+    pipe_tp_frame_hdr hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    if (!pipe_tp_xfer(fd_, (uint8_t *) &hdr, sizeof(hdr), false, timeout_ms_)) {
+        return false;
+    }
+    if (hdr.magic != PIPE_TP_MAGIC || hdr.flags != 0 || hdr.dtype != (uint8_t) dtype_) {
+        fprintf(stderr, "pipe-tp: malformed control frame header (magic=%08x type=%u dtype=%u flags=%u)\n",
+                hdr.magic, hdr.type, hdr.dtype, hdr.flags);
+        return false;
+    }
+    if (hdr.type == PIPE_TP_MSG_REDUCE) {
+        // A reduce frame where a descriptor was expected means the peer entered a graph this rank
+        // has not been told about: the ranks have diverged. Never silently skip it.
+        fprintf(stderr, "pipe-tp: received a REDUCE frame while waiting for a control frame - "
+                        "the two ranks have diverged\n");
+        return false;
+    }
+    if (hdr.seq != msg_seq_in_ + 1) {
+        fprintf(stderr, "pipe-tp: control frame out of order (expected seq %u, got %u)\n",
+                msg_seq_in_ + 1, hdr.seq);
+        return false;
+    }
+    msg_seq_in_ = hdr.seq;
+
+    payload.resize(hdr.payload_bytes);
+    if (hdr.payload_bytes > 0 &&
+            !pipe_tp_xfer(fd_, payload.data(), hdr.payload_bytes, false, timeout_ms_)) {
+        return false;
+    }
+    stats_.bytes_recvd += sizeof(hdr) + hdr.payload_bytes;
+    *type = hdr.type;
+    return true;
+#endif
 }
 
 void pipe_tp_comm::print_stats(const char * tag) const {

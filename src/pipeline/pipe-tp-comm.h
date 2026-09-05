@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 struct pipe_socket_t;
 
@@ -57,10 +58,10 @@ struct pipe_socket_t;
 enum pipe_tp_msg_type : uint8_t {
     PIPE_TP_MSG_INVALID = 0,
     PIPE_TP_MSG_REDUCE  = 1, // payload: the sender's partial sum, `payload_bytes` of `dtype`
-    PIPE_TP_MSG_HELLO   = 2, // reserved (M3): model identity, world/rank, tensor_split, n_subgraphs
-    PIPE_TP_MSG_DECODE  = 3, // reserved (M3): per-step batch descriptor
-    PIPE_TP_MSG_CTRL    = 4, // reserved (M3): RESET / KV_TRIM
-    PIPE_TP_MSG_ERROR   = 5, // reserved (M3)
+    PIPE_TP_MSG_HELLO   = 2, // M3: model identity, world/rank, tensor_split, context shape
+    PIPE_TP_MSG_DECODE  = 3, // M3: per-step batch descriptor (pipe_tp_encode_batch)
+    PIPE_TP_MSG_CTRL    = 4, // M3: memory mutation / shutdown (pipe_tp_encode_ctrl)
+    PIPE_TP_MSG_ERROR   = 5, // M3: a rank is aborting; payload is a UTF-8 reason
 };
 
 enum pipe_tp_wire_dtype : uint8_t {
@@ -110,6 +111,26 @@ struct pipe_tp_comm {
     // Parse "host:port". Returns false on a malformed address.
     static bool parse_peer(const std::string & spec, std::string * host, int * port);
 
+    // ---------------------------------------------------------------------------------------
+    // M3 control channel. These share the connection with the reduce frames above; ordering does
+    // the separation, because the leader always finishes sending a descriptor before it enters
+    // the graph that produces the reduce frames explaining it.
+    //
+    // They keep their OWN sequence counter. exchange_add() checks that the peer's Nth reduce is
+    // this rank's Nth reduce, which is the whole lockstep guarantee of M2; control frames flow in
+    // one direction only (leader -> follower), so counting them on the shared counter would make
+    // the two ranks' reduce numbering drift apart by exactly the number of control frames sent.
+    // ---------------------------------------------------------------------------------------
+
+    // Send one non-reduce frame. Blocking; these are tens of bytes to a few KB, one per decode
+    // step, so the poll loop of exchange_add() would be all cost and no benefit here.
+    bool send_msg(uint8_t type, const void * payload, size_t bytes);
+
+    // Receive one non-reduce frame. `payload` is resized to the frame's length. Returns false on
+    // a broken connection, a malformed header, or a REDUCE frame arriving where a control frame
+    // was expected (which means the ranks have diverged).
+    bool recv_msg(uint8_t * type, std::vector<uint8_t> & payload);
+
     // Exchange one partial with the peer and leave the total in `local`.
     //
     // `local` holds this rank's partial on entry and S_rank0 + S_rank1 on return. It is sent in
@@ -132,6 +153,9 @@ private:
     size_t                          max_values_ = 0;
     uint32_t                        seq_out_    = 0;
     uint32_t                        seq_in_     = 0;
+    uint32_t                        msg_seq_out_ = 0;
+    uint32_t                        msg_seq_in_  = 0;
+    int                             timeout_ms_  = 0; // 0 = block forever; WP_TP_TIMEOUT_MS
     pipe_tp_wire_dtype              dtype_      = PIPE_TP_DTYPE_F32;
     pipe_tp_stats                   stats_;
     bool                            print_stats_at_exit_ = false;
