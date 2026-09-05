@@ -3189,8 +3189,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
+    // Cross-host TP: see the note in decode() -- a follower rank owns no rows of the LM head,
+    // so its logits/embeddings tensors are slices of world devices it does not have, and it has
+    // no consumer for either. Skip the readback; n_outputs is left alone so the graph stays in
+    // lockstep with the leader.
+    const bool tp_skip_output_readback = tp_is_follower();
+
     // extract logits
-    if (logits.data && t_logits) {
+    if (logits.data && t_logits && !tp_skip_output_readback) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
@@ -3204,7 +3210,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     // extract embeddings
-    if (embd.data && t_embd) {
+    if (embd.data && t_embd && !tp_skip_output_readback) {
         ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
@@ -3773,8 +3779,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        // Cross-host tensor parallelism: a follower rank must not read its outputs back.
+        //
+        // The LM head is restricted to rank 0's world devices (n_head_devices, see
+        // llama_meta_device_get_split_state in src/llama-model.cpp), so output.weight has
+        // ZERO rows on every device the follower owns. The logits node is
+        // mul_mat(output.weight, cur), which the meta backend types as an AXIS_0 split
+        // carrying output.weight's world ne[] -- i.e. all of its non-empty chunks live on
+        // devices the follower does not have. ggml_backend_meta_get_tensor_async() cannot
+        // gather a remote slice and asserts ("cannot read back a remote slice of a split
+        // tensor", ggml/src/ggml-backend-meta.cpp), which is what killed the follower during
+        // the first live warm-up decode.
+        //
+        // The follower has no sampler, no HTTP and no caller for logits or embeddings, so the
+        // fix is simply not to read them. n_outputs and the logits flags are deliberately NOT
+        // changed: they feed the graph tail's output selection, and a rank whose n_outputs
+        // differs from its peer's builds a differently shaped graph, which deadlocks the
+        // lockstep instead of returning a wrong answer (spec risk R1).
+        //
+        // On the leader this is a no-op: it owns every non-empty chunk of the logits tensor,
+        // so its gather is local and yields the full 248320-wide vocab row with zero wire
+        // traffic. That is the whole point of pinning the LM head to rank 0.
+        const bool tp_skip_output_readback = tp_is_follower();
+
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && !tp_skip_output_readback &&
+                needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3793,7 +3823,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        if (embd.data && t_embd && n_outputs > 0 && !tp_skip_output_readback) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -3861,7 +3891,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && !tp_skip_output_readback &&
+                    cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -3877,7 +3908,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        if (has_samplers) {
+        if (has_samplers && !tp_skip_output_readback) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host

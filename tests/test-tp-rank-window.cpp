@@ -274,6 +274,57 @@ static void test_attention_units_are_indivisible() {
            any_zero ? "  (zero-sized slice present, as expected)" : "");
 }
 
+// 7. THE LOGITS READBACK RULE. ggml_backend_meta_get_tensor_async() walks all n_world chunks of a
+//    split tensor, skips the empty ones, and asserts that every NON-empty one falls inside the
+//    local window ("cannot read back a remote slice of a split tensor"). The logits node is
+//    mul_mat(output.weight, cur), which the meta backend types as an AXIS_0 split carrying
+//    output.weight's world ne[]. Reproduce that walk here for both rank windows:
+//      - the leader (window [0,2)) owns every non-empty chunk, so its gather is legal AND yields
+//        the full vocab row with zero cross-host traffic;
+//      - the follower (window [2,4)) owns none of them, so ANY readback there aborts. That is why
+//        llama_context::decode()/encode() skip the logits/embeddings extraction on a follower.
+static void test_logits_readback_ownership() {
+    const size_t n_world = 4;
+    const int64_t n_vocab = 248320;
+    const std::vector<std::vector<float>> splits = {
+        {52.36f, 24.64f, 11.5f, 11.5f},
+        {46.2f,  23.8f,  15.0f, 15.0f},
+        {0.0f,   0.0f,   0.0f,  0.0f},
+    };
+
+    // Mirrors the meta backend's gather loop: returns the number of rows a rank window could
+    // legally read, or -1 if it would hit the "remote slice" abort.
+    auto gathered_rows = [&](const int64_t * ne, size_t rank_first, size_t n_local) -> int64_t {
+        int64_t rows = 0;
+        for (size_t jw = 0; jw < n_world; jw++) {
+            if (ne[jw] == 0) {
+                continue;
+            }
+            if (!(jw >= rank_first && jw < rank_first + n_local)) {
+                return -1;
+            }
+            rows += ne[jw];
+        }
+        return rows;
+    };
+
+    for (const auto & ts : splits) {
+        for (size_t rot = 0; rot < n_world; rot++) {
+            int64_t ne[16] = {0};
+            llama_tp_split_segment(n_vocab, 1, ts.data(), n_world, /*n_devices_eff =*/ 2, rot, ne);
+
+            CHECK(gathered_rows(ne, 0, 2) == n_vocab,
+                  "leader rot %zu: gather yielded %lld rows, expected the full vocab %lld",
+                  rot, (long long) gathered_rows(ne, 0, 2), (long long) n_vocab);
+            CHECK(gathered_rows(ne, 2, 2) == -1,
+                  "follower rot %zu: a logits gather must be impossible, it holds no LM head rows", rot);
+            CHECK(ne[2] == 0 && ne[3] == 0,
+                  "follower rot %zu: got %lld + %lld LM head rows, expected none",
+                  rot, (long long) ne[2], (long long) ne[3]);
+        }
+    }
+}
+
 int main() {
     printf("test-tp-rank-window\n");
     test_partition_exact();
@@ -282,6 +333,7 @@ int main() {
     test_head_restricted_to_rank0();
     test_world_of_one_is_a_noop();
     test_attention_units_are_indivisible();
+    test_logits_readback_ownership();
 
     if (g_failures != 0) {
         fprintf(stderr, "test-tp-rank-window: %d failure(s)\n", g_failures);
