@@ -104,6 +104,8 @@ add_library(${TARGET}
     speculative.h
     subproc.cpp
     subproc.h
+    tp-follower.cpp
+    tp-follower.h
     trie.cpp
     trie.h
     unicode.cpp

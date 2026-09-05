@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "tp-follower.h"
 #include "log.h"
 
 #include "cli-context.h"
@@ -39,6 +40,13 @@ int llama_cli(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
+    }
+
+    // Cross-host tensor parallelism: a follower rank has no prompt, no sampler and no UI. It runs
+    // the lockstep loop instead of the CLI, using the same model/context construction (spec T7 -
+    // deliberately not a separate binary). Unreachable without --tp-world.
+    if (common_tp_is_follower(params)) {
+        return common_tp_follower_run(params);
     }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))

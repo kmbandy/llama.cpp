@@ -1450,6 +1450,18 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // Cross-host tensor parallelism: backend sampling adds nodes to the graph. Rank 1 has zero
+    // rows of output.weight, so its logits tensor is zero-sized and those nodes would not be the
+    // same nodes on the two ranks - and a graph shape that differs between ranks is the one
+    // failure mode of this design that DEADLOCKS instead of returning a wrong answer (spec R1).
+    // Off on both ranks under --tp-world, which costs nothing here: it is opt-in and off by
+    // default.
+    if (params.tp_world > 1 && params.sampling.backend_sampling) {
+        COM_WRN("%s", "cross-host tensor parallelism: disabling backend sampling; the two ranks "
+                      "must build identically shaped graphs\n");
+        params.sampling.backend_sampling = false;
+    }
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
