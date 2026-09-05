@@ -618,6 +618,33 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
+    // TurboQuant Walsh-Hadamard rotation (ggml_turbo_wht), used by the turbo{2,3,4}_0 KV cache to
+    // rotate Q before attention and to un-rotate the attention output.
+    //
+    // The result has exactly src[0]'s ne[] and the kernels (ggml-cpu/ops.cpp
+    // ggml_compute_forward_turbo_wht_f32, ggml-cuda/turbo-wht.cu k_turbo_wht_f32) address the data
+    // as flat rows of ne[0]: for every row they transform each consecutive run of `group_size`
+    // (32/64/128) elements independently - scale, sign flip, butterfly, normalize, sign flip - and
+    // copy the ne[0] % group_size tail through unchanged. No value ever crosses a row boundary, so
+    // this is a per-row op and the split state simply follows src[0], exactly like NORM/RMS_NORM.
+    //
+    // ne[0] must not be split. It is the head dim (128 after the turbo zero-padding in
+    // llama-kv-cache.cpp cpy_k/cpy_v) and group_size is the whole head dim in the KV path, so any
+    // split of ne[0] would cut a butterfly group in half and each device would compute a transform
+    // of the wrong length - silently wrong numerics, not a crash. Tensor parallelism shards heads
+    // here instead (ne[1] for q_cur / the flash-attn output, ne[2] once q is permuted for
+    // flash_attn_ext), which is safe: a device owns whole heads and therefore whole groups.
+    //
+    // src[1] is the optional InnerQ scale ("turbo_innerq_scale_inv", 128 floats). It is indexed by
+    // the position WITHIN a group and reused for every group of every row, so it is not sharded
+    // along with the heads - every device needs all of it, i.e. MIRRORED.
+    auto handle_turbo_wht = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0 &&
+            "turbo_wht mixes values within groups along ne[0], so ne[0] cannot be split");
+        GGML_ASSERT(tensor->src[1] == nullptr || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        return src_ss[0];
+    };
+
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -1123,6 +1150,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
+            } break;
+            case GGML_OP_TURBO_WHT: {
+                split_state = handle_turbo_wht(src_ss);
             } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
