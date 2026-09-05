@@ -1405,6 +1405,47 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Load-path profiling, GGML_META_PROFILE=1.
+//
+// Weight upload through the meta backend is silent and can take minutes on a slow interconnect,
+// with no way to tell from outside whether the time is going into the split-state callback, the
+// host-side source walk, or the device transfer itself. These counters separate the three. They
+// are off by default and cost one steady_clock read per set_tensor call when on.
+// ---------------------------------------------------------------------------------------------
+
+struct ggml_backend_meta_profile {
+    bool     enabled     = false;
+    uint64_t n_set       = 0;   // set_tensor calls
+    uint64_t n_transfers = 0;   // ggml_backend_tensor_set_* calls actually issued (per device)
+    uint64_t n_rows      = 0;   // rows those transfers cover, i.e. DMA descriptors for a 2D copy
+    uint64_t bytes_local = 0;   // bytes written to local devices
+    uint64_t bytes_world = 0;   // bytes walked over, including slices owned by other ranks
+    uint64_t ns_split    = 0;   // time in the split-state callback
+    uint64_t ns_transfer = 0;   // time in the transfer loop
+
+    ggml_backend_meta_profile() {
+        const char * env = getenv("GGML_META_PROFILE");
+        enabled = env != nullptr && atoi(env) != 0;
+    }
+    ~ggml_backend_meta_profile() {
+        if (!enabled || n_set == 0) {
+            return;
+        }
+        GGML_LOG_INFO("meta profile: set_tensor=%llu transfers=%llu rows=%llu "
+                      "local=%.2f GiB world_walked=%.2f GiB split=%.2f s transfer=%.2f s\n",
+            (unsigned long long) n_set, (unsigned long long) n_transfers, (unsigned long long) n_rows,
+            bytes_local / 1073741824.0, bytes_world / 1073741824.0,
+            ns_split / 1e9, ns_transfer / 1e9);
+    }
+};
+
+static ggml_backend_meta_profile g_meta_profile;
+
+static uint64_t ggml_backend_meta_now_ns() {
+    return g_meta_profile.enabled ? (uint64_t) ggml_time_us() * 1000ull : 0;
+}
+
 // Byte size of WORLD device jw's chunk along the split axis, for a single-segment (nr == 1) split.
 // For a local device this is exactly the simple tensor's nb[axis+1]; deriving it from the world
 // split state instead lets a rank advance the source/destination pointer past chunks it does not
@@ -1534,7 +1575,22 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const size_t n_bufs     = ggml_backend_meta_buffer_n_bufs(buffer);
     const size_t n_world    = ggml_backend_meta_buffer_n_world(buffer);
     const size_t rank_first = ggml_backend_meta_buffer_rank_first(buffer);
+    const uint64_t t_split0 = ggml_backend_meta_now_ns();
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (g_meta_profile.enabled) {
+        g_meta_profile.ns_split += ggml_backend_meta_now_ns() - t_split0;
+        g_meta_profile.n_set++;
+        g_meta_profile.bytes_world += size;
+    }
+    struct meta_set_timer {
+        uint64_t t0;
+        meta_set_timer() : t0(ggml_backend_meta_now_ns()) {}
+        ~meta_set_timer() {
+            if (g_meta_profile.enabled) {
+                g_meta_profile.ns_transfer += ggml_backend_meta_now_ns() - t0;
+            }
+        }
+    } meta_set_timer_instance;
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -1626,6 +1682,11 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     GGML_ASSERT(simple_tensor->nb[split_state.axis + 1] == chunk_size_j);
                     const size_t simple_offset = i_start * chunk_size_j;
                     ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                    if (g_meta_profile.enabled) {
+                        g_meta_profile.n_transfers++;
+                        g_meta_profile.n_rows      += (uint64_t) (i_stop - i_start);
+                        g_meta_profile.bytes_local += chunk_size_j * (uint64_t) (i_stop - i_start);
+                    }
                 }
                 offset_j += chunk_size_j;
             }
