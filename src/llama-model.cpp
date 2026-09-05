@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-tp-split.h"
 
 #include "llama-arch.h"
 #include "llama-context.h"
@@ -895,33 +896,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // always indexed with the full world stride so the remaining devices keep a zero slice.
         const size_t n_dev_eff = tc.n_devices_eff;
         GGML_ASSERT(n_dev_eff >= 1 && n_dev_eff <= ud->n_devices);
-        std::vector<float> tensor_split_scan;
-        tensor_split_scan.reserve(n_dev_eff);
-        for (size_t j = 0; j < n_dev_eff; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % n_dev_eff]);
-            if (j > 0) {
-                tensor_split_scan[j] += tensor_split_scan[j - 1];
-            }
-        }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         for (size_t is = 0; is < segments.size(); is++) {
-            const int64_t  ne_s = segments[is].first;
-            const uint32_t nr_s = segments[is].second;
-            const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
-            for (; j + 1 < n_dev_eff; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/n_dev_eff : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
-                }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % n_dev_eff] = high - low;
-                low = high;
-            }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % n_dev_eff] = ne_s - low;
-            split_state.nr[is] = nr_s;
+            llama_tp_split_segment(segments[is].first, granularity[is], tensor_split,
+                    ud->n_devices, n_dev_eff, tc.rotation, &split_state.ne[is*ud->n_devices]);
+            split_state.nr[is] = segments[is].second;
         }
         split_state.n_segments = segments.size();
     } else {

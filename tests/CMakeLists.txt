@@ -418,6 +418,30 @@ target_compile_definitions(test-wp-expert-dispatcher PRIVATE
 target_compile_features(test-wp-expert-dispatcher PRIVATE cxx_std_17)
 llama_test(test-wp-expert-dispatcher)
 
+# cross-host tensor parallelism: the rank-windowed row split (pure arithmetic, no model, no GPU)
+add_executable(
+    test-tp-rank-window
+    test-tp-rank-window.cpp
+)
+target_include_directories(test-tp-rank-window PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(test-tp-rank-window PRIVATE cxx_std_17)
+llama_test(test-tp-rank-window)
+
+# cross-host tensor parallelism: the peer exchange, over a real loopback socket (no ggml, no model)
+add_executable(
+    test-tp-comm
+    test-tp-comm.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-tp-comm.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
+)
+target_include_directories(test-tp-comm PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_link_libraries(test-tp-comm PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-tp-comm PRIVATE cxx_std_17)
+llama_test(test-tp-comm)
+
 # cross-machine pipeline band helpers (pure, no ggml dependency)
 add_executable(
     test-pipeline-band
