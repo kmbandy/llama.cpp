@@ -404,6 +404,25 @@ extern "C" {
         // indices are preserved. See src/llama-pipeline.h.
         int32_t pipeline_layer_first;
         int32_t pipeline_layer_last;
+
+        // Cross-host TENSOR parallelism (LLAMA_SPLIT_MODE_TENSOR spanning more than one process).
+        //
+        // tp_world      total number of DEVICES across every rank. 0 or 1 means "single process",
+        //               which is the default and is byte-identical to not setting these at all.
+        // tp_rank_first index, within that world, of this process's FIRST device. The process owns
+        //               the contiguous window [tp_rank_first, tp_rank_first + n_local_devices).
+        //               Rank 0 has tp_rank_first == 0.
+        // tp_head_devices
+        //               number of leading world devices that may hold output.weight (and the MTP
+        //               LM head). Every world device at or beyond it gets zero rows, which keeps
+        //               the LM head entirely on rank 0 and removes a per-token cross-host gather
+        //               of the vocab. 0 means "no restriction" (all world devices share the head).
+        //
+        // Every rank must be given the SAME tp_world, the same tensor_split and the same
+        // tp_head_devices, or the ranks compute different global row maps and diverge.
+        uint32_t tp_world;
+        uint32_t tp_rank_first;
+        uint32_t tp_head_devices;
     };
 
     struct llama_sampler_seq_config {

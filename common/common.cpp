@@ -1778,6 +1778,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     }
 
     // cross-machine pipeline band
+    mparams.tp_world        = (uint32_t) std::max(0, params.tp_world);
+    mparams.tp_rank_first   = (uint32_t) std::max(0, params.tp_rank);
+    mparams.tp_head_devices = (uint32_t) std::max(0, params.tp_head_devices);
+
     mparams.pipeline_layer_first = params.pipeline_layer_first;
     mparams.pipeline_layer_last  = params.pipeline_layer_last;
 

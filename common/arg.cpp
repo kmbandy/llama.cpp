@@ -3274,6 +3274,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"--tp-world"}, "N",
+        "cross-host tensor parallelism: total number of DEVICES across every rank\n"
+        "(0/1 = single process, the default; every path is byte-identical when unset).\n"
+        "All ranks must be given the same --tp-world and the same -ts.",
+        [](common_params & params, int value) {
+            params.tp_world = value;
+        }
+    ).set_env("LLAMA_ARG_TP_WORLD"));
+    add_opt(common_arg(
+        {"--tp-rank"}, "N",
+        "cross-host tensor parallelism: index of THIS process's first device inside the world.\n"
+        "Rank 0 passes 0; a second rank whose peer owns 2 devices passes 2. The process owns the\n"
+        "window [N, N + <number of local devices>). Rank 0 listens for the peer, others connect.",
+        [](common_params & params, int value) {
+            params.tp_rank = value;
+        }
+    ).set_env("LLAMA_ARG_TP_RANK"));
+    add_opt(common_arg(
+        {"--tp-head-devices"}, "N",
+        "cross-host tensor parallelism: number of leading world devices allowed to hold\n"
+        "output.weight. 0 (default) derives it so the LM head stays on rank 0 only, which avoids\n"
+        "a per-token cross-host gather of the vocab. Only set this for worlds of >2 ranks.",
+        [](common_params & params, int value) {
+            params.tp_head_devices = value;
+        }
+    ).set_env("LLAMA_ARG_TP_HEAD_DEVICES"));
+    add_opt(common_arg(
+        {"--tp-peer"}, "HOST:PORT",
+        "cross-host tensor parallelism: address of the peer rank. Rank 0 (--tp-rank 0) BINDS and\n"
+        "accepts on it, every other rank CONNECTS to it. Required whenever --tp-world exceeds the\n"
+        "number of local devices.",
+        [](common_params & params, const std::string & value) {
+            params.tp_peer = value;
+        }
+    ).set_env("LLAMA_ARG_TP_PEER"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {

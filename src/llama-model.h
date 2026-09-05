@@ -643,7 +643,15 @@ struct llama_device {
 };
 
 struct llama_meta_device_get_split_state_userdata {
+    // Number of devices in the WORLD, which under cross-host tensor parallelism is larger than the
+    // number of devices this process owns. The split policy is deliberately world-only: it never
+    // looks at which devices are local, so every rank derives an identical global row map.
     size_t                     n_devices;
+
+    // Number of leading world devices allowed to hold output.weight / the MTP LM head. Devices at
+    // or beyond it get zero rows, keeping the head on rank 0 and off the wire. 0 = no restriction.
+    size_t                     n_head_devices;
+
     const struct llama_model * model;
 };
 
