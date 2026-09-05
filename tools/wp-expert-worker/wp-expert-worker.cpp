@@ -17616,7 +17616,8 @@ public:
             TestHooks * test_hooks,
             const std::vector<int> & resident_expert_blocks,
             const std::vector<int> & expert_reserve_blocks,
-            uint64_t expert_reserve_bytes) :
+            uint64_t expert_reserve_bytes,
+            const std::vector<std::pair<std::vector<int>, std::string>> & layer_device = {}) :
         catalog_(std::move(catalog)),
         device_names_(devices),
         device_slots_(device_slots),
@@ -17631,6 +17632,7 @@ public:
                 throw std::invalid_argument("worker device slot budgets must be positive");
             }
         }
+        resolve_layer_device_override(layer_device);
         const size_t n_pages = catalog_.pages.size();
         page_access_counts_ = std::make_unique<std::atomic<uint64_t>[]>(n_pages);
         page_current_owner_ = std::make_unique<std::atomic<uint32_t>[]>(n_pages);
@@ -17675,6 +17677,13 @@ public:
                       << std::endl;
         }
         if (owner_policy_ == owner_policy::hot) {
+            if (!layer_device_override_.empty()) {
+                // hot rewrites the whole owner map after the static one is
+                // built, silently undoing the layer binding. Refuse instead.
+                throw std::invalid_argument(
+                    "WP_EXPERT_OWNER_POLICY=hot rewrites the owner map and would "
+                    "override --layer-device; use one or the other");
+            }
             if (single_device) {
                 std::cerr << "WARN wp expert worker: WP_EXPERT_OWNER_POLICY=hot on a "
                              "single-device worker has nothing to place; ignoring"
@@ -17688,13 +17697,59 @@ public:
         }
     }
 
+    // (size_t) -1 when the layer has no --layer-device entry. Called once per
+    // page at startup and, with WP_EXPERT_LFU_PLACEMENT off, never again.
+    size_t forced_device_for_layer(int layer) const {
+        if (layer < 0 || (size_t) layer >= layer_device_override_.size()) {
+            return (size_t) -1;
+        }
+        return layer_device_override_[layer];
+    }
+
+    void resolve_layer_device_override(
+            const std::vector<std::pair<std::vector<int>, std::string>> & layer_device) {
+        if (layer_device.empty()) {
+            return;
+        }
+        std::ostringstream summary;
+        for (const auto & entry : layer_device) {
+            const auto it = std::find(
+                device_names_.begin(), device_names_.end(), entry.second);
+            if (it == device_names_.end()) {
+                throw std::invalid_argument(
+                    "--layer-device names device '" + entry.second +
+                    "' which this worker does not serve");
+            }
+            const size_t device = (size_t) (it - device_names_.begin());
+            for (const int layer : entry.first) {
+                if (layer < 0) {
+                    continue;
+                }
+                if ((size_t) layer >= layer_device_override_.size()) {
+                    layer_device_override_.resize((size_t) layer + 1, (size_t) -1);
+                }
+                layer_device_override_[layer] = device;
+                summary << ' ' << layer << '=' << entry.second;
+            }
+        }
+        std::cerr << "WARN wp expert worker: layer_device forced owners:"
+                  << summary.str() << std::endl;
+    }
+
     size_t owning_device_for_page(
             int layer, int expert, size_t * migration_budget = nullptr) const {
         return owner_for_page(layer, expert, migration_budget);
     }
 
     size_t static_owner_for_page(int layer, int expert) const {
-        (void) layer;
+        // --layer-device pins a whole layer to one device. Everything
+        // downstream (the reserve partition, the pin file, resident experts,
+        // LFU placement) routes through owning_device_for_page, so overriding
+        // the owner map here is the only edit those mechanisms need.
+        const size_t forced = forced_device_for_layer(layer);
+        if (forced != (size_t) -1) {
+            return forced;
+        }
         return proportional_owner_for_expert(
             expert, catalog_.descriptor.expert_first,
             catalog_.descriptor.expert_last, device_slots_);
@@ -18429,8 +18484,10 @@ private:
         if (id == page_static_owners_.size()) {
             return static_owner_for_page(layer, expert);
         }
+        // A --layer-device layer must never be re-homed by LFU placement: the
+        // whole point of the flag is that the layer stays on the named device.
         if (!placement_enabled_ || !placement_ready_ || migration_budget == nullptr ||
-                resident_layer(layer)) {
+                resident_layer(layer) || forced_device_for_layer(layer) != (size_t) -1) {
             return placement_enabled_ && placement_ready_
                 ? (size_t) page_current_owner_[id].load(std::memory_order_relaxed)
                 : page_static_owners_[id];
@@ -19527,6 +19584,9 @@ private:
     std::unique_ptr<std::atomic<uint64_t>[]> page_access_counts_;
     std::unique_ptr<std::atomic<uint32_t>[]> page_current_owner_;
     std::vector<size_t> page_static_owners_;
+    // Indexed by layer; (size_t) -1 means "no --layer-device entry". Empty
+    // unless the flag/env is set, so the default path is unchanged.
+    std::vector<size_t> layer_device_override_;
     std::vector<int> resident_expert_blocks_;
     std::vector<uint64_t> placement_class_sizes_;
     std::vector<std::vector<size_t>> placement_pages_by_class_;
@@ -21714,7 +21774,7 @@ ResourcePlan inspect_resources(const Options & options) {
         options.host_victim_bytes,
         options.test_hooks,
         options.resident_expert_blocks, options.expert_reserve_blocks,
-        options.expert_reserve_bytes);
+        options.expert_reserve_bytes, options.layer_device);
     return worker.resources();
 }
 
@@ -21756,7 +21816,7 @@ int run(const Options & options) {
         options.host_victim_bytes,
         options.test_hooks,
         options.resident_expert_blocks, options.expert_reserve_blocks,
-        options.expert_reserve_bytes);
+        options.expert_reserve_bytes, options.layer_device);
     log_openmp_runtime_once();
     if (const char * shm = std::getenv("WP_LOCAL_SHM"); shm != nullptr && std::strcmp(shm, "1") == 0) {
         uint32_t shm_tokens = 2048;

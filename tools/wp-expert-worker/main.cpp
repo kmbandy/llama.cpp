@@ -2,6 +2,7 @@
 
 #include "weight-pager/wp-router.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cctype>
 #include <cstdint>
@@ -21,7 +22,8 @@ void print_usage(const char * argv0) {
         << " --listen HOST:PORT --slots N [--host-budget-bytes N]"
         << " [--host-victim-bytes N]"
         << " [--weight-paging-resident-experts BLOCKS]"
-        << " [--expert-reserve-blocks BLOCKS --expert-reserve-bytes SIZE]\n"
+        << " [--expert-reserve-blocks BLOCKS --expert-reserve-bytes SIZE]"
+        << " [--layer-device RANGE=DEVICE[,RANGE=DEVICE]]\n"
         << "       --slots is the device budget in largest-page equivalents\n"
         << "       --device NAME1,NAME2 with --slots N1,N2 selects multiple devices\n"
         << "       staging defaults to up to 16 largest-page buffers\n"
@@ -29,7 +31,9 @@ void print_usage(const char * argv0) {
         << "       WP_EXPERT_HOST_VICTIM_BYTES supplies the optional VRAM victim tier\n"
         << "       WP_EXPERT_HOST_SPEC_BYTES reserves additional host RAM for prefetch landings\n"
         << "       WP_EXPERT_RESIDENT_EXPERTS supplies resident block ranges\n"
-        << "       WP_EXPERT_RESERVE_BLOCKS and WP_EXPERT_RESERVE_BYTES supply the reserved partition\n";
+        << "       WP_EXPERT_RESERVE_BLOCKS and WP_EXPERT_RESERVE_BYTES supply the reserved partition\n"
+        << "       --layer-device 43-45=CPU forces those layers onto a named --device entry\n"
+        << "       WP_EXPERT_LAYER_DEVICE supplies the same layer/device map\n";
 }
 
 int parse_positive_int(const std::string & text, const char * option) {
@@ -105,6 +109,50 @@ std::vector<int> parse_slots(const std::string & text) {
     return result;
 }
 
+// "43-45=CPU" or "0-6,20-22=CPU,0-2=CUDA0". Entries are comma-separated and the
+// range half reuses the resident-experts grammar, which is ALSO comma-separated,
+// so a token without '=' is a continuation of the range list for the next entry.
+std::vector<std::pair<std::vector<int>, std::string>> parse_layer_device(
+        const std::string & text, const char * option) {
+    std::vector<std::pair<std::vector<int>, std::string>> result;
+    std::string ranges;
+    size_t begin = 0;
+    while (begin <= text.size()) {
+        const size_t end = text.find(',', begin);
+        const std::string token = text.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        const size_t equals = token.find('=');
+        const std::string head = token.substr(0, equals);
+        if (head.empty()) {
+            throw std::invalid_argument(std::string(option) + " has an empty layer range");
+        }
+        ranges += ranges.empty() ? head : ("," + head);
+        if (equals != std::string::npos) {
+            const std::string device = token.substr(equals + 1);
+            if (device.empty()) {
+                throw std::invalid_argument(std::string(option) + " expects RANGE=DEVICE");
+            }
+            const wp::ResidentExpertRequest request =
+                wp::parse_resident_expert_request(ranges.c_str());
+            if (request.blocks.empty()) {
+                throw std::invalid_argument(
+                    std::string(option) + " requires a non-empty layer range before '='");
+            }
+            result.emplace_back(request.blocks, device);
+            ranges.clear();
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    if (!ranges.empty() || result.empty()) {
+        throw std::invalid_argument(
+            std::string(option) + " expects RANGE=DEVICE, for example 43-45=CPU");
+    }
+    return result;
+}
+
 void parse_endpoint(const std::string & text, std::string & host, int & port) {
     const size_t colon = text.rfind(':');
     if (colon == std::string::npos || colon == 0 || colon + 1 == text.size()) {
@@ -162,6 +210,8 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
             options.expert_reserve_blocks_set = true;
         } else if (arg == "--expert-reserve-bytes") {
             options.expert_reserve_bytes = parse_size(take(), "--expert-reserve-bytes");
+        } else if (arg == "--layer-device") {
+            options.layer_device = parse_layer_device(take(), "--layer-device");
         } else {
             throw std::invalid_argument("unknown option: " + arg);
         }
@@ -210,6 +260,26 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
     if (options.expert_reserve_bytes == 0) {
         const char * value = std::getenv("WP_EXPERT_RESERVE_BYTES");
         if (value != nullptr && value[0] != '\0') options.expert_reserve_bytes = parse_size(value, "WP_EXPERT_RESERVE_BYTES");
+    }
+    if (options.layer_device.empty()) {
+        const char * value = std::getenv("WP_EXPERT_LAYER_DEVICE");
+        if (value != nullptr && value[0] != '\0') {
+            options.layer_device = parse_layer_device(value, "WP_EXPERT_LAYER_DEVICE");
+        }
+    }
+    // A device name that is not in --device looks configured and is not, so it
+    // is fatal here rather than a silent fall back to device 0.
+    for (const auto & entry : options.layer_device) {
+        if (std::find(options.devices.begin(), options.devices.end(), entry.second) ==
+                options.devices.end()) {
+            std::string names;
+            for (const std::string & name : options.devices) {
+                names += names.empty() ? name : ("," + name);
+            }
+            throw std::invalid_argument(
+                "--layer-device names device '" + entry.second +
+                "' which is not one of --device " + names);
+        }
     }
     return options;
 }

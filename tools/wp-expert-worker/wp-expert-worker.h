@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct ggml_context;
@@ -160,6 +161,9 @@ struct Options {
     std::vector<int>      expert_reserve_blocks;
     bool                  expert_reserve_blocks_set = false;
     uint64_t              expert_reserve_bytes = 0;
+    // --layer-device RANGE=DEVICE: forces every page of the named layers onto
+    // the named device, overriding the proportional-by-expert-index owner map.
+    std::vector<std::pair<std::vector<int>, std::string>> layer_device;
     TestHooks *           test_hooks = nullptr;
     bool                  once        = false;
 };
