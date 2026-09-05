@@ -45,8 +45,11 @@ int common_tp_follower_run(common_params & params) {
     // that would create one.
 
     LOG_INF("%s: tensor-parallel follower: world %d devices, this rank owns the window starting at "
-            "world device %d, leader at %s\n",
-            __func__, params.tp_world, params.tp_rank, params.tp_peer.c_str());
+            "world device %d, peer socket %s %s\n",
+            __func__, params.tp_world, params.tp_rank,
+            llama_tp_should_listen(params.tp_peer.c_str(), params.tp_rank, params.tp_listen)
+                ? "bound on" : "dialling",
+            params.tp_peer.c_str());
 
     // Same construction path as rank 0. Everything that could differ between the ranks - context
     // size, batch sizes, KV types, the tensor split, the model itself - is compared field by field

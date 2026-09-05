@@ -11,8 +11,11 @@
 #ifdef _WIN32
 #   include <winsock2.h>
 #else
+#   include <arpa/inet.h>
 #   include <errno.h>
 #   include <fcntl.h>
+#   include <ifaddrs.h>
+#   include <netinet/in.h>
 #   include <poll.h>
 #   include <sys/socket.h>
 #   include <sys/uio.h>
@@ -159,6 +162,41 @@ static void pipe_tp_waiting_note(const char * what, const std::string & host, in
         fprintf(stderr, "pipe-tp: %s %s:%d ... %.0f s elapsed (no timeout)\n",
                 what, host.c_str(), port, (now - t0_ns) / 1e9);
     }
+}
+
+bool pipe_tp_comm::host_is_local(const std::string & host) {
+    if (host.empty()) {
+        return false;
+    }
+    if (host == "0.0.0.0" || host == "*") {
+        return true; // the wildcard: bindable by definition
+    }
+#ifndef _WIN32
+    struct in_addr want;
+    if (inet_aton(host.c_str(), &want) == 0) {
+        // A NAME, not a literal. create_server() resolves with inet_addr() and so cannot bind one
+        // at all, which makes "not local" the only answer that leads anywhere useful.
+        return false;
+    }
+    if ((ntohl(want.s_addr) >> 24) == 127) {
+        return true; // loopback
+    }
+    struct ifaddrs * ifa = nullptr;
+    if (getifaddrs(&ifa) != 0) {
+        return false;
+    }
+    bool found = false;
+    for (struct ifaddrs * p = ifa; p != nullptr && !found; p = p->ifa_next) {
+        if (p->ifa_addr == nullptr || p->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        found = ((struct sockaddr_in *) p->ifa_addr)->sin_addr.s_addr == want.s_addr;
+    }
+    freeifaddrs(ifa);
+    return found;
+#else
+    return host == "127.0.0.1";
+#endif
 }
 
 bool pipe_tp_comm::parse_peer(const std::string & spec, std::string * host, int * port) {

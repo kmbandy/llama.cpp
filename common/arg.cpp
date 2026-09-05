@@ -3314,6 +3314,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TP_PEER"));
     add_opt(common_arg(
+        {"--tp-listen"},
+        "cross-host tensor parallelism: THIS rank binds and accepts on --tp-peer; the other rank\n"
+        "connects to it. The socket role is independent of the rank role - rank 0 stays the leader\n"
+        "(it samples and mirrors) whichever end of the connection it is on. Use this when the\n"
+        "firewall only allows one direction: a default-deny-inbound rank 0 must DIAL OUT, so pass\n"
+        "--tp-listen on rank 1 and point rank 0's --tp-peer at rank 1's address.\n"
+        "Absent, the role is derived: rank 0 binds if --tp-peer names an address it can bind, and\n"
+        "connects otherwise, which is what every previous launch line already did.",
+        [](common_params & params) {
+            params.tp_listen = 1;
+        }
+    ).set_env("WP_TP_LISTEN"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {

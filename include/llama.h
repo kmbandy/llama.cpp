@@ -531,7 +531,19 @@ extern "C" {
         // The rank's role is taken from the model's tensor-parallel window: the rank owning world
         // device 0 BINDS and accepts, every other rank CONNECTS.
         const char * tp_peer;
-        int32_t      tp_connect_timeout_ms; // 0 => 60000
+        int32_t      tp_connect_timeout_ms; // 0 => WP_TP_CONNECT_TIMEOUT_MS, default 30 min
+
+        // Which end of that connection this rank is. The SOCKET role is independent of the RANK
+        // role: rank 0 is always the leader (it samples and mirrors), but it need not be the one
+        // that binds. Firewalls decide this, not us - mad-lab-main runs ufw default-deny inbound,
+        // so the only direction that works on this rig is main dialling out to 2026 on a port
+        // 2026 already has open.
+        //   <0  auto: bind if this rank owns world device 0 AND tp_peer names an address this
+        //       machine can bind. Otherwise connect. This reproduces the previous behaviour for
+        //       every invocation that worked before.
+        //    0  connect to tp_peer.
+        //    1  bind and accept on tp_peer.
+        int32_t      tp_listen;
     };
 
     struct llama_model_tensor_override {
@@ -1158,6 +1170,11 @@ extern "C" {
     //
     // Returns false if the address is malformed or the port cannot be bound. Idempotent.
     LLAMA_API bool llama_tp_prebind_peer(const char * peer);
+
+    // Resolve the socket role: true when this rank should bind and accept on `peer`, false when it
+    // should connect. `tp_listen` is the tri-state above. Exposed so that the caller can bind the
+    // port BEFORE loading the model and still agree with what the context will do later.
+    LLAMA_API bool llama_tp_should_listen(const char * peer, int32_t rank_first, int32_t tp_listen);
 
     enum llama_tp_step_status {
         LLAMA_TP_STEP_ERROR    = -1,

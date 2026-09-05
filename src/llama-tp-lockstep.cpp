@@ -302,6 +302,25 @@ int llama_context::tp_follower_step() {
 // public C API
 // ---------------------------------------------------------------------------------------------
 
+bool llama_tp_should_listen(const char * peer, int32_t rank_first, int32_t tp_listen) {
+    if (tp_listen >= 0) {
+        return tp_listen != 0; // the operator said so
+    }
+    // AUTO. Rank 0 is the natural listener - that is what every launch line before the firewall
+    // problem used - but only if tp_peer actually names an address this machine can bind. An
+    // address it cannot bind is unambiguously a "dial there", and treating it as one is what lets
+    // rank 0 connect out to a listening rank 1 without anyone having to pass --tp-listen 0.
+    if (peer == nullptr || peer[0] == '\0') {
+        return false;
+    }
+    std::string host;
+    int port = 0;
+    if (!pipe_tp_comm::parse_peer(peer, &host, &port)) {
+        return false;
+    }
+    return rank_first == 0 && pipe_tp_comm::host_is_local(host);
+}
+
 bool llama_tp_prebind_peer(const char * peer) {
     if (peer == nullptr || peer[0] == '\0') {
         return false;

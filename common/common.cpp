@@ -1458,7 +1458,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     // in 43 seconds - exhausted its connect window against a port that did not exist yet. Binding
     // first means the kernel accepts the follower's connection from the backlog while this rank is
     // still loading, and start order no longer matters in either direction.
-    if (params.tp_world > 1 && params.tp_rank == 0 && !params.tp_peer.empty()) {
+    // NOTE the gate is the SOCKET role, not the rank: with --tp-listen on rank 1 it is rank 1 that
+    // must have the port up before its own load, and rank 0 that dials.
+    if (params.tp_world > 1 && !params.tp_peer.empty() &&
+            llama_tp_should_listen(params.tp_peer.c_str(), params.tp_rank, params.tp_listen)) {
         // Deliberately NOT a hard return: every caller in the tree dereferences the returned
         // pointer without a null check (tools/server/server-context.cpp:1963-1968), so failing
         // here would trade a clear error for a segfault. The run is doomed either way - the
@@ -1854,6 +1857,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_unified        = params.kv_unified;
     cparams.expert_dispatch   = params.expert_dispatch.empty() ? nullptr : params.expert_dispatch.c_str();
     cparams.tp_peer           = params.tp_peer.empty() ? nullptr : params.tp_peer.c_str();
+    cparams.tp_listen         = params.tp_listen;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

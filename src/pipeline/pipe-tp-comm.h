@@ -127,6 +127,12 @@ struct pipe_tp_comm {
     static std::unique_ptr<pipe_tp_comm> listen (const std::string & host, int port, size_t max_values, int timeout_ms);
     static std::unique_ptr<pipe_tp_comm> connect(const std::string & host, int port, size_t max_values, int timeout_ms);
 
+    // True when `host` is an address this machine can bind: the wildcard 0.0.0.0, a loopback
+    // address, or an address assigned to one of this host's interfaces. Used to decide the SOCKET
+    // role when no explicit one was given - an address you can bind is a "listen here", an address
+    // you cannot is a "dial there" - and that is the whole of the auto rule.
+    static bool host_is_local(const std::string & host);
+
     // Parse "host:port". Returns false on a malformed address.
     static bool parse_peer(const std::string & spec, std::string * host, int * port);
 

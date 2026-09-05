@@ -831,16 +831,25 @@ llama_context::llama_context(
                 ? params.tp_connect_timeout_ms
                 : pipe_tp_comm::default_connect_timeout_ms();
 
+            // TWO INDEPENDENT ROLES, and conflating them is what broke the live run.
+            //   tp_is_rank0  the LEADER role: who samples, who mirrors batches and memory ops, and
+            //                which operand is S_rank0 in the fixed-order add. Always device 0.
+            //   do_listen    the SOCKET role: who binds and who dials. Set by the firewall, not by
+            //                the topology - mad-lab-main is default-deny inbound, so the only
+            //                direction that connects is main dialling 2026. Rank 0 remains the
+            //                leader either way; only the socket flips.
             tp_is_rank0 = (rank_first == 0);
-            LLAMA_LOG_INFO("%s: cross-host TP: rank owns world devices [%zu,%zu) of %zu, %s %s:%d\n",
+            const bool do_listen = llama_tp_should_listen(params.tp_peer, (int32_t) rank_first, params.tp_listen);
+            LLAMA_LOG_INFO("%s: cross-host TP: rank owns world devices [%zu,%zu) of %zu; %s, %s %s:%d\n",
                     __func__, rank_first, rank_first + n_local, n_world,
-                    tp_is_rank0 ? "listening on" : "connecting to", host.c_str(), port);
+                    tp_is_rank0 ? "LEADER" : "FOLLOWER",
+                    do_listen ? "listening on" : "connecting to", host.c_str(), port);
 
             LLAMA_LOG_INFO("%s: cross-host TP: %s (cap %.0f s, WP_TP_CONNECT_TIMEOUT_MS)\n",
                     __func__,
-                    tp_is_rank0 ? "waiting for the peer rank to connect" : "connecting to the leader rank",
+                    do_listen ? "waiting for the peer rank to connect" : "connecting to the peer rank",
                     timeout_ms / 1000.0);
-            tp_comm = tp_is_rank0
+            tp_comm = do_listen
                 ? pipe_tp_comm::listen (host, port, max_values, timeout_ms)
                 : pipe_tp_comm::connect(host, port, max_values, timeout_ms);
             if (!tp_comm) {
@@ -5718,6 +5727,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_dispatch             =*/ nullptr,
         /*.tp_peer                     =*/ nullptr,
         /*.tp_connect_timeout_ms       =*/ 0,
+        /*.tp_listen                   =*/ -1,
     };
 
     return result;

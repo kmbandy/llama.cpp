@@ -202,10 +202,15 @@ struct rank_result {
 };
 
 // The leader: mirrors, then "performs". Exactly the order llama_context::decode() uses.
-static void run_leader(const std::vector<script_op> & script, rank_result * out) {
-    auto comm = pipe_tp_comm::listen(TEST_HOST, TEST_PORT, 1 << 16, 5000);
+static void run_leader(const std::vector<script_op> & script, rank_result * out,
+                       int port, bool do_listen) {
+    // The leader is the rank that MIRRORS. Whether it binds or dials is a separate question,
+    // answered by the firewall rather than by the topology, and nothing below depends on it.
+    auto comm = do_listen
+        ? pipe_tp_comm::listen (TEST_HOST, port, 1 << 16, 5000)
+        : pipe_tp_comm::connect(TEST_HOST, port, 1 << 16, 5000);
     if (!comm) {
-        out->err = "listen failed";
+        out->err = do_listen ? "leader listen failed" : "leader connect failed";
         return;
     }
     if (!hello_exchange(*comm, make_hello(0, 1), &out->err)) {
@@ -290,10 +295,13 @@ static void run_leader(const std::vector<script_op> & script, rank_result * out)
 // call log. A reduce is not a message it waits for - it is what its graph produces once it has
 // been told to decode, so it runs one immediately after each applied batch, exactly as the real
 // follower does.
-static void run_follower(const std::vector<script_op> & script, rank_result * out) {
-    auto comm = pipe_tp_comm::connect(TEST_HOST, TEST_PORT, 1 << 16, 5000);
+static void run_follower(const std::vector<script_op> & script, rank_result * out,
+                         int port, bool do_listen) {
+    auto comm = do_listen
+        ? pipe_tp_comm::listen (TEST_HOST, port, 1 << 16, 5000)
+        : pipe_tp_comm::connect(TEST_HOST, port, 1 << 16, 5000);
     if (!comm) {
-        out->err = "connect failed";
+        out->err = do_listen ? "follower listen failed" : "follower connect failed";
         return;
     }
     if (!hello_exchange(*comm, make_hello(1, 1), &out->err)) {
@@ -378,12 +386,16 @@ static void run_follower(const std::vector<script_op> & script, rank_result * ou
 
 // ---------------------------------------------------------------------------------------------
 
-static bool test_loopback_lockstep() {
+// `leader_listens` flips ONLY the socket direction. Rank 0 stays the leader in both arms: it is
+// the one that mirrors, and it is the one that passes local_is_rank0=true to the fixed-order add.
+// If any of the lockstep machinery had quietly taken "listener" to mean "rank 0", the flipped arm
+// would produce a different call log or a non-cancelling reduce, and both are checked below.
+static bool run_lockstep_arm(int port, bool leader_listens) {
     const std::vector<script_op> script = build_script();
 
     rank_result r0, r1;
-    std::thread t0([&]{ run_leader  (script, &r0); });
-    std::thread t1([&]{ run_follower(script, &r1); });
+    std::thread t0([&]{ run_leader  (script, &r0, port,  leader_listens); });
+    std::thread t1([&]{ run_follower(script, &r1, port, !leader_listens); });
     t0.join();
     t1.join();
 
@@ -418,9 +430,22 @@ static bool test_loopback_lockstep() {
         }
     }
 
-    printf("  %zu operations applied identically on both ranks, interleaved with reduces\n",
-           r0.log.size());
+    printf("  %zu operations applied identically on both ranks, interleaved with reduces (%s)\n",
+           r0.log.size(), leader_listens ? "leader listening" : "leader dialling out");
     return true;
+}
+
+static bool test_loopback_lockstep() {
+    return run_lockstep_arm(TEST_PORT, true);
+}
+
+// THE FIREWALL ARM. mad-lab-main runs ufw default-deny inbound with no allow rules, so nothing can
+// dial IN to rank 0; every existing rig has main connecting OUT to 2026's already-open worker
+// ports. So the follower binds and the LEADER dials - the reverse of every launch line written so
+// far - and all of prebind, HELLO, the operation counter and the fixed-order add must be
+// indifferent to it.
+static bool test_follower_listens_leader_connects() {
+    return run_lockstep_arm(TEST_PORT + 3, false);
 }
 
 // A leader that skips ONE mirror - the failure mode this whole design is built to catch, and the
@@ -581,14 +606,40 @@ static bool test_prebind_lets_the_follower_connect_during_the_load() {
     return true;
 }
 
+// The auto rule that keeps --tp-listen optional: an address this machine can bind is a "listen
+// here", one it cannot is a "dial there". Every launch line written before the firewall problem
+// gave rank 0 a wildcard or loopback address, so all of them still resolve to "rank 0 listens".
+static bool test_host_is_local() {
+    struct { const char * host; bool want; } cases[] = {
+        {"0.0.0.0",       true },  // the wildcard: what every rank-0 launch line has used
+        {"127.0.0.1",     true },  // the G1 loopback tripwire
+        {"127.1.2.3",     true },
+        {"192.168.1.33",  false},  // rank 1's address, seen from rank 0 -> dial it
+        {"203.0.113.7",   false},  // TEST-NET-3, cannot be assigned here
+        {"mad-lab-main",  false},  // a NAME: create_server cannot bind one at all
+        {"",              false},
+    };
+    for (auto & c : cases) {
+        const bool got = pipe_tp_comm::host_is_local(c.host);
+        if (got != c.want) {
+            fprintf(stderr, "FAIL: host_is_local(\"%s\") = %d, expected %d\n", c.host, (int) got, (int) c.want);
+            return false;
+        }
+    }
+    printf("  the wildcard and loopback bind here; a peer address and a name do not\n");
+    return true;
+}
+
 int main() {
     if (const char * p = getenv("WP_TP_TEST_PORT")) {
         TEST_PORT = atoi(p);
     }
     struct { const char * name; bool (*fn)(); } tests[] = {
         {"loopback-lockstep",  test_loopback_lockstep},
+        {"follower-listens",   test_follower_listens_leader_connects},
         {"dropped-mirror",     test_dropped_mirror_is_caught},
         {"prebind-ordering",   test_prebind_lets_the_follower_connect_during_the_load},
+        {"host-is-local",      test_host_is_local},
     };
     for (auto & t : tests) {
         printf("test-tp-lockstep: %s\n", t.name);

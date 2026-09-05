@@ -651,6 +651,9 @@ struct common_params {
     int32_t     tp_rank  = 0;
     int32_t     tp_head_devices = 0; // 0 = derive (LM head on rank 0 only)
     std::string tp_peer;
+    // Socket role, independent of rank. -1 auto (rank 0 binds if tp_peer is an address it can
+    // bind, else it dials), 1 = --tp-listen, 0 = connect. See llama_context_params::tp_listen.
+    int32_t     tp_listen = -1;
 
     bool single_turn       = false; // single turn chat conversation
 
