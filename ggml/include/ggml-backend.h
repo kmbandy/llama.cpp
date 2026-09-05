@@ -437,9 +437,29 @@ extern "C" {
     GGML_API size_t ggml_backend_meta_dev_n_world   (ggml_backend_dev_t meta_dev);
     GGML_API size_t ggml_backend_meta_dev_rank_first(ggml_backend_dev_t meta_dev);
 
-    // World size / first local world index of a meta backend.
+    // True when this backend is a meta backend (device type GGML_BACKEND_DEVICE_TYPE_META).
+    GGML_API bool ggml_backend_meta_is_meta(ggml_backend_t backend);
+
+    // Local simple backend count / world size / first local world index of a meta backend.
+    GGML_API size_t ggml_backend_meta_n_local   (ggml_backend_t meta_backend);
     GGML_API size_t ggml_backend_meta_n_world   (ggml_backend_t meta_backend);
     GGML_API size_t ggml_backend_meta_rank_first(ggml_backend_t meta_backend);
+
+    // Cross-host reduce hook.
+    //
+    // Called at every reduce point AFTER the local (intra-process) reduce has completed and BEFORE
+    // the next subgraph runs. `data` holds this rank's partial sum as `n_values` contiguous f32
+    // values in host memory; on return it must hold the sum over ALL ranks, computed in an order
+    // that is fixed and identical on every rank. Return false to abort the graph.
+    //
+    // The buffer handed to the callback is owned by the meta backend, is allocated once from the
+    // simple backend's host (pinned, where available) buffer type, and is reused for every call.
+    //
+    // Installed by the host application so that ggml keeps no dependency on a transport. With no
+    // reducer installed the meta backend behaves exactly as it did before this hook existed.
+    typedef bool (*ggml_backend_meta_cross_host_reduce_t)(void * ud, float * data, size_t n_values);
+    GGML_API void ggml_backend_meta_set_cross_host_reduce(
+        ggml_backend_t meta_backend, ggml_backend_meta_cross_host_reduce_t reduce, void * ud);
 
     //
     // Utils

@@ -16,6 +16,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct pipe_tp_comm; // cross-host tensor-parallel exchange, src/pipeline/pipe-tp-comm.h
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -445,6 +446,12 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // Cross-host tensor parallelism: the persistent connection to the peer rank, and the trampoline
+    // the meta backend calls at every reduce point. Null unless --tp-world and --tp-peer are set.
+    std::unique_ptr<pipe_tp_comm> tp_comm;
+    bool                          tp_is_rank0 = false;
+    static bool tp_cross_host_reduce(void * ud, float * data, size_t n_values);
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

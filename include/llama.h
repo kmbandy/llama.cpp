@@ -524,6 +524,14 @@ extern "C" {
 
         // Comma-separated expert worker endpoints. nullptr or empty disables remote expert dispatch.
         const char * expert_dispatch;
+
+        // Cross-host tensor parallelism: "host:port" of the peer rank, used to open the persistent
+        // connection that carries the per-reduce partial exchange. nullptr or empty disables it,
+        // which is the default and leaves the meta backend doing only its local reduce.
+        // The rank's role is taken from the model's tensor-parallel window: the rank owning world
+        // device 0 BINDS and accepts, every other rank CONNECTS.
+        const char * tp_peer;
+        int32_t      tp_connect_timeout_ms; // 0 => 60000
     };
 
     struct llama_model_tensor_override {

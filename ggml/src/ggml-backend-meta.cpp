@@ -1972,6 +1972,35 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // Cross-host (inter-process) reduce, installed by the host application. Runs after the local
+    // reduce at every reduce point; see ggml_backend_meta_set_cross_host_reduce.
+    ggml_backend_meta_cross_host_reduce_t cross_host_reduce    = nullptr;
+    void *                                cross_host_reduce_ud = nullptr;
+
+    // Host staging for the cross-host reduce: the partial is read back into it from local device
+    // 0, summed with the peer's, and written to every local device. Allocated once from the simple
+    // backend's host buffer type - pinned where the backend provides one, which is what makes the
+    // per-reduce D2H/H2D pair cheap - and grown only when a wider ubatch appears.
+    ggml_backend_buffer_ptr cross_host_buf;
+    std::vector<float>      cross_host_buf_fallback;
+
+    float * cross_host_staging(size_t nbytes) {
+        if (!cross_host_buf || ggml_backend_buffer_get_size(cross_host_buf.get()) < nbytes) {
+            ggml_backend_buffer_type_t host_buft =
+                ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend_configs[0].backend));
+            cross_host_buf.reset(host_buft ? ggml_backend_buft_alloc_buffer(host_buft, nbytes) : nullptr);
+        }
+        if (cross_host_buf) {
+            return (float *) ggml_backend_buffer_get_base(cross_host_buf.get());
+        }
+        // No host buffer type on this backend (e.g. a CPU-only test build): plain memory. Resized
+        // only when it grows, never per call.
+        if (cross_host_buf_fallback.size() * sizeof(float) < nbytes) {
+            cross_host_buf_fallback.resize(nbytes / sizeof(float));
+        }
+        return cross_host_buf_fallback.data();
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -2674,9 +2703,58 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+
+            // Cross-host reduce. The local reduce above left every local device holding this
+            // rank's partial sum over its own devices; add the peer rank's partial to it so that
+            // every device in the WORLD holds the same total before the next subgraph runs.
+            //
+            // This is done here, at the meta-backend hook, and not as a graph op: the reduce is
+            // not a node in this design, the tensor being reduced is the last node of a subgraph
+            // that the meta backend materialises separately per device, and there is no single
+            // ggml context owning all of the device copies.
+            if (backend_ctx->cross_host_reduce != nullptr) {
+                ggml_cgraph * cgraph_i0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                ggml_tensor * node0     = cgraph_i0->nodes[cgraph_i0->n_nodes - 1];
+                GGML_ASSERT(node0->type == GGML_TYPE_F32);
+                GGML_ASSERT(ggml_is_contiguous(node0));
+
+                const size_t nbytes   = ggml_nbytes(node0);
+                const size_t n_values = nbytes / sizeof(float);
+                float * staging = backend_ctx->cross_host_staging(nbytes);
+
+                // After the local reduce every local device holds the same values, so device 0 is
+                // as good as any; read it back once.
+                ggml_backend_tensor_get_async(backend_ctx->backend_configs[0].backend, node0, staging, 0, nbytes);
+                ggml_backend_synchronize(backend_ctx->backend_configs[0].backend);
+
+                if (!backend_ctx->cross_host_reduce(backend_ctx->cross_host_reduce_ud, staging, n_values)) {
+                    return GGML_STATUS_FAILED;
+                }
+
+                // The tensor is logically MIRRORED after the reduce, so a plain set per device is
+                // correct.
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                    ggml_tensor * node_j    = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                    GGML_ASSERT(ggml_nbytes(node_j) == nbytes);
+                    ggml_backend_tensor_set_async(bcj.backend, node_j, staging, 0, nbytes);
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                }
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
+}
+
+void ggml_backend_meta_set_cross_host_reduce(
+        ggml_backend_t meta_backend, ggml_backend_meta_cross_host_reduce_t reduce, void * ud) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend));
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) meta_backend->context;
+    backend_ctx->cross_host_reduce    = reduce;
+    backend_ctx->cross_host_reduce_ud = ud;
 }
 
 static const ggml_backend_i ggml_backend_meta_i = {
@@ -2717,6 +2795,14 @@ size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs.size();
+}
+
+bool ggml_backend_meta_is_meta(ggml_backend_t backend) {
+    return ggml_backend_is_meta(backend);
+}
+
+size_t ggml_backend_meta_n_local(ggml_backend_t meta_backend) {
+    return ggml_backend_meta_n_backends(meta_backend);
 }
 
 size_t ggml_backend_meta_n_world(ggml_backend_t meta_backend) {

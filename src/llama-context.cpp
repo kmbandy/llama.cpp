@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "pipeline/pipe-tp-comm.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -781,6 +783,51 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        // Cross-host tensor parallelism: open the persistent peer connection and install the
+        // cross-host reducer on the meta backend. Without it the meta backend performs only its
+        // local (intra-process) reduce, which is exactly the pre-TP behaviour.
+        for (auto & backend : backends) {
+            if (!ggml_backend_meta_is_meta(backend.get())) {
+                continue;
+            }
+            const size_t n_world    = ggml_backend_meta_n_world(backend.get());
+            const size_t rank_first = ggml_backend_meta_rank_first(backend.get());
+            const size_t n_local    = ggml_backend_meta_n_local(backend.get());
+            if (n_world <= n_local) {
+                continue; // single-process tensor parallelism, nothing to connect
+            }
+            if (params.tp_peer == nullptr || params.tp_peer[0] == '\0') {
+                throw std::runtime_error(
+                    "cross-host tensor parallelism needs --tp-peer: the meta device spans a world "
+                    "wider than this process's devices but no peer address was given");
+            }
+            std::string host;
+            int port = 0;
+            if (!pipe_tp_comm::parse_peer(params.tp_peer, &host, &port)) {
+                throw std::runtime_error(format("invalid --tp-peer '%s', expected host:port", params.tp_peer));
+            }
+
+            // Widest partial that can be exchanged: the PARTIAL nodes are the row-parallel
+            // projections' outputs, n_embd wide per token. Sized here so the hot path never
+            // allocates; a wider node grows it once rather than failing.
+            const size_t max_values = (size_t) hparams.n_embd * cparams.n_ubatch;
+            const int timeout_ms = params.tp_connect_timeout_ms > 0 ? params.tp_connect_timeout_ms : 60000;
+
+            tp_is_rank0 = (rank_first == 0);
+            LLAMA_LOG_INFO("%s: cross-host TP: rank owns world devices [%zu,%zu) of %zu, %s %s:%d\n",
+                    __func__, rank_first, rank_first + n_local, n_world,
+                    tp_is_rank0 ? "listening on" : "connecting to", host.c_str(), port);
+
+            tp_comm = tp_is_rank0
+                ? pipe_tp_comm::listen (host, port, max_values, timeout_ms)
+                : pipe_tp_comm::connect(host, port, max_values, timeout_ms);
+            if (!tp_comm) {
+                throw std::runtime_error(format("cross-host tensor parallelism: failed to establish the peer connection to %s:%d", host.c_str(), port));
+            }
+            ggml_backend_meta_set_cross_host_reduce(backend.get(), llama_context::tp_cross_host_reduce, this);
+            LLAMA_LOG_INFO("%s: cross-host TP: peer connection established\n", __func__);
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
@@ -5595,9 +5642,19 @@ llama_context_params llama_context_default_params() {
         /*.kv_tier_cold_budget_mb      =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.expert_dispatch             =*/ nullptr,
+        /*.tp_peer                     =*/ nullptr,
+        /*.tp_connect_timeout_ms       =*/ 0,
     };
 
     return result;
+}
+
+bool llama_context::tp_cross_host_reduce(void * ud, float * data, size_t n_values) {
+    llama_context * ctx = (llama_context *) ud;
+    if (!ctx->tp_comm) {
+        return false;
+    }
+    return ctx->tp_comm->exchange_add(data, n_values, ctx->tp_is_rank0);
 }
 
 llama_context * llama_init_from_model(
