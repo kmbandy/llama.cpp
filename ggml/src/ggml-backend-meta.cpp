@@ -56,29 +56,44 @@ struct ggml_backend_meta_device_context {
     ggml_backend_meta_get_split_state_t get_split_state;
     void *                              get_split_state_ud;
 
+    // Rank window into a (possibly cross-process) world of n_world devices.
+    // n_world == simple_devs.size() && rank_first == 0 is the single-process case and is the default.
+    size_t n_world;
+    size_t rank_first;
+
     std::string name;
     std::string description;
 
     ggml_backend_meta_device_context(
-            std::vector<ggml_backend_dev_t> simple_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) :
-            simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
+            std::vector<ggml_backend_dev_t> simple_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud,
+            size_t n_world, size_t rank_first) :
+            simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud),
+            n_world(n_world), rank_first(rank_first) {
+        GGML_ASSERT(n_world >= this->simple_devs.size());
+        GGML_ASSERT(rank_first + this->simple_devs.size() <= n_world);
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (this->simple_devs[i]);
+            description += ggml_backend_dev_description(this->simple_devs[i]);
         }
         name        += ")";
         description += ")";
+        if (n_world != this->simple_devs.size() || rank_first != 0) {
+            const std::string window = "[" + std::to_string(rank_first) + ".." +
+                std::to_string(rank_first + this->simple_devs.size()) + ")/" + std::to_string(n_world);
+            name        += window;
+            description += window;
+        }
     }
 
     bool operator<(const ggml_backend_meta_device_context & other) const {
-        return std::tie(simple_devs, get_split_state, get_split_state_ud)
-            < std::tie(other.simple_devs, other.get_split_state, other.get_split_state_ud);
+        return std::tie(simple_devs, get_split_state, get_split_state_ud, n_world, rank_first)
+            < std::tie(other.simple_devs, other.get_split_state, other.get_split_state_ud, other.n_world, other.rank_first);
     }
 };
 
@@ -212,9 +227,30 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     return meta_dev_ctx->simple_devs[index];
 }
 
+size_t ggml_backend_meta_dev_n_world(ggml_backend_dev_t meta_dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+    return meta_dev_ctx->n_world;
+}
+
+size_t ggml_backend_meta_dev_rank_first(ggml_backend_dev_t meta_dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+    return meta_dev_ctx->rank_first;
+}
+
 ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
+    return ggml_backend_meta_device_ranked(devs, n_devs, n_devs, 0, get_split_state, get_split_state_ud);
+}
+
+ggml_backend_dev_t ggml_backend_meta_device_ranked(
+        ggml_backend_dev_t * devs, size_t n_devs, size_t n_world, size_t rank_first,
+        ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
+    GGML_ASSERT(n_world <= GGML_BACKEND_META_MAX_DEVICES);
+    GGML_ASSERT(n_devs > 0);
+    GGML_ASSERT(rank_first + n_devs <= n_world);
     // TODO: this is not thread-safe - needs to be fixed
     static std::vector<std::unique_ptr<ggml_backend_meta_device_context>>         ctxs;
     static std::map<ggml_backend_meta_device_context, struct ggml_backend_device> meta_devs;
@@ -224,7 +260,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
     for (size_t i = 0; i < n_devs; i++) {
         simple_devs.push_back(devs[i]);
     }
-    ggml_backend_meta_device_context ctx(simple_devs, get_split_state, get_split_state_ud);
+    ggml_backend_meta_device_context ctx(simple_devs, get_split_state, get_split_state_ud, n_world, rank_first);
 
     {
         auto it = meta_devs.find(ctx);
@@ -423,6 +459,14 @@ struct ggml_backend_meta_buffer_context {
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
+    // Rank window, copied from the owning meta device (see ggml_backend_meta_device_ranked).
+    // ALL ggml_backend_meta_split_state::ne arrays in this file are indexed with a stride of
+    // n_world: ne[segment*n_world + world_device]. Local simple buffer/tensor `j` corresponds to
+    // world device `rank_first + j`. With n_world == bufs.size() && rank_first == 0 this is
+    // exactly the pre-existing indexing.
+    size_t n_world    = 0;
+    size_t rank_first = 0;
+
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
@@ -445,6 +489,16 @@ struct ggml_backend_meta_buffer_context {
         debug = GGML_META_DEBUG ? atoi(GGML_META_DEBUG) : 0;
     }
 
+    // World index of local simple buffer j.
+    size_t world_index(size_t j) const {
+        return rank_first + j;
+    }
+
+    // True when world device jw is owned by this process.
+    bool world_index_is_local(size_t jw) const {
+        return jw >= rank_first && jw < rank_first + bufs.size();
+    }
+
     ggml_backend_meta_simple_tensor_container & get_simple_tensor_container(const ggml_tensor * tensor) {
         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
             return stc_static;
@@ -463,6 +517,21 @@ static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) meta_buf->context;
     return buf_ctx->bufs.size();
+}
+
+// Stride of the split-state ne array: the number of devices in the WORLD, which is >= the number
+// of local simple buffers. Equal to it in the single-process case.
+static size_t ggml_backend_meta_buffer_n_world(ggml_backend_buffer_t meta_buf) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) meta_buf->context;
+    return buf_ctx->n_world;
+}
+
+// Index of local simple buffer 0 within the world.
+static size_t ggml_backend_meta_buffer_rank_first(ggml_backend_buffer_t meta_buf) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) meta_buf->context;
+    return buf_ctx->rank_first;
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t meta_buf, size_t index) {
@@ -492,7 +561,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    //
+    // Split states are computed over the WORLD, never over the local device window: every rank must
+    // derive the same axis and the same per-world-device ne[] for every node, otherwise the ranks
+    // disagree about where the subgraph boundaries are and lockstep deadlocks. n_bufs here is
+    // therefore the world size (== the local device count in the single-process case).
+    const size_t n_bufs = ggml_backend_meta_buffer_n_world(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
@@ -1083,7 +1157,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            const size_t n_bufs = ggml_backend_meta_buffer_n_world(tensor->buffer); // world stride, see above
 
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
@@ -1199,6 +1273,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    const size_t n_world       = ggml_backend_meta_buffer_n_world(tensor->buffer);
+    const size_t rank_first    = ggml_backend_meta_buffer_rank_first(tensor->buffer);
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(stc, tensor, /*assume_sync =*/ true);
     GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
@@ -1228,7 +1304,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
             ne[split_dim] = 0;
             for (size_t s = 0; s < split_state.n_segments; s++) {
-                ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
+                ne[split_dim] += split_state.ne[s*n_world + rank_first + j] * split_state.nr[s];
             }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
                 if (tensor->nb[i] > tensor->nb[split_dim]) {
@@ -1309,7 +1385,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         for (size_t j = 0; j < n_simple_bufs; j++) {
             int64_t ne_sum = 0;
             for (size_t s = 0; s < split_state_src.n_segments; s++) {
-                ne_sum += split_state_src.ne[s*n_simple_bufs + j] * split_state_src.nr[s];
+                ne_sum += split_state_src.ne[s*n_world + rank_first + j] * split_state_src.nr[s];
             }
             if (ne_sum == 0) {
                 simple_tensors[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
@@ -1329,9 +1405,28 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
+// Byte size of WORLD device jw's chunk along the split axis, for a single-segment (nr == 1) split.
+// For a local device this is exactly the simple tensor's nb[axis+1]; deriving it from the world
+// split state instead lets a rank advance the source/destination pointer past chunks it does not
+// own without needing a tensor for them.
+static size_t ggml_backend_meta_world_chunk_size(
+        const ggml_tensor * tensor, const ggml_backend_meta_split_state & split_state, size_t jw, size_t chunk_size_full) {
+    GGML_ASSERT(split_state.n_segments == 1);
+    GGML_ASSERT(split_state.nr[0]      == 1);
+    const int64_t ne_full = tensor->ne[int(split_state.axis)];
+    if (ne_full == 0) {
+        return 0;
+    }
+    const size_t num = chunk_size_full * (size_t) split_state.ne[jw];
+    GGML_ASSERT(num % (size_t) ne_full == 0);
+    return num / (size_t) ne_full;
+}
+
 static void ggml_backend_meta_buffer_memset_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const size_t n_bufs     = ggml_backend_meta_buffer_n_bufs(buffer);
+    const size_t n_world    = ggml_backend_meta_buffer_n_world(buffer);
+    const size_t rank_first = ggml_backend_meta_buffer_rank_first(buffer);
     const ggml_backend_meta_split_state split_state =
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1357,8 +1452,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
                     for (size_t j = 0; j < n_bufs; j++) {
                         ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                        GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                        const int64_t ne_j = split_state.ne[s*n_world + rank_first + j];
+                        GGML_ASSERT(ne_j % blck_size == 0);
+                        const size_t nbytes = ne_j/blck_size * tensor->nb[0];
                         for (int64_t row = 0; row < row_count; row++) {
                             ggml_backend_tensor_memset(simple_tensor, value,
                                     simple_offsets[j] + (row_start + row)*simple_tensor->nb[1], nbytes);
@@ -1383,7 +1479,7 @@ static void ggml_backend_meta_buffer_memset_tensor(
             for (size_t r = 0; r < split_state.nr[s]; r++) {
                 for (size_t j = 0; j < n_bufs; j++) {
                     ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                    const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
+                    const size_t nbytes = split_state.ne[s*n_world + rank_first + j] * tensor->nb[1];
                     for (int64_t row = 0; row < row_count; row++) {
                         ggml_backend_tensor_memset(simple_tensor, value,
                                 simple_offsets[j] + (row_start + row)*simple_tensor->nb[2], nbytes);
@@ -1431,8 +1527,13 @@ static void ggml_backend_meta_buffer_memset_tensor(
     }
 }
 
+// Under a rank window the source buffer handed in here is the FULL tensor: every rank reads the
+// same bytes and keeps only its own slices. The running source offset must therefore advance over
+// every world device, while ggml_backend_tensor_set_* is called only for the local ones.
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const size_t n_bufs     = ggml_backend_meta_buffer_n_bufs(buffer);
+    const size_t n_world    = ggml_backend_meta_buffer_n_world(buffer);
+    const size_t rank_first = ggml_backend_meta_buffer_rank_first(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
@@ -1456,15 +1557,19 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             const int64_t blck_size = ggml_blck_size(tensor->type);
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
-                    for (size_t j = 0; j < n_bufs; j++) {
-                        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                        GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                        ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
-                            simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
-                            row_count, simple_tensor->nb[1], tensor->nb[1]);
-                        offset_data       += nbytes;
-                        simple_offsets[j] += nbytes;
+                    for (size_t jw = 0; jw < n_world; jw++) {
+                        const int64_t ne_jw = split_state.ne[s*n_world + jw];
+                        GGML_ASSERT(ne_jw % blck_size == 0);
+                        const size_t nbytes = ne_jw/blck_size * tensor->nb[0];
+                        if (jw >= rank_first && jw < rank_first + n_bufs) {
+                            const size_t j = jw - rank_first;
+                            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
+                                simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
+                                row_count, simple_tensor->nb[1], tensor->nb[1]);
+                            simple_offsets[j] += nbytes;
+                        }
+                        offset_data += nbytes;
                     }
                 }
             }
@@ -1482,14 +1587,17 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
         for (size_t s = 0; s < split_state.n_segments; s++) {
             for (size_t r = 0; r < split_state.nr[s]; r++) {
-                for (size_t j = 0; j < n_bufs; j++) {
-                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                    const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
-                    ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
-                        simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
-                        row_count, simple_tensor->nb[2], tensor->nb[2]);
-                    offset_data       += nbytes;
-                    simple_offsets[j] += nbytes;
+                for (size_t jw = 0; jw < n_world; jw++) {
+                    const size_t nbytes = split_state.ne[s*n_world + jw] * tensor->nb[1];
+                    if (jw >= rank_first && jw < rank_first + n_bufs) {
+                        const size_t j = jw - rank_first;
+                        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                        ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
+                            simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
+                            row_count, simple_tensor->nb[2], tensor->nb[2]);
+                        simple_offsets[j] += nbytes;
+                    }
+                    offset_data += nbytes;
                 }
             }
         }
@@ -1508,14 +1616,17 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             size_t offset_j = 0;
-            for (size_t j = 0; j < n_bufs; j++) {
-                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+            for (size_t jw = 0; jw < n_world; jw++) {
+                const size_t chunk_size_j = ggml_backend_meta_world_chunk_size(tensor, split_state, jw, chunk_size_full);
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                const size_t simple_offset = i_start * chunk_size_j;
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                if (jw >= rank_first && jw < rank_first + n_bufs) {
+                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, jw - rank_first);
+                    GGML_ASSERT(simple_tensor->nb[split_state.axis + 1] == chunk_size_j);
+                    const size_t simple_offset = i_start * chunk_size_j;
+                    ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
@@ -1531,13 +1642,15 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             GGML_ASSERT(offset % sizeof(float) == 0);
             GGML_ASSERT(size   % sizeof(float) == 0);
             const size_t n_values = size / sizeof(float);
+            // Count contributors over the WORLD: the value must sum back to `data` only after the
+            // local reduce AND the cross-host reduce have both run.
             size_t n_contributors = 0;
-            for (size_t j = 0; j < n_bufs; j++) {
-                n_contributors += split_state.ne[j] != 0;
+            for (size_t jw = 0; jw < n_world; jw++) {
+                n_contributors += split_state.ne[jw] != 0;
             }
             const bool has_contributor_mask = n_contributors != 0;
             if (!has_contributor_mask) {
-                n_contributors = n_bufs;
+                n_contributors = n_world;
             }
             std::vector<float> tmp(n_values);
             for (size_t i = 0; i < n_values; i++) {
@@ -1549,7 +1662,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             }
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const float * partial = has_contributor_mask && split_state.ne[j] == 0 ? zero.data() : tmp.data();
+                const float * partial = has_contributor_mask && split_state.ne[rank_first + j] == 0 ? zero.data() : tmp.data();
                 ggml_backend_tensor_set(simple_tensor, partial, offset, size);
             }
         } break;
@@ -1559,8 +1672,17 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
 }
 
+// Reading a split tensor back gathers every world device's slice into `data`. A rank can only
+// supply its own slices, so under a rank window every REMOTE slice of a tensor that is read back
+// must be zero-sized. That is a design constraint, not a limitation to work around: the only split
+// tensor llama.cpp reads back through this path is the LM head's logits, and the cross-host TP
+// configuration deliberately places output.weight entirely on rank 0 precisely so that no
+// per-token cross-host vocab gather is needed. A non-zero remote slice here means that placement
+// was not applied, which would otherwise show up as silently stale logits.
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const size_t n_bufs     = ggml_backend_meta_buffer_n_bufs(buffer);
+    const size_t n_world    = ggml_backend_meta_buffer_n_world(buffer);
+    const size_t rank_first = ggml_backend_meta_buffer_rank_first(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
@@ -1584,15 +1706,21 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             const int64_t blck_size = ggml_blck_size(tensor->type);
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
-                    for (size_t j = 0; j < n_bufs; j++) {
-                        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                        GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                        ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
-                            simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
-                            row_count, simple_tensor->nb[1], tensor->nb[1]);
-                        offset_data       += nbytes;
-                        simple_offsets[j] += nbytes;
+                    for (size_t jw = 0; jw < n_world; jw++) {
+                        const int64_t ne_jw = split_state.ne[s*n_world + jw];
+                        GGML_ASSERT(ne_jw % blck_size == 0);
+                        const size_t nbytes = ne_jw/blck_size * tensor->nb[0];
+                        if (jw >= rank_first && jw < rank_first + n_bufs) {
+                            const size_t j = jw - rank_first;
+                            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
+                                simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
+                                row_count, simple_tensor->nb[1], tensor->nb[1]);
+                            simple_offsets[j] += nbytes;
+                        } else {
+                            GGML_ASSERT(ne_jw == 0 && "cannot read back a remote slice of a split tensor");
+                        }
+                        offset_data += nbytes;
                     }
                 }
             }
@@ -1610,14 +1738,20 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 
         for (size_t s = 0; s < split_state.n_segments; s++) {
             for (size_t r = 0; r < split_state.nr[s]; r++) {
-                for (size_t j = 0; j < n_bufs; j++) {
-                    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                    const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
-                    ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
-                        simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
-                        row_count, simple_tensor->nb[2], tensor->nb[2]);
-                    offset_data       += nbytes;
-                    simple_offsets[j] += nbytes;
+                for (size_t jw = 0; jw < n_world; jw++) {
+                    const int64_t ne_jw = split_state.ne[s*n_world + jw];
+                    const size_t nbytes = ne_jw * tensor->nb[1];
+                    if (jw >= rank_first && jw < rank_first + n_bufs) {
+                        const size_t j = jw - rank_first;
+                        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                        ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
+                            simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
+                            row_count, simple_tensor->nb[2], tensor->nb[2]);
+                        simple_offsets[j] += nbytes;
+                    } else {
+                        GGML_ASSERT(ne_jw == 0 && "cannot read back a remote slice of a split tensor");
+                    }
+                    offset_data += nbytes;
                 }
             }
         }
@@ -1636,12 +1770,15 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             size_t offset_j = 0;
-            for (size_t j = 0; j < n_bufs; j++){
-                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+            for (size_t jw = 0; jw < n_world; jw++){
+                const size_t chunk_size_j = ggml_backend_meta_world_chunk_size(tensor, split_state, jw, chunk_size_full);
                 if (chunk_size_j == 0) {
                     continue;
                 }
+                GGML_ASSERT((jw >= rank_first && jw < rank_first + n_bufs) &&
+                    "cannot read back a remote slice of a split tensor");
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, jw - rank_first);
+                GGML_ASSERT(simple_tensor->nb[split_state.axis + 1] == chunk_size_j);
                 const size_t simple_offset = i_start * chunk_size_j;
                 ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
@@ -1702,6 +1839,16 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
     }
 }
 
+// The rank window lives on the meta DEVICE; every meta buffer type carries that device.
+static void ggml_backend_meta_buft_rank_window(ggml_backend_buffer_type_t buft, size_t * n_world, size_t * rank_first) {
+    GGML_ASSERT(ggml_backend_buft_is_meta(buft));
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    *n_world    = dev_ctx->n_world;
+    *rank_first = dev_ctx->rank_first;
+}
+
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
@@ -1723,6 +1870,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buft_rank_window(buft, &buf_ctx->n_world, &buf_ctx->rank_first);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -1747,6 +1895,7 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
     ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buft_rank_window(buft, &meta_buf_ctx->n_world, &meta_buf_ctx->rank_first);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -1884,6 +2033,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const size_t n_world    = ggml_backend_meta_buffer_n_world(tensor->buffer);
+    const size_t rank_first = ggml_backend_meta_buffer_rank_first(tensor->buffer);
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
@@ -1902,15 +2053,19 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             size_t offset_j = 0;
-            for (size_t j = 0; j < n_backends; j++){
-                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
-                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+            for (size_t jw = 0; jw < n_world; jw++){
+                const size_t chunk_size_j = ggml_backend_meta_world_chunk_size(tensor, split_state, jw, chunk_size_full);
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
-                    i_stop - i_start, chunk_size_j, chunk_size_full);
+                if (jw >= rank_first && jw < rank_first + n_backends) {
+                    const size_t j = jw - rank_first;
+                    ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    GGML_ASSERT(simple_tensor->nb[split_state.axis + 1] == chunk_size_j);
+                    ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
+                        i_stop - i_start, chunk_size_j, chunk_size_full);
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
@@ -1927,8 +2082,11 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 }
 
+// See the note on ggml_backend_meta_buffer_get_tensor: remote slices cannot be gathered here.
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const size_t n_world    = ggml_backend_meta_buffer_n_world(tensor->buffer);
+    const size_t rank_first = ggml_backend_meta_buffer_rank_first(tensor->buffer);
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
@@ -1947,13 +2105,17 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             size_t offset_j = 0;
-            for (size_t j = 0; j < n_backends; j++){
-                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
-                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+            for (size_t jw = 0; jw < n_world; jw++){
+                const size_t chunk_size_j = ggml_backend_meta_world_chunk_size(tensor, split_state, jw, chunk_size_full);
                 if (chunk_size_j == 0) {
                     continue;
                 }
+                GGML_ASSERT((jw >= rank_first && jw < rank_first + n_backends) &&
+                    "cannot read back a remote slice of a split tensor");
+                const size_t j = jw - rank_first;
+                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                GGML_ASSERT(simple_tensor->nb[split_state.axis + 1] == chunk_size_j);
                 ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
                     i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
@@ -2040,6 +2202,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         {
+            // World size of this meta device. The subgraph boundary set below must be derived from
+            // it and never from the local device window: two ranks with different LOCAL device sets
+            // would otherwise derive different n_subgraphs from the same graph and deadlock the
+            // moment they try to exchange partials in lockstep.
+            const size_t n_world_g = ggml_backend_meta_dev_n_world(backend->device);
+
+            // World-invariant restatement of "the simple tensor of `node` on device jw has
+            // GGML_TENSOR_FLAG_COMPUTE set". Reproduces exactly the rule applied per local device in
+            // ggml_backend_meta_buffer_init_tensor_impl - a node is disabled on a device when any of
+            // its meta-buffer sources has a zero-sized slice there - but evaluated against the WORLD
+            // split state, so every rank gets the same answer for every world device.
+            auto node_computes_world = [&](const ggml_tensor * node, const size_t jw) -> bool {
+                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    return false;
+                }
+                for (int is = 0; is < GGML_MAX_SRC; is++) {
+                    const ggml_tensor * src = node->src[is];
+                    if (src == nullptr || !ggml_backend_buffer_is_meta(src->buffer)) {
+                        continue;
+                    }
+                    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true);
+                    if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+                        continue;
+                    }
+                    int64_t ne_sum = 0;
+                    for (size_t sg = 0; sg < ss.n_segments; sg++) {
+                        ne_sum += ss.ne[sg*n_world_g + jw] * ss.nr[sg];
+                    }
+                    if (ne_sum == 0) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed_branch = [&](const int i) -> int {
                 int id = i; // i_delayed
@@ -2184,10 +2381,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         return i_delayed;
                     }
 
-                    for (size_t j = 0; j < n_backends; j++) {
-                        auto & bcj = backend_ctx->backend_configs[j];
-                        const bool compute       = bcj.nodes[i]->flags       & GGML_TENSOR_FLAG_COMPUTE;
-                        const bool compute_other = bcj.nodes[i_other]->flags & GGML_TENSOR_FLAG_COMPUTE;
+                    // WORLD, not n_backends: see node_computes_world above (spec B.4).
+                    for (size_t jw = 0; jw < n_world_g; jw++) {
+                        const bool compute       = node_computes_world(cgraph->nodes[i],       jw);
+                        const bool compute_other = node_computes_world(cgraph->nodes[i_other], jw);
                         if (compute != compute_other) {
                             return i_delayed;
                         }
@@ -2520,6 +2717,16 @@ size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs.size();
+}
+
+size_t ggml_backend_meta_n_world(ggml_backend_t meta_backend) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend));
+    return ggml_backend_meta_dev_n_world(meta_backend->device);
+}
+
+size_t ggml_backend_meta_rank_first(ggml_backend_t meta_backend) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend));
+    return ggml_backend_meta_dev_rank_first(meta_backend->device);
 }
 
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {

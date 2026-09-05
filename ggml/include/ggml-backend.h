@@ -416,6 +416,31 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // Rank-windowed variant, for tensor parallelism spanning more than one process/host.
+    //
+    // The split-state callback is expected to describe a WORLD of `n_world` devices, i.e. the
+    // ggml_backend_meta_split_state::ne array it returns is indexed [segment*n_world + world_device].
+    // This process owns only the contiguous window [rank_first, rank_first + n_devs) of that world
+    // and allocates/computes only those slices; the remaining world devices exist in the split
+    // state so that every process derives an IDENTICAL global row map, identical per-node split
+    // states and therefore an identical subgraph sequence.
+    //
+    // ggml_backend_meta_device(devs, n, cb, ud) == ggml_backend_meta_device_ranked(devs, n, n, 0, cb, ud),
+    // and with n_world == n_devs && rank_first == 0 every code path below is byte-identical to it.
+    //
+    // The cross-process sum of the per-rank partial reductions is NOT performed here.
+    GGML_API ggml_backend_dev_t ggml_backend_meta_device_ranked(
+        ggml_backend_dev_t * devs, size_t n_devs, size_t n_world, size_t rank_first,
+        ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // Size of the world this meta device belongs to, and the index of its first local device in it.
+    GGML_API size_t ggml_backend_meta_dev_n_world   (ggml_backend_dev_t meta_dev);
+    GGML_API size_t ggml_backend_meta_dev_rank_first(ggml_backend_dev_t meta_dev);
+
+    // World size / first local world index of a meta backend.
+    GGML_API size_t ggml_backend_meta_n_world   (ggml_backend_t meta_backend);
+    GGML_API size_t ggml_backend_meta_rank_first(ggml_backend_t meta_backend);
+
     //
     // Utils
     //
