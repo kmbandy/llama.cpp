@@ -788,6 +788,16 @@ llama_context::llama_context(
         // Cross-host tensor parallelism: open the persistent peer connection and install the
         // cross-host reducer on the meta backend. Without it the meta backend performs only its
         // local (intra-process) reduce, which is exactly the pre-TP behaviour.
+        //
+        // The step logs below exist because the first two-machine run stalled for twenty minutes
+        // somewhere in this constructor with no output at all, and there was no way to tell from
+        // the log whether it had reached the socket, the KV allocation or neither. Each phase now
+        // announces itself. They are gated on tp_peer so a non-TP run's log is unchanged.
+        const bool tp_trace = params.tp_peer != nullptr && params.tp_peer[0] != '\0';
+        if (tp_trace) {
+            LLAMA_LOG_INFO("%s: cross-host TP: backends initialised (%zu local, plus CPU); "
+                           "looking for a meta device\n", __func__, backends.size() - 1);
+        }
         for (auto & backend : backends) {
             if (!ggml_backend_meta_is_meta(backend.get())) {
                 continue;
@@ -813,13 +823,23 @@ llama_context::llama_context(
             // projections' outputs, n_embd wide per token. Sized here so the hot path never
             // allocates; a wider node grows it once rather than failing.
             const size_t max_values = (size_t) hparams.n_embd * cparams.n_ubatch;
-            const int timeout_ms = params.tp_connect_timeout_ms > 0 ? params.tp_connect_timeout_ms : 60000;
+            // Default 30 minutes (WP_TP_CONNECT_TIMEOUT_MS), not 60 seconds. The old minute was
+            // shorter than the difference between the two ranks' model loads on this rig, which
+            // is what killed the first two-machine run. The port itself is bound long before this
+            // point by llama_tp_prebind_peer(), so on the leader this is only the accept.
+            const int timeout_ms = params.tp_connect_timeout_ms > 0
+                ? params.tp_connect_timeout_ms
+                : pipe_tp_comm::default_connect_timeout_ms();
 
             tp_is_rank0 = (rank_first == 0);
             LLAMA_LOG_INFO("%s: cross-host TP: rank owns world devices [%zu,%zu) of %zu, %s %s:%d\n",
                     __func__, rank_first, rank_first + n_local, n_world,
                     tp_is_rank0 ? "listening on" : "connecting to", host.c_str(), port);
 
+            LLAMA_LOG_INFO("%s: cross-host TP: %s (cap %.0f s, WP_TP_CONNECT_TIMEOUT_MS)\n",
+                    __func__,
+                    tp_is_rank0 ? "waiting for the peer rank to connect" : "connecting to the leader rank",
+                    timeout_ms / 1000.0);
             tp_comm = tp_is_rank0
                 ? pipe_tp_comm::listen (host, port, max_values, timeout_ms)
                 : pipe_tp_comm::connect(host, port, max_values, timeout_ms);
@@ -851,6 +871,11 @@ llama_context::llama_context(
                 LLAMA_LOG_INFO("%s: cross-host TP: this rank is a FOLLOWER - no sampler, no HTTP; "
                                "it decodes only what the leader mirrors to it\n", __func__);
             }
+        }
+
+        if (tp_trace) {
+            LLAMA_LOG_INFO("%s: cross-host TP: peer handshake done; continuing context "
+                           "construction (output buffer, then the KV/SSM allocation)\n", __func__);
         }
 
         // create a list of the set_n_threads functions in the backends

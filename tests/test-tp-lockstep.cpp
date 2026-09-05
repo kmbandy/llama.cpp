@@ -19,6 +19,7 @@
 #include "pipe-tp-msg.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -495,6 +496,91 @@ static bool test_dropped_mirror_is_caught() {
     return true;
 }
 
+
+// The first two-machine run died here, not in any of the logic above: rank 0 only bound its peer
+// port after its model load, and the two loads differ by minutes (~7 min off a spinning disk on
+// the leader against ~43 s on the follower), so the follower's connect window opened and closed
+// against a port that did not exist yet.
+//
+// The fix is prebind(): rank 0 opens the listening socket before it touches a weight. This test
+// pins the property the fix depends on, which is not obvious and is easy to regress - once
+// listen() has been called the KERNEL completes the peer's TCP handshake from the backlog, so the
+// follower's connect() returns IMMEDIATELY even though the leader will not call accept() for
+// another second and a half, and the follower can send its HELLO into a socket nobody is reading
+// yet. If prebind ever stopped actually listening, the connect below would fall into the retry
+// path and take at least as long as the leader's simulated load, which is what this asserts
+// against.
+static bool test_prebind_lets_the_follower_connect_during_the_load() {
+    const int port = TEST_PORT + 2;
+
+    if (!pipe_tp_comm::prebind(TEST_HOST, port)) {
+        fprintf(stderr, "FAIL: prebind(%s:%d) failed\n", TEST_HOST, port);
+        return false;
+    }
+
+    std::atomic<long long> connect_ms{-1};
+    std::atomic<bool>      follower_ok{false};
+    std::atomic<bool>      leader_ok{false};
+
+    std::thread t1([&]{
+        const auto t0 = std::chrono::steady_clock::now();
+        // A single attempt: no retry loop is allowed to rescue this. If the port is not already
+        // listening, this fails and the test fails with it.
+        auto comm = pipe_tp_comm::connect(TEST_HOST, port, 1024, 0);
+        connect_ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (!comm) {
+            return;
+        }
+        // Send HELLO into a socket the leader has not accepted yet - it sits in the kernel's
+        // receive buffer until the leader gets there, which is what lets the follower stop caring
+        // how long the leader's load takes.
+        std::string err;
+        if (!hello_exchange(*comm, make_hello(1, 1), &err)) {
+            fprintf(stderr, "  follower hello: %s\n", err.c_str());
+            return;
+        }
+        follower_ok = true;
+    });
+
+    std::thread t0([&]{
+        // "loading the model"
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        auto comm = pipe_tp_comm::listen(TEST_HOST, port, 1024, 30000);
+        if (!comm) {
+            return;
+        }
+        std::string err;
+        if (!hello_exchange(*comm, make_hello(0, 1), &err)) {
+            fprintf(stderr, "  leader hello: %s\n", err.c_str());
+            return;
+        }
+        leader_ok = true;
+    });
+
+    t0.join();
+    t1.join();
+
+    if (connect_ms < 0) {
+        fprintf(stderr, "FAIL: the follower could not connect to a prebound port at all\n");
+        return false;
+    }
+    if (connect_ms > 500) {
+        fprintf(stderr, "FAIL: connect to a prebound port took %lld ms - it should complete from "
+                        "the listen backlog immediately, not wait for the leader's accept\n",
+                (long long) connect_ms);
+        return false;
+    }
+    if (!follower_ok || !leader_ok) {
+        fprintf(stderr, "FAIL: handshake across the load window failed (follower ok=%d, leader ok=%d)\n",
+                (int) follower_ok, (int) leader_ok);
+        return false;
+    }
+    printf("  follower connected in %lld ms and its HELLO waited out a 1500 ms leader load\n",
+           (long long) connect_ms);
+    return true;
+}
+
 int main() {
     if (const char * p = getenv("WP_TP_TEST_PORT")) {
         TEST_PORT = atoi(p);
@@ -502,6 +588,7 @@ int main() {
     struct { const char * name; bool (*fn)(); } tests[] = {
         {"loopback-lockstep",  test_loopback_lockstep},
         {"dropped-mirror",     test_dropped_mirror_is_caught},
+        {"prebind-ordering",   test_prebind_lets_the_follower_connect_during_the_load},
     };
     for (auto & t : tests) {
         printf("test-tp-lockstep: %s\n", t.name);

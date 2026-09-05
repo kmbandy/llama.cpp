@@ -302,6 +302,25 @@ int llama_context::tp_follower_step() {
 // public C API
 // ---------------------------------------------------------------------------------------------
 
+bool llama_tp_prebind_peer(const char * peer) {
+    if (peer == nullptr || peer[0] == '\0') {
+        return false;
+    }
+    std::string host;
+    int port = 0;
+    if (!pipe_tp_comm::parse_peer(peer, &host, &port)) {
+        LLAMA_LOG_ERROR("%s: invalid --tp-peer '%s', expected host:port\n", __func__, peer);
+        return false;
+    }
+    if (!pipe_tp_comm::prebind(host, port)) {
+        LLAMA_LOG_ERROR("%s: cross-host TP: could not bind %s:%d\n", __func__, host.c_str(), port);
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: cross-host TP: listening on %s:%d BEFORE the model load, so the peer rank "
+                   "can connect while this rank is still loading\n", __func__, host.c_str(), port);
+    return true;
+}
+
 bool llama_tp_is_follower(const llama_context * ctx) {
     return ctx != nullptr && ctx->tp_is_follower();
 }

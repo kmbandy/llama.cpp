@@ -100,8 +100,27 @@ void pipe_tp_add_fixed_order(float * local, const float * peer, size_t n_values,
 struct pipe_tp_comm {
     ~pipe_tp_comm();
 
-    // Rank 0 binds `host:port` and accepts one peer; every other rank connects to it. Both block
-    // until the connection is established or `timeout_ms` elapses (<= 0 means a single attempt).
+    // Bind and listen on `host:port` NOW - called long before the model is loaded, so that a rank
+    // whose weights take minutes to come off disk is nevertheless REFUSING NOTHING from the moment
+    // it starts. Without this, rank 1 can only connect after rank 0's load has finished, and the
+    // two loads are not the same length: a 7-minute HDD load on the leader against a 43-second
+    // load on the follower means the follower's connect window opens and closes before the leader
+    // has bound the port at all. The listening socket is process-global and is picked up by the
+    // matching listen() call later. Idempotent; safe to call when this rank is not rank 0 (it
+    // simply should not be). `host` must be a dotted-quad (0.0.0.0 to accept on every interface),
+    // not a name: the underlying create_server() resolves with inet_addr().
+    static bool prebind(const std::string & host, int port);
+
+    // Cap on establishing the peer connection, in milliseconds. WP_TP_CONNECT_TIMEOUT_MS, default
+    // 30 minutes. It is long ON PURPOSE: the two ranks' model loads differ by minutes on this rig,
+    // and whichever finishes first has nothing useful to do but wait. A cap that expires is a
+    // configuration error being reported, not a deadline anybody wants enforced.
+    static int default_connect_timeout_ms();
+
+    // Rank 0 accepts one peer on the socket prebind() opened (or binds `host:port` itself if
+    // prebind was not called); every other rank connects to it. Both block until the connection is
+    // established or `timeout_ms` elapses (<= 0 means a single attempt), logging progress every
+    // ten seconds so a wait is visibly a wait and not a hang.
     // `max_values` sizes the receive buffer up front; it should be at least n_embd * n_ubatch,
     // the widest partial normally exchanged. A wider partial grows the buffer once (with a line to
     // stderr) rather than failing, so the steady state stays allocation-free either way.
@@ -155,7 +174,18 @@ private:
     uint32_t                        seq_in_     = 0;
     uint32_t                        msg_seq_out_ = 0;
     uint32_t                        msg_seq_in_  = 0;
-    int                             timeout_ms_  = 0; // 0 = block forever; WP_TP_TIMEOUT_MS
+    // Two different clocks, deliberately.
+    //   timeout_ms_     bounds a REDUCE. Both ranks are inside the same graph, so the peer's
+    //                   partial is due within one ubatch's compute; silence past that is a wedge.
+    //                   WP_TP_TIMEOUT_MS, default 120 s.
+    //   msg_timeout_ms_ bounds a CONTROL frame, and is 0 (block forever) because its arrival time
+    //                   is bounded by USER behaviour, not by compute: a follower attached to an
+    //                   idle llama-server legitimately waits hours between requests, and during
+    //                   startup it waits out the whole of the leader's model load before HELLO.
+    //                   A leader that DIES is still detected immediately - the socket closes and
+    //                   recv returns 0 - so blocking is safe here and a timeout is not.
+    int                             timeout_ms_     = 0;
+    int                             msg_timeout_ms_ = 0;
     pipe_tp_wire_dtype              dtype_      = PIPE_TP_DTYPE_F32;
     pipe_tp_stats                   stats_;
     bool                            print_stats_at_exit_ = false;

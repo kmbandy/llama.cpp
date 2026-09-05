@@ -1,6 +1,7 @@
 #include "pipe-tp-comm.h"
 #include "pipe-transport.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +87,80 @@ pipe_tp_comm::~pipe_tp_comm() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// establishing the connection
+//
+// THE ORDERING BUG THIS SOLVES. The peer socket used to be created inside llama_context, i.e.
+// AFTER the model load. The two ranks' loads are not the same length - on this rig the leader
+// reads BF16 weights off a spinning disk for ~7 minutes while the follower comes up in ~43
+// seconds - so the follower's connect window opened and closed long before the leader had bound
+// the port at all, and the follower died with "failed to establish the peer connection".
+//
+// Binding EARLY fixes it from both directions at once. Once listen() has been called the kernel
+// completes the TCP handshake from the backlog on its own, so the follower's connect() succeeds
+// the moment the port exists, whether or not the leader has reached its accept() - which means
+// the leader may still be loading, and start order stops mattering.
+// ---------------------------------------------------------------------------------------------
+
+// The listening socket, opened by prebind() long before any model is touched and picked up by the
+// matching listen() call later. Process-global because the two calls are minutes and several
+// stack frames apart; there is exactly one tensor-parallel world per process.
+static pipe_socket_ptr g_tp_prebound;
+static std::string     g_tp_prebound_host;
+static int             g_tp_prebound_port = 0;
+
+int pipe_tp_comm::default_connect_timeout_ms() {
+    const char * env = getenv("WP_TP_CONNECT_TIMEOUT_MS");
+    if (env != nullptr) {
+        const int v = atoi(env);
+        return v < 0 ? 0 : v;
+    }
+    return 30 * 60 * 1000; // 30 minutes
+}
+
+bool pipe_tp_comm::prebind(const std::string & host, int port) {
+    if (!pipe_transport_init()) {
+        return false;
+    }
+    if (g_tp_prebound && g_tp_prebound_host == host && g_tp_prebound_port == port) {
+        return true; // idempotent
+    }
+    if (g_tp_prebound) {
+        fprintf(stderr, "pipe-tp: refusing to rebind: already listening on %s:%d\n",
+                g_tp_prebound_host.c_str(), g_tp_prebound_port);
+        return false;
+    }
+    pipe_socket_ptr server = pipe_socket_t::create_server(host.c_str(), port);
+    if (!server) {
+        fprintf(stderr, "pipe-tp: failed to bind %s:%d (note: the host must be a dotted-quad, "
+                        "e.g. 0.0.0.0, not a name)\n", host.c_str(), port);
+        return false;
+    }
+    g_tp_prebound      = server;
+    g_tp_prebound_host = host;
+    g_tp_prebound_port = port;
+    return true;
+}
+
+// Report progress every ten seconds while waiting, so that a wait is visibly a wait. A silent
+// process is indistinguishable from a hung one, and both of the failures this code path has
+// actually produced looked like hangs.
+static void pipe_tp_waiting_note(const char * what, const std::string & host, int port,
+                                 uint64_t t0_ns, uint64_t * next_note_ns, int timeout_ms) {
+    const uint64_t now = pipe_tp_now_ns();
+    if (now < *next_note_ns) {
+        return;
+    }
+    *next_note_ns = now + 10ull * 1000000000ull;
+    if (timeout_ms > 0) {
+        fprintf(stderr, "pipe-tp: %s %s:%d ... %.0f s elapsed of at most %.0f s\n",
+                what, host.c_str(), port, (now - t0_ns) / 1e9, timeout_ms / 1000.0);
+    } else {
+        fprintf(stderr, "pipe-tp: %s %s:%d ... %.0f s elapsed (no timeout)\n",
+                what, host.c_str(), port, (now - t0_ns) / 1e9);
+    }
+}
+
 bool pipe_tp_comm::parse_peer(const std::string & spec, std::string * host, int * port) {
     const size_t colon = spec.rfind(':');
     if (colon == std::string::npos || colon == 0 || colon + 1 >= spec.size()) {
@@ -106,12 +181,57 @@ std::unique_ptr<pipe_tp_comm> pipe_tp_comm::listen(
     if (!pipe_transport_init()) {
         return nullptr;
     }
-    pipe_socket_ptr server = pipe_socket_t::create_server(host.c_str(), port);
-    if (!server) {
+
+    // Normally the socket is already open: prebind() bound it before the model load. Falling back
+    // to binding here keeps the call self-contained for the tests and for any caller that has not
+    // been taught to prebind, but on the real path this branch should not be taken - if it is, the
+    // port only became available after the load and the follower may already have given up.
+    pipe_socket_ptr server;
+    if (g_tp_prebound && g_tp_prebound_host == host && g_tp_prebound_port == port) {
+        server = g_tp_prebound;
+    } else {
+        server = pipe_socket_t::create_server(host.c_str(), port);
+        if (!server) {
+            return nullptr;
+        }
+    }
+
+    const int listen_fd = server->poll_fd();
+    if (listen_fd < 0) {
         return nullptr;
     }
-    const uint64_t deadline = pipe_tp_now_ns() + (uint64_t) (timeout_ms > 0 ? timeout_ms : 0) * 1000000ull;
+
+    const uint64_t t0       = pipe_tp_now_ns();
+    const uint64_t deadline = t0 + (uint64_t) (timeout_ms > 0 ? timeout_ms : 0) * 1000000ull;
+    uint64_t next_note = t0 + 10ull * 1000000000ull;
+
     for (;;) {
+#ifndef _WIN32
+        // poll the LISTENING fd rather than calling the blocking accept() directly. accept() on a
+        // blocking socket never returns until a peer arrives, which made both the timeout below
+        // and any progress logging dead code - a leader waiting for a follower that had already
+        // exited simply sat there silently, forever, which is exactly what it was observed doing.
+        struct pollfd pfd;
+        pfd.fd      = listen_fd;
+        pfd.events  = POLLIN;
+        pfd.revents = 0;
+        const int pr = poll(&pfd, 1, 1000);
+        if (pr < 0 && errno != EINTR) {
+            return nullptr;
+        }
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            pipe_socket_ptr peer = server->accept();
+            if (peer) {
+                std::unique_ptr<pipe_tp_comm> ret(new pipe_tp_comm(peer, max_values));
+                if (ret->fd_ < 0 || !pipe_tp_set_nonblocking(ret->fd_)) {
+                    return nullptr;
+                }
+                fprintf(stderr, "pipe-tp: peer rank connected on %s:%d after %.1f s\n",
+                        host.c_str(), port, (pipe_tp_now_ns() - t0) / 1e9);
+                return ret;
+            }
+        }
+#else
         pipe_socket_ptr peer = server->accept();
         if (peer) {
             std::unique_ptr<pipe_tp_comm> ret(new pipe_tp_comm(peer, max_values));
@@ -120,10 +240,14 @@ std::unique_ptr<pipe_tp_comm> pipe_tp_comm::listen(
             }
             return ret;
         }
-        if (timeout_ms <= 0 || pipe_tp_now_ns() >= deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+#endif
+        pipe_tp_waiting_note("waiting for the peer rank to connect on", host, port, t0, &next_note, timeout_ms);
+        if (timeout_ms > 0 && pipe_tp_now_ns() >= deadline) {
+            fprintf(stderr, "pipe-tp: no peer rank connected on %s:%d within %.0f s\n",
+                    host.c_str(), port, timeout_ms / 1000.0);
             return nullptr;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 }
 
@@ -132,7 +256,16 @@ std::unique_ptr<pipe_tp_comm> pipe_tp_comm::connect(
     if (!pipe_transport_init()) {
         return nullptr;
     }
-    const uint64_t deadline = pipe_tp_now_ns() + (uint64_t) (timeout_ms > 0 ? timeout_ms : 0) * 1000000ull;
+    const uint64_t t0       = pipe_tp_now_ns();
+    const uint64_t deadline = t0 + (uint64_t) (timeout_ms > 0 ? timeout_ms : 0) * 1000000ull;
+    uint64_t next_note   = t0 + 10ull * 1000000000ull;
+    // Modest backoff, capped at five seconds. The cap is set by NOISE, not by latency: every
+    // failed attempt makes pipe_socket_t::connect print a line, and against a seven-minute leader
+    // load a five-second reconnect granularity is free while a 50 ms one would bury the progress
+    // notes under twenty thousand identical failures.
+    uint64_t backoff_ms  = 50;
+    bool     first_try   = true;
+
     for (;;) {
         bool retryable = false;
         pipe_socket_ptr sock = pipe_socket_t::connect(host.c_str(), port, &retryable);
@@ -141,13 +274,33 @@ std::unique_ptr<pipe_tp_comm> pipe_tp_comm::connect(
             if (ret->fd_ < 0 || !pipe_tp_set_nonblocking(ret->fd_)) {
                 return nullptr;
             }
+            fprintf(stderr, "pipe-tp: connected to the leader rank at %s:%d after %.1f s\n",
+                    host.c_str(), port, (pipe_tp_now_ns() - t0) / 1e9);
             return ret;
         }
-        // Never retry a protocol, DNS or local setup error; only a refusal or timeout.
-        if (!retryable || timeout_ms <= 0 || pipe_tp_now_ns() >= deadline) {
+
+        // A name that does not resolve, or a local setup failure, is deterministic: it will fail
+        // identically for the next thirty minutes, so fail it now. But only on the FIRST attempt -
+        // once we know the address is usable, a later non-retryable error is a transient network
+        // condition (an interface flapping, a host rebooting) and is worth waiting out, which is
+        // the entire point of a thirty-minute cap.
+        if (first_try && !retryable) {
+            fprintf(stderr, "pipe-tp: cannot reach %s:%d and the failure is not transient "
+                            "(unresolvable host, or a local socket error)\n", host.c_str(), port);
             return nullptr;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        first_try = false;
+
+        if (timeout_ms > 0 && pipe_tp_now_ns() >= deadline) {
+            fprintf(stderr, "pipe-tp: gave up connecting to the leader rank at %s:%d after %.0f s. "
+                            "If the leader is still loading its model, raise "
+                            "WP_TP_CONNECT_TIMEOUT_MS.\n", host.c_str(), port, timeout_ms / 1000.0);
+            return nullptr;
+        }
+        pipe_tp_waiting_note("waiting for the leader rank at", host, port, t0, &next_note, timeout_ms);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        backoff_ms = backoff_ms < 5000 ? std::min<uint64_t>(backoff_ms * 2, 5000) : 5000;
     }
 }
 
@@ -381,10 +534,10 @@ bool pipe_tp_comm::send_msg(uint8_t type, const void * payload, size_t bytes) {
     // Two writes, not a gathered one: unlike a reduce this is not on the per-layer hot path, and
     // the peer is blocked reading rather than simultaneously writing, so there is no deadlock to
     // avoid and no wakeup budget to protect.
-    if (!pipe_tp_xfer(fd_, (uint8_t *) &hdr, sizeof(hdr), true, timeout_ms_)) {
+    if (!pipe_tp_xfer(fd_, (uint8_t *) &hdr, sizeof(hdr), true, msg_timeout_ms_)) {
         return false;
     }
-    if (bytes > 0 && !pipe_tp_xfer(fd_, (uint8_t *) payload, bytes, true, timeout_ms_)) {
+    if (bytes > 0 && !pipe_tp_xfer(fd_, (uint8_t *) payload, bytes, true, msg_timeout_ms_)) {
         return false;
     }
     stats_.bytes_sent += sizeof(hdr) + bytes;
@@ -402,7 +555,7 @@ bool pipe_tp_comm::recv_msg(uint8_t * type, std::vector<uint8_t> & payload) {
     }
     pipe_tp_frame_hdr hdr;
     memset(&hdr, 0, sizeof(hdr));
-    if (!pipe_tp_xfer(fd_, (uint8_t *) &hdr, sizeof(hdr), false, timeout_ms_)) {
+    if (!pipe_tp_xfer(fd_, (uint8_t *) &hdr, sizeof(hdr), false, msg_timeout_ms_)) {
         return false;
     }
     if (hdr.magic != PIPE_TP_MAGIC || hdr.flags != 0 || hdr.dtype != (uint8_t) dtype_) {
@@ -426,7 +579,7 @@ bool pipe_tp_comm::recv_msg(uint8_t * type, std::vector<uint8_t> & payload) {
 
     payload.resize(hdr.payload_bytes);
     if (hdr.payload_bytes > 0 &&
-            !pipe_tp_xfer(fd_, payload.data(), hdr.payload_bytes, false, timeout_ms_)) {
+            !pipe_tp_xfer(fd_, payload.data(), hdr.payload_bytes, false, msg_timeout_ms_)) {
         return false;
     }
     stats_.bytes_recvd += sizeof(hdr) + hdr.payload_bytes;

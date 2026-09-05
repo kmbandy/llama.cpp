@@ -3304,7 +3304,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--tp-peer"}, "HOST:PORT",
         "cross-host tensor parallelism: address of the peer rank. Rank 0 (--tp-rank 0) BINDS and\n"
         "accepts on it, every other rank CONNECTS to it. Required whenever --tp-world exceeds the\n"
-        "number of local devices.",
+        "number of local devices.\n"
+        "Rank 0 binds this port BEFORE loading the model, so the other rank can connect while rank 0\n"
+        "is still reading weights and start order does not matter. On rank 0 the host must be a\n"
+        "dotted-quad (0.0.0.0 for every interface), not a name; on the other ranks a name is fine.\n"
+        "A rank waits up to WP_TP_CONNECT_TIMEOUT_MS (default 30 min) for its peer.",
         [](common_params & params, const std::string & value) {
             params.tp_peer = value;
         }

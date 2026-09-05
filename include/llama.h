@@ -1147,6 +1147,18 @@ extern "C" {
     // A non-OK return is terminal: SHUTDOWN means the leader closed the world cleanly, ERROR
     // means the ranks diverged or the connection died and the reason has already been logged.
 
+    // Bind and listen on the tensor-parallel peer address NOW, before the model is loaded.
+    //
+    // Call this on rank 0 as early as possible - the two ranks' model loads are not the same
+    // length, and until the port exists the other rank has nothing to connect to. Once listen()
+    // has been called the kernel completes the peer's TCP handshake from the backlog on its own,
+    // so the follower connects the moment this returns even though rank 0 is still reading
+    // weights off disk, and start order stops mattering. `peer` is "host:port"; the host must be
+    // a dotted-quad (0.0.0.0 to accept on every interface), not a name.
+    //
+    // Returns false if the address is malformed or the port cannot be bound. Idempotent.
+    LLAMA_API bool llama_tp_prebind_peer(const char * peer);
+
     enum llama_tp_step_status {
         LLAMA_TP_STEP_ERROR    = -1,
         LLAMA_TP_STEP_OK       =  0,
