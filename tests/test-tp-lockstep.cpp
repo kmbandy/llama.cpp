@@ -116,6 +116,26 @@ static std::vector<script_op> build_script() {
 
     // context shift
     add_ctrl(PIPE_TP_CTRL_SEQ_DIV, 0, 0, 512, 2, 0);
+
+    // THE REQUEST BOUNDARY: decode, seq_rm, decode.
+    //
+    // This is the sequence tools/server/server-context.cpp performs between two completions on
+    // the same slot, and the one the 2026-09-05 live run answered correctly the first time and
+    // with an immediate EOS every time after. The server keeps_first(n_past), takes
+    // p0 = prompt.tokens.pos_next() and calls seq_rm(slot, p0, -1); when the model can only roll
+    // the recurrent state back by n_rs_seq tokens, n_past collapses to 0 and p0 with it, so the
+    // op that actually crosses the wire is seq_rm(seq, 0, -1) - a FULL removal expressed as a
+    // range, not as (-1, -1). Both spellings are scripted here because llama_memory_recurrent
+    // treats them differently on the way in (only the p0 == 0 form takes the rm_all branch that
+    // resets the rollback index) and a mirror that normalised one into the other would desync.
+    add_ctrl(PIPE_TP_CTRL_SEQ_RM, 0, 0, -1, 0, 0);
+    add_batch(make_batch(32, 0, true, true, true));   // request 2's prompt, reprocessed from pos 0
+    add_reduce(2048);
+    add_batch(make_batch(1, 32, true, true, true));   // and its first generated token
+    add_reduce(64);
+    add_ctrl(PIPE_TP_CTRL_SEQ_RM, 0, -1, -1, 0, 0);   // request 3 starts from a cleared sequence
+    add_batch(make_batch(28, 0, true, true, true));
+    add_reduce(1792);
     return s;
 }
 

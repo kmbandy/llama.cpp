@@ -306,6 +306,65 @@ static bool test_ctrl_round_trip() {
     return true;
 }
 
+// THE REQUEST BOUNDARY: decode, seq_rm, decode, at the codec level.
+//
+// The 2026-09-05 live run answered the first request correctly and every later one with an
+// immediate EOS. Everything that happens between them goes through these three frames, sharing
+// ONE operation counter, so the counter has to keep running across the mix and each frame has to
+// survive the round trip unchanged - in particular the two spellings of a full sequence removal,
+// (0, -1) and (-1, -1), which llama_memory_recurrent does NOT treat identically and which a codec
+// that normalised negative positions would silently merge.
+static bool test_decode_seq_rm_decode() {
+    uint32_t op_seq = 0;
+
+    auto prompt = [&](int n_tokens, int pos0) {
+        test_batch tb;
+        for (int i = 0; i < n_tokens; i++) {
+            tb.token.push_back(2000 + i);
+            tb.pos.push_back(pos0 + i);
+            tb.n_seq_id.push_back(1);
+            tb.seq_flat.push_back(0);
+            tb.logits.push_back(i == n_tokens - 1 ? 1 : 0);
+        }
+        tb.finish(true, true, true);
+        return tb;
+    };
+
+    // request 1: a 32-token prompt and one generated token
+    test_batch r1_prompt = prompt(32, 0);
+    CHECK(round_trip(r1_prompt, false, ++op_seq));
+    test_batch r1_gen = prompt(1, 32);
+    CHECK(round_trip(r1_gen, false, ++op_seq));
+
+    // the boundary: the server's seq_rm(slot, p0, -1) with p0 collapsed to 0
+    const struct { int32_t p0, p1; } rms[] = { {0, -1}, {-1, -1} };
+    for (auto & rm : rms) {
+        pipe_tp_ctrl in;
+        in.op_seq = ++op_seq;
+        in.op     = PIPE_TP_CTRL_SEQ_RM;
+        in.a = 0; in.b = rm.p0; in.c = rm.p1; in.d = 0; in.b0 = 0;
+
+        std::vector<uint8_t> wire;
+        pipe_tp_encode_ctrl(in, wire);
+
+        pipe_tp_ctrl out;
+        std::string err;
+        CHECK(pipe_tp_decode_ctrl(wire.data(), wire.size(), &out, &err));
+        CHECK(out.op_seq == in.op_seq && out.op == PIPE_TP_CTRL_SEQ_RM);
+        // the arguments the follower will hand to llama_memory_i::seq_rm, verbatim
+        CHECK(out.a == 0 && out.b == rm.p0 && out.c == rm.p1);
+
+        // request 2 / request 3: the prompt is reprocessed from position 0 again
+        test_batch again = prompt(rm.p0 == 0 ? 32 : 28, 0);
+        CHECK(round_trip(again, false, ++op_seq));
+    }
+
+    // the counter ran unbroken across batches and controls alike: 2 + 2*(1 + 1) = 6
+    CHECK(op_seq == 6);
+    printf("  decode/seq_rm/decode kept one unbroken operation counter across 6 frames\n");
+    return true;
+}
+
 static pipe_tp_hello base_hello() {
     pipe_tp_hello h = {};
     h.version = PIPE_TP_PROTO_VERSION;
@@ -391,6 +450,7 @@ int main() {
         {"rejections",         test_rejections},
         {"corruption",         test_corruption_is_caught},
         {"ctrl-round-trip",    test_ctrl_round_trip},
+        {"decode-seq_rm-decode", test_decode_seq_rm_decode},
         {"hello-gate",         test_hello_gate},
     };
     for (auto & t : tests) {

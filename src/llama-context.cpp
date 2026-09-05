@@ -3603,6 +3603,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    uint32_t n_ubatches_tp = 0; // WP_TP_TRACE only; see tp_trace_decode() below
     // MAD-LAB: the decode scope uses the shared dispatcher when borrowed.
     expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch);
 
@@ -3920,6 +3921,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        n_ubatches_tp++;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3974,6 +3976,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // Cross-host tensor parallelism, WP_TP_TRACE=1: one line per decode on BOTH ranks carrying
+    // every number the two of them must agree on. Diffing the leader's and the follower's traces
+    // line by line is what turns "the second request answers EOS" into a specific first
+    // disagreement. Off by default, and unreachable without --tp-world.
+    if (tp_enabled()) {
+        tp_trace_decode(/*is_encode =*/ false, n_tokens_all, n_outputs_all, n_ubatches_tp,
+                batch_inp.pos ? batch_inp.pos[0] : -1,
+                batch_inp.pos ? batch_inp.pos[batch_inp.n_tokens - 1] : -1);
+    }
 
     return 0;
 }
@@ -6225,6 +6237,10 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     }
 
     mem->clear(data);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_MEM_CLEAR, 0, 0, 0, 0, data ? 1 : 0, -1);
+    }
 }
 
 bool llama_memory_seq_rm(
@@ -6240,7 +6256,18 @@ bool llama_memory_seq_rm(
         llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_RM, seq_id, p0, p1, 0, 0);
     }
 
-    return mem->seq_rm(seq_id, p0, p1);
+    const bool res = mem->seq_rm(seq_id, p0, p1);
+
+    // The return value is traced because it is the ONE piece of state that differs between the
+    // ranks without any frame going missing: only the leader's answer is observed, and its
+    // callers branch on it (the server clears the whole sequence when a partial remove is
+    // refused, common_context_seq_rm() aborts). A false here on one rank and a true on the other
+    // is a silent divergence of everything that follows.
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_RM, seq_id, p0, p1, 0, 0, res ? 1 : 0);
+    }
+
+    return res;
 }
 
 void llama_memory_seq_cp(
@@ -6258,6 +6285,10 @@ void llama_memory_seq_cp(
     }
 
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_CP, seq_id_src, seq_id_dst, p0, p1, 0, -1);
+    }
 }
 
 void llama_memory_seq_keep(
@@ -6272,6 +6303,10 @@ void llama_memory_seq_keep(
     }
 
     mem->seq_keep(seq_id);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_KEEP, seq_id, 0, 0, 0, 0, -1);
+    }
 }
 
 void llama_memory_seq_add(
@@ -6289,6 +6324,10 @@ void llama_memory_seq_add(
     }
 
     mem->seq_add(seq_id, p0, p1, delta);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_ADD, seq_id, p0, p1, delta, 0, -1);
+    }
 }
 
 void llama_memory_seq_div(
@@ -6306,6 +6345,10 @@ void llama_memory_seq_div(
     }
 
     mem->seq_div(seq_id, p0, p1, d);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_DIV, seq_id, p0, p1, d, 0, -1);
+    }
 }
 
 llama_pos llama_memory_seq_pos_min(

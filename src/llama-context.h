@@ -384,6 +384,11 @@ public:
 
     llama_memory_i * tp_memory() const { return memory.get(); }
 
+    // Per-decode lockstep trace, WP_TP_TRACE=1 only. Called from the tail of decode()/encode() on
+    // BOTH ranks with the numbers that have to agree; see llama_tp_trace_enabled().
+    void tp_trace_decode(bool is_encode, uint32_t n_tokens_all, uint32_t n_outputs_all,
+                         uint32_t n_ubatches, llama_pos pos_first, llama_pos pos_last) const;
+
 private:
 
     //
@@ -551,3 +556,15 @@ extern llama_context * g_llama_tp_leader;
 // ever see a llama_memory_t, can reach it.
 void llama_tp_mirror_memory(llama_memory_t mem, uint8_t op,
                             int32_t a, int32_t b, int32_t c, int32_t d, uint8_t b0);
+
+// WP_TP_TRACE=1: cross-host TP lockstep tracing. Reads the environment ONCE, on the first call,
+// and is only ever reached from code that has already established that a TP world exists - so a
+// run without --tp-world does not evaluate it at all.
+bool llama_tp_trace_enabled();
+
+// One line per memory mutation, on both ranks, with the arguments AND the return value.
+// `res` is 1/0 for the ops that return bool and -1 for the ones that return void; a seq_rm that
+// returns true on one rank and false on the other is the divergence this is here to catch,
+// because the caller's fallback (clear the whole sequence) then only runs on one of them.
+void llama_tp_trace_mem(const char * role, uint8_t op,
+                        int32_t a, int32_t b, int32_t c, int32_t d, uint8_t b0, int res);

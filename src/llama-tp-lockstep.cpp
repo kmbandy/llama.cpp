@@ -51,8 +51,69 @@
 #include "pipeline/pipe-tp-msg.h"
 
 #include <cstring>
+#include <cstdlib>
 
 llama_context * g_llama_tp_leader = nullptr;
+
+// ---------------------------------------------------------------------------------------------
+// WP_TP_TRACE=1 - the lockstep trace
+//
+// The whole design rests on "both ranks perform the same operations, with the same arguments, in
+// the same order, against the same memory state". Everything above enforces the ORDER (the
+// operation counter) and the WIRE (the frame checksums), but nothing prints what was actually
+// applied, and nothing prints what the memory module RETURNED. That last one matters: the
+// llama_memory_* entry points that return bool have callers whose next action depends on the
+// answer (the server's "could not partially remove, clear the whole sequence" fallback, and
+// common_context_seq_rm()'s abort). Only the leader's return value is ever observed, so a rank
+// that answers differently silently applies a different sequence of operations from there on.
+//
+// This trace is off unless WP_TP_TRACE=1, is read once, and every call site is already inside a
+// branch that has established a TP world exists - so a run without --tp-world does not reach it.
+// ---------------------------------------------------------------------------------------------
+
+bool llama_tp_trace_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_TP_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+static const char * llama_tp_ctrl_name(uint8_t op) {
+    switch (op) {
+        case PIPE_TP_CTRL_MEM_CLEAR: return "mem_clear";
+        case PIPE_TP_CTRL_SEQ_RM:    return "seq_rm";
+        case PIPE_TP_CTRL_SEQ_CP:    return "seq_cp";
+        case PIPE_TP_CTRL_SEQ_KEEP:  return "seq_keep";
+        case PIPE_TP_CTRL_SEQ_ADD:   return "seq_add";
+        case PIPE_TP_CTRL_SEQ_DIV:   return "seq_div";
+        case PIPE_TP_CTRL_SHUTDOWN:  return "shutdown";
+        default:                     return "?";
+    }
+}
+
+void llama_tp_trace_mem(const char * role, uint8_t op,
+                        int32_t a, int32_t b, int32_t c, int32_t d, uint8_t b0, int res) {
+    if (!llama_tp_trace_enabled()) {
+        return;
+    }
+    LLAMA_LOG_INFO("WP_TP_TRACE %s mem %-9s a=%d b=%d c=%d d=%d b0=%u -> %s\n",
+            role, llama_tp_ctrl_name(op), a, b, c, d, (unsigned) b0,
+            res < 0 ? "void" : (res ? "true" : "false"));
+}
+
+void llama_context::tp_trace_decode(bool is_encode, uint32_t n_tokens_all, uint32_t n_outputs_all,
+                                    uint32_t n_ubatches, llama_pos pos_first, llama_pos pos_last) const {
+    if (!llama_tp_trace_enabled()) {
+        return;
+    }
+    const uint64_t n_exchanges = tp_comm ? tp_comm->stats().n_exchanges : 0;
+    LLAMA_LOG_INFO("WP_TP_TRACE %s %s op_seq=%u n_tokens=%u n_outputs=%u n_ubatch=%u "
+                   "pos=[%d,%d] exchanges=%llu\n",
+            tp_is_rank0 ? "leader  " : "follower", is_encode ? "encode" : "decode",
+            tp_op_seq, n_tokens_all, n_outputs_all, n_ubatches, pos_first, pos_last,
+            (unsigned long long) n_exchanges);
+}
 
 // ---------------------------------------------------------------------------------------------
 // HELLO
@@ -248,9 +309,10 @@ int llama_context::tp_follower_step() {
         // Applied through llama_memory_i directly, not through the llama_memory_* C API: the
         // follower must never re-enter the mirror (it is not the leader, so it would be a no-op,
         // but the intent is worth being explicit about).
+        int trace_res = -1; // -1 = the op returns void
         switch (ctrl.op) {
             case PIPE_TP_CTRL_MEM_CLEAR: mem->clear(ctrl.b0 != 0);                            break;
-            case PIPE_TP_CTRL_SEQ_RM:    mem->seq_rm  (ctrl.a, ctrl.b, ctrl.c);               break;
+            case PIPE_TP_CTRL_SEQ_RM:    trace_res = mem->seq_rm(ctrl.a, ctrl.b, ctrl.c) ? 1 : 0; break;
             case PIPE_TP_CTRL_SEQ_CP:    mem->seq_cp  (ctrl.a, ctrl.b, ctrl.c, ctrl.d);       break;
             case PIPE_TP_CTRL_SEQ_KEEP:  mem->seq_keep(ctrl.a);                               break;
             case PIPE_TP_CTRL_SEQ_ADD:   mem->seq_add (ctrl.a, ctrl.b, ctrl.c, ctrl.d);       break;
@@ -259,6 +321,7 @@ int llama_context::tp_follower_step() {
                 LLAMA_LOG_ERROR("%s: cross-host TP: unhandled control op %u\n", __func__, (unsigned) ctrl.op);
                 return LLAMA_TP_STEP_ERROR;
         }
+        llama_tp_trace_mem("follower", ctrl.op, ctrl.a, ctrl.b, ctrl.c, ctrl.d, ctrl.b0, trace_res);
         return LLAMA_TP_STEP_OK;
     }
 
@@ -295,6 +358,18 @@ int llama_context::tp_follower_step() {
                 desc.is_encode ? "encode" : "decode", desc.op_seq, batch.n_tokens, ret);
         return LLAMA_TP_STEP_ERROR;
     }
+
+    // llama_context::decode() deliberately does NOT wait for the graph it just submitted: the
+    // comment at its tail says so ("wait for the computation to finish (automatically done when
+    // obtaining the model output)"). On the leader that wait is paid for by the very next thing
+    // the server does - llama_get_logits_ith() calls llama_context::synchronize(). The follower
+    // used to get it the same way, through the logits/embeddings readback. f80933d61 removed that
+    // readback (the follower owns no LM head rows and cannot gather them), and with it the only
+    // synchronize() on this rank: from that commit on the follower returned to the message loop
+    // with the ubatch's graph still in flight and then applied the NEXT frame - a memory mutation
+    // or a fresh graph build - on top of it. Restore the wait here, where the readback used to be.
+    synchronize();
+
     return LLAMA_TP_STEP_OK;
 }
 
