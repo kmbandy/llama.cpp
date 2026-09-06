@@ -3550,15 +3550,38 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // they agree and the read is still wrong relative to a known-good run, the corruption was
     // already baked into the writer's own numbers (a kernel bug), not a persistence bug.
     if (ggml_backend_meta_trace_values_enabled() && getenv("WP_TP_TRACE")[0] >= '3') {
+        // Does this node's own name, or (for a bare view) the tensor its view_src chain bottoms
+        // out in, start with "cache_s_l" or "cache_r_l"? Used below to catch the in-place
+        // zero-clear (ggml_scale_inplace on a VIEW of the cache, src/llama-graph.cpp:4276 in
+        // build_rs) and the raw gather (GET_ROWS straight off the cache, before it gets its
+        // cb()-assigned name a reshape later) - neither is named "cache_s_l*"/"cache_r_l*" itself
+        // and neither was previously hashed, even though both sit directly between the
+        // reproducible write-back (end of one build) and the non-reproducible read
+        // (state_predelta-0, start of the next).
+        auto names_cache = [](const ggml_tensor * t) {
+            return strncmp(t->name, "cache_s_l", 9) == 0 || strncmp(t->name, "cache_r_l", 9) == 0;
+        };
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
-            const bool is_write = node->op == GGML_OP_CPY &&
-                (strstr(node->name, "cache_s_l") != nullptr || strstr(node->name, "cache_r_l") != nullptr);
+            const bool is_write = node->op == GGML_OP_CPY && names_cache(node);
             const bool is_read = strstr(node->name, "state_predelta") != nullptr ||
                 strstr(node->name, "conv_states_reshaped") != nullptr;
-            if (!is_write && !is_read) {
+            bool is_zero = false;
+            if (node->op == GGML_OP_SCALE) {
+                for (const ggml_tensor * v = node->view_src; v != nullptr; v = v->view_src) {
+                    if (names_cache(v)) {
+                        is_zero = true;
+                        break;
+                    }
+                }
+            }
+            const bool is_raw_gather = node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr &&
+                names_cache(node->src[0]);
+            if (!is_write && !is_read && !is_zero && !is_raw_gather) {
                 continue;
             }
+            const char * site =
+                is_write ? "state_writeback" : is_zero ? "state_zero" : is_raw_gather ? "state_gather" : "state_read";
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 ggml_tensor * node_j = ggml_backend_meta_buffer_simple_tensor(node, j);
@@ -3572,7 +3595,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=%s "
                               "n_tokens=%d dev=%zu node=%s nbytes=%zu C=%d hash=%016llx\n",
                         trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
-                        is_write ? "state_writeback" : "state_read",
+                        site,
                         (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node->name,
                         nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
                         (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
