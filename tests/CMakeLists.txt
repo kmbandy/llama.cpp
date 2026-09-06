@@ -659,7 +659,7 @@ target_link_libraries(test-dsv4-comp-plan PRIVATE llama llama-common)
 target_include_directories(test-dsv4-comp-plan PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 llama_build_and_test(test-cuda-graph-cache.cpp)
-target_include_directories(test-cuda-graph-cache PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cuda)
+target_include_directories(test-cuda-graph-cache PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cuda ${CMAKE_SOURCE_DIR}/ggml/src)
 
 llama_build_and_test(test-paged-semantic.cpp)
 target_link_libraries(test-paged-semantic PRIVATE llama llama-common)

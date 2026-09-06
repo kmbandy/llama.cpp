@@ -28,6 +28,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-impl.h" // full ggml_cgraph definition (ggml_cuda_graph_is_prefill_shaped)
 
 #include <cstddef>
 #include <cstdint>
@@ -248,4 +249,140 @@ inline bool ggml_cuda_graph_tensor_topo_equal(const ggml_tensor & a, const ggml_
         return false;
     }
     return true;
+}
+
+// Prefill-shaped graphs (activation width > decode/spec window) must not be
+// captured. Each distinct prompt length would otherwise park a HIP graph and
+// its host-visible scratch for the process lifetime — the 2057/1136/1010 MiB
+// /dev/zero set on the sliced spine. Decode/spec stay capturable (ne <= 32).
+//
+// 2026-09-03: the MUL_MAT-only test missed most prefill fragments on the sliced
+// spine (a split of ~86 fragments per ubatch holds norms / rope / GDN / mul_mat_id
+// and often no MUL_MAT at all), so every prefill fragment was captured and
+// instantiated: ~258 captures per 1372-token prompt, ~430 MiB of runtime scratch
+// on the R9700, which on a card within 1 GB of full evicts 3-6 GB to GTT and
+// OOMs the 15 GB host. Any op node whose output is a plain 2-D activation
+// [n, n_tokens] wider than the decode/spec window is prefill-shaped, and so is
+// a MUL_MAT_ID whose activations carry more than 32 tokens.
+//
+// 2026-09-05: GGML_OP_PAGED_ATTN_MT (mt:: paged attention, MAD-114) and the
+// other fork-only ops were never added to this switch, so a prefill fragment
+// whose only wide node is one of them was misclassified as decode-shaped and
+// captured -- the pagedattn tile/decode dispatch inside it then runs for the
+// first time *while the stream is mid-capture*, and whatever in that path
+// isn't capture-safe poisons the capture ("operation failed due to a previous
+// error during capture" on the next kernel launch, e.g. WP_HIP_GRAPHS=1 on the
+// qwen38-27b paged-attn preset). Each op's real token-count source is used
+// (not always the dst ne[], since GATED_DELTA_NET/SSM_SCAN concatenate
+// recurrent state onto the dst and TURBO_WHT mirrors whatever shape its input
+// happens to have) rather than folding them into the generic 2-D/ROPE-shaped
+// cases above, matching how MUL_MAT_ID already reads its own src instead of
+// dst.
+inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+            const int64_t n_act = node->src[1]->ne[1];
+            if (n_act > 32 && node->src[1]->ne[0] <= 16384) {
+                return true;
+            }
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[1] != nullptr) {
+            if (node->src[1]->ne[2] > 32) {
+                return true;
+            }
+        }
+        // GATED_DELTA_NET's dst is a flat [S_v*H, n_tokens*n_seqs + state_rows]
+        // buffer (ggml_gated_delta_net, ggml.c) -- the recurrent-state rows
+        // tacked on the end make dst->ne[1] useless as a token count. Read the
+        // true per-call token count from src[2] (v: [S_v, H, n_tokens, n_seqs]).
+        if (node->op == GGML_OP_GATED_DELTA_NET && node->src[2] != nullptr) {
+            if (node->src[2]->ne[2] > 32) {
+                return true;
+            }
+        }
+        // SSM_SCAN's dst is a flat 1-D [nelements(x) + K*state] buffer
+        // (ggml_ssm_scan, ggml.c) for the same reason -- read the token count
+        // from src[1] (x: [head_dim, n_head, n_seq_tokens, n_seqs]).
+        if (node->op == GGML_OP_SSM_SCAN && node->src[1] != nullptr) {
+            if (node->src[1]->ne[2] > 32) {
+                return true;
+            }
+        }
+        // Token-width rules per op. A blanket "any 2-D node wider than 32"
+        // test also caught decode fragments (recurrent-state copies are 2-D
+        // and wide), which halved graph replays on decode; scope it to ops
+        // whose 2-D output is [n, n_tokens].
+        switch (node->op) {
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_NORM:
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_GLU:
+            case GGML_OP_ADD:
+            case GGML_OP_MUL:
+            case GGML_OP_SCALE:
+                if (node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] > 32) {
+                    return true;
+                }
+                break;
+            case GGML_OP_ROPE:
+                if (node->ne[2] > 32) {
+                    return true;
+                }
+                break;
+            case GGML_OP_SSM_CONV:
+                if (node->ne[1] > 32) {
+                    return true;
+                }
+                break;
+            // dst mirrors q: [head_dim, n_heads, sum(q_lens), 1]
+            // (ggml_paged_attn_mt, ggml.c) -- token count is ne[2], same
+            // convention as ROPE above.
+            case GGML_OP_PAGED_ATTN_MT:
+                if (node->ne[2] > 32) {
+                    return true;
+                }
+                break;
+            // dst is [n_embd, n_tokens] (ggml_dsv4_hc_pre, ggml.c) -- fits the
+            // plain 2-D convention above but the op isn't in that op list.
+            case GGML_OP_DSV4_HC_PRE:
+                if (node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] > 32) {
+                    return true;
+                }
+                break;
+            // dst is [hc, hc, n_tokens] / [n_embd, hc, n_tokens]
+            // (ggml_dsv4_hc_comb / ggml_dsv4_hc_post, ggml.c) -- token count
+            // is ne[2], same convention as ROPE.
+            case GGML_OP_DSV4_HC_COMB:
+            case GGML_OP_DSV4_HC_POST:
+                if (node->ne[2] > 32) {
+                    return true;
+                }
+                break;
+            // dst is [k->ne[2] (n_kv), q->ne[2] (n_tokens), 1, q->ne[3]]
+            // (ggml_lightning_indexer, ggml.c) -- ne[3] (n_seqs) need not be 1,
+            // so this can't share the plain-2-D case above; token count is
+            // ne[1].
+            case GGML_OP_LIGHTNING_INDEXER:
+                if (node->ne[1] > 32) {
+                    return true;
+                }
+                break;
+            // dst shape mirrors src[0] exactly (ggml_turbo_wht, ggml.c), and
+            // callers apply it to both 4-D per-head activations
+            // ([head_dim, n_head, n_tokens, n_seqs], e.g. q) and flattened 2-D
+            // ones ([n_embd, n_tokens], e.g. kqv) -- ne[2] is the token axis
+            // in the former, ne[1] in the latter (ne[2]==1 there).
+            case GGML_OP_TURBO_WHT: {
+                const int64_t width = node->ne[2] > 1 ? node->ne[2] : node->ne[1];
+                if (width > 32) {
+                    return true;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return false;
 }

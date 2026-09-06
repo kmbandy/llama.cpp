@@ -185,6 +185,77 @@ int main() {
                 "same slot replays");
     }
 
-    std::printf("ok: cuda graph cache ttl + lru cap + topo identity\n");
+    {
+        // 2026-09-05 regression: a fragment whose only wide-token node is
+        // GGML_OP_PAGED_ATTN_MT (dst mirrors q: [head_dim, n_heads,
+        // sum(q_lens), 1], token count in ne[2]) must be classified
+        // prefill-shaped so the WP HIP-graph executor does not capture it --
+        // capturing it crashed prefill under WP_HIP_GRAPHS=1 ("operation
+        // failed due to a previous error during capture").
+        ggml_tensor wide = make_node("paged_attn_wide", GGML_OP_PAGED_ATTN_MT, 256, 24);
+        wide.ne[2] = 512; // sum(q_lens): a 512-token prefill
+        wide.ne[3] = 1;
+        ggml_tensor * nodes[] = { &wide };
+        ggml_cgraph g;
+        std::memset(&g, 0, sizeof(g));
+        g.n_nodes = 1;
+        g.nodes   = nodes;
+        require(ggml_cuda_graph_is_prefill_shaped(&g),
+                "PAGED_ATTN_MT with ne[2] (token count) > 32 is prefill-shaped");
+
+        ggml_tensor narrow = wide;
+        narrow.ne[2] = 5; // MTP decode: a handful of speculative queries
+        ggml_tensor * nodes_decode[] = { &narrow };
+        ggml_cgraph gd;
+        std::memset(&gd, 0, sizeof(gd));
+        gd.n_nodes = 1;
+        gd.nodes   = nodes_decode;
+        require(!ggml_cuda_graph_is_prefill_shaped(&gd),
+                "PAGED_ATTN_MT with ne[2] <= 32 stays capturable (decode/spec)");
+    }
+
+    {
+        // GATED_DELTA_NET's dst concatenates recurrent state onto the token
+        // rows (ggml_gated_delta_net, ggml.c), so dst->ne[1] alone cannot
+        // tell prefill from decode -- the true per-call token count is
+        // src[2] (v)'s ne[2]. A fragment with a small dst but a wide v must
+        // still be classified prefill-shaped.
+        ggml_tensor v = make_node("gdn_v", GGML_OP_NONE, 128, 4);
+        v.ne[2] = 512; // n_tokens
+        v.ne[3] = 1;   // n_seqs
+        ggml_tensor gdn = make_node("gdn_out", GGML_OP_GATED_DELTA_NET, 512, 8);
+        gdn.src[2] = &v;
+        ggml_tensor * nodes[] = { &gdn };
+        ggml_cgraph g;
+        std::memset(&g, 0, sizeof(g));
+        g.n_nodes = 1;
+        g.nodes   = nodes;
+        require(ggml_cuda_graph_is_prefill_shaped(&g),
+                "GATED_DELTA_NET reads token count from src[2] (v), not dst->ne[1]");
+
+        v.ne[2] = 3; // decode: a few tokens
+        require(!ggml_cuda_graph_is_prefill_shaped(&g),
+                "GATED_DELTA_NET stays capturable when v's token count is small");
+    }
+
+    {
+        // SSM_SCAN's dst is a flat 1-D [nelements(x) + K*state] buffer
+        // (ggml_ssm_scan, ggml.c); the real token count is src[1] (x)'s
+        // ne[2].
+        ggml_tensor x = make_node("ssm_x", GGML_OP_NONE, 128, 4);
+        x.ne[2] = 512;
+        x.ne[3] = 1;
+        ggml_tensor scan = make_node("ssm_scan_out", GGML_OP_SSM_SCAN, 1000000, 1);
+        scan.src[1] = &x;
+        ggml_tensor * nodes[] = { &scan };
+        ggml_cgraph g;
+        std::memset(&g, 0, sizeof(g));
+        g.n_nodes = 1;
+        g.nodes   = nodes;
+        require(ggml_cuda_graph_is_prefill_shaped(&g),
+                "SSM_SCAN reads token count from src[1] (x), not its flat dst");
+    }
+
+    std::printf("ok: cuda graph cache ttl + lru cap + topo identity + prefill-shaped classifier\n");
     return 0;
 }
