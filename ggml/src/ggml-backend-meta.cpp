@@ -3273,6 +3273,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return ret;
     };
 
+    // Read a node's LOCAL bytes into `out` for hashing, honoring what backend j is actually
+    // allowed to touch. ggml_backend_tensor_get_async asserts (ggml-cuda.cu:3744, and the
+    // Vulkan/other backends have the analogous check) that the tensor's buffer type matches the
+    // backend being asked to read it - a subgraph can legitimately contain nodes that are not
+    // backend j's own (a MIRRORED weight or input replicated in a host/pinned buffer, or - if
+    // this is ever pointed at something other than a device's own cgraph - another device's
+    // buffer entirely). Dumping "every node in the subgraph" without checking that crashed rank 0
+    // on the very first graph. Three cases: a host buffer can be memcpy'd directly regardless of
+    // which device is asking (no backend call needed); a buffer whose type matches backend j's
+    // own default buffer type is read the normal async way; anything else (some other device's
+    // buffer) is skipped rather than guessed at. Defined here (ahead of allreduce_fallback/
+    // push_data, which also use it to hash node_tmp) rather than lower down where the state_*
+    // trace lambdas use it, since C++ needs the local lambda declared before first use.
+    auto trace_read_local = [](auto & bcj, const ggml_tensor * node_j, std::vector<char> & out) -> bool {
+        if (node_j->buffer == nullptr) {
+            return false;
+        }
+        const size_t nbytes_j = ggml_nbytes(node_j);
+        if (ggml_backend_buffer_is_host(node_j->buffer)) {
+            if (node_j->data == nullptr) {
+                return false;
+            }
+            out.resize(nbytes_j);
+            memcpy(out.data(), node_j->data, nbytes_j);
+            return true;
+        }
+        if (ggml_backend_buffer_get_type(node_j->buffer) != ggml_backend_get_default_buffer_type(bcj.backend)) {
+            return false;
+        }
+        out.resize(nbytes_j);
+        ggml_backend_tensor_get_async(bcj.backend, node_j, out.data(), 0, nbytes_j);
+        ggml_backend_synchronize(bcj.backend);
+        return true;
+    };
+
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
@@ -3316,27 +3351,66 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
-
-            // MEASURED (2026-09-06, j9-j14, cross-host CUDA0+Vulkan0 pair): both devices' own
+            // MEASURED (2026-09-06, j9-j16, cross-host CUDA0+Vulkan0 pair): both devices' own
             // PRE-reduce partials are individually bit-reproducible across fresh-process runs
             // (site=sub0_node), but after this local butterfly reduce, CUDA0's combined value is
-            // NOT reproducible while Vulkan0's is - even though the two are supposed to be equal
-            // (each device receives the other's data and adds its own). ggml_backend_tensor_copy_
-            // async's generic fallback (ggml-backend.cpp:517) only synchronizes src and dst
-            // BEFORE the blocking host-bounce copy, never after - it relies on the destination
-            // write itself (ggml_backend_tensor_set -> the buffer type's .set_tensor) being fully
-            // ordered against whatever ggml_backend_graph_compute_async submits next on that same
-            // device. For CUDA that write is a plain synchronous cudaMemcpy (ggml-cuda.cu:1005,
-            // deliberately made blocking by MAD-114 for exactly this class of bug), which by the
-            // CUDA API contract should already order against a later kernel launch on ANY stream.
-            // The measurement says otherwise: the ADD that reads node_tmp right after this
-            // sometimes sees something other than what was just written, and only on the CUDA
-            // side of this specific cross-vendor pair. Do not trust "should be safe" reasoning
-            // over the measurement: synchronize the destination device explicitly, once, right
-            // here, so node_tmp is unambiguously complete before the ADD that reads it is even
-            // constructed, regardless of which exact layer of the copy path the gap is in.
+            // NOT reproducible while Vulkan0's is - even after adding an explicit
+            // ggml_backend_synchronize(bcj_dst.backend) right after the copy (commit e49787ccb),
+            // which ruled out plain missing-wait-before-the-ADD timing.
+            //
+            // ggml_backend_tensor_copy_async's generic fallback (ggml-backend.cpp:517-533), for a
+            // cross-vendor pair with no vendor fast path, does a host-bounce copy via the
+            // BUFFER-level ggml_backend_tensor_set (ggml-backend.cpp:505), which for CUDA calls
+            // ggml_backend_cuda_buffer_set_tensor (ggml-cuda.cu:990-1005): a plain, host-blocking
+            // cudaMemcpy on the LEGACY DEFAULT STREAM. CUDA streams in this backend are created
+            // with cudaStreamNonBlocking (ggml-cuda.cu:822 - ggml_cuda_context::stream()), which
+            // are BY DESIGN exempt from the legacy stream's implicit cross-stream synchronization.
+            // MAD-114's comment claims the blocking memcpy gives "device-wide ordering" - true for
+            // HIP/ROCm, where that fix was made, but NOT the same guarantee CUDA's own stream
+            // model gives against a cudaStreamNonBlocking stream: a legacy-stream operation is not
+            // ordered against work enqueued on such a stream just because the host waited for it.
+            // The ADD that reads node_tmp gets submitted moments later to exactly that kind of
+            // stream (cuda_ctx->stream()), so it is not guaranteed to see the bounce copy's write.
+            // Same class of defect as 603147cf5 in the worker.
+            //
+            // Fix: use the BACKEND-level async set (ggml_backend_tensor_set_async), which for CUDA
+            // is ggml_backend_cuda_set_tensor_async (ggml-cuda.cu:3730) - cudaMemcpyAsync issued
+            // ON cuda_ctx->stream() itself. The ADD is submitted to that SAME stream right after,
+            // so plain stream FIFO ordering (not a separate host-side wait) makes it correct by
+            // construction, on any backend, not just this pair. Falls back to a synchronous
+            // set through ggml_backend_tensor_set_async's own dispatcher when a backend has no
+            // .set_tensor_async (ggml-backend.cpp:271-282), same as before for such backends.
+            //
+            // The source read stays a plain (non-async) ggml_backend_tensor_get: it already forces
+            // full completion (blocking) into a host buffer we then own, which is what we need
+            // before handing that buffer to the async set below - and get_tensor's own
+            // completeness is a separate question from this stream-ordering bug (see the
+            // site=node_tmp_after_copy trace below, which now runs after the FIXED copy so a
+            // remaining divergence there points at the read side instead).
+            {
+                const size_t nbytes = ggml_nbytes(node_src);
+                std::vector<char> host_bounce(nbytes);
+                ggml_backend_tensor_get(node_src, host_bounce.data(), 0, nbytes);
+                ggml_backend_tensor_set_async(bcj_dst.backend, node_tmp, host_bounce.data(), 0, nbytes);
+            }
             ggml_backend_synchronize(bcj_dst.backend);
+
+            // WP_TP_TRACE=3: hash node_tmp itself, right after the (now stream-ordered) copy and
+            // its synchronize, before the ADD is even constructed - isolates the copy from the
+            // ADD. If this still varies across fresh-process runs for CUDA0 (j_dst matching
+            // dev=2), the fix above did not close the gap and the corruption is upstream, in what
+            // the copy actually read from node_src (the Vulkan-source get, not the CUDA-dest set).
+            if (ggml_backend_meta_trace_values_enabled() && getenv("WP_TP_TRACE")[0] >= '3') {
+                std::vector<char> tmp;
+                if (trace_read_local(bcj_dst, node_tmp, tmp)) {
+                    GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=node_tmp_after_copy "
+                                  "sub=%zu n_tokens=%d j_src=%zu j_dst=%zu dev=%zu node=%s nbytes=%zu hash=%016llx\n",
+                            trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build, i,
+                            (int) g_ggml_backend_meta_trace_n_tokens, j_src, j_dst, trace_rank_first + j_dst,
+                            node_src->name, tmp.size(),
+                            (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), tmp.size()));
+                }
+            }
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -3429,38 +3503,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return strncmp(t->name, "cache_s_l", 9) == 0 || strncmp(t->name, "cache_r_l", 9) == 0;
     };
 
-    // Read a node's LOCAL bytes into `out` for hashing, honoring what backend j is actually
-    // allowed to touch. ggml_backend_tensor_get_async asserts (ggml-cuda.cu:3744, and the
-    // Vulkan/other backends have the analogous check) that the tensor's buffer type matches the
-    // backend being asked to read it - a subgraph can legitimately contain nodes that are not
-    // backend j's own (a MIRRORED weight or input replicated in a host/pinned buffer, or - if
-    // this is ever pointed at something other than a device's own cgraph - another device's
-    // buffer entirely). Dumping "every node in the subgraph" without checking that crashed rank 0
-    // on the very first graph. Three cases: a host buffer can be memcpy'd directly regardless of
-    // which device is asking (no backend call needed); a buffer whose type matches backend j's
-    // own default buffer type is read the normal async way; anything else (some other device's
-    // buffer) is skipped rather than guessed at.
-    auto trace_read_local = [](auto & bcj, const ggml_tensor * node_j, std::vector<char> & out) -> bool {
-        if (node_j->buffer == nullptr) {
-            return false;
-        }
-        const size_t nbytes_j = ggml_nbytes(node_j);
-        if (ggml_backend_buffer_is_host(node_j->buffer)) {
-            if (node_j->data == nullptr) {
-                return false;
-            }
-            out.resize(nbytes_j);
-            memcpy(out.data(), node_j->data, nbytes_j);
-            return true;
-        }
-        if (ggml_backend_buffer_get_type(node_j->buffer) != ggml_backend_get_default_buffer_type(bcj.backend)) {
-            return false;
-        }
-        out.resize(nbytes_j);
-        ggml_backend_tensor_get_async(bcj.backend, node_j, out.data(), 0, nbytes_j);
-        ggml_backend_synchronize(bcj.backend);
-        return true;
-    };
+    // (trace_read_local now lives above, ahead of allreduce_fallback/push_data, which also use
+    // it to hash node_tmp right after the copy - see its definition there.)
 
     auto trace_state_hash_subgraph = [&](size_t i) {
         if (!ggml_backend_meta_trace_values_enabled() || getenv("WP_TP_TRACE")[0] < '3') {
