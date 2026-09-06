@@ -3332,6 +3332,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // Every local device's subgraph is now SUBMITTED, not necessarily FINISHED:
+        // ggml_backend_graph_compute_async is exactly backend->iface.graph_compute (see
+        // ggml_backend_graph_compute_async, ggml/src/ggml-backend.cpp), which for an async
+        // backend (CUDA, Vulkan) only enqueues work and returns. Below, allreduce_fallback's
+        // push_data() does synchronize its SOURCE device before copying it (the
+        // ggml_backend_tensor_copy_async generic fallback in ggml-backend.cpp calls
+        // ggml_backend_synchronize on both sides when no vendor fast-path exists, which is the
+        // case for a CUDA<->Vulkan copy), and the cross-host staging read below synchronizes
+        // device 0 before hashing/sending it - so every read SHOULD already be preceded by a
+        // sync on the device it reads. But that safety is spread across several call sites and
+        // implicit in each one's cgraph bookkeeping (fence/epoch state per ggml_backend_vk_context,
+        // stream state per CUDA context); a bug in any one of them silently reads a device's
+        // buffer before its own last kernel has actually landed, and on a small/fast subgraph
+        // (few nodes, e.g. this one) submission-to-completion latency is exactly where a
+        // still-in-flight read would land - large subgraphs have enough work in front of them
+        // that the device is done by the time anything touches its buffer regardless. Make it
+        // unconditional and unambiguous here, once, right after submission, rather than trusting
+        // every downstream reader to have gotten its own synchronize placement right.
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+
         if (i < backend_ctx->n_subgraphs - 1) {
             if (ggml_backend_meta_trace_enabled()) {
                 for (size_t j = 0; j < n_backends; j++) {
@@ -3444,19 +3466,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    // WP_TP_TRACE=3: hash the persistent recurrent-state write-back per local device, right
-    // after it executes. The write-back CPY (cache_s_l*/cache_r_l* "(copy of new_state-N)" /
-    // "(copy of conv_state_last-N)") never needs a cross-host reduce - each device disjointly
-    // owns a head range there, nothing to sum - so it is invisible to the xhost_value trace
-    // above. If a request's carried-forward state comes out wrong, hashing it here, once, right
-    // after the write that is supposed to make it correct for the NEXT request, tells us whether
-    // the corruption happens during THIS write (a kernel/materialization bug) or only shows up
-    // later when a subsequent request reads it back (a persistence/synchronization bug).
+    // WP_TP_TRACE=3: hash the persistent recurrent-state write-back, AND the read that a later
+    // build does of that same cache, per local device, right after each executes.
+    //
+    // The write-back CPY (cache_s_l*/cache_r_l* "(copy of new_state-N)" / "(copy of
+    // conv_state_last-N)") never needs a cross-host reduce - each device disjointly owns a head
+    // range there, nothing to sum - so it is invisible to the xhost_value trace above. The read
+    // (state_predelta-N, the RESHAPE right after the GET_ROWS that gathers cache_s_l* by
+    // s_copy; conv_states_reshaped-N, the equivalent for cache_r_l*) is equally invisible: it
+    // feeds GATED_DELTA_NET locally, no reduce needed either.
+    //
+    // If a request's carried-forward state comes out wrong, comparing the write-back hash at the
+    // end of one build against the read hash at the start of the NEXT build tells us where the
+    // corruption is: if they disagree, something between the two builds (allocator reuse,
+    // cross-host desync, a stale split_state_cache entry) is not really persisting the cache; if
+    // they agree and the read is still wrong relative to a known-good run, the corruption was
+    // already baked into the writer's own numbers (a kernel bug), not a persistence bug.
     if (ggml_backend_meta_trace_values_enabled() && getenv("WP_TP_TRACE")[0] >= '3') {
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
-            if (node->op != GGML_OP_CPY ||
-                    (strstr(node->name, "cache_s_l") == nullptr && strstr(node->name, "cache_r_l") == nullptr)) {
+            const bool is_write = node->op == GGML_OP_CPY &&
+                (strstr(node->name, "cache_s_l") != nullptr || strstr(node->name, "cache_r_l") != nullptr);
+            const bool is_read = strstr(node->name, "state_predelta") != nullptr ||
+                strstr(node->name, "conv_states_reshaped") != nullptr;
+            if (!is_write && !is_read) {
                 continue;
             }
             for (size_t j = 0; j < n_backends; j++) {
@@ -3469,9 +3502,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::vector<char> tmp(nbytes_j);
                 ggml_backend_tensor_get_async(bcj.backend, node_j, tmp.data(), 0, nbytes_j);
                 ggml_backend_synchronize(bcj.backend);
-                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=state_writeback "
+                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=%s "
                               "n_tokens=%d dev=%zu node=%s nbytes=%zu C=%d hash=%016llx\n",
                         trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                        is_write ? "state_writeback" : "state_read",
                         (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node->name,
                         nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
                         (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
