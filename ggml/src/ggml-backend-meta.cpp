@@ -3408,6 +3408,40 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     auto names_cache_persist = [](const ggml_tensor * t) {
         return strncmp(t->name, "cache_s_l", 9) == 0 || strncmp(t->name, "cache_r_l", 9) == 0;
     };
+
+    // Read a node's LOCAL bytes into `out` for hashing, honoring what backend j is actually
+    // allowed to touch. ggml_backend_tensor_get_async asserts (ggml-cuda.cu:3744, and the
+    // Vulkan/other backends have the analogous check) that the tensor's buffer type matches the
+    // backend being asked to read it - a subgraph can legitimately contain nodes that are not
+    // backend j's own (a MIRRORED weight or input replicated in a host/pinned buffer, or - if
+    // this is ever pointed at something other than a device's own cgraph - another device's
+    // buffer entirely). Dumping "every node in the subgraph" without checking that crashed rank 0
+    // on the very first graph. Three cases: a host buffer can be memcpy'd directly regardless of
+    // which device is asking (no backend call needed); a buffer whose type matches backend j's
+    // own default buffer type is read the normal async way; anything else (some other device's
+    // buffer) is skipped rather than guessed at.
+    auto trace_read_local = [](auto & bcj, const ggml_tensor * node_j, std::vector<char> & out) -> bool {
+        if (node_j->buffer == nullptr) {
+            return false;
+        }
+        const size_t nbytes_j = ggml_nbytes(node_j);
+        if (ggml_backend_buffer_is_host(node_j->buffer)) {
+            if (node_j->data == nullptr) {
+                return false;
+            }
+            out.resize(nbytes_j);
+            memcpy(out.data(), node_j->data, nbytes_j);
+            return true;
+        }
+        if (ggml_backend_buffer_get_type(node_j->buffer) != ggml_backend_get_default_buffer_type(bcj.backend)) {
+            return false;
+        }
+        out.resize(nbytes_j);
+        ggml_backend_tensor_get_async(bcj.backend, node_j, out.data(), 0, nbytes_j);
+        ggml_backend_synchronize(bcj.backend);
+        return true;
+    };
+
     auto trace_state_hash_subgraph = [&](size_t i) {
         if (!ggml_backend_meta_trace_values_enabled() || getenv("WP_TP_TRACE")[0] < '3') {
             return;
@@ -3436,16 +3470,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 const char * site = is_write ? "state_writeback" :
                     is_zero ? "state_zero" : is_raw_gather ? "state_gather" : "state_read";
-                const size_t nbytes_j = ggml_nbytes(node_j);
-                std::vector<char> tmp(nbytes_j);
-                ggml_backend_tensor_get_async(bcj.backend, node_j, tmp.data(), 0, nbytes_j);
-                ggml_backend_synchronize(bcj.backend);
+                std::vector<char> tmp;
+                if (!trace_read_local(bcj, node_j, tmp)) {
+                    continue;
+                }
                 GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=%s sub=%zu "
                               "n_tokens=%d dev=%zu node=%s nbytes=%zu C=%d hash=%016llx\n",
                         trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build, site, i,
                         (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node_j->name,
-                        nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
-                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
+                        tmp.size(), (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), tmp.size()));
             }
         }
     };
@@ -3471,16 +3505,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (ggml_nelements(node_j) == 0) {
                     continue;
                 }
-                const size_t nbytes_j = ggml_nbytes(node_j);
-                std::vector<char> tmp(nbytes_j);
-                ggml_backend_tensor_get_async(bcj.backend, node_j, tmp.data(), 0, nbytes_j);
-                ggml_backend_synchronize(bcj.backend);
+                std::vector<char> tmp;
+                if (!trace_read_local(bcj, node_j, tmp)) {
+                    continue;
+                }
                 GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=sub0_node k=%d "
                               "n_tokens=%d dev=%zu node=%s op=%s nbytes=%zu C=%d hash=%016llx\n",
                         trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build, k,
                         (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node_j->name,
-                        ggml_op_name(node_j->op), nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
-                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
+                        ggml_op_name(node_j->op), tmp.size(), (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), tmp.size()));
             }
         }
     };
