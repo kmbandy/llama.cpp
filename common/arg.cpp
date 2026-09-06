@@ -1730,6 +1730,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--prefix-cache"},
+        {"--no-prefix-cache"},
+        string_format("[MAD-445] let a fresh/idle slot adopt a shared prompt prefix already live in "
+            "another slot on the same stream via a cheap KV block-table copy (llama_memory_seq_cp), "
+            "instead of re-prefilling it or round-tripping the whole prefix through --cache-ram. "
+            "Requires --parallel > 1. Default: %s", params.prefix_cache ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.prefix_cache = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-min-tokens"}, "N",
+        string_format("[MAD-445] minimum matching prefix length, in tokens, before a live-slot prefix "
+            "is worth adopting via --prefix-cache (default: %d)", params.prefix_cache_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("prefix-cache-min-tokens must be >= 1");
+            }
+            params.prefix_cache_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     // Tiered KV cache (Phase 2 rewrite). Canonical flag names use the
     // "--kv-tier-*" prefix; a few legacy spellings are still accepted as
     // deprecation aliases that emit a one-shot warning.
