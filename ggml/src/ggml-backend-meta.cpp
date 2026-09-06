@@ -1528,7 +1528,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             const char * e = getenv("WP_TP_SPLIT_NAMES");
             const std::string spec = e && e[0] ? e :
                 "cache_s_l0,cache_r_l0,state_predelta-0,attn_output-0,linear_attn_out-0,"
-                "conv_states-0,new_state-0,q_conv_predelta-0";
+                "conv_states-0,new_state-0,q_conv_predelta-0,k_conv_predelta-0,v_conv_predelta-0,"
+                "conv_states_reshaped-0,conv_output_raw-0,attn_norm-0";
             std::vector<std::string> out;
             size_t p = 0;
             while (p <= spec.size()) {
@@ -3016,6 +3017,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                     !ggml_backend_buffer_is_meta(src->buffer)) {
                                 continue;
                             }
+                            // graph inputs/leaves are written by set_input (or are weights), not
+                            // by a producer node with a COMPUTE decision of its own: a disabled
+                            // COMPUTE flag on their "copy" just means this device never needed a
+                            // local slice, not that nothing wrote it. Only a genuine computed
+                            // producer (has an op, not itself a leaf) can be "never written".
+                            if ((src->flags & GGML_TENSOR_FLAG_INPUT) != 0 || src->op == GGML_OP_NONE) {
+                                continue;
+                            }
                             // only graph-produced values can be "never written"; a weight or a
                             // persistent cache row always holds something meaningful
                             if (ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -3037,20 +3046,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                     src_rows += ss.ne[s2*n_world_chk + trace_rank_first + j] * ss.nr[s2];
                                 }
                             }
+                            // src_rows == 0: the producer's local slice is empty, so the consumer
+                            // reads zero rows of it - benign, don't report.
+                            // src_rows == -1: not row-split (MIRRORED/PARTIAL) - we can't tell
+                            // whether the device's copy is meaningful from the split state alone,
+                            // so don't guess; only a definite non-empty slice (src_rows > 0) is a
+                            // genuine READS_UNWRITTEN.
+                            if (src_rows <= 0) {
+                                break;
+                            }
                             n_viol++;
                             if (n_lines < max_lines) {
                                 n_lines++;
                                 GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu+1 "
                                               "site=disabled_producer dev=%zu node=%s[%s] "
                                               "src%d=%s[%s] src_slice_rows=%lld src_nel_dev=%lld "
-                                              "verdict=%s\n",
+                                              "verdict=READS_UNWRITTEN\n",
                                         trace_rank_first,
                                         (unsigned long long) g_ggml_backend_meta_trace_build,
                                         trace_rank_first + j, node->name, ggml_op_name(node->op),
                                         is, src->name, ggml_op_name(src->op),
                                         (long long) src_rows,
-                                        (long long) ggml_nelements(src_j),
-                                        src_rows == 0 ? "benign(empty)" : "READS_UNWRITTEN");
+                                        (long long) ggml_nelements(src_j));
                             }
                             break; // one report per (node, src) chain
                         }
