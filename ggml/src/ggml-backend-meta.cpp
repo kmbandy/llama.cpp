@@ -1495,6 +1495,120 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         simple_tensors.push_back(t_ij);
     }
 
+    // WP_TP_TRACE=3: per-device split dump for the recurrent chain.
+    //
+    // The rs trace proves both ranks INTEND the same thing (same rs_z, same s_copy, same head).
+    // What it cannot show is what each rank's devices actually got: the state cache, the gather
+    // that reads it, the GDN output, the new_state view and the write-back destination each get
+    // their split derived by a DIFFERENT rule (cache_s_l by llama_meta_device_get_split_state's
+    // pattern_s_cache segments, the GDN output by handle_gated_delta_net, the views off it by
+    // handle_reshape's flatten-until-the-products-line-up arithmetic). If the rows a device owns
+    // in the state cache do not correspond to the heads it owns in the GDN, the read gathers one
+    // set of rows and the write-back stores a different one, and no counter anywhere says so.
+    //
+    // This dumps, for every tensor in that chain, the WORLD ne[] (what every rank must agree on)
+    // and this rank's LOCAL ne/nb3/view_offs/COMPUTE per device, plus the same for each source.
+    // Compare, for layer 0, on both ranks:
+    //   - cache_s_l0's world ne[] against the GDN output's world ne[]: the per-device row counts
+    //     must be in the same proportion (state rows per device == S_v*S_v*H_local),
+    //   - the write-back cpy's src local element count against its dst local element count,
+    //   - the get_rows result's local ne against what the GDN's state src expects.
+    // A device where those disagree is the bug.
+    //
+    // Selection: anything that stores into a persistent buffer, any GATED_DELTA_NET node, and any
+    // tensor whose name contains one of the WP_TP_SPLIT_NAMES substrings (default: the layer-0
+    // recurrent chain). Set WP_TP_SPLIT_NAMES to a comma-separated list to widen it.
+    // Note: init_tensor runs BEFORE graph_compute bumps the build counter, so these lines belong
+    // to the build whose summary line follows them.
+    auto trace_split_dump = [&](bool writes_persistent_in) {
+        if (!ggml_backend_meta_trace_values_enabled() || getenv("WP_TP_TRACE")[0] < '3') {
+            return;
+        }
+        static const std::vector<std::string> filters = []() {
+            const char * e = getenv("WP_TP_SPLIT_NAMES");
+            const std::string spec = e && e[0] ? e :
+                "cache_s_l0,cache_r_l0,state_predelta-0,attn_output-0,linear_attn_out-0,"
+                "conv_states-0,new_state-0,q_conv_predelta-0";
+            std::vector<std::string> out;
+            size_t p = 0;
+            while (p <= spec.size()) {
+                const size_t q = std::min(spec.find(',', p), spec.size());
+                if (q > p) {
+                    out.emplace_back(spec.substr(p, q - p));
+                }
+                p = q + 1;
+            }
+            return out;
+        }();
+
+        bool selected = writes_persistent_in || tensor->op == GGML_OP_GATED_DELTA_NET;
+        for (size_t f = 0; !selected && f < filters.size(); f++) {
+            selected = std::string(tensor->name).find(filters[f]) != std::string::npos;
+        }
+        if (!selected) {
+            return;
+        }
+
+        auto world_ne = [&](const ggml_backend_meta_split_state & ss) {
+            std::string s = "axis=";
+            s += ggml_backend_meta_split_axis_name(ss.axis);
+            s += " nr=" + std::to_string(ss.nr[0]) + " nseg=" + std::to_string(ss.n_segments) + " w=[";
+            if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                for (size_t jw = 0; jw < n_world; jw++) {
+                    int64_t sum = 0;
+                    for (size_t s2 = 0; s2 < ss.n_segments; s2++) {
+                        sum += ss.ne[s2*n_world + jw] * ss.nr[s2];
+                    }
+                    s += (jw ? "," : "") + std::to_string(sum);
+                }
+            }
+            return s + "]";
+        };
+
+        std::string local;
+        for (size_t j = 0; j < n_simple_bufs; j++) {
+            const ggml_tensor * t = simple_tensors[j];
+            local += (j ? " " : "");
+            local += "dev" + std::to_string(rank_first + j) + ":ne=[" +
+                std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+                std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]" +
+                " nel=" + std::to_string((long long) ggml_nelements(t)) +
+                " nb3=" + std::to_string((long long) t->nb[3]) +
+                " offs=" + std::to_string((long long) t->view_offs) +
+                " C=" + ((t->flags & GGML_TENSOR_FLAG_COMPUTE) ? "1" : "0");
+        }
+
+        std::string srcs;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (tensor->src[i] == nullptr) {
+                continue;
+            }
+            srcs += " src" + std::to_string(i) + "=" + tensor->src[i]->name + "[" +
+                ggml_op_name(tensor->src[i]->op) + " ne0=" +
+                std::to_string((long long) tensor->src[i]->ne[0]);
+            if (ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
+                srcs += " " + world_ne(ggml_backend_meta_get_split_state(stc, tensor->src[i], true));
+            } else {
+                srcs += " host";
+            }
+            srcs += "]";
+        }
+        std::string vsrc = "none";
+        if (tensor->view_src) {
+            vsrc = std::string(tensor->view_src->name) + "[usage=" +
+                std::to_string((int) ggml_backend_buffer_get_usage(tensor->view_src->buffer)) + "]";
+        }
+
+        GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu+1 site=split_dump name=%s op=%s "
+                      "ne=[%lld,%lld,%lld,%lld] persist=%d vsrc=%s %s | %s |%s\n",
+                rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                tensor->name, ggml_op_name(tensor->op),
+                (long long) tensor->ne[0], (long long) tensor->ne[1],
+                (long long) tensor->ne[2], (long long) tensor->ne[3],
+                writes_persistent_in ? 1 : 0, vsrc.c_str(),
+                world_ne(split_state).c_str(), local.c_str(), srcs.c_str());
+    };
+
     // Does this node STORE into a persistent buffer (the KV / recurrent-state cache) rather than
     // produce a value into the graph's own compute buffer? ggml_cpy() and every *_inplace op
     // return a view of their destination, so the view_src chain of such a node bottoms out in a
@@ -1560,6 +1674,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     + ",persist,devmask=0x" + std::to_string(trace_devmask) + "]");
             }
         }
+        trace_split_dump(true);
         return GGML_STATUS_SUCCESS;
     }
 
@@ -1600,6 +1715,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     }
 
     stc.simple_tensors[tensor] = simple_tensors;
+
+    trace_split_dump(false);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2849,6 +2966,101 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         trace_sweep_cleared,
                         names.empty() ? "" : " spared=", names.c_str());
             }
+        }
+
+        // WP_TP_TRACE: DISABLED-PRODUCER / ENABLED-CONSUMER CHECK.
+        //
+        // The zero-slice rule (ggml_backend_meta_buffer_init_tensor_impl) clears COMPUTE on a
+        // node for a device when one of its sources has no rows there. It does NOT propagate:
+        // a node whose own sources all have rows keeps COMPUTE even if one of those sources is
+        // itself a node that was disabled on this device. Such a consumer then reads a compute
+        // buffer region that nothing ever wrote - zero on a fresh allocation (so the first
+        // request of a process looks correct) and whatever the previous graph left there
+        // afterwards (so identical requests drift, and the drift depends on the previous
+        // graph's allocation layout, i.e. on the previous ubatch's n_tokens).
+        //
+        // Zero-sized slices only exist when a device's share of some tensor rounds to nothing,
+        // which needs an uneven world split - so this can only bite cross-host, and only on the
+        // rank holding the small shares. That is exactly the observed failure.
+        //
+        // This runs after BOTH clearing sites (the per-tensor zero-slice rule at init_tensor and
+        // the delayed-AllReduce sweep above), so what it sees is the final flag state the
+        // devices will actually execute. Capped; one line per violation.
+        //
+        // If this prints anything, the fix is to propagate the disable to the consumer (or to
+        // zero the producer's output on that device the way allreduce_fallback zeroes a disabled
+        // subgraph tail). If it prints nothing, the reads are all fed by enabled producers and
+        // the stale-memory hypothesis is dead.
+        if (ggml_backend_meta_trace_enabled()) {
+            const size_t max_lines = 40;
+            const size_t n_world_chk = ggml_backend_meta_dev_n_world(backend->device);
+            size_t n_viol = 0, n_lines = 0;
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    ggml_tensor * node   = cgraph->nodes[i];
+                    ggml_tensor * node_j = bcj.nodes[i];
+                    // the host-side s_copy views share the original tensor; they have no
+                    // per-device copy and no COMPUTE decision of their own
+                    if (node_j == nullptr || node_j == node) {
+                        continue;
+                    }
+                    if ((node_j->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue; // this consumer is itself disabled: fine
+                    }
+                    for (int is = 0; is < GGML_MAX_SRC; is++) {
+                        // walk the view_src chain too: a consumer often reads a VIEW of the
+                        // disabled producer rather than the producer itself
+                        for (const ggml_tensor * src = node->src[is]; src != nullptr; src = src->view_src) {
+                            if (src == node || src->buffer == nullptr ||
+                                    !ggml_backend_buffer_is_meta(src->buffer)) {
+                                continue;
+                            }
+                            // only graph-produced values can be "never written"; a weight or a
+                            // persistent cache row always holds something meaningful
+                            if (ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                                continue;
+                            }
+                            const ggml_tensor * src_j = ggml_backend_meta_buffer_simple_tensor(src, j);
+                            if (src_j == nullptr || (src_j->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                                continue;
+                            }
+                            // Is the producer's slice on this device actually empty? If it is,
+                            // the consumer reads zero rows of it and the violation is benign.
+                            // If it is NOT, the consumer reads rows nothing wrote: the bug.
+                            const ggml_backend_meta_split_state ss =
+                                ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true);
+                            int64_t src_rows = -1; // -1 = not row-split (MIRRORED/PARTIAL)
+                            if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                                src_rows = 0;
+                                for (size_t s2 = 0; s2 < ss.n_segments; s2++) {
+                                    src_rows += ss.ne[s2*n_world_chk + trace_rank_first + j] * ss.nr[s2];
+                                }
+                            }
+                            n_viol++;
+                            if (n_lines < max_lines) {
+                                n_lines++;
+                                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu+1 "
+                                              "site=disabled_producer dev=%zu node=%s[%s] "
+                                              "src%d=%s[%s] src_slice_rows=%lld src_nel_dev=%lld "
+                                              "verdict=%s\n",
+                                        trace_rank_first,
+                                        (unsigned long long) g_ggml_backend_meta_trace_build,
+                                        trace_rank_first + j, node->name, ggml_op_name(node->op),
+                                        is, src->name, ggml_op_name(src->op),
+                                        (long long) src_rows,
+                                        (long long) ggml_nelements(src_j),
+                                        src_rows == 0 ? "benign(empty)" : "READS_UNWRITTEN");
+                            }
+                            break; // one report per (node, src) chain
+                        }
+                    }
+                }
+            }
+            GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu+1 site=disabled_producer_summary "
+                          "n_tokens=%d violations=%zu printed=%zu\n",
+                    trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                    (int) g_ggml_backend_meta_trace_n_tokens, n_viol, n_lines);
         }
 
         backend_ctx->uid         = cgraph->uid;
