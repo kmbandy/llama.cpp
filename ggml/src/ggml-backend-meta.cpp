@@ -1495,8 +1495,74 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         simple_tensors.push_back(t_ij);
     }
 
+    // Does this node STORE into a persistent buffer (the KV / recurrent-state cache) rather than
+    // produce a value into the graph's own compute buffer? ggml_cpy() and every *_inplace op
+    // return a view of their destination, so the view_src chain of such a node bottoms out in a
+    // tensor whose buffer usage is not COMPUTE. build_rs() emits exactly two of these per
+    // recurrent layer: the ggml_scale_inplace that zeroes the reused state row
+    // (src/llama-graph.cpp:4217) and the ggml_cpy that stores the new state back
+    // (llm_build_delta_net_base::build_recurrent_attn, src/models/delta-net-base.cpp:551-556).
+    bool writes_persistent = false;
+    for (const ggml_tensor * v = tensor->view_src; v != nullptr; v = v->view_src) {
+        if (v->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(v->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            writes_persistent = true;
+            break;
+        }
+    }
+
     // If one of the sources has a zero-sized slice, disable the computation:
+    //
+    // WHY A PERSISTENT STORE IS EXEMPT FROM THE *SOURCE* TEST. The rule below exists so that a
+    // device holding no rows of a split source does not compute a garbage partial that the next
+    // AllReduce would then add in. That reasoning is about a node whose VALUE is consumed. It is
+    // wrong for a side-effecting store into the recurrent-state cache: there the source and the
+    // destination are different tensors with independently computed splits, so a source that
+    // rounds to a zero-sized slice on this device does NOT imply the destination row is empty -
+    // and skipping the store leaves that device's persistent row at whatever it held before,
+    // forever. The recurrent-state row is zero at construction time
+    // (ggml_backend_buffer_clear), so a dropped store is invisible on the first request of a
+    // process and wrong on every request after it: the state accumulates across requests on the
+    // rank whose devices lost the slice, while the other rank resets normally. Zero-sized slices
+    // only exist when a tensor's rows are spread unevenly enough for a device's share to round to
+    // nothing (a skewed --tensor-split, or n_head_devices, src/llama.cpp:667), which is a
+    // cross-host-only configuration - which is why a single-host -sm tensor run never shows it.
+    // This is the same defect the delayed-AllReduce sweep below documents; that sweep was
+    // narrowed to transitive consumers, but this site clears the very same nodes and was not.
+    //
+    // The safe test for a persistent store is the DESTINATION's own slice: when the node's own
+    // slice is zero-sized the store writes zero bytes and skipping it is free; when it is not,
+    // the store must run.
     uint32_t trace_devmask = 0; // WP_TP_TRACE only: local devices disabled for this tensor
+    if (writes_persistent) {
+        if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
+            for (size_t j = 0; j < n_simple_bufs; j++) {
+                int64_t ne_sum = 0;
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    ne_sum += split_state.ne[s*n_world + rank_first + j] * split_state.nr[s];
+                }
+                if (ne_sum == 0) {
+                    if (ggml_backend_meta_trace_enabled() &&
+                            (simple_tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                        trace_devmask |= 1u << j;
+                        g_ggml_backend_meta_trace_init.n_slots++;
+                    }
+                    simple_tensors[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                }
+            }
+        }
+        stc.simple_tensors[tensor] = simple_tensors;
+        if (trace_devmask != 0) {
+            auto & acc = g_ggml_backend_meta_trace_init;
+            acc.n_tensors++;
+            if (acc.names.size() < ggml_backend_meta_trace_init_acc::max_names) {
+                acc.names.emplace_back(std::string(tensor->name) + "[" + ggml_op_name(tensor->op)
+                    + ",persist,devmask=0x" + std::to_string(trace_devmask) + "]");
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i] == nullptr || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
             continue;

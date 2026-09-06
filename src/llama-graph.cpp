@@ -371,12 +371,48 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 // the one being zeroed, or where the new state is written back. That agreement is a precondition
 // for the chunked GDN path being correct, and it is invisible from outside. One line per
 // recurrent ubatch on each rank; join the two logs on the decode's operation counter and diff.
+// NOTE: llm_graph_input_rs::set_input is NOT the only writer of s_copy. The hybrid input classes
+// (llm_graph_input_mem_hybrid / _k / _iswa) each inline the same loop instead of delegating to it,
+// and qwen35 - like every hybrid GDN arch - goes through build_inp_mem_hybrid(), so
+// llm_graph_input_rs::set_input never runs for this model. The trace therefore lives in a shared
+// helper that every one of those four sites calls.
 static bool llm_graph_rs_trace_enabled() {
     static const bool enabled = []() {
         const char * e = getenv("WP_TP_TRACE");
         return e != nullptr && e[0] != '\0' && e[0] != '0';
     }();
     return enabled;
+}
+
+static void llm_graph_rs_trace(const llm_graph_input_rs * inp_rs,
+                               const llama_memory_recurrent_context * rctx,
+                               const llama_ubatch * ubatch) {
+    if (!llm_graph_rs_trace_enabled() || inp_rs == nullptr || rctx == nullptr) {
+        return;
+    }
+    // rs_z is the cell whose state row build_rs() zeroes via ggml_scale_inplace (build_rs, below),
+    // i.e. the ONLY thing that makes a reused recurrent row read as a fresh zero state. head is
+    // where the new state is written back (the ggml_cpy destination in
+    // llm_build_delta_net_base::build_recurrent_attn). s_copy is the gather map the state is read
+    // through. Under cross-host TP all three are DERIVED independently on each rank rather than
+    // shipped, so if any of them differs the two halves of the world are running different
+    // recurrent state and nothing on the wire would say so.
+    const int64_t n_rs = rctx->get_n_rs();
+    std::string s_copy_str;
+    if (inp_rs->s_copy) {
+        const int32_t * data = (const int32_t *) inp_rs->s_copy->data;
+        for (int64_t i = 0; i < n_rs && i < 16; ++i) {
+            s_copy_str += (i ? "," : "") + std::to_string(data[i]);
+        }
+        if (n_rs > 16) {
+            s_copy_str += ",...";
+        }
+    }
+    LLAMA_LOG_INFO("WP_TP_TRACE rs set_input n_tokens=%u n_seqs=%u n_seq_tokens=%u "
+                   "n_rs=%lld head=%u rs_z=%d s_copy=[%s]\n",
+            ubatch ? ubatch->n_tokens : 0, ubatch ? ubatch->n_seqs : 0,
+            ubatch ? ubatch->n_seq_tokens : 0,
+            (long long) n_rs, rctx->get_head(), rctx->get_rs_z(), s_copy_str.c_str());
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
@@ -392,28 +428,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    if (llm_graph_rs_trace_enabled()) {
-        // rs_z is the cell whose state row build_rs() zeroes via ggml_scale_inplace
-        // (llama-graph.cpp, build_rs), i.e. the ONLY thing that makes a reused recurrent row read
-        // as a fresh zero state. head is where the new state is written back. s_copy is the
-        // gather map the state is read through. If any of the three differs between the ranks,
-        // the two halves of the world are running different recurrent state.
-        std::string s_copy_str;
-        if (s_copy) {
-            const int32_t * data = (const int32_t *) s_copy->data;
-            for (int64_t i = 0; i < n_rs && i < 16; ++i) {
-                s_copy_str += (i ? "," : "") + std::to_string(data[i]);
-            }
-            if (n_rs > 16) {
-                s_copy_str += ",...";
-            }
-        }
-        LLAMA_LOG_INFO("WP_TP_TRACE rs set_input n_tokens=%u n_seqs=%u n_seq_tokens=%u "
-                       "n_rs=%lld head=%u rs_z=%d s_copy=[%s]\n",
-                ubatch ? ubatch->n_tokens : 0, ubatch ? ubatch->n_seqs : 0,
-                ubatch ? ubatch->n_seq_tokens : 0,
-                (long long) n_rs, mctx->get_head(), mctx->get_rs_z(), s_copy_str.c_str());
-    }
+    llm_graph_rs_trace(this, mctx, ubatch);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1273,6 +1288,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_rs_trace(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1330,6 +1347,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_rs_trace(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1404,6 +1423,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_rs_trace(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
