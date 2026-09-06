@@ -15,7 +15,7 @@ void ggml_cuda_mmq_debug_sync(const char * stage, cudaStream_t stream);
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
-typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int kbx_max, const int stride);
+typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max);
@@ -899,32 +899,20 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
-    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
-    constexpr int tile_x_size = ggml_cuda_mmq_get_config(type, J, fallback).use_mma_data_layout()
-        ? I * ggml_cuda_mmq_get_sram_stride(type, J, fallback) : txs.qs + txs.dm + txs.sc;
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        if (kb0 + blocks_per_iter > kb0_stop) {
-            for (int l = threadIdx.y*blockDim.x + threadIdx.x; l < tile_x_size; l += blockDim.x*blockDim.y) {
-                tile_x[l] = 0;
-            }
-            __syncthreads();
-        }
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, offset_x + kb0_stop, stride_row_x);
-        const int64_t y_start = int64_t(kb0) * qk;
-        const int64_t y_stop = int64_t(kb0_stop) * qk;
+        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
-            const bool y0_valid = y_start < y_stop;
-            const int * by0 = y0_valid ? y + ncols_y * (y_start / ne_block) * sz : y;
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = y0_valid ? by0[l] : 0;
+                tile_y[l] = by0[l];
             }
         }
 
@@ -935,13 +923,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
 
         {
-            const bool y1_valid = y_start + ne_block < y_stop;
-            const int * by0 = y1_valid ? y + ncols_y * ((y_start / ne_block) * sz + sz) : y;
+            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = y1_valid ? by0[l] : 0;
+                tile_y[l] = by0[l];
             }
         }
 

@@ -605,7 +605,7 @@ static __global__ void mul_mat_vec_q(
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
-    const     int blocks_per_row_x = (ncols_x + qk - 1) / qk;
+    const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
     const uint32_t channel_dst = blockIdx.y;
@@ -723,9 +723,6 @@ static __global__ void mul_mat_vec_q(
     }
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        if (kbx*qk + qk > ncols_x) {
-            continue;
-        }
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -892,7 +889,7 @@ static __global__ void mul_mat_vec_q_moe(
 
     const uint32_t token_idx   = threadIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
-    const int      blocks_per_row_x = (ncols_x + qk - 1) / qk;
+    const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
     const uint32_t channel_dst = blockIdx.y;
@@ -930,9 +927,6 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp_gate[c_rows_per_block] = {0.0f};
 
     for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        if (kbx*qk + qk > ncols_x) {
-            continue;
-        }
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
