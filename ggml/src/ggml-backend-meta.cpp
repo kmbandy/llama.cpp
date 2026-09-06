@@ -3444,6 +3444,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    // WP_TP_TRACE=3: hash the persistent recurrent-state write-back per local device, right
+    // after it executes. The write-back CPY (cache_s_l*/cache_r_l* "(copy of new_state-N)" /
+    // "(copy of conv_state_last-N)") never needs a cross-host reduce - each device disjointly
+    // owns a head range there, nothing to sum - so it is invisible to the xhost_value trace
+    // above. If a request's carried-forward state comes out wrong, hashing it here, once, right
+    // after the write that is supposed to make it correct for the NEXT request, tells us whether
+    // the corruption happens during THIS write (a kernel/materialization bug) or only shows up
+    // later when a subsequent request reads it back (a persistence/synchronization bug).
+    if (ggml_backend_meta_trace_values_enabled() && getenv("WP_TP_TRACE")[0] >= '3') {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_CPY ||
+                    (strstr(node->name, "cache_s_l") == nullptr && strstr(node->name, "cache_r_l") == nullptr)) {
+                continue;
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_tensor * node_j = ggml_backend_meta_buffer_simple_tensor(node, j);
+                if (node_j == nullptr || ggml_nelements(node_j) == 0) {
+                    continue;
+                }
+                const size_t nbytes_j = ggml_nbytes(node_j);
+                std::vector<char> tmp(nbytes_j);
+                ggml_backend_tensor_get_async(bcj.backend, node_j, tmp.data(), 0, nbytes_j);
+                ggml_backend_synchronize(bcj.backend);
+                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=state_writeback "
+                              "n_tokens=%d dev=%zu node=%s nbytes=%zu C=%d hash=%016llx\n",
+                        trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                        (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node->name,
+                        nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
+            }
+        }
+    }
+
     if (ggml_backend_meta_trace_enabled()) {
         GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=reduce n_tokens=%d "
                       "n_nodes=%d n_subgraphs=%zu rebuild=%d disabled_tails=%zu node_zero=%zu "
