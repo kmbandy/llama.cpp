@@ -3583,6 +3583,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
+            // WP_TP_TRACE=3: hash EVERY local device's own copy of the subgraph's last node
+            // right after the local (intra-rank) reduce, independently of the staging read
+            // below - subgraph 0's own nodes (site=sub0_node) are proven bit-reproducible on
+            // this rank, including linear_attn_out-0 BEFORE this local reduce, but
+            // xhost_value's sub=0 pre= (read from device 0 via the staging buffer, right after
+            // this point) is not. If local_reduce's hash for device 0 already disagrees with a
+            // known-good run, the corruption is in allreduce_fallback's push_data()/ADD (or the
+            // vendor comm_allreduce path) itself. If device 0's hash here matches staging's
+            // pre= will (later) mismatch anyway, the corruption is in the staging read/sync
+            // instead. Also hash device 1+ here, which xhost_value never does (it only ever
+            // reads device 0, "as good as any" - true only if the local reduce actually left
+            // them equal).
+            if (ggml_backend_meta_trace_values_enabled() && getenv("WP_TP_TRACE")[0] >= '3') {
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                    ggml_tensor * node_j = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                    std::vector<char> tmp;
+                    if (!trace_read_local(bcj, node_j, tmp)) {
+                        continue;
+                    }
+                    GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=local_reduce sub=%zu "
+                                  "n_tokens=%d dev=%zu node=%s nbytes=%zu C=%d hash=%016llx\n",
+                            trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build, i,
+                            (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node_j->name,
+                            tmp.size(), (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+                            (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), tmp.size()));
+                }
+            }
+
             // Cross-host reduce. The local reduce above left every local device holding this
             // rank's partial sum over its own devices; add the peer rank's partial to it so that
             // every device in the WORLD holds the same total before the next subgraph runs.
