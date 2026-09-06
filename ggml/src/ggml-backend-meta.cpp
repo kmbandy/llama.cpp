@@ -3318,6 +3318,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
 
+            // MEASURED (2026-09-06, j9-j14, cross-host CUDA0+Vulkan0 pair): both devices' own
+            // PRE-reduce partials are individually bit-reproducible across fresh-process runs
+            // (site=sub0_node), but after this local butterfly reduce, CUDA0's combined value is
+            // NOT reproducible while Vulkan0's is - even though the two are supposed to be equal
+            // (each device receives the other's data and adds its own). ggml_backend_tensor_copy_
+            // async's generic fallback (ggml-backend.cpp:517) only synchronizes src and dst
+            // BEFORE the blocking host-bounce copy, never after - it relies on the destination
+            // write itself (ggml_backend_tensor_set -> the buffer type's .set_tensor) being fully
+            // ordered against whatever ggml_backend_graph_compute_async submits next on that same
+            // device. For CUDA that write is a plain synchronous cudaMemcpy (ggml-cuda.cu:1005,
+            // deliberately made blocking by MAD-114 for exactly this class of bug), which by the
+            // CUDA API contract should already order against a later kernel launch on ANY stream.
+            // The measurement says otherwise: the ADD that reads node_tmp right after this
+            // sometimes sees something other than what was just written, and only on the CUDA
+            // side of this specific cross-vendor pair. Do not trust "should be safe" reasoning
+            // over the measurement: synchronize the destination device explicitly, once, right
+            // here, so node_tmp is unambiguously complete before the ADD that reads it is even
+            // constructed, regardless of which exact layer of the copy path the gap is in.
+            ggml_backend_synchronize(bcj_dst.backend);
+
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
             node_red->view_offs = node_dst->view_offs;
