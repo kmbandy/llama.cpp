@@ -1928,6 +1928,34 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     const size_t partials_n = (size_t) n_heads * (size_t) num_seqs
                                             * (size_t) num_chunks_alloc * (size_t) max_q_len
                                             * (size_t) (HS + 2);
+#ifdef USE_CUDA_GRAPH
+                    // 2026-09-05: ggml_cuda_pool_leg::alloc() (ggml-cuda.cu) does a
+                    // raw hip/cudaMalloc on a cache miss, which is illegal while the
+                    // stream is mid HIP/CUDA-graph capture. This decode branch is
+                    // only reachable inside a capture for a genuinely decode-shaped
+                    // fragment (the prefill-shaped classifier in ggml-cuda.cu now
+                    // excludes PAGED_ATTN_MT prefill fragments from capture, see
+                    // ggml_cuda_graph_is_prefill_shaped), and the MAD-380 ctx-bucket
+                    // sizing above means the same bucketed size is normally already
+                    // warm in the pool from earlier eager decode calls before a key
+                    // is ever captured -- so this is expected to be a cache hit in
+                    // practice. Flag it loudly (once) if that assumption is ever
+                    // wrong, since a miss here would silently poison the capture.
+                    {
+                        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+                        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+                        if (capture_status != cudaStreamCaptureStatusNone) {
+                            static std::atomic<bool> warned{false};
+                            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                                GGML_LOG_DEBUG("%s: PAGED_ATTN_MT decode partials allocation "
+                                               "(%zu floats) requested while the stream is capturing; "
+                                               "this is only capture-safe if the pool already has a "
+                                               "buffer of this bucketed size cached\n",
+                                               __func__, partials_n);
+                            }
+                        }
+                    }
+#endif // USE_CUDA_GRAPH
                     ggml_cuda_pool_alloc<float> partials(ctx.pool(), partials_n);
 
                     launch_paged_attn_decode<HS, BS, CT>(
