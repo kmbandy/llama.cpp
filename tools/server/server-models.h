@@ -296,6 +296,17 @@ private:
     int64_t effective_free_bytes_locked(const server_gpu_slot & slot) const;
     std::vector<int64_t> estimate_need_bytes(const server_model_meta & meta);
 
+public:
+    // Builds the on-disk cache key for estimate_need_bytes(). Exposed (and kept
+    // free of any server_models instance state -- it only reads meta.preset) so
+    // it can be unit-tested directly: see tests/test-server-models-estimate-key.cpp.
+    // Every env key this folds into the key MUST be exactly the set applied to
+    // params inside estimate_need_bytes()'s child-args path -- see the comment
+    // there.
+    static std::string estimate_need_bytes_key(const server_model_meta & meta);
+
+private:
+
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 

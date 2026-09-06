@@ -1004,6 +1004,51 @@ void server_models::reconcile_gpu_reservation_locked(const std::string & name) {
     }
 }
 
+// Single source of truth for "what affects the VRAM estimate": every env key
+// listed here is (a) the only set applied to params inside
+// estimate_need_bytes_key(), via apply_to_params(), and (b) folded verbatim
+// (as its raw preset string value) into the cache key. A key that is applied
+// but not hashed -- or vice versa -- was exactly the bug behind the
+// tiel-35b-par3 stale-estimate incident (kv-tiered/checkpoints/cache-ram were
+// applied to params but never reached the key), so keep this the one list
+// either side reads from; do not hand-maintain two lists.
+static const std::vector<std::string> k_estimate_env_keys = {
+    "LLAMA_ARG_MODEL",
+    "LLAMA_ARG_CTX_SIZE",
+    "LLAMA_ARG_CACHE_TYPE_K",
+    "LLAMA_ARG_CACHE_TYPE_V",
+    "LLAMA_ARG_N_PARALLEL",
+    "LLAMA_ARG_KV_TIERED",
+    "LLAMA_ARG_CTX_CHECKPOINTS",
+    "LLAMA_ARG_CACHE_RAM",
+};
+
+std::string server_models::estimate_need_bytes_key(const server_model_meta & meta) {
+    common_params params;
+    meta.preset.apply_to_params(params,
+            std::set<std::string>(k_estimate_env_keys.begin(), k_estimate_env_keys.end()));
+    std::string model_path = params.model.path;
+    int64_t mtime = 0;
+    if (!model_path.empty() && std::filesystem::exists(model_path)) {
+        mtime = (int64_t) std::filesystem::last_write_time(model_path).time_since_epoch().count();
+    }
+    // "v2|" invalidates every estimate cached under the pre-fix key (which
+    // silently ignored kv-tiered/checkpoints/cache-ram).
+    std::string k = string_format("v2|%s|%" PRId64 "|%d|%d|%d|%d",
+            model_path.c_str(), mtime, params.n_ctx, (int) params.cache_type_k,
+            (int) params.cache_type_v, params.n_parallel);
+    // Fold in the raw preset value (not the parsed params field) for every
+    // key in k_estimate_env_keys, so a new option added to that list is
+    // automatically covered here too without touching this code.
+    for (const auto & env : k_estimate_env_keys) {
+        std::string val;
+        if (meta.preset.get_option(env, val)) {
+            k += "|" + env + "=" + val;
+        }
+    }
+    return k;
+}
+
 std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta & meta) {
     // Read the value captured by parse_model_placement(), NOT meta.preset: update_args()
     // strips ROUTER_ARG_VRAM_MB from the preset in place at registration, so by the time
@@ -1013,27 +1058,7 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
         return { meta.placement.vram_mb_override * 1024LL * 1024LL };
     }
 
-    const std::string key = [&]() {
-        common_params params;
-        meta.preset.apply_to_params(params, {
-            "LLAMA_ARG_MODEL",
-            "LLAMA_ARG_CTX_SIZE",
-            "LLAMA_ARG_CACHE_TYPE_K",
-            "LLAMA_ARG_CACHE_TYPE_V",
-            "LLAMA_ARG_N_PARALLEL",
-            "LLAMA_ARG_KV_TIERED",
-            "LLAMA_ARG_CTX_CHECKPOINTS",
-            "LLAMA_ARG_CACHE_RAM",
-        });
-        std::string model_path = params.model.path;
-        int64_t mtime = 0;
-        if (!model_path.empty() && std::filesystem::exists(model_path)) {
-            mtime = (int64_t) std::filesystem::last_write_time(model_path).time_since_epoch().count();
-        }
-        return string_format("%s|%" PRId64 "|%d|%d|%d|%d",
-                model_path.c_str(), mtime, params.n_ctx, (int) params.cache_type_k,
-                (int) params.cache_type_v, params.n_parallel);
-    }();
+    const std::string key = estimate_need_bytes_key(meta);
 
     std::filesystem::path cache_dir = std::filesystem::temp_directory_path() / "llama-router-estimates";
     std::filesystem::create_directories(cache_dir);
@@ -1050,11 +1075,13 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
                     cached.push_back(v.get<int64_t>());
                 }
                 if (!cached.empty()) {
+                    SRV_INF("estimate cache HIT for model %s: key=%s\n", meta.name.c_str(), key.c_str());
                     return cached;
                 }
             }
         }
     }
+    SRV_INF("estimate cache MISS for model %s: key=%s (measuring fresh)\n", meta.name.c_str(), key.c_str());
 
     server_model_meta est = meta;
     est.update_args(ctx_preset, bin_path);
