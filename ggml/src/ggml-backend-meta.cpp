@@ -3391,6 +3391,64 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+    // WP_TP_TRACE=3: hash the persistent recurrent-state write-back and zero-clear, and the
+    // read of that same cache by a GET_ROWS gather, per local device, the moment each one's OWN
+    // subgraph finishes - not in one pass after the whole graph, which for a COMPUTE-buffer
+    // (non-persistent) tensor can read back memory the allocator has already handed to a later,
+    // unrelated node (see the long comment where this used to live, below the main loop).
+    //
+    // "cache_s_l*"/"cache_r_l*": the write-back CPY ("(copy of new_state-N)" / "(copy of
+    // conv_state_last-N)"), and the in-place zero-clear SCALE that build_rs() applies to a VIEW
+    // of the same persistent buffer (src/llama-graph.cpp:4276) before a NEW sequence's first
+    // gather. "state_predelta-N"/"conv_states_reshaped-N": the RESHAPE right after the GET_ROWS
+    // that gathers cache_s_l*/cache_r_l* by s_copy. The raw GET_ROWS itself (node_23-style, no
+    // cb() name of its own) is caught structurally: any GET_ROWS whose src[0] is one of the
+    // cache_* tensors above. None of these ever need a cross-host reduce (each device disjointly
+    // owns a head range, nothing to sum), so none of them are visible in the xhost_value trace.
+    auto names_cache_persist = [](const ggml_tensor * t) {
+        return strncmp(t->name, "cache_s_l", 9) == 0 || strncmp(t->name, "cache_r_l", 9) == 0;
+    };
+    auto trace_state_hash_subgraph = [&](size_t i) {
+        if (!ggml_backend_meta_trace_values_enabled() || getenv("WP_TP_TRACE")[0] < '3') {
+            return;
+        }
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+            for (int k = 0; k < cgraph_ij->n_nodes; k++) {
+                ggml_tensor * node_j = cgraph_ij->nodes[k];
+                const bool is_write = node_j->op == GGML_OP_CPY && names_cache_persist(node_j);
+                const bool is_read = strstr(node_j->name, "state_predelta") != nullptr ||
+                    strstr(node_j->name, "conv_states_reshaped") != nullptr;
+                bool is_zero = false;
+                if (node_j->op == GGML_OP_SCALE) {
+                    for (const ggml_tensor * v = node_j->view_src; v != nullptr; v = v->view_src) {
+                        if (names_cache_persist(v)) {
+                            is_zero = true;
+                            break;
+                        }
+                    }
+                }
+                const bool is_raw_gather = node_j->op == GGML_OP_GET_ROWS && node_j->src[0] != nullptr &&
+                    names_cache_persist(node_j->src[0]);
+                if ((!is_write && !is_read && !is_zero && !is_raw_gather) || ggml_nelements(node_j) == 0) {
+                    continue;
+                }
+                const char * site = is_write ? "state_writeback" :
+                    is_zero ? "state_zero" : is_raw_gather ? "state_gather" : "state_read";
+                const size_t nbytes_j = ggml_nbytes(node_j);
+                std::vector<char> tmp(nbytes_j);
+                ggml_backend_tensor_get_async(bcj.backend, node_j, tmp.data(), 0, nbytes_j);
+                ggml_backend_synchronize(bcj.backend);
+                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=%s sub=%zu "
+                              "n_tokens=%d dev=%zu node=%s nbytes=%zu C=%d hash=%016llx\n",
+                        trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build, site, i,
+                        (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node_j->name,
+                        nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
+            }
+        }
+    };
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
@@ -3400,6 +3458,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return status;
             }
         }
+
+        trace_state_hash_subgraph(i);
 
         // WP_TP_TRACE=3 investigation (2026-09-06): a per-subgraph
         // "synchronize every local device right after submitting it" was tried here (commit
@@ -3533,75 +3593,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    // WP_TP_TRACE=3: hash the persistent recurrent-state write-back, AND the read that a later
-    // build does of that same cache, per local device, right after each executes.
-    //
-    // The write-back CPY (cache_s_l*/cache_r_l* "(copy of new_state-N)" / "(copy of
-    // conv_state_last-N)") never needs a cross-host reduce - each device disjointly owns a head
-    // range there, nothing to sum - so it is invisible to the xhost_value trace above. The read
-    // (state_predelta-N, the RESHAPE right after the GET_ROWS that gathers cache_s_l* by
-    // s_copy; conv_states_reshaped-N, the equivalent for cache_r_l*) is equally invisible: it
-    // feeds GATED_DELTA_NET locally, no reduce needed either.
-    //
-    // If a request's carried-forward state comes out wrong, comparing the write-back hash at the
-    // end of one build against the read hash at the start of the NEXT build tells us where the
-    // corruption is: if they disagree, something between the two builds (allocator reuse,
-    // cross-host desync, a stale split_state_cache entry) is not really persisting the cache; if
-    // they agree and the read is still wrong relative to a known-good run, the corruption was
-    // already baked into the writer's own numbers (a kernel bug), not a persistence bug.
-    if (ggml_backend_meta_trace_values_enabled() && getenv("WP_TP_TRACE")[0] >= '3') {
-        // Does this node's own name, or (for a bare view) the tensor its view_src chain bottoms
-        // out in, start with "cache_s_l" or "cache_r_l"? Used below to catch the in-place
-        // zero-clear (ggml_scale_inplace on a VIEW of the cache, src/llama-graph.cpp:4276 in
-        // build_rs) and the raw gather (GET_ROWS straight off the cache, before it gets its
-        // cb()-assigned name a reshape later) - neither is named "cache_s_l*"/"cache_r_l*" itself
-        // and neither was previously hashed, even though both sit directly between the
-        // reproducible write-back (end of one build) and the non-reproducible read
-        // (state_predelta-0, start of the next).
-        auto names_cache = [](const ggml_tensor * t) {
-            return strncmp(t->name, "cache_s_l", 9) == 0 || strncmp(t->name, "cache_r_l", 9) == 0;
-        };
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            const bool is_write = node->op == GGML_OP_CPY && names_cache(node);
-            const bool is_read = strstr(node->name, "state_predelta") != nullptr ||
-                strstr(node->name, "conv_states_reshaped") != nullptr;
-            bool is_zero = false;
-            if (node->op == GGML_OP_SCALE) {
-                for (const ggml_tensor * v = node->view_src; v != nullptr; v = v->view_src) {
-                    if (names_cache(v)) {
-                        is_zero = true;
-                        break;
-                    }
-                }
-            }
-            const bool is_raw_gather = node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr &&
-                names_cache(node->src[0]);
-            if (!is_write && !is_read && !is_zero && !is_raw_gather) {
-                continue;
-            }
-            const char * site =
-                is_write ? "state_writeback" : is_zero ? "state_zero" : is_raw_gather ? "state_gather" : "state_read";
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                ggml_tensor * node_j = ggml_backend_meta_buffer_simple_tensor(node, j);
-                if (node_j == nullptr || ggml_nelements(node_j) == 0) {
-                    continue;
-                }
-                const size_t nbytes_j = ggml_nbytes(node_j);
-                std::vector<char> tmp(nbytes_j);
-                ggml_backend_tensor_get_async(bcj.backend, node_j, tmp.data(), 0, nbytes_j);
-                ggml_backend_synchronize(bcj.backend);
-                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=%s "
-                              "n_tokens=%d dev=%zu node=%s nbytes=%zu C=%d hash=%016llx\n",
-                        trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
-                        site,
-                        (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node->name,
-                        nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
-                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
-            }
-        }
-    }
+    // (trace_state_hash_subgraph, defined and called from inside the per-subgraph loop above,
+    // used to live here as a single end-of-graph pass. MEASURED BUG IN THE TRACE ITSELF: reading
+    // it after the whole graph finished meant "state_gather"/"state_read" (node_23 /
+    // state_predelta-0), which live in the ordinary COMPUTE buffer, could have already been
+    // reused by a LATER node's allocation by the time we read them back - ggml's graph allocator
+    // frees a tensor's memory for reuse as soon as its last consumer has run, and node_23 is
+    // consumed immediately by the RESHAPE into state_predelta-0 and then by GATED_DELTA_NET, all
+    // still early in a 3600+-node, 62-layer graph. What looked like "the read is
+    // non-reproducible" across separate fresh-process runs could just as well have been "some
+    // unrelated later tensor ended up at that address, and WHICH one varies with allocator
+    // timing" - not evidence about the gather itself. "state_zero" had the opposite problem:
+    // being a VIEW directly into the PERSISTENT cache_s_l0 buffer at the same offset the
+    // write-back CPY targets, reading it at the end of the graph returned the write-back's
+    // value, not the zero-clear's - which is exactly why every prior run showed
+    // state_zero's hash equal to that SAME build's state_writeback hash. Moved into the
+    // per-subgraph loop so each node is hashed the moment its OWN subgraph finishes, before
+    // anything later in the same build can touch that memory.
 
     if (ggml_backend_meta_trace_enabled()) {
         GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=reduce n_tokens=%d "
