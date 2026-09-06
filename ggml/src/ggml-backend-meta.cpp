@@ -1350,6 +1350,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         buf_ctx->split_state_cache.clear();
         it = buf_ctx->split_state_cache.end();
     }
+    const bool trace_cache_was_hit = (it != buf_ctx->split_state_cache.end());
 
     if (it == buf_ctx->split_state_cache.end()) {
         buf_ctx->split_state_cache[key].first = calculate_split_state();
@@ -1391,6 +1392,74 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
+
+    // WP_TP_TRACE=3: split_state_cache hit/miss and resolved split, for the tensors on the
+    // suspect path between a reproducible cache_s_l0 write-back and a non-reproducible read of
+    // it next build (state_predelta-0, its GET_ROWS source, cache_s_l0 itself, conv_states-0,
+    // and every other layer's cache_s_l*/cache_r_l* gather). The cache is keyed by tensor
+    // POINTER and only invalidated by a raw struct memcmp (just above); a fresh ggml_context is
+    // built every llama_decode() call, so a tensor at a given address in THIS build's arena can
+    // be a completely different node than whatever last lived there - if the memcmp ever misses
+    // that (or if two DIFFERENT tensors this same build alias the same key some other way), a
+    // stale ne/axis/offset would be silently reused. Logging hit/miss plus the resolved ne[]
+    // per call, across repeated fresh-process runs of the identical request sequence, is what
+    // would show that: a "hit" that should have been a "miss" (or the reverse) at build 4.
+    if (ggml_backend_meta_trace_values_enabled() && getenv("WP_TP_TRACE")[0] >= '3') {
+        bool selected =
+            strcmp(tensor->name, "node_23") == 0 ||
+            strcmp(tensor->name, "state_predelta-0") == 0 ||
+            strcmp(tensor->name, "cache_s_l0") == 0 ||
+            strcmp(tensor->name, "conv_states-0") == 0;
+        if (!selected && tensor->op == GGML_OP_GET_ROWS && tensor->src[0] != nullptr) {
+            selected = strncmp(tensor->src[0]->name, "cache_s_l", 9) == 0 ||
+                       strncmp(tensor->src[0]->name, "cache_r_l", 9) == 0;
+        }
+        if (selected) {
+            std::string ne_info;
+            for (size_t j = 0; j < n_bufs; j++) {
+                if (!ne_info.empty()) {
+                    ne_info += ",";
+                }
+                int64_t sum = 0;
+                for (size_t s = 0; s < ret.n_segments; s++) {
+                    sum += ret.ne[s*n_bufs + j] * ret.nr[s];
+                }
+                ne_info += std::to_string(sum);
+            }
+            GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=split_state_cache "
+                          "tensor=%p name=%s op=%s cache=%s axis=%s ne=[%s]\n",
+                    buf_ctx->rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                    (void *) tensor, tensor->name, ggml_op_name(tensor->op),
+                    trace_cache_was_hit ? "hit" : "miss",
+                    ggml_backend_meta_split_axis_name(ret.axis), ne_info.c_str());
+
+            // For the GET_ROWS itself: the s_copy index tensor's own resolved split (should be
+            // MIRRORED - the row/cache-slot axis is not split, only the channel/head axis is,
+            // see handle_get_rows) and, since s_copy is set_input on a host buffer, its actual
+            // values - the first 4 indices actually used to gather this build.
+            if (tensor->op == GGML_OP_GET_ROWS && tensor->src[1] != nullptr) {
+                const ggml_tensor * idx = tensor->src[1];
+                std::string idx_vals = "n/a";
+                if (ggml_backend_buffer_is_host(idx->buffer) && idx->data != nullptr) {
+                    const int32_t * d = (const int32_t *) idx->data;
+                    const int64_t n = std::min<int64_t>(4, ggml_nelements(idx));
+                    idx_vals.clear();
+                    for (int64_t k = 0; k < n; k++) {
+                        if (k) idx_vals += ",";
+                        idx_vals += std::to_string(d[k]);
+                    }
+                }
+                const ggml_backend_meta_split_state idx_ss =
+                    ggml_backend_meta_get_split_state(stc, idx, assume_sync);
+                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=split_state_cache_scopy "
+                              "node=%s idx=%s idx_axis=%s idx_first4=[%s]\n",
+                        buf_ctx->rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                        tensor->name, idx->name,
+                        ggml_backend_meta_split_axis_name(idx_ss.axis), idx_vals.c_str());
+            }
+        }
+    }
+
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
         int64_t ne_ret = 0;
@@ -3332,28 +3401,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        // Every local device's subgraph is now SUBMITTED, not necessarily FINISHED:
-        // ggml_backend_graph_compute_async is exactly backend->iface.graph_compute (see
-        // ggml_backend_graph_compute_async, ggml/src/ggml-backend.cpp), which for an async
-        // backend (CUDA, Vulkan) only enqueues work and returns. Below, allreduce_fallback's
-        // push_data() does synchronize its SOURCE device before copying it (the
-        // ggml_backend_tensor_copy_async generic fallback in ggml-backend.cpp calls
-        // ggml_backend_synchronize on both sides when no vendor fast-path exists, which is the
-        // case for a CUDA<->Vulkan copy), and the cross-host staging read below synchronizes
-        // device 0 before hashing/sending it - so every read SHOULD already be preceded by a
-        // sync on the device it reads. But that safety is spread across several call sites and
-        // implicit in each one's cgraph bookkeeping (fence/epoch state per ggml_backend_vk_context,
-        // stream state per CUDA context); a bug in any one of them silently reads a device's
-        // buffer before its own last kernel has actually landed, and on a small/fast subgraph
-        // (few nodes, e.g. this one) submission-to-completion latency is exactly where a
-        // still-in-flight read would land - large subgraphs have enough work in front of them
-        // that the device is done by the time anything touches its buffer regardless. Make it
-        // unconditional and unambiguous here, once, right after submission, rather than trusting
-        // every downstream reader to have gotten its own synchronize placement right.
-        for (size_t j = 0; j < n_backends; j++) {
-            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
-        }
-
+        // WP_TP_TRACE=3 investigation (2026-09-06): a per-subgraph
+        // "synchronize every local device right after submitting it" was tried here (commit
+        // c5cd9fb82) on the theory that allreduce_fallback's push_data() and the cross-host
+        // staging read might sometimes read a device's buffer before that device's own subgraph
+        // had actually finished (each is individually synchronized before its own read, but that
+        // safety is spread across call sites and implicit in per-backend fence/epoch state).
+        // MEASURED RESULT: build 4 (the failing small-graph request) was STILL non-reproducible
+        // across fresh-process runs with the extra syncs in place - not just downstream, but
+        // already at the very first read of the persistent state cache (state_predelta-0 /
+        // node_23, gathering cache_s_l0), even though cache_s_l0's OWN write-back at the end of
+        // the prior build hashed identically across runs. Reading back bit-identical data
+        // non-deterministically is not explained by a submit/read race on the writing device, so
+        // this fix was reverted (it also cost ~3x decode throughput). ROOT CAUSE STILL OPEN: the
+        // divergence is between a reproducible write and a non-reproducible read of the SAME
+        // bytes - look at tensor-identity/address-reuse across separate ggml_context builds
+        // (ggml_backend_meta_get_split_state's split_state_cache, keyed by tensor pointer and
+        // invalidated by a raw struct memcmp - ggml-backend-meta.cpp:1346-1356) and at whether
+        // the GET_ROWS gather's index tensor (s_copy) or the state tensor's per-device offset is
+        // being resolved from a stale cached split state for a reused ggml_context address,
+        // before assuming another race.
         if (i < backend_ctx->n_subgraphs - 1) {
             if (ggml_backend_meta_trace_enabled()) {
                 for (size_t j = 0; j < n_backends; j++) {
