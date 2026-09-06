@@ -6378,6 +6378,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
+// 2026-09-06: PAGED_ATTN_MT's decode branch (mt_pagedattn.cu,
+// ggml_cuda_op_paged_attn_mt) allocates its partials scratch from
+// ctx.pool(), and ggml_cuda_pool_leg::alloc() does a raw cudaMalloc on a
+// cache miss -- illegal while the stream is mid HIP/CUDA-graph capture.
+// That's normally safe because the same bucketed size is already warm in
+// the pool from earlier eager calls before a key is ever captured -- but
+// under WP_HIP_GRAPHS the FIRST visit of a graph key is captured directly
+// (see the warmup_complete handling below), with no prior eager pass. If
+// that first visit is also the very first time this process has ever
+// evaluated this exact decode shape (e.g. a brand-new turbo4/draft-MTP
+// shape hit at server startup), the pool has nothing cached for that
+// bucket and the in-capture alloc is a guaranteed miss, which poisons the
+// capture ("operation failed due to a previous error during capture").
+// Used to force one eager warm-up visit (below) for graphs containing this
+// op, same as the pre-WP two-visit warmup, without touching the WP fast
+// path for every other op.
+static bool ggml_cuda_graph_has_paged_attn_mt(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_PAGED_ATTN_MT) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -6453,10 +6478,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // Do NOT take the src-ptrs-only ExecUpdate path: that is the
                 // crash (hipGraphExecUpdate SEGV_MAPERR) and the decode
                 // regression (recapture+Update every expert instead of replay).
-                graph->warmup_complete = true;
-                use_cuda_graph = true;
-                cuda_graph_update_required =
-                    graph->instance == nullptr || properties_changed;
+                //
+                // Exception: a graph containing PAGED_ATTN_MT still needs one
+                // eager visit before its first capture, to warm the decode
+                // partials pool bucket outside of capture (see the comment on
+                // ggml_cuda_graph_has_paged_attn_mt above). Scoped to graphs
+                // carrying that op so every other op keeps the first-visit
+                // capture fast path.
+                if (!graph->warmup_complete && ggml_cuda_graph_has_paged_attn_mt(cgraph)) {
+                    graph->warmup_complete = true; // next visit captures
+                    use_cuda_graph = false;
+                } else {
+                    graph->warmup_complete = true;
+                    use_cuda_graph = true;
+                    cuda_graph_update_required =
+                        graph->instance == nullptr || properties_changed;
+                }
             } else if (!graph->warmup_complete) {
                 // Warmup: the first visit of a key always looks like a size
                 // change (empty -> N). The second visit of the SAME structural
