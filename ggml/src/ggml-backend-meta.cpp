@@ -867,6 +867,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // by graph passes that rewire sources); the data parent is equivalent
         const ggml_tensor * vsrc = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
         GGML_ASSERT(vsrc != nullptr);
+
+        // llm_build_delta_net_base::build_recurrent_attn (src/models/delta-net-base.cpp:400-421)
+        // packs GATED_DELTA_NET's per-token output and its updated state into ONE flat result
+        // tensor ([S_v*H, n_tokens*n_seqs + K*S_v*n_seqs]) and views the trailing K*S_v*n_seqs
+        // rows back out into the state's own [S_v, S_v, H, n_seqs] shape ("new_state"). That
+        // view's own nb[] is a textbook contiguous layout for ITS shape, which makes it pass
+        // the "both sides contiguous" fast path below and get treated as a plain reshape of
+        // vsrc - but vsrc's split axis (0, the flat S_v*H row) describes the S_v/H layout of a
+        // DIFFERENT sub-region (the tokens prefix, offset 0); this view starts at a nonzero
+        // offset and inserts an extra S_v axis the generic reshape logic cannot relate back to
+        // vsrc's split, so it fell through to a bogus raw fraction-of-S_v split on axis 1
+        // instead of the axis-2 (head) split the state actually has. The state that comes back
+        // out of GATED_DELTA_NET MUST be split exactly like the state that went in - reuse that
+        // split directly rather than re-deriving it from the flattened result tensor.
+        if (vsrc->op == GGML_OP_GATED_DELTA_NET && tensor->view_offs != 0) {
+            const ggml_tensor * state_in = vsrc->src[5];
+            if (state_in != nullptr &&
+                    tensor->ne[0] == state_in->ne[0] && tensor->ne[1] == state_in->ne[1] &&
+                    tensor->ne[2] == state_in->ne[2] && tensor->ne[3] == state_in->ne[3]) {
+                return ggml_backend_meta_get_split_state(stc, state_in, /*assume_sync =*/ true);
+            }
+        }
+
         const ggml_backend_meta_split_state ss0 = tensor->src[0] != nullptr
             ? src_ss[0]
             : ggml_backend_meta_get_split_state(stc, vsrc, /*assume_sync =*/ true);
