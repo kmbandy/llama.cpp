@@ -3450,6 +3450,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     };
 
+    // WP_TP_TRACE=3: the whole cache_s_l0/cache_r_l0 chain (zero-clear, gather, reshape,
+    // write-back) is now proven bit-reproducible across fresh-process runs (see the hashes
+    // above, fixed to read each node the moment its OWN subgraph finishes). But xhost_value's
+    // sub=0 pre= for linear_attn_out-0 is STILL non-reproducible - so the divergence is in some
+    // OTHER input to layer 0's GDN: q/k/v off the conv path, conv_states-0 (the analogous r_cache
+    // gather this same code never covered because it only tracked the s_cache/state side), or the
+    // residual stream up to attn_norm-0. Subgraph 0 is everything local to layer 0 before the
+    // first cross-host reduce and is small, so dump every one of its nodes, not just the
+    // suspects, and let the first non-reproducible name in the printed order answer it.
+    auto trace_dump_subgraph0 = [&](size_t i) {
+        if (i != 0 || !ggml_backend_meta_trace_values_enabled() || getenv("WP_TP_TRACE")[0] < '3') {
+            return;
+        }
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+            for (int k = 0; k < cgraph_ij->n_nodes; k++) {
+                ggml_tensor * node_j = cgraph_ij->nodes[k];
+                if (ggml_nelements(node_j) == 0) {
+                    continue;
+                }
+                const size_t nbytes_j = ggml_nbytes(node_j);
+                std::vector<char> tmp(nbytes_j);
+                ggml_backend_tensor_get_async(bcj.backend, node_j, tmp.data(), 0, nbytes_j);
+                ggml_backend_synchronize(bcj.backend);
+                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=sub0_node k=%d "
+                              "n_tokens=%d dev=%zu node=%s op=%s nbytes=%zu C=%d hash=%016llx\n",
+                        trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build, k,
+                        (int) g_ggml_backend_meta_trace_n_tokens, trace_rank_first + j, node_j->name,
+                        ggml_op_name(node_j->op), nbytes_j, (node_j->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+                        (unsigned long long) ggml_backend_meta_trace_fnv1a(tmp.data(), nbytes_j));
+            }
+        }
+    };
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -3460,6 +3495,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         trace_state_hash_subgraph(i);
+        trace_dump_subgraph0(i);
 
         // WP_TP_TRACE=3 investigation (2026-09-06): a per-subgraph
         // "synchronize every local device right after submitting it" was tried here (commit
