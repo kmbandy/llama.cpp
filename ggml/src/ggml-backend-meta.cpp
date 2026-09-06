@@ -75,6 +75,48 @@ struct ggml_backend_meta_trace_init_acc {
 
 static ggml_backend_meta_trace_init_acc g_ggml_backend_meta_trace_init;
 
+// WP_TP_TRACE=2: per-subgraph cross-host reduce trace.
+//
+// WHY THIS EXISTS. Everything the trace prints today is structural (how many tensors were
+// disabled, how many butterfly ADDs ran); nothing prints a VALUE. The observed failure -
+// large prefill ubatches always right, small ones wrong once the process has run a large one,
+// and the first real ubatch right at any size - cannot be told apart by structure alone,
+// because both candidate mechanisms (a) a stale, previous-shape node0 driving the reduce width
+// and (b) a correct-width reduce over a partly-stale buffer produce identical structural
+// counters. What separates them is the DATA: the byte width of each reduce and a hash of this
+// rank's partial before the exchange plus the world total after it.
+//
+// HOW TO USE IT. Run the same request twice - once at a size that works and once at a size that
+// fails - with WP_TP_TRACE=2 on BOTH ranks, then join the two logs on (build, subgraph):
+//   - nbytes differs between the good and the bad run at the SAME subgraph, or differs between
+//     the two ranks  => the reduce is being driven by a stale/foreign node0 (hypothesis a).
+//   - nbytes identical everywhere, but the FIRST subgraph whose pre= hash differs from the good
+//     run is on exactly one rank  => that rank's partial is already wrong before any exchange,
+//     and the subgraph index names the layer and the op (hypothesis b). If both ranks' pre=
+//     hashes match the good run up to subgraph N and the post= hash diverges at N, the defect is
+//     in the exchange/accumulate itself, not in either rank's compute.
+// The first subgraph index at which the good and bad runs diverge is the answer; every later
+// line is downstream of it.
+//
+// Level 2 and not 1: this is 128 lines per ubatch. WP_TP_TRACE=1 keeps the existing summaries.
+static bool ggml_backend_meta_trace_values_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("WP_TP_TRACE");
+        return e != nullptr && e[0] >= '2' && e[0] <= '9';
+    }();
+    return enabled;
+}
+
+static uint64_t ggml_backend_meta_trace_fnv1a(const void * data, size_t nbytes) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < nbytes; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -3040,8 +3082,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_backend_synchronize(backend_ctx->backend_configs[0].backend);
                 }
 
+                // WP_TP_TRACE=2: this rank's partial for this subgraph, BEFORE the exchange.
+                const uint64_t trace_hash_pre = ggml_backend_meta_trace_values_enabled()
+                    ? ggml_backend_meta_trace_fnv1a(staging, nbytes) : 0;
+
                 if (!backend_ctx->cross_host_reduce(backend_ctx->cross_host_reduce_ud, staging, n_values)) {
                     return GGML_STATUS_FAILED;
+                }
+
+                if (ggml_backend_meta_trace_values_enabled()) {
+                    // node0 is the tensor the whole reduce is driven from: its name, its shape and
+                    // its byte width are exactly what hypothesis (a) predicts will be stale. The
+                    // COMPUTE flag is printed too, because a tail that did not run on device 0 is
+                    // the one case where the pre= hash is legitimately meaningless.
+                    GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=xhost_value "
+                                  "n_tokens=%d sub=%zu/%zu node=%s op=%s ne=[%lld,%lld,%lld,%lld] "
+                                  "nbytes=%zu compute0=%d pre=%016llx post=%016llx\n",
+                            trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                            (int) g_ggml_backend_meta_trace_n_tokens, i, backend_ctx->n_subgraphs,
+                            node0->name, ggml_op_name(node0->op),
+                            (long long) node0->ne[0], (long long) node0->ne[1],
+                            (long long) node0->ne[2], (long long) node0->ne[3],
+                            nbytes, (node0->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
+                            (unsigned long long) trace_hash_pre,
+                            (unsigned long long) ggml_backend_meta_trace_fnv1a(staging, nbytes));
                 }
 
                 // The tensor is logically MIRRORED after the reduce, so a plain set per device is

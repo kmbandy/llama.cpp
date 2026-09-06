@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -362,9 +363,23 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+// WP_TP_TRACE=1: the recurrent-state ubatch inputs, on BOTH ranks.
+//
+// Under cross-host TP the ubatch split and every set_input() is DERIVED independently on each
+// rank rather than shipped (see the header of src/llama-tp-lockstep.cpp), so nothing on the wire
+// proves that the two ranks agree about WHICH recurrent cells this ubatch reads, which cell is
+// the one being zeroed, or where the new state is written back. That agreement is a precondition
+// for the chunked GDN path being correct, and it is invisible from outside. One line per
+// recurrent ubatch on each rank; join the two logs on the decode's operation counter and diff.
+static bool llm_graph_rs_trace_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("WP_TP_TRACE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return enabled;
+}
 
+void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
     if (s_copy) {
@@ -375,6 +390,29 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
+    }
+
+    if (llm_graph_rs_trace_enabled()) {
+        // rs_z is the cell whose state row build_rs() zeroes via ggml_scale_inplace
+        // (llama-graph.cpp, build_rs), i.e. the ONLY thing that makes a reused recurrent row read
+        // as a fresh zero state. head is where the new state is written back. s_copy is the
+        // gather map the state is read through. If any of the three differs between the ranks,
+        // the two halves of the world are running different recurrent state.
+        std::string s_copy_str;
+        if (s_copy) {
+            const int32_t * data = (const int32_t *) s_copy->data;
+            for (int64_t i = 0; i < n_rs && i < 16; ++i) {
+                s_copy_str += (i ? "," : "") + std::to_string(data[i]);
+            }
+            if (n_rs > 16) {
+                s_copy_str += ",...";
+            }
+        }
+        LLAMA_LOG_INFO("WP_TP_TRACE rs set_input n_tokens=%u n_seqs=%u n_seq_tokens=%u "
+                       "n_rs=%lld head=%u rs_z=%d s_copy=[%s]\n",
+                ubatch ? ubatch->n_tokens : 0, ubatch ? ubatch->n_seqs : 0,
+                ubatch ? ubatch->n_seq_tokens : 0,
+                (long long) n_rs, mctx->get_head(), mctx->get_rs_z(), s_copy_str.c_str());
     }
 }
 
