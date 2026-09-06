@@ -2644,6 +2644,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (ggml_cuda_wp_set_ubatch_width_hint) {
         ggml_cuda_wp_set_ubatch_width_hint((int32_t) ubatch.n_tokens);
     }
+    // WP_TP_TRACE=1: give the meta backend's COMPUTE-flag trace the ubatch width it cannot see.
+    ggml_backend_meta_trace_set_ubatch((int32_t) ubatch.n_tokens);
     const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
     if (wp_draft_active && !wp_draft_shape_logged) {
         wp_draft_shape_logged = true;

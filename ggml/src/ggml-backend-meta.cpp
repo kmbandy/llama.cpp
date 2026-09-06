@@ -24,6 +24,57 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
+// ---------------------------------------------------------------------------------------------
+// WP_TP_TRACE=1: COMPUTE-flag bookkeeping trace.
+//
+// A node is disabled on a device when one of its meta sources has a zero-sized slice there
+// (ggml_backend_meta_buffer_init_tensor_impl), and a whole window of nodes is disabled when the
+// AllReduce at a subgraph boundary is delayed (ggml_backend_meta_graph_compute). Zero-sized
+// slices only exist when some tensor is restricted to fewer than n_world devices, i.e. only in a
+// cross-host world - so these two sites behave differently on the leader and on the follower and
+// there is no way to see that from outside. Everything here is off unless WP_TP_TRACE is set to
+// something other than "0"; the environment is read once. One line per site per graph build, plus
+// one line per node for the clearing sweep, capped.
+//
+// Deliberately GGML_LOG_INFO and not GGML_LOG_DEBUG: DEBUG is log level 5 and does not print at
+// the -lv 4 the server is run with. Same spelling of the switch as src/llama-tp-lockstep.cpp.
+// ---------------------------------------------------------------------------------------------
+
+static bool ggml_backend_meta_trace_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("WP_TP_TRACE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return enabled;
+}
+
+// Graph build counter, incremented once per ggml_backend_meta_graph_compute rebuild. The two
+// ranks build the same sequence of graphs, so the counter is the join key between the two logs.
+static uint64_t g_ggml_backend_meta_trace_build = 0;
+
+// Width of the ubatch currently being processed, published by the host application
+// (llama_context::process_ubatch). Trace-only: nothing reads it except the lines below, and it is
+// 0 when nobody publishes it.
+static int32_t g_ggml_backend_meta_trace_n_tokens = 0;
+
+void ggml_backend_meta_trace_set_ubatch(int32_t n_tokens) {
+    g_ggml_backend_meta_trace_n_tokens = n_tokens;
+}
+
+// Accumulator for the init_tensor site. init_tensor_impl runs once per tensor, so it cannot log a
+// line of its own without drowning the log; it accumulates here instead and the next graph build
+// flushes one summary line. The name list is capped.
+struct ggml_backend_meta_trace_init_acc {
+    static constexpr size_t max_names = 24;
+    size_t                   n_tensors = 0; // tensors with >= 1 device slot disabled
+    size_t                   n_slots   = 0; // (tensor, local device) pairs disabled
+    std::vector<std::string> names;         // first max_names of them, "name[devmask]"
+
+    void reset() { n_tensors = 0; n_slots = 0; names.clear(); }
+};
+
+static ggml_backend_meta_trace_init_acc g_ggml_backend_meta_trace_init;
+
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1403,6 +1454,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     }
 
     // If one of the sources has a zero-sized slice, disable the computation:
+    uint32_t trace_devmask = 0; // WP_TP_TRACE only: local devices disabled for this tensor
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i] == nullptr || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
             continue;
@@ -1418,8 +1470,24 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 ne_sum += split_state_src.ne[s*n_world + rank_first + j] * split_state_src.nr[s];
             }
             if (ne_sum == 0) {
+                // WP_TP_TRACE: count it only on the transition, so a tensor whose flag is cleared
+                // twice (two zero-sized sources) is not double counted.
+                if (ggml_backend_meta_trace_enabled() &&
+                        (simple_tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                    trace_devmask |= 1u << j;
+                    g_ggml_backend_meta_trace_init.n_slots++;
+                }
                 simple_tensors[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
             }
+        }
+    }
+
+    if (trace_devmask != 0) {
+        auto & acc = g_ggml_backend_meta_trace_init;
+        acc.n_tensors++;
+        if (acc.names.size() < ggml_backend_meta_trace_init_acc::max_names) {
+            acc.names.emplace_back(std::string(tensor->name) + "[" + ggml_op_name(tensor->op)
+                + ",devmask=0x" + std::to_string(trace_devmask) + "]");
         }
     }
 
@@ -2281,6 +2349,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         assert(needs_rebuild);
     }
 
+    const size_t trace_rank_first = ggml_backend_meta_dev_rank_first(backend->device);
+
+    if (needs_rebuild && ggml_backend_meta_trace_enabled()) {
+        // WP_TP_TRACE: one line per graph build for the init_tensor clearing site
+        // (ggml_backend_meta_buffer_init_tensor_impl, "a source has a zero-sized slice here").
+        // The counters cover every tensor initialised since the previous build, which is exactly
+        // the allocation round for this graph.
+        g_ggml_backend_meta_trace_build++;
+        auto & acc = g_ggml_backend_meta_trace_init;
+        std::string names;
+        for (const std::string & n : acc.names) {
+            if (!names.empty()) {
+                names += " ";
+            }
+            names += n;
+        }
+        GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=init_tensor_zero_slice "
+                      "n_tokens=%d n_nodes=%d cleared_tensors=%zu cleared_slots=%zu%s%s\n",
+                trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                (int) g_ggml_backend_meta_trace_n_tokens, cgraph->n_nodes,
+                acc.n_tensors, acc.n_slots,
+                names.empty() ? "" : " names=", names.c_str());
+        acc.reset();
+    }
+
     if (needs_rebuild) {
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
@@ -2514,6 +2607,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
+            // WP_TP_TRACE accumulators for the delayed-AllReduce clearing sweep. One summary
+            // line per graph build is emitted after the boundary loop below.
+            size_t                   trace_sweep_windows      = 0;
+            size_t                   trace_sweep_window_nodes = 0;
+            size_t                   trace_sweep_tainted      = 0;
+            size_t                   trace_sweep_cleared      = 0;
+            std::vector<std::string> trace_sweep_names;
+
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -2535,13 +2636,79 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
                 //     its compute flag disabled and thus gets its data zeroed out.
                 // If the AllReduce is delayed then the nodes until that point also need to have their compute flag disabled.
+                //
+                // ...but only the nodes that actually CONSUME node i. [i+1, i_delayed] is an index
+                // range, not a dependency cone: get_i_delayed()'s skip_unrelated() deliberately
+                // steps over MIRRORED nodes that do not consume node i, so the range also holds
+                // ordinary, independent work - including the side-effecting writes into the
+                // PERSISTENT KV / recurrent-state buffers (the ggml_scale_inplace that zeroes the
+                // reused recurrent row, src/llama-graph.cpp:4217-4218, and the ggml_cpy that
+                // stores the new state, :4227-4232). Clearing their COMPUTE flag makes the device
+                // skip them outright, which silently drops those writes: invisible on the first
+                // request, whose recurrent rows are still zero from the construction-time
+                // ggml_backend_buffer_clear, and wrong on every request after it. Zero-sized
+                // slices only exist when a tensor is restricted to fewer than n_world devices
+                // (n_head_devices, src/llama.cpp:667), which is a cross-host-only configuration -
+                // which is why a single-host -sm tensor run never showed this.
                 if (i_delayed > i) {
+                    // Transitive consumers of node i inside the window, on the ORIGINAL graph:
+                    // the dependency structure is world-invariant, only the per-device COMPUTE
+                    // flag below is not.
+                    std::set<const ggml_tensor *> tainted;
+                    std::vector<int>              tainted_idx;
+                    tainted.insert(cgraph->nodes[i]);
+                    for (int ii = i + 1; ii <= i_delayed; ii++) {
+                        const ggml_tensor * n_ii = cgraph->nodes[ii];
+                        bool depends = false;
+                        for (const ggml_tensor * v = n_ii->view_src; v != nullptr && !depends; v = v->view_src) {
+                            depends = tainted.count(v) > 0;
+                        }
+                        for (int is = 0; is < GGML_MAX_SRC && !depends; is++) {
+                            for (const ggml_tensor * src = n_ii->src[is]; src != nullptr; src = src->view_src) {
+                                if (tainted.count(src) > 0) {
+                                    depends = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (depends) {
+                            tainted.insert(n_ii);
+                            tainted_idx.push_back(ii);
+                        }
+                    }
+
                     for (size_t j = 0; j < n_backends; j++) {
                         auto & bcj = backend_ctx->backend_configs[j];
-                        if ((bcj.nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-                            for (int ii = i + 1; ii <= i_delayed; ii++) {
-                                bcj.nodes[ii]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                        if ((bcj.nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                            continue;
+                        }
+                        for (const int ii : tainted_idx) {
+                            // Never touch the shared original. For the s_copy views bcj.nodes[ii]
+                            // IS cgraph->nodes[ii] (see the FIXME where bcj.nodes is filled), and
+                            // clearing the flag there would be seen by every local device AND by
+                            // node_computes_world() - which every rank evaluates to derive the
+                            // subgraph boundaries - turning a per-device decision into a per-rank
+                            // mutation of a world-invariant input.
+                            if (bcj.nodes[ii] == cgraph->nodes[ii]) {
+                                continue;
                             }
+                            bcj.nodes[ii]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                            trace_sweep_cleared++;
+                        }
+                    }
+
+                    if (ggml_backend_meta_trace_enabled()) {
+                        trace_sweep_windows++;
+                        trace_sweep_window_nodes += size_t(i_delayed - i);
+                        trace_sweep_tainted      += tainted_idx.size();
+                        // The nodes the old blanket sweep would have disabled and this one does
+                        // not: the whole point of the trace. Capped.
+                        for (int ii = i + 1; ii <= i_delayed && trace_sweep_names.size() < 24; ii++) {
+                            if (std::find(tainted_idx.begin(), tainted_idx.end(), ii) != tainted_idx.end()) {
+                                continue;
+                            }
+                            trace_sweep_names.emplace_back(
+                                std::string(cgraph->nodes[ii]->name) + "[" + ggml_op_name(cgraph->nodes[ii]->op) + "]");
                         }
                     }
                 }
@@ -2556,6 +2723,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+
+            if (ggml_backend_meta_trace_enabled()) {
+                std::string names;
+                for (const std::string & n : trace_sweep_names) {
+                    if (!names.empty()) {
+                        names += " ";
+                    }
+                    names += n;
+                }
+                GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=delayed_allreduce_sweep "
+                              "n_tokens=%d n_nodes=%d n_subgraphs=%zu windows=%zu window_nodes=%zu "
+                              "dependent=%zu cleared_slots=%zu%s%s\n",
+                        trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                        (int) g_ggml_backend_meta_trace_n_tokens, cgraph->n_nodes, n_subgraphs,
+                        trace_sweep_windows, trace_sweep_window_nodes, trace_sweep_tainted,
+                        trace_sweep_cleared,
+                        names.empty() ? "" : " spared=", names.c_str());
+            }
         }
 
         backend_ctx->uid         = cgraph->uid;
@@ -2623,6 +2808,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     size_t iga = 0; // i graph aux
     size_t ina = 0; // i node aux
 
+    // WP_TP_TRACE accumulators for the reduce path. One summary line per graph_compute call,
+    // emitted after the subgraph loop: which subgraph tails had to be zeroed because they were
+    // disabled on a device (node_zero), how many butterfly ADDs were issued (node_red), and how
+    // many cross-host contributions were an explicit zero rather than a device read-back.
+    size_t trace_zero_nodes    = 0;
+    size_t trace_red_nodes     = 0;
+    size_t trace_xhost_reduces = 0;
+    size_t trace_xhost_zero    = 0;
+    size_t trace_disabled_tails = 0; // (subgraph, local device) tails with COMPUTE cleared
+
     auto get_node_aux = [&](ggml_tensor * t) -> ggml_tensor * {
         ggml_tensor * ret = backend_ctx->nodes_aux[ina++];
         memset(ret, 0, sizeof(ggml_tensor));
@@ -2667,6 +2862,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             node_zero->data = node->data;
             node_zero->buffer = node->buffer;
             node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            trace_zero_nodes++;
 
             step_cgraphs[j] = get_cgraph_aux();
             step_cgraphs[j]->nodes[0] = node_zero;
@@ -2700,6 +2896,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             node_red->src[0] = node_dst;
             node_red->src[1] = node_tmp;
             node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            trace_red_nodes++;
             ggml_backend_view_init(node_red);
 
             ggml_cgraph * cgraph_aux = get_cgraph_aux();
@@ -2776,6 +2973,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         if (i < backend_ctx->n_subgraphs - 1) {
+            if (ggml_backend_meta_trace_enabled()) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_cgraph * cgraph_ij = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                    if ((cgraph_ij->nodes[cgraph_ij->n_nodes - 1]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        trace_disabled_tails++;
+                    }
+                }
+            }
             // Local (intra-process) reduce over this rank's own devices. With a single local
             // device there is nothing to reduce locally - but there may still be a peer rank, so
             // this gate must NOT also guard the cross-host reduce below. A world of two ranks with
@@ -2816,6 +3021,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const size_t nbytes   = ggml_nbytes(node0);
                 const size_t n_values = nbytes / sizeof(float);
                 float * staging = backend_ctx->cross_host_staging(nbytes);
+                trace_xhost_reduces++;
 
                 if (n_backends == 1 && (node0->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     // A rank with a single local device whose slice is zero-sized never ran this
@@ -2826,6 +3032,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // rather than garbage. Skewed tensor_splits DO produce zero-sized attention
                     // slices, so this is a live path, not a defensive one.
                     memset(staging, 0, nbytes);
+                    trace_xhost_zero++;
                 } else {
                     // After the local reduce every local device holds the same values, so device 0
                     // is as good as any; read it back once.
@@ -2853,6 +3060,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+
+    if (ggml_backend_meta_trace_enabled()) {
+        GGML_LOG_INFO("WP_TP_TRACE meta rank_first=%zu build=%llu site=reduce n_tokens=%d "
+                      "n_nodes=%d n_subgraphs=%zu rebuild=%d disabled_tails=%zu node_zero=%zu "
+                      "node_red=%zu xhost_reduces=%zu xhost_zero=%zu\n",
+                trace_rank_first, (unsigned long long) g_ggml_backend_meta_trace_build,
+                (int) g_ggml_backend_meta_trace_n_tokens, cgraph->n_nodes,
+                backend_ctx->n_subgraphs, needs_rebuild ? 1 : 0,
+                trace_disabled_tails, trace_zero_nodes, trace_red_nodes,
+                trace_xhost_reduces, trace_xhost_zero);
     }
     return GGML_STATUS_SUCCESS;
 }

@@ -461,6 +461,12 @@ extern "C" {
     GGML_API void ggml_backend_meta_set_cross_host_reduce(
         ggml_backend_t meta_backend, ggml_backend_meta_cross_host_reduce_t reduce, void * ud);
 
+    // WP_TP_TRACE=1 only: publish the width of the ubatch currently being processed so that the
+    // meta backend's trace lines can be correlated with the host's per-decode trace. The value is
+    // stored in a plain global and read by nothing except those lines; calling this is a no-op
+    // when the trace is off, and not calling it at all simply prints n_tokens=0.
+    GGML_API void ggml_backend_meta_trace_set_ubatch(int32_t n_tokens);
+
     //
     // Utils
     //
