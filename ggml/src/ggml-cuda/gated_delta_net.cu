@@ -220,7 +220,14 @@ gated_delta_net_cuda(const float * q,
 //
 // Net effect: the number of *serialized* cross-lane reductions drops from 2T to O(1).
 // ---------------------------------------------------------------------------------------
-template <int S_v, bool keep_rs_t>
+// TM is the compile-time block length: the smallest supported chunk width that still
+// covers n_tokens (see gdn_chunk_width()).  It is NOT always GGML_CUDA_GDN_CHUNK_MAX --
+// phases (2), (3) and (4) below are unrolled over TM, not over n_tokens, so a T=8 verify
+// block compiled at TM=16 paid for 16 cross-lane reductions, a 120-FMA substitution chain
+// and 2x the shared memory it needed.  Everything is still exact for any TM >= n_tokens:
+// the (t,j) arithmetic is identical, TM only changes the sh_A/sh_P row stride and how many
+// provably-inert t >= n_tokens slots the unrolled loops carry.
+template <int S_v, int TM, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_chunked_cuda(const float * q,
                              const float * k,
@@ -251,7 +258,7 @@ gated_delta_net_chunked_cuda(const float * q,
     static_assert(S_v % lanes == 0, "S_v must be a multiple of the reduction width");
     constexpr int rows_per_lane = S_v / lanes;
     constexpr int nwarps        = 4;
-    constexpr int TM            = GGML_CUDA_GDN_CHUNK_MAX;
+    static_assert(TM >= 2 && TM <= GGML_CUDA_GDN_CHUNK_MAX, "chunk width out of range");
 
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -461,6 +468,19 @@ gated_delta_net_chunked_cuda(const float * q,
     }
 }
 
+// Smallest supported chunk width that covers n_tokens. The chunked kernel unrolls its
+// substitution / output / state phases over this width, so a T=8 verify block must not be
+// compiled at 16: the fixed part of the kernel (TM cross-lane reductions in phase 2, a
+// TM(TM-1)/2 FMA chain in phase 3, TM*S_v*2 floats of staging LDS) is what made T=8 cost
+// 105 us/layer against 8.6 us for the T=1 autoregressive kernel. Widths are powers of two
+// to bound template instantiations to 4 per (S_v, keep_rs_t).
+static int gdn_chunk_width(int64_t n_tokens) {
+    if (n_tokens <= 2) { return 2; }
+    if (n_tokens <= 4) { return 4; }
+    if (n_tokens <= 8) { return 8; }
+    return GGML_CUDA_GDN_CHUNK_MAX;
+}
+
 template <bool keep_rs_t>
 static void launch_gated_delta_net_chunked(
         const float * q_d, const float * k_d, const float * v_d,
@@ -480,36 +500,38 @@ static void launch_gated_delta_net_chunked(
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
+    const int tm = gdn_chunk_width(n_tokens);
+    GGML_ASSERT(n_tokens <= tm);
+
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+
+#define GGML_CUDA_GDN_LAUNCH_CHUNKED(SV, TMV)                                                \
+    ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<(SV), (TMV), keep_rs_t>,            \
+        launch_params, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,                      \
+        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                      \
+        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K)
+
+#define GGML_CUDA_GDN_LAUNCH_CHUNKED_SV(SV)                                                  \
+    switch (tm) {                                                                            \
+        case  2: GGML_CUDA_GDN_LAUNCH_CHUNKED((SV),  2); break;                              \
+        case  4: GGML_CUDA_GDN_LAUNCH_CHUNKED((SV),  4); break;                              \
+        case  8: GGML_CUDA_GDN_LAUNCH_CHUNKED((SV),  8); break;                              \
+        case 16: GGML_CUDA_GDN_LAUNCH_CHUNKED((SV), 16); break;                              \
+        default: GGML_ABORT("fatal error");                                                  \
+    }
+
     switch (S_v) {
-        case 16:
-            ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<16, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-            break;
-        case 32:
-            ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<32, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-            break;
-        case 64:
-            ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<64, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-            break;
-        case 128:
-            ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<128, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-            break;
+        case  16: GGML_CUDA_GDN_LAUNCH_CHUNKED_SV( 16); break;
+        case  32: GGML_CUDA_GDN_LAUNCH_CHUNKED_SV( 32); break;
+        case  64: GGML_CUDA_GDN_LAUNCH_CHUNKED_SV( 64); break;
+        case 128: GGML_CUDA_GDN_LAUNCH_CHUNKED_SV(128); break;
         default:
             GGML_ABORT("fatal error");
             break;
     }
+
+#undef GGML_CUDA_GDN_LAUNCH_CHUNKED_SV
+#undef GGML_CUDA_GDN_LAUNCH_CHUNKED
 }
 
 // GGML_GDN_CHUNKED=0 forces the autoregressive kernel for every block length (A/B switch).
