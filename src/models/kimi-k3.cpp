@@ -442,8 +442,8 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
 
     const float eps = hparams.f_norm_rms_eps;
-    Qcur = ggml_l2_norm(ctx0, Qcur, eps);
-    Kcur = ggml_l2_norm(ctx0, Kcur, eps);
+    Qcur = build_gdn_l2_norm(ctx0, Qcur, eps);
+    Kcur = build_gdn_l2_norm(ctx0, Kcur, eps);
 
     auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);
 
