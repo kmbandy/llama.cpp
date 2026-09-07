@@ -91,6 +91,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -4031,7 +4032,13 @@ static void ggml_cuda_wp_graph_count_tick() {
     }
 }
 
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+// 2026-09-07: `blocker`/`why` (both optional) report WHICH node vetoed capture.
+// Without them the wp hip-graphs counter could say "64 fallbacks, 0 captures"
+// forever with no way to attribute it: a graph that fails this test never
+// reaches ggml_cuda_graph_update_required(), so the churn diagnostic -- the
+// only other per-graph log -- can never see it.
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph,
+        const ggml_tensor ** blocker = nullptr, const char ** why = nullptr) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -4051,6 +4058,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // (TQ weight types included -- see the helper)
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
+                if (blocker) { *blocker = node; }
+                if (why)     { *why = "MUL_MAT_ID needs a stream sync"; }
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
@@ -4060,6 +4069,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             // never sees the node. Keep these graphs eager.
             if (ggml_mul_mat_id_get_expert_ptrs_n_as(node) > 0) {
                 use_cuda_graph = false;
+                if (blocker) { *blocker = node; }
+                if (why)     { *why = "MUL_MAT_ID carries host expert_ptrs"; }
             }
         }
         // MAD-244: ml8 MoE dispatch downloads ids host-side to bin by expert
@@ -4068,6 +4079,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // capture when an ml8 MoE op is present.
         if (node->op == GGML_OP_ML8_MUL_MAT_ID) {
             use_cuda_graph = false;
+            if (blocker) { *blocker = node; }
+            if (why)     { *why = "ml8 MoE host-side routing"; }
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to ml8 MoE host-side routing\n", __func__);
 #endif
@@ -6413,6 +6426,66 @@ static bool ggml_cuda_graph_has_paged_attn_mt(const ggml_cgraph * cgraph) {
     return false;
 }
 
+// 2026-09-07 (MAD-LAB): attribute an eager fallback.
+//
+// The wp hip-graphs counter reports "interval(hits=192 captures=0 fallbacks=64)"
+// -- a permanent, per-decode-step eager split -- with no way to tell WHICH split
+// or WHY. The churn diagnostic cannot help: a graph vetoed by
+// ggml_cuda_graph_check_compability() / is_prefill_shaped() never reaches
+// ggml_cuda_graph_update_required(), which is where churn logging lives. So log
+// it here instead, once per distinct (key, reason), bounded by
+// WP_HIP_GRAPHS_FALLBACK_BUDGET (default 32; 0 disables).
+static void ggml_cuda_wp_graph_log_fallback(
+        const void * graph_key, const ggml_cgraph * cgraph,
+        const ggml_tensor * blocker, const char * reason,
+        const ggml_cuda_graph * graph) {
+    static const int budget_max = [] {
+        const char * e = std::getenv("WP_HIP_GRAPHS_FALLBACK_BUDGET");
+        if (e == nullptr) { return 32; }
+        const long v = std::strtol(e, nullptr, 10);
+        return (v >= 0 && v < 1000000) ? (int) v : 32;
+    }();
+    static std::atomic<int> budget{budget_max};
+
+    if (budget.load(std::memory_order_relaxed) <= 0) {
+        return;
+    }
+
+    // Only the FIRST fallback of each distinct key is interesting: a permanent
+    // fallback repeats the same reason every step and would drown the journal.
+    static std::mutex               seen_mutex;
+    static std::set<const void *>   seen;
+    {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        if (!seen.insert(graph_key).second) {
+            return;
+        }
+    }
+    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+
+    if (reason == nullptr) {
+        // Compatible graph whose capture was declined for a non-structural
+        // reason (upstream warmup pass, properties still churning).
+        reason = "capture declined (warmup / properties churning)";
+    }
+    GGML_UNUSED(graph);
+
+    if (blocker != nullptr) {
+        fprintf(stderr,
+                "wp hip-graphs fallback: key=%p n_nodes=%d reason='%s' "
+                "node op=%s name='%s' ne=[%lld,%lld,%lld,%lld]\n",
+                graph_key, cgraph->n_nodes, reason,
+                ggml_op_name(blocker->op), blocker->name,
+                (long long) blocker->ne[0], (long long) blocker->ne[1],
+                (long long) blocker->ne[2], (long long) blocker->ne[3]);
+    } else {
+        fprintf(stderr, "wp hip-graphs fallback: key=%p n_nodes=%d reason='%s'\n",
+                graph_key, cgraph->n_nodes, reason);
+    }
+}
+
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -6473,9 +6546,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         // HIP graph capture is per-thread/per-stream. The worker's one-node
         // keepalive graph is built before its device executor exists, so keep
         // it eager instead of replaying it from a different thread.
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph) &&
-            !ggml_cuda_graph_is_prefill_shaped(cgraph) &&
-            (!ggml_cuda_wp_hip_graphs_enabled() || cgraph->n_nodes >= 2);
+        const ggml_tensor * fb_node   = nullptr;
+        const char        * fb_reason = nullptr;
+        const bool node_compatible = ggml_cuda_graph_check_compability(cgraph, &fb_node, &fb_reason);
+        if (node_compatible) {
+            if (const ggml_tensor * pf = ggml_cuda_graph_prefill_shaped_node(cgraph)) {
+                fb_node   = pf;
+                fb_reason = "prefill-shaped node (token width > 32)";
+            } else if (ggml_cuda_wp_hip_graphs_enabled() && cgraph->n_nodes < 2) {
+                fb_node   = cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr;
+                fb_reason = "fragment has < 2 nodes";
+            }
+        }
+        const bool graph_compatible = node_compatible && fb_reason == nullptr;
         if (graph_compatible) {
             bool properties_src_data_ptrs_only = false;
             const bool properties_changed = ggml_cuda_graph_update_required(
@@ -6498,6 +6581,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (!graph->warmup_complete && ggml_cuda_graph_has_paged_attn_mt(cgraph)) {
                     graph->warmup_complete = true; // next visit captures
                     use_cuda_graph = false;
+                    fb_reason      = "PAGED_ATTN_MT warm-up (one eager visit, then captures)";
                 } else {
                     graph->warmup_complete = true;
                     use_cuda_graph = true;
@@ -6533,6 +6617,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (!use_cuda_graph && ggml_cuda_wp_hip_graphs_enabled()) {
             ggml_cuda_wp_graph_count_init();
             ggml_cuda_wp_graph_counts[cuda_ctx->device].fallbacks.fetch_add(1, std::memory_order_relaxed);
+            ggml_cuda_wp_graph_log_fallback(graph_key, cgraph, fb_node, fb_reason, graph);
         }
     }
 #endif // USE_CUDA_GRAPH

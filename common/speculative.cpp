@@ -1226,7 +1226,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_WRN("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f, conf_mode=%s (0=gate off)\n",
                 __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min,
                 this->params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN ? "per-token" : "chain");
-        LOG_WRN("%s: - block_size=%d (source=%s), mask_token_id=%d, n_extract=%u, hc_mult=%d, sample_from_anchor=%s\n", __func__, block_size, block_size_source, mask_token_id, target_layer_ids_n, hc_mult, sample_from_anchor ? "true" : "false");
+        LOG_WRN("%s: - block_size=%d (source=%s), mask_token_id=%d, n_extract=%u, hc_mult=%d, sample_from_anchor=%s, causal_attn=%s\n", __func__, block_size, block_size_source, mask_token_id, target_layer_ids_n, hc_mult, sample_from_anchor ? "true" : "false", causal_attn ? "true" : "false");
+        // MAD-LAB 2026-09-07: causal_attn and the tap list are the two head-metadata
+        // values that silently ran on defaults before the 2026-09-07 probe hoist, and
+        // an acceptance regression from either is invisible without them in the log.
+        {
+            std::string taps;
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                taps += (k ? "," : "") + std::to_string(target_layer_ids[k]);
+            }
+            LOG_WRN("%s: - target_layers=[%s], n_embd_tgt=%d, n_embd_enc=%d, n_embd_nextn=%d, n_embd_dec=%d\n",
+                    __func__, taps.c_str(), n_embd_tgt, n_embd_enc, n_embd_nextn, n_embd_dec);
+        }
         LOG_WRN("%s: - is_dflash2=%d, selector_top_k=%d, has_markov=%d, has_output_head=%d\n", __func__,
                 (int) is_dflash2, selector_top_k, (int) llama_model_has_dspark_markov(model_dft),
                 (int) llama_model_has_output_head(model_dft));

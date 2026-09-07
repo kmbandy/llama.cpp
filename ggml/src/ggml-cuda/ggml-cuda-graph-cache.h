@@ -278,18 +278,23 @@ inline bool ggml_cuda_graph_tensor_topo_equal(const ggml_tensor & a, const ggml_
 // happens to have) rather than folding them into the generic 2-D/ROPE-shaped
 // cases above, matching how MUL_MAT_ID already reads its own src instead of
 // dst.
-inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
+//
+// 2026-09-07: returns the OFFENDING node instead of a bare bool, so the
+// eager-fallback diagnostic in ggml-cuda.cu can name the op/shape that made a
+// graph permanently uncapturable. ggml_cuda_graph_is_prefill_shaped() below
+// keeps the original bool contract for existing call sites.
+inline const ggml_tensor * ggml_cuda_graph_prefill_shaped_node(const ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
             const int64_t n_act = node->src[1]->ne[1];
             if (n_act > 32 && node->src[1]->ne[0] <= 16384) {
-                return true;
+                return node;
             }
         }
         if (node->op == GGML_OP_MUL_MAT_ID && node->src[1] != nullptr) {
             if (node->src[1]->ne[2] > 32) {
-                return true;
+                return node;
             }
         }
         // GATED_DELTA_NET's dst is a flat [S_v*H, n_tokens*n_seqs + state_rows]
@@ -298,7 +303,7 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
         // true per-call token count from src[2] (v: [S_v, H, n_tokens, n_seqs]).
         if (node->op == GGML_OP_GATED_DELTA_NET && node->src[2] != nullptr) {
             if (node->src[2]->ne[2] > 32) {
-                return true;
+                return node;
             }
         }
         // SSM_SCAN's dst is a flat 1-D [nelements(x) + K*state] buffer
@@ -306,7 +311,7 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
         // from src[1] (x: [head_dim, n_head, n_seq_tokens, n_seqs]).
         if (node->op == GGML_OP_SSM_SCAN && node->src[1] != nullptr) {
             if (node->src[1]->ne[2] > 32) {
-                return true;
+                return node;
             }
         }
         // Token-width rules per op. A blanket "any 2-D node wider than 32"
@@ -322,17 +327,17 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
             case GGML_OP_MUL:
             case GGML_OP_SCALE:
                 if (node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             case GGML_OP_ROPE:
                 if (node->ne[2] > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             case GGML_OP_SSM_CONV:
                 if (node->ne[1] > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             // dst mirrors q: [head_dim, n_heads, sum(q_lens), 1]
@@ -340,14 +345,14 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
             // convention as ROPE above.
             case GGML_OP_PAGED_ATTN_MT:
                 if (node->ne[2] > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             // dst is [n_embd, n_tokens] (ggml_dsv4_hc_pre, ggml.c) -- fits the
             // plain 2-D convention above but the op isn't in that op list.
             case GGML_OP_DSV4_HC_PRE:
                 if (node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             // dst is [hc, hc, n_tokens] / [n_embd, hc, n_tokens]
@@ -356,7 +361,7 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_POST:
                 if (node->ne[2] > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             // dst is [k->ne[2] (n_kv), q->ne[2] (n_tokens), 1, q->ne[3]]
@@ -365,7 +370,7 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
             // ne[1].
             case GGML_OP_LIGHTNING_INDEXER:
                 if (node->ne[1] > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             // dst shape mirrors src[0] exactly (ggml_turbo_wht, ggml.c), and
@@ -376,7 +381,7 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
             case GGML_OP_TURBO_WHT: {
                 const int64_t width = node->ne[2] > 1 ? node->ne[2] : node->ne[1];
                 if (width > 32) {
-                    return true;
+                    return node;
                 }
                 break;
             }
@@ -384,5 +389,9 @@ inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
                 break;
         }
     }
-    return false;
+    return nullptr;
+}
+
+inline bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
+    return ggml_cuda_graph_prefill_shaped_node(cgraph) != nullptr;
 }
