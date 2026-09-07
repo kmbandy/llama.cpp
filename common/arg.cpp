@@ -4609,8 +4609,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "  reject - Leviathan/Chen rejection sampling: accept with probability min(1, p/q), resample the\n"
         "           residual norm(max(0, p - q)) on rejection. Output distribution is exactly the target's.\n"
         "           Also switches the drafter (DFlash2 selector lattice) from argmax to sampling from q.\n"
-        "  auto   - match, at every temperature (default). Rejection sampling also switches the\n"
-        "           drafter to stochastic lattice walks, so it is opt-in rather than implied by temp>0.",
+        "  auto   - reject when the sampling temperature is > 0, match at temperature 0 (default)",
         [](common_params & params, const std::string & value) {
             params.speculative.verify = common_speculative_verify_from_name(value);
         }
