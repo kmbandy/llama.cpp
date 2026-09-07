@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // CUDA / HIP AllReduce for tensor-parallel inference across two GPUs.
@@ -378,6 +379,51 @@ struct ggml_cuda_ar_host_mapping {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Duplex ("dx") transport -- asynchronous, event-driven, no host syncs.
+//
+// Ranks r0 = devices[0], r1 = devices[1].  Per reduce, each rank produces its
+// wire-typed partial in a device-resident send buffer on its compute stream,
+// then:
+//
+//   p2p:  r1's out-stream pushes send1 straight into a receive buffer that
+//         lives in r0's memory (peer access r1 -> r0 enabled at init; the
+//         reverse direction is not required and is not attempted).
+//         r0's out-stream D2H-copies send0 into pinned host staging; r1's
+//         in-stream waits that (cross-device event) and H2D-copies staging
+//         into r1's receive buffer.
+//   host: both ranks D2H into their own staging; each rank's in-stream waits
+//         the peer's D2H event and H2D-copies into its receive buffer.
+//
+// Both directions are issued back-to-back on separate streams so the link
+// runs duplex.  end() makes the compute stream wait for "own send done" and
+// "peer data landed" and runs the same add kernel as the copy-engine path,
+// i.e. identical numerics: both partials rounded through the wire type, F32
+// accumulate, own + peer order.
+//
+// Buffers are double-buffered by slot (DX_SLOTS).  Reuse of a slot is fenced
+// by three events per (rank, slot): sent (out-stream), recvd (in-stream) and
+// freed (compute stream, after the add kernel).  The fences assume the
+// caller ends op N before it begins op N+DX_SLOTS -- asserted at begin().
+// ---------------------------------------------------------------------------
+enum ggml_cuda_ar_transport {
+    GGML_CUDA_AR_TRANSPORT_COPY, // legacy synchronous copy-engine host bounce (+ chunked kernel)
+    GGML_CUDA_AR_TRANSPORT_P2P,  // duplex: r1 pushes into r0 memory, r1 pulls via host staging
+    GGML_CUDA_AR_TRANSPORT_HOST, // duplex: both directions via host staging
+};
+
+static constexpr int GGML_CUDA_AR_DX_SLOTS = 2;
+
+struct ggml_cuda_ar_dx_slot {
+    cudaEvent_t app   = nullptr; // compute stream: send buffer ready
+    cudaEvent_t sent  = nullptr; // out-stream: outbound transfer done (send + staging/peer-recv written)
+    cudaEvent_t recvd = nullptr; // in-stream:  inbound H2D into recv done (pull ranks only)
+    cudaEvent_t freed = nullptr; // compute stream: add kernel done, recv slot reusable
+    bool sent_valid  = false;
+    bool recvd_valid = false;
+    bool freed_valid = false;
+};
+
 struct ggml_cuda_ar_pipeline {
     int      n_devices;
     int      devices[GGML_CUDA_MAX_DEVICES];
@@ -413,7 +459,19 @@ struct ggml_cuda_ar_pipeline {
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
+
+    // Duplex transport state (unused when transport == COPY).
+    ggml_cuda_ar_transport    transport;
+    size_t                    dx_bytes;      // bytes per slot
+    uint64_t                  dx_call;       // begin() counter -> slot = dx_call % DX_SLOTS
+    int                       dx_in_flight;  // begun-but-not-ended ops
+    cudaStream_t              streams_in[GGML_CUDA_MAX_DEVICES];  // inbound H2D (non-blocking)
+    char *                    dx_send[GGML_CUDA_MAX_DEVICES];     // device: DX_SLOTS * dx_bytes, wire-typed partial
+    char *                    dx_recv[GGML_CUDA_MAX_DEVICES];     // device: DX_SLOTS * dx_bytes, peer's partial
+    ggml_cuda_ar_host_mapping dx_staging[GGML_CUDA_MAX_DEVICES];  // pinned host: DX_SLOTS * dx_bytes
+    ggml_cuda_ar_dx_slot      dx_ev[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_DX_SLOTS];
 };
+
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
@@ -661,9 +719,109 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Duplex transport selection.  GGML_CUDA_AR_TRANSPORT = p2p | host | copy.
+    // Default: p2p when device 1 can enable peer access to device 0's memory,
+    // else host.  "copy" is the legacy synchronous copy-engine path, kept
+    // selectable so a baseline can be re-run.
+    {
+        bool peer_ok = false;
+        {
+            int can = 0;
+            ggml_cuda_set_device(p->devices[1]);
+            if (cudaDeviceCanAccessPeer(&can, p->devices[1], p->devices[0]) == cudaSuccess && can) {
+                cudaError_t rc = cudaDeviceEnablePeerAccess(p->devices[0], 0);
+                if (rc == cudaErrorPeerAccessAlreadyEnabled) {
+                    rc = cudaSuccess;
+                }
+                (void) cudaGetLastError();
+                peer_ok = rc == cudaSuccess;
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+
+        const char * env = getenv("GGML_CUDA_AR_TRANSPORT");
+        std::string  env_str = env ? env : "";
+        if (env_str == "copy") {
+            p->transport = GGML_CUDA_AR_TRANSPORT_COPY;
+        } else if (env_str == "host") {
+            p->transport = GGML_CUDA_AR_TRANSPORT_HOST;
+        } else if (env_str == "p2p") {
+            if (!peer_ok) {
+                GGML_LOG_WARN("%s: GGML_CUDA_AR_TRANSPORT=p2p but device %d cannot access device %d memory; using host\n",
+                              __func__, p->devices[1], p->devices[0]);
+            }
+            p->transport = peer_ok ? GGML_CUDA_AR_TRANSPORT_P2P : GGML_CUDA_AR_TRANSPORT_HOST;
+        } else {
+            if (!env_str.empty()) {
+                GGML_LOG_WARN("%s: unknown GGML_CUDA_AR_TRANSPORT value '%s'; using default\n", __func__, env);
+            }
+            p->transport = peer_ok ? GGML_CUDA_AR_TRANSPORT_P2P : GGML_CUDA_AR_TRANSPORT_HOST;
+        }
+
+        // On the duplex transports every size class goes through the async
+        // path unless the operator explicitly asks for the chunked kernel
+        // below a threshold (the spec asks for this to be measured, not
+        // assumed).  The legacy transport keeps today's 1 MiB default.
+        if (p->transport != GGML_CUDA_AR_TRANSPORT_COPY) {
+            const char * thr = getenv("GGML_CUDA_AR_COPY_THRESHOLD");
+            if (thr == nullptr || thr[0] == '\0') {
+                p->copy_threshold = 0;
+            }
+        }
+    }
+
+    p->dx_bytes     = GGML_CUDA_AR_COPY_MAX_BYTES;
+    p->dx_call      = 0;
+    p->dx_in_flight = 0;
+    if (p->transport != GGML_CUDA_AR_TRANSPORT_COPY) {
+        const size_t dx_total = (size_t) GGML_CUDA_AR_DX_SLOTS * p->dx_bytes;
+        for (size_t i = 0; i < n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            if (cudaStreamCreateWithFlags(&p->streams_in[i], cudaStreamNonBlocking) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags (in) failed for device %d\n", __func__, p->devices[i]);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            if (cudaMalloc(reinterpret_cast<void **>(&p->dx_send[i]), dx_total) != cudaSuccess ||
+                cudaMalloc(reinterpret_cast<void **>(&p->dx_recv[i]), dx_total) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaMalloc for duplex send/recv failed (%zu bytes) on device %d\n",
+                               __func__, dx_total, p->devices[i]);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            // SDMA-only staging: default coherence, ordering comes from events.
+            if (p->dx_staging[i].alloc(dx_total) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: alloc for duplex staging failed (%zu bytes)\n", __func__, dx_total);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
+            for (int s = 0; s < GGML_CUDA_AR_DX_SLOTS; ++s) {
+                ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][s];
+                const bool ok =
+                    cudaEventCreateWithFlags(&ev.app,   cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev.sent,  cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev.recvd, cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev.freed, cudaEventDisableTiming) == cudaSuccess;
+                if (!ok) {
+                    GGML_LOG_ERROR("%s: cudaEventCreate (duplex) failed for device %d slot %d\n",
+                                   __func__, p->devices[i], s);
+                    ggml_cuda_ar_pipeline_free(p);
+                    return nullptr;
+                }
+            }
+        }
+    }
+
+    const char * transport_name =
+        p->transport == GGML_CUDA_AR_TRANSPORT_P2P  ? "p2p (r1 pushes into r0, r1 pulls via host staging)" :
+        p->transport == GGML_CUDA_AR_TRANSPORT_HOST ? "host (duplex via host staging)" :
+                                                      "copy (legacy copy-engine bounce)";
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
-                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU, "
+                  "transport=%s, copy_threshold=%zu\n",
+                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20,
+                  transport_name, p->copy_threshold);
 
     return p;
 }
@@ -679,6 +837,25 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             ggml_cuda_set_device(p->devices[i]);
             cudaStreamSynchronize(p->streams[i]);
         }
+        if (p->streams_in[i]) {
+            ggml_cuda_set_device(p->devices[i]);
+            cudaStreamSynchronize(p->streams_in[i]);
+        }
+    }
+
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (p->dx_send[i]) { cudaFree(p->dx_send[i]); }
+        if (p->dx_recv[i]) { cudaFree(p->dx_recv[i]); }
+        p->dx_staging[i].free();
+        for (int s = 0; s < GGML_CUDA_AR_DX_SLOTS; ++s) {
+            ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][s];
+            if (ev.app)   { cudaEventDestroy(ev.app); }
+            if (ev.sent)  { cudaEventDestroy(ev.sent); }
+            if (ev.recvd) { cudaEventDestroy(ev.recvd); }
+            if (ev.freed) { cudaEventDestroy(ev.freed); }
+        }
+        if (p->streams_in[i]) { cudaStreamDestroy(p->streams_in[i]); }
     }
 
     for (int i = 0; i < p->n_devices; ++i) {
@@ -874,10 +1051,16 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
     return ok;
 }
 
-bool ggml_cuda_ar_allreduce(
+// Legacy synchronous entry: chunked spin kernel (small) or copy-engine host
+// bounce (large), selected by use_copy_engine.  Everything is ordered on the
+// caller's compute streams before this returns (host event syncs inside
+// acquire_slot), so it may also serve as the fallback for calls the duplex
+// transport cannot take asynchronously.
+static bool ggml_cuda_ar_allreduce_sync(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
-        ggml_tensor           ** tensors) {
+        ggml_tensor           ** tensors,
+        const bool              use_copy_engine) {
     GGML_ASSERT(p != nullptr);
 
     const int n = p->n_devices;
@@ -909,13 +1092,6 @@ bool ggml_cuda_ar_allreduce(
     for (int i = 0; i < n; ++i) {
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
-
-    // Decide between copy-engine and chunked kernel paths based on the working
-    // type's actual byte count.  No upper bound: copy_outer slices reductions
-    // larger than copy_bytes into copy_bytes-sized pieces.
-    const bool use_copy_engine =
-        p->copy_threshold > 0 &&
-        nbytes >= p->copy_threshold;
 
     // BF16 inactive-shard zeroing: when use_bf16 is on, the combined kernel
     // (chunked kernel path) and the combined add kernel (copy_engine path)
@@ -1086,6 +1262,240 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Duplex transport: begin / end
+// ---------------------------------------------------------------------------
+
+template <typename T_dst, typename T_src>
+static void ggml_cuda_ar_dx_add(T_dst * dst, const T_src * src, int64_t ne, cudaStream_t stream) {
+    const int block_size = 256;
+    int n_blocks = (int) ((ne + block_size - 1) / block_size);
+    if (n_blocks > 1024) {
+        n_blocks = 1024;
+    }
+    ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(dst, src, (int) ne);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_ar_allreduce_begin(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors,
+        ggml_cuda_ar_op       * op) {
+    GGML_ASSERT(p != nullptr);
+    GGML_ASSERT(op != nullptr);
+    op->pending = false;
+
+    const int n = p->n_devices;
+    GGML_ASSERT(n == 2);
+
+    const ggml_type input_type = tensors[0]->type;
+    GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
+
+    const int64_t ne = ggml_nelements(tensors[0]);
+    GGML_ASSERT(ne > 0);
+    GGML_ASSERT(ne <= std::numeric_limits<int>::max());
+
+    const size_t input_nbytes = ggml_nbytes(tensors[0]);
+
+    // Same wire-type rule as the synchronous path (BF16 for F32 inputs by default).
+    const bool use_bf16 =
+        input_type == GGML_TYPE_F32 &&
+        p->bf16_threshold > 0 &&
+        input_nbytes >= p->bf16_threshold;
+    const ggml_type wire_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
+    const size_t    wire_size = ggml_type_size(wire_type);
+    const size_t    nbytes    = (size_t) ne * wire_size;
+
+    const bool chunked = p->copy_threshold > 0 && nbytes < p->copy_threshold;
+
+    if (p->transport == GGML_CUDA_AR_TRANSPORT_COPY) {
+        // Legacy semantics, unchanged: copy engine at/above the threshold, chunked kernel below.
+        return ggml_cuda_ar_allreduce_sync(p, backends, tensors, !chunked);
+    }
+    if (chunked || nbytes > p->dx_bytes) {
+        // Chunked kernel by explicit request, or a payload larger than one
+        // slot: run synchronously (copy engine for the oversize case).
+        return ggml_cuda_ar_allreduce_sync(p, backends, tensors, !chunked);
+    }
+
+    GGML_ASSERT(p->dx_in_flight < GGML_CUDA_AR_DX_SLOTS && "too many in-flight AllReduce ops (end() the oldest first)");
+
+    const int slot = (int) (p->dx_call % GGML_CUDA_AR_DX_SLOTS);
+    p->dx_call++;
+    p->dx_in_flight++;
+
+    const size_t slot_off = (size_t) slot * p->dx_bytes;
+    const bool   p2p      = p->transport == GGML_CUDA_AR_TRANSPORT_P2P;
+
+    ggml_backend_cuda_context * cuda_ctx[2] = {};
+    bool compute_flag[2] = {};
+    for (int i = 0; i < n; ++i) {
+        cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
+        compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    }
+
+    // Phase A (compute streams): materialise the wire-typed partial in
+    // dx_send[i][slot].  Inactive shards contribute zeros, and their F32
+    // accumulator is zeroed too since the add kernel accumulates in place.
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        cudaStream_t cs   = cuda_ctx[i]->stream();
+        char *       send = p->dx_send[i] + slot_off;
+        if (!compute_flag[i]) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, input_nbytes, cs));
+            CUDA_CHECK(cudaMemsetAsync(send, 0, nbytes, cs));
+        } else if (use_bf16) {
+            to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+            to_bf16(tensors[i]->data, reinterpret_cast<nv_bfloat16 *>(send), ne, cs);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(send, tensors[i]->data, nbytes, cudaMemcpyDeviceToDevice, cs));
+        }
+        CUDA_CHECK(cudaEventRecord(p->dx_ev[i][slot].app, cs));
+    }
+
+    // Phase B (out-streams): outbound transfers, both ranks back-to-back.
+    for (int i = 0; i < n; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        cudaStream_t          out  = p->streams[i];
+        ggml_cuda_ar_dx_slot & ev  = p->dx_ev[i][slot];
+        const char *          send = p->dx_send[i] + slot_off;
+
+        CUDA_CHECK(cudaStreamWaitEvent(out, ev.app));
+        if (p2p && i == 1) {
+            // Push straight into r0's receive slot.  r0's add kernel from the
+            // op that last used this slot must be done reading it.
+            if (p->dx_ev[0][slot].freed_valid) {
+                CUDA_CHECK(cudaStreamWaitEvent(out, p->dx_ev[0][slot].freed));
+            }
+            CUDA_CHECK(cudaMemcpyPeerAsync(
+                p->dx_recv[0] + slot_off, p->devices[0], send, p->devices[1], nbytes, out));
+        } else {
+            // D2H into our staging slot.  The peer's in-stream must be done
+            // pulling the previous contents of this staging slot.
+            if (p->dx_ev[peer][slot].recvd_valid) {
+                CUDA_CHECK(cudaStreamWaitEvent(out, p->dx_ev[peer][slot].recvd));
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                p->dx_staging[i].host + slot_off, send, nbytes, cudaMemcpyDeviceToHost, out));
+        }
+        CUDA_CHECK(cudaEventRecord(ev.sent, out));
+        ev.sent_valid = true;
+    }
+
+    // Phase C (in-streams): pulls from the peer's staging for the ranks that
+    // are not pushed into (r1 on p2p; both on host).
+    for (int i = 0; i < n; ++i) {
+        if (p2p && i == 0) {
+            continue;
+        }
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        cudaStream_t          in = p->streams_in[i];
+        ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][slot];
+
+        CUDA_CHECK(cudaStreamWaitEvent(in, p->dx_ev[peer][slot].sent)); // cross-device
+        if (ev.freed_valid) {
+            CUDA_CHECK(cudaStreamWaitEvent(in, ev.freed));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, nbytes, cudaMemcpyHostToDevice, in));
+        CUDA_CHECK(cudaEventRecord(ev.recvd, in));
+        ev.recvd_valid = true;
+    }
+
+    op->pending   = true;
+    op->slot      = slot;
+    op->ne        = ne;
+    op->dst_type  = input_type;
+    op->wire_type = wire_type;
+    for (int i = 0; i < n; ++i) {
+        op->dst[i] = tensors[i]->data;
+    }
+    return true;
+}
+
+bool ggml_cuda_ar_allreduce_end(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_cuda_ar_op       * op) {
+    GGML_ASSERT(p != nullptr);
+    GGML_ASSERT(op != nullptr);
+    if (!op->pending) {
+        return true;
+    }
+    GGML_ASSERT(p->transport != GGML_CUDA_AR_TRANSPORT_COPY);
+    GGML_ASSERT(p->dx_in_flight > 0);
+
+    const int    n        = p->n_devices;
+    const int    slot     = op->slot;
+    const size_t slot_off = (size_t) slot * p->dx_bytes;
+    const bool   p2p      = p->transport == GGML_CUDA_AR_TRANSPORT_P2P;
+
+    for (int i = 0; i < n; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+        cudaStream_t          cs = cuda_ctx->stream();
+        ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][slot];
+
+        // Own outbound done (send slot reusable, and for r0/p2p its staging
+        // read is what the peer's pull ordered on) + peer data landed.
+        CUDA_CHECK(cudaStreamWaitEvent(cs, ev.sent));
+        if (p2p && i == 0) {
+            CUDA_CHECK(cudaStreamWaitEvent(cs, p->dx_ev[peer][slot].sent)); // r1's push
+        } else {
+            CUDA_CHECK(cudaStreamWaitEvent(cs, ev.recvd));
+        }
+
+        const char * recv = p->dx_recv[i] + slot_off;
+        if (op->wire_type != op->dst_type) {
+            GGML_ASSERT(op->dst_type == GGML_TYPE_F32 && op->wire_type == GGML_TYPE_BF16);
+            ggml_cuda_ar_dx_add<float, nv_bfloat16>(
+                static_cast<float *>(op->dst[i]), reinterpret_cast<const nv_bfloat16 *>(recv), op->ne, cs);
+        } else {
+            switch (op->dst_type) {
+                case GGML_TYPE_F32:
+                    ggml_cuda_ar_dx_add<float, float>(
+                        static_cast<float *>(op->dst[i]), reinterpret_cast<const float *>(recv), op->ne, cs);
+                    break;
+                case GGML_TYPE_F16:
+                    ggml_cuda_ar_dx_add<half, half>(
+                        static_cast<half *>(op->dst[i]), reinterpret_cast<const half *>(recv), op->ne, cs);
+                    break;
+                case GGML_TYPE_BF16:
+                    ggml_cuda_ar_dx_add<nv_bfloat16, nv_bfloat16>(
+                        static_cast<nv_bfloat16 *>(op->dst[i]), reinterpret_cast<const nv_bfloat16 *>(recv), op->ne, cs);
+                    break;
+                default:
+                    GGML_ASSERT(false);
+            }
+        }
+
+        CUDA_CHECK(cudaEventRecord(ev.freed, cs));
+        ev.freed_valid = true;
+    }
+
+    p->dx_in_flight--;
+    op->pending = false;
+    return true;
+}
+
+bool ggml_cuda_ar_allreduce(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    ggml_cuda_ar_op op;
+    if (!ggml_cuda_ar_allreduce_begin(p, backends, tensors, &op)) {
+        return false;
+    }
+    return ggml_cuda_ar_allreduce_end(p, backends, &op);
+}
+
 #else // defined(GGML_USE_MUSA)
 
 // MUSA has not been audited for the host-mapped pinned-memory APIs
@@ -1101,6 +1511,12 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+bool ggml_cuda_ar_allreduce_begin(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, ggml_cuda_ar_op *) {
+    return false;
+}
+bool ggml_cuda_ar_allreduce_end(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_cuda_ar_op *) {
     return false;
 }
 
