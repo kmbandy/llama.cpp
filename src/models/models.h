@@ -10,6 +10,18 @@
 
 class llama_memory_hybrid_idx_context;
 
+// ref: https://github.com/ggml-org/llama.cpp/pull/28068
+//
+// NOT the same as ggml_l2_norm(x, eps), which scales by 1/max(sqrt(sum), eps) and so
+// blows up to 1/eps (1e6 at the usual f_norm_rms_eps) for a near-zero row instead of
+// saturating at 1/sqrt(eps). Gated-delta-net q/k rows feed the taps that DFlash-family
+// drafters condition on, so keep them bit-identical to upstream.
+static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
+    const float n = x->ne[0];
+
+    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+}
+
 //
 // base classes
 //

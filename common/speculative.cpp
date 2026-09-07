@@ -1083,9 +1083,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
-    // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
-    std::vector<float> features_buf;
-
     // MAD-LAB / WP_DSPARK_DEBUG: instrumentation state only, never read by the decode path.
     // dbg_n_draft counts draft() calls so the expensive per-slot dump can be capped at the
     // first few. dbg_blk_* remember the previous block's position span per seq so process()
@@ -1337,9 +1334,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,            n_seq);
-        // n_embd_nextn, not n_embd_dec: the injected rows are n_embd_out wide.
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_nextn, n_seq);
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+        // MAD-LAB 2026-09-07: back to upstream's width. With the fused encoder
+        // restored (src/models/dflash.cpp, graph<false>) the injection batch again
+        // carries the RAW concatenated target features, which are n_embd_enc wide --
+        // n_extract * n_embd_tgt -- not the n_embd_out-wide encoder output the split
+        // path used to hand it. process() chunks by n_ubatch, so n_ubatch rows is
+        // exactly what the buffer has to hold.
+        batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
@@ -1578,11 +1580,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer.
-                // (2026-09-04 merge fix: upstream #27310 fuses the encoder into the draft
-                // decode and dropped this resize; this fork still runs the encoder as a
-                // separate llama_encode over features_buf, so the buffer must be sized here.)
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                // MAD-LAB 2026-09-07: upstream's fused path (ggml-org #27310). Gather this
+                // chunk's target features straight into the injection batch, interleaved by
+                // extract layer; llama_decode() below runs model.fc + output_norm_enc INSIDE
+                // the draft graph and writes the result to the K/V cache at the target
+                // positions. The previous fork code ran a separate llama_encode() over a
+                // features_buf staging vector and round-tripped the encoder output through
+                // llama_get_embeddings_nextn() -- see the note in src/models/dflash.cpp.
                 batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
@@ -1592,50 +1596,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         // MAD-LAB: DSpark taps are collapsed per layer, like EAGLE3.
                         const int32_t n_embd_layer = n_embd_tgt;
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_layer;
+                        float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_layer;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_layer;
                         std::memcpy(dst, src, (size_t) n_embd_layer * sizeof(float));
-                    }
-                }
-
-                // fuse extracted features through DFlash encoder
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_nextn * sizeof(float));
-                {
-                    // WP_CAPTURE_DFLASH (read-only, gated): DFlash predictive hidden inp_g[i]
-                    // (predicts pos+1) + target position. In the DFlash class process(). Off by default.
-                    static const int s_cap_df = [](){ const char* e=std::getenv("WP_CAPTURE_DFLASH"); return (e&&e[0]=='1')?1:0; }();
-                    if (s_cap_df) {
-                        static FILE* s_df_fp = std::fopen("/home/kmbandy/wp_logs/accounting/dflash_capture.bin","wb");
-                        if (s_df_fp) {
-                            for (int32_t i = 0; i < n_chunk; ++i) {
-                                int32_t hdr[2] = { (int32_t) batch_in.pos[i_batch_beg[seq_id] + offset + i], (int32_t) n_embd_nextn };
-                                std::fwrite(hdr, sizeof(hdr), 1, s_df_fp);
-                                std::fwrite(inp_g + (size_t) i * n_embd_nextn, sizeof(float), (size_t) n_embd_nextn, s_df_fp);
-                            }
-                            std::fflush(s_df_fp);
-                        }
                     }
                 }
 
@@ -1651,10 +1614,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
-                const int32_t rc_dec = llama_decode(ctx_dft, batch_inject);
-                if (rc_dec != 0) {
+                const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc_dec, (int) n_chunk, (int) offset);
+                            __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
             }
@@ -3462,9 +3425,22 @@ common_speculative_verify common_speculative_verify_resolve(common_speculative_v
     if (v != COMMON_SPECULATIVE_VERIFY_AUTO) {
         return v;
     }
-    // greedy: the match rule is already optimal there, and a greedy chain does
-    // not produce the normalized distribution the p/q ratio needs.
-    return temp > 0.0f ? COMMON_SPECULATIVE_VERIFY_REJECT : COMMON_SPECULATIVE_VERIFY_MATCH;
+    // MAD-LAB 2026-09-07: AUTO resolves to MATCH at every temperature.
+    //
+    // This used to resolve to REJECT whenever temp > 0, which silently made
+    // Leviathan/Chen the default AND switched the DFlash2 drafter from argmax to
+    // sampling from the selector lattice (see verify_reject in
+    // common_speculative_impl_draft_dflash). That is not the configuration any
+    // published acceptance number for these heads was measured in: z-lab's
+    // Qwen3.8-27B-DFlash2 card reports 5.13 accepted tokens against UPSTREAM
+    // llama.cpp, i.e. argmax drafting plus match-based verification, at
+    // temperature 1.0. Defaulting to a different rule changed the measurement
+    // rather than the model, and hid whatever the real draft-path divergence was.
+    //
+    // Rejection sampling is still available and still correct -- it is now
+    // strictly opt-in via `--spec-verify reject`.
+    GGML_UNUSED(temp);
+    return COMMON_SPECULATIVE_VERIFY_MATCH;
 }
 
 std::vector<common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {

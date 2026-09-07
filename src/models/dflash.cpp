@@ -960,18 +960,38 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // out-of-graph Markov head). Without this guard that batch would be misrouted into
     // the injection path and the draft body would never run.
     if (ubatch.embd && !ubatch.token) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        // MAD-LAB 2026-09-07: back to upstream's FUSED encoder (ggml-org #27310).
+        //
+        // This fork used to run the DFlash encoder as a separate llama_encode() in
+        // common/speculative.cpp and inject its OUTPUT, so the injection batch carried
+        // an already-fused inp_g of width n_embd instead of the raw target features of
+        // width n_embd_inp_enc(). That split is not a fork feature -- nothing about
+        // paged/tiered KV or DSpark requires it -- and it moved the encoder's output
+        // out of the graph and through the host `embd_nextn` channel, whose row width
+        // and row ORDER are re-derived per graph (llama_context::decode /
+        // get_embeddings_nextn_ith). Every extra hop there is a chance for the drafter
+        // to be conditioned on a correctly-computed-but-wrongly-addressed feature row,
+        // which is exactly the failure shape that shows up as a uniformly weak draft
+        // rather than a draft that is wrong at one depth. It also doubled the number of
+        // draft-context decodes per prefill chunk.
+        //
+        // The `!ubatch.token` guard is kept: it is a genuine fork requirement, because a
+        // DSpark services-mode DRAFT batch carries both embd (precomputed token
+        // embeddings) and token ids, and must not be routed here.
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
         ggml_set_input(inp->embd);
 
-        // MAD-LAB: this fork runs the DFlash encoder as a separate llama_encode
-        // (common/speculative.cpp) and injects its OUTPUT, so the batch already
-        // carries inp_g -- upstream fuses model.fc/output_norm_enc here instead.
-        ggml_tensor * inp_g = inp->embd;
-        cb(inp_g, "inp_g_embeddings", -1);
+        ggml_tensor * inp_target = inp->embd;
+        cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));
+
+        // fuse the target features through the encoder
+        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+        cb(inp_g, "inp_g_embeddings", -1);
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
