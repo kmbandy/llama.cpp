@@ -1046,6 +1046,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t hc_mult    = 1;  // target residual streams per tapped layer
     int32_t n_embd_nextn = 0; // row width of the nextn embeddings buffer = n_embd_out
 
+    // MAD-LAB 2026-09-07 / upstream ggml-org#27310 -- THE INJECTION CONTRACT, made explicit.
+    //
+    // This one impl class drives two structurally different draft graphs, and they do NOT
+    // share an injection width. Which one is in play is decided once, here, from the draft
+    // model's metadata -- never inferred per call site:
+    //
+    //   fused_enc == true   sidecar DFlash / DFlash2 heads (dsv4_hc_mult == 0).
+    //                       src/models/dflash.cpp graph<false>. Upstream's FUSED contract:
+    //                       batch_inject carries RAW target features, n_embd_enc wide,
+    //                       and model.fc + output_norm_enc run inside the injection graph.
+    //                       One llama_decode per chunk, no llama_encode, no host round trip.
+    //
+    //   fused_enc == false  DS4 in-model DSpark head (dsv4_hc_mult > 0).
+    //                       src/models/dflash.cpp graph_dsv4. This fork's SPLIT contract,
+    //                       unchanged: a separate llama_encode() produces the encoded row,
+    //                       it is read back through llama_get_embeddings_nextn() and
+    //                       injected already-encoded, n_embd_nextn (= n_embd_out) wide.
+    //
+    // n_embd_inject is the single width every batch_inject user must go through. The two
+    // widths are generally different (25600 vs 5120 on the head of record), which is
+    // exactly why the 2026-09-07 attempt 7d30712e7 was wrong: it moved the SHARED width to
+    // the fused one while leaving graph_dsv4 on the split contract.
+    bool    fused_enc     = false;
+    int32_t n_embd_inject = 0;
+
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
@@ -1161,6 +1186,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // MAD-LAB: DSpark target taps are collapsed to n_embd_tgt at extraction.
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
+        // MAD-LAB 2026-09-07 / #27310: pick the injection contract (see the member decls).
+        fused_enc     = llama_model_dsv4_hc_mult(model_dft) == 0;
+        n_embd_inject = fused_enc ? n_embd_enc : n_embd_nextn;
+
+        if (fused_enc) {
+            // The fused graph declares its input at hparams.n_embd_inp_enc() =
+            // n_extract * dflash_hc_mult * n_embd(draft). The gather above produces
+            // n_extract * n_embd(target) COLLAPSED columns. These agree exactly when
+            // dflash_hc_mult == 1 and the two models share a hidden size -- true for
+            // every DFlash-family head on this box -- and disagree otherwise, in which
+            // case the fused graph would be handed a row of the wrong stride and the
+            // drafter would be conditioned on garbage with no visible error.
+            //
+            // hc_mult > 1 is therefore REFUSED, loudly, at init. The caller
+            // (common_speculative_init_from_params / server-context.cpp) catches
+            // std::runtime_error here and disables speculative decoding rather than
+            // serving a silently mis-shaped drafter. Landing hc_mult > 1 means deciding
+            // whether the gather must emit hc_mult streams per tap or the model must
+            // size the encoder input collapsed -- that needs the head loaded to answer.
+            const int32_t n_embd_inp_enc = (int32_t) llama_model_n_embd_inp_enc(model_dft);
+            if (n_embd_inject != n_embd_inp_enc) {
+                throw std::runtime_error(string_format(
+                    "%s: DFlash fused-encoder width mismatch: the host gathers %d "
+                    "(n_extract=%u x n_embd_tgt=%d, collapsed taps) but the draft graph's "
+                    "encoder input is %d (n_extract x dflash.hc_mult=%d x n_embd_dft=%d). "
+                    "Only hc_mult == 1 with matching hidden sizes is supported on the "
+                    "fused path; refusing to inject a mis-strided feature row.",
+                    __func__, n_embd_inject, target_layer_ids_n, n_embd_tgt,
+                    n_embd_inp_enc, hc_mult, n_embd_dec));
+            }
+        }
+
         const char * block_size_source = "default";
         block_size = 16;
         if (const uint32_t model_block_size = llama_model_dflash_block_size(model_dft); model_block_size > 0) {
@@ -1237,6 +1294,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             LOG_WRN("%s: - target_layers=[%s], n_embd_tgt=%d, n_embd_enc=%d, n_embd_nextn=%d, n_embd_dec=%d\n",
                     __func__, taps.c_str(), n_embd_tgt, n_embd_enc, n_embd_nextn, n_embd_dec);
+            // MAD-LAB / #27310: the injection contract, printed so a width mismatch is
+            // visible in the log even when the init-time refusal does not fire.
+            LOG_WRN("%s: - fused_enc=%d (1 = upstream #27310 fused fc+output_norm_enc in graph<false>; 0 = split encoder + graph_dsv4), n_embd_inject=%d, n_embd_inp_enc=%u, dflash_hc_mult=%d, dsv4_hc_mult=%u\n",
+                    __func__, (int) fused_enc, n_embd_inject,
+                    llama_model_n_embd_inp_enc(model_dft), hc_mult,
+                    llama_model_dsv4_hc_mult(model_dft));
         }
         LOG_WRN("%s: - is_dflash2=%d, selector_top_k=%d, has_markov=%d, has_output_head=%d\n", __func__,
                 (int) is_dflash2, selector_top_k, (int) llama_model_has_dspark_markov(model_dft),
@@ -1308,9 +1371,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,            n_seq);
-        // n_embd_nextn, not n_embd_dec: the injected rows are n_embd_out wide.
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_nextn, n_seq);
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,             n_seq);
+        // MAD-LAB / #27310: n_embd_inject, per the contract picked above -- n_embd_enc on
+        // the fused sidecar path, n_embd_nextn (= n_embd_out, NOT n_embd_dec) on the DS4
+        // split path. process() chunks strictly by n_ubatch, so on the fused path n_ubatch
+        // rows is exactly what has to fit and n_batch rows would waste
+        // (n_batch-n_ubatch)*n_embd_enc*4 bytes; the split path keeps its n_batch
+        // allocation byte-for-byte as it was.
+        batch_inject = llama_batch_init(fused_enc ? llama_n_ubatch(ctx_dft)
+                                                  : llama_n_batch(ctx_dft), n_embd_inject, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
@@ -1543,12 +1612,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer.
-                // (2026-09-04 merge fix: upstream #27310 fuses the encoder into the draft
-                // decode and dropped this resize; this fork still runs the encoder as a
-                // separate llama_encode over features_buf, so the buffer must be sized here.)
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                // MAD-LAB 2026-09-07 / upstream ggml-org#27310: gather this chunk's target
+                // features, interleaved by extract layer. On the FUSED path they go
+                // straight into batch_inject.embd and llama_decode() below runs
+                // model.fc + output_norm_enc inside the draft graph -- one graph, no
+                // llama_encode, no host round trip through the embd_nextn channel whose
+                // row width and row ORDER are re-derived per graph. On the DS4 SPLIT path
+                // (graph_dsv4) they are staged in features_buf and encoded separately,
+                // exactly as before.
                 batch_inject.n_tokens = n_chunk;
+
+                float * features = batch_inject.embd;
+                if (!fused_enc) {
+                    features_buf.resize((size_t) n_chunk * n_embd_enc);
+                    features = features_buf.data();
+                }
+
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
@@ -1557,49 +1636,50 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         // MAD-LAB: DSpark taps are collapsed per layer, like EAGLE3.
                         const int32_t n_embd_layer = n_embd_tgt;
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_layer;
+                        float       * dst = features + (size_t) i * n_embd_enc + k * (size_t) n_embd_layer;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_layer;
                         std::memcpy(dst, src, (size_t) n_embd_layer * sizeof(float));
                     }
                 }
 
-                // fuse extracted features through DFlash encoder
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
+                if (!fused_enc) {
+                    // fuse extracted features through DFlash encoder
+                    llama_batch enc_batch = {
+                        /*.n_tokens =*/ n_chunk,
+                        /*.token    =*/ nullptr,
+                        /*.embd     =*/ features_buf.data(),
+                        /*.pos      =*/ nullptr,
+                        /*.n_seq_id =*/ nullptr,
+                        /*.seq_id   =*/ nullptr,
+                        /*.logits   =*/ nullptr,
+                    };
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
+                    const int32_t rc_enc = llama_encode(ctx_dft, enc_batch);
+                    if (rc_enc != 0) {
+                        LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc_enc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
 
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+                    const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                    GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_nextn * sizeof(float));
-                {
-                    // WP_CAPTURE_DFLASH (read-only, gated): DFlash predictive hidden inp_g[i]
-                    // (predicts pos+1) + target position. In the DFlash class process(). Off by default.
-                    static const int s_cap_df = [](){ const char* e=std::getenv("WP_CAPTURE_DFLASH"); return (e&&e[0]=='1')?1:0; }();
-                    if (s_cap_df) {
-                        static FILE* s_df_fp = std::fopen("/home/kmbandy/wp_logs/accounting/dflash_capture.bin","wb");
-                        if (s_df_fp) {
-                            for (int32_t i = 0; i < n_chunk; ++i) {
-                                int32_t hdr[2] = { (int32_t) batch_in.pos[i_batch_beg[seq_id] + offset + i], (int32_t) n_embd_nextn };
-                                std::fwrite(hdr, sizeof(hdr), 1, s_df_fp);
-                                std::fwrite(inp_g + (size_t) i * n_embd_nextn, sizeof(float), (size_t) n_embd_nextn, s_df_fp);
+                    // inject the DFlash decoder K/V cache at the tokens' target positions
+                    std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_nextn * sizeof(float));
+                    {
+                        // WP_CAPTURE_DFLASH (read-only, gated): DFlash predictive hidden inp_g[i]
+                        // (predicts pos+1) + target position. In the DFlash class process(). Off by default.
+                        static const int s_cap_df = [](){ const char* e=std::getenv("WP_CAPTURE_DFLASH"); return (e&&e[0]=='1')?1:0; }();
+                        if (s_cap_df) {
+                            static FILE* s_df_fp = std::fopen("/home/kmbandy/wp_logs/accounting/dflash_capture.bin","wb");
+                            if (s_df_fp) {
+                                for (int32_t i = 0; i < n_chunk; ++i) {
+                                    int32_t hdr[2] = { (int32_t) batch_in.pos[i_batch_beg[seq_id] + offset + i], (int32_t) n_embd_nextn };
+                                    std::fwrite(hdr, sizeof(hdr), 1, s_df_fp);
+                                    std::fwrite(inp_g + (size_t) i * n_embd_nextn, sizeof(float), (size_t) n_embd_nextn, s_df_fp);
+                                }
+                                std::fflush(s_df_fp);
                             }
-                            std::fflush(s_df_fp);
                         }
                     }
                 }

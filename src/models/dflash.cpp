@@ -304,6 +304,48 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
     };
 }
 
+// MAD-LAB / upstream ggml-org#27310: the DFlash ENCODER BODY, factored out.
+//
+// `cur` is [n_embd_inp_enc, n_tokens] -- the raw target features, n_extract slices of
+// n_embd concatenated along ne[0]. Returns the fused hidden [n_embd, n_tokens].
+//
+// Shared by the standalone encoder graph (graph<true>, still used by the DSpark impl's
+// llama_encode() and by graph_dsv4's separate-encoder contract) and by the FUSED
+// KV-injection branch of graph<false> (#27310). Sharing it is the point: the fused and
+// the separate formulation are then the same op sequence by construction and cannot
+// drift. Note the aux_norm_enc block is fork-only (Laguna heads); upstream's fused path
+// is exactly the tail two ops, which is what this reduces to when aux_norm_enc is null.
+static ggml_tensor * build_dflash_encode(llm_graph_context & g, const llama_model & model, ggml_tensor * cur) {
+    const auto  & hparams  = g.hparams;
+    ggml_context * ctx0    = g.ctx0;
+    const int64_t  n_tokens = g.n_tokens;
+
+    // Per-aux-layer norm, applied to each target-layer slice before fusion.
+    // cur is [n_embd*n_aux, n_tokens] with each slice contiguous along ne[0], so
+    // viewing it as [n_embd, n_aux, n_tokens] makes ggml_rms_norm (which reduces
+    // over ne[0]) normalise every slice independently -- one op for all of them.
+    // The weight is [n_embd, n_aux] and broadcasts over the token axis.
+    if (model.aux_norm_enc) {
+        const int64_t n_aux = model.aux_norm_enc->ne[1];
+
+        GGML_ASSERT(cur->ne[0] == model.aux_norm_enc->ne[0] * n_aux);
+
+        cur = ggml_reshape_3d(ctx0, cur, model.aux_norm_enc->ne[0], n_aux, n_tokens);
+        cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
+        cur = ggml_mul(ctx0, cur, model.aux_norm_enc);
+        cur = ggml_reshape_2d(ctx0, cur, hparams.n_embd_inp_enc(), n_tokens);
+        g.cb(cur, "aux_norm_out", -1);
+    }
+
+    cur = g.build_lora_mm(model.fc, cur, model.fc_s);
+    g.cb(cur, "fc_out", -1);
+
+    cur = g.build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+    g.cb(cur, "enc_norm_out", -1);
+
+    return cur;
+}
+
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
@@ -325,28 +367,7 @@ template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
 
-    // Per-aux-layer norm, applied to each target-layer slice before fusion.
-    // cur is [n_embd*n_aux, n_tokens] with each slice contiguous along ne[0], so
-    // viewing it as [n_embd, n_aux, n_tokens] makes ggml_rms_norm (which reduces
-    // over ne[0]) normalise every slice independently -- one op for all of them.
-    // The weight is [n_embd, n_aux] and broadcasts over the token axis.
-    if (model.aux_norm_enc) {
-        const int64_t n_aux = model.aux_norm_enc->ne[1];
-
-        GGML_ASSERT(cur->ne[0] == model.aux_norm_enc->ne[0] * n_aux);
-
-        cur = ggml_reshape_3d(ctx0, cur, model.aux_norm_enc->ne[0], n_aux, n_tokens);
-        cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
-        cur = ggml_mul(ctx0, cur, model.aux_norm_enc);
-        cur = ggml_reshape_2d(ctx0, cur, hparams.n_embd_inp_enc(), n_tokens);
-        cb(cur, "aux_norm_out", -1);
-    }
-
-    cur = build_lora_mm(model.fc, cur, model.fc_s);
-    cb(cur, "fc_out", -1);
-
-    cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-    cb(cur, "enc_norm_out", -1);
+    cur = build_dflash_encode(*this, model, cur);
 
     ggml_set_output(cur);
     res->t_h_nextn = cur;
@@ -960,18 +981,39 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // out-of-graph Markov head). Without this guard that batch would be misrouted into
     // the injection path and the draft body would never run.
     if (ubatch.embd && !ubatch.token) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        // MAD-LAB 2026-09-07 / upstream ggml-org#27310: FUSED encoder.
+        //
+        // The injection batch carries the RAW concatenated target features, n_embd_inp
+        // = hparams.n_embd_inp_enc() = n_extract * dflash_hc_mult * n_embd wide, and the
+        // encoder (fc + output_norm_enc, plus this fork's optional aux_norm_enc) runs
+        // HERE, inside the injection graph. This is upstream's contract; the matching
+        // host-side width lives in common/speculative.cpp (n_embd_inject, asserted at
+        // init against llama_model_n_embd_inp_enc()) and the matching batch-side width
+        // in llama_context::decode (the dflash_enc_embd branch).
+        //
+        // It replaces this fork's previous SPLIT contract, which ran the encoder as a
+        // separate llama_encode() in common/speculative.cpp and injected its OUTPUT --
+        // an n_embd-wide already-encoded row round-tripped through the host embd_nextn
+        // channel, whose row width and row ORDER are re-derived per graph. That is the
+        // split graph_dsv4 still uses, deliberately and separately (see graph_dsv4).
+        //
+        // The `!ubatch.token` guard is kept and is load-bearing here: a DSpark
+        // services-mode DRAFT batch carries BOTH embd (precomputed token embeddings,
+        // n_embd_inp() wide) and token ids, and must not be routed into this branch --
+        // if it were, it would be read at the far wider encoder-input stride.
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
         ggml_set_input(inp->embd);
 
-        // MAD-LAB: this fork runs the DFlash encoder as a separate llama_encode
-        // (common/speculative.cpp) and injects its OUTPUT, so the batch already
-        // carries inp_g -- upstream fuses model.fc/output_norm_enc here instead.
-        ggml_tensor * inp_g = inp->embd;
-        cb(inp_g, "inp_g_embeddings", -1);
+        ggml_tensor * inp_target = inp->embd;
+        cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));
+
+        // fuse the target features through the encoder
+        ggml_tensor * inp_g = build_dflash_encode(*this, model, inp_target);
+        cb(inp_g, "inp_g_embeddings", -1);
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -1317,6 +1359,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
                                            int stage_base, int n_stages) :
     llama_model_deepseek4::graph(params) {
     const int64_t n_embd_inp       = hparams.n_embd_inp_enc();
+    GGML_UNUSED(n_embd_inp); // MAD-LAB: graph_dsv4 keeps the split-encoder contract, see below
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
@@ -1333,8 +1376,19 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp->embd);
 
-        // MAD-LAB: the encoder runs as a separate llama_encode in this fork, so the
-        // batch already carries inp_g (upstream fuses model.fc/output_norm_enc here).
+        // MAD-LAB: SPLIT-encoder contract, deliberately NOT upstream's fused one.
+        //
+        // This is the DS4 in-model DSpark path (arch DFLASH with dsv4_hc_mult > 0,
+        // selected in build_arch_graph). Upstream #27310 fused fc + output_norm_enc into
+        // BOTH dflash graphs; this fork fused it into graph<false> only. graph_dsv4 keeps
+        // its own contract: the injection batch carries an ALREADY-ENCODED row, n_embd
+        // wide, produced by a separate llama_encode() on the host side, and its taps are
+        // collapsed to n_embd_tgt per layer rather than hc_mult-wide. The two contracts
+        // are kept apart by width, not by luck -- common/speculative.cpp sizes
+        // batch_inject per impl (n_embd_inject) and llama_context::decode's
+        // dflash_enc_embd branch is gated on dsv4_hc_mult == 0, so a DS4 injection batch
+        // is never read at the encoder-input stride. Changing either side means changing
+        // all three. n_embd_inp is intentionally unused in this branch.
         ggml_tensor * inp_g = inp->embd;
         cb(inp_g, "inp_g_embeddings", -1);
 

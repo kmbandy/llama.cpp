@@ -225,6 +225,16 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // returns the DFlash hyper-connection stream multiplier
 LLAMA_API uint32_t        llama_model_dflash_hc_mult    (const struct llama_model * model);
 LLAMA_API uint32_t        llama_model_dflash_block_size (const struct llama_model * model);
+// MAD-LAB / #27310: the width of the DFlash ENCODER INPUT row, i.e. hparams.n_embd_inp_enc()
+// = n_extract * dflash_hc_mult * n_embd. With the fused encoder (upstream ggml-org #27310)
+// the KV-injection batch carries RAW target features at this width, so the drafter side
+// (common/speculative.cpp) must be able to check its own gather width against it at init.
+LLAMA_API uint32_t        llama_model_n_embd_inp_enc    (const struct llama_model * model);
+// MAD-LAB: hyper-connection stream count of an in-model DeepSeek-V4 DSpark head (0 for
+// every sidecar DFlash/DFlash2 head). Nonzero selects llama_model_dflash::graph_dsv4,
+// which keeps this fork's SEPARATE-encoder injection contract; zero selects graph<false>,
+// which is upstream's FUSED-encoder contract. See the contract note in speculative.cpp.
+LLAMA_API uint32_t        llama_model_dsv4_hc_mult      (const struct llama_model * model);
 // true if this model carries its own DSpark Markov/confidence head weights (in-graph
 // path, model.dspark_markov_w1 != nullptr) -- used by the draft context constructor
 // (common/speculative.cpp) to decide whether the multi-sequence-safe n_ubatch >=

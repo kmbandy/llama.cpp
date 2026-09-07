@@ -4547,6 +4547,14 @@ uint32_t llama_model_dflash_block_size(const struct llama_model * model) {
     return model->dflash_block_size;
 }
 
+uint32_t llama_model_n_embd_inp_enc(const struct llama_model * model) {
+    return model->hparams.n_embd_inp_enc();
+}
+
+uint32_t llama_model_dsv4_hc_mult(const struct llama_model * model) {
+    return model->hparams.dsv4_hc_mult;
+}
+
 bool llama_model_has_dspark_markov(const struct llama_model * model) {
     return model->dspark_markov_w1 != nullptr;
 }

@@ -3324,11 +3324,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool    mtp_embd = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
                               (s_dspark_mtp_embd && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK)
                              ) && batch_inp.embd;
-    // note: upstream widens DFlash embd batches to n_embd_inp_enc because its DFlash graph
-    // fuses the raw target features through the encoder inline. This fork runs that encoder
-    // as a separate llama_encode (common/speculative.cpp) and injects the encoder OUTPUT,
-    // so the injected rows stay n_embd_inp() / n_embd_out() wide here.
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    // MAD-LAB 2026-09-07 / upstream ggml-org#27310: DFlash embd batches carry the raw
+    // target features at the ENCODER INPUT width, because the encoder is fused into the
+    // injection graph (src/models/dflash.cpp, graph<false>).
+    //
+    // Upstream's condition is just `arch == DFLASH && batch_inp.embd`. That is too wide
+    // for this fork, which has two more kinds of DFlash embd batch, and both must keep
+    // their existing width:
+    //   * a DSpark services-mode DRAFT batch carries embd (precomputed token embeddings,
+    //     n_embd_inp() wide) AND token ids -- hence `!batch_inp.token`, the same guard
+    //     graph<false> uses to pick its injection branch;
+    //   * the DS4 in-model DSpark head (arch DFLASH, dsv4_hc_mult > 0) runs graph_dsv4,
+    //     which deliberately keeps the SPLIT-encoder contract and is handed an
+    //     already-encoded n_embd_out()-wide row -- hence `dsv4_hc_mult == 0`.
+    // The three gates (here, graph<false>'s branch, and speculative.cpp's n_embd_inject)
+    // are the same predicate written three times; keep them in step.
+    //
+    // This is checked BEFORE mtp_embd: an in-model DSpark ctx is LLAMA_CONTEXT_TYPE_DSPARK
+    // and would otherwise be captured by mtp_embd first, but dsv4_hc_mult > 0 excludes it
+    // here anyway, so the two are disjoint by construction.
+    const bool dflash_enc_embd = model.arch == LLM_ARCH_DFLASH &&
+                                 batch_inp.embd && !batch_inp.token &&
+                                 hparams.dsv4_hc_mult == 0;
+    const int64_t n_embd  = dflash_enc_embd ? hparams.n_embd_inp_enc()
+                          : mtp_embd        ? hparams.n_embd_out()
+                                            : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
