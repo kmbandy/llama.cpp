@@ -442,25 +442,39 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
         // pressure and lookup table contention at higher thread counts.
-        if (ncols_dst == 1) {
-            switch (type) {
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                case GGML_TYPE_Q5_0:
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                case GGML_TYPE_Q2_K:
-                case GGML_TYPE_Q4_K:
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                case GGML_TYPE_IQ4_NL:
-                case GGML_TYPE_IQ4_XS:
+        //
+        // ncols_dst >= 2 (speculative-verify / parallel-decode batches) used to fall
+        // through to nwarps=1.  On RDNA the CU caps *workgroups*, not just waves: a
+        // 1-wave workgroup can only reach ~16 waves/CU where the 64-wave ceiling needs
+        // >= 4 waves per workgroup.  Since calc_rows_per_block() is 1 on every AMD
+        // table, the block count does not grow with ncols_dst either, so the whole
+        // grid shrank 8x going from ncols_dst=1 (8 waves/block) to ncols_dst=8 (1),
+        // and mmvq fell from ~95% of peak weight bandwidth to ~42% (R9700, Q6_K).
+        // 4 warps is the smallest block that saturates the CU; going wider only adds
+        // LDS reduction work and K-loop tail idling.  nwarps costs no extra registers
+        // (the tmp[ncols_dst][rows_per_cuda_block] accumulators are per thread and
+        // independent of it) and no extra template instantiations (ncols_dst 1..8 are
+        // already instantiated per type), so this is free apart from the LDS
+        // reduction: (nwarps-1)*ncols_dst*rows*warp_size*4 = 3 KiB at ncols_dst=8.
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                if (ncols_dst == 1) {
                     return 8;
-                default:
-                    return 1;
-            }
+                }
+                return ncols_dst <= MMVQ_MAX_BATCH_SIZE ? 4 : 1;
+            default:
+                return 1;
         }
-        return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
         // RDNA3 (W7900): stricter whitelist than RDNA4.
@@ -509,7 +523,25 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 1;
             }
         }
-        return 1;
+        // Same workgroup-granularity argument as RDNA4 above, but RDNA2 has the
+        // smaller register file and the ncols_dst==1 table already backs off to 2
+        // warps for the K-quants, so stay at 2 here rather than 4 (untested part).
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                return ncols_dst <= MMVQ_MAX_BATCH_SIZE ? 2 : 1;
+            default:
+                return 1;
+        }
     }
     if (table_id == MMVQ_PARAMETERS_TURING) {
         if (ncols_dst == 1) {
