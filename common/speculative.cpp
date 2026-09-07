@@ -23,6 +23,8 @@
 #include <map>
 #include <cinttypes>
 #include <cstdlib>
+#include <random>
+#include <stdexcept>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1053,6 +1055,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
+    // MAD-LAB 2026-09-07: rejection-sampling verification (Leviathan/Chen).
+    // When true, the DFlash2 selector-lattice walk SAMPLES the next candidate
+    // index from softmax(scores) instead of taking the argmax, and reports that
+    // distribution as q so the target-side verifier can accept with
+    // min(1, p/q). Sampling the draft is not optional: with an argmax drafter q
+    // is a point mass and the expected acceptance sum_x min(p,q) collapses back
+    // to the match-based rate.
+    bool verify_reject = false;
+
+    // RNG for the lattice walk. Seeded from the draft sampler's resolved seed so
+    // it is reported and reproducible.
+    std::mt19937 rng_lat;
+
+    // scratch for one position's softmax over the selector top-k
+    std::vector<float> lat_probs;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1191,6 +1209,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+
+        // MAD-LAB 2026-09-07: only DFlash2 has a draft distribution to hand the
+        // verifier (the selector lattice). Every other shape of this impl
+        // (DFlash1 greedy read, DSpark) keeps argmax drafting and match-based
+        // verification -- see the WRN below.
+        verify_reject = params.verify == COMMON_SPECULATIVE_VERIFY_REJECT && is_dflash2;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         // MAD-LAB: a sidecar GGUF ships no LM head, which is the signal that this draft
@@ -1238,6 +1262,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             LOG_WRN("%s: - target_layers=[%s], n_embd_tgt=%d, n_embd_enc=%d, n_embd_nextn=%d, n_embd_dec=%d\n",
                     __func__, taps.c_str(), n_embd_tgt, n_embd_enc, n_embd_nextn, n_embd_dec);
         }
+        LOG_WRN("%s: - verify=%s%s\n", __func__,
+                common_speculative_verify_to_str(params.verify),
+                params.verify == COMMON_SPECULATIVE_VERIFY_REJECT && !is_dflash2
+                    ? " (no draft distribution for this head -- falling back to match-based verification and argmax drafting)"
+                    : (verify_reject ? " (Leviathan/Chen: lattice sampled from q, accept with min(1, p/q))" : ""));
         LOG_WRN("%s: - is_dflash2=%d, selector_top_k=%d, has_markov=%d, has_output_head=%d\n", __func__,
                 (int) is_dflash2, selector_top_k, (int) llama_model_has_dspark_markov(model_dft),
                 (int) llama_model_has_output_head(model_dft));
@@ -1331,6 +1360,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(model_dft, sparams));
+        }
+
+        if (verify_reject) {
+            const uint32_t seed_lat = common_sampler_get_seed(smpls[0].get());
+            rng_lat.seed(seed_lat);
+            LOG_WRN("%s: - lattice sampling seed=%u\n", __func__, seed_lat);
         }
 
         // offload draft sampling to the backend
@@ -2010,28 +2045,84 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                // MAD-LAB 2026-09-07: optional sink for the draft distribution q.
+                // One entry per pushed token; sparse over the selector top-k.
+                auto * result_q = verify_reject ? dp.result_q : nullptr;
+                if (result_q) {
+                    result_q->clear();
+                }
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
-                    predecessor = (int32_t) std::distance(scores,
+                    // the confidence gate stays on the ARGMAX probability, exactly as
+                    // before, whether or not the walk goes on to sample: p_min is a
+                    // "is the selector sure here" test, not a sampling decision.
+                    const int32_t k_max = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
-                    if (params.p_min > 0.0f) {
+
+                    float sum_exp = 0.0f;
+                    if (params.p_min > 0.0f || verify_reject) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
-                        float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
-                        }
-                        if (1.0f / sum < params.p_min) {
-                            break;
+                            sum_exp += std::exp(scores[k] - scores[k_max]);
                         }
                     }
+                    if (params.p_min > 0.0f && 1.0f / sum_exp < params.p_min) {
+                        break;
+                    }
+
+                    predecessor = k_max;
+
+                    if (verify_reject) {
+                        // q = softmax over the selector top-k. Tokens outside it get
+                        // q = 0, which is a valid q for the Leviathan construction as
+                        // long as the drafted token is sampled from this same q.
+                        lat_probs.resize(selector_top_k);
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            lat_probs[k] = std::exp(scores[k] - scores[k_max]) / sum_exp;
+                        }
+
+                        float acc = 0.0f;
+                        const float r = std::uniform_real_distribution<float>(0.0f, 1.0f)(rng_lat);
+                        predecessor = selector_top_k - 1;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            acc += lat_probs[k];
+                            if (acc >= r) {
+                                predecessor = k;
+                                break;
+                            }
+                        }
+
+                        if (result_q) {
+                            // merge duplicate ids: the lattice may list the same token
+                            // twice, and q(x) must be the TOTAL mass on x.
+                            std::vector<llama_token_data> q;
+                            q.reserve(selector_top_k);
+                            for (int32_t k = 0; k < selector_top_k; ++k) {
+                                const llama_token id_k = (llama_token) row[k];
+                                auto it = std::find_if(q.begin(), q.end(),
+                                        [id_k](const llama_token_data & e) { return e.id == id_k; });
+                                if (it != q.end()) {
+                                    it->p += lat_probs[k];
+                                } else {
+                                    q.push_back({ id_k, scores[k], lat_probs[k] });
+                                }
+                            }
+                            result_q->push_back(std::move(q));
+                        }
+                    }
+
                     result.push_back((llama_token) row[predecessor]);
                 }
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                    if (result_q) {
+                        result_q->clear();
+                    }
                 }
                 continue;
             }
@@ -3350,6 +3441,32 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
     }
 }
 
+// MAD-LAB 2026-09-07: verification-rule helpers (see common_speculative_verify)
+const char * common_speculative_verify_to_str(common_speculative_verify v) {
+    switch (v) {
+        case COMMON_SPECULATIVE_VERIFY_AUTO:   return "auto";
+        case COMMON_SPECULATIVE_VERIFY_MATCH:  return "match";
+        case COMMON_SPECULATIVE_VERIFY_REJECT: return "reject";
+    }
+    return "unknown";
+}
+
+common_speculative_verify common_speculative_verify_from_name(const std::string & name) {
+    if (name == "match")  { return COMMON_SPECULATIVE_VERIFY_MATCH;  }
+    if (name == "reject") { return COMMON_SPECULATIVE_VERIFY_REJECT; }
+    if (name == "auto")   { return COMMON_SPECULATIVE_VERIFY_AUTO;   }
+    throw std::invalid_argument("unknown speculative verification rule: " + name + " (expected match|reject|auto)");
+}
+
+common_speculative_verify common_speculative_verify_resolve(common_speculative_verify v, float temp) {
+    if (v != COMMON_SPECULATIVE_VERIFY_AUTO) {
+        return v;
+    }
+    // greedy: the match rule is already optimal there, and a greedy chain does
+    // not produce the normalized distribution the p/q ratio needs.
+    return temp > 0.0f ? COMMON_SPECULATIVE_VERIFY_REJECT : COMMON_SPECULATIVE_VERIFY_MATCH;
+}
+
 std::vector<common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {
     std::vector<common_speculative_type> types;
     types.reserve(names.size());
@@ -3810,6 +3927,15 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    // MAD-LAB 2026-09-07: the resolved verification rule, in the init log line.
+    // Only the DFlash2 selector lattice currently exports a draft distribution q,
+    // so every other speculator keeps the match rule regardless of this setting.
+    LOG_INF("%s: speculative verification rule: %s%s\n", __func__,
+            common_speculative_verify_to_str(params.verify),
+            params.verify == COMMON_SPECULATIVE_VERIFY_REJECT
+                ? " (rejection sampling where a draft distribution is available -- DFlash2 only; every other spec type falls back to match)"
+                : "");
+
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
