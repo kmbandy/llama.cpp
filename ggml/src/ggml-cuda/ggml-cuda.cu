@@ -6353,7 +6353,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            size_t wp_free_before = 0, wp_total_dummy = 0;
+            if (wp_alloc_log_enabled()) {
+                CUDA_CHECK(cudaMemGetInfo(&wp_free_before, &wp_total_dummy));
+            }
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            if (wp_alloc_log_enabled()) {
+                size_t wp_free_after = 0;
+                CUDA_CHECK(cudaMemGetInfo(&wp_free_after, &wp_total_dummy));
+                const size_t wp_used = wp_free_before > wp_free_after ? wp_free_before - wp_free_after : 0;
+                wp_alloc_log("graph_instantiate", cuda_ctx->device, wp_used, wp_free_after);
+            }
         }
         // CUDA: ExecUpdate patches kernel params in the existing exec.
         // HIP: never. hipGraphExecUpdate SIGSEGV'd on this path (s0 2026-08-20);
