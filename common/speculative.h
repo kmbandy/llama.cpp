@@ -23,13 +23,6 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
-// MAD-LAB 2026-09-07: verification-rule helpers (see common_speculative_verify)
-const char * common_speculative_verify_to_str(enum common_speculative_verify v);
-enum common_speculative_verify common_speculative_verify_from_name(const std::string & name);
-
-// resolve AUTO against the target's sampling temperature
-enum common_speculative_verify common_speculative_verify_resolve(enum common_speculative_verify v, float temp);
-
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
@@ -76,16 +69,6 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
-
-    // MAD-LAB 2026-09-07: optional sink for the DRAFT distribution q of each
-    // token in *result, needed by rejection-sampling verification.
-    // Sparse: only the drafter's candidate set is listed, .p holds the
-    // probability and the entries of one position sum to 1. Tokens outside the
-    // listed set have q = 0, which is a valid q for the Leviathan proof.
-    // Left empty by every implementation that has no distribution to give (the
-    // verifier then falls back to match-based for that step). When populated,
-    // result_q->size() == result->size().
-    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

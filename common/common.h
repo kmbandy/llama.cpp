@@ -185,35 +185,6 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
-// MAD-LAB 2026-09-07: speculative verification rule.
-//
-// MATCH  - the legacy llama.cpp rule: draw an independent sample from the
-//          target's post-chain distribution at each drafted position and accept
-//          the drafted token only if the two ids are equal. Optimal at
-//          temperature 0, but at temperature > 0 it throws away most of the
-//          probability mass the draft head agreed on (measured conditional
-//          acceptance ~0.66 flat across depth on Qwen3.8-27B-DFlash2).
-// REJECT - Leviathan/Chen speculative (rejection) sampling: the drafter SAMPLES
-//          x ~ q, and the verifier accepts with probability min(1, p(x)/q(x)),
-//          resampling from the residual norm(max(0, p - q)) on the first
-//          rejection. The emitted distribution is exactly p; expected
-//          acceptance is sum_x min(p(x), q(x)).
-//          ("Fast Inference from Transformers via Speculative Decoding",
-//           Leviathan et al. 2023, Alg. 1; Chen et al. 2023.)
-// AUTO   - REJECT when the sampling temperature is > 0, MATCH at temperature 0
-//          (where REJECT degenerates to MATCH anyway, but a greedy chain does
-//          not produce the normalized p that the ratio needs).
-//
-// NOTE: REJECT is only a win if the DRAFT is stochastic too. With a greedy
-// drafter q is a point mass and sum_x min(p,q) = p(argmax_q), i.e. exactly the
-// match-based rate. So selecting REJECT also switches the drafter that supports
-// it (currently DFlash2's selector lattice) from argmax to sampling.
-enum common_speculative_verify {
-    COMMON_SPECULATIVE_VERIFY_AUTO,
-    COMMON_SPECULATIVE_VERIFY_MATCH,
-    COMMON_SPECULATIVE_VERIFY_REJECT,
-};
-
 // MAD-LAB: keep the legacy first-failing-position gate selectable while testing
 // a conditional per-token confidence gate.
 enum common_speculative_draft_conf_mode {
@@ -424,11 +395,6 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
-
-    // MAD-LAB 2026-09-07: draft verification rule, see common_speculative_verify.
-    // Resolved once at speculative-init time against the target's sampling
-    // temperature; the resolved value is what the drafter and the verifier use.
-    common_speculative_verify verify = COMMON_SPECULATIVE_VERIFY_AUTO;
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;

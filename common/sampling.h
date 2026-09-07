@@ -4,7 +4,6 @@
 
 #include "common.h"
 
-#include <random>
 #include <string>
 #include <vector>
 
@@ -88,52 +87,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
-
-// MAD-LAB 2026-09-07: Leviathan/Chen rejection-sampling verification.
-//
-// One verification step, factored out of the accept loop so it can be unit
-// tested without a model (tests/test-speculative-reject.cpp).
-//
-//   p        target distribution AFTER the sampler chain (temperature, top-k,
-//            top-p, min-p, penalties already applied); .p must be normalized
-//            over the surviving candidates. MODIFIED IN PLACE on rejection --
-//            it is turned into the residual norm(max(0, p - q)) and re-sorted.
-//   q        sparse draft distribution over the drafter's candidate set, .p
-//            normalized; tokens not listed have q = 0.
-//   draft_id the token the drafter sampled from q.
-//   rng      the caller's RNG (the common_sampler's, for reproducibility).
-//   out      set to draft_id on acceptance, otherwise to the residual sample.
-//
-// returns true if the drafted token was accepted.
-//
-// The emitted token is distributed exactly as p, for ANY q the draft token was
-// actually sampled from -- including a q that is zero outside a small top-k.
-bool common_spec_verify_step(
-        llama_token_data_array & p,
-        const std::vector<llama_token_data> & q,
-        llama_token draft_id,
-        std::mt19937 & rng,
-        llama_token & out);
-
-// generalized version of common_sampler_sample_and_accept_n that verifies with
-// rejection sampling instead of an exact-match test.
-//
-// draft_q[i] is the draft distribution the drafter sampled draft[i] from (see
-// common_spec_verify_step). A position with an EMPTY draft_q[i] has no
-// distribution and is verified with the legacy match rule instead.
-//
-// requires: idxs.size() == draft.size() + 1 and draft_q.size() == draft.size()
-std::vector<llama_token> common_sampler_sample_and_accept_n_reject(
-        struct common_sampler * gsmpl,
-        struct llama_context * ctx,
-        const std::vector<int> & idxs,
-        const llama_tokens & draft,
-        const std::vector<std::vector<llama_token_data>> & draft_q,
-        bool grammar_first = false);
-
-// the sampler's RNG - shared by the rejection-sampling verifier so a run is
-// reproducible from the sampling seed alone
-std::mt19937 & common_sampler_get_rng(struct common_sampler * gsmpl);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

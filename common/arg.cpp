@@ -906,13 +906,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
-    // MAD-LAB 2026-09-07: resolve --spec-verify auto against the sampling
-    // temperature here, once, so that the drafter and the verifier agree on the
-    // rule for the whole process. A per-request temperature can still downgrade
-    // an individual verify step to match-based (see the server accept loop), but
-    // it cannot make the drafter stochastic after the fact.
-    params.speculative.verify = common_speculative_verify_resolve(params.speculative.verify, params.sampling.temp);
-
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
@@ -4602,18 +4595,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_max_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-    add_opt(common_arg(
-        {"--spec-verify"}, "RULE",
-        "speculative draft verification rule: match|reject|auto\n"
-        "  match  - accept a drafted token only if it equals an independent sample from the target (legacy)\n"
-        "  reject - Leviathan/Chen rejection sampling: accept with probability min(1, p/q), resample the\n"
-        "           residual norm(max(0, p - q)) on rejection. Output distribution is exactly the target's.\n"
-        "           Also switches the drafter (DFlash2 selector lattice) from argmax to sampling from q.\n"
-        "  auto   - reject when the sampling temperature is > 0, match at temperature 0 (default)",
-        [](common_params & params, const std::string & value) {
-            params.speculative.verify = common_speculative_verify_from_name(value);
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_VERIFY"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),

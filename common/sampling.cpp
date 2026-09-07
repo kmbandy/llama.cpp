@@ -12,7 +12,6 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
-#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -121,14 +120,6 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
-
-    // MAD-LAB 2026-09-07: RNG for the rejection-sampling verifier
-    // (common_sampler_sample_and_accept_n_reject). Kept on the sampler rather
-    // than on the caller so it is seeded from the sampling seed, and so that
-    // clone()/copy() -- which the server uses to snapshot and restore sampler
-    // state around a speculative checkpoint -- carry it along and a restored
-    // step replays the identical accept/reject decisions.
-    std::mt19937 rng;
 
     void reset() {
         prev.clear();
@@ -433,11 +424,6 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
-    // MAD-LAB: seed the verifier RNG from the sampling seed. LLAMA_DEFAULT_SEED
-    // means "pick one"; take it from the chain so it matches the seed the dist
-    // sampler resolved and is reported by common_sampler_get_seed().
-    const uint32_t seed_rng = llama_sampler_get_seed(chain);
-
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -446,7 +432,6 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
-        /* .rng     = */ std::mt19937(seed_rng == LLAMA_DEFAULT_SEED ? std::random_device{}() : seed_rng),
     };
 
     return result;
@@ -530,7 +515,6 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
-        /* .rng     = */ gsmpl->rng,
     };
 }
 
@@ -551,7 +535,6 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
-    dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -729,176 +712,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
-}
-
-// MAD-LAB 2026-09-07: Leviathan/Chen rejection-sampling verification.
-//
-// See common/sampling.h and the design note on common_speculative_verify.
-// The invariant that makes this exact: `draft_id` was sampled from `q`, the
-// same `q` used here. Then
-//
-//    P(emit x) = q(x) * min(1, p(x)/q(x))                       [accepted]
-//              + (1 - sum_y min(p(y), q(y))) * res(x)           [rejected]
-//              = min(p(x), q(x)) + (p(x) - q(x))^+   =  p(x)
-//
-// for any q, including one that is zero outside a small candidate set.
-
-static float common_spec_q_at(const std::vector<llama_token_data> & q, llama_token id) {
-    for (const auto & e : q) {
-        if (e.id == id) {
-            return e.p;
-        }
-    }
-    return 0.0f;
-}
-
-bool common_spec_verify_step(
-        llama_token_data_array & p,
-        const std::vector<llama_token_data> & q,
-        llama_token draft_id,
-        std::mt19937 & rng,
-        llama_token & out) {
-    // p(draft_id): 0 if the sampler chain truncated it away -> always rejected
-    float p_x = 0.0f;
-    for (size_t i = 0; i < p.size; ++i) {
-        if (p.data[i].id == draft_id) {
-            p_x = p.data[i].p;
-            break;
-        }
-    }
-
-    const float q_x = common_spec_q_at(q, draft_id);
-
-    std::uniform_real_distribution<float> u(0.0f, 1.0f);
-
-    // q_x <= 0 should not happen (the token was sampled from q), but if a caller
-    // hands us an inconsistent q, accept exactly with probability p_x rather
-    // than dividing by zero. That keeps the output distribution correct.
-    const float accept_p = q_x > 0.0f ? std::min(1.0f, p_x / q_x) : p_x;
-
-    if (u(rng) < accept_p) {
-        out = draft_id;
-        return true;
-    }
-
-    // rejected: sample from the residual norm(max(0, p - q)), in place
-    double sum = 0.0;
-    for (size_t i = 0; i < p.size; ++i) {
-        const float r = p.data[i].p - common_spec_q_at(q, p.data[i].id);
-        p.data[i].p = r > 0.0f ? r : 0.0f;
-        sum += p.data[i].p;
-    }
-
-    if (sum <= 0.0) {
-        // p == q on p's support: every draw would have been accepted. Only
-        // reachable through float noise; fall back to p's mode.
-        size_t best = 0;
-        for (size_t i = 1; i < p.size; ++i) {
-            if (p.data[i].p > p.data[best].p) {
-                best = i;
-            }
-        }
-        p.selected = (int64_t) best;
-        out = p.data[best].id;
-        return false;
-    }
-
-    const double target = std::uniform_real_distribution<double>(0.0, sum)(rng);
-
-    double acc = 0.0;
-    size_t sel = p.size - 1;
-    for (size_t i = 0; i < p.size; ++i) {
-        acc += p.data[i].p;
-        if (acc >= target) {
-            sel = i;
-            break;
-        }
-    }
-
-    for (size_t i = 0; i < p.size; ++i) {
-        p.data[i].p /= (float) sum;
-    }
-
-    p.selected = (int64_t) sel;
-    out = p.data[sel].id;
-
-    return false;
-}
-
-std::vector<llama_token> common_sampler_sample_and_accept_n_reject(
-        struct common_sampler * gsmpl,
-        struct llama_context * ctx,
-        const std::vector<int> & idxs,
-        const llama_tokens & draft,
-        const std::vector<std::vector<llama_token_data>> & draft_q,
-        bool grammar_first) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
-    GGML_ASSERT(draft_q.size() == draft.size()  && "draft_q.size() must be draft.size()");
-
-    // Two chain shapes do not expose the normalized post-chain distribution the
-    // ratio needs, so they keep the legacy match rule:
-    //  - backend sampling: common_sampler_sample() returns a token the backend
-    //    already picked and never runs the CPU chain, so cur_p.p is unset.
-    //  - grammar: the constraint is enforced by resampling the SELECTED token,
-    //    not by masking cur_p, so an accepted draft token could be invalid.
-    if (gsmpl->params.backend_sampling || gsmpl->grmr) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            LOG_WRN("%s: rejection-sampling verification is not compatible with %s - falling back to match-based verification\n",
-                    __func__, gsmpl->grmr ? "grammar" : "backend sampling");
-        }
-        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
-    }
-
-    std::vector<llama_token> result;
-    result.reserve(idxs.size());
-
-    size_t i = 0;
-    for (; i < draft.size(); i++) {
-        // run the full sampler chain at this position: this is what defines p.
-        // the returned id is only used for the match fallback below - the
-        // rejection test reads the post-chain candidate array instead.
-        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
-
-        if (draft_q[i].empty()) {
-            // no draft distribution at this position -> legacy match rule
-            common_sampler_accept(gsmpl, id_tgt, true);
-            result.push_back(id_tgt);
-
-            if (draft[i] != id_tgt) {
-                return result;
-            }
-            continue;
-        }
-
-        auto & p = *common_sampler_get_candidates(gsmpl, true);
-
-        llama_token id = LLAMA_TOKEN_NULL;
-        const bool accepted = common_spec_verify_step(p, draft_q[i], draft[i], gsmpl->rng, id);
-
-        common_sampler_accept(gsmpl, id, true);
-        result.push_back(id);
-
-        if (!accepted) {
-            return result;
-        }
-    }
-
-    // all drafted tokens accepted -> the free bonus token from the last position
-    {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
-
-        common_sampler_accept(gsmpl, id, true);
-
-        result.push_back(id);
-    }
-
-    return result;
-}
-
-std::mt19937 & common_sampler_get_rng(struct common_sampler * gsmpl) {
-    return gsmpl->rng;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
