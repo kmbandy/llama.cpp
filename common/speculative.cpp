@@ -1172,6 +1172,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 block_size = std::atoi(buf);
                 block_size_source = "metadata-probe";
             }
+        }
+
+        // MAD-LAB 2026-09-07: upstream reads all three keys unconditionally; the fork's
+        // block_size accessor short-circuit had buried sample_from_anchor and
+        // attention.causal inside the metadata-probe branch, so a head whose block_size
+        // came from the accessor silently ran with the DEFAULTS for both -- non-causal
+        // block attention on a head that asks for causal, for instance.
+        {
+            char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
                 sample_from_anchor = std::strcmp(buf, "true") == 0;
             }
@@ -1187,7 +1196,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // MAD-LAB: a sidecar GGUF ships no LM head, which is the signal that this draft
         // cannot produce logits in its own graph and that the two borrowed ops
         // (token_embd gather, LM-head projection) must be routed through the target.
-        services_mode = !llama_model_has_output_head(model_dft);
+        //
+        // MAD-LAB 2026-09-07: ...but that is true of upstream's DFlash/DFlash2 heads too,
+        // and those borrow the target's tok_embd/output through ctx_other exactly as
+        // upstream does (src/models/dflash.cpp, graph<false>). Only the DSpark sidecar --
+        // the one carrying markov_w1, whose target may be Meta-split under -sm tensor --
+        // needs the out-of-graph gather/projection/markov replay. Gating on "no output
+        // tensor" alone routed every upstream-format DFlash2 head into the services path,
+        // where llama_dspark_markov_head() failed on a model that has no Markov head and
+        // draft() returned before it could ever read the DFlash2 selector lattice.
+        services_mode = !llama_model_has_output_head(model_dft) && llama_model_has_dspark_markov(model_dft);
         n_vocab_dft   = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
 
         if (is_dspark && this->params.p_min > 0.0f) {
@@ -1209,7 +1227,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min,
                 this->params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN ? "per-token" : "chain");
         LOG_WRN("%s: - block_size=%d (source=%s), mask_token_id=%d, n_extract=%u, hc_mult=%d, sample_from_anchor=%s\n", __func__, block_size, block_size_source, mask_token_id, target_layer_ids_n, hc_mult, sample_from_anchor ? "true" : "false");
-        LOG_WRN("%s: - services_mode=%d (1 = sidecar without an LM head: token_embd gather and head projection run on the target)\n",
+        LOG_WRN("%s: - is_dflash2=%d, selector_top_k=%d, has_markov=%d, has_output_head=%d\n", __func__,
+                (int) is_dflash2, selector_top_k, (int) llama_model_has_dspark_markov(model_dft),
+                (int) llama_model_has_output_head(model_dft));
+        LOG_WRN("%s: - services_mode=%d (1 = DSpark sidecar without an LM head: token_embd gather and head projection run on the target; 0 = upstream path, tok_embd/output borrowed via ctx_other when absent)\n",
                 __func__, (int) services_mode);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
@@ -3715,7 +3736,8 @@ common_speculative_init_result::common_speculative_init_result(
         // here. Deliberately NOT cparams.embeddings: build_pooling() gates only on that
         // flag and would then run on this arch's encoder graph, which never sets t_embd.
         if (!llama_model_has_output_head(model_dft)) {
-            LOG_INF("%s: draft has no LM head -- hidden state will be exported via the nextn channel (services mode)\n", __func__);
+            LOG_INF("%s: draft has no LM head -- it will borrow the target's output projection via ctx_other, "
+                    "or (DSpark sidecar only) export the hidden state via the nextn channel\n", __func__);
 
             // The nextn copy in llama_context::decode is guarded on pooling being NONE.
             // The DFlash arm already depends on that for its confidence read, but it was

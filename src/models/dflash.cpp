@@ -1052,9 +1052,27 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // independent branches, and llama_batch_allocr propagates both independently, so a
     // dual-carry batch is well formed. We still need the token ids: the DSpark Markov
     // head conditions on them, not on the embeddings.
+    //
+    // MAD-LAB 2026-09-07: services mode is a DSPARK-SIDECAR-ONLY fallback. Upstream's
+    // DFlash and DFlash2 heads also ship no tok_embd/output, but they borrow the
+    // target's through ctx_other exactly as upstream does (see the ctx_other gate in
+    // llama_context's constructor, which arms cparams.ctx_other for precisely this
+    // case). Only the DSpark sidecar -- the one that carries markov_w1 -- has a target
+    // that may be Meta-split, and only it needs the driver to hand in the embeddings
+    // and to run the head projection out of graph. Keying services mode on "no output
+    // tensor" alone stole the upstream path from every DFlash2 head and left the
+    // selector lattice unbuilt.
+    const bool dspark_services = model.dspark_markov_w1 != nullptr;
+
     ggml_tensor * inpL;
     if (model.tok_embd != nullptr) {
         inpL = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    } else if (!dspark_services) {
+        // upstream: tok_embd from the target model (shared via ctx_other)
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
+        inpL = ggml_get_rows(ctx0, model_other->tok_embd, inp->tokens);
     } else {
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp->embd);
@@ -1215,7 +1233,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // ggml_view_2d slices, and its argmax chain feeds ggml_get_rows(w1, prev) -- the
     // sidecar's weights -- not the head. So this costs one projection per draft step,
     // not one per block position.
-    if (model.output == nullptr) {
+    if (model.output == nullptr && dspark_services) {
         // Export through the NEXTN channel, not the embeddings one.
         //
         // res->t_embd is set just above, but reading it would mean turning on
@@ -1234,10 +1252,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
-    ggml_tensor * output = model.output;
+    // upstream: lm_head from the target model (shared via ctx_other)
+    ggml_tensor * output   = model.output;
+    ggml_tensor * output_s = model.output_s;
+    if (output == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
+        output   = model_other->output;
+        output_s = model_other->output_s;
+    }
 
     cur = cap_lm_head_rows(cur);
-    cur = build_lora_mm(output, cur, model.output_s);
+    cur = build_lora_mm(output, cur, output_s);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
