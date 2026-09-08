@@ -105,6 +105,8 @@ extern "C" {
     // keep the two graphs' buffers disjoint (e.g. two schedulers) and must not rely on graph_compute having
     // finished before ggml_backend_synchronize() / a tensor get.
     GGML_API bool           ggml_backend_meta_overlap_enabled(ggml_backend_t meta_backend);
+    GGML_API enum ggml_status ggml_backend_meta_graph_compute_pair(ggml_backend_t meta_backend,
+            struct ggml_cgraph * cgraph_a, struct ggml_cgraph * cgraph_b);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
