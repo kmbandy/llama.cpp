@@ -69,6 +69,39 @@ static constexpr uint32_t k_meta_overlap_default_split = 2;
 static constexpr uint32_t k_meta_overlap_min_ubatch = 2;
 static constexpr uint32_t k_meta_overlap_min_subbatches = 4;
 
+enum class meta_overlap_mode {
+    rolling,
+    pairs,
+    disabled,
+};
+
+static meta_overlap_mode meta_overlap_scheduling_mode() {
+    static const meta_overlap_mode requested = []() {
+        const char * value = std::getenv("GGML_META_OVERLAP_MODE");
+        if (value == nullptr || std::strcmp(value, "rolling") == 0) {
+            return meta_overlap_mode::rolling;
+        }
+        if (std::strcmp(value, "pairs") == 0) {
+            return meta_overlap_mode::pairs;
+        }
+
+        LLAMA_LOG_WARN("%s: invalid GGML_META_OVERLAP_MODE='%s'; meta overlap disabled\n", __func__, value);
+        return meta_overlap_mode::disabled;
+    }();
+
+    return requested;
+}
+
+static const char * meta_overlap_mode_name(meta_overlap_mode mode) {
+    switch (mode) {
+        case meta_overlap_mode::rolling:  return "rolling";
+        case meta_overlap_mode::pairs:    return "pairs";
+        case meta_overlap_mode::disabled: return "disabled";
+    }
+
+    GGML_ABORT("invalid meta overlap mode");
+}
+
 static uint32_t meta_overlap_split_factor(uint32_t n_ubatch) {
     static const uint32_t requested = []() -> uint32_t {
         const char * value = std::getenv("GGML_META_OVERLAP_SPLIT");
@@ -3511,7 +3544,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const char * e = getenv("WP_QWEN4EXP_LAYER_CUT");
         return e != nullptr && e[0] == '1';
     }();
-    const uint32_t validated_overlap_split = overlap_meta != nullptr
+    const meta_overlap_mode overlap_mode = overlap_meta != nullptr
+        ? meta_overlap_scheduling_mode()
+        : meta_overlap_mode::disabled;
+    const uint32_t validated_overlap_split = overlap_mode != meta_overlap_mode::disabled
         ? meta_overlap_split_factor(cparams.n_ubatch)
         : 1;
     const uint32_t overlap_split = validated_overlap_split > 1 ? validated_overlap_split : 1;
@@ -3522,6 +3558,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     sched_overlap_split = overlap_split;
     const bool overlap_candidate = overlap_meta != nullptr &&
+        overlap_mode != meta_overlap_mode::disabled &&
         !cparams.pipeline_parallel &&
         !model.hparams.no_alloc &&
         !llm_arch_is_recurrent(model.arch) &&
@@ -3923,7 +3960,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         overlap_subbatches_are_full &&
         overlap_has_enough_work;
 
-    if (continuous_overlap) {
+    // Set only when the rolling sliding-window schedule is actually driven, so
+    // the banner below distinguishes "rolling" from "asked for rolling, ran the
+    // paired fallback".
+    bool rolling_fast_path = false;
+
+    if (continuous_overlap && overlap_mode == meta_overlap_mode::rolling) {
         struct overlap_slot {
             llama_ubatch            ubatch;
             int32_t                 n_outputs = 0;
@@ -4016,10 +4058,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
             return fail_slots(slot_b, slot_a, status);
         }
 
-        if (!ggml_backend_sched_graph_compute_async_meta_supported(slot_a.sched) ||
-                !ggml_backend_sched_graph_compute_async_meta_supported(slot_b.sched) ||
+        const bool rolling_supported =
+            ggml_backend_sched_graph_compute_async_meta_supported(slot_a.sched) &&
+            ggml_backend_sched_graph_compute_async_meta_supported(slot_b.sched);
+        if (!rolling_supported) {
+            // Loud once per process: a silent degradation here is what made four
+            // earlier fixes to the rolling loop measure as inert -- the loop was
+            // never entered. Report the discriminating numbers, not just "off".
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: rolling overlap unavailable (sched a: splits=%d meta_split=%d, "
+                               "sched b: splits=%d meta_split=%d); using the paired schedule\n", __func__,
+                               ggml_backend_sched_get_n_splits(slot_a.sched),
+                               ggml_backend_sched_graph_compute_async_meta_split(slot_a.sched),
+                               ggml_backend_sched_get_n_splits(slot_b.sched),
+                               ggml_backend_sched_graph_compute_async_meta_split(slot_b.sched));
+            }
+        }
+
+        if (!rolling_supported ||
                 !begin_slot(slot_a, status) || !begin_slot(slot_b, status) ||
                 slot_a.n_steps != slot_b.n_steps || slot_a.n_steps < 2) {
+            // Fallback: the PAIRED schedule for the whole batch, not just for the
+            // first two sub-batches. The old tail loop ran every remaining
+            // sub-batch on its own with no overlap at all, so a batch of eight
+            // got one overlapped pair and six serial sub-batches -- indis-
+            // tinguishable from GGML_META_OVERLAP=0 in throughput terms.
             const auto pair_status = normalize_compute_status(
                 graph_compute(slot_a.res->get_gf(), slot_a.ubatch.n_tokens > 1, slot_a.sched,
                               slot_b.res->get_gf(), slot_b.sched));
@@ -4029,20 +4094,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
             extract_slot(slot_a);
             extract_slot(slot_b);
             while (mctx->next()) {
-                const auto ubatch = mctx->get_ubatch();
-                const int32_t n_outputs_ubatch = prepare_ubatch(ubatch);
-                ggml_status tail_status;
-                const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), tail_status);
-                if (!res) {
-                    return handle_failed_ubatch(ubatch, tail_status);
+                if (!prepare_slot(slot_a, status)) {
+                    return handle_failed_ubatch(slot_a.ubatch, status);
                 }
-                extract_ubatch(res, ubatch, n_outputs_ubatch, n_outputs_prev, n_tokens_prev, sched.get());
-                n_outputs_prev += n_outputs_ubatch;
-                n_tokens_prev  += ubatch.n_tokens;
+                if (!mctx->next()) {
+                    const auto tail_status = normalize_compute_status(
+                        graph_compute(slot_a.res->get_gf(), slot_a.ubatch.n_tokens > 1, slot_a.sched));
+                    if (tail_status != GGML_STATUS_SUCCESS) {
+                        return handle_failed_ubatch(slot_a.ubatch, tail_status);
+                    }
+                    extract_slot(slot_a);
+                    break;
+                }
+                if (!prepare_slot(slot_b, status)) {
+                    return fail_slots(slot_b, slot_a, status);
+                }
+                const auto tail_status = normalize_compute_status(
+                    graph_compute(slot_a.res->get_gf(), slot_a.ubatch.n_tokens > 1, slot_a.sched,
+                                  slot_b.res->get_gf(), slot_b.sched));
+                if (tail_status != GGML_STATUS_SUCCESS) {
+                    return fail_slots(slot_b, slot_a, tail_status);
+                }
+                extract_slot(slot_a);
+                extract_slot(slot_b);
             }
         } else if (!step_slot(slot_a, status) || !step_slot(slot_b, status) || !end_slot(slot_a, status)) {
             return fail_slots(slot_a, slot_b, status);
         } else {
+            rolling_fast_path = true;
             const size_t n_steps = slot_a.n_steps;
             bool done = false;
             while (!done) {
@@ -4068,9 +4147,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
 
                     extract_slot(slot_a);
-                    if (!end_slot(slot_b, status) || !step_slot(slot_b, status) ||
-                            !prepare_slot(slot_a, status) || !begin_slot(slot_a, status) || slot_a.n_steps != n_steps ||
-                            !step_slot(slot_a, status)) {
+                    if (!prepare_slot(slot_a, status) || !begin_slot(slot_a, status) || slot_a.n_steps != n_steps ||
+                            !step_slot(slot_a, status) || !end_slot(slot_b, status) || !step_slot(slot_b, status)) {
                         return fail_slots(slot_a, slot_b, status);
                     }
                     extract_slot(slot_b);
@@ -4157,6 +4235,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (!mctx->next()) {
             break;
         }
+    }
+
+    if (continuous_overlap) {
+        LLAMA_LOG_INFO("%s: meta overlap mode=%s%s, split=%u, n_ubatch=%u, sub-batch=%u\n",
+                       __func__, meta_overlap_mode_name(overlap_mode),
+                       overlap_mode == meta_overlap_mode::rolling
+                           ? (rolling_fast_path ? " (sliding window)" : " (PAIRED FALLBACK)") : "",
+                       overlap_split, cparams.n_ubatch, memory_ubatch);
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
