@@ -759,16 +759,29 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             p->transport = peer_ok ? GGML_CUDA_AR_TRANSPORT_P2P : GGML_CUDA_AR_TRANSPORT_HOST;
         }
 
-        // On the duplex transports every size class goes through the async
-        // path unless the operator explicitly asks for the chunked kernel
-        // below a threshold (the spec asks for this to be measured, not
-        // assumed).  The legacy transport keeps today's 1 MiB default.
-        if (p->transport != GGML_CUDA_AR_TRANSPORT_COPY) {
-            const char * thr = getenv("GGML_CUDA_AR_COPY_THRESHOLD");
-            if (thr == nullptr || thr[0] == '\0') {
-                p->copy_threshold = 0;
-            }
-        }
+        // The duplex transports keep the same copy_threshold as the legacy
+        // path: below it, small reductions still take the chunked kernel.
+        //
+        // This was previously forced to 0 here, routing every size class
+        // through the async path, on the theory that the duplex transports
+        // made the chunked kernel redundant.  Measured on 2026-09-08
+        // (mad-lab-main, R9700 + RX 6900 XT over TB3, Qwen3.8-27B Q8,
+        // -sm tensor -ts 68/32), that cost decode and bought nothing:
+        //
+        //   arm                      pp512 t/s   tg128 t/s
+        //   copy (threshold 1 MiB)      612        20.66
+        //   p2p  (threshold 0)          730        17.85
+        //   p2p  (threshold 1 MiB)      729        20.76
+        //   host (threshold 0)          727        14.26
+        //
+        // The decode reduction is one token x n_embd (10 KB on the bf16 wire
+        // at n_embd=5120), ~100x below the threshold, so zeroing it moved
+        // decode off the chunked kernel -- whose in-kernel spin exists
+        // precisely for that latency-sensitive shape -- and onto the async
+        // path, for a flat ~7.4 ms/token penalty at every KV depth.  Prefill
+        // is unaffected either way: at n_ubatch 512 the reduction is 5.2 MB,
+        // above the threshold, so it takes the duplex path regardless.  The
+        // crossover sits at ~102 tokens.
     }
 
     p->dx_bytes     = GGML_CUDA_AR_COPY_MAX_BYTES;
