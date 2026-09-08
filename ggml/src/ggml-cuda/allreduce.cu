@@ -5,6 +5,8 @@
 #if !defined(GGML_USE_MUSA)
 
 #include "convert.cuh"
+#include "cpy-utils.cuh"
+#include "dequantize.cuh"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -285,6 +287,196 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // Pipeline structure
 // ---------------------------------------------------------------------------
 
+struct ggml_cuda_ar_codec;
+
+template <typename T_dst, typename T_src>
+static void ggml_cuda_ar_dx_add(T_dst * dst, const T_src * src, int64_t ne, cudaStream_t stream);
+
+using ggml_cuda_ar_pack_fn = void (*) (
+        const void * src, ggml_type src_type, void * dst, int64_t ne, cudaStream_t stream);
+using ggml_cuda_ar_unpack_accumulate_fn = void (*) (
+        void * dst, ggml_type dst_type, const void * src, int64_t ne, cudaStream_t stream);
+
+struct ggml_cuda_ar_codec {
+    const char *                         name;
+    ggml_type                            wire_type;
+    size_t                               elements_per_block;
+    size_t                               bytes_per_block;
+    ggml_cuda_ar_pack_fn                 pack_fn;
+    ggml_cuda_ar_unpack_accumulate_fn    unpack_accumulate_fn;
+};
+
+template <typename T_src>
+static __global__ void ggml_cuda_ar_codec_pack_q8_0_kernel(
+        const T_src * src, block_q8_0 * dst, int n_blocks) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nt  = gridDim.x * blockDim.x;
+    for (int ib = tid; ib < n_blocks; ib += nt) {
+        float values[QK8_0];
+        for (int j = 0; j < QK8_0; ++j) {
+            values[j] = ggml_cuda_cast<float>(src[ib * QK8_0 + j]);
+        }
+        quantize_f32_q8_0_block(values, &dst[ib]);
+    }
+}
+
+template <typename T_dst>
+static __global__ void ggml_cuda_ar_codec_unpack_q8_0_kernel(
+        T_dst * dst, const block_q8_0 * src, int n_blocks) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nt  = gridDim.x * blockDim.x;
+    for (int ib = tid; ib < n_blocks; ib += nt) {
+        float values[QK8_0];
+        for (int j = 0; j < QK8_0; ++j) {
+            values[j] = ggml_cuda_cast<float>(dst[ib * QK8_0 + j]);
+        }
+
+        block_q8_0 local;
+        quantize_f32_q8_0_block(values, &local);
+        for (int j = 0; j < QK8_0; j += 2) {
+            float2 local_value;
+            float2 peer_value;
+            dequantize_q8_0(&local, 0, j, local_value);
+            dequantize_q8_0(src, ib, j, peer_value);
+            dst[ib * QK8_0 + j + 0] = ggml_cuda_cast<T_dst>(local_value.x + peer_value.x);
+            dst[ib * QK8_0 + j + 1] = ggml_cuda_cast<T_dst>(local_value.y + peer_value.y);
+        }
+    }
+}
+
+static int ggml_cuda_ar_codec_grid(int64_t n) {
+    const int blocks = (int) ((n + 255) / 256);
+    return std::max(1, std::min(blocks, 1024));
+}
+
+template <typename T_src>
+static void ggml_cuda_ar_codec_pack_q8_0(
+        const void * src, void * dst, int64_t ne, cudaStream_t stream) {
+    const int n_blocks = (int) (ne / QK8_0);
+    ggml_cuda_ar_codec_pack_q8_0_kernel<T_src><<<ggml_cuda_ar_codec_grid(n_blocks), 256, 0, stream>>>(
+        static_cast<const T_src *>(src), static_cast<block_q8_0 *>(dst), n_blocks);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T_dst>
+static void ggml_cuda_ar_codec_unpack_q8_0(
+        void * dst, const void * src, int64_t ne, cudaStream_t stream) {
+    const int n_blocks = (int) (ne / QK8_0);
+    ggml_cuda_ar_codec_unpack_q8_0_kernel<T_dst><<<ggml_cuda_ar_codec_grid(n_blocks), 256, 0, stream>>>(
+        static_cast<T_dst *>(dst), static_cast<const block_q8_0 *>(src), n_blocks);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_ar_codec_pack_bf16(
+        const void * src, ggml_type src_type, void * dst, int64_t ne, cudaStream_t stream) {
+    if (src_type == GGML_TYPE_BF16) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, (size_t) ne * sizeof(nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+    } else {
+        to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(src_type);
+        to_bf16(src, static_cast<nv_bfloat16 *>(dst), ne, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static void ggml_cuda_ar_codec_pack_f16(
+        const void * src, ggml_type src_type, void * dst, int64_t ne, cudaStream_t stream) {
+    if (src_type == GGML_TYPE_F16) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, (size_t) ne * sizeof(half), cudaMemcpyDeviceToDevice, stream));
+    } else {
+        to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src_type);
+        to_fp16(src, static_cast<half *>(dst), ne, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static void ggml_cuda_ar_codec_pack_f32(
+        const void * src, ggml_type src_type, void * dst, int64_t ne, cudaStream_t stream) {
+    if (src_type == GGML_TYPE_F32) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, (size_t) ne * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    } else {
+        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src_type);
+        to_fp32(src, static_cast<float *>(dst), ne, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static void ggml_cuda_ar_codec_pack_q8_0_dispatch(
+        const void * src, ggml_type src_type, void * dst, int64_t ne, cudaStream_t stream) {
+    switch (src_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_codec_pack_q8_0<float>(src, dst, ne, stream); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_codec_pack_q8_0<half>(src, dst, ne, stream); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_codec_pack_q8_0<nv_bfloat16>(src, dst, ne, stream); break;
+        default: GGML_ABORT("AllReduce q8_0 pack: unsupported source type %d", (int) src_type);
+    }
+}
+
+static void ggml_cuda_ar_codec_unpack_bf16(
+        void * dst, ggml_type dst_type, const void * src, int64_t ne, cudaStream_t stream) {
+    switch (dst_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_dx_add<float, nv_bfloat16>(static_cast<float *>(dst), static_cast<const nv_bfloat16 *>(src), ne, stream); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_dx_add<half, nv_bfloat16>(static_cast<half *>(dst), static_cast<const nv_bfloat16 *>(src), ne, stream); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_dx_add<nv_bfloat16, nv_bfloat16>(static_cast<nv_bfloat16 *>(dst), static_cast<const nv_bfloat16 *>(src), ne, stream); break;
+        default: GGML_ABORT("AllReduce bf16 unpack: unsupported destination type %d", (int) dst_type);
+    }
+}
+
+static void ggml_cuda_ar_codec_unpack_f16(
+        void * dst, ggml_type dst_type, const void * src, int64_t ne, cudaStream_t stream) {
+    switch (dst_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_dx_add<float, half>(static_cast<float *>(dst), static_cast<const half *>(src), ne, stream); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_dx_add<half, half>(static_cast<half *>(dst), static_cast<const half *>(src), ne, stream); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_dx_add<nv_bfloat16, half>(static_cast<nv_bfloat16 *>(dst), static_cast<const half *>(src), ne, stream); break;
+        default: GGML_ABORT("AllReduce f16 unpack: unsupported destination type %d", (int) dst_type);
+    }
+}
+
+static void ggml_cuda_ar_codec_unpack_f32(
+        void * dst, ggml_type dst_type, const void * src, int64_t ne, cudaStream_t stream) {
+    switch (dst_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_dx_add<float, float>(static_cast<float *>(dst), static_cast<const float *>(src), ne, stream); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_dx_add<half, float>(static_cast<half *>(dst), static_cast<const float *>(src), ne, stream); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_dx_add<nv_bfloat16, float>(static_cast<nv_bfloat16 *>(dst), static_cast<const float *>(src), ne, stream); break;
+        default: GGML_ABORT("AllReduce f32 unpack: unsupported destination type %d", (int) dst_type);
+    }
+}
+
+static void ggml_cuda_ar_codec_unpack_q8_0_dispatch(
+        void * dst, ggml_type dst_type, const void * src, int64_t ne, cudaStream_t stream) {
+    switch (dst_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_codec_unpack_q8_0<float>(dst, src, ne, stream); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_codec_unpack_q8_0<half>(dst, src, ne, stream); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_codec_unpack_q8_0<nv_bfloat16>(dst, src, ne, stream); break;
+        default: GGML_ABORT("AllReduce q8_0 unpack: unsupported destination type %d", (int) dst_type);
+    }
+}
+
+static const ggml_cuda_ar_codec GGML_CUDA_AR_CODECS[] = {
+    { "bf16",  GGML_TYPE_BF16,  1, sizeof(nv_bfloat16),  ggml_cuda_ar_codec_pack_bf16,           ggml_cuda_ar_codec_unpack_bf16 },
+    { "f16",   GGML_TYPE_F16,   1, sizeof(half),          ggml_cuda_ar_codec_pack_f16,            ggml_cuda_ar_codec_unpack_f16  },
+    { "f32",   GGML_TYPE_F32,   1, sizeof(float),         ggml_cuda_ar_codec_pack_f32,            ggml_cuda_ar_codec_unpack_f32  },
+    { "q8_0",  GGML_TYPE_Q8_0, QK8_0, sizeof(block_q8_0), ggml_cuda_ar_codec_pack_q8_0_dispatch, ggml_cuda_ar_codec_unpack_q8_0_dispatch },
+};
+
+static_assert(sizeof(block_q8_0) == 34, "unexpected q8_0 wire block size");
+
+static const ggml_cuda_ar_codec * ggml_cuda_ar_codec_from_name(const char * name) {
+    for (const auto & codec : GGML_CUDA_AR_CODECS) {
+        if (std::strcmp(codec.name, name) == 0) {
+            return &codec;
+        }
+    }
+    return nullptr;
+}
+
+static const ggml_cuda_ar_codec * ggml_cuda_ar_codec_from_type(ggml_type type) {
+    for (const auto & codec : GGML_CUDA_AR_CODECS) {
+        if (codec.wire_type == type) {
+            return &codec;
+        }
+    }
+    return nullptr;
+}
+
 // Number of slots in the event / arrival ring.  Two slots is sufficient:
 // lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
 // slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
@@ -434,6 +626,8 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    const struct ggml_cuda_ar_codec * wire_codec;
+    bool     wire_codec_explicit;
     uint64_t call_count;
 
     // Per-device resources.
@@ -589,6 +783,22 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    const char * wire_env = getenv("GGML_CUDA_AR_WIRE_TYPE");
+    p->wire_codec_explicit = wire_env && wire_env[0];
+    p->wire_codec = ggml_cuda_ar_codec_from_name(wire_env && wire_env[0] ? wire_env : "bf16");
+    if (p->wire_codec == nullptr) {
+        GGML_ABORT("%s: unknown GGML_CUDA_AR_WIRE_TYPE='%s' (expected bf16, f16, f32, or q8_0)",
+                   __func__, wire_env ? wire_env : "");
+    }
+    if (p->wire_codec->elements_per_block == 0 || p->wire_codec->bytes_per_block == 0 ||
+        p->wire_codec->pack_fn == nullptr || p->wire_codec->unpack_accumulate_fn == nullptr) {
+        GGML_ABORT("%s: invalid AllReduce codec '%s'", __func__, p->wire_codec->name);
+    }
+    p->dx_bytes = (GGML_CUDA_AR_COPY_MAX_BYTES / p->wire_codec->bytes_per_block) *
+                  p->wire_codec->bytes_per_block;
+    if (p->dx_bytes == 0 || p->dx_bytes % p->wire_codec->bytes_per_block != 0) {
+        GGML_ABORT("%s: codec '%s' does not fit the duplex slot", __func__, p->wire_codec->name);
+    }
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -786,7 +996,6 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         // crossover sits at ~102 tokens.
     }
 
-    p->dx_bytes     = GGML_CUDA_AR_COPY_MAX_BYTES;
     p->dx_call      = 0;
     p->dx_in_flight = 0;
     if (p->transport != GGML_CUDA_AR_TRANSPORT_COPY) {
@@ -834,9 +1043,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                                                       "copy (legacy copy-engine bounce)";
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU, "
-                  "transport=%s, copy_threshold=%zu\n",
+                  "transport=%s, copy_threshold=%zu, wire_codec=%s (%.1f bits/element)\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20,
-                  transport_name, p->copy_threshold);
+                  transport_name, p->copy_threshold, p->wire_codec->name,
+                  8.0 * p->wire_codec->bytes_per_block / p->wire_codec->elements_per_block);
 
     return p;
 }
@@ -1408,16 +1618,48 @@ bool ggml_cuda_ar_allreduce_begin(
 
     const size_t input_nbytes = ggml_nbytes(tensors[0]);
 
-    // Same wire-type rule as the synchronous path (BF16 for F32 inputs by default).
-    const bool use_bf16 =
+    // Keep path selection identical to the synchronous path.  Codec packing is
+    // only used by the duplex path; decode-sized reductions stay unchanged.
+    const bool legacy_use_bf16 =
         input_type == GGML_TYPE_F32 &&
         p->bf16_threshold > 0 &&
         input_nbytes >= p->bf16_threshold;
-    const ggml_type wire_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
-    const size_t    wire_size = ggml_type_size(wire_type);
-    const size_t    nbytes    = (size_t) ne * wire_size;
+    const ggml_type legacy_wire_type = legacy_use_bf16 ? GGML_TYPE_BF16 : input_type;
+    const size_t    legacy_nbytes = (size_t) ne * ggml_type_size(legacy_wire_type);
 
-    const bool chunked = p->copy_threshold > 0 && nbytes < p->copy_threshold;
+    const bool chunked = p->copy_threshold > 0 && legacy_nbytes < p->copy_threshold;
+
+    if (p->transport == GGML_CUDA_AR_TRANSPORT_COPY) {
+        // Legacy semantics, unchanged: copy engine at/above the threshold, chunked kernel below.
+        return ggml_cuda_ar_allreduce_sync(p, backends, tensors, !chunked);
+    }
+    if (chunked) {
+        // Chunked kernel by explicit request.  It does not use the duplex codec.
+        return ggml_cuda_ar_allreduce_sync(p, backends, tensors, !chunked);
+    }
+
+    const ggml_cuda_ar_codec * codec = p->wire_codec;
+    if (!p->wire_codec_explicit) {
+        if (input_type != GGML_TYPE_F32) {
+            codec = ggml_cuda_ar_codec_from_type(input_type);
+        } else if (!legacy_use_bf16) {
+            codec = ggml_cuda_ar_codec_from_type(GGML_TYPE_F32);
+        }
+    }
+    GGML_ASSERT(codec != nullptr);
+    if (ne % (int64_t) codec->elements_per_block != 0) {
+        GGML_ABORT("%s: codec '%s' requires ne divisible by %zu (got %lld)",
+                   __func__, codec->name, codec->elements_per_block, (long long) ne);
+    }
+    const size_t nbytes = (size_t) ne / codec->elements_per_block * codec->bytes_per_block;
+    if (nbytes > p->dx_bytes) {
+        if (!p->wire_codec_explicit) {
+            // Preserve the default oversized-payload fallback.
+            return ggml_cuda_ar_allreduce_sync(p, backends, tensors, true);
+        }
+        GGML_ABORT("%s: codec '%s' payload %zu exceeds duplex slot %zu",
+                   __func__, codec->name, nbytes, p->dx_bytes);
+    }
 
     // Phase 0 only: bytes actually put on the wire.  Equals nbytes normally.
     const size_t shrink      = ggml_cuda_ar_wire_shrink();
@@ -1430,16 +1672,6 @@ bool ggml_cuda_ar_allreduce_begin(
                           "transferring %zu of %zu bytes per reduce. OUTPUT IS INVALID. "
                           "Benchmark use only.\n", shrink, xfer_nbytes, nbytes);
         }
-    }
-
-    if (p->transport == GGML_CUDA_AR_TRANSPORT_COPY) {
-        // Legacy semantics, unchanged: copy engine at/above the threshold, chunked kernel below.
-        return ggml_cuda_ar_allreduce_sync(p, backends, tensors, !chunked);
-    }
-    if (chunked || nbytes > p->dx_bytes) {
-        // Chunked kernel by explicit request, or a payload larger than one
-        // slot: run synchronously (copy engine for the oversize case).
-        return ggml_cuda_ar_allreduce_sync(p, backends, tensors, !chunked);
     }
 
     GGML_ASSERT(p->dx_in_flight < GGML_CUDA_AR_DX_SLOTS && "too many in-flight AllReduce ops (end() the oldest first)");
@@ -1469,12 +1701,8 @@ bool ggml_cuda_ar_allreduce_begin(
         if (!compute_flag[i]) {
             CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, input_nbytes, cs));
             CUDA_CHECK(cudaMemsetAsync(send, 0, nbytes, cs));
-        } else if (use_bf16) {
-            to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
-            to_bf16(tensors[i]->data, reinterpret_cast<nv_bfloat16 *>(send), ne, cs);
-            CUDA_CHECK(cudaGetLastError());
         } else {
-            CUDA_CHECK(cudaMemcpyAsync(send, tensors[i]->data, nbytes, cudaMemcpyDeviceToDevice, cs));
+            codec->pack_fn(tensors[i]->data, input_type, send, ne, cs);
         }
         CUDA_CHECK(cudaEventRecord(p->dx_ev[i][slot].app, cs));
     }
@@ -1536,7 +1764,7 @@ bool ggml_cuda_ar_allreduce_begin(
     op->slot      = slot;
     op->ne        = ne;
     op->dst_type  = input_type;
-    op->wire_type = wire_type;
+    op->wire_type = codec->wire_type;
     for (int i = 0; i < n; ++i) {
         op->dst[i] = tensors[i]->data;
     }
@@ -1578,28 +1806,11 @@ bool ggml_cuda_ar_allreduce_end(
         }
 
         const char * recv = p->dx_recv[i] + slot_off;
-        if (op->wire_type != op->dst_type) {
-            GGML_ASSERT(op->dst_type == GGML_TYPE_F32 && op->wire_type == GGML_TYPE_BF16);
-            ggml_cuda_ar_dx_add<float, nv_bfloat16>(
-                static_cast<float *>(op->dst[i]), reinterpret_cast<const nv_bfloat16 *>(recv), op->ne, cs);
-        } else {
-            switch (op->dst_type) {
-                case GGML_TYPE_F32:
-                    ggml_cuda_ar_dx_add<float, float>(
-                        static_cast<float *>(op->dst[i]), reinterpret_cast<const float *>(recv), op->ne, cs);
-                    break;
-                case GGML_TYPE_F16:
-                    ggml_cuda_ar_dx_add<half, half>(
-                        static_cast<half *>(op->dst[i]), reinterpret_cast<const half *>(recv), op->ne, cs);
-                    break;
-                case GGML_TYPE_BF16:
-                    ggml_cuda_ar_dx_add<nv_bfloat16, nv_bfloat16>(
-                        static_cast<nv_bfloat16 *>(op->dst[i]), reinterpret_cast<const nv_bfloat16 *>(recv), op->ne, cs);
-                    break;
-                default:
-                    GGML_ASSERT(false);
-            }
+        const ggml_cuda_ar_codec * codec = ggml_cuda_ar_codec_from_type(op->wire_type);
+        if (codec == nullptr) {
+            GGML_ABORT("%s: no codec registered for wire type %d", __func__, (int) op->wire_type);
         }
+        codec->unpack_accumulate_fn(op->dst[i], op->dst_type, recv, op->ne, cs);
 
         CUDA_CHECK(cudaEventRecord(ev.freed, cs));
         ev.freed_valid = true;
