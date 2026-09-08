@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -24,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cinttypes>
 #include <chrono>
 #include <cstdlib>
@@ -61,6 +63,52 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_DSPARK : return LLM_GRAPH_TYPE_DECODER_DSPARK;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static constexpr uint32_t k_meta_overlap_default_split = 2;
+static constexpr uint32_t k_meta_overlap_min_ubatch = 2;
+static constexpr uint32_t k_meta_overlap_min_subbatches = 4;
+
+static uint32_t meta_overlap_split_factor(uint32_t n_ubatch) {
+    static const uint32_t requested = []() -> uint32_t {
+        const char * value = std::getenv("GGML_META_OVERLAP_SPLIT");
+        if (value == nullptr) {
+            return k_meta_overlap_default_split;
+        }
+
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long split = std::strtoul(value, &end, 10);
+        if (errno != 0 || value[0] == '\0' || end == value || *end != '\0' ||
+                split > std::numeric_limits<uint32_t>::max() || split == 0) {
+            LLAMA_LOG_WARN("%s: invalid GGML_META_OVERLAP_SPLIT='%s'; meta overlap disabled\n", __func__, value);
+            return 0;
+        }
+
+        if (split == 1) {
+            LLAMA_LOG_INFO("%s: GGML_META_OVERLAP_SPLIT=1; meta batch splitting disabled\n", __func__);
+        }
+
+        return (uint32_t) split;
+    }();
+
+    if (requested <= 1) {
+        return requested;
+    }
+    if (n_ubatch % requested != 0) {
+        LLAMA_LOG_WARN("%s: GGML_META_OVERLAP_SPLIT=%u does not divide n_ubatch=%u; meta overlap disabled\n",
+                       __func__, requested, n_ubatch);
+        return 0;
+    }
+
+    const uint32_t subbatch = n_ubatch / requested;
+    if (subbatch < k_meta_overlap_min_ubatch) {
+        LLAMA_LOG_WARN("%s: GGML_META_OVERLAP_SPLIT=%u makes sub-batch=%u below minimum %u; meta overlap disabled\n",
+                       __func__, requested, subbatch, k_meta_overlap_min_ubatch);
+        return 0;
+    }
+
+    return requested;
 }
 
 // Token-path DSpark/MTP graphs run a vocab lm_head. Prefill injects via the
@@ -1064,14 +1112,17 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    sched_overlap.reset();
+    gf_res_overlap.reset();
 
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens_ubatch = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t reserve_ubatch = sched_overlap_reserve_requested ? cparams.n_ubatch / sched_overlap_split : cparams.n_ubatch;
+    const uint32_t n_tokens_ubatch = std::min(cparams.n_ctx, reserve_ubatch);
     const uint32_t n_tokens = draft_graph_n_tokens(cparams, n_tokens_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens_ubatch);
+    const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1199,6 +1250,8 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    sched_overlap_reserved = sched_overlap_reserve_requested;
 }
 
 void llama_context::synchronize() {
@@ -1207,6 +1260,9 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (sched_overlap) {
+        ggml_backend_sched_synchronize(sched_overlap.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1308,6 +1364,12 @@ bool llama_context::memory_update(bool optimize) {
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        if (gf_res_overlap) {
+            gf_res_overlap->reset();
+        }
+        if (sched_overlap) {
+            ggml_backend_sched_reset(sched_overlap.get());
+        }
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1322,7 +1384,8 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = draft_graph_n_tokens(cparams, std::min(cparams.n_ctx, cparams.n_ubatch));
+        const uint32_t memory_ubatch = sched_overlap_reserved ? cparams.n_ubatch / sched_overlap_split : cparams.n_ubatch;
+        const uint32_t n_tokens = draft_graph_n_tokens(cparams, std::min(cparams.n_ctx, memory_ubatch));
 
         const uint32_t n_outputs_max = reserve_graph_n_outputs(cparams, n_tokens);
 
@@ -2014,6 +2077,12 @@ void llama_context::set_no_output_head(bool value) {
     // the graph SHAPE changes (the LM head disappears), so the reserved
     // worst-case graph and any cached graph must be rebuilt.
     gf_res_prev->reset();
+    if (gf_res_overlap) {
+        gf_res_overlap->reset();
+    }
+    if (sched_overlap) {
+        ggml_backend_sched_reset(sched_overlap.get());
+    }
     sched_need_reserve = true;
 }
 
@@ -2376,10 +2445,14 @@ bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_ty
     return true;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (layer_cut_eligible(ubatch, gtype)) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret,
+                                                 ggml_backend_sched_t sched_override, llm_graph_result * res_override, bool defer_compute,
+                                                 bool disable_reuse) {
+    if (!sched_override && layer_cut_eligible(ubatch, gtype)) {
         return process_ubatch_staged(ubatch, gtype, mctx, ret);
     }
+
+    ggml_backend_sched_t sched_active = sched_override ? sched_override : sched.get();
 
     // The whole-graph path never sets layer_cut_slot.state_torn/failed (it
     // is atomic -- one graph_compute, no partial per-layer advancement to
@@ -2398,28 +2471,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
+    auto * res = res_override ? res_override : gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, sched_active);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && !disable_reuse && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_synchronize(sched_active);
         }
 
         n_reused++;
     } else {
         res->reset();
 
-        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_reset(sched_active);
         
         // Use the new wp::WeightPager eval callback when paging is enabled.
         // Note: GGML_CUDA_DISABLE_GRAPHS is now managed by wp::WeightPager
@@ -2431,7 +2504,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             eval_cb = wp::weight_pager_eval_cb;
             eval_cb_user_data = model.wp_pager.get();
         }
-        ggml_backend_sched_set_eval_callback(sched.get(), eval_cb, eval_cb_user_data);
+        ggml_backend_sched_set_eval_callback(sched_active, eval_cb, eval_cb_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2445,7 +2518,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (!ggml_backend_sched_alloc_graph(sched_active, gf)) {
             LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph returned false\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -2460,6 +2533,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (defer_compute) {
+        ret = GGML_STATUS_SUCCESS;
+        return res;
     }
 
     // WP_SPINE_STATS=1: time the spine's own graph compute. The expert
@@ -2536,7 +2614,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (wp_draft_active && !wp_draft_shape_logged) {
         wp_draft_shape_logged = true;
         const int n_nodes  = gf ? ggml_graph_n_nodes(gf) : -1;
-        const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
+        const int n_splits = ggml_backend_sched_get_n_splits(sched_active);
         LLAMA_LOG_WARN("wp draft-stats: graph shape (first call) n_nodes=%d n_splits=%d n_tokens=%u\n",
                        n_nodes, n_splits, ubatch.n_tokens);
     }
@@ -2549,12 +2627,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         expert_dispatch->spine_layer_profile_begin(
             wp_spine_layer_profile_index, ubatch.n_tokens, wp_gc_t0);
         ggml_backend_sched_set_split_callback(
-            sched.get(), wp_spine_layer_profile_split_cb, expert_dispatch);
+            sched_active, wp_spine_layer_profile_split_cb, expert_dispatch);
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, sched_active);
     if (wp_spine_layer_profile) {
         expert_dispatch->spine_layer_profile_end(std::chrono::steady_clock::now());
-        ggml_backend_sched_set_split_callback(sched.get(), nullptr, nullptr);
+        ggml_backend_sched_set_split_callback(sched_active, nullptr, nullptr);
     }
     if (wp_spine_profile_trace) {
         const auto wp_gc_t1 = std::chrono::steady_clock::now();
@@ -2604,7 +2682,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (ggml_backend_cuda_wp_graph_counts != nullptr) {
                 ggml_tensor * t_logits = res ? res->get_logits() : nullptr;
                 ggml_backend_t backend_res = t_logits
-                    ? ggml_backend_sched_get_tensor_backend(sched.get(), t_logits) : nullptr;
+                    ? ggml_backend_sched_get_tensor_backend(sched_active, t_logits) : nullptr;
                 have_counts = backend_res != nullptr &&
                     ggml_backend_cuda_wp_graph_counts(backend_res, &caps, &hits, &falls, &newkey, &lru);
             }
@@ -3422,7 +3500,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
+    ggml_backend_t overlap_meta = nullptr;
+    for (ggml_backend_t backend : backend_ptrs) {
+        if (ggml_backend_is_meta(backend) && ggml_backend_meta_overlap_enabled(backend)) {
+            overlap_meta = backend;
+            break;
+        }
+    }
+    static const bool overlap_layer_cut_env = [] {
+        const char * e = getenv("WP_QWEN4EXP_LAYER_CUT");
+        return e != nullptr && e[0] == '1';
+    }();
+    const uint32_t validated_overlap_split = overlap_meta != nullptr
+        ? meta_overlap_split_factor(cparams.n_ubatch)
+        : 1;
+    const uint32_t overlap_split = validated_overlap_split > 1 ? validated_overlap_split : 1;
+    const bool overlap_split_changed = sched_overlap_split != overlap_split;
+    if (overlap_split_changed && overlap_split > 1) {
+        LLAMA_LOG_INFO("%s: meta overlap split=%u, n_ubatch=%u, sub-batch=%u\n",
+                       __func__, overlap_split, cparams.n_ubatch, cparams.n_ubatch / overlap_split);
+    }
+    sched_overlap_split = overlap_split;
+    const bool overlap_candidate = overlap_meta != nullptr &&
+        !cparams.pipeline_parallel &&
+        !model.hparams.no_alloc &&
+        !llm_arch_is_recurrent(model.arch) &&
+        !is_draft_ctx(cparams) &&
+        !overlap_layer_cut_env &&
+        n_tokens_all >= cparams.n_ubatch &&
+        validated_overlap_split > 1;
+    if (sched_overlap_reserved != overlap_candidate || (overlap_candidate && overlap_split_changed)) {
+        sched_need_reserve = true;
+    }
+    sched_overlap_reserve_requested = overlap_candidate;
     sched_reserve();
+    sched_overlap_reserve_requested = false;
 
     bool did_optimize = false;
 
@@ -3431,8 +3543,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    const bool overlap_active = overlap_candidate;
+    const uint32_t memory_ubatch = overlap_active ? cparams.n_ubatch / overlap_split : cparams.n_ubatch;
+
+    if (overlap_active && !sched_overlap) {
+        const size_t max_nodes = gf_res_prev->get_max_nodes();
+        sched_overlap.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                                   max_nodes, false, cparams.op_offload));
+        gf_res_overlap.reset(new llm_graph_result(max_nodes));
+    }
+
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, memory_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -3490,8 +3613,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MAD-LAB: the decode scope uses the shared dispatcher when borrowed.
     expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch);
 
-    do {
-        const auto & ubatch = mctx->get_ubatch();
+    auto prepare_ubatch = [&](const llama_ubatch & ubatch) -> int32_t {
 
         // count the outputs in this ubatch
         {
@@ -3535,7 +3657,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
         if (expert_dispatch != nullptr && ubatch.token != nullptr) {
             expert_dispatch->note_batch_tokens(ubatch.token, ubatch.n_tokens);
-            // Filter the mask token at the hint site (throughput-analysis §6.1):
+            // Filter the mask token at the hint site (throughput-analysis section 6.1):
             // during a draft decode this ubatch is [id_last, mask x k], and the
             // tid2eid rows for mask_token_id are noise -- the dispatcher's
             // (layer, provenance) dedup eats the repeats after the first block,
@@ -3564,11 +3686,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        ggml_status status;
+        return (int32_t) n_outputs;
+    };
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-
-        if (!res) {
+    auto handle_failed_ubatch = [&](const llama_ubatch & ubatch, ggml_status status) -> int {
+        {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -3648,13 +3770,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+            return -3;
         }
 
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
+    };
 
+    auto extract_ubatch = [&](const llm_graph_result * res, const llama_ubatch & ubatch,
+                              int32_t n_outputs_ubatch, int64_t output_prev, int64_t token_prev,
+                              ggml_backend_sched_t sched_active) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -3664,18 +3787,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+        if (logits.data && t_logits && n_outputs_ubatch > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active, t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
             const int64_t n_graph_rows = t_logits->ne[1];
-            const int64_t n_copy = std::min<int64_t>({ n_outputs, n_graph_rows,
+            const int64_t n_copy = std::min<int64_t>({ n_outputs_ubatch, n_graph_rows,
                     n_vocab > 0 ? (int64_t) (logits.size / (size_t) n_vocab) : 0 });
-            const int64_t dst_row = n_outputs_prev + n_outputs - n_copy;
+            const int64_t dst_row = output_prev + n_outputs_ubatch - n_copy;
 
             if (n_copy > 0) {
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT( output_prev + n_outputs_ubatch <= n_outputs_all);
                 GGML_ASSERT((dst_row + n_copy)*n_vocab <= (int64_t) logits.size);
                 float * logits_out = logits.data + dst_row*n_vocab;
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_copy*n_vocab*sizeof(float));
@@ -3683,8 +3806,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+        if (embd.data && t_embd && n_outputs_ubatch > 0) {
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_active, t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
             switch (cparams.pooling_type) {
@@ -3693,12 +3816,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         // extract token embeddings
                         GGML_ASSERT(embd.data != nullptr);
                         const uint32_t n_embd_out = hparams.n_embd_out();
-                        float * embd_out = embd.data + n_outputs_prev*n_embd_out;
+                        float * embd_out = embd.data + output_prev*n_embd_out;
 
-                        if (n_outputs) {
-                            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                            GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                        if (n_outputs_ubatch) {
+                            GGML_ASSERT( output_prev + n_outputs_ubatch <= n_outputs_all);
+                            GGML_ASSERT((output_prev + n_outputs_ubatch)*n_embd_out <= (int64_t) embd.size);
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs_ubatch*n_embd_out*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_MEAN:
@@ -3742,17 +3865,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_layer_inputs(res, token_prev, ubatch.n_tokens, sched_active);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
         {
             const bool masked    = cparams.embeddings_nextn_masked;
-            const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
-            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+            const int64_t n_rows = masked ? n_outputs_ubatch       : (int64_t) ubatch.n_tokens;
+            const int64_t offset = masked ? output_prev  : token_prev;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active, t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
                 // MAD-LAB: use the width produced by this graph, not a model-wide width.
@@ -3771,15 +3894,270 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      output_prev, sched_active);
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, output_prev, sched_active, &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, output_prev, sched_active, &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, output_prev, sched_active, &sampling.candidates_count);
         }
 
-        n_outputs_prev += n_outputs;
-        n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+    };
+
+    auto normalize_compute_status = [&](ggml_status status) {
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        }
+        if (status == GGML_STATUS_SUCCESS && expert_dispatch && expert_dispatch->failed()) {
+            const std::string message = expert_dispatch->failure_message();
+            LLAMA_LOG_ERROR("%s: expert dispatch failed: %s\n", __func__, message.c_str());
+            status = GGML_STATUS_FAILED;
+        }
+        return status;
+    };
+
+    // Full sub-batches keep every reused graph shape identical. A partial tail uses the existing path.
+    const bool overlap_subbatches_are_full = n_tokens_all % memory_ubatch == 0;
+    const uint32_t n_overlap_subbatches = n_tokens_all / memory_ubatch;
+    // Four sub-batches amortize startup and drain overhead; this is not the two-reduce pipeline depth.
+    const bool overlap_has_enough_work = n_overlap_subbatches >= k_meta_overlap_min_subbatches;
+    const bool continuous_overlap = overlap_active &&
+        overlap_subbatches_are_full &&
+        overlap_has_enough_work;
+
+    if (continuous_overlap) {
+        struct overlap_slot {
+            llama_ubatch            ubatch;
+            int32_t                 n_outputs = 0;
+            const llm_graph_result * res = nullptr;
+            ggml_backend_sched_t    sched = nullptr;
+            size_t                  i_slot = 0;
+            size_t                  n_steps = 0;
+            bool                    pending = false;
+            bool                    finished = false;
+        };
+
+        overlap_slot slot_a = { {}, 0, nullptr, sched.get(),         0 };
+        overlap_slot slot_b = { {}, 0, nullptr, sched_overlap.get(), 1 };
+
+        auto setup_graph_compute = [&](bool batched) {
+            const int n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
+            const ggml_threadpool_t tp = batched ? threadpool_batch : threadpool;
+            if (backend_cpu != nullptr) {
+                auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+                auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+                if (set_threadpool_fn) {
+                    set_threadpool_fn(backend_cpu, tp);
+                }
+            }
+            for (const auto & set_n_threads_fn : set_n_threads_fns) {
+                set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+            }
+        };
+
+        auto prepare_slot = [&](overlap_slot & slot, ggml_status & status) {
+            slot.ubatch = mctx->get_ubatch();
+            slot.n_outputs = prepare_ubatch(slot.ubatch);
+            slot.res = process_ubatch(slot.ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
+                                      slot.sched, slot.i_slot == 0 ? gf_res_prev.get() : gf_res_overlap.get(), true, true);
+            return slot.res != nullptr;
+        };
+
+        auto begin_slot = [&](overlap_slot & slot, ggml_status & status) {
+            setup_graph_compute(slot.ubatch.n_tokens > 1);
+            status = ggml_backend_sched_graph_compute_async_meta_begin(
+                slot.sched, slot.res->get_gf(), slot.i_slot, &slot.n_steps);
+            return status == GGML_STATUS_SUCCESS;
+        };
+
+        auto step_slot = [&](overlap_slot & slot, ggml_status & status) {
+            status = ggml_backend_sched_graph_compute_async_meta_step(
+                slot.sched, slot.i_slot, (int) slot.i_slot, &slot.pending, &slot.finished);
+            return status == GGML_STATUS_SUCCESS;
+        };
+
+        auto end_slot = [&](overlap_slot & slot, ggml_status & status) {
+            if (!slot.pending) {
+                return true;
+            }
+            status = ggml_backend_sched_graph_compute_async_meta_end(slot.sched, slot.i_slot, (int) slot.i_slot);
+            if (status != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            slot.pending = false;
+            return true;
+        };
+
+        auto extract_slot = [&](const overlap_slot & slot) {
+            extract_ubatch(slot.res, slot.ubatch, slot.n_outputs, n_outputs_prev, n_tokens_prev, slot.sched);
+            n_outputs_prev += slot.n_outputs;
+            n_tokens_prev  += slot.ubatch.n_tokens;
+        };
+
+        auto fail_slots = [&](const overlap_slot & first, const overlap_slot & second, ggml_status status) {
+            const int result = handle_failed_ubatch(first.ubatch, status);
+            handle_failed_ubatch(second.ubatch, status);
+            return result;
+        };
+
+        auto finish_slot = [&](overlap_slot & slot, ggml_status & status) {
+            while (!slot.finished) {
+                if (!end_slot(slot, status) || !step_slot(slot, status)) {
+                    return false;
+                }
+            }
+            return end_slot(slot, status);
+        };
+
+        ggml_status status;
+        if (!prepare_slot(slot_a, status)) {
+            return handle_failed_ubatch(slot_a.ubatch, status);
+        }
+        GGML_ASSERT(mctx->next());
+        if (!prepare_slot(slot_b, status)) {
+            return fail_slots(slot_b, slot_a, status);
+        }
+
+        if (!ggml_backend_sched_graph_compute_async_meta_supported(slot_a.sched) ||
+                !ggml_backend_sched_graph_compute_async_meta_supported(slot_b.sched) ||
+                !begin_slot(slot_a, status) || !begin_slot(slot_b, status) ||
+                slot_a.n_steps != slot_b.n_steps || slot_a.n_steps < 2) {
+            const auto pair_status = normalize_compute_status(
+                graph_compute(slot_a.res->get_gf(), slot_a.ubatch.n_tokens > 1, slot_a.sched,
+                              slot_b.res->get_gf(), slot_b.sched));
+            if (pair_status != GGML_STATUS_SUCCESS) {
+                return fail_slots(slot_b, slot_a, pair_status);
+            }
+            extract_slot(slot_a);
+            extract_slot(slot_b);
+            while (mctx->next()) {
+                const auto ubatch = mctx->get_ubatch();
+                const int32_t n_outputs_ubatch = prepare_ubatch(ubatch);
+                ggml_status tail_status;
+                const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), tail_status);
+                if (!res) {
+                    return handle_failed_ubatch(ubatch, tail_status);
+                }
+                extract_ubatch(res, ubatch, n_outputs_ubatch, n_outputs_prev, n_tokens_prev, sched.get());
+                n_outputs_prev += n_outputs_ubatch;
+                n_tokens_prev  += ubatch.n_tokens;
+            }
+        } else if (!step_slot(slot_a, status) || !step_slot(slot_b, status) || !end_slot(slot_a, status)) {
+            return fail_slots(slot_a, slot_b, status);
+        } else {
+            const size_t n_steps = slot_a.n_steps;
+            bool done = false;
+            while (!done) {
+                for (size_t i = 1; i < n_steps; ++i) {
+                    if (!step_slot(slot_a, status)) {
+                        return fail_slots(slot_a, slot_b, status);
+                    }
+                    if (i + 1 != n_steps) {
+                        if (!end_slot(slot_b, status) || !step_slot(slot_b, status) || !end_slot(slot_a, status)) {
+                            return fail_slots(slot_a, slot_b, status);
+                        }
+                        continue;
+                    }
+
+                    if (!mctx->next()) {
+                        if (!end_slot(slot_b, status) || !step_slot(slot_b, status)) {
+                            return fail_slots(slot_a, slot_b, status);
+                        }
+                        extract_slot(slot_a);
+                        extract_slot(slot_b);
+                        done = true;
+                        break;
+                    }
+
+                    extract_slot(slot_a);
+                    if (!end_slot(slot_b, status) || !step_slot(slot_b, status) ||
+                            !prepare_slot(slot_a, status) || !begin_slot(slot_a, status) || slot_a.n_steps != n_steps ||
+                            !step_slot(slot_a, status)) {
+                        return fail_slots(slot_a, slot_b, status);
+                    }
+                    extract_slot(slot_b);
+
+                    if (!mctx->next()) {
+                        if (!finish_slot(slot_a, status)) {
+                            return fail_slots(slot_a, slot_b, status);
+                        }
+                        extract_slot(slot_a);
+                        done = true;
+                        break;
+                    }
+                    if (!prepare_slot(slot_b, status) || !begin_slot(slot_b, status) || slot_b.n_steps != n_steps ||
+                            !step_slot(slot_b, status) || !end_slot(slot_a, status)) {
+                        return fail_slots(slot_a, slot_b, status);
+                    }
+                }
+            }
+        }
+    } else while (true) {
+        const auto ubatch_a = mctx->get_ubatch();
+        const int32_t n_outputs_a = prepare_ubatch(ubatch_a);
+
+        ggml_status status_a;
+        const auto * res_a = overlap_active
+            ? process_ubatch(ubatch_a, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status_a,
+                             sched.get(), gf_res_prev.get(), true, true)
+            : process_ubatch(ubatch_a, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status_a);
+        if (!res_a) {
+            return handle_failed_ubatch(ubatch_a, status_a);
+        }
+
+        if (!overlap_active || !mctx->next()) {
+            const auto status = overlap_active
+                ? graph_compute(res_a->get_gf(), ubatch_a.n_tokens > 1, sched.get())
+                : status_a;
+            if (overlap_active) {
+                const auto normalized_status = normalize_compute_status(status);
+                if (normalized_status != GGML_STATUS_SUCCESS) {
+                    return handle_failed_ubatch(ubatch_a, normalized_status);
+                }
+            }
+            extract_ubatch(res_a, ubatch_a, n_outputs_a, n_outputs_prev, n_tokens_prev, sched.get());
+            n_outputs_prev += n_outputs_a;
+            n_tokens_prev  += ubatch_a.n_tokens;
+            if (!overlap_active) {
+                if (!mctx->next()) {
+                    break;
+                }
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        const auto ubatch_b = mctx->get_ubatch();
+        const int32_t n_outputs_b = prepare_ubatch(ubatch_b);
+
+        ggml_status status_b;
+        const auto * res_b = process_ubatch(ubatch_b, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status_b,
+                                             sched_overlap.get(), gf_res_overlap.get(), true, true);
+        if (!res_b) {
+            const int result = handle_failed_ubatch(ubatch_b, status_b);
+            handle_failed_ubatch(ubatch_a, status_b);
+            return result;
+        }
+
+        const auto status = normalize_compute_status(
+            graph_compute(res_a->get_gf(), ubatch_a.n_tokens > 1, sched.get(),
+                          res_b->get_gf(), sched_overlap.get()));
+        if (status != GGML_STATUS_SUCCESS) {
+            const int result = handle_failed_ubatch(ubatch_b, status);
+            handle_failed_ubatch(ubatch_a, status);
+            return result;
+        }
+
+        extract_ubatch(res_a, ubatch_a, n_outputs_a, n_outputs_prev, n_tokens_prev, sched.get());
+        n_outputs_prev += n_outputs_a;
+        n_tokens_prev  += ubatch_a.n_tokens;
+        extract_ubatch(res_b, ubatch_b, n_outputs_b, n_outputs_prev, n_tokens_prev, sched_overlap.get());
+        n_outputs_prev += n_outputs_b;
+        n_tokens_prev  += ubatch_b.n_tokens;
+
+        if (!mctx->next()) {
+            break;
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -4043,7 +4421,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
+                                         ggml_backend_sched_t sched_override) {
+    ggml_backend_sched_t sched_active = sched_override ? sched_override : sched.get();
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -4069,7 +4449,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         // backend; walk view_src to the tensor that owns the buffer.
         ggml_backend_t backend = nullptr;
         for (ggml_tensor * cur = t; cur != nullptr; cur = cur->view_src) {
-            backend = ggml_backend_sched_get_tensor_backend(sched.get(), cur);
+            backend = ggml_backend_sched_get_tensor_backend(sched_active, cur);
             if (backend != nullptr) {
                 break;
             }
@@ -4345,14 +4725,16 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                  ggml_backend_sched_t sched_override) const {
+    ggml_backend_sched_t sched_active = sched_override ? sched_override : sched.get();
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
+        /*.sched       =*/ sched_active,
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
@@ -4363,14 +4745,18 @@ llm_graph_params llama_context::graph_params(
         /*.expert_dispatch =*/ expert_dispatch,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ graph_get_cb(sched_active),
         /*.res         =*/ res,
     };
 }
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+        ggml_backend_sched_t sched_override,
+            ggml_cgraph * gf_pair,
+        ggml_backend_sched_t sched_pair) {
+    ggml_backend_sched_t sched_active = sched_override ? sched_override : sched.get();
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -4393,9 +4779,17 @@ ggml_status llama_context::graph_compute(
     // No-op unless the pager is active; cheap (cached, skips when topology unchanged).
     if (model.wp_pager) {
         model.wp_pager->mark_routing_boundaries(gf);
+        if (gf_pair != nullptr) {
+            model.wp_pager->mark_routing_boundaries(gf_pair);
+        }
     }
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (gf_pair != nullptr) {
+        GGML_ASSERT(sched_pair != nullptr);
+    }
+    auto status = gf_pair != nullptr
+        ? ggml_backend_sched_graph_compute_async_pair(sched_active, gf, sched_pair, gf_pair)
+        : ggml_backend_sched_graph_compute_async(sched_active, gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -4405,7 +4799,8 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
+llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_override) const {
+    ggml_backend_sched_t sched_active = sched_override ? sched_override : sched.get();
     // WP hetero (experts on paging GPU, attn on resident): resolve once.
     // FFN-island weights (ffn_norm / gate_inp / shexp) live on the paging buft.
     ggml_backend_t backend_paging = nullptr;
@@ -4431,7 +4826,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         }
     }
 
-    return [this, wp_hetero, backend_paging](
+    return [this, wp_hetero, backend_paging, sched_active](
                    const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
@@ -4464,7 +4859,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     strncmp(name, "hc_ffn", 6) == 0;
 
                 if (ffn_island && ggml_backend_supports_op(backend_paging, cur)) {
-                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_paging);
+                    ggml_backend_sched_set_tensor_backend(sched_active, cur, backend_paging);
                 }
                 // Deliberately skip the generic "norm" -> layer-home pin.
                 return;
@@ -4475,7 +4870,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched_active, cur, backend.get());
                         }
                     }
                 }

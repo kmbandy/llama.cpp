@@ -107,6 +107,12 @@ extern "C" {
     GGML_API bool           ggml_backend_meta_overlap_enabled(ggml_backend_t meta_backend);
     GGML_API enum ggml_status ggml_backend_meta_graph_compute_pair(ggml_backend_t meta_backend,
             struct ggml_cgraph * cgraph_a, struct ggml_cgraph * cgraph_b);
+    GGML_API enum ggml_status ggml_backend_meta_graph_compute_step_begin(ggml_backend_t meta_backend,
+            struct ggml_cgraph * cgraph, size_t i_slot, size_t * n_steps);
+    GGML_API enum ggml_status ggml_backend_meta_graph_compute_step(ggml_backend_t meta_backend,
+            size_t i_slot, int i_op, bool * pending, bool * finished);
+    GGML_API enum ggml_status ggml_backend_meta_graph_compute_step_end(ggml_backend_t meta_backend,
+            size_t i_slot, int i_op);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);

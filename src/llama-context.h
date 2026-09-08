@@ -191,7 +191,11 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                ggml_backend_sched_t sched_override = nullptr,
+                    llm_graph_result * res_override = nullptr,
+                              bool defer_compute = false,
+                              bool disable_reuse = false);
 
     // WP_QWEN4EXP_LAYER_CUT (Stage 3): true only for LLM_ARCH_QWEN4EXP,
     // LLM_GRAPH_TYPE_DEFAULT, a normal (non-draft) context, pooling_type NONE,
@@ -291,7 +295,8 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
+                              ggml_backend_sched_t sched_override = nullptr);
 
     //
     // graph
@@ -304,7 +309,10 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched,
+                              ggml_backend_sched_t sched_override = nullptr,
+                              ggml_cgraph * gf_pair = nullptr,
+                              ggml_backend_sched_t sched_pair = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -329,7 +337,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                  ggml_backend_sched_t sched_override = nullptr) const;
 
     // WP_QWEN4EXP_LAYER_CUT (Stage 3) serial stage-list executor: replaces only
     // the whole-graph execution decision at the graph_compute(res->get_gf(), ...)
@@ -343,7 +352,7 @@ private:
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_override = nullptr) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -436,6 +445,14 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // Second graph slot for the gated two-ubatch meta overlap path.
+    // Created only when a decode batch actually uses that path.
+    ggml_backend_sched_ptr sched_overlap;
+    bool sched_overlap_reserve_requested = false;
+    bool sched_overlap_reserved = false;
+    // Sub-batch count; independent of the two-slot reduce pipeline.
+    uint32_t sched_overlap_split = 1;
+
     // MAD-LAB logits-on-head: dedicated scheduler for output_project(). Kept
     // separate from `sched` so the decode path's graph reuse is never reset.
     // Created lazily -- nothing allocates it on a non-segment head.
@@ -463,6 +480,7 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_overlap;
     llm_graph_result_ptr gf_res_reserve;
 
     // WP_QWEN4EXP_LAYER_CUT (Stage 3): the one live logical execution slot

@@ -362,6 +362,19 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_pair(
+            ggml_backend_sched_t sched_a, struct ggml_cgraph * graph_a,
+            ggml_backend_sched_t sched_b, struct ggml_cgraph * graph_b);
+    // Stepwise execution for a single Meta scheduler split. This is used by the
+    // gated ubatch overlap path to replace a finished graph without draining
+    // the other graph's final reduce.
+    GGML_API bool                 ggml_backend_sched_graph_compute_async_meta_supported(ggml_backend_sched_t sched);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_meta_begin(
+            ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t i_slot, size_t * n_steps);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_meta_step(
+            ggml_backend_sched_t sched, size_t i_slot, int i_op, bool * pending, bool * finished);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_meta_end(
+            ggml_backend_sched_t sched, size_t i_slot, int i_op);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

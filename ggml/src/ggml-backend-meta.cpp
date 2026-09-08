@@ -1850,6 +1850,7 @@ struct ggml_backend_meta_context {
         size_t                     max_tmp_size  = 0;
         size_t                     max_subgraphs = 0;
         size_t                     n_subgraphs   = 0;
+        size_t                     next_subgraph = 0;
         uint64_t                   uid           = 0;
     };
     std::string                 name;
@@ -2564,6 +2565,61 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
     return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_backend_meta_graph_compute_step_begin(
+        ggml_backend_t backend, struct ggml_cgraph * cgraph, size_t i_slot, size_t * n_steps) {
+    GGML_ASSERT(ggml_backend_is_meta(backend));
+    GGML_ASSERT(i_slot < ggml_backend_meta_context::n_graph_slots);
+    GGML_ASSERT(n_steps != nullptr);
+    if (!ggml_backend_meta_overlap_enabled(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_backend_meta_graph_prepare(backend, cgraph, i_slot);
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    auto & gs = backend_ctx->graph_states[i_slot];
+    gs.next_subgraph = 0;
+    *n_steps = gs.n_subgraphs;
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_backend_meta_graph_compute_step(
+        ggml_backend_t backend, size_t i_slot, int i_op, bool * pending, bool * finished) {
+    GGML_ASSERT(ggml_backend_is_meta(backend));
+    GGML_ASSERT(i_slot < ggml_backend_meta_context::n_graph_slots);
+    GGML_ASSERT(pending != nullptr);
+    GGML_ASSERT(finished != nullptr);
+
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    auto & gs = backend_ctx->graph_states[i_slot];
+    GGML_ASSERT(gs.next_subgraph < gs.n_subgraphs);
+
+    ggml_backend_meta_graph_runner runner = { backend_ctx, i_slot, ggml_backend_meta_n_backends(backend) };
+    const size_t i = gs.next_subgraph++;
+    ggml_status status = runner.compute(i);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+
+    *pending = false;
+    if (runner.n_backends > 1 && i + 1 < gs.n_subgraphs) {
+        status = runner.begin_reduce(i, i_op, *pending);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    *finished = gs.next_subgraph == gs.n_subgraphs;
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_backend_meta_graph_compute_step_end(
+        ggml_backend_t backend, size_t i_slot, int i_op) {
+    GGML_ASSERT(ggml_backend_is_meta(backend));
+    GGML_ASSERT(i_slot < ggml_backend_meta_context::n_graph_slots);
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    ggml_backend_meta_graph_runner runner = { backend_ctx, i_slot, ggml_backend_meta_n_backends(backend) };
+    return runner.end_reduce(i_op);
 }
 
 enum ggml_status ggml_backend_meta_graph_compute_pair(

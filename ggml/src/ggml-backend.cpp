@@ -2045,6 +2045,441 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 template<bool collect_split_stats>
+struct ggml_backend_sched_compute_runner {
+    ggml_backend_sched_t sched;
+    wp_sched_split_stats split_stats = {};
+    ggml_tensor * prev_ids_tensor = nullptr;
+    std::vector<int32_t> ids;
+    std::vector<ggml_bitset_t> used_ids;
+    int prev_backend_id = -1;
+    int unsynced_backend_id = -1;
+
+    explicit ggml_backend_sched_compute_runner(ggml_backend_sched_t sched) : sched(sched) {
+        if constexpr (collect_split_stats) {
+            split_stats.n_splits = sched->n_splits;
+        }
+    }
+
+    void sync_backend(int backend_id) {
+        if (backend_id < 0) {
+            return;
+        }
+        uint64_t sync_start = 0;
+        if constexpr (collect_split_stats) {
+            sync_start = wp_sched_time_ns();
+        }
+        if (sched->events[backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(sched->backends[backend_id]);
+        }
+        if constexpr (collect_split_stats) {
+            ++split_stats.n_sync_calls;
+            split_stats.ns_sync_total += wp_sched_time_ns() - sync_start;
+        }
+    }
+
+    void synchronize_backend(ggml_backend_t backend) {
+        uint64_t sync_start = 0;
+        if constexpr (collect_split_stats) {
+            sync_start = wp_sched_time_ns();
+        }
+        ggml_backend_synchronize(backend);
+        if constexpr (collect_split_stats) {
+            ++split_stats.n_sync_calls;
+            split_stats.ns_sync_total += wp_sched_time_ns() - sync_start;
+        }
+    }
+
+    void synchronize_compute_stream(ggml_backend_t backend) {
+        uint64_t sync_start = 0;
+        if constexpr (collect_split_stats) {
+            sync_start = wp_sched_time_ns();
+        }
+        if (!ggml_backend_cuda_synchronize_compute || !ggml_backend_cuda_synchronize_compute(backend)) {
+            ggml_backend_synchronize(backend);
+        }
+        if constexpr (collect_split_stats) {
+            ++split_stats.n_sync_calls;
+            split_stats.ns_sync_total += wp_sched_time_ns() - sync_start;
+        }
+    }
+
+    enum ggml_status prepare(int split_id) {
+        struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        int split_backend_id = split->backend_id;
+        ggml_backend_t split_backend = sched->backends[split_backend_id];
+        bool split_backend_ready_for_input_copies = false;
+
+        if constexpr (collect_split_stats) {
+            if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+                ++split_stats.n_backend_switches;
+            }
+        }
+
+        // HIP graph capture needs an idle stream. Overlap wait with shexp, then
+        // drain the GPU before the next split that actually uses that backend.
+        if (unsynced_backend_id >= 0 && split_backend_id == unsynced_backend_id) {
+            sync_backend(unsynced_backend_id);
+            unsynced_backend_id = -1;
+        }
+
+        // ensure the previous split's async work has completed before we start
+        // this split, the allocator may have reused buffer regions across splits
+        // (#26040). Exception: expert-dispatch wait is MAP_CUSTOM2 on CPU with
+        // only CPU srcs — a different buffer type from the GPU shexp FFN, so
+        // gallocr cannot reuse VRAM for the wait output. Syncing here is what
+        // left the GPU idle for the whole worker RPC (48 layers).
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            bool dispatch_wait = split->graph.n_nodes > 0;
+            for (int ni = 0; dispatch_wait && ni < split->graph.n_nodes; ++ni) {
+                const struct ggml_tensor * node = split->graph.nodes[ni];
+                if (node == NULL || node->op != GGML_OP_MAP_CUSTOM2) {
+                    dispatch_wait = false;
+                }
+            }
+            if (dispatch_wait) {
+                unsynced_backend_id = prev_backend_id;
+            } else {
+                sync_backend(prev_backend_id);
+                if (unsynced_backend_id == prev_backend_id) {
+                    unsynced_backend_id = -1;
+                }
+            }
+        }
+
+        // copy the input tensors to the split backend
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            uint64_t copy_start;
+            bool copy_pinned_d2h = false;
+            bool copy_pageable_d2h = false;
+            if constexpr (collect_split_stats) {
+                copy_start = wp_sched_time_ns();
+                ++split_stats.n_copy_tensors;
+            }
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+            struct ggml_tensor * input = split->inputs[input_id];
+            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                sync_backend(split_backend_id);
+                ggml_backend_tensor_copy(input, input_cpy);
+            } else {
+                // wait for the split backend to finish using the input before overwriting it
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    uint64_t event_wait_start;
+                    if constexpr (collect_split_stats) {
+                        event_wait_start = wp_sched_time_ns();
+                    }
+                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    if constexpr (collect_split_stats) {
+                        ++split_stats.n_event_waits;
+                        split_stats.ns_event_wait_total += wp_sched_time_ns() - event_wait_start;
+                    }
+                } else if (!split_backend_ready_for_input_copies) {
+                    synchronize_backend(split_backend);
+                    split_backend_ready_for_input_copies = true;
+                } else if constexpr (collect_split_stats) {
+                    ++split_stats.n_syncs_elided;
+                }
+
+                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                ggml_tensor * node = split->graph.nodes[0];
+                if (split->graph.n_nodes > 0 &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer) && (
+                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+                    )) {
+
+                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+
+                    synchronize_backend(input_backend);
+
+                    // get the ids
+                    ggml_tensor * ids_tensor = node->src[2];
+                    ggml_backend_t ids_backend = split_backend;
+
+                    // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
+                    // in that case, we use the original ids tensor
+                    for (int i = input_id + 1; i < split->n_inputs; i++) {
+                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                            ids_tensor = split->inputs[i];
+                            ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+                            break;
+                        }
+                    }
+
+                    if (ids_tensor != prev_ids_tensor) {
+                        ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        synchronize_backend(ids_backend);
+
+                        // find the used experts
+                        used_ids.clear();
+                        used_ids.resize(ggml_bitset_size(n_expert));
+                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                                GGML_ASSERT(id >= 0 && id < n_expert);
+                                ggml_bitset_set(used_ids.data(), id);
+                            }
+                        }
+
+                        prev_ids_tensor = ids_tensor;
+                    }
+
+                    // group consecutive experts and copy them together
+                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        const size_t expert_offset = first_id * expert_size;
+                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                        const size_t padding = std::min<size_t>(expert_size, 512);
+                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+
+                        ggml_backend_tensor_set_async(split_backend,
+                            input_cpy,
+                            (const uint8_t *)input->data + expert_offset, expert_offset,
+                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                            // this is necessary for MMQ in the CUDA backend
+                            expert_size_copy + padding_end);
+                    };
+
+                    int id = 0;
+                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                        id++;
+                    }
+                    int32_t first_id = id;
+                    int32_t last_id = first_id;
+
+                    for (++id; id < n_expert; ++id) {
+                        if (!ggml_bitset_get(used_ids.data(), id)) {
+                            continue;
+                        }
+
+                        if (id == last_id + 1) {
+                            last_id = id;
+                            continue;
+                        }
+
+                        copy_experts(first_id, last_id);
+
+                        first_id = id;
+                        last_id = id;
+                    }
+                    copy_experts(first_id, last_id);
+                } else {
+                    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                    // WP_SCHED_COPY_DEBUG only -- see wp_sched_copy_debug_enabled().
+                    // The cached flag is checked first so the strstr() (and, on a
+                    // match, the synchronize + device reads + fprintf) is entirely
+                    // absent from the default per-split-input hot path.
+                    bool dbg = wp_sched_copy_debug_enabled() &&
+                               input && input->name[0] && strstr(input->name, "token_embd") != nullptr;
+                    if (dbg) {
+                        fprintf(stderr, "[sched_copy] %s ENTER: src data=%p buf=%p host=%d -> dst data=%p buf=%p host=%d size=%zu\n",
+                                input->name, input->data, (void*)input->buffer,
+                                input->buffer ? (int)ggml_backend_buffer_is_host(input->buffer) : -1,
+                                input_cpy->data, (void*)input_cpy->buffer,
+                                input_cpy->buffer ? (int)ggml_backend_buffer_is_host(input_cpy->buffer) : -1,
+                                ggml_nbytes(input));
+                    }
+                    if (wp_sched_copy_to_pinned_host_async(input_backend, input, input_cpy)) {
+                        ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                        synchronize_compute_stream(input_backend);
+                        copy_pinned_d2h = true;
+                        if constexpr (collect_split_stats) {
+                            ++split_stats.n_syncs_elided;
+                        }
+                    } else if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        if (dbg) fprintf(stderr, "[sched_copy] %s: SYNC path\n", input->name);
+                        synchronize_backend(input_backend);
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                            sync_backend(split_backend_id);
+                        } else if constexpr (collect_split_stats) {
+                            ++split_stats.n_syncs_elided;
+                        }
+                        ggml_backend_tensor_copy(input, input_cpy);
+                        copy_pageable_d2h =
+                            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                            !wp_sched_copy_uses_pinned_host(input_backend, input, input_cpy);
+                    } else if (dbg) {
+                        fprintf(stderr, "[sched_copy] %s: ASYNC submitted\n", input->name);
+                    }
+                    if (dbg) {
+                        synchronize_backend(split_backend);
+                        unsigned char sb[16] = {0}, db[16] = {0};
+                        ggml_backend_tensor_get(input,     sb, 0, 16);
+                        ggml_backend_tensor_get(input_cpy, db, 0, 16);
+                        fprintf(stderr, "[sched_copy] %s SRC:", input->name);
+                        for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", sb[i]);
+                        fprintf(stderr, "\n[sched_copy] %s DST:", input->name);
+                        for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", db[i]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+            if constexpr (collect_split_stats) {
+                const uint64_t copy_elapsed = wp_sched_time_ns() - copy_start;
+                split_stats.ns_copy_total += copy_elapsed;
+                if (copy_pinned_d2h) {
+                    ++split_stats.n_copy_pinned_d2h;
+                    split_stats.ns_copy_pinned_d2h += copy_elapsed;
+                }
+                if (copy_pageable_d2h) {
+                    ++split_stats.n_copy_pageable_d2h;
+                    split_stats.ns_copy_pageable_d2h += copy_elapsed;
+                }
+            }
+        }
+
+        // Complete deferred HIP multi-input stages after all split inputs are
+        // queued and BEFORE eval_cb / graph_compute (WP ensure must see staged
+        // activations). No-op when weak symbol is absent or batch is empty.
+        if (ggml_backend_cuda_xdev_batch_flush) {
+            ggml_backend_cuda_xdev_batch_flush();
+        }
+
+
+        return GGML_STATUS_SUCCESS;
+    }
+
+    enum ggml_status compute_one(int split_id) {
+        struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        const int split_backend_id = split->backend_id;
+        ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (sched->callback_split) {
+            sched->callback_split(ggml_backend_name(split_backend), &split->graph,
+                                  split_id, sched->n_splits, true,
+                                  sched->callback_split_user_data);
+        }
+
+        if (!sched->callback_eval) {
+            bool measure_graph_entry = false;
+            uint64_t graph_entry_start;
+            if constexpr (collect_split_stats) {
+                measure_graph_entry = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (measure_graph_entry) {
+                    graph_entry_start = wp_sched_time_ns();
+                }
+            }
+            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if constexpr (collect_split_stats) {
+                if (measure_graph_entry) {
+                    ++split_stats.n_graph_entries;
+                    split_stats.ns_graph_entry_total += wp_sched_time_ns() - graph_entry_start;
+                }
+            }
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+        } else {
+            // similar to ggml_backend_compare_graph_backend
+            for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+                struct ggml_tensor * t = split->graph.nodes[j0];
+
+                // check if the user needs data from this node
+                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+
+                int j1 = j0;
+
+                // determine the range [j0, j1] of nodes that can be computed together
+                while (!need && j1 < split->graph.n_nodes - 1) {
+                    t = split->graph.nodes[++j1];
+                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                }
+
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
+
+                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+
+                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                synchronize_backend(split_backend);
+
+                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                    break;
+                }
+
+                j0 = j1;
+            }
+        }
+
+        if (sched->callback_split) {
+            sched->callback_split(ggml_backend_name(split_backend), &split->graph,
+                                  split_id, sched->n_splits, false,
+                                  sched->callback_split_user_data);
+        }
+
+        // record the event of this split
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        prev_backend_id = split_backend_id;
+
+        return GGML_STATUS_SUCCESS;
+    }
+
+    enum ggml_status compute_pair(ggml_backend_sched_compute_runner & other, int split_id) {
+        struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        struct ggml_backend_sched_split * split_other = &other.sched->splits[split_id];
+        ggml_backend_t backend = sched->backends[split->backend_id];
+        ggml_backend_t backend_other = other.sched->backends[split_other->backend_id];
+        const bool can_pair = sched->callback_eval == nullptr && sched->callback_split == nullptr &&
+            other.sched->callback_eval == nullptr && other.sched->callback_split == nullptr &&
+            backend == backend_other && ggml_backend_is_meta(backend) &&
+            ggml_backend_meta_overlap_enabled(backend);
+
+        if (!can_pair) {
+            const enum ggml_status status = compute_one(split_id);
+            return status == GGML_STATUS_SUCCESS ? other.compute_one(split_id) : status;
+        }
+
+        bool measure_graph_entry = false;
+        uint64_t graph_entry_start = 0;
+        if constexpr (collect_split_stats) {
+            measure_graph_entry = ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (measure_graph_entry) {
+                graph_entry_start = wp_sched_time_ns();
+            }
+        }
+        const enum ggml_status status = ggml_backend_meta_graph_compute_pair(
+                backend, &split->graph, &split_other->graph);
+        if constexpr (collect_split_stats) {
+            if (measure_graph_entry) {
+                split_stats.n_graph_entries += 2;
+                split_stats.ns_graph_entry_total += wp_sched_time_ns() - graph_entry_start;
+            }
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+
+        if (sched->events[split->backend_id][sched->cur_copy] != nullptr) {
+            ggml_backend_event_record(sched->events[split->backend_id][sched->cur_copy], backend);
+        }
+        if (other.sched->events[split_other->backend_id][other.sched->cur_copy] != nullptr) {
+            ggml_backend_event_record(other.sched->events[split_other->backend_id][other.sched->cur_copy], backend_other);
+        }
+        prev_backend_id = split->backend_id;
+        other.prev_backend_id = split_other->backend_id;
+        return GGML_STATUS_SUCCESS;
+    }
+
+    void finish() {
+        if constexpr (collect_split_stats) {
+            wp_sched_split_stats_add(split_stats);
+        }
+    }
+};
+
+template<bool collect_split_stats>
 static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2424,6 +2859,34 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     return GGML_STATUS_SUCCESS;
 }
 
+template<bool collect_split_stats>
+static enum ggml_status ggml_backend_sched_compute_splits_pair_impl(
+        ggml_backend_sched_t sched_a, ggml_backend_sched_t sched_b) {
+    if (sched_a->n_splits != sched_b->n_splits || sched_a->n_backends != sched_b->n_backends) {
+        enum ggml_status status = ggml_backend_sched_compute_splits_impl<collect_split_stats>(sched_a);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        return ggml_backend_sched_compute_splits_impl<collect_split_stats>(sched_b);
+    }
+
+    ggml_backend_sched_compute_runner<collect_split_stats> runner_a(sched_a);
+    ggml_backend_sched_compute_runner<collect_split_stats> runner_b(sched_b);
+    for (int split_id = 0; split_id < sched_a->n_splits; ++split_id) {
+        if (runner_a.prepare(split_id) != GGML_STATUS_SUCCESS ||
+            runner_b.prepare(split_id) != GGML_STATUS_SUCCESS) {
+            return GGML_STATUS_FAILED;
+        }
+        const enum ggml_status status = runner_a.compute_pair(runner_b, split_id);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    runner_a.finish();
+    runner_b.finish();
+    return GGML_STATUS_SUCCESS;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     return wp_sched_split_stats_enabled()
         ? ggml_backend_sched_compute_splits_impl<true>(sched)
@@ -2612,6 +3075,99 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     return ggml_backend_sched_compute_splits(sched);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_pair(
+        ggml_backend_sched_t sched_a, struct ggml_cgraph * graph_a,
+        ggml_backend_sched_t sched_b, struct ggml_cgraph * graph_b) {
+    GGML_ASSERT(sched_a);
+    GGML_ASSERT(sched_b);
+    GGML_ASSERT(sched_a != sched_b);
+
+    auto prepare = [](ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+        if (!sched->is_reset && !sched->is_alloc) {
+            ggml_backend_sched_reset(sched);
+        }
+        if (!sched->is_alloc && !ggml_backend_sched_alloc_graph(sched, graph)) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
+    enum ggml_status status = prepare(sched_a, graph_a);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+    status = prepare(sched_b, graph_b);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+
+    return wp_sched_split_stats_enabled()
+        ? ggml_backend_sched_compute_splits_pair_impl<true>(sched_a, sched_b)
+        : ggml_backend_sched_compute_splits_pair_impl<false>(sched_a, sched_b);
+}
+
+bool ggml_backend_sched_graph_compute_async_meta_supported(ggml_backend_sched_t sched) {
+    if (sched == nullptr || !sched->is_alloc || sched->n_splits != 1 ||
+            sched->callback_eval != nullptr || sched->callback_split != nullptr) {
+        return false;
+    }
+
+    const int backend_id = sched->splits[0].backend_id;
+    ggml_backend_t backend = sched->backends[backend_id];
+    return ggml_backend_is_meta(backend) && ggml_backend_meta_overlap_enabled(backend);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_meta_begin(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t i_slot, size_t * n_steps) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(graph);
+    GGML_ASSERT(n_steps);
+
+    if (!sched->is_reset && !sched->is_alloc) {
+        ggml_backend_sched_reset(sched);
+    }
+    if (!sched->is_alloc && !ggml_backend_sched_alloc_graph(sched, graph)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    if (!ggml_backend_sched_graph_compute_async_meta_supported(sched)) {
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_backend_sched_compute_runner<false> runner(sched);
+    const ggml_status status = runner.prepare(0);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+
+    ggml_backend_t backend = sched->backends[sched->splits[0].backend_id];
+    return ggml_backend_meta_graph_compute_step_begin(backend, &sched->splits[0].graph, i_slot, n_steps);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_meta_step(
+        ggml_backend_sched_t sched, size_t i_slot, int i_op, bool * pending, bool * finished) {
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async_meta_supported(sched));
+    GGML_ASSERT(pending);
+    GGML_ASSERT(finished);
+
+    const int backend_id = sched->splits[0].backend_id;
+    ggml_backend_t backend = sched->backends[backend_id];
+    const ggml_status status = ggml_backend_meta_graph_compute_step(backend, i_slot, i_op, pending, finished);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+    if (*finished && sched->events[backend_id][sched->cur_copy] != nullptr) {
+        ggml_backend_event_record(sched->events[backend_id][sched->cur_copy], backend);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_meta_end(
+        ggml_backend_sched_t sched, size_t i_slot, int i_op) {
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async_meta_supported(sched));
+    ggml_backend_t backend = sched->backends[sched->splits[0].backend_id];
+    return ggml_backend_meta_graph_compute_step_end(backend, i_slot, i_op);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
