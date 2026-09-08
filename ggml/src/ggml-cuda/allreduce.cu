@@ -1,5 +1,7 @@
 #include "allreduce.cuh"
 
+#include <vector>
+
 #if !defined(GGML_USE_MUSA)
 
 #include "convert.cuh"
@@ -1290,6 +1292,101 @@ static void ggml_cuda_ar_dx_add(T_dst * dst, const T_src * src, int64_t ne, cuda
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ── PHASE 0 CEILING MEASUREMENT ONLY — DELIBERATELY MATH-INVALID ──────────
+//
+// GGML_CUDA_AR_WIRE_SHRINK=N transfers only nbytes/N across the link while
+// leaving the send buffers, the BF16 conversion and the add kernel at full
+// size, so the tail of every payload is whatever the receive slot held last.
+// OUTPUT IS GARBAGE BY CONSTRUCTION.
+//
+// Purpose: measure the throughput ceiling of ANY wire-compression scheme
+// before writing an encoder.  Encode+decode cost would land on the
+// TB3-attached 6900XT, which is already the contended card, so "fewer bytes
+// is faster" is a hypothesis, not a given.  If a 4x byte cut does not buy
+// meaningful throughput here, no encoder is worth writing.
+//
+// Never set this outside a benchmark.
+static size_t ggml_cuda_ar_wire_shrink() {
+    static const size_t shrink = []() -> size_t {
+        const uint64_t v = ggml_cuda_ar_env_u64("GGML_CUDA_AR_WIRE_SHRINK", 1);
+        return v < 1 ? 1 : (size_t) v;
+    }();
+    return shrink;
+}
+
+// ── FIDELITY CAPTURE (debug) ─────────────────────────────────────────────
+//
+// GGML_CUDA_AR_DUMP_PARTIALS=<dir> writes the F32 partials from BOTH ranks for
+// the first GGML_CUDA_AR_DUMP_N reduces (default 8) as raw little-endian f32:
+//   <dir>/ar<call>_r<rank>.f32
+// plus a one-line manifest per reduce recording ne and the element count kept.
+//
+// These are the exact tensors a wire codec would have to encode.  The point of
+// capturing REAL partials rather than synthesising activations is that the
+// error a block codec makes depends on the value distribution, and the whole
+// question is whether a fitted or outlier-preserving codec beats a flat one on
+// THIS data.  It is also the only way to measure the error entering TWICE
+// (both partials rounded before summing) which is what rank symmetry costs.
+//
+// Cost when unset: one getenv-backed static read per call. Off by default.
+static const char * ggml_cuda_ar_dump_dir() {
+    static const char * dir = getenv("GGML_CUDA_AR_DUMP_PARTIALS");
+    return (dir != nullptr && dir[0] != '\0') ? dir : nullptr;
+}
+
+static void ggml_cuda_ar_dump_partials(
+        ggml_cuda_ar_pipeline * p, ggml_tensor ** tensors, int n, int64_t ne) {
+    const char * dir = ggml_cuda_ar_dump_dir();
+    if (dir == nullptr) {
+        return;
+    }
+    static const uint64_t max_calls = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DUMP_N", 8);
+    // Cap per-reduce volume; block codecs need CONTIGUOUS elements, so keep a
+    // prefix rather than a stride sample.
+    static const uint64_t max_elts  = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DUMP_ELTS", 1u << 20);
+    // Sample ACROSS DEPTH, not the first N. Reduces arrive in layer order, so
+    // dumping the first N captures only early layers -- and the outlier
+    // structure these codecs exploit is layer-dependent (the OL channel sets
+    // were calibrated on activations POOLED ACROSS ALL LAYERS). Ranking codecs
+    // on layers 0-8 could invert the answer. Stride so the sample spans the
+    // model: with 2 reduces/layer x 64 layers x 8 ubatches, stride 37 walks the
+    // whole prefill.
+    static const uint64_t stride = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DUMP_STRIDE", 1);
+    static uint64_t seen = 0, call = 0;
+    const uint64_t this_seen = seen++;
+    if (stride > 1 && (this_seen % stride) != 0) {
+        return;
+    }
+    if (call >= max_calls) {
+        return;
+    }
+    const uint64_t idx  = call++;
+    const size_t   keep = (size_t) std::min<uint64_t>((uint64_t) ne, max_elts);
+
+    std::vector<float> host(keep);
+    for (int i = 0; i < n; ++i) {
+        if (tensors[i]->type != GGML_TYPE_F32) {
+            return;  // only the F32 partial case is interesting here
+        }
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(host.data(), tensors[i]->data, keep * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/ar%04llu_seen%06llu_r%d.f32", dir,
+                 (unsigned long long) idx, (unsigned long long) this_seen, i);
+        FILE * f = fopen(path, "wb");
+        if (f == nullptr) {
+            GGML_LOG_WARN("ggml_cuda_ar: cannot open %s for partial dump\n", path);
+            return;
+        }
+        fwrite(host.data(), sizeof(float), keep, f);
+        fclose(f);
+    }
+    GGML_LOG_INFO("ggml_cuda_ar: dumped partials %llu of reduce #%llu (ne=%lld, kept=%zu/rank)\n",
+                  (unsigned long long) idx, (unsigned long long) this_seen, (long long) ne, keep);
+}
+
 bool ggml_cuda_ar_allreduce_begin(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -1321,6 +1418,19 @@ bool ggml_cuda_ar_allreduce_begin(
     const size_t    nbytes    = (size_t) ne * wire_size;
 
     const bool chunked = p->copy_threshold > 0 && nbytes < p->copy_threshold;
+
+    // Phase 0 only: bytes actually put on the wire.  Equals nbytes normally.
+    const size_t shrink      = ggml_cuda_ar_wire_shrink();
+    const size_t xfer_nbytes = shrink > 1 ? std::max<size_t>(nbytes / shrink, 1) : nbytes;
+    if (shrink > 1) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("ggml_cuda_ar: GGML_CUDA_AR_WIRE_SHRINK=%zu ACTIVE - "
+                          "transferring %zu of %zu bytes per reduce. OUTPUT IS INVALID. "
+                          "Benchmark use only.\n", shrink, xfer_nbytes, nbytes);
+        }
+    }
 
     if (p->transport == GGML_CUDA_AR_TRANSPORT_COPY) {
         // Legacy semantics, unchanged: copy engine at/above the threshold, chunked kernel below.
@@ -1369,6 +1479,8 @@ bool ggml_cuda_ar_allreduce_begin(
         CUDA_CHECK(cudaEventRecord(p->dx_ev[i][slot].app, cs));
     }
 
+    ggml_cuda_ar_dump_partials(p, tensors, n, ne);
+
     // Phase B (out-streams): outbound transfers, both ranks back-to-back.
     for (int i = 0; i < n; ++i) {
         const int peer = 1 - i;
@@ -1385,7 +1497,7 @@ bool ggml_cuda_ar_allreduce_begin(
                 CUDA_CHECK(cudaStreamWaitEvent(out, p->dx_ev[0][slot].freed));
             }
             CUDA_CHECK(cudaMemcpyPeerAsync(
-                p->dx_recv[0] + slot_off, p->devices[0], send, p->devices[1], nbytes, out));
+                p->dx_recv[0] + slot_off, p->devices[0], send, p->devices[1], xfer_nbytes, out));
         } else {
             // D2H into our staging slot.  The peer's in-stream must be done
             // pulling the previous contents of this staging slot.
@@ -1393,7 +1505,7 @@ bool ggml_cuda_ar_allreduce_begin(
                 CUDA_CHECK(cudaStreamWaitEvent(out, p->dx_ev[peer][slot].recvd));
             }
             CUDA_CHECK(cudaMemcpyAsync(
-                p->dx_staging[i].host + slot_off, send, nbytes, cudaMemcpyDeviceToHost, out));
+                p->dx_staging[i].host + slot_off, send, xfer_nbytes, cudaMemcpyDeviceToHost, out));
         }
         CUDA_CHECK(cudaEventRecord(ev.sent, out));
         ev.sent_valid = true;
@@ -1415,7 +1527,7 @@ bool ggml_cuda_ar_allreduce_begin(
             CUDA_CHECK(cudaStreamWaitEvent(in, ev.freed));
         }
         CUDA_CHECK(cudaMemcpyAsync(
-            p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, nbytes, cudaMemcpyHostToDevice, in));
+            p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, xfer_nbytes, cudaMemcpyHostToDevice, in));
         CUDA_CHECK(cudaEventRecord(ev.recvd, in));
         ev.recvd_valid = true;
     }
