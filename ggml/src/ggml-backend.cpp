@@ -3108,15 +3108,46 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(
         : ggml_backend_sched_compute_splits_pair_impl<false>(sched_a, sched_b);
 }
 
-bool ggml_backend_sched_graph_compute_async_meta_supported(ggml_backend_sched_t sched) {
-    if (sched == nullptr || !sched->is_alloc || sched->n_splits != 1 ||
+// Index of the ONE split that runs on an overlap-enabled meta backend, or -1.
+//
+// The stepped (rolling) entry points below drive a single split's subgraphs one
+// AllReduce boundary at a time.  They used to require sched->n_splits == 1,
+// which is not what a real llama.cpp graph looks like: a fully offloaded
+// Qwen3.8-27B under -sm tensor reserves TWO splits (the meta split plus a small
+// non-meta one), so the "supported" test returned false on every ubatch and the
+// rolling driver silently took its degenerate fallback.  The paired entry point
+// never had this problem -- ggml_backend_sched_compute_splits_pair_impl walks
+// all splits and only pairs the ones that are meta-on-meta.  Match that: locate
+// the meta split, run the splits before/after it normally, and step only it.
+//
+// More than one meta split cannot be stepped (there is a single next_subgraph
+// cursor per graph slot), so that case still reports unsupported.
+static int ggml_backend_sched_meta_overlap_split(ggml_backend_sched_t sched) {
+    if (sched == nullptr || !sched->is_alloc || sched->n_splits < 1 ||
             sched->callback_eval != nullptr || sched->callback_split != nullptr) {
-        return false;
+        return -1;
     }
 
-    const int backend_id = sched->splits[0].backend_id;
-    ggml_backend_t backend = sched->backends[backend_id];
-    return ggml_backend_is_meta(backend) && ggml_backend_meta_overlap_enabled(backend);
+    int i_split_meta = -1;
+    for (int i = 0; i < sched->n_splits; i++) {
+        ggml_backend_t backend = sched->backends[sched->splits[i].backend_id];
+        if (!ggml_backend_is_meta(backend) || !ggml_backend_meta_overlap_enabled(backend)) {
+            continue;
+        }
+        if (i_split_meta >= 0) {
+            return -1;
+        }
+        i_split_meta = i;
+    }
+    return i_split_meta;
+}
+
+bool ggml_backend_sched_graph_compute_async_meta_supported(ggml_backend_sched_t sched) {
+    return ggml_backend_sched_meta_overlap_split(sched) >= 0;
+}
+
+int ggml_backend_sched_graph_compute_async_meta_split(ggml_backend_sched_t sched) {
+    return ggml_backend_sched_meta_overlap_split(sched);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async_meta_begin(
@@ -3131,42 +3162,84 @@ enum ggml_status ggml_backend_sched_graph_compute_async_meta_begin(
     if (!sched->is_alloc && !ggml_backend_sched_alloc_graph(sched, graph)) {
         return GGML_STATUS_ALLOC_FAILED;
     }
-    if (!ggml_backend_sched_graph_compute_async_meta_supported(sched)) {
+    const int i_split_meta = ggml_backend_sched_meta_overlap_split(sched);
+    if (i_split_meta < 0) {
         return GGML_STATUS_FAILED;
     }
 
+    // Splits ahead of the meta split are ordinary work (they feed it); run them
+    // exactly as ggml_backend_sched_compute_splits would, on one runner so the
+    // backend-switch bookkeeping matches the sequential path.
     ggml_backend_sched_compute_runner<false> runner(sched);
-    const ggml_status status = runner.prepare(0);
+    for (int split_id = 0; split_id < i_split_meta; split_id++) {
+        ggml_status status = runner.prepare(split_id);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        status = runner.compute_one(split_id);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+
+    const ggml_status status = runner.prepare(i_split_meta);
     if (status != GGML_STATUS_SUCCESS) {
         return status;
     }
 
-    ggml_backend_t backend = sched->backends[sched->splits[0].backend_id];
-    return ggml_backend_meta_graph_compute_step_begin(backend, &sched->splits[0].graph, i_slot, n_steps);
+    ggml_backend_t backend = sched->backends[sched->splits[i_split_meta].backend_id];
+    return ggml_backend_meta_graph_compute_step_begin(backend, &sched->splits[i_split_meta].graph, i_slot, n_steps);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async_meta_step(
         ggml_backend_sched_t sched, size_t i_slot, int i_op, bool * pending, bool * finished) {
-    GGML_ASSERT(ggml_backend_sched_graph_compute_async_meta_supported(sched));
     GGML_ASSERT(pending);
     GGML_ASSERT(finished);
 
-    const int backend_id = sched->splits[0].backend_id;
+    const int i_split_meta = ggml_backend_sched_meta_overlap_split(sched);
+    GGML_ASSERT(i_split_meta >= 0);
+
+    const int backend_id = sched->splits[i_split_meta].backend_id;
     ggml_backend_t backend = sched->backends[backend_id];
     const ggml_status status = ggml_backend_meta_graph_compute_step(backend, i_slot, i_op, pending, finished);
     if (status != GGML_STATUS_SUCCESS) {
         return status;
     }
-    if (*finished && sched->events[backend_id][sched->cur_copy] != nullptr) {
+    if (!*finished) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    if (sched->events[backend_id][sched->cur_copy] != nullptr) {
         ggml_backend_event_record(sched->events[backend_id][sched->cur_copy], backend);
+    }
+
+    // The meta split is complete (its last subgraph carries no AllReduce, and
+    // the caller ends the previous one before this step), so any splits that
+    // consume its output can now run.  This happens on the same call that
+    // reports "finished", i.e. immediately before the driver extracts this
+    // sub-batch's outputs -- the same position the paired path runs them in.
+    if (i_split_meta + 1 < sched->n_splits) {
+        ggml_backend_sched_compute_runner<false> runner(sched);
+        runner.prev_backend_id = backend_id;
+        for (int split_id = i_split_meta + 1; split_id < sched->n_splits; split_id++) {
+            ggml_status split_status = runner.prepare(split_id);
+            if (split_status != GGML_STATUS_SUCCESS) {
+                return split_status;
+            }
+            split_status = runner.compute_one(split_id);
+            if (split_status != GGML_STATUS_SUCCESS) {
+                return split_status;
+            }
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async_meta_end(
         ggml_backend_sched_t sched, size_t i_slot, int i_op) {
-    GGML_ASSERT(ggml_backend_sched_graph_compute_async_meta_supported(sched));
-    ggml_backend_t backend = sched->backends[sched->splits[0].backend_id];
+    const int i_split_meta = ggml_backend_sched_meta_overlap_split(sched);
+    GGML_ASSERT(i_split_meta >= 0);
+    ggml_backend_t backend = sched->backends[sched->splits[i_split_meta].backend_id];
     return ggml_backend_meta_graph_compute_step_end(backend, i_slot, i_op);
 }
 

@@ -369,6 +369,10 @@ extern "C" {
     // gated ubatch overlap path to replace a finished graph without draining
     // the other graph's final reduce.
     GGML_API bool                 ggml_backend_sched_graph_compute_async_meta_supported(ggml_backend_sched_t sched);
+    // Index of the single overlap-enabled Meta split, or -1 when the graph cannot
+    // be stepped (no Meta split, more than one, callbacks installed, not allocated).
+    // Diagnostic only -- _supported() is (index >= 0).
+    GGML_API int                  ggml_backend_sched_graph_compute_async_meta_split(ggml_backend_sched_t sched);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_meta_begin(
             ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t i_slot, size_t * n_steps);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_meta_step(
