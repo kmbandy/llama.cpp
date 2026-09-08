@@ -100,6 +100,11 @@ extern "C" {
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // true when the backend pairs consecutive graph_compute calls into a two-ubatch AllReduce/compute overlap
+    // (GGML_META_OVERLAP=1, two simple backends, split AllReduce available). A caller that wants the overlap must
+    // keep the two graphs' buffers disjoint (e.g. two schedulers) and must not rely on graph_compute having
+    // finished before ggml_backend_synchronize() / a tensor get.
+    GGML_API bool           ggml_backend_meta_overlap_enabled(ggml_backend_t meta_backend);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);

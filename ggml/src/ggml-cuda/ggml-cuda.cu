@@ -1223,6 +1223,10 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // Split AllReduce op slots for the meta backend's two-ubatch overlap
+    // (ggml_backend_comm_allreduce_begin / _end).  Internal transport only.
+    ggml_cuda_ar_op             ar_ops[GGML_BACKEND_COMM_MAX_OPS];
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -1316,7 +1320,10 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
 // Run the internal AR pipeline.  Returns false on unsupported / failed input
 // -- the caller decides whether to abort (env-forced) or fall back silently.
-static bool ggml_backend_cuda_comm_allreduce_internal(
+// Input validation shared by the blocking and the split (begin/end) internal
+// paths.  Returns false for inputs the pipeline cannot take; the caller then
+// falls back.  A zero-element reduce is accepted and the caller skips it.
+static bool ggml_backend_cuda_comm_allreduce_internal_check(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
@@ -1360,6 +1367,17 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
         GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
     }
 
+    return true;
+}
+
+static bool ggml_backend_cuda_comm_allreduce_internal(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (!ggml_backend_cuda_comm_allreduce_internal_check(comm_ctx, tensors)) {
+        return false;
+    }
+    if (ggml_nelements(tensors[0]) == 0) {
+        return true;
+    }
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
 }
 
@@ -1498,6 +1516,45 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+// Split AllReduce (ggml_backend_comm_allreduce_begin_t / _end_t).  Only the
+// internal transport has a split form; NCCL and the butterfly return false
+// from begin() so the meta backend uses the blocking call for that reduce.
+// The op slots and the two-in-flight limit are the ones of allreduce.cu
+// (GGML_CUDA_AR_DX_SLOTS == GGML_BACKEND_COMM_MAX_OPS).
+static bool ggml_backend_cuda_comm_allreduce_begin(void * comm_ctx_v, struct ggml_tensor ** tensors, int i_op) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(i_op >= 0 && i_op < GGML_BACKEND_COMM_MAX_OPS);
+    ggml_cuda_ar_op & op = comm_ctx->ar_ops[i_op];
+    GGML_ASSERT(!op.pending && "AllReduce op slot begun again before end()");
+
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal) {
+        return false;
+    }
+    if (!ggml_backend_cuda_comm_allreduce_internal_check(comm_ctx, tensors)) {
+        return false;
+    }
+    if (ggml_nelements(tensors[0]) == 0) {
+        return true;
+    }
+    return ggml_cuda_ar_allreduce_begin(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, &op);
+}
+
+static bool ggml_backend_cuda_comm_allreduce_end(void * comm_ctx_v, int i_op) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(i_op >= 0 && i_op < GGML_BACKEND_COMM_MAX_OPS);
+    ggml_cuda_ar_op & op = comm_ctx->ar_ops[i_op];
+    if (!op.pending) {
+        return true;
+    }
+    return ggml_cuda_ar_allreduce_end(comm_ctx->ar_pipeline, comm_ctx->backends.data(), &op);
 }
 
 // host buffer type
@@ -8049,6 +8106,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_begin") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_begin;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_end") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_end;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

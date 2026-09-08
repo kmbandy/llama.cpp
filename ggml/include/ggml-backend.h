@@ -208,6 +208,16 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Split AllReduce used by the meta backend to overlap two ubatches: begin() enqueues the wire transfer on the
+    // comm context's side streams and returns immediately, end() makes the compute streams wait for the peer data
+    // and applies the same in-place sum as the blocking call.  i_op selects one of GGML_BACKEND_COMM_MAX_OPS
+    // independent op slots; an op slot must be ended before it is begun again, and at most GGML_BACKEND_COMM_MAX_OPS
+    // ops may be in flight.  begin() returns false when the comm context cannot serve the call in split form
+    // (the caller then reduces the tensors with the blocking call instead); end() after a begin() that returned
+    // true is always valid, and a no-op when the whole reduce already ran inside begin().
+    #define GGML_BACKEND_COMM_MAX_OPS 2
+    typedef bool   (*ggml_backend_comm_allreduce_begin_t)(void * comm_ctx, struct ggml_tensor ** tensors, int i_op);
+    typedef bool   (*ggml_backend_comm_allreduce_end_t)(void * comm_ctx, int i_op);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
