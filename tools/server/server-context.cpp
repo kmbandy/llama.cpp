@@ -5537,7 +5537,20 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    // A context checkpoint exists to be RESTORED: either by a later
+                    // request reusing this prompt, or by a speculative rollback.
+                    // A task that caches nothing and has no speculator can never
+                    // reach either path, so every checkpoint written for it is
+                    // dead weight -- and on a recurrent model that weight is real:
+                    // 149.626 MiB of state serialized per checkpoint on
+                    // Qwen3.8-27B, twice per request, plus the chunk boundary it
+                    // forces. Measured on the 8404-token warm-server arm: 1113 ->
+                    // 1203 t/s prefill (+8.1%) with checkpointing off, and
+                    // llama_decode calls per request falling 3 -> 2.
+                    const bool checkpoints_reachable =
+                        slot.task->params.cache_prompt || slot.can_speculate();
+
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0 && checkpoints_reachable;
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
