@@ -3253,10 +3253,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_PIPELINE_LAYERS"));
     add_opt(common_arg(
-        {"--tp-wire-type"}, "{bf16,f16,f32,q8_0}",
+        {"--tp-wire-type"}, "{bf16,f16,f32,q8_0,ml8_4,ml8_5}",
         "tensor-parallel AllReduce duplex wire codec (default: bf16)",
         [](common_params & params, const std::string & value) {
-            if (value != "bf16" && value != "f16" && value != "f32" && value != "q8_0") {
+            if (value != "bf16" && value != "f16" && value != "f32" && value != "q8_0" &&
+                value != "ml8_4" && value != "ml8_5") {
                 throw std::invalid_argument("invalid value");
             }
             params.tp_wire_type = value;

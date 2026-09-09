@@ -5,6 +5,7 @@
 #if !defined(GGML_USE_MUSA)
 
 #include "convert.cuh"
+#include "allreduce-ml8.cuh"
 #include "cpy-utils.cuh"
 #include "dequantize.cuh"
 #include "ggml-impl.h"
@@ -450,11 +451,149 @@ static void ggml_cuda_ar_codec_unpack_q8_0_dispatch(
     }
 }
 
+
+// ---- ml8-k pack / unpack-accumulate ---------------------------------------
+// Same rank-symmetric contract as q8_0: the LOCAL partial is re-quantized here
+// before summing, so both ranks add two rounded values and produce bit-identical
+// sums. Leaving the local side unrounded would be more accurate per rank and
+// would make the two ranks disagree.
+#define GGML_CUDA_AR_ML8_DEF(K)                                                                   \
+template <typename T_src>                                                                          \
+static __global__ void ggml_cuda_ar_codec_pack_ml8_##K##_kernel(                                   \
+        const T_src * src, block_ml8_##K##_wire * dst, int n_blocks) {                             \
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;                                         \
+    const int nt  = gridDim.x * blockDim.x;                                                        \
+    for (int ib = tid; ib < n_blocks; ib += nt) {                                                  \
+        float v[QK_ML8_WIRE];                                                                      \
+        for (int j = 0; j < QK_ML8_WIRE; ++j) {                                                    \
+            v[j] = ggml_cuda_cast<float>(src[ib * QK_ML8_WIRE + j]);                               \
+        }                                                                                          \
+        ml8_##K##_quantize(v, &dst[ib]);                                                           \
+    }                                                                                              \
+}                                                                                                  \
+template <typename T_dst>                                                                          \
+static __global__ void ggml_cuda_ar_codec_unpack_ml8_##K##_kernel(                                 \
+        T_dst * dst, const block_ml8_##K##_wire * src, int n_blocks) {                             \
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;                                         \
+    const int nt  = gridDim.x * blockDim.x;                                                        \
+    for (int ib = tid; ib < n_blocks; ib += nt) {                                                  \
+        float v[QK_ML8_WIRE];                                                                      \
+        for (int j = 0; j < QK_ML8_WIRE; ++j) {                                                    \
+            v[j] = ggml_cuda_cast<float>(dst[ib * QK_ML8_WIRE + j]);                               \
+        }                                                                                          \
+        block_ml8_##K##_wire local;                                                                \
+        ml8_##K##_quantize(v, &local);                                                             \
+        float lv[QK_ML8_WIRE];                                                                     \
+        float pv[QK_ML8_WIRE];                                                                     \
+        ml8_##K##_dequantize(&local,   lv);                                                        \
+        ml8_##K##_dequantize(&src[ib], pv);                                                        \
+        for (int j = 0; j < QK_ML8_WIRE; ++j) {                                                    \
+            dst[ib * QK_ML8_WIRE + j] = ggml_cuda_cast<T_dst>(lv[j] + pv[j]);                      \
+        }                                                                                          \
+    }                                                                                              \
+}                                                                                                  \
+template <typename T_src>                                                                          \
+static void ggml_cuda_ar_codec_pack_ml8_##K(                                                       \
+        const void * src, void * dst, int64_t ne, cudaStream_t stream) {                           \
+    const int nb = (int) (ne / QK_ML8_WIRE);                                                       \
+    ggml_cuda_ar_codec_pack_ml8_##K##_kernel<T_src>                                                \
+        <<<ggml_cuda_ar_codec_grid(nb), 256, 0, stream>>>(                                          \
+            static_cast<const T_src *>(src), static_cast<block_ml8_##K##_wire *>(dst), nb);        \
+    CUDA_CHECK(cudaGetLastError());                                                                \
+}                                                                                                  \
+template <typename T_dst>                                                                          \
+static void ggml_cuda_ar_codec_unpack_ml8_##K(                                                     \
+        void * dst, const void * src, int64_t ne, cudaStream_t stream) {                           \
+    const int nb = (int) (ne / QK_ML8_WIRE);                                                       \
+    ggml_cuda_ar_codec_unpack_ml8_##K##_kernel<T_dst>                                              \
+        <<<ggml_cuda_ar_codec_grid(nb), 256, 0, stream>>>(                                          \
+            static_cast<T_dst *>(dst), static_cast<const block_ml8_##K##_wire *>(src), nb);        \
+    CUDA_CHECK(cudaGetLastError());                                                                \
+}                                                                                                  \
+static void ggml_cuda_ar_codec_pack_ml8_##K##_dispatch(                                            \
+        const void * src, ggml_type src_type, void * dst, int64_t ne, cudaStream_t stream) {       \
+    switch (src_type) {                                                                            \
+        case GGML_TYPE_F32:  ggml_cuda_ar_codec_pack_ml8_##K<float>(src, dst, ne, stream); break;  \
+        case GGML_TYPE_F16:  ggml_cuda_ar_codec_pack_ml8_##K<half>(src, dst, ne, stream); break;   \
+        case GGML_TYPE_BF16: ggml_cuda_ar_codec_pack_ml8_##K<nv_bfloat16>(src, dst, ne, stream); break; \
+        default: GGML_ABORT("AllReduce ml8-" #K " pack: unsupported source type %d", (int) src_type); \
+    }                                                                                              \
+}                                                                                                  \
+static void ggml_cuda_ar_codec_unpack_ml8_##K##_dispatch(                                          \
+        void * dst, ggml_type dst_type, const void * src, int64_t ne, cudaStream_t stream) {       \
+    switch (dst_type) {                                                                            \
+        case GGML_TYPE_F32:  ggml_cuda_ar_codec_unpack_ml8_##K<float>(dst, src, ne, stream); break; \
+        case GGML_TYPE_F16:  ggml_cuda_ar_codec_unpack_ml8_##K<half>(dst, src, ne, stream); break;  \
+        case GGML_TYPE_BF16: ggml_cuda_ar_codec_unpack_ml8_##K<nv_bfloat16>(dst, src, ne, stream); break; \
+        default: GGML_ABORT("AllReduce ml8-" #K " unpack: unsupported destination type %d", (int) dst_type); \
+    }                                                                                              \
+}
+
+GGML_CUDA_AR_ML8_DEF(4)
+GGML_CUDA_AR_ML8_DEF(5)
+GGML_CUDA_AR_ML8_DEF(8)
+
+
+// ml8-8r: scale-free E4M3. Elementwise, so it needs no block machinery -- and
+// rank symmetry still holds because both partials are rounded identically.
+template <typename T_src>
+static __global__ void ggml_cuda_ar_codec_pack_ml8_8r_kernel(const T_src * src, uint8_t * dst, int64_t ne) {
+    const int64_t tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t nt  = (int64_t) gridDim.x * blockDim.x;
+    for (int64_t i = tid; i < ne; i += nt) {
+        ml8_8r_quantize_elem(ggml_cuda_cast<float>(src[i]), &dst[i]);
+    }
+}
+template <typename T_dst>
+static __global__ void ggml_cuda_ar_codec_unpack_ml8_8r_kernel(T_dst * dst, const uint8_t * src, int64_t ne) {
+    const int64_t tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t nt  = (int64_t) gridDim.x * blockDim.x;
+    for (int64_t i = tid; i < ne; i += nt) {
+        const float local = ml8_8r_dequantize_elem(ml8_f32_to_e4m3(ggml_cuda_cast<float>(dst[i])));
+        dst[i] = ggml_cuda_cast<T_dst>(local + ml8_8r_dequantize_elem(src[i]));
+    }
+}
+template <typename T_src>
+static void ggml_cuda_ar_codec_pack_ml8_8r(const void * src, void * dst, int64_t ne, cudaStream_t stream) {
+    ggml_cuda_ar_codec_pack_ml8_8r_kernel<T_src><<<ggml_cuda_ar_codec_grid(ne), 256, 0, stream>>>(
+        static_cast<const T_src *>(src), static_cast<uint8_t *>(dst), ne);
+    CUDA_CHECK(cudaGetLastError());
+}
+template <typename T_dst>
+static void ggml_cuda_ar_codec_unpack_ml8_8r(void * dst, const void * src, int64_t ne, cudaStream_t stream) {
+    ggml_cuda_ar_codec_unpack_ml8_8r_kernel<T_dst><<<ggml_cuda_ar_codec_grid(ne), 256, 0, stream>>>(
+        static_cast<T_dst *>(dst), static_cast<const uint8_t *>(src), ne);
+    CUDA_CHECK(cudaGetLastError());
+}
+static void ggml_cuda_ar_codec_pack_ml8_8r_dispatch(const void * src, ggml_type src_type, void * dst, int64_t ne, cudaStream_t stream) {
+    switch (src_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_codec_pack_ml8_8r<float>(src, dst, ne, stream); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_codec_pack_ml8_8r<half>(src, dst, ne, stream); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_codec_pack_ml8_8r<nv_bfloat16>(src, dst, ne, stream); break;
+        default: GGML_ABORT("AllReduce ml8-8r pack: unsupported source type %d", (int) src_type);
+    }
+}
+static void ggml_cuda_ar_codec_unpack_ml8_8r_dispatch(void * dst, ggml_type dst_type, const void * src, int64_t ne, cudaStream_t stream) {
+    switch (dst_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_codec_unpack_ml8_8r<float>(dst, src, ne, stream); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_codec_unpack_ml8_8r<half>(dst, src, ne, stream); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_codec_unpack_ml8_8r<nv_bfloat16>(dst, src, ne, stream); break;
+        default: GGML_ABORT("AllReduce ml8-8r unpack: unsupported destination type %d", (int) dst_type);
+    }
+}
+
 static const ggml_cuda_ar_codec GGML_CUDA_AR_CODECS[] = {
     { "bf16",  GGML_TYPE_BF16,  1, sizeof(nv_bfloat16),  ggml_cuda_ar_codec_pack_bf16,           ggml_cuda_ar_codec_unpack_bf16 },
     { "f16",   GGML_TYPE_F16,   1, sizeof(half),          ggml_cuda_ar_codec_pack_f16,            ggml_cuda_ar_codec_unpack_f16  },
     { "f32",   GGML_TYPE_F32,   1, sizeof(float),         ggml_cuda_ar_codec_pack_f32,            ggml_cuda_ar_codec_unpack_f32  },
     { "q8_0",  GGML_TYPE_Q8_0, QK8_0, sizeof(block_q8_0), ggml_cuda_ar_codec_pack_q8_0_dispatch, ggml_cuda_ar_codec_unpack_q8_0_dispatch },
+    // ml8 wire tiers are NOT ggml types -- they exist only on this link and are
+    // never serialised. Q4_0/Q5_0 ids are reused as private registry keys so the
+    // end() lookup by op->wire_type works; nothing else may pack those ids here.
+    { "ml8_4", GGML_TYPE_Q4_0, QK_ML8_WIRE, sizeof(block_ml8_4_wire), ggml_cuda_ar_codec_pack_ml8_4_dispatch, ggml_cuda_ar_codec_unpack_ml8_4_dispatch },
+    { "ml8_5", GGML_TYPE_Q5_0, QK_ML8_WIRE, sizeof(block_ml8_5_wire), ggml_cuda_ar_codec_pack_ml8_5_dispatch, ggml_cuda_ar_codec_unpack_ml8_5_dispatch },
+    { "ml8_8", GGML_TYPE_Q4_1, QK_ML8_WIRE, sizeof(block_ml8_8_wire), ggml_cuda_ar_codec_pack_ml8_8_dispatch, ggml_cuda_ar_codec_unpack_ml8_8_dispatch },
+    { "ml8_8r", GGML_TYPE_Q5_1, 1, 1, ggml_cuda_ar_codec_pack_ml8_8r_dispatch, ggml_cuda_ar_codec_unpack_ml8_8r_dispatch },
 };
 
 static_assert(sizeof(block_q8_0) == 34, "unexpected q8_0 wire block size");
@@ -787,7 +926,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->wire_codec_explicit = wire_env && wire_env[0];
     p->wire_codec = ggml_cuda_ar_codec_from_name(wire_env && wire_env[0] ? wire_env : "bf16");
     if (p->wire_codec == nullptr) {
-        GGML_ABORT("%s: unknown GGML_CUDA_AR_WIRE_TYPE='%s' (expected bf16, f16, f32, or q8_0)",
+        GGML_ABORT("%s: unknown GGML_CUDA_AR_WIRE_TYPE='%s' (expected bf16, f16, f32, q8_0, ml8_4, ml8_5, ml8_8, or ml8_8r)",
                    __func__, wire_env ? wire_env : "");
     }
     if (p->wire_codec->elements_per_block == 0 || p->wire_codec->bytes_per_block == 0 ||
