@@ -649,6 +649,12 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // Encoding for SERIALIZED recurrent state -- context checkpoints, the
+    // prompt cache and session files. The live state stays f32; this only
+    // shrinks saved copies, which dominate RAM once several slots each keep a
+    // stack of checkpoints. F32 = store natively (exact).
+    ggml_type cache_type_state = GGML_TYPE_F32;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

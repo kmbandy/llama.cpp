@@ -160,6 +160,11 @@ struct llama_memory_i {
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 
+    // Encoding for SERIALIZED recurrent state (checkpoints, prompt cache,
+    // session files). Does not touch the live state. Backends that hold no
+    // recurrent state ignore it; wrappers forward it to the recurrent half.
+    virtual void set_state_type(ggml_type /* type */) {}
+
     //
     // Inner-access protocol for the tiered KV wrapper.
     //

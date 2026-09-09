@@ -21,6 +21,9 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // Serialization encoding for recurrent state; see llama_context_params.
+    ggml_type type_state = GGML_TYPE_F32;
+
     float rope_freq_base;
     float rope_freq_scale;
 

@@ -446,6 +446,12 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        // Encoding used when a sequence's recurrent state is SERIALIZED (context
+        // checkpoints, the prompt cache, session files). This does not change the
+        // live state, which stays f32 -- it only changes how a saved copy is
+        // stored. F32 keeps saves exact. [EXPERIMENTAL]
+        enum ggml_type type_state;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

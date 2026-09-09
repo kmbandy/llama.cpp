@@ -591,6 +591,7 @@ llama_context::llama_context(
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
+    cparams.type_state = params.type_state == GGML_TYPE_COUNT ? GGML_TYPE_F32 : params.type_state;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
@@ -923,6 +924,14 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // Serialization-only knob: no effect on the live state, so it is set
+        // after construction rather than threaded through every memory ctor.
+        if (memory && cparams.type_state != GGML_TYPE_F32) {
+            memory->set_state_type(cparams.type_state);
+            LLAMA_LOG_INFO("%s: recurrent state will be serialized as %s\n",
+                           __func__, ggml_type_name(cparams.type_state));
+        }
     }
 
     // init backends
@@ -5037,6 +5046,16 @@ public:
         size_written += size;
     }
 
+    // Size-only: account for the encoded size without pulling the rows off the
+    // device. Must stay in step with llama_io_write_i::write_tensor_as().
+    void write_tensor_as(ggml_tensor * /* tensor */, size_t /* offset */, size_t n_rows, size_t n_per_row, ggml_type dst_type) override {
+        if (skip_tensors) {
+            return;
+        }
+
+        size_written += n_rows * ggml_row_size(dst_type, n_per_row);
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
@@ -5054,8 +5073,33 @@ public:
 
     ~llama_io_write_host() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        //
+        // Bucketed by transfer size so the flush can be attributed: a per-call
+        // floor and a bandwidth ceiling call for different fixes, and the mix
+        // here is lopsided (on Qwen3.8-27B the recurrent state is 64 small R
+        // copies of 0.088 MiB and 64 large S copies of 2.25 MiB).
+        const int64_t t_flush_0 = ggml_time_us();
+        size_t n_small = 0, n_large = 0, b_small = 0, b_large = 0;
+        int64_t us_small = 0, us_large = 0;
         for (const auto & winfo : winfos) {
+            const int64_t t0 = ggml_time_us();
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            const int64_t dt = ggml_time_us() - t0;
+            if (winfo.size < (1u << 20)) {
+                ++n_small; b_small += winfo.size; us_small += dt;
+            } else {
+                ++n_large; b_large += winfo.size; us_large += dt;
+            }
+        }
+        if (!winfos.empty()) {
+            const auto rate = [](size_t bytes, int64_t us) {
+                return us > 0 ? (double) bytes / (1024.0 * 1024.0) / (us / 1e6) : 0.0;
+            };
+            LLAMA_LOG_INFO("%s: state flush: %zu copies in %.2f ms | <1MiB: %zu copies, %.2f MiB, %.2f ms, %.0f MiB/s"
+                           " | >=1MiB: %zu copies, %.2f MiB, %.2f ms, %.0f MiB/s\n",
+                           __func__, winfos.size(), (ggml_time_us() - t_flush_0) / 1000.0,
+                           n_small, b_small / 1048576.0, us_small / 1000.0, rate(b_small, us_small),
+                           n_large, b_large / 1048576.0, us_large / 1000.0, rate(b_large, us_large));
         }
     }
 
@@ -6113,6 +6157,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_state                  =*/ GGML_TYPE_F32,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

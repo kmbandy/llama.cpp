@@ -1003,20 +1003,27 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
-            // Write S tensor type
-            const int32_t s_type_i = (int32_t)s_l[il]->type;
+            // S carries the overwhelming majority of a serialized recurrent
+            // state (on Qwen3.8-27B: 144.00 of 149.62 MiB), so the encoding
+            // knob applies here and R/P stay native -- nearly all of the size
+            // win, none of the risk on the small conv-history rows.
+            const ggml_type s_type_enc = state_write_type(s_l[il]->type);
+
+            // Write S tensor type -- the ENCODED type; the reader decodes back
+            // into the live f32 tensor.
+            const int32_t s_type_i = (int32_t) s_type_enc;
             io.write(&s_type_i, sizeof(s_type_i));
 
-            // Write row size of S tensor
-            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            // Write row size of S tensor (encoded)
+            const uint64_t s_size_row     = ggml_row_size(s_type_enc,     hparams.n_embd_s());
+            const uint64_t s_size_row_src = ggml_row_size(s_l[il]->type,  hparams.n_embd_s());
             io.write(&s_size_row, sizeof(s_size_row));
 
             // Write each logical cell row range. With pending recurrent rollback,
             // the logical current state may live in a rollback snapshot plane.
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                io.write_tensor_as(s_l[il], range.first * s_size_row_src, range_size, hparams.n_embd_s(), s_type_enc);
             }
         }
     } else {
@@ -1215,20 +1222,30 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // skip null layers
             if (s_l[il] == nullptr) continue;
 
-            // Read type of value
+            // Read type of value. The stream may carry S in an encoding other
+            // than the live type -- that is the state-cache codec, not a
+            // corrupt file -- so accept any type that decodes back to f32 and
+            // reject only genuinely incompatible ones.
             int32_t s_type_i_ref;
             io.read(&s_type_i_ref, sizeof(s_type_i_ref));
-            const int32_t s_type_i = (int32_t)s_l[il]->type;
+            const ggml_type s_type_enc = (ggml_type) s_type_i_ref;
+            const bool      s_encoded  = s_type_enc != s_l[il]->type;
 
-            if (s_type_i != s_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched s type (%d != %d, layer %d)\n", __func__, s_type_i, s_type_i_ref, il);
-                return false;
+            if (s_encoded) {
+                const ggml_type_traits * qt = s_type_enc >= 0 && s_type_enc < GGML_TYPE_COUNT
+                    ? ggml_get_type_traits(s_type_enc) : nullptr;
+                if (s_l[il]->type != GGML_TYPE_F32 || qt == nullptr || qt->to_float == nullptr) {
+                    LLAMA_LOG_ERROR("%s: mismatched s type (%d != %d, layer %d)\n", __func__,
+                                    (int) s_l[il]->type, s_type_i_ref, il);
+                    return false;
+                }
             }
 
-            // Read row size of value
+            // Read row size of value (as encoded in the stream)
             uint64_t s_size_row_ref;
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row     = ggml_row_size(s_type_enc,    hparams.n_embd_s());
+            const size_t s_size_row_dst = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
             if (s_size_row != s_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
@@ -1236,7 +1253,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
             if (cell_count) {
                 // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                io.read_tensor_as(s_l[il], head * s_size_row_dst, cell_count, hparams.n_embd_s(), s_type_enc);
             }
         }
     } else {

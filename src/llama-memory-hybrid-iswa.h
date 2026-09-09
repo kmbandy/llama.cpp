@@ -86,6 +86,10 @@ public:
     //
 
     llama_kv_cache_iswa * get_mem_attn() const;
+    // Forward the serialization encoding to the recurrent half; the attention
+    // half holds no recurrent state.
+    void set_state_type(ggml_type type) override { if (mem_recr) { mem_recr->set_state_type(type); } }
+
     llama_memory_recurrent * get_mem_recr() const;
 
 private:

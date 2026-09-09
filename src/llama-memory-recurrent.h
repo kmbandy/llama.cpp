@@ -28,6 +28,22 @@ public:
 
     ~llama_memory_recurrent() = default;
 
+    void set_state_type(ggml_type type) override { type_state = type; }
+
+    // Encoding actually used for a serialized S row. Only f32 state is
+    // re-encodable, and an encoding without a dequantizer is refused rather
+    // than silently ignored, so a saved state is never unreadable.
+    ggml_type state_write_type(ggml_type live) const {
+        if (type_state == live || live != GGML_TYPE_F32) {
+            return live;
+        }
+        const ggml_type_traits * qt = ggml_get_type_traits(type_state);
+        if (qt == nullptr || qt->to_float == nullptr || ggml_blck_size(type_state) <= 0) {
+            return live;
+        }
+        return type_state;
+    }
+
     //
     // llama_memory_i
     //
@@ -123,6 +139,10 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    // Encoding used when recurrent state is serialized. GGML_TYPE_F32 (the
+    // live type) means "store natively" -- saves stay exact.
+    ggml_type type_state = GGML_TYPE_F32;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

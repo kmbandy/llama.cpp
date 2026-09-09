@@ -2722,6 +2722,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
+        {"-cts", "--cache-type-state"}, "TYPE",
+        string_format(
+            "encoding for SERIALIZED recurrent state (context checkpoints, prompt cache, session files)\n"
+            "the live state is unaffected and stays f32; this shrinks saved copies, which dominate RAM\n"
+            "once several slots each hold a stack of checkpoints\n"
+            "allowed values: %s\n"
+            "(default: %s -- exact)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_state)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_state = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_STATE"));
+    add_opt(common_arg(
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
             "KV cache data type for V\n"
