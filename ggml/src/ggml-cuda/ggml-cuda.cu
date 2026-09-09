@@ -2001,6 +2001,25 @@ static hipError_t hip_xdev_slab_lock(size_t need, void ** out_buf, hip_xdev_stag
     if (want < kHipXdevStagingFloor) {
         want = kHipXdevStagingFloor;
     }
+    // Round up to a power of two before comparing against capacity.
+    //
+    // Slabs are chosen ROUND-ROBIN, so without quantisation every distinct
+    // staging size that lands on a slab smaller than it forces a
+    // hipHostFree + hipHostMalloc. Pinned-host allocation costs 150-370 ms on
+    // this stack, and a server submits many distinct shapes (a full prompt
+    // chunk, a short tail, then 1-token decodes) where a benchmark submits one.
+    // Measured on llama-server: ~3 reallocations INSIDE every prefill,
+    // ~0.7-1.2 s of a ~9.7 s request; llama-bench never reallocated at all
+    // because its ubatch shape is uniform.
+    // Quantising collapses the size space so the 8 slabs converge after a few
+    // requests and then stop allocating, at the cost of at most 2x slack.
+    {
+        size_t pow2 = kHipXdevStagingFloor;
+        while (pow2 < want) {
+            pow2 <<= 1;
+        }
+        want = pow2;
+    }
     if (want > slab.cap) {
         if (slab.buf) {
             hipHostFree(slab.buf);

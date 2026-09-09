@@ -3951,14 +3951,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return status;
     };
 
-    // Full sub-batches keep every reused graph shape identical. A partial tail uses the existing path.
-    const bool overlap_subbatches_are_full = n_tokens_all % memory_ubatch == 0;
+    // Number of FULL sub-batches. A ragged tail (the last sub-batch shorter than
+    // the rest) is expected and handled by draining the pipeline for it -- it must
+    // NOT disable the overlap for the whole request.
+    //
+    // This previously required n_tokens_all % memory_ubatch == 0. That holds for a
+    // benchmark, which sends a round prompt length, and essentially never holds in
+    // production: an 8404-token request against a 1024 sub-batch leaves 212 tokens
+    // over, so the overlap silently did not run for ANY real request. Same shape as
+    // the n_splits == 1 bug -- a condition true in every test and false in the field.
     const uint32_t n_overlap_subbatches = n_tokens_all / memory_ubatch;
     // Four sub-batches amortize startup and drain overhead; this is not the two-reduce pipeline depth.
     const bool overlap_has_enough_work = n_overlap_subbatches >= k_meta_overlap_min_subbatches;
-    const bool continuous_overlap = overlap_active &&
-        overlap_subbatches_are_full &&
-        overlap_has_enough_work;
+    const bool continuous_overlap = overlap_active && overlap_has_enough_work;
+
+    // Diagnose the case that cost a full evening: the split factor applies and
+    // the geometry looks right, but continuous_overlap is false, so the whole
+    // pipeline silently does not run. Report the ACTUAL batch shape rather than
+    // leaving the absence of a banner to be interpreted.
+    if (overlap_active && !continuous_overlap) {
+        static bool warned_shape = false;
+        if (!warned_shape) {
+            warned_shape = true;
+            LLAMA_LOG_WARN("%s: meta overlap INACTIVE: n_tokens_all=%u memory_ubatch=%u "
+                           "-> %u full sub-batches (need >= %u)\n",
+                           __func__, n_tokens_all, memory_ubatch, n_overlap_subbatches,
+                           k_meta_overlap_min_subbatches);
+        }
+    }
 
     // Set only when the rolling sliding-window schedule is actually driven, so
     // the banner below distinguishes "rolling" from "asked for rolling, ran the
@@ -4147,8 +4167,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
 
                     extract_slot(slot_a);
-                    if (!prepare_slot(slot_a, status) || !begin_slot(slot_a, status) || slot_a.n_steps != n_steps ||
-                            !step_slot(slot_a, status) || !end_slot(slot_b, status) || !step_slot(slot_b, status)) {
+                    if (!prepare_slot(slot_a, status) || !begin_slot(slot_a, status)) {
+                        return fail_slots(slot_a, slot_b, status);
+                    }
+                    if (slot_a.n_steps != n_steps) {
+                        // Ragged tail: a shorter sub-batch has a different step
+                        // count and cannot be interleaved. Drain the in-flight
+                        // slot, then run the tail to completion on its own.
+                        if (!finish_slot(slot_b, status)) {
+                            return fail_slots(slot_a, slot_b, status);
+                        }
+                        extract_slot(slot_b);
+                        if (!step_slot(slot_a, status) || !finish_slot(slot_a, status)) {
+                            return fail_slots(slot_a, slot_b, status);
+                        }
+                        extract_slot(slot_a);
+                        done = true;
+                        break;
+                    }
+                    if (!step_slot(slot_a, status) || !end_slot(slot_b, status) || !step_slot(slot_b, status)) {
                         return fail_slots(slot_a, slot_b, status);
                     }
                     extract_slot(slot_b);
@@ -4161,8 +4198,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         done = true;
                         break;
                     }
-                    if (!prepare_slot(slot_b, status) || !begin_slot(slot_b, status) || slot_b.n_steps != n_steps ||
-                            !step_slot(slot_b, status) || !end_slot(slot_a, status)) {
+                    if (!prepare_slot(slot_b, status) || !begin_slot(slot_b, status)) {
+                        return fail_slots(slot_a, slot_b, status);
+                    }
+                    if (slot_b.n_steps != n_steps) {
+                        // Ragged tail, mirror of the slot_a case above.
+                        if (!finish_slot(slot_a, status)) {
+                            return fail_slots(slot_a, slot_b, status);
+                        }
+                        extract_slot(slot_a);
+                        if (!step_slot(slot_b, status) || !finish_slot(slot_b, status)) {
+                            return fail_slots(slot_a, slot_b, status);
+                        }
+                        extract_slot(slot_b);
+                        done = true;
+                        break;
+                    }
+                    if (!step_slot(slot_b, status) || !end_slot(slot_a, status)) {
                         return fail_slots(slot_a, slot_b, status);
                     }
                 }

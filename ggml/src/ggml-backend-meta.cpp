@@ -1760,7 +1760,16 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    // Maximum number of views per statically allocated tensor that can be
+    // created between evals. These contexts are no_alloc, so this bounds tensor
+    // HEADERS only -- raising it costs metadata, never VRAM.
+    // Raised 16 -> 48: with MTP speculative decoding the draft path adds views
+    // on top of the target graph and 16 overflowed by 368 bytes (needed 754032,
+    // available 753664), aborting mid-request in
+    // ggml_backend_meta_buffer_init_tensor_impl. Sized with margin rather than
+    // to the observed need, because the view count scales with the speculative
+    // draft depth (--spec-draft-n-max) and would silently re-break on a deeper draft.
+    constexpr size_t compute_headroom = 48;
     const ggml_init_params params_static = {
         /*.mem_size   =*/ ggml_get_mem_size(ctx),
         /*.mem_buffer =*/ nullptr,
