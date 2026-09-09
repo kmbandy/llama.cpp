@@ -448,8 +448,16 @@ private:
     // Second graph slot for the gated two-ubatch meta overlap path.
     // Created only when a decode batch actually uses that path.
     ggml_backend_sched_ptr sched_overlap;
-    bool sched_overlap_reserve_requested = false;
-    bool sched_overlap_reserved = false;
+    // NOTE: the worst-case reservation is deliberately NOT parameterized by
+    // whether the overlap is active. The overlap only ever makes ubatches
+    // SMALLER (n_ubatch / split), so a reservation sized for the full
+    // cparams.n_ubatch always covers it. Sizing the reserve by the overlap
+    // state instead made the reservation invalid every time the overlap
+    // toggled, and it toggles constantly in the serving path: a prompt chunk
+    // >= n_ubatch turns it on, the trailing short batch of the same request
+    // turns it off. Each toggle tore down and rebuilt the whole
+    // ggml_backend_sched -- measured at 239 ms + 510 ms per request on
+    // Qwen3.8-27B TP, charged straight to prompt eval time.
     // Sub-batch count; independent of the two-slot reduce pipeline.
     uint32_t sched_overlap_split = 1;
 

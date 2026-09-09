@@ -3730,10 +3730,31 @@ private:
         // stream.ctx_tgt/ctx_dft/spec. Using the per-slot fields here avoids
         // adding a parameter to a function whose only per-tick input is
         // already the slot.
+        // State capture has to see a quiesced device, so llama_state_seq_get_data_ext()
+        // implicitly drains whatever compute is still in flight. Draining first, on its
+        // own clock, keeps that GPU time out of the copy figure -- otherwise the
+        // checkpoint gets blamed for the tail of the ubatch that preceded it.
+        const int64_t t_ckpt_0 = ggml_time_us();
+        llama_synchronize(slot.ctx_tgt);
+        const int64_t t_ckpt_sync = ggml_time_us();
+
         cur.update_tgt(slot.ctx_tgt, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
+        const int64_t t_ckpt_tgt = ggml_time_us();
+
         cur.update_dft(slot.ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(slot.spec, slot.stream_slot_idx, cur.data_spec); // MAD-LAB: stream-local seq id (spec's dparams sized per-stream)
+        const int64_t t_ckpt_end = ggml_time_us();
+
+        const double ms_sync = (t_ckpt_sync - t_ckpt_0)   / 1000.0;
+        const double ms_tgt  = (t_ckpt_tgt  - t_ckpt_sync) / 1000.0;
+        const double ms_rest = (t_ckpt_end  - t_ckpt_tgt)  / 1000.0;
+        const double mib_tgt = (double) cur.data_tgt.size() / 1024 / 1024;
+
+        SLT_INF(slot,
+                "checkpoint timing: drain = %.2f ms, tgt capture = %.2f ms (%.3f MiB, %.0f MiB/s), dft+spec = %.2f ms, total = %.2f ms\n",
+                ms_sync, ms_tgt, mib_tgt, ms_tgt > 0.0 ? mib_tgt / (ms_tgt / 1000.0) : 0.0, ms_rest,
+                (t_ckpt_end - t_ckpt_0) / 1000.0);
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",

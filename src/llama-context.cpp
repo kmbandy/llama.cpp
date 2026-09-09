@@ -1151,8 +1151,10 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t reserve_ubatch = sched_overlap_reserve_requested ? cparams.n_ubatch / sched_overlap_split : cparams.n_ubatch;
-    const uint32_t n_tokens_ubatch = std::min(cparams.n_ctx, reserve_ubatch);
+    // Always reserve for the full n_ubatch -- see the note on sched_overlap in
+    // llama-context.h. The overlap path runs sub-batches of n_ubatch/split, so
+    // this is a strict upper bound for both configurations.
+    const uint32_t n_tokens_ubatch = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_tokens = draft_graph_n_tokens(cparams, n_tokens_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
@@ -1283,8 +1285,6 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
-
-    sched_overlap_reserved = sched_overlap_reserve_requested;
 }
 
 void llama_context::synchronize() {
@@ -1417,8 +1417,9 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t memory_ubatch = sched_overlap_reserved ? cparams.n_ubatch / sched_overlap_split : cparams.n_ubatch;
-        const uint32_t n_tokens = draft_graph_n_tokens(cparams, std::min(cparams.n_ctx, memory_ubatch));
+        // Worst-case reservation: full n_ubatch regardless of the overlap
+        // state, same reasoning as sched_reserve().
+        const uint32_t n_tokens = draft_graph_n_tokens(cparams, std::min(cparams.n_ctx, cparams.n_ubatch));
 
         const uint32_t n_outputs_max = reserve_graph_n_outputs(cparams, n_tokens);
 
@@ -3566,12 +3567,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         !overlap_layer_cut_env &&
         n_tokens_all >= cparams.n_ubatch &&
         validated_overlap_split > 1;
-    if (sched_overlap_reserved != overlap_candidate || (overlap_candidate && overlap_split_changed)) {
-        sched_need_reserve = true;
-    }
-    sched_overlap_reserve_requested = overlap_candidate;
+    // The overlap toggling on or off, or changing its split, does NOT
+    // invalidate the reservation: it is sized for the full n_ubatch either
+    // way (see llama-context.h). Forcing a re-reserve here cost a full
+    // sched teardown/rebuild twice per served request.
     sched_reserve();
-    sched_overlap_reserve_requested = false;
 
     bool did_optimize = false;
 
