@@ -885,7 +885,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // Everything else (FFN, recurrent/SSM, embeddings, output head) keeps tensor_split.
         // tensor_split_attn() falls back to tensor_split when unset, so the default behaviour
         // is bit-identical to the single-ratio path.
-        const bool is_attn_group =
+        // GATED BY LAYER TYPE, not by name alone. In hybrid architectures (Qwen3.5/3.8
+        // gated-delta-net) the RECURRENT layers carry their own fused attn_qkv
+        // projection, which feeds the conv-state path rather than any attention.
+        // Matching on the name alone moved that projection onto the attention ratio
+        // while its cache_r_l* stayed on tensor_split, and the CONCAT building
+        // conv_input then saw two different ratios (measured: node_share 7680 vs
+        // src_share 5120 on a 10240 axis) and tripped the meta backend's
+        // split-consistency assert at load.
+        //
+        // Only true attention layers belong to the attention group -- rebalancing the
+        // K/V cache and the attention that reads it is the entire point, and a
+        // recurrent layer has neither.
+        //
+        // Use is_recr(), NOT has_kv(): has_kv() returns true for every layer unless
+        // n_layer_kv_from_start >= 0, which is a PREFIX mechanism (the first N layers
+        // have KV) and is unset for an interleaved hybrid like this one. Gating on it
+        // is a silent no-op. is_recr() reads the per-layer bool array and is the idiom
+        // already used by get_il_eff() above.
+        const bool il_is_attn = tc.il < hparams.n_layer_all && !hparams.is_recr(tc.il);
+
+        const bool is_attn_group = il_is_attn && (
             std::regex_match(tensor_name, pattern_q_weight)         ||
             std::regex_match(tensor_name, pattern_kv_weight)        ||
             std::regex_match(tensor_name, pattern_qkv_weight)       ||
@@ -898,7 +918,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             std::regex_match(tensor_name, pattern_attn_sinks)       ||
             std::regex_match(tensor_name, pattern_attn_out_weight)  ||
             std::regex_match(tensor_name, pattern_attn_out_bias)    ||
-            std::regex_match(tensor_name, pattern_attn_gate_weight);
+            std::regex_match(tensor_name, pattern_attn_gate_weight));
 
         const float * tensor_split = is_attn_group ? ud->model->tensor_split_attn()
                                                    : ud->model->tensor_split();

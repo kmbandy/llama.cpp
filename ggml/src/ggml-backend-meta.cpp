@@ -1149,6 +1149,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
                         }
+                        if (split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
+                                                                 != sum * tensor->ne[split_state.axis]) {
+                            fprintf(stderr, "META SPLIT MISMATCH: node '%s' [%s] buf=%zu; src[%zu]='%s' [%s] axis=%d; "
+                                            "node.ne[%d]=%" PRId64 " src.ne[%d]=%" PRId64 " node_share=%" PRId64 " src_share=%" PRId64 "\n",
+                                    tensor->name, ggml_op_name(tensor->op), j,
+                                    i, tensor->src[i]->name, ggml_op_name(tensor->src[i]->op), (int) src_ss[i].axis,
+                                    (int) split_state.axis, tensor->ne[split_state.axis],
+                                    (int) src_ss[i].axis, tensor->src[i]->ne[src_ss[i].axis],
+                                    split_state.ne[j]*split_state.nr[0], sum);
+                        }
                         GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
                                                                  == sum * tensor->ne[split_state.axis]);
                     }
