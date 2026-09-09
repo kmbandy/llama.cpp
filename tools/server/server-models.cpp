@@ -411,8 +411,27 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
         // on the span -- otherwise a one-GPU model gets a nonsense one-element
         // --tensor-split of the card's byte count.
         if (placement.exclusive && placement.devs.size() > 1) {
-            preset.set_option(ctx_preset, "LLAMA_ARG_SPLIT_MODE", "layer");
-            preset.set_option(ctx_preset, "LLAMA_ARG_MAIN_GPU", "0");
+            // These are DEFAULTS for a multi-GPU span, not overrides. set_option()
+            // updates an existing entry in place, so setting them unconditionally
+            // silently discarded whatever the operator wrote in the preset -- which
+            // made a tensor-parallel model impossible to express: `split-mode =
+            // tensor` was rewritten to "layer", and an explicit `tensor-split`
+            // was replaced by one derived from the cards' byte counts.
+            //
+            // Only fill in what the preset did not specify. An operator who names
+            // a split mode or a ratio has a reason the VRAM ledger cannot see (here:
+            // a tensor-parallel span whose optimal ratio is set by compute rate, not
+            // capacity), and the ledger's guess must not win over it.
+            auto set_if_unset = [&](const char * env, const std::string & value) {
+                std::string existing;
+                if (preset.get_option(env, existing) && !existing.empty()) {
+                    return;
+                }
+                preset.set_option(ctx_preset, env, value);
+            };
+
+            set_if_unset("LLAMA_ARG_SPLIT_MODE", "layer");
+            set_if_unset("LLAMA_ARG_MAIN_GPU",   "0");
             if (!placement.split.empty()) {
                 std::string split_str;
                 for (float v : placement.split) {
@@ -421,7 +440,7 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
                     }
                     split_str += std::to_string(v);
                 }
-                preset.set_option(ctx_preset, "LLAMA_ARG_TENSOR_SPLIT", split_str);
+                set_if_unset("LLAMA_ARG_TENSOR_SPLIT", split_str);
             }
         }
     }
