@@ -6,6 +6,12 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -2554,18 +2560,86 @@ struct ggml_backend_meta_graph_runner {
     }
 };
 
+// Opt-in step-loop profile (GGML_META_STEP_STATS=1). The decode path submits
+// one graph_compute_async per SUBGRAPH per backend, and subgraphs are delimited
+// by AllReduce boundaries -- so a single decode token is many small submissions
+// plus many cross-device rendezvous. This splits that wall into prepare /
+// submit / reduce so the fragmentation cost can be attributed instead of
+// inferred.
+struct ggml_backend_meta_step_stats {
+    std::atomic<uint64_t> n_calls{0};
+    std::atomic<uint64_t> n_steps{0};
+    std::atomic<uint64_t> ns_prepare{0};
+    std::atomic<uint64_t> ns_submit{0};
+    std::atomic<uint64_t> ns_reduce{0};
+};
+static ggml_backend_meta_step_stats g_meta_step_stats;
+
+static bool ggml_backend_meta_step_stats_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_META_STEP_STATS");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
+static uint64_t ggml_backend_meta_now_ns() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void ggml_backend_meta_step_stats_print() {
+    const uint64_t nc = g_meta_step_stats.n_calls.load();
+    if (nc == 0) {
+        return;
+    }
+    const uint64_t ns = g_meta_step_stats.n_steps.load();
+    const double pr = g_meta_step_stats.ns_prepare.load() / 1e6;
+    const double su = g_meta_step_stats.ns_submit.load()  / 1e6;
+    const double rd = g_meta_step_stats.ns_reduce.load()  / 1e6;
+    fprintf(stderr,
+            "ggml-meta step-stats: calls=%" PRIu64 " steps=%" PRIu64 " (%.1f/call) "
+            "prepare=%.1f ms (%.1f us/call) submit=%.1f ms (%.1f us/step) reduce=%.1f ms (%.1f us/step) "
+            "total=%.1f ms (%.3f ms/call)\n",
+            nc, ns, (double) ns / (double) nc,
+            pr, pr * 1000.0 / (double) nc,
+            su, su * 1000.0 / (double) (ns ? ns : 1),
+            rd, rd * 1000.0 / (double) (ns ? ns : 1),
+            pr + su + rd, (pr + su + rd) / (double) nc);
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    const bool stats = ggml_backend_meta_step_stats_enabled();
+    if (stats) {
+        static std::once_flag once;
+        std::call_once(once, []() { atexit(ggml_backend_meta_step_stats_print); });
+    }
+    const uint64_t t_prep0 = stats ? ggml_backend_meta_now_ns() : 0;
     ggml_backend_meta_graph_prepare(backend, cgraph, 0);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     ggml_backend_meta_graph_runner runner = { backend_ctx, 0, ggml_backend_meta_n_backends(backend) };
     const size_t n_subgraphs = backend_ctx->graph_states[0].n_subgraphs;
+    if (stats) {
+        g_meta_step_stats.ns_prepare.fetch_add(ggml_backend_meta_now_ns() - t_prep0);
+        g_meta_step_stats.n_calls.fetch_add(1);
+        g_meta_step_stats.n_steps.fetch_add(n_subgraphs);
+    }
     for (size_t i = 0; i < n_subgraphs; i++) {
+        const uint64_t t0 = stats ? ggml_backend_meta_now_ns() : 0;
         const ggml_status status = runner.compute(i);
+        if (stats) {
+            g_meta_step_stats.ns_submit.fetch_add(ggml_backend_meta_now_ns() - t0);
+        }
         if (status != GGML_STATUS_SUCCESS) {
             return status;
         }
         if (runner.n_backends > 1 && i + 1 < n_subgraphs) {
-            if (!runner.blocking_reduce(i)) {
+            const uint64_t t1 = stats ? ggml_backend_meta_now_ns() : 0;
+            const bool ok = runner.blocking_reduce(i);
+            if (stats) {
+                g_meta_step_stats.ns_reduce.fetch_add(ggml_backend_meta_now_ns() - t1);
+            }
+            if (!ok) {
                 const ggml_status fallback_status = runner.allreduce_fallback(i);
                 if (fallback_status != GGML_STATUS_SUCCESS) {
                     return fallback_status;
