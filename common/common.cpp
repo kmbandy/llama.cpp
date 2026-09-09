@@ -1706,6 +1706,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
+    // NULL means "use tensor_split" on the llama.cpp side, so only hand over an
+    // attention split when the user actually asked for one.
+    mparams.tensor_split_attn = params.has_tensor_split_attn ? params.tensor_split_attn : nullptr;
     // Weight paging: never mmap GGUF into host VA. Weights stay on NVMe and
     // are staged into VRAM (or into host only when a host tier is explicit).
     //

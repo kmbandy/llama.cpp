@@ -345,6 +345,21 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // proportion of the ATTENTION group (attn_q/k/v/output + the K/V cache) to place on each
+        // GPU, size: llama_max_devices(). NULL (the default) means "use tensor_split".
+        //
+        // Why this is separate: attention and FFN are bound by different resources, so their
+        // optimal splits differ. Prefill is compute-dense and wants the ratio of the devices'
+        // compute rates; decode at depth is dominated by KV-cache reads and wants the ratio of
+        // their memory bandwidths, which on a heterogeneous pair is a much flatter number. One
+        // ratio cannot serve both. Splitting the attention group also rebalances the KV cache,
+        // which is what caps the reachable context per slot.
+        //
+        // The whole attention group moves together by necessity: head placement is set by the
+        // attn_q/attn_output split and the K/V cache is split at KV-head granularity to match,
+        // so moving the cache alone would leave a device computing more heads than it holds.
+        const float * tensor_split_attn;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.

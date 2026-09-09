@@ -875,7 +875,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
-        const float * tensor_split = ud->model->tensor_split();
+
+        // The attention group (attn_q/k/v/output and the K/V cache) may be split on its own
+        // ratio -- see llama_model_params::tensor_split_attn. These tensors must all use the
+        // SAME ratio as each other: attn_q/attn_output determine which heads a device owns and
+        // the cache is split at KV-head granularity to match, so a disagreement would leave a
+        // device computing heads whose K/V lives on the other card.
+        //
+        // Everything else (FFN, recurrent/SSM, embeddings, output head) keeps tensor_split.
+        // tensor_split_attn() falls back to tensor_split when unset, so the default behaviour
+        // is bit-identical to the single-ratio path.
+        const bool is_attn_group =
+            std::regex_match(tensor_name, pattern_q_weight)         ||
+            std::regex_match(tensor_name, pattern_kv_weight)        ||
+            std::regex_match(tensor_name, pattern_qkv_weight)       ||
+            std::regex_match(tensor_name, pattern_q_bias)           ||
+            std::regex_match(tensor_name, pattern_kv_bias)          ||
+            std::regex_match(tensor_name, pattern_qkv_bias)         ||
+            std::regex_match(tensor_name, pattern_qk_norm)          ||
+            std::regex_match(tensor_name, pattern_kv_cache)         ||
+            std::regex_match(tensor_name, pattern_idx_cache)        ||
+            std::regex_match(tensor_name, pattern_attn_sinks)       ||
+            std::regex_match(tensor_name, pattern_attn_out_weight)  ||
+            std::regex_match(tensor_name, pattern_attn_out_bias)    ||
+            std::regex_match(tensor_name, pattern_attn_gate_weight);
+
+        const float * tensor_split = is_attn_group ? ud->model->tensor_split_attn()
+                                                   : ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
@@ -1261,6 +1287,7 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::vector<float> tensor_split_attn_owned;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1269,6 +1296,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.tensor_split_attn != nullptr) {
+        pimpl->tensor_split_attn_owned.assign(params.tensor_split_attn, params.tensor_split_attn + llama_max_devices());
+        this->params.tensor_split_attn = pimpl->tensor_split_attn_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -2785,6 +2816,12 @@ const float * llama_model::tensor_split() const {
     return params.tensor_split;
 }
 
+// Falls back to tensor_split when unset, so an unspecified --tensor-split-attn is
+// exactly the previous single-ratio behaviour.
+const float * llama_model::tensor_split_attn() const {
+    return params.tensor_split_attn != nullptr ? params.tensor_split_attn : params.tensor_split;
+}
+
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
@@ -4001,6 +4038,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.tensor_split_attn           =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,

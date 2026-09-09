@@ -3330,6 +3330,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
     add_opt(common_arg(
+        {"-tsa", "--tensor-split-attn"}, "N0,N1,N2,...",
+        "fraction of the ATTENTION group (attn_q/k/v/output and the K/V cache) to place on each GPU, "
+        "comma-separated, e.g. 1,1. Defaults to --tensor-split when unset. Attention and FFN are bound "
+        "by different resources -- prefill is compute-bound, decode at depth is KV-bandwidth-bound -- so "
+        "on a heterogeneous pair their optimal splits differ, and this also rebalances the K/V cache, "
+        "which is what caps context per slot. Note the K/V cache splits at whole-KV-head granularity, "
+        "so with n_head_kv heads only that many ratios are actually reachable.",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+
+            // split string by , and /
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                if (i < split_arg.size()) {
+                    params.tensor_split_attn[i] = std::stof(split_arg[i]);
+                } else {
+                    params.tensor_split_attn[i] = 0.0f;
+                }
+            }
+            params.has_tensor_split_attn = true;
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting an attention tensor split has no effect.\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_TENSOR_SPLIT_ATTN"));
+    add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
         [](common_params & params, int value) {
