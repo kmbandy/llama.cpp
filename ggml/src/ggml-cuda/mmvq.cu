@@ -287,8 +287,39 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// Runtime override for the MMVQ *dispatch* cutoff (NOT the capacity constant
+// MMVQ_MAX_BATCH_SIZE, which also sizes kernel padding/grouping and must not move).
+//
+// Why this exists: should_use_mmvq is consulted BEFORE should_use_mmq, so any batch
+// it claims never reaches the matrix cores. There is no RDNA entry in the per-arch
+// table below, so RDNA3/4 fall through to `ne11 <= MMVQ_MAX_BATCH_SIZE` (8) and a
+// concurrency of 1..8 runs the vector kernel. On RDNA4 should_use_mmq returns an
+// unconditional true, so lowering this cutoff moves those batches onto MMQ (int8
+// WMMA for q8_0 -- NOT fp8; the fp8 WMMA path is the AITER Triton one) rather than
+// onto a cuBLAS fallback.
+//
+// Set GGML_CUDA_MMVQ_MAX_BATCH=N to cap the cutoff at N. The predicate is
+// `ne11 <= cutoff`, so to push a --parallel 4 decode onto MMQ the value is 3, not 4.
+// Default is MMVQ_MAX_BATCH_SIZE, i.e. upstream behaviour unchanged.
+static int ggml_cuda_mmvq_dispatch_cap() {
+    static const int cap = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_MAX_BATCH");
+        if (e == nullptr) {
+            return MMVQ_MAX_BATCH_SIZE;
+        }
+        const int v = atoi(e);
+        // Clamp: 0 disables MMVQ entirely, and the cutoff can never exceed the
+        // capacity the kernels are actually instantiated for.
+        return v < 0 ? 0 : (v > MMVQ_MAX_BATCH_SIZE ? MMVQ_MAX_BATCH_SIZE : v);
+    }();
+    return cap;
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
+        return false;
+    }
+    if (ne11 > ggml_cuda_mmvq_dispatch_cap()) {
         return false;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
