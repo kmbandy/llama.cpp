@@ -1434,11 +1434,41 @@ bool llama_kv_cache_paged::can_admit(llama_seq_id           seq_id,
         total += b;
     }
 
-    // n_blocks_total_ is the hot pool capacity. Headroom of a couple
+    // n_blocks_total_ is the HOT pool capacity. Headroom of a couple
     // blocks for new-block allocation churn during this batch.
     const uint32_t headroom = 2;
     const uint32_t budget   = (n_blocks_total_ > headroom) ? (n_blocks_total_ - headroom) : n_blocks_total_;
-    return total <= budget;
+
+    if (!warm_enabled() && n_cold_blocks_ == 0) {
+        // No tiering: every block of every live seq must be GPU-resident at once.
+        return total <= budget;
+    }
+
+    // Tiered. `total` above is the sum of every live seq's LOGICAL extent, and
+    // comparing that to the hot pool makes the warm/cold tiers worthless: a block
+    // evicted to host RAM still counts toward it, so eviction can never satisfy the
+    // predicate. evict_seq_to_warm would hand back every block it owned and the
+    // check would still fail, leaving MAD-141's deadlock guard to fail the request
+    // (observed: "evicted 512" then "evicted 0" x4). Admission then capped
+    // concurrent capacity at the hot pool -- exactly what tiering exists to lift.
+    //
+    // Two conditions actually have to hold:
+    //
+    //   1. Everything must fit SOMEWHERE across the tiers. Beyond that it is a
+    //      genuine out-of-capacity, not something eviction can fix.
+    //
+    //   2. The candidate alone must fit in the hot pool. Attention reads a
+    //      sequence's whole history, so all of ITS blocks must be resident
+    //      together while it runs; co-resident sequences need not be, since
+    //      ensure_blocks_for evicts them to warm and fault_in_warm_blocks_for_batch
+    //      restores them before the batch that touches them.
+    //
+    // Sequences beyond the candidate are therefore displaceable, and are not
+    // charged against the hot budget here.
+    const uint64_t tiered_capacity =
+        (uint64_t) n_blocks_total_ + (uint64_t) n_warm_blocks_ + (uint64_t) n_cold_blocks_;
+
+    return (uint64_t) total <= tiered_capacity && cand_blocks <= budget;
 }
 
 bool llama_kv_cache_paged::compute_slot_mapping(const llama_ubatch * ubatch, int32_t * out) const {
