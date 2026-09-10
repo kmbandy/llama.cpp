@@ -255,16 +255,19 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     k_bytes_per_block_ = k_bytes_per_layer / n_blocks_total_;
     v_bytes_per_block_ = v_bytes_per_layer / n_blocks_total_;
 
-    // Tensor parallelism x tiering is not wired up. Under the meta backend the
-    // arena is a per-device allocation reached through a meta buffer; the warm
-    // (host RAM) and cold (SSD) tiers do raw per-block hipMemcpy against a single
-    // base pointer and a single per-block stride, neither of which is meaningful
-    // once the arena is split across devices. Fail here rather than silently
-    // evict from, or fault into, the wrong card.
+    // Tensor parallelism x tiering: the warm (host RAM) and cold (SSD) tiers move
+    // whole logical blocks through ggml_backend_meta_tensor_{get,set}_block, which
+    // visits each device's slice and concatenates. The host-side buffers are sized
+    // by the FULL logical block, which is exactly what that helper produces, so the
+    // split is invisible to them. Gated behind an env kill-switch rather than a
+    // hard refusal: set MAD_PAGED_TP_TIERING=0 to fall back to refusing.
     if (ggml_backend_buft_is_meta(buft_) && (n_warm_blocks_ > 0 || n_cold_blocks_ > 0)) {
-        throw std::runtime_error(
-            "llama_kv_cache_paged: KV tiering (--kv-tiered warm/cold) is not supported with "
-            "tensor-parallel split (-sm tensor). Use an all-hot tier split (e.g. --kv-tiered 100,0,0).");
+        const char * e = std::getenv("MAD_PAGED_TP_TIERING");
+        if (e != nullptr && e[0] == '0') {
+            throw std::runtime_error(
+                "llama_kv_cache_paged: KV tiering disabled under tensor-parallel split "
+                "by MAD_PAGED_TP_TIERING=0.");
+        }
     }
 
     if (n_warm_blocks_ > 0) {
@@ -1391,11 +1394,32 @@ bool llama_kv_cache_paged::can_admit(llama_seq_id           seq_id,
                                        const std::vector<llama_seq_id> & accepted) const {
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
 
-    // Candidate seq's hot-block need = ceil((seq_pos_max + n_new + 1) / block).
-    // seq_pos_max is -1 for an unwritten seq, so adjust.
+    // Candidate seq's hot-block need.
+    //
+    // n_new_tokens is the caller's estimate of the seq's TOTAL token requirement
+    // (server-context.cpp passes slot.task->n_tokens(), the whole prompt), not an
+    // increment on top of what is already resident. Adding it to pos_max+1 therefore
+    // double-counts the part of its own prompt the slot has already prefilled, and
+    // the estimate grows toward 2x the true need as prefill proceeds:
+    //
+    //   3207-tok prompt (201 blocks), -b 2048, hot budget 382 blocks
+    //     iter 1  pos_max=-1    0 + 3207 = 3207 -> 201  admit
+    //     iter 2  pos_max=2047  2048 + 3207 = 5255 -> 329  admit
+    //     iter 3  pos_max=3206  3207 + 3207 = 6414 -> 401  REJECT
+    //
+    // The slot then has nothing left to evict and MAD-141 fails the request. It bites
+    // whenever 2 x prompt_blocks > hot budget, i.e. a prompt larger than HALF the hot
+    // pool. An all-hot tier has enough slack to hide it; any --kv-tiered warm/cold
+    // share shrinks the hot pool and exposes it, which is why tiering looked broken
+    // for long prompts while all-hot was fine.
+    //
+    // Take the max, not the sum: the seq will ultimately need whichever is larger of
+    // what it already holds and its full prompt. Correct in both phases -- the prompt
+    // dominates during prefill, pos_max+1 dominates once generation passes it.
     const llama_pos cand_pos_max = seq_states_[seq_id].pos_max;
-    const uint64_t  cand_total_tokens =
-        (cand_pos_max < 0 ? 0 : (uint64_t)(cand_pos_max + 1)) + (uint64_t) n_new_tokens;
+    const uint64_t  cand_total_tokens = std::max<uint64_t>(
+        (cand_pos_max < 0 ? 0 : (uint64_t)(cand_pos_max + 1)),
+        (uint64_t) n_new_tokens);
     const uint32_t cand_blocks = (uint32_t)
         ((cand_total_tokens + block_size_ - 1) / block_size_);
 
