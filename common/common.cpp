@@ -1859,13 +1859,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // the user didn't explicitly choose either way. The army-goal use
     // case (hybrid models + multi-agent serving) wants paged-on; the
     // explicit-pct path stays opt-in via --no-kv-tier-paged-blocks.
-    bool effective_paged = params.kv_tier_paged_blocks;
-    if (!params.kv_tier_paged_blocks_explicit && params.kv_tiered_enabled && !params.kv_tier_paged_blocks) {
-        effective_paged = true;
-        LOG_INF("%s: auto-enabled --kv-tier-paged-blocks (--kv-tiered set; pass "
-                "--no-kv-tier-paged-blocks to opt out)\n", __func__);
-    }
-    cparams.kv_tier_paged_blocks        = effective_paged;
+    // Resolved in common_params_parse() so params and cparams cannot disagree --
+    // see the MAD-134 note there. Deciding it here left params.kv_tier_paged_blocks
+    // false and split the server and the cache onto different tiering paths.
+    cparams.kv_tier_paged_blocks        = params.kv_tier_paged_blocks;
     cparams.kv_tier_paged_block_size    = params.kv_tier_paged_block_size;
     cparams.kv_tier_cold_resume         = params.kv_tier_cold_resume;
     cparams.kv_tier_instance_id         = params.kv_tier_instance_id.empty()

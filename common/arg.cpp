@@ -902,6 +902,28 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
 
+    // MAD-134: resolve the paged-blocks auto-default HERE, on params, so every
+    // consumer sees the same answer.
+    //
+    // common_params_to_llama() used to decide this into a local and write only
+    // cparams, leaving params.kv_tier_paged_blocks false. The cache then ran PAGED
+    // while the server still believed it was on the LEGACY tiered path and took the
+    // legacy branches: pre-shrinking n_ctx by hot_pct (server-context.cpp) and
+    // overriding the per-slot context to the full total (n_ctx_slot_uncapped).
+    // The result was a server that admitted prompts up to the full ctx against a
+    // cache that could only hold hot_pct/n_parallel of it, failing mid-decode with
+    // "Context size has been exceeded" -- e.g. -c 32768 --parallel 2 --kv-tiered
+    // 50,50,0 gave n_ctx 16384 / n_ctx_seq 8192 while slots reported 32768.
+    //
+    // Configs that pass --kv-tier-paged-blocks explicitly were never affected,
+    // which is why the fleet presets (kv-tier-paged-blocks = true) worked while a
+    // bare --kv-tiered did not.
+    if (!params.kv_tier_paged_blocks_explicit && params.kv_tiered_enabled && !params.kv_tier_paged_blocks) {
+        params.kv_tier_paged_blocks = true;
+        LOG_INF("%s: auto-enabled --kv-tier-paged-blocks (--kv-tiered set; pass "
+                "--no-kv-tier-paged-blocks to opt out)\n", __func__);
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
