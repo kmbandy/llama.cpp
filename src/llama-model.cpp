@@ -428,6 +428,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_paged_cache     ("paged_(k|v)_l\\d*");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -501,6 +502,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = std::stoull(tensor_name.substr(4, length_prefix));
             rotation = get_il_eff(il) % ud->n_devices;
         } else if (tensor_name.substr(0, 6) == "cache_") {
+            const size_t layer_index_start = tensor_name.find("_l", 6);
+            GGML_ASSERT(layer_index_start != std::string::npos);
+            il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            prefix = "blk." + std::to_string(il) + ".";
+            rotation = get_il_eff(il) % ud->n_devices;
+        } else if (std::regex_match(tensor_name, pattern_paged_cache)) {
+            // Paged KV arenas (llama_kv_cache_paged) are named paged_k_l<N> /
+            // paged_v_l<N>. Same layer-index extraction as the contiguous
+            // cache_*_l<N> tensors above; without this branch they fall to the
+            // il == 0 catch-all and every layer is assigned layer 0's config.
+            //
+            // Match the full regex, NOT a "paged_" prefix: the paged path also
+            // creates paged_block_table / paged_context_lens / paged_q_lens /
+            // paged_slot_mapping, which carry no layer index. A prefix test sends
+            // those here too and the _l search either finds nothing (assert) or
+            // finds the "_l" inside "context_lens" and throws in stoull. They are
+            // per-sequence metadata and belong in the MIRRORED catch-all.
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
@@ -610,6 +628,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+        }
+        // Paged KV arena. This is a FLAT 1-D allocation, and the paged layout
+        // (mt_pagedattn_ops.cuh) interleaves kv_head INSIDE every block, so a
+        // contiguous byte range of the arena is NOT "the data for some heads" --
+        // it is "all heads for some blocks". Splitting it here therefore does NOT
+        // mean what AXIS_0 means for a weight.
+        //
+        // What it means instead: give each device an arena sized for exactly the
+        // KV heads it owns. Each device then treats its own chunk as a COMPLETE
+        // arena addressed with its LOCAL n_kv_heads, holding all n_blocks_total
+        // blocks for its own heads. The byte sizes are identical either way
+        // (n_blocks x heads_local x rest), and nothing ever copies, broadcasts or
+        // reduces this tensor across devices -- the meta backend only allocates it
+        // and hands out base pointers -- so sizing is the whole contract.
+        //
+        // get_split_granularity pins the boundary to a whole-head multiple, and
+        // ggml_cuda_op_paged_attn_mt asserts k_cur->ne[1] == n_kv_heads, so a
+        // mismatch between the arena split and the projection split aborts rather
+        // than silently attending to the wrong heads.
+        if (std::regex_match(tensor_name, pattern_paged_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
@@ -845,6 +884,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_kv};
             }
+            if (std::regex_match(tensor_name, pattern_paged_cache)) {
+                GGML_ASSERT(segments.size() == 1);
+                // One whole KV head's slice of the flat arena. The paged cache
+                // sizes the arena as n_kv_heads x (per-head slice rounded to the
+                // quant block), so this division is exact -- see the
+                // TENSOR-PARALLEL INVARIANT in llama_kv_cache_paged's ctor.
+                const uint32_t n_head_kv = hparams.n_head_kv(il);
+                GGML_ASSERT(n_head_kv > 0);
+                GGML_ASSERT(tensor->ne[0] % n_head_kv == 0 &&
+                        "paged KV arena must be a whole multiple of n_head_kv");
+                return {tensor->ne[0] / (int64_t) n_head_kv};
+            }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
                 GGML_ASSERT(segments.size() == 2);
                 return {granularity_q, granularity_kv};
@@ -914,6 +965,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             std::regex_match(tensor_name, pattern_qkv_bias)         ||
             std::regex_match(tensor_name, pattern_qk_norm)          ||
             std::regex_match(tensor_name, pattern_kv_cache)         ||
+            std::regex_match(tensor_name, pattern_paged_cache)      ||
             std::regex_match(tensor_name, pattern_idx_cache)        ||
             std::regex_match(tensor_name, pattern_attn_sinks)       ||
             std::regex_match(tensor_name, pattern_attn_out_weight)  ||
