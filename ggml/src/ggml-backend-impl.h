@@ -98,6 +98,22 @@ extern "C" {
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
+    // Block-strided access to a tensor split across the meta backend's devices.
+    //
+    // A 1-D tensor split on axis 0 is a flat arena, so the generic partial
+    // get/set has no second dimension to derive a chunk stride from and can only
+    // serve the whole tensor. These let a caller that DOES know the arena's
+    // structure -- e.g. the paged KV cache, whose arena is n_blocks equal blocks
+    // -- read or write one block. Each device's slice of the block is visited in
+    // device order and concatenated into `data`, so the buffer holds exactly what
+    // the same block occupies in an unsplit arena.
+    //
+    // Requires: the tensor is MIRRORED or split on axis 0, and every device's
+    // slice divides evenly into n_blocks. Safe on a non-meta tensor, where it
+    // degenerates to a single get/set at block_index*(nbytes/n_blocks).
+    GGML_API void ggml_backend_meta_tensor_get_block(const struct ggml_tensor * tensor,       void * data, size_t block_index, size_t n_blocks);
+    GGML_API void ggml_backend_meta_tensor_set_block(const struct ggml_tensor * tensor, const void * data, size_t block_index, size_t n_blocks);
+
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
     // true when the backend pairs consecutive graph_compute calls into a two-ubatch AllReduce/compute overlap

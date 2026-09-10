@@ -7,6 +7,7 @@
 #include "llama-hparams.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include "memory-tier/mt-quant.h"
 
@@ -160,11 +161,20 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     };
     const size_t k_blk = (size_t) ggml_blck_size(type_k_);
     const size_t v_blk = (size_t) ggml_blck_size(type_v_);
-    const size_t per_token_per_layer_elts = (size_t) n_kv_heads * head_dim;
-    const size_t k_n_elts_per_layer = round_to_block(
-        (size_t) n_blocks_total_ * block_size_ * per_token_per_layer_elts, k_blk);
-    const size_t v_n_elts_per_layer = round_to_block(
-        (size_t) n_blocks_total_ * block_size_ * per_token_per_layer_elts, v_blk);
+    //
+    // TENSOR-PARALLEL INVARIANT: size the arena as n_kv_heads x (a per-head
+    // slice), rounding the PER-HEAD slice up to the quant block size rather
+    // than the layer total. That makes ne[0] % n_kv_heads == 0 by
+    // construction, which is what lets the meta backend split this flat
+    // arena on whole-KV-head boundaries (llama_meta_device_get_split_state,
+    // pattern_paged_cache). Rounding the total instead could leave a
+    // remainder that no head-granular split can express.
+    const size_t k_elts_per_head = round_to_block(
+        (size_t) n_blocks_total_ * block_size_ * head_dim, k_blk);
+    const size_t v_elts_per_head = round_to_block(
+        (size_t) n_blocks_total_ * block_size_ * head_dim, v_blk);
+    const size_t k_n_elts_per_layer = k_elts_per_head * n_kv_heads;
+    const size_t v_n_elts_per_layer = v_elts_per_head * n_kv_heads;
     const size_t k_bytes_per_layer = ggml_row_size(type_k_, (int64_t) k_n_elts_per_layer);
     const size_t v_bytes_per_layer = ggml_row_size(type_v_, (int64_t) v_n_elts_per_layer);
 
@@ -244,6 +254,18 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     // class so the methods can compute offsets without re-deriving.
     k_bytes_per_block_ = k_bytes_per_layer / n_blocks_total_;
     v_bytes_per_block_ = v_bytes_per_layer / n_blocks_total_;
+
+    // Tensor parallelism x tiering is not wired up. Under the meta backend the
+    // arena is a per-device allocation reached through a meta buffer; the warm
+    // (host RAM) and cold (SSD) tiers do raw per-block hipMemcpy against a single
+    // base pointer and a single per-block stride, neither of which is meaningful
+    // once the arena is split across devices. Fail here rather than silently
+    // evict from, or fault into, the wrong card.
+    if (ggml_backend_buft_is_meta(buft_) && (n_warm_blocks_ > 0 || n_cold_blocks_ > 0)) {
+        throw std::runtime_error(
+            "llama_kv_cache_paged: KV tiering (--kv-tiered warm/cold) is not supported with "
+            "tensor-parallel split (-sm tensor). Use an all-hot tier split (e.g. --kv-tiered 100,0,0).");
+    }
 
     if (n_warm_blocks_ > 0) {
         warm_k_.resize(n_layer);
@@ -590,8 +612,6 @@ bool llama_kv_cache_paged::evict_block_to_warm(llama_seq_id seq_id, uint32_t log
     }
 
     const uint32_t cpu_idx = cpu_physical - n_blocks_total_;
-    const size_t gpu_k_off  = (size_t) gpu_physical * k_bytes_per_block_;
-    const size_t gpu_v_off  = (size_t) gpu_physical * v_bytes_per_block_;
     const size_t warm_k_off = (size_t) cpu_idx     * k_bytes_per_block_;
     const size_t warm_v_off = (size_t) cpu_idx     * v_bytes_per_block_;
 
@@ -599,12 +619,10 @@ bool llama_kv_cache_paged::evict_block_to_warm(llama_seq_id seq_id, uint32_t log
     for (uint32_t il = 0; il < layers_.size(); ++il) {
         const auto & layer = layers_[il];
         if (!layer.k) continue;
-        ggml_backend_tensor_get(layer.k,
-                                warm_k_[il].data() + warm_k_off,
-                                gpu_k_off, k_bytes_per_block_);
-        ggml_backend_tensor_get(layer.v,
-                                warm_v_[il].data() + warm_v_off,
-                                gpu_v_off, v_bytes_per_block_);
+        ggml_backend_meta_tensor_get_block(layer.k, warm_k_[il].data() + warm_k_off,
+                                           gpu_physical, n_blocks_total_);
+        ggml_backend_meta_tensor_get_block(layer.v, warm_v_[il].data() + warm_v_off,
+                                           gpu_physical, n_blocks_total_);
     }
 
     // Atomic flip: table now maps (seq, lblock) to the CPU physical;
@@ -635,20 +653,16 @@ bool llama_kv_cache_paged::restore_block_from_warm(llama_seq_id seq_id, uint32_t
     }
 
     const uint32_t cpu_idx = cpu_physical - n_blocks_total_;
-    const size_t gpu_k_off  = (size_t) gpu_physical * k_bytes_per_block_;
-    const size_t gpu_v_off  = (size_t) gpu_physical * v_bytes_per_block_;
     const size_t warm_k_off = (size_t) cpu_idx     * k_bytes_per_block_;
     const size_t warm_v_off = (size_t) cpu_idx     * v_bytes_per_block_;
 
     for (uint32_t il = 0; il < layers_.size(); ++il) {
         const auto & layer = layers_[il];
         if (!layer.k) continue;
-        ggml_backend_tensor_set(layer.k,
-                                warm_k_[il].data() + warm_k_off,
-                                gpu_k_off, k_bytes_per_block_);
-        ggml_backend_tensor_set(layer.v,
-                                warm_v_[il].data() + warm_v_off,
-                                gpu_v_off, v_bytes_per_block_);
+        ggml_backend_meta_tensor_set_block(layer.k, warm_k_[il].data() + warm_k_off,
+                                           gpu_physical, n_blocks_total_);
+        ggml_backend_meta_tensor_set_block(layer.v, warm_v_[il].data() + warm_v_off,
+                                           gpu_physical, n_blocks_total_);
     }
 
     table_.swap_block(seq_id, logical_block, gpu_physical);
@@ -842,17 +856,13 @@ bool llama_kv_cache_paged::cow_writes_for_ubatch(const llama_ubatch & ub) {
         // block is small — k+v_bytes_per_block, ~17 KiB at turbo4).
         std::vector<uint8_t> kbuf(k_bytes_per_block_);
         std::vector<uint8_t> vbuf(v_bytes_per_block_);
-        const size_t k_off_old = (size_t) physical * k_bytes_per_block_;
-        const size_t v_off_old = (size_t) physical * v_bytes_per_block_;
-        const size_t k_off_new = (size_t) new_phys * k_bytes_per_block_;
-        const size_t v_off_new = (size_t) new_phys * v_bytes_per_block_;
         for (uint32_t il = 0; il < layers_.size(); ++il) {
             const auto & layer = layers_[il];
             if (!layer.k) continue;
-            ggml_backend_tensor_get(layer.k, kbuf.data(), k_off_old, k_bytes_per_block_);
-            ggml_backend_tensor_get(layer.v, vbuf.data(), v_off_old, v_bytes_per_block_);
-            ggml_backend_tensor_set(layer.k, kbuf.data(), k_off_new, k_bytes_per_block_);
-            ggml_backend_tensor_set(layer.v, vbuf.data(), v_off_new, v_bytes_per_block_);
+            ggml_backend_meta_tensor_get_block(layer.k, kbuf.data(), physical, n_blocks_total_);
+            ggml_backend_meta_tensor_get_block(layer.v, vbuf.data(), physical, n_blocks_total_);
+            ggml_backend_meta_tensor_set_block(layer.k, kbuf.data(), new_phys, n_blocks_total_);
+            ggml_backend_meta_tensor_set_block(layer.v, vbuf.data(), new_phys, n_blocks_total_);
         }
 
         // Swap seq's table entry to the fresh block; decrement old.
@@ -1053,10 +1063,8 @@ bool llama_kv_cache_paged::evict_block_to_cold(llama_seq_id seq_id, uint32_t lbl
         if (!layer.k) continue;
 
         if (from_gpu) {
-            const size_t k_off = (size_t) phys * k_bytes_per_block_;
-            const size_t v_off = (size_t) phys * v_bytes_per_block_;
-            ggml_backend_tensor_get(layer.k, kbuf.data(), k_off, k_bytes_per_block_);
-            ggml_backend_tensor_get(layer.v, vbuf.data(), v_off, v_bytes_per_block_);
+            ggml_backend_meta_tensor_get_block(layer.k, kbuf.data(), phys, n_blocks_total_);
+            ggml_backend_meta_tensor_get_block(layer.v, vbuf.data(), phys, n_blocks_total_);
         } else {
             const size_t k_off = (size_t) cpu_idx * k_bytes_per_block_;
             const size_t v_off = (size_t) cpu_idx * v_bytes_per_block_;
@@ -1203,10 +1211,8 @@ bool llama_kv_cache_paged::restore_block_from_cold(llama_seq_id seq_id, uint32_t
             }
         }
 
-        const size_t k_off = (size_t) gpu_phys * k_bytes_per_block_;
-        const size_t v_off = (size_t) gpu_phys * v_bytes_per_block_;
-        ggml_backend_tensor_set(layer.k, kbuf.data(), k_off, k_bytes_per_block_);
-        ggml_backend_tensor_set(layer.v, vbuf.data(), v_off, v_bytes_per_block_);
+        ggml_backend_meta_tensor_set_block(layer.k, kbuf.data(), gpu_phys, n_blocks_total_);
+        ggml_backend_meta_tensor_set_block(layer.v, vbuf.data(), gpu_phys, n_blocks_total_);
     }
 
     table_.swap_block(seq_id, lblock, gpu_phys);
@@ -2235,13 +2241,11 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
             io.write(&tag_u8, sizeof(tag_u8));
 
             if (tag == PagedTierTag::Hot) {
-                const size_t k_off_gpu = (size_t) physical * k_bytes_per_block_;
-                const size_t v_off_gpu = (size_t) physical * v_bytes_per_block_;
                 for (uint32_t il = 0; il < layers_.size(); ++il) {
                     const auto & layer = layers_[il];
                     if (!layer.k) continue;
-                    ggml_backend_tensor_get(layer.k, kbuf.data(), k_off_gpu, k_bytes_per_block_);
-                    ggml_backend_tensor_get(layer.v, vbuf.data(), v_off_gpu, v_bytes_per_block_);
+                    ggml_backend_meta_tensor_get_block(layer.k, kbuf.data(), physical, n_blocks_total_);
+                    ggml_backend_meta_tensor_get_block(layer.v, vbuf.data(), physical, n_blocks_total_);
                     io.write(kbuf.data(), k_bytes_per_block_);
                     io.write(vbuf.data(), v_bytes_per_block_);
                 }
@@ -2383,14 +2387,12 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                     throw std::runtime_error("llama_kv_cache_paged::state_read: GPU pool exhausted "
                                              "while restoring hot block");
                 }
-                const size_t k_off_gpu = (size_t) phys * k_bytes_per_block_;
-                const size_t v_off_gpu = (size_t) phys * v_bytes_per_block_;
                 for (uint32_t il = 0; il < layers_.size(); ++il) {
                     if (!layers_[il].k) continue;
                     io.read(kbuf.data(), k_bytes_per_block_);
                     io.read(vbuf.data(), v_bytes_per_block_);
-                    ggml_backend_tensor_set(layers_[il].k, kbuf.data(), k_off_gpu, k_bytes_per_block_);
-                    ggml_backend_tensor_set(layers_[il].v, vbuf.data(), v_off_gpu, v_bytes_per_block_);
+                    ggml_backend_meta_tensor_set_block(layers_[il].k, kbuf.data(), phys, n_blocks_total_);
+                    ggml_backend_meta_tensor_set_block(layers_[il].v, vbuf.data(), phys, n_blocks_total_);
                 }
                 table_.append_block(load_sid, phys);
             } else if (tag == PagedTierTag::Warm) {

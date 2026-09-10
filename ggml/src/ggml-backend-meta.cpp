@@ -832,6 +832,41 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
+    auto handle_paged_attn_mt = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // src: 0 q, 1 k_cache, 2 v_cache, 3 block_tables, 4 context_lens,
+        //      5 q_lens, 6 k_cur, 7 v_cur, 8 slot_mapping.
+        //
+        // q / k_cur / v_cur are [head_dim, heads, n_tokens] -> heads on axis 1.
+        // The block tables and the per-seq metadata describe the SEQUENCE, not the
+        // heads, so every device needs all of them: MIRRORED.
+        //
+        // k_cache / v_cache are the flat paged arenas. Their AXIS_0 "split" is a
+        // sizing device, not a data partition -- see the pattern_paged_cache
+        // comment in llama_meta_device_get_split_state. Each device gets an arena
+        // for its own KV heads and addresses it with its LOCAL n_kv_heads, which
+        // ggml_backend_meta_fixup_op_params writes into op_params[3] per device.
+        for (size_t i = 3; i <= 5; i++) {
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        GGML_ASSERT(src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            // Single-device / fully replicated attention: everything stays whole.
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+    };
+
     auto handle_lightning_indexer = [&](
             const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         for (size_t i = 0; i < 4; i++) {
@@ -1059,6 +1094,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_FILL: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_PAGED_ATTN_MT: {
+                split_state = handle_paged_attn_mt(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_EXT: {
                 split_state = handle_flash_attn_ext(src_ss);
@@ -1337,6 +1375,29 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
             }
+        }
+
+        // Per-device op_params fixup.
+        //
+        // op_params are memcpy'd verbatim above, which is right for every
+        // parameter that describes the MODEL. It is wrong for a parameter that
+        // describes the SHAPE this device actually computes, because that shape
+        // was just narrowed by the split. Fix those up here, from the per-device
+        // sources, after src[] has been rewired.
+        switch (t_ij->op) {
+            case GGML_OP_PAGED_ATTN_MT: {
+                // op_params[3] is n_kv_heads. Under tensor parallelism this device
+                // owns only its slice of the KV heads: its paged arena is sized for
+                // them and k_cur/v_cur carry only them, so the addressing inside
+                // mt_pagedattn must use the LOCAL count. Left at the global value
+                // the kernel would stride as if the arena held every head and read
+                // the wrong keys -- ggml_cuda_op_paged_attn_mt's
+                // k_cur->ne[1] == n_kv_heads assert catches that, loudly.
+                GGML_ASSERT(t_ij->src[6] != nullptr);
+                const int32_t n_kv_heads_local = (int32_t) t_ij->src[6]->ne[1];
+                memcpy((char *) t_ij->op_params + 3*sizeof(int32_t), &n_kv_heads_local, sizeof(int32_t));
+            } break;
+            default: break;
         }
 
         simple_tensors.push_back(t_ij);
@@ -1703,6 +1764,78 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             GGML_ABORT("fatal error");
         }
     }
+}
+
+// Shared implementation for ggml_backend_meta_tensor_{get,set}_block. See the
+// declarations in ggml-backend-impl.h for the contract.
+static void ggml_backend_meta_tensor_block_io(
+        const struct ggml_tensor * tensor, void * data, size_t block_index, size_t n_blocks, bool write) {
+    GGML_ASSERT(n_blocks > 0);
+    GGML_ASSERT(block_index < n_blocks);
+
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        const size_t block_size = ggml_nbytes(tensor) / n_blocks;
+        GGML_ASSERT(ggml_nbytes(tensor) % n_blocks == 0);
+        if (write) {
+            ggml_backend_tensor_set((struct ggml_tensor *) tensor, data, block_index*block_size, block_size);
+        } else {
+            ggml_backend_tensor_get(tensor, data, block_index*block_size, block_size);
+        }
+        return;
+    }
+
+    const struct ggml_backend_meta_split_state split_state =
+        ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    GGML_ASSERT((split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ||
+                 split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) &&
+            "meta block IO requires an axis-0 or mirrored tensor");
+
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+
+    // MIRRORED: every device holds the same bytes. Read from device 0; write to
+    // all of them so the copies stay in agreement.
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        for (size_t j = 0; j < n_bufs; j++) {
+            struct ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            GGML_ASSERT(st != nullptr);
+            const size_t block_size = ggml_nbytes(st) / n_blocks;
+            GGML_ASSERT(ggml_nbytes(st) % n_blocks == 0);
+            if (write) {
+                ggml_backend_tensor_set(st, data, block_index*block_size, block_size);
+            } else {
+                ggml_backend_tensor_get(st, data, block_index*block_size, block_size);
+                return;
+            }
+        }
+        return;
+    }
+
+    char * p = (char *) data;
+    for (size_t j = 0; j < n_bufs; j++) {
+        struct ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        GGML_ASSERT(st != nullptr);
+        const size_t nbytes_j = ggml_nbytes(st);
+        if (nbytes_j == 0) {
+            continue;
+        }
+        GGML_ASSERT(nbytes_j % n_blocks == 0 &&
+                "meta block IO: device slice must divide evenly into n_blocks");
+        const size_t block_size_j = nbytes_j / n_blocks;
+        if (write) {
+            ggml_backend_tensor_set(st, p, block_index*block_size_j, block_size_j);
+        } else {
+            ggml_backend_tensor_get(st, p, block_index*block_size_j, block_size_j);
+        }
+        p += block_size_j;
+    }
+}
+
+void ggml_backend_meta_tensor_get_block(const struct ggml_tensor * tensor, void * data, size_t block_index, size_t n_blocks) {
+    ggml_backend_meta_tensor_block_io(tensor, data, block_index, n_blocks, /*write =*/ false);
+}
+
+void ggml_backend_meta_tensor_set_block(const struct ggml_tensor * tensor, const void * data, size_t block_index, size_t n_blocks) {
+    ggml_backend_meta_tensor_block_io(tensor, (void *) data, block_index, n_blocks, /*write =*/ true);
 }
 
 static void ggml_backend_meta_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
