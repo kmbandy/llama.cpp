@@ -166,8 +166,21 @@ const KernelHandle * Registry::get_or_compile(const KernelSpec & spec) {
 
     const std::string key = spec.cache_key();
 
+    // The compiled HSACO is a property of the ARCH, so the on-disk cache is keyed
+    // by the spec alone. A loaded hipModule is a property of the DEVICE CONTEXT it
+    // was loaded into, so the in-memory handle must additionally be keyed by the
+    // active device -- otherwise two identical GPUs (same target, same key) share
+    // one module and launching it on the second fails with "invalid device
+    // ordinal". Heterogeneous pairs are already distinguished by their target;
+    // this is what makes a homogeneous multi-GPU split work too.
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        dev = 0;
+    }
+    const std::string mem_key = key + "|dev" + std::to_string(dev);
+
     // 1. In-memory hit?
-    auto it = handles_.find(key);
+    auto it = handles_.find(mem_key);
     if (it != handles_.end()) {
         return it->second.get();
     }
@@ -187,7 +200,7 @@ const KernelHandle * Registry::get_or_compile(const KernelSpec & spec) {
     }
 
     KernelHandle * raw = handle.get();
-    handles_.emplace(key, std::move(handle));
+    handles_.emplace(mem_key, std::move(handle));
     return raw;
 }
 

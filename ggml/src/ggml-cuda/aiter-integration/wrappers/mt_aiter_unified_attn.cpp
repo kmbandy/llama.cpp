@@ -21,6 +21,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace {
 
@@ -195,9 +196,27 @@ struct CachedHandles {
     hipError_t                  init_err    = hipSuccess;
 };
 
+// Per-DEVICE handle cache.
+//
+// A KernelHandle owns a HIP module loaded into one device's context, and the
+// Triton target is derived from the active device's gcnArchName. A single
+// process-wide cache therefore pins every later call to whichever device
+// happened to run attention first: under tensor parallelism the second card
+// reused the first card's modules and the launch failed with
+// "invalid device ordinal" (and the second arch was never even compiled for).
+//
+// Key by device ordinal. References into the map stay valid across rehash and
+// entries are only ever inserted, so handing out a reference under the lock and
+// using it after is safe.
 CachedHandles & get_cached() {
-    static CachedHandles c;
-    return c;
+    static std::mutex mu_map;
+    static std::unordered_map<int, CachedHandles> per_device;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        dev = 0;
+    }
+    std::lock_guard<std::mutex> g(mu_map);
+    return per_device[dev];
 }
 
 // Initialize on first call: build signatures from the shape we're handed and
@@ -214,7 +233,7 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
         if (std::memcmp(&c.shape, &shape, sizeof(shape)) != 0) {
             std::fprintf(stderr,
                 "mt_aiter_unified_attn: shape changed across calls (was %d/%d/%d/%d, "
-                "now %d/%d/%d/%d). Single-process AITER cache supports one shape only.\n",
+                "now %d/%d/%d/%d). The AITER cache supports one shape per device.\n",
                 c.shape.head_size, c.shape.num_q_heads, c.shape.num_kv_heads, c.shape.block_size,
                 shape.head_size,   shape.num_q_heads,   shape.num_kv_heads,   shape.block_size);
             return hipErrorInvalidValue;
