@@ -138,7 +138,8 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmm
 // Same K/V cache pointer dtype switch as build_signature_3d (cache_type
 // drives *fp16:16 vs *i8:16 and the CACHE_TYPE constexpr).
 std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
-                                int block_m, int block_q, int use_fp8_wmma) {
+                                int block_m, int block_q, int use_fp8_wmma,
+                                int tile_size = MT_AITER_UATTN_TILE_SIZE) {
     const char * kv_ptr_dtype;
     int          cache_type_val;
     switch (s.cache_type) {
@@ -168,7 +169,7 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         s.num_q_heads, s.num_q_heads / s.num_kv_heads,
         s.head_size, s.head_size,           // query_stride_1, output_stride_1
         s.block_size,                       // BLOCK_SIZE
-        MT_AITER_UATTN_TILE_SIZE,           // TILE_SIZE
+        tile_size,                          // TILE_SIZE (per-call override; MAD-2026-09-11 gfx1030 fix)
         s.head_size, s.head_size,           // HEAD_SIZE, HEAD_SIZE_PADDED
         block_q,                            // BLOCK_Q
         block_m,                            // BLOCK_M
@@ -302,6 +303,24 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     if (const char * s = std::getenv("MT_AITER_NUM_WARPS"))  { int v = std::atoi(s); if (v > 0 && v <= 32) env_nw = v; }
     if (const char * s = std::getenv("MT_AITER_NUM_STAGES")) { int v = std::atoi(s); if (v > 0 && v <= 8 ) env_ns = v; }
 
+    // MAD-2026-09-11 gfx1201 num_warps=8 option — OPT-IN, NOT the default.
+    // Separate, independently gated hunk (env var, not a target-string
+    // default flip like gfx1030's above) purely so the orchestrator can A/B
+    // it without touching gfx1030's behavior or gfx1201's default. Offline
+    // recompile of the identical BQ=10/BM=64/TILE=32 gfx1201 WMMA-path spec
+    // (USE_FP8_WMMA=1) at num_warps=8 eliminated its small residual spill
+    // entirely: vgpr_spill_count 132->0, private_segment_fixed_size
+    // 532B->0B/lane, vgpr_count 256->219 (i.e. it no longer even needs the
+    // per-wave cap). Strictly better statically at this one tile, but left
+    // off by default because (a) it wasn't asked for by the original task
+    // scope (gfx1030 only) and (b) the WMMA-path occupancy/operand-staging
+    // interaction at 8 warps was not otherwise audited here — only this one
+    // (BQ=10,BM=64,TILE=32) signature was measured.
+    const bool is_gfx1201 = target.find("gfx1201") != std::string::npos;
+    if (is_gfx1201 && std::getenv("MT_AITER_GFX1201_NUM_WARPS8") != nullptr) {
+        env_nw = 8;
+    }
+
     // MAD-214 Phase 1F-D: 3d + reduce kernels now handle FP8 too (IS_TURBO_FP8
     // branches mirrored from the 2d kernel). Compile unconditionally.
     aiter::KernelSpec spec_3d {
@@ -342,10 +361,47 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
         && block_q_large >= 1
         && (block_m_large != MT_AITER_UATTN_BLOCK_M
             || block_q_large != MT_AITER_UATTN_BLOCK_Q);
+    // MAD-2026-09-11 gfx1030 zero/near-zero-spill tiling fix: the 2D
+    // large-prefill spec (BLOCK_Q=10, BLOCK_M=64, HEAD_SIZE=256) is the
+    // kernel that carries prefill under TP with the 6900XT holding a
+    // fraction of the KV heads. Offline AOT recompiles of this EXACT
+    // production signature (Triton 3.8.0, target=hip:gfx1030:32, code-
+    // object amdhsa.kernels metadata read directly, no GPU touched) swept
+    // TILE_SIZE (the KV-tile-length constexpr, MT_AITER_UATTN_TILE_SIZE=32
+    // globally today) at num_warps in {4,8}:
+    //   BQ=10 BM=64 TILE=32 nw=4 (today's prod default): vgpr_spill=1836,
+    //     sgpr_spill=28,  scratch/lane=4980B  <- baseline
+    //   BQ=10 BM=64 TILE=32 nw=8 (this patch's v1 hunk, above):
+    //     vgpr_spill=755,  sgpr_spill=25, scratch/lane=2876B (-59%/-42%)
+    //   BQ=10 BM=64 TILE=16 nw=8 (THIS HUNK, gfx1030 default below):
+    //     vgpr_spill=245,  sgpr_spill=12, scratch/lane= 984B (-87%/-80%
+    //     vs. true baseline) — BLOCK_M/BLOCK_Q UNCHANGED from MAD-203, so
+    //     the full GQA=6 Q-row tile-reuse rationale is preserved; only the
+    //     KV-tile trip count doubles (32 tokens/iter -> 16 tokens/iter).
+    //   BQ=10 BM=64 TILE=4  nw=8: vgpr_spill=0, scratch=0 (TRUE ZERO) but
+    //     TILE=4 < BLOCK_SIZE=16 means 8x the loop trip count of
+    //     production and repeated redundant physical_block_idx/page
+    //     lookups per paged block — not applied, flagged as the "spill-
+    //     free but likely to hurt" option (see report.txt table).
+    //   BQ=5  BM=32 TILE=8  nw=8: vgpr_spill=0, scratch=0 (TRUE ZERO,
+    //     f16) / vgpr_spill=1, scratch=8B (fp8 — the turbo-FP8 LUT dequant
+    //     pushes it 1 VGPR past zero at the identical tile, see report.txt
+    //     "fp8 dequant fallback" section) — narrows BLOCK_M in half
+    //     (less GQA reuse per K/V load) AND halves TILE_SIZE again vs the
+    //     TILE=4 option's already-small tile. Also not applied by default;
+    //     documented as the best true-zero-spill fallback if TILE=16/nw=8
+    //     still isn't enough once measured on real hardware.
+    // Chose TILE=16/nw=8 as the default: smallest single-parameter change
+    // (TILE_SIZE only, BLOCK_M/BLOCK_Q untouched) that gets spill within
+    // "a few hundred bytes of scratch," not the most aggressive option.
+    // MT_AITER_UATTN_TILE_SIZE (the 3d/reduce/base-2d spec's global
+    // default) is intentionally NOT changed — only the 2d_large spec's
+    // TILE_SIZE is overridden, and only on gfx1030.
+    const int tile_size_large = is_gfx1030 ? 16 : MT_AITER_UATTN_TILE_SIZE;
     bool large_compiled = false;
     if (large_ok) {
         const std::string sig_2d_large = build_signature_2d(
-            shape, block_m_large, block_q_large, use_fp8_wmma);
+            shape, block_m_large, block_q_large, use_fp8_wmma, tile_size_large);
         aiter::KernelSpec spec_2d_large {
             AITER_KERNEL_SOURCE_DEFAULT,
             "kernel_unified_attention_2d",
