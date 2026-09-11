@@ -11,10 +11,19 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <limits>
 #include <string>
+#include <thread>
+
+#if defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif // defined(__linux__)
 
 // ---------------------------------------------------------------------------
 // CUDA / HIP AllReduce for tensor-parallel inference across two GPUs.
@@ -805,6 +814,23 @@ struct ggml_cuda_ar_pipeline {
     char *                    dx_recv[GGML_CUDA_MAX_DEVICES];     // device: DX_SLOTS * dx_bytes, peer's partial
     ggml_cuda_ar_host_mapping dx_staging[GGML_CUDA_MAX_DEVICES];  // pinned host: DX_SLOTS * dx_bytes
     ggml_cuda_ar_dx_slot      dx_ev[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_DX_SLOTS];
+
+    // -----------------------------------------------------------------
+    // Stall watchdog (GGML_CUDA_AR_WATCHDOG_S). All of the below is
+    // written with relaxed atomics from the existing hot-path call sites
+    // (begin/end/acquire_slot) -- no syscalls, no extra synchronization,
+    // zero cost when the watchdog thread isn't running. See
+    // ggml_cuda_ar_watchdog_touch() / ggml_cuda_ar_watchdog_main().
+    // -----------------------------------------------------------------
+    std::atomic<uint64_t> wd_progress_tick{0};   // bumped once per begin()/end()/acquire_slot()
+    std::atomic<uint64_t> wd_last_caller_tid{0}; // pthread/gettid of the last thread to touch the pipeline
+    std::atomic<size_t>   wd_last_nbytes{0};     // payload size of the most recent dx begin()
+    std::atomic<int>      wd_dx_phase[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_DX_SLOTS] = {}; // 0 idle,1 begun,2 sent,3 recvd,4 ended
+    std::atomic<uint64_t> wd_dx_slot_call[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_DX_SLOTS] = {}; // dx_call occupying the slot
+    std::thread            wd_thread;
+    std::atomic<bool>      wd_stop{false};
+    uint64_t                wd_seconds = 0;      // 0 = disabled
+    bool                     wd_abort   = false;   // GGML_CUDA_AR_WATCHDOG_ACTION=abort
 };
 
 
@@ -832,10 +858,23 @@ struct ggml_cuda_ar_slot_info {
     int token;
 };
 
+// Cheap "we're alive" marker for the stall watchdog: a relaxed store of an
+// already-cached value, no clock read and no syscall.  Called from the
+// existing hot-path sites (chunked-kernel acquire_slot, dx begin/end) --
+// the watchdog thread (off-path, 1 Hz) is the only reader, and it tolerates
+// a torn/stale read since this is diagnostics-only.
+static __forceinline__ void ggml_cuda_ar_watchdog_touch(ggml_cuda_ar_pipeline * p) {
+    p->wd_progress_tick.fetch_add(1, std::memory_order_relaxed);
+#if defined(__linux__)
+    p->wd_last_caller_tid.store((uint64_t) syscall(SYS_gettid), std::memory_order_relaxed);
+#endif // defined(__linux__)
+}
+
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
+    ggml_cuda_ar_watchdog_touch(p);
 
     if (pool_lapped) {
         for (int i = 0; i < p->n_devices; ++i) {
@@ -862,6 +901,165 @@ static void ggml_cuda_ar_wait_for_compute(
     ggml_cuda_ar_event_slot & ev = p->ev_pool[rank][slot];
     CUDA_CHECK(cudaEventRecord(ev.app, cuda_ctx->stream()));
     CUDA_CHECK(cudaStreamWaitEvent(p->streams[rank], ev.app));
+}
+
+// ---------------------------------------------------------------------------
+// Stall watchdog (GGML_CUDA_AR_WATCHDOG_S / GGML_CUDA_AR_WATCHDOG_ACTION).
+//
+// Off by default: no thread is started and the only steady-state cost is the
+// handful of relaxed atomic stores added at the existing begin()/end()/
+// acquire_slot() call sites above, which is noise next to the HIP calls they
+// sit beside. Reads below are best-effort diagnostics -- they intentionally
+// tolerate a torn/stale value rather than adding any synchronization to the
+// hot path.
+// ---------------------------------------------------------------------------
+
+// gpu_busy_percent, straight from sysfs, no privileges required.  Returns -1
+// if the card doesn't exist or the attribute can't be read (older/unloaded
+// driver, non-AMD GPU, etc).
+static int ggml_cuda_ar_watchdog_gpu_busy(int card) {
+#if defined(__linux__)
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/gpu_busy_percent", card);
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    int pct = -1;
+    if (fscanf(f, "%d", &pct) != 1) {
+        pct = -1;
+    }
+    fclose(f);
+    return pct;
+#else
+    (void) card;
+    return -1;
+#endif // defined(__linux__)
+}
+
+static const char * ggml_cuda_ar_watchdog_phase_name(int phase) {
+    switch (phase) {
+        case 0: return "idle";
+        case 1: return "begun";
+        case 2: return "sent";
+        case 3: return "recvd";
+        case 4: return "ended";
+        default: return "?";
+    }
+}
+
+// One self-describing dump of everything cheap we know about the pipeline's
+// state, prefixed so journalctl grep for "wp ar-watchdog:" finds it. Called
+// from the watchdog thread only -- never on the hot path.
+static void ggml_cuda_ar_watchdog_dump(ggml_cuda_ar_pipeline * p, uint64_t stalled_s) {
+    fprintf(stderr,
+        "wp ar-watchdog: STALL detected, no progress for %llu s (threshold %llu s)\n",
+        (unsigned long long) stalled_s, (unsigned long long) p->wd_seconds);
+    fprintf(stderr,
+        "wp ar-watchdog: transport=%s wire_codec=%s last_dx_nbytes=%zu "
+        "dx_call=%llu dx_in_flight=%d call_count=%llu progress_tick=%llu "
+        "last_caller_tid=%llu watchdog_tid=%llu\n",
+        p->transport == GGML_CUDA_AR_TRANSPORT_P2P  ? "p2p"  :
+        p->transport == GGML_CUDA_AR_TRANSPORT_HOST ? "host" : "copy",
+        p->wire_codec ? p->wire_codec->name : "?",
+        p->wd_last_nbytes.load(std::memory_order_relaxed),
+        (unsigned long long) p->dx_call,
+        p->dx_in_flight,
+        (unsigned long long) p->call_count,
+        (unsigned long long) p->wd_progress_tick.load(std::memory_order_relaxed),
+        (unsigned long long) p->wd_last_caller_tid.load(std::memory_order_relaxed),
+#if defined(__linux__)
+        (unsigned long long) syscall(SYS_gettid));
+#else
+        0ull);
+#endif // defined(__linux__)
+
+    for (int i = 0; i < p->n_devices; ++i) {
+        for (int s = 0; s < GGML_CUDA_AR_DX_SLOTS; ++s) {
+            const int phase = p->wd_dx_phase[i][s].load(std::memory_order_relaxed);
+            fprintf(stderr,
+                "wp ar-watchdog: dx_slot rank=%d slot=%d op=%llu phase=%s "
+                "sent_valid=%d recvd_valid=%d freed_valid=%d\n",
+                i, s,
+                (unsigned long long) p->wd_dx_slot_call[i][s].load(std::memory_order_relaxed),
+                ggml_cuda_ar_watchdog_phase_name(phase),
+                (int) p->dx_ev[i][s].sent_valid,
+                (int) p->dx_ev[i][s].recvd_valid,
+                (int) p->dx_ev[i][s].freed_valid);
+        }
+    }
+
+    // Chunked-kernel arrival ring: host-mapped, readable without a device
+    // sync (see the GGML_CUDA_AR_HOST_COHERENT comment at alloc()). Dump the
+    // most recently issued slot plus its immediate predecessor for both
+    // ranks -- covers the in-flight chunked AR, if any.
+    if (p->arrival.host && p->call_count > 0) {
+        for (int back = 0; back < 2 && (int64_t) p->call_count - 1 - back >= 0; ++back) {
+            const int slot = (int) ((p->call_count - 1 - (uint64_t) back) % GGML_CUDA_AR_POOL_SIZE);
+            for (int i = 0; i < p->n_devices; ++i) {
+                fprintf(stderr, "wp ar-watchdog: arrival rank=%d slot=%d blocks=[",
+                        i, slot);
+                // ggml_cuda_ar_arrival_ptr(p, slot, rank) returns the base for
+                // block 0; each block's token lives ARRIVAL_STRIDE bytes later.
+                const int * base = ggml_cuda_ar_arrival_ptr(p, slot, i);
+                for (int b = 0; b < GGML_CUDA_AR_KERNEL_BLOCKS; ++b) {
+                    const int * word = base + (size_t) b * (GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+                    fprintf(stderr, "%d%s", *word, b + 1 < GGML_CUDA_AR_KERNEL_BLOCKS ? "," : "");
+                }
+                fprintf(stderr, "]\n");
+            }
+        }
+    }
+
+    for (int card = 0; card < 8; ++card) {
+        const int busy = ggml_cuda_ar_watchdog_gpu_busy(card);
+        if (busy < 0) {
+            continue;
+        }
+        fprintf(stderr, "wp ar-watchdog: gpu_busy_percent card=%d value=%d\n", card, busy);
+    }
+}
+
+static void ggml_cuda_ar_watchdog_main(ggml_cuda_ar_pipeline * p) {
+    uint64_t last_tick     = p->wd_progress_tick.load(std::memory_order_relaxed);
+    uint64_t stalled_since = 0; // seconds; 0 == not currently stalled
+    bool     dumped_this_stall = false;
+
+    while (!p->wd_stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (p->wd_stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+
+        const uint64_t tick = p->wd_progress_tick.load(std::memory_order_relaxed);
+        const bool     in_flight = p->dx_in_flight > 0;
+
+        if (tick != last_tick) {
+            // Progress since last check -- re-arm.
+            last_tick          = tick;
+            stalled_since       = 0;
+            dumped_this_stall   = false;
+            continue;
+        }
+
+        if (!in_flight) {
+            // Nothing outstanding -- idle, not stalled.
+            stalled_since = 0;
+            dumped_this_stall = false;
+            continue;
+        }
+
+        stalled_since++;
+        if (stalled_since >= p->wd_seconds && !dumped_this_stall) {
+            dumped_this_stall = true;
+            ggml_cuda_ar_watchdog_dump(p, stalled_since);
+            if (p->wd_abort) {
+                fprintf(stderr, "wp ar-watchdog: GGML_CUDA_AR_WATCHDOG_ACTION=abort, aborting\n");
+                fflush(stderr);
+                abort();
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,12 +1385,29 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                   transport_name, p->copy_threshold, p->wire_codec->name,
                   8.0 * p->wire_codec->bytes_per_block / p->wire_codec->elements_per_block);
 
+    // Stall watchdog: off unless GGML_CUDA_AR_WATCHDOG_S is set. Started
+    // last, after everything the dump reads from is already initialized.
+    p->wd_seconds = ggml_cuda_ar_env_u64("GGML_CUDA_AR_WATCHDOG_S", 0);
+    if (p->wd_seconds > 0) {
+        const char * action = getenv("GGML_CUDA_AR_WATCHDOG_ACTION");
+        p->wd_abort = action && std::string(action) == "abort";
+        p->wd_stop.store(false, std::memory_order_relaxed);
+        p->wd_thread = std::thread(ggml_cuda_ar_watchdog_main, p);
+        GGML_LOG_INFO("%s: ar-watchdog armed, N=%llu s, action=%s\n",
+                      __func__, (unsigned long long) p->wd_seconds, p->wd_abort ? "abort" : "dump");
+    }
+
     return p;
 }
 
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     if (!p) {
         return;
+    }
+
+    if (p->wd_thread.joinable()) {
+        p->wd_stop.store(true, std::memory_order_relaxed);
+        p->wd_thread.join();
     }
 
     // Drain all in-flight kernels before tearing down resources.
@@ -1818,6 +2033,8 @@ bool ggml_cuda_ar_allreduce_begin(
     const int slot = (int) (p->dx_call % GGML_CUDA_AR_DX_SLOTS);
     p->dx_call++;
     p->dx_in_flight++;
+    p->wd_last_nbytes.store(nbytes, std::memory_order_relaxed);
+    ggml_cuda_ar_watchdog_touch(p);
 
     const size_t slot_off = (size_t) slot * p->dx_bytes;
     const bool   p2p      = p->transport == GGML_CUDA_AR_TRANSPORT_P2P;
@@ -1844,6 +2061,8 @@ bool ggml_cuda_ar_allreduce_begin(
             codec->pack_fn(tensors[i]->data, input_type, send, ne, cs);
         }
         CUDA_CHECK(cudaEventRecord(p->dx_ev[i][slot].app, cs));
+        p->wd_dx_slot_call[i][slot].store(p->dx_call, std::memory_order_relaxed);
+        p->wd_dx_phase[i][slot].store(1 /* begun */, std::memory_order_relaxed);
     }
 
     ggml_cuda_ar_dump_partials(p, tensors, n, ne);
@@ -1876,6 +2095,7 @@ bool ggml_cuda_ar_allreduce_begin(
         }
         CUDA_CHECK(cudaEventRecord(ev.sent, out));
         ev.sent_valid = true;
+        p->wd_dx_phase[i][slot].store(2 /* sent */, std::memory_order_relaxed);
     }
 
     // Phase C (in-streams): pulls from the peer's staging for the ranks that
@@ -1897,6 +2117,7 @@ bool ggml_cuda_ar_allreduce_begin(
             p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, xfer_nbytes, cudaMemcpyHostToDevice, in));
         CUDA_CHECK(cudaEventRecord(ev.recvd, in));
         ev.recvd_valid = true;
+        p->wd_dx_phase[i][slot].store(3 /* recvd */, std::memory_order_relaxed);
     }
 
     op->pending   = true;
@@ -1953,10 +2174,12 @@ bool ggml_cuda_ar_allreduce_end(
 
         CUDA_CHECK(cudaEventRecord(ev.freed, cs));
         ev.freed_valid = true;
+        p->wd_dx_phase[i][slot].store(4 /* ended */, std::memory_order_relaxed);
     }
 
     p->dx_in_flight--;
     op->pending = false;
+    ggml_cuda_ar_watchdog_touch(p);
     return true;
 }
 
