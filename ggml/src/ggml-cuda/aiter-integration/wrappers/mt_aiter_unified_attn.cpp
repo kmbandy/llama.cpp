@@ -56,6 +56,24 @@ bool target_has_fp8_wmma(const std::string & target) {
 //   pos 23 → block_size (BLOCK_SIZE constexpr)
 //   pos 25 → head_size (HEAD_SIZE constexpr)
 //   pos 26 → head_size (HEAD_SIZE_PADDED constexpr; assumes head_size is pow2)
+// MAD-2026-09-11 vectorized loads: the AOT signature must carry Triton's
+// ":16" divisibility specialization on the stride arguments, exactly as the
+// JIT would infer it, or the compiler cannot prove 16-byte alignment of the
+// K/V/Q/out tile addresses and emits one 2-byte load per element
+// (global_load_ushort / d16_b16). Measured on the production 2D spec:
+// gfx1030 f16 96 x ushort -> 12 x dwordx4, gfx1201 f16 256 x d16 -> 32 x b128.
+// q/out stride_0 = num_q_heads*head_size and every f16 K/V cache stride is a
+// multiple of head_size, so head_size % 16 == 0 makes them all 16-divisible;
+// the launch path asserts the runtime values. Turbo cache types leave the
+// (unused) K/V stride args unhinted.
+static inline bool mt_aiter_q_stride_div16(const mt_aiter_uattn_shape_t & s) {
+    return s.head_size % 16 == 0 && ((int64_t) s.num_q_heads * s.head_size) % 16 == 0;
+}
+static inline bool mt_aiter_kv_stride_div16(const mt_aiter_uattn_shape_t & s) {
+    return s.cache_type == MT_AITER_CACHE_F16 && s.head_size % 16 == 0;
+}
+static inline const char * mt_aiter_i64_sig(bool div16) { return div16 ? "i64:16" : "i64"; }
+
 std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmma,
                                 int use_fp8_loader_v2 = 0) {
     // MAD-199: K/V cache pointer dtype depends on cache_type. F16 stays
@@ -103,21 +121,24 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmm
         "*fp32:16, *fp32, *fp32, *fp16:16, %s, %s, *fp32, *i32, *i32, "
         "*fp32, *fp16, fp32, *fp32, *fp32, *fp32, fp32, "
         "%d, %d, "                          // num_q_heads, num_queries_per_kv
-        "i64, i64, %d, i64, "               // block_table_stride, q_stride_0, query_stride_1=head_size, qq_bias_stride_0
+        "i64, %s, %d, i64, "               // block_table_stride, q_stride_0 (":16" when divisible), query_stride_1=head_size, qq_bias_stride_0
         "%d, %d, %d, %d, "                  // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
-        "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
+        "%s, %s, %s, 1, %s, %s, %s, 1, "  // k/v cache strides (":16" for f16; last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
         "*i32, %d, i32, %d, %d, 1, %d, %d, %d, " // query_start_len, BLOCK_Q, num_seqs, BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE, USE_FP8_WMMA, USE_FP8_LOADER_V2
         "*i8:16, *i8:16",                     // MAD-214: centroids_k_ptr, centroids_v_ptr (None-safe for non-FP8)
         kv_ptr_dtype,                           // K cache pointer dtype
         kv_ptr_dtype,                           // V cache pointer dtype
         s.num_q_heads,                          // num_q_heads constexpr
         s.num_q_heads / s.num_kv_heads,         // num_queries_per_kv constexpr
+        mt_aiter_i64_sig(mt_aiter_q_stride_div16(s)),  // q_stride_0 divisibility
         s.head_size,                            // query_stride_1 = head_size constexpr
         s.block_size,                           // BLOCK_SIZE constexpr
         MT_AITER_UATTN_TILE_SIZE,               // TILE_SIZE constexpr
         s.head_size,                            // HEAD_SIZE constexpr
         s.head_size,                            // HEAD_SIZE_PADDED (assumes head_size is pow2)
+        mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)),  // k cache strides 0..2
+        mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)),  // v cache strides 0..2
         MT_AITER_UATTN_BLOCK_Q,                 // BLOCK_Q constexpr
         MT_AITER_UATTN_BLOCK_M,                 // BLOCK_M constexpr
         MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ,    // NUM_SEGMENTS_PER_SEQ constexpr
@@ -161,19 +182,22 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         "*fp16:16, *fp16:16, %s, %s, *fp32, *i32, *i32, *fp32, *fp16, "  // out, q, k, v, sink, bt, sl, alibi, qq_bias
         "fp32, *fp32, *fp32, *fp32, *fp32, fp32, "                       // scale, q/k/v_descale, out_scale, softcap
         "%d, %d, "                                                       // num_q_heads, num_queries_per_kv
-        "i64, i64, %d, i64, %d, i64, "                                   // bt_stride, q_stride_0, q_stride_1=head_size, out_stride_0, out_stride_1=head_size, qq_bias_stride_0
+        "i64, %s, %d, %s, %d, i64, "                                     // bt_stride, q_stride_0, q_stride_1=head_size, out_stride_0, out_stride_1=head_size, qq_bias_stride_0 (":16" on q/out stride_0 when divisible)
         "%d, %d, %d, %d, "                                               // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                                                // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
-        "i64, i64, i64, 1, i64, i64, i64, 1, "                           // k/v cache strides (last is constexpr=1)
+        "%s, %s, %s, 1, %s, %s, %s, 1, "                                 // k/v cache strides (":16" for f16; last is constexpr=1)
         "*i32, %d, i32, %d, "                                            // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M
         "-448.0, 448.0, 0, %d, %d, %d, "                                 // FP8_MIN, FP8_MAX, ALL_DECODE=0, CACHE_TYPE, USE_FP8_WMMA, USE_FP8_LOADER_V2
         "*i8:16, *i8:16",                                                  // MAD-214: centroids_k_ptr, centroids_v_ptr
         kv_ptr_dtype, kv_ptr_dtype,
         s.num_q_heads, s.num_q_heads / s.num_kv_heads,
-        s.head_size, s.head_size,           // query_stride_1, output_stride_1
+        mt_aiter_i64_sig(mt_aiter_q_stride_div16(s)), s.head_size,   // q_stride_0 divisibility, query_stride_1
+        mt_aiter_i64_sig(mt_aiter_q_stride_div16(s)), s.head_size,   // out_stride_0 divisibility, output_stride_1
         s.block_size,                       // BLOCK_SIZE
         tile_size,                          // TILE_SIZE (per-call override; MAD-2026-09-11 gfx1030 fix)
         s.head_size, s.head_size,           // HEAD_SIZE, HEAD_SIZE_PADDED
+        mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)),  // k cache strides 0..2
+        mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)), mt_aiter_i64_sig(mt_aiter_kv_stride_div16(s)),  // v cache strides 0..2
         block_q,                            // BLOCK_Q
         block_m,                            // BLOCK_M
         cache_type_val,                     // CACHE_TYPE
@@ -325,6 +349,11 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     int env_nw = is_gfx1030 ? 8 : 4;
     int env_ns = 1;
     if (const char * s = std::getenv("MT_AITER_NUM_WARPS"))  { int v = std::atoi(s); if (v > 0 && v <= 32) env_nw = v; }
+    // Card-scoped variant so a TP process can raise only the gfx1030 rank
+    // (the 2026-09-11 zero-spill point is gfx1030 TILE=8 + 16 warps).
+    if (is_gfx1030) {
+        if (const char * s = std::getenv("MT_AITER_GFX1030_NUM_WARPS")) { int v = std::atoi(s); if (v > 0 && v <= 32) env_nw = v; }
+    }
     if (const char * s = std::getenv("MT_AITER_NUM_STAGES")) { int v = std::atoi(s); if (v > 0 && v <= 8 ) env_ns = v; }
 
     // MAD-2026-09-11 gfx1201 num_warps=8 option — OPT-IN, NOT the default.
@@ -378,8 +407,21 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     // tl.arange(0, BLOCK_M) and Triton rejects a non-power-of-two extent at
     // compile time. 8*GQA=48 satisfied the %16 check but not that one, which is
     // what produced the rc=256 compile failure on gfx1201.
-    const int block_m_large = mt_aiter_uattn_block_m_large(shape.num_q_heads, shape.num_kv_heads);
-    const int block_q_large = mt_aiter_uattn_block_q_large(shape.num_q_heads, shape.num_kv_heads);
+    int block_m_large = mt_aiter_uattn_block_m_large(shape.num_q_heads, shape.num_kv_heads);
+    int block_q_large = mt_aiter_uattn_block_q_large(shape.num_q_heads, shape.num_kv_heads);
+    // gfx1030 A/B knob (2026-09-11): MT_AITER_GFX1030_BLOCK_M=<pow2 >= 16>
+    // overrides the large-prefill BLOCK_M (BLOCK_Q follows as BLOCK_M/GQA);
+    // the offline sweep found BM32/BQ5 spill-free at TILE 8 with 8 warps.
+    if (is_gfx1030) {
+        if (const char * t = std::getenv("MT_AITER_GFX1030_BLOCK_M")) {
+            const int v = std::atoi(t);
+            const int gqa = shape.num_q_heads / shape.num_kv_heads;
+            if (v >= 16 && (v & (v - 1)) == 0 && gqa > 0 && v / gqa >= 1) {
+                block_m_large = v;
+                block_q_large = v / gqa;
+            }
+        }
+    }
     const bool block_m_pow2 = block_m_large > 0
         && (block_m_large & (block_m_large - 1)) == 0;
     const bool large_ok = block_m_large >= 16 && (block_m_large % 16 == 0) && block_m_pow2
@@ -422,7 +464,18 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     // MT_AITER_UATTN_TILE_SIZE (the 3d/reduce/base-2d spec's global
     // default) is intentionally NOT changed — only the 2d_large spec's
     // TILE_SIZE is overridden, and only on gfx1030.
-    const int tile_size_large = is_gfx1030 ? 16 : MT_AITER_UATTN_TILE_SIZE;
+    // gfx1030 KV tile for the large-prefill spec: 16 by default (tolerance-level,
+    // eye-tested 2026-09-11). MT_AITER_GFX1030_TILE=8 selects the zero-spill
+    // point found by the 2026-09-11 offline sweep (BM64/BQ10/TILE8 with
+    // MT_AITER_NUM_WARPS=16: 0 VGPR spills, 0 scratch, both cache types);
+    // any power of two in [8, 64] is accepted, baked into the AOT signature.
+    int tile_size_large = is_gfx1030 ? 16 : MT_AITER_UATTN_TILE_SIZE;
+    if (is_gfx1030) {
+        if (const char * t = std::getenv("MT_AITER_GFX1030_TILE")) {
+            const int v = std::atoi(t);
+            if (v >= 8 && v <= 64 && (v & (v - 1)) == 0) { tile_size_large = v; }
+        }
+    }
     bool large_compiled = false;
     if (large_ok) {
         const std::string sig_2d_large = build_signature_2d(
@@ -524,6 +577,25 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     int64_t        vs0           = a->v_stride_0;
     int64_t        vs1           = a->v_stride_1;
     int64_t        vs2           = a->v_stride_2;
+    // The AOT spec was compiled with ":16" divisibility on these strides
+    // (see mt_aiter_q_stride_div16 / mt_aiter_kv_stride_div16); a runtime
+    // value that breaks that promise would make the vectorized loads read
+    // misaligned memory, so refuse loudly instead.
+    {
+        const mt_aiter_uattn_shape_t & sh = a->shape;
+        const bool q_div  = mt_aiter_q_stride_div16(sh);
+        const bool kv_div = mt_aiter_kv_stride_div16(sh);
+        const bool ok = (!q_div || (qs0 % 16 == 0 && a->output_stride_0 % 16 == 0)) &&
+                        (!kv_div || (ks0 % 16 == 0 && ks1 % 16 == 0 && ks2 % 16 == 0 &&
+                                     vs0 % 16 == 0 && vs1 % 16 == 0 && vs2 % 16 == 0));
+        if (!ok) {
+            std::fprintf(stderr, "mt_aiter_unified_attn: stride divisibility promise violated "
+                         "(q0=%lld out0=%lld k=%lld/%lld/%lld v=%lld/%lld/%lld)\n",
+                         (long long) qs0, (long long) a->output_stride_0, (long long) ks0, (long long) ks1,
+                         (long long) ks2, (long long) vs0, (long long) vs1, (long long) vs2);
+            std::abort();
+        }
+    }
     hipDeviceptr_t p_cu          = (hipDeviceptr_t) a->query_start_len;
     int32_t        num_seqs      = a->num_seqs;
     // MAD-214: turbo-FP8 centroid LUT pointers. NULL'd defensively for non-FP8
