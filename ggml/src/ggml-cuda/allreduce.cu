@@ -1393,8 +1393,15 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         p->wd_abort = action && std::string(action) == "abort";
         p->wd_stop.store(false, std::memory_order_relaxed);
         p->wd_thread = std::thread(ggml_cuda_ar_watchdog_main, p);
-        GGML_LOG_INFO("%s: ar-watchdog armed, N=%llu s, action=%s\n",
-                      __func__, (unsigned long long) p->wd_seconds, p->wd_abort ? "abort" : "dump");
+        // GGML_LOG_INFO is dropped at llama-server's default verbosity --
+        // common_log_get_verbosity() maps GGML_LOG_LEVEL_INFO to
+        // LOG_LEVEL_TRACE (4), which is above the LOG_DEFAULT_LLAMA (3)
+        // threshold, so common_log_default_callback() never queues it. Use
+        // the same raw fprintf(stderr, ...) the "wp hip-graphs" stats line
+        // uses so this reaches the journal unconditionally, like that line
+        // does.
+        fprintf(stderr, "wp ar-watchdog: armed, N=%llu s, action=%s\n",
+                      (unsigned long long) p->wd_seconds, p->wd_abort ? "abort" : "dump");
     }
 
     return p;
