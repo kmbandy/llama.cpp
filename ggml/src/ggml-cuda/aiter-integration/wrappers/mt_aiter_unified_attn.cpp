@@ -265,7 +265,40 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     // arch-specific defaults per third_party/amd/backend/compiler.py). The
     // FP8 path may benefit from different values; sweepable via env without
     // recompile. Each (nw, ns) pair gets its own JIT cache slot.
-    int env_nw = 4, env_ns = 1;
+    //
+    // MAD-2026-09-11 gfx1030 prefill tiling fix: on gfx1030 (RDNA2, no WMMA,
+    // USE_FP8_WMMA=0 -> the tl.dot fallback lowers to a manual per-lane FMA
+    // accumulation instead of a matrix-core reduction) the production 2D
+    // large-prefill spec (BLOCK_Q=10, BLOCK_M=64, head_size=256) was measured
+    // offline (Triton AOT compile + AMDGPU code-object metadata, no GPU
+    // touched) to already spill heavily at num_warps=4:
+    //   vgpr_count=256 (HW per-wave cap, hit regardless of tile), vgpr_spill
+    //   _count=1836, sgpr_spill_count=28, private_segment_fixed_size=4980B/
+    //   lane. The fp8 2D-large spec spills even harder (6800B/lane).
+    // Raising num_warps to 8 for gfx1030 ONLY spreads the same BLOCK_M x
+    // HEAD_SIZE_PADDED fp32 accumulator tile over twice as many physical
+    // lanes without changing BLOCK_M/BLOCK_Q/the KV-tile loop or the
+    // per-output-row accumulation order, and cut spilling sharply in offline
+    // recompiles of the exact production signature:
+    //   BLOCK_Q=10/BLOCK_M=64 nw4->nw8: vgpr_spill 1836->755 (-59%),
+    //     scratch/lane 4980B->2876B (-42%), sgpr_spill 28->25.
+    //   BLOCK_Q=5/BLOCK_M=32  nw4->nw8: vgpr_spill  815->246 (-70%),
+    //     scratch/lane 3056B->984B (-68%).
+    // vgpr_count stays pinned at the 256 HW cap in every configuration
+    // tested (gfx1030's per-wave VGPR file), so waves/SIMD occupancy is not
+    // reduced by this change; LDS usage (32KB/workgroup) is unaffected
+    // (num_warps only changes threads-per-workgroup, not the tile shape or
+    // shared-memory footprint). The same num_warps=8 recompile against
+    // gfx1201 (WMMA path, USE_FP8_WMMA=1) also strictly improved (spill
+    // 132->0 VGPRs at the identical BLOCK_Q=10/BLOCK_M=64 signature) but is
+    // deliberately NOT changed here — this fix is scoped to gfx1030 only, so
+    // gfx1201's kernel and launch config are byte-for-byte unchanged unless
+    // a future patch chooses to also raise its default.
+    // MT_AITER_NUM_WARPS/_NUM_STAGES env overrides still take precedence, so
+    // the old default remains reachable for A/B sweeps without a rebuild.
+    const bool is_gfx1030 = target.find("gfx1030") != std::string::npos;
+    int env_nw = is_gfx1030 ? 8 : 4;
+    int env_ns = 1;
     if (const char * s = std::getenv("MT_AITER_NUM_WARPS"))  { int v = std::atoi(s); if (v > 0 && v <= 32) env_nw = v; }
     if (const char * s = std::getenv("MT_AITER_NUM_STAGES")) { int v = std::atoi(s); if (v > 0 && v <= 8 ) env_ns = v; }
 
