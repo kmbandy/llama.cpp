@@ -466,6 +466,26 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     void clear_pool() {
         ggml_cuda_set_device(device);
+        // MAD-XXX diag (2026-09-10): PHYSICAL free of pooled memory. A HIP graph
+        // captured earlier may still hold these pointers and replay against them
+        // later -- cudaDeviceSynchronize() before this only drains IN-FLIGHT work,
+        // not a FUTURE replay. This path fires only under memory pressure, so the
+        // print costs nothing on the hot path and cannot mask a timing-sensitive
+        // fault the way per-call instrumentation did.
+        if (std::getenv("MAD_POOL_FREE_TRACE")) {
+            int n = 0; size_t tot = 0;
+            for (int i = 0; i < MAX_BUFFERS; ++i) {
+                if (buffer_pool[i].ptr) { ++n; tot += buffer_pool[i].size; }
+            }
+            std::fprintf(stderr, "[pool-free] dev=%d CLEAR_POOL freeing %d buffers, %.2f MiB (alloc failure)\n",
+                         device, n, tot/1048576.0);
+            for (int i = 0; i < MAX_BUFFERS; ++i) {
+                if (buffer_pool[i].ptr) {
+                    std::fprintf(stderr, "[pool-free] dev=%d   cudaFree %p +%zu\n",
+                                 device, buffer_pool[i].ptr, buffer_pool[i].size);
+                }
+            }
+        }
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
@@ -553,6 +573,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             }
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
+        // MAD-XXX diag: second physical-free path. Same hazard as clear_pool().
+        if (std::getenv("MAD_POOL_FREE_TRACE")) {
+            std::fprintf(stderr, "[pool-free] dev=%d POOL_FULL cudaFree %p +%zu\n", device, ptr, size);
+        }
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
@@ -730,6 +754,13 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#ifdef USE_CUDA_GRAPH
+    // Drain point 3/3: force-sync whatever's left in the retired list. A
+    // stream sync is acceptable here (teardown), and necessary -- nothing
+    // else will drive these events to completion after this point.
+    ggml_cuda_graph_drain_retired(true);
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -4011,6 +4042,14 @@ struct ggml_cuda_wp_graph_counters {
     std::atomic<uint64_t> cap_ttl{0};
     std::atomic<uint64_t> cap_recapture{0};
     std::atomic<uint64_t> live_graphs{0};
+    // 2026-09-11: deferred-destroy retired-graph list (common.cuh
+    // ggml_cuda_graph_retire()/drain_retired()) -- see hipgraph-ttl-race.patch.
+    // retired = current size of the per-device retired list (gauge);
+    // retired_freed = cumulative graphs actually destroyed via that list;
+    // retired_synced = of those, how many needed the bounded-list fallback sync.
+    std::atomic<uint64_t> retired{0};
+    std::atomic<uint64_t> retired_freed{0};
+    std::atomic<uint64_t> retired_synced{0};
 };
 
 static ggml_cuda_wp_graph_counters ggml_cuda_wp_graph_counts[GGML_CUDA_MAX_DEVICES];
@@ -4019,6 +4058,7 @@ static std::once_flag ggml_cuda_wp_graph_atexit_once;
 static void ggml_cuda_wp_graph_print_counts() {
     uint64_t captures = 0, replays = 0, fallbacks = 0;
     uint64_t newkey = 0, lru = 0, ttl = 0, live = 0, recap = 0;
+    uint64_t retired = 0, retired_freed = 0, retired_synced = 0;
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         captures += ggml_cuda_wp_graph_counts[i].captures.load(std::memory_order_relaxed);
         replays += ggml_cuda_wp_graph_counts[i].replays.load(std::memory_order_relaxed);
@@ -4028,6 +4068,9 @@ static void ggml_cuda_wp_graph_print_counts() {
         ttl += ggml_cuda_wp_graph_counts[i].cap_ttl.load(std::memory_order_relaxed);
         recap += ggml_cuda_wp_graph_counts[i].cap_recapture.load(std::memory_order_relaxed);
         live += ggml_cuda_wp_graph_counts[i].live_graphs.load(std::memory_order_relaxed);
+        retired += ggml_cuda_wp_graph_counts[i].retired.load(std::memory_order_relaxed);
+        retired_freed += ggml_cuda_wp_graph_counts[i].retired_freed.load(std::memory_order_relaxed);
+        retired_synced += ggml_cuda_wp_graph_counts[i].retired_synced.load(std::memory_order_relaxed);
     }
     static std::atomic<uint64_t> last_captures{0};
     static std::atomic<uint64_t> last_replays{0};
@@ -4037,14 +4080,17 @@ static void ggml_cuda_wp_graph_print_counts() {
     const uint64_t interval_fallbacks = fallbacks - last_fallbacks.exchange(fallbacks, std::memory_order_relaxed);
     fprintf(stderr, "wp hip-graphs: hits=%llu captures=%llu fallbacks=%llu "
             "interval(hits=%llu captures=%llu fallbacks=%llu) "
-            "(newkey=%llu lru_evicted=%llu ttl_evicted=%llu recapture=%llu live=%llu)\n",
+            "(newkey=%llu lru_evicted=%llu ttl_evicted=%llu recapture=%llu live=%llu "
+            "retired=%llu retired_freed=%llu retired_synced=%llu)\n",
             (unsigned long long) replays, (unsigned long long) captures,
             (unsigned long long) fallbacks,
             (unsigned long long) interval_replays, (unsigned long long) interval_captures,
             (unsigned long long) interval_fallbacks,
             (unsigned long long) newkey,
             (unsigned long long) lru, (unsigned long long) ttl,
-            (unsigned long long) recap, (unsigned long long) live);
+            (unsigned long long) recap, (unsigned long long) live,
+            (unsigned long long) retired, (unsigned long long) retired_freed,
+            (unsigned long long) retired_synced);
 }
 
 bool ggml_backend_cuda_wp_graph_counts(
@@ -6465,9 +6511,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        // Record right after launch (async, no host sync) so a later TTL/LRU
+        // eviction of THIS graph can tell whether this replay has finished
+        // before it retires/frees the graph -- see ggml_cuda_graph_retire()/
+        // drain_retired() in common.cuh and the race they close.
+        if (graph->last_launch_event == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&graph->last_launch_event, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(graph->last_launch_event, cuda_ctx->stream()));
         if (ggml_cuda_wp_hip_graphs_enabled() && !cuda_graph_update_required) {
             ggml_cuda_wp_graph_count_init();
-            ggml_cuda_wp_graph_counts[cuda_ctx->device].replays.fetch_add(1, std::memory_order_relaxed);
+            auto & c = ggml_cuda_wp_graph_counts[cuda_ctx->device];
+            c.replays.fetch_add(1, std::memory_order_relaxed);
+            c.retired.store(cuda_ctx->retired_graphs.size(), std::memory_order_relaxed);
+            c.retired_freed.store(cuda_ctx->retired_freed, std::memory_order_relaxed);
+            c.retired_synced.store(cuda_ctx->retired_synced, std::memory_order_relaxed);
         }
 #else
         GGML_UNUSED(graph_key);

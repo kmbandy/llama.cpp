@@ -37,13 +37,12 @@
 //   2D base prefill         — BLOCK_M=16, BLOCK_Q=2, TILE_SIZE=32
 //                             (used for short prefills where use_2d_kernel
 //                             returns true but max_seqlen_q < 256)
-//   2D large prefill        — BLOCK_M=64, BLOCK_Q=8, TILE_SIZE=32
-//                             (max_seqlen_q >= 256; 4× LDS reuse vs base;
-//                             this is the meat of MAD-203)
+//   2D large prefill        — BLOCK_Q=8, BLOCK_M=8*GQA, TILE_SIZE=32
+
 //
-// BLOCK_Q in each spec must equal BLOCK_M / num_queries_per_kv. The values
-// here assume num_queries_per_kv == 8 (Qwen3.5/3.6: 16 q-heads, 2 kv-heads).
-// For other GQA ratios these need to be regenerated — guard added below.
+// BLOCK_Q is BLOCK_M / num_queries_per_kv (floor; padding lanes are masked).
+// Large-prefill BLOCK_M is
+// derived at runtime from the live GQA (see mt_aiter_uattn_block_m_large).
 //
 // Dispatch (mirrors upstream use_2d_kernel; see MAD-203 phase 2 for the
 // full program-count-driven heuristic):
@@ -59,9 +58,53 @@
 #define MT_AITER_UATTN_BLOCK_M                   16
 
 // 2D-large spec (max_seqlen_q >= 256). MAD-203.
-#define MT_AITER_UATTN_BLOCK_M_LARGE             64
+// BLOCK_M = next_pow2(BLOCK_Q_LARGE * GQA); BLOCK_Q = BLOCK_M / GQA. Qwen3.8-27B
+// (GQA=6) gets 64/10 instead of falling back to the base 16/2 tile. GQA=8 still
+// gets 64/8. Plain BLOCK_Q*GQA=48 is NOT legal: Triton needs a power of two.
 #define MT_AITER_UATTN_BLOCK_Q_LARGE             8
+#define MT_AITER_UATTN_BLOCK_M_LARGE             64  /* GQA=8 historical; use helper below */
 #define MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD   256
+
+static inline int mt_aiter_uattn_gqa(int num_q_heads, int num_kv_heads) {
+    return (num_kv_heads > 0) ? (num_q_heads / num_kv_heads) : 0;
+}
+// Triton requires tl.arange(0, BLOCK_M) to have a power-of-two extent, so
+// BLOCK_M cannot simply be BLOCK_Q_LARGE*GQA: GQA=6 gives 48, which is a
+// multiple of 16 but not a power of two, and Triton rejects the kernel at
+// compile time ("arange's range must be a power of 2"). Round the tile up to
+// the next power of two instead, then derive BLOCK_Q from it so the tile stays
+// as full as possible. GQA=8 still yields exactly 64/8 (the historical shape);
+// GQA=6 yields 64/10, using 60 of 64 lanes.
+static inline int mt_aiter_uattn_next_pow2(int v) {
+    int p = 1;
+    while (p < v) {
+        p <<= 1;
+    }
+    return p;
+}
+static inline int mt_aiter_uattn_block_m_large(int num_q_heads, int num_kv_heads) {
+    const int gqa = mt_aiter_uattn_gqa(num_q_heads, num_kv_heads);
+    if (gqa <= 0) {
+        return 0;
+    }
+    return mt_aiter_uattn_next_pow2(MT_AITER_UATTN_BLOCK_Q_LARGE * gqa);
+}
+// BLOCK_Q for the large tile: how many query positions the padded BLOCK_M rows
+// actually cover. Floor division leaves BLOCK_M - BLOCK_Q*GQA padding lanes,
+// which the kernel already masks off via query_mask_0/query_mask_1.
+static inline int mt_aiter_uattn_block_q_large(int num_q_heads, int num_kv_heads) {
+    const int gqa = mt_aiter_uattn_gqa(num_q_heads, num_kv_heads);
+    if (gqa <= 0) {
+        return MT_AITER_UATTN_BLOCK_Q_LARGE;
+    }
+    return mt_aiter_uattn_block_m_large(num_q_heads, num_kv_heads) / gqa;
+}
+static inline int mt_aiter_uattn_avg_q_len(int num_q_tokens, int num_seqs) {
+    return (num_seqs > 0) ? (num_q_tokens / num_seqs) : 1;
+}
+static inline int mt_aiter_uattn_use_2d(int num_q_tokens, int num_seqs) {
+    return mt_aiter_uattn_avg_q_len(num_q_tokens, num_seqs) >= MT_AITER_UATTN_BLOCK_Q;
+}
 
 // KV cache element format. Selects which AOT spec / runtime-compile path
 // gets dispatched. F16 keeps the upstream `*fp16:16` pointer signature;

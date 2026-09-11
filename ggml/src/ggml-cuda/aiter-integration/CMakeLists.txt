@@ -85,27 +85,30 @@ add_triton_aot_kernel(
 )
 
 # ────────────────────────────────────────────────────────────────────────
-# unified_attention 3D + reduce_segments (MAD-188).
+# unified_attention 3D + reduce_segments (MAD-188 POC).
 #
-# Vendored from ROCm/aiter — see kernels/unified_attention.py header for
-# upstream commit + patch info.
+# These CMake AOT specs are the original Qwen3.6 F16 decode shape
+# (16 q-heads, GQA=8, head_size=128, ALL_DECODE=1, CACHE_TYPE=0). They
+# generate C launchers that the SERVING PATH DOES NOT USE.
 #
-# Shape: Qwen3.6 (num_query_heads=16, num_queries_per_kv=8, head_size=128,
-# block_size=16). All bool/feature constexprs disabled (no alibi, no qq_bias,
-# no softcap, no sinks, no sliding-window). ALL_DECODE=1 (q_len=1 per seq).
-# These match the validated launcher hashes from 2026-05-17:
-#   3D     gfx1201: uattn_3d.11808415_0d3d4d5d
-#   reduce gfx1201: uattn_reduce.ecdee0c8_0d1d
+# Production dispatch is the runtime registry in
+# wrappers/mt_aiter_unified_attn.cpp: it builds a signature from the live
+# model shape (Qwen3.8-27B TP: 12 q-heads / 2 kv-heads / hd=256 /
+# CACHE_TYPE=24) and compiles into ~/.cache/llama.cpp/aiter on first use.
+# Do not treat a successful CMake AOT of this block as "the 27B TP kernels
+# are baked." If you want a cold-start prewarm, add a custom command that
+# invokes tools/compile_aiter_kernel.py with the wrapper's live signature.
 #
 # Grid expressions are C-syntax (Triton inlines them verbatim).
 # ────────────────────────────────────────────────────────────────────────
 
 set(_uattn_3d_signature
-    "*fp32:16, *fp32, *fp32, *fp16:16, *fp16:16, *fp16:16, *fp32, *i32, *i32, *fp32, *fp16, fp32, *fp32, *fp32, *fp32, fp32, 16, 8, i64, i64, 128, i64, 16, 32, 128, 128, 0, 0, 0, 0, 0, i64, i64, i64, 1, i64, i64, i64, 1, *i32, 2, i32, 16, 32, 1, 0, *i8:16, *i8:16"
-    # Trailing fields:                                                                                                                                                                                                                                                                                  ^  ^                ^
-    #                                                                                                                                                                                                                                                                                                  |  |                └─ MAD-214: centroids_k_ptr, centroids_v_ptr (turbo-FP8 path; NULL for F16/TURBO3/4)
-    #                                                                                                                                                                                                                                                                                                  |  └─ MAD-199: CACHE_TYPE constexpr (0=F16, 1=TURBO3, 2=TURBO4, 14/24/34=TURBO{3,4,5}_FP8_BS256)
-    #                                                                                                                                                                                                                                                                                                  └─── ALL_DECODE constexpr (1=True for decode shape)
+    "*fp32:16, *fp32, *fp32, *fp16:16, *fp16:16, *fp16:16, *fp32, *i32, *i32, *fp32, *fp16, fp32, *fp32, *fp32, *fp32, fp32, 16, 8, i64, i64, 128, i64, 16, 32, 128, 128, 0, 0, 0, 0, 0, i64, i64, i64, 1, i64, i64, i64, 1, *i32, 2, i32, 16, 32, 1, 0, 1, *i8:16, *i8:16"
+    # Trailing fields:                                                                                                                                                                                                                                                                                  ^  ^  ^             ^
+    #                                                                                                                                                                                                                                                                                                  |  |  |             └─ centroids_k/v (NULL for this F16 POC)
+    #                                                                                                                                                                                                                                                                                                  |  |  └─ USE_FP8_WMMA (dead on CACHE_TYPE=0; 1 matches kernel default)
+    #                                                                                                                                                                                                                                                                                                  |  └─ CACHE_TYPE=0 (F16)
+    #                                                                                                                                                                                                                                                                                                  └─── ALL_DECODE=1
 )
 set(_uattn_3d_grid       "num_seqs / 2 + num_seqs, 2, 32")
 

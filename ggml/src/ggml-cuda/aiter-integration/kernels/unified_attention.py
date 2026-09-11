@@ -65,7 +65,14 @@
 #    constant table) so the loader does an extra tl.load(lut_ptr + idx)
 #    per element.
 #
-# 4. IDX_BITS=4 skips qs_hi load (MAD-229, 2026-05-22):
+# 4. USE_FP8_WMMA constexpr (2026-09-09):
+#    gfx1201 keeps the MAD-214 FP8 WMMA tl.dot. gfx1030 has no FP8 WMMA
+#    and no v_dot4_i32_i8, so the wrapper bakes USE_FP8_WMMA=0 and the
+#    kernel dequants LUT bytes to f16 then uses packed f16 tl.dot
+#    (v_dot2_f32_f16) instead of Triton's emulated f32 FMA+spill path.
+#    ALL_DECODE skips find_seq_idx (AITER PR #2888).
+#
+# 5. IDX_BITS=4 skips qs_hi load (MAD-229, 2026-05-22):
 #    For turbo4_fp8 (IDX_BITS=4), bit_pos = offs_d * 4 → bit_off ∈ {0, 4}.
 #    The 4-bit index always sits in a single byte (qs_lo), so the qs_hi
 #    load in load_turbo_fp8_kv_tile_{K,V}_bs256 was reading a byte whose
@@ -587,6 +594,22 @@ def load_turbo_fp8_kv_tile_K_bs256(
     # (MAD-215 — currently flagged as not-implemented at the wrapper layer).
     tl.static_assert(HEAD_SIZE == 256, "turbo-FP8 BS=256 kernel requires HEAD_SIZE=256 (Qwen3.5 family)")
 
+    # bufops (nomask variant): host fill (llama-kv-cache-paged.cpp:63,481,
+    # 1539/1798 kInvalidBlockTableEntry=-1) writes -1 into block-table slots
+    # that are unused (past this seq's live block count) or non-resident
+    # (evicted to warm/cold). tile_mask is false for exactly the lanes whose
+    # physical_block_idx can be this -1 sentinel (or otherwise stale/OOB).
+    # Left unclamped, block_byte_base below would be built from
+    # physical_block_idx=-1 -> a huge negative byte offset -> the "address
+    # not within +-64MiB of any KV/LUT/block-table region" garbage-pointer
+    # fault this whole investigation started from. Clamp to physical block 0
+    # (always resident/mapped — the pool is sized for >=1 block) BEFORE
+    # forming any address; this is a select, not a branch, and the actual
+    # bytes read from block 0 for masked-off lanes are discarded below (see
+    # the post-load tl.where), so which garbage happens to live in block 0
+    # is irrelevant to correctness, only to memory safety.
+    physical_block_idx = tl.where(tile_mask, physical_block_idx, 0)
+
     # Byte base of each token's block in the paged cache.
     block_byte_base = (
         physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_BLOCK)
@@ -611,24 +634,74 @@ def load_turbo_fp8_kv_tile_K_bs256(
     byte_lo_off = (bit_pos // 8).to(tl.int64)          # which byte in qs
     bit_off     = (bit_pos % 8).to(tl.int32)           # bit offset within that byte
 
-    # Broadcast offsets to (HEAD_SIZE_PADDED, TILE_SIZE) and add token-base.
-    qs_lo_addr = block_byte_base[None, :] + 2 + byte_lo_off[:, None]
     sign_addr  = block_byte_base[None, :] + SIGNS_OFFSET + (offs_d[:, None] // 8).to(tl.int64)
-
     load_mask = dim_mask[:, None] & tile_mask[None, :]
-    qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
+
     # MAD-229 perf opt: for IDX_BITS=4 (turbo4_fp8), bit_pos = offs_d * 4 so
     # bit_off ∈ {0, 4} — the index always fits in qs_lo's byte. Skip the
     # qs_hi load entirely (halves cache-byte read volume on the K hot path).
     # IDX_BITS=3 (turbo3_fp8) / IDX_BITS=5 (turbo5_fp8) straddle bytes, so
     # they still need the word-spanning read.
     if IDX_BITS == 4:
-        word = qs_lo.to(tl.int32)
+        # bufops (gfx1030 fp8 page-fault fix, see aiter-integration report):
+        # replace the scalar 1-byte qs_lo load with a 4-byte (int32) word
+        # load grouping 8 head-dim elements per word — mirrors the CUDA
+        # reference decoder (mt_pagedattn_turbo_fp8.cuh:7-19, "Reads 4 bytes
+        # of qs = 8 4-bit indices"). Value-preserving: byte_lo_off = word*4 +
+        # byte_in_word for all offs_d (proof: offs_d=8w+r => offs_d//2 =
+        # 4w + r//2 = word*4 + byte_in_word), and the byte extracted via
+        # shift+mask from the little-endian int32 word is bit-identical to
+        # the original single-byte load. QS_BYTES=256*4//8=128 is an exact
+        # multiple of 4, so every 4-byte-group word stays fully inside the
+        # qs region [2, 2+128) regardless of which block/page it lands in —
+        # no out-of-bounds read is introduced by widening the load, and no
+        # 4-byte alignment is required (RDNA/CDNA global & buffer loads
+        # tolerate unaligned byte offsets: SH_MEM_ALIGNMENT_MODE_UNALIGNED).
+        #
+        # bufops nomask: the load itself carries NO mask now — physical_block_idx
+        # was already clamped to a valid (block 0) address above, so the load
+        # is memory-safe unconditionally; dropping the mask operand is what
+        # lets ConvertMaskedLoadOp's `useDirectLoad = matchPattern(mask,
+        # m_One())` (MaskedOpsToLLVM.cpp:81) take the unconditional-load path
+        # instead of emitting an `s_and_saveexec_b32`/`s_cbranch_execz` guard
+        # (MaskedOpsToLLVM.cpp:87-108). The masking semantics (`other=0`) are
+        # reproduced AFTER the load instead, via tl.where on the extracted
+        # byte — see the comment below for why that is exactly equivalent,
+        # including for the downstream LUT index.
+        word_no    = offs_d // 8                                    # (HEAD_SIZE_PADDED,) 0..31
+        word_addr  = (2 + word_no * 4).to(tl.int64)                 # byte offset of the 4B word
+        word_ptr   = (cache_byte_ptr + (block_byte_base[None, :] + word_addr[:, None])
+                     ).to(tl.pointer_type(tl.int32))
+        qs_word    = tl.load(word_ptr)                              # (HEAD_SIZE_PADDED, TILE_SIZE), unmasked
+        byte_shift = (((offs_d // 2) % 4) * 8).to(tl.int32)         # which of the 4 bytes, in bits
+        word       = (qs_word >> byte_shift[:, None]) & 0xFF
+        # Post-load select reproduces `other=0`: originally the masked-off
+        # lane's LOADED BYTE was forced to 0 before it ever fed `idx =
+        # (word >> bit_off) & mask`, so idx (and everything downstream --
+        # the LUT lookup, the sign XOR, fp8_bytes) was already a pure
+        # function of "0" for those lanes, not of the discarded raw memory
+        # content. Zeroing `word` here, at the exact same point in the data-
+        # flow (the extracted-byte value, before `idx` is computed from it),
+        # produces the identical downstream idx/centroid_byte/fp8_bytes for
+        # every masked-off lane -- the substitution commutes with every op
+        # between here and the return (shift/and/LUT-index/or are all pure
+        # functions of `word`, none of them re-reads memory using `word`).
+        word = tl.where(load_mask, word, 0)
+        # bufops nomask: sign_addr is built from the same clamped
+        # block_byte_base, so this load is also memory-safe unmasked; zero
+        # masked-off lanes' extracted sign byte after the load, same
+        # reasoning as `word` above (sign_bit is a pure function of
+        # sign_bytes, computed after this point). Scoped to IDX_BITS==4
+        # only — the IDX_BITS in {3,5} path below is untouched.
+        sign_bytes = tl.load(cache_byte_ptr + sign_addr)
+        sign_bytes = tl.where(load_mask, sign_bytes, 0)
     else:
+        qs_lo_addr = block_byte_base[None, :] + 2 + byte_lo_off[:, None]
+        qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
         qs_hi_addr = qs_lo_addr + 1
         qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
         word       = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
-    sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
+        sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
     sign_bit_off = (offs_d % 8).to(tl.int32)            # (HEAD_SIZE_PADDED,)
 
     # Extract IDX_BITS index, look up centroid byte, XOR sign → signed E4M3 byte.
@@ -661,6 +734,12 @@ def load_turbo_fp8_kv_tile_V_bs256(
     load_turbo4_kv_tile_V convention)."""
     tl.static_assert(HEAD_SIZE == 256, "turbo-FP8 BS=256 kernel requires HEAD_SIZE=256")
 
+    # bufops nomask: clamp -1 (kInvalidBlockTableEntry) to block 0 before any
+    # address is formed — see load_turbo_fp8_kv_tile_K_bs256 for the full
+    # rationale (host fill site, why block 0 is always mapped, why the
+    # discarded garbage value doesn't matter).
+    physical_block_idx = tl.where(tile_mask, physical_block_idx, 0)
+
     block_byte_base = (
         physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_BLOCK)
         + token_in_block   * (n_kv_heads * BYTES_PER_BLOCK)
@@ -678,19 +757,32 @@ def load_turbo_fp8_kv_tile_V_bs256(
     bit_off     = (bit_pos % 8).to(tl.int32)
 
     # V tile shape is (TILE_SIZE, HEAD_SIZE_PADDED) — token-major.
-    qs_lo_addr = block_byte_base[:, None] + 2 + byte_lo_off[None, :]
     sign_addr  = block_byte_base[:, None] + SIGNS_OFFSET + (offs_d[None, :] // 8).to(tl.int64)
-
     load_mask = tile_mask[:, None] & dim_mask[None, :]
-    qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
+
     # MAD-229 perf opt: see K loader for full rationale. IDX_BITS=4 skips qs_hi.
     if IDX_BITS == 4:
-        word = qs_lo.to(tl.int32)
+        # bufops fix: see load_turbo_fp8_kv_tile_K_bs256 for the full proof
+        # this is bit-identical to the scalar byte load it replaces. Only
+        # the broadcast axes are transposed here to match the V tile's
+        # (TILE_SIZE, HEAD_SIZE_PADDED) layout.
+        word_no    = offs_d // 8
+        word_addr  = (2 + word_no * 4).to(tl.int64)
+        word_ptr   = (cache_byte_ptr + (block_byte_base[:, None] + word_addr[None, :])
+                     ).to(tl.pointer_type(tl.int32))
+        qs_word    = tl.load(word_ptr)                      # unmasked — see K loader
+        byte_shift = (((offs_d // 2) % 4) * 8).to(tl.int32)
+        word       = (qs_word >> byte_shift[None, :]) & 0xFF
+        word       = tl.where(load_mask, word, 0)            # reproduces other=0 — see K loader
+        sign_bytes = tl.load(cache_byte_ptr + sign_addr)      # unmasked — see K loader
+        sign_bytes = tl.where(load_mask, sign_bytes, 0)
     else:
+        qs_lo_addr = block_byte_base[:, None] + 2 + byte_lo_off[None, :]
+        qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
         qs_hi_addr = qs_lo_addr + 1
         qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
         word       = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
-    sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
+        sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
     sign_bit_off = (offs_d % 8).to(tl.int32)
 
     mask          = (1 << IDX_BITS) - 1
@@ -755,6 +847,11 @@ def kernel_unified_attention_2d(
                                         # 10..14 = TURBO3_FP8_BS{16..256} (MAD-214),
                                         # 20..24 = TURBO4_FP8_BS{16..256},
                                         # 30..34 = TURBO5_FP8_BS{16..256}
+    # gfx1201: tl.dot(fp8e4nv) → v_wmma_f32_16x16x16_fp8_fp8.
+    # gfx1030: no FP8 WMMA and no v_dot4_i32_i8 (RDNA3+). Dequant to f16 and
+    # use packed f16 tl.dot (v_dot2_f32_f16) instead of Triton's emulated
+    # FP8 WMMA (scalar v_fmac_f32 + register spills).
+    USE_FP8_WMMA: tl.constexpr = True,
     # MAD-214: per-(kv, layer) E4M3 centroid LUTs for turbo-FP8 paths. Caller
     # passes the LUT slice already indexed to the current layer's K/V head.
     # Safely None when CACHE_TYPE is not in the turbo-FP8 family.
@@ -768,18 +865,28 @@ def kernel_unified_attention_2d(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
-    )
+    # PR #2888 ALL_DECODE: one q-token per seq. seq_idx is the q-block id;
+    # skip the binary search over query_start_len.
+    if ALL_DECODE:
+        seq_idx = q_block_global_idx
+        if seq_idx >= num_seqs:
+            return
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        cur_batch_query_len = 1
+        q_block_local_idx = 0
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        )
 
-    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+        q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
 
-    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
 
-    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
@@ -910,9 +1017,10 @@ def kernel_unified_attention_2d(
     # gives FP8 dynamic range; the Q_scale_fp8 vector is multiplied into the
     # FP32 accumulator AFTER the FP8 tl.dot via qk_scale broadcast.
     #
-    # This branch is constexpr-dead for non-FP8 CACHE_TYPEs.
+    # This branch is constexpr-dead for non-FP8 CACHE_TYPEs and for the
+    # gfx1030 f16-dot fallback (USE_FP8_WMMA=0).
     IS_TURBO_FP8: tl.constexpr = (CACHE_TYPE >= 10) and (CACHE_TYPE <= 34)
-    if IS_TURBO_FP8:
+    if IS_TURBO_FP8 and USE_FP8_WMMA:
         Q_fp32        = Q.to(tl.float32)
         Q_abs_max     = tl.max(tl.abs(Q_fp32), axis=1)          # (BLOCK_M,)
         Q_scale_fp8   = tl.where(Q_abs_max > 0, Q_abs_max, 1.0) # guard zero rows
@@ -1028,14 +1136,18 @@ def kernel_unified_attention_2d(
                 IDX_BITS, BYTES_PER_FP8_BLOCK,
                 dim_mask, tile_mask,
             )
-            # Dot-site wiring lives below in this same kernel (Phase 1F-C).
-            # K_fp8 / V_fp8 (int8 byte tiles) and K_scales / V_scales (per-token
-            # fp32) are consumed by the IS_TURBO_FP8 branches at the Q·K^T and
-            # P·V dot sites.
+            # gfx1030: fold the LUT decode into f16 tiles here so the dot
+            # sites below can share the F16 tl.dot path. gfx1201 keeps the
+            # fp8 bytes for WMMA.
+            if not USE_FP8_WMMA:
+                K = (K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                     * K_scales[None, :].to(tl.float16))
+                V = (V_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                     * V_scales[:, None].to(tl.float16))
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        if IS_TURBO_FP8:
+        if IS_TURBO_FP8 and USE_FP8_WMMA:
             # FP8 Q·K^T via tl.dot — verified to emit v_wmma_f32_16x16x16_fp8_fp8
             # on gfx1201 (tests/test_triton_fp8_dot_probe.py). int8 byte tiles
             # bitcast to tl.float8e4nv at the call site. FP32 accumulator gets
@@ -1105,7 +1217,7 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        if IS_TURBO_FP8:
+        if IS_TURBO_FP8 and USE_FP8_WMMA:
             # FP8 P·V leg. P (fp32 from softmax) gets per-V-token scale folded
             # in (since V[t, h] = V_fp8[t, h] * V_scale[t] and the matmul sums
             # over t, we factor scale into P[:, t]). Then per-row max FP8 quant
@@ -1197,6 +1309,7 @@ def kernel_unified_attention_3d(
     ALL_DECODE: tl.constexpr = False,  # bool
     CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199),
                                         # 10..14/20..24/30..34 = TURBO{3,4,5}_FP8_BS{16..256} (MAD-214)
+    USE_FP8_WMMA: tl.constexpr = True,  # False on gfx1030: dequant to f16, packed f16 dot
     centroids_k_ptr = None,             # MAD-214: per-(kv, layer) K centroid LUT (*u8)
     centroids_v_ptr = None,             # MAD-214: per-(kv, layer) V centroid LUT (*u8)
 ):
@@ -1208,18 +1321,27 @@ def kernel_unified_attention_3d(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
-    )
+    # PR #2888 ALL_DECODE: grid X is num_seqs, seq_idx = program_id(0).
+    if ALL_DECODE:
+        seq_idx = q_block_global_idx
+        if seq_idx >= num_seqs:
+            return
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        cur_batch_query_len = 1
+        q_block_local_idx = 0
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        )
 
-    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+        q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
 
-    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
 
-    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
@@ -1329,11 +1451,10 @@ def kernel_unified_attention_3d(
         k_descale = None
         v_descale = None
 
-    # MAD-214 Phase 1F-D: mirror of 2D kernel's IS_TURBO_FP8 Q FP8 quant. Per-row
-    # max gives the FP8 dynamic range; Q_scale_fp8 is multiplied into the FP32
-    # accumulator after the FP8 tl.dot via broadcast. Constexpr-dead for non-FP8.
+    # MAD-214 Phase 1F-D: mirror of 2D kernel's IS_TURBO_FP8 Q FP8 quant.
+    # Constexpr-dead for non-FP8 and for the gfx1030 f16-dot fallback.
     IS_TURBO_FP8: tl.constexpr = (CACHE_TYPE >= 10) and (CACHE_TYPE <= 34)
-    if IS_TURBO_FP8:
+    if IS_TURBO_FP8 and USE_FP8_WMMA:
         Q_fp32        = Q.to(tl.float32)
         Q_abs_max     = tl.max(tl.abs(Q_fp32), axis=1)          # (BLOCK_M,)
         Q_scale_fp8   = tl.where(Q_abs_max > 0, Q_abs_max, 1.0) # guard zero rows
@@ -1441,12 +1562,17 @@ def kernel_unified_attention_3d(
                 IDX_BITS, BYTES_PER_FP8_BLOCK,
                 dim_mask, tile_mask,
             )
+            if not USE_FP8_WMMA:
+                K = (K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                     * K_scales[None, :].to(tl.float16))
+                V = (V_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                     * V_scales[:, None].to(tl.float16))
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        if IS_TURBO_FP8:
+        if IS_TURBO_FP8 and USE_FP8_WMMA:
             # FP8 Q·K^T via tl.dot — emits v_wmma_f32_16x16x16_fp8_fp8 on gfx1201.
             K_fp8_view = K_fp8.to(tl.float8e4nv, bitcast=True)              # (HEAD, TILE)
             S_partial_fp8 = tl.dot(Q_fp8_tensor, K_fp8_view, out_dtype=tl.float32)
@@ -1512,7 +1638,7 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        if IS_TURBO_FP8:
+        if IS_TURBO_FP8 and USE_FP8_WMMA:
             # FP8 P·V leg — mirror of 2D kernel. Fold per-V-token scale into P
             # before the FP8 quant, then dot, accumulate with per-row scale.
             P_scaled       = P * V_scales[None, :]                  # (BLOCK_M, TILE)

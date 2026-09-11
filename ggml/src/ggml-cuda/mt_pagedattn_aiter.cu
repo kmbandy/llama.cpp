@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <atomic>
 #include <mutex>
+#include <set>
+#include <map>
 
 // The runtime AITER wrapper. Lives in aiter-integration's static library
 // (libaiter_triton_aot.a), linked into ggml-hip when GGML_HIP_AITER=ON.
@@ -25,6 +27,7 @@
 
 #include <cstring>
 #include <sys/stat.h>  // MAD-214 Option F: mkdir for dump dir
+#include <unordered_map>
 #include <vector>
 
 namespace mt {
@@ -526,6 +529,114 @@ __global__ void mt_build_cu_seqlens_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+
+// MAD-XXX diag (2026-09-10, temporary): env-gated per-launch sync probe for the
+// turbo4_fp8 gfx1030 memory fault. Prints "-> <what>" before a launch and
+// "   ok <what>" once it has drained. The last "->" with no matching "ok" names
+// the faulting launch. GPU memory faults kill the process, so the localisation
+// comes from the log tail, not from the returned status.
+static bool mt_aiter_sync_probe_on() {
+    static int on = -1;
+    if (on < 0) { const char * e = std::getenv("MAD_AITER_SYNC_PROBE"); on = (e && *e && e[0] != '0') ? 1 : 0; }
+    return on != 0;
+}
+static void mt_aiter_sync_probe(cudaStream_t stream, const char * what, int layer) {
+    if (!mt_aiter_sync_probe_on()) { return; }
+    int dev = ggml_cuda_get_device();
+    hipError_t e = hipStreamSynchronize(stream);
+    std::fprintf(stderr, "[sync-probe] dev=%d l=%d   ok %s%s%s\n", dev, layer, what,
+                 e == hipSuccess ? "" : " ERR=", e == hipSuccess ? "" : hipGetErrorString(e));
+}
+static void mt_aiter_sync_probe_pre(const char * what, int layer) {
+    if (!mt_aiter_sync_probe_on()) { return; }
+    std::fprintf(stderr, "[sync-probe] dev=%d l=%d -> %s\n", ggml_cuda_get_device(), layer, what);
+}
+
+
+// MAD-XXX diag (2026-09-10, v2): BLOCK-TABLE VALIDITY SCAN.
+//
+// Answers: does this device ever READ a kInvalidBlockTableEntry (-1) at an
+// index the kernel treats as valid? That is the difference between "gfx1030
+// faults" and "gfx1201 silently reads wild memory", since BOTH targets compile
+// the turbo-FP8 loads to raw global_load with no bounds check.
+//
+// v1 was INVALID: it did hipMemcpyAsync + hipStreamSynchronize on the op's
+// stream, which fails under HIP graph capture ("operation not permitted when
+// stream is capturing") and returned early, silently skipping every captured
+// call. v2 copies on a DEDICATED non-blocking stream that is never captured.
+// Safe because the block table is written before the op and is not mutated
+// during it. Counters are PER DEVICE (v1 shared one counter across devices,
+// so only dev 0 ever hit the print condition).
+static hipStream_t mt_aiter_scan_stream(int dev) {
+    static std::mutex mu;
+    static std::map<int, hipStream_t> streams;
+    std::lock_guard<std::mutex> g(mu);
+    auto it = streams.find(dev);
+    if (it != streams.end()) { return it->second; }
+    hipStream_t st = nullptr;
+    if (hipStreamCreateWithFlags(&st, hipStreamNonBlocking) != hipSuccess) { st = nullptr; }
+    streams[dev] = st;
+    return st;
+}
+
+static void mt_aiter_scan_block_table(const ggml_tensor * block_tables,
+                                      const ggml_tensor * context_lens,
+                                      int num_seqs, int max_bps, int block_size,
+                                      long blocks_capacity) {
+    static int on = -1;
+    if (on < 0) { const char * e = std::getenv("MAD_AITER_BT_SCAN"); on = (e && *e && e[0] != '0') ? 1 : 0; }
+    if (!on) { return; }
+
+    const int dev = ggml_cuda_get_device();
+    hipStream_t st = mt_aiter_scan_stream(dev);
+    if (!st) { return; }
+
+    std::vector<int32_t> bt((size_t) num_seqs * max_bps);
+    std::vector<int32_t> cl((size_t) num_seqs);
+    if (hipMemcpyAsync(bt.data(), block_tables->data, bt.size()*sizeof(int32_t),
+                       hipMemcpyDeviceToHost, st) != hipSuccess) { return; }
+    if (hipMemcpyAsync(cl.data(), context_lens->data, cl.size()*sizeof(int32_t),
+                       hipMemcpyDeviceToHost, st) != hipSuccess) { return; }
+    if (hipStreamSynchronize(st) != hipSuccess) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) == 0) {
+            std::fprintf(stderr, "[bt-scan] dev=%d scan stream sync FAILED - results invalid\n", dev);
+        }
+        return;
+    }
+
+    struct Acc { long calls=0, bad_calls=0, neg=0, oor=0, worst_neg_run=0; };
+    static std::mutex mu; static std::map<int, Acc> per_dev;
+    std::lock_guard<std::mutex> g(mu);
+    Acc & a = per_dev[dev];
+    ++a.calls;
+
+    int neg = 0, oor = 0, fb_seq = -1, fb_idx = -1; int32_t fb_val = 0;
+    for (int sq = 0; sq < num_seqs; ++sq) {
+        const int n_used = (cl[sq] + block_size - 1) / block_size;
+        for (int b = 0; b < n_used && b < max_bps; ++b) {
+            const int32_t v = bt[(size_t) sq * max_bps + b];
+            if (v < 0)                          { ++neg; if (fb_seq<0){fb_seq=sq;fb_idx=b;fb_val=v;} }
+            else if (v >= (int32_t) blocks_capacity) { ++oor; if (fb_seq<0){fb_seq=sq;fb_idx=b;fb_val=v;} }
+        }
+    }
+    if (neg || oor) {
+        ++a.bad_calls; a.neg += neg; a.oor += oor;
+        if (a.bad_calls <= 8 || a.bad_calls % 256 == 0) {
+            std::fprintf(stderr,
+                "[bt-scan] dev=%d *** BAD *** neg=%d oor=%d first(seq=%d blk=%d val=%d) ctx=%d cap=%ld "
+                "| calls=%ld bad=%ld neg_tot=%ld oor_tot=%ld\n",
+                dev, neg, oor, fb_seq, fb_idx, fb_val,
+                fb_seq >= 0 ? cl[fb_seq] : -1, blocks_capacity,
+                a.calls, a.bad_calls, a.neg, a.oor);
+        }
+    }
+    if (a.calls % 1024 == 1) {
+        std::fprintf(stderr, "[bt-scan] dev=%d summary: calls=%ld bad_calls=%ld neg_tot=%ld oor_tot=%ld\n",
+                     dev, a.calls, a.bad_calls, a.neg, a.oor);
+    }
+}
+
 // Runtime gate
 // ─────────────────────────────────────────────────────────────────────────
 bool aiter_backend_enabled() {
@@ -547,17 +658,23 @@ bool aiter_backend_enabled() {
 // path passes ones).
 // ─────────────────────────────────────────────────────────────────────────
 static float * descale_ones_device() {
-    static float * ptr = nullptr;
-    static std::atomic<bool> ready{false};
-    if (ready.load(std::memory_order_acquire)) return ptr;
-    // Init under a coarse lock — rare, on first AITER call.
+    // Per-device: a single process-wide allocation is the same class of bug
+    // as the AITER kernel-handle cache (d41c22e1d). Under TP the second card
+    // must not read a 1.0f that lives on the first card.
     static std::mutex mu;
+    static std::unordered_map<int, float *> ptrs;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        dev = 0;
+    }
     std::lock_guard<std::mutex> g(mu);
-    if (ready.load(std::memory_order_relaxed)) return ptr;
+    auto it = ptrs.find(dev);
+    if (it != ptrs.end()) return it->second;
+    float * ptr = nullptr;
     cudaMalloc((void**) &ptr, sizeof(float));
     const float one = 1.0f;
     cudaMemcpy(ptr, &one, sizeof(float), cudaMemcpyHostToDevice);
-    ready.store(true, std::memory_order_release);
+    ptrs[dev] = ptr;
     return ptr;
 }
 
@@ -617,8 +734,51 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
         d_centroids_k = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_K);
         d_centroids_v = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_V);
         GGML_ASSERT(d_centroids_k && d_centroids_v && "turbo4_fp8: centroid LUT lookup returned null");
+
+        // MAD-XXX diag (2026-09-10): ASTRA CANDIDATES 4 AND 5, both fp8-only.
+        // Runs ONCE per process (function-local static), then costs a guard-byte
+        // test. Prints a definite PASS/FAIL either way, so the answer does not
+        // depend on whether the fault happens to land during the run.
+        //  C4: are both centroid-LUT bases valid, device-accessible, and on THIS device?
+        //  C5: does q actually hold the q_elts the Hadamard Q-copy reads out of it?
+        // PER-DEVICE: the previous function-local static ran once per PROCESS and
+        // only ever sampled dev 0. dev 1 (gfx1030) is the card that faults.
+        static std::atomic<bool> fp8_checked_dev[8] = {};
+        const int dv_chk = ggml_cuda_get_device();
+        if (dv_chk >= 0 && dv_chk < 8 && !fp8_checked_dev[dv_chk].load(std::memory_order_relaxed)
+            && !fp8_checked_dev[dv_chk].exchange(true)) {
+            const int dv = dv_chk;
+            const bool had = mt_turbo_fp8::hadamard_required();
+            const size_t q_elts = (size_t) num_q_tokens * n_heads * head_size;
+            const size_t q_want = q_elts * sizeof(__half);
+            const size_t q_have = (size_t) ggml_nbytes(q);
+            std::fprintf(stderr,
+                "[c5-qsize] dev=%d hadamard=%d  q_want=%zu q_have=%zu  %s  "
+                "(q->ne=[%ld,%ld,%ld,%ld] k_cur->ne[2]=%d n_heads=%d hs=%d)\n",
+                dv, (int) had, q_want, q_have,
+                had ? (q_want > q_have ? "*** OVERREAD ***" : "PASS") : "PASS (copy inactive)",
+                (long)q->ne[0],(long)q->ne[1],(long)q->ne[2],(long)q->ne[3],
+                num_q_tokens, n_heads, head_size);
+            for (int k = 0; k < 2; ++k) {
+                const void * lut = (k == 0) ? (const void *) d_centroids_k : (const void *) d_centroids_v;
+                hipPointerAttribute_t at {};
+                const hipError_t e = hipPointerGetAttributes(&at, lut);
+                if (e != hipSuccess) {
+                    std::fprintf(stderr, "[c4-lut]  dev=%d %s=%p *** hipPointerGetAttributes FAILED: %s ***\n",
+                                 dv, k ? "V" : "K", lut, hipGetErrorString(e));
+                } else {
+                    const bool dev_ok = (at.device == dv);
+                    std::fprintf(stderr, "[c4-lut]  dev=%d %s=%p type=%d owner_dev=%d  %s\n",
+                                 dv, k ? "V" : "K", lut, (int) at.type, at.device,
+                                 dev_ok ? "PASS" : "*** WRONG DEVICE ***");
+                }
+            }
+        }
     }
 
+    // MAD-XXX diag (2026-09-10, temporary): one-shot per-device arena audit for
+    // the gfx1030 memory fault at tsa 1,1 + turbo4_fp8. Prints what the Triton
+    // address math assumes vs what is actually allocated.
     mt_aiter_uattn_shape_t shape {};
     shape.head_size    = head_size;
     shape.num_q_heads  = n_heads;
@@ -761,17 +921,31 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
             }
         }
     }
+    mt_aiter_sync_probe(stream, "scatter", parse_layer_from_kv_cache_name(k_cache->name));
 
     // ── 2. Allocate AITER workspace + cu_seqlens ──
-    const size_t segm_out_n   = mt_aiter_uattn_segm_output_bytes(&shape, num_q_tokens) / sizeof(float);
-    const size_t segm_ms_n    = mt_aiter_uattn_segm_max_bytes(&shape, num_q_tokens)    / sizeof(float);
-    ggml_cuda_pool_alloc<float>   segm_out_buf(ctx.pool(), segm_out_n);
-    ggml_cuda_pool_alloc<float>   segm_max_buf(ctx.pool(), segm_ms_n);
-    ggml_cuda_pool_alloc<float>   segm_exp_buf(ctx.pool(), segm_ms_n);
+    // 3D split-K workspace is unused on the 2D prefill path (avg_q_len >= BLOCK_Q).
+    const bool use_2d = mt_aiter_uattn_use_2d(num_q_tokens, num_seqs);
+    ggml_cuda_pool_alloc<float>   segm_out_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float>   segm_max_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float>   segm_exp_buf(ctx.pool());
+    if (!use_2d) {
+        segm_out_buf.alloc(mt_aiter_uattn_segm_output_bytes(&shape, num_q_tokens) / sizeof(float));
+        segm_max_buf.alloc(mt_aiter_uattn_segm_max_bytes(&shape, num_q_tokens)    / sizeof(float));
+        segm_exp_buf.alloc(mt_aiter_uattn_segm_expsum_bytes(&shape, num_q_tokens) / sizeof(float));
+    }
     ggml_cuda_pool_alloc<int32_t> cu_seqlens_buf(ctx.pool(), (size_t)(num_seqs + 1));
 
     mt_build_cu_seqlens_kernel<<<1, 1, 0, stream>>>(
         cu_seqlens_buf.get(), (const int32_t*) q_lens->data, num_seqs);
+    mt_aiter_sync_probe(stream, "cu_seqlens", parse_layer_from_kv_cache_name(k_cache->name));
+    {
+        const long bpb_scan = (k_cache->type == GGML_TYPE_TURBO4_FP8_BS256) ? 162 : 0;
+        const long cap = bpb_scan ? ((long) ggml_nbytes(k_cache) / ((long) block_size * n_kv_heads * bpb_scan)) : 0;
+        if (cap > 0) {
+            mt_aiter_scan_block_table(block_tables, context_lens, num_seqs, max_bps, block_size, cap);
+        }
+    }
 
     // ── MAD-227: optional Q pre-rotation for Hadamard-mode FP8 ──
     // Identity (QH)·(HK)^T = QK^T requires rotating BOTH Q and K. K is
@@ -783,9 +957,33 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_cuda_pool_alloc<__half> q_rot_scratch(ctx.pool());
     if (cache_type == MT_AITER_CACHE_TURBO4_FP8 && mt_turbo_fp8::hadamard_required()) {
         const size_t q_elts = (size_t) num_q_tokens * n_heads * head_size;
+        // MAD-XXX diag (2026-09-10): num_q_tokens comes from k_cur->ne[2] but
+        // n_heads/head_size come from q, and nothing asserts q actually holds
+        // that many elements. An overread walks off the END of q, which lives in
+        // the compute buffer -- far from the KV arena, matching the measured
+        // fault address. Pure rare-path: compares two already-computed numbers
+        // and prints ONLY on violation, so it has no hot-path cost and cannot
+        // mask the fault the way per-call instrumentation did.
+        {
+            static std::atomic<bool> q_warned{false};
+            const size_t q_have = (size_t) ggml_nbytes(q);
+            const size_t q_want = q_elts * sizeof(__half);
+            if (q_want > q_have && !q_warned.exchange(true)) {
+                std::fprintf(stderr,
+                    "[q-overread] dev=%d WANT %zu B from q but ggml_nbytes(q)=%zu B  "
+                    "(OVERREAD %zu B)  q->ne=[%ld,%ld,%ld,%ld] k_cur->ne[2]=%d n_heads=%d hs=%d\n",
+                    ggml_cuda_get_device(), q_want, q_have, q_want - q_have,
+                    (long)q->ne[0],(long)q->ne[1],(long)q->ne[2],(long)q->ne[3],
+                    num_q_tokens, n_heads, head_size);
+            }
+        }
         q_rot_scratch.alloc(q_elts);
-        hipMemcpyAsync(q_rot_scratch.get(), q->data,
+        const hipError_t q_cpy = hipMemcpyAsync(q_rot_scratch.get(), q->data,
                        q_elts * sizeof(__half), hipMemcpyDeviceToDevice, stream);
+        if (q_cpy != hipSuccess) {
+            std::fprintf(stderr, "[q-overread] dev=%d Q copy FAILED: %s\n",
+                         ggml_cuda_get_device(), hipGetErrorString(q_cpy));
+        }
         const hipError_t herr = mt_turbo_fp8_fwht_half(
             stream, q_rot_scratch.get(),
             (int)(num_q_tokens * n_heads), head_size, head_size);
@@ -802,9 +1000,9 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     args.k_cache      = k_cache->data;
     args.v_cache      = v_cache->data;
     args.out          = dst->data;
-    args.segm_output  = segm_out_buf.get();
-    args.segm_max     = segm_max_buf.get();
-    args.segm_expsum  = segm_exp_buf.get();
+    args.segm_output  = use_2d ? nullptr : segm_out_buf.get();
+    args.segm_max     = use_2d ? nullptr : segm_max_buf.get();
+    args.segm_expsum  = use_2d ? nullptr : segm_exp_buf.get();
     args.block_tables = (const int32_t*) block_tables->data;
     args.seq_lens     = (const int32_t*) context_lens->data;
     args.query_start_len = cu_seqlens_buf.get();
@@ -833,10 +1031,12 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     args.v_stride_1         = args.k_stride_1;
     args.v_stride_2         = args.k_stride_2;
 
+    mt_aiter_sync_probe_pre("uattn", parse_layer_from_kv_cache_name(k_cache->name));
     hipError_t err = mt_aiter_unified_attn(stream, &args);
     if (err != hipSuccess) {
         GGML_ABORT("mt_aiter_unified_attn launch failed: %s", hipGetErrorString(err));
     }
+    mt_aiter_sync_probe(stream, "uattn", parse_layer_from_kv_cache_name(k_cache->name));
 }
 
 }  // namespace mt

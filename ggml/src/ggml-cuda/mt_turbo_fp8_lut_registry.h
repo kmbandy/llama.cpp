@@ -13,8 +13,9 @@
 //                 manifest.json        (n_layers, head_dim, fingerprint metadata)
 //
 // Per-process lifetime: registry holds device buffers and pointer table
-// keyed by (layer, k_or_v); the table is built on first lookup and reused
-// for the rest of the process. Thread-safe (mutex around init).
+// keyed by (device, layer, k_or_v); the table is built on first lookup
+// per device and reused. Thread-safe (mutex around init). Tensor-parallel
+// MUST key by device — a hipMalloc belongs to one context.
 
 #pragma once
 

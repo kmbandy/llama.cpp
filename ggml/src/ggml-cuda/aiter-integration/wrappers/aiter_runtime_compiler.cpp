@@ -11,6 +11,7 @@
 #include <fstream>
 #include <regex>
 #include <sstream>
+#include <vector>
 #include <sys/stat.h>
 
 namespace aiter {
@@ -280,6 +281,30 @@ bool Registry::ensure_on_disk(const std::string & cache_key, const KernelSpec & 
     std::fprintf(stderr, "aiter::Registry: compile script rc=%d for %s\n", rc, cache_key.c_str());
     std::fflush(stderr);
     if (rc != 0) {
+        // The script's stdout+stderr was redirected to compile.log above. Echo
+        // its tail here: without this the caller only ever sees "rc=N", and the
+        // actual Triton diagnostic (which is the whole answer) stays on disk.
+        std::ifstream log_in(artifact_dir / "compile.log");
+        if (log_in) {
+            std::vector<std::string> lines;
+            std::string line;
+            while (std::getline(log_in, line)) {
+                lines.push_back(line);
+            }
+            const size_t kTail = 40;
+            const size_t first = lines.size() > kTail ? lines.size() - kTail : 0;
+            std::fprintf(stderr, "aiter::Registry: --- compile.log tail (%s) ---\n",
+                         cache_key.c_str());
+            for (size_t i = first; i < lines.size(); ++i) {
+                std::fprintf(stderr, "aiter::Registry: | %s\n", lines[i].c_str());
+            }
+            std::fprintf(stderr, "aiter::Registry: --- end compile.log (full: %s) ---\n",
+                         (artifact_dir / "compile.log").c_str());
+        } else {
+            std::fprintf(stderr, "aiter::Registry: no compile.log at %s\n",
+                         (artifact_dir / "compile.log").c_str());
+        }
+        std::fflush(stderr);
         return false;
     }
 

@@ -40,6 +40,14 @@ std::string detect_hip_target() {
     return std::string("hip:") + arch + (cdna ? ":64" : ":32");
 }
 
+// FP8 WMMA (v_wmma_f32_16x16x16_fp8_fp8) exists on gfx1200/gfx1201/gfx1250.
+// gfx1030 (RDNA2) has neither FP8 WMMA nor v_dot4_i32_i8. The kernel falls
+// back to dequant-to-f16 + packed f16 tl.dot on those targets.
+bool target_has_fp8_wmma(const std::string & target) {
+    return target.find("gfx120") != std::string::npos
+        || target.find("gfx125") != std::string::npos;
+}
+
 // Build the 3D-kernel Triton signature for the given model shape.
 // Substitutions vs. the AITER signature template:
 //   pos 17 → num_q_heads
@@ -48,7 +56,7 @@ std::string detect_hip_target() {
 //   pos 23 → block_size (BLOCK_SIZE constexpr)
 //   pos 25 → head_size (HEAD_SIZE constexpr)
 //   pos 26 → head_size (HEAD_SIZE_PADDED constexpr; assumes head_size is pow2)
-std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
+std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmma) {
     // MAD-199: K/V cache pointer dtype depends on cache_type. F16 stays
     // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:16` byte
     // pointers and bake CACHE_TYPE=1/2 as the kernel constexpr — both branches
@@ -98,7 +106,7 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
         "%d, %d, %d, %d, "                  // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
-        "*i32, %d, i32, %d, %d, 1, %d, "    // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE (MAD-199)
+        "*i32, %d, i32, %d, %d, 1, %d, %d, " // query_start_len, BLOCK_Q, num_seqs, BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE, USE_FP8_WMMA
         "*i8:16, *i8:16",                     // MAD-214: centroids_k_ptr, centroids_v_ptr (None-safe for non-FP8)
         kv_ptr_dtype,                           // K cache pointer dtype
         kv_ptr_dtype,                           // V cache pointer dtype
@@ -112,7 +120,8 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
         MT_AITER_UATTN_BLOCK_Q,                 // BLOCK_Q constexpr
         MT_AITER_UATTN_BLOCK_M,                 // BLOCK_M constexpr
         MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ,    // NUM_SEGMENTS_PER_SEQ constexpr
-        cache_type_val);                        // CACHE_TYPE constexpr (MAD-199)
+        cache_type_val,                         // CACHE_TYPE constexpr (MAD-199)
+        use_fp8_wmma);                          // USE_FP8_WMMA constexpr (0 on gfx1030)
     return buf;
 }
 
@@ -129,7 +138,7 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
 // Same K/V cache pointer dtype switch as build_signature_3d (cache_type
 // drives *fp16:16 vs *i8:16 and the CACHE_TYPE constexpr).
 std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
-                                int block_m, int block_q) {
+                                int block_m, int block_q, int use_fp8_wmma) {
     const char * kv_ptr_dtype;
     int          cache_type_val;
     switch (s.cache_type) {
@@ -153,7 +162,7 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         "0, 0, 0, 0, 0, "                                                // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "                           // k/v cache strides (last is constexpr=1)
         "*i32, %d, i32, %d, "                                            // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M
-        "-448.0, 448.0, 0, %d, "                                         // FP8_MIN, FP8_MAX, ALL_DECODE=0 (prefill), CACHE_TYPE
+        "-448.0, 448.0, 0, %d, %d, "                                     // FP8_MIN, FP8_MAX, ALL_DECODE=0, CACHE_TYPE, USE_FP8_WMMA
         "*i8:16, *i8:16",                                                  // MAD-214: centroids_k_ptr, centroids_v_ptr
         kv_ptr_dtype, kv_ptr_dtype,
         s.num_q_heads, s.num_q_heads / s.num_kv_heads,
@@ -163,7 +172,8 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         s.head_size, s.head_size,           // HEAD_SIZE, HEAD_SIZE_PADDED
         block_q,                            // BLOCK_Q
         block_m,                            // BLOCK_M
-        cache_type_val);                    // CACHE_TYPE
+        cache_type_val,                     // CACHE_TYPE
+        use_fp8_wmma);                      // USE_FP8_WMMA (0 on gfx1030)
     return buf;
 }
 
@@ -187,13 +197,14 @@ std::string build_signature_reduce(const mt_aiter_uattn_shape_t & s) {
 }
 
 struct CachedHandles {
-    mt_aiter_uattn_shape_t      shape       = {};
-    const aiter::KernelHandle * h_3d        = nullptr;
-    const aiter::KernelHandle * h_reduce    = nullptr;
-    const aiter::KernelHandle * h_2d        = nullptr;  // MAD-199 D3: base prefill (BLOCK_M=16, BLOCK_Q=2)
-    const aiter::KernelHandle * h_2d_large  = nullptr;  // MAD-203:    large prefill (BLOCK_M=64, BLOCK_Q=8)
-    bool                        initialized = false;
-    hipError_t                  init_err    = hipSuccess;
+    mt_aiter_uattn_shape_t      shape         = {};
+    const aiter::KernelHandle * h_3d          = nullptr;
+    const aiter::KernelHandle * h_reduce      = nullptr;
+    const aiter::KernelHandle * h_2d          = nullptr;  // base prefill (BLOCK_M=16, BLOCK_Q=2)
+    const aiter::KernelHandle * h_2d_large    = nullptr;  // large prefill (BLOCK_M=8*GQA, BLOCK_Q=8)
+    int                         block_q_large = MT_AITER_UATTN_BLOCK_Q_LARGE;
+    bool                        initialized   = false;
+    hipError_t                  init_err      = hipSuccess;
 };
 
 // Per-DEVICE handle cache.
@@ -242,7 +253,8 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     }
 
     const std::string target  = detect_hip_target();
-    const std::string sig_3d  = build_signature_3d(shape);
+    const int use_fp8_wmma    = target_has_fp8_wmma(target) ? 1 : 0;
+    const std::string sig_3d  = build_signature_3d(shape, use_fp8_wmma);
     const std::string sig_red = build_signature_reduce(shape);
 
     aiter::Registry & reg = aiter::Registry::instance();
@@ -274,7 +286,8 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     c.h_reduce = reg.get_or_compile(spec_reduce);
 
     // MAD-199 D3: 2D base prefill spec (BLOCK_M=16, BLOCK_Q=2).
-    const std::string sig_2d = build_signature_2d(shape, MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q);
+    const std::string sig_2d = build_signature_2d(
+        shape, MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q, use_fp8_wmma);
     aiter::KernelSpec spec_2d {
         AITER_KERNEL_SOURCE_DEFAULT,
         "kernel_unified_attention_2d",
@@ -282,26 +295,57 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     };
     c.h_2d = reg.get_or_compile(spec_2d);
 
-    // MAD-203: 2D large-prefill spec (BLOCK_M=64, BLOCK_Q=8). Per the
-    // upstream host dispatcher's large-prefill branch (max_seqlen_q >= 256):
-    // 4× LDS reuse vs the base spec. Single best win expected from MAD-203.
-    // Requires num_queries_per_kv == 8 for BLOCK_Q=8 to be valid; assert.
-    if (shape.num_kv_heads > 0 &&
-        (shape.num_q_heads / shape.num_kv_heads) == 8) {
+    // MAD-203: 2D large-prefill. BLOCK_M = next_pow2(BLOCK_Q_LARGE*GQA) and
+    // BLOCK_Q = BLOCK_M/GQA — 64/8 for GQA=8, 64/10 for GQA=6. BLOCK_M must be
+    // a multiple of 16 for WMMA AND a power of two, because the kernel does
+    // tl.arange(0, BLOCK_M) and Triton rejects a non-power-of-two extent at
+    // compile time. 8*GQA=48 satisfied the %16 check but not that one, which is
+    // what produced the rc=256 compile failure on gfx1201.
+    const int block_m_large = mt_aiter_uattn_block_m_large(shape.num_q_heads, shape.num_kv_heads);
+    const int block_q_large = mt_aiter_uattn_block_q_large(shape.num_q_heads, shape.num_kv_heads);
+    const bool block_m_pow2 = block_m_large > 0
+        && (block_m_large & (block_m_large - 1)) == 0;
+    const bool large_ok = block_m_large >= 16 && (block_m_large % 16 == 0) && block_m_pow2
+        && block_q_large >= 1
+        && (block_m_large != MT_AITER_UATTN_BLOCK_M
+            || block_q_large != MT_AITER_UATTN_BLOCK_Q);
+    bool large_compiled = false;
+    if (large_ok) {
         const std::string sig_2d_large = build_signature_2d(
-            shape, MT_AITER_UATTN_BLOCK_M_LARGE, MT_AITER_UATTN_BLOCK_Q_LARGE);
+            shape, block_m_large, block_q_large, use_fp8_wmma);
         aiter::KernelSpec spec_2d_large {
             AITER_KERNEL_SOURCE_DEFAULT,
             "kernel_unified_attention_2d",
             target, sig_2d_large, env_nw, env_ns,
         };
-        c.h_2d_large = reg.get_or_compile(spec_2d_large);
-    } else {
-        // For non-8-GQA shapes, fall back to the base spec for large prefill too.
-        // BLOCK_Q must equal BLOCK_M / num_queries_per_kv; with our hardcoded
-        // BLOCK_Q_LARGE=8 this only matches GQA=8. Generalizing is MAD-203 phase 2.
-        c.h_2d_large = c.h_2d;
+        c.h_2d_large   = reg.get_or_compile(spec_2d_large);
+        large_compiled = (c.h_2d_large != nullptr);
     }
+    if (large_compiled) {
+        c.block_q_large = block_q_large;
+    } else {
+        // The large tile is an optimisation, never a correctness requirement:
+        // the base 16/2 spec handles every prefill shape. A failed or skipped
+        // large-tile compile must degrade to it, not abort the server — losing
+        // prefill throughput beats refusing to serve.
+        if (large_ok) {
+            std::fprintf(stderr,
+                "mt_aiter_unified_attn: large-prefill spec (BLOCK_M=%d BLOCK_Q=%d) failed to "
+                "compile on %s — falling back to the base %d/%d tile. Prefill will be slower.\n",
+                block_m_large, block_q_large, target.c_str(),
+                MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q);
+        }
+        c.h_2d_large    = c.h_2d;
+        c.block_q_large = MT_AITER_UATTN_BLOCK_Q;
+    }
+
+    std::fprintf(stderr,
+        "mt_aiter_unified_attn: target=%s USE_FP8_WMMA=%d GQA=%d "
+        "2d_large BLOCK_M=%d BLOCK_Q=%d (base 16/2)\n",
+        target.c_str(), use_fp8_wmma,
+        mt_aiter_uattn_gqa(shape.num_q_heads, shape.num_kv_heads),
+        large_compiled ? block_m_large : MT_AITER_UATTN_BLOCK_M,
+        large_compiled ? block_q_large : MT_AITER_UATTN_BLOCK_Q);
 
     c.shape       = shape;
     c.initialized = true;
@@ -335,8 +379,8 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // gives 4× LDS reuse vs the base BLOCK_M=16 spec, but BLOCK_Q=8 only
     // pays off when each Q block has ≥256 tokens to chew through (matches
     // upstream's max_seqlen_q >= 256 cutover).
-    const int32_t avg_q_len    = (a->num_seqs > 0) ? (a->num_q_tokens / a->num_seqs) : 1;
-    const bool    use_2d       = (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
+    const int32_t avg_q_len    = mt_aiter_uattn_avg_q_len(a->num_q_tokens, a->num_seqs);
+    const bool    use_2d       = mt_aiter_uattn_use_2d(a->num_q_tokens, a->num_seqs);
     const bool    use_2d_large = use_2d && (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
 
     // ── 3D split-K phase ───────────────────────────────────────────────────
@@ -409,7 +453,7 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
         // BLOCK_Q differs between base (2) and large (8) specs — must match the
         // selected handle.
         const int32_t block_q_for_grid = use_2d_large
-            ? MT_AITER_UATTN_BLOCK_Q_LARGE
+            ? c.block_q_large
             : MT_AITER_UATTN_BLOCK_Q;
         const aiter::KernelHandle * h_2d_selected = use_2d_large ? c.h_2d_large : c.h_2d;
 
@@ -436,13 +480,11 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
         &p_global_scratch, &p_profile_scratch,
     };
 
-    // Grid for 3D — mirrors AITER's host dispatcher:
-    //   gX = num_q_tokens / BLOCK_Q + num_seqs  (q-block index space)
-    //   gY = num_kv_heads
-    //   gZ = NUM_SEGMENTS_PER_SEQ
-    // For pure decode (q_len=1 each), num_q_tokens == num_seqs so this
-    // collapses to num_seqs/BLOCK_Q + num_seqs (the POC formula).
-    unsigned int g3_x = (unsigned int)(num_q_tokens / MT_AITER_UATTN_BLOCK_Q + num_seqs);
+    // Grid for 3D ALL_DECODE: one q-block per sequence (PR #2888). The 3D
+    // kernel is only launched for avg_q_len < BLOCK_Q, and the 3D signature
+    // bakes ALL_DECODE=1, so grid X is num_seqs rather than the padded
+    // num_q_tokens/BLOCK_Q + num_seqs formula used for mixed-length prefill.
+    unsigned int g3_x = (unsigned int) num_seqs;
     unsigned int g3_y = (unsigned int) a->shape.num_kv_heads;
     unsigned int g3_z = (unsigned int) MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ;
 

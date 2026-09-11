@@ -1,4 +1,8 @@
 #include <atomic>
+#include <algorithm>
+#include <vector>
+#include <mutex>
+#include <map>
 #include <cstring>
 // mt_pagedattn — paged attention kernel implementation.
 //
@@ -1630,7 +1634,113 @@ static void launch_paged_attn(
             max_blocks_per_seq, n_kv_heads, n_heads, scale);
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────
+// Per-device GPU timing for the paged-attention op. Gated on
+// MAD_PAGEDATTN_GPUTIME=1; completely inert otherwise.
+//
+// Why this exists: the paged x tensor-split-attn interaction (2026-09-10)
+// costs 24% at -tsa 1,1 and 0% at -tsa 3,1, and NONE of the candidate
+// mechanisms could be told apart from end-to-end throughput. rocprofv3 cannot
+// profile this path -- launch-wrapping it stops ggml_cuda_ar_pipeline_init from
+// running at all, and --attach needs ROCP_TOOL_ATTACH=1 on the target, which
+// costs 11-28x and then fails anyway. GGML_META_STEP_STATS only times the host
+// submit loop (~1.5 s of a ~40 s wall), so it cannot see GPU execution either.
+//
+// Events are recorded on the op's own stream and only read at exit, so nothing
+// synchronises during serving. Per (token, layer) the call count is small: 16
+// attention layers x 8 ubatches = 128 calls for one 16k prefill.
+namespace {
+struct mt_paged_gputime {
+    struct rec { int dev; cudaEvent_t beg, end; };
+
+    static std::vector<rec> & recs() { static std::vector<rec> v; return v; }
+    static std::mutex      & mtx()  { static std::mutex m; return m; }
+
+    static bool enabled() {
+        static const bool on = []() {
+            const char * e = std::getenv("MAD_PAGEDATTN_GPUTIME");
+            return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+        }();
+        return on;
+    }
+
+    // Reading elapsed time requires the events to have completed, so this
+    // synchronises -- which is why it runs at exit and nowhere else.
+    static void report() {
+        std::lock_guard<std::mutex> lk(mtx());
+        std::map<int, double> total_ms;
+        std::map<int, int>    calls;
+        for (auto & r : recs()) {
+            cudaEventSynchronize(r.end);
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, r.beg, r.end) == cudaSuccess) {
+                total_ms[r.dev] += (double) ms;
+                calls[r.dev]    += 1;
+            }
+            cudaEventDestroy(r.beg);
+            cudaEventDestroy(r.end);
+        }
+        recs().clear();
+        double sum = 0.0;
+        for (const auto & kv : total_ms) sum += kv.second;
+        for (const auto & kv : total_ms) {
+            const int d = kv.first;
+            std::fprintf(stderr,
+                "mt_pagedattn gpu-time: device %d  calls=%d  total=%.1f ms  avg=%.3f ms  share=%.1f%%\n",
+                d, calls[d], kv.second, kv.second / (double) std::max(1, calls[d]),
+                sum > 0.0 ? 100.0 * kv.second / sum : 0.0);
+        }
+        if (total_ms.size() > 1) {
+            // If the devices overlap, wall time tracks the MAX; if they
+            // serialise, it tracks the SUM. Printing both is the whole point.
+            double mx = 0.0;
+            for (const auto & kv : total_ms) mx = std::max(mx, kv.second);
+            std::fprintf(stderr,
+                "mt_pagedattn gpu-time: sum=%.1f ms  max=%.1f ms  (sum/max=%.2f; ~1.0 means the devices overlap, ~2.0 means they serialise)\n",
+                sum, mx, mx > 0.0 ? sum / mx : 0.0);
+        }
+    }
+};
+
+// Records on construction/destruction so every return path in the op is
+// covered, including the early AITER dispatch.
+struct mt_paged_gputime_scope {
+    bool         on  = false;
+    int          dev = -1;
+    cudaEvent_t  beg{}, end{};
+    cudaStream_t stream{};
+
+    explicit mt_paged_gputime_scope(cudaStream_t s) {
+        on = mt_paged_gputime::enabled();
+        if (!on) {
+            return;
+        }
+        stream = s;
+        cudaGetDevice(&dev);
+        if (cudaEventCreate(&beg) != cudaSuccess || cudaEventCreate(&end) != cudaSuccess) {
+            on = false;
+            return;
+        }
+        cudaEventRecord(beg, stream);
+        static std::once_flag once;
+        std::call_once(once, []() { std::atexit(&mt_paged_gputime::report); });
+    }
+
+    ~mt_paged_gputime_scope() {
+        if (!on) {
+            return;
+        }
+        cudaEventRecord(end, stream);
+        std::lock_guard<std::mutex> lk(mt_paged_gputime::mtx());
+        mt_paged_gputime::recs().push_back({dev, beg, end});
+    }
+};
+} // namespace
+
 void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const mt_paged_gputime_scope gputime_scope(ctx.stream());
+
     // outlier-matrix sweep (2026-07-01): sync the GGML_TURBO4_64_OL_TABLE
     // env-var toggle into the device-readable global once per process,
     // before any turbo4_64_ol/ol8/ol12 kernel (scatter or dequant) reads it.

@@ -35,6 +35,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
+#include <cstdio>
+#include <atomic>
 
 struct ggml_cuda_graph_cache_policy {
     size_t  cap      = 256;
@@ -43,9 +45,42 @@ struct ggml_cuda_graph_cache_policy {
     bool    track_ttl = false;
 };
 
-template <typename Map>
+
+// MAD-XXX diag (2026-09-10): graphs.erase() used to destroy ggml_cuda_graph
+// in place, whose destructor calls cudaGraphExecDestroy with NO
+// synchronization (common.cuh, ~ggml_cuda_graph()). If a launch of that
+// graph was still pending, the GPU walked freed command buffers -> a wild
+// page-aligned address unrelated to any tensor (both GPUs spin, no fault,
+// no forward progress). Observed counters show evictions are ALL ttl
+// (>=10 s idle, benign) with lru_evicted=0, so this records only the
+// DANGEROUS case: an eviction whose victim was used recently.
+//
+// 2026-09-11: erase() below no longer destroys directly -- the caller's
+// retire_fn (ggml_backend_cuda_context::ggml_cuda_graph_retire(), common.cuh)
+// moves the victim to a per-device retired list and only frees it once its
+// last-launch event has fired, closing the race this comment describes.
+// This check now fires on every genuinely-recent eviction as a hot/cold
+// signal, not a crash signal; still no hot-path cost when disabled.
+static inline void mt_graph_evict_check(const char * kind, int64_t age_us) {
+    static int on = -1;
+    if (on < 0) { const char * e = std::getenv("MAD_GRAPH_EVICT_TRACE"); on = (e && *e && e[0] != '0') ? 1 : 0; }
+    if (!on) { return; }
+    if (age_us < 1'000'000) {   // evicted <1 s after last use
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 16) {
+            std::fprintf(stderr,
+                "[graph-evict] *** %s eviction retiring a graph used only %.3f ms ago "
+                "(deferred destroy pending its last-launch event) ***\n", kind, age_us / 1000.0);
+        }
+    }
+}
+
+// retire_fn(std::unique_ptr<ggml_cuda_graph>) takes ownership of an evicted
+// graph instead of it being destroyed in place -- see the retired-list
+// comment above and in common.cuh.
+template <typename Map, typename RetireFn>
 size_t ggml_cuda_graph_cache_evict_ttl(
-        Map & graphs, int64_t time_now, int64_t ttl_us,
+        Map & graphs, int64_t time_now, int64_t ttl_us, RetireFn && retire_fn,
         std::unordered_set<typename Map::key_type> * ttl_evicted_keys = nullptr) {
     size_t n = 0;
     for (auto it = graphs.begin(); it != graphs.end(); ) {
@@ -53,6 +88,8 @@ size_t ggml_cuda_graph_cache_evict_ttl(
             if (ttl_evicted_keys != nullptr) {
                 ttl_evicted_keys->insert(it->first);
             }
+            mt_graph_evict_check("TTL", time_now - it->second->last_used_time);
+            retire_fn(std::move(it->second));
             it = graphs.erase(it);
             ++n;
         } else {
@@ -64,8 +101,8 @@ size_t ggml_cuda_graph_cache_evict_ttl(
 
 // Evict LRU until graphs.size() < cap. `keep` is never removed (the key
 // about to be returned). cap == 0 means no cap.
-template <typename Map>
-size_t ggml_cuda_graph_cache_evict_lru(Map & graphs, size_t cap, typename Map::key_type keep) {
+template <typename Map, typename RetireFn>
+size_t ggml_cuda_graph_cache_evict_lru(Map & graphs, size_t cap, typename Map::key_type keep, RetireFn && retire_fn) {
     if (cap == 0) {
         return 0;
     }
@@ -85,6 +122,8 @@ size_t ggml_cuda_graph_cache_evict_lru(Map & graphs, size_t cap, typename Map::k
         if (victim == graphs.end()) {
             break;
         }
+        mt_graph_evict_check("LRU", 0);   // LRU ignores age entirely -> always report
+        retire_fn(std::move(victim->second));
         graphs.erase(victim);
         ++n;
     }

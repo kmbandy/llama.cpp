@@ -42,6 +42,19 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+// vendors/hip.h doesn't map these two (not otherwise used in-tree); needed
+// below by ggml_backend_cuda_context::ggml_cuda_graph_event_done() (the
+// TTL/LRU deferred-graph-destroy fix). Scoped here rather than editing
+// vendors/hip.h, which is out of scope for that fix.
+#if defined(GGML_USE_HIP)
+#ifndef cudaEventQuery
+#define cudaEventQuery hipEventQuery
+#endif
+#ifndef cudaErrorNotReady
+#define cudaErrorNotReady hipErrorNotReady
+#endif
+#endif // defined(GGML_USE_HIP)
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -1234,15 +1247,30 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
+        // MAD-XXX (2026-09-11): by the time this destructor runs, any
+        // outstanding replay of `instance` must already be complete -- see
+        // last_launch_event below and ggml_backend_cuda_context::
+        // ggml_cuda_graph_retire()/drain_retired() in this header, which are
+        // the only paths that erase()/destroy a cache entry. This destructor
+        // itself performs NO synchronization; it is only safe to run here
+        // because the caller already guaranteed the event fired (or synced).
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        if (last_launch_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(last_launch_event));
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // Recorded on `cuda_ctx->stream()` immediately after every cudaGraphLaunch
+    // of `instance` (ggml-cuda.cu). Lets an evictor tell "safe to destroy now"
+    // from "a replay may still be running on the device" without a host sync
+    // on the common (query-only) path. nullptr until the first launch.
+    cudaEvent_t last_launch_event = nullptr;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     std::vector<int> node_types;
@@ -1454,6 +1482,85 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // MAD-XXX (2026-09-11): TTL/LRU eviction used to erase() straight out of
+    // cuda_graphs, which destroys the ggml_cuda_graph (cudaGraphExecDestroy/
+    // cudaGraphDestroy, no sync). Under GGML_META_OVERLAP two ubatches' async
+    // graph launches can be outstanding at once, and cuda_graph() runs at six
+    // sites per graph evaluation -- so a sweep could destroy a graph whose
+    // replay was still running on the device (UB via a freed-but-still-mapped
+    // cudaGraphExec_t -> both GPUs spin, no fault, no progress). Fix: evicted
+    // graphs go here instead of being destroyed; they are freed only once
+    // their last_launch_event has fired. Host-side access to one
+    // ggml_backend_cuda_context is already single-threaded (only the GPU-side
+    // work overlaps), so this needs no locking of its own.
+    static constexpr size_t GGML_CUDA_GRAPH_RETIRED_BOUND = 64;
+    std::vector<std::unique_ptr<ggml_cuda_graph>> retired_graphs;
+    uint64_t retired_freed  = 0; // cumulative graphs actually destroyed via the retired list
+    uint64_t retired_synced = 0; // of those, how many needed the bounded-list fallback sync
+
+    static bool ggml_cuda_graph_event_done(cudaEvent_t ev) {
+        if (ev == nullptr) {
+            return true;
+        }
+        const cudaError_t st = cudaEventQuery(ev);
+        if (st == cudaSuccess) {
+            return true;
+        }
+        if (st == cudaErrorNotReady) {
+            return false;
+        }
+        (void) cudaGetLastError(); // clear sticky error; be conservative, retry later
+        return false;
+    }
+
+    // Move an evicted graph to the retired list rather than destroying it in
+    // place. If its last launch has already completed (the common case for a
+    // genuinely idle TTL victim), free it immediately -- same cost as before.
+    void ggml_cuda_graph_retire(std::unique_ptr<ggml_cuda_graph> g) {
+        if (g == nullptr) {
+            return;
+        }
+        if (ggml_cuda_graph_event_done(g->last_launch_event)) {
+            ++retired_freed; // g destructs here, replay already finished
+            return;
+        }
+        retired_graphs.push_back(std::move(g));
+        // Bound: rather than let this grow unbounded if replays keep lagging,
+        // force-sync and free the oldest entries. Rare path, logged only via
+        // the retired_synced counter in the existing hip-graphs stats line.
+        while (retired_graphs.size() > GGML_CUDA_GRAPH_RETIRED_BOUND) {
+            std::unique_ptr<ggml_cuda_graph> & oldest = retired_graphs.front();
+            if (oldest->last_launch_event != nullptr) {
+                CUDA_CHECK(cudaEventSynchronize(oldest->last_launch_event));
+            }
+            retired_graphs.erase(retired_graphs.begin());
+            ++retired_freed;
+            ++retired_synced;
+        }
+    }
+
+    // Free whatever retired graphs have finished replaying. `force_sync` is
+    // only for context teardown, where a sync is acceptable (and necessary --
+    // nothing will drive the event to completion after this point otherwise).
+    void ggml_cuda_graph_drain_retired(bool force_sync) {
+        for (size_t i = 0; i < retired_graphs.size(); ) {
+            ggml_cuda_graph * g = retired_graphs[i].get();
+            bool done = ggml_cuda_graph_event_done(g->last_launch_event);
+            if (!done && force_sync) {
+                if (g->last_launch_event != nullptr) {
+                    CUDA_CHECK(cudaEventSynchronize(g->last_launch_event));
+                }
+                done = true;
+            }
+            if (done) {
+                retired_graphs.erase(retired_graphs.begin() + i);
+                ++retired_freed;
+            } else {
+                ++i;
+            }
+        }
+    }
+
     // Live entries in the graph cache. Used to tell "cache too small" apart
     // from "genuinely new shapes" when captures climb.
     size_t cuda_graph_count() const { return cuda_graphs.size(); }
@@ -1495,10 +1602,14 @@ struct ggml_backend_cuda_context {
             return p;
         }();
 
-        // TTL sweep every 5s by default: drop graphs unused for >=10s.
+        // TTL sweep every 5s by default: drop graphs unused for >=10s. Drain
+        // point 1/3 -- pick up anything retired since the last sweep whose
+        // replay has since finished, before this sweep retires more.
         if (time_now - last_graph_eviction_sweep >= cache_pol.sweep_us) {
             last_graph_eviction_sweep = time_now;
-            ggml_cuda_graph_cache_evict_ttl(cuda_graphs, time_now, cache_pol.ttl_us,
+            ggml_cuda_graph_drain_retired(false);
+            auto retire_fn = [this](std::unique_ptr<ggml_cuda_graph> g) { ggml_cuda_graph_retire(std::move(g)); };
+            ggml_cuda_graph_cache_evict_ttl(cuda_graphs, time_now, cache_pol.ttl_us, retire_fn,
                                              cache_pol.track_ttl ? &ttl_evicted_graph_keys : nullptr);
         }
 
@@ -1506,10 +1617,14 @@ struct ggml_backend_cuda_context {
         if (it == cuda_graphs.end()) {
             const bool ttl_evicted = cache_pol.track_ttl &&
                 ttl_evicted_graph_keys.erase(first_node_ptr) != 0;
+            // Drain point 2/3 -- before capture of a new graph, in case the
+            // LRU pass below is about to retire more.
+            ggml_cuda_graph_drain_retired(false);
             // Optional cap (GGML_CUDA_GRAPH_MAX). Default is unlimited so a
             // split decode working set (~40-90 segments × a few shapes) can
             // stay resident long enough for warmup. LRU, not LFU.
-            const size_t n_lru = ggml_cuda_graph_cache_evict_lru(cuda_graphs, cache_pol.cap, first_node_ptr);
+            auto retire_fn = [this](std::unique_ptr<ggml_cuda_graph> g) { ggml_cuda_graph_retire(std::move(g)); };
+            const size_t n_lru = ggml_cuda_graph_cache_evict_lru(cuda_graphs, cache_pol.cap, first_node_ptr, retire_fn);
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
             it->second->capture_reason = ttl_evicted ? ggml_cuda_graph::CAPTURE_TTL :
                 n_lru != 0 ? ggml_cuda_graph::CAPTURE_LRU : ggml_cuda_graph::CAPTURE_NEWKEY;

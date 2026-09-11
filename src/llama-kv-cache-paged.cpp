@@ -17,6 +17,7 @@
 #endif
 
 #include <cassert>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
@@ -1510,6 +1511,22 @@ bool llama_kv_cache_paged::compute_slot_mapping(const llama_ubatch * ubatch, int
         const uint32_t physical = table_.get_physical(seq_id, logical);
         if (physical == mt::kInvalidBlockId) {
             return false;
+        }
+        // MAD-XXX diag (2026-09-10): physical ids >= n_blocks_total_ are CPU-TIER
+        // blocks (see the cpu_block_idx encoding note in the header). Nothing here
+        // bounds `physical` against the GPU pool, and the GPU scatter kernels only
+        // test `slot < 0` -- so a CPU-tier id would become a slot that writes PAST
+        // THE END of the GPU KV arena. Host-side, fires only on violation, zero GPU
+        // cost, and cannot mask a timing-sensitive fault.
+        if (physical >= n_blocks_total_) {
+            static std::atomic<int> warned{0};
+            if (warned.fetch_add(1) < 8) {
+                fprintf(stderr,
+                    "[slotmap] *** OUT-OF-POOL physical=%u >= n_blocks_total=%u *** "
+                    "seq=%d logical=%u pos=%d slot=%u -> slot_mapping=%d (GPU arena is %u blocks)\n",
+                    physical, n_blocks_total_, (int) seq_id, logical, (int) pos, slot,
+                    (int)(physical * block_size_ + slot), n_blocks_total_);
+            }
         }
         out[i] = (int32_t)(physical * block_size_ + slot);
     }

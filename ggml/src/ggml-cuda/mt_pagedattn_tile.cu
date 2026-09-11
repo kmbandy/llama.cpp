@@ -50,7 +50,36 @@ using namespace ggml_cuda_mma;
 static constexpr int TILE_NUM_THREADS = 32;
 
 static constexpr int Q_TILE_M = 16;
-static constexpr int K_TILE_N = 16;
+// K_TILE_N is the COMPUTE tile: how many KV tokens are scored per iteration of
+// the K-tile loop. It is deliberately DECOUPLED from BLOCK_SIZE (the STORAGE
+// block). stage_k_tile/stage_v_tile already translate logical->physical per
+// element via seq_block_table, so a compute tile spanning several storage
+// blocks needs no gather change -- only more block-table lookups.
+//
+// Why it matters (measured 2026-09-10): the online-softmax accumulator rescale
+// touches N_INNER*acc.ne = 16*8 = 128 floats per lane and fires ONCE PER
+// K-TILE. At K_TILE_N=16 that is every 16 KV tokens, i.e. ~1000 rescales per
+// (q_tile, head) at 16k context, where flash-attn amortises over a much larger
+// tile. Doubling K_TILE_N halves the rescale count for identical WMMA work.
+//
+// LDS BUDGET IS THE BINDING CONSTRAINT (64 KiB/workgroup on gfx1030/gfx1201).
+// smem = (q_tiles*Q_TILE_M + 2*K_TILE_N) * HEAD_SIZE * 2 bytes, so at
+// HEAD_SIZE=256, q_tiles=1:  K_TILE_N=16 -> 24 KiB, 32 -> 40 KiB, 64 -> 72 KiB
+// (does NOT fit). 64 would require not staging V in LDS.
+#ifndef MT_PAGED_K_TILE_N
+// MEASURED 2026-09-10: K_TILE_N=32 is a REGRESSION (-10..-15% end to end;
+// per-call paged attention 11.18 -> 26.03 ms on the R9700). LDS is an
+// OCCUPANCY resource: 24 KiB -> 40 KiB per workgroup drops 2 concurrent
+// workgroups per CU to 1 against the 64 KiB budget, and halving occupancy
+// costs more than halving the rescale count saves. The rescale-frequency
+// hypothesis (the leading candidate in KG 3a943c3f after eight other
+// refutations) is REFUTED. Keep 16; the promising direction is the opposite
+// one -- REDUCE LDS per workgroup to raise occupancy.
+#define MT_PAGED_K_TILE_N 16
+#endif
+static constexpr int K_TILE_N = MT_PAGED_K_TILE_N;
+static_assert(K_TILE_N % 16 == 0, "K_TILE_N must be a multiple of the 16-wide WMMA tile");
+static constexpr int K_SUBTILES = K_TILE_N / 16;
 static constexpr int K_INNER  = 16;
 
 // Multi-warp tile configuration. Q_TILES_PER_BLOCK = number of Q tiles
@@ -467,51 +496,60 @@ __global__ void mt_paged_attention_tile_kernel(
             kv_head_idx, n_kv_heads, tid);
         __syncthreads();
 
-        // scores[16, 16] = Q[16, HEAD_SIZE] · K^T[HEAD_SIZE, 16]
-        // (WMMA's natural C = A·B^T; A=Q, B=K both [16, K_INNER], so the
-        // K_INNER dim becomes the contracted dim.)
-        tile<16, 16, float, DATA_LAYOUT_I_MAJOR> scores;
+        // scores[s] = Q[16, HEAD_SIZE] . K^T for sub-tile s of this compute tile.
+        // K_SUBTILES 16-wide WMMA tiles cover the K_TILE_N staged tokens; the
+        // softmax state below is updated ONCE for the whole tile, which is
+        // where the saving comes from.
+        tile<16, 16, float, DATA_LAYOUT_I_MAJOR> scores[K_SUBTILES];
         #pragma unroll
-        for (int e = 0; e < scores.ne; ++e) {
-            scores.x[e] = 0.0f;
-        }
-
-        #pragma unroll
-        for (int n = 0; n < N_INNER; ++n) {
-            tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
-            const half2 * src = (const half2 *)(smem_k + n * K_INNER);
-            load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
-            // RDNA4 WMMA operand order — see mt_pagedattn_decode.cu mma swap.
-            mma(scores, K_tile, Q_tiles[n]);
+        for (int st = 0; st < K_SUBTILES; ++st) {
+            #pragma unroll
+            for (int e = 0; e < scores[st].ne; ++e) {
+                scores[st].x[e] = 0.0f;
+            }
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
+                const half2 * src = (const half2 *)(smem_k + st * 16 * HEAD_SIZE + n * K_INNER);
+                load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
+                // RDNA4 WMMA operand order - see mt_pagedattn_decode.cu mma swap.
+                mma(scores[st], K_tile, Q_tiles[n]);
+            }
         }
 
         // Apply scale + causal mask. Each thread inspects its 8 elements:
         //   row = scores.get_i(l) = tid % 16  (same for all l)
-        //   col = scores.get_j(l) = 8*(tid/16) + l
+        //   col = scores.get_j(l) = 8*(tid/16) + l   (within the sub-tile)
         const int row = tid % 16;          // Q row this lane owns
         const int q_pos = q_pos_base + row;
         const bool row_valid = (row < q_tile_actual);
 
         #pragma unroll
-        for (int l = 0; l < scores.ne; ++l) {
-            const int col   = 8 * (tid / 16) + l;
-            const int k_pos = k_tile_start + col;
-            const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < valid_ctx);
-            scores.x[l] = visible ? (scores.x[l] * scale) : SOFTMAX_MASK_VAL;
+        for (int st = 0; st < K_SUBTILES; ++st) {
+            #pragma unroll
+            for (int l = 0; l < scores[st].ne; ++l) {
+                const int col   = 8 * (tid / 16) + l;
+                const int k_pos = k_tile_start + st * 16 + col;
+                const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < valid_ctx);
+                scores[st].x[l] = visible ? (scores[st].x[l] * scale) : SOFTMAX_MASK_VAL;
+            }
         }
 
-        // Per-row max: 8-wide local max + shfl_xor(mask=16) with the
-        // pair-lane that owns cols 8..15 (vs 0..7) of the same row.
+        // Per-row max across ALL sub-tiles: local max + shfl_xor(mask=16) with
+        // the pair-lane that owns cols 8..15 (vs 0..7) of the same row.
         float local_max = SOFTMAX_MASK_VAL;
         #pragma unroll
-        for (int l = 0; l < scores.ne; ++l) {
-            local_max = max(local_max, scores.x[l]);
+        for (int st = 0; st < K_SUBTILES; ++st) {
+            #pragma unroll
+            for (int l = 0; l < scores[st].ne; ++l) {
+                local_max = max(local_max, scores[st].x[l]);
+            }
         }
         const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
 
         const float new_max = max(running_max, row_max);
 
-        // Rescale running state if needed.
+        // Rescale running state if needed. ONE rescale per K_TILE_N tokens.
         float rescale = 1.0f;
         if (running_max > SOFTMAX_MASK_VAL) {
             rescale = __expf(running_max - new_max);
@@ -528,56 +566,41 @@ __global__ void mt_paged_attention_tile_kernel(
         // exp(scores - new_max), local sum + shfl_xor for per-row sum.
         float local_sum = 0.0f;
         #pragma unroll
-        for (int l = 0; l < scores.ne; ++l) {
-            const float e = (scores.x[l] == SOFTMAX_MASK_VAL) ? 0.0f : __expf(scores.x[l] - new_max);
-            scores.x[l]   = e;
-            local_sum   += e;
+        for (int st = 0; st < K_SUBTILES; ++st) {
+            #pragma unroll
+            for (int l = 0; l < scores[st].ne; ++l) {
+                const float e = (scores[st].x[l] == SOFTMAX_MASK_VAL) ? 0.0f : __expf(scores[st].x[l] - new_max);
+                scores[st].x[l] = e;
+                local_sum      += e;
+            }
         }
         const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
         running_sum += row_sum;
         running_max  = new_max;
 
-        // Stage V tile.
+        // Stage V tile (K_TILE_N tokens, same multi-block walk as K).
         stage_v_tile<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>(
             smem_v, v_cache, seq_block_table, k_tile_start, valid_ctx,
             kv_head_idx, n_kv_heads, tid);
         __syncthreads();
 
-        // Convert scores (f32) to half tile for the matmul. Note: scores
-        // is in tile<16,16,float,I_MAJOR>; we pack to tile<16,8,half2,I_MAJOR>
-        // by reinterpreting pairs of consecutive cols (l, l+ne/2 in mem
-        // layout) — but get_j(l) is contiguous, so pair l and l+1 in mem.
-        tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> scores_h;
-        static_assert(decltype(scores_h)::ne == 4, "expected 4 half2 per thread for tile<16,8,half2>");
-        // scores.ne == 8 (one f32 per col 0..7 of this lane's row half).
-        // scores_h.ne == 4 (one half2 per 2-col pair).
-        // Lane mapping for tile<16, 8, half2>: get_j(l) = 2*(tid/16) + l for l in [0..??]
-        // Wait — looking at mma.cuh L139-140 for tile<16,8,half2,I_MAJOR>:
-        //   get_j(l) = 2*(tid/16) + l    (AMD_MFMA branch, but is this AMD_WMMA?)
-        //
-        // For AMD_WMMA tile<16,8,T>: get_j(l) = ne*(tid/16) + l = 4*(tid/16) + l (ne=4).
-        // So thread tid owns cols 4*(tid/16) + 0..3 for half2 layout, which is
-        // cols 8*(tid/16) + 0..7 for half layout. Matches scores's cols.
-        // Pack: scores_h.x[l] = make_half2(scores.x[2*l], scores.x[2*l+1]).
+        // acc[N_INNER] += sum_s scores_h[s] . V[s].
         #pragma unroll
-        for (int l = 0; l < scores_h.ne; ++l) {
-            scores_h.x[l] = __floats2half2_rn(scores.x[2*l], scores.x[2*l+1]);
-        }
-
-        // acc[N_INNER] += scores_h · V[K, HEAD_SIZE].
-        // We want output[i, d] = sum_k scores[i,k] * V[k,d]; mma computes
-        // D = A · B^T, so B[d,k] = V[k,d] — i.e., we load V transposed.
-        #pragma unroll
-        for (int n = 0; n < N_INNER; ++n) {
-            tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_tile;
-            // V_smem layout: [K_TILE_N tokens, HEAD_SIZE cols], half stride.
-            // For load_ldmatrix_trans, xs0 is (const half2 *) base; the
-            // transposed load picks up V[k, d] as V_tile[d-block, k] —
-            // exactly what we need for B in the matmul.
-            const half2 * src = (const half2 *)(smem_v + n * K_INNER);
-            load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
-            // RDNA4 WMMA operand order — see mt_pagedattn_decode.cu mma swap.
-            mma(acc[n], V_tile, scores_h);
+        for (int st = 0; st < K_SUBTILES; ++st) {
+            tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> scores_h;
+            static_assert(decltype(scores_h)::ne == 4, "expected 4 half2 per thread for tile<16,8,half2>");
+            #pragma unroll
+            for (int l = 0; l < scores_h.ne; ++l) {
+                scores_h.x[l] = __floats2half2_rn(scores[st].x[2*l], scores[st].x[2*l+1]);
+            }
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_tile;
+                const half2 * src = (const half2 *)(smem_v + st * 16 * HEAD_SIZE + n * K_INNER);
+                load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
+                // RDNA4 WMMA operand order - see mt_pagedattn_decode.cu mma swap.
+                mma(acc[n], V_tile, scores_h);
+            }
         }
 
         __syncthreads();  // before next iter overwrites smem_k / smem_v
