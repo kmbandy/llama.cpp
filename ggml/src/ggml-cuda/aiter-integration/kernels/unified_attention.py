@@ -794,6 +794,183 @@ def load_turbo_fp8_kv_tile_V_bs256(
     return fp8_bytes, scales
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# LOADER V2 (opt-in via USE_FP8_LOADER_V2, IDX_BITS==4 / turbo4_fp8 only).
+#
+# Root cause addressed: load_turbo_fp8_kv_tile_{K,V}_bs256 above materialize
+# a per-element (HEAD_SIZE_PADDED, TILE_SIZE) int64 byte address and a
+# per-element 4-byte word load (each of the 8 elements sharing a word issues
+# its own address + load), plus a per-element sign-byte load, plus
+# per-element tl.where/shift/and — none of this is vectorizable because
+# per-element addresses have zero contiguity along the head-dim axis. This
+# is what MAD-2026-09-11's num_warps=8 experiment could not remove (it only
+# gave the compiler more registers to spill into) and what fp8-kernel-why
+# report §3/§4 identify as the v_cmp/v_cndmask + bit-extract instruction
+# bloat (independent of, and additive with, the spill problem).
+#
+# Loader v2 instead issues exactly TWO contiguous-along-dim-1 loads per
+# token row — one (TILE_SIZE, 32) int32 load for the packed 4-bit index
+# stream, one (TILE_SIZE, 8) int32 load for the sign-bit stream — and
+# expands both to per-element (TILE_SIZE, 256) values with broadcast shifts
+# in registers, not per-element global addresses. Bit-for-bit identical
+# output to the v1 loader (same LUT gather, same idx, same sign, same
+# `other=0` masked-lane semantics); see the proofs in
+# load_turbo4_fp8_kv_tile_bs256_v2's body for why the two tl.reshape calls
+# land elements at their correct offs_d.
+#
+# Scoped to IDX_BITS==4 (turbo4_fp8) only, per the investigation that
+# motivated this: the byte layout's 2-nibbles/byte packing is what makes a
+# whole 4-byte word decode to a whole number of nibbles (8 per word) with no
+# partial-nibble spillover at a word boundary. IDX_BITS in {3,5}
+# (turbo3_fp8/turbo5_fp8) indices straddle byte (and would straddle word)
+# boundaries irregularly — v1 loader is untouched for those; not attempted.
+# ─────────────────────────────────────────────────────────────────────────
+
+@triton.jit
+def load_turbo4_fp8_kv_tile_bs256_v2(
+    cache_byte_ptr,          # *i8 — base of K or V cache
+    physical_block_idx,      # (TILE_SIZE,) — paged block id per token
+    token_in_block,          # (TILE_SIZE,) — slot within paged block
+    kv_head_idx,              # scalar int — KV head index
+    lut_ptr,                  # *u8 — per-(kv, layer) centroid LUT (16 bytes, IDX_BITS=4)
+    n_kv_heads:        tl.constexpr,
+    BLOCK_SIZE:        tl.constexpr,
+    HEAD_SIZE:         tl.constexpr,
+    BYTES_PER_BLOCK:   tl.constexpr,  # 162 for turbo4_fp8 BS=256 (IDX_BITS=4)
+    tile_mask,                # (TILE_SIZE,) — valid token mask
+):
+    """Shared K/V core for loader v2. Returns (fp8_bytes, scales):
+        fp8_bytes  (TILE_SIZE, HEAD_SIZE) int8 — token-major (V's native
+                   layout; the K call site transposes, see
+                   load_turbo_fp8_kv_tile_K_bs256_v2 below).
+        scales     (TILE_SIZE,) fp32.
+
+    HEAD_SIZE_PADDED == HEAD_SIZE == 256 is required (static_assert'd by the
+    v1 loader's callers already, since this whole kernel family only wires
+    BS=256 == HEAD_SIZE=256, i.e. dim_mask is unconditionally all-True here)
+    — offs_d is therefore never materialized: the (32, 8) / (8, 32) index
+    and sign expansions below cover the full [0, 256) head-dim range by
+    construction, with no separate head-dim mask needed.
+    """
+    tl.static_assert(HEAD_SIZE == 256, "loader v2 assumes HEAD_SIZE_PADDED == HEAD_SIZE == 256")
+
+    # bufops nomask: clamp -1 (kInvalidBlockTableEntry) to block 0 before any
+    # address is formed — identical rationale to the v1 loader (see
+    # load_turbo_fp8_kv_tile_K_bs256 above): block 0 is always resident, and
+    # the bytes read for masked-off lanes are discarded by the post-load
+    # tl.where below, so garbage content there is harmless, only memory
+    # safety (not correctness) depends on the clamp.
+    physical_block_idx = tl.where(tile_mask, physical_block_idx, 0)
+
+    block_byte_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_BLOCK)
+        + token_in_block   * (n_kv_heads * BYTES_PER_BLOCK)
+        + kv_head_idx      * BYTES_PER_BLOCK
+    )  # (TILE_SIZE,) int64
+
+    # Per-token FP16 scale — unchanged from v1.
+    scale_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+    scales    = tl.load(scale_ptr, mask=tile_mask, other=0.0).to(tl.float32)  # (TILE_SIZE,)
+
+    # Layout (turbo4_fp8, BS=256, BYTES_PER_BLOCK=162): bytes [0,2) fp16
+    # scale; [2,130) 128 bytes of packed 4-bit indices (element d at nibble
+    # d, low nibble first: byte 2+d//2, nibble d%2); [130,162) 32 sign bytes
+    # (element d at bit d%8 of byte 130+d//8).
+
+    # ---- packed-index load: (TILE_SIZE, 32) int32, one word per 8 elements.
+    # word w covers qs-bytes [4w, 4w+4) (absolute [2+4w, 2+4w+4)), i.e.
+    # elements [8w, 8w+8). NOT tl.multiple_of-hinted: BYTES_PER_BLOCK=162 is
+    # not a multiple of 4, so successive tokens' word-0 addresses are not
+    # 4-byte-aligned in general — RDNA/CDNA global loads tolerate unaligned
+    # offsets (same argument the v1 loader's header comment makes for its
+    # own unaligned int32 word load). Unmasked: memory-safe per the clamp
+    # above; token mask applied post-load below.
+    w = tl.arange(0, 32)
+    idx_word_ptr = (cache_byte_ptr + block_byte_base[:, None] + 2 + 4 * w[None, :]
+                    ).to(tl.pointer_type(tl.int32))
+    idx_words = tl.load(idx_word_ptr)  # (TILE_SIZE, 32) int32
+
+    # ---- sign-byte load: (TILE_SIZE, 8) int32, one word per 32 elements.
+    s = tl.arange(0, 8)
+    sign_word_ptr = (cache_byte_ptr + block_byte_base[:, None] + 130 + 4 * s[None, :]
+                     ).to(tl.pointer_type(tl.int32))
+    sign_words = tl.load(sign_word_ptr)  # (TILE_SIZE, 8) int32
+
+    # ---- expand to per-element idx via broadcast shifts (register-only,
+    # no per-element addresses). nibble j (0..7) of word w is bits
+    # [4j, 4j+4) of the little-endian int32 word (2 nibbles/byte * 4
+    # bytes/word = 8 nibbles/word, low nibble of byte p is nibble 2p, high
+    # nibble of byte p is nibble 2p+1 — i.e. sequential nibble index j runs
+    # low-then-high through bytes p=0..3 in order, matching bit shift 4*j).
+    #
+    # Proof this lands at offs_d = 8w + j: the v1 loader's byte_lo_off for
+    # element d is d//2 (absolute qs-byte d//2, i.e. word (d//2)//4, byte-
+    # in-word (d//2)%4), and bit_off is 0 (low nibble) if d even else 4
+    # (high nibble). Word w's byte-in-word p and nibble parity r together
+    # give word-relative nibble j = 2p + r. Substituting p = (d//2) % 4 and
+    # r = d % 2: j = 2*((d//2) % 4) + d % 2. For d = 8w + j' with j' in
+    # [0, 8): d//2 = 4w + j'//2, (d//2) % 4 = j'//2 (since j'//2 < 4), and
+    # d % 2 = j' % 2, so j = 2*(j'//2) + j'%2 = j' — i.e. the map d <-> (w,j)
+    # is exactly d = 8w + j, both directions. tl.reshape's row-major flatten
+    # of a (., 32, 8) tensor to (., 256) produces flat index 32-block w times
+    # 8 plus j = 8w + j, so the reshape below lands element (w, j) at flat
+    # position 8w + j == d. QED.
+    j = tl.arange(0, 8)
+    nib = (idx_words[:, :, None] >> (4 * j)[None, None, :]) & 0xF   # (TILE, 32, 8)
+    idx = tl.reshape(nib, (idx_words.shape[0], HEAD_SIZE))          # (TILE, 256); can_reorder=False (default) preserves order
+    idx = tl.where(tile_mask[:, None], idx, 0)                      # reproduces v1's `other=0` masked-lane semantics
+
+    # ---- expand to per-element sign bit, same technique. sign byte
+    # offs_d//8 sits at bit position (offs_d//8)*8 + offs_d%8 == offs_d
+    # (standard identity a*8 + a%8's quotient/remainder decomposition), and
+    # sign byte s*4+q of word s occupies bit q*8+b of that word at absolute
+    # bit-of-word b — so word s bit b (0..31) is sign byte s*4 + b//8, bit
+    # b%8 within it, i.e. absolute bit position (s*4 + b//8)*8 + b%8 =
+    # 32s + 8*(b//8) + b%8 = 32s + b (since 8*(b//8) + b%8 == b) == offs_d.
+    # tl.reshape of a (., 8, 32) tensor to (., 256) flattens to 32s + b,
+    # matching offs_d exactly, same argument as the index reshape above.
+    b = tl.arange(0, 32)
+    sgn = (sign_words[:, :, None] >> b[None, None, :]) & 1              # (TILE, 8, 32)
+    sign_bit = tl.reshape(sgn, (sign_words.shape[0], HEAD_SIZE))        # (TILE, 256)
+    sign_bit = tl.where(tile_mask[:, None], sign_bit, 0)
+
+    centroid_byte = tl.load(lut_ptr + idx).to(tl.int32)              # (TILE, 256) — LUT gather unchanged from v1
+    fp8_bytes     = (centroid_byte | (sign_bit << 7)).to(tl.int8)
+
+    return fp8_bytes, scales
+
+
+@triton.jit
+def load_turbo_fp8_kv_tile_K_bs256_v2(
+    cache_byte_ptr, physical_block_idx, token_in_block, kv_head_idx, lut_ptr,
+    n_kv_heads: tl.constexpr, BLOCK_SIZE: tl.constexpr, HEAD_SIZE: tl.constexpr,
+    BYTES_PER_BLOCK: tl.constexpr, tile_mask,
+):
+    """K wrapper: transpose the shared (TILE_SIZE, HEAD_SIZE) core result to
+    (HEAD_SIZE_PADDED, TILE_SIZE), matching load_turbo_fp8_kv_tile_K_bs256's
+    (and every other K loader's) return shape so the tl.dot call sites are
+    unchanged."""
+    fp8_tile, scales = load_turbo4_fp8_kv_tile_bs256_v2(
+        cache_byte_ptr, physical_block_idx, token_in_block, kv_head_idx, lut_ptr,
+        n_kv_heads, BLOCK_SIZE, HEAD_SIZE, BYTES_PER_BLOCK, tile_mask,
+    )
+    return tl.trans(fp8_tile), scales
+
+
+@triton.jit
+def load_turbo_fp8_kv_tile_V_bs256_v2(
+    cache_byte_ptr, physical_block_idx, token_in_block, kv_head_idx, lut_ptr,
+    n_kv_heads: tl.constexpr, BLOCK_SIZE: tl.constexpr, HEAD_SIZE: tl.constexpr,
+    BYTES_PER_BLOCK: tl.constexpr, tile_mask,
+):
+    """V wrapper: the core result is already (TILE_SIZE, HEAD_SIZE_PADDED),
+    V's native layout — no transpose needed."""
+    return load_turbo4_fp8_kv_tile_bs256_v2(
+        cache_byte_ptr, physical_block_idx, token_in_block, kv_head_idx, lut_ptr,
+        n_kv_heads, BLOCK_SIZE, HEAD_SIZE, BYTES_PER_BLOCK, tile_mask,
+    )
+
+
 @triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -852,6 +1029,16 @@ def kernel_unified_attention_2d(
     # use packed f16 tl.dot (v_dot2_f32_f16) instead of Triton's emulated
     # FP8 WMMA (scalar v_fmac_f32 + register spills).
     USE_FP8_WMMA: tl.constexpr = True,
+    # Loader v2 (MAD-2026-09-11 fp8-loader-v2): opt-in, IDX_BITS==4 only
+    # (turbo4_fp8, CACHE_TYPE=24). Replaces the per-element address/load
+    # machinery in load_turbo_fp8_kv_tile_{K,V}_bs256 with the compact
+    # vectorized loader load_turbo_fp8_kv_tile_{K,V}_bs256_v2 (math-
+    # preserving — see that function's docstring/proof comments). Default
+    # False keeps the v1 loader's cache entries untouched; both variants
+    # coexist in the AOT/runtime-compile cache under distinct signatures
+    # (this constexpr is baked into the signature string the same way
+    # USE_FP8_WMMA is).
+    USE_FP8_LOADER_V2: tl.constexpr = False,
     # MAD-214: per-(kv, layer) E4M3 centroid LUTs for turbo-FP8 paths. Caller
     # passes the LUT slice already indexed to the current layer's K/V head.
     # Safely None when CACHE_TYPE is not in the turbo-FP8 family.
@@ -1120,22 +1307,41 @@ def kernel_unified_attention_2d(
             BYTES_PER_FP8_BLOCK: tl.constexpr = 2 + 256 * IDX_BITS // 8 + 32  # 130 / 162 / 194
             N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
 
-            K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256(
-                key_cache_ptr, physical_block_idx, token_in_block,
-                offs_d, kv_head_idx,
-                centroids_k_ptr,
-                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
-                IDX_BITS, BYTES_PER_FP8_BLOCK,
-                dim_mask, tile_mask,
-            )
-            V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256(
-                value_cache_ptr, physical_block_idx, token_in_block,
-                offs_d, kv_head_idx,
-                centroids_v_ptr,
-                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
-                IDX_BITS, BYTES_PER_FP8_BLOCK,
-                dim_mask, tile_mask,
-            )
+            if USE_FP8_LOADER_V2 and IDX_BITS == 4:
+                # Loader v2 (opt-in): compact vectorized load, IDX_BITS==4 only.
+                # See load_turbo4_fp8_kv_tile_bs256_v2 for the full rationale
+                # and correctness proof. Same return shapes as the v1 branch
+                # below (K: (HEAD_SIZE_PADDED, TILE_SIZE), V: (TILE_SIZE,
+                # HEAD_SIZE_PADDED)), so nothing downstream changes.
+                K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256_v2(
+                    key_cache_ptr, physical_block_idx, token_in_block,
+                    kv_head_idx, centroids_k_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    BYTES_PER_FP8_BLOCK, tile_mask,
+                )
+                V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256_v2(
+                    value_cache_ptr, physical_block_idx, token_in_block,
+                    kv_head_idx, centroids_v_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    BYTES_PER_FP8_BLOCK, tile_mask,
+                )
+            else:
+                K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256(
+                    key_cache_ptr, physical_block_idx, token_in_block,
+                    offs_d, kv_head_idx,
+                    centroids_k_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    IDX_BITS, BYTES_PER_FP8_BLOCK,
+                    dim_mask, tile_mask,
+                )
+                V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256(
+                    value_cache_ptr, physical_block_idx, token_in_block,
+                    offs_d, kv_head_idx,
+                    centroids_v_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    IDX_BITS, BYTES_PER_FP8_BLOCK,
+                    dim_mask, tile_mask,
+                )
             # gfx1030: fold the LUT decode into f16 tiles here so the dot
             # sites below can share the F16 tl.dot path. gfx1201 keeps the
             # fp8 bytes for WMMA.
@@ -1310,6 +1516,9 @@ def kernel_unified_attention_3d(
     CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199),
                                         # 10..14/20..24/30..34 = TURBO{3,4,5}_FP8_BS{16..256} (MAD-214)
     USE_FP8_WMMA: tl.constexpr = True,  # False on gfx1030: dequant to f16, packed f16 dot
+    # Loader v2 (MAD-2026-09-11 fp8-loader-v2): see kernel_unified_attention_2d
+    # for full rationale. Opt-in, IDX_BITS==4 (turbo4_fp8) only.
+    USE_FP8_LOADER_V2: tl.constexpr = False,
     centroids_k_ptr = None,             # MAD-214: per-(kv, layer) K centroid LUT (*u8)
     centroids_v_ptr = None,             # MAD-214: per-(kv, layer) V centroid LUT (*u8)
 ):
@@ -1546,22 +1755,41 @@ def kernel_unified_attention_3d(
             BYTES_PER_FP8_BLOCK: tl.constexpr = 2 + 256 * IDX_BITS // 8 + 32  # 130 / 162 / 194
             N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
 
-            K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256(
-                key_cache_ptr, physical_block_idx, token_in_block,
-                offs_d, kv_head_idx,
-                centroids_k_ptr,
-                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
-                IDX_BITS, BYTES_PER_FP8_BLOCK,
-                dim_mask, tile_mask,
-            )
-            V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256(
-                value_cache_ptr, physical_block_idx, token_in_block,
-                offs_d, kv_head_idx,
-                centroids_v_ptr,
-                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
-                IDX_BITS, BYTES_PER_FP8_BLOCK,
-                dim_mask, tile_mask,
-            )
+            if USE_FP8_LOADER_V2 and IDX_BITS == 4:
+                # Loader v2 (opt-in): compact vectorized load, IDX_BITS==4 only.
+                # See load_turbo4_fp8_kv_tile_bs256_v2 for the full rationale
+                # and correctness proof. Same return shapes as the v1 branch
+                # below (K: (HEAD_SIZE_PADDED, TILE_SIZE), V: (TILE_SIZE,
+                # HEAD_SIZE_PADDED)), so nothing downstream changes.
+                K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256_v2(
+                    key_cache_ptr, physical_block_idx, token_in_block,
+                    kv_head_idx, centroids_k_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    BYTES_PER_FP8_BLOCK, tile_mask,
+                )
+                V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256_v2(
+                    value_cache_ptr, physical_block_idx, token_in_block,
+                    kv_head_idx, centroids_v_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    BYTES_PER_FP8_BLOCK, tile_mask,
+                )
+            else:
+                K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256(
+                    key_cache_ptr, physical_block_idx, token_in_block,
+                    offs_d, kv_head_idx,
+                    centroids_k_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    IDX_BITS, BYTES_PER_FP8_BLOCK,
+                    dim_mask, tile_mask,
+                )
+                V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256(
+                    value_cache_ptr, physical_block_idx, token_in_block,
+                    offs_d, kv_head_idx,
+                    centroids_v_ptr,
+                    N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                    IDX_BITS, BYTES_PER_FP8_BLOCK,
+                    dim_mask, tile_mask,
+                )
             if not USE_FP8_WMMA:
                 K = (K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
                      * K_scales[None, :].to(tl.float16))

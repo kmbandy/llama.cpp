@@ -47,6 +47,10 @@ ggml_tensor make_node(const char * name, ggml_op op, int64_t ne0, int64_t ne1 = 
 } // namespace
 
 int main() {
+    // evict_* now hand the evicted graph to a retire callback (deferred
+    // destroy on its last-launch event) instead of destroying in place.
+    auto retire = [](std::unique_ptr<FakeGraph>) {};
+
     const void * a = (const void *) 0x1;
     const void * b = (const void *) 0x2;
     const void * c = (const void *) 0x3;
@@ -56,7 +60,7 @@ int main() {
         Map m;
         put(m, a, 1'000'000);
         put(m, b, 9'000'000);
-        const size_t n = ggml_cuda_graph_cache_evict_ttl(m, 11'000'000, 10'000'000);
+        const size_t n = ggml_cuda_graph_cache_evict_ttl(m, 11'000'000, 10'000'000, retire);
         require(n == 1 && m.size() == 1 && m.count(b) == 1, "ttl drops only unused >= 10s");
     }
 
@@ -65,7 +69,7 @@ int main() {
         put(m, a, 1);
         put(m, b, 2);
         put(m, c, 3);
-        const size_t n = ggml_cuda_graph_cache_evict_lru(m, /*cap=*/2, /*keep=*/nullptr);
+        const size_t n = ggml_cuda_graph_cache_evict_lru(m, /*cap=*/2, /*keep=*/nullptr, retire);
         require(n == 2 && m.size() == 1 && m.count(c) == 1,
                 "lru evicts until size < cap so the next insert fits");
         require(m.count(a) == 0 && m.count(b) == 0, "two oldest are gone");
@@ -75,7 +79,7 @@ int main() {
         Map m;
         put(m, a, 1);
         put(m, b, 2);
-        const size_t n = ggml_cuda_graph_cache_evict_lru(m, /*cap=*/1, /*keep=*/a);
+        const size_t n = ggml_cuda_graph_cache_evict_lru(m, /*cap=*/1, /*keep=*/a, retire);
         require(n == 1 && m.size() == 1 && m.count(a) == 1, "lru never evicts keep");
     }
 
@@ -83,9 +87,9 @@ int main() {
         Map m;
         put(m, a, 1);
         put(m, b, 2);
-        require(ggml_cuda_graph_cache_evict_lru(m, /*cap=*/0, nullptr) == 0 && m.size() == 2,
+        require(ggml_cuda_graph_cache_evict_lru(m, /*cap=*/0, nullptr, retire) == 0 && m.size() == 2,
                 "cap 0 is no cap");
-        require(ggml_cuda_graph_cache_evict_lru(m, /*cap=*/8, nullptr) == 0 && m.size() == 2,
+        require(ggml_cuda_graph_cache_evict_lru(m, /*cap=*/8, nullptr, retire) == 0 && m.size() == 2,
                 "under cap is a no-op");
     }
 
@@ -95,7 +99,7 @@ int main() {
         put(m, a, 1);
         put(m, b, 2);
         put(m, c, 3);
-        ggml_cuda_graph_cache_evict_lru(m, /*cap=*/3, nullptr);
+        ggml_cuda_graph_cache_evict_lru(m, /*cap=*/3, nullptr, retire);
         put(m, d, 4);
         require(m.size() == 3 && m.count(d) == 1 && m.count(a) == 0,
                 "insert after lru-to-cap keeps the new key and drops LRU");

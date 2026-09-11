@@ -56,7 +56,8 @@ bool target_has_fp8_wmma(const std::string & target) {
 //   pos 23 → block_size (BLOCK_SIZE constexpr)
 //   pos 25 → head_size (HEAD_SIZE constexpr)
 //   pos 26 → head_size (HEAD_SIZE_PADDED constexpr; assumes head_size is pow2)
-std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmma) {
+std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmma,
+                                int use_fp8_loader_v2 = 0) {
     // MAD-199: K/V cache pointer dtype depends on cache_type. F16 stays
     // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:16` byte
     // pointers and bake CACHE_TYPE=1/2 as the kernel constexpr — both branches
@@ -106,7 +107,7 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmm
         "%d, %d, %d, %d, "                  // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
-        "*i32, %d, i32, %d, %d, 1, %d, %d, " // query_start_len, BLOCK_Q, num_seqs, BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE, USE_FP8_WMMA
+        "*i32, %d, i32, %d, %d, 1, %d, %d, %d, " // query_start_len, BLOCK_Q, num_seqs, BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE, USE_FP8_WMMA, USE_FP8_LOADER_V2
         "*i8:16, *i8:16",                     // MAD-214: centroids_k_ptr, centroids_v_ptr (None-safe for non-FP8)
         kv_ptr_dtype,                           // K cache pointer dtype
         kv_ptr_dtype,                           // V cache pointer dtype
@@ -121,7 +122,8 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmm
         MT_AITER_UATTN_BLOCK_M,                 // BLOCK_M constexpr
         MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ,    // NUM_SEGMENTS_PER_SEQ constexpr
         cache_type_val,                         // CACHE_TYPE constexpr (MAD-199)
-        use_fp8_wmma);                          // USE_FP8_WMMA constexpr (0 on gfx1030)
+        use_fp8_wmma,                           // USE_FP8_WMMA constexpr (0 on gfx1030)
+        use_fp8_loader_v2);                     // USE_FP8_LOADER_V2 constexpr (MAD-2026-09-11 fp8-loader-v2, opt-in)
     return buf;
 }
 
@@ -139,7 +141,8 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmm
 // drives *fp16:16 vs *i8:16 and the CACHE_TYPE constexpr).
 std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
                                 int block_m, int block_q, int use_fp8_wmma,
-                                int tile_size = MT_AITER_UATTN_TILE_SIZE) {
+                                int tile_size = MT_AITER_UATTN_TILE_SIZE,
+                                int use_fp8_loader_v2 = 0) {
     const char * kv_ptr_dtype;
     int          cache_type_val;
     switch (s.cache_type) {
@@ -163,7 +166,7 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         "0, 0, 0, 0, 0, "                                                // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "                           // k/v cache strides (last is constexpr=1)
         "*i32, %d, i32, %d, "                                            // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M
-        "-448.0, 448.0, 0, %d, %d, "                                     // FP8_MIN, FP8_MAX, ALL_DECODE=0, CACHE_TYPE, USE_FP8_WMMA
+        "-448.0, 448.0, 0, %d, %d, %d, "                                 // FP8_MIN, FP8_MAX, ALL_DECODE=0, CACHE_TYPE, USE_FP8_WMMA, USE_FP8_LOADER_V2
         "*i8:16, *i8:16",                                                  // MAD-214: centroids_k_ptr, centroids_v_ptr
         kv_ptr_dtype, kv_ptr_dtype,
         s.num_q_heads, s.num_q_heads / s.num_kv_heads,
@@ -174,7 +177,8 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         block_q,                            // BLOCK_Q
         block_m,                            // BLOCK_M
         cache_type_val,                     // CACHE_TYPE
-        use_fp8_wmma);                      // USE_FP8_WMMA (0 on gfx1030)
+        use_fp8_wmma,                       // USE_FP8_WMMA (0 on gfx1030)
+        use_fp8_loader_v2);                 // USE_FP8_LOADER_V2 (MAD-2026-09-11 fp8-loader-v2, opt-in)
     return buf;
 }
 
@@ -255,7 +259,27 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
 
     const std::string target  = detect_hip_target();
     const int use_fp8_wmma    = target_has_fp8_wmma(target) ? 1 : 0;
-    const std::string sig_3d  = build_signature_3d(shape, use_fp8_wmma);
+    // fp8-loader-v2 (MAD-2026-09-11): opt-in compact-vectorized-load variant
+    // of the turbo4_fp8 (IDX_BITS=4, CACHE_TYPE=24) K/V loaders — see
+    // kernels/unified_attention.py's USE_FP8_LOADER_V2 comment for the full
+    // rationale (targets the per-element address/instruction bloat that
+    // num_warps=8 alone could not remove, per fp8-kernel-why-0911.txt §3/§4).
+    // Plumbed exactly like MT_AITER_GFX1201_NUM_WARPS8 below: an opt-in env
+    // var, off by default, baked into the signature string (and therefore
+    // the AOT/runtime-compile cache key) the same way USE_FP8_WMMA is, so
+    // the v1 and v2 loader variants compile to and live in distinct cache
+    // entries and can be A/B'd without a rebuild. The kernel itself only
+    // acts on this flag when IDX_BITS==4 (CACHE_TYPE==24); for other
+    // turbo-FP8 cache types the flag is still baked into the signature (its
+    // own cache slot) but the kernel body silently falls back to the v1
+    // loader for them.
+    // Default ON since 2026-09-11: measured bit-identical to the v1 loader
+    // (tests/test_aiter_turbo_fp8_smoke on gfx1201 and gfx1030) and +33%
+    // prefill at 16k on the 27B TP shape (634 -> 846 tok/s). Set
+    // MT_AITER_FP8_LOADER_V2=0 to fall back to the v1 loader.
+    int use_fp8_loader_v2 = 1;
+    if (const char * s = std::getenv("MT_AITER_FP8_LOADER_V2")) { use_fp8_loader_v2 = std::atoi(s) != 0 ? 1 : 0; }
+    const std::string sig_3d  = build_signature_3d(shape, use_fp8_wmma, use_fp8_loader_v2);
     const std::string sig_red = build_signature_reduce(shape);
 
     aiter::Registry & reg = aiter::Registry::instance();
@@ -339,7 +363,8 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
 
     // MAD-199 D3: 2D base prefill spec (BLOCK_M=16, BLOCK_Q=2).
     const std::string sig_2d = build_signature_2d(
-        shape, MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q, use_fp8_wmma);
+        shape, MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q, use_fp8_wmma,
+        MT_AITER_UATTN_TILE_SIZE, use_fp8_loader_v2);
     aiter::KernelSpec spec_2d {
         AITER_KERNEL_SOURCE_DEFAULT,
         "kernel_unified_attention_2d",
@@ -401,7 +426,8 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     bool large_compiled = false;
     if (large_ok) {
         const std::string sig_2d_large = build_signature_2d(
-            shape, block_m_large, block_q_large, use_fp8_wmma, tile_size_large);
+            shape, block_m_large, block_q_large, use_fp8_wmma, tile_size_large,
+            use_fp8_loader_v2);
         aiter::KernelSpec spec_2d_large {
             AITER_KERNEL_SOURCE_DEFAULT,
             "kernel_unified_attention_2d",
@@ -429,9 +455,9 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     }
 
     std::fprintf(stderr,
-        "mt_aiter_unified_attn: target=%s USE_FP8_WMMA=%d GQA=%d "
+        "mt_aiter_unified_attn: target=%s USE_FP8_WMMA=%d USE_FP8_LOADER_V2=%d GQA=%d "
         "2d_large BLOCK_M=%d BLOCK_Q=%d (base 16/2)\n",
-        target.c_str(), use_fp8_wmma,
+        target.c_str(), use_fp8_wmma, use_fp8_loader_v2,
         mt_aiter_uattn_gqa(shape.num_q_heads, shape.num_kv_heads),
         large_compiled ? block_m_large : MT_AITER_UATTN_BLOCK_M,
         large_compiled ? block_q_large : MT_AITER_UATTN_BLOCK_Q);
