@@ -128,16 +128,24 @@ static uint32_t meta_overlap_split_factor(uint32_t n_ubatch) {
     if (requested <= 1) {
         return requested;
     }
+    // Called once per decode; warn once per distinct n_ubatch, not per call.
+    static uint32_t warned_n_ubatch = 0;
     if (n_ubatch % requested != 0) {
-        LLAMA_LOG_WARN("%s: GGML_META_OVERLAP_SPLIT=%u does not divide n_ubatch=%u; meta overlap disabled\n",
-                       __func__, requested, n_ubatch);
+        if (warned_n_ubatch != n_ubatch) {
+            warned_n_ubatch = n_ubatch;
+            LLAMA_LOG_WARN("%s: GGML_META_OVERLAP_SPLIT=%u does not divide n_ubatch=%u; meta overlap disabled\n",
+                           __func__, requested, n_ubatch);
+        }
         return 0;
     }
 
     const uint32_t subbatch = n_ubatch / requested;
     if (subbatch < k_meta_overlap_min_ubatch) {
-        LLAMA_LOG_WARN("%s: GGML_META_OVERLAP_SPLIT=%u makes sub-batch=%u below minimum %u; meta overlap disabled\n",
-                       __func__, requested, subbatch, k_meta_overlap_min_ubatch);
+        if (warned_n_ubatch != n_ubatch) {
+            warned_n_ubatch = n_ubatch;
+            LLAMA_LOG_WARN("%s: GGML_META_OVERLAP_SPLIT=%u makes sub-batch=%u below minimum %u; meta overlap disabled\n",
+                           __func__, requested, subbatch, k_meta_overlap_min_ubatch);
+        }
         return 0;
     }
 
@@ -3557,7 +3565,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const meta_overlap_mode overlap_mode = overlap_meta != nullptr
         ? meta_overlap_scheduling_mode()
         : meta_overlap_mode::disabled;
-    const uint32_t validated_overlap_split = overlap_mode != meta_overlap_mode::disabled
+    // A draft context (MTP/DFlash sidecar, n_ubatch of a few tokens) can never
+    // overlap; do not validate the split against it or it warns every decode.
+    const uint32_t validated_overlap_split = overlap_mode != meta_overlap_mode::disabled && !is_draft_ctx(cparams)
         ? meta_overlap_split_factor(cparams.n_ubatch)
         : 1;
     const uint32_t overlap_split = validated_overlap_split > 1 ? validated_overlap_split : 1;
