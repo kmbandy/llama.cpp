@@ -126,6 +126,37 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // MAD-LAB: opt-in second nextn-embedding staging path -- see the
+    // extraction block in llama_context::decode() (search "nextn_stage") and
+    // draft-sync-cost-0912.txt for why this exists. nextn_stage_enable() is
+    // idempotent; safe to call every process() invocation. Every other
+    // context (staging never enabled) pays exactly one `if` per ubatch and
+    // is otherwise unaffected -- embd_nextn/get_embeddings_nextn() and their
+    // existing callers are untouched.
+    void nextn_stage_enable();
+
+    // Which stage slot (0 or 1) the CURRENT/most-recent decode() call wrote
+    // (or will write) its nextn rows into. A caller that wants to read a
+    // SPECIFIC decode() call's staged rows later must record this value
+    // right after that call, then pass it back to
+    // get_embeddings_nextn_staged_at() -- do NOT assume "the other slot
+    // from whatever is current now": that only holds if exactly one more
+    // decode() call has happened in between, which is not true across a
+    // flush with nothing left to overlap (see draft-sync-cost-0912.txt,
+    // the have=0/need=N fix). No sync needed, just an int read.
+    int nextn_stage_index() const { return nextn_stage_write; }
+
+    // Wall time (ns) spent on the nextn staging copy during the most
+    // recent decode() call -- see nextn_stage_copy_ns's declaration below.
+    uint64_t wp_nextn_stage_copy_ns() const { return nextn_stage_copy_ns; }
+
+    // Returns the nextn rows staged by the decode() call that wrote slot
+    // `slot` (0 or 1, from nextn_stage_index() taken right after that
+    // call), after synchronizing so it is safe to read, plus how many rows
+    // are valid in it. Returns nullptr / *n_tokens_out = 0 if staging was
+    // never enabled or that slot has not been written yet.
+    const float * get_embeddings_nextn_staged_at(int slot, uint32_t * n_tokens_out);
+
     // dense-segment head: the nextn buffer is filled from the tail segment's
     // wire sideband instead of the local graph, which never sets the width.
     // The wire owner declares it here so *_ith accessors stride correctly.
@@ -401,6 +432,38 @@ private:
     buffer_view<float> embd_nextn = {nullptr, 0};
     // MAD-LAB: nextn rows follow the graph tensor width, which can vary by graph.
     uint32_t n_embd_nextn = 0;
+
+    // MAD-LAB: opt-in second nextn-embedding staging buffer (see
+    // nextn_stage_enable() / get_embeddings_nextn_staged_at() above). Two
+    // plain host vectors, ping-ponged one decode() call at a time, entirely
+    // separate from embd_nextn/buf_output so this never touches (or is
+    // touched by) the existing single-buffer path every other caller uses.
+    bool                     nextn_stage_enabled = false;
+    int                      nextn_stage_write   = 0; // slot index written by the CURRENT decode() call
+    std::vector<float>       nextn_stage[2];
+    uint32_t                 nextn_stage_n_tokens[2] = {0, 0};
+    // MAD-LAB: incremented once per top-level decode() call while staging is
+    // enabled, so WP_SPEC_PREFILL_STATS log lines can pair a "wrote chunk N"
+    // line with the "resolved chunk N" line in common/speculative.cpp.
+    uint64_t                 nextn_stage_chunk_id = 0;
+
+    // MAD-LAB: wall time (ns) spent issuing the nextn staging copy
+    // (ggml_backend_tensor_get_async into nextn_stage[]) during the MOST
+    // RECENT top-level decode() call -- reset to 0 at the top of every
+    // decode() call, summed across that call's ubatches, same
+    // reset-then-sum shape as wp_last_gc_ns (WP_STEP_STATS) above. Only
+    // accumulated when WP_SPEC_PREFILL_STATS is set (see
+    // wp_spec_prefill_stats_enabled() in llama-context.cpp); 0 otherwise.
+    // Read back via llama_get_nextn_stage_copy_ns() so a caller
+    // (server-context.cpp's decode()) can fold it into its own per-prompt
+    // accumulator right after each llama_decode(ctx_tgt, ...) call -- this
+    // is NOT part of common_speculative's a/b/c buckets (which live
+    // entirely inside common_speculative_process()); it measures something
+    // those buckets cannot see: time spent INSIDE llama_context::decode()
+    // itself, extracting/copying nextn rows for the whole batch, per
+    // target decode call, independent of whether/when draft-mtp later
+    // reads them.
+    uint64_t                 nextn_stage_copy_ns = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

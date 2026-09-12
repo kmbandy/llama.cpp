@@ -82,6 +82,16 @@ void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// MAD-LAB: prefill-sync pipelining (see draft-sync-cost-0912.txt). Resolves
+// whatever a prior common_speculative_process() call deferred (currently
+// only draft-mtp's single-head path defers anything; every other
+// implementation's flush is a no-op). MUST be called once after the LAST
+// common_speculative_process() call for a prompt and before the first
+// common_speculative_draft() call for it -- draft() reads per-sequence
+// state (pending_h/i_last/chain_h) that a deferred process() call has not
+// written yet. Safe to call even when nothing is pending (no-op then too).
+bool common_speculative_flush_prefill(common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
@@ -92,6 +102,34 @@ void common_speculative_draft(common_speculative * spec);
 // spec is null.
 size_t common_speculative_last_n_draft_decodes(const common_speculative * spec);
 
+// WP_SPEC_PREFILL_STATS: wall-clock breakdown of the MOST RECENT
+// common_speculative_process(spec, batch) call's draft-mtp hidden-state
+// handoff, in nanoseconds. Only set (nonzero) by
+// common_speculative_impl_draft_mtp's process() override, in its
+// non-mem-shared (catch-up decode) branch; every other implementation, and
+// the mem-shared branch (e.g. Gemma4), leaves these at 0. All fields are 0
+// unless WP_SPEC_PREFILL_STATS=1 -- the timers are not taken at all when
+// unset, so this is a zero-cost accessor returning zeroes.
+//   a_sync_ns   -- time inside llama_get_embeddings_nextn(ctx_tgt), which is
+//                  ctx_tgt->synchronize() (the dual-GPU meta-backend drain)
+//                  plus the embeddings_nextn pointer fetch.
+//   b_copy_ns   -- host-side work around that: the draft llama_batch build
+//                  (common_batch_clear/common_batch_add loop) plus the
+//                  memcpy of h_tgt into batch.embd and the pending/prior
+//                  hidden-state fill (set_h()).
+//   c_decode_ns -- sum of llama_decode(ctx_dft, batch) calls (the per-MTP-
+//                  layer catch-up decode loop).
+//   c_n_chunks  -- number of llama_decode(ctx_dft, ...) calls summed into
+//                  c_decode_ns (== n_mtp_layers on success).
+//   c_n_tokens  -- sum of n_tokens across those calls.
+struct common_speculative_wp_prefill_call_stats {
+    uint64_t a_sync_ns   = 0;
+    uint64_t b_copy_ns   = 0;
+    uint64_t c_decode_ns = 0;
+    uint32_t c_n_chunks  = 0;
+    uint64_t c_n_tokens  = 0;
+};
+common_speculative_wp_prefill_call_stats common_speculative_wp_prefill_last_call_stats(const common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

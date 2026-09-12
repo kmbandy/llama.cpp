@@ -46,6 +46,18 @@ static bool wp_dspark_debug() {
     return s_on;
 }
 
+// WP_SPEC_PREFILL_STATS=1: see common_speculative_wp_prefill_call_stats in
+// speculative.h. Read once; when unset, process() takes none of the
+// std::chrono timestamps below the gate -- same zero-cost-when-off shape as
+// wp_dspark_debug()/wp_spec_hash_trace() above.
+static bool wp_spec_prefill_stats_enabled() {
+    static const bool s_on = [](){
+        const char * e = std::getenv("WP_SPEC_PREFILL_STATS");
+        return e && e[0] == '1';
+    }();
+    return s_on;
+}
+
 static bool wp_spec_hash_trace() {
     static const bool s_on = [](){
         const char * e = std::getenv("WP_SPEC_HASH_TRACE");
@@ -263,6 +275,22 @@ struct common_speculative_impl {
     // can normalise a decode step's ms by how many draft calls it cost.
     size_t n_decode_calls_last = 0;
 
+    // WP_SPEC_PREFILL_STATS: wall-clock breakdown of the MOST RECENT
+    // process() call's draft-mtp hidden-state handoff, in nanoseconds. Only
+    // common_speculative_impl_draft_mtp::process() sets these (guarded by
+    // wp_spec_prefill_stats_enabled(), zero-cost when unset -- the timers
+    // are not taken at all in that case, these fields just stay 0); every
+    // other implementation leaves them at 0. Read back via
+    // common_speculative_wp_prefill_last_call_stats() so a caller
+    // (server-context.cpp) can fold them into a per-prompt accumulator.
+    // See common_speculative_wp_prefill_call_stats in speculative.h for
+    // what each field measures.
+    uint64_t wp_pp_a_sync_ns   = 0;
+    uint64_t wp_pp_b_copy_ns   = 0;
+    uint64_t wp_pp_c_decode_ns = 0;
+    uint32_t wp_pp_c_n_chunks  = 0;
+    uint64_t wp_pp_c_n_tokens  = 0;
+
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
@@ -279,6 +307,15 @@ struct common_speculative_impl {
     virtual void reset(llama_seq_id /*seq_id*/) {}
 
     virtual bool process(const llama_batch & batch) = 0;
+
+    // MAD-LAB: prefill-sync pipelining (see draft-sync-cost-0912.txt). Some
+    // implementations (currently draft-mtp's single-head path) defer part of
+    // a process() call's work by one call so its target-side sync overlaps
+    // the NEXT target decode() instead of blocking it from being issued.
+    // Must be called once after the LAST process() call for a prompt and
+    // before the first draft() call for it, to resolve whatever is still
+    // pending. No-op (true) for every implementation that doesn't defer.
+    virtual bool flush_pending() { return true; }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -2350,6 +2387,62 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // MAD-LAB: prefill-sync pipelining (see draft-sync-cost-0912.txt).
+    // Scoped STRICTLY to the single-head, non-shared-KV case (n_mtp_layers
+    // == 1, i.e. !chain_heads -- qwen35/qwen35moe's one trained MTP head,
+    // the setup this was measured on). is_mem_shared (gemma4) already skips
+    // the whole catch-up decode and never sets pipeline_enabled; chain_heads
+    // models (multi-head MTP) always take the original, byte-for-byte
+    // unmodified path in process() below -- pipelining is wired in only
+    // through the two `if (!chain_heads)` branches there, so nothing about
+    // their control flow, KV writes, or per-head bookkeeping changes.
+    //
+    // process() for chunk K+1 captures chunk K+1's batch (tokens/pos/seq_id,
+    // a cheap CPU-only copy -- NOT the sync) and, if a PRIOR chunk (K) is
+    // still pending, resolves it now: sync + read ctx_tgt's *staged* nextn
+    // rows for chunk K (llama_get_embeddings_nextn_staged_at(), by the
+    // EXPLICIT stage slot capture_pending() recorded for chunk K via
+    // llama_get_embd_nextn_stage_index() right after chunk K's own
+    // decode() call -- NOT "the other slot from whatever's current now",
+    // which is only correct when exactly one more decode() has happened in
+    // between and breaks at a flush with nothing left to overlap; see
+    // draft-sync-cost-0912.txt) +
+    // the shift-copy + the draft's own catch-up llama_decode(ctx_dft, ...)
+    // for chunk K + the verify_h/pending_h bookkeeping chunk K's tail needs.
+    // Because chunk K+1's own llama_decode(ctx_tgt, ...) was already issued
+    // by the caller (server-context.cpp's decode()) before this
+    // process(batch_in) call runs, that sync drains chunk K+1's freshly
+    // enqueued GPU work too -- i.e. it's no longer wasted idle wait time in
+    // front of chunk K+1's issuance, it overlaps with chunk K+1's own
+    // compute. See draft-sync-cost-0912.txt for the full mechanism and the
+    // wall-time argument for why this is a real reduction, not just a
+    // relabeling.
+    //
+    // flush_pending() (called once by the caller, right before the first
+    // draft() for this prompt -- see common_speculative_flush_prefill())
+    // resolves whatever chunk is still pending after the LAST process()
+    // call, exactly like every prior resolve, just with nothing left to
+    // overlap it with (same cost as today's per-chunk sync, paid once
+    // instead of N times).
+    bool pipeline_enabled = false;
+    bool pipeline_pending = false;
+
+    std::vector<llama_token>  pend_token;
+    std::vector<llama_pos>    pend_pos;
+    std::vector<llama_seq_id> pend_seq_id;
+    int32_t pend_n_tokens = 0;
+    std::vector<int32_t> pend_i_batch_beg;
+    std::vector<int32_t> pend_i_batch_end;
+    // MAD-LAB: which nextn_stage slot (0/1) THIS pending chunk's decode()
+    // call wrote -- recorded explicitly at capture time via
+    // llama_get_embd_nextn_stage_index(), NOT re-derived at resolve time.
+    // "the other slot from whatever's current now" is only correct when
+    // exactly one more decode() call has happened since capture, which is
+    // false at a flush with nothing left to overlap (a prompt that fits in
+    // one chunk, or any prompt's LAST pending chunk) -- see
+    // draft-sync-cost-0912.txt for the have=0/need=N bug this fixes.
+    int pend_stage_slot = -1;
+
     uint64_t hash_trace_step = 0;
     std::vector<llama_token> hash_trace_tokens;
     std::vector<int32_t> hash_trace_i_batch;
@@ -2418,6 +2511,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        // MAD-LAB: prefill-sync pipelining (see draft-sync-cost-0912.txt).
+        // MUST happen here, at construction, NOT lazily on the first
+        // process() call -- server-context.cpp's decode() always issues
+        // ctx_tgt's llama_decode() for a prompt's FIRST chunk before this
+        // spec's process() is ever called, so enabling staging inside
+        // process() would be one decode() call too late: that first
+        // chunk's own extraction would already have run with
+        // nextn_stage_enabled still false and never write anything into
+        // the stage buffer, leaving resolve_pending() to find nothing
+        // there when it later tries to read it (have=0). Enabling here,
+        // before ANY decode() on ctx_tgt has happened for this spec, means
+        // even the very first chunk's extraction sees staging on. Scoped
+        // to the case that actually uses it (see the pipeline_* member
+        // comments above); gemma4/chain_heads never call
+        // get_embeddings_nextn_staged_at() so there is no reason to pay
+        // the extra per-ubatch copy for them.
+        if (!is_mem_shared && !chain_heads) {
+            llama_enable_embd_nextn_staging(ctx_tgt);
+            pipeline_enabled = true;
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
@@ -2436,6 +2550,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        pend_i_batch_beg.assign(n_seq, -1);
+        pend_i_batch_end.assign(n_seq, -1);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -2479,6 +2596,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void reset(llama_seq_id seq_id) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        // MAD-LAB: if a chunk is still pending (prefill-sync pipelining --
+        // see process()/resolve_pending()), resolve it now, BEFORE clearing
+        // this seq's state below. Otherwise a later resolve_pending() /
+        // flush_pending() would silently resurrect pending_h/verify_h for a
+        // sequence that was just reset. Cheap no-op when nothing is
+        // pending. May touch OTHER seq_ids present in the same pending
+        // chunk too -- harmless, it's the same work they'd need resolved
+        // eventually anyway, just done a little earlier.
+        if (pipeline_pending) {
+            resolve_pending();
         }
 
         std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
@@ -2538,8 +2667,46 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
-        // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        // if kv is shared with target (e.g Gemma4), then we can skip the
+        // catch-up decode entirely -- ORIGINAL, unmodified path.
+        if (is_mem_shared) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] < 0) {
+                    continue;
+                }
+
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                verify_h_rows[seq_id] = n_rows;
+                verify_h[seq_id].resize((size_t) n_rows * n_embd);
+
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
+
+                std::memcpy(pending_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            }
+
+            return true;
+        }
+
+        if (chain_heads) {
+            // ORIGINAL, unmodified multi-head path -- MAD-LAB prefill-sync
+            // pipelining (see draft-sync-cost-0912.txt) is scoped to the
+            // single-head case only; chain models keep this exact
+            // byte-for-byte behavior, sync included, every call.
+            const bool wp_pp_stats = wp_spec_prefill_stats_enabled();
+            if (wp_pp_stats) {
+                wp_pp_a_sync_ns   = 0;
+                wp_pp_b_copy_ns   = 0;
+                wp_pp_c_decode_ns = 0;
+                wp_pp_c_n_chunks  = 0;
+                wp_pp_c_n_tokens  = 0;
+            }
+
+            const auto wp_pp_t_b0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -2552,11 +2719,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
+                const auto wp_pp_t_a0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                if (wp_pp_stats) {
+                    wp_pp_a_sync_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - wp_pp_t_a0).count();
+                }
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
-            // fill the pending embeddings from a previous run
             auto set_h = [&](int idx, const float * h_row) {
                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
             };
@@ -2569,22 +2740,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
+            if (wp_pp_stats) {
+                wp_pp_b_copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wp_pp_t_b0).count() - wp_pp_a_sync_ns;
+            }
+
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
                     }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
+                    llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
                 }
+                llama_set_nextn_layer_offset(ctx_dft, head);
 
+                const auto wp_pp_t_c0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                if (wp_pp_stats) {
+                    wp_pp_c_decode_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - wp_pp_t_c0).count();
+                    wp_pp_c_n_chunks += 1;
+                    wp_pp_c_n_tokens += (uint64_t) n_tokens;
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -2593,12 +2774,176 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
-            if (chain_heads) {
-                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
-            }
+            llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             if (!ok) {
                 return false;
             }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] < 0) {
+                    continue;
+                }
+
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                verify_h_rows[seq_id] = n_rows;
+                verify_h[seq_id].resize((size_t) n_rows * n_embd);
+
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
+
+                std::memcpy(pending_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            }
+
+            return true;
+        }
+
+        // Single-head case (!is_mem_shared && !chain_heads, i.e.
+        // n_mtp_layers == 1 -- qwen35/qwen35moe). Staging is enabled once,
+        // at construction time (see the ctor, above) -- NOT lazily here.
+        // It must be on before the very first decode() call this spec ever
+        // sees on ctx_tgt, which already happened by the time this
+        // process() call runs (server-context.cpp issues
+        // llama_decode(ctx_tgt, ...) before calling process()); enabling it
+        // lazily here would be one decode() call too late for chunk 1.
+        // GGML_ASSERT, not a silent bail: if this ever fires, staging
+        // wasn't enabled where it needs to be and resolve_pending() would
+        // otherwise fail confusingly later with "have=0".
+        GGML_ASSERT(pipeline_enabled && "nextn staging must be enabled in the ctor, not lazily in process()");
+
+        // MAD-LAB: this SAME call site (server-context.cpp decode(), the
+        // ONE place that calls common_speculative_process() for real token
+        // batches) fires for BOTH prompt prefill chunks AND every
+        // generation-time verify step -- see draft-sync-cost-0912.txt's
+        // second bugfix. Only prefill chunks may be deferred: draft(),
+        // called immediately after a verify-step process() call, needs
+        // pending_h/verify_h/i_last refreshed for THAT call right now, not
+        // one process() call later, and a verify call never gets a later
+        // flush_pending() to resolve it (that only fires once per prompt,
+        // at prompt-done) -- deferring one would leave it pending forever,
+        // corrupting the NEXT thing that finally does drain it (this is
+        // exactly what produced the observed "pos=8017 rc=-1" crash: a
+        // stale, wrong-phase batch sitting in pend_* got resolved against
+        // the wrong KV state at the next prompt's flush).
+        //
+        // A verify batch is at most n_max+1 tokens (the last accepted/
+        // sampled token plus up to n_max drafted tokens); a real prefill
+        // chunk is the server's whole n_batch-bounded slab, always far
+        // larger for any config that would benefit from pipelining at all.
+        // Using n_max+1 as the cutoff (rather than an arbitrary constant)
+        // means a prompt/chunk that happens to be small enough to be
+        // ambiguous just falls back to the always-correct synchronous
+        // path instead of guessing wrong -- see process_single_head_sync().
+        const bool is_prefill_chunk = n_tokens > (this->n_max + 1);
+
+        if (!is_prefill_chunk) {
+            // Generation-time verify call: byte-for-byte the ORIGINAL
+            // synchronous single-head behavior (process_single_head_sync()
+            // below), never deferred.
+            if (pipeline_pending) {
+                // Defensive only: flush_pending() is supposed to have
+                // already resolved the last prefill chunk before
+                // generation starts, so this should never fire. If it
+                // ever does, resolve it now rather than silently
+                // dropping/misordering state.
+                if (!resolve_pending()) {
+                    return false;
+                }
+            }
+            return process_single_head_sync(batch_in, n_tokens);
+        }
+
+        // Prefill chunk: deferred/pipelined path. See draft-sync-cost-0912.txt
+        // and the pipeline_* member comments above for the mechanism.
+        bool ok = true;
+        if (pipeline_pending) {
+            // Resolve the PRIOR chunk now. ctx_tgt's llama_decode() for
+            // THIS chunk (batch_in) was already issued by the caller before
+            // this process(batch_in) call (see server-context.cpp decode():
+            // llama_decode(ctx_tgt, ...) always precedes
+            // common_speculative_process()), so resolve_pending()'s sync
+            // overlaps that already-enqueued GPU work instead of blocking
+            // its issuance.
+            ok = resolve_pending();
+        }
+
+        capture_pending(batch_in, n_tokens);
+        pipeline_pending = true;
+
+        return ok;
+    }
+
+    // MAD-LAB: byte-for-byte the ORIGINAL (pre-pipelining) single-head
+    // process() body -- builds the draft batch, reads ctx_tgt's nextn rows
+    // via the LIVE (not staged) accessor (an immediate, un-overlapped
+    // synchronize() -- correct and necessary here: this path is only used
+    // for generation-time verify calls, one at a time, with nothing later
+    // to overlap the wait with), runs the single catch-up
+    // llama_decode(ctx_dft, ...), and fills verify_h/pending_h. Used for
+    // (a) every generation-time verify call in the pipelined single-head
+    // case, and (b) any prefill chunk small enough to be classified as a
+    // verify call by the n_max+1 heuristic above (safe fallback, just
+    // forgoes pipelining for that one chunk).
+    bool process_single_head_sync(const llama_batch & batch_in, int32_t n_tokens) {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        const bool wp_pp_stats = wp_spec_prefill_stats_enabled();
+        if (wp_pp_stats) {
+            wp_pp_a_sync_ns   = 0;
+            wp_pp_b_copy_ns   = 0;
+            wp_pp_c_decode_ns = 0;
+            wp_pp_c_n_chunks  = 0;
+            wp_pp_c_n_tokens  = 0;
+        }
+
+        const auto wp_pp_t_b0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+
+        common_batch_clear(batch);
+        for (int k = 0; k < n_tokens; ++k) {
+            common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+        }
+
+        {
+            const auto wp_pp_t_a0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            if (wp_pp_stats) {
+                wp_pp_a_sync_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wp_pp_t_a0).count();
+            }
+            std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+        }
+
+        auto set_h = [&](int idx, const float * h_row) {
+            std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+        };
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+        }
+
+        if (wp_pp_stats) {
+            wp_pp_b_copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wp_pp_t_b0).count() - wp_pp_a_sync_ns;
+        }
+
+        const auto wp_pp_t_c0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+        const int32_t rc = llama_decode(ctx_dft, batch);
+        if (wp_pp_stats) {
+            wp_pp_c_decode_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wp_pp_t_c0).count();
+            wp_pp_c_n_chunks += 1;
+            wp_pp_c_n_tokens += (uint64_t) n_tokens;
+        }
+        if (rc != 0) {
+            SPC_ERR("llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
+            return false;
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2620,6 +2965,139 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         return true;
+    }
+
+    // MAD-LAB: cheap CPU-only snapshot of the just-decoded chunk (tokens,
+    // positions, single seq_id per token, and this call's i_batch_beg/end),
+    // so resolve_pending() can replay it one process() call later without
+    // touching ctx_tgt again. No sync, no GPU work -- see process() above.
+    void capture_pending(const llama_batch & batch_in, int32_t n_tokens) {
+        pend_token.assign(batch_in.token, batch_in.token + n_tokens);
+        pend_pos.assign(batch_in.pos, batch_in.pos + n_tokens);
+        pend_seq_id.resize(n_tokens);
+        for (int32_t k = 0; k < n_tokens; ++k) {
+            pend_seq_id[k] = batch_in.seq_id[k][0];
+        }
+        pend_n_tokens    = n_tokens;
+        pend_i_batch_beg = i_batch_beg;
+        pend_i_batch_end = i_batch_end;
+        // Record which stage slot THIS chunk's already-completed decode()
+        // call wrote -- ctx_tgt's decode() for batch_in ran before this
+        // process(batch_in) call (see server-context.cpp decode()), so the
+        // index is already fixed by the time we read it here.
+        pend_stage_slot  = llama_get_embd_nextn_stage_index(this->params.ctx_tgt);
+        if (wp_spec_prefill_stats_enabled()) {
+            SPC_INF("captured pending chunk: tokens=%d stage_slot=%d (pair with the "
+                    "\"nextn stage write ... slot=%d\" line llama-context.cpp just logged)\n",
+                    n_tokens, pend_stage_slot, pend_stage_slot);
+        }
+    }
+
+    // MAD-LAB: resolves whatever chunk capture_pending() last captured --
+    // the deferred half of process()'s original single-head body: sync +
+    // read the STAGED (not live) nextn rows for that chunk + the shift-copy
+    // + the draft's own catch-up llama_decode(ctx_dft, ...) + the
+    // verify_h/pending_h bookkeeping. Only called for !is_mem_shared &&
+    // !chain_heads (see process() / flush_pending()).
+    bool resolve_pending() {
+        if (!pipeline_pending) {
+            return true;
+        }
+        pipeline_pending = false;
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+        const int32_t  n_tokens  = pend_n_tokens;
+        const size_t   row_bytes = (size_t) n_embd * sizeof(float);
+
+        const bool wp_pp_stats = wp_spec_prefill_stats_enabled();
+        if (wp_pp_stats) {
+            wp_pp_a_sync_ns   = 0;
+            wp_pp_b_copy_ns   = 0;
+            wp_pp_c_decode_ns = 0;
+            wp_pp_c_n_chunks  = 0;
+            wp_pp_c_n_tokens  = 0;
+        }
+
+        const auto wp_pp_t_b0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+
+        common_batch_clear(batch);
+        for (int32_t k = 0; k < n_tokens; ++k) {
+            common_batch_add(batch, pend_token[k], pend_pos[k], { pend_seq_id[k] }, 0);
+        }
+
+        const auto wp_pp_t_a0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+        uint32_t n_staged = 0;
+        const float * h_tgt = llama_get_embeddings_nextn_staged_at(ctx_tgt, pend_stage_slot, &n_staged);
+        if (wp_pp_stats) {
+            wp_pp_a_sync_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wp_pp_t_a0).count();
+        }
+        if (h_tgt == nullptr || (int32_t) n_staged < n_tokens) {
+            SPC_ERR("draft-mtp: staged nextn rows missing/short for pending chunk "
+                    "(have=%u need=%d stage_slot=%d) -- staging must be enabled before "
+                    "the chunk's own decode() call; see draft-sync-cost-0912.txt\n",
+                    n_staged, n_tokens, pend_stage_slot);
+            return false;
+        }
+
+        std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens - 1));
+
+        auto set_h = [&](int idx, const float * h_row) {
+            std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+        };
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (pend_i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            set_h(pend_i_batch_beg[seq_id], pending_h[seq_id].data());
+        }
+
+        if (wp_pp_stats) {
+            wp_pp_b_copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wp_pp_t_b0).count() - wp_pp_a_sync_ns;
+        }
+
+        const auto wp_pp_t_c0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+        const int32_t rc = llama_decode(ctx_dft, batch);
+        if (wp_pp_stats) {
+            wp_pp_c_decode_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wp_pp_t_c0).count();
+            wp_pp_c_n_chunks += 1;
+            wp_pp_c_n_tokens += (uint64_t) n_tokens;
+        }
+        if (rc != 0) {
+            SPC_ERR("llama_decode(ctx_dft) pending-chunk failed rc=%d (pos=%d)\n",
+                    (int) rc, pend_n_tokens > 0 ? (int) pend_pos[0] : -1);
+            return false;
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (pend_i_batch_end[seq_id] < 0) {
+                continue;
+            }
+
+            const int32_t n_rows = pend_i_batch_end[seq_id] - pend_i_batch_beg[seq_id] + 1;
+            verify_h_rows[seq_id] = n_rows;
+            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const float * h = h_tgt + (size_t) (pend_i_batch_beg[seq_id] + i) * n_embd;
+                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            }
+
+            std::memcpy(pending_h[seq_id].data(),
+                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+        }
+
+        return true;
+    }
+
+    bool flush_pending() override {
+        // is_mem_shared / chain_heads never set pipeline_pending, so this is
+        // a no-op for them (matches the base class default).
+        return resolve_pending();
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -4167,6 +4645,20 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+bool common_speculative_flush_prefill(common_speculative * spec) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->flush_pending();
+    }
+
+    return result;
+}
+
 bool common_speculative_need_embd_nextn(common_speculative * spec) {
     if (spec == nullptr) {
         return false;
@@ -4191,6 +4683,22 @@ size_t common_speculative_last_n_draft_decodes(const common_speculative * spec) 
         total += impl->n_decode_calls_last;
     }
     return total;
+}
+
+common_speculative_wp_prefill_call_stats common_speculative_wp_prefill_last_call_stats(const common_speculative * spec) {
+    common_speculative_wp_prefill_call_stats result;
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result.a_sync_ns   += impl->wp_pp_a_sync_ns;
+        result.b_copy_ns   += impl->wp_pp_b_copy_ns;
+        result.c_decode_ns += impl->wp_pp_c_decode_ns;
+        result.c_n_chunks  += impl->wp_pp_c_n_chunks;
+        result.c_n_tokens  += impl->wp_pp_c_n_tokens;
+    }
+    return result;
 }
 
 static void common_speculative_capture_draft(const common_speculative_impl * impl,

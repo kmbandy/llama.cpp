@@ -183,6 +183,45 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// MAD-LAB: draft-mtp prefill-sync pipelining (see draft-sync-cost-0912.txt).
+// Enable the second nextn staging buffer on `ctx` (idempotent). MUST be
+// called before the FIRST llama_decode(ctx, ...) the caller cares about
+// staging rows for -- enabling it after that call has already happened is
+// one call too late (that call's own extraction already ran with staging
+// off and wrote nothing to the stage buffer). Once enabled, every
+// llama_decode(ctx, ...) also copies that call's nextn rows into a staging
+// slot; llama_get_embd_nextn_stage_index() / llama_get_embeddings_nextn_staged_at()
+// below read them back explicitly by slot. Does not change
+// llama_get_embeddings_nextn()/_ith() or any other reader of `ctx`.
+LLAMA_API void llama_enable_embd_nextn_staging(struct llama_context * ctx);
+
+// Which stage slot (0 or 1) the CURRENT/most-recent llama_decode(ctx, ...)
+// call wrote (or will write) its nextn rows into. Call this right after the
+// decode() call whose rows you'll want later, and hang onto the result --
+// do NOT assume "the other slot from whatever's current" at read time,
+// that only holds if exactly one more decode() call has happened in
+// between (see draft-sync-cost-0912.txt). No sync, just an int read.
+LLAMA_API int llama_get_embd_nextn_stage_index(struct llama_context * ctx);
+
+// Returns the nextn rows staged by the decode() call that wrote slot
+// `slot` (0 or 1, from llama_get_embd_nextn_stage_index() taken right
+// after that call), or nullptr / *n_tokens = 0 if staging isn't enabled or
+// that slot hasn't been written. Synchronizes just enough to make the data
+// safe to read; unlike llama_get_embeddings_nextn(), this is intended to be
+// called AFTER the caller has already issued a LATER llama_decode(ctx,
+// ...) (if any), so the wait is paid concurrently with that later call's
+// GPU work rather than serialized in front of it.
+LLAMA_API const float * llama_get_embeddings_nextn_staged_at(struct llama_context * ctx, int slot, uint32_t * n_tokens);
+
+// Wall time (ns) spent issuing the nextn staging copy during the MOST
+// RECENT llama_decode(ctx, ...) call (0 if staging isn't enabled or
+// WP_SPEC_PREFILL_STATS isn't set -- the timer isn't taken at all then).
+// This measures something common_speculative's a/b/c buckets cannot see:
+// time spent INSIDE llama_context::decode() itself doing the staging copy,
+// per target decode call, independent of when/whether draft-mtp later
+// reads the result. See draft-sync-cost-0912.txt.
+LLAMA_API uint64_t llama_get_nextn_stage_copy_ns(struct llama_context * ctx);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

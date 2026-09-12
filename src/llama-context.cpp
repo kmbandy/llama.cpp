@@ -281,6 +281,18 @@ static bool wp_spine_layer_profile_enabled() {
     return enabled;
 }
 
+// MAD-LAB: same flag common/speculative.cpp and tools/server/server-context.cpp
+// gate their WP_SPEC_PREFILL_STATS timers/log lines on -- reused here only to
+// gate the nextn-staging enable/write LOG_INF lines below (see
+// draft-sync-cost-0912.txt), not to take any timing measurements in this file.
+static bool wp_spec_prefill_stats_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_SPEC_PREFILL_STATS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 static void wp_spine_layer_profile_split_cb(
         const char * backend_name,
         const ggml_cgraph * graph,
@@ -1962,6 +1974,52 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+void llama_context::nextn_stage_enable() {
+    // MAD-LAB: idempotent -- callers (common/speculative.cpp's draft-mtp
+    // ctor) may call this more than once; only the first call matters.
+    if (nextn_stage_enabled) {
+        return;
+    }
+    nextn_stage_enabled = true;
+    if (wp_spec_prefill_stats_enabled()) {
+        LLAMA_LOG_INFO("%s: nextn staging enabled on ctx=%p\n", __func__, (void *) this);
+    }
+}
+
+const float * llama_context::get_embeddings_nextn_staged_at(int slot, uint32_t * n_tokens_out) {
+    // MAD-LAB: see nextn_stage_enable()/nextn_stage_index() in
+    // llama-context.h and draft-sync-cost-0912.txt. Reads an EXPLICIT slot
+    // (the caller must have recorded nextn_stage_index() right after the
+    // decode() call it wants) rather than guessing "the other slot from
+    // whatever's current" -- that guess is only correct when exactly one
+    // more decode() call has happened since, which is false when resolving
+    // at a flush point with no further decode() in between (a prompt that
+    // fits in one chunk, or the last pending chunk of any prompt). If the
+    // caller follows the intended pipelining pattern (issue the next
+    // llama_decode(), THEN call this for the PRIOR call's slot), that next
+    // call's GPU work is already enqueued by the time synchronize() below
+    // runs, so the wait is paid concurrently with it instead of serialized
+    // in front of it; if there is no next call (flush), this is just a
+    // normal, unhidden synchronize(), same cost as the pre-pipelining code.
+    if (n_tokens_out) {
+        *n_tokens_out = 0;
+    }
+    if (!nextn_stage_enabled || slot < 0 || slot > 1) {
+        return nullptr;
+    }
+
+    if (nextn_stage[slot].empty() || nextn_stage_n_tokens[slot] == 0) {
+        return nullptr;
+    }
+
+    synchronize();
+
+    if (n_tokens_out) {
+        *n_tokens_out = nextn_stage_n_tokens[slot];
+    }
+    return nextn_stage[slot].data();
 }
 
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
@@ -3709,6 +3767,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+
+    // MAD-LAB: flip the nextn staging write-slot once per top-level decode()
+    // call (not per ubatch -- multiple ubatches/sub-batches of THIS call
+    // accumulate into the SAME slot at increasing offsets below, mirroring
+    // embd_nextn's own within-call accumulation). No-op when staging was
+    // never enabled. See nextn_stage_enable() / llama-context.h.
+    if (nextn_stage_enabled) {
+        nextn_stage_write = 1 - nextn_stage_write;
+        nextn_stage_n_tokens[nextn_stage_write] = 0;
+        nextn_stage_chunk_id++;
+        nextn_stage_copy_ns = 0; // reset-then-sum across this call's ubatches, see wp_nextn_stage_copy_ns()
+    }
+
     // MAD-LAB: the decode scope uses the shared dispatcher when borrowed.
     expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch);
 
@@ -3986,6 +4057,42 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+
+                // MAD-LAB: optional second copy into a caller-owned staging slot, so
+                // a caller (draft-mtp prefill pipelining -- see
+                // draft-sync-cost-0912.txt) can read THIS call's nextn rows via
+                // llama_get_embeddings_nextn_staged_at() one decode() call later,
+                // after it has already issued the NEXT decode() -- instead of
+                // forcing a synchronize() here that blocks the next decode() from
+                // being issued at all. Opt-in via nextn_stage_enable(); a single
+                // bool check (false) for every context that never calls it, so
+                // this changes nothing for embd_nextn/get_embeddings_nextn() or any
+                // of their existing callers (Gemma4/GLM4-MoE/Cohere2MoE/... all
+                // still read the unchanged buffer above exactly as before).
+                // Unmasked-only ( !masked ): masked (single-row) callers only ever
+                // need one row at a time and don't have the per-chunk drain problem
+                // this exists for.
+                if (nextn_stage_enabled && !masked) {
+                    const bool wp_pp_stats = wp_spec_prefill_stats_enabled();
+                    const auto wp_pp_t0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+
+                    auto & slot = nextn_stage[nextn_stage_write];
+                    const size_t need = (size_t) (offset + n_rows) * n_embd;
+                    if (slot.size() < need) {
+                        slot.resize(need);
+                    }
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, slot.data() + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
+                    nextn_stage_n_tokens[nextn_stage_write] = (uint32_t) std::max<int64_t>(nextn_stage_n_tokens[nextn_stage_write], offset + n_rows);
+
+                    if (wp_pp_stats) {
+                        const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - wp_pp_t0).count();
+                        nextn_stage_copy_ns += ns;
+                        LLAMA_LOG_INFO("%s: nextn stage write chunk_id=%" PRIu64 " slot=%d +%" PRId64 " rows -> cumulative=%u (issue took %.3f ms, call total so far %.3f ms)\n",
+                                __func__, nextn_stage_chunk_id, nextn_stage_write, n_rows,
+                                nextn_stage_n_tokens[nextn_stage_write], ns / 1e6, nextn_stage_copy_ns / 1e6);
+                    }
+                }
             }
         }
 
@@ -6581,6 +6688,22 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+void llama_enable_embd_nextn_staging(llama_context * ctx) {
+    ctx->nextn_stage_enable();
+}
+
+int llama_get_embd_nextn_stage_index(llama_context * ctx) {
+    return ctx->nextn_stage_index();
+}
+
+uint64_t llama_get_nextn_stage_copy_ns(llama_context * ctx) {
+    return ctx->wp_nextn_stage_copy_ns();
+}
+
+const float * llama_get_embeddings_nextn_staged_at(llama_context * ctx, int slot, uint32_t * n_tokens) {
+    return ctx->get_embeddings_nextn_staged_at(slot, n_tokens);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
