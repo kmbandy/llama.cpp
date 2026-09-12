@@ -325,10 +325,11 @@ namespace GGUFMeta {
             case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
                                               (std::is_same<T,    uint32_t>::value); break;
             case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+            case GGUF_TYPE_INT64:   type_ok = (std::is_same<T,     int64_t>::value); break;
             case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
             case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64/int64 array", key.c_str()));
         }
         if (!type_ok) {
             throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
@@ -416,6 +417,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<int64_t>>(enum llm_kv kid, std::vector<int64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
@@ -545,7 +547,8 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const std::vector<std::string> & sidecars)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -676,6 +679,37 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
+
+        // MAD-LAB: sidecar GGUFs. Separately converted tensor sets (e.g. the
+        // DeepSeek-V4.1 Engram tables, converted straight from HF shards into
+        // their own GGUF) that carry no split.* metadata. Loaded after any
+        // numbered splits, in the given order; each gets the next file_idx,
+        // which is what the weight pager keys page sources on.
+        for (const std::string & fname_side : sidecars) {
+            struct ggml_context * ctx_side = NULL;
+            struct gguf_init_params side_params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &ctx_side,
+            };
+            gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_side.c_str(), side_params) };
+            if (!ctx_gguf) {
+                throw std::runtime_error(format("%s: failed to load GGUF sidecar from %s", __func__, fname_side.c_str()));
+            }
+            const uint16_t idx = (uint16_t) files.size();
+            files.emplace_back(new llama_file(fname_side.c_str(), "rb", use_direct_io));
+            contexts.emplace_back(ctx_side);
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx_side); cur; cur = ggml_get_next_tensor(ctx_side, cur)) {
+                std::string tensor_name = std::string(cur->name);
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated by sidecar %s", ggml_get_name(cur), fname_side.c_str()));
+                }
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+            }
+            LLAMA_LOG_INFO("%s: sidecar GGUF %s loaded as file %u (%" PRId64 " tensors)\n", __func__,
+                    fname_side.c_str(), (unsigned) idx, gguf_get_n_tensors(ctx_gguf.get()));
+        }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
@@ -709,6 +743,40 @@ llama_model_loader::llama_model_loader(
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        const int64_t n_user_tensors = gguf_get_n_tensors(metadata);
+        if (n_user_tensors > 0) {
+            if ((uint64_t) n_user_tensors > SIZE_MAX / ggml_tensor_overhead()) {
+                throw std::runtime_error(format("too many tensors in user metadata"));
+            }
+
+            struct ggml_context * ctx = NULL;
+            ggml_init_params params = {
+                /*.mem_size   =*/ (size_t) n_user_tensors * ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctx = ggml_init(params);
+            if (ctx == nullptr) {
+                throw std::runtime_error(format("failed to create ggml context for user tensor metadata"));
+            }
+            contexts.emplace_back(ctx);
+
+            for (int64_t i = 0; i < n_user_tensors; ++i) {
+                const char * tensor_name = gguf_get_tensor_name(metadata, i);
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", tensor_name));
+                }
+
+                ggml_tensor * cur = ggml_new_tensor(ctx, gguf_get_tensor_type(metadata, i), GGML_MAX_DIMS,
+                        gguf_get_tensor_ne(metadata, i));
+                if (cur == nullptr) {
+                    throw std::runtime_error(format("failed to create tensor metadata for '%s'", tensor_name));
+                }
+                ggml_set_name(cur, tensor_name);
+                weights_map.emplace(tensor_name, llama_tensor_weight(cur));
+            }
+        }
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -1449,10 +1517,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 void llama_model_loader::done_getting_tensors(bool partial, bool pipeline_band) {
     is_pipeline_band = pipeline_band;
 
-    if (n_created > n_tensors) {
+    if (!files.empty() && n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
-    if (n_created < n_tensors) {
+    if (!files.empty() && n_created < n_tensors) {
         if (!partial) {
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
         }

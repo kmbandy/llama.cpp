@@ -1315,7 +1315,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // MAD-LAB: the draft must not inherit the target's resident-expert placement --
         // it would run its own island fill against whatever VRAM the target left behind.
         params_dft.weight_paging_resident_experts = "off";
-
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
@@ -1779,6 +1778,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.weight_paging_blob_entries  = params.weight_paging_blob_index->entries.data();
         mparams.weight_paging_n_blob_entries = params.weight_paging_blob_index->entries.size();
     }
+
+    // MAD-LAB: sidecar GGUFs (see --model-sidecar)
+    params.model_sidecar_ptrs.clear();
+    for (const std::string & path : params.model_sidecars) {
+        params.model_sidecar_ptrs.push_back(path.c_str());
+    }
+    mparams.sidecar_files   = params.model_sidecar_ptrs.empty() ? nullptr : params.model_sidecar_ptrs.data();
+    mparams.n_sidecar_files = params.model_sidecar_ptrs.size();
 
     // cross-machine pipeline band
     mparams.pipeline_layer_first = params.pipeline_layer_first;

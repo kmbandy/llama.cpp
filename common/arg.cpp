@@ -3273,6 +3273,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_BLOBS"));
     add_opt(common_arg(
+        {"--model-sidecar"}, "FNAME",
+        "extra GGUF loaded with the model (repeatable). For tensor sets converted\n"
+        "separately from the main file and carrying no split metadata, e.g. the\n"
+        "DeepSeek-V4.1 Engram tables. Tensor names must not collide with the model.",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.model_sidecars.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
         {"--pipeline-layers"}, "FIRST-LAST",
         "cross-machine pipeline parallelism: this process owns only layers [FIRST, LAST].\n"
         "token_embd loads only when FIRST == 0; output_norm/output only when LAST is the\n"

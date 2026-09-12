@@ -3093,6 +3093,11 @@ struct Descriptor {
     int                                          expert_first = -1;
     int                                          expert_last  = -1;
     bool                                         sliced = false;
+    // layer-ranges: a band of whole layers (every retained expert), one shard
+    // per layer. Per-layer expert counts may be below hparams.n_expert
+    // (DeepSeek-V4.1 MTP blocks route over 128 of 384).
+    bool                                         layered = false;
+    std::map<int, int>                           layer_n_expert;
     int64_t                                      slice_first = 0;
     int64_t                                      slice_last  = 0;
     json                                         expert_slicing;
@@ -3330,6 +3335,14 @@ Descriptor load_descriptor(const fs::path & path) {
     if (result.identity_algorithm.empty() || result.identity_value.empty()) {
         throw std::runtime_error(path.string() + ": empty shard manifest identity");
     }
+    if (value.contains("sharding_mode")) {
+        const std::string mode = get_value<std::string>(value, "sharding_mode", path);
+        result.layered = mode == "layer-ranges";
+        if ((result.sliced && mode != "expert-slice") ||
+            (!result.sliced && !result.layered && mode != "expert-index-range")) {
+            throw std::runtime_error(path.string() + ": descriptor sharding_mode disagrees with its geometry");
+        }
+    }
     const json & source_model = value.at("source_model");
     result.input_model = get_value<std::string>(source_model, "input_model", path);
     for (const json & model_file : get_array(source_model, "model_files", path)) {
@@ -3345,6 +3358,15 @@ Descriptor load_descriptor(const fs::path & path) {
         if (layer < 0 || layer >= result.hparams.n_layer || result.layers.count(layer) != 0) {
             throw std::runtime_error(path.string() + ": invalid or repeated layer descriptor");
         }
+        int n_expert_il = result.hparams.n_expert;
+        if (layer_value.contains("n_expert")) {
+            n_expert_il = get_value<int>(layer_value, "n_expert", path);
+            if (n_expert_il <= 0 || n_expert_il > result.hparams.n_expert ||
+                (!result.layered && n_expert_il != result.hparams.n_expert)) {
+                throw std::runtime_error(path.string() + ": invalid per-layer expert count");
+            }
+        }
+        result.layer_n_expert[layer] = n_expert_il;
         const json & roles = layer_value.at("roles");
         std::map<std::string, RoleSpec> parsed;
         for (const std::string name : { "gate", "up", "down" }) {
@@ -3385,7 +3407,8 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
     check_format(manifest, MANIFEST_FORMAT, manifest_path);
     const std::string sharding_mode = get_value<std::string>(manifest, "sharding_mode", manifest_path);
     if ((result.descriptor.sliced && sharding_mode != "expert-slice") ||
-        (!result.descriptor.sliced && sharding_mode != "expert-index-range")) {
+        (result.descriptor.layered && sharding_mode != "layer-ranges") ||
+        (!result.descriptor.sliced && !result.descriptor.layered && sharding_mode != "expert-index-range")) {
         throw std::runtime_error("worker descriptor and shard manifest sharding modes disagree");
     }
     if (result.descriptor.sliced && manifest.at("expert_slicing") != result.descriptor.expert_slicing) {
@@ -3462,6 +3485,17 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
         const json & groups = get_array(index, "groups", index_path);
         if (groups.size() != get_value<uint64_t>(index, "group_count", index_path)) {
             throw std::runtime_error(index_path.string() + ": group count mismatch");
+        }
+        {
+            // Whole-layer shards carry expert_first..expert_first+n-1 where n is
+            // the layer's own expert count (== the retained width unless the
+            // descriptor says the layer is narrower).
+            const size_t want_groups = result.descriptor.layered
+                ? (size_t) result.descriptor.layer_n_expert.at(layer_first)
+                : (size_t) (result.descriptor.expert_last - result.descriptor.expert_first + 1);
+            if (groups.size() != want_groups) {
+                throw std::runtime_error(index_path.string() + ": group count does not match the layer's expert count");
+            }
         }
         uint64_t next_offset = 0;
         int expected_expert = result.descriptor.expert_first;

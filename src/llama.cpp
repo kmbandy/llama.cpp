@@ -792,8 +792,16 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        std::vector<std::string> sidecars;
+        for (size_t i = 0; i < params.n_sidecar_files; ++i) {
+            if (params.sidecar_files == nullptr || params.sidecar_files[i] == nullptr) {
+                throw std::runtime_error("sidecar_files has a null entry");
+            }
+            sidecars.emplace_back(params.sidecar_files[i]);
+        }
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides,
+            sidecars);
 
         ml.lazy.mode = params.lazy_mode;
 

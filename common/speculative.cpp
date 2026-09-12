@@ -3645,6 +3645,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (has_draft) {
         result.devices               = params_spec.devices;
         result.model                 = params_spec.mparams;
+        // MAD-LAB: sidecars belong to the target GGUF; a separate draft model
+        // must not pick up the target's Engram tables.
+        result.model_sidecars.clear();
+        result.model_sidecar_ptrs.clear();
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 

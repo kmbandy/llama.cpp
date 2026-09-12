@@ -49,6 +49,8 @@ public:
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
+    void fill_score(float value) const;
+
 private:
     struct layer {
         uint32_t il;
@@ -161,6 +163,7 @@ private:
 
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
+    const bool csa2;
 
     std::vector<uint32_t> rs_idx;
 

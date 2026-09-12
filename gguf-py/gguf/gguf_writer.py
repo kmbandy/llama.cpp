@@ -727,6 +727,50 @@ class GGUFWriter:
     def add_hash_layer_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.HASH_LAYER_COUNT.format(arch=self.arch), count)
 
+    def add_engram_head_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.ENGRAM_HEAD_COUNT.format(arch=self.arch), count)
+
+    def add_engram_key_length(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.ENGRAM_KEY_LENGTH.format(arch=self.arch), length)
+
+    def add_engram_max_ngram_size(self, size: int) -> None:
+        self.add_uint32(Keys.LLM.ENGRAM_MAX_NGRAM_SIZE.format(arch=self.arch), size)
+
+    def add_engram_layer_ids(self, ids: Sequence[int]) -> None:
+        self.add_array(Keys.LLM.ENGRAM_LAYER_IDS.format(arch=self.arch), ids)
+
+    def add_engram_vocab_size(self, size: int) -> None:
+        self.add_uint32(Keys.LLM.ENGRAM_VOCAB_SIZE.format(arch=self.arch), size)
+
+    def add_engram_pad_token_id(self, token_id: int) -> None:
+        self.add_uint32(Keys.LLM.ENGRAM_PAD_TOKEN_ID.format(arch=self.arch), token_id)
+
+    def add_engram_compressed_vocab_size(self, size: int) -> None:
+        self.add_uint32(Keys.LLM.ENGRAM_COMPRESSED_VOCAB_SIZE.format(arch=self.arch), size)
+
+    def add_engram_token_map(self, token_map: Sequence[int]) -> None:
+        self.add_array(Keys.LLM.ENGRAM_TOKEN_MAP.format(arch=self.arch), token_map)
+
+    def add_engram_hash_multipliers(self, multipliers: Sequence[int]) -> None:
+        # ~1e13 magnitudes: force the int64 element type rather than letting get_type() infer int32
+        self.add_key_value(Keys.LLM.ENGRAM_HASH_MULTIPLIERS.format(arch=self.arch), list(multipliers),
+                           GGUFValueType.ARRAY, GGUFValueType.INT64)
+
+    def add_kv_source_layer_ids(self, ids: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.KV_SOURCE_LAYER_IDS.format(arch=self.arch), ids)
+
+    def add_index_source_layer_ids(self, ids: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.INDEX_SOURCE_LAYER_IDS.format(arch=self.arch), ids)
+
+    def add_candidate_source_layer_id(self, layer_id: int) -> None:
+        self.add_uint32(Keys.Attention.CANDIDATE_SOURCE_LAYER_ID.format(arch=self.arch), layer_id)
+
+    def add_candidate_topk_blocks(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.CANDIDATE_TOPK_BLOCKS.format(arch=self.arch), count)
+
+    def add_candidate_block_size(self, size: int) -> None:
+        self.add_uint32(Keys.Attention.CANDIDATE_BLOCK_SIZE.format(arch=self.arch), size)
+
     def add_feed_forward_length(self, length: int | Sequence[int]) -> None:
         if isinstance(length, int):
             self.add_uint32(Keys.LLM.FEED_FORWARD_LENGTH.format(arch=self.arch), length)
@@ -910,6 +954,9 @@ class GGUFWriter:
 
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
+
+    def add_nextn_expert_used_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.NEXTN_EXPERT_USED_COUNT.format(arch=self.arch), count)
 
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)

@@ -394,6 +394,13 @@ extern "C" {
         // Explicit paged block bands per device, e.g. "ROCm0:0-37;ROCm1:38-74".
         const char * weight_paging_device_layers;
 
+        // MAD-LAB: sidecar GGUFs loaded alongside the model. Separately
+        // converted tensor sets (e.g. the DeepSeek-V4.1 Engram tables) that
+        // carry no split.* metadata. Each gets the next loader file index in
+        // order; tensor names must not collide with the main file.
+        const char * const * sidecar_files;
+        size_t               n_sidecar_files;
+
         // Expert-major repacked blobs (wp-repack). When set, the pager reads
         // routed-expert pages from these blobs instead of the source GGUFs.
         // A blob stores one expert's gate/up/down CONTIGUOUSLY, so a routed

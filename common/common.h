@@ -637,6 +637,10 @@ struct common_params {
     // When set, routed experts are read from the blobs (one contiguous read per
     // expert) instead of from the source GGUFs (three scattered reads).
     std::string weight_paging_blobs;
+    // MAD-LAB: extra GGUFs loaded with the model (no split.* metadata), e.g.
+    // the DeepSeek-V4.1 Engram tables. Owned here; mparams borrows pointers.
+    std::vector<std::string>  model_sidecars;
+    std::vector<const char *> model_sidecar_ptrs;
     // Parsed form of the above. Lives here because llama_model_params holds
     // borrowed pointers into it for the duration of the model load.
     std::shared_ptr<common_wp_blob_index> weight_paging_blob_index;

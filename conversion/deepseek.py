@@ -526,6 +526,7 @@ class DeepseekV32Model(DeepseekV2Model):
 @ModelBase.register("DeepseekV4ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-Base")
 class DeepseekV4Model(TextModel):
+    _dspark_tap_offset = 1  # legacy V4 convention (see set_gguf_parameters)
     model_arch = gguf.MODEL_ARCH.DEEPSEEK4
 
     # Root (unprefixed) tensors after mtp.{stage}. rekey — DSpark / DFlash heads.
@@ -740,7 +741,10 @@ class DeepseekV4Model(TextModel):
             markov_rank = int(hparams.get("dspark_markov_rank", 256))
             target_layer_ids = hparams.get("dspark_target_layer_ids", [40, 41, 42])
             # Runtime extract indices are 1-based (see DSparkDraftMixin / dflash loader).
-            extract_layer_ids = [int(i) + 1 for i in target_layer_ids]
+            # t_layer_inp[lid] is the INPUT of layer lid. DeepSeek's reference taps h
+            # BEFORE layer i for i in dspark_target_layer_ids, i.e. lid == i; the V4
+            # converter has always shifted by one, so the offset is per class.
+            extract_layer_ids = [int(i) + self._dspark_tap_offset for i in target_layer_ids]
 
             self.gguf_writer.add_block_size(block_size)
             self.gguf_writer.add_target_layers(extract_layer_ids)
@@ -919,6 +923,10 @@ class DeepseekV4Model(TextModel):
         for bid in range(self.block_count):
             if self.mtp_only and bid < main_layers:
                 continue
+            probe = f"layers.{bid}.ffn.experts.0.w1.weight"
+            if probe not in self.model_tensors:
+                # Spine-only convert: routed experts already live in .wpb blobs.
+                continue
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP))
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP))
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP))
@@ -1084,6 +1092,275 @@ class DeepseekV4Model(TextModel):
         super().prepare_tensors()
         self._is_mxfp4 = True
         self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41Model(DeepseekV4Model):
+    """DeepSeek-V4.1-Flash. Subclasses V4; own GGUF arch; Engram forced MXFP4.
+
+    Differences from V4 this class has to account for:
+
+      * text parameters are nested under text_config
+      * num_hash_layers is absent; V4 reads it unconditionally
+      * FP8 scale block size is [32, 32] rather than V4's [128, 128]
+      * engram tables, indexer k_norm and wk projections are new
+      * attn.compressor.ape and attn.indexer.compressor.* are absent
+      * no output_hc_fn/base/scale (Single-Pass mHC)
+      * compress_ratios use CSA2 0/1/2, not V4's 0/4/128
+
+    Do NOT overwrite block_count after the parent MTP integration. V4.1 still
+    ships mtp.0-2 (num_nextn_predict_layers=3); #28696's convert-only draft
+    reset block_count to num_hidden_layers and would drop those stages.
+    """
+    # V4.1 reference (inference/model.py Transformer.forward) taps the input of layer i.
+    _dspark_tap_offset = 0
+
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK41
+
+    _MTP_ROOT_MAP = {
+        **DeepseekV4Model._MTP_ROOT_MAP,
+        "markov_head.embed.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.head.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+    }
+    _MTP_UNPREFIXED_REST = frozenset({
+        *_MTP_ROOT_MAP.keys(),
+        "main_proj.scale",
+    })
+
+    def _v41_flatten_hparams(self):
+        for key, value in (self.hparams.get("text_config") or {}).items():
+            self.hparams.setdefault(key, value)
+        self.hparams.setdefault("num_hash_layers", 0)
+
+    def index_tensors(self, remote_hf_model_id=None):
+        self._v41_flatten_hparams()
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        qcfg = raw.get("quantization_config") or {}
+        block = qcfg.get("weight_block_size") or [128, 128]
+        self._v41_block_rows = int(block[0])
+        self._v41_block_cols = int(block[1] if len(block) > 1 else block[0])
+        logger.info(
+            "DeepSeek-V4.1: fp8 weight_block_size %dx%d, block_count=%d "
+            "(main %d + mtp %d), engram layers %s",
+            self._v41_block_rows, self._v41_block_cols,
+            self.block_count,
+            int(self.hparams.get("num_hidden_layers", 0)),
+            self._mtp_stage_count,
+            self.hparams.get("engram_layer_ids"),
+        )
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, _ = item
+        if name.startswith(("vision.", "aligner.", "image_")):
+            return None
+        if ".ffn.experts." in name:
+            return None
+        return super().filter_tensors(item)
+
+    def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_TENSOR, str]:
+        match = re.match(r"layers\.(\d+)\.(.+)$", name)
+        if match is not None:
+            extra = {
+                "attn.indexer.k_norm.weight": (gguf.MODEL_TENSOR.INDEXER_K_NORM, ".weight"),
+                "attn.indexer.wk.weight": (gguf.MODEL_TENSOR.INDEXER_ATTN_K, ".weight"),
+            }
+            rest = match.group(2)
+            if rest in extra:
+                return extra[rest]
+        return super()._map_dsv4_tensor_name(name, bid)
+
+    def dequant_model(self):
+        fp8_dtypes = self._float8_dtypes()
+        tensors_to_remove: list[str] = []
+        rows, cols = self._v41_block_rows, self._v41_block_cols
+
+        def dequant_fp8_weight(weight: Tensor, scale: Tensor) -> Tensor:
+            out_features, in_features = weight.shape
+            scale_f = self._e8m0_to_float(scale)
+            scale_f = scale_f.repeat_interleave(rows, 0)[:out_features]
+            scale_f = scale_f.repeat_interleave(cols, 1)[:, :in_features]
+            return weight.float() * scale_f
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".scale"):
+                continue
+            # Engram scale is [rows, 8] (per-row 32-col groups), not [32,32].
+            # The table is rewritten from the safetensors shard in
+            # _write_engram_table; do not materialize a 384M-row dequant here.
+            if ".engram.embed." in name:
+                continue
+            weight_name = name.removesuffix(".scale") + ".weight"
+            if weight_name not in self.model_tensors:
+                continue
+            weight = self.model_tensors[weight_name]
+            scale = self.model_tensors[name]
+            if weight().dtype not in fp8_dtypes:
+                continue
+            self.model_tensors[weight_name] = lambda w=weight, s=scale: dequant_fp8_weight(w(), s())
+            self._dsv4_fp8_dequantized.add(weight_name)
+            tensors_to_remove.append(name)
+
+        for name in tensors_to_remove:
+            del self.model_tensors[name]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+        if (n_expert_used := hparams.get("dspark_num_experts_per_tok")) is not None:
+            self.gguf_writer.add_nextn_expert_used_count(int(n_expert_used))
+        if (engram_ids := hparams.get("engram_layer_ids")) is not None:
+            self.gguf_writer.add_engram_head_count(hparams["engram_n_heads"])
+            self.gguf_writer.add_engram_key_length(hparams["engram_head_dim"])
+            self.gguf_writer.add_engram_max_ngram_size(hparams["engram_max_ngram_size"])
+            self.gguf_writer.add_engram_layer_ids(engram_ids)
+            if (vocab := hparams.get("engram_vocab_size")) is not None:
+                self.gguf_writer.add_engram_vocab_size(vocab)
+            if (pad := hparams.get("engram_pad_token_id")) is not None:
+                self.gguf_writer.add_engram_pad_token_id(pad)
+            if (cvocab := hparams.get("engram_compressed_vocab_size")) is not None:
+                self.gguf_writer.add_engram_compressed_vocab_size(cvocab)
+            # Hasher inputs the C++ side cannot derive (tokenizers normalizer
+            # chain; numpy PCG64 rng). Primes/offsets are derived at load.
+            tokenizer_json = self.dir_model / "tokenizer.json"
+            if tokenizer_json.is_file():
+                from conversion.dsv41_engram_hash import engram_hash_kvs
+                token_map, multipliers = engram_hash_kvs(tokenizer_json, hparams)
+                self.gguf_writer.add_engram_token_map(token_map)
+                self.gguf_writer.add_engram_hash_multipliers([int(x) for x in multipliers.reshape(-1)])
+            else:
+                logger.warning("no tokenizer.json in %s: engram token_map/multipliers not emitted", self.dir_model)
+        if (kv_src := hparams.get("kv_source_layer_ids")) is not None:
+            self.gguf_writer.add_kv_source_layer_ids(kv_src)
+        if (idx_src := hparams.get("index_source_layer_ids")) is not None:
+            self.gguf_writer.add_index_source_layer_ids(idx_src)
+        if (cand := hparams.get("candidate_source_layer_id")) is not None:
+            self.gguf_writer.add_candidate_source_layer_id(cand)
+        if (topk := hparams.get("candidate_topk_blocks")) is not None:
+            self.gguf_writer.add_candidate_topk_blocks(topk)
+        if (bsize := hparams.get("candidate_block_size")) is not None:
+            self.gguf_writer.add_candidate_block_size(bsize)
+
+    _V41_ENGRAM_CHUNK_ROWS = 1_000_000
+
+    def _write_engram_table(self, bid: int) -> list[str]:
+        """Quantize one engram table to MXFP4 in row blocks via a disk memmap.
+
+        One table is ~384M x 256 FP8. Dequantizing the whole thing to f32 is
+        ~393 GB; conversion walks 1M-row chunks instead. Scale layout is
+        [rows, 8] (one e8m0 per 32 columns), not the dense [32, 32] block.
+        Forced MXFP4: 200 GB FP8 on SN850X is not possible (decision aa5d1948).
+        """
+        import json as _json
+        import os as _os
+        import tempfile as _tempfile
+
+        import numpy as _np
+        from safetensors import safe_open as _safe_open
+
+        weight_name = f"layers.{bid}.engram.embed.weight"
+        scale_name = f"layers.{bid}.engram.embed.scale"
+
+        index_path = self.dir_model / "model.safetensors.index.json"
+        with open(index_path, "r", encoding="utf-8") as f:
+            weight_map = _json.load(f)["weight_map"]
+        shard = self.dir_model / weight_map[weight_name]
+
+        qtype = gguf.GGMLQuantizationType.MXFP4
+        block_elems = gguf.GGML_QUANT_SIZES[qtype][0]
+
+        with _safe_open(str(shard), framework="pt") as f:
+            wsl = f.get_slice(weight_name)
+            n_rows, n_cols = (int(x) for x in wsl.get_shape())
+            has_scale = scale_name in f.keys()
+            ssl = f.get_slice(scale_name) if has_scale else None
+            scale_groups = int(ssl.get_shape()[1]) if has_scale else 0
+
+            if n_cols % block_elems:
+                raise ValueError(
+                    f"engram row width {n_cols} is not a multiple of the {qtype.name} block {block_elems}"
+                )
+            if has_scale and n_cols % scale_groups:
+                raise ValueError(
+                    f"engram row width {n_cols} is not divisible by its {scale_groups} scale groups"
+                )
+            per_group = n_cols // scale_groups if has_scale else 0
+
+            row_bytes = int(gguf.quantize(_np.zeros((1, n_cols), dtype=_np.float32), qtype).nbytes)
+            rows_per_chunk = min(int(self._V41_ENGRAM_CHUNK_ROWS), n_rows)
+            n_chunks = (n_rows + rows_per_chunk - 1) // rows_per_chunk
+
+            tmp_dir = _os.environ.get("V41_ENGRAM_TMPDIR") or _tempfile.gettempdir()
+            tmp_path = _os.path.join(tmp_dir, f"engram_{bid}_{qtype.name}.bin")
+            logger.info(
+                "engram layer %d: %d x %d, scale groups %d, %s in %d blocks of %d rows, staging %.1f GB at %s",
+                bid, n_rows, n_cols, scale_groups, qtype.name, n_chunks, rows_per_chunk,
+                n_rows * row_bytes / 1e9, tmp_path,
+            )
+
+            out = _np.memmap(tmp_path, dtype=_np.uint8, mode="w+", shape=(n_rows, row_bytes))
+            for ci, start in enumerate(range(0, n_rows, rows_per_chunk)):
+                stop = min(start + rows_per_chunk, n_rows)
+                chunk = wsl[start:stop, :].float()
+                if has_scale:
+                    s = self._e8m0_to_float(ssl[start:stop, :])
+                    chunk = chunk * s.repeat_interleave(per_group, 1)[:, :n_cols]
+                out[start:stop] = gguf.quantize(
+                    chunk.cpu().numpy().astype(_np.float32), qtype
+                ).reshape(stop - start, row_bytes)
+                del chunk
+                if ci % 25 == 0:
+                    logger.info("  engram layer %d: %d / %d rows", bid, stop, n_rows)
+            out.flush()
+
+        new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ".weight")
+        self.gguf_writer.add_tensor(new_name, out, raw_dtype=qtype)
+        logger.info("engram layer %d: wrote %s as %s", bid, new_name, qtype.name)
+
+        consumed = [weight_name]
+        if has_scale:
+            consumed.append(scale_name)
+        return consumed
+
+    def generate_extra_tensors(self):
+        yield from super().generate_extra_tensors()
+
+        consumed: list[str] = []
+        for bid in (self.hparams.get("engram_layer_ids") or []):
+            if f"layers.{bid}.engram.embed.weight" in self.model_tensors:
+                consumed.extend(self._write_engram_table(int(bid)))
+        for name in consumed:
+            if name in self.model_tensors:
+                del self.model_tensors[name]
+
+    def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_TENSOR, str]:
+        match = re.match(r"layers\.(\d+)\.(.+)$", name)
+        if match is not None:
+            v41_only = {
+                "engram.embed.weight": (gguf.MODEL_TENSOR.ENGRAM_EMBD, ".weight"),
+                "engram.k_weight": (gguf.MODEL_TENSOR.ENGRAM_K, ".weight"),
+                "engram.q_weight": (gguf.MODEL_TENSOR.ENGRAM_Q, ".weight"),
+                "engram.wkv.weight": (gguf.MODEL_TENSOR.ENGRAM_WKV, ".weight"),
+                "attn.indexer.k_norm.weight": (gguf.MODEL_TENSOR.INDEXER_K_NORM, ".weight"),
+                "attn.indexer.wk.weight": (gguf.MODEL_TENSOR.INDEXER_ATTN_K, ".weight"),
+            }
+            tensor_name = match.group(2)
+            if tensor_name in v41_only:
+                return v41_only[tensor_name]
+        return super()._map_dsv4_tensor_name(name, bid)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if re.match(r"layers\.\d+\.engram\.embed\.(weight|scale)$", name):
+            return []
+        return super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("DeepseekV4DSparkModel")

@@ -12,6 +12,9 @@
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
 #define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
 #define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
+#define LLAMA_MAX_ENGRAM_LAYERS 8
+#define LLAMA_MAX_KV_SOURCES    16
+#define LLAMA_MAX_INDEX_SOURCES 16
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -293,6 +296,26 @@ struct llama_hparams {
     float    dsv4_compress_rope_base   = 0.0f;
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
+
+    // DeepSeek-V4.1 Engram + CSA2
+    uint32_t dsv41_engram_n_heads               = 0;
+    uint32_t dsv41_engram_head_dim              = 0;
+    uint32_t dsv41_engram_max_ngram             = 0;
+    uint32_t dsv41_engram_vocab_size            = 0;
+    uint32_t dsv41_engram_pad_token_id          = 0;
+    uint32_t dsv41_engram_compressed_vocab_size = 0;
+    uint32_t dsv41_n_engram_layers              = 0;
+    std::array<uint32_t, LLAMA_MAX_ENGRAM_LAYERS> dsv41_engram_layer_ids{};
+    std::bitset<LLAMA_MAX_LAYERS> is_engram_impl;
+    uint32_t dsv41_n_kv_sources = 0;
+    std::array<uint32_t, LLAMA_MAX_KV_SOURCES> dsv41_kv_source_layer_ids{};
+    uint32_t dsv41_n_index_sources = 0;
+    std::array<uint32_t, LLAMA_MAX_INDEX_SOURCES> dsv41_index_source_layer_ids{};
+    uint32_t dsv41_candidate_source_layer = 0;
+    uint32_t dsv41_candidate_topk_blocks  = 0;
+    uint32_t dsv41_candidate_block_size   = 0;
+
+    bool is_engram(uint32_t il) const;
 
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;

@@ -282,6 +282,14 @@ bool llama_hparams::is_ple(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
+bool llama_hparams::is_engram(uint32_t il) const {
+    if (il < n_layer_all) {
+        return is_engram_impl[il];
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+}
+
 uint32_t llama_hparams::n_pos_per_embd() const {
     return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
 }

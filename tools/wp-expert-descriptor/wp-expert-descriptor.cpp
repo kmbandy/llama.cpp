@@ -277,8 +277,15 @@ int run(const Options & options) {
     check_format(manifest, MANIFEST_FORMAT, options.manifest);
     const std::string sharding_mode = get_value<std::string>(manifest, "sharding_mode", options.manifest);
     const bool sliced = sharding_mode == "expert-slice";
-    if (!sliced && sharding_mode != "expert-index-range") {
-        throw std::runtime_error("descriptor requires an expert-index-range or expert-slice shard manifest");
+    // layer-ranges (DeepSeek-V4.1 layer-band EP): every retained expert of a
+    // band of layers, one shard per layer, stitched from per-layer repacks.
+    // The source GGUF is the SPINE (no routed experts in-file), so the role
+    // geometry comes from the manifest's expert type + hparams, and per-layer
+    // expert counts come from each shard's group_count (V4.1's MTP blocks
+    // route over 128 experts against a 384-expert main stack).
+    const bool layered = sharding_mode == "layer-ranges";
+    if (!sliced && !layered && sharding_mode != "expert-index-range") {
+        throw std::runtime_error("descriptor requires an expert-index-range, expert-slice or layer-ranges shard manifest");
     }
     const json & retained = manifest.at("retained_expert_range");
     const int expert_first = get_value<int>(retained, "first", options.manifest);
@@ -344,7 +351,7 @@ int run(const Options & options) {
     if (activation_id >= 0) {
         activation = required_string(first_loaded.first.get(), architecture + ".hidden_activation");
     } else if (architecture == "glm-dsa" || architecture == "deepseek4" ||
-               architecture == "qwen4exp") {
+               architecture == "deepseek41" || architecture == "qwen4exp") {
         // NOTE 2026-07-31: this was a one-entry allowlist ("glm-dsa"), so every
         // other SwiGLU model failed here with a message implying the MODEL was
         // deficient rather than this list. deepseek4 added on evidence, not
@@ -374,7 +381,21 @@ int run(const Options & options) {
 
     std::map<int, LayerRoles> layers;
     std::set<std::string> tensor_names;
-    for (size_t file_index = 0; file_index < model_files.size(); ++file_index) {
+    enum ggml_type layered_type = GGML_TYPE_COUNT;
+    if (layered) {
+        const std::string type_name = get_value<std::string>(manifest, "expert_ggml_type", options.manifest);
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const char * name = ggml_type_name((enum ggml_type) t);
+            if (name != nullptr && type_name == name) {
+                layered_type = (enum ggml_type) t;
+                break;
+            }
+        }
+        if (layered_type == GGML_TYPE_COUNT) {
+            throw std::runtime_error("manifest expert_ggml_type is not a ggml type: " + type_name);
+        }
+    }
+    for (size_t file_index = 0; !layered && file_index < model_files.size(); ++file_index) {
         std::pair<gguf_ptr, ggml_ptr> loaded =
             file_index == 0 ? std::move(first_loaded) : load_gguf(model_files[file_index]);
         const int64_t n_tensors = gguf_get_n_tensors(loaded.first.get());
@@ -425,6 +446,7 @@ int run(const Options & options) {
     }
 
     std::set<int> served_layers;
+    std::map<int, int> layer_n_expert;
     std::set<int> seen_shard_indices;
     uint64_t checked_groups = 0;
     uint64_t checked_members = 0;
@@ -453,6 +475,20 @@ int run(const Options & options) {
             layer_first != layer_last || !served_layers.insert(layer_first).second) {
             throw std::runtime_error(index_path.string() + ": expected one unique layer");
         }
+        if (layered) {
+            LayerRoles roles;
+            for (const std::string role_name : { "gate", "up", "down" }) {
+                RoleDesc role;
+                role.role = role_name;
+                role.source_tensor_name = "blk." + std::to_string(layer_first) + ".ffn_" + role_name + "_exps.weight";
+                role.type = layered_type;
+                role.ne0  = role_name == "down" ? (int64_t) n_ff_exp : (int64_t) n_embd;
+                role.ne1  = role_name == "down" ? (int64_t) n_embd   : (int64_t) n_ff_exp;
+                role.bytes = ggml_row_size(role.type, role.ne0) * (uint64_t) role.ne1;
+                roles.emplace(role_name, std::move(role));
+            }
+            layers.emplace(layer_first, std::move(roles));
+        }
         auto layer_it = layers.find(layer_first);
         if (layer_it == layers.end() || layer_it->second.size() != 3) {
             throw std::runtime_error(
@@ -460,10 +496,16 @@ int run(const Options & options) {
         }
 
         const json & groups = get_array(index, "groups", index_path);
-        if (groups.size() != get_value<uint64_t>(index, "group_count", index_path) ||
-            groups.size() != (uint64_t) (expert_last - expert_first + 1)) {
+        if (groups.size() != get_value<uint64_t>(index, "group_count", index_path)) {
+            throw std::runtime_error(index_path.string() + ": group count mismatch");
+        }
+        // A layer-band shard may route over fewer experts than the main stack
+        // (V4.1 MTP: 128 of 384); it must still start at expert_first.
+        if (layered ? (groups.empty() || groups.size() > (uint64_t) (expert_last - expert_first + 1))
+                    : groups.size() != (uint64_t) (expert_last - expert_first + 1)) {
             throw std::runtime_error(index_path.string() + ": group count does not match retained range");
         }
+        layer_n_expert[layer_first] = (int) groups.size();
         uint64_t next_offset = 0;
         int expected_expert = expert_first;
         for (const json & group : groups) {
@@ -578,6 +620,7 @@ int run(const Options & options) {
     if (sliced) {
         descriptor["expert_slicing"] = manifest.at("expert_slicing");
     }
+    descriptor["sharding_mode"] = sharding_mode;
 
     std::map<std::string, std::map<std::pair<int, std::string>, int>> distribution;
     for (int layer : served_layers) {
@@ -593,6 +636,7 @@ int run(const Options & options) {
         };
         json layer_json = {
             { "layer", layer },
+            { "n_expert", layer_n_expert.at(layer) },
             { "roles",
               {
                   { "gate", role_to_json(sliced_role(roles.at("gate"))) },

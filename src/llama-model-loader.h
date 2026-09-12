@@ -56,6 +56,8 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        llama_tensor_weight(ggml_tensor * tensor) : idx(0), offs(0), tensor(tensor) {}
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -206,7 +208,8 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const std::vector<std::string> & sidecars = {}); // MAD-LAB: extra GGUFs without split.* metadata
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

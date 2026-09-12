@@ -318,6 +318,36 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,             hparams.hc_low_rank);
 
+    if (hparams.dsv41_n_engram_layers > 0) {
+        const std::vector<uint32_t> engram_ids(
+                hparams.dsv41_engram_layer_ids.begin(),
+                hparams.dsv41_engram_layer_ids.begin() + hparams.dsv41_n_engram_layers);
+        add_kv(LLM_KV_ENGRAM_HEAD_COUNT,            hparams.dsv41_engram_n_heads);
+        add_kv(LLM_KV_ENGRAM_KEY_LENGTH,            hparams.dsv41_engram_head_dim);
+        add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE,        hparams.dsv41_engram_max_ngram);
+        add_kv(LLM_KV_ENGRAM_LAYER_IDS,             engram_ids);
+        add_kv(LLM_KV_ENGRAM_VOCAB_SIZE,            hparams.dsv41_engram_vocab_size);
+        add_kv(LLM_KV_ENGRAM_PAD_TOKEN_ID,          hparams.dsv41_engram_pad_token_id);
+        add_kv(LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE, hparams.dsv41_engram_compressed_vocab_size);
+    }
+    if (hparams.dsv41_n_kv_sources > 0) {
+        const std::vector<uint32_t> kv_src(
+                hparams.dsv41_kv_source_layer_ids.begin(),
+                hparams.dsv41_kv_source_layer_ids.begin() + hparams.dsv41_n_kv_sources);
+        add_kv(LLM_KV_ATTENTION_KV_SOURCE_LAYER_IDS, kv_src);
+    }
+    if (hparams.dsv41_n_index_sources > 0) {
+        const std::vector<uint32_t> idx_src(
+                hparams.dsv41_index_source_layer_ids.begin(),
+                hparams.dsv41_index_source_layer_ids.begin() + hparams.dsv41_n_index_sources);
+        add_kv(LLM_KV_ATTENTION_INDEX_SOURCE_LAYER_IDS, idx_src);
+    }
+    if (hparams.dsv41_candidate_source_layer > 0 || hparams.dsv41_candidate_topk_blocks > 0) {
+        add_kv(LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER_ID, hparams.dsv41_candidate_source_layer);
+        add_kv(LLM_KV_ATTENTION_CANDIDATE_TOPK_BLOCKS,     hparams.dsv41_candidate_topk_blocks);
+        add_kv(LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,      hparams.dsv41_candidate_block_size);
+    }
+
     // the PLE group only means anything whole: write all of it or none
     if (hparams.ple_n_heads > 0) {
         std::vector<uint32_t> ple_layers;

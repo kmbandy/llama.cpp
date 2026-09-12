@@ -526,6 +526,12 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
 
+    // DeepSeek-V4.1 Engram
+    struct ggml_tensor * engram_embd = nullptr;
+    struct ggml_tensor * engram_k    = nullptr;
+    struct ggml_tensor * engram_q    = nullptr;
+    struct ggml_tensor * engram_wkv  = nullptr;
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
