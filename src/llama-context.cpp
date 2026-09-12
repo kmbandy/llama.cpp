@@ -176,7 +176,14 @@ static bool is_draft_ctx(const llama_cparams & cparams) {
            cparams.ctx_other != nullptr;
 }
 
-static uint32_t draft_graph_n_tokens(const llama_cparams & cparams, uint32_t n_tokens) {
+// OUTPUT-ROW / LM-head cap only: how many logit rows a draft-ctx graph ever
+// needs (governs draft_graph_n_outputs() below and, transitively, the
+// ROCm_Host logits arena). This is independent of the graph's TOKEN WIDTH
+// (see draft_graph_n_tokens() below) -- a draft ctx can legitimately need to
+// run a wide attention/FFN pass over many input tokens (prompt catch-up)
+// while still only ever producing a handful of output rows from it
+// (cap_lm_head_rows(), llama-graph.cpp).
+static uint32_t draft_graph_n_output_tokens(const llama_cparams & cparams, uint32_t n_tokens) {
     if (!is_draft_ctx(cparams)) {
         return n_tokens;
     }
@@ -187,9 +194,45 @@ static uint32_t draft_graph_n_tokens(const llama_cparams & cparams, uint32_t n_t
     return std::min(n_tokens, n_draft_tokens);
 }
 
+// GRAPH TOKEN WIDTH used to size the reserved compute buffer (attention
+// scratch, FFN intermediate, etc. -- everything that scales with n_tokens,
+// not just the output/logits rows capped by draft_graph_n_output_tokens()
+// above).
+//
+// 2026-09-12 scratch-bound-and-draft-vram-0912: this used to also clamp to
+// n_outputs_max_per_seq (i.e. reused draft_graph_n_output_tokens' cap
+// verbatim), on the assumption that a draft ctx's live process_ubatch() call
+// is never wider than n_max+1 tokens. That held only while
+// common_speculative_init_result() force-clamped the draft ctx's own
+// cparams.n_ubatch down to n_max+1 (see 38a88719e's predecessor state,
+// mtp-draft-prefill-cost-0912.txt) -- decode()'s batch splitter
+// (memory->init_batch(*balloc, cparams.n_ubatch, ...)) never handed
+// process_ubatch() more than n_max+1 tokens at a time, so reserving a
+// n_max+1-wide graph was a true worst case.
+//
+// 38a88719e removed that n_ubatch clamp (it was serializing prompt catch-up
+// into ~410 tiny sub-batch graph builds per target ubatch, a 26-31% prefill
+// regression) without updating this reserve, so the RESERVED graph width
+// (n_max+1) stopped being an upper bound on the LIVE one (up to
+// cparams.n_ubatch, e.g. 2048): the first real prompt catch-up call had to
+// grow the compute buffer on the fly, which is what OOM'd on the tight
+// device ("allocating 488.00 MiB on device 1: cudaMalloc failed").
+// common/speculative.cpp now reintroduces an n_ubatch cap for the draft ctx
+// (WP_MTP_DRAFT_UBATCH, default 256) specifically so this reserve and the
+// live graph width agree again -- size the reserve from that real cap
+// (cparams.n_ubatch) instead of n_outputs_max_per_seq, so no runtime growth
+// is needed on the actual (bounded) worst case.
+static uint32_t draft_graph_n_tokens(const llama_cparams & cparams, uint32_t n_tokens) {
+    if (!is_draft_ctx(cparams)) {
+        return n_tokens;
+    }
+
+    return std::min(n_tokens, cparams.n_ubatch);
+}
+
 static uint32_t draft_graph_n_outputs(const llama_cparams & cparams, uint32_t n_tokens) {
     const uint32_t cap = std::min(n_tokens, cparams.n_outputs_max);
-    return is_draft_ctx(cparams) ? std::min(cap, draft_graph_n_tokens(cparams, n_tokens)) : cap;
+    return is_draft_ctx(cparams) ? std::min(cap, draft_graph_n_output_tokens(cparams, n_tokens)) : cap;
 }
 
 // Worst-case pp reserve used to pass n_outputs == n_ubatch. On DS4 that

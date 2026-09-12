@@ -443,6 +443,24 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // Update a single int32 op_param slot on `tensor` AFTER graph build (e.g. from an
+    // llm_graph_input_*::set_input() override), and have the value reach the tensor(s)
+    // that actually execute the op.
+    //
+    // Background: ggml_backend_meta_buffer_init_tensor() memcpy's op_params from a meta
+    // tensor into its per-device "simple" clones exactly once, at tensor-init time (graph
+    // build / (re)allocation) -- see ggml-backend-meta.cpp. A graph that is later reused
+    // across ubatches (same shape, no rebuild) never re-runs that copy, so plain
+    // `tensor->op_params[i] = v` on the meta tensor only updates the (unused-by-compute)
+    // meta tensor itself and is silently lost for every subsequent call on a reused graph.
+    // This function additionally re-propagates the write to every already-materialized
+    // per-device simple tensor for `tensor`, so op_params fields that are meant to carry a
+    // host-known value that changes call-to-call (unlike op_params fields that describe the
+    // model/shape and are correctly captured once) stay live across graph reuse.
+    //
+    // If `tensor->buffer` is not a meta buffer this just does `tensor->op_params[i] = v`.
+    GGML_API void ggml_backend_meta_buffer_set_op_param_i32(struct ggml_tensor * tensor, int i, int32_t v);
+
     //
     // Utils
     //

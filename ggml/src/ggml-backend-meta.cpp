@@ -491,6 +491,31 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
+void ggml_backend_meta_buffer_set_op_param_i32(struct ggml_tensor * tensor, int i, int32_t v) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(i >= 0 && i * (int) sizeof(int32_t) < (int) sizeof(tensor->op_params));
+
+    tensor->op_params[i] = v;
+
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return;
+    }
+
+    // MAD-378 predequant scratch-bound plumbing: propagate to every per-device
+    // "simple" clone already materialized for this meta tensor -- see the
+    // declaration comment in ggml-backend.h for why the memcpy done once at
+    // tensor-init time (below, in ggml_backend_meta_buffer_init_tensor_impl)
+    // isn't enough for an op_param whose host-known value changes call-to-call
+    // on a graph that gets reused (not rebuilt) across ubatches.
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    for (size_t j = 0; j < n_bufs; j++) {
+        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        if (simple_tensor != nullptr) {
+            simple_tensor->op_params[i] = v;
+        }
+    }
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(

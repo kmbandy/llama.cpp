@@ -3798,6 +3798,54 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.n_outputs_max_per_seq = n_draft_tokens;
     }
 
+    // 2026-09-12 scratch-bound-and-draft-vram-0912 (fixes the load-time OOM
+    // 38a88719e introduced): 38a88719e removed the (n_max+1)-token n_ubatch
+    // clamp above to stop common_speculative_impl_draft_mtp::process()'s
+    // prompt catch-up (up to the TARGET's n_ubatch tokens, e.g. 2048, in one
+    // llama_decode(ctx_dft, batch) call) from being silently exploded into
+    // ceil(n_tokens/5) ~410 tiny sub-batch graph builds per target ubatch --
+    // that fixed the 26-31% prefill regression (mtp-draft-prefill-cost-0912.txt)
+    // but broke a load-time invariant: is_draft_ctx()'s draft_graph_n_tokens()
+    // (llama-context.cpp, used by sched_reserve()) sizes the draft ctx's
+    // RESERVED compute-buffer graph WIDTH (attention scratch, FFN
+    // intermediate -- not just logit rows, those stay capped separately via
+    // n_outputs_max_per_seq / cap_lm_head_rows) from n_outputs_max_per_seq
+    // (5), on the assumption process_ubatch() would never see more than
+    // n_max+1 tokens in one call. With the clamp gone, the catch-up call
+    // really does build/execute a graph up to cparams.n_ubatch tokens wide
+    // (2048) -- ~400x the reserved width -- so the backend scheduler has to
+    // grow the compute buffer on the fly the first time that happens. On the
+    // tight card in this alias (6900XT, ~100 MiB free once the target's KV +
+    // weight split lands) that on-the-fly growth is exactly the observed
+    // "allocating 488.00 MiB on device 1: cudaMalloc failed" load abort.
+    //
+    // Fix: reintroduce an n_ubatch cap for the draft ctx -- big enough to
+    // keep the catch-up sub-batch count sane (still far fewer than the
+    // pre-38a88719e ~410/target-ubatch) while keeping the RESERVED compute
+    // buffer small enough to fit the tight card. draft_graph_n_tokens() is
+    // changed alongside this (llama-context.cpp) to size the reserve from
+    // cparams.n_ubatch instead of n_outputs_max_per_seq, so the reserve and
+    // the live graph width agree again -- no runtime buffer growth, no OOM.
+    // Configurable via WP_MTP_DRAFT_UBATCH so it can be measured; default 256
+    // (8 catch-up sub-batches per 2048-token target ubatch, vs. ~410
+    // pre-38a88719e and 1 -- but OOM-prone -- immediately post-38a88719e).
+    // Decode-time draft width (n_max+1 = 5 tokens/step) and draft KV contents
+    // are untouched: cparams.n_ubatch only bounds catch-up chunk size and
+    // reserve sizing, never the per-step draft() call.
+    if (has_draft || spec_self) {
+        static const uint32_t wp_mtp_draft_ubatch = [] {
+            const char * env = std::getenv("WP_MTP_DRAFT_UBATCH");
+            if (env != nullptr && env[0] != '\0') {
+                const long v = std::strtol(env, nullptr, 10);
+                if (v > 0) {
+                    return (uint32_t) v;
+                }
+            }
+            return (uint32_t) 256;
+        }();
+        cparams.n_ubatch = std::min(cparams.n_ubatch, wp_mtp_draft_ubatch);
+    }
+
     // MAD-LAB: select the graph for an in-model DSpark context.
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
