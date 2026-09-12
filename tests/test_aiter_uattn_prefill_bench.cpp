@@ -255,6 +255,11 @@ static int bench_cache_type(int cache_type, const char *name, int q_len, int num
     args.num_seqs        = NUM_SEQS;
     args.num_q_tokens    = num_q_tokens;
     args.block_table_stride = num_blocks;
+    // MAD-2026-09-11 fp8-predequant: lets this existing fp8-vs-f16 bench
+    // exercise the new gfx1030 2D-large pre-dequant path (see
+    // mt_aiter_unified_attn.cpp). 0 for the f16 run — harmless, the wrapper
+    // only reads num_blocks for cache_type == TURBO4_FP8_BS256.
+    args.num_blocks      = is_fp8 ? num_blocks : 0;
     args.q_stride_0      = (int64_t) NUM_Q_HEADS * HEAD_SIZE;
     args.output_stride_0 = args.q_stride_0;
     args.k_stride_0      = (int64_t) BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE;

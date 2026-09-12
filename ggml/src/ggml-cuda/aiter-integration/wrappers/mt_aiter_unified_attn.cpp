@@ -17,7 +17,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -225,6 +227,21 @@ std::string build_signature_reduce(const mt_aiter_uattn_shape_t & s) {
     return buf;
 }
 
+// MAD-2026-09-11 fp8-predequant: signature for dequant_turbo4_fp8_bs256_to_f16_2d.
+// Fixed to the turbo4_fp8 BS=256 (IDX_BITS=4) family — only cache type this
+// pre-pass is wired for (see MT_AITER_CACHE_TURBO4_FP8_BS256 gate below).
+std::string build_signature_dequant(const mt_aiter_uattn_shape_t & s) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "*i8:16, *i8:16, *fp16:16, *fp16:16, "  // k_fp8, v_fp8, k_f16 (scratch), v_f16 (scratch)
+        "*i32, *i32, *i8:16, *i8:16, "          // block_tables, seq_lens, centroids_k, centroids_v
+        "i64, "                                  // block_table_stride
+        "%d, %d, %d, %d",                        // n_kv_heads, BLOCK_SIZE, HEAD_SIZE, BYTES_PER_BLOCK (constexpr)
+        s.num_kv_heads, s.block_size, s.head_size,
+        162 /* BYTES_PER_BLOCK for turbo4_fp8 BS=256, IDX_BITS=4 */);
+    return buf;
+}
+
 struct CachedHandles {
     mt_aiter_uattn_shape_t      shape         = {};
     const aiter::KernelHandle * h_3d          = nullptr;
@@ -234,6 +251,27 @@ struct CachedHandles {
     int                         block_q_large = MT_AITER_UATTN_BLOCK_Q_LARGE;
     bool                        initialized   = false;
     hipError_t                  init_err      = hipSuccess;
+
+    // MAD-2026-09-11 fp8-predequant (gfx1030 2D-large-prefill only). See
+    // build_signature_dequant() / ensure_initialized() / the dispatch in
+    // mt_aiter_unified_attn() below for the full path. `predequant_enabled`
+    // is decided once at init time (arch + cache_type + env override);
+    // whether a given call actually TAKES the path additionally depends on
+    // use_2d_large and args->num_blocks > 0, both only known per-call.
+    bool                         predequant_enabled = false;
+    const aiter::KernelHandle  * h_dequant          = nullptr;  // dequant_turbo4_fp8_bs256_to_f16_2d
+    const aiter::KernelHandle  * h_2d_large_f16     = nullptr;  // F16 shadow of h_2d_large, same cache key
+                                                                  // a real F16 call of this shape would use
+    int                          block_q_large_f16  = MT_AITER_UATTN_BLOCK_Q_LARGE;
+    // Lazily grown, device-owned f16 scratch K/V paged caches. Sized in
+    // physical blocks (never shrunk once grown — only the largest num_blocks
+    // seen so far matters). Guarded by its own mutex since growth can happen
+    // on any call, not just the first.
+    std::mutex                   scratch_mu;
+    void                        *scratch_k          = nullptr;
+    void                        *scratch_v          = nullptr;
+    size_t                       scratch_blocks     = 0;
+    bool                         predequant_logged  = false;
 };
 
 // Per-DEVICE handle cache.
@@ -507,6 +545,65 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
         c.block_q_large = MT_AITER_UATTN_BLOCK_Q;
     }
 
+    // MAD-2026-09-11 fp8-predequant. Default ON when: gfx1030 (no FP8 WMMA —
+    // gfx1201/gfx125x already run the fp8 kernel via WMMA and see no benefit
+    // here), cache_type is turbo4_fp8 BS=256 (the only family this pre-pass
+    // is wired for), and the large-prefill spec actually compiled (a
+    // fallback to the base 16/2 tile means the geometry this pre-pass was
+    // sized for isn't what's being launched this call — skip it, the fp8
+    // kernel's existing in-kernel dequant still runs correctly on the base
+    // tile). MT_AITER_FP8_PREDEQUANT=0 forces off (any arch); =1 forces on
+    // (any arch, e.g. to A/B the R9700 once it's usable) provided the
+    // cache_type/large-tile preconditions still hold — the env only overrides
+    // the is_gfx1030 arch check, not the cache_type or large_compiled gates,
+    // since those aren't just perf knobs: the kernel below hard-requires
+    // turbo4_fp8 BS=256 (tl.static_assert HEAD_SIZE==256 in the loader) and a
+    // real large-tile handle to shadow.
+    int predequant_env = -1;  // -1 = unset
+    if (const char * s = std::getenv("MT_AITER_FP8_PREDEQUANT")) { predequant_env = std::atoi(s) != 0 ? 1 : 0; }
+    const bool predequant_arch_ok = (predequant_env == 1) || (predequant_env == -1 && is_gfx1030);
+    const bool predequant_wanted  = predequant_env != 0 && predequant_arch_ok
+        && shape.cache_type == MT_AITER_CACHE_TURBO4_FP8_BS256
+        && large_compiled;
+
+    if (predequant_wanted) {
+        const std::string sig_dequant = build_signature_dequant(shape);
+        aiter::KernelSpec spec_dequant {
+            AITER_KERNEL_SOURCE_DEFAULT,
+            "dequant_turbo4_fp8_bs256_to_f16_2d",
+            target, sig_dequant, env_nw, env_ns,
+        };
+        c.h_dequant = reg.get_or_compile(spec_dequant);
+
+        // F16 shadow of the large-prefill spec: same shape/tile/target/
+        // num_warps/num_stages/use_fp8_wmma/use_fp8_loader_v2 as the
+        // production fp8 large-prefill spec above, but cache_type = F16 —
+        // this MUST produce the identical signature (and therefore the
+        // identical registry cache key) that a real F16 call of this same
+        // geometry would build, so the operator can verify it lands on an
+        // existing entry rather than silently compiling a near-duplicate.
+        mt_aiter_uattn_shape_t shadow_shape = shape;
+        shadow_shape.cache_type = MT_AITER_CACHE_F16;
+        const std::string sig_2d_large_f16 = build_signature_2d(
+            shadow_shape, block_m_large, block_q_large, use_fp8_wmma,
+            tile_size_large, use_fp8_loader_v2);
+        aiter::KernelSpec spec_2d_large_f16 {
+            AITER_KERNEL_SOURCE_DEFAULT,
+            "kernel_unified_attention_2d",
+            target, sig_2d_large_f16, env_nw, env_ns,
+        };
+        c.h_2d_large_f16    = reg.get_or_compile(spec_2d_large_f16);
+        c.block_q_large_f16 = block_q_large;
+
+        c.predequant_enabled = (c.h_dequant != nullptr) && (c.h_2d_large_f16 != nullptr);
+        if (!c.predequant_enabled) {
+            std::fprintf(stderr,
+                "mt_aiter_unified_attn: fp8-predequant kernels failed to compile on %s "
+                "(dequant=%p, f16_shadow=%p) — falling back to the in-kernel fp8 dequant path.\n",
+                target.c_str(), (const void*)c.h_dequant, (const void*)c.h_2d_large_f16);
+        }
+    }
+
     std::fprintf(stderr,
         "mt_aiter_unified_attn: target=%s USE_FP8_WMMA=%d USE_FP8_LOADER_V2=%d GQA=%d "
         "2d_large BLOCK_M=%d BLOCK_Q=%d (base 16/2)\n",
@@ -530,13 +627,49 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     return c.init_err;
 }
 
+// MAD-2026-09-11 fp8-predequant: lazily grow the per-device f16 scratch K/V
+// paged caches to at least `num_blocks` physical blocks. Never shrinks — a
+// later call with fewer blocks just reuses the existing (larger) buffer.
+// Returns false (leaving the previous buffers, if any, untouched) on
+// allocation failure; the caller falls back to the in-kernel fp8 dequant
+// path for that call rather than aborting.
+bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t & shape, int32_t num_blocks) {
+    std::lock_guard<std::mutex> g(c.scratch_mu);
+    if ((size_t) num_blocks <= c.scratch_blocks && c.scratch_k && c.scratch_v) {
+        return true;
+    }
+    const size_t bytes_per_cache = (size_t) num_blocks * (size_t) shape.block_size
+        * (size_t) shape.num_kv_heads * (size_t) shape.head_size * sizeof(uint16_t);
+    void * new_k = nullptr;
+    void * new_v = nullptr;
+    if (hipMalloc(&new_k, bytes_per_cache) != hipSuccess) return false;
+    if (hipMalloc(&new_v, bytes_per_cache) != hipSuccess) { (void) hipFree(new_k); return false; }
+    if (c.scratch_k) (void) hipFree(c.scratch_k);
+    if (c.scratch_v) (void) hipFree(c.scratch_v);
+    c.scratch_k      = new_k;
+    c.scratch_v      = new_v;
+    c.scratch_blocks = (size_t) num_blocks;
+    if (!c.predequant_logged) {
+        int dev = 0;
+        (void) hipGetDevice(&dev);
+        std::fprintf(stderr,
+            "mt_aiter_unified_attn: fp8-predequant path active on device %d "
+            "(num_blocks=%d, scratch=%zu B/cache x2)\n",
+            dev, num_blocks, bytes_per_cache);
+        c.predequant_logged = true;
+    }
+    return true;
+}
+
 }  // anonymous namespace
 
 hipError_t mt_aiter_unified_attn(hipStream_t stream,
                                   const mt_aiter_uattn_args_t *a) {
     hipError_t init_err = ensure_initialized(a->shape);
     if (init_err != hipSuccess) return init_err;
-    const CachedHandles & c = get_cached();
+    // Non-const: the fp8-predequant path below lazily grows c.scratch_k/v
+    // under c.scratch_mu on (possibly) every call, not just the first.
+    CachedHandles & c = get_cached();
     if (!c.h_2d || !c.h_2d_large || !c.h_3d || !c.h_reduce) return hipErrorInvalidImage;
 
     // MAD-199 D3 + MAD-203: three-way dispatch.
@@ -647,6 +780,72 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
         unsigned int g2_x = (unsigned int) a->shape.num_kv_heads;
         unsigned int g2_y = (unsigned int)(num_q_tokens / block_q_for_grid + num_seqs);
         unsigned int g2_z = 1;
+
+        // MAD-2026-09-11 fp8-predequant: 2D-large-prefill only. Dequant the
+        // production turbo4_fp8 K/V cache into an f16 scratch paged cache
+        // (same physical block indices, standard f16 layout), then launch
+        // the UNMODIFIED F16 2D-large kernel against the scratch cache —
+        // bit-identical to the fp8 in-kernel-dequant path by construction
+        // (see dequant_turbo4_fp8_bs256_to_f16_2d's docstring in
+        // kernels/unified_attention.py). Falls through to the normal fp8
+        // launch below if scratch growth fails for this call.
+        if (use_2d_large && c.predequant_enabled && a->num_blocks > 0
+            && ensure_predequant_scratch(c, a->shape, a->num_blocks)) {
+            hipDeviceptr_t p_k_f16 = (hipDeviceptr_t) c.scratch_k;
+            hipDeviceptr_t p_v_f16 = (hipDeviceptr_t) c.scratch_v;
+            int64_t        bt_stride_dq = a->block_table_stride;
+
+            void *args_dequant[] = {
+                &p_k, &p_v,               // fp8 source caches (a->k_cache / a->v_cache)
+                &p_k_f16, &p_v_f16,       // f16 scratch destination caches
+                &p_bt, &p_sl,
+                &p_centroids_k, &p_centroids_v,
+                &bt_stride_dq,
+                &p_global_scratch, &p_profile_scratch,
+            };
+            unsigned int gd_x = (unsigned int) num_seqs;
+            unsigned int gd_y = (unsigned int) a->block_table_stride;
+            unsigned int gd_z = (unsigned int) a->shape.num_kv_heads;
+            hipError_t dq_err = c.h_dequant->launch(stream, gd_x, gd_y, gd_z, args_dequant);
+            if (dq_err == hipSuccess) {
+                // F16-shadow strides: the scratch cache is a fresh, tightly
+                // packed [num_blocks_allocated, BLOCK_SIZE, n_kv_heads,
+                // HEAD_SIZE] f16 buffer (ensure_predequant_scratch), so the
+                // element strides are the standard contiguous f16 formula —
+                // identical to what mt_pagedattn_aiter.cu computes for a real
+                // F16 k_cache/v_cache of this shape.
+                int64_t ks0_f16 = (int64_t) a->shape.block_size * a->shape.num_kv_heads * a->shape.head_size;
+                int64_t ks1_f16 = (int64_t) a->shape.num_kv_heads * a->shape.head_size;
+                int64_t ks2_f16 = (int64_t) a->shape.head_size;
+                // A real F16 call passes NULL centroids (mt_aiter_cache_is_turbo_fp8
+                // is false for cache_type F16) — match that exactly rather than
+                // relying on CACHE_TYPE=0 dead-code elimination to make the fp8
+                // pointers harmless.
+                hipDeviceptr_t p_centroids_null = (hipDeviceptr_t) nullptr;
+
+                void *args_2d_f16[] = {
+                    &p_out, &p_q, &p_k_f16, &p_v_f16,
+                    &p_sink,
+                    &p_bt, &p_sl,
+                    &p_alibi, &p_qq_bias,
+                    &scale_f,
+                    &p_qd, &p_kd, &p_vd, &p_os,
+                    &softcap_f,
+                    &bts, &qs0, &os0, &qqs0,
+                    &ks0_f16, &ks1_f16, &ks2_f16,
+                    &ks0_f16, &ks1_f16, &ks2_f16,  // v strides == k strides (identical scratch layout)
+                    &p_cu, &num_seqs,
+                    &p_centroids_null, &p_centroids_null,  // NULL, matching a real F16 call
+                    &p_global_scratch, &p_profile_scratch,
+                };
+                unsigned int gf_y = (unsigned int)(num_q_tokens / c.block_q_large_f16 + num_seqs);
+                return c.h_2d_large_f16->launch(stream, g2_x, gf_y, g2_z, args_2d_f16);
+            }
+            // Dequant launch failed — fall through to the normal fp8 2D-large
+            // launch below rather than propagating a spurious error; the
+            // in-kernel dequant path is still fully correct.
+        }
+
         return h_2d_selected->launch(stream, g2_x, g2_y, g2_z, args_2d);
     }
 

@@ -222,6 +222,15 @@ struct mt_aiter_uattn_args_t {
     int32_t        num_seqs;
     int32_t        num_q_tokens;   // total q tokens across all seqs (= sum of q_lens). For pure decode == num_seqs.
     int64_t        block_table_stride;
+    // MAD-2026-09-11 fp8-predequant: total physical blocks in the paged
+    // k_cache/v_cache buffer (not just the blocks live sequences reference —
+    // the allocator's full block count). Used only to size the f16 scratch
+    // cache for the gfx1030 2D-large-prefill turbo4_fp8 pre-dequant path
+    // (see MT_AITER_FP8_PREDEQUANT in mt_aiter_unified_attn.cpp). 0 = unknown
+    // and disables the pre-dequant path for this call — falls back to the
+    // existing in-kernel fp8 dequant, no behavior change. Ignored for every
+    // other cache_type / dispatch path.
+    int32_t        num_blocks;
     // Strides
     int64_t        q_stride_0;     // bytes per row in q = NUM_Q_HEADS * HEAD_SIZE
     int64_t        output_stride_0;

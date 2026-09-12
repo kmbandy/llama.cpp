@@ -81,6 +81,18 @@
 #    byte read for IDX_BITS=3 (turbo3_fp8) and IDX_BITS=5 (turbo5_fp8)
 #    where indices genuinely straddle bytes.
 #
+# 6. dequant_turbo4_fp8_bs256_to_f16_2d (MAD-2026-09-11 fp8-predequant):
+#    New standalone @triton.jit kernel (not an upstream function, purely
+#    local). Hoists the CACHE_TYPE=24/USE_FP8_WMMA=0 branch's in-kernel
+#    fp8->f16 dequant (added by patch 4 above) into its own pre-pass that
+#    writes an f16-shaped paged scratch cache, so gfx1030 2D-large prefill
+#    can run the existing, unmodified CACHE_TYPE=0 kernel afterward instead
+#    of paying the register cost of dequanting inline on every Q-block's
+#    pass over the same K/V tile. See that kernel's own docstring/comments
+#    for the bit-identical-by-construction argument. Reuses
+#    load_turbo4_fp8_kv_tile_bs256_v2 (patch 5) unchanged — no decode logic
+#    duplicated.
+#
 # Validated: AITER 2D + 3D + reduce_segments AOT-compile cleanly for
 #            gfx1201 (R9700) and gfx1030 (6900XT) from this vendor.
 #            See docs/aiter-integration/ARCHITECTURE.md §7 + MAD-188.
@@ -969,6 +981,117 @@ def load_turbo_fp8_kv_tile_V_bs256_v2(
         cache_byte_ptr, physical_block_idx, token_in_block, kv_head_idx, lut_ptr,
         n_kv_heads, BLOCK_SIZE, HEAD_SIZE, BYTES_PER_BLOCK, tile_mask,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# MAD-2026-09-11 fp8-predequant: gfx1030 2D-large-prefill pre-pass.
+#
+# gfx1030 has no FP8 WMMA, so kernel_unified_attention_2d's CACHE_TYPE=24
+# branch already dequantizes every K/V tile to f16 in-kernel before the dot
+# (see the `if not USE_FP8_WMMA:` branch above: `K = (K_fp8...).to(tl.float16)
+# * K_scales...`, `V = (V_fp8...).to(tl.float16) * V_scales...`) and then
+# runs the exact same f16 tl.dot path CACHE_TYPE=0 uses. That inline dequant
+# is register-hungry (per fp8-kernel-why-0911.txt) and is the reason the fp8
+# kernel is SLOWER than a plain f16 kernel on this arch even though it's
+# doing strictly more work per K/V element. Hoisting the dequant into its own
+# pre-pass kernel, writing the result into an f16-shaped paged scratch cache,
+# and then launching the *existing, unmodified* CACHE_TYPE=0 2D-large kernel
+# against that scratch cache computes exactly the same per-element values
+# (same op order: fp8-bitcast -> f16 -> multiply by f16(scale)) that the
+# in-kernel branch would have computed for the SAME physical block/token/kv-
+# head/dim, so the two paths are bit-identical by construction — see
+# wrappers/mt_aiter_unified_attn.cpp's pre-dequant dispatch for the launch
+# sequencing and the cache-key argument for why the second launch must reuse
+# build_signature_2d() unmodified.
+#
+# One program per (seq, block-table slot, kv head). Early-exits for slots
+# past this seq's own block-table range or an unused-slot sentinel entry, so
+# only the physical blocks the attention kernel's own tile loop could ever
+# touch for this seq get dequantized — mirrors block_tables_ptr indexing
+# exactly. Within a touched block, all BLOCK_SIZE token slots are
+# unconditionally decoded (no tile_mask): this matches production's own
+# TILE_SIZE == BLOCK_SIZE fast path above (`if TILE_SIZE == BLOCK_SIZE:
+# tile_mask = tl.full(...)`, i.e. already-unconditional in the common case),
+# and for the token slots past this seq's actual seq_len in a partially
+# filled trailing block, whatever finite fp8 bytes are physically resident
+# there get dequantized to SOME finite f16 value — harmless, because the
+# downstream f16 kernel's own per-(query,key) `seq_mask` unconditionally
+# overwrites S to -inf at those positions regardless of the K/V value that
+# fed the dot product (tl.dot's per-key-column independence means garbage in
+# one K/V column cannot leak into any other column's S value), so the final
+# softmax output is identical to production's own tile-mask-elided behavior
+# whether or not TILE_SIZE happens to equal BLOCK_SIZE for a given run.
+@triton.jit
+def dequant_turbo4_fp8_bs256_to_f16_2d(
+    k_cache_fp8_ptr,      # *i8 — turbo4_fp8 (CACHE_TYPE=24) K cache, byte layout
+                           # [num_blocks, BLOCK_SIZE, n_kv_heads, BYTES_PER_BLOCK]
+    v_cache_fp8_ptr,      # *i8 — same layout for V
+    k_cache_f16_ptr,      # *fp16 — scratch K cache [num_blocks, BLOCK_SIZE, n_kv_heads, HEAD_SIZE]
+    v_cache_f16_ptr,      # *fp16 — scratch V cache, same layout
+    block_tables_ptr,     # [num_seqs, block_table_stride] int32 (kInvalidBlockTableEntry = -1)
+    seq_lens_ptr,          # [num_seqs] int32
+    centroids_k_ptr,       # *u8 — per-(layer, K) centroid LUT, 16 bytes (IDX_BITS=4)
+    centroids_v_ptr,       # *u8 — per-(layer, V) centroid LUT
+    block_table_stride: tl.int64,
+    n_kv_heads:       tl.constexpr,
+    BLOCK_SIZE:       tl.constexpr,   # paged-cache block size (tokens)
+    HEAD_SIZE:        tl.constexpr,   # must be 256 (loader v2 requirement)
+    BYTES_PER_BLOCK:  tl.constexpr,   # 162 for turbo4_fp8 BS=256 (IDX_BITS=4)
+):
+    seq_idx     = tl.program_id(0)
+    slot_idx    = tl.program_id(1)
+    kv_head_idx = tl.program_id(2)
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    num_blocks_for_seq = cdiv_fn(seq_len, BLOCK_SIZE)
+    if slot_idx >= num_blocks_for_seq:
+        return
+
+    physical_block_idx_i32 = tl.load(
+        block_tables_ptr + seq_idx * block_table_stride + slot_idx
+    )
+    if physical_block_idx_i32 < 0:  # kInvalidBlockTableEntry — nothing to write
+        return
+    physical_block_idx = physical_block_idx_i32.to(tl.int64)
+
+    token_in_block = tl.arange(0, BLOCK_SIZE)
+    # Broadcast the scalar physical block id to a (BLOCK_SIZE,) tensor — the
+    # v2 loader core indexes it with [:, None], same shape it gets from the
+    # attention kernel's own per-tile `tl.load(block_tables_ptr + ...)`.
+    pb = tl.zeros([BLOCK_SIZE], dtype=tl.int64) + physical_block_idx
+    tile_mask = tl.full([BLOCK_SIZE], 1, dtype=tl.int1)
+
+    K_fp8, K_scales = load_turbo4_fp8_kv_tile_bs256_v2(
+        k_cache_fp8_ptr, pb, token_in_block, kv_head_idx, centroids_k_ptr,
+        n_kv_heads, BLOCK_SIZE, HEAD_SIZE, BYTES_PER_BLOCK, tile_mask,
+    )
+    V_fp8, V_scales = load_turbo4_fp8_kv_tile_bs256_v2(
+        v_cache_fp8_ptr, pb, token_in_block, kv_head_idx, centroids_v_ptr,
+        n_kv_heads, BLOCK_SIZE, HEAD_SIZE, BYTES_PER_BLOCK, tile_mask,
+    )
+
+    # Same op order/dtypes as kernel_unified_attention_2d's USE_FP8_WMMA=0
+    # branch. Both K_fp8/V_fp8 here are token-major (BLOCK_SIZE, HEAD_SIZE) —
+    # the core loader's native (un-transposed) shape, i.e. V's orientation in
+    # the attention kernel — so the scale broadcasts per-row for both (the
+    # attention kernel's K_scales[None, :] there is the SAME per-token scale
+    # values as K_scales[:, None] here, just against K_fp8's transposed
+    # (HEAD_SIZE, TILE_SIZE) shape; per-element products are identical).
+    K16 = (K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+           * K_scales[:, None].to(tl.float16))
+    V16 = (V_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+           * V_scales[:, None].to(tl.float16))
+
+    offs_d = tl.arange(0, HEAD_SIZE)
+    out_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * HEAD_SIZE)
+        + token_in_block    * (n_kv_heads * HEAD_SIZE)
+        + kv_head_idx       * HEAD_SIZE
+    )
+    out_offset = out_base[:, None] + offs_d[None, :]
+
+    tl.store(k_cache_f16_ptr + out_offset, K16)
+    tl.store(v_cache_f16_ptr + out_offset, V16)
 
 
 @triton.jit

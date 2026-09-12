@@ -939,9 +939,16 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     mt_build_cu_seqlens_kernel<<<1, 1, 0, stream>>>(
         cu_seqlens_buf.get(), (const int32_t*) q_lens->data, num_seqs);
     mt_aiter_sync_probe(stream, "cu_seqlens", parse_layer_from_kv_cache_name(k_cache->name));
+    // MAD-2026-09-11 fp8-predequant: total physical blocks in the paged
+    // turbo4_fp8 cache, reused below to fill args.num_blocks (sizes the
+    // gfx1030 pre-dequant scratch cache). Same computation the block-table
+    // scan below already needed (`cap`), just hoisted out of that block's
+    // scope so both consumers share one calculation.
+    long num_blocks_fp8 = 0;
     {
         const long bpb_scan = (k_cache->type == GGML_TYPE_TURBO4_FP8_BS256) ? 162 : 0;
         const long cap = bpb_scan ? ((long) ggml_nbytes(k_cache) / ((long) block_size * n_kv_heads * bpb_scan)) : 0;
+        num_blocks_fp8 = cap;
         if (cap > 0) {
             mt_aiter_scan_block_table(block_tables, context_lens, num_seqs, max_bps, block_size, cap);
         }
@@ -1022,6 +1029,9 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     args.num_seqs           = num_seqs;
     args.num_q_tokens       = num_q_tokens;
     args.block_table_stride = max_bps;
+    // MAD-2026-09-11 fp8-predequant: 0 for every non-turbo4_fp8 cache type
+    // (the wrapper only reads this when cache_type == TURBO4_FP8_BS256).
+    args.num_blocks         = (cache_type == MT_AITER_CACHE_TURBO4_FP8) ? (int32_t) num_blocks_fp8 : 0;
     args.q_stride_0         = (int64_t) n_heads * head_size;
     args.output_stride_0    = args.q_stride_0;
     args.k_stride_0         = (int64_t) block_size * n_kv_heads * head_size;
