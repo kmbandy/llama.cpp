@@ -259,7 +259,12 @@ static int bench_cache_type(int cache_type, const char *name, int q_len, int num
     // exercise the new gfx1030 2D-large pre-dequant path (see
     // mt_aiter_unified_attn.cpp). 0 for the f16 run — harmless, the wrapper
     // only reads num_blocks for cache_type == TURBO4_FP8_BS256.
-    args.num_blocks      = is_fp8 ? num_blocks : 0;
+    // MAD-2026-09-12 predequant-scratch: single seq, fully populated table
+    // (block_table_stride == num_blocks, h_block_tables[i]=i) — the
+    // compacted table is the identity, so reusing d_block_tables directly
+    // reproduces the pre-fix scratch layout exactly.
+    args.scratch_block_tables = is_fp8 ? d_block_tables : nullptr;
+    args.num_scratch_blocks   = is_fp8 ? num_blocks : 0;
     args.q_stride_0      = (int64_t) NUM_Q_HEADS * HEAD_SIZE;
     args.output_stride_0 = args.q_stride_0;
     args.k_stride_0      = (int64_t) BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE;

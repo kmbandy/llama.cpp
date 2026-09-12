@@ -528,6 +528,66 @@ __global__ void mt_build_cu_seqlens_kernel(
     }
 }
 
+// MAD-2026-09-12 predequant-scratch (predequant-scratch-0912.txt): build a
+// compacted block table for the gfx1030 fp8 pre-dequant scratch cache
+// (ggml-cuda/aiter-integration/wrappers/mt_aiter_unified_attn.cpp's
+// ensure_predequant_scratch() + the dequant_turbo4_fp8_bs256_to_f16_2d
+// kernel). The old scheme sized that scratch cache by the paged cache's
+// TOTAL physical block count (args.num_blocks, from `cap` below) — 512
+// MiB/cache x2, permanently, at production ctx=524288/block=256/2 kv
+// heads/head=256. Only kernel A/B below fix that; num_blocks_fp8 (still
+// computed a few lines down) is unrelated (feeds the diagnostic block-table
+// scan) and is left alone.
+//
+// Kernel A: per-seq block count (ceil(seq_len/block_size)) + exclusive
+// prefix sum + grand total, single-thread — num_seqs is tiny in production
+// (1-2; a prefill batch), so a single-workgroup sequential scan is simply
+// not worth parallelizing (mirrors mt_build_cu_seqlens_kernel above).
+__global__ void mt_aiter_predequant_scan_kernel(
+    const int32_t * __restrict__ seq_lens,
+    int32_t         block_size,
+    int32_t         num_seqs,
+    int32_t       * __restrict__ out_counts,   // [num_seqs]
+    int32_t       * __restrict__ out_prefix,   // [num_seqs], exclusive
+    int32_t       * __restrict__ out_total) {  // [1]
+    if (threadIdx.x != 0) return;
+    int32_t running = 0;
+    for (int s = 0; s < num_seqs; ++s) {
+        int32_t sl  = seq_lens[s];
+        int32_t cnt = sl > 0 ? (sl + block_size - 1) / block_size : 0;
+        out_counts[s] = cnt;
+        out_prefix[s] = running;
+        running += cnt;
+    }
+    *out_total = running;
+}
+
+// Kernel B: fill the compacted [num_seqs, block_table_stride] scratch table
+// — scratch_table[s][j] = prefix[s]+j for a live, valid slot (j < counts[s]
+// AND the physical block_tables[s][j] entry isn't kInvalidBlockTableEntry),
+// -1 otherwise. The validity check against the ORIGINAL table (not just the
+// live-range cutoff) matters: it keeps this compacted table's -1 convention
+// exactly as defensive as block_tables_ptr's own -1 check inside
+// dequant_turbo4_fp8_bs256_to_f16_2d, so a hole in the physical table still
+// makes the dequant/F16-shadow pair skip that slot instead of touching an
+// uninitialized scratch block.
+__global__ void mt_aiter_predequant_fill_table_kernel(
+    const int32_t * __restrict__ orig_table,    // [num_seqs, block_table_stride], physical
+    const int32_t * __restrict__ counts,        // [num_seqs]
+    const int32_t * __restrict__ prefix,        // [num_seqs], exclusive
+    int32_t         block_table_stride,
+    int32_t       * __restrict__ scratch_table) { // [num_seqs, block_table_stride]
+    const int s = blockIdx.x;
+    const int j = blockIdx.y * (int) blockDim.x + threadIdx.x;
+    if (j >= block_table_stride) return;
+    const size_t idx = (size_t) s * (size_t) block_table_stride + (size_t) j;
+    int32_t out = -1;
+    if (j < counts[s] && orig_table[idx] >= 0) {
+        out = prefix[s] + j;
+    }
+    scratch_table[idx] = out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 
 // MAD-XXX diag (2026-09-10, temporary): env-gated per-launch sync probe for the
@@ -924,8 +984,12 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     mt_aiter_sync_probe(stream, "scatter", parse_layer_from_kv_cache_name(k_cache->name));
 
     // ── 2. Allocate AITER workspace + cu_seqlens ──
-    // 3D split-K workspace is unused on the 2D prefill path (avg_q_len >= BLOCK_Q).
-    const bool use_2d = mt_aiter_uattn_use_2d(num_q_tokens, num_seqs);
+    // MAD-2026-09-12 dispatch-fix: 3D split-K workspace is unused on the 2D
+    // path. This MUST call the exact same predicate (same three arguments)
+    // as mt_aiter_unified_attn()'s own launch-gate below, or the workspace
+    // sizing and the kernel actually launched can disagree — see the
+    // comment on mt_aiter_uattn_should_use_2d() in mt_aiter_unified_attn.h.
+    const bool use_2d = mt_aiter_uattn_should_use_2d(num_q_tokens, num_seqs, n_kv_heads) != 0;
     ggml_cuda_pool_alloc<float>   segm_out_buf(ctx.pool());
     ggml_cuda_pool_alloc<float>   segm_max_buf(ctx.pool());
     ggml_cuda_pool_alloc<float>   segm_exp_buf(ctx.pool());
@@ -939,11 +1003,12 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     mt_build_cu_seqlens_kernel<<<1, 1, 0, stream>>>(
         cu_seqlens_buf.get(), (const int32_t*) q_lens->data, num_seqs);
     mt_aiter_sync_probe(stream, "cu_seqlens", parse_layer_from_kv_cache_name(k_cache->name));
-    // MAD-2026-09-11 fp8-predequant: total physical blocks in the paged
-    // turbo4_fp8 cache, reused below to fill args.num_blocks (sizes the
-    // gfx1030 pre-dequant scratch cache). Same computation the block-table
-    // scan below already needed (`cap`), just hoisted out of that block's
-    // scope so both consumers share one calculation.
+    // Total physical blocks (capacity) of the paged turbo4_fp8 cache — feeds
+    // ONLY the diagnostic block-table validity scan (mt_aiter_scan_block_table,
+    // MAD_AITER_BT_SCAN-gated) below. MAD-2026-09-12 predequant-scratch: this
+    // is no longer used to size the gfx1030 pre-dequant scratch cache — see
+    // num_scratch_blocks / mt_aiter_predequant_scan_kernel further down,
+    // which sizes it by the blocks THIS call actually touches instead.
     long num_blocks_fp8 = 0;
     {
         const long bpb_scan = (k_cache->type == GGML_TYPE_TURBO4_FP8_BS256) ? 162 : 0;
@@ -951,6 +1016,54 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
         num_blocks_fp8 = cap;
         if (cap > 0) {
             mt_aiter_scan_block_table(block_tables, context_lens, num_seqs, max_bps, block_size, cap);
+        }
+    }
+
+    // MAD-2026-09-12 predequant-scratch (predequant-scratch-0912.txt):
+    // compacted block table + the actual slot count THIS call needs for the
+    // gfx1030 fp8 pre-dequant scratch cache — replaces num_blocks_fp8 (the
+    // paged cache's total physical capacity) as the scratch-sizing input.
+    // Gated to exactly the calls that can take that path (turbo4_fp8 cache +
+    // the 2D-large-prefill tile) so decode and every other cache type pay
+    // nothing extra. use_2d_large mirrors mt_aiter_unified_attn()'s own
+    // large-tile cutover (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD)
+    // exactly — both must agree on which calls are prefill-shaped, same as
+    // the use_2d predicate above.
+    ggml_cuda_pool_alloc<int32_t> predq_counts(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> predq_prefix(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> predq_total(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> predq_scratch_table(ctx.pool());
+    int32_t num_scratch_blocks = 0;
+    const bool use_2d_large =
+        use_2d && (mt_aiter_uattn_avg_q_len(num_q_tokens, num_seqs) >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
+    const bool want_predequant_scratch = (cache_type == MT_AITER_CACHE_TURBO4_FP8) && use_2d_large;
+    if (want_predequant_scratch) {
+        predq_counts.alloc((size_t) num_seqs);
+        predq_prefix.alloc((size_t) num_seqs);
+        predq_total.alloc(1);
+        mt_aiter_predequant_scan_kernel<<<1, 1, 0, stream>>>(
+            (const int32_t*) context_lens->data, block_size, num_seqs,
+            predq_counts.get(), predq_prefix.get(), predq_total.get());
+
+        // Single D2H sync per call — needed to know the slot TOTAL on the
+        // host before sizing/growing the scratch hipMalloc below. Gated to
+        // this prefill-only, fp8-predequant-only path (never the hot decode
+        // loop): one sync per prefill call is acceptable. See
+        // predequant-scratch-0912.txt "sync" section.
+        int32_t host_total = 0;
+        if (hipMemcpyAsync(&host_total, predq_total.get(), sizeof(int32_t),
+                            hipMemcpyDeviceToHost, stream) == hipSuccess
+            && hipStreamSynchronize(stream) == hipSuccess) {
+            num_scratch_blocks = host_total;
+        }
+
+        if (num_scratch_blocks > 0) {
+            predq_scratch_table.alloc((size_t) num_seqs * (size_t) max_bps);
+            const dim3 fill_grid((unsigned) num_seqs, (unsigned) ((max_bps + 255) / 256));
+            mt_aiter_predequant_fill_table_kernel<<<fill_grid, 256, 0, stream>>>(
+                (const int32_t*) block_tables->data,
+                predq_counts.get(), predq_prefix.get(), max_bps,
+                predq_scratch_table.get());
         }
     }
 
@@ -1029,9 +1142,11 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     args.num_seqs           = num_seqs;
     args.num_q_tokens       = num_q_tokens;
     args.block_table_stride = max_bps;
-    // MAD-2026-09-11 fp8-predequant: 0 for every non-turbo4_fp8 cache type
-    // (the wrapper only reads this when cache_type == TURBO4_FP8_BS256).
-    args.num_blocks         = (cache_type == MT_AITER_CACHE_TURBO4_FP8) ? (int32_t) num_blocks_fp8 : 0;
+    // MAD-2026-09-12 predequant-scratch: NULL/0 for every call that isn't
+    // turbo4_fp8 2D-large-prefill (the wrapper only reads these when
+    // cache_type == TURBO4_FP8_BS256 && the 2D-large tile is selected).
+    args.scratch_block_tables = num_scratch_blocks > 0 ? predq_scratch_table.get() : nullptr;
+    args.num_scratch_blocks   = num_scratch_blocks;
     args.q_stride_0         = (int64_t) n_heads * head_size;
     args.output_stride_0    = args.q_stride_0;
     args.k_stride_0         = (int64_t) block_size * n_kv_heads * head_size;

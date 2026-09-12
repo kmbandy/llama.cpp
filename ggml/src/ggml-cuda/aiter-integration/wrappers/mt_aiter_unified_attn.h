@@ -102,6 +102,32 @@ static inline int mt_aiter_uattn_block_q_large(int num_q_heads, int num_kv_heads
 static inline int mt_aiter_uattn_avg_q_len(int num_q_tokens, int num_seqs) {
     return (num_seqs > 0) ? (num_q_tokens / num_seqs) : 1;
 }
+
+// MAD-2026-09-12 dispatch-fix (decode-depth-scaling-0912.txt): occupancy-
+// driven 2D/3D dispatch, replacing the old avg_q_len>=BLOCK_Q token-count
+// proxy. Upstream AITER/vLLM (unified_attention_host_reference.py) picks the
+// 2D (no split-K) kernel only when it would actually fill the GPU better
+// than 3D's split-K parallelism:
+//   num_2d_prgms      = (num_q_tokens/BLOCK_Q + num_seqs) * num_kv_heads
+//   target_num_prgms  = cu_count * 4
+//   use_2d            = num_2d_prgms > target_num_prgms
+// The old avg_q_len>=2 proxy agreed with this in the two original regimes
+// (single-token decode, and genuine long prefill) but always picked 2D for
+// MTP/DFlash verify batches (avg_q_len 2..~17) regardless of how few
+// workgroups that produced — e.g. 6 workgroups/layer on a 64-CU part, vs.
+// the 256-workgroup occupancy target. See mt_aiter_uattn_should_use_2d()
+// (mt_aiter_unified_attn.cpp) for the actual implementation: it additionally
+// queries cu_count from the active HIP device (cached per device) and reads
+// the MT_AITER_UATTN_FORCE_2D env override. Declared here as the single
+// function BOTH dispatch sites (this wrapper's mt_aiter_unified_attn() launch
+// gate, and mt_pagedattn_aiter.cu's workspace-allocation gate) must call with
+// identical arguments — see that function's own comment for why.
+//
+// mt_aiter_uattn_use_2d() below is kept ONLY for the large-prefill spec
+// selection cutover (avg_q_len >= LARGE_PREFILL_THRESHOLD), which is
+// unchanged by this fix and still legitimately avg_q_len-driven (a large,
+// uniform prefill chunk is always better served by the wide 2D-large tile
+// regardless of occupancy).
 static inline int mt_aiter_uattn_use_2d(int num_q_tokens, int num_seqs) {
     return mt_aiter_uattn_avg_q_len(num_q_tokens, num_seqs) >= MT_AITER_UATTN_BLOCK_Q;
 }
@@ -222,15 +248,30 @@ struct mt_aiter_uattn_args_t {
     int32_t        num_seqs;
     int32_t        num_q_tokens;   // total q tokens across all seqs (= sum of q_lens). For pure decode == num_seqs.
     int64_t        block_table_stride;
-    // MAD-2026-09-11 fp8-predequant: total physical blocks in the paged
-    // k_cache/v_cache buffer (not just the blocks live sequences reference —
-    // the allocator's full block count). Used only to size the f16 scratch
-    // cache for the gfx1030 2D-large-prefill turbo4_fp8 pre-dequant path
-    // (see MT_AITER_FP8_PREDEQUANT in mt_aiter_unified_attn.cpp). 0 = unknown
-    // and disables the pre-dequant path for this call — falls back to the
-    // existing in-kernel fp8 dequant, no behavior change. Ignored for every
-    // other cache_type / dispatch path.
-    int32_t        num_blocks;
+    // MAD-2026-09-12 predequant-scratch (predequant-scratch-0912.txt):
+    // replaces the old args.num_blocks (total PHYSICAL blocks in the whole
+    // paged cache — pinned the f16 scratch cache to the cache's full
+    // capacity forever, 512 MiB/cache x2 at production ctx=524288). The
+    // scratch cache is now sized by the blocks THIS call actually touches.
+    //
+    // scratch_block_tables has the SAME [num_seqs, block_table_stride]
+    // layout as block_tables, but every live entry j (j < ceil(seq_lens[s] /
+    // shape.block_size)) is remapped from the physical block index to a
+    // compact scratch slot prefix[s]+j, where prefix is the exclusive
+    // prefix sum over seqs of ceil(seq_lens[s]/block_size); entries beyond
+    // the live count, or whose physical entry is kInvalidBlockTableEntry
+    // (-1), are -1 (same past-end/invalid convention as block_tables).
+    // num_scratch_blocks is the total slot count needed by THIS call (the
+    // sum the prefix sum above ends at) — the actual high-water mark
+    // ensure_predequant_scratch() should grow to.
+    //
+    // NULL scratch_block_tables or num_scratch_blocks == 0 disables the
+    // pre-dequant path for this call (same as num_blocks==0 did before this
+    // change) — falls back to the existing in-kernel fp8 dequant, no
+    // behavior change. Both ignored for every other cache_type / dispatch
+    // path.
+    const int32_t *scratch_block_tables;
+    int32_t        num_scratch_blocks;
     // Strides
     int64_t        q_stride_0;     // bytes per row in q = NUM_Q_HEADS * HEAD_SIZE
     int64_t        output_stride_0;
@@ -241,6 +282,25 @@ struct mt_aiter_uattn_args_t {
     int64_t        v_stride_1;
     int64_t        v_stride_2;
 };
+
+// Occupancy-driven 2D/3D dispatch predicate — see the long comment above
+// mt_aiter_uattn_use_2d() for the rationale. Returns nonzero when the batch
+// should take the 2D (no split-K) path. num_kv_heads must be the caller's
+// per-device (post-tensor-parallel-split) KV head count, matching what will
+// be passed as mt_aiter_uattn_shape_t::num_kv_heads to mt_aiter_unified_attn().
+//
+// MUST be called with identical (num_q_tokens, num_seqs, num_kv_heads) from
+// every site that needs to agree on which kernel gets launched — today that
+// is mt_pagedattn_aiter.cu (decides whether to allocate the 3D segm_*
+// workspace) and mt_aiter_unified_attn() (decides which kernel to actually
+// launch). A mismatch between the two would allocate workspace for the
+// wrong kernel (undersized 3D workspace, or wasted-but-harmless 3D workspace
+// on the 2D path).
+//
+// Env override: MT_AITER_UATTN_FORCE_2D=0 forces the 3D split-K path, =1
+// forces the 2D (non-large) path, unset (default) computes the occupancy
+// test. For A/B against the pre-fix behavior only — not a tuning knob.
+int mt_aiter_uattn_should_use_2d(int num_q_tokens, int num_seqs, int num_kv_heads);
 
 // Launch attention: 3D split-K + reduce_segments, in stream order.
 // Returns the first non-success hipError_t, or hipSuccess.

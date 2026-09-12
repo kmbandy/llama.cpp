@@ -77,7 +77,7 @@ static inline bool mt_aiter_kv_stride_div16(const mt_aiter_uattn_shape_t & s) {
 static inline const char * mt_aiter_i64_sig(bool div16) { return div16 ? "i64:16" : "i64"; }
 
 std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmma,
-                                int use_fp8_loader_v2 = 0) {
+                                int use_fp8_loader_v2 = 0, int all_decode = 1) {
     // MAD-199: K/V cache pointer dtype depends on cache_type. F16 stays
     // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:16` byte
     // pointers and bake CACHE_TYPE=1/2 as the kernel constexpr — both branches
@@ -127,7 +127,7 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmm
         "%d, %d, %d, %d, "                  // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "%s, %s, %s, 1, %s, %s, %s, 1, "  // k/v cache strides (":16" for f16; last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
-        "*i32, %d, i32, %d, %d, 1, %d, %d, %d, " // query_start_len, BLOCK_Q, num_seqs, BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE, USE_FP8_WMMA, USE_FP8_LOADER_V2
+        "*i32, %d, i32, %d, %d, %d, %d, %d, %d, " // query_start_len, BLOCK_Q, num_seqs, BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE, USE_FP8_WMMA, USE_FP8_LOADER_V2
         "*i8:16, *i8:16",                     // MAD-214: centroids_k_ptr, centroids_v_ptr (None-safe for non-FP8)
         kv_ptr_dtype,                           // K cache pointer dtype
         kv_ptr_dtype,                           // V cache pointer dtype
@@ -144,6 +144,7 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s, int use_fp8_wmm
         MT_AITER_UATTN_BLOCK_Q,                 // BLOCK_Q constexpr
         MT_AITER_UATTN_BLOCK_M,                 // BLOCK_M constexpr
         MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ,    // NUM_SEGMENTS_PER_SEQ constexpr
+        all_decode,                             // ALL_DECODE constexpr (MAD-2026-09-12: was hardcoded 1)
         cache_type_val,                         // CACHE_TYPE constexpr (MAD-199)
         use_fp8_wmma,                           // USE_FP8_WMMA constexpr (0 on gfx1030)
         use_fp8_loader_v2);                     // USE_FP8_LOADER_V2 constexpr (MAD-2026-09-11 fp8-loader-v2, opt-in)
@@ -234,7 +235,9 @@ std::string build_signature_dequant(const mt_aiter_uattn_shape_t & s) {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
         "*i8:16, *i8:16, *fp16:16, *fp16:16, "  // k_fp8, v_fp8, k_f16 (scratch), v_f16 (scratch)
-        "*i32, *i32, *i8:16, *i8:16, "          // block_tables, seq_lens, centroids_k, centroids_v
+        // MAD-2026-09-12 predequant-scratch: scratch_block_tables inserted
+        // right after block_tables — see predequant-scratch-0912.txt.
+        "*i32, *i32, *i32, *i8:16, *i8:16, "    // block_tables, scratch_block_tables, seq_lens, centroids_k, centroids_v
         "i64, "                                  // block_table_stride
         "%d, %d, %d, %d",                        // n_kv_heads, BLOCK_SIZE, HEAD_SIZE, BYTES_PER_BLOCK (constexpr)
         s.num_kv_heads, s.block_size, s.head_size,
@@ -244,7 +247,14 @@ std::string build_signature_dequant(const mt_aiter_uattn_shape_t & s) {
 
 struct CachedHandles {
     mt_aiter_uattn_shape_t      shape         = {};
-    const aiter::KernelHandle * h_3d          = nullptr;
+    const aiter::KernelHandle * h_3d          = nullptr;  // ALL_DECODE=1 (one q-token per seq)
+    // MAD-2026-09-12 dispatch-fix: second 3D handle, ALL_DECODE=0, for
+    // multi-query-token batches (MTP verify / DFlash draft-check) now routed
+    // to the 3D split-K kernel by the occupancy-driven dispatch predicate
+    // instead of unconditionally to the 2D base kernel. See
+    // mt_aiter_uattn_should_use_2d() and the dispatch in
+    // mt_aiter_unified_attn() below.
+    const aiter::KernelHandle * h_3d_md       = nullptr;  // ALL_DECODE=0 (find_seq_idx addressing)
     const aiter::KernelHandle * h_reduce      = nullptr;
     const aiter::KernelHandle * h_2d          = nullptr;  // base prefill (BLOCK_M=16, BLOCK_Q=2)
     const aiter::KernelHandle * h_2d_large    = nullptr;  // large prefill (BLOCK_M=8*GQA, BLOCK_Q=8)
@@ -257,7 +267,8 @@ struct CachedHandles {
     // mt_aiter_unified_attn() below for the full path. `predequant_enabled`
     // is decided once at init time (arch + cache_type + env override);
     // whether a given call actually TAKES the path additionally depends on
-    // use_2d_large and args->num_blocks > 0, both only known per-call.
+    // use_2d_large and args->num_scratch_blocks > 0 (MAD-2026-09-12
+    // predequant-scratch), both only known per-call.
     bool                         predequant_enabled = false;
     const aiter::KernelHandle  * h_dequant          = nullptr;  // dequant_turbo4_fp8_bs256_to_f16_2d
     const aiter::KernelHandle  * h_2d_large_f16     = nullptr;  // F16 shadow of h_2d_large, same cache key
@@ -420,6 +431,20 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
         target, sig_3d, env_nw, env_ns,
     };
     c.h_3d = reg.get_or_compile(spec_3d);
+
+    // MAD-2026-09-12 dispatch-fix: ALL_DECODE=0 sibling of h_3d. Same shape/
+    // target/num_warps/num_stages/cache-type/fp8-loader-v2 selection, only
+    // the ALL_DECODE literal differs (0 instead of 1) — kernel_unified_
+    // attention_3d already has fully general find_seq_idx/q_block_local_idx
+    // addressing for this case (kernels/unified_attention.py:1664-1679), it
+    // was just never instantiated with ALL_DECODE=0 before this patch.
+    const std::string sig_3d_md = build_signature_3d(shape, use_fp8_wmma, use_fp8_loader_v2, /*all_decode=*/0);
+    aiter::KernelSpec spec_3d_md {
+        AITER_KERNEL_SOURCE_DEFAULT,
+        "kernel_unified_attention_3d",
+        target, sig_3d_md, env_nw, env_ns,
+    };
+    c.h_3d_md = reg.get_or_compile(spec_3d_md);
 
     aiter::KernelSpec spec_reduce {
         AITER_KERNEL_SOURCE_DEFAULT,
@@ -614,12 +639,12 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
 
     c.shape       = shape;
     c.initialized = true;
-    const bool kernels_ok = c.h_3d && c.h_reduce && c.h_2d && c.h_2d_large;
+    const bool kernels_ok = c.h_3d && c.h_3d_md && c.h_reduce && c.h_2d && c.h_2d_large;
     if (!kernels_ok) {
         std::fprintf(stderr,
             "mt_aiter_unified_attn: registry could not compile/load kernels "
-            "(3d=%p, reduce=%p, 2d=%p, 2d_large=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d)\n",
-            (const void*)c.h_3d, (const void*)c.h_reduce, (const void*)c.h_2d, (const void*)c.h_2d_large,
+            "(3d=%p, 3d_md=%p, reduce=%p, 2d=%p, 2d_large=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d)\n",
+            (const void*)c.h_3d, (const void*)c.h_3d_md, (const void*)c.h_reduce, (const void*)c.h_2d, (const void*)c.h_2d_large,
             target.c_str(),
             shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size, shape.cache_type);
         c.init_err = hipErrorInvalidImage;
@@ -627,18 +652,23 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     return c.init_err;
 }
 
-// MAD-2026-09-11 fp8-predequant: lazily grow the per-device f16 scratch K/V
-// paged caches to at least `num_blocks` physical blocks. Never shrinks — a
-// later call with fewer blocks just reuses the existing (larger) buffer.
+// MAD-2026-09-12 predequant-scratch: lazily grow the per-device f16 scratch
+// K/V paged caches to at least `num_scratch_blocks` slots. Never shrinks — a
+// later call needing fewer slots just reuses the existing (larger) buffer,
+// so the high-water mark is the largest single call's compacted slot count
+// seen so far (e.g. the largest prefill batch), NOT the paged cache's total
+// physical block capacity — see predequant-scratch-0912.txt for why that
+// distinction matters (512 MiB/cache x2 permanently vs. a few tens of MiB
+// scaled to the actual prefill).
 // Returns false (leaving the previous buffers, if any, untouched) on
 // allocation failure; the caller falls back to the in-kernel fp8 dequant
 // path for that call rather than aborting.
-bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t & shape, int32_t num_blocks) {
+bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t & shape, int32_t num_scratch_blocks) {
     std::lock_guard<std::mutex> g(c.scratch_mu);
-    if ((size_t) num_blocks <= c.scratch_blocks && c.scratch_k && c.scratch_v) {
+    if ((size_t) num_scratch_blocks <= c.scratch_blocks && c.scratch_k && c.scratch_v) {
         return true;
     }
-    const size_t bytes_per_cache = (size_t) num_blocks * (size_t) shape.block_size
+    const size_t bytes_per_cache = (size_t) num_scratch_blocks * (size_t) shape.block_size
         * (size_t) shape.num_kv_heads * (size_t) shape.head_size * sizeof(uint16_t);
     void * new_k = nullptr;
     void * new_v = nullptr;
@@ -648,20 +678,88 @@ bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t &
     if (c.scratch_v) (void) hipFree(c.scratch_v);
     c.scratch_k      = new_k;
     c.scratch_v      = new_v;
-    c.scratch_blocks = (size_t) num_blocks;
+    c.scratch_blocks = (size_t) num_scratch_blocks;
     if (!c.predequant_logged) {
         int dev = 0;
         (void) hipGetDevice(&dev);
         std::fprintf(stderr,
             "mt_aiter_unified_attn: fp8-predequant path active on device %d "
-            "(num_blocks=%d, scratch=%zu B/cache x2)\n",
-            dev, num_blocks, bytes_per_cache);
+            "(num_scratch_blocks=%d, scratch=%zu B/cache x2)\n",
+            dev, num_scratch_blocks, bytes_per_cache);
         c.predequant_logged = true;
     }
     return true;
 }
 
+// MAD-2026-09-12 dispatch-fix: per-device CU count, queried once and cached.
+// Used only by mt_aiter_uattn_should_use_2d()'s occupancy test below —
+// separate from CachedHandles/get_cached() because this must be callable
+// from mt_pagedattn_aiter.cu's workspace-allocation gate BEFORE
+// ensure_initialized() has necessarily run for this device (workspace is
+// sized before mt_aiter_unified_attn() — and therefore ensure_initialized()
+// — is ever called).
+int cached_cu_count_for_current_device() {
+    static std::mutex mu;
+    static std::unordered_map<int, int> per_device;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        dev = 0;
+    }
+    std::lock_guard<std::mutex> g(mu);
+    auto it = per_device.find(dev);
+    if (it != per_device.end()) {
+        return it->second;
+    }
+    hipDeviceProp_t prop {};
+    int cu = 0;
+    if (hipGetDeviceProperties(&prop, dev) == hipSuccess) {
+        cu = prop.multiProcessorCount;
+    }
+    per_device[dev] = cu;
+    return cu;
+}
+
 }  // anonymous namespace
+
+// MAD-2026-09-12 dispatch-fix (decode-depth-scaling-0912.txt): occupancy-
+// driven 2D/3D dispatch predicate — see the declaration comment in
+// mt_aiter_unified_attn.h and the long comment above mt_aiter_uattn_use_2d()
+// there. Mirrors upstream's use_2d_kernel + program-count formula
+// (kernels/unified_attention_host_reference.py:33-129), minus the
+// sliding_window/max_seqlen_k<=512 short-context clause (neither dispatch
+// site here currently threads sliding-window or a real max_seqlen_k through
+// to this call, and skipping that clause only ever biases the choice toward
+// 3D, which is never worse than 2D at low context — 3D degrades gracefully
+// to a single, mostly-empty segment when context is tiny).
+int mt_aiter_uattn_should_use_2d(int num_q_tokens, int num_seqs, int num_kv_heads) {
+    // Env override, read once. Matches the read-once-via-function-local-
+    // static style already used elsewhere in this file (e.g.
+    // aiter_backend_enabled(), mt_aiter_scan_block_table's `on`) rather than
+    // std::call_once — a first-call data race between threads reading the
+    // same env value is benign (same result either way) and this file
+    // doesn't otherwise synchronize env reads.
+    static int force = -1;  // -1 = not yet checked, 0 = no override, 1 = force 3D, 2 = force 2D
+    if (force < 0) {
+        const char * e = std::getenv("MT_AITER_UATTN_FORCE_2D");
+        force = e ? (std::atoi(e) != 0 ? 2 : 1) : 0;
+    }
+    if (force == 2) { return 1; }
+    if (force == 1) { return 0; }
+
+    const int avg_q_len = mt_aiter_uattn_avg_q_len(num_q_tokens, num_seqs);
+    // 2D-large prefill path unchanged (task spec): avg_q_len >= 256 always
+    // takes the wide 2D-large tile regardless of occupancy.
+    if (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD) {
+        return 1;
+    }
+
+    const int kv_heads        = num_kv_heads > 0 ? num_kv_heads : 1;
+    const int num_2d_prgms    = (num_q_tokens / MT_AITER_UATTN_BLOCK_Q + num_seqs) * kv_heads;
+    const int cu_count        = cached_cu_count_for_current_device();
+    const int target_num_prgms = (cu_count > 0 ? cu_count : 1) * 4;
+
+    return (num_2d_prgms > target_num_prgms) ? 1 : 0;
+}
 
 hipError_t mt_aiter_unified_attn(hipStream_t stream,
                                   const mt_aiter_uattn_args_t *a) {
@@ -670,7 +768,7 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // Non-const: the fp8-predequant path below lazily grows c.scratch_k/v
     // under c.scratch_mu on (possibly) every call, not just the first.
     CachedHandles & c = get_cached();
-    if (!c.h_2d || !c.h_2d_large || !c.h_3d || !c.h_reduce) return hipErrorInvalidImage;
+    if (!c.h_2d || !c.h_2d_large || !c.h_3d || !c.h_3d_md || !c.h_reduce) return hipErrorInvalidImage;
 
     // MAD-199 D3 + MAD-203: three-way dispatch.
     //
@@ -681,7 +779,13 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // pays off when each Q block has ≥256 tokens to chew through (matches
     // upstream's max_seqlen_q >= 256 cutover).
     const int32_t avg_q_len    = mt_aiter_uattn_avg_q_len(a->num_q_tokens, a->num_seqs);
-    const bool    use_2d       = mt_aiter_uattn_use_2d(a->num_q_tokens, a->num_seqs);
+    // MAD-2026-09-12 dispatch-fix: occupancy-driven predicate (see
+    // mt_aiter_uattn_should_use_2d() above and mt_aiter_unified_attn.h) in
+    // place of the old avg_q_len>=BLOCK_Q token-count proxy. MUST use the
+    // same shape.num_kv_heads the caller will pass — mt_pagedattn_aiter.cu's
+    // workspace-allocation gate calls this exact function with the same
+    // three arguments.
+    const bool    use_2d       = mt_aiter_uattn_should_use_2d(a->num_q_tokens, a->num_seqs, a->shape.num_kv_heads) != 0;
     const bool    use_2d_large = use_2d && (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
 
     // ── 3D split-K phase ───────────────────────────────────────────────────
@@ -781,24 +885,32 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
         unsigned int g2_y = (unsigned int)(num_q_tokens / block_q_for_grid + num_seqs);
         unsigned int g2_z = 1;
 
-        // MAD-2026-09-11 fp8-predequant: 2D-large-prefill only. Dequant the
-        // production turbo4_fp8 K/V cache into an f16 scratch paged cache
-        // (same physical block indices, standard f16 layout), then launch
-        // the UNMODIFIED F16 2D-large kernel against the scratch cache —
-        // bit-identical to the fp8 in-kernel-dequant path by construction
-        // (see dequant_turbo4_fp8_bs256_to_f16_2d's docstring in
+        // MAD-2026-09-11 fp8-predequant, MAD-2026-09-12 predequant-scratch:
+        // 2D-large-prefill only. Dequant the production turbo4_fp8 K/V cache
+        // into an f16 scratch paged cache — COMPACTED block indices
+        // (a->scratch_block_tables), not the physical ones, since
+        // predequant-scratch-0912.txt — standard f16 layout otherwise, then
+        // launch the UNMODIFIED F16 2D-large kernel against the scratch
+        // cache (indexed by that same compacted table) — bit-identical to
+        // the fp8 in-kernel-dequant path by construction (see
+        // dequant_turbo4_fp8_bs256_to_f16_2d's docstring in
         // kernels/unified_attention.py). Falls through to the normal fp8
         // launch below if scratch growth fails for this call.
-        if (use_2d_large && c.predequant_enabled && a->num_blocks > 0
-            && ensure_predequant_scratch(c, a->shape, a->num_blocks)) {
+        if (use_2d_large && c.predequant_enabled && a->num_scratch_blocks > 0 && a->scratch_block_tables
+            && ensure_predequant_scratch(c, a->shape, a->num_scratch_blocks)) {
             hipDeviceptr_t p_k_f16 = (hipDeviceptr_t) c.scratch_k;
             hipDeviceptr_t p_v_f16 = (hipDeviceptr_t) c.scratch_v;
             int64_t        bt_stride_dq = a->block_table_stride;
+            // MAD-2026-09-12 predequant-scratch: compacted [num_seqs,
+            // block_table_stride] table (prefix[seq]+slot, or -1) built on
+            // the host from seq_lens/block_size — where the dequant kernel
+            // WRITES, as opposed to p_bt (physical), where it READS.
+            hipDeviceptr_t p_bt_scratch = (hipDeviceptr_t) a->scratch_block_tables;
 
             void *args_dequant[] = {
                 &p_k, &p_v,               // fp8 source caches (a->k_cache / a->v_cache)
                 &p_k_f16, &p_v_f16,       // f16 scratch destination caches
-                &p_bt, &p_sl,
+                &p_bt, &p_bt_scratch, &p_sl,
                 &p_centroids_k, &p_centroids_v,
                 &bt_stride_dq,
                 &p_global_scratch, &p_profile_scratch,
@@ -823,10 +935,15 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
                 // pointers harmless.
                 hipDeviceptr_t p_centroids_null = (hipDeviceptr_t) nullptr;
 
+                // MAD-2026-09-12 predequant-scratch: the F16 shadow kernel
+                // reads K/V through the SAME table it loaded from — since
+                // k_f16/v_f16 above are the scratch caches (compacted
+                // indexing), this launch must index them with p_bt_scratch,
+                // not the physical p_bt used for the real fp8 cache.
                 void *args_2d_f16[] = {
                     &p_out, &p_q, &p_k_f16, &p_v_f16,
                     &p_sink,
-                    &p_bt, &p_sl,
+                    &p_bt_scratch, &p_sl,
                     &p_alibi, &p_qq_bias,
                     &scale_f,
                     &p_qd, &p_kd, &p_vd, &p_os,
@@ -866,15 +983,64 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
         &p_global_scratch, &p_profile_scratch,
     };
 
-    // Grid for 3D ALL_DECODE: one q-block per sequence (PR #2888). The 3D
-    // kernel is only launched for avg_q_len < BLOCK_Q, and the 3D signature
-    // bakes ALL_DECODE=1, so grid X is num_seqs rather than the padded
-    // num_q_tokens/BLOCK_Q + num_seqs formula used for mixed-length prefill.
-    unsigned int g3_x = (unsigned int) num_seqs;
+    // MAD-2026-09-12 dispatch-fix: pick ALL_DECODE=1 vs ALL_DECODE=0 3D
+    // handle. ALL_DECODE=1 (seq_idx = program_id(0) directly, cur_batch_
+    // query_len hardcoded to 1 — kernels/unified_attention.py:1657-1663) is
+    // only valid when every one of the num_seqs slots contributes EXACTLY
+    // one query token this call. `num_q_tokens == num_seqs` is a necessary
+    // AND (for this codebase's actual traffic shapes) sufficient proxy for
+    // that: pure decode always satisfies it (each live seq contributes 1
+    // token, num_seqs counts only live-per-tensor-shape slots that all
+    // decode together); MTP/DFlash verify batches never satisfy it (every
+    // live seq contributes num_q_tokens/num_seqs > 1 tokens uniformly, so
+    // the sum != num_seqs whenever depth > 1); and — this is the par-4 fault
+    // review finding, see par-4-fault-report.txt candidate #2 — a partially-
+    // masked decode call (num_seqs fixed at n_seq_max by block_tables'
+    // tensor shape, but fewer than n_seq_max sequences actually live this
+    // step, so num_q_tokens < num_seqs) ALSO now correctly falls through to
+    // the ALL_DECODE=0 handle instead of ALL_DECODE=1.
+    //   This matters beyond just picking the "more correct" kernel: with
+    // ALL_DECODE=1's cur_batch_query_len hardcoded to 1, a dead/masked seq
+    // slot's cu_seqlens entry (query_start_len_ptr[seq_idx], built by
+    // mt_build_cu_seqlens_kernel from that slot's own q_len — 0 for a dead
+    // slot) is a REPEAT of the previous live slot's boundary, not a fresh
+    // one; the hardcoded query_mask_0 = (query_pos < 1) then evaluates TRUE
+    // for that dead slot's "query" anyway (query_pos=0 < cur_batch_query_len
+    // forced to 1), so the kernel treats a phantom query token as real: it
+    // reads Q at that repeated boundary offset — up to one row PAST the end
+    // of the real [num_q_tokens, ...] Q tensor when the dead slot is the
+    // last one scanned — and, worse, WRITES segm_output/segm_max/segm_expsum
+    // at that same one-past-the-end row, i.e. an out-of-bounds heap write
+    // into whatever pool allocation follows the (num_q_tokens-sized) segm_*
+    // workspace. That is a plausible mechanism for the kind of heap
+    // corruption that later surfaces as an unrelated HSA_STATUS_ERROR_
+    // MEMORY_FAULT. Routing this case to ALL_DECODE=0 (which derives
+    // cur_batch_query_len from the REAL cu_seqlens diff via find_seq_idx, so
+    // a dead slot's query_len is genuinely 0 and query_mask_0 is correctly
+    // all-False for it) closes this off entirely rather than papering over
+    // it with an extra clamp.
+    const bool all_decode = (num_q_tokens == num_seqs);
+    const aiter::KernelHandle * h_3d_selected = all_decode ? c.h_3d : c.h_3d_md;
+
+    unsigned int g3_x;
+    if (all_decode) {
+        // ALL_DECODE grid: one q-block (= one query token) per sequence
+        // (PR #2888).
+        g3_x = (unsigned int) num_seqs;
+    } else {
+        // ALL_DECODE=0 grid: upstream's axis order/formula — total_num_q_
+        // blocks = num_q_tokens/BLOCK_Q + num_seqs (upper bound on
+        // sum_i[ceil(query_len[i]/BLOCK_Q)]; see the derivation comment in
+        // unified_attention_host_reference.py's unified_attention()). This
+        // is a DIFFERENT axis-0 quantity than num_seqs — they only coincide
+        // when every sequence contributes exactly one q-block, which is
+        // exactly the invariant `all_decode` above checks.
+        g3_x = (unsigned int)(num_q_tokens / MT_AITER_UATTN_BLOCK_Q + num_seqs);
+    }
     unsigned int g3_y = (unsigned int) a->shape.num_kv_heads;
     unsigned int g3_z = (unsigned int) MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ;
 
-    hipError_t err = c.h_3d->launch(stream, g3_x, g3_y, g3_z, args_3d);
+    hipError_t err = h_3d_selected->launch(stream, g3_x, g3_y, g3_z, args_3d);
     if (err != hipSuccess) return err;
 
     // ── reduce_segments phase ──────────────────────────────────────────────

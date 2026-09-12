@@ -1021,14 +1021,28 @@ def load_turbo_fp8_kv_tile_V_bs256_v2(
 # one K/V column cannot leak into any other column's S value), so the final
 # softmax output is identical to production's own tile-mask-elided behavior
 # whether or not TILE_SIZE happens to equal BLOCK_SIZE for a given run.
+#
+# MAD-2026-09-12 predequant-scratch: the above is all still about the READ
+# side (block_tables_ptr / physical_block_idx). The WRITE side is now a
+# separate, compacted index (scratch_block_tables_ptr / scratch_block_idx) —
+# see predequant-scratch-0912.txt — so the scratch cache this kernel fills is
+# sized by the blocks THIS call touches, not the paged cache's full physical
+# capacity.
 @triton.jit
 def dequant_turbo4_fp8_bs256_to_f16_2d(
     k_cache_fp8_ptr,      # *i8 — turbo4_fp8 (CACHE_TYPE=24) K cache, byte layout
                            # [num_blocks, BLOCK_SIZE, n_kv_heads, BYTES_PER_BLOCK]
     v_cache_fp8_ptr,      # *i8 — same layout for V
-    k_cache_f16_ptr,      # *fp16 — scratch K cache [num_blocks, BLOCK_SIZE, n_kv_heads, HEAD_SIZE]
+    k_cache_f16_ptr,      # *fp16 — scratch K cache [num_scratch_blocks, BLOCK_SIZE, n_kv_heads, HEAD_SIZE]
     v_cache_f16_ptr,      # *fp16 — scratch V cache, same layout
-    block_tables_ptr,     # [num_seqs, block_table_stride] int32 (kInvalidBlockTableEntry = -1)
+    block_tables_ptr,     # [num_seqs, block_table_stride] int32 (kInvalidBlockTableEntry = -1) — physical
+                           # block index, used to READ the fp8 source cache
+    scratch_block_tables_ptr,  # MAD-2026-09-12 predequant-scratch: [num_seqs, block_table_stride]
+                           # int32, same shape as block_tables_ptr but holding the COMPACT scratch
+                           # slot (prefix[seq]+slot, or -1) this program should WRITE its dequantized
+                           # block to — see predequant-scratch-0912.txt. Built on the host from
+                           # seq_lens/block_size (mt_pagedattn_aiter.cu), not from block_tables_ptr's
+                           # physical values.
     seq_lens_ptr,          # [num_seqs] int32
     centroids_k_ptr,       # *u8 — per-(layer, K) centroid LUT, 16 bytes (IDX_BITS=4)
     centroids_v_ptr,       # *u8 — per-(layer, V) centroid LUT
@@ -1053,6 +1067,19 @@ def dequant_turbo4_fp8_bs256_to_f16_2d(
     if physical_block_idx_i32 < 0:  # kInvalidBlockTableEntry — nothing to write
         return
     physical_block_idx = physical_block_idx_i32.to(tl.int64)
+
+    # MAD-2026-09-12 predequant-scratch: where to WRITE, as opposed to
+    # physical_block_idx above (where to READ). The host built this entry as
+    # -1 in exactly the same cases block_tables_ptr's own entry is -1 or past
+    # this seq's live range, so this redundant load can only early-exit on a
+    # slot the physical_block_idx check above would already have caught —
+    # but check it anyway rather than assume the two tables never disagree.
+    scratch_block_idx_i32 = tl.load(
+        scratch_block_tables_ptr + seq_idx * block_table_stride + slot_idx
+    )
+    if scratch_block_idx_i32 < 0:
+        return
+    scratch_block_idx = scratch_block_idx_i32.to(tl.int64)
 
     token_in_block = tl.arange(0, BLOCK_SIZE)
     # Broadcast the scalar physical block id to a (BLOCK_SIZE,) tensor — the
@@ -1083,8 +1110,11 @@ def dequant_turbo4_fp8_bs256_to_f16_2d(
            * V_scales[:, None].to(tl.float16))
 
     offs_d = tl.arange(0, HEAD_SIZE)
+    # MAD-2026-09-12 predequant-scratch: write at the COMPACT scratch slot,
+    # not physical_block_idx — the scratch cache is now sized by blocks this
+    # call actually touches, not the paged cache's total physical capacity.
     out_base = (
-        physical_block_idx * (BLOCK_SIZE * n_kv_heads * HEAD_SIZE)
+        scratch_block_idx * (BLOCK_SIZE * n_kv_heads * HEAD_SIZE)
         + token_in_block    * (n_kv_heads * HEAD_SIZE)
         + kv_head_idx       * HEAD_SIZE
     )

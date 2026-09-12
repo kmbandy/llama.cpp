@@ -197,7 +197,12 @@ static int run_and_dump(const char *out_path) {
     args.num_seqs        = NUM_SEQS;
     args.num_q_tokens    = num_q_tokens;
     args.block_table_stride = num_blocks;
-    args.num_blocks      = num_blocks;  // MAD-2026-09-11: the field under test
+    // MAD-2026-09-12 predequant-scratch: the field(s) under test. NUM_SEQS=1
+    // and this table is fully populated (block_table_stride == num_blocks,
+    // h_block_tables[i]=i), so the compacted table is the identity — reusing
+    // d_block_tables directly reproduces the exact pre-fix scratch layout.
+    args.scratch_block_tables = d_block_tables;
+    args.num_scratch_blocks   = num_blocks;
     args.q_stride_0      = (int64_t) NUM_Q_HEADS * HEAD_SIZE;
     args.output_stride_0 = args.q_stride_0;
     args.k_stride_0      = (int64_t) BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE;
