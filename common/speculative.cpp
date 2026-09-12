@@ -3760,13 +3760,42 @@ common_speculative_init_result::common_speculative_init_result(
     auto cparams = common_context_params_to_llama(params);
 
     // Draft decoding emits at most the anchor plus n_max tokens per sequence.
-    // Keep prompt processing within the same startup graph reserve.
+    // Cap the graph's output-row budget (n_outputs_max_per_seq) to that --
+    // is_draft_ctx()'s draft_graph_n_tokens()/draft_graph_n_outputs() in
+    // llama-context.cpp already derive the *reserved* graph size (and the
+    // live LM-head row count) from n_outputs_max_per_seq, clamped again to
+    // llm_graph_logit_row_cap (32). That reserve does NOT read cparams.n_ubatch
+    // directly -- see llama-context.cpp:1174-1175 -- so it is unaffected by
+    // whatever n_ubatch is left at below.
+    //
+    // 2026-09-12 WP_MTP_PREFILL_COST: cparams.n_ubatch here used to be clamped
+    // to the same n_draft_tokens (<= 5 for --spec-draft-n-max 4), on the
+    // reasoning above ("keep prompt processing within the same startup graph
+    // reserve") -- but the reserve was already independent of n_ubatch, so that
+    // clamp bought nothing and cost everything: cparams.n_ubatch is also the
+    // chunk size llama_context::decode() uses to split an incoming batch
+    // (memory->init_batch(*balloc, cparams.n_ubatch, ...), llama-context.cpp
+    // ~3603-3614). common_speculative_impl_draft_mtp::process() feeds the
+    // draft context ctx_tgt's per-target-ubatch catch-up batch (up to the
+    // TARGET's n_ubatch, e.g. 2048) in one llama_decode(ctx_dft, batch) call;
+    // with ctx_dft's n_ubatch clamped to 5 that call was silently exploded
+    // into ceil(n_tokens/5) sub-batches -- ~410 per 2048-token target ubatch,
+    // ~3200 for a 16k prompt -- each a full graph build + backend-sched launch
+    // for a chunk almost entirely below the wavefront/launch-overhead floor.
+    // That serialized, launch-bound loop (not the actual one-layer compute,
+    // which is cheap) is what was measured as a 26-31% prefill throughput hit
+    // on Qwen3.8-27B draft-mtp vs. no-spec. Leaving n_ubatch at its normal
+    // (target-matching) value lets that catch-up batch run as ~1 big ubatch
+    // instead of hundreds of tiny ones. KV contents and accepted-token
+    // selection are unchanged: the decode-time draft loop
+    // (common_speculative_impl_draft_mtp::draft()) still only ever submits
+    // n_max+1 tokens per call regardless of how large n_ubatch is (larger
+    // capacity, not larger use), and the LM-head/output-row cap governing what
+    // draft() reads back is n_outputs_max_per_seq, set below exactly as before.
     if ((has_draft || spec_self) && params.speculative.draft.n_max_explicit) {
         const uint32_t n_draft_tokens = (uint32_t) std::max<int64_t>(
                 1, (int64_t) params.speculative.draft.n_max + 1);
         cparams.n_outputs_max_per_seq = n_draft_tokens;
-        cparams.n_ubatch = std::min(cparams.n_ubatch,
-                std::min(n_draft_tokens, llm_graph_logit_row_cap));
     }
 
     // MAD-LAB: select the graph for an in-model DSpark context.
