@@ -757,6 +757,17 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     const int32_t block_size  = ((const int32_t *)(op_params_f + 1))[0];
     const int32_t max_bps     = ((const int32_t *)(op_params_f + 2))[0];
     const int32_t n_kv_heads  = ((const int32_t *)(op_params_f + 3))[0];
+    // MAD-2026-09-12 predequant-sync-fix (predequant-sync-fix-0912.txt):
+    // op_params[5] (max live context, across all seqs in this ubatch) is
+    // populated host-side by llm_graph_input_attn_kv::update_paged_attn_max_ctx_len()
+    // from set_input() -- see src/llama-graph.cpp:550-574 (MAD-378) -- i.e.
+    // it is already known on the host before this op ever launches, with no
+    // device readback required. Used below to size the fp8 pre-dequant
+    // scratch cache without the D2H + hipStreamSynchronize this file used
+    // to do per call. 0 means "unset" (e.g. a cold graph executed before
+    // its first set_input, such as during warmup) -- same convention as
+    // op_params[4]/[5] in mt_pagedattn.cu.
+    const int32_t max_ctx_len_param = ((const int32_t *)(op_params_f + 5))[0];
 
     const int head_size      = (int) q->ne[0];
     const int n_heads        = (int) q->ne[1];
@@ -1038,26 +1049,54 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
         use_2d && (mt_aiter_uattn_avg_q_len(num_q_tokens, num_seqs) >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
     const bool want_predequant_scratch = (cache_type == MT_AITER_CACHE_TURBO4_FP8) && use_2d_large;
     if (want_predequant_scratch) {
-        predq_counts.alloc((size_t) num_seqs);
-        predq_prefix.alloc((size_t) num_seqs);
-        predq_total.alloc(1);
-        mt_aiter_predequant_scan_kernel<<<1, 1, 0, stream>>>(
-            (const int32_t*) context_lens->data, block_size, num_seqs,
-            predq_counts.get(), predq_prefix.get(), predq_total.get());
-
-        // Single D2H sync per call — needed to know the slot TOTAL on the
-        // host before sizing/growing the scratch hipMalloc below. Gated to
-        // this prefill-only, fp8-predequant-only path (never the hot decode
-        // loop): one sync per prefill call is acceptable. See
-        // predequant-scratch-0912.txt "sync" section.
-        int32_t host_total = 0;
-        if (hipMemcpyAsync(&host_total, predq_total.get(), sizeof(int32_t),
-                            hipMemcpyDeviceToHost, stream) == hipSuccess
-            && hipStreamSynchronize(stream) == hipSuccess) {
-            num_scratch_blocks = host_total;
-        }
+        // MAD-2026-09-12 predequant-sync-fix (predequant-sync-fix-0912.txt):
+        // this used to be `mt_aiter_predequant_scan_kernel` + a D2H
+        // hipMemcpyAsync + hipStreamSynchronize(stream) to learn the exact
+        // live-block TOTAL on the host before sizing the scratch cache. That
+        // sync blocked the issuing host thread on THIS device's stream --
+        // under GGML_META_OVERLAP=1 the meta backend's single host thread
+        // submits device subgraphs one at a time (ggml_backend_meta_graph_
+        // runner::compute(), ggml/src/ggml-backend-meta.cpp:2649-2657), so
+        // blocking here stalls it before it can ever submit the OTHER
+        // device's subgraph -- including that device's half of any
+        // AllReduce whose duplex handshake (ggml/src/ggml-cuda/allreduce.cu,
+        // ggml_cuda_ar_dx_slot, "asynchronous, event-driven, no host syncs"
+        // by design at allreduce.cu:724-750) this device's stream is
+        // already waiting on. Host-level deadlock, not a device fault --
+        // see predequant-sync-fix-0912.txt for the full trace.
+        //
+        // Fix: size the scratch cache from a bound that is host-visible
+        // WITHOUT any device readback. op_params[5] (max_ctx_len_param,
+        // read above) already carries the per-ubatch max live context
+        // length across all seqs, computed host-side at set_input() from
+        // the paged cache's own host mirrors (src/llama-graph.cpp:550-574,
+        // MAD-378) -- strictly earlier than this op ever launches. Bound:
+        //   num_scratch_blocks = num_seqs * ceil(max_ctx_len / block_size)
+        // For the production shape (num_seqs==1 prefill) this equals the
+        // exact live-block total the old scan kernel computed -- no VRAM
+        // regression in the case that matters. 0 (unset -- a cold graph run
+        // before its first set_input, e.g. warmup) falls back to the old
+        // pre-0912 conservative bound (num_seqs * max_bps, i.e. the paged
+        // cache's full allocated capacity for these seqs).
+        const int32_t ctx_len_bound =
+            max_ctx_len_param > 0 ? max_ctx_len_param : (int32_t) max_bps * block_size;
+        const int32_t blocks_per_seq_bound = (ctx_len_bound + block_size - 1) / block_size;
+        num_scratch_blocks = num_seqs * blocks_per_seq_bound;
 
         if (num_scratch_blocks > 0) {
+            predq_counts.alloc((size_t) num_seqs);
+            predq_prefix.alloc((size_t) num_seqs);
+            predq_total.alloc(1);
+            // Kernel A still runs, fully device-side: it produces the exact
+            // per-seq counts/prefix the fill kernel below needs to keep the
+            // compacted table DENSE (packed by actual live blocks, not the
+            // worst-case bound) even though the ALLOCATION above is sized by
+            // the bound. out_total is written but deliberately never copied
+            // back to host -- that copyback + sync was the bug.
+            mt_aiter_predequant_scan_kernel<<<1, 1, 0, stream>>>(
+                (const int32_t*) context_lens->data, block_size, num_seqs,
+                predq_counts.get(), predq_prefix.get(), predq_total.get());
+
             predq_scratch_table.alloc((size_t) num_seqs * (size_t) max_bps);
             const dim3 fill_grid((unsigned) num_seqs, (unsigned) ((max_bps + 255) / 256));
             mt_aiter_predequant_fill_table_kernel<<<fill_grid, 256, 0, stream>>>(
