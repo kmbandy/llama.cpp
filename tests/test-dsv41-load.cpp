@@ -231,7 +231,8 @@ static llama_batch make_dsv41_token_batch(
 static llama_batch make_dsv41_embd_batch(
         const std::vector<float> & embd,
         uint32_t n_embd,
-        llama_pos pos0) {
+        llama_pos pos0,
+        bool outputs = false) {
     const int32_t n_tokens = (int32_t) (embd.size() / n_embd);
     llama_batch batch = llama_batch_init(n_tokens, (int32_t) n_embd, 1);
     std::memcpy(batch.embd, embd.data(), embd.size() * sizeof(float));
@@ -239,7 +240,7 @@ static llama_batch make_dsv41_embd_batch(
         batch.pos[i]       = pos0 + i;
         batch.n_seq_id[i]  = 1;
         batch.seq_id[i][0] = 0;
-        batch.logits[i]    = false;
+        batch.logits[i]    = outputs;
     }
     batch.n_tokens = n_tokens;
     return batch;
@@ -506,7 +507,7 @@ static bool test_dsv41_dspark_cycle() {
 
     std::vector<float> features((size_t) n_prompt * n_embd);
     std::memcpy(features.data(), target_tap, features.size() * sizeof(float));
-    llama_batch enc_batch = make_dsv41_embd_batch(features, n_embd, 0);
+    llama_batch enc_batch = make_dsv41_embd_batch(features, n_embd, 0, /*outputs*/ true);
     const int enc_rc = llama_encode(ctx_dft.get(), enc_batch);
     llama_batch_free(enc_batch);
     if (enc_rc != 0) {
@@ -628,7 +629,7 @@ static bool test_dsv41_dspark_cycle() {
     printf("DSpark cycle clear: draft_seq=0 pos=[12,inf) before successor injection\n");
 
     std::vector<float> successor_features(successor_tap, successor_tap + n_embd);
-    llama_batch enc_batch_next = make_dsv41_embd_batch(successor_features, n_embd, 12);
+    llama_batch enc_batch_next = make_dsv41_embd_batch(successor_features, n_embd, 12, /*outputs*/ true);
     const int enc_next_rc = llama_encode(ctx_dft.get(), enc_batch_next);
     llama_batch_free(enc_batch_next);
     if (enc_next_rc != 0) {
