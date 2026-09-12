@@ -428,6 +428,7 @@ static bool test_dsv41_dspark_cycle() {
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     ggml_backend_dev_t devices[] = { cpu, nullptr };
     model_params.devices = devices;
+    model_params.load_mtp = true; // the DSPARK draft context needs the stage tensors (common_model_params_to_llama does this for a self-draft)
 
     llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data_f32, nullptr, model_params));
     if (!model) {
