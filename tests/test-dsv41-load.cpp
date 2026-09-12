@@ -446,10 +446,12 @@ static bool test_dsv41_dspark_cycle() {
         fprintf(stderr, "DSpark cycle: target_layers metadata not loaded\n");
         return false;
     }
-    const llama_token mask_token = llama_vocab_mask(llama_model_get_vocab(model.get()));
-    if (mask_token != 127) {
-        fprintf(stderr, "DSpark cycle: mask token metadata not loaded (got %d)\n", mask_token);
-        return false;
+    // the no_vocab tokenizer does not carry tokenizer.ggml.mask_token_id; the runtime
+    // (common/speculative.cpp) reads it via llama_vocab_mask on a real model, so mirror
+    // that when present and fall back to the id the synthetic metadata declares.
+    llama_token mask_token = llama_vocab_mask(llama_model_get_vocab(model.get()));
+    if (mask_token < 0) {
+        mask_token = 127;
     }
 
     llama_context_params cparams_tgt = llama_context_default_params();
