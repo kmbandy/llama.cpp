@@ -1,3 +1,5 @@
+#include "wp-expert-descriptor.h"
+
 #include "ggml.h"
 #include "gguf.h"
 
@@ -46,11 +48,7 @@ struct ggml_deleter {
 using gguf_ptr = std::unique_ptr<gguf_context, gguf_deleter>;
 using ggml_ptr = std::unique_ptr<ggml_context, ggml_deleter>;
 
-struct Options {
-    fs::path model;
-    fs::path manifest;
-    fs::path output;
-};
+// Options is defined in wp-expert-descriptor.h (shared with the test target).
 
 struct RoleDesc {
     std::string    role;
@@ -272,6 +270,10 @@ Options parse_cli(int argc, char ** argv) {
     return options;
 }
 
+} // namespace
+
+// External linkage: declared in wp-expert-descriptor.h so the test target can
+// link this translation unit (built with WP_EXPERT_DESCRIPTOR_NO_MAIN).
 int run(const Options & options) {
     const json manifest = read_json(options.manifest);
     check_format(manifest, MANIFEST_FORMAT, options.manifest);
@@ -283,7 +285,8 @@ int run(const Options & options) {
     // geometry comes from the manifest's expert type + hparams, and per-layer
     // expert counts come from each shard's group_count (V4.1's MTP blocks
     // route over 128 experts against a 384-expert main stack).
-    const bool layered = sharding_mode == "layer-ranges";
+    const bool layered = sharding_mode == "layer-ranges" ||
+        (sharding_mode == "expert-slice" && manifest.contains("expert_ggml_type"));
     if (!sliced && !layered && sharding_mode != "expert-index-range") {
         throw std::runtime_error("descriptor requires an expert-index-range, expert-slice or layer-ranges shard manifest");
     }
@@ -620,6 +623,9 @@ int run(const Options & options) {
     if (sliced) {
         descriptor["expert_slicing"] = manifest.at("expert_slicing");
     }
+    if (manifest.contains("layer_ranges")) {
+        descriptor["layer_ranges"] = manifest.at("layer_ranges");
+    }
     descriptor["sharding_mode"] = sharding_mode;
 
     std::map<std::string, std::map<std::pair<int, std::string>, int>> distribution;
@@ -675,8 +681,7 @@ int run(const Options & options) {
     return 0;
 }
 
-} // namespace
-
+#ifndef WP_EXPERT_DESCRIPTOR_NO_MAIN
 int main(int argc, char ** argv) {
     try {
         return run(parse_cli(argc, argv));
@@ -685,3 +690,4 @@ int main(int argc, char ** argv) {
         return 1;
     }
 }
+#endif // WP_EXPERT_DESCRIPTOR_NO_MAIN

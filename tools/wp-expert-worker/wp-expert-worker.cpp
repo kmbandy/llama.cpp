@@ -3337,7 +3337,8 @@ Descriptor load_descriptor(const fs::path & path) {
     }
     if (value.contains("sharding_mode")) {
         const std::string mode = get_value<std::string>(value, "sharding_mode", path);
-        result.layered = mode == "layer-ranges";
+        result.layered = mode == "layer-ranges" ||
+            (value.contains("expert_slicing") && value.contains("layer_ranges"));
         if ((result.sliced && mode != "expert-slice") ||
             (!result.sliced && !result.layered && mode != "expert-index-range")) {
             throw std::runtime_error(path.string() + ": descriptor sharding_mode disagrees with its geometry");
@@ -3406,8 +3407,12 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
     const json manifest = read_json(manifest_path);
     check_format(manifest, MANIFEST_FORMAT, manifest_path);
     const std::string sharding_mode = get_value<std::string>(manifest, "sharding_mode", manifest_path);
+    // A width-sliced set that is also layer-partial (wp-forge: HF source,
+    // spine-only model_files) declares "expert-slice" and carries layer_ranges;
+    // its descriptor is both sliced and layered.
+    const bool sliced_layered = result.descriptor.sliced && result.descriptor.layered;
     if ((result.descriptor.sliced && sharding_mode != "expert-slice") ||
-        (result.descriptor.layered && sharding_mode != "layer-ranges") ||
+        (result.descriptor.layered && !sliced_layered && sharding_mode != "layer-ranges") ||
         (!result.descriptor.sliced && !result.descriptor.layered && sharding_mode != "expert-index-range")) {
         throw std::runtime_error("worker descriptor and shard manifest sharding modes disagree");
     }

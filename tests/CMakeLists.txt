@@ -374,6 +374,21 @@ target_link_libraries(test-wp-expert-shard PRIVATE llama-common)
 target_compile_features(test-wp-expert-shard PRIVATE cxx_std_17)
 llama_test(test-wp-expert-shard)
 
+# expert descriptor: width-sliced + layer-partial (spine-only) manifest
+add_executable(
+    test-wp-expert-descriptor
+    test-wp-expert-descriptor.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-expert-descriptor/wp-expert-descriptor.cpp
+)
+target_compile_definitions(test-wp-expert-descriptor PRIVATE WP_EXPERT_DESCRIPTOR_NO_MAIN)
+target_include_directories(test-wp-expert-descriptor PRIVATE
+    ${CMAKE_SOURCE_DIR}/tools/wp-expert-descriptor
+    ${CMAKE_SOURCE_DIR}/vendor
+)
+target_link_libraries(test-wp-expert-descriptor PRIVATE ggml)
+target_compile_features(test-wp-expert-descriptor PRIVATE cxx_std_17)
+llama_test(test-wp-expert-descriptor)
+
 # CPU-only expert worker service: synthetic O_DIRECT shard, real TCP framing,
 # token batching, weighted multi-expert SwiGLU, and ownership rejection.
 add_executable(test-wp-expert-worker test-wp-expert-worker.cpp)
