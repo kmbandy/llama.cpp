@@ -12,3 +12,4 @@ ggml-common.h
 cmake_install.cmake
 CTestTestfile.cmake
 *.a
+!wp_forge/
