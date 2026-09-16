@@ -2777,6 +2777,91 @@ private:
         return nullptr;
     }
 
+    // [MAD-445] Cross-request prefix cache, live-slot fast path.
+    //
+    // If another slot on the SAME stream (same ctx_tgt / same underlying llama_memory_t,
+    // required because llama_memory_seq_cp cannot cross two independent contexts) already
+    // holds a live, token-exact-prefix match for `task.tokens` that is longer than what
+    // `dst` currently has cached, give `dst` a cheap refcounted share of that donor's KV
+    // blocks (and, for hybrid GDN models, a copy of the small recurrent state) via
+    // llama_memory_seq_cp, instead of paying for either a full re-prefill or a byte-level
+    // round-trip through the (much larger) --cache-ram whole-prompt cache.
+    //
+    // Correctness: llama_memory_seq_cp for the paged KV backend shares physical blocks by
+    // refcount (copy-on-write on first divergent write), so the bytes `dst` sees for
+    // positions [0, lcp_len) are bit-identical to the donor's until dst.: temp-0 output for
+    // the shared prefix is unaffected by construction. For the hybrid wrapper, seq_cp also
+    // copies the recurrent (GDN) state cell, so this only produces a correct result when the
+    // donor's OWN recurrent state actually reflects having processed exactly `lcp_len`
+    // tokens and nothing past that — which is why we require the donor to be idle (not
+    // mid-decode) and use only the donor's already-committed prompt length as the copy
+    // range, never a length that includes any of the donor's own generated continuation.
+    //
+    // This does not touch --cache-ram / server_prompt_cache at all; it is a strictly
+    // additive, disabled-by-default fast path (see params_base.prefix_cache).
+    bool try_adopt_live_prefix(server_slot & dst, const server_task & task) {
+        if (!params_base.prefix_cache) {
+            return false;
+        }
+
+        if (task.type != SERVER_TASK_TYPE_COMPLETION) {
+            return false;
+        }
+
+        server_slot * donor = nullptr;
+        size_t        lcp_best = dst.prompt.tokens.get_common_prefix(task.tokens);
+
+        for (server_slot & cand : slots) {
+            if (&cand == &dst || cand.is_processing()) {
+                continue;
+            }
+
+            // seq_cp only makes sense within the same underlying memory / context
+            if (cand.ctx_tgt != dst.ctx_tgt) {
+                continue;
+            }
+
+            if (cand.prompt.tokens.empty()) {
+                continue;
+            }
+
+            const size_t lcp_cur = cand.prompt.tokens.get_common_prefix(task.tokens);
+
+            if ((int32_t) lcp_cur >= params_base.prefix_cache_min_tokens && lcp_cur > lcp_best) {
+                lcp_best = lcp_cur;
+                donor    = &cand;
+            }
+        }
+
+        if (donor == nullptr) {
+            return false;
+        }
+
+        SLT_INF(dst, "adopting live prefix of %zu tokens from slot %d via seq_cp (prefix-cache)\n",
+                lcp_best, donor->id);
+
+        const int64_t t_start = ggml_time_us();
+
+        // fully vacate dst's own sequence before sharing the donor's blocks into it
+        dst.prompt_clear();
+
+        llama_memory_seq_cp(llama_get_memory(dst.ctx_tgt), donor->stream_slot_idx, dst.stream_slot_idx, 0, (llama_pos) lcp_best);
+        if (dst.ctx_dft) {
+            llama_memory_seq_cp(llama_get_memory(dst.ctx_dft), donor->stream_slot_idx, dst.stream_slot_idx, 0, (llama_pos) lcp_best);
+        }
+
+        dst.prompt.tokens = donor->prompt.tokens.clone();
+        dst.prompt.tokens.keep_first(lcp_best);
+        // the donor's context checkpoints reference the donor's own seq id and pos range;
+        // they are not transferable to dst's freshly-shared blocks, so start dst with none.
+        // update_slots() will create fresh checkpoints for dst as it continues decoding.
+        dst.prompt.checkpoints.clear();
+
+        SLT_TRC(dst, "prefix-cache adoption took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+
+        return true;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -2867,10 +2952,19 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
-
-            // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // [MAD-445] try the cheap live-slot prefix fast path first, and only in the
+            // exact scenarios where the code below would otherwise pay for either a full
+            // re-prefill or a --cache-ram byte-level round-trip (ret's own content is being
+            // discarded / ret was LRU-picked while mostly idle). If some OTHER live slot
+            // already has a longer match, sharing its blocks is strictly cheaper than either
+            // of those; if not, this is a no-op and falls through unchanged.
+            if (update_cache && try_adopt_live_prefix(*ret, task)) {
+                update_cache = false;
+            }
+
+            update_cache = update_cache && prompt_cache;
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");

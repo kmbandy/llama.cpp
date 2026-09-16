@@ -38,6 +38,15 @@ if(GGML_HIP)
 endif()
 target_link_libraries(${TARGET} PUBLIC llama-common llama-expert-dispatch mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# [MAD-445] CPU-only unit test for the cross-request prefix-cache token matching logic.
+# No GPU, no model load -- see tools/server/tests-cpp/test-prefix-cache-match.cpp.
+if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
+    add_executable(test-prefix-cache-match tests-cpp/test-prefix-cache-match.cpp)
+    target_include_directories(test-prefix-cache-match PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src ../mtmd)
+    target_link_libraries(test-prefix-cache-match PRIVATE server-context)
+    add_test(NAME test-prefix-cache-match COMMAND test-prefix-cache-match)
+endif()
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)

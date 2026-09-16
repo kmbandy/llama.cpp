@@ -705,6 +705,13 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // [MAD-445] cross-request prefix cache: let a fresh/idle slot adopt an already-computed
+    // shared prefix (KV blocks + hybrid recurrent state) from another LIVE slot on the same
+    // stream via a cheap llama_memory_seq_cp, instead of re-prefilling it or round-tripping
+    // through the (much more expensive) whole-prompt --cache-ram byte cache. Off by default.
+    bool    prefix_cache            = false; // enable cross-slot live-prefix adoption
+    int32_t prefix_cache_min_tokens = 256;   // minimum matching prefix length to bother adopting
+
     // tiered KV cache parameters
     bool kv_tiered_enabled    = false;   // enable tiered KV cache
     float kv_tier_hot_pct     = 25.0f;   // hot tier percentage (VRAM)
