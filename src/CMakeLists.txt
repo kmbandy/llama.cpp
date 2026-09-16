@@ -21,6 +21,7 @@ add_library(llama-expert-dispatch STATIC
             pipeline/pipe-prefetch-hints.cpp
             pipeline/pipe-protocol.cpp
             pipeline/pipe-reduce-simd.cpp
+            pipeline/pipe-tp-comm.cpp
             pipeline/pipe-transport.cpp
             ../vendor/hash/sha256/sha256.c
             )
@@ -42,6 +43,8 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-tp-lockstep.cpp
+            pipeline/pipe-tp-msg.cpp
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp

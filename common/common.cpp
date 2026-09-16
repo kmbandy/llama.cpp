@@ -1449,6 +1449,41 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // Cross-host tensor parallelism: BIND THE PEER PORT BEFORE THE MODEL LOAD.
+    //
+    // This has to happen here, above `new common_init_result(params, ...)`, because that is what
+    // reads the weights. The first two-machine run failed exactly on this ordering: the leader
+    // spent ~7 minutes pulling BF16 weights off a spinning disk while the follower - which came up
+    // in 43 seconds - exhausted its connect window against a port that did not exist yet. Binding
+    // first means the kernel accepts the follower's connection from the backlog while this rank is
+    // still loading, and start order no longer matters in either direction.
+    // NOTE the gate is the SOCKET role, not the rank: with --tp-listen on rank 1 it is rank 1 that
+    // must have the port up before its own load, and rank 0 that dials.
+    if (params.tp_world > 1 && !params.tp_peer.empty() &&
+            llama_tp_should_listen(params.tp_peer.c_str(), params.tp_rank, params.tp_listen)) {
+        // Deliberately NOT a hard return: every caller in the tree dereferences the returned
+        // pointer without a null check (tools/server/server-context.cpp:1963-1968), so failing
+        // here would trade a clear error for a segfault. The run is doomed either way - the
+        // context constructor will fail to open the peer connection a few minutes from now and
+        // throw with the reason - but it fails through the existing channel.
+        if (!llama_tp_prebind_peer(params.tp_peer.c_str())) {
+            COM_ERR("cross-host tensor parallelism: failed to bind --tp-peer '%s' - is another "
+                    "rank 0 already running on this port?\n", params.tp_peer.c_str());
+        }
+    }
+
+    // Cross-host tensor parallelism: backend sampling adds nodes to the graph. Rank 1 has zero
+    // rows of output.weight, so its logits tensor is zero-sized and those nodes would not be the
+    // same nodes on the two ranks - and a graph shape that differs between ranks is the one
+    // failure mode of this design that DEADLOCKS instead of returning a wrong answer (spec R1).
+    // Off on both ranks under --tp-world, which costs nothing here: it is opt-in and off by
+    // default.
+    if (params.tp_world > 1 && params.sampling.backend_sampling) {
+        COM_WRN("%s", "cross-host tensor parallelism: disabling backend sampling; the two ranks "
+                      "must build identically shaped graphs\n");
+        params.sampling.backend_sampling = false;
+    }
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1788,6 +1823,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_sidecar_files = params.model_sidecar_ptrs.size();
 
     // cross-machine pipeline band
+    mparams.tp_world        = (uint32_t) std::max(0, params.tp_world);
+    mparams.tp_rank_first   = (uint32_t) std::max(0, params.tp_rank);
+    mparams.tp_head_devices = (uint32_t) std::max(0, params.tp_head_devices);
+
     mparams.pipeline_layer_first = params.pipeline_layer_first;
     mparams.pipeline_layer_last  = params.pipeline_layer_last;
 
@@ -1827,6 +1866,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.expert_dispatch   = params.expert_dispatch.empty() ? nullptr : params.expert_dispatch.c_str();
+    cparams.tp_peer           = params.tp_peer.empty() ? nullptr : params.tp_peer.c_str();
+    cparams.tp_listen         = params.tp_listen;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_state = params.cache_type_state;

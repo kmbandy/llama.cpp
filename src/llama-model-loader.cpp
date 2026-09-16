@@ -1960,15 +1960,35 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
-        // unmap offloaded tensors and metadata
+        // Unmap the parts of the mapping nothing aliases any more.
+        //
+        // NOTE on -sm tensor / the meta backend: mmaps_used is only narrowed in the branch above
+        // that ALIASES a tensor onto the mapping (ggml_backend_tensor_alloc). The meta backend
+        // always takes the other branch -- its tensors already have data pointers into device
+        // memory, so the bytes are copied out and nothing aliases the file -- which leaves
+        // mmaps_used at its initial (mapping->size(), 0) and makes the first call below unmap the
+        // WHOLE mapping. That is correct (there is genuinely nothing left pointing into it) but it
+        // means a single munmap of the entire model file, tens of GiB of page-table teardown on
+        // one thread with no output of its own. It is timed here because a silent multi-second
+        // (or worse, under memory pressure) stall at the very end of loading is otherwise
+        // indistinguishable from a hang.
         if (use_mmap) {
+            const int64_t t_unmap_us = ggml_time_us();
+            size_t n_unmapped = 0;
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
+                n_unmapped += mmap_used.first;
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {
+                    n_unmapped += mapping->size() - mmap_used.second;
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
+            }
+            const double t_unmap_ms = (ggml_time_us() - t_unmap_us) / 1000.0;
+            if (t_unmap_ms > 250.0) {
+                LLAMA_LOG_INFO("%s: unmapped %.2f GiB of the model mapping in %.0f ms\n",
+                        __func__, n_unmapped / 1073741824.0, t_unmap_ms);
             }
         }
         if (progress_callback) {

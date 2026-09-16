@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-tp-split.h"
 
 #include "llama-arch.h"
 #include "llama-context.h"
@@ -478,10 +479,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         uint32_t il;
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
+
+        // Number of leading world devices that may receive rows. Devices at or beyond it get a
+        // zero-sized slice. Only the LM head uses this (see n_head_devices); everything else
+        // spreads over the whole world.
+        size_t   n_devices_eff;
     };
 
+    // Devices allowed to hold the LM head. Under cross-host tensor parallelism this is rank 0's
+    // device count, which keeps output.weight off the remote rank entirely: its logits gather
+    // (ggml_backend_meta_buffer_get_tensor, AXIS_1) would otherwise have to pull the remote rank's
+    // vocab slice across the wire once per token.
+    const size_t n_head_devices = ud->n_head_devices == 0 ?
+        ud->n_devices : std::min<size_t>(ud->n_head_devices, ud->n_devices);
+
     auto get_tensor_config_impl = [&](
-                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
+                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "",
+                const size_t n_devices_eff_in = 0) -> tensor_config {
+        const size_t n_devices_eff = n_devices_eff_in == 0 ? ud->n_devices : n_devices_eff_in;
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
         //     count only the same type of previous layers to avoid this
         auto get_il_eff = [&](const size_t il){
@@ -502,13 +517,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_il_eff(il) % n_devices_eff;
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_il_eff(il) % n_devices_eff;
         } else if (std::regex_match(tensor_name, pattern_paged_cache)) {
             // Paged KV arenas (llama_kv_cache_paged) are named paged_k_l<N> /
             // paged_v_l<N>. Same layer-index extraction as the contiguous
@@ -525,10 +540,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_il_eff(il) % n_devices_eff;
         } else {
             il = 0;
-            rotation = hparams.n_layer() % ud->n_devices;
+            rotation = hparams.n_layer() % n_devices_eff;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
@@ -536,7 +551,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
-        return {axis, tensor_axis_0, il, rotation};
+        return {axis, tensor_axis_0, il, rotation, n_devices_eff};
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
@@ -562,7 +577,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // single worst placement choice available. Models that omit this tensor
             // fall back to model.output in the graph, which is already AXIS_1, so
             // this keeps both cases on the same layout.
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "", "", n_head_devices);
         }
         if (std::regex_match(tensor_name, pattern_nextn_mirrored)) {
             // Must stay replicated (this is also what the catch-all below would do;
@@ -709,12 +724,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "", "", n_head_devices);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            // must follow output.weight's column split exactly, restriction included
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", n_head_devices);
         }
 
         // everything else
@@ -984,25 +1000,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
         }
+
+        // Rows are distributed over the first tc.n_devices_eff world devices; the ne array is
+        // always indexed with the full world stride so the remaining devices keep a zero slice.
+        const size_t n_dev_eff = tc.n_devices_eff;
+        GGML_ASSERT(n_dev_eff >= 1 && n_dev_eff <= ud->n_devices);
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         for (size_t is = 0; is < segments.size(); is++) {
-            const int64_t  ne_s = segments[is].first;
-            const uint32_t nr_s = segments[is].second;
-            const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
-                }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
-                low = high;
-            }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
-            split_state.nr[is] = nr_s;
+            llama_tp_split_segment(segments[is].first, granularity[is], tensor_split,
+                    ud->n_devices, n_dev_eff, tc.rotation, &split_state.ne[is*ud->n_devices]);
+            split_state.nr[is] = segments[is].second;
         }
         split_state.n_segments = segments.size();
     } else {
@@ -2159,6 +2167,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
+    }
+
+    // Cross-host tensor parallelism: token_embd.weight must not live on the GPUs.
+    //
+    // The split policy MIRRORS it (get_rows needs a MIRRORED or AXIS_0 table), so every device in
+    // the world holds a full copy - 2.37 GiB per card for Qwen3.8-27B, 9.5 GiB across a four-card
+    // world - to serve exactly one get_rows of n_embd values per token. Forcing it to the CPU
+    // buffer trades that for a host-side gather and is the difference between the model fitting in
+    // VRAM and not.
+    //
+    // This reuses the ordinary -ot mechanism (llama-model-loader.cpp checks tensor_buft_overrides
+    // before consulting the per-device buft list, and routes a CPU override through the CPU buft
+    // list), so it behaves exactly like passing -ot 'token_embd\.weight=CPU' by hand. A user
+    // override wins: entries the caller supplied are searched first.
+    std::vector<llama_model_tensor_buft_override> tp_tensor_buft_overrides;
+    if (params.tp_world > 1) {
+        for (const auto * override = ml.tensor_buft_overrides;
+             override != nullptr && override->pattern != nullptr; ++override) {
+            tp_tensor_buft_overrides.push_back(*override);
+        }
+        tp_tensor_buft_overrides.push_back({"token_embd\\.weight", ggml_backend_cpu_buffer_type()});
+        tp_tensor_buft_overrides.push_back({nullptr, nullptr});
+        ml.tensor_buft_overrides = tp_tensor_buft_overrides.data();
+        pimpl->has_tensor_overrides = true;
+        LLAMA_LOG_INFO("%s: cross-host TP: forcing token_embd.weight to the CPU buffer\n", __func__);
     }
 
     // calculate the split points
@@ -4235,6 +4268,9 @@ llama_model_params llama_model_default_params() {
         /*.weight_paging_n_blob_entries =*/ 0,
         /*.pipeline_layer_first         =*/ -1,
         /*.pipeline_layer_last          =*/ -1,
+        /*.tp_world                     =*/ 0,
+        /*.tp_rank_first                =*/ 0,
+        /*.tp_head_devices              =*/ 0,
     };
 
     return result;

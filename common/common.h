@@ -650,6 +650,18 @@ struct common_params {
     int32_t pipeline_layer_first = -1;
     int32_t pipeline_layer_last  = -1;
 
+    // cross-host TENSOR parallelism (-sm tensor spanning two processes/hosts).
+    // tp_world  = total DEVICE count across all ranks (0/1 = single process, the default)
+    // tp_rank   = index of this process's FIRST device inside that world (rank 0 => 0)
+    // tp_peer   = "host:port" of the other rank. Rank 0 (tp_rank == 0) listens, the rest connect.
+    int32_t     tp_world = 0;
+    int32_t     tp_rank  = 0;
+    int32_t     tp_head_devices = 0; // 0 = derive (LM head on rank 0 only)
+    std::string tp_peer;
+    // Socket role, independent of rank. -1 auto (rank 0 binds if tp_peer is an address it can
+    // bind, else it dials), 1 = --tp-listen, 0 = connect. See llama_context_params::tp_listen.
+    int32_t     tp_listen = -1;
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

@@ -426,6 +426,25 @@ extern "C" {
         // indices are preserved. See src/llama-pipeline.h.
         int32_t pipeline_layer_first;
         int32_t pipeline_layer_last;
+
+        // Cross-host TENSOR parallelism (LLAMA_SPLIT_MODE_TENSOR spanning more than one process).
+        //
+        // tp_world      total number of DEVICES across every rank. 0 or 1 means "single process",
+        //               which is the default and is byte-identical to not setting these at all.
+        // tp_rank_first index, within that world, of this process's FIRST device. The process owns
+        //               the contiguous window [tp_rank_first, tp_rank_first + n_local_devices).
+        //               Rank 0 has tp_rank_first == 0.
+        // tp_head_devices
+        //               number of leading world devices that may hold output.weight (and the MTP
+        //               LM head). Every world device at or beyond it gets zero rows, which keeps
+        //               the LM head entirely on rank 0 and removes a per-token cross-host gather
+        //               of the vocab. 0 means "no restriction" (all world devices share the head).
+        //
+        // Every rank must be given the SAME tp_world, the same tensor_split and the same
+        // tp_head_devices, or the ranks compute different global row maps and diverge.
+        uint32_t tp_world;
+        uint32_t tp_rank_first;
+        uint32_t tp_head_devices;
     };
 
     struct llama_sampler_seq_config {
@@ -533,6 +552,26 @@ extern "C" {
 
         // Comma-separated expert worker endpoints. nullptr or empty disables remote expert dispatch.
         const char * expert_dispatch;
+
+        // Cross-host tensor parallelism: "host:port" of the peer rank, used to open the persistent
+        // connection that carries the per-reduce partial exchange. nullptr or empty disables it,
+        // which is the default and leaves the meta backend doing only its local reduce.
+        // The rank's role is taken from the model's tensor-parallel window: the rank owning world
+        // device 0 BINDS and accepts, every other rank CONNECTS.
+        const char * tp_peer;
+        int32_t      tp_connect_timeout_ms; // 0 => WP_TP_CONNECT_TIMEOUT_MS, default 30 min
+
+        // Which end of that connection this rank is. The SOCKET role is independent of the RANK
+        // role: rank 0 is always the leader (it samples and mirrors), but it need not be the one
+        // that binds. Firewalls decide this, not us - mad-lab-main runs ufw default-deny inbound,
+        // so the only direction that works on this rig is main dialling out to 2026 on a port
+        // 2026 already has open.
+        //   <0  auto: bind if this rank owns world device 0 AND tp_peer names an address this
+        //       machine can bind. Otherwise connect. This reproduces the previous behaviour for
+        //       every invocation that worked before.
+        //    0  connect to tp_peer.
+        //    1  bind and accept on tp_peer.
+        int32_t      tp_listen;
     };
 
     struct llama_model_tensor_override {
@@ -1130,6 +1169,53 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    //
+    // Cross-host tensor parallelism: the FOLLOWER loop (rank != 0).
+    //
+    // Rank 0 is an ordinary llama-server / llama-cli: it samples, it serves HTTP, and every
+    // llama_decode() it performs and every llama_memory_* mutation it makes is mirrored to the
+    // follower over the connection opened by llama_context_params::tp_peer. The follower runs no
+    // sampler and no HTTP; it does nothing but apply those messages, so that both ranks call
+    // llama_decode() with identical batches against identical memory state and their graphs -
+    // and therefore their per-layer reduce exchanges - line up.
+    //
+    // Usage on the follower, after building the model and context exactly as rank 0 does:
+    //
+    //     while (llama_tp_follower_step(ctx) == LLAMA_TP_STEP_OK) { }
+    //
+    // A non-OK return is terminal: SHUTDOWN means the leader closed the world cleanly, ERROR
+    // means the ranks diverged or the connection died and the reason has already been logged.
+
+    // Bind and listen on the tensor-parallel peer address NOW, before the model is loaded.
+    //
+    // Call this on rank 0 as early as possible - the two ranks' model loads are not the same
+    // length, and until the port exists the other rank has nothing to connect to. Once listen()
+    // has been called the kernel completes the peer's TCP handshake from the backlog on its own,
+    // so the follower connects the moment this returns even though rank 0 is still reading
+    // weights off disk, and start order stops mattering. `peer` is "host:port"; the host must be
+    // a dotted-quad (0.0.0.0 to accept on every interface), not a name.
+    //
+    // Returns false if the address is malformed or the port cannot be bound. Idempotent.
+    LLAMA_API bool llama_tp_prebind_peer(const char * peer);
+
+    // Resolve the socket role: true when this rank should bind and accept on `peer`, false when it
+    // should connect. `tp_listen` is the tri-state above. Exposed so that the caller can bind the
+    // port BEFORE loading the model and still agree with what the context will do later.
+    LLAMA_API bool llama_tp_should_listen(const char * peer, int32_t rank_first, int32_t tp_listen);
+
+    enum llama_tp_step_status {
+        LLAMA_TP_STEP_ERROR    = -1,
+        LLAMA_TP_STEP_OK       =  0,
+        LLAMA_TP_STEP_SHUTDOWN =  1,
+    };
+
+    // True when this context is a tensor-parallel FOLLOWER (tp_peer set and this rank does not own
+    // world device 0). False for every non-TP run and for the leader.
+    LLAMA_API bool llama_tp_is_follower(const struct llama_context * ctx);
+
+    // Receive and apply exactly one message from the leader. See llama_tp_step_status.
+    LLAMA_API int32_t llama_tp_follower_step(struct llama_context * ctx);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

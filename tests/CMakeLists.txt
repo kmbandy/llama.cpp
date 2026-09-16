@@ -439,6 +439,67 @@ target_compile_definitions(test-wp-expert-dispatcher PRIVATE
 target_compile_features(test-wp-expert-dispatcher PRIVATE cxx_std_17)
 llama_test(test-wp-expert-dispatcher)
 
+# cross-host tensor parallelism: the rank-windowed row split (pure arithmetic, no model, no GPU)
+add_executable(
+    test-tp-rank-window
+    test-tp-rank-window.cpp
+)
+target_include_directories(test-tp-rank-window PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(test-tp-rank-window PRIVATE cxx_std_17)
+llama_test(test-tp-rank-window)
+
+# cross-host tensor parallelism: the peer exchange, over a real loopback socket (no ggml, no model)
+add_executable(
+    test-tp-comm
+    test-tp-comm.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-tp-comm.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
+)
+target_include_directories(test-tp-comm PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_link_libraries(test-tp-comm PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-tp-comm PRIVATE cxx_std_17)
+llama_test(test-tp-comm)
+
+# cross-host tensor parallelism: the M3 batch-descriptor / control-message codec.
+# Pure host code - it includes llama.h only for the plain-old-data llama_batch types and links
+# nothing from libllama - so it runs in milliseconds with no model and no GPU.
+add_executable(
+    test-tp-msg
+    test-tp-msg.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-tp-msg.cpp
+)
+target_include_directories(test-tp-msg PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ggml/include
+)
+target_compile_features(test-tp-msg PRIVATE cxx_std_17)
+llama_test(test-tp-msg)
+
+# cross-host tensor parallelism: the M3 lockstep loop over a real loopback socket - a scripted
+# leader and a stand-in follower must produce identical call logs, with the M2 reduce exchanges
+# interleaved on the same connection.
+add_executable(
+    test-tp-lockstep
+    test-tp-lockstep.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-tp-msg.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-tp-comm.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
+)
+target_include_directories(test-tp-lockstep PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-tp-lockstep PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-tp-lockstep PRIVATE cxx_std_17)
+llama_test(test-tp-lockstep)
+
 # cross-machine pipeline band helpers (pure, no ggml dependency)
 add_executable(
     test-pipeline-band

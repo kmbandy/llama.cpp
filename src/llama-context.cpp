@@ -1,5 +1,8 @@
 #include "llama-context.h"
 
+#include "pipeline/pipe-tp-comm.h"
+#include "pipeline/pipe-tp-msg.h"
+
 #include "ggml.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "llama-arch.h"
@@ -928,6 +931,108 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // Cross-host tensor parallelism: open the persistent peer connection and install the
+        // cross-host reducer on the meta backend. Without it the meta backend performs only its
+        // local (intra-process) reduce, which is exactly the pre-TP behaviour.
+        //
+        // The step logs below exist because the first two-machine run stalled for twenty minutes
+        // somewhere in this constructor with no output at all, and there was no way to tell from
+        // the log whether it had reached the socket, the KV allocation or neither. Each phase now
+        // announces itself. They are gated on tp_peer so a non-TP run's log is unchanged.
+        const bool tp_trace = params.tp_peer != nullptr && params.tp_peer[0] != '\0';
+        if (tp_trace) {
+            LLAMA_LOG_INFO("%s: cross-host TP: backends initialised (%zu local, plus CPU); "
+                           "looking for a meta device\n", __func__, backends.size() - 1);
+        }
+        for (auto & backend : backends) {
+            if (!ggml_backend_meta_is_meta(backend.get())) {
+                continue;
+            }
+            const size_t n_world    = ggml_backend_meta_n_world(backend.get());
+            const size_t rank_first = ggml_backend_meta_rank_first(backend.get());
+            const size_t n_local    = ggml_backend_meta_n_local(backend.get());
+            if (n_world <= n_local) {
+                continue; // single-process tensor parallelism, nothing to connect
+            }
+            if (params.tp_peer == nullptr || params.tp_peer[0] == '\0') {
+                throw std::runtime_error(
+                    "cross-host tensor parallelism needs --tp-peer: the meta device spans a world "
+                    "wider than this process's devices but no peer address was given");
+            }
+            std::string host;
+            int port = 0;
+            if (!pipe_tp_comm::parse_peer(params.tp_peer, &host, &port)) {
+                throw std::runtime_error(format("invalid --tp-peer '%s', expected host:port", params.tp_peer));
+            }
+
+            // Widest partial that can be exchanged: the PARTIAL nodes are the row-parallel
+            // projections' outputs, n_embd wide per token. Sized here so the hot path never
+            // allocates; a wider node grows it once rather than failing.
+            const size_t max_values = (size_t) hparams.n_embd * cparams.n_ubatch;
+            // Default 30 minutes (WP_TP_CONNECT_TIMEOUT_MS), not 60 seconds. The old minute was
+            // shorter than the difference between the two ranks' model loads on this rig, which
+            // is what killed the first two-machine run. The port itself is bound long before this
+            // point by llama_tp_prebind_peer(), so on the leader this is only the accept.
+            const int timeout_ms = params.tp_connect_timeout_ms > 0
+                ? params.tp_connect_timeout_ms
+                : pipe_tp_comm::default_connect_timeout_ms();
+
+            // TWO INDEPENDENT ROLES, and conflating them is what broke the live run.
+            //   tp_is_rank0  the LEADER role: who samples, who mirrors batches and memory ops, and
+            //                which operand is S_rank0 in the fixed-order add. Always device 0.
+            //   do_listen    the SOCKET role: who binds and who dials. Set by the firewall, not by
+            //                the topology - mad-lab-main is default-deny inbound, so the only
+            //                direction that connects is main dialling 2026. Rank 0 remains the
+            //                leader either way; only the socket flips.
+            tp_is_rank0 = (rank_first == 0);
+            const bool do_listen = llama_tp_should_listen(params.tp_peer, (int32_t) rank_first, params.tp_listen);
+            LLAMA_LOG_INFO("%s: cross-host TP: rank owns world devices [%zu,%zu) of %zu; %s, %s %s:%d\n",
+                    __func__, rank_first, rank_first + n_local, n_world,
+                    tp_is_rank0 ? "LEADER" : "FOLLOWER",
+                    do_listen ? "listening on" : "connecting to", host.c_str(), port);
+
+            LLAMA_LOG_INFO("%s: cross-host TP: %s (cap %.0f s, WP_TP_CONNECT_TIMEOUT_MS)\n",
+                    __func__,
+                    do_listen ? "waiting for the peer rank to connect" : "connecting to the peer rank",
+                    timeout_ms / 1000.0);
+            tp_comm = do_listen
+                ? pipe_tp_comm::listen (host, port, max_values, timeout_ms)
+                : pipe_tp_comm::connect(host, port, max_values, timeout_ms);
+            if (!tp_comm) {
+                throw std::runtime_error(format("cross-host tensor parallelism: failed to establish the peer connection to %s:%d", host.c_str(), port));
+            }
+            LLAMA_LOG_INFO("%s: cross-host TP: peer connection established\n", __func__);
+
+            // Startup equality gate (spec D.2). Anything that would make the two ranks build
+            // different graphs or different row maps has to fail HERE, loudly, and not a hundred
+            // layers into the first token.
+            if (!tp_hello_exchange((uint32_t) n_world, (uint32_t) rank_first, (uint32_t) n_local,
+                                   (uint32_t) params.type_k, (uint32_t) params.type_v)) {
+                throw std::runtime_error("cross-host tensor parallelism: the HELLO handshake with the peer rank failed");
+            }
+
+            ggml_backend_meta_set_cross_host_reduce(backend.get(), llama_context::tp_cross_host_reduce, this);
+
+            if (tp_is_rank0) {
+                // NOTE: the process-wide leader registration happens in llama_init_from_model,
+                // AFTER this constructor has returned successfully. Doing it here would leave
+                // g_llama_tp_leader pointing at a half-built object if any later step of the
+                // constructor threw - and ~llama_context, which is what clears it, does not run
+                // for a constructor that threw.
+                if (g_llama_tp_leader != nullptr) {
+                    throw std::runtime_error("cross-host tensor parallelism: a second leader context in one process is not supported");
+                }
+            } else {
+                LLAMA_LOG_INFO("%s: cross-host TP: this rank is a FOLLOWER - no sampler, no HTTP; "
+                               "it decodes only what the leader mirrors to it\n", __func__);
+            }
+        }
+
+        if (tp_trace) {
+            LLAMA_LOG_INFO("%s: cross-host TP: peer handshake done; continuing context "
+                           "construction (output buffer, then the KV/SSM allocation)\n", __func__);
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1101,6 +1206,13 @@ llama_context::~llama_context() {
         if (nextn_stage_event[slot] != nullptr) {
             ggml_backend_event_free(nextn_stage_event[slot]);
         }
+    }
+
+    // Close the tensor-parallel world cleanly: without this the follower's next recv sees a socket
+    // error and exits 1, which looks like a fault in the logs when it was an ordinary shutdown.
+    if (g_llama_tp_leader == this) {
+        tp_mirror_ctrl(PIPE_TP_CTRL_SHUTDOWN, 0, 0, 0, 0, 0);
+        g_llama_tp_leader = nullptr;
     }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
@@ -3027,6 +3139,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (ggml_cuda_wp_set_ubatch_width_hint) {
         ggml_cuda_wp_set_ubatch_width_hint((int32_t) ubatch.n_tokens);
     }
+    // WP_TP_TRACE=1: give the meta backend's COMPUTE-flag trace the ubatch width it cannot see.
+    ggml_backend_meta_trace_set_ubatch((int32_t) ubatch.n_tokens);
     const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
     if (wp_draft_active && !wp_draft_shape_logged) {
         wp_draft_shape_logged = true;
@@ -3470,6 +3584,15 @@ int llama_context::encode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // Cross-host tensor parallelism: mirror this batch to the follower rank BEFORE anything is
+    // derived from it. The follower runs the identical batch through the identical batch allocator
+    // and ubatch split, so the two ranks' graphs - and therefore their per-layer reduce exchanges -
+    // line up without the split itself ever going on the wire. A leader whose peer is gone fails
+    // the batch here rather than blocking on the first reduce.
+    if (tp_is_leader() && !tp_mirror_batch(batch_inp, true)) {
+        return -1;
+    }
+
     const auto & hparams = model.hparams;
 
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
@@ -3566,8 +3689,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
+    // Cross-host TP: see the note in decode() -- a follower rank owns no rows of the LM head,
+    // so its logits/embeddings tensors are slices of world devices it does not have, and it has
+    // no consumer for either. Skip the readback; n_outputs is left alone so the graph stays in
+    // lockstep with the leader.
+    const bool tp_skip_output_readback = tp_is_follower();
+
     // extract logits
-    if (logits.data && t_logits) {
+    if (logits.data && t_logits && !tp_skip_output_readback) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_cur(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
@@ -3581,7 +3710,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     // extract embeddings
-    if (embd.data && t_embd) {
+    if (embd.data && t_embd && !tp_skip_output_readback) {
         ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_cur(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
@@ -3755,6 +3884,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+        return -1;
+    }
+
+    // Cross-host tensor parallelism: mirror this batch to the follower rank BEFORE anything is
+    // derived from it. The follower runs the identical batch through the identical batch allocator
+    // and ubatch split, so the two ranks' graphs - and therefore their per-layer reduce exchanges -
+    // line up without the split itself ever going on the wire. A leader whose peer is gone fails
+    // the batch here rather than blocking on the first reduce.
+    if (tp_is_leader() && !tp_mirror_batch(batch_inp, false)) {
         return -1;
     }
 
@@ -4048,6 +4186,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         nextn_stage_copy_ns = 0; // reset-then-sum across this call's ubatches, see wp_nextn_stage_copy_ns()
     }
 
+    uint32_t n_ubatches_tp = 0; // WP_TP_TRACE only; see tp_trace_decode() below
     // MAD-LAB: the decode scope uses the shared dispatcher when borrowed.
     expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch);
 
@@ -4224,8 +4363,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        // Cross-host tensor parallelism: a follower rank must not read its outputs back.
+        //
+        // The LM head is restricted to rank 0's world devices (n_head_devices, see
+        // llama_meta_device_get_split_state in src/llama-model.cpp), so output.weight has
+        // ZERO rows on every device the follower owns. The logits node is
+        // mul_mat(output.weight, cur), which the meta backend types as an AXIS_0 split
+        // carrying output.weight's world ne[] -- i.e. all of its non-empty chunks live on
+        // devices the follower does not have. ggml_backend_meta_get_tensor_async() cannot
+        // gather a remote slice and asserts ("cannot read back a remote slice of a split
+        // tensor", ggml/src/ggml-backend-meta.cpp), which is what killed the follower during
+        // the first live warm-up decode.
+        //
+        // The follower has no sampler, no HTTP and no caller for logits or embeddings, so the
+        // fix is simply not to read them. n_outputs and the logits flags are deliberately NOT
+        // changed: they feed the graph tail's output selection, and a rank whose n_outputs
+        // differs from its peer's builds a differently shaped graph, which deadlocks the
+        // lockstep instead of returning a wrong answer (spec risk R1).
+        //
+        // On the leader this is a no-op: it owns every non-empty chunk of the logits tensor,
+        // so its gather is local and yields the full 248320-wide vocab row with zero wire
+        // traffic. That is the whole point of pinning the LM head to rank 0.
+        const bool tp_skip_output_readback = tp_is_follower();
+
         // extract logits
-        if (logits.data && t_logits && n_outputs_ubatch > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs_ubatch > 0 && !tp_skip_output_readback &&
+                needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active, t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -4244,7 +4407,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs_ubatch > 0) {
+        if (embd.data && t_embd && n_outputs_ubatch > 0 && !tp_skip_output_readback) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_active, t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -4312,7 +4475,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs_ubatch       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? output_prev  : token_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && !tp_skip_output_readback &&
+                    cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active, t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -4428,7 +4592,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        if (has_samplers) {
+        if (has_samplers && !tp_skip_output_readback) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
@@ -4553,6 +4717,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             extract_ubatch(slot.res, slot.ubatch, slot.n_outputs, n_outputs_prev, n_tokens_prev, slot.sched);
             n_outputs_prev += slot.n_outputs;
             n_tokens_prev  += slot.ubatch.n_tokens;
+            n_ubatches_tp++; // WP_TP_TRACE only; see tp_trace_decode() below
         };
 
         auto fail_slots = [&](const overlap_slot & first, const overlap_slot & second, ggml_status status) {
@@ -4747,6 +4912,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             extract_ubatch(res_a, ubatch_a, n_outputs_a, n_outputs_prev, n_tokens_prev, sched.get());
             n_outputs_prev += n_outputs_a;
             n_tokens_prev  += ubatch_a.n_tokens;
+            n_ubatches_tp++; // WP_TP_TRACE only; see tp_trace_decode() below
             if (!overlap_active) {
                 if (!mctx->next()) {
                     break;
@@ -4781,9 +4947,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         extract_ubatch(res_a, ubatch_a, n_outputs_a, n_outputs_prev, n_tokens_prev, sched.get());
         n_outputs_prev += n_outputs_a;
         n_tokens_prev  += ubatch_a.n_tokens;
+        n_ubatches_tp++; // WP_TP_TRACE only; see tp_trace_decode() below
         extract_ubatch(res_b, ubatch_b, n_outputs_b, n_outputs_prev, n_tokens_prev, sched_overlap.get());
         n_outputs_prev += n_outputs_b;
         n_tokens_prev  += ubatch_b.n_tokens;
+        n_ubatches_tp++; // WP_TP_TRACE only; see tp_trace_decode() below
 
         if (!mctx->next()) {
             break;
@@ -4850,6 +5018,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // Cross-host tensor parallelism, WP_TP_TRACE=1: one line per decode on BOTH ranks carrying
+    // every number the two of them must agree on. Diffing the leader's and the follower's traces
+    // line by line is what turns "the second request answers EOS" into a specific first
+    // disagreement. Off by default, and unreachable without --tp-world.
+    if (tp_enabled()) {
+        tp_trace_decode(/*is_encode =*/ false, n_tokens_all, n_outputs_all, n_ubatches_tp,
+                batch_inp.pos ? batch_inp.pos[0] : -1,
+                batch_inp.pos ? batch_inp.pos[batch_inp.n_tokens - 1] : -1);
+    }
 
     return 0;
 }
@@ -6758,9 +6936,20 @@ llama_context_params llama_context_default_params() {
         /*.kv_tier_cold_budget_mb      =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.expert_dispatch             =*/ nullptr,
+        /*.tp_peer                     =*/ nullptr,
+        /*.tp_connect_timeout_ms       =*/ 0,
+        /*.tp_listen                   =*/ -1,
     };
 
     return result;
+}
+
+bool llama_context::tp_cross_host_reduce(void * ud, float * data, size_t n_values) {
+    llama_context * ctx = (llama_context *) ud;
+    if (!ctx->tp_comm) {
+        return false;
+    }
+    return ctx->tp_comm->exchange_add(data, n_values, ctx->tp_is_rank0);
 }
 
 llama_context * llama_init_from_model(
@@ -6885,6 +7074,14 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+
+        // Cross-host tensor parallelism: this context is now fully built, so it is safe to publish
+        // it as the process's leader. Every llama_memory_* entry point mirrors through this one
+        // pointer, and ~llama_context clears it.
+        if (ctx->tp_is_leader()) {
+            g_llama_tp_leader = ctx;
+        }
+
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -7213,7 +7410,21 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
         return;
     }
 
+    // Cross-host tensor parallelism: these six functions are the ONE place every KV/SSM mutation
+    // in the tree bottoms out - common_memory::seq_rm/seq_cp/seq_add, llama-cli's context shift,
+    // the server's prompt-cache truncation and speculative rollback, and
+    // common_context_can_seq_rm()'s probe all arrive here. Mirroring at this seam means a new
+    // call site cannot forget to mirror. g_llama_tp_leader is null unless --tp-world is in use,
+    // so a non-TP run pays one predictable null check per call and nothing else.
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_MEM_CLEAR, 0, 0, 0, 0, data ? 1 : 0);
+    }
+
     mem->clear(data);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_MEM_CLEAR, 0, 0, 0, 0, data ? 1 : 0, -1);
+    }
 }
 
 bool llama_memory_seq_rm(
@@ -7225,7 +7436,22 @@ bool llama_memory_seq_rm(
         return true;
     }
 
-    return mem->seq_rm(seq_id, p0, p1);
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_RM, seq_id, p0, p1, 0, 0);
+    }
+
+    const bool res = mem->seq_rm(seq_id, p0, p1);
+
+    // The return value is traced because it is the ONE piece of state that differs between the
+    // ranks without any frame going missing: only the leader's answer is observed, and its
+    // callers branch on it (the server clears the whole sequence when a partial remove is
+    // refused, common_context_seq_rm() aborts). A false here on one rank and a true on the other
+    // is a silent divergence of everything that follows.
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_RM, seq_id, p0, p1, 0, 0, res ? 1 : 0);
+    }
+
+    return res;
 }
 
 void llama_memory_seq_cp(
@@ -7238,7 +7464,15 @@ void llama_memory_seq_cp(
         return;
     }
 
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_CP, seq_id_src, seq_id_dst, p0, p1, 0);
+    }
+
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_CP, seq_id_src, seq_id_dst, p0, p1, 0, -1);
+    }
 }
 
 void llama_memory_seq_keep(
@@ -7248,7 +7482,15 @@ void llama_memory_seq_keep(
         return;
     }
 
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_KEEP, seq_id, 0, 0, 0, 0);
+    }
+
     mem->seq_keep(seq_id);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_KEEP, seq_id, 0, 0, 0, 0, -1);
+    }
 }
 
 void llama_memory_seq_add(
@@ -7261,7 +7503,15 @@ void llama_memory_seq_add(
         return;
     }
 
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_ADD, seq_id, p0, p1, delta, 0);
+    }
+
     mem->seq_add(seq_id, p0, p1, delta);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_ADD, seq_id, p0, p1, delta, 0, -1);
+    }
 }
 
 void llama_memory_seq_div(
@@ -7274,7 +7524,15 @@ void llama_memory_seq_div(
         return;
     }
 
+    if (g_llama_tp_leader) {
+        llama_tp_mirror_memory(mem, PIPE_TP_CTRL_SEQ_DIV, seq_id, p0, p1, d, 0);
+    }
+
     mem->seq_div(seq_id, p0, p1, d);
+
+    if (g_llama_tp_leader) {
+        llama_tp_trace_mem("leader  ", PIPE_TP_CTRL_SEQ_DIV, seq_id, p0, p1, d, 0, -1);
+    }
 }
 
 llama_pos llama_memory_seq_pos_min(
@@ -7386,12 +7644,33 @@ size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
+    // Cross-host tensor parallelism: a state RESTORE is the one memory mutation this design does
+    // not mirror. Rank 1's KV and SSM state is a DIFFERENT SHARD of the same logical state (its
+    // own rows of cache_k/v and cache_r/s), so rank 0's blob is meaningless there - and
+    // llama-memory-recurrent's serialiser writes n_embd_s, so shipping it would be rejected
+    // rather than silently misapplied. Restoring on rank 0 alone would leave the two ranks with
+    // different KV contents and produce a plausible wrong answer, so it is refused instead.
+    // Server context checkpoints and /slots restore therefore have to be off under --tp-world.
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism: the peer rank "
+                        "holds a different shard of this state and cannot be restored from this "
+                        "blob. Run with context checkpoints and slot save/restore disabled.\n",
+                __func__);
+        return 0;
+    }
+
     ctx->synchronize();
 
     return ctx->state_set_data(src, size);
 }
 
 bool llama_state_load_file(llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism (see "
+                        "llama_state_seq_set_data_ext)\n", __func__);
+        return false;
+    }
+
     ctx->synchronize();
 
     try {
@@ -7435,6 +7714,21 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // Cross-host tensor parallelism: a state RESTORE is the one memory mutation this design does
+    // not mirror. Rank 1's KV and SSM state is a DIFFERENT SHARD of the same logical state (its
+    // own rows of cache_k/v and cache_r/s), so rank 0's blob is meaningless there - and
+    // llama-memory-recurrent's serialiser writes n_embd_s, so shipping it would be rejected
+    // rather than silently misapplied. Restoring on rank 0 alone would leave the two ranks with
+    // different KV contents and produce a plausible wrong answer, so it is refused instead.
+    // Server context checkpoints and /slots restore therefore have to be off under --tp-world.
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism: the peer rank "
+                        "holds a different shard of this state and cannot be restored from this "
+                        "blob. Run with context checkpoints and slot save/restore disabled.\n",
+                __func__);
+        return 0;
+    }
+
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
@@ -7452,6 +7746,21 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    // Cross-host tensor parallelism: a state RESTORE is the one memory mutation this design does
+    // not mirror. Rank 1's KV and SSM state is a DIFFERENT SHARD of the same logical state (its
+    // own rows of cache_k/v and cache_r/s), so rank 0's blob is meaningless there - and
+    // llama-memory-recurrent's serialiser writes n_embd_s, so shipping it would be rejected
+    // rather than silently misapplied. Restoring on rank 0 alone would leave the two ranks with
+    // different KV contents and produce a plausible wrong answer, so it is refused instead.
+    // Server context checkpoints and /slots restore therefore have to be off under --tp-world.
+    if (g_llama_tp_leader == ctx) {
+        LLAMA_LOG_ERROR("%s: not supported under cross-host tensor parallelism: the peer rank "
+                        "holds a different shard of this state and cannot be restored from this "
+                        "blob. Run with context checkpoints and slot save/restore disabled.\n",
+                __func__);
+        return 0;
+    }
+
     ctx->synchronize();
 
     try {

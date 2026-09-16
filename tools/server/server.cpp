@@ -11,6 +11,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "tp-follower.h"
 #include "pipe-dense-segment-manifest.h"
 #include "wp-expert-worker.h"
 
@@ -112,6 +113,16 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
     wp_expert_worker::install_inproc_factory();
+
+    // Cross-host tensor parallelism: a follower rank serves no HTTP and holds no slots. It runs
+    // the lockstep loop instead of the server, using the same model/context construction the
+    // server would have used (spec T7 - deliberately not a separate binary). This is unreachable
+    // without --tp-world, so every existing server path is untouched.
+    if (common_tp_is_follower(params)) {
+        const int rc = common_tp_follower_run(params);
+        llama_backend_free();
+        return rc;
+    }
 
     return llama_server(params, argc, argv);
 }

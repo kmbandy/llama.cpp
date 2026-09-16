@@ -631,6 +631,50 @@ int64_t llama_time_us(void) {
 }
 
 // returns true on success
+// Resolve the (n_world, rank_first, n_head_devices) window for a meta device built from n_local
+// devices. Without --tp-world (or with a world no larger than the local device count) this is the
+// single-process identity window and every downstream path is byte-identical to before.
+static bool llama_resolve_tp_window(
+        const llama_model_params & params, size_t n_local, size_t * n_world, size_t * rank_first, size_t * n_head_devices) {
+    *n_world        = n_local;
+    *rank_first     = 0;
+    *n_head_devices = params.tp_head_devices;
+
+    if (params.tp_world <= 1) {
+        if (params.tp_rank_first != 0) {
+            LLAMA_LOG_ERROR("%s: --tp-rank %u given without --tp-world\n", __func__, params.tp_rank_first);
+            return false;
+        }
+        return true;
+    }
+    if (params.tp_world < n_local || params.tp_rank_first + n_local > params.tp_world) {
+        LLAMA_LOG_ERROR("%s: tensor-parallel window [%u,%u) does not fit a world of %u devices\n",
+                __func__, params.tp_rank_first, params.tp_rank_first + (uint32_t) n_local, params.tp_world);
+        return false;
+    }
+    if (params.tp_world > (uint32_t) llama_max_devices()) {
+        LLAMA_LOG_ERROR("%s: --tp-world %u exceeds llama_max_devices() = %u\n",
+                __func__, params.tp_world, (uint32_t) llama_max_devices());
+        return false;
+    }
+    *n_world    = params.tp_world;
+    *rank_first = params.tp_rank_first;
+
+    // Default head placement: keep output.weight on rank 0 only. In a two-rank world rank 0 owns
+    // devices [0, n_rank0) and rank 1's first device index IS n_rank0, so both ranks can derive
+    // the same number without extra configuration. Pass tp_head_devices explicitly for >2 ranks.
+    if (*n_head_devices == 0) {
+        *n_head_devices = params.tp_rank_first == 0 ? n_local : params.tp_rank_first;
+    }
+    if (*n_head_devices > *n_world) {
+        LLAMA_LOG_ERROR("%s: --tp-head-devices %zu exceeds the world size %zu\n", __func__, *n_head_devices, *n_world);
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: cross-host tensor parallelism: world %zu devices, this rank owns [%zu,%zu), LM head on the first %zu\n",
+            __func__, *n_world, *rank_first, *rank_first + n_local, *n_head_devices);
+    return true;
+}
+
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
     if (params.devices) {
@@ -647,11 +691,16 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
             }
-            model->get_split_state_ud.n_devices = n_devs;
+            size_t n_world = 0, rank_first = 0, n_head_devices = 0;
+            if (!llama_resolve_tp_window(params, n_devs, &n_world, &rank_first, &n_head_devices)) {
+                return false;
+            }
+            model->get_split_state_ud.n_devices      = n_world;
+            model->get_split_state_ud.n_head_devices = n_head_devices;
             model->get_split_state_ud.model = model;
             model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                true, ggml_backend_meta_device_ranked(
+                params.devices, n_devs, n_world, rank_first, llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
@@ -688,11 +737,16 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
+            size_t n_world = 0, rank_first = 0, n_head_devices = 0;
+            if (!llama_resolve_tp_window(params, devs.size(), &n_world, &rank_first, &n_head_devices)) {
+                return false;
+            }
+            model->get_split_state_ud.n_devices      = n_world;
+            model->get_split_state_ud.n_head_devices = n_head_devices;
+            model->get_split_state_ud.model          = model;
             gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
+                true, ggml_backend_meta_device_ranked(
+                devs.data(), devs.size(), n_world, rank_first, llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
