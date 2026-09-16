@@ -1,0 +1,22 @@
+# Plan of record for DeepSeek-V4.1-Flash, reproducing the 2026-09 DS4.1 layout:
+# spine + engram on mad-lab-main, encoder experts 0-25 on mad-lab-main,
+# decoder experts 26-39 + MTP head 40-42 on mad-lab-2026 NVMe (/mnt/nvme).
+# The acceptance run is the next new model.
+name: dsv41-flash
+source: hf:deepseek-ai/DeepSeek-V4.1-Flash
+quant:
+  experts: mxfp4
+  dense: q8_0
+  engram: q4_0
+spine: mad-lab-main
+sidecars: mad-lab-main
+experts:
+  - layers: "0-25"
+    machine: mad-lab-main
+  - layers: "26-39"
+    machine: mad-lab-2026
+    path: /mnt/nvme
+spec_head:
+  layers: "40-42"
+  machine: mad-lab-2026
+  path: /mnt/nvme
