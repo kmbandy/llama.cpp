@@ -156,6 +156,94 @@ static wp_step_stats_state & wp_step_stats() {
     return s;
 }
 
+// WP_SPEC_PREFILL_STATS=1: per-prompt wall-clock breakdown of the draft-mtp
+// hidden-state handoff cost during PROMPT PROCESSING (prefill), added to
+// investigate the residual 9-20% prefill regression documented in
+// draft-prefill-handoff-0912.txt (raising the target n_batch so a whole
+// prompt is one server decode() call did NOT fix it -- see
+// spec-prefill-stats-0912.txt for the write-up this instrumentation feeds).
+//
+// A "prompt" here is one slot's SLOT_STATE_STARTED -> SLOT_STATE_DONE_PROMPT
+// span. Buckets, accumulated across every server-side decode() call that
+// prompt takes (n_batch-bounded outer chunks -- see run_stream_decode_loop()):
+//   a. target-side drain: llama_get_embeddings_nextn(ctx_tgt) /
+//      ctx_tgt->synchronize() inside common_speculative_process() --
+//      common/speculative.cpp (the non-mem-shared branch of
+//      common_speculative_impl_draft_mtp::process()), src/llama-context.cpp
+//      6574-6577 / 1350-1358.
+//   b. host copies of hidden states in/out + the draft llama_batch build,
+//      same process() call, common/speculative.cpp.
+//   c. llama_decode(ctx_dft, ...) catch-up chunks (summed), plus chunk and
+//      token counts -- same process() call.
+//   (a)-(c) are pulled from common_speculative_wp_prefill_last_call_stats()
+//   right after each common_speculative_process() call in decode() below.
+//   d1. checkpoint capture drain: create_checkpoint()'s
+//       llama_synchronize(slot.ctx_tgt) (~3738), when do_checkpoint fires
+//       mid-prompt (params_base.n_ctx_checkpoints > 0 and slot.can_speculate()
+//       makes checkpoints_reachable true for a spec-mtp slot regardless of
+//       cache_prompt -- server-context.cpp ~5550-5553).
+//   d2. decode()'s own llama_synchronize(ctx_tgt) when has_output (~5801).
+//   d3. everything else inside the common_speculative_process() call
+//       (server-context.cpp ~6039) that isn't (a)+(b)+(c) -- batch_in
+//       seq-id bookkeeping, dispatch/call overhead.
+//   e. denominator: slot.stats.t_prompt_ms() (the target's own existing
+//      prompt-eval wall, t_prompt_last - t_start), read at the
+//      SLOT_STATE_DONE_PROMPT -> GENERATING transition where the summary
+//      line below is printed.
+// Also tracked: n_target_decode_calls (how many times decode() ran
+// llama_decode(ctx_tgt, ...) for this prompt) and n_target_ubatches (sum of
+// ceil(n_tokens_this_call / llama_n_ubatch(ctx_tgt)) -- the number of
+// internal sub-batches llama_decode()'s own splitter will have produced;
+// not read back from llama-context.cpp, computed from the same inputs it
+// uses, since there is no existing per-call ubatch-count accessor).
+//
+// Scoped to server_stream (not server_slot): decode() operates on a whole
+// stream's rendered batch, and the fast path here is one active
+// prompt-processing slot per stream (this instrumentation's target
+// use case), matching WP_STEP_STATS' existing pooled-not-per-slot design
+// above. If more than one slot in the same stream is mid-prefill at once,
+// the numbers pool across them instead of separating by slot.
+//
+// Unset: one getenv() + one bool check per call site, no timers taken --
+// same zero-cost-when-off shape as WP_STEP_STATS.
+static bool wp_spec_prefill_stats_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("WP_SPEC_PREFILL_STATS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+struct wp_spec_prefill_stats_state {
+    bool     active            = false; // true from SLOT_STATE_STARTED reset until the next flush
+    uint64_t a_sync_ns         = 0;
+    uint64_t b_copy_ns         = 0;
+    uint64_t c_decode_ns       = 0;
+    uint32_t c_n_chunks        = 0;
+    uint64_t c_n_tokens        = 0;
+    uint64_t d1_checkpoint_ns  = 0;
+    uint64_t d2_decode_sync_ns = 0;
+    uint64_t d3_process_other_ns = 0;
+    // MAD-LAB: bucket d4 -- wall time spent INSIDE llama_context::decode()
+    // itself issuing the nextn staging copy (ggml_backend_tensor_get_async
+    // into llama_context's nextn_stage[] buffer), summed per target decode
+    // call via llama_get_nextn_stage_copy_ns(ctx_tgt) right after each
+    // llama_decode(ctx_tgt, ...) call below. This is NOT inside a/b/c
+    // (those live entirely inside common_speculative_process(), called
+    // AFTER decode() returns) -- it measures the in-decode extraction cost
+    // the a/b/c buckets structurally cannot see. 0 unless staging is
+    // actually enabled (draft-mtp's single-head pipelined path -- see
+    // draft-sync-cost-0912.txt) and WP_SPEC_PREFILL_STATS is set.
+    uint64_t d4_extract_ns    = 0;
+    uint32_t n_target_decode_calls = 0;
+    uint32_t n_target_ubatches     = 0;
+
+    void reset() {
+        *this = wp_spec_prefill_stats_state{};
+        active = true;
+    }
+};
+
 // MAD-125: walk the active memory pointer chain and return the
 // llama_kv_cache_paged at the bottom (if any). Three nestings to cover:
 //   - paged is the raw active memory (rare standalone test case)
@@ -1255,6 +1343,11 @@ struct server_stream {
     // B did," which is not what the upstream safety abort (decode(),
     // ++n_empty_consecutive > 3) means to detect.
     int32_t n_empty_consecutive = 0;
+
+    // WP_SPEC_PREFILL_STATS: per-prompt accumulator for this stream. See the
+    // struct's declaration (above server_context_impl) for what each field
+    // measures. No-op fields when WP_SPEC_PREFILL_STATS is unset.
+    wp_spec_prefill_stats_state wp_pp_stats;
 };
 
 //
@@ -3777,7 +3870,14 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // wp_pp_stats: non-null only when the caller wants this checkpoint's
+    // capture drain folded into a WP_SPEC_PREFILL_STATS per-prompt total
+    // (bucket d1) -- see the caller in pre_decode(), which already has its
+    // stream's wp_pp_stats in scope; kept as a plain out-param rather than
+    // threading server_stream through here, per the no-server_stream-needed
+    // note below.
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
+                            wp_spec_prefill_stats_state * wp_pp_stats = nullptr) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3831,6 +3931,10 @@ private:
         const int64_t t_ckpt_0 = ggml_time_us();
         llama_synchronize(slot.ctx_tgt);
         const int64_t t_ckpt_sync = ggml_time_us();
+
+        if (wp_pp_stats != nullptr && wp_pp_stats->active) {
+            wp_pp_stats->d1_checkpoint_ns += (uint64_t) (t_ckpt_sync - t_ckpt_0) * 1000;
+        }
 
         cur.update_tgt(slot.ctx_tgt, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
         const int64_t t_ckpt_tgt = ggml_time_us();
@@ -5583,6 +5687,10 @@ private:
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
+                        if (wp_spec_prefill_stats_enabled() && slot.can_speculate()) {
+                            stream.wp_pp_stats.reset();
+                        }
+
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
@@ -5819,7 +5927,8 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max,
+                            wp_spec_prefill_stats_enabled() ? &stream.wp_pp_stats : nullptr);
                     }
                 }
 
@@ -5886,15 +5995,47 @@ private:
 
         const int64_t t_local0 = spec_phase ? ggml_time_us() : 0;
 
+        // WP_SPEC_PREFILL_STATS: classify this decode() call as prompt
+        // processing using the same trunk-width heuristic WP_STEP_STATS
+        // already uses (n_tokens <= 8 == verify-sized, > 8 == prefill) --
+        // see wp_spec_prefill_stats_state's declaration above.
+        const bool wp_pp = wp_spec_prefill_stats_enabled() && spec != nullptr &&
+                            stream.wp_pp_stats.active && batch_view.n_tokens > 8;
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        uint64_t wp_pp_d2_ns = 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
+                // bucket d2: decode()'s own post-decode drain (distinct from
+                // the target-side drain inside common_speculative_process(),
+                // bucket a, further below).
+                const auto wp_pp_t0 = wp_pp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 llama_synchronize(ctx_tgt);
+                if (wp_pp) {
+                    wp_pp_d2_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - wp_pp_t0).count();
+                }
             }
         });
+
+        if (wp_pp && ret == 0) {
+            auto & st = stream.wp_pp_stats;
+            st.d2_decode_sync_ns += wp_pp_d2_ns;
+            // bucket d4: time spent inside the llama_decode(ctx_tgt, ...)
+            // call just above doing the nextn staging copy -- see
+            // wp_spec_prefill_stats_state::d4_extract_ns's declaration.
+            // Read unconditionally (not has_output-gated like d2): staging
+            // writes happen for every ubatch of this call whenever staging
+            // is enabled, regardless of whether this call also needed
+            // logits.
+            st.d4_extract_ns += llama_get_nextn_stage_copy_ns(ctx_tgt);
+            st.n_target_decode_calls += 1;
+            const uint32_t n_ubatch = std::max<uint32_t>(1, llama_n_ubatch(ctx_tgt));
+            st.n_target_ubatches += (uint32_t) ((batch_view.n_tokens + n_ubatch - 1) / n_ubatch);
+        }
 
         if (spec_phase) {
             SRV_INF("SPECPHASE local_decode_us=%" PRId64 " n_tokens=%d\n", ggml_time_us() - t_local0, batch_view.n_tokens);
@@ -6127,6 +6268,7 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         const int64_t t_proc0 = spec_phase ? ggml_time_us() : 0;
+        const auto wp_pp_proc_t0 = wp_pp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
@@ -6142,6 +6284,25 @@ private:
         }
         if (spec_phase && spec) {
             SRV_INF("SPECPHASE process_us=%" PRId64 "\n", ggml_time_us() - t_proc0);
+        }
+        if (wp_pp && spec) {
+            // buckets a/b/c: pulled from the impl's last-call snapshot (see
+            // common_speculative_wp_prefill_last_call_stats() in
+            // common/speculative.cpp). bucket d3: whatever this
+            // common_speculative_process() call's wall time doesn't account
+            // for once a+b+c are subtracted -- seq-id bookkeeping in
+            // process() (the i_batch_beg/end scan) plus dispatch overhead.
+            const uint64_t wall_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wp_pp_proc_t0).count();
+            const auto call = common_speculative_wp_prefill_last_call_stats(spec);
+            auto & st = stream.wp_pp_stats;
+            st.a_sync_ns   += call.a_sync_ns;
+            st.b_copy_ns   += call.b_copy_ns;
+            st.c_decode_ns += call.c_decode_ns;
+            st.c_n_chunks  += call.c_n_chunks;
+            st.c_n_tokens  += call.c_n_tokens;
+            const uint64_t abc_ns = call.a_sync_ns + call.b_copy_ns + call.c_decode_ns;
+            st.d3_process_other_ns += wall_ns > abc_ns ? wall_ns - abc_ns : 0;
         }
 
         // MAD-LAB DS4-Flash pipeline-streams: the n_cmpl>1 parent/child
@@ -6253,6 +6414,63 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // MAD-LAB: prefill-sync pipelining (see
+                // draft-sync-cost-0912.txt) -- draft-mtp's single-head path
+                // defers part of its LAST process() call's work by one
+                // call. Resolve it now, BEFORE common_speculative_begin()
+                // below: draft() reads per-sequence state (pending_h/i_last)
+                // that a still-pending chunk hasn't written yet. No-op for
+                // every other implementation and for chain_heads/gemma4
+                // draft-mtp configs (they never defer anything).
+                if (slot.can_speculate()) {
+                    if (!common_speculative_flush_prefill(spec)) {
+                        SRV_ERR("%s", "failed to flush pending speculative prefill state\n");
+                        throw std::runtime_error("failed to flush pending speculative prefill state");
+                    }
+                }
+
+                // WP_SPEC_PREFILL_STATS: flush this prompt's accumulated
+                // buckets now, one line, before common_speculative_begin()
+                // below resets the spec state for generation. See
+                // wp_spec_prefill_stats_state's declaration for what each
+                // field measures and spec-prefill-stats-0912.txt for the
+                // write-up. Folds in whatever the flush above just resolved
+                // (common_speculative_wp_prefill_last_call_stats() reflects
+                // resolve_pending()'s timings the same way it reflects a
+                // normal process() call's -- see common/speculative.cpp).
+                if (wp_spec_prefill_stats_enabled() && slot.can_speculate() && stream.wp_pp_stats.active) {
+                    {
+                        const auto call = common_speculative_wp_prefill_last_call_stats(spec);
+                        auto & st = stream.wp_pp_stats;
+                        st.a_sync_ns   += call.a_sync_ns;
+                        st.b_copy_ns   += call.b_copy_ns;
+                        st.c_decode_ns += call.c_decode_ns;
+                        st.c_n_chunks  += call.c_n_chunks;
+                        st.c_n_tokens  += call.c_n_tokens;
+                    }
+                    auto & st = stream.wp_pp_stats;
+                    const double t_prompt_ms = slot.stats.t_prompt_ms();
+                    auto pct = [&](uint64_t ns) {
+                        return t_prompt_ms > 0.0 ? (double) ns / 1e6 / t_prompt_ms * 100.0 : 0.0;
+                    };
+                    LOG_INF("wp spec-prefill: prompt_eval = %.2f ms / %" PRIu64 " tok | "
+                            "a_sync = %.2f ms (%.1f%%) | b_copy = %.2f ms (%.1f%%) | "
+                            "c_decode = %.2f ms (%.1f%%, chunks=%u, tok=%" PRIu64 ") | "
+                            "d1_ckpt = %.2f ms (%.1f%%) | d2_dsync = %.2f ms (%.1f%%) | "
+                            "d3_other = %.2f ms (%.1f%%) | d4_extract = %.2f ms (%.1f%%) | "
+                            "tgt_decode_calls=%u tgt_ubatches=%u\n",
+                            t_prompt_ms, (uint64_t) slot.stats.n_prompt_processed,
+                            st.a_sync_ns / 1e6, pct(st.a_sync_ns),
+                            st.b_copy_ns / 1e6, pct(st.b_copy_ns),
+                            st.c_decode_ns / 1e6, pct(st.c_decode_ns), st.c_n_chunks, st.c_n_tokens,
+                            st.d1_checkpoint_ns / 1e6, pct(st.d1_checkpoint_ns),
+                            st.d2_decode_sync_ns / 1e6, pct(st.d2_decode_sync_ns),
+                            st.d3_process_other_ns / 1e6, pct(st.d3_process_other_ns),
+                            st.d4_extract_ns / 1e6, pct(st.d4_extract_ns),
+                            st.n_target_decode_calls, st.n_target_ubatches);
+                    st.active = false;
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec, slot.stream_slot_idx, slot.prompt.tokens.get_text_tokens()); // MAD-LAB: spec is a raw ptr

@@ -132,7 +132,17 @@ public:
         const  layer_share_cb & share,
                          bool   filter_authoritative = false,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // MAD-LAB (WP_MTP_DRAFT_SWA): log once, at LLAMA_LOG_WARN, the first time
+        // find_slot() actually reuses a cell via SWA eviction (i.e. the window has
+        // been exceeded and the ring has started recycling). The WP_MTP_DRAFT_SWA
+        // feature (src/llama-model.cpp, mtp_on_hybrid_qwen) was only verified
+        // "bit-identical" at prompt depths shallower than the window, so eviction
+        // itself is an unvalidated code path for this cache; this flag exists so
+        // that regressions past the window boundary are visible in the log instead
+        // of only showing up as a silent acceptance-rate collapse. Every other
+        // caller leaves this false and pays nothing beyond one bool compare.
+                         bool   warn_first_swa_evict = false);
 
     ~llama_kv_cache() = default;
 
@@ -325,6 +335,10 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // MAD-LAB (WP_MTP_DRAFT_SWA): see the constructor's warn_first_swa_evict doc.
+    const bool warn_first_swa_evict = false;
+    mutable bool logged_first_swa_evict = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

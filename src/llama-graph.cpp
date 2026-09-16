@@ -569,7 +569,19 @@ int32_t llm_graph_input_attn_kv::paged_max_ctx_len() const {
 void llm_graph_input_attn_kv::update_paged_attn_max_ctx_len() {
     const int32_t max_ctx_len = paged_max_ctx_len();
     for (ggml_tensor * op : paged_attn_ops) {
-        op->op_params[5] = max_ctx_len;
+        // MAD-378 / predequant-sync-fix-0912: plain `op->op_params[5] = max_ctx_len`
+        // only updates the meta (unsplit) tensor. Under tensor-split-attn the meta
+        // backend's per-device sub-op that actually executes the kernel is a separate
+        // ggml_tensor cloned once at graph-build time (ggml-backend-meta.cpp,
+        // ggml_backend_meta_buffer_init_tensor_impl), before this function's first
+        // call ever ran (op_params defaults to 0 then) -- so on a graph that gets
+        // reused rather than rebuilt across ubatches, the split clone's op_params[5]
+        // was frozen at 0 forever and the CUDA-side dispatcher always fell back to
+        // the full-capacity scratch bound. ggml_backend_meta_buffer_set_op_param_i32()
+        // re-propagates to any already-materialized per-device clone as well as the
+        // meta tensor, so both the unsplit and tensor-split-attn paths pick up the
+        // current per-ubatch max context length.
+        ggml_backend_meta_buffer_set_op_param_i32(op, 5, max_ctx_len);
     }
 }
 

@@ -3928,7 +3928,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 nullptr,
                                 nullptr,
-                                filter_authoritative);
+                                filter_authoritative,
+                                mtp_draft_swa > 0 ? "mtp_draft_" : "",
+                                /* warn_first_swa_evict */ mtp_draft_swa > 0);
                     }
                 }
             }

@@ -149,9 +149,11 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
                      bool   filter_authoritative,
-             const char *   name_tag) :
+             const char *   name_tag,
+                     bool   warn_first_swa_evict) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    warn_first_swa_evict(warn_first_swa_evict),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -1379,6 +1381,22 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                         // SWA mask
                         if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
                             can_use = true;
+
+                            // MAD-LAB (WP_MTP_DRAFT_SWA): the first real eviction means the
+                            // ring has started recycling cells - the code path the original
+                            // "bit-identical" validation for this feature never exercised
+                            // (see llama-kv-cache.h's warn_first_swa_evict doc). Surface it
+                            // once so a collapse past this point is diagnosable from the log
+                            // instead of only showing up as a silent acceptance-rate drop.
+                            if (warn_first_swa_evict && !logged_first_swa_evict) {
+                                logged_first_swa_evict = true;
+                                LLAMA_LOG_WARN("%s: first SWA eviction (n_swa=%u, seq=%d, evicted pos=%d, "
+                                        "current pos=%d) - the draft cache is now recycling cells; this "
+                                        "code path was not covered by WP_MTP_DRAFT_SWA's original "
+                                        "verification\n",
+                                        __func__, n_swa, (int) seq_id_cell, (int) pos_cell,
+                                        (int) cells.seq_pos_max(seq_id_cell));
+                            }
                         }
                     }
                 }

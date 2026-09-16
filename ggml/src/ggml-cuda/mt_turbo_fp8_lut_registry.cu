@@ -17,6 +17,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -86,8 +87,11 @@ struct registry_state {
     model_fingerprint                       fp {};
     std::string                             cache_dir;
     int                                     n_attn_layers = 0;
-    // Per-(layer, k|v) device pointer. Filled lazily by get_lut_device_ptr.
-    std::vector<std::pair<uint8_t *, uint8_t *>> dev_luts;   // (k_ptr, v_ptr)
+    // Per-DEVICE, per-(layer, k|v) device pointer. Same class of bug as the
+    // AITER kernel-handle cache: a hipMalloc lives in one device's context,
+    // and under tensor-parallel the second card must not reuse the first
+    // card's LUT pointer (tl.load(lut_ptr+idx) per KV element over TB3).
+    std::unordered_map<int, std::vector<std::pair<uint8_t *, uint8_t *>>> per_dev_luts;
     bool                                    warned_fallback = false;
 };
 
@@ -172,7 +176,7 @@ bool init(const model_fingerprint & fp, bool auto_calibrate_if_missing) {
     s.cache_dir      = cache_root() + "/" + fp.digest();
     if (s.hadamard) s.cache_dir += "/hadamard";
     s.n_attn_layers  = fp.n_layer;
-    s.dev_luts.assign(s.n_attn_layers, { nullptr, nullptr });
+    s.per_dev_luts.clear();
     mkdir_p(s.cache_dir);
     // Write a manifest for human inspection (not consumed by this code).
     {
@@ -210,29 +214,37 @@ const uint8_t * get_lut_device_ptr(int layer, kv_dir dir) {
         std::fprintf(stderr, "mt_turbo_fp8: get_lut_device_ptr called before init\n");
         return nullptr;
     }
-    if (layer < 0 || layer >= (int) s.dev_luts.size()) {
-        std::fprintf(stderr, "mt_turbo_fp8: layer %d out of range [0, %zu)\n",
-                     layer, s.dev_luts.size());
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        dev = 0;
+    }
+    auto & vec = s.per_dev_luts[dev];
+    if ((int) vec.size() != s.n_attn_layers) {
+        vec.assign((size_t) s.n_attn_layers, { nullptr, nullptr });
+    }
+    if (layer < 0 || layer >= (int) vec.size()) {
+        std::fprintf(stderr, "mt_turbo_fp8: layer %d out of range [0, %zu) on device %d\n",
+                     layer, vec.size(), dev);
         return nullptr;
     }
-    uint8_t *& slot = (dir == KV_K) ? s.dev_luts[layer].first : s.dev_luts[layer].second;
+    uint8_t *& slot = (dir == KV_K) ? vec[layer].first : vec[layer].second;
     if (slot != nullptr) return slot;
 
     uint8_t host_lut[LUT_BYTES];
     if (!resolve_lut_bytes(layer, dir, host_lut)) return nullptr;
 
-    uint8_t * dev = nullptr;
-    if (hipMalloc(&dev, LUT_BYTES) != hipSuccess) {
-        std::fprintf(stderr, "mt_turbo_fp8: hipMalloc(%zu) failed\n", LUT_BYTES);
+    uint8_t * dptr = nullptr;
+    if (hipMalloc(&dptr, LUT_BYTES) != hipSuccess) {
+        std::fprintf(stderr, "mt_turbo_fp8: hipMalloc(%zu) failed on device %d\n", LUT_BYTES, dev);
         return nullptr;
     }
-    if (hipMemcpy(dev, host_lut, LUT_BYTES, hipMemcpyHostToDevice) != hipSuccess) {
-        std::fprintf(stderr, "mt_turbo_fp8: hipMemcpy upload failed\n");
-        hipFree(dev);
+    if (hipMemcpy(dptr, host_lut, LUT_BYTES, hipMemcpyHostToDevice) != hipSuccess) {
+        std::fprintf(stderr, "mt_turbo_fp8: hipMemcpy upload failed on device %d\n", dev);
+        hipFree(dptr);
         return nullptr;
     }
-    slot = dev;
-    return dev;
+    slot = dptr;
+    return dptr;
 }
 
 bool all_luts_cached() {
@@ -252,11 +264,17 @@ bool all_luts_cached() {
 void shutdown() {
     auto & s = state();
     std::lock_guard<std::mutex> g(s.mu);
-    for (auto & p : s.dev_luts) {
-        if (p.first)  hipFree(p.first);
-        if (p.second) hipFree(p.second);
+    int prev = 0;
+    hipGetDevice(&prev);
+    for (auto & kv : s.per_dev_luts) {
+        hipSetDevice(kv.first);
+        for (auto & p : kv.second) {
+            if (p.first)  hipFree(p.first);
+            if (p.second) hipFree(p.second);
+        }
     }
-    s.dev_luts.clear();
+    hipSetDevice(prev);
+    s.per_dev_luts.clear();
     s.initialized = false;
 }
 
