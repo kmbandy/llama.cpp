@@ -613,6 +613,103 @@ private:
     llm_graph_result_ptr gf_res_overlap;
     llm_graph_result_ptr gf_res_reserve;
 
+    // WP_GRAPH_RESULT_SLOTS=N (default 1 == today's behaviour exactly).
+    //
+    // WHY. There is exactly ONE cached graph result (gf_res_prev), but the spine
+    // runs several DIFFERENT graph shapes through the same llama_context: the
+    // n_tokens=4 speculative-verify trunk pass and the n_tokens=1 MTP draft-head
+    // passes alternate 4 -> 1 -> 1 -> 1 -> 4 within a single decode step. Because
+    // llm_graph_params::allow_reuse() compares ubatch.n_tokens, every
+    // verify<->draft transition misses and rebuilds a ~7-9k-node graph. Measured
+    // on the g128 spine: "graphs reused = 198" against ~700 decode() calls (28%),
+    // even though 63% of verify calls already share the n_tokens=4 shape -- i.e.
+    // the binding constraint is the single slot, not the batch shape.
+    //
+    // A slot holds a graph RESULT (the built topology), keyed by (gtype, n_tokens).
+    //
+    // EACH SLOT OWNS ITS SCHEDULER. This is not an optimisation, it is the only
+    // sound design, and the first attempt (c7b8001ff) crashed the R9700 with
+    // HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION for want of it.
+    //
+    // A ggml_backend_sched owns a ggml_gallocr, and BOTH of the guards that decide
+    // whether a graph must be re-allocated are POSITIONAL AND SIZE-BASED, never
+    // identity-based:
+    //   * ggml_backend_sched_alloc_splits() (ggml-backend.cpp) compares
+    //     node_backend_ids[i] against prev_node_backend_ids[i] and only flags a
+    //     change when the BUFT differs;
+    //   * ggml_gallocr_needs_realloc() (ggml-alloc.c) compares n_nodes / n_leafs
+    //     and then, per node index i, only asks `talloc->size_max >= node_size`.
+    // Neither can tell "the same graph re-run" from "a DIFFERENT graph that happens
+    // to have the same node/leaf counts and whose tensors fit the previous
+    // offsets". When both guards pass, ggml_gallocr_alloc_graph() runs
+    // ggml_gallocr_init_tensor() over the new graph using the OLD graph's
+    // node_allocs[i], assigning tensor i the offset AND buffer_id computed for a
+    // different tensor i. Going from the 4-token verify graph to the 1-token draft
+    // graph every tensor "fits", so nothing trips: tensors silently alias, and one
+    // whose true extent exceeds the recorded chunk runs off the end of its buffer.
+    // With ~96 CPU splits per layer-set, index i can even be CPU in one graph and
+    // ROCm0 in the other, handing a kernel a host pointer.
+    //
+    // The whole reuse machinery rests on the invariant that ONE sched sees ONE
+    // graph topology at a time. Keeping two graph results against one sched breaks
+    // that invariant; a per-slot sched restores it, and lets a cross-slot hit skip
+    // allocation entirely rather than re-running it.
+    //
+    // See also the comment above output_project() in llama-context.cpp: it gives
+    // the projection head a DEDICATED sched for exactly this reason.
+    //
+    // COST. One compute buffer per extra slot. It is NOT the +429 MiB worst case:
+    // an extra sched is never graph_reserve()d, so ggml_gallocr_reserve_n() sizes
+    // it on first use for the shapes that slot actually sees, and a slot keyed to
+    // n_tokens=1 (the MTP draft head) is far smaller than the n_ubatch=512
+    // worst-case reserve. Slot 0 keeps the context's reserved sched unchanged.
+    struct wp_graph_slot {
+        // NON-OWNING. Slot 0 points at gf_res_prev (owned by that unique_ptr);
+        // slots 1..N-1 point into gf_slots_owned below. Keeping this raw avoids
+        // a second unique_ptr claiming ownership of the gf_res_prev object.
+        llm_graph_result *   res      = nullptr;
+        // NON-OWNING. Slot 0 points at this context's `sched`; slots 1..N-1 point
+        // into gf_slots_sched below. Every slot MUST have its own allocator.
+        ggml_backend_sched_t sch      = nullptr;
+        llm_graph_type       gtype    = LLM_GRAPH_TYPE_DEFAULT;
+        uint32_t             n_tokens = 0;
+        bool                 keyed    = false;
+        uint64_t             last_use = 0;
+    };
+
+    // empty when WP_GRAPH_RESULT_SLOTS <= 1; otherwise slot 0 aliases gf_res_prev
+    // so that every pre-existing gf_res_prev code path keeps working untouched.
+    std::vector<wp_graph_slot> gf_slots;
+    // owns only the EXTRA results (slots 1..N-1); slot 0's object is gf_res_prev's
+    std::vector<llm_graph_result_ptr> gf_slots_owned;
+    // owns only the EXTRA schedulers (slots 1..N-1); slot 0 uses `sched`
+    std::vector<ggml_backend_sched_ptr> gf_slots_sched;
+    // the scheduler the CURRENT process_ubatch/graph_compute call must drive.
+    // Always sched.get() in single-slot mode.
+    ggml_backend_sched_t sched_active = nullptr;
+
+    // The scheduler that owns whatever graph result is currently live. EVERY
+    // lookup of a tensor produced by a graph result -- ggml_backend_sched_get_
+    // tensor_backend() for t_logits / t_embd / t_h_nextn, and every build-time
+    // ggml_backend_sched_set_tensor_backend() pin -- must go through this, not
+    // through `sched`. Asking the context's scheduler about a tensor that an
+    // extra slot's scheduler allocated returns nullptr, which is what tripped
+    // GGML_ASSERT(backend_h != nullptr) at the first decode under
+    // WP_GRAPH_RESULT_SLOTS=2. Falls back to `sched` before any slot is chosen.
+    ggml_backend_sched_t sched_cur() const {
+        return sched_active != nullptr ? sched_active : sched.get();
+    }
+    uint64_t                   gf_slot_clock     = 0;
+    int32_t                    gf_slot_hits      = 0;
+    int32_t                    gf_slot_misses    = 0;
+
+    // number of graph-result slots (>=1). 1 == the single-slot legacy path.
+    size_t wp_graph_result_slots() const;
+    // select the slot for (gtype, n_tokens); returns null when single-slot.
+    wp_graph_slot * wp_pick_graph_slot(llm_graph_type gtype, uint32_t n_tokens);
+    // invalidate every cached graph result (all slots + gf_res_prev).
+    void wp_reset_graph_results();
+
     // WP_QWEN4EXP_LAYER_CUT (Stage 3): the one live logical execution slot
     // (plan item 4) -- see llama_context::process_ubatch_staged().
     llm_graph_stage_slot layer_cut_slot;

@@ -1363,6 +1363,39 @@ void llama_context::sched_reserve() {
         LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
     }
 
+    // WP_GRAPH_RESULT_SLOTS: see llama_context::wp_graph_slot in llama-context.h.
+    // Slot 0 ALIASES gf_res_prev (same llm_graph_result object, not a copy), so
+    // every existing gf_res_prev call site keeps operating on slot 0 and the
+    // N == 1 path allocates nothing extra and behaves byte-identically.
+    {
+        const size_t n_slots = wp_graph_result_slots();
+        if (n_slots > 1) {
+            gf_slots.clear();
+            gf_slots_owned.clear();
+            gf_slots_sched.clear();
+            gf_slots.resize(n_slots);
+            // slot 0 reuses this context's result AND scheduler (non-owning), so
+            // it behaves exactly as the single-slot path does.
+            gf_slots[0].res = gf_res_prev.get();
+            gf_slots[0].sch = nullptr; // resolved to sched.get() at use, see below
+            for (size_t i = 1; i < n_slots; ++i) {
+                gf_slots_owned.emplace_back(new llm_graph_result(max_nodes));
+                gf_slots[i].res = gf_slots_owned.back().get();
+                // EACH SLOT NEEDS ITS OWN ALLOCATOR -- see wp_graph_slot in the
+                // header for why sharing one is a memory-corruption bug. Not
+                // graph_reserve()d: ggml_gallocr_reserve_n sizes it on first use
+                // for the shapes this slot actually sees.
+                gf_slots_sched.emplace_back(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+                gf_slots[i].sch = gf_slots_sched.back().get();
+            }
+            LLAMA_LOG_INFO("%s: WP_GRAPH_RESULT_SLOTS = %zu graph-result slots "
+                           "(slot 0 aliases gf_res_prev; %zu extra graph buffers)\n",
+                           __func__, n_slots, n_slots - 1);
+        }
+    }
+
     const int64_t t_end_us = ggml_time_us();
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
@@ -1377,6 +1410,14 @@ void llama_context::synchronize() {
     ggml_backend_sched_synchronize(sched.get());
     if (sched_overlap) {
         ggml_backend_sched_synchronize(sched_overlap.get());
+    }
+
+    // WP_GRAPH_RESULT_SLOTS: extra slots run on their own schedulers, so a
+    // compute launched on one of them is NOT drained by the line above.
+    for (auto & slot_sched : gf_slots_sched) {
+        if (slot_sched) {
+            ggml_backend_sched_synchronize(slot_sched.get());
+        }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1478,7 +1519,8 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        // WP: must invalidate EVERY slot, not just slot 0 (see wp_reset_graph_results)
+        wp_reset_graph_results();
         if (gf_res_overlap) {
             gf_res_overlap->reset();
         }
@@ -2337,7 +2379,7 @@ void llama_context::set_no_output_head(bool value) {
 
     // the graph SHAPE changes (the LM head disappears), so the reserved
     // worst-case graph and any cached graph must be rebuilt.
-    gf_res_prev->reset();
+    wp_reset_graph_results();
     if (gf_res_overlap) {
         gf_res_overlap->reset();
     }
@@ -2706,6 +2748,86 @@ bool llama_context::layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_ty
     return true;
 }
 
+// WP_GRAPH_RESULT_SLOTS=N: number of cached graph-result slots. Default 1, which
+// is exactly today's single-gf_res_prev behaviour (gf_slots stays empty and no
+// selection code runs at all). Parsed once; values < 1 clamp to 1.
+size_t llama_context::wp_graph_result_slots() const {
+    static const size_t n = []() -> size_t {
+        const char * e = getenv("WP_GRAPH_RESULT_SLOTS");
+        if (e == nullptr || e[0] == '\0') {
+            return 1;
+        }
+        const long long v = atoll(e);
+        if (v < 1) {
+            return 1;
+        }
+        // a slot costs one graph-metadata buffer; keep the knob sane
+        return (size_t) std::min<long long>(v, 8);
+    }();
+    return n;
+}
+
+// Pick the slot for (gtype, n_tokens): exact key match, else an unkeyed slot,
+// else least-recently-used. Returns nullptr in single-slot mode so the caller
+// falls through to the untouched gf_res_prev path.
+llama_context::wp_graph_slot * llama_context::wp_pick_graph_slot(llm_graph_type gtype, uint32_t n_tokens) {
+    if (gf_slots.empty()) {
+        return nullptr;
+    }
+
+    size_t best = 0;
+    for (size_t i = 0; i < gf_slots.size(); ++i) {
+        if (gf_slots[i].keyed && gf_slots[i].gtype == gtype && gf_slots[i].n_tokens == n_tokens) {
+            gf_slots[i].last_use = ++gf_slot_clock;
+            return &gf_slots[i];
+        }
+    }
+    // no key match: prefer an unused slot, else evict the LRU one
+    bool found_free = false;
+    for (size_t i = 0; i < gf_slots.size(); ++i) {
+        if (!gf_slots[i].keyed) {
+            best = i;
+            found_free = true;
+            break;
+        }
+    }
+    if (!found_free) {
+        for (size_t i = 1; i < gf_slots.size(); ++i) {
+            if (gf_slots[i].last_use < gf_slots[best].last_use) {
+                best = i;
+            }
+        }
+        // the evicted slot's cached topology no longer describes this key
+        gf_slots[best].res->reset();
+    }
+    gf_slots[best].gtype    = gtype;
+    gf_slots[best].n_tokens = n_tokens;
+    gf_slots[best].keyed    = true;
+    gf_slots[best].last_use = ++gf_slot_clock;
+    return &gf_slots[best];
+}
+
+// Invalidate every cached graph result. Callers that previously did
+// `gf_res_prev->reset()` to guarantee "this graph must not be reused" must go
+// through here, or an extra slot would keep serving a stale topology.
+void llama_context::wp_reset_graph_results() {
+    gf_res_prev->reset();
+    for (auto & slot : gf_slots) {
+        if (slot.res != nullptr && slot.res != gf_res_prev.get()) {
+            slot.res->reset();
+        }
+        slot.keyed    = false;
+        slot.last_use = 0;
+    }
+    // an extra slot's scheduler holds the allocation for the topology we just
+    // invalidated; reset it so the next use re-splits and re-allocates.
+    for (auto & slot_sched : gf_slots_sched) {
+        if (slot_sched) {
+            ggml_backend_sched_reset(slot_sched.get());
+        }
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret,
                                                  ggml_backend_sched_t sched_override, llm_graph_result * res_override, bool defer_compute,
                                                  bool disable_reuse) {
@@ -2732,7 +2854,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = res_override ? res_override : gf_res_prev.get();
+    // WP_GRAPH_RESULT_SLOTS: pick the slot for this (gtype, n_tokens), unless the
+    // caller supplied an explicit override (res_override/sched_override bypass
+    // the slot cache entirely -- that's the TP-overlap/staged path's own
+    // bookkeeping, e.g. gf_res_overlap). Returns null in single-slot mode or
+    // when overridden, in which case everything below is unchanged.
+    wp_graph_slot * slot     = res_override ? nullptr : wp_pick_graph_slot(gtype, ubatch.n_tokens);
+    const int       slot_idx = slot == nullptr ? -1 : (int) (slot - gf_slots.data());
+
+    // Every scheduler touched below is THIS slot's. Slot 0 (and single-slot mode)
+    // resolves to the context's own `sched`, so the unset path is unchanged.
+    // sched_override still takes precedence when the caller supplied one.
+    if (!sched_override) {
+        sched_active = (slot == nullptr || slot->sch == nullptr) ? sched.get() : slot->sch;
+    }
+
+    auto * res = res_override ? res_override : (slot == nullptr ? gf_res_prev.get() : slot->res);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2749,8 +2886,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched_active);
         }
 
+        // No cross-slot re-allocation needed: this slot owns its scheduler, so its
+        // tensor addresses are still exactly the ones its last allocation assigned
+        // and no other slot's allocation can have disturbed them.
+        if (slot_idx >= 0) {
+            gf_slot_hits++;
+        }
         n_reused++;
     } else {
+        if (slot_idx >= 0) {
+            gf_slot_misses++;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched_active);
@@ -2784,6 +2930,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+
+    // WP_GRAPH_RESULT_SLOTS: reuse accounting, once per 256 decisions. Same
+    // counter family as the "graphs reused" line in slot print_timing, but split
+    // hit/miss so a run says whether the extra slots actually earned their keep.
+    if (slot_idx >= 0 && ((gf_slot_hits + gf_slot_misses) % 256) == 0) {
+        const int32_t total = gf_slot_hits + gf_slot_misses;
+        LLAMA_LOG_INFO("%s: graph-result slots: n=%zu hits=%d misses=%d (%.1f%% reuse)\n",
+                       __func__, gf_slots.size(), gf_slot_hits, gf_slot_misses,
+                       total > 0 ? 100.0 * (double) gf_slot_hits / (double) total : 0.0);
     }
 
     // set the input data for the input tensors
@@ -3003,7 +3159,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return e != nullptr && e[0] == '1';
         }();
         if (wp_layer_cut_trace && !res->t_trace_layer_out.empty()) {
-            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_synchronize(sched_active);
             std::vector<float> host;
             for (uint32_t il = 0; il < res->t_trace_layer_out.size(); ++il) {
                 ggml_tensor * t = res->t_trace_layer_out[il];
@@ -3061,6 +3217,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 //     "max simultaneous stage" sizing item 5 describes.
 llm_graph_result * llama_context::process_ubatch_staged(
         const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // the staged walk reuses gf_res_prev, which belongs to slot 0 == `sched`
+    sched_active = sched.get();
+
     const uint32_t n_layer = model.hparams.n_layer();
 
     // FIX 5 (adversarial review 2026-09-01): every early-failure return in
@@ -3409,7 +3568,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract logits
     if (logits.data && t_logits) {
-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_cur(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
@@ -3423,7 +3582,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract embeddings
     if (embd.data && t_embd) {
-        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_cur(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
         switch (cparams.pooling_type) {
@@ -3478,7 +3637,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract nextn embeddings (hidden state before the final output norm)
     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_cur(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
         // MAD-LAB: use the width produced by this graph, not a model-wide width.
@@ -5166,10 +5325,14 @@ ggml_cgraph * llama_context::graph_reserve(
         n_outputs = n_tokens;
     }
 
+    // reserve always drives THIS context's scheduler, never a slot's; pin it so
+    // sched_cur() cannot hand a stale slot scheduler to graph_params/pins below
+    sched_active = sched.get();
+
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    wp_reset_graph_results();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -6430,6 +6593,9 @@ void llama_context::opt_epoch_iter(
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
                 break;
             }
+
+            // borrows gf_res_prev (slot 0), which belongs to the context scheduler
+            sched_active = sched.get();
 
             auto * res = gf_res_prev.get();
 
