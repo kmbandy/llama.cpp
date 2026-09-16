@@ -1581,13 +1581,23 @@ __global__ void mt_paged_attention_kernel(
 //
 // src tensors:
 //   src[0] = Q     [head_size, n_heads, sum(q_lens), 1]   — packed across seqs
-//   src[1] = K cache [paged layout]
-//   src[2] = V cache [paged layout]
+//   src[1] = K cache [paged layout, F16, mutated by this op]
+//   src[2] = V cache [paged layout, F16, mutated by this op]
 //   src[3] = block_tables [max_blocks_per_seq, num_seqs]
 //   src[4] = context_lens [num_seqs]
 //   src[5] = q_lens       [num_seqs]
+//   src[6] = K_cur        [head_dim, n_kv_heads, n_tokens]   F16  ← fused scatter
+//   src[7] = V_cur        [head_dim, n_kv_heads, n_tokens]   F16  ← fused scatter
+//   src[8] = slot_mapping [n_tokens]                          I32  ← fused scatter
 // dst:
 //   out [head_size, n_heads, sum(q_lens), 1]
+//
+// MAD-114: src[6..8] make this op the SINGLE handler for both KV cache
+// writes AND attention reads. Doing both phases inside one kernel
+// (separated by __syncthreads()) sidesteps the HIP runtime bug
+// where same-stream inter-kernel ordering isn't enforced — see the
+// kernel header comment. The legacy ggml_paged_kv_update_mt op is no
+// longer needed and has been removed.
 //
 // For the v1 single-batch case sum(q_lens) collapses to q_len * num_seqs
 // when all seqs in the batch have the same q_len (typical decode batch).

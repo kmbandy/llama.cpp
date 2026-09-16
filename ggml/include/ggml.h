@@ -2568,10 +2568,23 @@ extern "C" {
     // ggml-cuda/mt_pagedattn.cuh for the layout contract.
     //   q             [head_dim, n_heads,    sum(q_lens), 1]    f16
     //   k_cache       [num_blocks, n_kv_heads, head_dim/x, block_size, x]  f16 (interleaved)
+    //                 — mutated in-place by this op (fused scatter writes the
+    //                 per-batch K_cur into the cache slots before the attn
+    //                 math runs). Pass the raw cache tensor.
     //   v_cache       [num_blocks, n_kv_heads, head_dim, block_size]       f16 (transposed)
+    //                 — mutated in-place same as k_cache.
     //   block_tables  [max_blocks_per_seq, num_seqs]                       i32
     //   context_lens  [num_seqs]                                            i32
     //   q_lens        [num_seqs]                                            i32
+    //   k_cur         [head_dim, n_kv_heads, n_tokens]                     f16
+    //   v_cur         [head_dim, n_kv_heads, n_tokens]                     f16
+    //   slot_mapping  [n_tokens]                                            i32
+    //                 — slot_mapping[i] = physical slot for token i (negative
+    //                 = padding/skip). The kernel scatters K_cur/V_cur into
+    //                 those slots, syncs intra-block, then runs attention
+    //                 against the just-updated cache. This avoids any
+    //                 inter-kernel sync (which is unreliable on HIP/RDNA —
+    //                 see ROCm/hip#3882, #3887).
     // returns a tensor with q's shape (head_dim, n_heads, sum(q_lens), 1).
     //   k_cur, v_cur   [head_dim, n_kv_heads, n_tokens]    f16  ← fused scatter inputs
     //   slot_mapping   [n_tokens]                          i32  ← fused scatter inputs
