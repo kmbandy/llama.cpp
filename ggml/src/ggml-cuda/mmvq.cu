@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -253,8 +254,47 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
     }
 }
 
+// MAD-LAB: WP_MMVQ_MMID_MAX_BATCH overrides the per-arch/type table below.
+// "batch" here is dst->ne[2] == src1->ne[2] == n_tokens in the MUL_MAT_ID call
+// (see ggml_mul_mat_id() in ggml/src/ggml.c: dst ne = {as->ne[1], ids->ne[0],
+// b->ne[2], 1}), NOT n_expert_used (that's ids->ne[0] == dst->ne[1], which this
+// cap never looks at). A routed-MoE decode of n_tokens=1 already satisfies
+// "dst->ne[2] <= get_mmvq_mmid_max_batch(...)" for every table entry >= 1, so
+// this knob only matters once n_tokens climbs past the type's tuned cutoff
+// (e.g. speculative verify batches, or wider ubatches) -- it does nothing for
+// a single-token MTP draft decode, whose expert count (10) never enters this
+// comparison. Unset (default): behavior is byte-identical to upstream. Set to
+// a positive integer N: every call clamps to min(N, MMVQ_MAX_BATCH_SIZE)
+// instead of the tuned per-(arch,type) value, for exploring whether MMVQ still
+// wins at n_tokens counts the shipped tables were not tuned for. This is read
+// once, applies uniformly across arch/type (RDNA4 included), and is only
+// consulted from the !force_mm branch of ggml_cuda_mul_mat_id_needs_sync(), so
+// it can never affect a call that already forced MMQ via
+// ggml_cuda_mul_mat_id_force_mm() or ggml_cuda_mul_mat_id_hint_pinned()
+// (WP_EXPERT_MM_PIN=decode / GGML_MUL_MAT_PIN_KERNEL) -- those bypass this
+// function entirely.
+static int wp_mmvq_mmid_max_batch_override() {
+    static const int ov = [] () -> int {
+        const char * e = std::getenv("WP_MMVQ_MMID_MAX_BATCH");
+        if (e == nullptr || e[0] == '\0') {
+            return 0; // disabled: fall through to the tuned table below
+        }
+        char * end = nullptr;
+        long v = std::strtol(e, &end, 10);
+        if (end == e || v <= 0 || v > MMVQ_MAX_BATCH_SIZE) {
+            return 0;
+        }
+        return (int) v;
+    }();
+    return ov;
+}
+
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    if (const int ov = wp_mmvq_mmid_max_batch_override(); ov > 0) {
+        return ov;
+    }
+
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
