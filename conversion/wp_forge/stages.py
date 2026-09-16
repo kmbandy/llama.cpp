@@ -1,4 +1,8 @@
-"""wp-forge expert stage driver.
+"""wp-forge stage drivers.
+
+``SpineBuilder`` / ``ConverterSpineBuilder`` / ``SpineStage`` and
+``SidecarStage`` produce the dense spine GGUF and per-class sidecar GGUFs;
+``ExpertStage`` (below) owns the routed-expert stages.
 
 ``ExpertStage`` owns ALL width sets of one plan stage. The sets of a stage
 share the same layers (the stage's ``layers`` range); they differ only in
@@ -37,12 +41,12 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Callable, Dict, Protocol
 
 import gguf
 import numpy as np
 
-from .arch import expert_tensor_names, expert_tensor_names_stage
+from .arch import ArchSpec, classify, expert_tensor_names, expert_tensor_names_stage
 from .plan import ResolvedPlan, SetSpec
 from .quant import lossless_repack, quantize_expert
 from .sink import Sink
@@ -371,3 +375,248 @@ class ExpertStage:
         for p in self.workdir.glob("desc-*"):
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Spine + sidecar stages (Task 11)
+# ---------------------------------------------------------------------------
+
+
+class SpineBuilder(Protocol):
+    def build(self, peel_dir: Path, out_gguf: Path, quant: dict[str, str]) -> Path: ...
+
+
+class ConverterSpineBuilder:
+    """Spine via the stock convert_hf_to_gguf.py + llama-quantize.
+
+    NOTE: the plan's per-class ``spec_head.dense`` quant override is NOT wired
+    for the converter path yet -- llama-quantize ``--tensor-type`` keys on the
+    GGUF tensor names the stock converter emits, not on wp-forge classes, so
+    only the plan's ``dense`` class (defaulted to q8_0) is applied.
+    """
+
+    def __init__(self, tools: Tools, arch: ArchSpec) -> None:
+        self.tools = tools
+        self.arch = arch
+
+    def build(self, peel_dir: Path, out_gguf: Path, quant: dict[str, str]) -> Path:
+        if not self.arch.converter_tolerates_missing_experts:
+            raise NotImplementedError(
+                f"converter path for arch {self.arch.name}: the stock converter "
+                "rejects HF repos whose routed-expert tensors are missing; the "
+                "zero-stub peel trick is a follow-up"
+            )
+        tmp_bf16 = out_gguf.parent / (out_gguf.name + ".bf16.gguf")
+        try:
+            self.tools.convert_hf(peel_dir, tmp_bf16)
+            result = self.tools.quantize(
+                tmp_bf16, out_gguf,
+                default_type=quant.get("dense", "q8_0"), tensor_types={},
+            )
+        finally:
+            tmp_bf16.unlink(missing_ok=True)
+        return result
+
+
+class SpineStage:
+    """Produce the spine GGUF (dense tensors only) and land it on the sink.
+
+    HF source: every shard is peeled -- tensors classified "dense" /
+    "spec_head.dense" are copied, bf16, into workdir/peel/<shard filename>,
+    config.json is copied, and model.safetensors.index.json is regenerated
+    over the peel -- then the builder converts+quantizes the peel.
+
+    The peel deliberately keeps the source's SHARD FILENAMES so the index and
+    the weight_map a stock converter expects stay valid. Shards are NOT
+    released after the peel: the expert stages still need to read the routed
+    expert tensors out of the same shards.
+
+    GGUF source: tools.dense_extract on the first shard; no peel, no builder.
+    """
+
+    def __init__(
+        self,
+        rplan: ResolvedPlan,
+        source: Source,
+        tools: Tools,
+        sink: Sink,
+        events: Callable[[dict], None],
+        workdir: Path,
+        builder: SpineBuilder,
+    ) -> None:
+        self.rplan = rplan
+        self.source = source
+        self.tools = tools
+        self.sink = sink
+        self.events = events
+        self.workdir = Path(workdir)
+        self.builder = builder
+
+    def run(self) -> tuple[int, str]:
+        spine_rel = self.rplan.spine_path.rsplit("/", 1)[-1]
+        if self.sink.exists(spine_rel) and (self.sink.size(spine_rel) or 0) > 0:
+            self.events({"kind": "stage_done", "stage": "spine", "resumed": True})
+            return self.sink.size(spine_rel), self.sink.sha256(spine_rel)
+
+        t0 = time.time()
+        if self.source.is_gguf:
+            local = self.tools.dense_extract(self.source.path, self.workdir / "spine.gguf")
+            size, sha = self.sink.put_file(local, spine_rel)
+            local.unlink()
+            self.events(
+                {"kind": "stage_done", "stage": "spine", "bytes": size,
+                 "sha": sha, "secs": round(time.time() - t0, 3)}
+            )
+            return size, sha
+
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        peel_dir = self.workdir / "peel"
+        peel_bytes = self._peel(peel_dir)
+        self.events(
+            {"kind": "stage_start", "stage": "spine",
+             "est_local_peak_bytes": 2 * peel_bytes}
+        )
+        out_gguf = self.workdir / "spine.gguf"
+        result = self.builder.build(peel_dir, out_gguf, self.rplan.plan.quant)
+        size, sha = self.sink.put_file(result, spine_rel)
+        shutil.rmtree(peel_dir)
+        for p in (out_gguf, result):
+            p.unlink(missing_ok=True)
+        self.events(
+            {"kind": "stage_done", "stage": "spine", "bytes": size,
+             "sha": sha, "secs": round(time.time() - t0, 3)}
+        )
+        return size, sha
+
+    def _peel(self, peel_dir: Path) -> int:
+        import torch
+        from safetensors.torch import save_file  # noqa: F401 (API per contract)
+
+        peel_dir.mkdir(parents=True, exist_ok=True)
+        arch = self.rplan.arch
+        index = self.source.tensor_index()
+        shards = sorted(set(index.values()))
+        weight_map: dict[str, str] = {}
+        for shard in shards:
+            tensors: dict[str, "torch.Tensor"] = {}
+            with self.source.open_shard(shard) as reader:
+                for name in reader.keys():
+                    if classify(arch, name) not in ("dense", "spec_head.dense"):
+                        continue
+                    # reader.get_tensor f32-casts; back to bf16 for the peel
+                    # (dsv41_experts_from_hf peels raw, the synthetic repo is
+                    # bf16 so the round trip is lossless there)
+                    tensors[name] = torch.from_numpy(reader.get_tensor(name)).to(torch.bfloat16)
+                    weight_map[name] = shard
+            # NOTE: no source.release_shard(shard) -- the expert stages still
+            # read routed experts from these shards.
+            if tensors:
+                save_file(tensors, str(peel_dir / shard))
+        (peel_dir / "config.json").write_text(
+            (self.source.cache_dir / "config.json").read_text()
+        )
+        total = sum(p.stat().st_size for p in peel_dir.glob("*.safetensors"))
+        (peel_dir / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {"total_size": total},
+                        "weight_map": weight_map}) + "\n"
+        )
+        return total
+
+
+class SidecarStage:
+    """One named sidecar class (e.g. "engram") from the HF source to the sink.
+
+    Every tensor classified ``cls`` is written into ONE GGUF (arch = the plan's
+    arch, KV is just general.name). Tensor names: for class "engram" the HF
+    name ``layers.{L}.engram.*`` is rekeyed to the deepseek41 blk names the
+    converter uses (engram.embed -> blk.{L}.engram_embd); any other sidecar
+    class keeps its HF name unchanged. f16/bf16 plan quants store the raw
+    values; quant types are packed per-tensor through quantize_expert.
+
+    GGUF sources have no sidecars: run() is a no-op returning (0, "").
+    """
+
+    def __init__(
+        self,
+        cls: str,
+        rplan: ResolvedPlan,
+        source: Source,
+        tools: Tools,
+        sink: Sink,
+        events: Callable[[dict], None],
+        workdir: Path,
+    ) -> None:
+        self.cls = cls
+        self.rplan = rplan
+        self.source = source
+        self.tools = tools
+        self.sink = sink
+        self.events = events
+        self.workdir = Path(workdir)
+
+    def run(self) -> tuple[int, str]:
+        if self.source.is_gguf:
+            return 0, ""
+        sidecar_rel = self.rplan.sidecar_paths[self.cls].rsplit("/", 1)[-1]
+        if self.sink.exists(sidecar_rel) and (self.sink.size(sidecar_rel) or 0) > 0:
+            self.events({"kind": "stage_done", "stage": self.cls, "resumed": True})
+            return self.sink.size(sidecar_rel), self.sink.sha256(sidecar_rel)
+
+        t0 = time.time()
+        arch = self.rplan.arch
+        qtype = self.rplan.plan.quant[self.cls]
+        out_gguf = self.workdir / f"{self.cls}.gguf"
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        writer = gguf.GGUFWriter(str(out_gguf), arch=arch.name)
+        writer.add_name(self.rplan.plan.name)
+        for name, shard in self.source.tensor_index().items():
+            if classify(arch, name) != self.cls:
+                continue
+            with self.source.open_shard(shard) as reader:
+                arr = reader.get_tensor(name)
+            payload = self._to_gguf(arr, qtype)
+            if isinstance(payload, tuple):
+                packed, qt = payload
+                # raw_shape is the byte shape the writer stores; gguf-py
+                # derives the ggml shape from it (quants.quant_shape_from_byte_shape)
+                writer.add_tensor(self._gguf_name(name), packed, raw_dtype=qt)
+            else:
+                writer.add_tensor(self._gguf_name(name), payload)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+        size, sha = self.sink.put_file(out_gguf, sidecar_rel)
+        out_gguf.unlink()
+        self.events(
+            {"kind": "stage_done", "stage": self.cls, "bytes": size,
+             "sha": sha, "secs": round(time.time() - t0, 3)}
+        )
+        return size, sha
+
+    @staticmethod
+    def _gguf_name(hf_name: str) -> str:
+        # dsv41_engram_from_hf naming: layers.{L}.engram.embed.weight is the
+        # only sidecar tensor the arch ships; k/q/wkv are absent from this
+        # source layout. Any other class keeps its HF name unchanged.
+        if hf_name.rsplit(".", 2)[0].rsplit(".", 1)[-1] == "engram":
+            bid = hf_name.split(".")[1]
+            return gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_EMBD].format(bid=bid) + ".weight"
+        return hf_name
+
+    def _to_gguf(self, arr: np.ndarray, qtype: str):
+        qt = gguf.GGMLQuantizationType[qtype.upper()]
+        if qt in (gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.BF16):
+            # BF16 is packed through gguf-py (np has no bf16); F16 is plain
+            # little-endian bytes, matching the writer's F16 handling.
+            if qt is gguf.GGMLQuantizationType.BF16:
+                return gguf.quantize(np.ascontiguousarray(arr), qt)
+            return arr.astype(np.float16)
+        if arr.ndim != 2:
+            raise QuantError(
+                f"sidecar {self.cls}: quant {qtype} needs a 2-D tensor, "
+                f"got shape {arr.shape}"
+            )
+        packed = quantize_expert({"t": arr}, qtype, workers=1)["t"]
+        return packed, qt

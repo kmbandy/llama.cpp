@@ -89,3 +89,51 @@ def make_synthetic_hf_repo(
         "weight_map": weight_map,
     }, indent=1))
     return dir
+
+
+class SyntheticSpineBuilder:
+    """Test double for wp-forge's SpineBuilder.
+
+    Reads a peeled spine (dense + spec_head.dense safetensors + config.json)
+    and writes a spine GGUF with the deepseek41 KV, one f32 tensor per peeled
+    tensor. Tensor names: a leading "layers." is replaced by "blk.", the rest
+    is kept unchanged; other names are unchanged. The peeled tensor names are
+    recorded on ``self.peeled`` (in shard order) so tests can assert on them.
+    """
+
+    def __init__(self) -> None:
+        self.peeled: list[str] = []
+
+    def build(self, peel_dir, out_gguf, quant) -> Path:
+        import gguf
+        from safetensors import safe_open
+
+        peel_dir = Path(peel_dir)
+        out_gguf = Path(out_gguf)
+        cfg = json.loads((peel_dir / "config.json").read_text())
+        w = gguf.GGUFWriter(str(out_gguf), arch="deepseek41")
+        w.add_name("synthetic")
+        w.add_block_count(int(cfg["num_hidden_layers"]) + int(cfg.get("num_nextn_predict_layers", 0)))
+        w.add_embedding_length(int(cfg["hidden_size"]))
+        w.add_expert_feed_forward_length(int(cfg["moe_intermediate_size"]))
+        w.add_expert_count(int(cfg["n_routed_experts"]))
+        w.add_expert_used_count(int(cfg["num_experts_per_tok"]))
+        for st in sorted(peel_dir.glob("*.safetensors")):
+            with safe_open(str(st), framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    self.peeled.append(name)
+                    w.add_tensor(
+                        self._gguf_name(name),
+                        f.get_tensor(name).float().numpy(),
+                    )
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        return out_gguf
+
+    @staticmethod
+    def _gguf_name(name: str) -> str:
+        if name.startswith("layers."):
+            return "blk." + name[len("layers."):]
+        return name

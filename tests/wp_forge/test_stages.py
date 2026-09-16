@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from os import environ
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,9 +21,14 @@ from conversion.wp_forge.arch import ARCHS
 from conversion.wp_forge.plan import LayerRange, SetSpec
 from conversion.wp_forge.sink import LocalSink
 from conversion.wp_forge.source import HFSource
-from conversion.wp_forge.stages import ExpertStage
+from conversion.wp_forge.stages import (
+    ConverterSpineBuilder,
+    ExpertStage,
+    SidecarStage,
+    SpineStage,
+)
 from conversion.wp_forge.tools import Tools
-from synth import make_synthetic_hf_repo
+from synth import SyntheticSpineBuilder, make_synthetic_hf_repo
 
 # Expected on-disk size of one layer of experts at the test's geometry:
 # n_ff=64, n_embd=32, 4 experts, q8_0 -> gate/up 64x34, down 32x68 per expert,
@@ -65,7 +71,12 @@ def env(tmp_path: Path):
         arch=ARCHS["deepseek41"],
         hparams=source.hparams(),
         spine_path=str(spine),
-        plan=SimpleNamespace(source="fake/repo"),
+        sidecar_paths={"engram": f"/models/fake-repo/synthetic-engram.gguf"},
+        plan=SimpleNamespace(
+            source="fake/repo",
+            name="synthetic",
+            quant={"dense": "q8_0", "spec_head.dense": "q8_0", "engram": "q8_0"},
+        ),
     )
     return SimpleNamespace(source=source, rplan=rplan, tools=tools, tmp_path=tmp_path)
 
@@ -201,3 +212,124 @@ def test_resume_skips_resided_layers(env):
 
     assert mtimes[other] == Path(other).stat().st_mtime_ns  # resided blob untouched
     assert Path(victim).exists() and sink.size(Path(victim).name) == BLOB_1LYR
+
+
+def test_spine_stage_synthetic(env):
+    sink = LocalSink(str(env.tmp_path / "spine-out"))
+    sink.mkdir()
+    builder = SyntheticSpineBuilder()
+    stage = SpineStage(
+        env.rplan, env.source, env.tools, sink, lambda e: None,
+        env.tmp_path / "work-spine", builder,
+    )
+    size, sha = stage.run()
+
+    spine_rel = env.rplan.spine_path.rsplit("/", 1)[-1]
+    assert sink.exists(spine_rel) and sink.size(spine_rel) == size
+    assert sink.sha256(spine_rel) == sha
+    assert not (env.tmp_path / "work-spine" / "peel").exists()
+    assert not (env.tmp_path / "work-spine" / "spine.gguf").exists()
+
+    r = gguf.GGUFReader(str(env.tmp_path / "spine-out" / spine_rel))
+    names = {t.name for t in r.tensors}
+    for want in ("blk.0.attn.wq.weight",
+                 "blk.0.ffn.shared_experts.w1.weight",
+                 "blk.0.attn_norm.weight",
+                 "mtp.0.attn.wq.weight",
+                 "embed.weight"):
+        assert want in names, names
+    assert not any("ffn.experts" in n for n in names)
+    assert not any("engram" in n for n in names)
+    # engram tensors were peeled away, not written
+    assert not any(n.endswith("engram.embed.weight") for n in builder.peeled)
+
+    # resume: second run skips everything, builder not called again
+    events: list[dict] = []
+    builds = {"n": 0}
+    real_build = builder.build
+
+    def counting_build(*a, **k):
+        builds["n"] += 1
+        return real_build(*a, **k)
+
+    builder.build = counting_build
+    try:
+        stage2 = SpineStage(
+            env.rplan, env.source, env.tools, sink, events.append,
+            env.tmp_path / "work-spine2", builder,
+        )
+        size2, sha2 = stage2.run()
+    finally:
+        builder.build = real_build
+    assert builds["n"] == 0
+    assert size2 == size and sha2 == sha
+    done = [e for e in events if e.get("kind") == "stage_done"]
+    assert done and done[0].get("resumed") is True
+    assert done[0]["stage"] == "spine"
+
+
+def test_sidecar_stage_engram(env):
+    sink = LocalSink(str(env.tmp_path / "engram-out"))
+    sink.mkdir()
+    stage = SidecarStage(
+        "engram", env.rplan, env.source, env.tools, sink,
+        lambda e: None, env.tmp_path / "work-engram",
+    )
+    size, sha = stage.run()
+
+    sidecar_rel = env.rplan.sidecar_paths["engram"].rsplit("/", 1)[-1]
+    assert sink.exists(sidecar_rel) and sink.size(sidecar_rel) == size
+    assert sink.sha256(sidecar_rel) == sha
+    assert not (env.tmp_path / "work-engram" / "engram.gguf").exists()
+
+    n_layer = env.rplan.arch.n_layer(env.rplan.hparams)
+    r = gguf.GGUFReader(str(env.tmp_path / "engram-out" / sidecar_rel))
+    assert r.tensors is not None and len(r.tensors) == n_layer
+    for L, t in enumerate(r.tensors):
+        assert t.name == f"blk.{L}.engram_embd.weight", t.name
+        assert t.tensor_type is gguf.GGMLQuantizationType.Q8_0
+        assert tuple(int(x) for x in t.shape[::-1]) == (16, 32)  # GGUFReader shape is ggml ne-order (reversed)
+    assert r.get_field("general.name").contents() == "synthetic"
+
+
+def test_converter_builder_env_gated(env):
+    if environ.get("WP_FORGE_REAL_CONVERTER") != "1":
+        pytest.skip("set WP_FORGE_REAL_CONVERTER=1 to run the stock converter")
+    # Peel the synthetic repo exactly like SpineStage does, then hand it to the
+    # real converter. If the stock converter demands tokenizer files this
+    # fails -- by design we do NOT fake them; the failure message names what
+    # it wanted.
+    import torch
+    from safetensors.torch import save_file
+
+    from conversion.wp_forge.arch import classify
+
+    rplan = env.rplan
+    source = env.source
+    peel_dir = env.tmp_path / "peel-real"
+    peel_dir.mkdir()
+    weight_map = {}
+    for shard in sorted(set(source.tensor_index().values())):
+        tensors = {}
+        with source.open_shard(shard) as reader:
+            for name in reader.keys():
+                if classify(rplan.arch, name) in ("dense", "spec_head.dense"):
+                    tensors[name] = torch.from_numpy(reader.get_tensor(name)).to(torch.bfloat16)
+                    weight_map[name] = shard
+        if tensors:
+            save_file(tensors, str(peel_dir / shard))
+    (peel_dir / "config.json").write_text((source.cache_dir / "config.json").read_text())
+    total = sum(p.stat().st_size for p in peel_dir.glob("*.safetensors"))
+    (peel_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map}) + "\n"
+    )
+
+    builder = ConverterSpineBuilder(env.tools, rplan.arch)
+    out = env.tmp_path / "work-real" / "spine.gguf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = builder.build(peel_dir, out, rplan.plan.quant)
+    except Exception as e:  # noqa: BLE001 - report exactly what the converter asked for
+        pytest.fail(f"stock converter path failed: {type(e).__name__}: {e}")
+    assert result.is_file() and result.stat().st_size > 0
+    assert not out.with_name(out.name + ".bf16.gguf").exists()
