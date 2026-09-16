@@ -3293,7 +3293,7 @@ static void ggml_backend_meta_graph_prepare(
                 auto & bcj = backend_ctx->backend_configs[j];
                 for (int i = 0; i < cgraph->n_nodes; i++) {
                     ggml_tensor * node   = cgraph->nodes[i];
-                    ggml_tensor * node_j = bcj.nodes[i];
+                    ggml_tensor * node_j = bcj.nodes[i_slot][i];
                     // the host-side s_copy views share the original tensor; they have no
                     // per-device copy and no COMPUTE decision of their own
                     if (node_j == nullptr || node_j == node) {
@@ -3769,11 +3769,6 @@ static bool ggml_backend_meta_step_stats_enabled() {
         return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
     }();
     return on;
-}
-
-static uint64_t ggml_backend_meta_now_ns() {
-    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 static void ggml_backend_meta_step_stats_print() {
