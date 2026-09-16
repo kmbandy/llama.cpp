@@ -1961,7 +1961,8 @@ struct ggml_backend_meta_profile {
 static ggml_backend_meta_profile g_meta_profile;
 
 static uint64_t ggml_backend_meta_now_ns() {
-    return g_meta_profile.enabled ? (uint64_t) ggml_time_us() * 1000ull : 0;
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 // Byte size of WORLD device jw's chunk along the split axis, for a single-segment (nr == 1) split.
