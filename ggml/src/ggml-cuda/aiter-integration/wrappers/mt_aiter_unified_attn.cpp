@@ -731,7 +731,24 @@ bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t &
     sb.blocks = (size_t) num_scratch_blocks;
     *out_k = new_k;
     *out_v = new_v;
-    if (!sb.logged) {
+    // MAD-2026-09-12 predequant-overflow-guard / draft-ubatch-split-0912.txt
+    // "VERIFY-BATCH FAULT" FIX item 3: this used to be gated on `!sb.logged`
+    // -- a one-shot latch that printed only the FIRST-EVER allocation for
+    // this stream and then never again, even though this function is
+    // grow-only and DOES reallocate to a larger size later in the same
+    // session (e.g. a draft-mtp stream's first catch-up ubatch genuinely
+    // only needs ~32 blocks at position ~256-512, then grows to hundreds of
+    // blocks as the real sequence depth grows past that). An operator
+    // reading logs saw only that first, small "num_scratch_blocks=32" line
+    // and had no way to see that the buffer had since grown to cover the
+    // real depth -- this is a logging gap, not evidence that the live
+    // buffer stayed undersized. Every actual (re)allocation reached this
+    // point already ONLY on real growth (the early return above at
+    // `num_scratch_blocks <= sb.blocks` handles the no-growth case), so
+    // logging unconditionally here reports every genuine growth event,
+    // exactly once each, with no added log spam on the (much more common)
+    // reuse path.
+    {
         int dev = 0;
         (void) hipGetDevice(&dev);
         std::fprintf(stderr,
@@ -831,14 +848,35 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // gives 4× LDS reuse vs the base BLOCK_M=16 spec, but BLOCK_Q=8 only
     // pays off when each Q block has ≥256 tokens to chew through (matches
     // upstream's max_seqlen_q >= 256 cutover).
-    const int32_t avg_q_len    = mt_aiter_uattn_avg_q_len(a->num_q_tokens, a->num_seqs);
+    // MAD-LAB (draft-KV-paged num_seqs fix, 2026-09-12): dispatch-only real
+    // live-seq count, falling back to the static a->num_seqs when unset —
+    // see the field comment in mt_aiter_unified_attn.h. Used ONLY for the
+    // avg_q_len / 2D-vs-3D predicate below, never for indexing/grid/ALL_DECODE
+    // (those keep reading a->num_seqs directly, further down).
+    //
+    // MAD-LAB (draft-KV-paged fault-analysis fix, 2026-09-12): hard-clamped
+    // to <= a->num_seqs, mirroring mt_pagedattn_aiter.cu's num_seqs_dispatch
+    // (same reasoning there: a->num_seqs_active can never legitimately exceed
+    // a->num_seqs, the cache's own n_seq_max, so a larger value is always
+    // invalid and must not be allowed to under-estimate avg_q_len and
+    // misroute a large batch onto the 3D kernel). Belt-and-suspenders with
+    // the mt_pagedattn_aiter.cu clamp — args.num_seqs_active is already
+    // clamped there before this function is even called, but this function
+    // has its own callers/tests (see test_mt_aiter_unified_attn.cpp) that
+    // don't necessarily go through that clamp, so re-asserting the invariant
+    // here costs nothing and closes that gap too.
+    const int32_t num_seqs_for_dispatch = a->num_seqs_active > 0
+        ? (a->num_seqs_active < a->num_seqs ? a->num_seqs_active : a->num_seqs)
+        : a->num_seqs;
+    const int32_t avg_q_len    = mt_aiter_uattn_avg_q_len(a->num_q_tokens, num_seqs_for_dispatch);
     // MAD-2026-09-12 dispatch-fix: occupancy-driven predicate (see
     // mt_aiter_uattn_should_use_2d() above and mt_aiter_unified_attn.h) in
     // place of the old avg_q_len>=BLOCK_Q token-count proxy. MUST use the
     // same shape.num_kv_heads the caller will pass — mt_pagedattn_aiter.cu's
     // workspace-allocation gate calls this exact function with the same
-    // three arguments.
-    const bool    use_2d       = mt_aiter_uattn_should_use_2d(a->num_q_tokens, a->num_seqs, a->shape.num_kv_heads) != 0;
+    // (num_q_tokens, num_seqs_dispatch, num_kv_heads) — see that file's
+    // num_seqs_dispatch comment.
+    const bool    use_2d       = mt_aiter_uattn_should_use_2d(a->num_q_tokens, num_seqs_for_dispatch, a->shape.num_kv_heads) != 0;
     const bool    use_2d_large = use_2d && (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
 
     // ── 3D split-K phase ───────────────────────────────────────────────────
@@ -1075,7 +1113,27 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // a dead slot's query_len is genuinely 0 and query_mask_0 is correctly
     // all-False for it) closes this off entirely rather than papering over
     // it with an extra clamp.
-    const bool all_decode = (num_q_tokens == num_seqs);
+    // MAD-LAB 2026-09-13 (two-slot fault fix): the proxy above is NOT
+    // sufficient. A DFlash/MTP verify ubatch holding ONE live sequence with
+    // exactly num_seqs rows (e.g. 1 bonus + 1 draft token on a 2-slot server,
+    // the other slot idle this ubatch -- confirmed from the 15:01 core:
+    // ubatch.n_tokens=2, n_seqs=1, num_seqs=2) satisfies num_q_tokens ==
+    // num_seqs and selected ALL_DECODE=1, which then ran the dead slot as a
+    // phantom 1-token query: an OOB Q read one row past the tensor and an OOB
+    // segm_* write (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION on the 6900XT,
+    // silent corruption of the other sequence's row on the R9700). Because
+    // op_params (n_seqs_active) are not part of the HIP-graph key, a graph
+    // captured with ALL_DECODE=1 would also replay for any later ubatch of the
+    // same token count regardless of which slot holds the rows, so gating on
+    // the live count is not replay-safe either. Always use the ALL_DECODE=0
+    // handle: it derives every slot's query length from the device-side
+    // cu_seqlens, so idle slots are genuinely masked. The old fast path stays
+    // available for A/B measurement only via MT_AITER_UATTN_ALL_DECODE=1.
+    static const bool allow_all_decode = [] {
+        const char * s = std::getenv("MT_AITER_UATTN_ALL_DECODE");
+        return s != nullptr && std::atoi(s) != 0;
+    }();
+    const bool all_decode = allow_all_decode && (num_q_tokens == num_seqs);
     const aiter::KernelHandle * h_3d_selected = all_decode ? c.h_3d : c.h_3d_md;
 
     unsigned int g3_x;

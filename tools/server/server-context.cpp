@@ -50,6 +50,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <malloc.h>
+
+// AR pipeline state dump (defined in ggml-cuda.cu / allreduce.cu, exported
+// via ggml/include/ggml-cuda.h). Declared locally + weak, same pattern as
+// ggml_backend_cuda_wp_graph_counts in src/llama-context.cpp, so this stays
+// null (and is skipped below) on any build that doesn't link ggml-cuda's TP
+// internal-AllReduce path -- no hard #include "ggml-cuda.h" dependency here.
+extern "C" void ggml_backend_cuda_ar_dump_state(const char * reason) __attribute__((weak));
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -116,6 +124,16 @@ static int32_t server_spec_const_width() {
 static bool wp_step_stats_enabled() {
     static const bool enabled = [] {
         const char * v = std::getenv("WP_STEP_STATS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+// WP_VRAM_LOG=1 to print the per-GPU free/used suffix appended to "slot
+// release:" below (fires on every slot release, so silent by default).
+static bool wp_vram_log_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("WP_VRAM_LOG");
         return v != nullptr && v[0] == '1';
     }();
     return enabled;
@@ -977,6 +995,46 @@ struct server_slot {
             ++fp_epoch;
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+
+            if (ctx_tgt != nullptr) {
+                const llama_pos cache_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), stream_slot_idx);
+                SLT_INF(*this, "slot release: n_tokens = %d, cache_pos_max = %d\n", prompt.n_tokens(), cache_pos_max);
+            }
+
+            // host RSS at every release so a multi-turn run shows per-turn growth in the log
+            {
+                long rss_pages = -1;
+                if (FILE * f = fopen("/proc/self/statm", "r")) {
+                    long vsz_pages = 0;
+                    if (fscanf(f, "%ld %ld", &vsz_pages, &rss_pages) != 2) {
+                        rss_pages = -1;
+                    }
+                    fclose(f);
+                }
+                const long page_kb = sysconf(_SC_PAGESIZE) / 1024;
+                const struct mallinfo2 mi = mallinfo2();
+                // MAD-LAB 2026-09-13: free VRAM per GPU at every release too, so host and
+                // device memory are on the same timeline in one log.
+                if (wp_vram_log_enabled()) {
+                    std::string vram;
+                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            continue;
+                        }
+                        size_t free_b = 0, total_b = 0;
+                        ggml_backend_dev_memory(dev, &free_b, &total_b);
+                        char buf[128];
+                        snprintf(buf, sizeof(buf), " %s free=%.0f used=%.0f MiB", ggml_backend_dev_name(dev),
+                                 free_b / 1048576.0, (total_b - free_b) / 1048576.0);
+                        vram += buf;
+                    }
+                    SLT_INF(*this, "slot release: vram:%s\n", vram.c_str());
+                }
+                SLT_INF(*this, "slot release: host rss = %.1f MiB, heap in-use = %.1f MiB, heap free-retained = %.1f MiB, mmap'd = %.1f MiB, arena = %.1f MiB\n",
+                        rss_pages < 0 ? -1.0 : rss_pages * page_kb / 1024.0,
+                        mi.uordblks / 1048576.0, mi.fordblks / 1048576.0, mi.hblkhd / 1048576.0, mi.arena / 1048576.0);
+            }
 
             t_last_used = ggml_time_us();
 
@@ -2236,14 +2294,27 @@ private:
                         : tgt_n_ctx);
                 }
 
-                // Disable tier/paged KV on the MTP draft context — it's a small
-                // re-eval context with no working-set pressure, and at full
-                // ctx_size the paged block pool would try to allocate enormous
-                // amounts on the MTP-only layer. Tier features stay on for ctx_tgt.
-                // paged_blocks_explicit suppresses the MAD-134 auto-default so this
-                // really is off rather than re-enabled by the heuristic.
+                // Disable hot/warm/cold TIERING on the draft context — it's a small
+                // re-eval context with no working-set pressure, so the multi-tier
+                // heuristics (sized off --kv-tiered pct splits) don't apply here.
+                // Tier features stay on for ctx_tgt.
+                //
+                // MAD-LAB (draft-KV-paged, 2026-09-12): paged BLOCKS (single-tier,
+                // no warm/cold) are a separate knob from tiering, and are exactly
+                // what lets this draft context share the target's paged KV cache
+                // class + GGML_OP_PAGED_ATTN_MT (AITER) attention path instead of
+                // a plain llama_kv_cache. Route to it only when the operator asked
+                // for a paged-only cache type via --spec-cache-type-k/-v (today
+                // that's turbo4_fp8_bs256) — otherwise a plain draft cache type
+                // (e.g. the default f16) has no reason to pay for the paged block
+                // table, so keep the pre-existing forced-off behavior for it.
+                // paged_blocks_explicit suppresses the MAD-134 auto-default either
+                // way, so this is never re-enabled/disabled by the heuristic.
+                const bool draft_wants_paged_kv =
+                    params_dft.cache_type_k == GGML_TYPE_TURBO4_FP8_BS256 ||
+                    params_dft.cache_type_v == GGML_TYPE_TURBO4_FP8_BS256;
                 params_dft.kv_tiered_enabled             = false;
-                params_dft.kv_tier_paged_blocks          = false;
+                params_dft.kv_tier_paged_blocks          = draft_wants_paged_kv;
                 params_dft.kv_tier_paged_blocks_explicit = true;
                 params_dft.kv_tier_total_ctx             = 0;
 
@@ -2289,8 +2360,13 @@ private:
                         : tgt_n_ctx);
                 }
 
+                // See the stream-A block above (draft_wants_paged_kv) for the
+                // reasoning — same mirror as everywhere else in this block.
+                const bool draft_wants_paged_kv2 =
+                    params_dft2.cache_type_k == GGML_TYPE_TURBO4_FP8_BS256 ||
+                    params_dft2.cache_type_v == GGML_TYPE_TURBO4_FP8_BS256;
                 params_dft2.kv_tiered_enabled             = false;
-                params_dft2.kv_tier_paged_blocks          = false;
+                params_dft2.kv_tier_paged_blocks          = draft_wants_paged_kv2;
                 params_dft2.kv_tier_paged_blocks_explicit = true;
                 params_dft2.kv_tier_total_ctx             = 0;
 
@@ -3876,7 +3952,15 @@ private:
     // stream's wp_pp_stats in scope; kept as a plain out-param rather than
     // threading server_stream through here, per the no-server_stream-needed
     // note below.
+    //
+    // ctx_dft_seq_rm_type: the caller's (pre_decode's) precomputed
+    // common_context_can_seq_rm(ctx_dft) classification for this slot's
+    // draft context. Passed in rather than recomputed here because
+    // common_context_can_seq_rm() decodes a probe batch and clears the
+    // memory -- it is an init-time-only call (see server_context_impl::init()),
+    // never something to run per checkpoint.
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
+                            common_context_seq_rm_type ctx_dft_seq_rm_type,
                             wp_spec_prefill_stats_state * wp_pp_stats = nullptr) {
         const int id_task = slot.task->id;
 
@@ -3939,7 +4023,62 @@ private:
         cur.update_tgt(slot.ctx_tgt, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
         const int64_t t_ckpt_tgt = ggml_time_us();
 
-        cur.update_dft(slot.ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
+        // MAD-LAB fix (draft-paged-holes-0912): draft-mtp's single-head pipeline
+        // (common/speculative.cpp's pipeline_pending/capture_pending/resolve_pending,
+        // driven from process()'s is_prefill_chunk path) defers part of the PRIOR
+        // prefill chunk's ctx_dft catch-up decode() by one process() call, so that
+        // it can overlap with the caller's already-issued ctx_tgt decode for the
+        // CURRENT chunk. cur.pos_max above was just read from ctx_tgt, which is
+        // always fully caught up (llama_decode(ctx_tgt, ...) precedes every
+        // process() call -- see server-context.cpp decode()/pre_decode()). But
+        // if a chunk is still pending at this point, ctx_dft's *actual* KV only
+        // reaches the end of the chunk before that -- one whole deferred chunk
+        // short of cur.pos_max. update_dft() below would silently snapshot that
+        // shorter state under the longer pos_max/n_tokens recorded above.
+        //
+        // A later restore of this checkpoint (the prefix-reuse path at
+        // server-context.cpp ~5571, or a context-shift/rollback restore) trusts
+        // pos_max/n_tokens to size how much of ctx_dft is valid and skips
+        // re-decoding that range. Since the draft's paged block-table row only
+        // has physical blocks for what update_dft() actually captured, the
+        // skipped range is left with its default -1 ("not resident") entries --
+        // now sitting INSIDE what the server believes is live prefix. That is
+        // the paged-cache draft-context hole this fixes at its source: flush the
+        // pending chunk into ctx_dft first, so update_dft() captures a state that
+        // truly reaches cur.pos_max and no gap can be recorded in the first
+        // place. (The kernel-side negative-block-table guard in
+        // aiter-integration/kernels/unified_attention.py is kept as
+        // belt-and-braces for any hole from an as-yet-unidentified source; this
+        // is the fix for the one that measurement traced to this checkpoint
+        // path.) No-op (single llama_memory_seq_rm-guarded early return) for any
+        // spec impl that doesn't defer work: chain_heads/is_mem_shared configs
+        // never set pipeline_pending, so flush_pending() is a no-op for them.
+        if (slot.can_speculate()) {
+            if (!common_speculative_flush_prefill(slot.spec)) {
+                SLT_ERR(slot, "%s", "failed to flush pending speculative prefill state before checkpoint\n");
+                throw std::runtime_error("failed to flush pending speculative prefill state before checkpoint");
+            }
+        }
+
+        // Only capture ctx_dft's state when its memory cannot be rolled back with a
+        // plain partial seq_rm (COMMON_CONTEXT_SEQ_RM_TYPE_FULL: e.g. a recurrent/hybrid
+        // draft memory whose history is gone after any seq_rm). For a pure-attention
+        // draft context (DFlash: LLM_ARCH_DFLASH is not in llm_arch_is_hybrid/is_recurrent,
+        // so common_context_can_seq_rm(ctx_dft) reports PART), the restore path already
+        // rolls ctx_dft back correctly via slot.mem.seq_rm(..., p0, -1) below (server-context.cpp,
+        // the "truncate any tokens that are beyond n_past" block) -- capturing and later
+        // restoring the entire draft KV here is dead weight. This mirrors the gate the
+        // per-draft-step speculative checkpoint already applies (use_ckpt_dft_full above,
+        // in the "make checkpoints if needed" iterate()). Neither llama_kv_cache::state_write
+        // nor llama_kv_cache_paged::state_write honour LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
+        // (they ignore `flags` outright -- only the *_iswa caches filter on it), so without
+        // this gate update_dft() below unconditionally serializes ctx_dft's full KV every
+        // checkpoint regardless of the flag.
+        if (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            cur.update_dft(slot.ctx_dft, slot.stream_slot_idx, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); // MAD-LAB: stream-local seq id
+        } else {
+            cur.clear_dft();
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(slot.spec, slot.stream_slot_idx, cur.data_spec); // MAD-LAB: stream-local seq id (spec's dparams sized per-stream)
         const int64_t t_ckpt_end = ggml_time_us();
@@ -3953,6 +4092,23 @@ private:
                 "checkpoint timing: drain = %.2f ms, tgt capture = %.2f ms (%.3f MiB, %.0f MiB/s), dft+spec = %.2f ms, total = %.2f ms\n",
                 ms_sync, ms_tgt, mib_tgt, ms_tgt > 0.0 ? mib_tgt / (ms_tgt / 1000.0) : 0.0, ms_rest,
                 (t_ckpt_end - t_ckpt_0) / 1000.0);
+
+        // A checkpoint's tgt capture is normally ~180 ms; an outlier this
+        // large is exactly the shape of symptom a stuck TP allreduce could
+        // produce underneath it (the capture blocks on device sync). Dump
+        // the AR pipeline's host-side state alongside the slow capture so a
+        // postmortem doesn't have to guess whether an AR was already wedged
+        // at this point. PRINT-ONLY: no behaviour here depends on the dump.
+        if (ms_tgt > 2000.0) {
+            if (ggml_backend_cuda_ar_dump_state != nullptr) {
+                ggml_backend_cuda_ar_dump_state("slow-checkpoint");
+            } else {
+                SLT_WRN(slot,
+                        "slow checkpoint tgt capture (%.2f ms) but no CUDA/HIP AR pipeline is linked into this "
+                        "build; cannot dump AR state\n",
+                        ms_tgt);
+            }
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -5723,7 +5879,29 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    {
+                        const llama_pos cache_pos_max = llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.stream_slot_idx);
+                        if (p0 > cache_pos_max + 1) {
+                            SLT_WRN(slot, "TOKEN/CACHE DRIFT: p0 = %d, n_tokens = %d, n_prompt_cached = %d, cache_pos_max = %d\n",
+                                    p0, slot.prompt.n_tokens(), slot.stats.n_prompt_cached, cache_pos_max);
+                        } else {
+                            SLT_INF(slot, "continuation trim: p0 = %d, n_tokens = %d, n_prompt_cached = %d, cache_pos_max = %d\n",
+                                    p0, slot.prompt.n_tokens(), slot.stats.n_prompt_cached, cache_pos_max);
+                        }
+                    }
+
                     slot.mem.seq_rm(slot.stream_slot_idx, p0, -1);
+
+                    // common_speculative_reset() is a no-op for DFlash but is needed for
+                    // MTP drafts: it clears per-seq speculative bookkeeping (i_last,
+                    // chain_h, pending_h/verify_h) that goes stale once the seq_rm above
+                    // truncates the KV range it was tracking to p0. It touches no KV
+                    // memory, so it's safe to call unconditionally here, and must sit
+                    // after the seq_rm so p0 already reflects the trimmed range.
+                    if (slot.can_speculate() && slot.ctx_dft) {
+                        common_speculative_reset(slot.spec, slot.stream_slot_idx);
+                        SLT_DBG(slot, "draft cache trimmed to p0=%d\n", p0);
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -5754,6 +5932,29 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0 && checkpoints_reachable;
 
+                    // Whether a checkpoint is the ONLY way to roll this memory back to an
+                    // earlier position (as opposed to a cheap partial seq_rm). True for
+                    // hybrid/recurrent memory (COMMON_CONTEXT_SEQ_RM_TYPE_FULL/RS -- e.g.
+                    // qwen35's recurrent state has no history, so a continuation can only
+                    // resume from a checkpoint) and for SWA models (n_swa > 0), where the
+                    // window has already dropped what a partial seq_rm would need.
+                    const bool checkpoints_required =
+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                            n_swa > 0;
+
+                    static const bool wp_spec_no_checkpoints = [] {
+                        const char * env = std::getenv("WP_SPEC_PREFILL_NO_CHECKPOINTS");
+                        return env != nullptr && env[0] == '1';
+                    }();
+                    // The env override may only skip checkpoints when they are not
+                    // structurally required -- otherwise a checkpoint-less continuation
+                    // on one of these models finds no checkpoint to restore from (see the
+                    // "forcing full prompt re-processing" path above) and is forced into a
+                    // full re-prefill (n_past reset to 0) on every turn, which is far more
+                    // expensive than the checkpoint it was trying to avoid.
+                    do_checkpoint = do_checkpoint && !(wp_spec_no_checkpoints && slot.can_speculate() && !checkpoints_required);
+
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
@@ -5762,10 +5963,7 @@ private:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
                     // - the model supports partial sequence removal but only up to a fixed bound
-                    do_checkpoint = do_checkpoint && (
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                            n_swa > 0);
+                    do_checkpoint = do_checkpoint && checkpoints_required;
 
                     bool has_mtmd = false;
 
@@ -5927,7 +6125,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max,
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, ctx_dft_seq_rm_type,
                             wp_spec_prefill_stats_enabled() ? &stream.wp_pp_stats : nullptr);
                     }
                 }
@@ -6558,6 +6756,50 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // MAD-LAB (WP_MTP_DRAFT_SWA_DEBUG): for the first 32 draft
+                // rejections that occur once the sequence position exceeds the
+                // draft-mtp SWA ring's window (WP_MTP_DRAFT_SWA), log the
+                // rejected position plus the draft's proposed token vs. the
+                // target's actual sampled token (id + decoded piece), so a
+                // "plausible but wrong" draft (out-of-distribution windowing)
+                // can be told apart from a "degenerate/garbage" one (a ring/
+                // masking bug) from the log alone -- see
+                // mtp-swa-sliding-0912.txt task item (b). Env-gated, cached
+                // after the first check, zero cost beyond that when unset.
+                if (accepted.size() - 1 < n_draft) {
+                    static const bool     wp_dbg_on = [] {
+                        const char * env = std::getenv("WP_MTP_DRAFT_SWA_DEBUG");
+                        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+                    }();
+                    static const uint32_t wp_dbg_n_swa = [] {
+                        const char * env = std::getenv("WP_MTP_DRAFT_SWA");
+                        if (env == nullptr || env[0] == '\0') {
+                            return (uint32_t) 0;
+                        }
+                        const long v = std::strtol(env, nullptr, 10);
+                        return v > 0 ? (uint32_t) std::max(256L, v) : (uint32_t) 0;
+                    }();
+
+                    if (wp_dbg_on && wp_dbg_n_swa > 0) {
+                        static std::atomic<int> wp_dbg_n_logged{0};
+
+                        const llama_pos pos_rejected = (llama_pos) slot.prompt.n_tokens() + (llama_pos) (accepted.size() - 1);
+
+                        if (pos_rejected > (llama_pos) wp_dbg_n_swa && wp_dbg_n_logged.load(std::memory_order_relaxed) < 32) {
+                            const int n = wp_dbg_n_logged.fetch_add(1, std::memory_order_relaxed);
+                            if (n < 32) {
+                                const llama_token tok_draft  = slot.spec_draft[accepted.size() - 1];
+                                const llama_token tok_target = accepted.back();
+
+                                SRV_INF("[WP_MTP_DRAFT_SWA_DEBUG] rejection #%d pos=%d draft_tok=%d (%s) target_tok=%d (%s)\n",
+                                        n + 1, (int) pos_rejected,
+                                        (int) tok_draft, common_token_to_piece(slot.ctx_tgt, tok_draft).c_str(),
+                                        (int) tok_target, common_token_to_piece(slot.ctx_tgt, tok_target).c_str());
+                            }
+                        }
+                    }
+                }
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
                 segment_trim_required = n_rollback > 0;
 
@@ -6647,6 +6889,14 @@ private:
                                      (uint32_t) slot.prompt.tokens.pos_next());
                 if (spec_phase) {
                     SRV_INF("SPECPHASE trim_us=%" PRId64 "\n", ggml_time_us() - t_trim0);
+                }
+            }
+            {
+                const llama_pos gen_pos_next = slot.prompt.tokens.pos_next();
+                const llama_pos cache_pos_max = llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.stream_slot_idx);
+                if (gen_pos_next > cache_pos_max + 1) {
+                    SLT_WRN(slot, "TOKEN/CACHE DRIFT gen: pos_next = %d, n_tokens = %d, cache_pos_max = %d\n",
+                            gen_pos_next, slot.prompt.n_tokens(), cache_pos_max);
                 }
             }
             slot.mem.seq_rm(slot.stream_slot_idx, slot.prompt.tokens.pos_next(), -1);

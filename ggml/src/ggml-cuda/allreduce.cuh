@@ -56,3 +56,9 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// PRINT-ONLY diagnostic: dump a host-side heartbeat of every live pipeline's
+// state (call_count, pool slot/token, spin-watchdog fields, etc.) to stderr.
+// Safe to call from a SIGABRT handler (see the .cu definition) -- uses only
+// plain/atomic loads and snprintf+write(2), no locks, no allocation.
+void ggml_cuda_ar_dump_state(const char * reason);
+

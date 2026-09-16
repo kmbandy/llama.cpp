@@ -520,6 +520,14 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ok && "paged compute_slot_mapping failed — block_table out of sync with ubatch positions");
 
         update_paged_attn_max_ctx_len();
+        // MAD-LAB (draft-KV-paged num_seqs fix, 2026-09-12): ubatch->n_seqs_unq
+        // is the number of DISTINCT sequence ids actually present in this
+        // ubatch — exactly "the live sequence count for the call" that
+        // mt_pagedattn_aiter.cu's dispatch heuristics need but cannot derive
+        // from any of the paged tensors themselves (they're all fixed at the
+        // cache's static n_seq_max width). See the declaration comment on
+        // update_paged_attn_n_seqs_active() (llama-graph.h) for why.
+        update_paged_attn_n_seqs_active(ubatch->n_seqs_unq);
         ggml_backend_tensor_set(paged_slot_mapping, slots.data(), 0,
                                 sizeof(int32_t) * slots.size());
         ggml_backend_tensor_set(paged_context_lens, paged_parent->h_context_lens_data(), 0,
@@ -582,6 +590,36 @@ void llm_graph_input_attn_kv::update_paged_attn_max_ctx_len() {
         // meta tensor, so both the unsplit and tensor-split-attn paths pick up the
         // current per-ubatch max context length.
         ggml_backend_meta_buffer_set_op_param_i32(op, 5, max_ctx_len);
+    }
+}
+
+void llm_graph_input_attn_kv::update_paged_attn_n_seqs_active(uint32_t n_seqs_active) {
+    // op_params[6]: same per-device-clone propagation as op_params[5] above
+    // (MAD-378) — see the declaration comment in llama-graph.h. 0 means
+    // "unset" (e.g. a cold graph executed before its first set_input, same
+    // convention as op_params[4]/[5]), and the CUDA-side reader falls back
+    // to block_tables->ne[1] (the cache's static n_seq_max) in that case, so
+    // a graph that somehow executes before set_input still behaves exactly
+    // as it did before this change.
+    //
+    // MAD-LAB (draft-KV-paged fault-analysis fix, 2026-09-12): clamp to the
+    // cache's own n_seq_max before it ever reaches op_params[6] — a cache
+    // can never legitimately have more live sequences than it was
+    // constructed with, so a larger ubatch->n_seqs_unq (e.g. a reserve/
+    // warmup-time synthetic ubatch, whose seq_id_unq can be sized to a
+    // placeholder capacity rather than a real live count — see
+    // llama_batch_allocr::ubatch_reserve(), src/llama-batch.cpp:399-429)
+    // must never be trusted downstream. The CUDA-side readers
+    // (mt_pagedattn_aiter.cu's num_seqs_dispatch,
+    // mt_aiter_unified_attn.cpp's num_seqs_for_dispatch) independently
+    // re-clamp against their own local n_seq_max too — this is defense in
+    // depth, fixing the value at its source rather than relying solely on
+    // the two CUDA-side clamps.
+    GGML_ASSERT(mctx_paged != nullptr);
+    const uint32_t n_seq_max = mctx_paged->parent()->n_seq_max();
+    const uint32_t n_seqs_active_clamped = n_seqs_active > n_seq_max ? n_seq_max : n_seqs_active;
+    for (ggml_tensor * op : paged_attn_ops) {
+        ggml_backend_meta_buffer_set_op_param_i32(op, 6, (int32_t) n_seqs_active_clamped);
     }
 }
 

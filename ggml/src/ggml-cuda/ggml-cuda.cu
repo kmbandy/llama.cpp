@@ -67,6 +67,7 @@
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
+#include "ggml-cuda/wp-node-trace.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
@@ -96,6 +97,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -161,10 +163,74 @@ static void wp_alloc_log(const char * what, int device, size_t size, size_t extr
             size / 1048576.0, extra / 1048576.0);
 }
 
+// MAD-LAB 2026-09-13 (VRAM->GTT eviction incident): amdgpu/KFD does not fail an
+// over-budget device allocation -- it evicts the WHOLE process's resident VRAM
+// into GTT (host RAM) to satisfy it. On a 16 GB host that took the box down twice
+// (18.7 GB evicted in one second on the display GPU). So the runtime must never
+// ask the driver for memory the device does not have: every device allocation
+// after model load goes through ggml_cuda_device_malloc (pool misses, backend
+// buffers, gallocr regrowth) or the VMM pool's cuMemCreate, and both now check
+// live free VRAM against GGML_CUDA_VRAM_RESERVE_MB (default 512 MiB) first. A
+// refused allocation fails the request (ggml_cuda_pool_oom below ->
+// GGML_STATUS_ALLOC_FAILED), it does not abort and it never reaches the driver.
+// Every post-load device allocation is also logged at INFO with its size and
+// the free VRAM before it, so the server log attributes growth to a call site.
+struct ggml_cuda_pool_oom : public std::runtime_error {
+    int    device;
+    size_t requested;
+    size_t free_before;
+    ggml_cuda_pool_oom(int device, size_t requested, size_t free_before)
+        : std::runtime_error("ggml_cuda: device allocation refused (VRAM reserve)"),
+          device(device), requested(requested), free_before(free_before) {}
+};
+
+static size_t ggml_cuda_vram_reserve_bytes() {
+    static const size_t reserve = [] {
+        // Default 0 = LOG ONLY, never refuse: behaviour identical to before this
+        // change except that every post-load device allocation is attributed in
+        // the log. Set GGML_CUDA_VRAM_RESERVE_MB>0 to turn on refusal.
+        const char * e = getenv("GGML_CUDA_VRAM_RESERVE_MB");
+        const long long mb = e ? atoll(e) : 0;
+        return (size_t) (mb < 0 ? 0 : mb) * 1024ull * 1024ull;
+    }();
+    return reserve;
+}
+
+// returns true if `size` bytes may be allocated on `device` without dipping under
+// the reserve; logs the allocation either way. `what` names the call site.
+static bool ggml_cuda_vram_budget_check(const char * what, int device, size_t size, size_t * free_out) {
+    ggml_cuda_set_device(device);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (free_out) { *free_out = 0; }
+        return true; // cannot measure: keep the old behaviour rather than block loading
+    }
+    if (free_out) { *free_out = free_b; }
+    const size_t reserve = ggml_cuda_vram_reserve_bytes();
+    if (reserve > 0 && size + reserve > free_b) {
+        GGML_LOG_ERROR(GGML_CUDA_NAME " vram-budget: REFUSING %s of %.1f MiB on device %d: free %.1f MiB of %.1f MiB, reserve %.1f MiB (GGML_CUDA_VRAM_RESERVE_MB) -- the driver would have evicted this process to GTT\n",
+                       what, size / 1048576.0, device, free_b / 1048576.0, total_b / 1048576.0, reserve / 1048576.0);
+        return false;
+    }
+    // raw stderr like the "wp hip-graphs" prints: common_log demotes GGML_LOG_INFO to trace (verbosity 4)
+    // WP_VRAM_LOG=1 to enable; silent by default (fires on every allocation).
+    if (ggml_cuda_wp_vram_log_enabled()) {
+        fprintf(stderr, GGML_CUDA_NAME " vram-budget: %s %.1f MiB on device %d (free before %.1f MiB of %.1f MiB)\n",
+                what, size / 1048576.0, device, free_b / 1048576.0, total_b / 1048576.0);
+        fflush(stderr);
+    }
+    return true;
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     wp_alloc_log("device_malloc", device, size, 0);
+    if (!ggml_cuda_vram_budget_check("device_malloc", device, size, nullptr)) {
+        *ptr = nullptr;
+        return cudaErrorMemoryAllocation;
+    }
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
@@ -553,6 +619,16 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
         }
+        if (err == cudaErrorMemoryAllocation) {
+            // MAD-LAB: refused by the VRAM budget (or a genuine driver OOM) even after
+            // flushing the pool. Fail this graph compute, do not abort the process.
+            (void)cudaGetLastError();
+            size_t free_b = 0, total_b = 0;
+            (void)cudaMemGetInfo(&free_b, &total_b);
+            GGML_LOG_ERROR(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB refused after flush (pool cached %.2f MiB, device free %.2f MiB) -- failing the request\n",
+                           device, look_ahead_size/1024.0/1024.0, pool_size/1024.0/1024.0, free_b/1024.0/1024.0);
+            throw ggml_cuda_pool_oom(device, look_ahead_size, free_b);
+        }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
@@ -631,6 +707,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
 
             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
+
+            // MAD-LAB: same VRAM reserve as ggml_cuda_device_malloc; see ggml_cuda_pool_oom.
+            {
+                size_t free_b = 0;
+                if (!ggml_cuda_vram_budget_check("pool_vmm_grow", device, reserve_size, &free_b)) {
+                    throw ggml_cuda_pool_oom(device, reserve_size, free_b);
+                }
+            }
 
             // allocate more physical memory
             CUmemAllocationProp prop = {};
@@ -4041,6 +4125,19 @@ struct ggml_cuda_wp_graph_counters {
     std::atomic<uint64_t> cap_lru{0};
     std::atomic<uint64_t> cap_ttl{0};
     std::atomic<uint64_t> cap_recapture{0};
+    // wp hip-graphs churn diagnostic: recapture cause/flip breakdown, updated
+    // only from ggml_cuda_graph_update_required's real-recapture path (see
+    // that function) -- these cost nothing on the no-change hot path.
+    // recap_total/recap_topo/recap_addr classify every real recapture by
+    // cause (topo-only vs addr-only vs both, where "both" is
+    // recap_total - recap_topo - recap_addr); recap_flip counts how many of
+    // those recaptures were an A->B->A flip back to a value seen two
+    // recaptures ago at the same key (see ggml_cuda_graph::last_recap_data0 /
+    // recap_prev2_data0 in common.cuh).
+    std::atomic<uint64_t> recap_total{0};
+    std::atomic<uint64_t> recap_flip{0};
+    std::atomic<uint64_t> recap_topo{0};
+    std::atomic<uint64_t> recap_addr{0};
     std::atomic<uint64_t> live_graphs{0};
     // 2026-09-11: deferred-destroy retired-graph list (common.cuh
     // ggml_cuda_graph_retire()/drain_retired()) -- see hipgraph-ttl-race.patch.
@@ -4050,15 +4147,61 @@ struct ggml_cuda_wp_graph_counters {
     std::atomic<uint64_t> retired{0};
     std::atomic<uint64_t> retired_freed{0};
     std::atomic<uint64_t> retired_synced{0};
+    // vram-budget: sum of measured hipGraphInstantiate deltas (ggml_cuda_graph::
+    // exec_bytes) for execs currently alive on this device -- added at
+    // instantiate, subtracted when the exec is actually destroyed (either the
+    // HIP recapture destroy site below or ~ggml_cuda_graph()). budget_evicted
+    // counts LRU evictions triggered specifically because exec_bytes_live
+    // exceeded GGML_CUDA_GRAPH_VRAM_BUDGET_MB, as opposed to the cap/TTL
+    // evictions already tracked above.
+    std::atomic<size_t>   exec_bytes_live{0};
+    std::atomic<uint64_t> budget_evicted{0};
 };
 
 static ggml_cuda_wp_graph_counters ggml_cuda_wp_graph_counts[GGML_CUDA_MAX_DEVICES];
+
+#ifdef USE_CUDA_GRAPH
+// vram-budget: accessors declared in common.cuh so ggml_cuda_graph's
+// destructor and ggml_backend_cuda_context::cuda_graph()/ggml_cuda_graph_retire()
+// (both header-only, included before this struct exists) can reach the
+// per-device counters above without common.cuh needing to know about
+// ggml_cuda_wp_graph_counters itself.
+void ggml_cuda_graph_wp_live_inc(int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    ggml_cuda_wp_graph_counts[device].live_graphs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ggml_cuda_graph_wp_live_dec(int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    ggml_cuda_wp_graph_counts[device].live_graphs.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void ggml_cuda_graph_wp_exec_bytes_sub(int device, size_t bytes) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || bytes == 0) {
+        return;
+    }
+    ggml_cuda_wp_graph_counts[device].exec_bytes_live.fetch_sub(bytes, std::memory_order_relaxed);
+}
+#endif // USE_CUDA_GRAPH
 static std::once_flag ggml_cuda_wp_graph_atexit_once;
 
 static void ggml_cuda_wp_graph_print_counts() {
     uint64_t captures = 0, replays = 0, fallbacks = 0;
     uint64_t newkey = 0, lru = 0, ttl = 0, live = 0, recap = 0;
     uint64_t retired = 0, retired_freed = 0, retired_synced = 0;
+    uint64_t budget_evicted = 0;
+    uint64_t recap_total = 0, recap_flip = 0, recap_topo = 0, recap_addr = 0;
+    size_t   exec_bytes_live_total = 0;
+    // vram-budget: per-device exec_mb, appended to the line below so a
+    // per-device VRAM skew (e.g. two contexts sharing device 0) is visible
+    // without cross-referencing the "wp vram:" line.
+    char exec_mb_per_dev[256];
+    size_t exec_mb_per_dev_len = 0;
+    exec_mb_per_dev[0] = '\0';
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         captures += ggml_cuda_wp_graph_counts[i].captures.load(std::memory_order_relaxed);
         replays += ggml_cuda_wp_graph_counts[i].replays.load(std::memory_order_relaxed);
@@ -4071,6 +4214,20 @@ static void ggml_cuda_wp_graph_print_counts() {
         retired += ggml_cuda_wp_graph_counts[i].retired.load(std::memory_order_relaxed);
         retired_freed += ggml_cuda_wp_graph_counts[i].retired_freed.load(std::memory_order_relaxed);
         retired_synced += ggml_cuda_wp_graph_counts[i].retired_synced.load(std::memory_order_relaxed);
+        budget_evicted += ggml_cuda_wp_graph_counts[i].budget_evicted.load(std::memory_order_relaxed);
+        recap_total += ggml_cuda_wp_graph_counts[i].recap_total.load(std::memory_order_relaxed);
+        recap_flip += ggml_cuda_wp_graph_counts[i].recap_flip.load(std::memory_order_relaxed);
+        recap_topo += ggml_cuda_wp_graph_counts[i].recap_topo.load(std::memory_order_relaxed);
+        recap_addr += ggml_cuda_wp_graph_counts[i].recap_addr.load(std::memory_order_relaxed);
+        const size_t dev_exec_bytes = ggml_cuda_wp_graph_counts[i].exec_bytes_live.load(std::memory_order_relaxed);
+        exec_bytes_live_total += dev_exec_bytes;
+        if (dev_exec_bytes != 0 && exec_mb_per_dev_len < sizeof(exec_mb_per_dev) - 32) {
+            const int n = snprintf(exec_mb_per_dev + exec_mb_per_dev_len, sizeof(exec_mb_per_dev) - exec_mb_per_dev_len,
+                                    " dev%d=%.1f", i, dev_exec_bytes / 1048576.0);
+            if (n > 0) {
+                exec_mb_per_dev_len += (size_t) n;
+            }
+        }
     }
     static std::atomic<uint64_t> last_captures{0};
     static std::atomic<uint64_t> last_replays{0};
@@ -4078,10 +4235,16 @@ static void ggml_cuda_wp_graph_print_counts() {
     const uint64_t interval_captures = captures - last_captures.exchange(captures, std::memory_order_relaxed);
     const uint64_t interval_replays  = replays  - last_replays.exchange(replays, std::memory_order_relaxed);
     const uint64_t interval_fallbacks = fallbacks - last_fallbacks.exchange(fallbacks, std::memory_order_relaxed);
+    // WP_HIP_GRAPHS_LOG=1 to print; counters above are still maintained either way.
+    if (!ggml_cuda_wp_hip_graphs_log_enabled()) {
+        return;
+    }
     fprintf(stderr, "wp hip-graphs: hits=%llu captures=%llu fallbacks=%llu "
             "interval(hits=%llu captures=%llu fallbacks=%llu) "
             "(newkey=%llu lru_evicted=%llu ttl_evicted=%llu recapture=%llu live=%llu "
-            "retired=%llu retired_freed=%llu retired_synced=%llu)\n",
+            "retired=%llu retired_freed=%llu retired_synced=%llu budget_evicted=%llu "
+            "recap_total=%llu recap_flip=%llu recap_topo=%llu recap_addr=%llu "
+            "exec_mb=%.1f exec_mb_per_dev=[%s])\n",
             (unsigned long long) replays, (unsigned long long) captures,
             (unsigned long long) fallbacks,
             (unsigned long long) interval_replays, (unsigned long long) interval_captures,
@@ -4090,7 +4253,33 @@ static void ggml_cuda_wp_graph_print_counts() {
             (unsigned long long) lru, (unsigned long long) ttl,
             (unsigned long long) recap, (unsigned long long) live,
             (unsigned long long) retired, (unsigned long long) retired_freed,
-            (unsigned long long) retired_synced);
+            (unsigned long long) retired_synced, (unsigned long long) budget_evicted,
+            (unsigned long long) recap_total, (unsigned long long) recap_flip,
+            (unsigned long long) recap_topo, (unsigned long long) recap_addr,
+            exec_bytes_live_total / 1048576.0, exec_mb_per_dev);
+    // MAD-LAB 2026-09-13: VRAM trace in the same periodic line -- free/total per
+    // device from the driver (includes every other process on the card), so the
+    // server log shows when device memory moves and next to which graph stats.
+    {
+        int ndev = 0;
+        if (cudaGetDeviceCount(&ndev) == cudaSuccess) {
+            int cur = 0;
+            (void)cudaGetDevice(&cur);
+            std::string line = "wp vram:";
+            for (int d = 0; d < ndev && d < GGML_CUDA_MAX_DEVICES; ++d) {
+                size_t free_b = 0, total_b = 0;
+                if (cudaSetDevice(d) == cudaSuccess && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                    char buf[96];
+                    snprintf(buf, sizeof(buf), " dev%d free=%.0fMiB used=%.0fMiB", d,
+                             free_b / 1048576.0, (total_b - free_b) / 1048576.0);
+                    line += buf;
+                }
+            }
+            (void)cudaSetDevice(cur);
+            (void)cudaGetLastError();
+            fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
 }
 
 bool ggml_backend_cuda_wp_graph_counts(
@@ -4121,6 +4310,10 @@ bool ggml_backend_cuda_wp_graph_counts(
         *cap_lru = c.cap_lru.load(std::memory_order_relaxed);
     }
     return true;
+}
+
+void ggml_backend_cuda_ar_dump_state(const char * reason) {
+    ggml_cuda_ar_dump_state(reason);
 }
 
 static void ggml_cuda_wp_graph_count_init() {
@@ -4208,6 +4401,42 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph,
 #endif
         }
 
+        // MAD-288 (ported from ~/GitHub/llama-gpu, gpu-portability branch,
+        // never ported to this branch until now): GGML_OP_PAGED_ATTN_MT's
+        // AITER launch (mt_aiter_unified_attn.cpp) bakes grid dims, kernel-
+        // handle selection (2D/3D/ALL_DECODE/2D-large), and pool-allocated
+        // workspace pointers (segm_out/segm_max/segm_expsum, cu_seqlens,
+        // predequant scratch table — ggml_cuda_pool_alloc in
+        // mt_pagedattn_aiter.cu) into the captured graph node BY VALUE. Those
+        // pool allocations are host-side RAII objects, not ggml tensors, so
+        // their addresses are never covered by the node-property topology
+        // compare (ggml_cuda_graph_update_required) — the pool can and does
+        // hand the same address to an unrelated allocation between capture
+        // and replay, aliasing a replayed op's workspace. Under 2-GPU TP
+        // (WP_HIP_GRAPHS=1) each rank decides capture/replay independently
+        // per device, so a wedge on one rank alone (not both) is consistent
+        // with this: the two ranks captured different graphs. Mirrors the
+        // existing ML8_MUL_MAT_ID precedent immediately above — always
+        // disable capture when a PAGED_ATTN_MT node is present. Deterministic
+        // per graph content (pure node->op test, no runtime/env state other
+        // than the override below), so both TP ranks make the same call for
+        // the same graph. WP_HIP_GRAPHS_PAGED_ATTN=1 restores the old
+        // (capture-eligible) behavior for A/B measurement only.
+        if (node->op == GGML_OP_PAGED_ATTN_MT) {
+            static const bool allow_paged_attn_mt_graphs = [] {
+                const char * e = std::getenv("WP_HIP_GRAPHS_PAGED_ATTN");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (!allow_paged_attn_mt_graphs) {
+                use_cuda_graph = false;
+                if (blocker) { *blocker = node; }
+                if (why)     { *why = "PAGED_ATTN_MT: pool-allocated workspace not replay-safe (MAD-288)"; }
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to PAGED_ATTN_MT (MAD-288)\n", __func__);
+#endif
+            }
+        }
+
         if (!use_cuda_graph) {
             break;
         }
@@ -4245,12 +4474,14 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) (unsigned) cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]);
+        h = ggml_cuda_graph_mix_rcache_offset(h, cgraph->nodes[i]);
         if (key_addrs) {
             h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]);
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]->src[j]);
+                h = ggml_cuda_graph_mix_rcache_offset(h, cgraph->nodes[i]->src[j]);
                 if (key_addrs) {
                     h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]->src[j]);
                 }
@@ -4369,24 +4600,33 @@ static bool ggml_cuda_graph_update_required(
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    // WP_HIP_GRAPHS churn diagnostic (throttled)
-    // Budget raised via WP_HIP_GRAPHS_CHURN_BUDGET. The default 60 is spent
-    // entirely on the startup first_snapshot captures, so STEADY-STATE churn --
-    // the only kind that explains a collapsing capture:replay ratio -- is never
-    // logged. Default unchanged so a bare run behaves exactly as before.
+    // WP_HIP_GRAPHS churn diagnostic.
+    //
+    // churn_log_budget (WP_HIP_GRAPHS_CHURN_BUDGET, default 400) now gates a
+    // single compact line per REAL recapture only -- an entry that already
+    // had node_props from a prior capture (not a first_snapshot) and for
+    // which ggml_cuda_graph_update_required is about to return true because
+    // of a topology or resolved-address change. Whether a given call is a
+    // real recapture can only be known after the per-node comparison loop
+    // below, so the budget is spent (fetch_sub) only after the loop, and
+    // only on that classification -- first-snapshot captures (a brand new
+    // key, or the SIZE-changed resize below) and no-change lookups never
+    // touch the budget. That is the fix for the budget being exhausted by
+    // startup captures before any steady-state churn could be logged.
     static std::atomic<int> churn_log_budget{[] {
         const char * e = std::getenv("WP_HIP_GRAPHS_CHURN_BUDGET");
-        if (e == nullptr) { return 60; }
+        if (e == nullptr) { return 400; }
         const long v = std::strtol(e, nullptr, 10);
-        return (v > 0 && v < 10000000) ? (int) v : 60;
+        return (v > 0 && v < 10000000) ? (int) v : 400;
     }()};
-    const bool churn_log = ggml_cuda_wp_hip_graphs_enabled() &&
-        churn_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0;
-    if (churn_log) {
-        fprintf(stderr, "wp hip-graphs churn: key=%p cgraph_uid=%zu graph_uid=%zu n_nodes=%d prev_props=%d\n",
-                graph_key, (size_t) cgraph->uid, (size_t) graph->uid, cgraph->n_nodes,
-                (int) graph->node_props.size());
-    }
+    // WP_HIP_GRAPHS_CHURN_VERBOSE=1 restores the old per-node dump (the first
+    // few differing nodes, unthrottled by the budget). Off by default: the
+    // one-line recap summary below is what the default run relies on.
+    static const bool churn_verbose = [] {
+        const char * e = std::getenv("WP_HIP_GRAPHS_CHURN_VERBOSE");
+        return e != nullptr && e[0] == '1';
+    }();
+    const bool wp_hip_graphs = ggml_cuda_wp_hip_graphs_enabled();
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
@@ -4399,18 +4639,32 @@ static bool ggml_cuda_graph_update_required(
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
-        if (churn_log) {
-            fprintf(stderr, "wp hip-graphs churn: SIZE changed %d -> %d\n",
-                    (int) graph->node_props.size(), cgraph->n_nodes);
-        }
         res = true;
         only_src_data_ptrs_changed = false;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
-    // Only safe to skip work when the churn diagnostic is not classifying this
-    // pass (it needs the full memcmp to tell object_ptr_only from addr_ptr_only).
-    const bool fast_props = !churn_log && ggml_cuda_graph_fast_props_enabled();
+    // Only safe to skip work when the verbose per-node dump is not
+    // classifying this pass (it needs the full memcmp to tell
+    // object_ptr_only from addr_ptr_only for every differing node).
+    const bool fast_props = !churn_verbose && ggml_cuda_graph_fast_props_enabled();
+
+    // Diagnostic-only accounting for a real recapture on this call (see the
+    // "wp hip-graphs recap:" line below and the recap_* counters in
+    // ggml_cuda_wp_graph_counters). Cheap: only touched for nodes that a) are
+    // not skipped by fast_props (which only skips provably-unchanged nodes)
+    // and b) already had stored props and topo/addr-changed. Gated on
+    // wp_hip_graphs so a non-WP_HIP_GRAPHS run pays nothing extra.
+    int        recap_addr_nodes   = 0;
+    int        recap_src_nodes    = 0;
+    bool       recap_any_topo     = false;
+    bool       recap_any_addr     = false;
+    int        recap_first_idx    = -1;
+    ggml_op    recap_first_op     = GGML_OP_NONE;
+    const void * recap_first_old_data = nullptr;
+    const void * recap_first_new_data = nullptr;
+    const void * recap_first_old_src0 = nullptr;
+    const void * recap_first_new_src0 = nullptr;
 
     int churn_nodes_logged = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4437,8 +4691,33 @@ static bool ggml_cuda_graph_update_required(
             if (topo_changed) {
                 only_src_data_ptrs_changed = false;
             }
-            // WP_HIP_GRAPHS churn diagnostic: log the first few differing nodes.
-            if (churn_log && churn_nodes_logged < 6) {
+            // Real-recapture accounting: only nodes that already had stored
+            // props AND changed topology or resolved addresses count -- a
+            // first_snapshot node (stored == false) never contributes.
+            if (wp_hip_graphs && stored && (topo_changed || addrs_changed)) {
+                const bool node_addr_diff = graph->node_props[i].node.data != prop.node.data;
+                bool node_src_diff = false;
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (graph->node_props[i].node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) {
+                        node_src_diff = true;
+                        break;
+                    }
+                }
+                if (node_addr_diff) { ++recap_addr_nodes; }
+                if (node_src_diff)  { ++recap_src_nodes; }
+                if (topo_changed)   { recap_any_topo = true; }
+                if (addrs_changed)  { recap_any_addr = true; }
+                if (recap_first_idx < 0) {
+                    recap_first_idx     = i;
+                    recap_first_op      = cgraph->nodes[i]->op;
+                    recap_first_old_data = graph->node_props[i].node.data;
+                    recap_first_new_data = prop.node.data;
+                    recap_first_old_src0 = graph->node_props[i].node_src_data_ptrs[0];
+                    recap_first_new_src0 = prop.node_src_data_ptrs[0];
+                }
+            }
+            // WP_HIP_GRAPHS_CHURN_VERBOSE=1: log the first few differing nodes.
+            if (churn_verbose && churn_nodes_logged < 6) {
                 ++churn_nodes_logged;
                 const char * kind = !stored ? "first_snapshot" :
                                    (topo_changed ? "TOPOLOGY(ne/nb/op)" :
@@ -4453,6 +4732,63 @@ static bool ggml_cuda_graph_update_required(
             if (!stored || topo_changed || addrs_changed) {
                 res = true;
             }
+        }
+    }
+
+    // This call was a real recapture iff some node already had stored props
+    // and its topology or a resolved address changed (recap_first_idx set).
+    if (wp_hip_graphs && recap_first_idx >= 0) {
+        ggml_cuda_wp_graph_counters & dc = ggml_cuda_wp_graph_counts[cuda_ctx->device];
+        dc.recap_total.fetch_add(1, std::memory_order_relaxed);
+        // Pure topology vs addr-only classification (task 4): "pure topology"
+        // is a topology change with no node-owned address movement at all;
+        // "addr-only" is a resolved-address change with no topology change.
+        // A recapture that is neither (both topo and addr moved) falls into
+        // neither bucket -- recap_total - recap_topo - recap_addr recovers it.
+        if (recap_addr_nodes == 0 && recap_any_topo) {
+            dc.recap_topo.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (recap_any_addr && !recap_any_topo) {
+            dc.recap_addr.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Always-on A/B/A flip detector (no budget cost): does the NEW data
+        // pointer of the first differing node match what that same slot held
+        // two recaptures ago at this key? See ggml_cuda_graph::
+        // last_recap_data0 / recap_prev2_data0 (common.cuh).
+        if (graph->recap_prev2_data0 != nullptr && recap_first_new_data == graph->recap_prev2_data0) {
+            graph->recap_flips++;
+            dc.recap_flip.fetch_add(1, std::memory_order_relaxed);
+        }
+        graph->recap_prev2_data0 = graph->last_recap_data0;
+        graph->last_recap_data0  = recap_first_new_data;
+
+        // Budget-gated one-line summary. Spent only here -- real recaptures --
+        // never on first_snapshot captures or no-change lookups.
+        // Refill: 20 recap lines per 5 s of wall clock, forever, so a long-lived
+        // router child keeps sampling steady-state churn instead of going
+        // silent after the first burst (and so journald's rate limit keeps
+        // most of them).
+        {
+            static std::atomic<int64_t> recap_refill_us{0};
+            const int64_t now_us = ggml_time_us();
+            int64_t last = recap_refill_us.load(std::memory_order_relaxed);
+            if (now_us - last > 5000000 && recap_refill_us.compare_exchange_strong(last, now_us, std::memory_order_relaxed)) {
+                churn_log_budget.store(20, std::memory_order_relaxed);
+            }
+        }
+        if (ggml_cuda_wp_hip_graphs_log_enabled() && churn_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            const char * cause = (recap_any_topo && recap_any_addr) ? "both" :
+                                 (recap_any_topo ? "topo" : "addr");
+            fprintf(stderr,
+                    "wp hip-graphs recap: key=%016llx n_nodes=%d cause=%s topo_changed=%d addr_nodes=%d src_nodes=%d "
+                    "first=[%d] op=%s name='%s' data %p->%p src0 %p->%p\n",
+                    (unsigned long long) (uintptr_t) graph_key, cgraph->n_nodes, cause,
+                    (int) recap_any_topo, recap_addr_nodes, recap_src_nodes,
+                    recap_first_idx, ggml_op_name(recap_first_op), cgraph->nodes[recap_first_idx]->name,
+                    recap_first_old_data, recap_first_new_data,
+                    recap_first_old_src0, recap_first_new_src0);
+            fflush(stderr);
         }
     }
 
@@ -6235,6 +6571,57 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+#ifdef USE_CUDA_GRAPH
+// vram-budget: per-device cap on ggml_cuda_wp_graph_counters::exec_bytes_live
+// (the sum of measured hipGraphInstantiate deltas for execs currently alive
+// on this device). MB, read once via getenv (called from the hot instantiate
+// path -- see ggml_cuda_wp_hip_graphs_enabled() above for why a live getenv()
+// per call is unacceptable here). 0 disables the budget (pre-existing
+// unbounded behavior). Default 512 MiB.
+static size_t ggml_cuda_graph_vram_budget_bytes() {
+    static const size_t budget_bytes = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_VRAM_BUDGET_MB");
+        long mb = 512;
+        if (e != nullptr) {
+            mb = atol(e);
+            if (mb < 0) {
+                mb = 512;
+            }
+        }
+        return (size_t) mb * 1024ull * 1024ull;
+    }();
+    return budget_bytes;
+}
+
+// vram-budget: called right after a successful hipGraphInstantiate for
+// `keep_key`'s graph. While this device's exec_bytes_live total exceeds the
+// configured budget and the cache holds more than just the entry we just
+// captured/are about to replay, evict THIS context's single LRU entry
+// through the existing retire_fn path (ggml_backend_cuda_context::
+// ggml_cuda_graph_retire(), common.cuh) -- the same deferred-destroy
+// machinery TTL/cap eviction already use, so there is no second erase path
+// and no extra synchronization beyond what retire already does. Reusing
+// ggml_cuda_graph_cache_evict_lru() with cap == current size makes it evict
+// exactly one entry per call: the loop's `size() >= cap` is true once, before
+// the eviction, and false immediately after size drops by one.
+static void ggml_cuda_graph_enforce_vram_budget(ggml_backend_cuda_context * cuda_ctx, const void * keep_key) {
+    const size_t budget_bytes = ggml_cuda_graph_vram_budget_bytes();
+    if (budget_bytes == 0) {
+        return; // 0 = disabled
+    }
+    auto & counts = ggml_cuda_wp_graph_counts[cuda_ctx->device];
+    auto retire_fn = [cuda_ctx](std::unique_ptr<ggml_cuda_graph> g) { cuda_ctx->ggml_cuda_graph_retire(std::move(g)); };
+    while (counts.exec_bytes_live.load(std::memory_order_relaxed) > budget_bytes &&
+           cuda_ctx->cuda_graphs.size() > 1) {
+        const size_t n_evicted = ggml_cuda_graph_cache_evict_lru(cuda_ctx->cuda_graphs, cuda_ctx->cuda_graphs.size(), keep_key, retire_fn);
+        if (n_evicted == 0) {
+            break; // nothing left to evict besides keep_key
+        }
+        counts.budget_evicted.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+#endif // USE_CUDA_GRAPH
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -6410,6 +6797,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (wp_node_trace_enabled()) {
+                    // In capture iff this pass is being captured into a
+                    // CUDA/HIP graph -- see ggml_backend_cuda_graph_compute()
+                    // (cudaStreamBeginCapture is called there exactly when
+                    // use_cuda_graph && cuda_graph_update_required, right
+                    // before this function runs the same node loop).
+                    const bool in_capture = use_cuda_graph && cuda_graph_update_required;
+                    wp_node_trace_record(cuda_ctx->device, cuda_ctx->stream(), node, i, in_capture);
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
@@ -6428,8 +6825,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &captured));
 #if defined(GGML_USE_HIP)
             if (graph->instance != nullptr) {
+                // vram-budget: this destroy bypasses ~ggml_cuda_graph; measure it here.
+                size_t wp_fb = 0, wp_fa = 0, wp_tot = 0;
+                (void) cudaMemGetInfo(&wp_fb, &wp_tot);
                 CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
                 graph->instance = nullptr;
+                (void) cudaMemGetInfo(&wp_fa, &wp_tot);
+                if (ggml_cuda_wp_hip_graphs_log_enabled()) {
+                    fprintf(stderr, GGML_CUDA_NAME " vram-budget: graph_exec_destroy(recapture) freed %.1f MiB on device %d (free after %.1f MiB)\n",
+                            (wp_fa > wp_fb ? wp_fa - wp_fb : 0) / 1048576.0, cuda_ctx->device, wp_fa / 1048576.0);
+                    fflush(stderr);
+                }
+                // vram-budget: this exec is gone -- return its tracked share of
+                // exec_bytes_live now, and zero exec_bytes so ~ggml_cuda_graph()
+                // (which will run later, whenever this cache entry is eventually
+                // evicted/replaced) does not subtract it a second time.
+                if (graph->exec_bytes != 0) {
+                    ggml_cuda_graph_wp_exec_bytes_sub(cuda_ctx->device, graph->exec_bytes);
+                    graph->exec_bytes = 0;
+                }
             }
 #endif
             if (graph->graph != nullptr) {
@@ -6473,7 +6887,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     default:
                         c.cap_newkey.fetch_add(1, std::memory_order_relaxed); break;
                 }
-                c.live_graphs.store(cuda_ctx->cuda_graph_count(), std::memory_order_relaxed);
+                // vram-budget: live_graphs is no longer set here. Two contexts
+                // (e.g. main model + DFlash draft) can share device 0, and this
+                // per-context cuda_graph_count() used to clobber whatever the
+                // other context's capture had just stored. It is now true
+                // per-device accounting: fetch_add on cache insert
+                // (ggml_backend_cuda_context::cuda_graph(), common.cuh) and
+                // fetch_sub on every erase (ggml_cuda_graph_retire(), common.cuh).
             }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6488,16 +6908,54 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            // vram-budget: hipGraphInstantiate consumes device memory outside ggml's
+            // pools (kernel-arg buffers); measure every instantiate unconditionally.
             size_t wp_free_before = 0, wp_total_dummy = 0;
-            if (wp_alloc_log_enabled()) {
-                CUDA_CHECK(cudaMemGetInfo(&wp_free_before, &wp_total_dummy));
-            }
+            CUDA_CHECK(cudaMemGetInfo(&wp_free_before, &wp_total_dummy));
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-            if (wp_alloc_log_enabled()) {
+            {
                 size_t wp_free_after = 0;
                 CUDA_CHECK(cudaMemGetInfo(&wp_free_after, &wp_total_dummy));
                 const size_t wp_used = wp_free_before > wp_free_after ? wp_free_before - wp_free_after : 0;
-                wp_alloc_log("graph_instantiate", cuda_ctx->device, wp_used, wp_free_after);
+                // journald rate-limits the router child (10000 msgs / 30 s): a
+                // two-slot rep instantiates ~150k graphs and floods everything
+                // else out. Print the first 300 only; exec_mb in the stats line
+                // carries the running total.
+                static std::atomic<int> wp_inst_print_budget{300};
+                if (ggml_cuda_wp_hip_graphs_log_enabled() && wp_used > 0 &&
+                    wp_inst_print_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                    fprintf(stderr, GGML_CUDA_NAME " vram-budget: graph_instantiate %.1f MiB on device %d (free after %.1f MiB of %.1f MiB, n_nodes=%d)\n",
+                            wp_used / 1048576.0, cuda_ctx->device, wp_free_after / 1048576.0, wp_total_dummy / 1048576.0, (int) cgraph->n_nodes);
+                    fflush(stderr);
+                }
+                if (wp_alloc_log_enabled()) {
+                    wp_alloc_log("graph_instantiate", cuda_ctx->device, wp_used, wp_free_after);
+                }
+
+                // vram-budget: record this exec's measured cost and enforce the
+                // per-device budget (GGML_CUDA_GRAPH_VRAM_BUDGET_MB) by evicting
+                // this context's coldest cache entries, if configured. graph is
+                // the entry we just instantiated -- never evict it here.
+                // The delta is a free-memory difference around the instantiate
+                // call, so an unrelated pool/device allocation on another
+                // thread that lands inside the window gets attributed here
+                // (seen: 94 MiB on gfx1030, where an exec otherwise costs 0).
+                // Real exec costs measured so far are 2.0 MiB (gfx1201); cap
+                // the charge so a coincidence cannot poison the budget.
+                const size_t wp_exec_charge_cap = 32u * 1024u * 1024u;
+                size_t wp_charge = wp_used;
+                if (wp_charge > wp_exec_charge_cap) {
+                    if (ggml_cuda_wp_hip_graphs_log_enabled()) {
+                        fprintf(stderr, GGML_CUDA_NAME " vram-budget: graph_instantiate delta %.1f MiB on device %d exceeds exec charge cap; not charged to graph budget\n",
+                                wp_used / 1048576.0, cuda_ctx->device);
+                    }
+                    wp_charge = 0;
+                }
+                graph->exec_bytes = wp_charge;
+                if (wp_charge != 0) {
+                    ggml_cuda_wp_graph_counts[cuda_ctx->device].exec_bytes_live.fetch_add(wp_charge, std::memory_order_relaxed);
+                }
+                ggml_cuda_graph_enforce_vram_budget(cuda_ctx, graph_key);
             }
         }
         // CUDA: ExecUpdate patches kernel params in the existing exec.
@@ -6573,6 +7031,9 @@ static void ggml_cuda_wp_graph_log_fallback(
         const void * graph_key, const ggml_cgraph * cgraph,
         const ggml_tensor * blocker, const char * reason,
         const ggml_cuda_graph * graph) {
+    if (!ggml_cuda_wp_hip_graphs_log_enabled()) {
+        return;
+    }
     static const int budget_max = [] {
         const char * e = std::getenv("WP_HIP_GRAPHS_FALLBACK_BUDGET");
         if (e == nullptr) { return 32; }
@@ -6766,7 +7227,33 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    try {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    } catch (const ggml_cuda_pool_oom & e) {
+        // MAD-LAB: a device allocation was refused by the VRAM reserve mid-graph.
+        // Unwind an in-progress stream capture (discard the partial graph) and the
+        // capture lock the begin above took, then fail this compute so llama_decode
+        // returns an error and the server fails the request instead of the process
+        // dying or the driver evicting it.
+        if (use_cuda_graph && cuda_graph_update_required) {
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(cuda_ctx->stream(), &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone) {
+                cudaGraph_t discarded = nullptr;
+                (void)cudaStreamEndCapture(cuda_ctx->stream(), &discarded);
+                if (discarded != nullptr) {
+                    (void)cudaGraphDestroy(discarded);
+                }
+            }
+            (void)cudaGetLastError();
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+        GGML_LOG_ERROR("%s: device %d: allocation of %.1f MiB refused (free was %.1f MiB) -- returning GGML_STATUS_ALLOC_FAILED\n",
+                       __func__, e.device, e.requested / 1048576.0, e.free_before / 1048576.0);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }

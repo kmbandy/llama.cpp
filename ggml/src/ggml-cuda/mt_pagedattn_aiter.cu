@@ -543,8 +543,14 @@ __global__ void mt_build_cu_seqlens_kernel(
 // prefix sum + grand total, single-thread — num_seqs is tiny in production
 // (1-2; a prefill batch), so a single-workgroup sequential scan is simply
 // not worth parallelizing (mirrors mt_build_cu_seqlens_kernel above).
+// q_lens must gate this scan the same way paged_max_ctx_len() (which sizes
+// num_scratch_blocks, src/llama-graph.cpp:569) gates its max: an idle slot's
+// seq_lens entry stays real and nonzero across ubatches it doesn't
+// participate in, so counting it here without the same filter can inflate
+// the total past a bound that was never sized to include it.
 __global__ void mt_aiter_predequant_scan_kernel(
     const int32_t * __restrict__ seq_lens,
+    const int32_t * __restrict__ q_lens,
     int32_t         block_size,
     int32_t         num_seqs,
     int32_t       * __restrict__ out_counts,   // [num_seqs]
@@ -554,7 +560,7 @@ __global__ void mt_aiter_predequant_scan_kernel(
     int32_t running = 0;
     for (int s = 0; s < num_seqs; ++s) {
         int32_t sl  = seq_lens[s];
-        int32_t cnt = sl > 0 ? (sl + block_size - 1) / block_size : 0;
+        int32_t cnt = (q_lens[s] > 0 && sl > 0) ? (sl + block_size - 1) / block_size : 0;
         out_counts[s] = cnt;
         out_prefix[s] = running;
         running += cnt;
@@ -571,11 +577,36 @@ __global__ void mt_aiter_predequant_scan_kernel(
 // dequant_turbo4_fp8_bs256_to_f16_2d, so a hole in the physical table still
 // makes the dequant/F16-shadow pair skip that slot instead of touching an
 // uninitialized scratch block.
+//
+// MAD-2026-09-12 predequant-overflow-guard (draft-ubatch-split-0912.txt,
+// "VERIFY-BATCH FAULT" / FIX): `counts`/`prefix` are derived from the REAL,
+// per-token-refreshed context_lens tensor (mt_aiter_predequant_scan_kernel
+// above), but the destination f16 scratch cache the compacted index feeds
+// (dequant_turbo4_fp8_bs256_to_f16_2d, kernels/unified_attention.py) is
+// allocated from a DIFFERENT, separately-derived bound
+// (`num_scratch_blocks`, computed from op_params[5] / max_ctx_len_param —
+// see mt_pagedattn_aiter.cu's caller below). If those two disagree (the
+// real live block count exceeds what the scratch cache was allocated for),
+// the old code wrote `prefix[s]+j` unconditionally, and the dequant kernel
+// would later store at that compact index into a too-small buffer — an
+// out-of-bounds device write ("Page not present"). Clamp here instead: a
+// compact index >= num_scratch_blocks is never written into scratch_table
+// (stays -1, the same "skip this slot" convention already used for a hole
+// in the physical table), so dequant_turbo4_fp8_bs256_to_f16_2d's own
+// `if (scratch_block_idx_i32 < 0) return;` (kernels/unified_attention.py)
+// early-exits on it — no OOB write can happen. `overflow_flag` (may be
+// nullptr — a failed guard-state allocation degrades to "no flag", not a
+// crash) is set to 1 (plain store, not atomic — every thread that hits this
+// writes the same value 1, so a race here cannot produce a wrong result)
+// so the host can report the disagreement without polling every kernel
+// launch or adding a synchronous device readback.
 __global__ void mt_aiter_predequant_fill_table_kernel(
     const int32_t * __restrict__ orig_table,    // [num_seqs, block_table_stride], physical
     const int32_t * __restrict__ counts,        // [num_seqs]
     const int32_t * __restrict__ prefix,        // [num_seqs], exclusive
     int32_t         block_table_stride,
+    int32_t         num_scratch_blocks,         // MAD-2026-09-12: scratch cache's real capacity
+    int32_t       * __restrict__ overflow_flag, // MAD-2026-09-12: 1 int32, may be nullptr
     int32_t       * __restrict__ scratch_table) { // [num_seqs, block_table_stride]
     const int s = blockIdx.x;
     const int j = blockIdx.y * (int) blockDim.x + threadIdx.x;
@@ -583,9 +614,131 @@ __global__ void mt_aiter_predequant_fill_table_kernel(
     const size_t idx = (size_t) s * (size_t) block_table_stride + (size_t) j;
     int32_t out = -1;
     if (j < counts[s] && orig_table[idx] >= 0) {
-        out = prefix[s] + j;
+        const int32_t compact = prefix[s] + j;
+        if (compact < num_scratch_blocks) {
+            out = compact;
+        } else if (overflow_flag != nullptr) {
+            *overflow_flag = 1;
+        }
     }
     scratch_table[idx] = out;
+}
+
+// MAD-2026-09-12 predequant-overflow-guard: per-stream device flag + pinned
+// host mirror + event that lets the host learn, WITHOUT ever blocking on
+// this stream, whether mt_aiter_predequant_fill_table_kernel above had to
+// clamp (skip) a compacted index because num_scratch_blocks disagreed with
+// the real live block count. Keyed by stream for the same reason
+// CachedHandles::scratch_by_stream is (mt_aiter_unified_attn.cpp) — the
+// target and an independent draft llama_context each own their own
+// hipStream_t even on the same physical device.
+//
+// Checking is deliberately deferred to the START of the NEXT call on this
+// stream (not the end of this one): the D2H copy issued at the end of a
+// call is only ORDERED after this call's kernels on the stream, not
+// necessarily COMPLETE by the time the host issues the next call — HOST
+// issue order never implies device completion. A hipEventQuery (never
+// hipEventSynchronize/hipStreamSynchronize/hipDeviceSynchronize) is the
+// only non-blocking way to learn "has this specific copy landed yet";
+// blocking here would serialize the issuing host thread in front of
+// whatever else it still has to submit, which for the meta backend's
+// single-host-thread AllReduce dispatch is a deadlock, not just a stall.
+namespace {
+struct mt_predequant_overflow_guard {
+    int32_t  * flag_dev             = nullptr; // device-resident, 1 int32
+    int32_t  * flag_host            = nullptr; // pinned host mirror
+    hipEvent_t copy_event           = nullptr; // recorded right after the D2H copy
+    bool       pending              = false;   // a copy is in flight, not yet checked
+    int32_t    num_scratch_blocks   = 0;       // for the abort message
+    int32_t    requested_total      = 0;
+    int32_t    max_ctx_len_param    = 0;
+};
+std::mutex g_predequant_overflow_mu;
+std::unordered_map<hipStream_t, mt_predequant_overflow_guard> g_predequant_overflow_by_stream;
+} // namespace
+
+// Call right BEFORE issuing this call's fill-table kernel. Non-blockingly
+// checks the PREVIOUS call's overflow flag (if its D2H copy has landed) and
+// GGML_ABORTs if it fired; then resets the flag to 0 for THIS call (async,
+// same stream) and returns the device pointer the fill kernel should write
+// to. Returns nullptr only if the one-time allocation of the guard's own
+// state failed — the caller must treat a null return as "no guard this
+// call" (degrades to the pre-existing, unguarded behavior; never itself a
+// fault).
+static int32_t * mt_aiter_predequant_overflow_guard_begin(
+        hipStream_t stream, int32_t num_scratch_blocks, int32_t requested_total,
+        int32_t max_ctx_len_param) {
+    std::lock_guard<std::mutex> lock(g_predequant_overflow_mu);
+    mt_predequant_overflow_guard & st = g_predequant_overflow_by_stream[stream];
+
+    if (st.pending && st.copy_event != nullptr) {
+        if (hipEventQuery(st.copy_event) == hipSuccess) {
+            if (st.flag_host != nullptr && *st.flag_host != 0) {
+                int dev = 0;
+                (void) hipGetDevice(&dev);
+                GGML_ABORT(
+                    "mt_aiter_unified_attn: predequant-scratch compacted index "
+                    "exceeded num_scratch_blocks on a previous call -- the write "
+                    "was skipped (no out-of-bounds write occurred), but the scratch "
+                    "cache is undersized for this stream's real live context length "
+                    "(num_scratch_blocks=%d requested_total=%d max_ctx_len_param=%d "
+                    "stream=%p device=%d)\n",
+                    st.num_scratch_blocks, st.requested_total, st.max_ctx_len_param,
+                    (void *) stream, dev);
+            }
+            st.pending = false;
+        }
+        // else: hipErrorNotReady -- the copy hasn't landed yet. Do not wait;
+        // just try again at the start of the next call on this stream.
+    }
+
+    if (st.flag_dev == nullptr) {
+        if (hipMalloc(&st.flag_dev, sizeof(int32_t)) != hipSuccess) {
+            st.flag_dev = nullptr;
+            return nullptr;
+        }
+    }
+    if (st.flag_host == nullptr) {
+        if (hipHostMalloc(&st.flag_host, sizeof(int32_t)) != hipSuccess) {
+            st.flag_host = nullptr; // guard degrades to "reset only, never checked"
+        } else {
+            *st.flag_host = 0;
+        }
+    }
+    if (st.copy_event == nullptr) {
+        if (hipEventCreateWithFlags(&st.copy_event, hipEventDisableTiming) != hipSuccess) {
+            st.copy_event = nullptr;
+        }
+    }
+
+    (void) hipMemsetAsync(st.flag_dev, 0, sizeof(int32_t), stream);
+
+    st.num_scratch_blocks = num_scratch_blocks;
+    st.requested_total    = requested_total;
+    st.max_ctx_len_param  = max_ctx_len_param;
+
+    return st.flag_dev;
+}
+
+// Call right AFTER issuing this call's fill-table kernel: async-copies the
+// flag back to the pinned host mirror on the SAME stream and records the
+// event mt_aiter_predequant_overflow_guard_begin() will non-blockingly poll
+// on the NEXT call. No-op if this stream's guard state isn't usable (no
+// flag_host / no event) -- the same "degrade, never fault" contract as
+// _begin().
+static void mt_aiter_predequant_overflow_guard_end(hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(g_predequant_overflow_mu);
+    auto it = g_predequant_overflow_by_stream.find(stream);
+    if (it == g_predequant_overflow_by_stream.end()) {
+        return;
+    }
+    mt_predequant_overflow_guard & st = it->second;
+    if (st.flag_dev == nullptr || st.flag_host == nullptr || st.copy_event == nullptr) {
+        return;
+    }
+    (void) hipMemcpyAsync(st.flag_host, st.flag_dev, sizeof(int32_t), hipMemcpyDeviceToHost, stream);
+    (void) hipEventRecord(st.copy_event, stream);
+    st.pending = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -768,10 +921,56 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     // its first set_input, such as during warmup) -- same convention as
     // op_params[4]/[5] in mt_pagedattn.cu.
     const int32_t max_ctx_len_param = ((const int32_t *)(op_params_f + 5))[0];
+    // MAD-LAB (draft-KV-paged num_seqs fix, 2026-09-12): op_params[6] is the
+    // REAL number of live/active sequences in this ubatch
+    // (llama_ubatch::n_seqs_unq), populated the same way as op_params[5]
+    // above by llm_graph_input_attn_kv::update_paged_attn_n_seqs_active()
+    // (src/llama-graph.cpp, MAD-378-style per-device-clone propagation). 0
+    // means "unset" (same convention as op_params[4]/[5]) -- num_seqs_dispatch
+    // then falls back to num_seqs (== block_tables->ne[1], the cache's
+    // static n_seq_max), i.e. exactly today's (pre-fix) behavior.
+    const int32_t n_seqs_active_param = ((const int32_t *)(op_params_f + 6))[0];
 
     const int head_size      = (int) q->ne[0];
     const int n_heads        = (int) q->ne[1];
+    // block_tables->ne[1] is the paged cache's STATIC n_seq_max -- the
+    // block_table/context_lens/q_lens tensors are always allocated at this
+    // width (src/llama-kv-cache-paged.cpp:482, src/llama-graph.cpp:3330/3334)
+    // regardless of how many of those slots are actually live this call, and
+    // slots are seq-id-indexed, NOT compacted -- a single live sequence can
+    // sit at any slot index, so this value is the correct (and only safe)
+    // bound for anything that INDEXES into those arrays (grid dims, the
+    // reduce-segments phase, ALL_DECODE/g3_x sizing, cu_seqlens
+    // construction) or that must conservatively cover every possible live
+    // slot. Keep using it for all of that -- see num_seqs_dispatch below for
+    // the one place (the 2D/3D + large-prefill dispatch HEURISTIC, which
+    // only ever consumes num_seqs as a divisor/scale factor, never as an
+    // array bound) that needs the real count instead.
     const int num_seqs       = (int) block_tables->ne[1];
+    // Real live count for dispatch-only decisions (avg_q_len, 2D-vs-3D
+    // occupancy, the large-prefill cutover below) -- falls back to the old,
+    // static `num_seqs` when unset (cold graph / pre-set_input warmup),
+    // reproducing today's behavior exactly in that case.
+    //
+    // MAD-LAB (draft-KV-paged fault-analysis fix, 2026-09-12): also HARD-CLAMP
+    // to `num_seqs` (never exceed it). A cache can never legitimately have
+    // MORE live sequences than its own n_seq_max, so op_params[6] reading
+    // back larger than that is always invalid input for THIS cache instance
+    // -- e.g. a stale/reserve-time ubatch value, or any future bug in
+    // ubatch->n_seqs_unq's population -- and must never be trusted over the
+    // known-safe static value. This is the critical direction to guard: an
+    // over-large num_seqs_dispatch UNDER-estimates avg_q_len
+    // (num_q_tokens/num_seqs_dispatch), which can push a genuinely large
+    // (e.g. ~2048-token) batch below the large-prefill threshold and
+    // misroute it onto the 3D split-K kernel with workspace/grid math sized
+    // for a much smaller call -- see draft-kv-paged-0912.txt "FAULT
+    // ANALYSIS" for the observed HSA_STATUS_ERROR_MEMORY_FAULT this class of
+    // mistake produces. The clamp is a no-op whenever n_seqs_active_param is
+    // correct (it is always <= num_seqs by construction in the intended
+    // case), so it changes nothing for the calls this optimization targets.
+    const int num_seqs_dispatch = n_seqs_active_param > 0
+        ? (n_seqs_active_param < num_seqs ? (int) n_seqs_active_param : num_seqs)
+        : num_seqs;
     const int num_q_tokens   = (int) k_cur->ne[2];
 
     // Shape gate — the wrapper builds a Triton signature from these at first
@@ -1000,7 +1199,47 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     // as mt_aiter_unified_attn()'s own launch-gate below, or the workspace
     // sizing and the kernel actually launched can disagree — see the
     // comment on mt_aiter_uattn_should_use_2d() in mt_aiter_unified_attn.h.
-    const bool use_2d = mt_aiter_uattn_should_use_2d(num_q_tokens, num_seqs, n_kv_heads) != 0;
+    // MAD-LAB (draft-KV-paged num_seqs fix): uses num_seqs_dispatch (the
+    // real live-seq count when known), NOT num_seqs, and propagates that
+    // same value to mt_aiter_unified_attn() via args.num_seqs_active below
+    // so its own internal recompute of this exact predicate agrees --
+    // required by the "MUST call the exact same predicate" invariant above.
+    const bool use_2d = mt_aiter_uattn_should_use_2d(num_q_tokens, num_seqs_dispatch, n_kv_heads) != 0;
+
+    // MAD-LAB (draft-KV-paged fault-analysis-2 fix, 2026-09-12): fail LOUDLY,
+    // before any kernel launch, if the 3D split-K path was somehow selected
+    // for a batch large enough that it would have qualified for 2D-large
+    // under the cache's own STATIC (n_seq_max, always safe) num_seqs — i.e.
+    // avg_q_len computed with num_seqs (not num_seqs_dispatch) is still
+    // >= the large-prefill threshold. This is a pure sanity re-check, not a
+    // new decision: with num_seqs_dispatch now hard-clamped to <= num_seqs
+    // (see its declaration above), this condition is believed unreachable
+    // -- num_seqs_dispatch <= num_seqs implies
+    // avg_q_len(num_seqs_dispatch) >= avg_q_len(num_seqs), so if the
+    // static-num_seqs avg_q_len already clears the threshold, the
+    // dispatch-num_seqs avg_q_len must too, and use_2d must be true. It's
+    // kept as a second, independent layer specifically because the 3D
+    // kernel's own internal tiling was never designed or validated for a
+    // batch this wide (see draft-kv-paged-0912.txt "FAULT ANALYSIS" /
+    // "FAULT ANALYSIS 2" for the HSA_STATUS_ERROR_MEMORY_FAULT this exact
+    // grid shape — 1024x2x32 on a ~2044-token batch — produced before the
+    // num_seqs clamp existed): a 3D split-K launch this wide is unvalidated
+    // territory regardless of how it got selected, so if some future change
+    // reopens a path to it, this converts that into a clean, diagnosable
+    // process abort instead of a repeat of the same GPU memory fault.
+    if (!use_2d && num_seqs > 0 &&
+        (num_q_tokens / num_seqs) >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD) {
+        GGML_ABORT("AITER paged-attn: 3D split-K selected for an oversized batch "
+                   "(num_q_tokens=%d, num_seqs_dispatch=%d, static num_seqs=%d) -- "
+                   "this batch would have qualified for the 2D-large path under the "
+                   "cache's own static n_seq_max (avg_q_len=%d >= threshold=%d). "
+                   "Refusing to launch an unvalidated large-grid 3D dispatch rather "
+                   "than risk a repeat of the HSA_STATUS_ERROR_MEMORY_FAULT documented "
+                   "in draft-kv-paged-0912.txt 'FAULT ANALYSIS 2'.",
+                   num_q_tokens, num_seqs_dispatch, num_seqs,
+                   num_q_tokens / num_seqs, (int) MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
+    }
+
     ggml_cuda_pool_alloc<float>   segm_out_buf(ctx.pool());
     ggml_cuda_pool_alloc<float>   segm_max_buf(ctx.pool());
     ggml_cuda_pool_alloc<float>   segm_exp_buf(ctx.pool());
@@ -1045,8 +1284,10 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_cuda_pool_alloc<int32_t> predq_total(ctx.pool());
     ggml_cuda_pool_alloc<int32_t> predq_scratch_table(ctx.pool());
     int32_t num_scratch_blocks = 0;
+    // MAD-LAB (draft-KV-paged num_seqs fix): num_seqs_dispatch, not num_seqs
+    // -- see the comment on num_seqs_dispatch's declaration above.
     const bool use_2d_large =
-        use_2d && (mt_aiter_uattn_avg_q_len(num_q_tokens, num_seqs) >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
+        use_2d && (mt_aiter_uattn_avg_q_len(num_q_tokens, num_seqs_dispatch) >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
     const bool want_predequant_scratch = (cache_type == MT_AITER_CACHE_TURBO4_FP8) && use_2d_large;
     if (want_predequant_scratch) {
         // MAD-2026-09-12 predequant-sync-fix (predequant-sync-fix-0912.txt):
@@ -1094,15 +1335,30 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
             // the bound. out_total is written but deliberately never copied
             // back to host -- that copyback + sync was the bug.
             mt_aiter_predequant_scan_kernel<<<1, 1, 0, stream>>>(
-                (const int32_t*) context_lens->data, block_size, num_seqs,
+                (const int32_t*) context_lens->data, (const int32_t*) q_lens->data,
+                block_size, num_seqs,
                 predq_counts.get(), predq_prefix.get(), predq_total.get());
 
             predq_scratch_table.alloc((size_t) num_seqs * (size_t) max_bps);
             const dim3 fill_grid((unsigned) num_seqs, (unsigned) ((max_bps + 255) / 256));
+            // MAD-2026-09-12 predequant-overflow-guard: `counts`/`prefix`
+            // above are exact (real context_lens), but num_scratch_blocks is
+            // the separately-derived, possibly-stale bound this scratch
+            // cache was actually ALLOCATED for. Clamp the fill kernel's
+            // writes against it (see the kernel's own comment) and check
+            // asynchronously, without ever blocking this stream, whether a
+            // clamp fired on the PREVIOUS call.
+            // requested_total is unavailable without a host readback (predq_total
+            // is intentionally never copied back — see the comment above); -1
+            // marks it as "not tracked" rather than duplicating num_scratch_blocks.
+            int32_t * predequant_overflow_flag = mt_aiter_predequant_overflow_guard_begin(
+                stream, num_scratch_blocks, -1, max_ctx_len_param);
             mt_aiter_predequant_fill_table_kernel<<<fill_grid, 256, 0, stream>>>(
                 (const int32_t*) block_tables->data,
                 predq_counts.get(), predq_prefix.get(), max_bps,
+                num_scratch_blocks, predequant_overflow_flag,
                 predq_scratch_table.get());
+            mt_aiter_predequant_overflow_guard_end(stream);
         }
     }
 
@@ -1179,6 +1435,13 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
 
     args.scale              = scale;
     args.num_seqs           = num_seqs;
+    // MAD-LAB (draft-KV-paged num_seqs fix): dispatch-only real live count,
+    // consumed ONLY by mt_aiter_unified_attn()'s own avg_q_len / 2D-vs-3D
+    // predicate recompute (must agree with use_2d above -- see that
+    // comment). Every other use of a->num_seqs in that file (grid dims,
+    // ALL_DECODE, reduce-segments, indexing) intentionally keeps reading
+    // args.num_seqs (static n_seq_max) unchanged.
+    args.num_seqs_active    = (int32_t) num_seqs_dispatch;
     args.num_q_tokens       = num_q_tokens;
     args.block_table_stride = max_bps;
     // MAD-2026-09-12 predequant-scratch: NULL/0 for every call that isn't

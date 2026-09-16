@@ -361,6 +361,22 @@ public:
     int32_t paged_max_ctx_len() const;
     void update_paged_attn_max_ctx_len();
 
+    // MAD-LAB (draft-KV-paged num_seqs fix, 2026-09-12): propagate the
+    // REAL number of active/live sequences in this ubatch (ubatch->n_seqs_unq,
+    // already known to the graph builder / set_input) as op_params[6], mirroring
+    // the op_params[5] max_ctx_len pattern above exactly — same per-device-clone
+    // propagation via ggml_backend_meta_buffer_set_op_param_i32, same "0 means
+    // unset, fall back to the conservative/static value" convention. This exists
+    // because ggml/src/ggml-cuda/mt_pagedattn_aiter.cu has no other host-visible
+    // way to learn how many of the cache's n_seq_max block_table/context_lens/
+    // q_lens slots are actually live THIS call — block_tables->ne[1] is always
+    // the cache's static n_seq_max, not the live count, which deflates avg_q_len
+    // for any call using fewer than n_seq_max sequences (e.g. a single-sequence
+    // draft catch-up ubatch under a paged cache with n_seq_max > 1) and can miss
+    // the large-prefill / fp8-predequant cutover it should take. See
+    // draft-kv-paged-0912.txt "MEASURED + REVISION (part 2)" for the full trace.
+    void update_paged_attn_n_seqs_active(uint32_t n_seqs_active);
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 

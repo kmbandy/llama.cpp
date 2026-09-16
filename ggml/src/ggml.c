@@ -5737,6 +5737,9 @@ struct ggml_tensor * ggml_paged_attn_mt(
     //   [3]: int32_t n_kv_heads
     //   [4]: int32_t max_q_len (optional graph-builder override)
     //   [5]: int32_t max active context length (optional graph-builder override)
+    //   [6]: int32_t live/active sequence count this call (optional graph-builder
+    //        override; 0 = unset -- see llm_graph_input_attn_kv::update_paged_attn_n_seqs_active()
+    //        and mt_pagedattn_aiter.cu's num_seqs_dispatch, 2026-09-12)
     int32_t max_blocks_per_seq = (int32_t) block_tables->ne[0];
     int32_t params_i32[4];
     memcpy(&params_i32[0], &scale, sizeof(scale));

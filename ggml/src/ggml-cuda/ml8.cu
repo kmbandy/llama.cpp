@@ -213,6 +213,11 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     const size_t b_packed_bytes = (size_t) (K / 2) * (size_t) N;
     const size_t b_scale_bytes  = (size_t) n_groups_k * (size_t) N * sizeof(float);
 
+    if (ggml_cuda_wp_vram_log_enabled()) {
+        size_t fb = 0, tot = 0; int dev = -1; (void) cudaGetDevice(&dev); (void) cudaMemGetInfo(&fb, &tot);
+        fprintf(stderr, "wp vram-budget: ml8_repack %.1f MiB on device %d (free before %.1f MiB) K=%d N=%d\n",
+                (b_packed_bytes + b_scale_bytes) / 1048576.0, dev, fb / 1048576.0, (int) K, (int) N); fflush(stderr);
+    }
     cudaError_t err = cudaMalloc(&d_b_packed, b_packed_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "[ml8] cudaMalloc(b_packed=%zu) failed: %s\n",
@@ -373,6 +378,11 @@ static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
     const size_t b_fp8_bytes   = (size_t) K * (size_t) N;            // [K, N] raw e4m3
     const size_t b_scale_bytes = (size_t) n_groups_k * (size_t) N * sizeof(float);
 
+    if (ggml_cuda_wp_vram_log_enabled()) {
+        size_t fb = 0, tot = 0; int dev = -1; (void) cudaGetDevice(&dev); (void) cudaMemGetInfo(&fb, &tot);
+        fprintf(stderr, "wp vram-budget: ml8_repack_fp8 %.1f MiB on device %d (free before %.1f MiB) K=%d N=%d\n",
+                (b_fp8_bytes + b_scale_bytes) / 1048576.0, dev, fb / 1048576.0, (int) K, (int) N); fflush(stderr);
+    }
     cudaError_t err = cudaMalloc(&d_b_fp8, b_fp8_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "[ml8-fp8] cudaMalloc(b_fp8=%zu) failed: %s\n",
@@ -1629,6 +1639,11 @@ const ml8_weight_repack_moe_t * ggml_cuda_ml8_get_or_repack_moe(
     const size_t b_scale_bytes  = (size_t) n_experts * (size_t) n_groups_k * (size_t) N * sizeof(float);
 
     std::lock_guard<std::mutex> lock(g_buf_mu);
+    if ((b_packed_bytes > g_buf_packed_cap || b_scale_bytes > g_buf_scale_cap) && ggml_cuda_wp_vram_log_enabled()) {
+        size_t fb = 0, tot = 0; int dev = -1; (void) cudaGetDevice(&dev); (void) cudaMemGetInfo(&fb, &tot);
+        fprintf(stderr, "wp vram-budget: ml8_moe_regrow %.1f MiB on device %d (free before %.1f MiB, old cap %.1f MiB)\n",
+                (b_packed_bytes + b_scale_bytes) / 1048576.0, dev, fb / 1048576.0, (g_buf_packed_cap + g_buf_scale_cap) / 1048576.0); fflush(stderr);
+    }
     if (b_packed_bytes > g_buf_packed_cap) {
         if (g_buf_packed) cudaFree(g_buf_packed);
         g_buf_packed = nullptr;

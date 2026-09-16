@@ -250,6 +250,86 @@ inline uint64_t ggml_cuda_graph_mix_tensor_addrs(uint64_t h, const ggml_tensor *
     return h;
 }
 
+// WP_HIP_GRAPH_KEY_RCACHE=0 disables mixing recurrent-cache view offsets into
+// the graph key (call site: ggml_cuda_graph_get_key, ggml-cuda.cu). Default
+// ON: two decode slots share a recurrent-memory tensor (cache_r_lN /
+// cache_s_lN, llama-memory-recurrent.cpp) and the graph differs only in which
+// cell each slot's CPY view targets -- same structural key, addresses flip
+// A->B->A on every slot switch, forcing a recapture HIP can't ExecUpdate (see
+// file header, "Replay identity"). Mixing the view offset of just these two
+// prefixes keys each cell into its own cache slot without thrashing on
+// cache_k_/cache_v_ views, which move every token.
+inline bool ggml_cuda_graph_key_rcache() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_HIP_GRAPH_KEY_RCACHE");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
+// WP_VRAM_LOG=1 turns on the per-allocation "vram-budget"/"wp vram-budget"
+// device_malloc prints (ggml-cuda.cu, ml8.cu) and the per-slot-release vram
+// suffix (tools/server/server-context.cpp). Off by default -- these fire on
+// every allocation/request and are pure noise once a server is warmed up.
+// The underlying accounting (budget checks, eviction) is unaffected; only
+// the fprintf is gated.
+inline bool ggml_cuda_wp_vram_log_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_VRAM_LOG");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// WP_HIP_GRAPHS_LOG=1 turns on the per-recapture "wp hip-graphs" diagnostics
+// (the recap/fallback lines, the recapture-destroy and per-instantiate
+// prints) and the periodic "wp hip-graphs" hit/capture/fallback stats line.
+// Off by default. Does NOT gate WP_HIP_GRAPHS_CHURN_VERBOSE's per-node churn
+// dump (ggml-cuda.cu) -- that already has its own dedicated opt-in flag,
+// off by default. One-time startup lines (e.g. the WP_HIP_GRAPH_KEY_RCACHE
+// announcement above) are unaffected -- they print once regardless of this
+// gate.
+inline bool ggml_cuda_wp_hip_graphs_log_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_HIP_GRAPHS_LOG");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+inline bool ggml_cuda_graph_is_rcache_view(const ggml_tensor * view_src) {
+    return view_src != nullptr &&
+           (strncmp(view_src->name, "cache_r_", 8) == 0 ||
+            strncmp(view_src->name, "cache_s_", 8) == 0);
+}
+
+// Mix the recurrent-cache cell offset carried by a node's own view_src/
+// view_offs, when that view resolves to cache_r_*/cache_s_*. A CPY node
+// targeting a recurrent-cache cell IS such a view: ggml_cpy_impl (ggml.c)
+// makes the CPY's own result tensor `ggml_view_tensor(ctx, dst)`, and
+// ggml_new_tensor_impl collapses chained views (view_offs += inner
+// view_src->view_offs; view_src = inner view_src->view_src) so the CPY
+// node's view_src/view_offs point straight at the base cache_r_/cache_s_
+// tensor and the cell's byte offset -- no separate VIEW node needed.
+// Other views (cache_k_/cache_v_, activations) are left untouched: NOT
+// mixed, since their offsets move every token and would thrash the key.
+inline uint64_t ggml_cuda_graph_mix_rcache_offset(uint64_t h, const ggml_tensor * t) {
+    if (t == nullptr || !ggml_cuda_graph_key_rcache()) {
+        return h;
+    }
+    if (!ggml_cuda_graph_is_rcache_view(t->view_src)) {
+        return h;
+    }
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        std::fprintf(stderr,
+            "wp hip-graphs: keying by recurrent-cache cell (WP_HIP_GRAPH_KEY_RCACHE=1)\n");
+    }
+    h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->view_offs);
+    h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) (uintptr_t) t->view_src);
+    return h;
+}
+
 inline bool ggml_cuda_graph_tensor_is_view_or_noop(const ggml_tensor * t) {
     return t == nullptr ||
            t->op == GGML_OP_NONE ||

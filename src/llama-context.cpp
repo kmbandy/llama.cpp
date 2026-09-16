@@ -1094,6 +1094,15 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // MAD-LAB (pinned-host nextn staging): free any cached nextn_stage_event[]
+    // handles before the pinned buffers/device go away below. No-op for every
+    // context that never enabled pinned staging.
+    for (int slot = 0; slot < 2; slot++) {
+        if (nextn_stage_event[slot] != nullptr) {
+            ggml_backend_event_free(nextn_stage_event[slot]);
+        }
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1984,9 +1993,83 @@ void llama_context::nextn_stage_enable() {
         return;
     }
     nextn_stage_enabled = true;
+
+    // MAD-LAB (pinned-host handoff, draft-handoff-device-0912.txt):
+    // WP_MTP_HANDOFF=host keeps the pre-existing pageable nextn_stage[]
+    // vectors + full ctx->synchronize() read (byte-for-byte the original,
+    // pre-this-feature behavior) for A/B; anything else, including unset,
+    // defaults to pinned-host staging. The actual pinned buffers are
+    // allocated lazily in nextn_stage_pinned_ensure() on the first
+    // extraction write, once n_embd (the nextn width) and t_h_nextn's
+    // backend are known -- a pinned-allocation failure (or, in principle, a
+    // non-CUDA/HIP backend with no host buffer type) falls back to the
+    // plain vectors transparently for the rest of this context's lifetime.
+    const char * handoff_env = getenv("WP_MTP_HANDOFF");
+    nextn_stage_pinned_enabled = !(handoff_env != nullptr && strcmp(handoff_env, "host") == 0);
+
     if (wp_spec_prefill_stats_enabled()) {
-        LLAMA_LOG_INFO("%s: nextn staging enabled on ctx=%p\n", __func__, (void *) this);
+        LLAMA_LOG_INFO("%s: nextn staging enabled on ctx=%p (handoff=%s)\n",
+                __func__, (void *) this, nextn_stage_pinned_enabled ? "pinned" : "host");
     }
+}
+
+bool llama_context::nextn_stage_pinned_ensure(ggml_backend_t backend0, uint32_t n_embd) {
+    if (nextn_stage_pinned_buf[0] && nextn_stage_pinned_buf[1]) {
+        return true; // already allocated (allocated-once, not grow-only in practice --
+                      // see the header comment: n_batch is the worst case a prompt
+                      // chunk can be, so a second, wider need should not occur).
+    }
+
+    const uint32_t cap = (uint32_t) std::max<int64_t>(cparams.n_batch, 1);
+    const size_t   nbytes = (size_t) cap * n_embd * sizeof(float);
+
+    ggml_backend_dev_t device0 = ggml_backend_get_device(backend0);
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(device0);
+    if (host_buft == nullptr) {
+        LLAMA_LOG_WARN("%s: device %s has no pinned host buffer type -- falling back to the "
+                        "pageable host handoff for this context\n",
+                        __func__, ggml_backend_dev_name(device0));
+        nextn_stage_pinned_enabled = false;
+        return false;
+    }
+
+    for (int slot = 0; slot < 2; slot++) {
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, nbytes);
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate a %.1f MiB pinned host nextn stage buffer "
+                            "(slot %d, %u x %u F32) -- falling back to the pageable host handoff "
+                            "for this context\n",
+                            __func__, nbytes / (1024.0 * 1024.0), slot, cap, n_embd);
+            nextn_stage_pinned_buf[0].reset();
+            nextn_stage_pinned_buf[1].reset();
+            nextn_stage_pinned_enabled = false;
+            return false;
+        }
+        nextn_stage_pinned_buf[slot].reset(buf);
+        nextn_stage_pinned_data[slot] = (float *) ggml_backend_buffer_get_base(buf);
+
+        if (nextn_stage_event[slot] == nullptr) {
+            nextn_stage_event[slot] = ggml_backend_event_new(device0);
+            if (nextn_stage_event[slot] == nullptr) {
+                // No event support on this device -- resolve_pending()'s
+                // ggml_backend_event_synchronize() would be a no-op, silently
+                // NOT waiting for the copy. Unsafe to proceed with the pinned
+                // path in that case (the whole point is the event-scoped
+                // wait); fall back to pageable+full-sync instead of shipping
+                // a race.
+                LLAMA_LOG_WARN("%s: device %s has a pinned host buffer type but no event support "
+                                "-- falling back to the pageable host handoff for this context\n",
+                                __func__, ggml_backend_dev_name(device0));
+                nextn_stage_pinned_buf[0].reset();
+                nextn_stage_pinned_buf[1].reset();
+                nextn_stage_pinned_enabled = false;
+                return false;
+            }
+        }
+    }
+
+    nextn_stage_pinned_cap = cap;
+    return true;
 }
 
 const float * llama_context::get_embeddings_nextn_staged_at(int slot, uint32_t * n_tokens_out) {
@@ -1997,18 +2080,43 @@ const float * llama_context::get_embeddings_nextn_staged_at(int slot, uint32_t *
     // whatever's current" -- that guess is only correct when exactly one
     // more decode() call has happened since, which is false when resolving
     // at a flush point with no further decode() in between (a prompt that
-    // fits in one chunk, or the last pending chunk of any prompt). If the
-    // caller follows the intended pipelining pattern (issue the next
-    // llama_decode(), THEN call this for the PRIOR call's slot), that next
-    // call's GPU work is already enqueued by the time synchronize() below
-    // runs, so the wait is paid concurrently with it instead of serialized
-    // in front of it; if there is no next call (flush), this is just a
-    // normal, unhidden synchronize(), same cost as the pre-pipelining code.
+    // fits in one chunk, or the last pending chunk of any prompt).
+    //
+    // MAD-LAB (pinned-host handoff, draft-handoff-device-0912.txt): when
+    // pinned staging is active, the wait below is ggml_backend_event_
+    // synchronize() on the event recorded right after THIS slot's D2H copy
+    // was issued -- it blocks only until that specific copy has landed, NOT
+    // the whole scheduler/stream queue, so whatever GPU work the caller has
+    // ALREADY enqueued for a later chunk (the intended pipelining pattern:
+    // issue the next llama_decode(), THEN call this for the PRIOR call's
+    // slot) keeps running concurrently with this wait rather than being
+    // drained by it. This function must NOT call ctx->synchronize() /
+    // llama_synchronize() on the pinned path -- that would drain the WHOLE
+    // scheduler (both devices, every queued split) and reintroduce
+    // exactly the cost this feature exists to remove. The host-fallback
+    // path (WP_MTP_HANDOFF=host) is the one place a full synchronize() is
+    // still correct, since that path never issued anything async to begin
+    // with (pageable D2H is already synchronous, see the extraction block).
     if (n_tokens_out) {
         *n_tokens_out = 0;
     }
     if (!nextn_stage_enabled || slot < 0 || slot > 1) {
         return nullptr;
+    }
+
+    if (nextn_stage_pinned_enabled) {
+        if (nextn_stage_pinned_data[slot] == nullptr || nextn_stage_n_tokens[slot] == 0) {
+            return nullptr;
+        }
+
+        if (nextn_stage_event[slot] != nullptr) {
+            ggml_backend_event_synchronize(nextn_stage_event[slot]);
+        }
+
+        if (n_tokens_out) {
+            *n_tokens_out = nextn_stage_n_tokens[slot];
+        }
+        return nextn_stage_pinned_data[slot];
     }
 
     if (nextn_stage[slot].empty() || nextn_stage_n_tokens[slot] == 0) {
@@ -4077,21 +4185,85 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     const bool wp_pp_stats = wp_spec_prefill_stats_enabled();
                     const auto wp_pp_t0 = wp_pp_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
-                    auto & slot = nextn_stage[nextn_stage_write];
-                    const size_t need = (size_t) (offset + n_rows) * n_embd;
-                    if (slot.size() < need) {
-                        slot.resize(need);
+                    // MAD-LAB (pinned-host handoff, draft-handoff-device-0912.txt):
+                    // reach device 0's OWN simple backend/tensor for the MIRRORED
+                    // t_h_nextn via the meta accessors (device 0's mirror already
+                    // holds the full rows after the final AllReduce, same as every
+                    // other device's) and issue the D2H get directly on that simple
+                    // backend rather than through the meta wrapper -- so the event
+                    // recorded right after it is on the SAME backend/stream the copy
+                    // itself runs on. ggml-backend-meta.cpp's own event_new/
+                    // event_record are nullptr ("Not implemented"); the underlying
+                    // simple CUDA/HIP backend genuinely supports events, which is
+                    // the whole reason to reach it directly instead of going through
+                    // ggml_backend_tensor_get_async(backend_h, t_h_nextn, ...) (the
+                    // Meta wrapper's own MIRRORED dispatch, used by the unconditional
+                    // embd_nextn copy just above, which already forwards to device
+                    // 0's simple backend internally -- but gives the caller no way to
+                    // record an event on it afterward).
+                    bool wrote_pinned = false;
+                    if (nextn_stage_pinned_enabled && ggml_backend_is_meta(backend_h)) {
+                        ggml_backend_t dev0_backend = ggml_backend_meta_simple_backend(backend_h, 0);
+                        ggml_tensor  * dev0_tensor  = ggml_backend_meta_get_simple_tensor(t_h_nextn, 0);
+                        if (dev0_backend != nullptr && dev0_tensor != nullptr &&
+                                nextn_stage_pinned_ensure(dev0_backend, n_embd)) {
+                            float * dst = nextn_stage_pinned_data[nextn_stage_write] + offset*n_embd;
+                            // Genuinely async now: dst is PINNED (page-locked) host
+                            // memory (nextn_stage_pinned_ensure() allocated it via
+                            // ggml_backend_dev_host_buffer_type()), so cudaMemcpyAsync/
+                            // hipMemcpyAsync does not fall back to a synchronous copy
+                            // the way it does for pageable memory -- see
+                            // draft-handoff-device-0912.txt's "PROBLEM" section for the
+                            // root cause this directly targets.
+                            ggml_backend_tensor_get_async(dev0_backend, dev0_tensor, dst, 0, n_rows*n_embd*sizeof(float));
+
+                            // Record IMMEDIATELY after issuing the copy, on the same
+                            // backend -- this is what lets resolve_pending() (one chunk
+                            // later) wait for exactly this copy via
+                            // ggml_backend_event_synchronize() without draining the
+                            // whole scheduler. Chunks spanning multiple ubatches
+                            // re-record the SAME event on the SAME stream each ubatch;
+                            // waiting on the last recording implies every earlier one on
+                            // that stream already completed too (CUDA/HIP streams
+                            // execute in issue order), so the final wait still covers
+                            // the whole chunk correctly.
+                            ggml_backend_event_record(nextn_stage_event[nextn_stage_write], dev0_backend);
+                            wrote_pinned = true;
+                        }
                     }
-                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, slot.data() + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
+
+                    if (!wrote_pinned) {
+                        // Host fallback: WP_MTP_HANDOFF=host, or the pinned
+                        // allocation/meta lookup declined for this build -- pageable
+                        // std::vector, read back with a full ctx->synchronize() at
+                        // get_embeddings_nextn_staged_at() -- byte-for-byte the
+                        // original, pre-pinned-handoff behavior, kept as the A/B
+                        // control.
+                        auto & slot = nextn_stage[nextn_stage_write];
+                        const size_t need = (size_t) (offset + n_rows) * n_embd;
+                        if (slot.size() < need) {
+                            slot.resize(need);
+                        }
+                        ggml_backend_tensor_get_async(backend_h, t_h_nextn, slot.data() + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
+                    }
                     nextn_stage_n_tokens[nextn_stage_write] = (uint32_t) std::max<int64_t>(nextn_stage_n_tokens[nextn_stage_write], offset + n_rows);
 
                     if (wp_pp_stats) {
                         const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wp_pp_t0).count();
                         nextn_stage_copy_ns += ns;
-                        LLAMA_LOG_INFO("%s: nextn stage write chunk_id=%" PRIu64 " slot=%d +%" PRId64 " rows -> cumulative=%u (issue took %.3f ms, call total so far %.3f ms)\n",
+                        // Requirement (3): one line per chunk, slot + rows + which
+                        // path actually stored the data this call. `ns` here is just
+                        // the ISSUE/enqueue cost (this bucket is d4_extract, folded in
+                        // by tools/server/server-context.cpp) -- with the pinned path
+                        // this should now read a few ms, not the multi-second
+                        // drain the pageable path pays.
+                        LLAMA_LOG_INFO("%s: nextn stage write chunk_id=%" PRIu64 " slot=%d +%" PRId64 " rows -> cumulative=%u "
+                                "path=%s (issue took %.3f ms, call total so far %.3f ms)\n",
                                 __func__, nextn_stage_chunk_id, nextn_stage_write, n_rows,
-                                nextn_stage_n_tokens[nextn_stage_write], ns / 1e6, nextn_stage_copy_ns / 1e6);
+                                nextn_stage_n_tokens[nextn_stage_write],
+                                wrote_pinned ? "pinned" : "host",
+                                ns / 1e6, nextn_stage_copy_ns / 1e6);
                     }
                 }
             }
@@ -4571,8 +4743,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // still emitted all n_outputs rows into a 32-row buffer and decode() aborted
     // on `(dst_row + n_copy)*n_vocab <= logits.size`. The pooling exemption stays
     // because cap_lm_head_rows() exempts pooling graphs too.
+    //
+    // MAD-LAB: DFlash2 exports (model.dflash_selector_hidden != nullptr) are
+    // exempted here too, mirroring the same predicate the graph uses in
+    // src/models/dflash.cpp's DFlash decoder to skip cap_lm_head_rows() --
+    // the selector head needs full per-token logits, so the output buffer
+    // must be sized for n_outputs_max rows, not the 32-row cap.
     const bool cap_logit_rows =
         llm_arch_caps_lm_head_rows(model.arch) &&
+        !model.dflash_selector_hidden &&
         !(cparams.embeddings &&
           (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
            cparams.pooling_type == LLAMA_POOLING_TYPE_RANK));
@@ -5242,25 +5421,84 @@ public:
         const int64_t t_flush_0 = ggml_time_us();
         size_t n_small = 0, n_large = 0, b_small = 0, b_large = 0;
         int64_t us_small = 0, us_large = 0;
+
+        // MAD-LAB instrumentation (wp-checkpoint-slow-capture-0915, print-only,
+        // no new syncs / no behaviour change): per-device byte/ms breakdown, so
+        // a slow flush (e.g. a 100+ s "tgt capture") can be attributed to a
+        // specific device instead of just a MiB/s figure that blends whatever
+        // devices this tensor set spans. Keyed by ggml_backend_buffer_name()
+        // (e.g. "ROCm0"/"ROCm1"), which is a cheap string lookup -- no new
+        // syncs or device queries. Also tracks the single slowest copy call,
+        // and prints immediately (before the loop finishes) if any one copy
+        // exceeds 1000 ms, so the journal shows WHERE the time went even if
+        // the process aborts right after (e.g. from a TP allreduce watchdog
+        // trap triggered by whatever is stalling this flush).
+        struct dev_bucket { size_t n = 0, bytes = 0; int64_t us = 0; };
+        std::map<std::string, dev_bucket> dev_buckets;
+        size_t      max_copy_size = 0;
+        int64_t     max_copy_us   = 0;
+        std::string max_copy_dev;
+        std::string max_copy_tensor;
+
         for (const auto & winfo : winfos) {
+            const char * dev_name = winfo.tensor->buffer ? ggml_backend_buffer_name(winfo.tensor->buffer) : "?";
+
             const int64_t t0 = ggml_time_us();
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
             const int64_t dt = ggml_time_us() - t0;
+
             if (winfo.size < (1u << 20)) {
                 ++n_small; b_small += winfo.size; us_small += dt;
             } else {
                 ++n_large; b_large += winfo.size; us_large += dt;
             }
+
+            auto & b = dev_buckets[dev_name];
+            ++b.n; b.bytes += winfo.size; b.us += dt;
+
+            if (dt > max_copy_us) {
+                max_copy_us     = dt;
+                max_copy_size   = winfo.size;
+                max_copy_dev    = dev_name;
+                max_copy_tensor = winfo.tensor->name;
+            }
+
+            if (dt >= 1000 * 1000) {
+                LLAMA_LOG_WARN("%s: SLOW COPY mid-flush: tensor='%s' dev=%s bytes=%zu took %.2f ms"
+                               " (flush not yet complete -- %zu/%zu copies done)\n",
+                               __func__, winfo.tensor->name, dev_name, winfo.size, dt / 1000.0,
+                               n_small + n_large, winfos.size());
+            }
         }
+
         if (!winfos.empty()) {
             const auto rate = [](size_t bytes, int64_t us) {
                 return us > 0 ? (double) bytes / (1024.0 * 1024.0) / (us / 1e6) : 0.0;
             };
-            LLAMA_LOG_INFO("%s: state flush: %zu copies in %.2f ms | <1MiB: %zu copies, %.2f MiB, %.2f ms, %.0f MiB/s"
-                           " | >=1MiB: %zu copies, %.2f MiB, %.2f ms, %.0f MiB/s\n",
-                           __func__, winfos.size(), (ggml_time_us() - t_flush_0) / 1000.0,
+            const int64_t total_us = ggml_time_us() - t_flush_0;
+
+            // Use WARN, not INFO: this fork's common_log_default_callback maps
+            // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE (see common/log.cpp
+            // common_log_get_verbosity()), which is above the default
+            // verbosity threshold (LOG_LEVEL_INFO) -- an LLAMA_LOG_INFO here
+            // would be silently swallowed at default verbosity and never
+            // reach the router journal. WARN always passes the default
+            // threshold, matching how server-context.cpp's own
+            // "checkpoint timing" (SLT_INF) / "erasing old context
+            // checkpoint" (SLT_WRN) lines already do reach it.
+            LLAMA_LOG_WARN("%s: state flush: %zu copies in %.2f ms | <1MiB: %zu copies, %.2f MiB, %.2f ms, %.0f MiB/s"
+                           " | >=1MiB: %zu copies, %.2f MiB, %.2f ms, %.0f MiB/s | slowest copy: tensor='%s' dev=%s"
+                           " bytes=%zu %.2f ms\n",
+                           __func__, winfos.size(), total_us / 1000.0,
                            n_small, b_small / 1048576.0, us_small / 1000.0, rate(b_small, us_small),
-                           n_large, b_large / 1048576.0, us_large / 1000.0, rate(b_large, us_large));
+                           n_large, b_large / 1048576.0, us_large / 1000.0, rate(b_large, us_large),
+                           max_copy_tensor.c_str(), max_copy_dev.c_str(), max_copy_size, max_copy_us / 1000.0);
+
+            for (const auto & kv : dev_buckets) {
+                LLAMA_LOG_WARN("%s: state flush by device: dev=%s copies=%zu bytes=%zu (%.3f MiB) %.2f ms (%.0f MiB/s)\n",
+                               __func__, kv.first.c_str(), kv.second.n, kv.second.bytes,
+                               kv.second.bytes / 1048576.0, kv.second.us / 1000.0, rate(kv.second.bytes, kv.second.us));
+            }
         }
     }
 

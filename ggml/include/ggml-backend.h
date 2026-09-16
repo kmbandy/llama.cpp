@@ -461,6 +461,46 @@ extern "C" {
     // If `tensor->buffer` is not a meta buffer this just does `tensor->op_params[i] = v`.
     GGML_API void ggml_backend_meta_buffer_set_op_param_i32(struct ggml_tensor * tensor, int i, int32_t v);
 
+    // MAD-LAB (pinned-host MTP draft handoff -- see llama-context.cpp's
+    // nextn_stage_pinned* members and draft-handoff-device-0912.txt): narrow
+    // public accessors for the per-physical-device pieces behind a meta
+    // backend/tensor. These already had external linkage in
+    // ggml-backend-meta.cpp (used internally there and, for the first two,
+    // by llama-model.cpp) but were never declared here; declaring them lets
+    // a caller reach device 0's own simple backend/tensor for a MIRRORED
+    // activation tensor (every device already holds the full rows after the
+    // final AllReduce) directly -- bypassing the Meta wrapper, which has no
+    // event support (event_new/event_record are nullptr, "Not
+    // implemented"), so a real CUDA/HIP event can be recorded on the exact
+    // backend/stream the D2H copy runs on.
+    GGML_API bool           ggml_backend_is_meta(ggml_backend_t backend);
+    GGML_API bool           ggml_backend_buffer_is_meta(ggml_backend_buffer_t buffer);
+    GGML_API size_t         ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
+    GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // Returns the per-device "simple" clone of `tensor` (index in [0, ggml_backend_meta_n_backends)),
+    // or nullptr if that clone has not been materialized for the tensor yet (e.g. queried
+    // before the owning graph has been built/allocated at least once).
+    GGML_API struct ggml_tensor * ggml_backend_meta_get_simple_tensor(const struct ggml_tensor * tensor, size_t index);
+
+    // MAD-LAB (WP_DFLASH_BORROW_META, dflash-borrow-meta-0912.txt): given a tensor
+    // that is pre-allocated in a Meta buffer, find the per-device index (suitable
+    // for ggml_backend_meta_get_simple_tensor()) whose simple buffer's underlying
+    // device is `dev`, or -1 if no device in the split matches or `tensor->buffer`
+    // is not a meta buffer.
+    //
+    // This is a device *lookup*, not a correctness check: for a MIRRORED tensor
+    // (e.g. token_embd.weight, which the split-state rules in llama-model.cpp
+    // never assign a per-tensor pattern to and which therefore falls to the
+    // MIRRORED catch-all) every index holds the full tensor, so the index found
+    // here is directly usable as a zero-copy stand-in for the meta tensor on that
+    // device's own scheduler. For a tensor split along a real axis (e.g.
+    // output.weight, split AXIS_1 == the vocab dimension for every non-DSV4 arch --
+    // see the `pattern_output_weight` branch in llama_meta_device_get_split_state())
+    // the tensor returned by ggml_backend_meta_get_simple_tensor() at the found
+    // index is only that device's SHARD, not the full tensor -- callers MUST NOT
+    // use this to bypass a split tensor's meta dispatch, only a mirrored one.
+    GGML_API int ggml_backend_meta_find_device_index_for_tensor(const struct ggml_tensor * tensor, ggml_backend_dev_t dev);
+
     //
     // Utils
     //

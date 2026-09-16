@@ -1244,6 +1244,18 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+#ifdef USE_CUDA_GRAPH
+// vram-budget: per-device HIP-graph-exec accounting lives in
+// ggml_cuda_wp_graph_counters (ggml-cuda.cu), which is not visible from this
+// header (common.cuh is included before that struct is declared). These
+// accessors keep the counters in one place while letting ggml_cuda_graph's
+// destructor and ggml_backend_cuda_context::cuda_graph()/ggml_cuda_graph_retire()
+// (both below) update them. Defined in ggml-cuda.cu.
+void ggml_cuda_graph_wp_live_inc(int device);
+void ggml_cuda_graph_wp_live_dec(int device);
+void ggml_cuda_graph_wp_exec_bytes_sub(int device, size_t bytes);
+#endif
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1254,8 +1266,32 @@ struct ggml_cuda_graph {
         // the only paths that erase()/destroy a cache entry. This destructor
         // itself performs NO synchronization; it is only safe to run here
         // because the caller already guaranteed the event fired (or synced).
+        // vram-budget: return this exec's tracked share of the per-device
+        // budget before touching the runtime. exec_bytes is zeroed by the
+        // HIP recapture destroy site (ggml-cuda.cu) after it already
+        // subtracted, so this is a no-op there (no double subtraction).
+        if (exec_bytes != 0) {
+            ggml_cuda_graph_wp_exec_bytes_sub(device, exec_bytes);
+            exec_bytes = 0;
+        }
         if (instance != nullptr) {
+            // vram-budget: does the runtime return the exec's device memory on destroy?
+            size_t fb = 0, fa = 0, tot = 0; int dev = -1;
+            (void) cudaGetDevice(&dev);
+            (void) cudaMemGetInfo(&fb, &tot);
             CUDA_CHECK(cudaGraphExecDestroy(instance));
+            (void) cudaMemGetInfo(&fa, &tot);
+            if (ggml_cuda_wp_vram_log_enabled()) {
+                fprintf(stderr, "wp vram-budget: graph_exec_destroy freed %.1f MiB on device %d (free after %.1f MiB)\n",
+                        (fa > fb ? fa - fb : 0) / 1048576.0, dev, fa / 1048576.0);
+            }
+        } else {
+            // vram-budget: entry retired with no exec -- nothing to return here
+            if (ggml_cuda_wp_vram_log_enabled()) {
+                int dev = -1;
+                (void) cudaGetDevice(&dev);
+                fprintf(stderr, "wp vram-budget: graph_dtor no-instance on device %d (graph=%s)\n", dev, graph != nullptr ? "yes" : "null");
+            }
         }
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
@@ -1271,6 +1307,15 @@ struct ggml_cuda_graph {
     // from "a replay may still be running on the device" without a host sync
     // on the common (query-only) path. nullptr until the first launch.
     cudaEvent_t last_launch_event = nullptr;
+    // vram-budget: device this graph belongs to (set once, at cache insert,
+    // by ggml_backend_cuda_context::cuda_graph()) and the measured
+    // hipGraphInstantiate delta for its exec (set at the instantiate site in
+    // ggml-cuda.cu). Together these let the destructor return this graph's
+    // share of ggml_cuda_wp_graph_counters::exec_bytes_live without needing
+    // cudaGetDevice() (unreliable once the graph outlives its capture site,
+    // e.g. in the retired list) or a device parameter threaded through.
+    int device = -1;
+    size_t exec_bytes = 0;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     std::vector<int> node_types;
@@ -1295,6 +1340,19 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+
+    // wp hip-graphs churn: A/B/A flip detection (always-on, no budget cost).
+    // last_recap_data0 is the data pointer of the first differing node at the
+    // most recent recapture; recap_prev2_data0 is that same value from two
+    // recaptures back. If the NEW pointer at this recapture equals
+    // recap_prev2_data0, the address flipped back to a value seen two
+    // recaptures ago (A->B->A), which is what a caller-side ping-pong buffer
+    // swap looks like. recap_flips is the per-entry count of that; see
+    // ggml_cuda_wp_graph_counters::recap_flip (ggml-cuda.cu) for the
+    // per-device aggregate.
+    const void * last_recap_data0 = nullptr;
+    const void * recap_prev2_data0 = nullptr;
+    uint32_t     recap_flips = 0;
 
     bool is_enabled() const {
         const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1520,6 +1578,21 @@ struct ggml_backend_cuda_context {
         if (g == nullptr) {
             return;
         }
+        // live_graphs is cache-membership accounting (in cuda_graphs or not),
+        // not VRAM accounting -- decrement it here, once per erase, regardless
+        // of whether the exec's memory comes back now or later via the
+        // retired list. retire_fn (this function) is invoked exactly once per
+        // erase()'d entry from every eviction path (TTL, LRU, and the
+        // vram-budget eviction below), so one call site is enough.
+        ggml_cuda_graph_wp_live_dec(device);
+        // vram-budget: charge the eviction now, not at destruction. A deferred
+        // entry (replay still in flight) would otherwise keep its bytes in
+        // exec_bytes_live and the budget loop would evict the whole cache
+        // chasing a total that cannot drop until the event fires.
+        if (g->exec_bytes != 0) {
+            ggml_cuda_graph_wp_exec_bytes_sub(device, g->exec_bytes);
+            g->exec_bytes = 0;
+        }
         if (ggml_cuda_graph_event_done(g->last_launch_event)) {
             ++retired_freed; // g destructs here, replay already finished
             return;
@@ -1626,6 +1699,8 @@ struct ggml_backend_cuda_context {
             auto retire_fn = [this](std::unique_ptr<ggml_cuda_graph> g) { ggml_cuda_graph_retire(std::move(g)); };
             const size_t n_lru = ggml_cuda_graph_cache_evict_lru(cuda_graphs, cache_pol.cap, first_node_ptr, retire_fn);
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it->second->device = device; // vram-budget: needed by ~ggml_cuda_graph() / retire()
+            ggml_cuda_graph_wp_live_inc(device);
             it->second->capture_reason = ttl_evicted ? ggml_cuda_graph::CAPTURE_TTL :
                 n_lru != 0 ? ggml_cuda_graph::CAPTURE_LRU : ggml_cuda_graph::CAPTURE_NEWKEY;
         } else if (cache_pol.track_ttl) {

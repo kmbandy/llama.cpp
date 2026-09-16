@@ -3007,3 +3007,36 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
 }
+
+// MAD-LAB: public wrapper for the static ggml_backend_meta_buffer_simple_tensor()
+// above -- see its declaration comment in ggml-backend.h. Kept as a thin wrapper
+// rather than un-static'ing the original so the many internal call sites (which
+// take/return const/non-const combinations this public signature does not need
+// to distinguish) are untouched.
+struct ggml_tensor * ggml_backend_meta_get_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
+    return ggml_backend_meta_buffer_simple_tensor(tensor, index);
+}
+
+// MAD-LAB (WP_DFLASH_BORROW_META, dflash-borrow-meta-0912.txt): see the declaration
+// comment in ggml-backend.h -- this is a device lookup only, it says nothing about
+// whether the found index's simple tensor is the FULL tensor (MIRRORED) or a SHARD
+// (any real split axis). Callers are responsible for knowing which case applies to
+// the tensor they're calling this on.
+int ggml_backend_meta_find_device_index_for_tensor(const struct ggml_tensor * tensor, ggml_backend_dev_t dev) {
+    if (tensor == nullptr || tensor->buffer == nullptr || dev == nullptr ||
+            !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return -1;
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    for (size_t i = 0; i < n_bufs; i++) {
+        ggml_backend_buffer_t simple_buf = ggml_backend_meta_buffer_simple_buffer(tensor->buffer, i);
+        if (simple_buf == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(simple_buf);
+        if (buft != nullptr && ggml_backend_buft_get_device(buft) == dev) {
+            return (int) i;
+        }
+    }
+    return -1;
+}

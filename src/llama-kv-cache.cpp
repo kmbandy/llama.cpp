@@ -1432,6 +1432,37 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     assert(res.s1 >= res.s0);
 
+    // MAD-LAB (WP_MTP_DRAFT_SWA_DEBUG): diagnostic for the draft-mtp SWA ring's
+    // find_slot() resolution. Gated on warn_first_swa_evict (true only for the
+    // WP_MTP_DRAFT_SWA cache -- see the ctor doc) plus a separately-cached
+    // WP_MTP_DRAFT_SWA_DEBUG=1 check, so every other cache in the tree still
+    // pays just the one bool compare from warn_first_swa_evict, and a non-debug
+    // draft-mtp run pays one more bool compare. Logs, once per find_slot() call
+    // (i.e. once per draft-mtp catch-up sub-batch or verify decode), each
+    // resolved seq's pos_min/pos_max/used-cell-count plus the n_kv width this
+    // ubatch resolved into -- so an acceptance collapse can be correlated
+    // against whether the ring's window bookkeeping is actually sane at that
+    // step, per mtp-swa-sliding-0912.txt task item (b).
+    if (warn_first_swa_evict) {
+        static const bool debug_ring = [] {
+            const char * env = std::getenv("WP_MTP_DRAFT_SWA_DEBUG");
+            return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+        }();
+
+        if (debug_ring) {
+            const uint32_t n_kv_resolved = get_n_kv(res);
+
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                const auto   seq_id = ubatch.seq_id_unq[s];
+                const auto & cells  = v_cells[seq_to_stream[seq_id]];
+
+                LLAMA_LOG_INFO("%s: [WP_MTP_DRAFT_SWA_DEBUG] seq=%d pos_min=%d pos_max=%d used=%u n_kv=%u n_swa=%u\n",
+                        __func__, (int) seq_id, cells.seq_pos_min(seq_id), cells.seq_pos_max(seq_id),
+                        cells.get_used(), n_kv_resolved, n_swa);
+            }
+        }
+    }
+
     return res;
 }
 

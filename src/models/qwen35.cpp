@@ -1,5 +1,9 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"
+
+#include <algorithm>
+#include <cstdlib>
 
 #include "ggml-ml8.h"
 
@@ -809,6 +813,24 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+
+    static const bool wp_kv_only = [] {
+        const char * env = std::getenv("WP_MTP_PREFILL_KV_ONLY");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (wp_kv_only && n_outputs == 0 && n_tokens > 32 && !cparams.embeddings &&
+            cparams.embeddings_nextn_masked &&
+            std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; }) &&
+            !inp_attn->is_paged && !inp_attn->self_k_rot && !inp_attn->self_v_rot &&
+            inp_attn->mctx->get_k(ctx0, il)->type == GGML_TYPE_F16 &&
+            inp_attn->mctx->get_v(ctx0, il)->type == GGML_TYPE_F16) {
+        // Catch-up needs K/V; its next hidden input comes from the target.
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
