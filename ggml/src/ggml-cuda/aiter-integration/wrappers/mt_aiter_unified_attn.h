@@ -245,7 +245,24 @@ struct mt_aiter_uattn_args_t {
     const uint8_t *centroids_v;
     // Scalars
     float          scale;          // attention softmax scale (typically 1/sqrt(head_size))
-    int32_t        num_seqs;
+    int32_t        num_seqs;       // STATIC width of block_tables/seq_lens/query_start_len
+                                    // (the cache's n_seq_max) -- use for anything that INDEXES
+                                    // those arrays, grid sizing, or ALL_DECODE/reduce-phase math.
+    // MAD-LAB (draft-KV-paged num_seqs fix, 2026-09-12): the REAL number of
+    // live sequences in THIS call (0 = unknown -- caller falls back to
+    // num_seqs). block_tables/seq_lens/query_start_len are always allocated
+    // at num_seqs (n_seq_max) width and are seq-id-indexed (NOT compacted --
+    // a single live sequence can sit at any slot, not necessarily slot 0), so
+    // num_seqs_active must NEVER be used as an array-index bound. It exists
+    // ONLY for the avg_q_len / 2D-vs-3D / large-prefill dispatch HEURISTIC
+    // (mt_aiter_uattn_avg_q_len / mt_aiter_uattn_should_use_2d), which uses
+    // num_seqs purely as a divisor/scale factor -- there, using the static
+    // n_seq_max instead of the real live count deflates avg_q_len for any
+    // call using fewer than n_seq_max sequences (e.g. a single-sequence
+    // draft-mtp catch-up ubatch under a paged cache with n_seq_max > 1) and
+    // can miss the large-prefill / fp8-predequant cutover it should take.
+    // See draft-kv-paged-0912.txt "MEASURED + REVISION (part 2)".
+    int32_t        num_seqs_active;
     int32_t        num_q_tokens;   // total q tokens across all seqs (= sum of q_lens). For pure decode == num_seqs.
     int64_t        block_table_stride;
     // MAD-2026-09-12 predequant-scratch (predequant-scratch-0912.txt):

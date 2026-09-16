@@ -1,4 +1,5 @@
 #include "allreduce.cuh"
+#include "wp-node-trace.cuh"
 
 #include <vector>
 
@@ -23,6 +24,7 @@
 #if defined(__linux__)
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <signal.h>
 #endif // defined(__linux__)
 
 // ---------------------------------------------------------------------------
@@ -141,6 +143,50 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
 // ---------------------------------------------------------------------------
+// Spin watchdog (GGML_CUDA_AR_SPIN_BUDGET_S).
+//
+// The phase-2 arrival spin below is otherwise unbounded (see the note at the
+// loop). One record per device, in host-coherent pinned memory (same
+// allocation pattern as `arrival` / `host_buf`) so the host can read it
+// without a device round-trip after a trapped kernel is detected via a
+// failed cudaEventSynchronize/cudaStreamSynchronize. Zeroed at pipeline
+// init; a device only ever writes it once, immediately before trapping.
+// ---------------------------------------------------------------------------
+struct ggml_cuda_ar_spin_debug {
+    int                fired;
+    int                rank;
+    int                slot;
+    int                block;
+    int                expected_token;
+    int                observed_token;
+    unsigned long long elapsed_cycles;
+};
+
+// Fill the debug record for this block and trap. Called only once the spin
+// budget has been exceeded -- everything here runs at most once per kernel
+// launch, so it doesn't need to be cheap.
+static __device__ __forceinline__ void ggml_cuda_ar_spin_trap(
+        volatile ggml_cuda_ar_spin_debug * dbg,
+        int                                rank,
+        int                                slot,
+        int                                block,
+        int                                expected_token,
+        int                                observed_token,
+        unsigned long long                elapsed_cycles) {
+    if (dbg != nullptr) {
+        dbg->rank           = rank;
+        dbg->slot           = slot;
+        dbg->block          = block;
+        dbg->expected_token = expected_token;
+        dbg->observed_token = observed_token;
+        dbg->elapsed_cycles = elapsed_cycles;
+        dbg->fired          = 1;
+    }
+    __threadfence_system();
+    __builtin_trap();
+}
+
+// ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
 //
 // Both GPUs run this kernel simultaneously on independent streams.  sendbuf
@@ -179,7 +225,11 @@ static __global__ void ggml_cuda_ar_kernel(
         int                         count,
         int *                       arrival_mine,
         int *                       arrival_other,
-        int                         token) {
+        int                         token,
+        int                         rank,
+        int                         slot,
+        volatile ggml_cuda_ar_spin_debug * dbg,
+        uint64_t                    budget_cycles) {
 
     // Vector unit for the wire type, sized to the arch's widest single-instruction
     // copy (16 B on Volta+).  Each phase-1 iter writes one vector to host memory;
@@ -234,14 +284,43 @@ static __global__ void ggml_cuda_ar_kernel(
         ggml_cuda_ar_signal_set(my_slot, token);
         __threadfence_system(); // make our signal visible system-wide
 
-        // Deliberately unbounded.  Bailing out after N iterations would let the
-        // kernel proceed to phase 3 and read a stale/partial host_other, i.e.
-        // silently wrong numerics; a hang is at least diagnosable.  The
-        // fail-safe for this pipeline is at init time (nullptr -> generic
-        // AllReduce), not mid-kernel.  On ROCm a genuine deadlock here trips
-        // the HSA queue watchdog and surfaces as a GPU fault.
+        // Bounded by budget_cycles (GGML_CUDA_AR_SPIN_BUDGET_S; 0 = unbounded,
+        // matching the original always-spin behaviour). Unlike bailing out
+        // and falling through to phase 3 -- which would read a stale/partial
+        // host_other, i.e. silently wrong numerics -- exceeding the budget
+        // traps the kernel outright, so there is no silent-corruption risk;
+        // it only turns an undiagnosable hang into a reported one. On ROCm an
+        // unbounded (budget_cycles == 0) deadlock here still trips the HSA
+        // queue watchdog and surfaces as a GPU fault, as before.
+        int iters = 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+        // wall_clock64() is HIP's constant-rate device timestamp (s_memrealtime
+        // on GCN/RDNA2, s_sendmsg_rtn REALTIME on RDNA3/4 where s_memrealtime
+        // does not exist); its rate is hipDeviceAttributeWallClockRate (kHz),
+        // queried per device on the host, so budget_cycles is already in this
+        // device's ticks. Read once at loop entry and every 1024 iterations.
+        const unsigned long long t_start = (budget_cycles != 0) ? wall_clock64() : 0;
+#endif
         while (ggml_cuda_ar_signal_get(other_slot) != token) {
             ggml_cuda_ar_spin_pause();
+            if (budget_cycles != 0) {
+                ++iters;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+                if ((iters & 1023) == 0) {
+                    const unsigned long long elapsed = wall_clock64() - t_start;
+                    if (elapsed > budget_cycles) {
+                        ggml_cuda_ar_spin_trap(dbg, rank, slot, bid, token,
+                                               ggml_cuda_ar_signal_get(other_slot), elapsed);
+                    }
+                }
+#else
+                // No constant-rate device clock outside HIP -- flat iteration cap.
+                if (iters >= 2000000000) {
+                    ggml_cuda_ar_spin_trap(dbg, rank, slot, bid, token,
+                                           ggml_cuda_ar_signal_get(other_slot), 0);
+                }
+#endif // defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+            }
         }
     }
 
@@ -804,6 +883,20 @@ struct ggml_cuda_ar_pipeline {
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
 
+    // Spin watchdog: one debug record per device, host-coherent pinned
+    // memory (see ggml_cuda_ar_spin_debug). spin_budget_cycles is the
+    // per-block phase-2 spin budget threaded into the chunked kernel launch;
+    // 0 = unbounded. Set from GGML_CUDA_AR_SPIN_BUDGET_S at init.
+    ggml_cuda_ar_host_mapping spin_dbg[GGML_CUDA_MAX_DEVICES];
+    uint64_t                  spin_budget_cycles[GGML_CUDA_MAX_DEVICES] = {};
+    int                       spin_clock_khz[GGML_CUDA_MAX_DEVICES]     = {};
+    // Host-side "already printed this device's spin_dbg record" latch, set
+    // by ggml_cuda_ar_acquire_slot's pre-sync check below. Distinct from
+    // ggml_cuda_ar_spin_debug::fired (device-visible) -- this one lives only
+    // on the host and is never written by device code, so setting it can't
+    // race the kernel's one-shot write to `fired`.
+    bool                      spin_dbg_reported[GGML_CUDA_MAX_DEVICES] = {};
+
     // Duplex transport state (unused when transport == COPY).
     ggml_cuda_ar_transport    transport;
     size_t                    dx_bytes;      // bytes per slot
@@ -827,12 +920,70 @@ struct ggml_cuda_ar_pipeline {
     std::atomic<size_t>   wd_last_nbytes{0};     // payload size of the most recent dx begin()
     std::atomic<int>      wd_dx_phase[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_DX_SLOTS] = {}; // 0 idle,1 begun,2 sent,3 recvd,4 ended
     std::atomic<uint64_t> wd_dx_slot_call[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_DX_SLOTS] = {}; // dx_call occupying the slot
+    // Chunked-kernel pool bookkeeping, indexed [device][pool slot]: the call
+    // index (== arrival token, see ggml_cuda_ar_acquire_slot) whose kernel was
+    // last launched into that device/slot, and the token it wrote/expects.
+    // launched_call > 0 doubles as "this slot has been recorded at least once".
+    std::atomic<int64_t>  wd_pool_call[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE] = {};
+    std::atomic<int32_t>  wd_pool_token[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE] = {};
+    // Element count of the most recently launched chunked-kernel call (any
+    // device/rank) -- for ggml_cuda_ar_dump_state's "last launched count".
+    std::atomic<int64_t>  wd_last_launch_count{0};
+    // Host-blocking-call marker: set immediately before, cleared immediately
+    // after, every cudaEventSynchronize/cudaStreamSynchronize/
+    // cudaDeviceSynchronize in this file, so the watchdog can report exactly
+    // where the main thread is stuck. wd_host_wait holds a short literal (no
+    // allocation) or nullptr when nothing is host-blocked.
+    std::atomic<const char *> wd_host_wait{nullptr};
+    std::atomic<int>          wd_host_wait_dev{-1};
+    std::atomic<int>          wd_host_wait_slot{-1};
     std::thread            wd_thread;
     std::atomic<bool>      wd_stop{false};
     uint64_t                wd_seconds = 0;      // 0 = disabled
     bool                     wd_abort   = false;   // GGML_CUDA_AR_WATCHDOG_ACTION=abort
 };
 
+
+// ---------------------------------------------------------------------------
+// Registry of live pipelines, for ggml_cuda_ar_dump_state (defined further
+// below, after ggml_cuda_ar_watchdog_phase_name). A process normally owns
+// exactly one internal-AllReduce pipeline (one TP group), so a small fixed
+// slot table avoids a dynamic container/allocator in a path that must also
+// run from a SIGABRT handler. ggml_cuda_ar_pipeline_init registers;
+// ggml_cuda_ar_pipeline_free deregisters.
+// ---------------------------------------------------------------------------
+static constexpr int GGML_CUDA_AR_MAX_PIPELINES = 8;
+static std::atomic<ggml_cuda_ar_pipeline *> g_ar_pipeline_registry[GGML_CUDA_AR_MAX_PIPELINES] = {};
+
+static void ggml_cuda_ar_registry_add(ggml_cuda_ar_pipeline * p) {
+    for (int i = 0; i < GGML_CUDA_AR_MAX_PIPELINES; ++i) {
+        ggml_cuda_ar_pipeline * expected = nullptr;
+        if (g_ar_pipeline_registry[i].compare_exchange_strong(expected, p)) {
+            return;
+        }
+    }
+    // Registry full -- diagnostics-only, so drop silently rather than fail
+    // pipeline init over it.
+}
+
+static void ggml_cuda_ar_registry_remove(ggml_cuda_ar_pipeline * p) {
+    for (int i = 0; i < GGML_CUDA_AR_MAX_PIPELINES; ++i) {
+        ggml_cuda_ar_pipeline * expected = p;
+        g_ar_pipeline_registry[i].compare_exchange_strong(expected, nullptr);
+    }
+}
+
+// Raw stderr write, usable from a SIGABRT handler: write(2) of a
+// pre-formatted (snprintf'd) buffer, no fprintf/iostreams (those buffer and
+// lock internally and are not async-signal-safe).
+static void ggml_cuda_ar_dump_write(const char * buf, size_t len) {
+#if defined(__linux__)
+    const ssize_t rc = write(STDERR_FILENO, buf, len);
+    (void) rc; // best-effort diagnostic write; nothing sane to do on failure
+#else
+    fwrite(buf, 1, len, stderr);
+#endif // defined(__linux__)
+}
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
@@ -853,10 +1004,40 @@ static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) 
     return end != value ? (uint64_t) parsed : default_value;
 }
 
+static double ggml_cuda_ar_env_f64(const char * name, double default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const double parsed = strtod(value, &end);
+    return end != value ? parsed : default_value;
+}
+
 struct ggml_cuda_ar_slot_info {
     int slot;
     int token;
 };
+
+// Print the per-device spin-debug record (see ggml_cuda_ar_spin_debug).
+// spin_dbg[i].host is host-coherent pinned memory, so this is a plain host
+// read -- no device sync needed, which matters since this is called right
+// after a host-blocking wait has already failed. fired == 0 just means the
+// spin watchdog never tripped on that device (the normal case); still
+// printed so a caller can tell "checked, didn't fire" from "never checked".
+static void ggml_cuda_ar_spin_report(ggml_cuda_ar_pipeline * p) {
+    for (int i = 0; i < p->n_devices; ++i) {
+        if (!p->spin_dbg[i].host) {
+            continue;
+        }
+        const auto * dbg = reinterpret_cast<const ggml_cuda_ar_spin_debug *>(p->spin_dbg[i].host);
+        const double elapsed_ms = p->spin_clock_khz[i] > 0 ? (double) dbg->elapsed_cycles / (double) p->spin_clock_khz[i] : 0.0;
+        fprintf(stderr,
+            "wp ar-spin: dev=%d fired=%d rank=%d slot=%d block=%d expected=%d observed=%d elapsed_ms=%.1f\n",
+            i, dbg->fired, dbg->rank, dbg->slot, dbg->block, dbg->expected_token, dbg->observed_token, elapsed_ms);
+    }
+}
 
 // Cheap "we're alive" marker for the stall watchdog: a relaxed store of an
 // already-cached value, no clock read and no syscall.  Called from the
@@ -879,7 +1060,42 @@ static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * 
     if (pool_lapped) {
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+
+            // Proactive check, BEFORE the blocking sync below: spin_dbg[i]
+            // is already-coherent host memory (see ggml_cuda_ar_spin_debug),
+            // so this is a plain host read -- no device sync. If the kernel
+            // already trapped, report it right now rather than waiting for
+            // the sync below to fail: on ROCm, the async-exception-handler
+            // thread can abort() the whole process before this thread
+            // returns from cudaEventSynchronize, which would otherwise lose
+            // the report entirely (see ggml_cuda_ar_spin_trap). Guarded by
+            // the host-side spin_dbg_reported latch (not the device-visible
+            // record) so this fires at most once per record.
+            if (p->spin_dbg[i].host && !p->spin_dbg_reported[i]) {
+                const auto * dbg = reinterpret_cast<const ggml_cuda_ar_spin_debug *>(p->spin_dbg[i].host);
+                if (dbg->fired != 0) {
+                    p->spin_dbg_reported[i] = true;
+                    fprintf(stderr,
+                        "wp ar-spin: pre-sync check rank=%d about-to-wait-on call_count=%llu slot=%d token=%d\n",
+                        i, (unsigned long long) p->call_count, slot, (int) p->call_count);
+                    ggml_cuda_ar_spin_report(p);
+                    ggml_cuda_ar_dump_state("spin-fired-pre-sync");
+                }
+            }
+
+            p->wd_host_wait_dev.store(i, std::memory_order_relaxed);
+            p->wd_host_wait_slot.store(slot, std::memory_order_relaxed);
+            p->wd_host_wait.store("acquire_slot:ev_pool.ker", std::memory_order_relaxed);
+            const cudaError_t sync_rc = cudaEventSynchronize(p->ev_pool[i][slot].ker);
+            if (sync_rc != cudaSuccess) {
+                // A trapped kernel (see ggml_cuda_ar_spin_trap) surfaces here
+                // as a failed sync -- report which device/block/slot tripped
+                // the spin budget before the CUDA_CHECK abort below fires.
+                ggml_cuda_ar_spin_report(p);
+                ggml_cuda_ar_dump_state("acquire-slot-sync-failed");
+            }
+            p->wd_host_wait.store(nullptr, std::memory_order_relaxed);
+            CUDA_CHECK(sync_rc);
         }
     }
 
@@ -948,10 +1164,41 @@ static const char * ggml_cuda_ar_watchdog_phase_name(int phase) {
     }
 }
 
+// cudaEventQuery status as a short label for dump output. Never aborts and
+// never touches the sticky error state -- diagnostics-only, called from the
+// watchdog thread while the main thread may be mid-launch/mid-sync on the
+// same device. buf/buflen back the "err:<code>" case only.
+static const char * ggml_cuda_ar_watchdog_event_status(cudaEvent_t ev, char * buf, size_t buflen) {
+    if (ev == nullptr) {
+        return "n/a";
+    }
+    const cudaError_t st = cudaEventQuery(ev);
+    if (st == cudaSuccess) {
+        return "ready";
+    }
+    if (st == cudaErrorNotReady) {
+        return "not-ready";
+    }
+    snprintf(buf, buflen, "err:%d", (int) st);
+    return buf;
+}
+
 // One self-describing dump of everything cheap we know about the pipeline's
 // state, prefixed so journalctl grep for "wp ar-watchdog:" finds it. Called
 // from the watchdog thread only -- never on the hot path.
-static void ggml_cuda_ar_watchdog_dump(ggml_cuda_ar_pipeline * p, uint64_t stalled_s) {
+static void ggml_cuda_ar_watchdog_dump(
+        ggml_cuda_ar_pipeline * p, uint64_t stalled_s,
+        std::chrono::steady_clock::time_point stall_start) {
+    // Monotonic "ms since stall was first detected" -- read fresh for each
+    // group below rather than once up front, so the prefix actually shows
+    // how far apart in time the groups were queried (this is what closes the
+    // TOCTOU gap between the pool and arrival reads: the pool state is now
+    // queried and printed first, before anything below it can advance).
+    const auto ms_since_stall = [stall_start]() {
+        return (double) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - stall_start).count();
+    };
+
     fprintf(stderr,
         "wp ar-watchdog: STALL detected, no progress for %llu s (threshold %llu s)\n",
         (unsigned long long) stalled_s, (unsigned long long) p->wd_seconds);
@@ -989,10 +1236,44 @@ static void ggml_cuda_ar_watchdog_dump(ggml_cuda_ar_pipeline * p, uint64_t stall
         }
     }
 
+    // Chunked-kernel pool: per (device, slot), what was launched and whether
+    // its completion event (ev_pool[i][s].ker) has fired. Only query slots
+    // that have actually had a launch recorded -- an event that was never
+    // cudaEventRecord()'d has undefined query behaviour.
+    //
+    // Queried and printed BEFORE the arrival-ring dump below (was the other
+    // way around): the arrival ring is host-mapped and free to read, so it
+    // used to be dumped first and the ker_event query -- which touches the
+    // device -- came later, leaving a window where the pool state could have
+    // moved on from what the arrival dump just showed. Pool-first removes
+    // that gap for the pairing that matters (pool launch vs. its own event).
+    fprintf(stderr, "wp ar-watchdog: t=%.1fms pool:\n", ms_since_stall());
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            const int64_t launched_call = p->wd_pool_call[i][s].load(std::memory_order_relaxed);
+            const int32_t token         = p->wd_pool_token[i][s].load(std::memory_order_relaxed);
+            char err_buf[32];
+            const char * status = launched_call > 0
+                ? ggml_cuda_ar_watchdog_event_status(p->ev_pool[i][s].ker, err_buf, sizeof(err_buf))
+                : "n/a";
+            fprintf(stderr,
+                "wp ar-watchdog: pool dev=%d slot=%d launched_call=%lld token=%d ker_event=%s\n",
+                i, s, (long long) launched_call, (int) token, status);
+        }
+    }
+
+    // Spin-debug record per device (see ggml_cuda_ar_spin_debug) -- reports
+    // whether the phase-2 arrival spin in the chunked kernel itself tripped
+    // its budget (GGML_CUDA_AR_SPIN_BUDGET_S), independent of whether the
+    // ker_event above ever got queried as "not-ready" vs. an actual error.
+    ggml_cuda_ar_spin_report(p);
+
     // Chunked-kernel arrival ring: host-mapped, readable without a device
     // sync (see the GGML_CUDA_AR_HOST_COHERENT comment at alloc()). Dump the
     // most recently issued slot plus its immediate predecessor for both
     // ranks -- covers the in-flight chunked AR, if any.
+    fprintf(stderr, "wp ar-watchdog: t=%.1fms arrival:\n", ms_since_stall());
     if (p->arrival.host && p->call_count > 0) {
         for (int back = 0; back < 2 && (int64_t) p->call_count - 1 - back >= 0; ++back) {
             const int slot = (int) ((p->call_count - 1 - (uint64_t) back) % GGML_CUDA_AR_POOL_SIZE);
@@ -1011,6 +1292,41 @@ static void ggml_cuda_ar_watchdog_dump(ggml_cuda_ar_pipeline * p, uint64_t stall
         }
     }
 
+    {
+        const char * site = p->wd_host_wait.load(std::memory_order_relaxed);
+        fprintf(stderr, "wp ar-watchdog: host_wait=%s dev=%d slot=%d\n",
+                site ? site : "none",
+                p->wd_host_wait_dev.load(std::memory_order_relaxed),
+                p->wd_host_wait_slot.load(std::memory_order_relaxed));
+    }
+
+    // Duplex ("dx") transport events, per (device, dx slot): only queried when
+    // the corresponding *_valid flag says the event has actually been
+    // recorded at least once.
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        for (int s = 0; s < GGML_CUDA_AR_DX_SLOTS; ++s) {
+            const ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][s];
+            char sent_buf[32], recvd_buf[32], freed_buf[32];
+            const char * sent  = ev.sent_valid  ? ggml_cuda_ar_watchdog_event_status(ev.sent,  sent_buf,  sizeof(sent_buf))  : "n/a";
+            const char * recvd = ev.recvd_valid ? ggml_cuda_ar_watchdog_event_status(ev.recvd, recvd_buf, sizeof(recvd_buf)) : "n/a";
+            const char * freed = ev.freed_valid ? ggml_cuda_ar_watchdog_event_status(ev.freed, freed_buf, sizeof(freed_buf)) : "n/a";
+            fprintf(stderr,
+                "wp ar-watchdog: dx_ev dev=%d slot=%d op=%llu sent=%s recvd=%s freed=%s\n",
+                i, s,
+                (unsigned long long) p->wd_dx_slot_call[i][s].load(std::memory_order_relaxed),
+                sent, recvd, freed);
+        }
+    }
+
+    // Per-device node-launch ring (WP_NODE_TRACE=1 only) -- says which graph
+    // node each device was last launching/completing, so a stall can be
+    // attributed to a specific stuck kernel rather than just a stuck AR slot.
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        wp_node_trace_dump(p->devices[i]);
+    }
+
     for (int card = 0; card < 8; ++card) {
         const int busy = ggml_cuda_ar_watchdog_gpu_busy(card);
         if (busy < 0) {
@@ -1020,10 +1336,141 @@ static void ggml_cuda_ar_watchdog_dump(ggml_cuda_ar_pipeline * p, uint64_t stall
     }
 }
 
+// ---------------------------------------------------------------------------
+// ggml_cuda_ar_dump_state -- host-side heartbeat that survives an async
+// abort (see the ggml_cuda_ar_spin_trap comment: ROCm's exception-handler
+// thread can abort() the process before the main thread returns from
+// cudaEventSynchronize, so the normal "sync failed -> report" path at
+// ggml_cuda_ar_acquire_slot below may simply never run). This is a second,
+// independent path to the same information, reachable from a SIGABRT
+// handler as well as normal call sites -- see the install/handler code
+// right below it.
+//
+// SIGABRT-safety: only plain/atomic loads of already-resident host memory
+// (including the host-coherent spin_dbg record -- no device round-trip) and
+// snprintf-into-stack-buffer + ggml_cuda_ar_dump_write (write(2)). No
+// mutexes, no heap allocation, no fprintf/iostreams.
+// ---------------------------------------------------------------------------
+void ggml_cuda_ar_dump_state(const char * reason) {
+    char buf[512];
+    int  len;
+
+    len = snprintf(buf, sizeof(buf), "wp ar-state[%s]: dump begin\n", reason ? reason : "?");
+    if (len > 0) {
+        ggml_cuda_ar_dump_write(buf, (size_t) std::min<int>(len, (int) sizeof(buf) - 1));
+    }
+
+    for (int pi = 0; pi < GGML_CUDA_AR_MAX_PIPELINES; ++pi) {
+        ggml_cuda_ar_pipeline * p = g_ar_pipeline_registry[pi].load(std::memory_order_relaxed);
+        if (p == nullptr) {
+            continue;
+        }
+
+        const uint64_t call_count = p->call_count; // main-thread-owned; plain load, best-effort under abort
+        const int      cur_slot   = (int) (call_count % GGML_CUDA_AR_POOL_SIZE);
+        const char *   host_wait  = p->wd_host_wait.load(std::memory_order_relaxed);
+
+        len = snprintf(buf, sizeof(buf),
+            "wp ar-state[%s]: pipeline=%p n_devices=%d call_count=%llu cur_pool_slot=%d cur_token=%llu "
+            "last_launch_count=%lld progress_tick=%llu last_caller_tid=%llu last_dx_nbytes=%zu "
+            "dx_call=%llu dx_in_flight=%d host_wait=%s host_wait_dev=%d host_wait_slot=%d\n",
+            reason ? reason : "?", (const void *) p, p->n_devices,
+            (unsigned long long) call_count, cur_slot, (unsigned long long) call_count,
+            (long long) p->wd_last_launch_count.load(std::memory_order_relaxed),
+            (unsigned long long) p->wd_progress_tick.load(std::memory_order_relaxed),
+            (unsigned long long) p->wd_last_caller_tid.load(std::memory_order_relaxed),
+            p->wd_last_nbytes.load(std::memory_order_relaxed),
+            (unsigned long long) p->dx_call, p->dx_in_flight,
+            host_wait ? host_wait : "none",
+            p->wd_host_wait_dev.load(std::memory_order_relaxed),
+            p->wd_host_wait_slot.load(std::memory_order_relaxed));
+        if (len > 0) {
+            ggml_cuda_ar_dump_write(buf, (size_t) std::min<int>(len, (int) sizeof(buf) - 1));
+        }
+
+        for (int i = 0; i < p->n_devices; ++i) {
+            for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+                len = snprintf(buf, sizeof(buf),
+                    "wp ar-state[%s]: rank=%d pool_slot=%d launched_call=%lld token=%d budget_cycles=%llu\n",
+                    reason ? reason : "?", i, s,
+                    (long long) p->wd_pool_call[i][s].load(std::memory_order_relaxed),
+                    (int) p->wd_pool_token[i][s].load(std::memory_order_relaxed),
+                    (unsigned long long) p->spin_budget_cycles[i]);
+                if (len > 0) {
+                    ggml_cuda_ar_dump_write(buf, (size_t) std::min<int>(len, (int) sizeof(buf) - 1));
+                }
+            }
+
+            for (int s = 0; s < GGML_CUDA_AR_DX_SLOTS; ++s) {
+                len = snprintf(buf, sizeof(buf),
+                    "wp ar-state[%s]: rank=%d dx_slot=%d phase=%s slot_call=%llu\n",
+                    reason ? reason : "?", i, s,
+                    ggml_cuda_ar_watchdog_phase_name(p->wd_dx_phase[i][s].load(std::memory_order_relaxed)),
+                    (unsigned long long) p->wd_dx_slot_call[i][s].load(std::memory_order_relaxed));
+                if (len > 0) {
+                    ggml_cuda_ar_dump_write(buf, (size_t) std::min<int>(len, (int) sizeof(buf) - 1));
+                }
+            }
+
+            if (p->spin_dbg[i].host) {
+                const auto * dbg = reinterpret_cast<const ggml_cuda_ar_spin_debug *>(p->spin_dbg[i].host);
+                len = snprintf(buf, sizeof(buf),
+                    "wp ar-state[%s]: rank=%d spin_dbg fired=%d slot=%d block=%d expected=%d observed=%d elapsed_cycles=%llu\n",
+                    reason ? reason : "?", i, dbg->fired, dbg->slot, dbg->block,
+                    dbg->expected_token, dbg->observed_token,
+                    (unsigned long long) dbg->elapsed_cycles);
+                if (len > 0) {
+                    ggml_cuda_ar_dump_write(buf, (size_t) std::min<int>(len, (int) sizeof(buf) - 1));
+                }
+            }
+        }
+    }
+}
+
+#if defined(__linux__)
+static struct sigaction g_ar_prev_sigaction;
+
+// Runs in the aborting thread (which, for the ROCm async-exception case,
+// is NOT the main thread) before the process dies. Chains to whatever
+// SIGABRT disposition was installed before us so behaviour (core dump,
+// another handler, etc.) is otherwise unchanged.
+static void ggml_cuda_ar_sigabrt_handler(int sig) {
+    ggml_cuda_ar_dump_state("SIGABRT");
+    sigaction(SIGABRT, &g_ar_prev_sigaction, nullptr);
+    raise(sig);
+}
+#endif // defined(__linux__)
+
+static void ggml_cuda_ar_atexit_dump() {
+    ggml_cuda_ar_dump_state("atexit");
+}
+
+// Idempotent: only the first pipeline created in the process installs these
+// (a second TP pipeline, if one is ever created, is covered by the same
+// process-wide handler/atexit hook).
+static std::atomic<bool> g_ar_dump_handlers_installed{false};
+
+static void ggml_cuda_ar_install_dump_handlers() {
+    bool expected = false;
+    if (!g_ar_dump_handlers_installed.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    std::atexit(ggml_cuda_ar_atexit_dump);
+#if defined(__linux__)
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ggml_cuda_ar_sigabrt_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGABRT, &sa, &g_ar_prev_sigaction);
+#endif // defined(__linux__)
+}
+
 static void ggml_cuda_ar_watchdog_main(ggml_cuda_ar_pipeline * p) {
     uint64_t last_tick     = p->wd_progress_tick.load(std::memory_order_relaxed);
     uint64_t stalled_since = 0; // seconds; 0 == not currently stalled
     bool     dumped_this_stall = false;
+    std::chrono::steady_clock::time_point stall_start{};
 
     while (!p->wd_stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1049,10 +1496,16 @@ static void ggml_cuda_ar_watchdog_main(ggml_cuda_ar_pipeline * p) {
             continue;
         }
 
+        if (stalled_since == 0) {
+            // First tick of a new stall -- anchor the "ms since stall"
+            // timestamps the dump prints. Approximate: the stall actually
+            // began up to 1s ago (this thread only samples once/second).
+            stall_start = std::chrono::steady_clock::now();
+        }
         stalled_since++;
         if (stalled_since >= p->wd_seconds && !dumped_this_stall) {
             dumped_this_stall = true;
-            ggml_cuda_ar_watchdog_dump(p, stalled_since);
+            ggml_cuda_ar_watchdog_dump(p, stalled_since, stall_start);
             if (p->wd_abort) {
                 fprintf(stderr, "wp ar-watchdog: GGML_CUDA_AR_WATCHDOG_ACTION=abort, aborting\n");
                 fflush(stderr);
@@ -1227,6 +1680,20 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Spin-debug ring: one ggml_cuda_ar_spin_debug record per device, same
+    // host-coherent allocation pattern as host_buf above -- the chunked
+    // kernel writes it (once, only if it trips the spin budget) and the host
+    // reads it back without a device round-trip via ggml_cuda_ar_spin_report.
+    for (size_t i = 0; i < n_devices; ++i) {
+        if (p->spin_dbg[i].alloc(sizeof(ggml_cuda_ar_spin_debug), GGML_CUDA_AR_HOST_COHERENT) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: alloc for spin-debug record failed (%zu bytes)\n",
+                           __func__, sizeof(ggml_cuda_ar_spin_debug));
+            ggml_cuda_ar_pipeline_free(p);
+            return nullptr;
+        }
+        std::memset(p->spin_dbg[i].host, 0, sizeof(ggml_cuda_ar_spin_debug));
+    }
+
     // Copy-engine path: pinned host staging + device scratch, sized for the
     // largest tensor we accept on this path (GGML_CUDA_AR_COPY_MAX_BYTES).
     // dev_tmp is single-buffered; cross-AR safety is enforced by an explicit
@@ -1385,6 +1852,25 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                   transport_name, p->copy_threshold, p->wire_codec->name,
                   8.0 * p->wire_codec->bytes_per_block / p->wire_codec->elements_per_block);
 
+    // Chunked-kernel spin budget: GGML_CUDA_AR_SPIN_BUDGET_S, seconds as a
+    // double; 0 disables (spin unbounded, the original behaviour). Converted
+    // per device to wall_clock64() ticks (hipDeviceAttributeWallClockRate is
+    // in kHz and differs between gfx1030 and gfx1201) so the kernel launch
+    // just passes a plain uint64_t.
+    {
+        const double spin_budget_s = ggml_cuda_ar_env_f64("GGML_CUDA_AR_SPIN_BUDGET_S", 10.0);
+        for (int i = 0; i < p->n_devices; ++i) {
+            int khz = 0;
+            if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, p->devices[i]) != hipSuccess || khz <= 0) {
+                khz = 100000; // 100 MHz, the GCN/RDNA2 s_memrealtime rate
+                (void) hipGetLastError();
+            }
+            p->spin_clock_khz[i]     = khz;
+            p->spin_budget_cycles[i] = spin_budget_s > 0.0 ? (uint64_t) (spin_budget_s * 1000.0 * (double) khz) : 0;
+            fprintf(stderr, "wp ar-spin: dev=%d budget=%.1f s clock=%d kHz (GGML_CUDA_AR_SPIN_BUDGET_S)\n", i, spin_budget_s, khz);
+        }
+    }
+
     // Stall watchdog: off unless GGML_CUDA_AR_WATCHDOG_S is set. Started
     // last, after everything the dump reads from is already initialized.
     p->wd_seconds = ggml_cuda_ar_env_u64("GGML_CUDA_AR_WATCHDOG_S", 0);
@@ -1404,6 +1890,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                       (unsigned long long) p->wd_seconds, p->wd_abort ? "abort" : "dump");
     }
 
+    // Register for ggml_cuda_ar_dump_state and install the atexit/SIGABRT
+    // hooks that call it (idempotent process-wide; see the function).
+    ggml_cuda_ar_registry_add(p);
+    ggml_cuda_ar_install_dump_handlers();
+
     return p;
 }
 
@@ -1412,20 +1903,43 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         return;
     }
 
+    // Deregister before tearing down: the atexit/SIGABRT hooks installed by
+    // ggml_cuda_ar_install_dump_handlers() read the registry at any point in
+    // the process lifetime, so a freed pipeline must not be left in it.
+    ggml_cuda_ar_registry_remove(p);
+
     if (p->wd_thread.joinable()) {
         p->wd_stop.store(true, std::memory_order_relaxed);
         p->wd_thread.join();
     }
 
-    // Drain all in-flight kernels before tearing down resources.
+    // Drain all in-flight kernels before tearing down resources.  wd_thread is
+    // already joined above, but keep the marker discipline uniform with the
+    // rest of the file.
     for (int i = 0; i < p->n_devices; ++i) {
         if (p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            cudaStreamSynchronize(p->streams[i]);
+            p->wd_host_wait_dev.store(i, std::memory_order_relaxed);
+            p->wd_host_wait_slot.store(-1, std::memory_order_relaxed);
+            p->wd_host_wait.store("pipeline_free:streams", std::memory_order_relaxed);
+            const cudaError_t sync_rc = cudaStreamSynchronize(p->streams[i]);
+            if (sync_rc != cudaSuccess) {
+                ggml_cuda_ar_spin_report(p);
+            }
+            p->wd_host_wait.store(nullptr, std::memory_order_relaxed);
+            CUDA_CHECK(sync_rc);
         }
         if (p->streams_in[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            cudaStreamSynchronize(p->streams_in[i]);
+            p->wd_host_wait_dev.store(i, std::memory_order_relaxed);
+            p->wd_host_wait_slot.store(-1, std::memory_order_relaxed);
+            p->wd_host_wait.store("pipeline_free:streams_in", std::memory_order_relaxed);
+            const cudaError_t sync_in_rc = cudaStreamSynchronize(p->streams_in[i]);
+            if (sync_in_rc != cudaSuccess) {
+                ggml_cuda_ar_spin_report(p);
+            }
+            p->wd_host_wait.store(nullptr, std::memory_order_relaxed);
+            CUDA_CHECK(sync_in_rc);
         }
     }
 
@@ -1447,6 +1961,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         p->host_buf[i].free();
         p->host_large[i].free();
+        p->spin_dbg[i].free();
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
             cudaFree(p->dev_tmp[i]);
@@ -1821,7 +2336,11 @@ static bool ggml_cuda_ar_allreduce_sync(
                     static_cast<int>(chunk_elems), \
                     ggml_cuda_ar_arrival_ptr(p, slot, i), \
                     ggml_cuda_ar_arrival_ptr(p, slot, peer), \
-                    token)
+                    token, \
+                    i, \
+                    slot, \
+                    reinterpret_cast<volatile ggml_cuda_ar_spin_debug *>(p->spin_dbg[i].dev), \
+                    p->spin_budget_cycles[i])
 
                 if (use_bf16) {
                     GGML_ASSERT(input_type == GGML_TYPE_F32);
@@ -1837,6 +2356,25 @@ static bool ggml_cuda_ar_allreduce_sync(
 
 #undef LAUNCH_AR_KERNEL
                 CUDA_CHECK(cudaGetLastError());
+
+                // Watchdog bookkeeping: record what this launch wrote into the
+                // pool slot so ggml_cuda_ar_watchdog_dump can report it.
+                p->wd_pool_call[i][slot].store((int64_t) token, std::memory_order_relaxed);
+                p->wd_pool_token[i][slot].store((int32_t) token, std::memory_order_relaxed);
+                p->wd_last_launch_count.store((int64_t) chunk_elems, std::memory_order_relaxed);
+
+                // Low-rate launch log: one line every 4096 calls so a live
+                // process can be sampled for "is the AR kernel still being
+                // launched, and at what token/slot/size" without per-call
+                // volume. Unconditional (no env gate) -- this is one line
+                // per 4096 calls, not a hot-path cost.
+                if ((token & 4095) == 0) {
+                    fprintf(stderr,
+                        "wp ar-launch: call=%d slot=%d token=%d count=%zu dtype=%s:%s budget_cycles=%llu\n",
+                        token, slot, token, chunk_elems,
+                        ggml_type_name(input_type), use_bf16 ? "bf16" : ggml_type_name(input_type),
+                        (unsigned long long) p->spin_budget_cycles[i]);
+                }
 
                 if (last_chunk) {
                     CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
@@ -1940,7 +2478,11 @@ static void ggml_cuda_ar_dump_partials(
             return;  // only the F32 partial case is interesting here
         }
         ggml_cuda_set_device(p->devices[i]);
+        p->wd_host_wait_dev.store(i, std::memory_order_relaxed);
+        p->wd_host_wait_slot.store(-1, std::memory_order_relaxed);
+        p->wd_host_wait.store("dump_partials:device_sync", std::memory_order_relaxed);
         CUDA_CHECK(cudaDeviceSynchronize());
+        p->wd_host_wait.store(nullptr, std::memory_order_relaxed);
         CUDA_CHECK(cudaMemcpy(host.data(), tensors[i]->data, keep * sizeof(float),
                               cudaMemcpyDeviceToHost));
         char path[1024];
@@ -2223,6 +2765,8 @@ bool ggml_cuda_ar_allreduce_begin(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggm
 }
 bool ggml_cuda_ar_allreduce_end(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_cuda_ar_op *) {
     return false;
+}
+void ggml_cuda_ar_dump_state(const char *) {
 }
 
 #endif // !defined(GGML_USE_MUSA)

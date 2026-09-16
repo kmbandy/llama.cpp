@@ -465,6 +465,65 @@ private:
     // reads them.
     uint64_t                 nextn_stage_copy_ns = 0;
 
+    // MAD-LAB (pinned-host nextn staging, WP_MTP_HANDOFF, default "pinned";
+    // "host" reverts to the plain pageable nextn_stage[] vectors above,
+    // read with a full ctx->synchronize(), i.e. byte-for-byte the original
+    // pre-this-diff behavior, kept as the A/B control). See
+    // draft-handoff-device-0912.txt for the full design and the two prior,
+    // reverted attempts (device-resident write+read machinery, removed).
+    //
+    // Root cause this targets directly: ggml_backend_tensor_get_async()'s
+    // D2H copy is executed SYNCHRONOUSLY by the CUDA/HIP runtime whenever
+    // its host destination is PAGEABLE memory, regardless of the "async"
+    // name -- a plain std::vector<float> (nextn_stage[] above) is pageable.
+    // A page-locked (pinned, cudaMallocHost-backed) destination does not
+    // have this problem; the exact same get_async() call becomes genuinely
+    // asynchronous with no other change needed.
+    //
+    // Decided once in nextn_stage_enable() from getenv("WP_MTP_HANDOFF").
+    bool nextn_stage_pinned_enabled = false;
+
+    // Row capacity of EACH pinned slot -- sized to n_batch (cparams.n_batch)
+    // x n_embd at first allocation (nextn_stage_pinned_ensure(), called from
+    // the decode() extraction block once n_embd -- the nextn width -- is
+    // known), matching a prompt chunk's worst-case width; grow-only if a
+    // wider need is ever seen (should not happen in normal operation, but
+    // costs nothing to allow). Same for both slots (allocated together).
+    uint32_t nextn_stage_pinned_cap = 0;
+
+    // Per slot: the pinned host buffer (ggml_backend_buft_alloc_buffer() on
+    // ggml_backend_dev_host_buffer_type(device 0) -- device 0's own host-
+    // pinned allocator, cudaMallocHost/hipHostMalloc-backed) and a cached
+    // float* into it (ggml_backend_buffer_get_base()), F32
+    // [n_embd, nextn_stage_pinned_cap].
+    ggml_backend_buffer_ptr nextn_stage_pinned_buf[2];
+    float *                 nextn_stage_pinned_data[2] = {nullptr, nullptr};
+
+    // Per slot: a CUDA/HIP event (ggml_backend_event_new() on device 0's
+    // OWN device, NOT the meta backend -- ggml-backend-meta.cpp's
+    // event_new/event_record/event_synchronize are all nullptr, "Not
+    // implemented"; the underlying simple CUDA/HIP backend genuinely
+    // supports events, which is the whole point of reaching it directly via
+    // the meta accessors below) allocated once per slot and re-recorded
+    // (ggml_backend_event_record(), not reallocated) after every extraction
+    // write into that slot. nullptr if ggml_backend_event_new() returned
+    // null for this device (no event support -- resolve_pending()'s
+    // ggml_backend_event_synchronize() call degrades to a no-op in that
+    // case, which is only safe if the device path was never actually armed;
+    // guarded in the extraction block, see nextn_stage_pinned_ensure()).
+    ggml_backend_event_t    nextn_stage_event[2] = {nullptr, nullptr};
+
+    // Lazily allocate nextn_stage_pinned_buf[0]/[1] (to cparams.n_batch x
+    // n_embd rows each) and nextn_stage_event[0]/[1], once, the first time
+    // the extraction block needs them. Returns false (and leaves
+    // nextn_stage_pinned_enabled = false for the rest of this context's
+    // lifetime, falling back to the plain pageable nextn_stage[] path
+    // transparently) if allocation fails for any reason -- a pinned host
+    // allocation can fail (fragmentation, cgroup/ulimit on locked memory)
+    // in ways a plain std::vector never does, so this is a real fallback
+    // path, not just defensive code.
+    bool nextn_stage_pinned_ensure(ggml_backend_t backend0, uint32_t n_embd);
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;

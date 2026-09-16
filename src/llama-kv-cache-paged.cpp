@@ -61,6 +61,17 @@ namespace {
 // .cpp. Statically asserted in the .cu side to match the kernel's
 // expected sentinel.
 constexpr int32_t kInvalidBlockTableEntry = -1;
+
+// draft-paged-holes-0912: WP_PAGED_HOLE_CHECK=1 turns on the per-ubatch
+// live-prefix hole scan in prepare_batch_tensors(). Off by default; read
+// once (env doesn't change mid-process).
+bool paged_hole_check_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("WP_PAGED_HOLE_CHECK");
+        return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
 }
 
 llama_kv_cache_paged::llama_kv_cache_paged(
@@ -110,12 +121,23 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     // `cache.layer(il)` works directly from the graph; non-attn entries
     // stay default-constructed (k/v == nullptr) and never queried.
     const auto & hparams = model.hparams;
-    const uint32_t n_layer    = hparams.n_layer();
+    // MAD-LAB (draft-KV-paged, 2026-09-12): use n_layer_all, not n_layer(),
+    // so a filter selecting layers at/above n_layer() — e.g. an MTP/DSPARK
+    // draft's nextn layer(s), il >= hparams.n_layer() — has room in
+    // layers_[]. n_layer_all == n_layer() whenever a model has no nextn
+    // layers, so this is a no-op for every existing (non-draft) caller.
+    const uint32_t n_layer    = hparams.n_layer_all;
     // Hybrid models (e.g. LFM2.5 lfm2moe) interleave conv/recurrent layers
     // (n_head_kv == 0) with attention layers; layer 0 may be non-attention.
-    // Size the paged K/V storage from the first attention layer (n_head_kv > 0).
+    // Size the paged K/V storage from the first attention layer (n_head_kv > 0)
+    // that also passes `filter` (when one is given) — otherwise a draft cache
+    // whose filter selects only the nextn layer(s) could pick up an unrelated
+    // trunk layer's dims first (usually identical for MTP, but not guaranteed).
     uint32_t head_dim = 0, n_kv_heads = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
+        if (filter && !filter((int32_t) il)) {
+            continue;
+        }
         if (hparams.n_head_kv(il) > 0) {
             n_kv_heads = hparams.n_head_kv(il);
             head_dim   = hparams.n_embd_head_v(il);
@@ -1561,6 +1583,51 @@ void llama_kv_cache_paged::prepare_batch_tensors() {
         // q_lens is filled by init_batch when it knows the ubatch shape.
     }
 
+    // draft-paged-holes-0912: cheap, opt-in diagnostic for a block-table entry
+    // of -1 (kInvalidBlockTableEntry, "not resident") sitting INSIDE a live
+    // seq's addressed prefix -- exactly the shape of hole that produces a
+    // negative/garbage KV address in the attention kernels (see
+    // aiter-integration/kernels/unified_attention.py's block-table load).
+    // The loop above only ever writes indices [0, num_blocks(seq)); any
+    // index below the seq's required block count (ceil((pos_max+1)/block_size))
+    // that the loop didn't reach, or that it reached but the block wasn't
+    // GPU-resident (pool_.is_gpu(phys) false), is left at the initial
+    // kInvalidBlockTableEntry fill from this function's very first line --
+    // a hole. Off by default (one getenv + a per-call scan over a small,
+    // already-hot array); enable with WP_PAGED_HOLE_CHECK=1.
+    if (paged_hole_check_enabled()) {
+        for (uint32_t s = 0; s < n_seq_max_; ++s) {
+            const llama_pos pos_max = seq_states_[s].pos_max;
+            if (pos_max < 0) {
+                continue; // seq not live
+            }
+
+            const uint32_t n_blk_required =
+                (uint32_t) (((uint64_t) pos_max + 1 + block_size_ - 1) / block_size_);
+            const uint32_t n_blk_live = table_.num_blocks((llama_seq_id) s);
+            const uint32_t n_blk_scan = std::min(n_blk_required, max_blocks_per_seq_);
+
+            uint32_t first_hole = std::numeric_limits<uint32_t>::max();
+            uint32_t hole_count = 0;
+            for (uint32_t b = 0; b < n_blk_scan; ++b) {
+                if (h_block_table_[(size_t) s * max_blocks_per_seq_ + b] == kInvalidBlockTableEntry) {
+                    if (first_hole == std::numeric_limits<uint32_t>::max()) {
+                        first_hole = b;
+                    }
+                    ++hole_count;
+                }
+            }
+
+            if (hole_count > 0) {
+                LLAMA_LOG_WARN("llama_kv_cache_paged[%s]: WP_PAGED_HOLE_CHECK: live-prefix hole -- "
+                               "seq=%u pos_max=%d required_blocks=%u live_blocks=%u "
+                               "first_hole_block=%u hole_count=%u block_size=%u\n",
+                               instance_id_.c_str(), s, (int) pos_max, n_blk_required, n_blk_live,
+                               first_hole, hole_count, block_size_);
+            }
+        }
+    }
+
     // MAD-348: skip the synchronous full-table H2D upload when the block table
     // is unchanged since the last upload. The table is append-only across decode
     // steps (a new block only every block_size tokens), so ~15/16 steps upload an
@@ -1814,6 +1881,11 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
     if (p1 <= p0) return true;  // empty range
 
     const llama_pos cur_max = seq_states_[seq_id].pos_max;
+
+    if (p0 > cur_max + 1) {
+        LLAMA_LOG_WARN("llama_kv_cache_paged: seq_rm beyond tail seq=%d p0=%d cur_max=%d num_blocks=%u\n",
+                       seq_id, p0, cur_max, table_.num_blocks(seq_id));
+    }
 
     // Whole-seq wipe when the range covers everything.
     if (p0 == 0 && p1 > cur_max) {

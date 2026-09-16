@@ -3,6 +3,12 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+// Fork-local declarations below must sit inside the extern "C" block: their
+// call sites bind them as weak extern "C" symbols (unmangled names).
+#ifdef  __cplusplus
+extern "C" {
+#endif
+
 // Fork-local weight-pager copy-stream hooks. These return false when the
 // feature is unavailable or has permanently disarmed after a runtime error.
 GGML_BACKEND_API bool ggml_backend_cuda_wp_copy_stream_enabled(ggml_backend_t backend);
@@ -16,10 +22,12 @@ GGML_BACKEND_API bool ggml_backend_cuda_wp_graph_counts(
         ggml_backend_t backend,
         uint64_t * captures, uint64_t * replays, uint64_t * fallbacks,
         uint64_t * cap_newkey, uint64_t * cap_lru);
-
-#ifdef  __cplusplus
-extern "C" {
-#endif
+// PRINT-ONLY diagnostic: dumps the internal-AllReduce pipeline's host-side
+// state (call_count, pool slot/token, spin-watchdog fields, etc.) to stderr.
+// No-op if no internal-AllReduce pipeline was ever created in this process
+// (e.g. non-TP runs, or TP running the meta/NCCL backend instead). Defined
+// in ggml-cuda.cu, thin wrapper over allreduce.cu's ggml_cuda_ar_dump_state.
+GGML_BACKEND_API void ggml_backend_cuda_ar_dump_state(const char * reason);
 
 #ifdef GGML_USE_HIP
 #define GGML_CUDA_NAME "ROCm"

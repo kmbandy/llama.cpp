@@ -7,7 +7,74 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <unordered_set>
+
+// MAD-LAB (WP_DFLASH_BORROW_META, dflash-borrow-meta-0912.txt): when the target
+// is Meta-split (-sm tensor) and the draft borrows one of its tensors through
+// ctx_other, the borrowed tensor is pre-allocated in the target's Meta buffer,
+// which the draft's own ggml_backend_sched does not own -- it aborts at
+// ggml_backend_sched_backend_id_from_cur()'s "pre-allocated tensor ... that
+// cannot run the operation" GGML_ABORT (ggml-backend.cpp:~1243, see the comment
+// on model_other->tok_embd usage a few lines below for the full story).
+//
+// For a MIRRORED tensor this has a zero-copy fix: every device in the split
+// already holds the complete tensor, so if the draft's own device is one of
+// them, the draft can reference that device's per-device "simple" clone
+// directly instead of the meta wrapper -- no cross-device traffic, no extra
+// VRAM, and ggml_backend_sched schedules it exactly like any other
+// pre-allocated weight on the draft's own backend.
+//
+// This is NOT valid for a tensor split along a real axis (AXIS_0..3): each
+// device's simple clone there is only that device's SHARD of the tensor, and
+// using a shard where the graph expects the full tensor would silently
+// compute over a subset of rows (e.g. `output.weight` under split-mode tensor
+// is split AXIS_1 -- the vocab dimension -- for every non-DSV4 arch; see the
+// `pattern_output_weight` branch of llama_meta_device_get_split_state() in
+// llama-model.cpp). This helper is therefore only ever called on
+// token_embd.weight, which the same split-state function never gives an
+// explicit pattern to and which therefore always falls to the MIRRORED
+// catch-all -- regardless of arch, including DSV4.
+//
+// Gated behind WP_DFLASH_BORROW_META=1 (default: off, i.e. current behavior --
+// go through the meta wrapper / abort as before) until this has been validated
+// against a live -sm tensor run; see the launch args in
+// dflash-borrow-meta-0912.txt.
+static ggml_tensor * wp_dflash_borrow_meta_mirrored(
+        const ggml_tensor * mirrored_tensor, const ggml_tensor * draft_owned_tensor) {
+    if (mirrored_tensor == nullptr || draft_owned_tensor == nullptr) {
+        return nullptr;
+    }
+    if (mirrored_tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(mirrored_tensor->buffer)) {
+        return nullptr; // target isn't Meta-split; nothing to borrow around
+    }
+    if (draft_owned_tensor->buffer == nullptr) {
+        return nullptr; // draft model not loaded yet (shouldn't happen at graph-build time)
+    }
+    const char * gate = std::getenv("WP_DFLASH_BORROW_META");
+    if (gate == nullptr || std::strcmp(gate, "1") != 0) {
+        return nullptr;
+    }
+    ggml_backend_dev_t draft_dev = ggml_backend_buft_get_device(
+            ggml_backend_buffer_get_type(draft_owned_tensor->buffer));
+    if (draft_dev == nullptr) {
+        return nullptr;
+    }
+    const int idx = ggml_backend_meta_find_device_index_for_tensor(mirrored_tensor, draft_dev);
+    if (idx < 0) {
+        // Draft's device isn't one of the target's split devices at all (e.g.
+        // --device-draft names a GPU the target doesn't span) -- fall back to
+        // the meta wrapper / existing behavior rather than silently no-op'ing.
+        return nullptr;
+    }
+    ggml_tensor * simple = ggml_backend_meta_get_simple_tensor(mirrored_tensor, (size_t) idx);
+    if (simple == nullptr) {
+        // Not materialized yet (e.g. first-ever graph build before the target's
+        // own reserve/alloc pass has run) -- fall back rather than crash.
+        return nullptr;
+    }
+    return simple;
+}
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -237,7 +304,6 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     aux_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_AUX_NORM, "weight"), { n_embd, n_aux }, TENSOR_NOT_REQUIRED);
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -1114,7 +1180,18 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        inpL = ggml_get_rows(ctx0, model_other->tok_embd, inp->tokens);
+        // WP_DFLASH_BORROW_META: token_embd.weight is always MIRRORED under
+        // split-mode tensor (see wp_dflash_borrow_meta_mirrored() above), so if
+        // the target is Meta-split and the draft's own device is one of the
+        // split devices, borrow that device's simple clone directly instead of
+        // the raw meta tensor -- avoids the ggml-backend.cpp pre-allocated-tensor
+        // abort without needing a self-contained copy of this tensor.
+        // model.output_norm is always draft-owned (created a few lines above
+        // this whole embedding block, non-optional), so its buffer names the
+        // draft's own device.
+        ggml_tensor * tok_embd_borrowed =
+                wp_dflash_borrow_meta_mirrored(model_other->tok_embd, model.output_norm);
+        inpL = ggml_get_rows(ctx0, tok_embd_borrowed ? tok_embd_borrowed : model_other->tok_embd, inp->tokens);
     } else {
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp->embd);
@@ -1305,7 +1382,14 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
-    cur = cap_lm_head_rows(cur);
+    // DFlash2 (selector head present) needs the full per-token logits for
+    // build_dflash2_selector() below (dflash.cpp:854 asserts t_logits->ne[1] ==
+    // n_tokens); only cap rows for plain DFlash1/DSpark exports, which have no
+    // selector and read logits through the sampler instead. Keep this predicate
+    // in lockstep with llama-context.cpp's output_reserve() cap_logit_rows.
+    if (!model.dflash_selector_hidden) {
+        cur = cap_lm_head_rows(cur);
+    }
     cur = build_lora_mm(output, cur, output_s);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output

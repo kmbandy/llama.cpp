@@ -214,6 +214,43 @@ const uint8_t * get_lut_device_ptr(int layer, kv_dir dir) {
         std::fprintf(stderr, "mt_turbo_fp8: get_lut_device_ptr called before init\n");
         return nullptr;
     }
+    // MAD-LAB (draft-KV-paged centroid-LUT fix, 2026-09-12): an MTP/DSPARK
+    // nextn layer's ABSOLUTE layer index is >= hparams.n_layer() -- the
+    // trunk-only attention-layer count this registry was fingerprinted/sized
+    // from (mt_turbo_fp8::model_fingerprint.n_layer is set to hparams.n_layer(),
+    // not n_layer_all, in both call sites: src/llama-kv-cache.cpp's plain
+    // llama_kv_cache path and src/llama-kv-cache-paged.cpp's paged path --
+    // deliberately, so a draft-mtp cache shares the SAME fingerprint/digest/
+    // on-disk cache dir as the target's, rather than fingerprinting a second,
+    // separate (and today entirely empty) directory). That means a nextn
+    // layer's index is structurally outside [0, s.n_attn_layers), and used
+    // to unconditionally return nullptr here -- observed as
+    // "mt_pagedattn_aiter.cu:834: GGML_ASSERT(d_centroids_k && d_centroids_v
+    // && ...)" the first time a draft-mtp paged turbo4_fp8_bs256 cache ran
+    // its nextn layer's attention (see draft-kv-paged-0912.txt "MEASURED +
+    // REVISION, part 3"). The SAME call pattern already existed, latent and
+    // unexercised, in the plain (non-paged) llama_kv_cache::cpy_k/cpy_v path
+    // for a plain turbo4_fp8_bs256 MTP draft -- this is not new to the paged
+    // change, just the first workload to hit it.
+    //
+    // Fix: clamp the LOOKUP layer to the last real attention layer
+    // (s.n_attn_layers - 1) whenever the requested layer is out of that
+    // range. This is a lossless no-op today: resolve_lut_bytes() already
+    // serves the SAME single embedded canonical LUT for every (layer, dir)
+    // whenever no calibrated file exists on disk (see the "no calibrated
+    // LUTs found... falling back to a single embedded canonical LUT for all
+    // (layer, dir)" warning above) -- which is the ONLY state this registry
+    // is in today (Phase 1G-E per-layer auto-calibration has not landed).
+    // Once it does, a nextn layer genuinely needs its OWN calibrated LUT (it
+    // is a distinct set of weights, not a copy of the trunk layer clamped to
+    // here) -- this clamp is a stop-gap for the CURRENT fallback-only state,
+    // not a long-term answer, and should be revisited then. Target-path
+    // impact: NONE -- the target only ever requests layer < hparams.n_layer(),
+    // always within [0, s.n_attn_layers) already, so this clamp is never
+    // exercised on the target's own calls.
+    const int lookup_layer = (s.n_attn_layers > 0 && layer >= s.n_attn_layers)
+        ? s.n_attn_layers - 1 : layer;
+
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess) {
         dev = 0;
@@ -222,16 +259,16 @@ const uint8_t * get_lut_device_ptr(int layer, kv_dir dir) {
     if ((int) vec.size() != s.n_attn_layers) {
         vec.assign((size_t) s.n_attn_layers, { nullptr, nullptr });
     }
-    if (layer < 0 || layer >= (int) vec.size()) {
-        std::fprintf(stderr, "mt_turbo_fp8: layer %d out of range [0, %zu) on device %d\n",
-                     layer, vec.size(), dev);
+    if (lookup_layer < 0 || lookup_layer >= (int) vec.size()) {
+        std::fprintf(stderr, "mt_turbo_fp8: layer %d (lookup %d) out of range [0, %zu) on device %d\n",
+                     layer, lookup_layer, vec.size(), dev);
         return nullptr;
     }
-    uint8_t *& slot = (dir == KV_K) ? vec[layer].first : vec[layer].second;
+    uint8_t *& slot = (dir == KV_K) ? vec[lookup_layer].first : vec[lookup_layer].second;
     if (slot != nullptr) return slot;
 
     uint8_t host_lut[LUT_BYTES];
-    if (!resolve_lut_bytes(layer, dir, host_lut)) return nullptr;
+    if (!resolve_lut_bytes(lookup_layer, dir, host_lut)) return nullptr;
 
     uint8_t * dptr = nullptr;
     if (hipMalloc(&dptr, LUT_BYTES) != hipSuccess) {

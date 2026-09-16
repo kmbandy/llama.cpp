@@ -1377,7 +1377,9 @@ def kernel_unified_attention_2d(
             tile_mask = seq_offset < max_seq_prefix_len
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            mask=seq_offset < max_seq_prefix_len,
+            other=0,
         ).to(tl.int64)
 
         token_in_block = seq_offset % BLOCK_SIZE
@@ -1386,6 +1388,22 @@ def kernel_unified_attention_2d(
         # if/elif so only one path lowers per AOT spec; the f16 branch is
         # byte-for-byte the upstream code.
         if CACHE_TYPE == 0:  # F16
+            # bufops (nomask variant): host fill (llama-kv-cache-paged.cpp:63,
+            # 481, 1539/1798 kInvalidBlockTableEntry=-1) writes -1 into
+            # block-table slots that are unused (past this seq's live block
+            # count). tile_mask is false for exactly these lanes in the
+            # general (TILE_SIZE != BLOCK_SIZE) case, but when
+            # TILE_SIZE == BLOCK_SIZE tile_mask is forced constant true
+            # above, so it would not by itself exclude a -1 lane. Clamp to
+            # physical block 0 (always resident/mapped) BEFORE forming any
+            # address — same rationale as the turbo/fp8 loaders' clamp — and
+            # fold the validity check directly into this branch's load mask
+            # so a -1 block is discarded from the softmax/accumulation
+            # rather than silently read as block 0.
+            block_valid = physical_block_idx >= 0
+            physical_block_idx = tl.where(block_valid, physical_block_idx, 0)
+            kv_tile_mask = tile_mask & block_valid
+
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
@@ -1401,14 +1419,14 @@ def kernel_unified_attention_2d(
             # K : (HEAD_SIZE, TILE_SIZE)
             K_load = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
+                mask=dim_mask[:, None] & kv_tile_mask[None, :],
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
             # V : (TILE_SIZE, HEAD_SIZE)
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
+                mask=dim_mask[None, :] & kv_tile_mask[:, None],
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
@@ -1835,13 +1853,31 @@ def kernel_unified_attention_3d(
             tile_mask = seq_offset < max_seq_prefix_len
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            mask=seq_offset < max_seq_prefix_len,
+            other=0,
         ).to(tl.int64)
 
         token_in_block = seq_offset % BLOCK_SIZE
 
         # MAD-199: branch K/V loads on cache type — see 2D kernel for notes.
         if CACHE_TYPE == 0:  # F16
+            # bufops (nomask variant): host fill (llama-kv-cache-paged.cpp:63,
+            # 481, 1539/1798 kInvalidBlockTableEntry=-1) writes -1 into
+            # block-table slots that are unused (past this seq's live block
+            # count). tile_mask is false for exactly these lanes in the
+            # general (TILE_SIZE != BLOCK_SIZE) case, but when
+            # TILE_SIZE == BLOCK_SIZE tile_mask is forced constant true
+            # above, so it would not by itself exclude a -1 lane. Clamp to
+            # physical block 0 (always resident/mapped) BEFORE forming any
+            # address — same rationale as the turbo/fp8 loaders' clamp — and
+            # fold the validity check directly into this branch's load mask
+            # so a -1 block is discarded from the softmax/accumulation
+            # rather than silently read as block 0.
+            block_valid = physical_block_idx >= 0
+            physical_block_idx = tl.where(block_valid, physical_block_idx, 0)
+            kv_tile_mask = tile_mask & block_valid
+
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
@@ -1856,13 +1892,13 @@ def kernel_unified_attention_3d(
             )
             K_load = tl.load(
                 key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
+                mask=dim_mask[:, None] & kv_tile_mask[None, :],
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
+                mask=dim_mask[None, :] & kv_tile_mask[:, None],
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )

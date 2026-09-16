@@ -3907,6 +3907,99 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                            mtp_draft_swa, mtp_draft_kv_size);
                         }
 
+                        // MAD-LAB (draft-KV-paged, 2026-09-12): let the draft-mtp
+                        // nextn-layer cache use the same llama_kv_cache_paged /
+                        // GGML_OP_PAGED_ATTN_MT (AITER) path the target uses,
+                        // when the operator asked for it via
+                        // --spec-cache-type-k/-v naming a paged type (the server
+                        // sets params.kv_tier_paged_blocks for this ctx in that
+                        // case — see tools/server/server-context.cpp). Sizing
+                        // mirrors the hybrid-inline paged path above (non-tiered:
+                        // 1.5x headroom over the full per-slot working set), but
+                        // uses mtp_draft_kv_size (this context's own n_ctx, via
+                        // --spec-draft-n-ctx / WP_MTP_DRAFT_SWA) instead of the
+                        // target's cparams.n_ctx_seq. WP_MTP_DRAFT_SWA's ring
+                        // buffer has no paged-cache equivalent (paged eviction
+                        // is block-granular, not a SWA window), so the two are
+                        // mutually exclusive — reject with a clear error rather
+                        // than silently picking one.
+                        if (mtp_draft_swa > 0 && params.kv_tier_paged_blocks) {
+                            throw std::runtime_error(
+                                "create_memory: WP_MTP_DRAFT_SWA and a paged draft "
+                                "KV cache (--spec-cache-type-k/-v naming a paged "
+                                "type) are mutually exclusive on the draft-mtp "
+                                "context; unset WP_MTP_DRAFT_SWA or drop the paged "
+                                "draft cache type.");
+                        }
+
+                        if (params.kv_tier_paged_blocks) {
+                            const uint32_t bsize = params.kv_tier_paged_block_size > 0
+                                                 ? (uint32_t) params.kv_tier_paged_block_size : 16u;
+                            const uint32_t max_blocks_per_seq = (mtp_draft_kv_size + bsize - 1) / bsize;
+                            // MAD-LAB (draft-KV-paged, 2026-09-12 REVISION): mirror
+                            // the plain llama_kv_cache draft's OWN degree of
+                            // multiplexing (n_stream = kv_unified ? 1 : n_seq_max,
+                            // src/llama-kv-cache.cpp:155) instead of the Phase 3.4a
+                            // / hybrid-inline paged-cache convention of
+                            // n_ctx_seq * n_seq_max * 1.5 non-tiered headroom. That
+                            // convention is correct for the TARGET's own paged
+                            // cache (a long-lived, block-table-multiplexed pool
+                            // that must genuinely be able to hold up to n_seq_max
+                            // independent full-depth sequences at once), but the
+                            // f16 draft-mtp cache this branch used to build never
+                            // provisioned that way — it allocates kv_size *
+                            // n_stream cells total, i.e. exactly mtp_draft_kv_size
+                            // cells when kv_unified (all sequences share one ring)
+                            // and mtp_draft_kv_size * n_seq_max only when NOT
+                            // unified. The original (pre-revision) version of this
+                            // code always multiplied by n_seq_max AND added 1.5x
+                            // headroom regardless of kv_unified, which measured out
+                            // to several GB of unintended VRAM growth per card
+                            // (16.4/32 GB peak vs. the plain f16 draft's much
+                            // smaller footprint) — see
+                            // draft-kv-paged-0912.txt "MEASURED + REVISION".
+                            const uint32_t n_stream_draft = cparams.kv_unified ? 1u : cparams.n_seq_max;
+                            const uint32_t n_blocks_total = (mtp_draft_kv_size * n_stream_draft + bsize - 1) / bsize;
+
+                            ggml_backend_buffer_type_t buft = nullptr;
+                            if (!devices.empty()) {
+                                buft = ggml_backend_dev_buffer_type(devices.front().dev);
+                            }
+                            if (!buft) {
+                                throw std::runtime_error("llama_kv_cache_paged (draft-mtp): no GPU buffer type available");
+                            }
+
+                            LLAMA_LOG_INFO("create_memory: draft-mtp attn routed to llama_kv_cache_paged "
+                                           "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u, n_stream=%u, "
+                                           "kv_unified=%d, type_k=%s, type_v=%s)\n",
+                                           n_blocks_total, bsize, mtp_draft_kv_size, cparams.n_seq_max,
+                                           n_stream_draft, (int) cparams.kv_unified,
+                                           ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+
+                            res = new llama_kv_cache_paged(
+                                    *this, buft,
+                                    /*n_blocks_total     =*/ n_blocks_total,
+                                    /*block_size         =*/ bsize,
+                                    /*n_seq_max          =*/ cparams.n_seq_max,
+                                    /*max_blocks_per_seq =*/ max_blocks_per_seq,
+                                    /*n_warm_blocks      =*/ 0,
+                                    /*n_cold_blocks      =*/ 0,
+                                    /*ssd_path           =*/ std::string(),
+                                    /*cold_resume        =*/ false,
+                                    // draft-paged-holes-0912: explicit, not the
+                                    // pid-default fallback -- ctx_tgt and ctx_dft
+                                    // share a process/pid, so leaving this empty
+                                    // (as before) made the two caches indistinguishable
+                                    // to instance_id()-keyed logging/diagnostics
+                                    // (e.g. WP_PAGED_HOLE_CHECK below).
+                                    /*instance_id        =*/ std::string("draft-mtp"),
+                                    /*cold_budget_mb     =*/ 0,
+                                    /*filter             =*/ filter,
+                                    /*type_k             =*/ params.type_k,
+                                    /*type_v             =*/ params.type_v);
+                            break;
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,

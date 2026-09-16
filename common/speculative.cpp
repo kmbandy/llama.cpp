@@ -13,6 +13,7 @@
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "../src/llama-graph.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <cassert>
@@ -54,6 +55,27 @@ static bool wp_spec_prefill_stats_enabled() {
     static const bool s_on = [](){
         const char * e = std::getenv("WP_SPEC_PREFILL_STATS");
         return e && e[0] == '1';
+    }();
+    return s_on;
+}
+
+// WP_SPEC_SKIP_CATCHUP=1: diagnostic-only. Skips ALL draft-mtp draft-context
+// work during prompt processing -- the deferred one-chunk-behind prompt
+// catch-up (resolve_pending()/flush_pending()/common_speculative_flush_prefill())
+// and the per-chunk draft llama_decode() of prompt tokens -- to isolate the
+// draft's prompt-time GPU cost. Target prefill, nextn embedding staging,
+// checkpoint creation, and decode-time drafting are untouched. Decode-time
+// acceptance is expected to collapse when this is on; it is a measurement
+// arm, not a production mode. Read once; default off, so the production path
+// is byte-identical when unset.
+static bool wp_spec_skip_catchup() {
+    static const bool s_on = [](){
+        const char * e = std::getenv("WP_SPEC_SKIP_CATCHUP");
+        const bool on = e && e[0] == '1';
+        if (on) {
+            SPC_INF("%s", "wp spec: WP_SPEC_SKIP_CATCHUP=1 -- draft prompt catch-up disabled (diagnostic)\n");
+        }
+        return on;
     }();
     return s_on;
 }
@@ -1114,6 +1136,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
+    int32_t prefill_tail = 0;
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
@@ -1285,6 +1308,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+
+        const char * tail_env = std::getenv("WP_DFLASH_PREFILL_TAIL");
+        if (tail_env != nullptr && tail_env[0] == '1' && is_dflash2 && fused_enc && !is_dspark) {
+            const auto & hp = model_dft->hparams;
+            bool all_swa = hp.swa_type == LLAMA_SWA_TYPE_STANDARD && hp.n_swa > 0;
+            for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+                all_swa = all_swa && hp.is_swa(il);
+            }
+            if (all_swa) {
+                prefill_tail = llama_model_n_swa(model_dft);
+            }
+            SPC_INF("DFlash prompt tail retention = %d tokens per sequence per process call\n", prefill_tail);
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         // MAD-LAB: a sidecar GGUF ships no LM head, which is the signal that this draft
@@ -1616,7 +1652,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
+            const int32_t n_rows_in = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            if (prefill_tail > 0 && has_tokens && n_rows_in > prefill_tail) {
+                bool contiguous = true;
+                for (int32_t i = i_batch_beg[seq_id] + 1; i <= i_batch_end[seq_id]; ++i) {
+                    contiguous = contiguous && batch_in.seq_id[i][0] == seq_id &&
+                        (int64_t) batch_in.pos[i] == (int64_t) batch_in.pos[i - 1] + 1;
+                }
+                if (contiguous) {
+                    // Injection rows are independent; retain the full visible window.
+                    i_batch_beg[seq_id] = i_batch_end[seq_id] - prefill_tail + 1;
+                }
+            }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            if (wp_spec_prefill_stats_enabled()) {
+                SPC_INF("DFlash inject seq=%d input_rows=%d kept_rows=%d chunks=%d\n",
+                        seq_id, n_rows_in, n_rows, 1 + (n_rows - 1) / n_ubatch);
+            }
 
             // (c) MAD-LAB / WP_DSPARK_DEBUG: encoder/injection census.
             //
@@ -2855,6 +2908,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return process_single_head_sync(batch_in, n_tokens);
         }
 
+        // WP_SPEC_SKIP_CATCHUP: diagnostic short-circuit. Skip the deferred
+        // catch-up entirely for prompt chunks -- no resolve of a prior
+        // pending chunk, no capture of this one, no draft llama_decode().
+        // pipeline_pending is left false, so resolve_pending()/flush_pending()
+        // stay no-ops for the rest of this prompt (see their own top-of-
+        // function guards). Decode-time drafting keeps reading whatever
+        // pending_h/verify_h it last had -- acceptance collapsing is expected.
+        if (wp_spec_skip_catchup()) {
+            return true;
+        }
+
         // Prefill chunk: deferred/pipelined path. See draft-sync-cost-0912.txt
         // and the pipeline_* member comments above for the mechanism.
         bool ok = true;
@@ -3001,6 +3065,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // !chain_heads (see process() / flush_pending()).
     bool resolve_pending() {
         if (!pipeline_pending) {
+            return true;
+        }
+        // WP_SPEC_SKIP_CATCHUP: defensive no-op. process() never sets
+        // pipeline_pending while this is on, so this should be unreachable,
+        // but bail out here too rather than ever running the catch-up decode.
+        if (wp_spec_skip_catchup()) {
+            pipeline_pending = false;
             return true;
         }
         pipeline_pending = false;
