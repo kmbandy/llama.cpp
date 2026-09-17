@@ -187,7 +187,7 @@ static __device__ __forceinline__ void ggml_cuda_ar_spin_trap(
         dbg->fired          = 1;
     }
     __threadfence_system();
-    __builtin_trap();
+    __trap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1951,10 +1951,16 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         const double spin_budget_s = ggml_cuda_ar_env_f64("GGML_CUDA_AR_SPIN_BUDGET_S", 10.0);
         for (int i = 0; i < p->n_devices; ++i) {
             int khz = 0;
+#if defined(GGML_USE_HIP)
             if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, p->devices[i]) != hipSuccess || khz <= 0) {
                 khz = 100000; // 100 MHz, the GCN/RDNA2 s_memrealtime rate
                 (void) hipGetLastError();
             }
+#else
+            // No wall_clock64() outside HIP: the kernel uses a flat iteration
+            // cap and this rate only scales the debug-dump elapsed_ms.
+            khz = 100000;
+#endif // defined(GGML_USE_HIP)
             p->spin_clock_khz[i]     = khz;
             p->spin_budget_cycles[i] = spin_budget_s > 0.0 ? (uint64_t) (spin_budget_s * 1000.0 * (double) khz) : 0;
             fprintf(stderr, "wp ar-spin: dev=%d budget=%.1f s clock=%d kHz (GGML_CUDA_AR_SPIN_BUDGET_S)\n", i, spin_budget_s, khz);
