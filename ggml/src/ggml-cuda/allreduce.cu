@@ -456,11 +456,25 @@ static int ggml_cuda_ar_codec_grid(int64_t n) {
     return std::max(1, std::min(blocks, 1024));
 }
 
+// Grid cap for the lane-per-element q8_0 codec kernels (256 lanes = 8 q8
+// blocks per CTA; CTAs loop). The pack runs on the AR out-stream concurrently
+// with the compute stream, so a grid that floods the CUs starves whatever
+// compute kernel is running (measured 2026-09-17: an uncapped 20k-CTA pack
+// made the 9070 XT's paged attention 1.9 -> 7.2 ms/call). GGML_CUDA_AR_CODEC_GRID
+// overrides.
+static int ggml_cuda_ar_codec_lane_grid(int64_t ne) {
+    static const int cap = [] {
+        const char * e = std::getenv("GGML_CUDA_AR_CODEC_GRID");
+        return e != nullptr && atoi(e) > 0 ? atoi(e) : 512;
+    }();
+    return (int) std::max<int64_t>(1, std::min<int64_t>((ne + 255) / 256, cap));
+}
+
 template <typename T_src>
 static void ggml_cuda_ar_codec_pack_q8_0(
         const void * src, void * dst, int64_t ne, cudaStream_t stream) {
     const int n_blocks = (int) (ne / QK8_0);
-    const int grid = (int) std::max<int64_t>(1, std::min<int64_t>((ne + 255) / 256, 65535));
+    const int grid = ggml_cuda_ar_codec_lane_grid(ne);
     ggml_cuda_ar_codec_pack_q8_0_kernel<T_src><<<grid, 256, 0, stream>>>(
         static_cast<const T_src *>(src), static_cast<block_q8_0 *>(dst), n_blocks);
     CUDA_CHECK(cudaGetLastError());
@@ -470,8 +484,7 @@ template <typename T_dst>
 static void ggml_cuda_ar_codec_unpack_q8_0(
         void * dst, const void * src, int64_t ne, cudaStream_t stream) {
     const int n_blocks = (int) (ne / QK8_0);
-    // one lane per element; 256 threads = 8 q8 blocks per CTA
-    const int grid = (int) std::max<int64_t>(1, std::min<int64_t>((ne + 255) / 256, 65535));
+    const int grid = ggml_cuda_ar_codec_lane_grid(ne);
     ggml_cuda_ar_codec_unpack_q8_0_kernel<T_dst><<<grid, 256, 0, stream>>>(
         static_cast<T_dst *>(dst), static_cast<const block_q8_0 *>(src), n_blocks);
     CUDA_CHECK(cudaGetLastError());
