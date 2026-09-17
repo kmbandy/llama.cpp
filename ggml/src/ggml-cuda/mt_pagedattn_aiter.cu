@@ -17,6 +17,7 @@
 #include <mutex>
 #include <set>
 #include <map>
+#include <array>
 
 // The runtime AITER wrapper. Lives in aiter-integration's static library
 // (libaiter_triton_aot.a), linked into ggml-hip when GGML_HIP_AITER=ON.
@@ -894,6 +895,65 @@ static float * descale_ones_device() {
 // ─────────────────────────────────────────────────────────────────────────
 // AITER dispatch entry
 // ─────────────────────────────────────────────────────────────────────────
+// ── MAD-288 replay-safe scratch (2026-09-16) ─────────────────────────────
+// Every scratch buffer this op needs used to come from ctx.pool() per call.
+// Captured HIP graphs bake those pool addresses into their launches, and the
+// pool hands the same memory to other callers between replays (the 09-12
+// pre-dequant table alone churns it by num_seqs*max_bps ints per prefill
+// call), so a replayed decode graph could run attention against memory that
+// now belongs to something else -- the two-slot freeze of 09-13. The 09-13
+// answer was to exclude PAGED_ATTN_MT from graph capture entirely
+// (WP_HIP_GRAPHS_PAGED_ATTN, ggml-cuda.cu), which cost every decode step its
+// graph replay. This is the fix that exclusion stood in for: scratch that is
+// persistent and never moves.
+//   * keyed by (device, stream): the two overlapping meta contexts on one
+//     device (GGML_META_OVERLAP) each get their own set, so in-flight work
+//     on one stream never shares a buffer with the other.
+//   * grow-only, and a grown buffer's predecessor is deliberately kept
+//     alive: a graph captured against the old address still owns memory
+//     that fits the shape it was captured for.
+//   * growth happens only on an eager visit. Capturable graphs containing
+//     this op get one eager warm-up visit before capture (ggml-cuda.cu,
+//     "eager warm-up visit ... PAGED_ATTN_MT"), and a shape that would need
+//     more is a different graph key, which warms up eagerly again.
+struct mt_aiter_persist_buf {
+    void * ptr   = nullptr;
+    size_t bytes = 0;
+};
+enum mt_aiter_persist_slot {
+    MT_AITER_PERSIST_SEGM_OUT = 0,
+    MT_AITER_PERSIST_SEGM_MAX,
+    MT_AITER_PERSIST_SEGM_EXP,
+    MT_AITER_PERSIST_CU_SEQLENS,
+    MT_AITER_PERSIST_PREDQ_COUNTS,
+    MT_AITER_PERSIST_PREDQ_PREFIX,
+    MT_AITER_PERSIST_PREDQ_TOTAL,
+    MT_AITER_PERSIST_PREDQ_TABLE,
+    MT_AITER_PERSIST_Q_ROT,
+    MT_AITER_PERSIST_COUNT
+};
+static std::mutex g_mt_aiter_persist_mutex;
+static std::map<std::pair<int, cudaStream_t>, std::array<mt_aiter_persist_buf, MT_AITER_PERSIST_COUNT>> g_mt_aiter_persist;
+
+template <typename T>
+static T * mt_aiter_persist_get(int device, cudaStream_t stream, mt_aiter_persist_slot slot, size_t n_elems) {
+    const size_t need = n_elems * sizeof(T);
+    std::lock_guard<std::mutex> lock(g_mt_aiter_persist_mutex);
+    mt_aiter_persist_buf & b = g_mt_aiter_persist[std::make_pair(device, stream)][slot];
+    if (need > b.bytes) {
+        // Round up so a slowly growing shape (num_seqs, live blocks) does not
+        // reallocate every call; the old allocation is kept alive on purpose.
+        size_t bytes = std::max(need, b.bytes * 2);
+        bytes = (bytes + (1u << 20) - 1) & ~(size_t) ((1u << 20) - 1);
+        void * ptr = nullptr;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        b.ptr   = ptr;
+        b.bytes = bytes;
+    }
+    return (T *) b.ptr;
+}
+
 void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_cache       = dst->src[1];
@@ -1240,18 +1300,21 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
                    num_q_tokens / num_seqs, (int) MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
     }
 
-    ggml_cuda_pool_alloc<float>   segm_out_buf(ctx.pool());
-    ggml_cuda_pool_alloc<float>   segm_max_buf(ctx.pool());
-    ggml_cuda_pool_alloc<float>   segm_exp_buf(ctx.pool());
+    // MAD-288: persistent scratch (see mt_aiter_persist_get above); nullptr
+    // where the 2D path does not use the segment buffers, as before.
+    const int dev = ctx.device;
+    float * segm_out_ptr = nullptr;
+    float * segm_max_ptr = nullptr;
+    float * segm_exp_ptr = nullptr;
     if (!use_2d) {
-        segm_out_buf.alloc(mt_aiter_uattn_segm_output_bytes(&shape, num_q_tokens) / sizeof(float));
-        segm_max_buf.alloc(mt_aiter_uattn_segm_max_bytes(&shape, num_q_tokens)    / sizeof(float));
-        segm_exp_buf.alloc(mt_aiter_uattn_segm_expsum_bytes(&shape, num_q_tokens) / sizeof(float));
+        segm_out_ptr = mt_aiter_persist_get<float>(dev, stream, MT_AITER_PERSIST_SEGM_OUT, mt_aiter_uattn_segm_output_bytes(&shape, num_q_tokens) / sizeof(float));
+        segm_max_ptr = mt_aiter_persist_get<float>(dev, stream, MT_AITER_PERSIST_SEGM_MAX, mt_aiter_uattn_segm_max_bytes(&shape, num_q_tokens)    / sizeof(float));
+        segm_exp_ptr = mt_aiter_persist_get<float>(dev, stream, MT_AITER_PERSIST_SEGM_EXP, mt_aiter_uattn_segm_expsum_bytes(&shape, num_q_tokens) / sizeof(float));
     }
-    ggml_cuda_pool_alloc<int32_t> cu_seqlens_buf(ctx.pool(), (size_t)(num_seqs + 1));
+    int32_t * cu_seqlens_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_CU_SEQLENS, (size_t)(num_seqs + 1));
 
     mt_build_cu_seqlens_kernel<<<1, 1, 0, stream>>>(
-        cu_seqlens_buf.get(), (const int32_t*) q_lens->data, num_seqs);
+        cu_seqlens_ptr, (const int32_t*) q_lens->data, num_seqs);
     mt_aiter_sync_probe(stream, "cu_seqlens", parse_layer_from_kv_cache_name(k_cache->name));
     // Total physical blocks (capacity) of the paged turbo4_fp8 cache — feeds
     // ONLY the diagnostic block-table validity scan (mt_aiter_scan_block_table,
@@ -1279,10 +1342,10 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     // large-tile cutover (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD)
     // exactly — both must agree on which calls are prefill-shaped, same as
     // the use_2d predicate above.
-    ggml_cuda_pool_alloc<int32_t> predq_counts(ctx.pool());
-    ggml_cuda_pool_alloc<int32_t> predq_prefix(ctx.pool());
-    ggml_cuda_pool_alloc<int32_t> predq_total(ctx.pool());
-    ggml_cuda_pool_alloc<int32_t> predq_scratch_table(ctx.pool());
+    int32_t * predq_counts_ptr        = nullptr;
+    int32_t * predq_prefix_ptr        = nullptr;
+    int32_t * predq_total_ptr         = nullptr;
+    int32_t * predq_scratch_table_ptr = nullptr;
     int32_t num_scratch_blocks = 0;
     // MAD-LAB (draft-KV-paged num_seqs fix): num_seqs_dispatch, not num_seqs
     // -- see the comment on num_seqs_dispatch's declaration above.
@@ -1325,9 +1388,9 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
         num_scratch_blocks = num_seqs * blocks_per_seq_bound;
 
         if (num_scratch_blocks > 0) {
-            predq_counts.alloc((size_t) num_seqs);
-            predq_prefix.alloc((size_t) num_seqs);
-            predq_total.alloc(1);
+            predq_counts_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_COUNTS, (size_t) num_seqs);
+            predq_prefix_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_PREFIX, (size_t) num_seqs);
+            predq_total_ptr  = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_TOTAL, 1);
             // Kernel A still runs, fully device-side: it produces the exact
             // per-seq counts/prefix the fill kernel below needs to keep the
             // compacted table DENSE (packed by actual live blocks, not the
@@ -1337,9 +1400,9 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
             mt_aiter_predequant_scan_kernel<<<1, 1, 0, stream>>>(
                 (const int32_t*) context_lens->data, (const int32_t*) q_lens->data,
                 block_size, num_seqs,
-                predq_counts.get(), predq_prefix.get(), predq_total.get());
+                predq_counts_ptr, predq_prefix_ptr, predq_total_ptr);
 
-            predq_scratch_table.alloc((size_t) num_seqs * (size_t) max_bps);
+            predq_scratch_table_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_TABLE, (size_t) num_seqs * (size_t) max_bps);
             const dim3 fill_grid((unsigned) num_seqs, (unsigned) ((max_bps + 255) / 256));
             // MAD-2026-09-12 predequant-overflow-guard: `counts`/`prefix`
             // above are exact (real context_lens), but num_scratch_blocks is
@@ -1355,9 +1418,9 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
                 stream, num_scratch_blocks, -1, max_ctx_len_param);
             mt_aiter_predequant_fill_table_kernel<<<fill_grid, 256, 0, stream>>>(
                 (const int32_t*) block_tables->data,
-                predq_counts.get(), predq_prefix.get(), max_bps,
+                predq_counts_ptr, predq_prefix_ptr, max_bps,
                 num_scratch_blocks, predequant_overflow_flag,
-                predq_scratch_table.get());
+                predq_scratch_table_ptr);
             mt_aiter_predequant_overflow_guard_end(stream);
         }
     }
@@ -1369,7 +1432,7 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     // Allocation only happens when both (a) registry says hadamard mode AND
     // (b) cache is turbo-FP8 — non-FP8 paths bypass entirely.
     const __half * q_ptr = (const __half *) q->data;
-    ggml_cuda_pool_alloc<__half> q_rot_scratch(ctx.pool());
+    __half * q_rot_ptr = nullptr;
     if (cache_type == MT_AITER_CACHE_TURBO4_FP8 && mt_turbo_fp8::hadamard_required()) {
         const size_t q_elts = (size_t) num_q_tokens * n_heads * head_size;
         // MAD-XXX diag (2026-09-10): num_q_tokens comes from k_cur->ne[2] but
@@ -1392,20 +1455,20 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
                     num_q_tokens, n_heads, head_size);
             }
         }
-        q_rot_scratch.alloc(q_elts);
-        const hipError_t q_cpy = hipMemcpyAsync(q_rot_scratch.get(), q->data,
+        q_rot_ptr = mt_aiter_persist_get<__half>(dev, stream, MT_AITER_PERSIST_Q_ROT, q_elts);
+        const hipError_t q_cpy = hipMemcpyAsync(q_rot_ptr, q->data,
                        q_elts * sizeof(__half), hipMemcpyDeviceToDevice, stream);
         if (q_cpy != hipSuccess) {
             std::fprintf(stderr, "[q-overread] dev=%d Q copy FAILED: %s\n",
                          ggml_cuda_get_device(), hipGetErrorString(q_cpy));
         }
         const hipError_t herr = mt_turbo_fp8_fwht_half(
-            stream, q_rot_scratch.get(),
+            stream, q_rot_ptr,
             (int)(num_q_tokens * n_heads), head_size, head_size);
         if (herr != hipSuccess) {
             GGML_ABORT("mt_turbo_fp8_fwht_half(Q) launch failed: %s", hipGetErrorString(herr));
         }
-        q_ptr = q_rot_scratch.get();
+        q_ptr = q_rot_ptr;
     }
 
     // ── 3. Launch AITER attention via the runtime wrapper ──
@@ -1415,12 +1478,12 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     args.k_cache      = k_cache->data;
     args.v_cache      = v_cache->data;
     args.out          = dst->data;
-    args.segm_output  = use_2d ? nullptr : segm_out_buf.get();
-    args.segm_max     = use_2d ? nullptr : segm_max_buf.get();
-    args.segm_expsum  = use_2d ? nullptr : segm_exp_buf.get();
+    args.segm_output  = use_2d ? nullptr : segm_out_ptr;
+    args.segm_max     = use_2d ? nullptr : segm_max_ptr;
+    args.segm_expsum  = use_2d ? nullptr : segm_exp_ptr;
     args.block_tables = (const int32_t*) block_tables->data;
     args.seq_lens     = (const int32_t*) context_lens->data;
-    args.query_start_len = cu_seqlens_buf.get();
+    args.query_start_len = cu_seqlens_ptr;
 
     float * ones = descale_ones_device();
     args.q_descale   = ones;
@@ -1447,7 +1510,7 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     // MAD-2026-09-12 predequant-scratch: NULL/0 for every call that isn't
     // turbo4_fp8 2D-large-prefill (the wrapper only reads these when
     // cache_type == TURBO4_FP8_BS256 && the 2D-large tile is selected).
-    args.scratch_block_tables = num_scratch_blocks > 0 ? predq_scratch_table.get() : nullptr;
+    args.scratch_block_tables = num_scratch_blocks > 0 ? predq_scratch_table_ptr : nullptr;
     args.num_scratch_blocks   = num_scratch_blocks;
     args.q_stride_0         = (int64_t) n_heads * head_size;
     args.output_stride_0    = args.q_stride_0;

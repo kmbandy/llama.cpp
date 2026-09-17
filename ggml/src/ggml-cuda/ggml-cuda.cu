@@ -4401,27 +4401,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph,
 #endif
         }
 
-        // MAD-288 (ported from ~/GitHub/llama-gpu, gpu-portability branch,
-        // never ported to this branch until now): GGML_OP_PAGED_ATTN_MT's
-        // AITER launch (mt_aiter_unified_attn.cpp) bakes grid dims, kernel-
-        // handle selection (2D/3D/ALL_DECODE/2D-large), and pool-allocated
-        // workspace pointers (segm_out/segm_max/segm_expsum, cu_seqlens,
-        // predequant scratch table — ggml_cuda_pool_alloc in
-        // mt_pagedattn_aiter.cu) into the captured graph node BY VALUE. Those
-        // pool allocations are host-side RAII objects, not ggml tensors, so
-        // their addresses are never covered by the node-property topology
-        // compare (ggml_cuda_graph_update_required) — the pool can and does
-        // hand the same address to an unrelated allocation between capture
-        // and replay, aliasing a replayed op's workspace. Under 2-GPU TP
-        // (WP_HIP_GRAPHS=1) each rank decides capture/replay independently
-        // per device, so a wedge on one rank alone (not both) is consistent
-        // with this: the two ranks captured different graphs. Mirrors the
-        // existing ML8_MUL_MAT_ID precedent immediately above — always
-        // disable capture when a PAGED_ATTN_MT node is present. Deterministic
-        // per graph content (pure node->op test, no runtime/env state other
-        // than the override below), so both TP ranks make the same call for
-        // the same graph. WP_HIP_GRAPHS_PAGED_ATTN=1 restores the old
-        // (capture-eligible) behavior for A/B measurement only.
+        // MAD-288 (2026-09-13): capture is disabled for any graph holding a
+        // GGML_OP_PAGED_ATTN_MT node. Original reason: the op's workspace came
+        // from ctx.pool() per call, so a replayed graph could alias recycled
+        // pool memory. That half is fixed (mt_pagedattn_aiter.cu,
+        // mt_aiter_persist_get, 2026-09-16: persistent scratch that never
+        // moves). The exclusion STAYS ON because with capture enabled the
+        // production TP alias wedges deterministically at 16k prefill
+        // (2026-09-16 chains 22/24/25/26: both GPUs 99-100% busy, duplex AR
+        // ops never complete, spin trap not fired) -- the AITER launch still
+        // bakes grid dims / kernel-handle selection derived from tensor DATA
+        // (context lens) into the captured node, invisible to the topology
+        // compare. Cost of the exclusion, measured: -12% prefill, -20% decode
+        // on qwen38-27b-q8-tp. WP_HIP_GRAPHS_PAGED_ATTN=1 re-enables capture
+        // for A/B only.
         if (node->op == GGML_OP_PAGED_ATTN_MT) {
             static const bool allow_paged_attn_mt_graphs = [] {
                 const char * e = std::getenv("WP_HIP_GRAPHS_PAGED_ATTN");
@@ -4430,10 +4423,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph,
             if (!allow_paged_attn_mt_graphs) {
                 use_cuda_graph = false;
                 if (blocker) { *blocker = node; }
-                if (why)     { *why = "PAGED_ATTN_MT: pool-allocated workspace not replay-safe (MAD-288)"; }
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to PAGED_ATTN_MT (MAD-288)\n", __func__);
-#endif
+                if (why)     { *why = "PAGED_ATTN_MT: launch geometry not replay-safe (MAD-288)"; }
             }
         }
 
