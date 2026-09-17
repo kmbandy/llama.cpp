@@ -514,6 +514,41 @@ void ggml_vec_dot_ml8_fp8_f32(int n, float * GGML_RESTRICT s, size_t bs, const v
     *s = sumf;
 }
 
+// FP8_B128 phase 2: CPU vec_dot for e4m3 block-128 weights x fp32 activations.
+// vec_dot_type is GGML_TYPE_F32 (no src1 requantization), so y is raw fp32.
+// Each FP8_B128 block is { fp16 d, 128 x e4m3 byte }; the weight value is
+// e4m3_decode(qs[i]) * fp16_to_fp32(d). This is the CPU reference / dequant
+// fallback path for MUL_MAT and GET_ROWS with FP8_B128 src0.
+void ggml_vec_dot_fp8_b128_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_FP8_B128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb = n / QK_FP8_B128;
+
+    const block_fp8_b128 * GGML_RESTRICT x = vx;
+    const float           * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    float wdec[QK_FP8_B128];
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        dequantize_row_f8_e4m3(x[ib].qs, wdec, QK_FP8_B128);
+        const float * yb = y + (size_t) ib * QK_FP8_B128;
+        float blk = 0.0f;
+        for (int j = 0; j < QK_FP8_B128; ++j) {
+            blk += wdec[j] * yb[j];
+        }
+        sumf += blk * d;
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

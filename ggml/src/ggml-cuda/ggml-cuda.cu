@@ -8157,6 +8157,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TQ4_1S:
                     case GGML_TYPE_TQ3_1S:
                         return true;
+                    // FP8_B128 phase 2: no dedicated GEMM kernel yet (that lands
+                    // with the HIP AITER preshuffle work) -- covered here only so
+                    // the generic dequant(to_fp32)+cuBLAS fallback in
+                    // ggml_cuda_op_mul_mat can serve it as a correctness path,
+                    // same as the dequant fallback exercised by test-backend-ops'
+                    // MUL_MAT/GET_ROWS "all types" sweep.
+                    case GGML_TYPE_FP8_B128:
+                        return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
                     // MAD Task 11: scaled-fp8 (ml8-fp8) weights are a real
                     // MUL_MAT weight type — routed to the no-LUT FP8-WMMA path
                     // (WEIGHT_FORMAT=0) in ggml_cuda_mul_mat. Requires fp32
@@ -8270,6 +8278,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (cent->ne[1] != w->ne[0] / 64)    return false;
                 return true;
             } break;
+        case GGML_OP_FP8_QUANT_ROT:
+        case GGML_OP_FP8_MUL_MAT:
+            // FP8_B128 phase 2: no CUDA/HIP kernel yet (a later change adds
+            // the AITER preshuffle GEMM + quant_rot kernel on RDNA4). CPU
+            // handles both ops for now.
+            return false;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
@@ -8289,6 +8303,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TQ4_1S:
                     case GGML_TYPE_TQ3_1S:
                     case GGML_TYPE_ML8_FP8:
+                    case GGML_TYPE_FP8_B128:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:

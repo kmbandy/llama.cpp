@@ -8,11 +8,11 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    6
 #define RPC_PROTO_MINOR_VERSION    0
-// fork patch version 3: our 105 ops + upstream's 4 new DSA/DSV4 ops = 109
-#define RPC_PROTO_PATCH_VERSION    3
+// fork patch version 4: 109 + FP8_B128 phase 2's 2 new ops (FP8_QUANT_ROT, FP8_MUL_MAT) = 111
+#define RPC_PROTO_PATCH_VERSION    4
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

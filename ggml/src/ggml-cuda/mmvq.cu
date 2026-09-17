@@ -359,6 +359,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // FP8_B128 phase 2: no vec_dot_q kernel exists for this type (it is only
+    // meant to be routed through GGML_OP_FP8_MUL_MAT, or -- for the plain
+    // MUL_MAT dequant-fallback correctness path exercised by
+    // test-backend-ops -- through ggml_cuda_op_mul_mat_cublas). Without this
+    // early-out, mul_mat_vec_q's default: case would GGML_ABORT.
+    if (type == GGML_TYPE_FP8_B128) {
+        return false;
+    }
     if (ne11 > ggml_cuda_mmvq_dispatch_cap()) {
         return false;
     }

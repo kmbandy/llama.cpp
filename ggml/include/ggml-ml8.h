@@ -147,6 +147,63 @@ GGML_API struct ggml_tensor * ggml_ml8_get_rows(
         struct ggml_tensor  * centroids,
         struct ggml_tensor  * ids);
 
+// FP8_B128 phase 2 (see ggml.h GGML_OP_FP8_QUANT_ROT / GGML_OP_FP8_MUL_MAT
+// doc comments and scripts/calibration/convert_fp8_rotated.py --format
+// fp8_b128 for the full design).
+//
+// kind values for ggml_fp8_quant_rot's `kind` argument. Kinds 1/2 reuse the
+// exact same rotation math as ggml_ml8_apply_rotation (see
+// GGML_ML8_ROTATION_KIND_* above); kind 0 is new — a plain pass-through
+// (no rotation) fused with the block-128 e4m3 quantize.
+#define GGML_FP8_QUANT_ROT_KIND_NONE             0
+#define GGML_FP8_QUANT_ROT_KIND_KRONECKER        1
+#define GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD   2
+
+// Fused activation rotate + block-128 fp8 quantize. Computed once per input
+// tensor and shared by every GEMM of the input group (see
+// GGML_OP_FP8_QUANT_ROT in ggml.h for the exact packed row layout).
+//
+// Tensor shapes:
+//   x   : [K, n1, n2, n3] GGML_TYPE_F32   (rows contiguous, nb[1] == K*4)
+//   h_a : [a_dim, a_dim]  GGML_TYPE_F32   required iff kind == KRONECKER,
+//                                         must be NULL otherwise
+//
+// Output:
+//   y   : [K + K/32, n1, n2, n3] GGML_TYPE_I8
+//
+// Constraints:
+//   - K % 128 == 0
+//   - kind == GGML_FP8_QUANT_ROT_KIND_NONE:            h_a must be NULL
+//   - kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER:        h_a required,
+//     K == a_dim * b_dim, h_a->ne[0] == h_a->ne[1] == a_dim
+//   - kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD:   h_a must be NULL,
+//     K == a_dim * b_dim (a_dim == K / b_dim)
+GGML_API struct ggml_tensor * ggml_fp8_quant_rot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * h_a,
+        int64_t a_dim,
+        int64_t b_dim,
+        int32_t kind);
+
+// Block-128 fp8 weight x packed-fp8 activation matmul. `a` must be the output
+// of ggml_fp8_quant_rot (or bit-compatible with it).
+//
+// Tensor shapes:
+//   w : [K, N]                    GGML_TYPE_FP8_B128
+//   a : [K + K/32, n1, n2, n3]    GGML_TYPE_I8
+//
+// Output:
+//   y : [N, n1, n2, n3]           GGML_TYPE_F32
+//
+// Constraints:
+//   - K % 128 == 0
+//   - a->ne[0] == w->ne[0] + w->ne[0] / 32
+GGML_API struct ggml_tensor * ggml_fp8_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * a);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

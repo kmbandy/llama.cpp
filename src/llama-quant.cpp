@@ -936,6 +936,22 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     llama_ftype ftype = params->ftype;
 
+    if (ftype == LLAMA_FTYPE_MOSTLY_FP8_B128) {
+        // FP8_B128 phase 2: the per-128-block quantize_row_fp8_b128_ref path
+        // exists (used by test-backend-ops), but it is NOT tile-scale-aware —
+        // it would silently violate the 128x128-tile-shared-scale invariant
+        // the runtime relies on. The real producer is the Python converter
+        // (scripts/calibration/convert_fp8_rotated.py --format fp8_b128),
+        // which also handles input-group rotation. Reject llama-quantize as
+        // a target here with a clear message instead of emitting a
+        // technically-valid-but-runtime-incompatible GGUF.
+        throw std::runtime_error(
+            "llama-quantize cannot produce FP8_B128: it requires a Python-side "
+            "converter (scripts/calibration/convert_fp8_rotated.py --format fp8_b128) "
+            "that applies per-input-group rotation and writes 128x128-tile-shared "
+            "scales; use that converter instead of llama-quantize for this format.");
+    }
+
     int nthread = params->nthread;
 
     if (nthread <= 0) {

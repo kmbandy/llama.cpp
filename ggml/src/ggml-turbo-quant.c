@@ -1529,6 +1529,84 @@ size_t quantize_ml8_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT ds
     return nrows * row_size;
 }
 
+// ── fp8_b128 ──────────────────────────────────────────────────────────────
+//
+// FP8_B128 phase 2: dequantize a row of fp8_b128 blocks.
+//
+// Block layout (130 bytes, tightly packed):
+//   [d : fp16 LE (2 bytes)] [qs : 128 × uint8 OCP e4m3fn]
+//
+// output[b*128 + i] = e4m3_decode(qs[i]) * fp16_to_fp32(d)
+//
+// Reuses g_fp8_e4m3_lut / ml8_init_fp8_e4m3_lut, the same OCP e4m3fn decode
+// used by ml8_fp8. k must be divisible by QK_FP8_B128 (128).
+
+void dequantize_row_fp8_b128(const block_fp8_b128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK_FP8_B128 == 0);
+    ml8_init_fp8_e4m3_lut();
+    const int64_t n_blocks = k / QK_FP8_B128;
+    for (int64_t b = 0; b < n_blocks; b++) {
+        const float   d   = GGML_FP16_TO_FP32(x[b].d);
+        float       * out = &y[b * QK_FP8_B128];
+        for (int i = 0; i < QK_FP8_B128; i++) {
+            out[i] = g_fp8_e4m3_lut[x[b].qs[i]] * d;
+        }
+    }
+}
+
+// FP8_B128 phase 2: quantize a row of fp32 -> fp8_b128 blocks, one scale per
+// 128-element block (NOT the 128x128-tile-shared scale the Python converter
+// uses — this reference path is for test-backend-ops/llama-quantize only).
+//
+// Block layout (130 bytes): [d : fp16 LE] [qs : 128 × uint8 OCP e4m3fn]
+// d = amax(|x[i]|) / 448.0 (E4M3_MAX; guard scale==0 -> 1.0f)
+// qs[i] = f32_to_e4m3(x[i] / d)
+//
+// This is the exact inverse of dequantize_row_fp8_b128. k must be divisible
+// by QK_FP8_B128 (128).
+
+void quantize_row_fp8_b128_ref(const float * GGML_RESTRICT x, block_fp8_b128 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK_FP8_B128 == 0);
+    const int64_t n_blocks = k / QK_FP8_B128;
+
+    float scaled[QK_FP8_B128];
+
+    for (int64_t b = 0; b < n_blocks; b++) {
+        const float * blk = &x[b * QK_FP8_B128];
+
+        float amax = 0.0f;
+        for (int i = 0; i < QK_FP8_B128; i++) {
+            float av = blk[i] < 0.0f ? -blk[i] : blk[i];
+            if (av > amax) amax = av;
+        }
+
+        float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+        y[b].d = GGML_FP32_TO_FP16(scale);
+
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < QK_FP8_B128; i++) {
+            scaled[i] = blk[i] * inv_scale;
+        }
+        quantize_row_f8_e4m3_ref(scaled, y[b].qs, QK_FP8_B128);
+    }
+}
+
+size_t quantize_fp8_b128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                          int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    GGML_ASSERT(n_per_row % QK_FP8_B128 == 0);
+
+    const size_t row_size = (n_per_row / QK_FP8_B128) * sizeof(block_fp8_b128);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_fp8_b128_ref(
+            src + row * n_per_row,
+            (block_fp8_b128 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
 void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
     // Round-to-nearest-even fp32 → fp8 e4m3fn. Saturates at ±448 (no inf in
     // this variant). NaN inputs map to S.1111.111. Used at calibration-time

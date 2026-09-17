@@ -359,6 +359,12 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK_ML8_FP8, 1, dequantize_ml8_fp8>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_FP8_B128:
+            // QR=1: each dequantize call produces two consecutive e4m3 elements scaled by per-block fp16 scale.
+            // Block layout: block_fp8_b128 { ggml_half d; uint8_t qs[128]; } = 130 bytes.
+            get_rows_cuda_q<QK_FP8_B128, 1, dequantize_fp8_b128>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q2_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q2_K<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

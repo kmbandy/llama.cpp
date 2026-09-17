@@ -2488,6 +2488,81 @@ struct test_ml8_apply_rotation : public test_case {
     }
 };
 
+// GGML_OP_FP8_QUANT_ROT (FP8_B128 phase 2) — fused activation rotate + block-128
+// e4m3 quantize. kind selects rotation: NONE (0, no h_a), KRONECKER (1, h_a
+// required, K == a_dim*b_dim), BLOCK_HADAMARD (2, h_a NULL, K == a_dim*b_dim).
+// The rotation math for kinds 1/2 is bit-identical to GGML_OP_ML8_APPLY_ROTATION
+// (see test_ml8_apply_rotation above); only CPU implements this op today, so
+// comparison is exact and ROCm0 reports "not supported" instead of a mismatch.
+struct test_fp8_quant_rot : public test_case {
+    const int64_t a_dim;
+    const int64_t b_dim;
+    const int32_t kind;
+    const int64_t n_tokens; // ne[1]
+    const int64_t ne2;
+    const int64_t ne3;
+
+    std::string vars() override {
+        return VARS_TO_STR6(a_dim, b_dim, kind, n_tokens, ne2, ne3);
+    }
+
+    test_fp8_quant_rot(int64_t a_dim = 5, int64_t b_dim = 128,
+                        int32_t kind = GGML_FP8_QUANT_ROT_KIND_KRONECKER,
+                        int64_t n_tokens = 4, int64_t ne2 = 1, int64_t ne3 = 1)
+        : a_dim(a_dim), b_dim(b_dim), kind(kind), n_tokens(n_tokens), ne2(ne2), ne3(ne3) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = a_dim * b_dim;
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_tokens, ne2, ne3);
+        ggml_set_name(x, "x");
+        ggml_tensor * h_a = nullptr;
+        if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
+            h_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a_dim, a_dim);
+            ggml_set_name(h_a, "h_a");
+        }
+        ggml_tensor * out = ggml_fp8_quant_rot(ctx, x, h_a, a_dim, b_dim, kind);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_FP8_MUL_MAT (FP8_B128 phase 2) — block-128 fp8 weight x packed-fp8
+// activation matmul. The weight is a real GGML_TYPE_FP8_B128 tensor,
+// initialized the normal test-harness way (init_tensor_uniform quantizes it
+// via ggml_quantize_chunk / quantize_row_fp8_b128_ref, so the 128x128-tile-
+// shared-scale invariant the production converter enforces is NOT required
+// here). The packed I8 activation is produced by a GGML_OP_FP8_QUANT_ROT
+// (kind NONE, no rotation) node built INSIDE this test's graph, so CPU and
+// the backend under test see byte-identical fp32 input `x` and there is no
+// separate "prepare an I8 tensor" step to keep in sync between backends.
+struct test_fp8_mul_mat : public test_case {
+    const int64_t k; // K (in features), multiple of 128
+    const int64_t n; // N (out features)
+    const int64_t m; // M (tokens)
+
+    std::string vars() override {
+        return VARS_TO_STR3(k, n, m);
+    }
+
+    double max_nmse_err() override {
+        return 5e-3; // fp8 weight + fp8 activation quantization noise
+    }
+
+    test_fp8_mul_mat(int64_t k = 128, int64_t n = 16, int64_t m = 16) : k(k), n(n), m(m) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_FP8_B128, k, n);
+        ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(x, "x");
+        ggml_tensor * qrot = ggml_fp8_quant_rot(ctx, x, nullptr, 1, k, GGML_FP8_QUANT_ROT_KIND_NONE);
+        ggml_set_name(qrot, "qrot");
+        ggml_tensor * out = ggml_fp8_mul_mat(ctx, w, qrot);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -8744,6 +8819,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_ML8_FP8,
+    GGML_TYPE_FP8_B128,
     GGML_TYPE_Q2_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
@@ -9776,6 +9852,68 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         /*a_dim=*/5, /*b_dim=*/128, /*with_h_a=*/true, /*n_tokens=*/3, /*ne2=*/2, /*ne3=*/1));  // 3D batch, kronecker
     test_cases.emplace_back(new test_ml8_apply_rotation(
         /*a_dim=*/38, /*b_dim=*/128, /*with_h_a=*/false, /*n_tokens=*/3, /*ne2=*/2, /*ne3=*/1)); // 3D batch, block_hadamard
+
+    // FP8_B128 phase 2: dequant fallback for a plain FP8_B128 weight through
+    // the generic MUL_MAT dispatch (mirrors the ML8_FP8 loop above).
+    for (int M : { 1, 8, 16, 32 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FP8_B128, GGML_TYPE_F32,
+            /*m=N*/ 128, /*n=M*/ M, /*k=K*/ 256, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FP8_B128, GGML_TYPE_F32,
+        /*m=N*/ 256, /*n=M*/ 16, /*k=K*/ 512, {1, 1}, {1, 1}));
+
+    // GGML_OP_FP8_QUANT_ROT: kinds 0 (none) / 1 (kronecker) / 2 (block_hadamard)
+    // crossed with K in {128, 256, 5120} and M in {1, 7, 16, 33, 64, 512}, per
+    // the FP8_B128 phase 2 design doc. The kronecker (5, 1024) shape is the
+    // only one whose CPU reference cost is dominated by b_dim^2 (~5.2M
+    // mul-adds/token, same as the existing a=9,b=1024 ml8_apply_rotation
+    // case above) -- capped to the smaller M values to keep it fast; every
+    // other shape here is cheap (b_dim <= 128) so gets the full M sweep.
+    {
+        const int64_t Ms_full[]  = { 1, 7, 16, 33, 64, 512 };
+        const int64_t Ms_small[] = { 1, 7, 16, 33 };
+
+        // kind NONE: no rotation compute, just quantize -- cheap at any size.
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 128,  GGML_FP8_QUANT_ROT_KIND_NONE, M));
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 256,  GGML_FP8_QUANT_ROT_KIND_NONE, M));
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 5120, GGML_FP8_QUANT_ROT_KIND_NONE, M));
+        }
+        // kind KRONECKER: b_dim <= 128 shapes are cheap (full sweep); the
+        // b_dim=1024 shape is capped to Ms_small.
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 128, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M));
+            test_cases.emplace_back(new test_fp8_quant_rot(2, 128, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M));
+        }
+        for (int64_t M : Ms_small) {
+            test_cases.emplace_back(new test_fp8_quant_rot(5, 1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M));
+        }
+        // kind BLOCK_HADAMARD: all shapes here use b_dim=128, cheap -- full sweep.
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M));
+            test_cases.emplace_back(new test_fp8_quant_rot(2,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M));
+            test_cases.emplace_back(new test_fp8_quant_rot(40, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M));
+        }
+    }
+
+    // GGML_OP_FP8_MUL_MAT: touches every K in {128, 5120, 17408}, N in
+    // {16, 128, 256, 5120} and M in {1, 7, 16, 32, 33, 64, 512} from the
+    // FP8_B128 phase 2 design doc at least once (zipped rather than a full
+    // cross product -- the CPU reference is O(K*N*M) and a full 3x4x7 sweep
+    // at these sizes would dominate test-backend-ops' runtime), plus a couple
+    // of larger spot checks for confidence at scale.
+    {
+        const int64_t Ks[] = { 128, 5120, 17408 };
+        const int64_t Ns[] = { 16, 128, 256, 5120 };
+        const int64_t Ms[] = { 1, 7, 16, 32, 33, 64, 512 };
+        for (size_t i = 0; i < sizeof(Ms) / sizeof(Ms[0]); i++) {
+            const int64_t K = Ks[i % (sizeof(Ks) / sizeof(Ks[0]))];
+            const int64_t N = Ns[i % (sizeof(Ns) / sizeof(Ns[0]))];
+            test_cases.emplace_back(new test_fp8_mul_mat(K, N, Ms[i]));
+        }
+        test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/5120,  /*n=*/5120, /*m=*/16));
+        test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/17408, /*n=*/16,   /*m=*/1));
+    }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {

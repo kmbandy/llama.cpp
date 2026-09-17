@@ -9,7 +9,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gguf-py"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
 
 import gguf  # noqa: E402
 from gguf import GGMLQuantizationType  # noqa: E402
@@ -18,7 +18,12 @@ from convert_fp8_rotated import (  # noqa: E402
     _sidecar_base,
     build_plan, classify_tensor, convert, tensor_role, _quantize_q8_0_gpu,
     _CHUNK_ROWS, _row_chunk_bounds,
+    _quantize_fp8_b128_gpu, role_group_key, _group_seed, _parse_layer,
+    _FP8B128_TILE, _FP8B128_BLOCK_BYTES, _FP8B128_MAX,
+    _fit_ml8_centroids, _assign_ml8_indices, _process_rotate_ml8_4_chunked,
+    _ML8_FIT_ROWS_DEFAULT,
 )
+from ml8_to_gguf import QK_ML8, ML8_BLOCK_BYTES, N_CENTROIDS  # noqa: E402
 from gguf.quants import quantize as gguf_quantize  # noqa: E402
 from kronecker_rotation import (  # noqa: E402
     KroneckerRotation, BlockHadamardRotation, random_orthogonal, factor_for_dim,
@@ -365,6 +370,571 @@ def test_different_seed_changes_kronecker_rotation(synthetic_gguf, tmp_path):
     h2 = next(t for t in r2.tensors if t.name == "blk.0.attn_qkv.rotation_h_a").data
     assert not np.array_equal(np.ascontiguousarray(h1), np.ascontiguousarray(h2))
     print("  PASS test_different_seed_changes_kronecker_rotation")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# --format fp8_b128 tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+# All dims here are 128-aligned on both N and K so fp8_b128 rotates them
+# (except D_B128_ODD_N, deliberately NOT 128-aligned, to exercise the
+# fallback rule).
+D_B128 = 384          # hidden size (K for kronecker roles); factor_for_dim(384) -> a=3,b=128
+                       # (a>1 so the group-vs-group h_a comparison below isn't a 1x1 coin flip)
+FFN_B128 = 256         # ffn intermediate size (K for hadamard roles)
+VOCAB_B128 = 128
+D_B128_ODD_N = 100    # not a multiple of 128 -> fp8_b128 fallback to q8_0
+
+
+def _add_bf16_b128(writer, name, t: torch.Tensor):
+    data = np.ascontiguousarray(t.to(torch.bfloat16).view(torch.uint8).numpy())
+    writer.add_tensor(name, data, raw_dtype=GGMLQuantizationType.BF16)
+
+
+def _make_synthetic_gguf_b128(path: Path) -> dict:
+    """Two-layer synthetic bf16 GGUF, 128-aligned on N/K, exercising: kronecker
+    input groups (attn_qkv+attn_gate, ffn_gate+ffn_up) per layer, hadamard
+    singletons (attn_output/ffn_down/ssm_out), the untied lm head (output,
+    top-level singleton), q8_0 exclusions, and one deliberately-unaligned
+    tensor (attn_v) to hit the 128-alignment fallback."""
+    w = gguf.GGUFWriter(str(path), arch="qwen35")
+    w.add_uint32("qwen35.embedding_length", D_B128)
+    w.add_uint32("qwen35.block_count", 2)
+
+    weights: dict[str, torch.Tensor] = {}
+
+    def add(name, N, K):
+        t = torch.randn(N, K, dtype=torch.float32) * 0.5
+        weights[name] = t
+        _add_bf16_b128(w, name, t)
+
+    add("token_embd.weight", VOCAB_B128, D_B128)               # q8_0
+
+    for layer in (0, 1):
+        add(f"blk.{layer}.attn_qkv.weight", 3 * D_B128, D_B128)     # kronecker, group A
+        add(f"blk.{layer}.attn_gate.weight", D_B128, D_B128)        # kronecker, group A
+        add(f"blk.{layer}.attn_v.weight", D_B128_ODD_N, D_B128)     # kronecker role, N%128!=0 -> fallback q8_0
+        add(f"blk.{layer}.attn_output.weight", D_B128, FFN_B128)    # hadamard, singleton
+        add(f"blk.{layer}.ffn_gate.weight", FFN_B128, D_B128)       # kronecker, group B
+        add(f"blk.{layer}.ffn_up.weight", FFN_B128, D_B128)         # kronecker, group B
+        add(f"blk.{layer}.ffn_down.weight", D_B128, FFN_B128)       # hadamard, singleton
+        add(f"blk.{layer}.ssm_out.weight", D_B128, FFN_B128)        # hadamard, singleton
+        add(f"blk.{layer}.ssm_alpha.weight", 48, D_B128)            # q8_0
+        add(f"blk.{layer}.ssm_beta.weight", 48, D_B128)             # q8_0
+        norm = torch.ones(D_B128)
+        weights[f"blk.{layer}.attn_norm.weight"] = norm
+        _add_bf16_b128(w, f"blk.{layer}.attn_norm.weight", norm)    # copy
+
+    add("output.weight", VOCAB_B128, D_B128)                   # kronecker, singleton (top-level)
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    return weights
+
+
+@pytest.fixture()
+def synthetic_gguf_b128(tmp_path):
+    src = tmp_path / "tiny_bf16_b128.gguf"
+    weights = _make_synthetic_gguf_b128(src)
+    return src, weights
+
+
+def _decode_e4m3_bytes_numpy(b: np.ndarray) -> np.ndarray:
+    """Independent (no torch) OCP e4m3fn decoder: 1 sign / 4 exp (bias 7) /
+    3 mantissa bits, no infinities, 0x7F/0xFF = NaN. Used to check the
+    converter's packed bytes without relying on torch's own e4m3 codec for
+    both the encode and the check."""
+    b = np.asarray(b, dtype=np.uint8)
+    sign = ((b >> 7) & 1).astype(np.float64)
+    exp = ((b >> 3) & 0xF).astype(np.int64)
+    mant = (b & 0x7).astype(np.float64)
+    is_nan = (exp == 15) & (mant == 7)
+    subnormal = exp == 0
+    normal_val = (1.0 + mant / 8.0) * np.exp2((exp - 7).astype(np.float64))
+    subnormal_val = (mant / 8.0) * np.exp2(-6.0)
+    val = np.where(subnormal, subnormal_val, normal_val)
+    val = np.where(sign == 1.0, -val, val)
+    val = np.where(is_nan, np.nan, val)
+    return val.astype(np.float32)
+
+
+def test_decode_e4m3_bytes_numpy_matches_torch():
+    """Sanity-check the independent numpy decoder against torch's own e4m3
+    codec before trusting it to validate the converter's output."""
+    torch.manual_seed(11)
+    x = (torch.randn(2000) * 300.0).clamp(-_FP8B128_MAX, _FP8B128_MAX)
+    e4m3 = x.to(torch.float8_e4m3fn)
+    expected = e4m3.to(torch.float32).numpy()
+    raw = e4m3.view(torch.uint8).numpy()
+    actual = _decode_e4m3_bytes_numpy(raw)
+    np.testing.assert_array_equal(actual, expected)
+    print("  PASS test_decode_e4m3_bytes_numpy_matches_torch")
+
+
+def test_quantize_fp8_b128_tile_scale_and_roundtrip():
+    """Block encoding round-trips: byte size is 130*N*K/128, every block in a
+    128x128 tile carries the identical fp16 scale, and decoding the e4m3
+    bytes (independent numpy decoder) times that scale reproduces the
+    quantized tensor closely."""
+    torch.manual_seed(5)
+    N, K = 256, 256   # 2x2 tiles
+    w = torch.randn(N, K, dtype=torch.float32) * 2.0
+    packed = _quantize_fp8_b128_gpu(w)
+
+    n_col_blocks = K // _FP8B128_TILE
+    assert packed.shape == (N, n_col_blocks * _FP8B128_BLOCK_BYTES)
+    assert packed.nbytes == _FP8B128_BLOCK_BYTES * N * K // _FP8B128_TILE
+
+    packed3 = packed.reshape(N, n_col_blocks, _FP8B128_BLOCK_BYTES)
+    scale_bytes = packed3[:, :, :2]
+    qs_bytes = packed3[:, :, 2:]
+    scales = scale_bytes.reshape(N, n_col_blocks, 2).view(np.float16).astype(np.float32).reshape(N, n_col_blocks)
+
+    n_row_tiles = N // _FP8B128_TILE
+    for rt in range(n_row_tiles):
+        r0, r1 = rt * _FP8B128_TILE, (rt + 1) * _FP8B128_TILE
+        for cb in range(n_col_blocks):
+            tile_scales = scales[r0:r1, cb]
+            # Same fp16 scale replicated across all 128 rows of the tile.
+            assert np.all(tile_scales == tile_scales[0]), f"tile ({rt},{cb}) scale not uniform"
+            assert tile_scales[0] > 0   # always positive, even for a degenerate tile
+
+    decoded_e4m3 = _decode_e4m3_bytes_numpy(qs_bytes.reshape(-1)).reshape(N, n_col_blocks, _FP8B128_TILE)
+    dequant = decoded_e4m3 * scales[:, :, None]
+    dequant = dequant.reshape(N, K)
+    err = _nmse(dequant, w.numpy())
+    assert err < 3e-2, f"fp8_b128 round-trip NMSE {err:.3e} too high"
+    print("  PASS test_quantize_fp8_b128_tile_scale_and_roundtrip")
+
+
+def test_quantize_fp8_b128_degenerate_zero_tile():
+    """An all-zero tile must get a tiny positive scale (never zero/NaN) and
+    decode back to all-zero e4m3 bytes."""
+    w = torch.zeros(128, 128, dtype=torch.float32)
+    packed = _quantize_fp8_b128_gpu(w)
+    scale = packed[:, :2].reshape(128, 2).view(np.float16).astype(np.float32)
+    assert np.all(scale > 0.0)
+    qs = packed[:, 2:]
+    assert np.all(qs == 0)   # +0.0 e4m3 encodes as byte 0x00
+    print("  PASS test_quantize_fp8_b128_degenerate_zero_tile")
+
+
+def test_quantize_fp8_b128_rejects_non_128_aligned():
+    with pytest.raises(ValueError):
+        _quantize_fp8_b128_gpu(torch.randn(100, 256))
+    with pytest.raises(ValueError):
+        _quantize_fp8_b128_gpu(torch.randn(256, 100))
+    print("  PASS test_quantize_fp8_b128_rejects_non_128_aligned")
+
+
+def test_role_group_key():
+    assert role_group_key("attn_qkv") == role_group_key("attn_gate")
+    assert role_group_key("attn_q") == role_group_key("attn_k") == role_group_key("attn_v")
+    assert role_group_key("ffn_gate") == role_group_key("ffn_up")
+    # singletons: each keyed by its own role, all distinct from each other
+    # and from the grouped keys above.
+    singleton_roles = ["attn_output", "ffn_down", "ssm_out", "output"]
+    keys = {role_group_key(r) for r in singleton_roles}
+    assert len(keys) == len(singleton_roles)
+    assert role_group_key("attn_qkv") not in keys
+    assert role_group_key("ffn_gate") not in keys
+    print("  PASS test_role_group_key")
+
+
+def test_group_seed_deterministic_and_distinct():
+    assert _group_seed(0, 3, "attn_qkv_gate") == _group_seed(0, 3, "attn_qkv_gate")
+    assert _group_seed(0, 3, "attn_qkv_gate") != _group_seed(0, 3, "ffn_gate_up")
+    assert _group_seed(0, 3, "attn_qkv_gate") != _group_seed(0, 4, "attn_qkv_gate")
+    assert _group_seed(0, None, "output") == _group_seed(0, None, "output")
+    print("  PASS test_group_seed_deterministic_and_distinct")
+
+
+def test_parse_layer():
+    assert _parse_layer("blk.3.attn_output.weight") == 3
+    assert _parse_layer("output.weight") is None
+    assert _parse_layer("token_embd.weight") is None
+    print("  PASS test_parse_layer")
+
+
+def test_dry_run_classification_fp8_b128(synthetic_gguf_b128):
+    """--dry-run classification: aligned roles rotate, the unaligned attn_v
+    and the standing q8_0/copy exclusions behave as documented."""
+    src, _ = synthetic_gguf_b128
+    reader = gguf.GGUFReader(src)
+    plan = build_plan(reader, rotation_seed=0, local_b=128, max_b=1024, format="fp8_b128")
+    by_name = {e["name"]: e for e in plan}
+
+    assert by_name["blk.0.attn_qkv.weight"]["action"] == "rotate_kronecker"
+    assert by_name["blk.0.attn_gate.weight"]["action"] == "rotate_kronecker"
+    assert by_name["blk.0.ffn_gate.weight"]["action"] == "rotate_kronecker"
+    assert by_name["blk.0.ffn_up.weight"]["action"] == "rotate_kronecker"
+    assert by_name["blk.0.attn_output.weight"]["action"] == "rotate_hadamard"
+    assert by_name["blk.0.ffn_down.weight"]["action"] == "rotate_hadamard"
+    assert by_name["blk.0.ssm_out.weight"]["action"] == "rotate_hadamard"
+    assert by_name["output.weight"]["action"] == "rotate_kronecker"
+
+    # Fallback: attn_v's role is kronecker-eligible but N=100 isn't 128-aligned.
+    assert by_name["blk.0.attn_v.weight"]["action"] == "q8_0"
+    assert by_name["blk.1.attn_v.weight"]["action"] == "q8_0"
+
+    # Untouched exclusions/copies still behave as in ml8_fp8 mode.
+    assert by_name["token_embd.weight"]["action"] == "q8_0"
+    assert by_name["blk.0.ssm_alpha.weight"]["action"] == "q8_0"
+    assert by_name["blk.0.attn_norm.weight"]["action"] == "copy"
+
+    # Group ids present for kronecker entries and match the design's groups.
+    assert by_name["blk.0.attn_qkv.weight"]["group"] == by_name["blk.0.attn_gate.weight"]["group"]
+    assert by_name["blk.0.ffn_gate.weight"]["group"] == by_name["blk.0.ffn_up.weight"]["group"]
+    assert by_name["blk.0.attn_qkv.weight"]["group"] != by_name["blk.0.ffn_gate.weight"]["group"]
+    print("  PASS test_dry_run_classification_fp8_b128")
+
+
+def test_convert_fp8_b128_end_to_end(synthetic_gguf_b128, tmp_path):
+    src, weights = synthetic_gguf_b128
+    out = tmp_path / "tiny_fp8b128.gguf"
+    convert(src, out, rotation_seed=1234, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128")
+    reader = gguf.GGUFReader(out)
+    names = {t.name: t for t in reader.tensors}
+
+    for role_name in ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight",
+                      "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight",
+                      "blk.0.attn_output.weight", "blk.0.ffn_down.weight",
+                      "blk.0.ssm_out.weight", "output.weight"]:
+        assert names[role_name].tensor_type == GGMLQuantizationType.FP8_B128, role_name
+
+    # Fallback tensor: plain unrotated Q8_0, no sidecars.
+    assert names["blk.0.attn_v.weight"].tensor_type == GGMLQuantizationType.Q8_0
+    assert "blk.0.attn_v.rotation_meta" not in names
+    assert "blk.0.attn_v.rotation_h_a" not in names
+
+    assert names["token_embd.weight"].tensor_type == GGMLQuantizationType.Q8_0
+    assert names["blk.0.attn_norm.weight"].tensor_type == GGMLQuantizationType.BF16
+
+    # Byte size: FP8_B128 is 130 bytes / 128 elems.
+    block_size, block_bytes = gguf.constants.GGML_QUANT_SIZES[GGMLQuantizationType.FP8_B128]
+    assert (block_size, block_bytes) == (128, 130)
+    t = names["blk.0.ffn_gate.weight"]
+    N, K = FFN_B128, D_B128
+    assert np.ascontiguousarray(t.data).nbytes == N * (K // block_size) * block_bytes
+    print("  PASS test_convert_fp8_b128_end_to_end")
+
+
+def test_group_members_share_h_a_bytewise(synthetic_gguf_b128, tmp_path):
+    """attn_qkv/attn_gate (group A) share h_a; ffn_gate/ffn_up (group B) share
+    h_a; group A and group B (and the same group across different layers)
+    get DIFFERENT h_a."""
+    src, _ = synthetic_gguf_b128
+    out = tmp_path / "tiny_fp8b128.gguf"
+    convert(src, out, rotation_seed=1234, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128")
+    reader = gguf.GGUFReader(out)
+
+    def h_a(weight_name):
+        base = _sidecar_base(weight_name)
+        t = next(x for x in reader.tensors if x.name == base + ".rotation_h_a")
+        return np.ascontiguousarray(t.data).copy()
+
+    qkv0, gate0 = h_a("blk.0.attn_qkv.weight"), h_a("blk.0.attn_gate.weight")
+    np.testing.assert_array_equal(qkv0, gate0)
+
+    fgate0, fup0 = h_a("blk.0.ffn_gate.weight"), h_a("blk.0.ffn_up.weight")
+    np.testing.assert_array_equal(fgate0, fup0)
+
+    # Different groups -> different rotation.
+    assert not np.array_equal(qkv0, fgate0)
+
+    # Same group, different layer -> different rotation (layer is part of the key).
+    qkv1 = h_a("blk.1.attn_qkv.weight")
+    assert not np.array_equal(qkv0, qkv1)
+
+    # Sanity: layer 1's own group A pair still agrees with itself.
+    gate1 = h_a("blk.1.attn_gate.weight")
+    np.testing.assert_array_equal(qkv1, gate1)
+    print("  PASS test_group_members_share_h_a_bytewise")
+
+
+def test_seed_determinism_fp8_b128(synthetic_gguf_b128, tmp_path):
+    """Two runs with the same --rotation-seed give bit-identical bytes in
+    fp8_b128 mode too (group-derived seeds are deterministic)."""
+    src, _ = synthetic_gguf_b128
+    out1 = tmp_path / "run1.gguf"
+    out2 = tmp_path / "run2.gguf"
+    convert(src, out1, rotation_seed=42, device_str="cpu", local_b=128, max_b=1024, format="fp8_b128")
+    convert(src, out2, rotation_seed=42, device_str="cpu", local_b=128, max_b=1024, format="fp8_b128")
+    r1, r2 = gguf.GGUFReader(out1), gguf.GGUFReader(out2)
+    names1 = {t.name: t for t in r1.tensors}
+    names2 = {t.name: t for t in r2.tensors}
+    assert set(names1) == set(names2)
+    for name in names1:
+        b1 = np.ascontiguousarray(names1[name].data)
+        b2 = np.ascontiguousarray(names2[name].data)
+        np.testing.assert_array_equal(b1, b2, err_msg=f"{name}: bytes differ across runs")
+    print("  PASS test_seed_determinism_fp8_b128")
+
+
+def test_ml8_fp8_format_unchanged_by_default(synthetic_gguf, tmp_path):
+    """The existing ml8_fp8 tests all call convert()/build_plan() without
+    --format, which must keep behaving exactly as before fp8_b128 existed —
+    covered structurally by the untouched tests above, and spot-checked here:
+    default format plan == explicit format="ml8_fp8" plan."""
+    src, _ = synthetic_gguf
+    reader = gguf.GGUFReader(src)
+    plan_default = build_plan(reader, rotation_seed=7, local_b=128, max_b=1024)
+    plan_explicit = build_plan(reader, rotation_seed=7, local_b=128, max_b=1024, format="ml8_fp8")
+    assert plan_default == plan_explicit
+    print("  PASS test_ml8_fp8_format_unchanged_by_default")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# --format ml8_4 tests (data-free codebook: 4-bit centroid idx + fp32
+# per-(row,group) scale over 64-element K-groups, per-K-group 16-e4m3-
+# centroid LUT sidecar — see ggml-common.h block_ml8_4 / ml8_to_gguf.py).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# D_MODEL (2048) and K_HADAMARD (4864) are both multiples of QK_ML8=64, so the
+# existing `synthetic_gguf` fixture (shared with the ml8_fp8 tests above)
+# exercises ml8_4 rotation for every role without needing a new fixture.
+D_ML8_ODD_K = 96   # multiple of 32 (Q8_0-compatible) but NOT of 64 -> ml8_4 fallback to plain Q8_0
+
+
+def _decode_ml8_4_numpy(reader, weight_name: str) -> np.ndarray:
+    """Independent (no torch-side packing reuse) numpy decoder for the
+    block_ml8_4 on-disk layout: per (row, 64-col group) a 36-byte block
+    ([0:4) little-endian fp32 scale, [4:36) 32 bytes of lo-nibble-first 4-bit
+    centroid indices), dequantized via the per-K-group F8_E4M3 centroids
+    sidecar: value = centroids[group, idx] * scale[row, group]. Used to
+    validate the converter's output against ggml-common.h's block_ml8_4 /
+    ml8_to_gguf.py's exact byte layout, independent of the converter's own
+    pack_ml8_blocks/cast_centroids_to_fp8 helpers."""
+    t = next(x for x in reader.tensors if x.name == weight_name)
+    assert t.tensor_type == GGMLQuantizationType.ML8_4
+    block_size, block_bytes = gguf.constants.GGML_QUANT_SIZES[GGMLQuantizationType.ML8_4]
+    assert (block_size, block_bytes) == (QK_ML8, ML8_BLOCK_BYTES)
+    raw = np.ascontiguousarray(t.data)
+    N = raw.shape[0]
+    n_blocks = raw.shape[1] // block_bytes
+    raw = raw.reshape(N, n_blocks, block_bytes)
+
+    scale_bytes = raw[:, :, :4].reshape(N, n_blocks, 4)
+    scale = scale_bytes.reshape(N, n_blocks, 4).view(np.float32).reshape(N, n_blocks)
+
+    packed = raw[:, :, 4:4 + block_size // 2].reshape(N, n_blocks, block_size // 2)
+    lo = (packed & 0x0F).astype(np.uint8)
+    hi = ((packed >> 4) & 0x0F).astype(np.uint8)
+    idx = np.empty((N, n_blocks, block_size), dtype=np.uint8)
+    idx[:, :, 0::2] = lo
+    idx[:, :, 1::2] = hi
+
+    base = _sidecar_base(weight_name)
+    cent_t = next(x for x in reader.tensors if x.name == base + ".centroids")
+    assert cent_t.tensor_type == GGMLQuantizationType.F8_E4M3
+    cent_raw = np.ascontiguousarray(cent_t.data).reshape(-1)[:n_blocks * N_CENTROIDS]
+    cent_bytes = cent_raw.reshape(n_blocks, N_CENTROIDS)
+    centroids = torch.from_numpy(cent_bytes.copy()).view(torch.float8_e4m3fn).to(torch.float32).numpy()
+
+    block_idx = np.broadcast_to(np.arange(n_blocks).reshape(1, n_blocks, 1), (N, n_blocks, block_size))
+    cent_lookup = centroids[block_idx, idx.astype(np.int64)]  # [N, n_blocks, block_size]
+    out = (cent_lookup * scale[:, :, None]).reshape(N, n_blocks * block_size)
+    return out
+
+
+def test_classify_tensor_ml8_4_fallback():
+    # K%64==0 -> rotates normally, same as ml8_fp8/fp8_b128 classification.
+    assert classify_tensor("blk.3.attn_output.weight", (4864, 5120), format="ml8_4")[0] == "rotate_hadamard"
+    assert classify_tensor("blk.0.attn_qkv.weight", (2048, 96), format="ml8_4")[0] == "rotate_kronecker"
+    # K%64!=0 -> falls back to plain Q8_0 (unlike ml8_fp8, which has no such
+    # constraint since it groups by 32 and this codebook is data-free).
+    assert classify_tensor("blk.0.attn_qkv.weight", (D_ML8_ODD_K, 96), format="ml8_4")[0] == "q8_0"
+    assert classify_tensor("blk.3.attn_output.weight", (D_ML8_ODD_K, 5120), format="ml8_4")[0] == "q8_0"
+    # Standing exclusions/copies are format-independent.
+    assert classify_tensor("token_embd.weight", (2048, 40), format="ml8_4")[0] == "q8_0"
+    assert classify_tensor("blk.0.attn_norm.weight", (2048,), format="ml8_4")[0] == "copy"
+    print("  PASS test_classify_tensor_ml8_4_fallback")
+
+
+def test_dry_run_classification_ml8_4(synthetic_gguf):
+    src, _ = synthetic_gguf
+    reader = gguf.GGUFReader(src)
+    plan = build_plan(reader, rotation_seed=0, local_b=128, max_b=1024, format="ml8_4")
+    by_name = {e["name"]: e for e in plan}
+
+    assert by_name["blk.0.attn_output.weight"]["action"] == "rotate_hadamard"
+    assert by_name["blk.0.ffn_down.weight"]["action"] == "rotate_hadamard"
+    assert by_name["blk.0.ssm_out.weight"]["action"] == "rotate_hadamard"
+    assert by_name["blk.0.attn_qkv.weight"]["action"] == "rotate_kronecker"
+    assert by_name["blk.0.ffn_gate.weight"]["action"] == "rotate_kronecker"
+    assert by_name["blk.0.ffn_up.weight"]["action"] == "rotate_kronecker"
+    assert by_name["output.weight"]["action"] == "rotate_kronecker"
+    assert by_name["token_embd.weight"]["action"] == "q8_0"
+    assert by_name["blk.0.ssm_alpha.weight"]["action"] == "q8_0"
+    assert by_name["blk.0.attn_norm.weight"]["action"] == "copy"
+
+    # One-rotation-per-input-group applies to ml8_4 too (same rule as fp8_b128).
+    assert by_name["blk.0.ffn_gate.weight"]["group"] == by_name["blk.0.ffn_up.weight"]["group"]
+    print("  PASS test_dry_run_classification_ml8_4")
+
+
+def test_fit_and_assign_ml8_centroids_roundtrip():
+    """_fit_ml8_centroids + _assign_ml8_indices on a small identity-rotated
+    tensor: centroids land on the e4m3 lattice, indices are in [0,15], and
+    dequant(idx)*scale reconstructs the (normalized-then-rescaled) weight
+    with codebook-level (not garbage) error."""
+    from kronecker_rotation import BlockHadamardRotation
+
+    class _Identity:
+        def forward(self, x):
+            return x
+
+    torch.manual_seed(21)
+    N, K = 64, 128  # K = 2 groups of QK_ML8=64
+    w = torch.randn(N, K, dtype=torch.float32) * 0.7
+
+    class _Tensor:
+        tensor_type = GGMLQuantizationType.BF16
+        name = "synthetic"
+
+        def __init__(self, data):
+            self.data = data
+
+    t16 = w.to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
+    tensor = _Tensor(t16)
+
+    rot = _Identity()
+    centroids = _fit_ml8_centroids(tensor, K, N, torch.device("cpu"), rot, fit_rows=N)
+    assert centroids.shape == (K // QK_ML8, 16)
+    # Every centroid value must itself be exactly representable as e4m3
+    # (snap_to_e4m3 is idempotent on e4m3-lattice values).
+    snapped_twice = centroids.to(torch.float8_e4m3fn).to(torch.float32)
+    torch.testing.assert_close(centroids, snapped_twice, atol=0.0, rtol=0.0)
+
+    indices, scale = _assign_ml8_indices(w, centroids)
+    assert indices.dtype == torch.int8
+    assert indices.shape == (N, K)
+    assert int(indices.min()) >= 0 and int(indices.max()) <= 15
+    assert scale.shape == (N, K // QK_ML8)
+    assert bool((scale > 0).all())
+
+    n_groups = K // QK_ML8
+    idx_r = indices.long().view(N, n_groups, QK_ML8)
+    dequant = torch.empty(N, n_groups, QK_ML8)
+    for g in range(n_groups):
+        dequant[:, g, :] = centroids[g][idx_r[:, g, :]]
+    dequant = dequant * scale.unsqueeze(-1)
+    dequant = dequant.reshape(N, K)
+    err = _nmse(dequant.numpy(), w.numpy())
+    assert err < 0.15, f"ml8_4 fit/assign NMSE {err:.3e} too high"
+    print("  PASS test_fit_and_assign_ml8_centroids_roundtrip")
+
+
+def test_convert_ml8_4_end_to_end(synthetic_gguf, tmp_path):
+    src, weights = synthetic_gguf
+    out = tmp_path / "tiny_ml8_4.gguf"
+    convert(src, out, rotation_seed=1234, device_str="cpu", local_b=128, max_b=1024,
+           format="ml8_4", ml8_fit_rows=_ML8_FIT_ROWS_DEFAULT)
+    reader = gguf.GGUFReader(out)
+    names = {t.name: t for t in reader.tensors}
+
+    rotated_names = ["blk.0.attn_output.weight", "blk.0.ffn_down.weight",
+                      "blk.0.ssm_out.weight", "blk.0.attn_qkv.weight",
+                      "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "output.weight"]
+    for name in rotated_names:
+        assert names[name].tensor_type == GGMLQuantizationType.ML8_4, name
+        base = _sidecar_base(name)
+        assert base + ".centroids" in names, f"{name}: missing centroids sidecar"
+        assert base + ".rotation_meta" in names
+
+    assert "blk.0.attn_output.rotation_h_a" not in names   # block_hadamard: no h_a
+    assert "blk.0.attn_qkv.rotation_h_a" in names          # kronecker: has h_a
+
+    assert names["token_embd.weight"].tensor_type == GGMLQuantizationType.Q8_0
+    assert names["blk.0.ssm_alpha.weight"].tensor_type == GGMLQuantizationType.Q8_0
+    assert names["blk.0.attn_norm.weight"].tensor_type == GGMLQuantizationType.BF16
+
+    # ── Centroids sidecar shape/dtype: GGUF ne order [16, K/64] == numpy/byte
+    # shape (K/64, 16) ─────────────────────────────────────────────────────
+    for name, K in [("blk.0.attn_qkv.weight", K_KRON), ("blk.0.attn_output.weight", K_HADAMARD),
+                     ("output.weight", K_KRON)]:
+        base = _sidecar_base(name)
+        cent = names[base + ".centroids"]
+        assert cent.tensor_type == GGMLQuantizationType.F8_E4M3
+        n_groups = K // QK_ML8
+        assert np.ascontiguousarray(cent.data).size == n_groups * 16
+
+    # ── Block encode/decode round trip against the independent numpy decoder
+    # for one kronecker-rotated and one hadamard-rotated weight ─────────────
+    from kronecker_rotation import KroneckerRotation, BlockHadamardRotation
+    for name, K, kind in [
+        ("blk.0.attn_qkv.weight", K_KRON, "kronecker_orth_sylvester"),
+        ("blk.0.attn_output.weight", K_HADAMARD, "block_hadamard"),
+    ]:
+        base = _sidecar_base(name)
+        meta = _read_rotation_meta(reader, name)
+        a, b, in_features, kind_id = [int(v) for v in meta]
+        assert in_features == K
+        if kind == "block_hadamard":
+            rot = BlockHadamardRotation(in_features=K, b_dim=b)
+        else:
+            h_a_t = next(t for t in reader.tensors if t.name == base + ".rotation_h_a")
+            h_a = torch.from_numpy(np.ascontiguousarray(h_a_t.data).copy())
+            rot = KroneckerRotation(h_a=h_a, b_dim=b)
+
+        W = weights[name]
+        w_rot_expected = rot.forward(W)  # [N, K] fp32, the rotated weight
+        decoded = _decode_ml8_4_numpy(reader, name)
+        err = _nmse(decoded, w_rot_expected.numpy())
+        # 4-bit codebook quant: coarser than fp8_b128/ml8_fp8 but should still
+        # be codebook-level error, not garbage (a broken decode/assign would
+        # give NMSE ~O(1) or worse).
+        assert err < 0.15, f"{name}: ml8_4 round-trip NMSE {err:.3e} too high"
+    print("  PASS test_convert_ml8_4_end_to_end")
+
+
+def test_convert_ml8_4_k_fallback(tmp_path):
+    """A kronecker-eligible role whose K isn't a multiple of QK_ML8=64 must
+    fall back to plain unrotated Q8_0 with no ml8_4 sidecars, in an actual
+    convert() run (not just classify_tensor)."""
+    path = tmp_path / "odd_k.gguf"
+    w = gguf.GGUFWriter(str(path), arch="qwen35")
+    w.add_uint32("qwen35.embedding_length", D_ML8_ODD_K)
+    w.add_uint32("qwen35.block_count", 1)
+    t = torch.randn(32, D_ML8_ODD_K, dtype=torch.float32) * 0.5
+    _add_bf16(w, "blk.0.attn_qkv.weight", t)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    out = tmp_path / "odd_k_out.gguf"
+    convert(path, out, rotation_seed=0, device_str="cpu", local_b=128, max_b=1024, format="ml8_4")
+    reader = gguf.GGUFReader(out)
+    names = {t.name: t for t in reader.tensors}
+    assert names["blk.0.attn_qkv.weight"].tensor_type == GGMLQuantizationType.Q8_0
+    assert "blk.0.attn_qkv.centroids" not in names
+    assert "blk.0.attn_qkv.rotation_meta" not in names
+    print("  PASS test_convert_ml8_4_k_fallback")
+
+
+def test_seed_determinism_ml8_4(synthetic_gguf, tmp_path):
+    """Two runs with the same --rotation-seed give bit-identical bytes,
+    including the fitted centroids sidecar (the Lloyd-Max fit subsample is
+    deterministic — uniformly spaced row indices, not random)."""
+    src, _ = synthetic_gguf
+    out1 = tmp_path / "run1.gguf"
+    out2 = tmp_path / "run2.gguf"
+    convert(src, out1, rotation_seed=42, device_str="cpu", local_b=128, max_b=1024, format="ml8_4")
+    convert(src, out2, rotation_seed=42, device_str="cpu", local_b=128, max_b=1024, format="ml8_4")
+    r1, r2 = gguf.GGUFReader(out1), gguf.GGUFReader(out2)
+    names1 = {t.name: t for t in r1.tensors}
+    names2 = {t.name: t for t in r2.tensors}
+    assert set(names1) == set(names2)
+    for name in names1:
+        b1 = np.ascontiguousarray(names1[name].data)
+        b2 = np.ascontiguousarray(names2[name].data)
+        np.testing.assert_array_equal(b1, b2, err_msg=f"{name}: bytes differ across runs")
+    print("  PASS test_seed_determinism_ml8_4")
 
 
 if __name__ == "__main__":

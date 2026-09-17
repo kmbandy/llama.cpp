@@ -190,6 +190,18 @@ GGML_API void dequantize_row_ml8_fp8(const block_ml8_fp8 * GGML_RESTRICT x, floa
 GGML_API void quantize_row_ml8_fp8_ref(const float * GGML_RESTRICT x, block_ml8_fp8 * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_ml8_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// FP8_B128 phase 2: dequant. Each block: fp16 scale + 128 e4m3 bytes -> 128 fp32 outputs.
+// k must be divisible by QK_FP8_B128 (128).
+GGML_API void dequantize_row_fp8_b128(const block_fp8_b128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+// FP8_B128 phase 2: per-128-block-scale quantize (inverse of dequantize_row_fp8_b128).
+// Used ONLY by test-backend-ops/llama-quantize; the real production path (the
+// Python converter) uses 128x128-tile-shared scales instead.
+// scale = amax(|x|) / 448.0f; qs[i] = f32_to_e4m3fn(x[i]/scale).
+// k must be divisible by QK_FP8_B128 (128).
+GGML_API void quantize_row_fp8_b128_ref(const float * GGML_RESTRICT x, block_fp8_b128 * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_fp8_b128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

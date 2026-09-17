@@ -226,6 +226,20 @@ static __device__ __forceinline__ void dequantize_ml8_fp8(const void * vx, const
     v.y = ggml_cuda_e4m3fn_to_fp32(x[ib].qs[iqs + 1]) * scale;
 }
 
+// FP8_B128: fp16 per-block scale (d) + 128 × OCP e4m3fn bytes, block size 128, QR=1.
+// iqs is the element index within the block (even, 0..126); produces elements iqs and iqs+1.
+// Dequant: v.x = e4m3fn_decode(qs[iqs])   * fp16_to_fp32(d)
+//          v.y = e4m3fn_decode(qs[iqs+1]) * fp16_to_fp32(d)
+// Matches CPU dequantize_row_fp8_b128 (ggml-turbo-quant.c) exactly.
+static __device__ __forceinline__ void dequantize_fp8_b128(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_fp8_b128 * x = (const block_fp8_b128 *) vx;
+
+    const float d = __half2float(x[ib].d);
+
+    v.x = ggml_cuda_e4m3fn_to_fp32(x[ib].qs[iqs + 0]) * d;
+    v.y = ggml_cuda_e4m3fn_to_fp32(x[ib].qs[iqs + 1]) * d;
+}
+
 // TQ3_1S: 3-bit weight type with inverse WHT, block size 32, dual half-block scales
 // 3-bit packing: 4 groups of 8 indices in 3 bytes each (24 bits = 8 * 3-bit)
 static __device__ __forceinline__ void dequantize_tq3_1s(const void * vx, const int64_t ib, const int iqs, float2 & v) {

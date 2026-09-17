@@ -891,6 +891,19 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_ml8_fp8,
         .from_float_ref           = (ggml_from_float_t) quantize_row_ml8_fp8_ref,
     },
+    // FP8_B128 phase 2: e4m3 weight quantization, 128-element blocks, 130 bytes
+    // each: fp16 per-block scale (2 bytes) + 128 OCP e4m3fn weight bytes.
+    // from_float_ref does a per-128-block scale (used only by
+    // test-backend-ops/llama-quantize); the real production path is the
+    // Python converter, which writes 128x128-tile-shared scales directly.
+    [GGML_TYPE_FP8_B128] = {
+        .type_name                = "fp8_b128",
+        .blck_size                = QK_FP8_B128,
+        .type_size                = sizeof(block_fp8_b128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_fp8_b128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_fp8_b128_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1234,10 +1247,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ML8_MUL_MAT_ID",
     "ML8_GET_ROWS",
 
+    "FP8_QUANT_ROT",
+    "FP8_MUL_MAT",
+
     "SINKHORN_NORM",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1359,10 +1375,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ml8_mul_mat_id(w,centroids,x,ids)",
     "ml8_get_rows(w,centroids,ids)",
 
+    "fp8_quant_rot(x,h_a)",
+    "fp8_mul_mat(w,a)",
+
     "sinkhorn_norm(x)",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -8340,6 +8359,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ3_1S:  result = quantize_tq3_1s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ4_1S:  result = quantize_tq4_1s  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_ML8_FP8: result = quantize_ml8_fp8 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_FP8_B128: result = quantize_fp8_b128 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

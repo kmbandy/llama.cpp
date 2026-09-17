@@ -125,6 +125,8 @@ void ggml_compute_forward_ml8_mul_mat(const struct ggml_compute_params * params,
 void ggml_compute_forward_ml8_apply_rotation(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ml8_mul_mat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ml8_get_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_fp8_quant_rot(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_fp8_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus
 }
 #endif

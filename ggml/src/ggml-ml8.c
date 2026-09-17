@@ -360,3 +360,72 @@ struct ggml_tensor * ggml_ml8_get_rows(
     y->src[2] = ids;
     return y;
 }
+
+struct ggml_tensor * ggml_fp8_quant_rot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * h_a,
+        int64_t a_dim,
+        int64_t b_dim,
+        int32_t kind) {
+    GGML_ASSERT(x != NULL);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+
+    const int64_t K = x->ne[0];
+    GGML_ASSERT(K % QK_FP8_B128 == 0 && "K must be a multiple of 128");
+
+    switch (kind) {
+        case GGML_FP8_QUANT_ROT_KIND_NONE:
+            GGML_ASSERT(h_a == NULL && "kind NONE takes no h_a");
+            break;
+        case GGML_FP8_QUANT_ROT_KIND_KRONECKER:
+            GGML_ASSERT(h_a != NULL && "kronecker requires h_a");
+            GGML_ASSERT(h_a->type == GGML_TYPE_F32);
+            GGML_ASSERT(a_dim > 0 && b_dim > 0);
+            GGML_ASSERT(a_dim * b_dim == K && "a_dim * b_dim must equal K");
+            GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+            break;
+        case GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD:
+            GGML_ASSERT(h_a == NULL && "block_hadamard takes no h_a");
+            GGML_ASSERT(a_dim > 0 && b_dim > 0);
+            GGML_ASSERT(a_dim * b_dim == K && "a_dim * b_dim must equal K");
+            break;
+        default:
+            GGML_ABORT("ggml_fp8_quant_rot: unknown kind %d", kind);
+    }
+
+    const int64_t n_groups = K / QK_FP8_B128;
+    const int64_t ne[4] = { K + n_groups * (int64_t) sizeof(float), x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_I8, 4, ne);
+    y->op     = GGML_OP_FP8_QUANT_ROT;
+    y->src[0] = x;
+    y->src[1] = h_a;
+    int32_t * params = (int32_t *) y->op_params;
+    params[0] = (int32_t) a_dim;
+    params[1] = (int32_t) b_dim;
+    params[2] = kind;
+    return y;
+}
+
+struct ggml_tensor * ggml_fp8_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(w != NULL);
+    GGML_ASSERT(a != NULL);
+    GGML_ASSERT(w->type == GGML_TYPE_FP8_B128);
+    GGML_ASSERT(a->type == GGML_TYPE_I8);
+
+    // Shape: w [K, N], a [K + K/32, n1, n2, n3] -> y [N, n1, n2, n3]
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    GGML_ASSERT(K % QK_FP8_B128 == 0 && "K must be a multiple of 128");
+    GGML_ASSERT(a->ne[0] == K + K / 32 && "a's packed row width must be K + K/32");
+
+    const int64_t ne[4] = { N, a->ne[1], a->ne[2], a->ne[3] };
+    struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    y->op     = GGML_OP_FP8_MUL_MAT;
+    y->src[0] = w;
+    y->src[1] = a;
+    return y;
+}

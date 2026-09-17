@@ -5719,6 +5719,11 @@ class GGMLQuantizationType(IntEnum):
     # NOTE(fork): upstream numbers Q2_0 as 42, which this fork already uses for
     # TURBO3_0. Kept in sync with GGML_TYPE_Q2_0 = 56 in ggml/include/ggml.h.
     Q2_0      = 56
+    # FP8_B128 design (2026-09-17): vllm-radiance-style block-128 fp8 weight
+    # storage — one fp16 scale per 128x128 tile, replicated into every
+    # block_fp8_b128 {fp16 d; e4m3 qs[128]} of that tile (130 B / 128 elems).
+    # Kept in sync with GGML_TYPE_FP8_B128 = 57 in ggml/include/ggml.h.
+    FP8_B128  = 57
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5775,6 +5780,9 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    # FP8_B128 design (2026-09-17). Kept in sync with
+    # LLAMA_FTYPE_MOSTLY_FP8_B128 = 46 in llama.h.
+    MOSTLY_FP8_B128      = 46  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5919,6 +5927,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.ML8_4_SOA: (64, 4 + 32),
     GGMLQuantizationType.ML8_FP8: (32, 32 + 2),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    # FP8_B128: 128 e4m3 bytes + one fp16 tile scale (replicated across the
+    # tile's 128 rows by the converter invariant) = 130 B / 128 elems.
+    GGMLQuantizationType.FP8_B128: (128, 128 + 2),
 }
 
 

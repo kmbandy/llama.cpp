@@ -448,7 +448,8 @@ extern "C" {
         // Q2_0 is appended here instead. Consequence: an upstream-produced Q2_0 GGUF
         // will not load as-is on this fork (it would be read as TURBO3_0); reconvert.
         GGML_TYPE_Q2_0    = 56,
-        GGML_TYPE_COUNT   = 57,
+        GGML_TYPE_FP8_B128 = 57, // FP8_B128 phase 2: e4m3 weight quant, 128-element blocks, fp16 per-block scale + 128 e4m3 bytes (130 bytes/block). Converter enforces a 128x128-tile-shared scale invariant (not checked by the type itself). See scripts/calibration/convert_fp8_rotated.py --format fp8_b128.
+        GGML_TYPE_COUNT   = 58,
     };
 
     // precision
@@ -650,6 +651,37 @@ extern "C" {
         //   src[2] = ids (GGML_TYPE_I32, [n_rows, ...])
         //   dst    = y (GGML_TYPE_F32, [K, n_rows, ...])
         GGML_OP_ML8_GET_ROWS,
+
+        // FP8_B128 phase 2 — fused activation rotate + block-128 fp8 quantize.
+        // Computed ONCE per input tensor and shared by all GEMMs of the input
+        // group (rotation is per input-group, not per weight).
+        //   src[0] = x   (GGML_TYPE_F32, [K, n1, n2, n3]; rows contiguous, nb[1]==K*4)
+        //   src[1] = h_a (GGML_TYPE_F32, [a_dim, a_dim]) or NULL
+        //   op_params[0] = a_dim (int32)
+        //   op_params[1] = b_dim (int32)
+        //   op_params[2] = kind  (int32: 0 = no rotation, 1 = kronecker
+        //                  (h_a required, K == a_dim*b_dim), 2 = block_hadamard
+        //                  (h_a NULL, K % b_dim == 0))
+        //   dst = y (GGML_TYPE_I8, [K + K/32, n1, n2, n3]). Row m layout (bytes):
+        //     [0, K)       = e4m3 of rotated x[m], quantized per 128-wide K group
+        //     [K, K+K/32)  = K/128 fp32 scales (4-byte aligned; K%128==0),
+        //                    scale g = absmax(group g)/448, eps-clamped (>=1e-12)
+        //   Rotation math is bit-identical to GGML_OP_ML8_APPLY_ROTATION (FWHT
+        //   with 1/sqrt(b) normalize; kronecker H_a^T left multiply).
+        //   Constraint: K % 128 == 0.
+        GGML_OP_FP8_QUANT_ROT,
+        // FP8_B128 phase 2 — block-128 fp8 weight x packed-fp8 activation matmul.
+        //   src[0] = w (GGML_TYPE_FP8_B128, [K, N])
+        //   src[1] = a (GGML_TYPE_I8, [K + K/32, n1, n2, n3]) — produced by
+        //            GGML_OP_FP8_QUANT_ROT
+        //   dst    = y (GGML_TYPE_F32, [N, n1, n2, n3])
+        //   out[m,n] = sum_g ( a_scale[m,g] * w_scale[n/128,g] *
+        //              sum_{k in g} a_q[m,k] * w_q[n,k] ), g = 128-wide K
+        //   groups, fp32 accumulate.
+        //   supports_op on CUDA: only when w is 2D, K%128==0, N%16==0, device
+        //   is RDNA4 (gfx1201) with GGML_HIP_AITER; else CPU handles it
+        //   (correctness fallback) — for now CPU always handles it.
+        GGML_OP_FP8_MUL_MAT,
 
         // Fused Sinkhorn normalization for the DeepSeek-V4 hyper-connection
         // mixer. Replaces ~139 tiny ggml nodes per call (39 sum_rows + 40 add

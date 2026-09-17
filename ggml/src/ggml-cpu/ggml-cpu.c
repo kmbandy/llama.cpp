@@ -313,6 +313,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_FP8_B128] = {
+        // FP8_B128 phase 2: e4m3 block-128 weight x fp32 activation. Mirrors
+        // ML8_FP8's CPU traits so MUL_MAT / GET_ROWS dequant-dispatch works.
+        .from_float               = (ggml_from_float_t) quantize_row_fp8_b128_ref,
+        .vec_dot                  = ggml_vec_dot_fp8_b128_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_MXFP4] = {
         .from_float               = quantize_row_mxfp4,
         .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
@@ -2355,6 +2363,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ml8_get_rows(params, tensor);
             }
             break;
+        case GGML_OP_FP8_QUANT_ROT:
+            {
+                ggml_compute_forward_fp8_quant_rot(params, tensor);
+            }
+            break;
+        case GGML_OP_FP8_MUL_MAT:
+            {
+                ggml_compute_forward_fp8_mul_mat(params, tensor);
+            }
+            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2706,6 +2724,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ML8_APPLY_ROTATION:
         case GGML_OP_ML8_MUL_MAT_ID:
         case GGML_OP_ML8_GET_ROWS:
+        case GGML_OP_FP8_QUANT_ROT:
+        case GGML_OP_FP8_MUL_MAT:
             {
                 n_tasks = n_threads;
             } break;

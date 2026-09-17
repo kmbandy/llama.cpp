@@ -5298,6 +5298,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_TQ3_1S:
         case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_ML8_FP8:
+        case GGML_TYPE_FP8_B128:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -12395,6 +12396,40 @@ static void ml8_build_sylvester_cpu(float * H, int64_t b) {
     }
 }
 
+// Shared row-rotation kernel used by both GGML_OP_ML8_APPLY_ROTATION and
+// GGML_OP_FP8_QUANT_ROT (FP8_B128 phase 2), so the two ops stay bit-identical
+// on the rotation math. h_a_data == NULL selects block_hadamard (Q = I_a ⊗ H_b);
+// otherwise kronecker_orth_sylvester (Q = H_a ⊗ H_b). xp is scratch of size
+// >= a_dim*b_dim, only touched (and required non-NULL) when h_a_data != NULL.
+static void ml8_rotate_row_cpu(const float * xt, float * yt,
+                                const float * h_a_data, int64_t a_dim, int64_t b_dim,
+                                const float * h_b, float * xp) {
+    const float * ab = xt;
+    if (h_a_data != NULL) {
+        // Step 1: xp[k, l] = sum_i H_a[i, k] * X[i, l]
+        for (int64_t k = 0; k < a_dim; k++) {
+            for (int64_t l = 0; l < b_dim; l++) {
+                float s = 0.0f;
+                for (int64_t i = 0; i < a_dim; i++) {
+                    s += h_a_data[i * a_dim + k] * xt[i * b_dim + l];
+                }
+                xp[k * b_dim + l] = s;
+            }
+        }
+        ab = xp;
+    }
+    // Step 2: yt[k, l] = sum_j ab[k, j] * H_b[j, l]
+    for (int64_t k = 0; k < a_dim; k++) {
+        for (int64_t l = 0; l < b_dim; l++) {
+            float s = 0.0f;
+            for (int64_t j = 0; j < b_dim; j++) {
+                s += ab[k * b_dim + j] * h_b[j * b_dim + l];
+            }
+            yt[k * b_dim + l] = s;
+        }
+    }
+}
+
 void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * x   = dst->src[0];
     const ggml_tensor * h_a = dst->src[1];   // NULL => block_hadamard (Q = I_a ⊗ H_b)
@@ -12444,31 +12479,7 @@ void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params,
     for (int64_t t = t_start; t < t_end; t++) {
         const float * xt = x_data + t * d_dim;
         float       * yt = y_data + t * d_dim;
-
-        const float * ab = xt;
-        if (h_a != NULL) {
-            // Step 1: xp[k, l] = sum_i H_a[i, k] * X[i, l]
-            for (int64_t k = 0; k < a_dim; k++) {
-                for (int64_t l = 0; l < b_dim; l++) {
-                    float s = 0.0f;
-                    for (int64_t i = 0; i < a_dim; i++) {
-                        s += h_a_data[i * a_dim + k] * xt[i * b_dim + l];
-                    }
-                    xp[k * b_dim + l] = s;
-                }
-            }
-            ab = xp;
-        }
-        // Step 2: yt[k, l] = sum_j ab[k, j] * H_b[j, l]
-        for (int64_t k = 0; k < a_dim; k++) {
-            for (int64_t l = 0; l < b_dim; l++) {
-                float s = 0.0f;
-                for (int64_t j = 0; j < b_dim; j++) {
-                    s += ab[k * b_dim + j] * h_b[j * b_dim + l];
-                }
-                yt[k * b_dim + l] = s;
-            }
-        }
+        ml8_rotate_row_cpu(xt, yt, h_a_data, a_dim, b_dim, h_b, xp);
     }
 
     free(xp);
@@ -12563,6 +12574,200 @@ void ggml_compute_forward_ml8_mul_mat_id(const ggml_compute_params * params, ggm
     }
 
     free(w_row_fp32);
+}
+
+// ─── ggml_compute_forward_fp8_quant_rot (FP8_B128 phase 2) ────────────────
+//
+// CPU reference / oracle for GGML_OP_FP8_QUANT_ROT: fused activation rotate
+// (bit-identical to GGML_OP_ML8_APPLY_ROTATION via the shared
+// ml8_rotate_row_cpu/ml8_build_sylvester_cpu helpers above) + block-128 e4m3
+// quantize into the packed I8 row layout described in ggml.h.
+//
+// op_params: int32_t[0]=a_dim, [1]=b_dim, [2]=kind
+//   kind 0 = no rotation (copy); 1 = kronecker (h_a required, K==a_dim*b_dim);
+//   2 = block_hadamard (h_a NULL, K==a_dim*b_dim, i.e. a_dim = K/b_dim).
+// src[0]=x F32 [K, n1, n2, n3] (rows contiguous); src[1]=h_a F32 [a,a] or NULL.
+// dst=y I8 [K + K/32, n1, n2, n3]. Row layout: [0,K) e4m3 bytes (128-wide
+// groups), [K, K+K/32) K/128 fp32 scales (4-byte aligned since K%128==0).
+void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * h_a = dst->src[1];
+
+    GGML_ASSERT(x != NULL);
+    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I8);
+
+    const int32_t * pp    = (const int32_t *) dst->op_params;
+    const int64_t   a_dim = (int64_t) pp[0];
+    const int64_t   b_dim = (int64_t) pp[1];
+    const int32_t   kind  = pp[2];
+
+    const int64_t K = x->ne[0];
+    GGML_ASSERT(K % 128 == 0);
+    const int64_t n_groups = K / 128;
+
+    const float * h_a_data = NULL;
+    if (kind == 1) {
+        GGML_ASSERT(h_a != NULL);
+        GGML_ASSERT(h_a->type == GGML_TYPE_F32);
+        GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+        GGML_ASSERT(a_dim > 0 && b_dim > 0 && a_dim * b_dim == K);
+        h_a_data = (const float *) h_a->data;
+    } else if (kind == 2) {
+        GGML_ASSERT(h_a == NULL);
+        GGML_ASSERT(a_dim > 0 && b_dim > 0 && a_dim * b_dim == K);
+    } else {
+        GGML_ASSERT(kind == 0);
+    }
+
+    const int64_t row_out_i8 = K + n_groups * (int64_t) sizeof(float);
+    GGML_ASSERT(dst->ne[0] == row_out_i8);
+
+    const int64_t n_rows = x->ne[1] * x->ne[2] * x->ne[3];
+    const float * x_data = (const float *) x->data;
+    int8_t      * y_data = (int8_t *) dst->data;
+
+    float * h_b  = NULL;
+    float * xp   = NULL;
+    float * yrot = (float *) malloc((size_t) K * sizeof(float));
+    if (!yrot) {
+        GGML_ABORT("ggml_compute_forward_fp8_quant_rot: malloc(%zu) failed", (size_t) K * sizeof(float));
+    }
+    if (kind != 0) {
+        h_b = (float *) malloc((size_t) b_dim * (size_t) b_dim * sizeof(float));
+        if (!h_b) {
+            free(yrot);
+            GGML_ABORT("ggml_compute_forward_fp8_quant_rot: malloc h_b(%zu) failed",
+                       (size_t) b_dim * (size_t) b_dim * sizeof(float));
+        }
+        ml8_build_sylvester_cpu(h_b, b_dim);
+        if (kind == 1) {
+            xp = (float *) malloc((size_t) a_dim * (size_t) b_dim * sizeof(float));
+            if (!xp) {
+                free(h_b);
+                free(yrot);
+                GGML_ABORT("ggml_compute_forward_fp8_quant_rot: malloc xp(%zu) failed",
+                           (size_t) a_dim * (size_t) b_dim * sizeof(float));
+            }
+        }
+    }
+
+    const int64_t per_thread = (n_rows + params->nth - 1) / params->nth;
+    const int64_t r_start    = (int64_t) params->ith * per_thread;
+    const int64_t r_end      = (r_start + per_thread < n_rows) ? (r_start + per_thread) : n_rows;
+
+    float scaled[128];
+
+    for (int64_t r = r_start; r < r_end; r++) {
+        const float * xt = x_data + r * K;
+        int8_t      * yt = y_data + r * row_out_i8;
+
+        const float * rotated = xt;
+        if (kind != 0) {
+            ml8_rotate_row_cpu(xt, yrot, h_a_data, a_dim, b_dim, h_b, xp);
+            rotated = yrot;
+        }
+
+        uint8_t * qs     = (uint8_t *) yt;
+        float   * scales = (float *) (yt + K);
+
+        for (int64_t g = 0; g < n_groups; g++) {
+            const float * grp = rotated + g * 128;
+            float amax = 0.0f;
+            for (int i = 0; i < 128; i++) {
+                const float av = fabsf(grp[i]);
+                if (av > amax) amax = av;
+            }
+            float scale = amax / 448.0f;
+            if (scale < 1e-12f) {
+                scale = 1e-12f;
+            }
+            scales[g] = scale;
+            const float inv_scale = 1.0f / scale;
+            for (int i = 0; i < 128; i++) {
+                scaled[i] = grp[i] * inv_scale;
+            }
+            quantize_row_f8_e4m3_ref(scaled, qs + g * 128, 128);
+        }
+    }
+
+    free(yrot);
+    free(xp);
+    free(h_b);
+}
+
+// ─── ggml_compute_forward_fp8_mul_mat (FP8_B128 phase 2) ──────────────────
+//
+// CPU reference for GGML_OP_FP8_MUL_MAT: dequantizes each FP8_B128 weight row
+// (block scale folded in via dequantize_row_fp8_b128) then, per 128-wide K
+// group, decodes the packed e4m3 activation bytes and applies the
+// activation's own group scale, accumulating in fp32.
+//
+//   dst->src[0] = w (GGML_TYPE_FP8_B128, [K, N])
+//   dst->src[1] = a (GGML_TYPE_I8,       [K + K/32, n1, n2, n3])
+//   dst         = y (GGML_TYPE_F32,      [N, n1, n2, n3])
+void ggml_compute_forward_fp8_mul_mat(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * a = dst->src[1];
+    GGML_ASSERT(w && a);
+    GGML_ASSERT(w->type   == GGML_TYPE_FP8_B128);
+    GGML_ASSERT(a->type   == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    GGML_ASSERT(K % 128 == 0);
+    const int64_t n_groups = K / 128;
+    GGML_ASSERT(a->ne[0] == K + n_groups * (int64_t) sizeof(float));
+    GGML_ASSERT(dst->ne[0] == N);
+    GGML_ASSERT(dst->ne[1] == a->ne[1] && dst->ne[2] == a->ne[2] && dst->ne[3] == a->ne[3]);
+
+    const int64_t n_rows = a->ne[1] * a->ne[2] * a->ne[3];
+
+    const block_fp8_b128 * w_blocks = (const block_fp8_b128 *) w->data;
+    const int8_t          * a_data  = (const int8_t *) a->data;
+    float                  * y_data = (float *) dst->data;
+
+    const int64_t a_row_i8 = a->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t n_per_thread = (N + nth - 1) / nth;
+    const int64_t n_start      = (int64_t) ith * n_per_thread;
+    const int64_t n_end        = (n_start + n_per_thread < N) ? (n_start + n_per_thread) : N;
+
+    // Per-thread fp32 scratch for one dequantized weight row (K floats), same
+    // malloc/free rationale as ggml_compute_forward_ml8_mul_mat above.
+    float * w_dec = (float *) malloc((size_t) K * sizeof(float));
+    if (!w_dec) {
+        GGML_ABORT("ggml_compute_forward_fp8_mul_mat: malloc(%zu) failed", (size_t) K * sizeof(float));
+    }
+    float a_dec[128];
+
+    for (int64_t n = n_start; n < n_end; n++) {
+        const block_fp8_b128 * w_row = w_blocks + (size_t) n * n_groups;
+        dequantize_row_fp8_b128(w_row, w_dec, K);
+
+        for (int64_t r = 0; r < n_rows; r++) {
+            const int8_t  * a_row    = a_data + (size_t) r * a_row_i8;
+            const uint8_t * a_qs     = (const uint8_t *) a_row;
+            const float    * a_scale = (const float *) (a_row + K);
+
+            float sum = 0.0f;
+            for (int64_t g = 0; g < n_groups; g++) {
+                dequantize_row_f8_e4m3(a_qs + g * 128, a_dec, 128);
+                const float * wgrp = w_dec + g * 128;
+                float gsum = 0.0f;
+                for (int i = 0; i < 128; i++) {
+                    gsum += wgrp[i] * a_dec[i];
+                }
+                sum += gsum * a_scale[g];
+            }
+            y_data[r * N + n] = sum;
+        }
+    }
+
+    free(w_dec);
 }
 
 static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, ggml_tensor * dst) {

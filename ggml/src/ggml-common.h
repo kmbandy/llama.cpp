@@ -533,6 +533,22 @@ typedef struct {
 } block_ml8_fp8;
 static_assert(sizeof(block_ml8_fp8) == 34, "ml8_fp8 block must be 34 bytes");
 
+// FP8_B128 phase 2: e4m3 weight quantization block.
+// 128 elements per block, matching gguf-py FP8_B128 registration (id=57, block_size=128, type_size=130).
+// Each block: fp16 per-block scale (2 bytes) + 128 x uint8 e4m3 weights = 130 bytes, tightly packed.
+// On-disk format from Python writer: little-endian fp16 scale followed by 128 OCP e4m3fn bytes.
+// Dequant: x[i] = d * e4m3_to_f32(qs[i]).
+// CONVERTER INVARIANT (not enforced by this type): for a weight stored as
+// FP8_B128, d is shared by every block in an aligned 128x128 tile: the true
+// scale tensor is [N/128, K/128], replicated across the 128 rows of each
+// tile. See scripts/calibration/convert_fp8_rotated.py --format fp8_b128.
+#define QK_FP8_B128 128
+typedef struct {
+    ggml_half d;                 // fp16 per-block scale (2 bytes, little-endian)
+    uint8_t   qs[QK_FP8_B128];   // 128 x uint8 OCP e4m3fn weights
+} block_fp8_b128;
+static_assert(sizeof(block_fp8_b128) == 130, "fp8_b128 block must be 130 bytes");
+
 // TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max for N(0,1))
 // Block size 32, dual half-block scales (d0 for [0..15], d1 for [16..31])
 // Per block: d0(fp16) + d1(fp16) + 3-bit indices packed (12 bytes) = 16 bytes per 32 values
