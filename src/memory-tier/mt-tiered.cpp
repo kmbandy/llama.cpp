@@ -1035,14 +1035,15 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         backup_seq_rm_range(seq_id, p0, p1);
     }
 
-    // Recurrent state: capture the seq's whole r+s state on whole-seq
-    // wipes (sentinel p0/p1) and on partial wipes that include the seq
-    // tail. The implementation conservatively backs up on every seq_rm
-    // call against this seq_id — it's idempotent (no-op when already
-    // backed up) and the cost is bounded by n_seq_max.
-    if (seq_id >= 0) {
-        backup_seq_rm_recurrent(seq_id);
-    }
+    // Recurrent state backup on seq_rm is OFF. Nothing ever calls
+    // restore_recurrent_from_warm(), so the sweep only cost: on
+    // qwen38-27b-q8-tp it read every cache_r/cache_s tensor of both TP
+    // ranks to host through ggml_backend_tensor_get (synchronous, on
+    // cudaStreamPerThread -- ~800 D2H copies per request, each acquiring
+    // a HIP HW queue), several times per request because every whole-seq
+    // wipe erases the buffer. Measured 2026-09-17: with the default 4 HW
+    // queues per device the prefill sat at 620 t/s; the sweep was the
+    // cause. Re-enable only together with a restore path.
 
     const bool ok = inner_->seq_rm(seq_id, p0, p1);
     if (ok) {

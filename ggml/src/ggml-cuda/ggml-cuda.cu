@@ -308,6 +308,60 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP)
+// MAD-LAB 2026-09-17: the HIP runtime's default hardware-queue pool is 4 per
+// device and KFD reports num_cp_queues=4 for gfx12 (R9700, 9070 XT). A process
+// that lands streams on all four queues takes the device's whole HQD budget
+// and the HWS starts time-slicing them (wave save/restore on every switch):
+// every kernel on that device pays a fixed latency, small kernels most. On
+// qwen38-27b-q8-tp (-sm tensor, R9700 + 9070 XT) prefill @8k measured
+// 660 t/s with 4 queues, 1225 with 3, 1318 with 2, 1034 with 1; decode was
+// unchanged. The runtime reads GPU_MAX_HW_QUEUES once, lazily, on the first
+// HIP API call, so this must run at library load: cap the pool at 2 when any
+// GPU node's num_cp_queues is 4 or fewer. An explicit GPU_MAX_HW_QUEUES in
+// the environment always wins (the same knob also fixes the RDNA2 wedge).
+static int ggml_hip_kfd_min_cp_queues() {
+    int min_q = -1;
+    for (int node = 0; node < 64; ++node) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/properties", node);
+        FILE * f = fopen(path, "r");
+        if (f == nullptr) {
+            break;
+        }
+        int  cp_queues = -1;
+        long simd      = 0;
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "num_cp_queues ", 14) == 0) {
+                cp_queues = atoi(line + 14);
+            } else if (strncmp(line, "simd_count ", 11) == 0) {
+                simd = atol(line + 11);
+            }
+        }
+        fclose(f);
+        if (simd > 0 && cp_queues >= 0 && (min_q < 0 || cp_queues < min_q)) {
+            min_q = cp_queues;
+        }
+    }
+    return min_q;
+}
+
+static bool g_ggml_hip_hw_queues_capped = false;
+static int  g_ggml_hip_kfd_cp_queues    = -1;
+
+__attribute__((constructor)) static void ggml_hip_cap_hw_queues() {
+    if (getenv("GPU_MAX_HW_QUEUES") != nullptr) {
+        return;
+    }
+    g_ggml_hip_kfd_cp_queues = ggml_hip_kfd_min_cp_queues();
+    if (g_ggml_hip_kfd_cp_queues > 0 && g_ggml_hip_kfd_cp_queues <= 4) {
+        setenv("GPU_MAX_HW_QUEUES", "2", 0);
+        g_ggml_hip_hw_queues_capped = true;
+    }
+}
+#endif
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -508,6 +562,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // before the first HIP call) is what makes it drain; =8 hangs earlier.
     // This cannot be set from here (the runtime is already initialised), so
     // say so loudly instead.
+    if (g_ggml_hip_hw_queues_capped) {
+        GGML_LOG_INFO("%s: GPU_MAX_HW_QUEUES=2 (KFD num_cp_queues=%d; 4 queues time-slice, see ggml_hip_cap_hw_queues)\n",
+                      __func__, g_ggml_hip_kfd_cp_queues);
+    }
     if (info.device_count > 1) {
         bool has_rdna2 = false;
         for (int id = 0; id < info.device_count; ++id) {
@@ -1149,6 +1207,12 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    static const bool trace = getenv("WP_GET_TENSOR_TRACE") != nullptr;
+    if (trace) {
+        fprintf(stderr, "wp get_tensor: dev=%d name=%s op=%s size=%zu offset=%zu ne=[%lld,%lld,%lld,%lld]\n",
+                ctx->device, tensor->name, ggml_op_name(tensor->op), size, offset,
+                (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
