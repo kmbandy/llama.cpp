@@ -713,7 +713,12 @@ bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t &
         *out_v = sb.v;
         return true;
     }
-    const size_t bytes_per_cache = (size_t) num_scratch_blocks * (size_t) shape.block_size
+    // Grow geometrically: the previous buffer is leaked (see below), so linear
+    // +128-block growth would leak O(n^2) -- ~2 GB per device by 32k context,
+    // which OOM'd both (full) cards on 2026-09-17. Doubling bounds the total
+    // leak to < 2x the final size.
+    const size_t grow_blocks = std::max<size_t>((size_t) num_scratch_blocks, sb.blocks * 2);
+    const size_t bytes_per_cache = grow_blocks * (size_t) shape.block_size
         * (size_t) shape.num_kv_heads * (size_t) shape.head_size * sizeof(uint16_t);
     void * new_k = nullptr;
     void * new_v = nullptr;
@@ -729,7 +734,7 @@ bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t &
     // by the context length, so the leaked total is < 2x the final size.
     sb.k      = new_k;
     sb.v      = new_v;
-    sb.blocks = (size_t) num_scratch_blocks;
+    sb.blocks = grow_blocks;
     *out_k = new_k;
     *out_v = new_v;
     // MAD-2026-09-12 predequant-overflow-guard / draft-ubatch-split-0912.txt
@@ -754,8 +759,8 @@ bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t &
         (void) hipGetDevice(&dev);
         std::fprintf(stderr,
             "mt_aiter_unified_attn: fp8-predequant path active on device %d stream=%p "
-            "(num_scratch_blocks=%d, scratch=%zu B/cache x2)\n",
-            dev, (void*) stream, num_scratch_blocks, bytes_per_cache);
+            "(num_scratch_blocks=%d, allocated %zu blocks, scratch=%zu B/cache x2)\n",
+            dev, (void*) stream, num_scratch_blocks, grow_blocks, bytes_per_cache);
         sb.logged = true;
     }
     return true;
