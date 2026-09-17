@@ -2655,6 +2655,62 @@ struct ggml_backend_meta_context {
     ggml_backend_buffer_ptr cross_host_buf;
     std::vector<float>      cross_host_buf_fallback;
 
+    // Bounded host run-ahead (GGML_META_RUNAHEAD, default 4 subgraphs, 0 = off).
+    //
+    // Every submission path here is asynchronous: compute() enqueues a
+    // subgraph on each device, begin_reduce()/end_reduce() enqueue the
+    // AllReduce halves, and nothing waits for completion until the caller
+    // reads outputs. The devices, however, depend on each other at every
+    // AllReduce, and the vendor runtime's per-device command queue is
+    // finite: when it is full the runtime BLOCKS the submitting host thread
+    // until packets retire. With one host thread submitting to both devices
+    // in order, that is a deadlock whenever device A's queue fills with work
+    // that waits on device B while B's matching subgraph has not been
+    // submitted yet (2026-09-16: the "16k wedge" -- host thread parked in
+    // hipEventRecord inside libamdhip64's queue-full spin, AR watchdog
+    // reporting rank 1 never reaching its send). It only triggers when the
+    // slower device lags far enough for the faster one's queue to fill,
+    // which is why longer contexts (slower attention on the 6900 XT) and
+    // anything that adds packets per node (HIP-graph replays, per-node
+    // profiling events) made it appear.
+    //
+    // The fix is to never let the host get more than `runahead_depth`
+    // subgraph submissions ahead of the slowest device: before submitting
+    // subgraph number s, wait (host-side) for submission s - depth to have
+    // completed on every device. That wait cannot itself deadlock -- every
+    // dependency of submission s - depth was submitted before it -- and it
+    // bounds the per-device queue occupancy to depth x (packets per
+    // subgraph), far below the queue size.
+    std::vector<std::vector<ggml_backend_event_t>> runahead_ev; // [backend][ring]
+    size_t                                          runahead_depth = 0;
+    uint64_t                                        runahead_seq   = 0;
+
+    void runahead_before_submit() {
+        if (runahead_depth == 0) {
+            return;
+        }
+        if (runahead_seq >= runahead_depth) {
+            const size_t k = runahead_seq % runahead_depth;
+            for (auto & evs : runahead_ev) {
+                ggml_backend_event_synchronize(evs[k]);
+            }
+        }
+    }
+
+    void runahead_after_submit(size_t j) {
+        if (runahead_depth == 0) {
+            return;
+        }
+        const size_t k = runahead_seq % runahead_depth;
+        ggml_backend_event_record(runahead_ev[j][k], backend_configs[j].backend);
+    }
+
+    void runahead_advance() {
+        if (runahead_depth != 0) {
+            runahead_seq++;
+        }
+    }
+
     float * cross_host_staging(size_t nbytes) {
         if (!cross_host_buf || ggml_backend_buffer_get_size(cross_host_buf.get()) < nbytes) {
             ggml_backend_buffer_type_t host_buft =
@@ -2691,6 +2747,34 @@ struct ggml_backend_meta_context {
         name += ")";
 
         if (n_devs > 1) {
+            size_t depth = 4;
+            if (const char * e = getenv("GGML_META_RUNAHEAD")) {
+                depth = (size_t) atoi(e);
+            }
+            runahead_ev.resize(n_devs);
+            for (size_t i = 0; i < n_devs && depth > 0; i++) {
+                ggml_backend_dev_t simple_dev = ggml_backend_get_device(simple_backends[i]);
+                for (size_t k = 0; k < depth; k++) {
+                    ggml_backend_event_t ev = ggml_backend_event_new(simple_dev);
+                    if (ev == nullptr) {
+                        depth = 0; // backend has no events: cannot bound, run unbounded as before
+                        break;
+                    }
+                    runahead_ev[i].push_back(ev);
+                }
+            }
+            runahead_depth = depth;
+            if (runahead_depth == 0) {
+                for (auto & evs : runahead_ev) {
+                    for (auto ev : evs) {
+                        ggml_backend_event_free(ev);
+                    }
+                    evs.clear();
+                }
+            }
+        }
+
+        if (n_devs > 1) {
             ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
             if (comm_init != nullptr) {
@@ -2717,6 +2801,11 @@ struct ggml_backend_meta_context {
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
             GGML_ASSERT(comm_free != nullptr);
             comm_free(comm_ctx);
+        }
+        for (auto & evs : runahead_ev) {
+            for (auto ev : evs) {
+                ggml_backend_event_free(ev);
+            }
         }
         for (auto & bc : backend_configs) {
             ggml_backend_free(bc.backend);
@@ -3622,13 +3711,16 @@ struct ggml_backend_meta_graph_runner {
     }
 
     ggml_status compute(const size_t i) {
+        backend_ctx->runahead_before_submit();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i_slot][i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+            backend_ctx->runahead_after_submit(j);
         }
+        backend_ctx->runahead_advance();
         return GGML_STATUS_SUCCESS;
     }
 

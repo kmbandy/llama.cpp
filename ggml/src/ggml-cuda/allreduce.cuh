@@ -4,6 +4,12 @@
 #include "ggml-backend-impl.h"
 
 #include <cstddef>
+#include <cstdint>
+
+// Diagnostic: cudaStreamWaitEvent + record into the AR watchdog's wait ring
+// (dumped on a stall). Use for any cross-stream/cross-device wait whose
+// satisfaction matters for deadlock analysis.
+void ggml_cuda_ar_wait_logged(cudaStream_t stream, cudaEvent_t event, const char * tag, uint64_t op, int dev);
 
 // Opaque pipeline context -- owns all pinned buffers, streams, and events.
 struct ggml_cuda_ar_pipeline;
@@ -29,6 +35,8 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * pipeline);
 struct ggml_cuda_ar_op {
     bool      pending   = false;
     int       slot      = -1;
+    int       hist      = -1;   // index into the per-op event history ring
+    uint64_t  op_id     = 0;    // dx_call number of this op
     int64_t   ne        = 0;
     ggml_type dst_type  = GGML_TYPE_F32;   // tensor / accumulator type
     ggml_type wire_type = GGML_TYPE_F32;   // on-wire type (BF16 for F32 inputs by default)

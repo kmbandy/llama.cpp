@@ -954,6 +954,31 @@ static T * mt_aiter_persist_get(int device, cudaStream_t stream, mt_aiter_persis
     return (T *) b.ptr;
 }
 
+
+// MT_AITER_UATTN_PROFILE=1 (diagnostic, synchronous): time the op's own
+// phases -- scatter, table/workspace prep, unified_attn call -- per device.
+namespace {
+struct mt_op_prof_acc { double scatter_ms = 0, prep_ms = 0, attn_ms = 0; uint64_t n = 0; };
+mt_op_prof_acc g_mt_op_prof[16];
+bool mt_op_prof_enabled() {
+    static const bool e = [] { const char * v = std::getenv("MT_AITER_UATTN_PROFILE"); return v && v[0] == '1'; }();
+    return e;
+}
+struct mt_op_prof_timer {
+    bool on = false; int dev = 0; cudaStream_t st = nullptr; cudaEvent_t e0 = nullptr, e1 = nullptr;
+    mt_op_prof_timer(int d, cudaStream_t s) : on(mt_op_prof_enabled()), dev(d), st(s) {
+        if (on) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, st); }
+    }
+    float lap() {
+        if (!on) return 0.f;
+        cudaEventRecord(e1, st); cudaEventSynchronize(e1);
+        float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1); cudaEventRecord(e0, st);
+        return ms;
+    }
+    ~mt_op_prof_timer() { if (on) { cudaEventDestroy(e0); cudaEventDestroy(e1); } }
+};
+} // namespace
+
 void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_cache       = dst->src[1];
@@ -1117,6 +1142,7 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     shape.cache_type   = cache_type;
 
     cudaStream_t stream = ctx.stream();
+    mt_op_prof_timer mt_prof(ctx.device, stream);
 
     // ── MAD-214 Option F: calibration dump hook ──
     // When MT_TURBO_FP8_DUMP_DIR is set and the cache type is turbo-FP8,
@@ -1252,6 +1278,7 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
         }
     }
     mt_aiter_sync_probe(stream, "scatter", parse_layer_from_kv_cache_name(k_cache->name));
+    const float mt_prof_scatter = mt_prof.lap();
 
     // ── 2. Allocate AITER workspace + cu_seqlens ──
     // MAD-2026-09-12 dispatch-fix: 3D split-K workspace is unused on the 2D
@@ -1522,7 +1549,18 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     args.v_stride_2         = args.k_stride_2;
 
     mt_aiter_sync_probe_pre("uattn", parse_layer_from_kv_cache_name(k_cache->name));
+    const float mt_prof_prep = mt_prof.lap();
     hipError_t err = mt_aiter_unified_attn(stream, &args);
+    if (mt_prof.on) {
+        mt_op_prof_acc & pa = g_mt_op_prof[ctx.device & 15];
+        pa.attn_ms += mt_prof.lap(); pa.scatter_ms += mt_prof_scatter; pa.prep_ms += mt_prof_prep; pa.n++;
+        if (pa.n % 200 == 0) {
+            fprintf(stderr, "mt_pagedattn-op-profile dev=%d n=%llu scatter=%.2fms/call prep=%.2fms/call unified_attn=%.2fms/call (q=%d kv_heads=%d seqs=%d)\n",
+                    ctx.device, (unsigned long long) pa.n, pa.scatter_ms / pa.n, pa.prep_ms / pa.n, pa.attn_ms / pa.n,
+                    (int) num_q_tokens, (int) n_kv_heads, (int) num_seqs);
+            fflush(stderr);
+        }
+    }
     if (err != hipSuccess) {
         GGML_ABORT("mt_aiter_unified_attn launch failed: %s", hipGetErrorString(err));
     }

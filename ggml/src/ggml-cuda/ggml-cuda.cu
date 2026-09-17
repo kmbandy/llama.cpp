@@ -68,6 +68,7 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/wp-node-trace.cuh"
+#include "ggml-cuda/wp-op-profile.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
@@ -4054,7 +4055,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
 
         // wait on dst stream for the copy to complete
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+        {
+            char tag[80];
+            snprintf(tag, sizeof(tag), "cpy<-dev%d:%s", cuda_ctx_src->device, dst->name);
+            ggml_cuda_ar_wait_logged(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, tag, 0, cuda_ctx_dst->device);
+        }
     } else {
         // src and dst are on the same backend
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
@@ -6744,17 +6749,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 prev_i = i;
 
-                if (ggml_cuda_is_view_or_noop(node)) {
+                if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    if (wp_node_trace_enabled()) {
+                        // Log skipped nodes too (no event) so the ring shows the full node sequence.
+                        wp_node_trace_record(cuda_ctx->device, cuda_ctx->stream(), node, i, /*in_capture=*/true);
+                    }
                     continue;
                 }
 
-                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-                    continue;
-                }
+                const bool wp_prof_capture = use_cuda_graph && cuda_graph_update_required;
+                wp_op_profile_begin_node(cuda_ctx->device, cuda_ctx->stream(), wp_prof_capture);
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    wp_op_profile_end_node(cuda_ctx->device, cuda_ctx->stream(), node, nodes_to_skip + 1, wp_prof_capture);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -6786,6 +6795,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                wp_op_profile_end_node(cuda_ctx->device, cuda_ctx->stream(), node, 1, wp_prof_capture);
 
                 if (wp_node_trace_enabled()) {
                     // In capture iff this pass is being captured into a
@@ -6958,7 +6968,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 #endif
         // Launch graph
+        wp_op_profile_begin_replay(cuda_ctx->device, cuda_ctx->stream());
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        wp_op_profile_end_replay(cuda_ctx->device, cuda_ctx->stream());
         // Record right after launch (async, no host sync) so a later TTL/LRU
         // eviction of THIS graph can tell whether this replay has finished
         // before it retires/frees the graph -- see ggml_cuda_graph_retire()/
@@ -7096,6 +7108,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    wp_op_profile_begin_graph(cuda_ctx->device, cgraph);
+    if (wp_node_trace_enabled() && cgraph->n_nodes > 0) {
+        // Marker entry: an event recorded on the compute stream BEFORE any node of
+        // this graph, so the ring can tell "stream never reached this graph" from
+        // "stream is stuck inside it".
+        wp_node_trace_record(cuda_ctx->device, cuda_ctx->stream(), cgraph->nodes[0], -1, false);
+    }
 
     // See ggml_cuda_wp_graph_count_tick(): the atexit dump never runs under this
     // harness's SIGKILL teardown, so the counters are reported periodically from
@@ -7258,7 +7278,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(backend)) {
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
+        ggml_cuda_ar_wait_logged(cuda_ctx->stream(), (cudaEvent_t)event->context, "backend_event_wait", 0, cuda_ctx->device);
     } else {
 #if 0
         // untested

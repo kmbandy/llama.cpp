@@ -719,13 +719,14 @@ bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t &
     void * new_v = nullptr;
     if (hipMalloc(&new_k, bytes_per_cache) != hipSuccess) return false;
     if (hipMalloc(&new_v, bytes_per_cache) != hipSuccess) { (void) hipFree(new_k); return false; }
-    // hipFree implicitly device-synchronizes, so any in-flight kernel on
-    // THIS stream (or any other) that was still reading/writing the old
-    // buffer for this stream has necessarily drained first — safe, and this
-    // regrowth path is rare (grow-only, high-water mark) so the cost is
-    // acceptable.
-    if (sb.k) (void) hipFree(sb.k);
-    if (sb.v) (void) hipFree(sb.v);
+    // The previous scratch is deliberately LEAKED, never hipFree'd here:
+    // hipFree implicitly device-synchronizes, and under GGML_META_OVERLAP
+    // the single meta-backend host thread must never block on one device
+    // while the other device's subgraph -- including its half of the
+    // AllReduce this device's stream is already waiting on -- is still
+    // unsubmitted (the same host-level deadlock predequant-sync-fix-0912
+    // removed from mt_pagedattn_aiter.cu). Growth is monotone and bounded
+    // by the context length, so the leaked total is < 2x the final size.
     sb.k      = new_k;
     sb.v      = new_v;
     sb.blocks = (size_t) num_scratch_blocks;
@@ -830,6 +831,37 @@ int mt_aiter_uattn_should_use_2d(int num_q_tokens, int num_seqs, int num_kv_head
     return (num_2d_prgms > target_num_prgms) ? 1 : 0;
 }
 
+
+// MT_AITER_UATTN_PROFILE=1: diagnostic sub-launch timing (dequant pre-pass
+// vs attention kernel) per device. Synchronous (event sync after each
+// launch) -- only for profiling runs, never production.
+namespace {
+struct uattn_prof_acc {
+    double   dq_ms = 0, at_ms = 0;
+    uint64_t n = 0, sum_q = 0, sum_kv = 0, sum_scratch = 0;
+    unsigned last_gd[3] = {0,0,0}, last_gf[3] = {0,0,0};
+};
+uattn_prof_acc g_uattn_prof[16];
+bool uattn_prof_enabled() {
+    static const bool e = [] { const char * v = std::getenv("MT_AITER_UATTN_PROFILE"); return v && v[0] == '1'; }();
+    return e;
+}
+float uattn_prof_time(hipStream_t stream, hipEvent_t & e0, hipEvent_t & e1) {
+    hipEventRecord(e1, stream);
+    hipEventSynchronize(e1);
+    float ms = 0.f;
+    hipEventElapsedTime(&ms, e0, e1);
+    return ms;
+}
+void uattn_prof_report(int dev, const char * path, uattn_prof_acc & a) {
+    if (a.n % 200 != 0) return;
+    std::fprintf(stderr, "mt_aiter_uattn-profile dev=%d %s n=%llu dequant=%.1fms/call attn=%.1fms/call avg_q=%llu avg_kv=%llu avg_scratch_blocks=%llu grid_dq=%u,%u,%u grid_attn=%u,%u,%u\n",
+                 dev, path, (unsigned long long) a.n, a.dq_ms / a.n, a.at_ms / a.n,
+                 (unsigned long long) (a.sum_q / a.n), (unsigned long long) (a.sum_kv / a.n), (unsigned long long) (a.sum_scratch / a.n),
+                 a.last_gd[0], a.last_gd[1], a.last_gd[2], a.last_gf[0], a.last_gf[1], a.last_gf[2]);
+    std::fflush(stderr);
+}
+} // namespace
 hipError_t mt_aiter_unified_attn(hipStream_t stream,
                                   const mt_aiter_uattn_args_t *a) {
     hipError_t init_err = ensure_initialized(a->shape);
@@ -1012,7 +1044,21 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
             unsigned int gd_x = (unsigned int) num_seqs;
             unsigned int gd_y = (unsigned int) a->block_table_stride;
             unsigned int gd_z = (unsigned int) a->shape.num_kv_heads;
+            const bool prof = uattn_prof_enabled();
+            int prof_dev = 0;
+            hipEvent_t pe0 = nullptr, pe1 = nullptr;
+            uattn_prof_acc * pa = nullptr;
+            if (prof) {
+                hipGetDevice(&prof_dev);
+                pa = &g_uattn_prof[prof_dev & 15];
+                hipEventCreate(&pe0); hipEventCreate(&pe1);
+                hipEventRecord(pe0, stream);
+            }
             hipError_t dq_err = c.h_dequant->launch(stream, gd_x, gd_y, gd_z, args_dequant);
+            if (prof) {
+                pa->dq_ms += uattn_prof_time(stream, pe0, pe1);
+                hipEventRecord(pe0, stream);
+            }
             if (dq_err == hipSuccess) {
                 // F16-shadow strides: the scratch cache is a fresh, tightly
                 // packed [num_blocks_allocated, BLOCK_SIZE, n_kv_heads,
@@ -1050,13 +1096,41 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
                     &p_global_scratch, &p_profile_scratch,
                 };
                 unsigned int gf_y = (unsigned int)(num_q_tokens / c.block_q_large_f16 + num_seqs);
-                return c.h_2d_large_f16->launch(stream, g2_x, gf_y, g2_z, args_2d_f16);
+                hipError_t at_err = c.h_2d_large_f16->launch(stream, g2_x, gf_y, g2_z, args_2d_f16);
+                if (prof) {
+                    pa->at_ms += uattn_prof_time(stream, pe0, pe1);
+                    pa->n++;
+                    pa->sum_q += num_q_tokens;
+                    int32_t sl = 0;
+                    hipMemcpy(&sl, a->seq_lens, sizeof(sl), hipMemcpyDeviceToHost);
+                    pa->sum_kv += sl;
+                    pa->sum_scratch += a->num_scratch_blocks;
+                    pa->last_gd[0] = gd_x; pa->last_gd[1] = gd_y; pa->last_gd[2] = gd_z;
+                    pa->last_gf[0] = g2_x; pa->last_gf[1] = gf_y; pa->last_gf[2] = g2_z;
+                    hipEventDestroy(pe0); hipEventDestroy(pe1);
+                    uattn_prof_report(prof_dev, "2d-large-predequant", *pa);
+                }
+                return at_err;
             }
             // Dequant launch failed — fall through to the normal fp8 2D-large
             // launch below rather than propagating a spurious error; the
             // in-kernel dequant path is still fully correct.
         }
 
+        if (uattn_prof_enabled()) {
+            int prof_dev = 0; hipGetDevice(&prof_dev);
+            uattn_prof_acc & pa = g_uattn_prof[prof_dev & 15];
+            hipEvent_t pe0, pe1; hipEventCreate(&pe0); hipEventCreate(&pe1);
+            hipEventRecord(pe0, stream);
+            hipError_t at_err = h_2d_selected->launch(stream, g2_x, g2_y, g2_z, args_2d);
+            pa.at_ms += uattn_prof_time(stream, pe0, pe1);
+            pa.n++; pa.sum_q += num_q_tokens;
+            int32_t sl = 0; hipMemcpy(&sl, a->seq_lens, sizeof(sl), hipMemcpyDeviceToHost); pa.sum_kv += sl;
+            pa.last_gf[0] = g2_x; pa.last_gf[1] = g2_y; pa.last_gf[2] = g2_z;
+            hipEventDestroy(pe0); hipEventDestroy(pe1);
+            uattn_prof_report(prof_dev, use_2d_large ? "2d-large" : "2d-base", pa);
+            return at_err;
+        }
         return h_2d_selected->launch(stream, g2_x, g2_y, g2_z, args_2d);
     }
 

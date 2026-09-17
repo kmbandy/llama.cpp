@@ -9,7 +9,7 @@
 // See wp-node-trace.cuh for the contract. Ring size fixed at 64 per the
 // WP_NODE_TRACE spec; events are created lazily per (device, ring slot) and
 // never destroyed -- they are reused in place across wrap-arounds.
-static constexpr int WP_NODE_TRACE_RING = 64;
+static constexpr int WP_NODE_TRACE_RING = 512;
 
 struct wp_node_trace_entry {
     bool        valid      = false;
@@ -22,6 +22,8 @@ struct wp_node_trace_entry {
     bool        has_src0   = false;
     bool        in_capture = false; // true => "graph-replay": no event was recorded for this launch
     cudaEvent_t event      = nullptr;
+    cudaStream_t stream    = nullptr; // stream the node was launched on
+    char        bufs[96]   = {0};     // buffer names of dst/src0/src1
 };
 
 struct wp_node_trace_device {
@@ -80,6 +82,13 @@ void wp_node_trace_record(int device, cudaStream_t stream, const ggml_tensor * n
         e.has_src0 = false;
     }
     e.in_capture = in_capture;
+    e.stream     = stream;
+    {
+        const char * b0 = node->buffer ? ggml_backend_buffer_name(node->buffer) : "-";
+        const char * b1 = node->src[0] && node->src[0]->buffer ? ggml_backend_buffer_name(node->src[0]->buffer) : "-";
+        const char * b2 = node->src[1] && node->src[1]->buffer ? ggml_backend_buffer_name(node->src[1]->buffer) : "-";
+        snprintf(e.bufs, sizeof(e.bufs), "dst=%s s0=%s s1=%s", b0, b1, b2);
+    }
 
     if (!in_capture) {
         // Recording an event on a stream that is being captured would itself
@@ -213,4 +222,22 @@ void wp_node_trace_dump(int device) {
     fprintf(stderr,
             "wp ar-watchdog: node-trace dev=%d last_launched=%s last_completed=%s stuck_after=%s\n",
             device, launched_buf, completed_buf, stuck_buf);
+
+    // Full ring, oldest first, so the boundary between completed and
+    // never-started nodes is visible (a stream blocked on an event shows as
+    // a run of not-ready entries starting right after the last ready one).
+    for (uint32_t k = 0; k < n_entries; ++k) {
+        const uint32_t idx = (count - n_entries + k) % (uint32_t) WP_NODE_TRACE_RING;
+        const wp_node_trace_entry & e = dev.ring[idx];
+        if (!e.valid) {
+            continue;
+        }
+        char buf[160];
+        wp_node_trace_format_entry(buf, sizeof(buf), e);
+        fprintf(stderr, "wp ar-watchdog:   node dev=%d call=%llu stream=%p %s ne=[%lld,%lld] %s -> %s\n",
+                device, (unsigned long long) e.call_idx, (void *) e.stream, buf,
+                (long long) e.ne[0], (long long) e.ne[1], e.bufs,
+                e.in_capture ? "replay" : wp_node_trace_event_status(e.event));
+    }
+    fflush(stderr);
 }
