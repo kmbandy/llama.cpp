@@ -291,6 +291,10 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     return true;
 }
 
+static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev);
+static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event);
+static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event);
+
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
     /* .get_description      = */ ggml_backend_meta_device_get_description,
@@ -304,13 +308,57 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
     /* .offload_op           = */ nullptr,
-    /* .event_new            = */ nullptr,
-    /* .event_free           = */ nullptr,
-    /* .event_synchronize    = */ nullptr,
+    /* .event_new            = */ ggml_backend_meta_device_event_new,
+    /* .event_free           = */ ggml_backend_meta_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
     return dev != nullptr && dev->iface.get_name == ggml_backend_meta_device_iface.get_name;
+}
+
+// Meta events: one event per simple device, recorded on every device's stream
+// at once. Lets ggml_backend_sched run the meta backend with rotating input
+// copies (parallel=true) so a slot's next graph only waits for the graph that
+// last used its input copy instead of ggml_backend_synchronize() draining
+// both devices (the per-sub-batch bubble in the rolling TP loop).
+struct ggml_backend_meta_event_context {
+    std::vector<ggml_backend_event_t> simple;
+};
+
+static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev) {
+    auto * dev_ctx = (ggml_backend_meta_device_context *) dev->context;
+    auto * ctx = new ggml_backend_meta_event_context;
+    for (ggml_backend_dev_t simple_dev : dev_ctx->simple_devs) {
+        ggml_backend_event_t ev = ggml_backend_event_new(simple_dev);
+        if (ev == nullptr) {
+            for (ggml_backend_event_t e : ctx->simple) {
+                ggml_backend_event_free(e);
+            }
+            delete ctx;
+            return nullptr;
+        }
+        ctx->simple.push_back(ev);
+    }
+    return new ggml_backend_event { dev, ctx };
+}
+
+static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    auto * ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t e : ctx->simple) {
+        ggml_backend_event_free(e);
+    }
+    delete ctx;
+    delete event;
+}
+
+static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    auto * ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t e : ctx->simple) {
+        ggml_backend_event_synchronize(e);
+    }
 }
 
 static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
@@ -2838,8 +2886,11 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        // Layouts the async splice does not cover: synchronous buffer path.
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -2876,7 +2927,17 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             }
         } break;
         default: {
-            GGML_ABORT("fatal error");
+            // Layouts the async splice does not cover: take the synchronous
+            // buffer path (correct, just not queued behind in-flight work).
+            static int warned = 0;
+            if (warned < 4) {
+                warned++;
+                GGML_LOG_WARN("%s: tensor %s: split axis %d (n_segments=%zu nr0=%zu) type=%s ne=[%lld,%lld,%lld,%lld] view_src=%s not handled asynchronously, using synchronous set\n",
+                              __func__, tensor->name, (int) split_state.axis, split_state.n_segments, split_state.nr[0],
+                              ggml_type_name(tensor->type), (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+                              tensor->view_src ? tensor->view_src->name : "-");
+            }
+            ggml_backend_tensor_set(tensor, data, offset, size);
         }
     }
 }
@@ -2937,6 +2998,24 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
+    }
+}
+
+static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    auto * ctx = (ggml_backend_meta_event_context *) event->context;
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    GGML_ASSERT(ctx->simple.size() == n_backends);
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_event_record(ctx->simple[i], ggml_backend_meta_simple_backend(backend, i));
+    }
+}
+
+static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    auto * ctx = (ggml_backend_meta_event_context *) event->context;
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    GGML_ASSERT(ctx->simple.size() == n_backends);
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, i), ctx->simple[i]);
     }
 }
 
@@ -4086,8 +4165,8 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_plan_update       = */ nullptr,
     /* .graph_plan_compute      = */ nullptr,
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
-    /* .event_record            = */ nullptr,
-    /* .event_wait              = */ nullptr,
+    /* .event_record            = */ ggml_backend_meta_event_record,
+    /* .event_wait              = */ ggml_backend_meta_event_wait,
     /* .graph_optimize          = */ nullptr,
 };
 

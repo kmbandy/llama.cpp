@@ -605,6 +605,7 @@ private:
     // Second graph slot for the gated two-ubatch meta overlap path.
     // Created only when a decode batch actually uses that path.
     ggml_backend_sched_ptr sched_overlap;
+    bool sched_rolling_parallel = false; // scheds created with rotating input copies (meta overlap)
     // NOTE: the worst-case reservation is deliberately NOT parameterized by
     // whether the overlap is active. The overlap only ever makes ubatches
     // SMALLER (n_ubatch / split), so a reservation sized for the full

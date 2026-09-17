@@ -32,3 +32,9 @@ void wp_op_profile_end_node(int device, cudaStream_t stream, const ggml_tensor *
 // Wrap a cudaGraphLaunch replay of the whole cgraph.
 void wp_op_profile_begin_replay(int device, cudaStream_t stream);
 void wp_op_profile_end_replay(int device, cudaStream_t stream);
+
+// Generic spans (e.g. AllReduce phases): begin records an event on the stream,
+// end records another and accounts the elapsed time under `key` (bucketed like
+// ops). Spans do not participate in GAP accounting.
+void wp_op_profile_span_begin(int device, cudaStream_t stream);
+void wp_op_profile_span_end(int device, cudaStream_t stream, const char * key);

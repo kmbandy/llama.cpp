@@ -1117,6 +1117,11 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+
+    // Pinned host staging for user-input copies, one per copy index (see
+    // ggml_backend_sched_compute_runner::stage_user_input). n_copies > 1 only.
+    ggml_backend_buffer_t input_staging[GGML_SCHED_MAX_COPIES];
+    size_t                input_staging_size[GGML_SCHED_MAX_COPIES];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2060,6 +2065,67 @@ struct ggml_backend_sched_compute_runner {
         }
     }
 
+    // User-input copies. ggml_backend_tensor_copy() lands in the buffer's
+    // synchronous set_tensor (on CUDA/HIP a null-stream cudaMemcpy), which on
+    // ROCm waits for the whole device to drain: with the rolling TP loop that
+    // was a 1.2 s stall per slot boundary followed by ~30 ms of host work with
+    // an empty GPU (TPPHASE prepare_meta, 2026-09-17). With n_copies > 1 the
+    // user's data is consumed immediately into a pinned host staging slot
+    // (one per copy index, protected by the same completion event that guards
+    // input_cpy) and the H2D copy goes async on the split backend's own
+    // stream, so it queues behind the in-flight graphs instead of draining
+    // them. WP_SCHED_SYNC_INPUTS=1 restores the synchronous copy for A/B.
+    size_t staging_used = 0;
+
+    bool stage_user_input(int split_backend_id, const struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
+        static const bool disabled = getenv("WP_SCHED_SYNC_INPUTS") != NULL;
+        ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (disabled || sched->n_copies <= 1 || split_backend->iface.set_tensor_async == NULL) {
+            return false;
+        }
+        if (!ggml_is_contiguous(input) || input->data == NULL || input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer)) {
+            return false;
+        }
+        static const bool dbg = getenv("WP_TP_PHASE") != NULL;
+        const int64_t d0 = dbg ? ggml_time_us() : 0;
+        // host-side wait for the graph that last used copy index cur_copy: it
+        // is what makes staging[cur_copy] and input_cpy free to overwrite
+        sync_backend(split_backend_id);
+        const int64_t d1 = dbg ? ggml_time_us() : 0;
+        struct dbg_t { bool on; int64_t d0, d1; const ggml_tensor * in; ~dbg_t() { if (on) { const int64_t d2 = ggml_time_us(); if (d2 - d0 > 20000) fprintf(stderr, "TPPHASE stage %s sync_us=%lld copy_us=%lld\n", in->name, (long long) (d1 - d0), (long long) (d2 - d1)); } } } dbgg { dbg, d0, d1, input };
+        const size_t nbytes = ggml_nbytes(input);
+        if (nbytes == 0) {
+            return true; // e.g. inp_out_ids with no outputs: nothing to copy, and the sync path would drain the device for it
+        }
+        const size_t align  = 256;
+        const size_t off    = (staging_used + align - 1) / align * align;
+        const int    c      = sched->cur_copy;
+        if (sched->input_staging[c] == NULL || sched->input_staging_size[c] < off + nbytes) {
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(split_backend->device);
+            if (host_buft == NULL) {
+                return false;
+            }
+            // Grow (never shrink). The slot's previous contents are no longer
+            // read: sync_backend() above waited for the graph that last used
+            // this copy index. Keep headroom so regrowth is rare.
+            const size_t want = (off + nbytes) * 2 + 1024 * 1024;
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, want);
+            if (buf == NULL) {
+                return false;
+            }
+            if (sched->input_staging[c] != NULL) {
+                ggml_backend_buffer_free(sched->input_staging[c]);
+            }
+            sched->input_staging[c]      = buf;
+            sched->input_staging_size[c] = ggml_backend_buffer_get_size(buf);
+        }
+        char * stage = (char *) ggml_backend_buffer_get_base(sched->input_staging[c]) + off;
+        memcpy(stage, input->data, nbytes);
+        ggml_backend_tensor_set_async(split_backend, input_cpy, stage, 0, nbytes);
+        staging_used = off + nbytes;
+        return true;
+    }
+
     void sync_backend(int backend_id) {
         if (backend_id < 0) {
             return;
@@ -2149,6 +2215,9 @@ struct ggml_backend_sched_compute_runner {
         }
 
         // copy the input tensors to the split backend
+        static const bool tp_phase_dbg = getenv("WP_TP_PHASE") != NULL;
+        char dbg_line[1024]; size_t dbg_len = 0; int64_t dbg_t0 = tp_phase_dbg ? ggml_time_us() : 0;
+        dbg_line[0] = 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             uint64_t copy_start;
             bool copy_pinned_d2h = false;
@@ -2160,11 +2229,18 @@ struct ggml_backend_sched_compute_runner {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            const int64_t dbg_ti = tp_phase_dbg ? ggml_time_us() : 0;
+            struct dbg_guard_t { bool on; int64_t t; const ggml_tensor * in; char * line; size_t * len; ggml_backend_t ib;
+                ~dbg_guard_t() { if (on && *len < 900) *len += snprintf(line + *len, 1024 - *len, " %s[%s%s,%s]=%lld", in->name,
+                    (in->flags & GGML_TENSOR_FLAG_INPUT) ? "I" : "-", (in->buffer && ggml_backend_buffer_is_host(in->buffer)) ? "h" : "d",
+                    ggml_backend_name(ib), (long long) (ggml_time_us() - t)); } } dbg_guard { tp_phase_dbg, dbg_ti, input, dbg_line, &dbg_len, input_backend };
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                sync_backend(split_backend_id);
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (!stage_user_input(split_backend_id, input, input_cpy)) {
+                    sync_backend(split_backend_id);
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2293,6 +2369,12 @@ struct ggml_backend_sched_compute_runner {
                         if constexpr (collect_split_stats) {
                             ++split_stats.n_syncs_elided;
                         }
+                    } else if (input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+                               (synchronize_backend(input_backend), stage_user_input(split_backend_id, input, input_cpy))) {
+                        // host-resident input (e.g. produced by a CPU split): staged
+                        // through pinned memory and copied on the split backend's own
+                        // stream instead of the synchronous tensor_copy -- see
+                        // stage_user_input
                     } else if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         if (dbg) fprintf(stderr, "[sched_copy] %s: SYNC path\n", input->name);
                         synchronize_backend(input_backend);
@@ -2334,6 +2416,11 @@ struct ggml_backend_sched_compute_runner {
                     split_stats.ns_copy_pageable_d2h += copy_elapsed;
                 }
             }
+        }
+
+        if (tp_phase_dbg && ggml_time_us() - dbg_t0 > 30000) {
+            fprintf(stderr, "TPPHASE prepare split=%d backend=%s total_us=%lld inputs:%s\n", split_id, ggml_backend_name(split_backend),
+                    (long long) (ggml_time_us() - dbg_t0), dbg_line);
         }
 
         // Complete deferred HIP multi-input stages after all split inputs are
@@ -2974,6 +3061,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
     }
+    for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
+        if (sched->input_staging[c] != NULL) {
+            ggml_backend_buffer_free(sched->input_staging[c]);
+        }
+    }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
@@ -3156,12 +3248,15 @@ enum ggml_status ggml_backend_sched_graph_compute_async_meta_begin(
     GGML_ASSERT(graph);
     GGML_ASSERT(n_steps);
 
+    static const bool tp_phase = getenv("WP_TP_PHASE") != nullptr;
+    const int64_t t0 = tp_phase ? ggml_time_us() : 0;
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
     if (!sched->is_alloc && !ggml_backend_sched_alloc_graph(sched, graph)) {
         return GGML_STATUS_ALLOC_FAILED;
     }
+    const int64_t t1 = tp_phase ? ggml_time_us() : 0;
     const int i_split_meta = ggml_backend_sched_meta_overlap_split(sched);
     if (i_split_meta < 0) {
         return GGML_STATUS_FAILED;
@@ -3181,14 +3276,24 @@ enum ggml_status ggml_backend_sched_graph_compute_async_meta_begin(
             return status;
         }
     }
+    const int64_t t2 = tp_phase ? ggml_time_us() : 0;
 
     const ggml_status status = runner.prepare(i_split_meta);
     if (status != GGML_STATUS_SUCCESS) {
         return status;
     }
+    const int64_t t3 = tp_phase ? ggml_time_us() : 0;
 
     ggml_backend_t backend = sched->backends[sched->splits[i_split_meta].backend_id];
-    return ggml_backend_meta_graph_compute_step_begin(backend, &sched->splits[i_split_meta].graph, i_slot, n_steps);
+    const ggml_status st = ggml_backend_meta_graph_compute_step_begin(backend, &sched->splits[i_split_meta].graph, i_slot, n_steps);
+    if (tp_phase) {
+        const int bid = sched->splits[i_split_meta].backend_id;
+        fprintf(stderr, "TPPHASE sched_begin slot=%zu n_splits=%d i_split_meta=%d n_copies=%d cur_copy=%d event=%p n_inputs=%d alloc_us=%lld pre_splits_us=%lld prepare_meta_us=%lld step_begin_us=%lld\n",
+                i_slot, sched->n_splits, i_split_meta, sched->n_copies, sched->cur_copy, (void *) sched->events[bid][sched->cur_copy],
+                sched->splits[i_split_meta].n_inputs,
+                (long long) (t1 - t0), (long long) (t2 - t1), (long long) (t3 - t2), (long long) (ggml_time_us() - t3));
+    }
+    return st;
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async_meta_step(

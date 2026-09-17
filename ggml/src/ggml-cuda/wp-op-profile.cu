@@ -16,6 +16,9 @@ struct pending_pair {
     cudaEvent_t start;
     cudaEvent_t end;
     std::string key;
+    bool        free_start = true;
+    bool        free_end   = true;
+    bool        is_gap     = false;
 };
 
 struct acc {
@@ -31,6 +34,14 @@ struct dev_state {
     uint64_t                   n_graphs = 0;
     std::string                bucket = "?";
     cudaEvent_t                cur_start = nullptr;
+    // End event of the previous node on the compute stream, kept alive so the
+    // idle gap before the next node can be measured (GAP rows). Owned by the
+    // gap pair that consumes it, or freed here when a graph ends without a
+    // successor.
+    cudaEvent_t                prev_end = nullptr;
+    cudaEvent_t                span_start = nullptr;
+    uint64_t                   prev_graph = 0;
+    double                     gap_ms_sum = 0.0;
     std::chrono::steady_clock::time_point last_print = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point graph_t0;
     bool                       in_graph = false;
@@ -102,11 +113,18 @@ void drain(dev_state & d, bool all) {
             acc & a = d.totals[p.key];
             a.ms += ms;
             a.n  += 1;
+            if (p.is_gap) {
+                d.gap_ms_sum += ms;
+            }
         } else {
             (void) cudaGetLastError();
         }
-        d.free_events.push_back(p.start);
-        d.free_events.push_back(p.end);
+        if (p.free_start) {
+            d.free_events.push_back(p.start);
+        }
+        if (p.free_end) {
+            d.free_events.push_back(p.end);
+        }
         d.pending.pop_front();
     }
 }
@@ -127,8 +145,12 @@ void maybe_print(int device, dev_state & d) {
         total += r.second.ms;
     }
     std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
-    fprintf(stderr, "wp op-profile dev=%d window=%.1fs graphs=%llu graph_wall=%.0fms gpu_op_sum=%.0fms\n",
-            device, since, (unsigned long long) d.n_graphs, d.graph_wall_ms, total);
+    // gpu_op_sum counts ops only; GAP rows (idle on the compute stream between
+    // consecutive ops, keyed by the op that follows, GAPg when the gap spans a
+    // graph_compute boundary) are reported separately and excluded from total.
+    total -= d.gap_ms_sum;
+    fprintf(stderr, "wp op-profile dev=%d window=%.1fs graphs=%llu graph_wall=%.0fms gpu_op_sum=%.0fms gap_sum=%.0fms\n",
+            device, since, (unsigned long long) d.n_graphs, d.graph_wall_ms, total, d.gap_ms_sum);
     int shown = 0;
     for (const auto & r : rows) {
         if (shown++ >= 40) {
@@ -140,6 +162,7 @@ void maybe_print(int device, dev_state & d) {
     fflush(stderr);
     d.totals.clear();
     d.graph_wall_ms = 0.0;
+    d.gap_ms_sum = 0.0;
     d.n_graphs = 0;
 }
 
@@ -206,8 +229,24 @@ void wp_op_profile_end_node(int device, cudaStream_t stream, const ggml_tensor *
     }
     cudaEvent_t end = take_event(d);
     CUDA_CHECK(cudaEventRecord(end, stream));
-    d.pending.push_back({d.cur_start, end, d.bucket + " " + make_key(node, n_fused)});
-    d.cur_start = nullptr;
+    const std::string key = make_key(node, n_fused);
+    if (d.prev_end != nullptr) {
+        // idle between the previous node's end and this node's start; the gap
+        // pair owns prev_end, the op pair below owns cur_start
+        const bool cross_graph = d.prev_graph != d.n_graphs;
+        pending_pair g;
+        g.start = d.prev_end; g.end = d.cur_start; g.is_gap = true;
+        g.free_start = true; g.free_end = false;
+        g.key = d.bucket + (cross_graph ? " GAPg>" : " GAP>") + key;
+        d.pending.push_back(g);
+    }
+    pending_pair op;
+    op.start = d.cur_start; op.end = end; op.free_start = true; op.free_end = false;
+    op.key = d.bucket + " " + key;
+    d.pending.push_back(op);
+    d.prev_end   = end;
+    d.prev_graph = d.n_graphs;
+    d.cur_start  = nullptr;
 }
 
 void wp_op_profile_begin_replay(int device, cudaStream_t stream) {
@@ -224,6 +263,45 @@ void wp_op_profile_end_replay(int device, cudaStream_t stream) {
     }
     cudaEvent_t end = take_event(d);
     CUDA_CHECK(cudaEventRecord(end, stream));
-    d.pending.push_back({d.cur_start, end, d.bucket + " GRAPH_REPLAY"});
-    d.cur_start = nullptr;
+    if (d.prev_end != nullptr) {
+        pending_pair g;
+        g.start = d.prev_end; g.end = d.cur_start; g.is_gap = true;
+        g.free_start = true; g.free_end = false;
+        g.key = d.bucket + (d.prev_graph != d.n_graphs ? " GAPg>" : " GAP>") + "GRAPH_REPLAY";
+        d.pending.push_back(g);
+    }
+    pending_pair op;
+    op.start = d.cur_start; op.end = end; op.free_start = true; op.free_end = false;
+    op.key = d.bucket + " GRAPH_REPLAY";
+    d.pending.push_back(op);
+    d.prev_end   = end;
+    d.prev_graph = d.n_graphs;
+    d.cur_start  = nullptr;
+}
+
+void wp_op_profile_span_begin(int device, cudaStream_t stream) {
+    if (!wp_op_profile_enabled() || device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    dev_state & d = g_dev[device];
+    cudaEvent_t e = take_event(d);
+    CUDA_CHECK(cudaEventRecord(e, stream));
+    d.span_start = e;
+}
+
+void wp_op_profile_span_end(int device, cudaStream_t stream, const char * key) {
+    if (!wp_op_profile_enabled() || device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    dev_state & d = g_dev[device];
+    if (d.span_start == nullptr) {
+        return;
+    }
+    cudaEvent_t end = take_event(d);
+    CUDA_CHECK(cudaEventRecord(end, stream));
+    pending_pair op;
+    op.start = d.span_start; op.end = end; op.free_start = true; op.free_end = true;
+    op.key = d.bucket + " " + key;
+    d.pending.push_back(op);
+    d.span_start = nullptr;
 }

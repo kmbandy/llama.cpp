@@ -1365,7 +1365,24 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // The rolling meta-overlap loop needs the scheduler's rotating input copies
+    // (parallel=true, GGML_SCHED_MAX_COPIES device-side copies + completion
+    // events): with a single copy every slot boundary had to
+    // ggml_backend_synchronize() the meta backend -- draining BOTH devices --
+    // before the next sub-batch's inputs could be written (TPPHASE prepare_meta
+    // 1.2 s per slot 0 boundary at 8k, then ~30 ms of host work with an empty
+    // GPU). Meta events are composite over the simple devices.
+    sched_rolling_parallel = false;
+    for (ggml_backend_t b : backend_ptrs) {
+        if (ggml_backend_is_meta(b) && ggml_backend_meta_overlap_enabled(b)) {
+            sched_rolling_parallel = true;
+        }
+    }
+    if (sched_rolling_parallel && getenv("WP_SCHED_ROLLING_SERIAL") != nullptr) {
+        sched_rolling_parallel = false; // A/B: the old single-copy scheduler
+    }
+
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel || sched_rolling_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -4119,7 +4136,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (overlap_active && !sched_overlap) {
         const size_t max_nodes = gf_res_prev->get_max_nodes();
         sched_overlap.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-                                                   max_nodes, false, cparams.op_offload));
+                                                   max_nodes, sched_rolling_parallel, cparams.op_offload));
         gf_res_overlap.reset(new llm_graph_result(max_nodes));
     }
 
@@ -4687,18 +4704,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         };
 
+        // WP_TP_PHASE=1: host time of the per-ubatch phases that sit between a
+        // slot's last submitted step and its next graph's first kernel. While
+        // they run the GPUs hold ~2 subgraph steps of queued work, so anything
+        // beyond that is idle on both cards (op-profile "GAPg>RMS_NORM").
+        static const bool tp_phase = getenv("WP_TP_PHASE") != nullptr;
+
         auto prepare_slot = [&](overlap_slot & slot, ggml_status & status) {
+            const int64_t t0 = tp_phase ? ggml_time_us() : 0;
             slot.ubatch = mctx->get_ubatch();
             slot.n_outputs = prepare_ubatch(slot.ubatch);
+            const int64_t t1 = tp_phase ? ggml_time_us() : 0;
             slot.res = process_ubatch(slot.ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
                                       slot.sched, slot.i_slot == 0 ? gf_res_prev.get() : gf_res_overlap.get(), true, true);
+            if (tp_phase) {
+                LLAMA_LOG_WARN("TPPHASE prepare slot=%zu n_tokens=%u prepare_ubatch_us=%lld process_ubatch_us=%lld\n",
+                               slot.i_slot, slot.ubatch.n_tokens, (long long) (t1 - t0), (long long) (ggml_time_us() - t1));
+            }
             return slot.res != nullptr;
         };
 
         auto begin_slot = [&](overlap_slot & slot, ggml_status & status) {
+            const int64_t t0 = tp_phase ? ggml_time_us() : 0;
             setup_graph_compute(slot.ubatch.n_tokens > 1);
             status = ggml_backend_sched_graph_compute_async_meta_begin(
                 slot.sched, slot.res->get_gf(), slot.i_slot, &slot.n_steps);
+            if (tp_phase) {
+                LLAMA_LOG_WARN("TPPHASE begin slot=%zu n_steps=%zu begin_us=%lld\n",
+                               slot.i_slot, slot.n_steps, (long long) (ggml_time_us() - t0));
+            }
             return status == GGML_STATUS_SUCCESS;
         };
 
@@ -4721,7 +4755,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         };
 
         auto extract_slot = [&](const overlap_slot & slot) {
+            const int64_t t0 = tp_phase ? ggml_time_us() : 0;
             extract_ubatch(slot.res, slot.ubatch, slot.n_outputs, n_outputs_prev, n_tokens_prev, slot.sched);
+            if (tp_phase) {
+                LLAMA_LOG_WARN("TPPHASE extract slot=%zu n_outputs=%d extract_us=%lld\n",
+                               slot.i_slot, slot.n_outputs, (long long) (ggml_time_us() - t0));
+            }
             n_outputs_prev += slot.n_outputs;
             n_tokens_prev  += slot.ubatch.n_tokens;
             n_ubatches_tp++; // WP_TP_TRACE only; see tp_trace_decode() below

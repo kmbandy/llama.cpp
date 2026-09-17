@@ -1,4 +1,5 @@
 #include "allreduce.cuh"
+#include "wp-op-profile.cuh"
 #include "wp-node-trace.cuh"
 
 #include <vector>
@@ -399,41 +400,54 @@ struct ggml_cuda_ar_codec {
     ggml_cuda_ar_unpack_accumulate_fn    unpack_accumulate_fn;
 };
 
+// Pack: one lane per element, 32 lanes per q8 block (coalesced reads; the
+// block amax is a width-32 shuffle reduction). Same arithmetic as
+// quantize_f32_q8_0_block. See the unpack kernel below for why.
 template <typename T_src>
 static __global__ void ggml_cuda_ar_codec_pack_q8_0_kernel(
         const T_src * src, block_q8_0 * dst, int n_blocks) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int nt  = gridDim.x * blockDim.x;
-    for (int ib = tid; ib < n_blocks; ib += nt) {
-        float values[QK8_0];
-        for (int j = 0; j < QK8_0; ++j) {
-            values[j] = ggml_cuda_cast<float>(src[ib * QK8_0 + j]);
+    const int lane      = threadIdx.x % QK8_0;
+    const int ib0       = (blockIdx.x * blockDim.x + threadIdx.x) / QK8_0;
+    const int nb_stride = (gridDim.x * blockDim.x) / QK8_0;
+    for (int ib = ib0; ib < n_blocks; ib += nb_stride) {
+        const float x    = ggml_cuda_cast<float>(src[ib * QK8_0 + lane]);
+        const float amax = warp_reduce_max<QK8_0>(fabsf(x));
+        const float d    = amax / ((1 << 7) - 1);
+        const float id   = d ? 1.0f / d : 0.0f;
+        dst[ib].qs[lane] = (int8_t) roundf(x * id);
+        if (lane == 0) {
+            dst[ib].d = d;
         }
-        quantize_f32_q8_0_block(values, &dst[ib]);
     }
 }
 
+// Unpack + accumulate: dst = dequant(quant_q8(dst)) + dequant(src). The local
+// partial is requantized to q8_0 so both ranks add the same two values and
+// end up bit-identical. One lane per element (32 lanes per q8 block, the
+// block's amax via a width-32 shuffle reduction): consecutive lanes touch
+// consecutive floats, so the 20 MB read-modify-write is coalesced. The
+// previous thread-per-block mapping strided each lane 128 B apart; measured
+// 2026-09-17 on qwen38-27b-q8-tp it took 0.23 ms per reduce on the R9700 and
+// 1.6 ms on the TB3-attached 9070 XT, and was the critical path of the
+// R9700's 0.84 ms wait at every AllReduce boundary.
 template <typename T_dst>
 static __global__ void ggml_cuda_ar_codec_unpack_q8_0_kernel(
         T_dst * dst, const block_q8_0 * src, int n_blocks) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int nt  = gridDim.x * blockDim.x;
-    for (int ib = tid; ib < n_blocks; ib += nt) {
-        float values[QK8_0];
-        for (int j = 0; j < QK8_0; ++j) {
-            values[j] = ggml_cuda_cast<float>(dst[ib * QK8_0 + j]);
-        }
-
-        block_q8_0 local;
-        quantize_f32_q8_0_block(values, &local);
-        for (int j = 0; j < QK8_0; j += 2) {
-            float2 local_value;
-            float2 peer_value;
-            dequantize_q8_0(&local, 0, j, local_value);
-            dequantize_q8_0(src, ib, j, peer_value);
-            dst[ib * QK8_0 + j + 0] = ggml_cuda_cast<T_dst>(local_value.x + peer_value.x);
-            dst[ib * QK8_0 + j + 1] = ggml_cuda_cast<T_dst>(local_value.y + peer_value.y);
-        }
+    const int lane      = threadIdx.x % QK8_0;
+    const int ib0       = (blockIdx.x * blockDim.x + threadIdx.x) / QK8_0;
+    const int nb_stride = (gridDim.x * blockDim.x) / QK8_0;
+    for (int ib = ib0; ib < n_blocks; ib += nb_stride) {
+        const int   idx = ib * QK8_0 + lane;
+        const float x   = ggml_cuda_cast<float>(dst[idx]);
+        const float amax = warp_reduce_max<QK8_0>(fabsf(x));
+        // identical arithmetic to quantize_f32_q8_0_block / dequantize_q8_0
+        const float d   = amax / ((1 << 7) - 1);
+        const float id  = d ? 1.0f / d : 0.0f;
+        const float q   = roundf(x * id);
+        const half  dh  = d;
+        const float local = q * (float) dh;
+        const float peer  = (float) src[ib].qs[lane] * (float) src[ib].d;
+        dst[idx] = ggml_cuda_cast<T_dst>(local + peer);
     }
 }
 
@@ -446,7 +460,8 @@ template <typename T_src>
 static void ggml_cuda_ar_codec_pack_q8_0(
         const void * src, void * dst, int64_t ne, cudaStream_t stream) {
     const int n_blocks = (int) (ne / QK8_0);
-    ggml_cuda_ar_codec_pack_q8_0_kernel<T_src><<<ggml_cuda_ar_codec_grid(n_blocks), 256, 0, stream>>>(
+    const int grid = (int) std::max<int64_t>(1, std::min<int64_t>((ne + 255) / 256, 65535));
+    ggml_cuda_ar_codec_pack_q8_0_kernel<T_src><<<grid, 256, 0, stream>>>(
         static_cast<const T_src *>(src), static_cast<block_q8_0 *>(dst), n_blocks);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -455,7 +470,9 @@ template <typename T_dst>
 static void ggml_cuda_ar_codec_unpack_q8_0(
         void * dst, const void * src, int64_t ne, cudaStream_t stream) {
     const int n_blocks = (int) (ne / QK8_0);
-    ggml_cuda_ar_codec_unpack_q8_0_kernel<T_dst><<<ggml_cuda_ar_codec_grid(n_blocks), 256, 0, stream>>>(
+    // one lane per element; 256 threads = 8 q8 blocks per CTA
+    const int grid = (int) std::max<int64_t>(1, std::min<int64_t>((ne + 255) / 256, 65535));
+    ggml_cuda_ar_codec_unpack_q8_0_kernel<T_dst><<<grid, 256, 0, stream>>>(
         static_cast<T_dst *>(dst), static_cast<const block_q8_0 *>(src), n_blocks);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1609,6 +1626,28 @@ static void ggml_cuda_ar_stall_bt_all_threads() {
 // Init / free
 // ---------------------------------------------------------------------------
 
+// GGML_CUDA_AR_STREAM_PRIORITY=high|low: create the AllReduce out/in streams
+// with a non-default priority. On ROCm CLR allocates hardware queues per
+// priority class, so this moves the AR streams (which carry cross-device
+// barrier packets) onto their own HW queue(s) instead of sharing the
+// compute stream's queue under a small GPU_MAX_HW_QUEUES, where a barrier
+// waiting for the peer blocks the other overlap slot's compute behind it.
+static cudaError_t ggml_cuda_ar_stream_create(cudaStream_t * stream) {
+    static const int pref = [] {
+        const char * e = std::getenv("GGML_CUDA_AR_STREAM_PRIORITY");
+        if (e == nullptr) return 0;
+        if (std::strcmp(e, "high") == 0) return  1;
+        if (std::strcmp(e, "low")  == 0) return -1;
+        return 0;
+    }();
+    if (pref == 0) {
+        return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
+    }
+    int least = 0, greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&least, &greatest);
+    return cudaStreamCreateWithPriority(stream, cudaStreamNonBlocking, pref > 0 ? greatest : least);
+}
+
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
 
     if (n_devices != 2) {
@@ -1688,7 +1727,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         ggml_cuda_set_device(p->devices[i]);
 
         cudaStream_t stream = nullptr;
-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        if (ggml_cuda_ar_stream_create(&stream) != cudaSuccess) {
             GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags failed for device %d\n",
                            __func__, p->devices[i]);
             ggml_cuda_ar_pipeline_free(p);
@@ -1896,7 +1935,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         const size_t dx_total = (size_t) GGML_CUDA_AR_DX_SLOTS * p->dx_bytes;
         for (size_t i = 0; i < n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
-            if (cudaStreamCreateWithFlags(&p->streams_in[i], cudaStreamNonBlocking) != cudaSuccess) {
+            if (ggml_cuda_ar_stream_create(&p->streams_in[i]) != cudaSuccess) {
                 GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags (in) failed for device %d\n", __func__, p->devices[i]);
                 ggml_cuda_ar_pipeline_free(p);
                 return nullptr;
@@ -2836,19 +2875,23 @@ bool ggml_cuda_ar_allreduce_end(
 
         // Own outbound done (send slot reusable, and for r0/p2p its staging
         // read is what the peer's pull ordered on) + peer data landed.
+        wp_op_profile_span_begin(p->devices[i], cs);
         ggml_cuda_ar_wait_logged(cs, ev.sent, "cs<-sent_own(end)", op->op_id, p->devices[i]);
         if (p2p && i == 0) {
             ggml_cuda_ar_wait_logged(cs, p->dx_ev[peer][op->hist].sent, "cs0<-sent1(end,r1 push)", op->op_id, p->devices[i]);
         } else {
             ggml_cuda_ar_wait_logged(cs, ev.recvd, "cs<-recvd_own(end)", op->op_id, p->devices[i]);
         }
+        wp_op_profile_span_end(p->devices[i], cs, "AR_END_WAIT");
 
         const char * recv = p->dx_recv[i] + slot_off;
         const ggml_cuda_ar_codec * codec = ggml_cuda_ar_codec_from_type(op->wire_type);
         if (codec == nullptr) {
             GGML_ABORT("%s: no codec registered for wire type %d", __func__, (int) op->wire_type);
         }
+        wp_op_profile_span_begin(p->devices[i], cs);
         codec->unpack_accumulate_fn(op->dst[i], op->dst_type, recv, op->ne, cs);
+        wp_op_profile_span_end(p->devices[i], cs, "AR_END_UNPACK");
 
         CUDA_CHECK(cudaEventRecord(ev.freed, cs));
         ev.freed_valid = true;

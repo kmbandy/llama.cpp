@@ -1744,7 +1744,20 @@ static bool ggml_backend_cuda_comm_allreduce_begin(void * comm_ctx_v, struct ggm
     if (ggml_nelements(tensors[0]) == 0) {
         return true;
     }
-    return ggml_cuda_ar_allreduce_begin(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, &op);
+    const bool ok = ggml_cuda_ar_allreduce_begin(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, &op);
+    // WP_AR_TRACE=N: print the first N AllReduces (tensor, shape, bytes, path) so the
+    // per-layer reduce structure can be read off the log.
+    static const int trace_n = [] { const char * e = getenv("WP_AR_TRACE"); return e ? atoi(e) : 0; }();
+    static int traced = 0;
+    if (traced < trace_n) {
+        traced++;
+        const ggml_tensor * t = tensors[0];
+        fprintf(stderr, "wp ar-trace: #%d name=%s op=%s type=%s ne=[%lld,%lld,%lld,%lld] bytes=%zu path=%s\n",
+                traced, t->name, ggml_op_name(t->op), ggml_type_name(t->type),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                ggml_nbytes(t), ok ? (op.pending ? "duplex" : "sync/chunked") : "fallback");
+    }
+    return ok;
 }
 
 static bool ggml_backend_cuda_comm_allreduce_end(void * comm_ctx_v, int i_op) {
@@ -4033,6 +4046,15 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    // A degenerate 2D copy (one row, or rows that are contiguous on both
+    // sides) is a plain 1D copy. On ROCm this matters: CLR runs every 2D host
+    // copy through its "unpinned rect" path, which is synchronous and queues
+    // behind all in-flight work even from pinned memory (the meta backend's
+    // per-device splice of a row-split input is exactly this shape).
+    if (n_copies == 1 || (stride_tensor == size && stride_data == size)) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size * n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -4044,6 +4066,10 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (n_copies == 1 || (stride_tensor == size && stride_data == size)) {
+        CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size * n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
