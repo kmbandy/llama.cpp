@@ -49,7 +49,7 @@ std::string detect_hip_target() {
 //   2.  b_ptr               *i8:16          (uint8 packed nibbles)
 //   3.  c_ptr               *bf16:16
 //   4.  a_scale_ptr         *fp32:16
-//   5.  b_scale_ptr         *fp32:16
+//   5.  b_scale_ptr         *fp32:16 (WF=1 ml8-4 LUT) or *fp16:16 (WF=0 ml8-fp8)
 //   6-8.  M, N, K           i32 / constexpr-N,K / runtime-M
 //   9-19. 11 strides         i32 runtime
 //   20.   GROUP_K            constexpr int = group_size
@@ -79,7 +79,8 @@ std::string build_signature_ml8(const mt_ml8_gemm_shape_t & s, int32_t runtime_M
     const int even_k = (s.K % block_size_k == 0) ? 1 : 0;
 
     // WEIGHT_FORMAT switch (see mt_ml8_gemm_shape_t::weight_format):
-    //   WF=1 (ml8-4 LUT): arg #2 (b_ptr) is *i8:16 (packed uint8 nibbles).
+    //   WF=1 (ml8-4 LUT): arg #2 (b_ptr) is *i8:16 (packed uint8 nibbles);
+    //                     arg #5 (b_scale_ptr) stays *fp32:16.
     //   WF=0 (ml8-fp8):   arg #2 (b_ptr) is *fp8e4nv:16 (raw e4m3, same dtype
     //                     as A, fed straight to tl.dot). The trailing
     //                     centroid_lut_ptr/stride_lut_k args remain in the
@@ -87,7 +88,15 @@ std::string build_signature_ml8(const mt_ml8_gemm_shape_t & s, int32_t runtime_M
     //                     the body branch that reads them is DCE'd), so the
     //                     launcher still binds those positional slots — ml8.cu
     //                     passes a non-null dummy lut pointer + stride_lut_k=0.
+    //                     arg #5 (b_scale_ptr) is *fp16:16: ML8_FP8's packed
+    //                     in-place layout stores per-group scales as fp16
+    //                     (copied through verbatim from the on-disk value) to
+    //                     stay at 8.5 bpw instead of 9.0; the kernel loads it
+    //                     and upcasts to fp32 before the epilogue multiply
+    //                     (see `b_scale = tl.load(b_scale_ptrs).to(tl.float32)`
+    //                     in gemm_ml8.py — a no-op for WF=1's fp32 scale).
     const char * b_dtype       = (s.weight_format == 0) ? "*fp8e4nv:16" : "*i8:16";
+    const char * b_scale_dtype = (s.weight_format == 0) ? "*fp16:16"    : "*fp32:16";
     const int32_t weight_format = s.weight_format;
 
     char buf[2048];
@@ -100,7 +109,7 @@ std::string build_signature_ml8(const mt_ml8_gemm_shape_t & s, int32_t runtime_M
     // = K or N. Arg order: M, N, K, am, ak, bk, bn, 0, cm, cn, 1, 0,
     // bscale_k, bscale_n.
     std::snprintf(buf, sizeof(buf),
-        "*fp8e4nv:16, %s, *bf16:16, *fp32:16, *fp32:16, "
+        "*fp8e4nv:16, %s, *bf16:16, *fp32:16, %s, "
         "i32:16, i32:16, i32:16, "
         "i32:16, i32:1, i32:16, i32:1, i32:16, i32:16, i32:1, i32:1, i32:16, i32:16, i32:1, "
         // GROUP_K, GROUP_N, BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE_M,
@@ -109,6 +118,7 @@ std::string build_signature_ml8(const mt_ml8_gemm_shape_t & s, int32_t runtime_M
         // ml8 additions: WEIGHT_FORMAT, N_CENTROIDS, centroid_lut_ptr, stride_lut_k
         "%d, %d, *fp8e4nv:16, i32",
         b_dtype,                     // arg #2 b_ptr dtype (WF-dependent)
+        b_scale_dtype,               // arg #5 b_scale_ptr dtype (WF-dependent)
         group_size,                  // GROUP_K
         MT_ML8_GROUP_N,              // GROUP_N (= 1)
         cfg.bm,                      // BLOCK_SIZE_M  (G.6.a tuned)

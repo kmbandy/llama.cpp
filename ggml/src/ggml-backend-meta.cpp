@@ -817,6 +817,50 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
+    // ML8_FP8 rotation sidecar (GGML_OP_ML8_APPLY_ROTATION; "ML8_FP8 + rotation
+    // under tensor parallel", 2026-09-17). src[0] is the activation x (F32);
+    // src[1] is the Kronecker factor h_a (F32 [a,a]) or nullptr. op_params[0]/
+    // [1] carry (a_dim, b_dim) -- see ggml_ml8_apply_rotation in ggml-ml8.c.
+    // The result always has src[0]'s exact ne[], so like turbo_wht above the
+    // split state is just src[0]'s, propagated as-is -- but which split states
+    // of src[0] are even legal depends on which of the two rotation kinds this
+    // node is:
+    //   - kronecker (h_a != nullptr): Q = H_a (x) H_b mixes across the WHOLE
+    //     of ne[0], so it is only well-defined when every device already holds
+    //     x in full, i.e. src[0] MIRRORED. h_a is a tiny sidecar and must be
+    //     MIRRORED too (see the ml8-sidecar rule in
+    //     llama_meta_device_get_split_state).
+    //   - block_hadamard (h_a == nullptr): independent, normalized Hadamard on
+    //     each contiguous b_dim-wide block of ne[0], so it is purely local to
+    //     each block and a K-split (AXIS_0) x can be rotated slice-by-slice --
+    //     that is the whole point of this variant, it is what lets a K-split
+    //     weight's activation (attn_output/ffn_down/ssm_out) be rotated
+    //     without an AllReduce first. Also legal, trivially, when x is
+    //     MIRRORED (single-device / no TP).
+    //   - a kronecker rotation fed a split x, or any split axis other than
+    //     MIRRORED/AXIS_0, is a graph-construction bug (the registry should
+    //     never emit that combination) -- abort loudly naming the tensor
+    //     rather than silently rotate the wrong slice.
+    auto handle_ml8_apply_rotation = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(tensor->src[1] == nullptr || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return src_ss[0];
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            if (tensor->src[1] != nullptr) {
+                GGML_ABORT("ML8_APPLY_ROTATION %s: activation %s is K-split (AXIS_0) but the "
+                    "rotation factor h_a (%s) is non-null -- kronecker rotation mixes across the "
+                    "whole K dimension and requires a MIRRORED activation; only block_hadamard "
+                    "(h_a == NULL) may run on a K-split activation",
+                    tensor->name, tensor->src[0]->name, tensor->src[1]->name);
+            }
+            return src_ss[0];
+        }
+        GGML_ABORT("ML8_APPLY_ROTATION %s: unsupported split state for activation %s (axis=%d) -- "
+            "expected MIRRORED (kronecker) or AXIS_0 (block_hadamard)",
+            tensor->name, tensor->src[0]->name, (int) src_ss[0].axis);
+    };
+
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -1387,6 +1431,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_TURBO_WHT: {
                 split_state = handle_turbo_wht(src_ss);
             } break;
+            case GGML_OP_ML8_APPLY_ROTATION: {
+                split_state = handle_ml8_apply_rotation(src_ss);
+            } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
             } break;
@@ -1730,6 +1777,24 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 GGML_ASSERT(t_ij->src[6] != nullptr);
                 const int32_t n_kv_heads_local = (int32_t) t_ij->src[6]->ne[1];
                 memcpy((char *) t_ij->op_params + 3*sizeof(int32_t), &n_kv_heads_local, sizeof(int32_t));
+            } break;
+            case GGML_OP_ML8_APPLY_ROTATION: {
+                // op_params[0] is a_dim, op_params[1] is b_dim (ggml_ml8_apply_rotation,
+                // ggml-ml8.c); a_dim*b_dim must equal src[0]'s ne[0]. That holds for the
+                // WORLD tensor by construction, but when src[0] (the activation) is
+                // K-split (AXIS_0, block_hadamard -- see handle_ml8_apply_rotation
+                // above) this device only sees its local slice, so a_dim must be
+                // rederived from the LOCAL ne[0]. b_dim never changes: it is the fixed
+                // Hadamard block size (128) and the K-split boundary is guaranteed to
+                // land on a whole multiple of it (get_split_granularity pins K-split
+                // weights to a 128-or-whole-head boundary), so the division below is
+                // always exact. This also leaves a_dim unchanged in the MIRRORED case,
+                // where the local ne[0] equals the world ne[0].
+                const int32_t b_dim = ((const int32_t *) t_ij->op_params)[1];
+                GGML_ASSERT(t_ij->src[0]->ne[0] % b_dim == 0 &&
+                    "ML8_APPLY_ROTATION: this device's local K slice is not a whole multiple of b_dim");
+                const int32_t a_dim_local = (int32_t) (t_ij->src[0]->ne[0] / b_dim);
+                memcpy((char *) t_ij->op_params, &a_dim_local, sizeof(int32_t));
             } break;
             default: break;
         }

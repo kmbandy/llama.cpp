@@ -285,7 +285,9 @@ def _gemm_a8w8_blockscale_kernel(
     - B (WEIGHT_FORMAT=1): Packed B with shape (K/2, N), uint8 nibbles (lo-first).
     - C: Matrix C with shape (M, N).
     - A_scale: Scale tensor for A with shape (M, *scale_k).
-    - B_scale: Scale tensor for B with shape (*scale_k, **scale_n). SHARED across paths.
+    - B_scale: Scale tensor for B with shape (*scale_k, **scale_n). SHARED across paths;
+      dtype is fp32 for WEIGHT_FORMAT=1 (ml8-4) or fp16 for WEIGHT_FORMAT=0 (ml8-fp8),
+      selected by the caller's Triton signature string — always upcast to fp32 here.
     - centroid_lut: (WEIGHT_FORMAT=1 only) per-K-group fp8 LUT, shape (*scale_k, N_CENTROIDS).
 
     *scale_k = (K + GROUP_K - 1) // GROUP_K
@@ -387,7 +389,12 @@ def _gemm_a8w8_blockscale_kernel(
                 )
 
             a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
+            # b_scale_ptr's pointee dtype is fp32 for WF=1 (ml8-4 LUT) or fp16
+            # for WF=0 (ml8-fp8, MAD VRAM-footprint fix): the fp16 case is
+            # copied through verbatim from the on-disk scale by ml8.cu, so the
+            # only conversion here is the upcast to fp32 before the epilogue
+            # multiply (a no-op for the already-fp32 WF=1 case).
+            b_scale = tl.load(b_scale_ptrs).to(tl.float32)
 
             # ─── LOCAL PATCH #2: WEIGHT_FORMAT-branched B-load + dequant ──
             if WEIGHT_FORMAT == tl.constexpr(0):

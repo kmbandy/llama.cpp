@@ -224,15 +224,17 @@ struct ggml_tensor * ggml_ml8_apply_rotation(
         int64_t a_dim,
         int64_t b_dim) {
     GGML_ASSERT(x != NULL);
-    if (h_a == NULL) {
-        // No rotation configured — return input unchanged.
-        return x;
-    }
     GGML_ASSERT(x->type == GGML_TYPE_F32);
-    GGML_ASSERT(h_a->type == GGML_TYPE_F32);
     GGML_ASSERT(a_dim > 0);
     GGML_ASSERT(b_dim > 0 && (b_dim & (b_dim - 1)) == 0 && "b_dim must be a positive power of 2");
-    GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+    // h_a == NULL selects block_hadamard (Q = I_a ⊗ H_b, no H_a leg) — see
+    // ggml-ml8.h. Callers never pass NULL wanting a pass-through; every
+    // existing caller (llama-ml8-registry.cpp, qwen35.cpp, llama-graph.cpp)
+    // guards the call on rotation being configured.
+    if (h_a != NULL) {
+        GGML_ASSERT(h_a->type == GGML_TYPE_F32);
+        GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+    }
 
     const int64_t d_dim = a_dim * b_dim;
     GGML_ASSERT(x->ne[0] == d_dim);
@@ -241,9 +243,10 @@ struct ggml_tensor * ggml_ml8_apply_rotation(
                                                  x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
     y->op     = GGML_OP_ML8_APPLY_ROTATION;
     y->src[0] = x;
-    y->src[1] = h_a;
-    // Pack (a_dim, b_dim) into op_params as int32. Both fit easily —
-    // a_dim is typically 5..9, b_dim is a power of 2 up to ~1024.
+    y->src[1] = h_a;   // NULL => block_hadamard
+    // Pack (a_dim, b_dim) into op_params as int32. Both fit easily — a_dim is
+    // typically 5..9 for kronecker, up to a few hundred (in_features/b_dim)
+    // for block_hadamard; b_dim is a power of 2 up to ~1024.
     int32_t * params = (int32_t *) y->op_params;
     params[0] = (int32_t) a_dim;
     params[1] = (int32_t) b_dim;

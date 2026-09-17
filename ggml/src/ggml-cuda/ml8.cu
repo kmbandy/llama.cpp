@@ -325,10 +325,12 @@ void ggml_cuda_ml8_clear_cache(void) {
 // Rows are [N, K] laid out as per-row sequences of n_groups_k blocks.
 //
 // The WF=0 Triton path wants B as raw e4m3 [K, N] (transposed, same dtype
-// as A) plus a fp32 per-(K-group, N) scale [n_groups_k, N]. So this repack
-// is the FP8 sibling of ml8_repack_kernel: copy the e4m3 byte straight
-// through (no 4-bit unpack, no centroid), and widen the fp16 group scale to
-// fp32. group_size is QK_ML8_FP8 = 32.
+// as A) plus a fp16 per-(K-group, N) scale [n_groups_k, N] — copied through
+// verbatim from the on-disk fp16 scale (no widen/narrow round-trip), so the
+// packed layout stays 8.5 bpw. So this repack is the FP8 sibling of
+// ml8_repack_kernel: copy the e4m3 byte straight through (no 4-bit unpack,
+// no centroid) and the fp16 group scale straight through (no widen).
+// group_size is QK_ML8_FP8 = 32.
 // ─────────────────────────────────────────────────────────────────────
 static constexpr int ML8_FP8_BLOCK_BYTES = (int) sizeof(block_ml8_fp8);  // 34
 
@@ -338,7 +340,7 @@ static constexpr int ML8_FP8_BLOCK_BYTES = (int) sizeof(block_ml8_fp8);  // 34
 static __global__ void ml8_fp8_repack_kernel(
     const uint8_t * __restrict__ src,        // (N, n_groups_k * 34) bytes
     uint8_t       * __restrict__ b_fp8,      // (K, N) row-major raw e4m3
-    float         * __restrict__ b_scale,    // (n_groups_k, N) row-major
+    __half        * __restrict__ b_scale,    // (n_groups_k, N) row-major, fp16
     int N,
     int n_groups_k) {
 
@@ -352,11 +354,11 @@ static __global__ void ml8_fp8_repack_kernel(
         + (size_t) n * (size_t) n_groups_k * (size_t) ML8_FP8_BLOCK_BYTES
         + (size_t) g * (size_t) ML8_FP8_BLOCK_BYTES;
 
-    // Scale: 2-byte fp16 at the start of the block → widen to fp32.
-    uint16_t scale_h;
-    memcpy(&scale_h, blk, sizeof(uint16_t));
-    const float scale = __half2float(reinterpret_cast<const __half &>(scale_h));
-    b_scale[(size_t) g * (size_t) N + (size_t) n] = scale;
+    // Scale: 2-byte fp16 at the start of the block, copied through verbatim
+    // (no widen to fp32 — the packed layout keeps fp16 scales at 8.5 bpw).
+    __half scale_h;
+    memcpy(&scale_h, blk, sizeof(__half));
+    b_scale[(size_t) g * (size_t) N + (size_t) n] = scale_h;
 
     // Weights: 32 raw e4m3 bytes after the scale, covering K-rows
     // [g * QK_ML8_FP8, (g + 1) * QK_ML8_FP8). Copied straight through.
@@ -410,11 +412,11 @@ static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
         }
     }
 
-    void *  d_b_fp8   = nullptr;
-    float * d_b_scale = nullptr;
+    void *   d_b_fp8   = nullptr;
+    __half * d_b_scale = nullptr;
 
     const size_t b_fp8_bytes   = (size_t) K * (size_t) N;            // [K, N] raw e4m3
-    const size_t b_scale_bytes = (size_t) n_groups_k * (size_t) N * sizeof(float);
+    const size_t b_scale_bytes = (size_t) n_groups_k * (size_t) N * sizeof(__half);
 
     if (ggml_cuda_wp_vram_log_enabled()) {
         size_t fb = 0, tot = 0; int dev = -1; (void) cudaGetDevice(&dev); (void) cudaMemGetInfo(&fb, &tot);
@@ -482,7 +484,7 @@ static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
 // on-disk {fp16 scale, 32 e4m3} blocks. One thread per (n, g).
 static __global__ void ml8_fp8_unpack_kernel(
     const uint8_t * __restrict__ b_fp8,      // (K, N) row-major raw e4m3
-    const float   * __restrict__ b_scale,    // (n_groups_k, N) row-major
+    const __half  * __restrict__ b_scale,    // (n_groups_k, N) row-major, fp16
     uint8_t       * __restrict__ dst,        // (N, n_groups_k * 34) bytes
     int N,
     int n_groups_k) {
@@ -497,11 +499,11 @@ static __global__ void ml8_fp8_unpack_kernel(
         + (size_t) n * (size_t) n_groups_k * (size_t) ML8_FP8_BLOCK_BYTES
         + (size_t) g * (size_t) ML8_FP8_BLOCK_BYTES;
 
-    const __half   scale_h = __float2half(b_scale[(size_t) g * (size_t) N + (size_t) n]);
-    const uint16_t scale_u = reinterpret_cast<const uint16_t &>(scale_h);
-    memcpy(blk, &scale_u, sizeof(uint16_t));
+    // Copied through verbatim — b_scale is already fp16, no round-trip.
+    const __half scale_h = b_scale[(size_t) g * (size_t) N + (size_t) n];
+    memcpy(blk, &scale_h, sizeof(__half));
 
-    uint8_t * qs     = blk + sizeof(uint16_t);
+    uint8_t * qs     = blk + sizeof(__half);
     const int k_base = g * QK_ML8_FP8;
     #pragma unroll
     for (int j = 0; j < QK_ML8_FP8; ++j) {
@@ -564,7 +566,9 @@ size_t ggml_cuda_ml8_inplace_alloc_size(const ggml_tensor * t) {
         // nibbles [K/2, N] + fp32 scales [K/64, N] == 4.5 bpw, same as on disk
         return K * N / 2 + (K / QK_ML8) * N * sizeof(float);
     }
-    return K * N + (K / QK_ML8_FP8) * N * sizeof(float);
+    // raw e4m3 [K, N] + fp16 scales [K/32, N] == 8.5 bpw, same as on disk
+    // (== ggml_nbytes(t)).
+    return K * N + (K / QK_ML8_FP8) * N * sizeof(__half);
 }
 
 bool ggml_cuda_ml8_inplace_is_packed(const void * data) {
@@ -581,8 +585,8 @@ void ggml_cuda_ml8_inplace_alias(const void * src_data, const void * dst_data) {
     }
     inplace_entry_t e = it->second;
     const ptrdiff_t delta = (const char *) dst_data - (const char *) src_data;
-    e.info.b_packed = (void *)  ((char *) e.info.b_packed + delta);
-    e.info.b_scale  = (float *) ((char *) e.info.b_scale  + delta);
+    e.info.b_packed = (void *) ((char *) e.info.b_packed + delta);
+    e.info.b_scale  = (void *) ((char *) e.info.b_scale  + delta);
     g_ml8_inplace[dst_data] = e;
 }
 
@@ -628,7 +632,7 @@ void ggml_cuda_ml8_inplace_set(
     inplace_entry_t & e = g_ml8_inplace[t->data];
     if (e.info.b_packed == nullptr) {
         e.info.b_packed   = t->data;
-        e.info.b_scale    = (float *) ((char *) t->data + packed_sz);
+        e.info.b_scale    = (void *) ((char *) t->data + packed_sz);
         e.info.N          = N;
         e.info.K          = K;
         e.info.n_groups_k = n_groups_k;
@@ -666,10 +670,10 @@ void ggml_cuda_ml8_inplace_set(
         const dim3 block(BLOCK_N, 1, 1);
         if (is_ml8_4) {
             ml8_repack_kernel<<<grid, block, 0, stream>>>(
-                staging, (uint8_t *) e.info.b_packed, e.info.b_scale, N, n_groups_k);
+                staging, (uint8_t *) e.info.b_packed, (float *) e.info.b_scale, N, n_groups_k);
         } else {
             ml8_fp8_repack_kernel<<<grid, block, 0, stream>>>(
-                staging, (uint8_t *) e.info.b_packed, e.info.b_scale, N, n_groups_k);
+                staging, (uint8_t *) e.info.b_packed, (__half *) e.info.b_scale, N, n_groups_k);
         }
         CUDA_CHECK(cudaGetLastError());
     }
@@ -714,10 +718,10 @@ void ggml_cuda_ml8_inplace_get(
     const dim3 block(BLOCK_N, 1, 1);
     if (type == GGML_TYPE_ML8_4) {
         ml8_unpack_kernel<<<grid, block, 0, stream>>>(
-            (const uint8_t *) info.b_packed, info.b_scale, tmp, info.N, info.n_groups_k);
+            (const uint8_t *) info.b_packed, (const float *) info.b_scale, tmp, info.N, info.n_groups_k);
     } else {
         ml8_fp8_unpack_kernel<<<grid, block, 0, stream>>>(
-            (const uint8_t *) info.b_packed, info.b_scale, tmp, info.N, info.n_groups_k);
+            (const uint8_t *) info.b_packed, (const __half *) info.b_scale, tmp, info.N, info.n_groups_k);
     }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(data, tmp + offset, size, cudaMemcpyDeviceToHost, stream));
@@ -730,7 +734,7 @@ void ggml_cuda_ml8_inplace_get(
 template <typename dst_t>
 static __global__ void ml8_fp8_packed_get_rows_kernel(
     const uint8_t * __restrict__ b_fp8,     // (K, N)
-    const float   * __restrict__ b_scale,   // (K/32, N)
+    const __half  * __restrict__ b_scale,   // (K/32, N), fp16
     const int32_t * __restrict__ ids,
     dst_t         * __restrict__ dst,
     int K, int N,
@@ -750,7 +754,8 @@ static __global__ void ml8_fp8_packed_get_rows_kernel(
     }
     dst_t * out = (dst_t *) ((char *) dst + i10*nb1 + i11*nb2 + i12*nb3);
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        const float v = ggml_cuda_e4m3fn_to_fp32(b_fp8[(size_t) k * N + n]) * b_scale[(size_t) (k / QK_ML8_FP8) * N + n];
+        const float scale = __half2float(b_scale[(size_t) (k / QK_ML8_FP8) * N + n]);
+        const float v = ggml_cuda_e4m3fn_to_fp32(b_fp8[(size_t) k * N + n]) * scale;
         out[k] = ggml_cuda_cast<dst_t>(v);
     }
 }
@@ -780,13 +785,13 @@ bool ggml_cuda_ml8_inplace_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor
     switch (dst->type) {
         case GGML_TYPE_F32:
             ml8_fp8_packed_get_rows_kernel<float><<<grid, block, 0, stream>>>(
-                (const uint8_t *) info.b_packed, info.b_scale, (const int32_t *) src1->data, (float *) dst->data,
+                (const uint8_t *) info.b_packed, (const __half *) info.b_scale, (const int32_t *) src1->data, (float *) dst->data,
                 info.K, info.N, src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[1], src1->nb[2],
                 dst->nb[1], dst->nb[2], dst->nb[3]);
             break;
         case GGML_TYPE_F16:
             ml8_fp8_packed_get_rows_kernel<half><<<grid, block, 0, stream>>>(
-                (const uint8_t *) info.b_packed, info.b_scale, (const int32_t *) src1->data, (half *) dst->data,
+                (const uint8_t *) info.b_packed, (const __half *) info.b_scale, (const int32_t *) src1->data, (half *) dst->data,
                 info.K, info.N, src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[1], src1->nb[2],
                 dst->nb[1], dst->nb[2], dst->nb[3]);
             break;
@@ -1554,6 +1559,14 @@ bool ggml_cuda_ml8_can_fuse_rot_mm(
         mm->src[2] != rot) {
         return false;
     }
+    // block_hadamard (h_a == NULL) never feeds an ML8_MUL_MAT in practice —
+    // that op family is ML8_4-only, block_hadamard targets ML8_FP8's plain
+    // MUL_MAT — but guard explicitly: the fused path unconditionally reads
+    // rot->src[1] as H_a and would silently drop the rotation if it were
+    // NULL (ml8_mul_mat_core's `if (h_a != nullptr)` quantize branch).
+    if (rot->src[1] == nullptr) {
+        return false;
+    }
     const ggml_tensor * x = rot->src[0];
     if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
         return false;
@@ -1721,7 +1734,7 @@ void ggml_cuda_op_ml8_get_rows(
         }
         if (packed) {
             ml8_packed_get_rows_kernel<<<grid, dim3(256), 0, stream>>>(
-                (const uint8_t *) info.b_packed, info.b_scale, lut_d, ids_d, y_d, K, N, n_groups_k, nr);
+                (const uint8_t *) info.b_packed, (const float *) info.b_scale, lut_d, ids_d, y_d, K, N, n_groups_k, nr);
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -1770,6 +1783,10 @@ void ggml_cuda_op_ml8_fp8_mul_mat(
     GGML_ASSERT(dst->ne[0] == N);
     GGML_ASSERT((int64_t) dst->ne[1] * dst->ne[2] * dst->ne[3] == (int64_t) M);
     GGML_ASSERT(K % QK_ML8_FP8       == 0);
+    if (N % MT_ML8_BLOCK_SIZE_N != 0) {
+        fprintf(stderr, "[ml8-fp8] %s: N=%d is not a multiple of %d (K=%d M=%d)\n", w->name, (int) N, MT_ML8_BLOCK_SIZE_N, (int) K, (int) M);
+        fflush(stderr);
+    }
     GGML_ASSERT(N % MT_ML8_BLOCK_SIZE_N == 0);
 
     const int32_t group_size = QK_ML8_FP8;          // 32
@@ -1862,6 +1879,10 @@ void ggml_cuda_op_ml8_fp8_mul_mat(
 //   compute on the H_b leg). H_b is the Sylvester orthogonal Hadamard, so
 //   X @ H_b == row-wise FWHT(X) normalized by 1/sqrt(b_dim) — exactly what
 //   mt_turbo_fp8_fwht (turbo_fp8_hadamard.cuh) produces.
+// MAD-266: h_a == NULL selects block_hadamard (Q = I_a ⊗ H_b) for the
+//   tensor-parallel ML8_FP8 path — the FWHT leg is unchanged, the H_a^T
+//   left-multiply (and its a_dim <= 16 register-array limit) is simply
+//   skipped, so block count a_dim is unbounded (e.g. 4864/128 = 38).
 // ─────────────────────────────────────────────────────────────────────
 
 // One block per token, blockDim.x = b_dim. Each thread l computes the
@@ -1903,14 +1924,12 @@ void ggml_cuda_op_ml8_apply_rotation(
     ggml_tensor *               dst) {
 
     const ggml_tensor * x   = dst->src[0];
-    const ggml_tensor * h_a = dst->src[1];
+    const ggml_tensor * h_a = dst->src[1];   // NULL => block_hadamard (Q = I_a ⊗ H_b)
 
-    GGML_ASSERT(x   != nullptr && h_a != nullptr);
+    GGML_ASSERT(x   != nullptr);
     GGML_ASSERT(x->type   == GGML_TYPE_F32);
-    GGML_ASSERT(h_a->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(x));
-    GGML_ASSERT(ggml_is_contiguous(h_a));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     const int32_t * pp    = (const int32_t *) dst->op_params;
@@ -1918,12 +1937,22 @@ void ggml_cuda_op_ml8_apply_rotation(
     const int32_t   b_dim = pp[1];
     const int32_t   d_dim = a_dim * b_dim;
 
-    GGML_ASSERT(a_dim > 0 && a_dim <= 16 && "a_dim must fit in z_col register array");
+    GGML_ASSERT(a_dim > 0 && "a_dim must be positive");
     GGML_ASSERT(b_dim > 0 && (b_dim & (b_dim - 1)) == 0 && "b_dim must be power of 2");
     GGML_ASSERT(b_dim >= 16 && b_dim <= 1024 && "b_dim must be supported by FWHT kernel (16..1024)");
     GGML_ASSERT(x->ne[0]   == d_dim);
-    GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
     GGML_ASSERT(dst->ne[0] == d_dim && dst->ne[1] == x->ne[1]);
+
+    if (h_a != nullptr) {
+        GGML_ASSERT(h_a->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(h_a));
+        // a_dim <= 16 only for the H_a leg: ml8_h_a_left_multiply_kernel keeps
+        // a per-thread z_col[16] register array. block_hadamard skips that
+        // kernel entirely, so it has no such bound (a_dim = in_features/b_dim,
+        // e.g. 38 or 98 in practice).
+        GGML_ASSERT(a_dim <= 16 && "a_dim must fit in z_col register array (kronecker path)");
+        GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+    }
 
     cudaStream_t stream = ctx.stream();
     // MAD-244: rotation is per-row; the "n_tokens" the kernel needs is the
@@ -1944,25 +1973,35 @@ void ggml_cuda_op_ml8_apply_rotation(
 
     // (rotation kernel runs below; output dump happens after the kernel returns)
 
-    // Step 1: copy X into a scratch Z buffer (FWHT is in-place).
-    ggml_cuda_pool_alloc<float> z_buf(ctx.pool(), total_elems);
-    CUDA_CHECK(cudaMemcpyAsync(z_buf.get(), x->data,
-        total_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    if (h_a == nullptr) {
+        // block_hadamard: Q = I_a ⊗ H_b, no H_a leg. FWHT runs directly on a
+        // copy of X in dst — no separate Z scratch buffer or left-multiply
+        // kernel needed.
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, x->data,
+            total_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(mt_turbo_fp8_fwht(stream, (float *) dst->data,
+            n_tokens * a_dim, b_dim, b_dim));
+    } else {
+        // Step 1: copy X into a scratch Z buffer (FWHT is in-place).
+        ggml_cuda_pool_alloc<float> z_buf(ctx.pool(), total_elems);
+        CUDA_CHECK(cudaMemcpyAsync(z_buf.get(), x->data,
+            total_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
-    // Step 2: row-wise FWHT on Z. Each (token, i) slice of length b_dim
-    // becomes (X @ H_b)[token][i] (orthogonal Hadamard, normalized).
-    CUDA_CHECK(mt_turbo_fp8_fwht(stream, z_buf.get(),
-        n_tokens * a_dim, b_dim, b_dim));
+        // Step 2: row-wise FWHT on Z. Each (token, i) slice of length b_dim
+        // becomes (X @ H_b)[token][i] (orthogonal Hadamard, normalized).
+        CUDA_CHECK(mt_turbo_fp8_fwht(stream, z_buf.get(),
+            n_tokens * a_dim, b_dim, b_dim));
 
-    // Step 3: small left-multiply Y = H_a^T @ Z per token.
-    const dim3 grid((unsigned) n_tokens, 1, 1);
-    const dim3 block((unsigned) b_dim,   1, 1);
-    ml8_h_a_left_multiply_kernel<<<grid, block, 0, stream>>>(
-        z_buf.get(),
-        (const float *) h_a->data,
-        (float *) dst->data,
-        a_dim,
-        b_dim);
+        // Step 3: small left-multiply Y = H_a^T @ Z per token.
+        const dim3 grid((unsigned) n_tokens, 1, 1);
+        const dim3 block((unsigned) b_dim,   1, 1);
+        ml8_h_a_left_multiply_kernel<<<grid, block, 0, stream>>>(
+            z_buf.get(),
+            (const float *) h_a->data,
+            (float *) dst->data,
+            a_dim,
+            b_dim);
+    }
 
     // G.6.g.C: dump rotation output (post-FWHT + H_a^T) on first call.
     if (ml8_dump_enabled() && !g_ml8_dump_rotdst_done.exchange(true)) {

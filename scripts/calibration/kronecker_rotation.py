@@ -134,6 +134,72 @@ class KroneckerRotation:
         return cls(h_a=blob["h_a"], b_dim=int(blob["b_dim"]))
 
 
+# rotation_meta kind_id — matches the [a_dim, b_dim, in_features, kind_id] I32[4]
+# sidecar contract documented in ml8_to_gguf.py::_rotation_meta_bytes and
+# ggml/src/ggml-cuda/aiter-integration/ML8_GGUF_INTEGRATION_DESIGN.md.
+# 1 = kronecker_orth_sylvester (existing). 2 = block_hadamard — PLACEHOLDER: the
+# C++ side (rotation op + registry agent) had not landed a kind_id constant for
+# block_hadamard as of this writing; grep ggml/ and src/ for the real constant
+# once it lands and update this value + the design doc table to match.
+KRONECKER_ORTH_SYLVESTER_KIND_ID = 1
+BLOCK_HADAMARD_KIND_ID = 2
+
+
+class BlockHadamardRotation:
+    """Q = I_a ⊗ H_b applied to the last dim: an independent normalized Hadamard
+    on each contiguous b-sized block along K, no cross-block mixing (no h_a leg).
+
+    Unlike KroneckerRotation, this has nothing to persist besides (a_dim, b_dim,
+    in_features) — there is no h_a matrix, so only a rotation_meta sidecar is
+    written (no rotation_h_a). By construction, forward()/inverse() here are
+    identical to KroneckerRotation(h_a=eye(a_dim), b_dim=b_dim).forward()/
+    inverse() — same H_b (Sylvester) normalization, just without the (trivial)
+    identity a-leg matmul. See test_block_hadamard_matches_kronecker_identity.
+    """
+
+    def __init__(self, in_features: int, b_dim: int = 128):
+        if b_dim < 1 or (b_dim & (b_dim - 1)) != 0:
+            raise ValueError(f"b_dim must be a positive power of 2, got {b_dim}")
+        if in_features % b_dim != 0:
+            raise ValueError(
+                f"in_features={in_features} not divisible by b_dim={b_dim}"
+            )
+        self.b_dim = b_dim
+        self.a_dim = in_features // b_dim
+        self.d = in_features
+        self._inv_sqrt_b = 1.0 / math.sqrt(b_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Right-multiply last dim of x by Q = I_a ⊗ H_b (row-vector convention).
+
+        Equivalent to applying the normalized Hadamard independently to each
+        contiguous b_dim-sized block of the last axis.
+        """
+        if x.shape[-1] != self.d:
+            raise ValueError(f"last dim {x.shape[-1]} != d={self.d}")
+        X = x.reshape(*x.shape[:-1], self.a_dim, self.b_dim)
+        Y = fwht_raw(X) * self._inv_sqrt_b
+        return Y.reshape(x.shape)
+
+    def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        """Q.T == Q since H_b (Sylvester) is symmetric and I_a is symmetric."""
+        return self.forward(x)
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": "block_hadamard",
+            "a_dim": self.a_dim,
+            "b_dim": self.b_dim,
+            "in_features": self.d,
+        }
+
+    @classmethod
+    def from_dict(cls, blob: dict) -> "BlockHadamardRotation":
+        if blob.get("kind") != "block_hadamard":
+            raise ValueError(f"unsupported rotation kind: {blob.get('kind')!r}")
+        return cls(in_features=int(blob["in_features"]), b_dim=int(blob["b_dim"]))
+
+
 def factor_for_dim(d: int, max_b: int = 1024) -> tuple:
     """Pick (a, b) such that a*b == d, b is the largest power of 2 ≤ max_b that divides d.
 

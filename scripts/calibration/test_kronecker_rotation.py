@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from kronecker_rotation import (  # noqa: E402
     sylvester, random_orthogonal, KroneckerRotation,
     factor_for_dim, rotate_hessian, fwht_raw,
+    BlockHadamardRotation, BLOCK_HADAMARD_KIND_ID, KRONECKER_ORTH_SYLVESTER_KIND_ID,
 )
 
 
@@ -179,6 +180,49 @@ def test_rotate_hessian_matches_dense():
     print(f"  PASS test_rotate_hessian_matches_dense")
 
 
+def test_block_hadamard_matches_kronecker_identity():
+    """BlockHadamardRotation(K, b) forward/inverse == KroneckerRotation(h_a=eye(a), b).
+
+    block_hadamard is Q = I_a ⊗ H_b — the same H_b (Sylvester) normalization as
+    KroneckerRotation, just with an identity a-leg instead of a random one. Pin
+    this equivalence so the "no h_a" fast path can never silently drift from
+    the general Kronecker math.
+    """
+    torch.manual_seed(2)
+    for a, b in [(1, 128), (2, 128), (5, 128), (38, 128)]:
+        d = a * b
+        bh = BlockHadamardRotation(in_features=d, b_dim=b)
+        krak = KroneckerRotation(h_a=torch.eye(a, dtype=torch.float32), b_dim=b)
+        x = torch.randn(3, 7, d, dtype=torch.float32)
+        _assert_close(bh.forward(x), krak.forward(x), tol=1e-5,
+                      label=f"block_hadamard({a},{b}) forward vs Kronecker(identity)")
+        _assert_close(bh.inverse(x), krak.inverse(x), tol=1e-5,
+                      label=f"block_hadamard({a},{b}) inverse vs Kronecker(identity)")
+        # Round-trip and orthogonality of the block_hadamard path itself.
+        x_back = bh.inverse(bh.forward(x))
+        _assert_close(x_back, x, tol=1e-4, label=f"block_hadamard({a},{b}) round-trip")
+    print("  PASS test_block_hadamard_matches_kronecker_identity")
+
+
+def test_block_hadamard_serialize_round_trip():
+    """to_dict/from_dict round-trip for block_hadamard (no h_a sidecar needed)."""
+    bh = BlockHadamardRotation(in_features=4864, b_dim=128)
+    blob = bh.to_dict()
+    assert blob == {"kind": "block_hadamard", "a_dim": 38, "b_dim": 128, "in_features": 4864}
+    bh2 = BlockHadamardRotation.from_dict(blob)
+    x = torch.randn(4864, dtype=torch.float32)
+    _assert_close(bh.forward(x), bh2.forward(x), tol=0.0,
+                  label="block_hadamard serialized forward equality")
+    print("  PASS test_block_hadamard_serialize_round_trip")
+
+
+def test_rotation_kind_ids_distinct():
+    """kind_id constants used in the rotation_meta sidecar must be distinct."""
+    assert KRONECKER_ORTH_SYLVESTER_KIND_ID == 1
+    assert BLOCK_HADAMARD_KIND_ID != KRONECKER_ORTH_SYLVESTER_KIND_ID
+    print("  PASS test_rotation_kind_ids_distinct")
+
+
 if __name__ == "__main__":
     test_sylvester_orthonormal()
     test_random_orthogonal()
@@ -187,4 +231,7 @@ if __name__ == "__main__":
     test_kronecker_serialize_round_trip()
     test_factor_for_dim_qwen35_layers()
     test_rotate_hessian_matches_dense()
+    test_block_hadamard_matches_kronecker_identity()
+    test_block_hadamard_serialize_round_trip()
+    test_rotation_kind_ids_distinct()
     print("\nALL TESTS PASSED")

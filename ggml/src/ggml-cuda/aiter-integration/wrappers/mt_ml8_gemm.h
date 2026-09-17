@@ -127,7 +127,14 @@ extern "C" {
 //                                                  from on-disk [N, K/2])
 //   c                bf16      [M, N]              row-major
 //   a_scale_fp32     fp32      [M]                 per-row activation scale
-//   b_scale_fp32     fp32      [n_groups_k, N]     per-(K-group, N), n_groups_k = K/group_size
+//   b_scale_fp32     fp32 or fp16 [n_groups_k, N]  per-(K-group, N), n_groups_k = K/group_size.
+//                                                  fp32 for weight_format==1 (ml8-4 LUT);
+//                                                  fp16 for weight_format==0 (ml8-fp8) — copied
+//                                                  through verbatim from the on-disk fp16 scale
+//                                                  to keep the packed weight at 8.5 bpw. The
+//                                                  field stays `const void *`; the dtype is
+//                                                  selected in the Triton signature string built
+//                                                  by build_signature_ml8() from shape.weight_format.
 //   centroid_lut_fp8 fp8_e4m3  [n_groups_k, 16]    per-K-group LUT
 //
 // Reconstruction formula the kernel computes:

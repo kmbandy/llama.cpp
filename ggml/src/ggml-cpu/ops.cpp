@@ -12355,13 +12355,23 @@ void ggml_compute_forward_ml8_get_rows(const ggml_compute_params * params, ggml_
     }
 }
 
-// ─── ggml_compute_forward_ml8_apply_rotation (MAD-223 G.4.g) ──────────────
+// ─── ggml_compute_forward_ml8_apply_rotation (MAD-223 G.4.g; MAD-244 block
+//     batch fix; block_hadamard kind added for TP-K-split ML8_FP8 rotation) ─
 //
-// Y[:, t] = unflatten(H_a^T @ flatten(X[:, t]) @ H_b, d=a*b)
-// where H_b is the Sylvester Hadamard of size b_dim, built deterministically.
+// Two kinds, selected by whether src[1] (h_a) is NULL:
+//   h_a != NULL — kronecker_orth_sylvester:
+//     Y[:, t] = unflatten(H_a^T @ flatten(X[:, t]) @ H_b, d=a*b)
+//   h_a == NULL — block_hadamard (Q = I_a ⊗ H_b, no H_a leg):
+//     Y[:, t] = unflatten(flatten(X[:, t]) @ H_b, d=a*b)
+// where H_b is the Sylvester Hadamard of size b_dim, built deterministically
+// (identical normalization in both kinds — see ggml-ml8.h).
 //
 // op_params: int32_t[0]=a_dim, int32_t[1]=b_dim.
-// src[0]=x F32 [d=a*b, n_tokens]; src[1]=h_a F32 [a, a]; dst=y F32 [d, n_tokens].
+// src[0]=x F32 [d=a*b, n_tokens...]; src[1]=h_a F32 [a, a] or NULL;
+// dst=y F32 [d, n_tokens...]. "n_tokens" is the product of every dim but
+// ne[0] (ne[1]*ne[2]*ne[3]) — matches the HIP dispatch in ml8.cu so 3D/4D
+// batched inputs (e.g. MoE's [d, n_used, n_tokens]) rotate every row instead
+// of only the first ne[1].
 //
 // Ported from the original ggml_custom_4d implementation in ggml-ml8.c.
 // Uses malloc/free (NOT std::vector) for scratch; std::vector inside a
@@ -12387,10 +12397,9 @@ static void ml8_build_sylvester_cpu(float * H, int64_t b) {
 
 void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * x   = dst->src[0];
-    const ggml_tensor * h_a = dst->src[1];
+    const ggml_tensor * h_a = dst->src[1];   // NULL => block_hadamard (Q = I_a ⊗ H_b)
 
     GGML_ASSERT(x->type   == GGML_TYPE_F32);
-    GGML_ASSERT(h_a->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     const int32_t * pp    = (const int32_t *) dst->op_params;
@@ -12398,11 +12407,16 @@ void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params,
     const int64_t   b_dim = (int64_t) pp[1];
     const int64_t   d_dim = a_dim * b_dim;
     GGML_ASSERT(x->ne[0] == d_dim);
-    GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
 
-    const int64_t n_tokens = x->ne[1];
+    if (h_a != NULL) {
+        GGML_ASSERT(h_a->type == GGML_TYPE_F32);
+        GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+    }
+
+    // n_tokens = product of every dim but ne[0] (see comment above).
+    const int64_t n_tokens = x->ne[1] * x->ne[2] * x->ne[3];
     const float * x_data   = (const float *) x->data;
-    const float * h_a_data = (const float *) h_a->data;
+    const float * h_a_data = h_a ? (const float *) h_a->data : NULL;
     float       * y_data   = (float *) dst->data;
 
     float * h_b = (float *) malloc((size_t) b_dim * (size_t) b_dim * sizeof(float));
@@ -12412,10 +12426,15 @@ void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params,
     }
     ml8_build_sylvester_cpu(h_b, b_dim);
 
-    float * xp = (float *) malloc((size_t) d_dim * sizeof(float));
-    if (!xp) {
-        free(h_b);
-        GGML_ABORT("ml8_apply_rotation: malloc xp(%zu) failed", (size_t) d_dim * sizeof(float));
+    // xp only needed for the H_a leg (kronecker); block_hadamard feeds `xt`
+    // straight into the H_b step below.
+    float * xp = NULL;
+    if (h_a != NULL) {
+        xp = (float *) malloc((size_t) d_dim * sizeof(float));
+        if (!xp) {
+            free(h_b);
+            GGML_ABORT("ml8_apply_rotation: malloc xp(%zu) failed", (size_t) d_dim * sizeof(float));
+        }
     }
 
     const int64_t per_thread = (n_tokens + params->nth - 1) / params->nth;
@@ -12426,22 +12445,26 @@ void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params,
         const float * xt = x_data + t * d_dim;
         float       * yt = y_data + t * d_dim;
 
-        // Step 1: xp[k, l] = sum_i H_a[i, k] * X[i, l]
-        for (int64_t k = 0; k < a_dim; k++) {
-            for (int64_t l = 0; l < b_dim; l++) {
-                float s = 0.0f;
-                for (int64_t i = 0; i < a_dim; i++) {
-                    s += h_a_data[i * a_dim + k] * xt[i * b_dim + l];
+        const float * ab = xt;
+        if (h_a != NULL) {
+            // Step 1: xp[k, l] = sum_i H_a[i, k] * X[i, l]
+            for (int64_t k = 0; k < a_dim; k++) {
+                for (int64_t l = 0; l < b_dim; l++) {
+                    float s = 0.0f;
+                    for (int64_t i = 0; i < a_dim; i++) {
+                        s += h_a_data[i * a_dim + k] * xt[i * b_dim + l];
+                    }
+                    xp[k * b_dim + l] = s;
                 }
-                xp[k * b_dim + l] = s;
             }
+            ab = xp;
         }
-        // Step 2: yt[k, l] = sum_j xp[k, j] * H_b[j, l]
+        // Step 2: yt[k, l] = sum_j ab[k, j] * H_b[j, l]
         for (int64_t k = 0; k < a_dim; k++) {
             for (int64_t l = 0; l < b_dim; l++) {
                 float s = 0.0f;
                 for (int64_t j = 0; j < b_dim; j++) {
-                    s += xp[k * b_dim + j] * h_b[j * b_dim + l];
+                    s += ab[k * b_dim + j] * h_b[j * b_dim + l];
                 }
                 yt[k * b_dim + l] = s;
             }

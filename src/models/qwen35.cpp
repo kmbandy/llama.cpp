@@ -60,10 +60,20 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    // ml8-4 sidecar loader (MAD-223). Reads the GGUF metadata for the rotation
-    // factor h_a so we can declare its (a, a) shape without baking the python
-    // factor_for_dim heuristic into C++. All sidecars are TENSOR_NOT_REQUIRED:
-    // an ml8 weight without rotation/awq still loads cleanly.
+    // ml8-4 / ml8-fp8 sidecar loader (MAD-223; MAD-266 extended to ML8_FP8).
+    // Reads the GGUF metadata for the rotation factor h_a so we can declare
+    // its (a, a) shape without baking the python factor_for_dim heuristic
+    // into C++. All sidecars are TENSOR_NOT_REQUIRED: an ml8 weight without
+    // rotation/awq still loads cleanly.
+    //
+    // centroids/awq_scale stay ML8_4-only (the ml8-4 LUT dequant path and its
+    // AWQ pre-scale have no FP8 counterpart — see design note in
+    // llama-ml8-registry.h). rotation_h_a/rotation_meta are created for
+    // either type: ML8_FP8 needs them for the tensor-parallel K-split
+    // rotation (kronecker if rotation_h_a is present, block_hadamard if only
+    // rotation_meta is present — h_a is optional for block_hadamard since
+    // Q = I_a ⊗ H_b has no H_a leg, so rotation_meta must be checked
+    // independently of rotation_h_a here).
     auto load_ml8_sidecars = [&](
             struct ggml_tensor * weight,
             llm_tensor tensor_id,
@@ -73,36 +83,88 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             struct ggml_tensor ** out_rotation_h_a,
             struct ggml_tensor ** out_rotation_meta,
             struct ggml_tensor ** out_awq_scale) {
-        if (!weight || weight->type != GGML_TYPE_ML8_4) {
+        if (!weight || (weight->type != GGML_TYPE_ML8_4 && weight->type != GGML_TYPE_ML8_FP8)) {
             return;
         }
-        *out_centroids = create_tensor(tn(tensor_id, "centroids", il_),
-                                       { 16, k_dim / 64 }, TENSOR_NOT_REQUIRED);
-        *out_awq_scale = create_tensor(tn(tensor_id, "awq_scale", il_),
-                                       { k_dim }, TENSOR_NOT_REQUIRED);
+        if (weight->type == GGML_TYPE_ML8_4) {
+            *out_centroids = create_tensor(tn(tensor_id, "centroids", il_),
+                                           { 16, k_dim / 64 }, TENSOR_NOT_REQUIRED);
+            *out_awq_scale = create_tensor(tn(tensor_id, "awq_scale", il_),
+                                           { k_dim }, TENSOR_NOT_REQUIRED);
+        }
         const auto * h_a_meta = ml.get_tensor_meta(tn(tensor_id, "rotation_h_a", il_).str().c_str());
         if (h_a_meta != nullptr) {
             const int64_t a = h_a_meta->ne[0];
             *out_rotation_h_a  = create_tensor(tn(tensor_id, "rotation_h_a",  il_),
                                                { a, a }, TENSOR_NOT_REQUIRED);
+        }
+        // block_hadamard weights carry rotation_meta with NO rotation_h_a, so
+        // this is checked independently rather than nested under h_a_meta.
+        const auto * meta_meta = ml.get_tensor_meta(tn(tensor_id, "rotation_meta", il_).str().c_str());
+        if (meta_meta != nullptr) {
             *out_rotation_meta = create_tensor(tn(tensor_id, "rotation_meta", il_),
                                                { 4 }, TENSOR_NOT_REQUIRED);
         }
     };
 
-    // ml8-4 registry registration (MAD-223 T13). For a target weight that is
-    // ML8_4, create its centroids/rotation/awq sidecars via load_ml8_sidecars
-    // and register the (weight → sidecars) mapping so build_lora_mm routes the
-    // base matmul through the ml8 helper. Sidecar tensors are owned by the
-    // model's context (create_tensor tracks them for loading); the registry
-    // only holds their pointers. Guarded on ML8_4: a bf16/FFN-only GGUF
-    // registers nothing for these roles → registry miss → plain mul_mat.
+    // Read the rotation_meta I32[4] = [a_dim, b_dim, in_features, kind_id]
+    // sidecar's raw bytes directly from the GGUF file. This runs during
+    // load_arch_tensors, which is called BEFORE llama_model_loader::
+    // init_mappings() and load_all_data() — the sidecar tensor's backend
+    // buffer isn't allocated or populated yet, so ggml_backend_tensor_get /
+    // ml.load_data_range() aren't usable here. `ml.files` (opened for the
+    // GGUF header/metadata scan) IS available this early, and every read
+    // seeks first (matches llama_model_loader::load_all_data's own non-mmap
+    // read path), so this is safe to call from anywhere in load_arch_tensors.
+    // Returns false when the sidecar tensor isn't present in the GGUF.
+    auto read_rotation_meta = [&](llm_tensor tensor_id, int il_, int32_t (&out)[4]) -> bool {
+        const std::string name = tn(tensor_id, "rotation_meta", il_).str();
+        const auto * w = ml.get_weight(name.c_str());
+        if (w == nullptr) {
+            return false;
+        }
+        GGML_ASSERT(w->idx < ml.files.size());
+        ml.files.at(w->idx)->seek(w->offs, SEEK_SET);
+        ml.files.at(w->idx)->read_raw(out, sizeof(out));
+        return true;
+    };
+
+    // Fill in an ml8_sidecars' rotation_b_dim / rotation_block_hadamard from
+    // rotation_meta, when present. `rotation_meta` is the tensor created by
+    // load_ml8_sidecars above (non-null iff the GGUF has the sidecar).
+    auto fill_rotation_meta = [&](ml8_sidecars & sc, struct ggml_tensor * rotation_meta,
+                                  llm_tensor tensor_id, int il_) {
+        if (rotation_meta == nullptr) {
+            return;
+        }
+        int32_t meta[4];
+        if (!read_rotation_meta(tensor_id, il_, meta)) {
+            return;
+        }
+        const int32_t kind_id = meta[3];
+        GGML_ASSERT((kind_id == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER ||
+                     kind_id == GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD) &&
+                    "rotation_meta: unrecognized kind_id");
+        GGML_ASSERT((kind_id == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) == (sc.rotation_h_a != nullptr) &&
+                    "rotation_meta kind_id / rotation_h_a presence mismatch");
+        sc.rotation_b_dim          = meta[1];
+        sc.rotation_block_hadamard = (kind_id == GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD);
+    };
+
+    // ml8-4 / ml8-fp8 registry registration (MAD-223 T13; MAD-266 extended to
+    // ML8_FP8). For a target weight that is ML8_4 or ML8_FP8, create its
+    // sidecars via load_ml8_sidecars and register the (weight → sidecars)
+    // mapping so build_lora_mm routes the base matmul through the ml8
+    // helper. Sidecar tensors are owned by the model's context (create_tensor
+    // tracks them for loading); the registry only holds their pointers.
+    // Guarded on ML8_4/ML8_FP8: any other type registers nothing for these
+    // roles → registry miss → plain mul_mat, unchanged from before.
     //
     // k_dim is the weight's input feature count (ne[0] / K) — the same value
     // the weight's create_tensor used for its leading dim.
     auto register_ml8_weight = [&](struct ggml_tensor * weight,
                                    llm_tensor tensor_id, int il_, int64_t k_dim) {
-        if (!weight || weight->type != GGML_TYPE_ML8_4) {
+        if (!weight || (weight->type != GGML_TYPE_ML8_4 && weight->type != GGML_TYPE_ML8_FP8)) {
             return;
         }
         struct ggml_tensor * centroids    = nullptr;
@@ -111,7 +173,31 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         struct ggml_tensor * awq_scale    = nullptr;
         load_ml8_sidecars(weight, tensor_id, il_, k_dim,
                           &centroids, &rotation_h_a, &rotation_meta, &awq_scale);
-        ml8_reg.register_weight(weight, { centroids, rotation_h_a, awq_scale });
+        ml8_sidecars sc{ centroids, rotation_h_a, awq_scale };
+        fill_rotation_meta(sc, rotation_meta, tensor_id, il_);
+        ml8_reg.register_weight(weight, sc);
+    };
+
+    // FFN gate/up/down registry registration, ML8_FP8 only (MAD-266). The
+    // ML8_4 FFN path is handled entirely inline in build_layer_ffn (direct
+    // field access on layer.ffn_*_centroids/rotation_h_a/awq_scale — see
+    // qwen35.cpp's build_layer_ffn), bypassing build_lora_mm/the registry
+    // altogether, so registering ML8_4 weights here would be dead weight.
+    // FP8 FFN weights have no such inline path — build_layer_ffn falls
+    // through to build_ffn()/build_lora_mm() for them — so this is the only
+    // place their rotation reaches build_ml8_or_mul_mat. Sidecar tensors are
+    // already created by load_ml8_sidecars (called just before this at every
+    // call site); this only registers the (weight → sidecars) mapping.
+    auto register_ffn_fp8 = [&](struct ggml_tensor * weight,
+                                struct ggml_tensor * rotation_h_a,
+                                struct ggml_tensor * rotation_meta,
+                                llm_tensor tensor_id, int il_) {
+        if (!weight || weight->type != GGML_TYPE_ML8_FP8) {
+            return;
+        }
+        ml8_sidecars sc{ /*centroids=*/nullptr, rotation_h_a, /*awq_scale=*/nullptr };
+        fill_rotation_meta(sc, rotation_meta, tensor_id, il_);
+        ml8_reg.register_weight(weight, sc);
     };
 
     // token_embd ml8-4 sidecars (MAD-256). A native-4-bit token_embd needs its
@@ -197,7 +283,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
 
-        // ml8-4 sidecars (MAD-223). No-op when the FFN weights are not ml8-typed.
+        // ml8-4 / ml8-fp8 sidecars (MAD-223; MAD-266). No-op when the FFN
+        // weights are not ml8-typed.
         load_ml8_sidecars(layer.ffn_gate, LLM_TENSOR_FFN_GATE, il, n_embd,
                           &layer.ffn_gate_centroids, &layer.ffn_gate_rotation_h_a,
                           &layer.ffn_gate_rotation_meta, &layer.ffn_gate_awq_scale);
@@ -207,6 +294,15 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         load_ml8_sidecars(layer.ffn_down, LLM_TENSOR_FFN_DOWN, il, n_ff,
                           &layer.ffn_down_centroids, &layer.ffn_down_rotation_h_a,
                           &layer.ffn_down_rotation_meta, &layer.ffn_down_awq_scale);
+        // FP8 FFN weights need explicit registry registration (see
+        // register_ffn_fp8 above) — ML8_4 stays on its inline build_layer_ffn
+        // path and doesn't need this.
+        register_ffn_fp8(layer.ffn_gate, layer.ffn_gate_rotation_h_a, layer.ffn_gate_rotation_meta,
+                         LLM_TENSOR_FFN_GATE, il);
+        register_ffn_fp8(layer.ffn_up,   layer.ffn_up_rotation_h_a,   layer.ffn_up_rotation_meta,
+                         LLM_TENSOR_FFN_UP,   il);
+        register_ffn_fp8(layer.ffn_down, layer.ffn_down_rotation_h_a, layer.ffn_down_rotation_meta,
+                         LLM_TENSOR_FFN_DOWN, il);
     };
 
     auto load_block_mtp = [&](int il) {
@@ -234,7 +330,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, mtp_flags);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, mtp_flags);
 
-        // ml8-4 sidecars (MAD-223) — same wiring as the trunk block. No-op if not ml8-typed.
+        // ml8-4 / ml8-fp8 sidecars (MAD-223; MAD-266) — same wiring as the
+        // trunk block. No-op if not ml8-typed.
         load_ml8_sidecars(layer.ffn_gate, LLM_TENSOR_FFN_GATE, il, n_embd,
                           &layer.ffn_gate_centroids, &layer.ffn_gate_rotation_h_a,
                           &layer.ffn_gate_rotation_meta, &layer.ffn_gate_awq_scale);
@@ -244,6 +341,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         load_ml8_sidecars(layer.ffn_down, LLM_TENSOR_FFN_DOWN, il, n_ff,
                           &layer.ffn_down_centroids, &layer.ffn_down_rotation_h_a,
                           &layer.ffn_down_rotation_meta, &layer.ffn_down_awq_scale);
+        register_ffn_fp8(layer.ffn_gate, layer.ffn_gate_rotation_h_a, layer.ffn_gate_rotation_meta,
+                         LLM_TENSOR_FFN_GATE, il);
+        register_ffn_fp8(layer.ffn_up,   layer.ffn_up_rotation_h_a,   layer.ffn_up_rotation_meta,
+                         LLM_TENSOR_FFN_UP,   il);
+        register_ffn_fp8(layer.ffn_down, layer.ffn_down_rotation_h_a, layer.ffn_down_rotation_meta,
+                         LLM_TENSOR_FFN_DOWN, il);
 
         // NextN-specific tensors that define the MTP block.
         layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);

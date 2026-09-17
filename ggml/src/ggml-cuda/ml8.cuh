@@ -34,7 +34,16 @@ struct ggml_tensor;
 
 struct ml8_weight_repack_t {
     void *  b_packed;     // device: uint8 [K/2, N] row-major
-    float * b_scale;      // device: fp32 [n_groups_k, N] row-major
+    // device: [n_groups_k, N] row-major per-(group, col) scale. Dtype is a
+    // property of which weight type populated this entry, NOT a fixed C
+    // type: ML8_4 (LUT path) scales are fp32 (float*); ML8_FP8 (no-LUT,
+    // in-place) scales are fp16 (__half*), copied through verbatim from the
+    // on-disk fp16 scale to keep the packed layout at 8.5 bpw (see
+    // ggml_cuda_ml8_inplace_alloc_size). Callers must know which producer
+    // filled this struct and cast accordingly — see ggml_cuda_ml8_get_or_repack
+    // (fp32) vs ggml_cuda_ml8_fp8_get_or_repack / the in-place ML8_FP8 path
+    // (fp16) in ml8.cu.
+    void *  b_scale;
     int32_t N;
     int32_t K;
     int32_t n_groups_k;
@@ -83,14 +92,16 @@ void ggml_cuda_ml8_clear_cache(void);
 // ─────────────────────────────────────────────────────────────────────
 // ML8_FP8 in-place repack (load-time).
 //
-// The WF=0 Triton GEMM reads B as raw e4m3 [K, N] plus fp32 scales
-// [K/32, N]; the GGUF stores [N, K] rows of 34-byte {fp16 scale, 32 e4m3}
-// blocks. The cache above builds the kernel layout as a SECOND device copy
-// on first use, which doubles the weight footprint of a full model. For a
-// plain 2D ML8_FP8 weight the HIP buffer instead allocates the kernel layout
-// directly (9 bpw vs 8.5 on disk, +6%) and set_tensor transposes the host
-// blocks into it once at load; the tensor's ->data then IS the repack and
-// the GEMM uses it with no cache entry. get_tensor reverses the transform.
+// The WF=0 Triton GEMM reads B as raw e4m3 [K, N] plus fp16 scales
+// [K/32, N] (copied through verbatim from the on-disk value, upcast to
+// fp32 only in the epilogue multiply); the GGUF stores [N, K] rows of
+// 34-byte {fp16 scale, 32 e4m3} blocks. The cache above builds the kernel
+// layout as a SECOND device copy on first use, which doubles the weight
+// footprint of a full model. For a plain 2D ML8_FP8 weight the HIP buffer
+// instead allocates the kernel layout directly (8.5 bpw, matching the
+// on-disk size exactly) and set_tensor transposes the host blocks into it
+// once at load; the tensor's ->data then IS the repack and the GEMM uses
+// it with no cache entry. get_tensor reverses the transform.
 // ─────────────────────────────────────────────────────────────────────
 
 // True when `t` is a contiguous 2D ML8_FP8 (K % 32 == 0) or ML8_4 (K % 64 == 0)
@@ -100,7 +111,9 @@ void ggml_cuda_ml8_clear_cache(void);
 // (falls back to the cached second copy; diagnostic only).
 bool ggml_cuda_ml8_inplace_eligible(const ggml_tensor * t);
 
-// Bytes of the kernel layout: K*N e4m3 + (K/32)*N fp32 scales.
+// Bytes of the kernel layout: for ML8_FP8, K*N e4m3 + (K/32)*N fp16 scales
+// (== ggml_nbytes(t), 8.5 bpw); for ML8_4, (K/2)*N nibbles + (K/64)*N fp32
+// scales (4.5 bpw, unchanged).
 size_t ggml_cuda_ml8_inplace_alloc_size(const ggml_tensor * t);
 
 // Host -> device write of on-disk block bytes into an eligible tensor.
@@ -270,14 +283,22 @@ void ggml_cuda_op_ml8_mul_mat_id(
 
 // Execute GGML_OP_ML8_APPLY_ROTATION on the HIP backend.
 //   dst:       fp32 [d, n_tokens]
-//   src[0]: x  fp32 [d, n_tokens]   (d = a_dim * b_dim)
-//   src[1]: h_a fp32 [a_dim, a_dim]
-//   op_params[0] = a_dim, op_params[1] = b_dim (power of 2, ≤ 1024)
+//   src[0]: x  fp32 [d, n_tokens]   (d = a_dim * b_dim; n_tokens spans
+//                                    ne[1]..ne[3] for batched/MoE inputs)
+//   src[1]: h_a fp32 [a_dim, a_dim] OR NULL
+//   op_params[0] = a_dim, op_params[1] = b_dim (power of 2, 16..1024)
 //
-// Math: Y[:, t] reshapes X[:, t] to (a, b), then H_a^T @ X @ H_b (per token).
-// H_b is the Sylvester Hadamard, built once per b_dim and cached in device
-// memory. One CUDA block per token, blockDim.x = b_dim, shared memory holds
-// the intermediate (a*b) fp32 buffer (≤ 36KB at a=9, b=1024 — fits AMD LDS).
+// Math, kronecker_orth_sylvester (h_a != NULL): Y[:, t] reshapes X[:, t] to
+// (a, b), then H_a^T @ X @ H_b (per token). a_dim <= 16 (register-array
+// bound on the H_a leg — see ml8_h_a_left_multiply_kernel in ml8.cu).
+//
+// Math, block_hadamard (h_a == NULL, MAD-266): Y[:, t] = X[:, t] @ H_b only
+// (Q = I_a ⊗ H_b) — no H_a leg, no a_dim limit. Used for ML8_FP8 weights
+// under tensor-parallel K-split, where each device only holds a slice of x
+// and there is no cross-block a-leg to mix.
+//
+// H_b is the Sylvester Hadamard, applied via the row-wise FWHT kernel
+// (turbo_fp8_hadamard.cuh), normalized identically in both kinds.
 void ggml_cuda_op_ml8_apply_rotation(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);

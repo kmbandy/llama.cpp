@@ -472,6 +472,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_nextn_head    ("blk\\.\\d+\\.nextn\\.shared_head_head\\.weight");
     static const std::regex pattern_nextn_mirrored("blk\\.\\d+\\.nextn\\.(eh_proj|embed_tokens|enorm|hnorm|shared_head_norm)\\.weight");
 
+    // ml8 calibration sidecars: `<weight name>.centroids` / `.awq_scale` (MAD-223
+    // ml8-4) and `<weight name>.rotation_h_a` / `.rotation_meta` (2026-09-17
+    // ML8_FP8 rotation design). All four are tiny per-weight tensors named by
+    // appending ".<suffix>" to the parent weight's own name (LLM_TN_IMPL::str),
+    // so their tensor_name always has an extra ".<suffix>" trailing the base
+    // weight's ".weight" and never matches the base weight's own pattern above
+    // (regex_match requires a full match).
+    static const std::regex pattern_ml8_sidecar(".*\\.(centroids|awq_scale|rotation_h_a|rotation_meta)");
+
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
 
@@ -569,6 +578,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // (is_recr / n_ff / n_gqa / n_embd_head_k) are all valid up to n_layer_all-1,
         // so il == n_layer() resolves correctly here.
         //
+        // ml8 sidecars (centroids/awq_scale/rotation_h_a/rotation_meta) are all
+        // tiny per-weight calibration tensors that every device needs in full
+        // regardless of how the parent weight itself is split:
+        //   - centroids is the [16, K/64] LUT ml8_mul_mat needs to decode ITS
+        //     device-local slice of the ML8_4 weight -- every device that owns
+        //     any rows/cols of the weight decodes them with this same LUT.
+        //   - awq_scale and rotation_h_a are applied to the ACTIVATION (not
+        //     the weight) before the matmul; ggml_backend_meta_get_split_state
+        //     handles the actual split-state propagation for the ops that
+        //     consume them (GGML_OP_MUL / GGML_OP_ML8_APPLY_ROTATION in
+        //     ggml-backend-meta.cpp) and requires them to be MIRRORED there.
+        //   - rotation_meta is the [4] i32 sidecar carrying (a_dim, b_dim, ...)
+        //     for the block_hadamard rotation kind; read at graph-build time,
+        //     never split.
+        // Before this rule these all fell through every pattern below (their
+        // name is `<weight name>.<suffix>`, never an exact match for the
+        // parent weight's own pattern) to the MIRRORED catch-all at the end of
+        // this function. Stated explicitly so that isn't an accident of
+        // pattern ordering.
+        if (std::regex_match(tensor_name, pattern_ml8_sidecar)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // Only the nextn-specific tensors need explicit rules:
         if (std::regex_match(tensor_name, pattern_nextn_head)) {
             // The MTP LM head. Same layout as output.weight -- column-parallel over
@@ -931,6 +963,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
+        }
+
+        // output (vocab rows): the FP8-WMMA GEMM tiles N by 16 and MMQ prefers
+        // 128-row slices, so cut the vocab at a 128 boundary instead of at
+        // whatever row the split ratio lands on (72/28 of 248320 = 178790.4).
+        if (std::regex_match(tensor_name, pattern_output_weight)) {
+            GGML_ASSERT(segments.size() == 1);
+            return {std::lcm(blck_size, (int64_t) 128)};
         }
 
         // everything else

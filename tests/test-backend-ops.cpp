@@ -2447,6 +2447,47 @@ struct test_ml8_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_ML8_APPLY_ROTATION — two rotation kinds selected by whether h_a is
+// present (see ggml-ml8.h / MAD-266):
+//   with_h_a=true  -> kronecker_orth_sylvester, Q = H_a ⊗ H_b (a_dim <= 16
+//                      on the HIP path — register-array bound).
+//   with_h_a=false -> block_hadamard, Q = I_a ⊗ H_b, no H_a leg, no a_dim
+//                      limit (targets ML8_FP8 tensor-parallel K-split, where
+//                      b_dim is the TP shard's Hadamard block, e.g. 128).
+// x is 4D so a non-trivial ne2/ne3 exercises the "n_tokens = ne1*ne2*ne3"
+// batch handling both backends implement (see ops.cpp / ml8.cu) — without it
+// a 3D/4D input would silently rotate only the first ne1 rows.
+struct test_ml8_apply_rotation : public test_case {
+    const int64_t a_dim;
+    const int64_t b_dim;
+    const bool    with_h_a;
+    const int64_t n_tokens; // ne[1]
+    const int64_t ne2;
+    const int64_t ne3;
+
+    std::string vars() override {
+        return VARS_TO_STR6(a_dim, b_dim, with_h_a, n_tokens, ne2, ne3);
+    }
+
+    test_ml8_apply_rotation(int64_t a_dim = 5, int64_t b_dim = 128, bool with_h_a = true,
+                            int64_t n_tokens = 4, int64_t ne2 = 1, int64_t ne3 = 1)
+        : a_dim(a_dim), b_dim(b_dim), with_h_a(with_h_a), n_tokens(n_tokens), ne2(ne2), ne3(ne3) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = a_dim * b_dim;
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_tokens, ne2, ne3);
+        ggml_set_name(x, "x");
+        ggml_tensor * h_a = nullptr;
+        if (with_h_a) {
+            h_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a_dim, a_dim);
+            ggml_set_name(h_a, "h_a");
+        }
+        ggml_tensor * out = ggml_ml8_apply_rotation(ctx, x, h_a, a_dim, b_dim);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -9717,6 +9758,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 64, /*n=M*/ M, /*k=K*/ 256));
     }
     test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 256, /*n=M*/ 16, /*k=K*/ 512));
+
+    // GGML_OP_ML8_APPLY_ROTATION (MAD-266 adds block_hadamard alongside the
+    // existing kronecker kind — see ggml-ml8.h). kronecker: h_a present,
+    // a_dim <= 16 (HIP register-array bound). block_hadamard: h_a == NULL,
+    // b_dim = 128 (the TP K-split shard size), a_dim = ne0/128 including
+    // non-power-of-two multiples of 128 (4864 = 38*128, 12544 = 98*128) —
+    // exactly the shapes the tensor-parallel ML8_FP8 path will use. A 3D
+    // batch case for each kind exercises the ne1*ne2*ne3 token-count fix.
+    test_cases.emplace_back(new test_ml8_apply_rotation(/*a_dim=*/5,  /*b_dim=*/128,  /*with_h_a=*/true,  /*n_tokens=*/4));
+    test_cases.emplace_back(new test_ml8_apply_rotation(/*a_dim=*/9,  /*b_dim=*/1024, /*with_h_a=*/true,  /*n_tokens=*/2));
+    test_cases.emplace_back(new test_ml8_apply_rotation(/*a_dim=*/16, /*b_dim=*/64,   /*with_h_a=*/true,  /*n_tokens=*/3));
+    test_cases.emplace_back(new test_ml8_apply_rotation(/*a_dim=*/38, /*b_dim=*/128,  /*with_h_a=*/false, /*n_tokens=*/4)); // ne0=4864
+    test_cases.emplace_back(new test_ml8_apply_rotation(/*a_dim=*/98, /*b_dim=*/128,  /*with_h_a=*/false, /*n_tokens=*/4)); // ne0=12544
+    test_cases.emplace_back(new test_ml8_apply_rotation(/*a_dim=*/4,  /*b_dim=*/16,   /*with_h_a=*/false, /*n_tokens=*/5)); // small block_hadamard
+    test_cases.emplace_back(new test_ml8_apply_rotation(
+        /*a_dim=*/5, /*b_dim=*/128, /*with_h_a=*/true, /*n_tokens=*/3, /*ne2=*/2, /*ne3=*/1));  // 3D batch, kronecker
+    test_cases.emplace_back(new test_ml8_apply_rotation(
+        /*a_dim=*/38, /*b_dim=*/128, /*with_h_a=*/false, /*n_tokens=*/3, /*ne2=*/2, /*ne3=*/1)); // 3D batch, block_hadamard
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {

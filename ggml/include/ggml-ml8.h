@@ -47,16 +47,43 @@ GGML_API struct ggml_tensor * ggml_ml8_mul_mat(
         struct ggml_tensor  * centroids,
         struct ggml_tensor  * x);
 
-// Apply a Kronecker rotation Q = H_a ⊗ H_b to the leading dim of `x`.
+// rotation_meta[3] kind_id values. The GGUF rotation_meta sidecar is
+// I32[4] = [a_dim, b_dim, in_features, kind_id]; kind_id selects which of the
+// two rotation kinds below `ggml_ml8_apply_rotation` is computing. Mirrored
+// in scripts/calibration/kronecker_rotation.py
+// (KRONECKER_ORTH_SYLVESTER_KIND_ID / BLOCK_HADAMARD_KIND_ID) and consumed by
+// scripts/calibration/ml8_to_gguf.py::_rotation_meta_bytes — update all three
+// together if a new kind is ever added.
+#define GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER 1
+#define GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD            2
+
+// Apply a rotation to the leading dim of `x`. Two kinds, selected by whether
+// `h_a` is non-NULL:
 //
-// Math (matches scripts/calibration/kronecker_rotation.py::KroneckerRotation.forward):
-//   Reshape x along its leading dim from d = a*b → (b, a), then per token compute
-//   Y = H_a^T @ X @ H_b, reshape back to d. H_b is the Sylvester Hadamard of size
-//   b_dim, constructed internally (deterministic, no storage needed).
+//   h_a != NULL — kind_id 1, "kronecker_orth_sylvester": Q = H_a ⊗ H_b.
+//     Math (matches scripts/calibration/kronecker_rotation.py::
+//     KroneckerRotation.forward): reshape x along its leading dim from
+//     d = a*b → (b, a), then per token compute Y = H_a^T @ X @ H_b, reshape
+//     back to d. h_a is the GGUF rotation_h_a sidecar; a_dim is limited to
+//     16 on the HIP path (fits a register array — see ml8.cu).
+//
+//   h_a == NULL — kind_id 2, "block_hadamard": Q = I_a ⊗ H_b. Independent
+//     normalized Hadamard applied to each contiguous b_dim-sized block of
+//     the leading dim, no cross-block mixing (equivalent to the kronecker
+//     path with h_a == identity — see
+//     scripts/calibration/kronecker_rotation.py::BlockHadamardRotation and
+//     test_block_hadamard_matches_kronecker_identity). No a_dim limit; the
+//     caller must still pass a_dim = x->ne[0] / b_dim.
+//
+// In both cases H_b is the Sylvester Hadamard of size b_dim, constructed
+// internally (deterministic, no storage needed).
 //
 // Tensor shapes:
-//   x   : [d, n_tokens]  GGML_TYPE_F32   (d == a_dim * b_dim)
-//   h_a : [a_dim, a_dim] GGML_TYPE_F32   from the GGUF rotation_h_a sidecar
+//   x   : [d, n_tokens]  GGML_TYPE_F32   (d == a_dim * b_dim; n_tokens may
+//                                         span ne[1]..ne[3] for batched/MoE
+//                                         inputs)
+//   h_a : [a_dim, a_dim] GGML_TYPE_F32   from the GGUF rotation_h_a sidecar,
+//                                        or NULL for block_hadamard
 //
 // Output:
 //   y   : [d, n_tokens]  GGML_TYPE_F32
@@ -64,10 +91,7 @@ GGML_API struct ggml_tensor * ggml_ml8_mul_mat(
 // Constraints:
 //   - b_dim must be a positive power of 2
 //   - a_dim * b_dim must equal x->ne[0]
-//   - h_a->ne[0] == h_a->ne[1] == a_dim
-//
-// CPU-only for now (G.4 will lift this to GPU). When `h_a` is NULL, returns `x`
-// unchanged so callers can plumb the optional rotation uniformly.
+//   - when h_a != NULL: h_a->ne[0] == h_a->ne[1] == a_dim
 GGML_API struct ggml_tensor * ggml_ml8_apply_rotation(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,

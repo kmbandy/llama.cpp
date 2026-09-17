@@ -8212,19 +8212,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ML8_APPLY_ROTATION:
             {
                 // MAD-223 G.4.g: per-token Kronecker rotation H_a^T @ X @ H_b.
-                // One CUDA block per token; blockDim.x = b_dim, so b_dim must
-                // fit the device block-size limit. Shared memory holds the
-                // intermediate buffer (a_dim*b_dim fp32) — also bounded.
+                // MAD-266: h_a == NULL selects block_hadamard (Q = I_a ⊗ H_b,
+                // no H_a leg) — no a_dim limit in that case, unlike kronecker
+                // whose a_dim must fit ml8_h_a_left_multiply_kernel's register
+                // array (see ml8.cu). One CUDA block per token; blockDim.x =
+                // b_dim, so b_dim must fit the device block-size limit.
                 const ggml_tensor * x   = op->src[0];
                 const ggml_tensor * h_a = op->src[1];
-                if (!x || !h_a) return false;
+                if (!x) return false;
                 if (x->type   != GGML_TYPE_F32) return false;
-                if (h_a->type != GGML_TYPE_F32) return false;
+                if (h_a != nullptr && h_a->type != GGML_TYPE_F32) return false;
                 if (op->type  != GGML_TYPE_F32) return false;
                 const int32_t * pp    = (const int32_t *) op->op_params;
+                const int32_t   a_dim = pp[0];
                 const int32_t   b_dim = pp[1];
+                if (h_a != nullptr && (a_dim <= 0 || a_dim > 16)) return false;
                 if (b_dim <= 0 || (b_dim & (b_dim - 1)) != 0) return false;
-                if (b_dim > 1024) return false;
+                if (b_dim < 16 || b_dim > 1024) return false;
                 return true;
             } break;
         case GGML_OP_ML8_MUL_MAT_ID:
