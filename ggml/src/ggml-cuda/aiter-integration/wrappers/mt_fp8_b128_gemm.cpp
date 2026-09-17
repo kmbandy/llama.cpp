@@ -70,7 +70,8 @@ std::string build_signature_fp8_b128(int32_t M, int32_t N, int32_t K,
         a_dtype,
         MT_FP8_B128_GROUP_K, MT_FP8_B128_GROUP_N,
         cfg.bm, cfg.bn, MT_FP8_B128_BLOCK_SIZE_K,
-        MT_FP8_B128_GROUP_SIZE_M, MT_FP8_B128_NUM_KSPLIT, K /* SPLITK_BLOCK_SIZE == K */,
+        (M > 32) ? mt_fp8_b128_env_int("MT_FP8_GSM", MT_FP8_B128_GROUP_SIZE_M) : MT_FP8_B128_GROUP_SIZE_M,
+        MT_FP8_B128_NUM_KSPLIT, K /* SPLITK_BLOCK_SIZE == K */,
         even_k, grid_mn);
     return buf;
 }
@@ -134,7 +135,7 @@ hipError_t ensure_initialized(int32_t N, int32_t K, int32_t M,
         target, sig,
         MT_FP8_B128_NUM_WARPS, MT_FP8_B128_NUM_STAGES,
     };
-    spec.waves_per_eu         = MT_FP8_B128_WAVES_PER_EU;
+    spec.waves_per_eu         = (M > 32) ? mt_fp8_b128_env_int("MT_FP8_WPE", MT_FP8_B128_WAVES_PER_EU) : MT_FP8_B128_WAVES_PER_EU;
     spec.matrix_instr_nonkdim = MT_FP8_B128_MATRIX_INSTR_NONKDIM;
 
     if (const char * s = std::getenv("MT_ML8_NUM_WARPS"))  { int v = std::atoi(s); if (v > 0 && v <= 32) spec.num_warps  = v; }

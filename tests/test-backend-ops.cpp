@@ -11119,6 +11119,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // FP8_B128 preshuffle GEMM vs the ML8_FP8 generic aiter GEMM vs Q8_0 MMQ at
+    // Qwen3.8-27B ffn_gate (K=5120, N=17408) and ffn_down (K=17408, N=5120) shapes
+    for (int64_t m : {16, 64, 512, 2048}) {
+        test_cases.emplace_back(new test_fp8_mul_mat(5120, 17408, m));
+        test_cases.emplace_back(new test_fp8_mul_mat(17408, 5120, m));
+        for (ggml_type type : {GGML_TYPE_ML8_FP8, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17408, m, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, m, 17408, {1, 1}, {1, 1}));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

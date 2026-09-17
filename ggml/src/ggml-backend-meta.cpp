@@ -949,13 +949,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // K-split weight x K-split (packed) activation -> PARTIAL, reduced via AllReduce.
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             const size_t n_bufs_local = ggml_backend_meta_buffer_n_world(tensor->buffer);
+            // per-device element counts: sum over segments of (slice units x repeats)
+            auto local_elems = [&](const ggml_backend_meta_split_state & ss, size_t j) {
+                int64_t n = 0;
+                for (int is = 0; is < ss.n_segments; is++) {
+                    n += ss.ne[is*n_bufs_local + j] * (int64_t) ss.nr[is];
+                }
+                return n;
+            };
             for (size_t j = 0; j < n_bufs_local; j++) {
-                const int64_t w_local = src_ss[0].ne[j];
-                const int64_t a_local = src_ss[1].ne[j];
-                GGML_ASSERT(a_local == w_local + w_local / 32 &&
-                    "FP8_MUL_MAT: K-split activation's per-device packed width must be "
-                    "this device's w-slice K_local + K_local/32 (the QUANT_ROT packing on the "
-                    "SAME K-split as the weight)");
+                const int64_t w_local = local_elems(src_ss[0], j);
+                const int64_t a_local = local_elems(src_ss[1], j);
+                if (a_local != w_local + w_local / 32) {
+                    GGML_LOG_ERROR("%s: FP8_MUL_MAT %s: device %zu w=%s ne0=%" PRId64 " w_local=%" PRId64 " nr=%u nseg=%d | a=%s ne0=%" PRId64 " a_local=%" PRId64 " nr=%u nseg=%d\n",
+                        __func__, tensor->name, j, tensor->src[0]->name, tensor->src[0]->ne[0], w_local, src_ss[0].nr[0], src_ss[0].n_segments,
+                        tensor->src[1]->name, tensor->src[1]->ne[0], a_local, src_ss[1].nr[0], src_ss[1].n_segments);
+                    GGML_ABORT("FP8_MUL_MAT: K-split activation's per-device packed width must be "
+                        "this device's w-slice K_local + K_local/32 (the QUANT_ROT packing on the "
+                        "SAME K-split as the weight)");
+                }
             }
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }

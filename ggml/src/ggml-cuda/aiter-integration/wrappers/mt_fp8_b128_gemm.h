@@ -21,6 +21,7 @@
 
 #include <hip/hip_runtime_api.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stddef.h>
 
 // Fixed by the design (radiance _ps_cfg / vllm-radiance recipe).
@@ -39,8 +40,21 @@ struct mt_fp8_b128_tuned_cfg {
     int32_t bn;   // BLOCK_SIZE_N: 128
 };
 
+// Diagnostic overrides for the prefill tier (M > 32) only — A/B sweeps, not config:
+//   MT_FP8_BM, MT_FP8_BN (BLOCK_SIZE_M/N), MT_FP8_GSM (GROUP_SIZE_M),
+//   MT_FP8_WPE (waves_per_eu), MT_ML8_NUM_WARPS / MT_ML8_NUM_STAGES (shared with ml8).
+static inline int32_t mt_fp8_b128_env_int(const char * name, int32_t def) {
+    const char * s = getenv(name);
+    if (s == NULL) return def;
+    const int v = atoi(s);
+    return v > 0 ? v : def;
+}
+
 static inline mt_fp8_b128_tuned_cfg mt_fp8_b128_pick_config(int32_t M) {
-    return mt_fp8_b128_tuned_cfg{ (M <= 32) ? 16 : 64, MT_FP8_B128_GROUP_N };
+    if (M <= 32) {
+        return mt_fp8_b128_tuned_cfg{ 16, MT_FP8_B128_GROUP_N };
+    }
+    return mt_fp8_b128_tuned_cfg{ mt_fp8_b128_env_int("MT_FP8_BM", 64), mt_fp8_b128_env_int("MT_FP8_BN", MT_FP8_B128_GROUP_N) };
 }
 
 #ifdef __cplusplus

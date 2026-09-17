@@ -1064,12 +1064,25 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // or explicitly with 128 once blck_size itself is 128, so this
             // should always hold -- assert it rather than let it corrupt
             // results under tensor parallelism.
-            if (tc.tensor_axis_0->type == GGML_TYPE_FP8_B128) {
+            // (tensor, not tc.tensor_axis_0: e.g. ssm_dt/ssm_a follow ssm_out.weight's split
+            // in head units and are not themselves FP8_B128)
+            if (tensor->type == GGML_TYPE_FP8_B128) {
+                // segments are expressed in per-arch units (e.g. GDN head slots x repeats);
+                // one unit = ne[axis] / sum(segment * repeats) elements
+                int64_t units_total = 0;
+                for (const auto & seg : segments) {
+                    units_total += seg.first * (int64_t) seg.second;
+                }
+                const int64_t unit_elems = tensor->ne[split_state.axis] / units_total;
                 for (size_t j = 0; j < ud->n_devices; j++) {
-                    const int64_t ne_j = split_state.ne[is*ud->n_devices + j];
-                    GGML_ASSERT(ne_j % 128 == 0 &&
-                            "FP8_B128 tensor split slice is not 128-aligned; "
-                            "get_split_granularity must lcm this tensor's granularity with 128");
+                    const int64_t ne_j = split_state.ne[is*ud->n_devices + j] * (int64_t) segments[is].second * unit_elems;
+                    if (ne_j % 128 != 0) {
+                        LLAMA_LOG_ERROR("%s: FP8_B128 tensor %s: segment %zu device %zu slice ne=%" PRId64
+                                " (segment %" PRId64 ", granularity %" PRId64 ") is not 128-aligned\n",
+                                __func__, ggml_get_name(tensor), is, j, ne_j, segments[is].first, granularity[is]);
+                        GGML_ABORT("FP8_B128 tensor split slice is not 128-aligned; "
+                                "get_split_granularity must lcm this tensor's granularity with 128");
+                    }
                 }
             }
         }
