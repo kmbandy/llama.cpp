@@ -5557,6 +5557,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_0, data, nb);
             } break;
+        case GGML_TYPE_ML8_FP8:
+            {
+                // {fp16 scale, 32 e4m3 bytes}: only the scale can be non-finite.
+                const block_ml8_fp8 * q = (const block_ml8_fp8 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].scale, i)) {
+                        return false;
+                    }
+                }
+            } break;
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);

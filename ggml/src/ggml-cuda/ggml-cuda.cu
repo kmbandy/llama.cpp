@@ -1139,6 +1139,9 @@ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     // a stale repack if the allocator later hands the same address to a
     // different weight. Cheap no-op when no ml8 weights are in use.
     ggml_cuda_ml8_clear_cache();
+    // In-place ML8_FP8 weights live inside this buffer: drop their registry
+    // entries (there is no separate allocation to free).
+    ggml_cuda_ml8_inplace_forget_range(ctx->dev_ptr, buffer->size);
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     ggml_backend_cuda_device_active_count_dec(buffer->buft->device);
@@ -1200,6 +1203,10 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     // to the caller. Cost is not negligible for large transfers (e.g. 12.2 MB
     // expert pages) — that was true only for the KB-sized activations this
     // comment originally described.
+    if (ggml_cuda_ml8_inplace_eligible(tensor)) {
+        ggml_cuda_ml8_inplace_set(cudaStreamPerThread, tensor, data, offset, size, 1, size, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpy((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice));
 }
 
@@ -1213,6 +1220,10 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                 ctx->device, tensor->name, ggml_op_name(tensor->op), size, offset,
                 (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
     }
+    if (ggml_cuda_ml8_inplace_eligible(tensor)) {
+        ggml_cuda_ml8_inplace_get(cudaStreamPerThread, tensor, data, offset, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1222,6 +1233,10 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_ml8_inplace_eligible(tensor)) {
+        ggml_cuda_ml8_inplace_set(cudaStreamPerThread, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1232,6 +1247,13 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_ml8_inplace_eligible(tensor)) {
+        // Strided read of an in-place tensor: unpack per row (load-time / test only).
+        for (size_t i = 0; i < n_copies; i++) {
+            ggml_cuda_ml8_inplace_get(cudaStreamPerThread, tensor, (char *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1249,6 +1271,11 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
         if (src_physical == dst_physical) {
+            if (ggml_cuda_ml8_inplace_is_packed(src->data) && ggml_cuda_ml8_inplace_eligible(dst)) {
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_cuda_ml8_inplace_alloc_size(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                ggml_cuda_ml8_inplace_alias(src->data, dst->data);
+                return true;
+            }
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
@@ -1345,6 +1372,13 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
+
+    // In-place ML8_FP8: allocate the FP8-WMMA kernel layout (e4m3 [K,N] +
+    // fp32 scales) instead of the on-disk block layout. No mmvq row padding
+    // is needed: these weights never touch the generic quantized kernels.
+    if (ggml_cuda_ml8_inplace_eligible(tensor)) {
+        return std::max(size, ggml_cuda_ml8_inplace_alloc_size(tensor));
+    }
 
     // [TAG_ALLOC_SIZE_EXPAND]
     if (ggml_is_quantized(tensor->type)) {
@@ -4027,6 +4061,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     ggml_cuda_set_device(cuda_ctx->device);
+    if (ggml_cuda_ml8_inplace_eligible(tensor)) {
+        ggml_cuda_ml8_inplace_set(cuda_ctx->stream(), tensor, data, offset, size, 1, size, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 

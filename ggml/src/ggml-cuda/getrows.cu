@@ -1,6 +1,7 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "ml8.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -463,6 +464,12 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
     GGML_ASSERT(ne13 == 1);
+
+    // In-place packed ML8_FP8 weights (token_embd) are in the FP8-GEMM layout,
+    // not the block layout the generic dequantizer reads.
+    if (src0->type == GGML_TYPE_ML8_FP8 && ggml_cuda_ml8_inplace_get_rows(ctx, dst)) {
+        return;
+    }
 
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));

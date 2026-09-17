@@ -80,6 +80,70 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
 // normal backend teardown path (the OS reclaims VRAM at process exit).
 void ggml_cuda_ml8_clear_cache(void);
 
+// ─────────────────────────────────────────────────────────────────────
+// ML8_FP8 in-place repack (load-time).
+//
+// The WF=0 Triton GEMM reads B as raw e4m3 [K, N] plus fp32 scales
+// [K/32, N]; the GGUF stores [N, K] rows of 34-byte {fp16 scale, 32 e4m3}
+// blocks. The cache above builds the kernel layout as a SECOND device copy
+// on first use, which doubles the weight footprint of a full model. For a
+// plain 2D ML8_FP8 weight the HIP buffer instead allocates the kernel layout
+// directly (9 bpw vs 8.5 on disk, +6%) and set_tensor transposes the host
+// blocks into it once at load; the tensor's ->data then IS the repack and
+// the GEMM uses it with no cache entry. get_tensor reverses the transform.
+// ─────────────────────────────────────────────────────────────────────
+
+// True when `t` is a contiguous 2D ML8_FP8 (K % 32 == 0) or ML8_4 (K % 64 == 0)
+// tensor that the HIP buffer stores in the kernel layout (ML8_4: nibbles
+// [K/2,N] + fp32 scales, 4.5 bpw, no growth). Must give the same answer at
+// get_alloc_size and at set_tensor time. Env WP_ML8_INPLACE=0 disables
+// (falls back to the cached second copy; diagnostic only).
+bool ggml_cuda_ml8_inplace_eligible(const ggml_tensor * t);
+
+// Bytes of the kernel layout: K*N e4m3 + (K/32)*N fp32 scales.
+size_t ggml_cuda_ml8_inplace_alloc_size(const ggml_tensor * t);
+
+// Host -> device write of on-disk block bytes into an eligible tensor.
+// Accepts the same (offset, size, n_copies, stride_tensor, stride_data)
+// shape as set_tensor_2d (n_copies == 1 for a plain set_tensor); partial
+// writes are staged on the device and the repack runs once the whole
+// tensor has arrived. Synchronous on return.
+void ggml_cuda_ml8_inplace_set(
+    cudaStream_t  stream,
+    ggml_tensor * t,
+    const void *  data,
+    size_t        offset,
+    size_t        size,
+    size_t        n_copies,
+    size_t        stride_tensor,
+    size_t        stride_data);
+
+// Device -> host read of on-disk block bytes [offset, offset+size) from an
+// eligible, fully-written tensor. Synchronous on return.
+void ggml_cuda_ml8_inplace_get(
+    cudaStream_t        stream,
+    const ggml_tensor * t,
+    void *              data,
+    size_t              offset,
+    size_t              size);
+
+// True when `data` is the ->data of a fully-repacked in-place tensor.
+bool ggml_cuda_ml8_inplace_is_packed(const void * data);
+
+// GGML_OP_GET_ROWS on an in-place packed ML8_FP8 tensor (token_embd): gathers
+// rows out of the kernel layout. Returns false (does nothing) when src0 is
+// not a packed in-place tensor so the caller falls through to the generic
+// block-layout path.
+bool ggml_cuda_ml8_inplace_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// Register `dst_data` as a packed copy of `src_data` (device-to-device
+// buffer copy of the whole allocation). No-op if src is not packed.
+void ggml_cuda_ml8_inplace_alias(const void * src_data, const void * dst_data);
+
+// Drop every in-place registration and staging entry whose pointer lies in
+// [base, base + size): called when a HIP buffer is freed.
+void ggml_cuda_ml8_inplace_forget_range(const void * base, size_t size);
+
 // Quantize a row-major fp32 activation tensor (src, [M, K]) into the
 // (a_fp8[M, K] uint8 e4m3, a_scale[M] fp32) layout that mt_ml8_gemm
 // consumes. Per-row absmax scaling: a_scale[m] = max(|x[m]|) / 448 +

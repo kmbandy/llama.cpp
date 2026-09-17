@@ -398,6 +398,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_ML8_FP8: return_type = GGML_TYPE_Q8_0;   break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
@@ -456,7 +457,21 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor
-    if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
+    if (ftype == LLAMA_FTYPE_MOSTLY_ML8_FP8) {
+        // 2D GEMM weights -> ML8_FP8 (aiter FP8-WMMA path). Everything the HIP
+        // backend reads through get_rows / mul_mat_id or generic quantized
+        // kernels (token_embd incl. tied, 3D expert stacks, K not a multiple
+        // of 32) stays Q8_0: those paths read the on-disk block layout, and
+        // an in-place packed ML8_FP8 tensor is in the kernel layout instead.
+        // N % 128: a TP row split of a narrower tensor (ssm_alpha/beta, N=48)
+        // can leave a device slice that is not a multiple of the GEMM's 16-row
+        // tile, and those tensors are too small to matter for FP8 anyway.
+        if (category == tensor_category::TOKEN_EMBD || tensor->ne[2] > 1 || tensor->ne[0] % 32 != 0 || tensor->ne[1] % 128 != 0) {
+            new_type = GGML_TYPE_Q8_0;
+        } else {
+            new_type = GGML_TYPE_ML8_FP8;
+        }
+    } else if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
         if (qs.params->output_tensor_type < GGML_TYPE_COUNT) {
             new_type = qs.params->output_tensor_type;
         } else {
@@ -861,6 +876,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+        case LLAMA_FTYPE_MOSTLY_ML8_FP8: return GGML_TYPE_ML8_FP8;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 

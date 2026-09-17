@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "common.cuh"
 #include "convert.cuh"
+#include "dequantize.cuh"
 #ifdef GGML_HIP_AITER
 // The ml8 GEMM dispatch goes through the AITER Triton-AOT kernels. Their headers
 // only live on the include path when ggml-hip is configured with -DGGML_HIP_AITER=ON
@@ -20,6 +21,8 @@
 #endif // GGML_HIP_AITER
 #include "turbo_fp8_hadamard.cuh"  // G.6.f: FWHT for rotation H_b leg
 
+#include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
@@ -174,6 +177,22 @@ std::unordered_map<const void *, cache_entry_t>       g_ml8_cache;
 std::mutex                                       g_ml8_fp8_cache_mu;
 std::unordered_map<const void *, cache_entry_t>  g_ml8_fp8_cache;
 
+// In-place (load-time) ML8_FP8 repack registry, keyed by the tensor's own
+// device pointer. `staging` holds the on-disk block bytes while a tensor is
+// being written in pieces; once `received == nbytes` the repack kernel
+// scatters staging -> info.{b_packed,b_scale} (both inside the tensor's
+// allocation), staging is freed and `packed` flips to true.
+struct inplace_entry_t {
+    ml8_weight_repack_t info;
+    ggml_type           type;       // GGML_TYPE_ML8_4 or GGML_TYPE_ML8_FP8
+    size_t              nbytes;     // on-disk block bytes (ggml_nbytes)
+    uint8_t *           staging;    // device, nbytes; null once packed
+    size_t              received;
+    bool                packed;
+};
+std::mutex                                        g_ml8_inplace_mu;
+std::unordered_map<const void *, inplace_entry_t> g_ml8_inplace;
+
 } // namespace
 
 const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
@@ -196,6 +215,15 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     const int32_t n_groups_k = K / group_size;
 
     const void * key = w->data;
+
+    // Load-time in-place repack: the tensor's own allocation is the kernel layout.
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+        auto it = g_ml8_inplace.find(key);
+        if (it != g_ml8_inplace.end() && it->second.packed) {
+            return &it->second.info;
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_ml8_cache_mu);
@@ -364,6 +392,16 @@ static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
 
     const void * key = w->data;
 
+    // Load-time in-place repack: the tensor's own allocation already holds
+    // the kernel layout, so there is nothing to build and nothing to cache.
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+        auto it = g_ml8_inplace.find(key);
+        if (it != g_ml8_inplace.end() && it->second.packed) {
+            return &it->second.info;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_ml8_fp8_cache_mu);
         auto it = g_ml8_fp8_cache.find(key);
@@ -434,6 +472,329 @@ static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
     entry.info.group_size = group_size;
     auto [ins_it, _ins_ok] = g_ml8_fp8_cache.emplace(key, entry);
     return &ins_it->second.info;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ML8_FP8 in-place repack (see ml8.cuh).
+// ─────────────────────────────────────────────────────────────────────
+
+// Inverse of ml8_fp8_repack_kernel: gather the kernel layout back into the
+// on-disk {fp16 scale, 32 e4m3} blocks. One thread per (n, g).
+static __global__ void ml8_fp8_unpack_kernel(
+    const uint8_t * __restrict__ b_fp8,      // (K, N) row-major raw e4m3
+    const float   * __restrict__ b_scale,    // (n_groups_k, N) row-major
+    uint8_t       * __restrict__ dst,        // (N, n_groups_k * 34) bytes
+    int N,
+    int n_groups_k) {
+
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int g = blockIdx.y;
+    if (n >= N || g >= n_groups_k) {
+        return;
+    }
+
+    uint8_t * blk = dst
+        + (size_t) n * (size_t) n_groups_k * (size_t) ML8_FP8_BLOCK_BYTES
+        + (size_t) g * (size_t) ML8_FP8_BLOCK_BYTES;
+
+    const __half   scale_h = __float2half(b_scale[(size_t) g * (size_t) N + (size_t) n]);
+    const uint16_t scale_u = reinterpret_cast<const uint16_t &>(scale_h);
+    memcpy(blk, &scale_u, sizeof(uint16_t));
+
+    uint8_t * qs     = blk + sizeof(uint16_t);
+    const int k_base = g * QK_ML8_FP8;
+    #pragma unroll
+    for (int j = 0; j < QK_ML8_FP8; ++j) {
+        qs[j] = b_fp8[((size_t) (k_base + j)) * (size_t) N + (size_t) n];
+    }
+}
+
+// Inverse of ml8_repack_kernel (ML8_4): gather nibbles + fp32 scale back into
+// the on-disk block_ml8_4 {float scale; uint8_t qs[32]} blocks.
+static __global__ void ml8_unpack_kernel(
+    const uint8_t * __restrict__ b_packed,   // (K/2, N)
+    const float   * __restrict__ b_scale,    // (n_groups_k, N)
+    uint8_t       * __restrict__ dst,        // (N, n_groups_k * 36) bytes
+    int N,
+    int n_groups_k) {
+
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int g = blockIdx.y;
+    if (n >= N || g >= n_groups_k) {
+        return;
+    }
+    uint8_t * blk = dst + ((size_t) n * (size_t) n_groups_k + (size_t) g) * sizeof(block_ml8_4);
+    const float scale = b_scale[(size_t) g * (size_t) N + (size_t) n];
+    memcpy(blk, &scale, sizeof(float));
+    uint8_t * qs = blk + sizeof(float);
+    const int k_half_base = g * ML8_GROUP_NIBBLES;
+    #pragma unroll
+    for (int j = 0; j < ML8_GROUP_NIBBLES; ++j) {
+        qs[j] = b_packed[((size_t) (k_half_base + j)) * (size_t) N + (size_t) n];
+    }
+}
+
+bool ggml_cuda_ml8_inplace_eligible(const ggml_tensor * t) {
+    static const bool disabled = [] {
+        const char * e = getenv("WP_ML8_INPLACE");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    if (disabled || t == nullptr || t->view_src != nullptr) {
+        return false;
+    }
+    if (t->type != GGML_TYPE_ML8_FP8 && t->type != GGML_TYPE_ML8_4) {
+        return false;
+    }
+    const int    qk  = t->type == GGML_TYPE_ML8_4 ? QK_ML8 : QK_ML8_FP8;
+    const size_t bsz = t->type == GGML_TYPE_ML8_4 ? sizeof(block_ml8_4) : (size_t) ML8_FP8_BLOCK_BYTES;
+    if (t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] <= 0 || t->ne[1] <= 0 || t->ne[0] % qk != 0) {
+        return false;
+    }
+    if (t->ne[0] > INT32_MAX || t->ne[1] > INT32_MAX) {
+        return false;
+    }
+    // Contiguous rows of whole blocks (the loader never hands us anything else).
+    return t->nb[0] == bsz && t->nb[1] == (size_t) (t->ne[0] / qk) * bsz;
+}
+
+size_t ggml_cuda_ml8_inplace_alloc_size(const ggml_tensor * t) {
+    const size_t K = (size_t) t->ne[0];
+    const size_t N = (size_t) t->ne[1];
+    if (t->type == GGML_TYPE_ML8_4) {
+        // nibbles [K/2, N] + fp32 scales [K/64, N] == 4.5 bpw, same as on disk
+        return K * N / 2 + (K / QK_ML8) * N * sizeof(float);
+    }
+    return K * N + (K / QK_ML8_FP8) * N * sizeof(float);
+}
+
+bool ggml_cuda_ml8_inplace_is_packed(const void * data) {
+    std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+    auto it = g_ml8_inplace.find(data);
+    return it != g_ml8_inplace.end() && it->second.packed;
+}
+
+void ggml_cuda_ml8_inplace_alias(const void * src_data, const void * dst_data) {
+    std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+    auto it = g_ml8_inplace.find(src_data);
+    if (it == g_ml8_inplace.end() || !it->second.packed) {
+        return;
+    }
+    inplace_entry_t e = it->second;
+    const ptrdiff_t delta = (const char *) dst_data - (const char *) src_data;
+    e.info.b_packed = (void *)  ((char *) e.info.b_packed + delta);
+    e.info.b_scale  = (float *) ((char *) e.info.b_scale  + delta);
+    g_ml8_inplace[dst_data] = e;
+}
+
+void ggml_cuda_ml8_inplace_forget_range(const void * base, size_t size) {
+    const char * lo = (const char *) base;
+    const char * hi = lo + size;
+    std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+    for (auto it = g_ml8_inplace.begin(); it != g_ml8_inplace.end(); ) {
+        const char * p = (const char *) it->first;
+        if (p >= lo && p < hi) {
+            if (it->second.staging != nullptr) {
+                cudaFree(it->second.staging);
+            }
+            it = g_ml8_inplace.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ggml_cuda_ml8_inplace_set(
+    cudaStream_t  stream,
+    ggml_tensor * t,
+    const void *  data,
+    size_t        offset,
+    size_t        size,
+    size_t        n_copies,
+    size_t        stride_tensor,
+    size_t        stride_data) {
+
+    GGML_ASSERT(ggml_cuda_ml8_inplace_eligible(t));
+    const bool    is_ml8_4   = t->type == GGML_TYPE_ML8_4;
+    const int32_t K          = (int32_t) t->ne[0];
+    const int32_t N          = (int32_t) t->ne[1];
+    const int32_t group_size = is_ml8_4 ? QK_ML8 : QK_ML8_FP8;
+    const int32_t n_groups_k = K / group_size;
+    const size_t  packed_sz  = is_ml8_4 ? (size_t) K * (size_t) N / 2 : (size_t) K * (size_t) N;
+    const size_t  nbytes     = ggml_nbytes(t);
+    GGML_ASSERT(n_copies >= 1);
+    GGML_ASSERT(offset + (n_copies - 1) * stride_tensor + size <= nbytes);
+
+    std::unique_lock<std::mutex> lock(g_ml8_inplace_mu);
+    inplace_entry_t & e = g_ml8_inplace[t->data];
+    if (e.info.b_packed == nullptr) {
+        e.info.b_packed   = t->data;
+        e.info.b_scale    = (float *) ((char *) t->data + packed_sz);
+        e.info.N          = N;
+        e.info.K          = K;
+        e.info.n_groups_k = n_groups_k;
+        e.info.group_size = group_size;
+        e.type            = t->type;
+        e.nbytes          = nbytes;
+        e.staging         = nullptr;
+        e.received        = 0;
+        e.packed          = false;
+    }
+    if (e.packed) {
+        // Re-writing an already packed tensor: start over from a fresh staging.
+        e.packed   = false;
+        e.received = 0;
+    }
+    if (e.staging == nullptr) {
+        CUDA_CHECK(cudaMalloc((void **) &e.staging, nbytes));
+    }
+    uint8_t * staging = e.staging;
+    lock.unlock();
+
+    if (n_copies == 1 || (stride_tensor == size && stride_data == size)) {
+        CUDA_CHECK(cudaMemcpyAsync(staging + offset, data, size * n_copies, cudaMemcpyHostToDevice, stream));
+    } else {
+        CUDA_CHECK(cudaMemcpy2DAsync(staging + offset, stride_tensor, data, stride_data, size, n_copies,
+                                     cudaMemcpyHostToDevice, stream));
+    }
+
+    lock.lock();
+    e.received += size * n_copies;
+    const bool complete = e.received >= nbytes;
+    if (complete) {
+        constexpr int BLOCK_N = 64;
+        const dim3 grid((N + BLOCK_N - 1) / BLOCK_N, n_groups_k, 1);
+        const dim3 block(BLOCK_N, 1, 1);
+        if (is_ml8_4) {
+            ml8_repack_kernel<<<grid, block, 0, stream>>>(
+                staging, (uint8_t *) e.info.b_packed, e.info.b_scale, N, n_groups_k);
+        } else {
+            ml8_fp8_repack_kernel<<<grid, block, 0, stream>>>(
+                staging, (uint8_t *) e.info.b_packed, e.info.b_scale, N, n_groups_k);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    lock.unlock();
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (complete) {
+        lock.lock();
+        CUDA_CHECK(cudaFree(staging));
+        e.staging  = nullptr;
+        e.received = 0;
+        e.packed   = true;
+    }
+}
+
+void ggml_cuda_ml8_inplace_get(
+    cudaStream_t        stream,
+    const ggml_tensor * t,
+    void *              data,
+    size_t              offset,
+    size_t              size) {
+
+    ml8_weight_repack_t info;
+    size_t nbytes;
+    ggml_type type;
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+        auto it = g_ml8_inplace.find(t->data);
+        GGML_ASSERT(it != g_ml8_inplace.end() && it->second.packed &&
+            "ml8 in-place tensor read before it was fully written");
+        info   = it->second.info;
+        nbytes = it->second.nbytes;
+        type   = it->second.type;
+    }
+    GGML_ASSERT(offset + size <= nbytes);
+
+    uint8_t * tmp = nullptr;
+    CUDA_CHECK(cudaMalloc((void **) &tmp, nbytes));
+    constexpr int BLOCK_N = 64;
+    const dim3 grid((info.N + BLOCK_N - 1) / BLOCK_N, info.n_groups_k, 1);
+    const dim3 block(BLOCK_N, 1, 1);
+    if (type == GGML_TYPE_ML8_4) {
+        ml8_unpack_kernel<<<grid, block, 0, stream>>>(
+            (const uint8_t *) info.b_packed, info.b_scale, tmp, info.N, info.n_groups_k);
+    } else {
+        ml8_fp8_unpack_kernel<<<grid, block, 0, stream>>>(
+            (const uint8_t *) info.b_packed, info.b_scale, tmp, info.N, info.n_groups_k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(data, tmp + offset, size, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(tmp));
+}
+
+// get_rows over the packed layout: row n of the logical [N, K] weight is
+// column n of b_fp8 [K, N]. One block per output row, threads stride K.
+template <typename dst_t>
+static __global__ void ml8_fp8_packed_get_rows_kernel(
+    const uint8_t * __restrict__ b_fp8,     // (K, N)
+    const float   * __restrict__ b_scale,   // (K/32, N)
+    const int32_t * __restrict__ ids,
+    dst_t         * __restrict__ dst,
+    int K, int N,
+    int64_t ne10, int64_t ne11,
+    size_t nb10, size_t nb11, size_t nb12,
+    size_t nb1,  size_t nb2,  size_t nb3) {
+
+    const int64_t i10 = blockIdx.x;
+    const int64_t i11 = blockIdx.y;
+    const int64_t i12 = blockIdx.z;
+    if (i10 >= ne10 || i11 >= ne11) {
+        return;
+    }
+    const int32_t n = *(const int32_t *) ((const char *) ids + i10*nb10 + i11*nb11 + i12*nb12);
+    if (n < 0 || n >= N) {
+        return;
+    }
+    dst_t * out = (dst_t *) ((char *) dst + i10*nb1 + i11*nb2 + i12*nb3);
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        const float v = ggml_cuda_e4m3fn_to_fp32(b_fp8[(size_t) k * N + n]) * b_scale[(size_t) (k / QK_ML8_FP8) * N + n];
+        out[k] = ggml_cuda_cast<dst_t>(v);
+    }
+}
+
+bool ggml_cuda_ml8_inplace_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0->type != GGML_TYPE_ML8_FP8) {
+        return false;
+    }
+    ml8_weight_repack_t info;
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+        auto it = g_ml8_inplace.find(src0->data);
+        if (it == g_ml8_inplace.end() || !it->second.packed) {
+            return false;
+        }
+        info = it->second.info;
+    }
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(src1->ne[3] == 1);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+
+    const dim3 grid((unsigned) src1->ne[0], (unsigned) src1->ne[1], (unsigned) src1->ne[2]);
+    const dim3 block(256, 1, 1);
+    cudaStream_t stream = ctx.stream();
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            ml8_fp8_packed_get_rows_kernel<float><<<grid, block, 0, stream>>>(
+                (const uint8_t *) info.b_packed, info.b_scale, (const int32_t *) src1->data, (float *) dst->data,
+                info.K, info.N, src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[1], src1->nb[2],
+                dst->nb[1], dst->nb[2], dst->nb[3]);
+            break;
+        case GGML_TYPE_F16:
+            ml8_fp8_packed_get_rows_kernel<half><<<grid, block, 0, stream>>>(
+                (const uint8_t *) info.b_packed, info.b_scale, (const int32_t *) src1->data, (half *) dst->data,
+                info.K, info.N, src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[1], src1->nb[2],
+                dst->nb[1], dst->nb[2], dst->nb[3]);
+            break;
+        default:
+            GGML_ABORT("ml8_fp8 packed get_rows: unsupported dst type %s", ggml_type_name(dst->type));
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -556,9 +917,8 @@ static constexpr float ML8_ACT_SCALE_EPS = 1e-12f;
 // GEMV tile: BN output columns × K_COOP threads per column.
 // Block size = BN * K_COOP = 256 threads. 4-way K-cooperative reduction
 // per output column splits the K loop across 4 threads, then merges via
-// shared memory. The K-split must align to group boundaries (K_COOP must
-// divide n_groups_k cleanly; for QK_ML8=64 and our K values 2560/9216,
-// n_groups_k = 40/144 — both divisible by 4).
+// shared memory. Groups are strided over the K_COOP threads, so n_groups_k
+// need not divide evenly (TP K-slices do not).
 // G.6.h sweep: kernel is templated on <BN, K_COOP, USE_LDS_A, LAYOUT>.
 // Dispatch reads env vars ML8_GEMV_BN / ML8_GEMV_K_COOP / ML8_GEMV_LDS_A /
 // ML8_GEMV_LAYOUT and routes to the matching instantiation. After the
@@ -618,9 +978,10 @@ static __global__ void ml8_gemv_tpl(
     const int n_base = blockIdx.x * BN;
     const int n      = n_base + n_local;
 
-    const int groups_per_thread = n_groups_k / K_COOP;
-    const int g_start = k_part * groups_per_thread;
-    const int g_end   = g_start + groups_per_thread;
+    // K groups are strided across the K_COOP threads of a column so any
+    // n_groups_k is covered exactly once (a contiguous n_groups_k / K_COOP
+    // split silently dropped the remainder — TP K-slices such as 12544 or
+    // 4992 give 196 / 78 groups, and K=256 gives fewer groups than threads).
 
     // Optional LDS cache for activations.
     extern __shared__ float s_mem[];
@@ -634,7 +995,7 @@ static __global__ void ml8_gemv_tpl(
 
     float acc = 0.0f;
     if (n < N) {
-        for (int g = g_start; g < g_end; g++) {
+        for (int g = k_part; g < n_groups_k; g += K_COOP) {
             const float scale_gn = b_scale[g * N + n];
             const uint8_t * lut_g = lut + g * 16;
             const int k_base = g * 64;
@@ -1282,6 +1643,30 @@ static __global__ void ml8_get_rows_kernel(
     }
 }
 
+// Packed-layout sibling of ml8_get_rows_kernel: row n is column n of the
+// nibble matrix [K/2, N]; threads stride K.
+static __global__ void ml8_packed_get_rows_kernel(
+    const uint8_t * __restrict__ b_packed,  // (K/2, N)
+    const float   * __restrict__ b_scale,   // (n_groups_k, N)
+    const uint8_t * __restrict__ lut,       // [n_groups_k, 16]
+    const int32_t * __restrict__ ids,
+    float         * __restrict__ y,         // [nr, K]
+    int K, int N, int n_groups_k, int64_t nr) {
+
+    const int64_t i = blockIdx.x;
+    if (i >= nr) return;
+    const int32_t row = ids[i];
+    const int32_t n   = (row >= 0 && row < N) ? row : 0;
+    float * y_row = y + i * (int64_t) K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        const int     g    = k / QK_ML8;
+        const uint8_t byte = b_packed[(size_t) (k / 2) * (size_t) N + (size_t) n];
+        const uint8_t idx  = (k & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+        y_row[k] = ml8_fp8_e4m3_to_fp32(lut[(int64_t) g * 16 + idx]) * b_scale[(size_t) g * (size_t) N + (size_t) n];
+    }
+    GGML_UNUSED(n_groups_k);
+}
+
 void ggml_cuda_op_ml8_get_rows(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst) {
@@ -1322,6 +1707,25 @@ void ggml_cuda_op_ml8_get_rows(
 
     const int threads = (n_groups_k < 256) ? ((n_groups_k + 31) / 32) * 32 : 256;
     const dim3 grid((unsigned) nr);
+
+    {
+        // In-place packed weight (kernel layout) -> gather from the packed form.
+        ml8_weight_repack_t info;
+        bool packed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+            auto it = g_ml8_inplace.find(w->data);
+            if (it != g_ml8_inplace.end() && it->second.packed) {
+                info = it->second.info; packed = true;
+            }
+        }
+        if (packed) {
+            ml8_packed_get_rows_kernel<<<grid, dim3(256), 0, stream>>>(
+                (const uint8_t *) info.b_packed, info.b_scale, lut_d, ids_d, y_d, K, N, n_groups_k, nr);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     ml8_get_rows_kernel<<<grid, dim3(threads > 0 ? threads : 32), 0, stream>>>(
         w_d, lut_d, ids_d, y_d, K, N, n_groups_k, nr);
 }
@@ -1434,6 +1838,13 @@ void ggml_cuda_op_ml8_fp8_mul_mat(
     args.stride_lut_k      = 0;
 
     const hipError_t gemm_rc = mt_ml8_gemm(stream, &args);
+    if (gemm_rc != hipSuccess) {
+        const mt_ml8_tuned_cfg cfg = ml8_pick_config(M_pad, K, N);
+        fprintf(stderr, "[ml8-fp8] mt_ml8_gemm failed: %s (M=%d M_pad=%d K=%d N=%d w=%s cfg bm=%d bn=%d gsm=%d nw=%d)\n",
+                hipGetErrorString(gemm_rc), (int) M, (int) M_pad, (int) K, (int) N, w->name,
+                cfg.bm, cfg.bn, cfg.gsm, cfg.nw);
+        fflush(stderr);
+    }
     GGML_ASSERT(gemm_rc == hipSuccess && "mt_ml8_gemm (fp8 WF=0) dispatch failed");
 
     // ── 5. Convert first M rows of bf16 [M_pad, N] → fp32 [M, N] into dst.

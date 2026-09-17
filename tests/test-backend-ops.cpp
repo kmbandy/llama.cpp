@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-ml8.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2378,6 +2379,67 @@ struct test_get_rows : public test_case {
                     data[i] = rand() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_ML8_MUL_MAT (ml8-4 weight + F8_E4M3 centroid LUT sidecar). The
+// weight and LUT are filled with raw bytes (any nibble/e4m3 pattern is a valid
+// ml8-4 tensor), so CPU and HIP read the same codebook; HIP additionally
+// exercises the load-time in-place repack (set_tensor -> kernel layout).
+struct test_ml8_mul_mat : public test_case {
+    const int64_t m; // N (out features)
+    const int64_t n; // M (tokens)
+    const int64_t k; // K (in features), multiple of 64
+
+    std::string vars() override {
+        return VARS_TO_STR3(m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-3; // fp8 activations + bf16 output on the HIP path
+    }
+
+    test_ml8_mul_mat(int64_t m = 64, int64_t n = 16, int64_t k = 256) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_ML8_4, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * cent = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, k / 64);
+        ggml_set_name(cent, "centroids");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_ml8_mul_mat(ctx, w, cent, x);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_ML8_4) {
+                // {float scale; uint8_t qs[32]} blocks: scale in [0.5, 1.5], random nibbles.
+                const size_t nbytes = ggml_nbytes(t);
+                std::vector<uint8_t> data(nbytes);
+                const size_t nblk = nbytes / 36;
+                for (size_t b = 0; b < nblk; b++) {
+                    const float scale = 0.5f + (float) (rand() % 1000) / 1000.0f;
+                    memcpy(data.data() + b * 36, &scale, sizeof(float));
+                    for (int j = 0; j < 32; j++) {
+                        data[b * 36 + 4 + j] = (uint8_t) (rand() & 0xFF);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, nbytes);
+            } else if (t->type == GGML_TYPE_F8_E4M3) {
+                // e4m3fn bytes with exponent <= 7 (no NaN encodings, realistic magnitudes), either sign.
+                const size_t nbytes = ggml_nbytes(t);
+                std::vector<uint8_t> data(nbytes);
+                for (size_t i = 0; i < nbytes; i++) {
+                    data[i] = (uint8_t) ((rand() & 0x80) | (rand() % 0x40)); // magnitude <= 1.875 like real centroids
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, nbytes);
             } else {
                 init_tensor_uniform(t);
             }
@@ -9649,6 +9711,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // A larger K/N shape to exercise multiple K-groups and N-tiles.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_ML8_FP8, GGML_TYPE_F32,
         /*m=N*/ 256, /*n=M*/ 16, /*k=K*/ 512, {1, 1}, {1, 1}));
+
+    // ml8-4 LUT GEMM (GGML_OP_ML8_MUL_MAT): decode + prefill tiers, multi-group K.
+    for (int M : { 1, 8, 16, 32 }) {
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 64, /*n=M*/ M, /*k=K*/ 256));
+    }
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 256, /*n=M*/ 16, /*k=K*/ 512));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {

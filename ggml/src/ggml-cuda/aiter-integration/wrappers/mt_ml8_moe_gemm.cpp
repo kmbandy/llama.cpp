@@ -167,6 +167,7 @@ std::string build_signature_moe(const mt_ml8_moe_gemm_shape_t & s) {
 
 struct CachedHandle {
     mt_ml8_moe_gemm_shape_t     shape       = {};
+    int                         device      = -1;   // hipModule handles are per device
     const aiter::KernelHandle * handle      = nullptr;
     bool                        initialized = false;
     hipError_t                  init_err    = hipSuccess;
@@ -182,13 +183,16 @@ std::vector<CachedHandle> & get_cache() {
 }
 
 CachedHandle * find_or_alloc(const mt_ml8_moe_gemm_shape_t & shape) {
+    int dev = 0;
+    (void) hipGetDevice(&dev);
     auto & cache = get_cache();
     for (auto & c : cache) {
-        if (std::memcmp(&c.shape, &shape, sizeof(shape)) == 0) {
+        if (c.device == dev && std::memcmp(&c.shape, &shape, sizeof(shape)) == 0) {
             return &c;
         }
     }
     cache.emplace_back();
+    cache.back().device = dev;
     return &cache.back();
 }
 

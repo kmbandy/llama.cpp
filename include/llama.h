@@ -158,6 +158,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ML8_FP8       = 45, // scaled-fp8 weights (aiter FP8-WMMA GEMM on RDNA4); token_embd stays Q8_0
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

@@ -139,6 +139,8 @@ struct ShapeKey {
     int32_t N, K, group_size, n_centroids;
     int32_t weight_format;  // 0=fp8 baseline, 1=ml8-4 LUT — different b_ptr dtype
     int32_t prefill;        // 0=decode (M<=16), 1=prefill (M>16) — tuned configs differ
+    int32_t device;         // hipModule handles are per device (TP runs the same
+                            // shape on every GPU; the registry keys by device too)
 };
 struct ShapeKeyHash {
     size_t operator()(const ShapeKey & k) const noexcept {
@@ -150,6 +152,7 @@ struct ShapeKeyHash {
         mix((uint64_t) k.n_centroids);
         mix((uint64_t) k.weight_format);
         mix((uint64_t) k.prefill);
+        mix((uint64_t) k.device);
         return (size_t) h;
     }
 };
@@ -157,7 +160,7 @@ struct ShapeKeyEq {
     bool operator()(const ShapeKey & a, const ShapeKey & b) const noexcept {
         return a.N == b.N && a.K == b.K && a.group_size == b.group_size
             && a.n_centroids == b.n_centroids && a.weight_format == b.weight_format
-            && a.prefill == b.prefill;
+            && a.prefill == b.prefill && a.device == b.device;
     }
 };
 
@@ -173,8 +176,10 @@ std::mutex & get_cache_mutex() {
 }
 
 static ShapeKey shape_to_key(const mt_ml8_gemm_shape_t & s, int32_t M) {
+    int dev = 0;
+    (void) hipGetDevice(&dev);
     return ShapeKey { s.N, s.K, s.group_size, s.n_centroids,
-                      s.weight_format, (M > 16) ? 1 : 0 };
+                      s.weight_format, (M > 16) ? 1 : 0, dev };
 }
 
 // Returns the cached handle for (shape, M-tier), JIT-compiling on first sight.
