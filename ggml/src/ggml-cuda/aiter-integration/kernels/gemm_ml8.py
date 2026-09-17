@@ -466,31 +466,30 @@ def _gemm_a8w8_blockscale_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+# LOCAL PATCH #6 (FP8_B128 phase 2): same treatment as LOCAL PATCH #3/#4/#5
+# applied to _gemm_a8w8_blockscale_kernel above, for the same reason —
+# the runtime-AOT signature parser (Triton's ASTSource path,
+# compile_aiter_kernel.py) cannot handle a @triton.heuristics-wrapped
+# JITFunction or a string constexpr (cache_modifier). Reason this kernel
+# was untouched until now: it was vendored but unused (Phase A/B/C only
+# dispatched the non-preshuffle kernel); FP8_B128 phase 2 is its first
+# runtime-AOT caller (mt_fp8_b128_gemm.cpp).
+#   - @triton.heuristics removed: EVEN_K and GRID_MN are now plain runtime
+#     args, computed by the C++ caller (mt_fp8_b128_gemm.cpp) exactly as
+#     the lambdas here did (K % BLOCK_SIZE_K == 0; cdiv(M,BM)*cdiv(N,BN)).
+#   - cache_modifier constexpr str arg removed; the b_ptrs tl.load below
+#     uses the default (no cache hint), same behavior every existing call
+#     site passed ("").
+#   - config_keys emptied (LOCAL PATCH #5 rationale): the HSACO's embedded
+#     kernel symbol must equal the plain kernel name our C++ launcher looks
+#     up (see compile_aiter_kernel.py); a repr with constexpr suffixes
+#     would mismatch it the same way patch #5 avoided for the other kernel.
 _gemm_a8w8_blockscale_preshuffle_repr = make_kernel_repr(
     "_gemm_a8w8_blockscale_preshuffle_kernel",
-    [
-        "GROUP_K",
-        "GROUP_N",
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
-        "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
-        "EVEN_K",
-        "GRID_MN",
-        "cache_modifier",
-    ],
+    [],  # was: [GROUP_K, GROUP_N, BLOCK_SIZE_M, ...] — pre-Patch #6 list
 )
 
 
-@triton.heuristics(
-    {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
-    }
-)
 @triton.jit(repr=_gemm_a8w8_blockscale_preshuffle_repr)
 def _gemm_a8w8_blockscale_preshuffle_kernel(
     # Pointers to matrices
@@ -527,9 +526,14 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
     GROUP_SIZE_M: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
+    # LOCAL PATCH #6: EVEN_K / GRID_MN are now plain runtime-computed
+    # constexpr args passed explicitly by the caller (previously
+    # @triton.heuristics-computed — see patch note above).
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    # LOCAL PATCH #6: `cache_modifier` arg removed (see LOCAL PATCH #4 on
+    # the non-preshuffle kernel above for the same rationale). The
+    # b_ptrs tl.load below drops the cache_modifier= kwarg entirely.
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -628,7 +632,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
             # If it is out of bounds, set it to 0.
             if EVEN_K:
                 a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                b = tl.load(b_ptrs)  # LOCAL PATCH #6: cache_modifier removed (AOT compat)
             else:
                 a = tl.load(
                     a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0

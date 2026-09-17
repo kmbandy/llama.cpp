@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-ml8.h" // GGML_FP8_QUANT_ROT_KIND_* (FP8_B128 phase 2, see handle_fp8_quant_rot below)
 
 #include <algorithm>
 #include <atomic>
@@ -861,6 +862,114 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             tensor->name, tensor->src[0]->name, (int) src_ss[0].axis);
     };
 
+    // GGML_OP_FP8_QUANT_ROT (FP8_B128 phase 2, "meta backend tensor-parallel rules", 2026-09-17).
+    // ggml_fp8_quant_rot (ggml-ml8.c): fused activation rotate + block-128 fp8 quantize. src[0] is
+    // the activation x (F32); src[1] is the Kronecker factor h_a (F32 [a,a]) or nullptr;
+    // op_params[0]/[1]/[2] carry (a_dim, b_dim, kind) with kind 0 = none (per-element
+    // copy+quantize), 1 = kronecker, 2 = block_hadamard.
+    //
+    // This follows GGML_OP_ML8_APPLY_ROTATION's split rules EXACTLY (same rotation math, same
+    // per-kind locality) even though, unlike ML8_APPLY_ROTATION, the dst tensor here is NOT
+    // src[0]'s ne[] verbatim -- it is I8 [K + K/32, n1, n2, n3] (K/128 fp32 scale bytes appended
+    // per row). Returning src_ss[0] as-is (same axis, same per-device ne) is still correct: the
+    // generic epilogue below (the "take over ratio from src" block) recomputes
+    // split_state.ne[j] by scaling src[0]'s per-device ne (K_local) by
+    // tensor->ne[axis]/src[0]->ne[axis] == (K + K/32)/K, i.e. split_state.ne[j] becomes
+    // K_local * (K + K/32) / K. Because K_local % 32 == 0 (K % 128 == 0 is a hard constraint on
+    // this op, and any K-split boundary is itself a multiple of 128 -- see get_split_granularity
+    // and the 128-alignment enforced below for FP8_B128 weights), that arithmetic is exact and
+    // yields precisely K_local + K_local/32: the per-device dst ne0 is derived from the
+    // per-device SRC ne0, not from a naive proportional split of dst->ne[0] against the
+    // (K + K/32)-wide WORLD dst, which would not equal K_local + K_local/32 in general (it does
+    // here only because the epilogue's scaling factor is applied to src's ne, not dst's).
+    //   - kronecker (kind 1): mixes across the WHOLE of ne[0], so it is only well-defined when
+    //     every device already holds x in full (src[0] MIRRORED); h_a is MIRRORED too.
+    //   - block_hadamard (kind 2): independent per b_dim-wide (128) block, so it is purely local
+    //     to each block and a K-split (AXIS_0) x is fine -- that is the whole point of this
+    //     variant. op_params[0] (a_dim) is rederived per device from the LOCAL K
+    //     (K_local / b_dim) in the per-device op_params fixup in
+    //     ggml_backend_meta_buffer_init_tensor_impl, exactly like ML8_APPLY_ROTATION's.
+    //   - kind 0 (no rotation) is likewise purely per-element/per-group, so K-split is fine too
+    //     and needs no a_dim fixup (a_dim/b_dim are unused by the kind-0 compute path).
+    //   - a kronecker rotation fed a split x, or any split axis other than MIRRORED/AXIS_0, is a
+    //     graph-construction bug (the registry should never emit that combination) -- abort
+    //     loudly naming the tensor rather than silently rotate/quantize the wrong slice.
+    auto handle_fp8_quant_rot = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        const int32_t kind = ggml_get_op_params_i32(tensor, 2);
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(tensor->src[1] == nullptr || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return src_ss[0];
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
+                GGML_ABORT("FP8_QUANT_ROT %s: activation %s is K-split (AXIS_0) but kind is KRONECKER -- "
+                    "kronecker rotation mixes across the whole K dimension and requires a MIRRORED "
+                    "activation; only kind NONE/BLOCK_HADAMARD may run on a K-split activation",
+                    tensor->name, tensor->src[0]->name);
+            }
+            GGML_ASSERT(tensor->src[1] == nullptr &&
+                "FP8_QUANT_ROT: h_a must be NULL for kind NONE/BLOCK_HADAMARD");
+            return src_ss[0];
+        }
+        GGML_ABORT("FP8_QUANT_ROT %s: unsupported split state for activation %s (axis=%d) -- "
+            "expected MIRRORED (kronecker) or AXIS_0 (none/block_hadamard)",
+            tensor->name, tensor->src[0]->name, (int) src_ss[0].axis);
+    };
+
+    // GGML_OP_FP8_MUL_MAT (FP8_B128 phase 2). ggml_fp8_mul_mat (ggml-ml8.c): src[0] = w
+    // (GGML_TYPE_FP8_B128, [K, N]), src[1] = a (GGML_TYPE_I8, [K + K/32, n1, n2, n3], the packed
+    // output of GGML_OP_FP8_QUANT_ROT). dst = F32 [N, n1, n2, n3]. Same slot roles as
+    // GGML_OP_MUL_MAT (src[0] weight, src[1] activation) and the same split rules:
+    //   - N-split weight (AXIS_1, e.g. attn_qkv/attn_gate/ffn_gate/ffn_up/output) with a
+    //     MIRRORED (or replicated) activation -> dst split on AXIS_0 (each device produces its
+    //     own N-slice of the output; no reduce needed).
+    //   - K-split weight (AXIS_0, e.g. attn_output/ssm_out/ffn_down) -> the activation MUST be
+    //     the K-split QUANT_ROT output, i.e. also AXIS_0 with per-device ne0 == this device's
+    //     w-slice ne0 + w-slice ne0/32 (asserted below); dst is PARTIAL (accumulate via
+    //     AllReduce), matching plain MUL_MAT's K-split rule exactly.
+    //   - Token-split activations (weight MIRRORED, activation split on a token/batch axis) and
+    //     the fully-MIRRORED (single-device / no TP) case follow MUL_MAT's existing behaviour
+    //     unchanged.
+    auto handle_fp8_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        // N-split weight, replicated activation -> dst split on axis 0.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            ggml_backend_meta_split_state ret = src_ss[0];
+            ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+            ret.nr[0] = 1;
+            ret.n_segments = 1;
+            return ret;
+        }
+        // Replicated weight, token-split activation (MUL_MAT's existing behaviour).
+        if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[1];
+        }
+        // K-split weight x K-split (packed) activation -> PARTIAL, reduced via AllReduce.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            const size_t n_bufs_local = ggml_backend_meta_buffer_n_world(tensor->buffer);
+            for (size_t j = 0; j < n_bufs_local; j++) {
+                const int64_t w_local = src_ss[0].ne[j];
+                const int64_t a_local = src_ss[1].ne[j];
+                GGML_ASSERT(a_local == w_local + w_local / 32 &&
+                    "FP8_MUL_MAT: K-split activation's per-device packed width must be "
+                    "this device's w-slice K_local + K_local/32 (the QUANT_ROT packing on the "
+                    "SAME K-split as the weight)");
+            }
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // Batched matmul: batches split identically on both sides (rare for a 2D FP8_B128
+        // weight, kept for symmetry with handle_mul_mat).
+        if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[0].axis < GGML_MAX_DIMS) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            return src_ss[0];
+        }
+        GGML_ABORT("unsupported fp8_mul_mat split states: node=%s src0=%s axis=%d src1=%s axis=%d",
+            tensor->name, tensor->src[0]->name, (int) src_ss[0].axis, tensor->src[1]->name, (int) src_ss[1].axis);
+    };
+
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -1220,7 +1329,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
             if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
-                const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
+                // FP8_B128 (block_fp8_b128, blck_size 128, type_size 130 -- see ggml.h) packs a
+                // 128x128 tile scale shared across 128 CONSECUTIVE rows (the N dimension, axis 1)
+                // as well as 128 CONSECUTIVE columns (the K dimension, axis 0, which is already
+                // what ggml_blck_size enforces below for any quantized type). A loader that split
+                // N at a non-128 boundary would hand two devices halves of the same tile, and the
+                // in-place CUDA packer (which reads the shared scale from row
+                // 128*(n/128) of the WORLD tensor) would read across a device boundary or read a
+                // scale that does not belong to the rows this device actually owns. Pin BOTH axes
+                // to 128 for this type so a bad N-split (get_split_granularity's job, src/llama-*)
+                // aborts here instead of silently corrupting tile scales.
+                const int64_t granularity = tensor->type == GGML_TYPE_FP8_B128 ? 128
+                    : (ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1);
                 int64_t ne_sum = 0;
                 for (size_t s = 0; s < ret.n_segments; s++) {
                     for (size_t j = 0; j < n_bufs; j++) {
@@ -1433,6 +1553,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_ML8_APPLY_ROTATION: {
                 split_state = handle_ml8_apply_rotation(src_ss);
+            } break;
+            case GGML_OP_FP8_QUANT_ROT: {
+                split_state = handle_fp8_quant_rot(src_ss);
+            } break;
+            case GGML_OP_FP8_MUL_MAT: {
+                split_state = handle_fp8_mul_mat(src_ss);
             } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
@@ -1795,6 +1921,25 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     "ML8_APPLY_ROTATION: this device's local K slice is not a whole multiple of b_dim");
                 const int32_t a_dim_local = (int32_t) (t_ij->src[0]->ne[0] / b_dim);
                 memcpy((char *) t_ij->op_params, &a_dim_local, sizeof(int32_t));
+            } break;
+            case GGML_OP_FP8_QUANT_ROT: {
+                // op_params[0] is a_dim, op_params[1] is b_dim, op_params[2] is kind (ggml_fp8_quant_rot,
+                // ggml-ml8.c). Same rederivation as ML8_APPLY_ROTATION above, but only for kind
+                // BLOCK_HADAMARD: that is the only kind handle_fp8_quant_rot allows on a K-split (AXIS_0)
+                // activation (kind KRONECKER is asserted MIRRORED-only there, and kind NONE does not read
+                // a_dim/b_dim at all -- see ggml_compute_forward_fp8_quant_rot). For kind BLOCK_HADAMARD,
+                // a_dim*b_dim must equal src[0]'s LOCAL ne[0]; b_dim (the fixed 128-wide Hadamard block)
+                // never changes, and the K-split boundary is guaranteed 128-aligned (enforced on FP8_B128
+                // weight splits below), so the division is always exact. Kind MIRRORED (whole-K) case needs
+                // no fixup since local ne[0] == world ne[0] already.
+                const int32_t kind = ((const int32_t *) t_ij->op_params)[2];
+                if (kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD) {
+                    const int32_t b_dim = ((const int32_t *) t_ij->op_params)[1];
+                    GGML_ASSERT(t_ij->src[0]->ne[0] % b_dim == 0 &&
+                        "FP8_QUANT_ROT: this device's local K slice is not a whole multiple of b_dim");
+                    const int32_t a_dim_local = (int32_t) (t_ij->src[0]->ne[0] / b_dim);
+                    memcpy((char *) t_ij->op_params, &a_dim_local, sizeof(int32_t));
+                }
             } break;
             default: break;
         }

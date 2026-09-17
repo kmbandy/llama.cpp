@@ -2524,6 +2524,99 @@ struct test_fp8_quant_rot : public test_case {
         ggml_set_name(out, "out");
         return out;
     }
+
+    // kind NONE does no rotation: both backends must apply the exact same
+    // scale/round arithmetic to the exact same fp32 input, so the packed I8
+    // output is expected to be byte-identical -- keep the base class's
+    // default nmse-over-raw-bytes comparison (max_nmse_err() == 1e-7).
+    //
+    // kind KRONECKER/BLOCK_HADAMARD do rotate first: the GPU applies the
+    // FWHT as a butterfly network while the CPU reference walks it serially
+    // (ml8_rotate_row_cpu), so the two accumulate the same mathematical sum
+    // in a different fp32 operation order. That is a legitimate, expected
+    // source of last-bit differences in the rotated fp32 values feeding the
+    // quantizer -- comparing raw quantized bytes rejects those (a value
+    // sitting right at an e4m3 rounding boundary can quantize to an
+    // adjacent code), even though both backends round correctly. Comparing
+    // a second FP8_MUL_MAT against an identity-like FP8_B128 weight would
+    // work but adds an entire unrelated op (and its own quantization noise)
+    // to what is supposed to be a QUANT_ROT test; the actually clean fix is
+    // to just dequantize (qs[i] * group_scale) each backend's own I8 output
+    // in the test and nmse-compare the fp32 values, which is what the
+    // rotation-then-mul_mat idea was really trying to get to.
+    static float e4m3_to_f32_for_cmp(uint8_t b) {
+        const uint32_t s = (b >> 7) & 1u;
+        const uint32_t e = (b >> 3) & 0xFu;
+        const uint32_t m = b & 0x7u;
+        uint32_t bits;
+        if (e == 0 && m == 0) {
+            bits = s << 31;
+        } else if (e == 15 && m == 7) {
+            bits = (s << 31) | (0xFFu << 23) | (1u << 22); // NaN
+        } else if (e == 0) {
+            const int lead = (m >= 4) ? 2 : (m >= 2) ? 1 : 0;
+            const uint32_t mant_norm = (m << (3 - lead)) & 0x7u;
+            const int exp_un = -6 - (2 - lead);
+            const uint32_t exp_fp32 = (uint32_t) (exp_un + 127);
+            bits = (s << 31) | (exp_fp32 << 23) | (mant_norm << 20);
+        } else {
+            const uint32_t exp_fp32 = e + 120u;
+            bits = (s << 31) | (exp_fp32 << 23) | (m << 20);
+        }
+        float f;
+        memcpy(&f, &bits, 4);
+        return f;
+    }
+
+    double max_nmse_err() override {
+        if (kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+            return test_case::max_nmse_err();
+        }
+        // Dequantized-value comparison: only rounding-boundary flips from the
+        // FWHT's different fp32 operation order should show up here.
+        return 1e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+            return test_case::err(a, b, n);
+        }
+
+        const int64_t d         = a_dim * b_dim;
+        const int64_t n_groups  = d / 128;
+        const int64_t row_out   = d + n_groups * (int64_t) sizeof(float);
+        if ((int64_t) n % row_out != 0) {
+            // not the packed output (the harness also compares its sentinel nodes)
+            return test_case::err(a, b, n);
+        }
+        const int64_t n_rows    = (int64_t) n / row_out;
+
+        // a/b are tensor_to_float()'s output for a GGML_TYPE_I8 tensor: each
+        // entry is one packed byte reinterpreted as (float)(int8_t)byte, in
+        // row-major memory order -- i.e. exactly the on-wire row layout
+        // (K e4m3 bytes, then K/128 little-endian fp32 group scales).
+        auto decode_row = [&](const float * row_bytes, float * out) {
+            for (int64_t g = 0; g < n_groups; g++) {
+                uint8_t sbytes[4];
+                for (int j = 0; j < 4; j++) {
+                    sbytes[j] = (uint8_t) (int8_t) (int) row_bytes[d + g * 4 + j];
+                }
+                float scale;
+                memcpy(&scale, sbytes, 4);
+                for (int i = 0; i < 128; i++) {
+                    const uint8_t qb = (uint8_t) (int8_t) (int) row_bytes[g * 128 + i];
+                    out[g * 128 + i] = e4m3_to_f32_for_cmp(qb) * scale;
+                }
+            }
+        };
+
+        std::vector<float> da((size_t) n_rows * d), db((size_t) n_rows * d);
+        for (int64_t r = 0; r < n_rows; r++) {
+            decode_row(a + r * row_out, da.data() + r * d);
+            decode_row(b + r * row_out, db.data() + r * d);
+        }
+        return nmse(da.data(), db.data(), da.size());
+    }
 };
 
 // GGML_OP_FP8_MUL_MAT (FP8_B128 phase 2) — block-128 fp8 weight x packed-fp8
@@ -2560,6 +2653,31 @@ struct test_fp8_mul_mat : public test_case {
         ggml_tensor * out = ggml_fp8_mul_mat(ctx, w, qrot);
         ggml_set_name(out, "out");
         return out;
+    }
+
+    // Enforce the converter's tile invariant on the harness-quantized weight:
+    // every block_fp8_b128 in an aligned 128x128 tile carries the scale of the
+    // tile's first row. The HIP packer dedups the scale table from row
+    // tile_n*128, so without this the two backends would legitimately compute
+    // different products. Same bytes are uploaded to both backends.
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            if (t->type != GGML_TYPE_FP8_B128) {
+                continue;
+            }
+            const size_t row_size = ggml_row_size(t->type, t->ne[0]);
+            const int64_t n_blk   = t->ne[0] / 128;
+            std::vector<uint8_t> buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+            for (int64_t r = 0; r < t->ne[1]; r++) {
+                const int64_t r0 = (r / 128) * 128;
+                for (int64_t b = 0; b < n_blk; b++) {
+                    memcpy(buf.data() + r*row_size + b*130, buf.data() + r0*row_size + b*130, sizeof(ggml_fp16_t));
+                }
+            }
+            ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+        }
     }
 };
 

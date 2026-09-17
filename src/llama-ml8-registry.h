@@ -18,6 +18,8 @@
 #include "ggml.h"
 #include "ggml-ml8.h"
 
+#include <cstdint>
+#include <functional>
 #include <unordered_map>
 
 // ─── sidecar struct ──────────────────────────────────────────────────────────
@@ -28,13 +30,14 @@
 struct ml8_sidecars {
     // [16, n_groups_k] GGML_TYPE_F8_E4M3 — per-K-group centroid LUT.
     // Required for ML8_4 matmul; nullptr means the ml8 path is unavailable.
-    // Always nullptr for ML8_FP8 (the FP8 GEMM has no LUT — see ml8.cuh's
-    // ggml_cuda_op_ml8_fp8_mul_mat).
+    // Always nullptr for ML8_FP8 and FP8_B128 (neither GEMM has a LUT — see
+    // ml8.cuh's ggml_cuda_op_ml8_fp8_mul_mat and the FP8_B128 phase 2 design).
     struct ggml_tensor * centroids    = nullptr;
 
     // [a_dim, a_dim] GGML_TYPE_F32 — kronecker_orth_sylvester rotation factor
     // H_a. Optional. When non-null, ggml_ml8_apply_rotation(..., h_a, a, b)
-    // is applied to x before matmul, with a = rotation_h_a->ne[0].
+    // (ML8_FP8) or ggml_fp8_quant_rot(..., h_a, a, b, KIND_KRONECKER)
+    // (FP8_B128) is applied to x before matmul, with a = rotation_h_a->ne[0].
     struct ggml_tensor * rotation_h_a = nullptr;
 
     // Elementwise AWQ scale tensor (broadcastable over x's leading dim).
@@ -77,6 +80,49 @@ private:
     std::unordered_map<const struct ggml_tensor *, ml8_sidecars> entries;
 };
 
+// ─── FP8_B128 quant-rot memo ─────────────────────────────────────────────────
+
+// FP8_B128 phase 2: every weight in an "input group" (e.g. {attn_qkv,
+// attn_gate}, {ffn_gate, ffn_up}) consumes the SAME activation tensor and,
+// per the converter invariant, was rotated with the SAME rotation — so the
+// fused rotate+quantize (GGML_OP_FP8_QUANT_ROT) only needs to be computed
+// once per graph build and shared by every mul_mat of the group. This key
+// identifies "the same quant_rot call" — two calls with an identical key
+// produce byte-identical output, so the second is served from the memo
+// instead of emitting a duplicate graph node.
+//
+// The memo itself (an instance of fp8_qrot_memo below) is owned by the
+// caller (llm_graph_context — see llama-graph.h) and MUST be reset once per
+// graph build: llama_model::build_graph constructs a fresh
+// unique_ptr<llm_graph_context> for every build, so a plain non-static
+// member there resets itself automatically. Do not make this map static or
+// hang it off the (long-lived, per-model) ml8_registry — that would leak
+// stale tensor pointers across graph builds.
+struct fp8_qrot_key {
+    const struct ggml_tensor * x   = nullptr; // the raw input tensor (pre-AWQ)
+    const struct ggml_tensor * h_a = nullptr; // nullptr for NONE/BLOCK_HADAMARD
+    int64_t a_dim = 0;
+    int64_t b_dim = 0;
+    int32_t kind  = 0;
+
+    bool operator==(const fp8_qrot_key & o) const {
+        return x == o.x && h_a == o.h_a && a_dim == o.a_dim && b_dim == o.b_dim && kind == o.kind;
+    }
+};
+
+struct fp8_qrot_key_hash {
+    size_t operator()(const fp8_qrot_key & k) const noexcept {
+        size_t h = std::hash<const void *>()(k.x);
+        h = h * 1000003u ^ std::hash<const void *>()(k.h_a);
+        h = h * 1000003u ^ std::hash<int64_t>()(k.a_dim);
+        h = h * 1000003u ^ std::hash<int64_t>()(k.b_dim);
+        h = h * 1000003u ^ std::hash<int32_t>()(k.kind);
+        return h;
+    }
+};
+
+using fp8_qrot_memo = std::unordered_map<fp8_qrot_key, struct ggml_tensor *, fp8_qrot_key_hash>;
+
 // ─── helper ──────────────────────────────────────────────────────────────────
 
 // Build a matmul graph node, dispatching to the ml8 path when appropriate.
@@ -95,12 +141,24 @@ private:
 //       Registry miss or a registry entry with no rotation info is a plain
 //       ggml_mul_mat(ctx, weight, x) — byte-identical to before this
 //       transform existed (backend auto-dispatches FP8 off src0->type).
+//   - GGML_TYPE_FP8_B128:
+//       Apply the optional AWQ scale (as today), then build/reuse (via
+//       `qrot_memo`, keyed by fp8_qrot_key on the ORIGINAL `x` — i.e. before
+//       AWQ) a single ggml_fp8_quant_rot node per input group, named
+//       "<weight>.qrot" the first time it's created, and return
+//       ggml_fp8_mul_mat(ctx, weight, qrot). A registry miss (no rotation
+//       sidecars) uses GGML_FP8_QUANT_ROT_KIND_NONE. `qrot_memo == nullptr`
+//       disables sharing (every call builds its own node) — used by the
+//       single-shot output-projection path in llama-context.cpp where there
+//       is only one weight and nothing to share with.
 //   - Any other type:
 //       return ggml_mul_mat(ctx, weight, x)
 //
-// This is a pure function over the registry — no global state.
+// This is a pure function over the registry (and, for FP8_B128, the caller-
+// supplied per-build memo) — no global state.
 struct ggml_tensor * build_ml8_or_mul_mat(
         struct ggml_context  * ctx,
         const ml8_registry   & reg,
         struct ggml_tensor   * weight,
-        struct ggml_tensor   * x);
+        struct ggml_tensor   * x,
+        fp8_qrot_memo        * qrot_memo = nullptr);

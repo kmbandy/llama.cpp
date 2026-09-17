@@ -60,20 +60,31 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    // ml8-4 / ml8-fp8 sidecar loader (MAD-223; MAD-266 extended to ML8_FP8).
-    // Reads the GGUF metadata for the rotation factor h_a so we can declare
-    // its (a, a) shape without baking the python factor_for_dim heuristic
-    // into C++. All sidecars are TENSOR_NOT_REQUIRED: an ml8 weight without
-    // rotation/awq still loads cleanly.
+    // Any weight type that can carry the ml8 calibration sidecars
+    // (centroids/awq_scale/rotation_h_a/rotation_meta): ML8_4, ML8_FP8, and
+    // (2026-09-17 FP8_B128 phase 2) FP8_B128. FP8_B128 reuses the exact same
+    // sidecar names/meta layout as ML8_FP8 (see the design doc referenced
+    // below) — the converter and the split-granularity regex in
+    // llama-model.cpp already treat them identically.
+    auto is_ml8_sidecar_weight = [](const struct ggml_tensor * w) {
+        return w && (w->type == GGML_TYPE_ML8_4 || w->type == GGML_TYPE_ML8_FP8 || w->type == GGML_TYPE_FP8_B128);
+    };
+
+    // ml8-4 / ml8-fp8 / fp8_b128 sidecar loader (MAD-223; MAD-266 extended to
+    // ML8_FP8; 2026-09-17 extended to FP8_B128). Reads the GGUF metadata for
+    // the rotation factor h_a so we can declare its (a, a) shape without
+    // baking the python factor_for_dim heuristic into C++. All sidecars are
+    // TENSOR_NOT_REQUIRED: an ml8 weight without rotation/awq still loads
+    // cleanly.
     //
     // centroids/awq_scale stay ML8_4-only (the ml8-4 LUT dequant path and its
     // AWQ pre-scale have no FP8 counterpart — see design note in
-    // llama-ml8-registry.h). rotation_h_a/rotation_meta are created for
-    // either type: ML8_FP8 needs them for the tensor-parallel K-split
-    // rotation (kronecker if rotation_h_a is present, block_hadamard if only
-    // rotation_meta is present — h_a is optional for block_hadamard since
-    // Q = I_a ⊗ H_b has no H_a leg, so rotation_meta must be checked
-    // independently of rotation_h_a here).
+    // llama-ml8-registry.h). rotation_h_a/rotation_meta are created for any
+    // of the three types: ML8_FP8 and FP8_B128 both need them for the
+    // tensor-parallel K-split rotation (kronecker if rotation_h_a is
+    // present, block_hadamard if only rotation_meta is present — h_a is
+    // optional for block_hadamard since Q = I_a ⊗ H_b has no H_a leg, so
+    // rotation_meta must be checked independently of rotation_h_a here).
     auto load_ml8_sidecars = [&](
             struct ggml_tensor * weight,
             llm_tensor tensor_id,
@@ -83,7 +94,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             struct ggml_tensor ** out_rotation_h_a,
             struct ggml_tensor ** out_rotation_meta,
             struct ggml_tensor ** out_awq_scale) {
-        if (!weight || (weight->type != GGML_TYPE_ML8_4 && weight->type != GGML_TYPE_ML8_FP8)) {
+        if (!is_ml8_sidecar_weight(weight)) {
             return;
         }
         if (weight->type == GGML_TYPE_ML8_4) {
@@ -151,20 +162,21 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         sc.rotation_block_hadamard = (kind_id == GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD);
     };
 
-    // ml8-4 / ml8-fp8 registry registration (MAD-223 T13; MAD-266 extended to
-    // ML8_FP8). For a target weight that is ML8_4 or ML8_FP8, create its
-    // sidecars via load_ml8_sidecars and register the (weight → sidecars)
-    // mapping so build_lora_mm routes the base matmul through the ml8
-    // helper. Sidecar tensors are owned by the model's context (create_tensor
-    // tracks them for loading); the registry only holds their pointers.
-    // Guarded on ML8_4/ML8_FP8: any other type registers nothing for these
+    // ml8-4 / ml8-fp8 / fp8_b128 registry registration (MAD-223 T13; MAD-266
+    // extended to ML8_FP8; 2026-09-17 extended to FP8_B128). For a target
+    // weight of any of the three types, create its sidecars via
+    // load_ml8_sidecars and register the (weight → sidecars) mapping so
+    // build_lora_mm routes the base matmul through the ml8 helper. Sidecar
+    // tensors are owned by the model's context (create_tensor tracks them
+    // for loading); the registry only holds their pointers. Guarded on
+    // ML8_4/ML8_FP8/FP8_B128: any other type registers nothing for these
     // roles → registry miss → plain mul_mat, unchanged from before.
     //
     // k_dim is the weight's input feature count (ne[0] / K) — the same value
     // the weight's create_tensor used for its leading dim.
     auto register_ml8_weight = [&](struct ggml_tensor * weight,
                                    llm_tensor tensor_id, int il_, int64_t k_dim) {
-        if (!weight || (weight->type != GGML_TYPE_ML8_4 && weight->type != GGML_TYPE_ML8_FP8)) {
+        if (!is_ml8_sidecar_weight(weight)) {
             return;
         }
         struct ggml_tensor * centroids    = nullptr;
@@ -178,21 +190,24 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         ml8_reg.register_weight(weight, sc);
     };
 
-    // FFN gate/up/down registry registration, ML8_FP8 only (MAD-266). The
-    // ML8_4 FFN path is handled entirely inline in build_layer_ffn (direct
-    // field access on layer.ffn_*_centroids/rotation_h_a/awq_scale — see
-    // qwen35.cpp's build_layer_ffn), bypassing build_lora_mm/the registry
-    // altogether, so registering ML8_4 weights here would be dead weight.
-    // FP8 FFN weights have no such inline path — build_layer_ffn falls
-    // through to build_ffn()/build_lora_mm() for them — so this is the only
-    // place their rotation reaches build_ml8_or_mul_mat. Sidecar tensors are
+    // FFN gate/up/down registry registration, ML8_FP8 and FP8_B128 only
+    // (MAD-266; 2026-09-17 extended to FP8_B128). The ML8_4 FFN path is
+    // handled entirely inline in build_layer_ffn (direct field access on
+    // layer.ffn_*_centroids/rotation_h_a/awq_scale — see qwen35.cpp's
+    // build_layer_ffn), bypassing build_lora_mm/the registry altogether, so
+    // registering ML8_4 weights here would be dead weight. FP8-family FFN
+    // weights (ML8_FP8, FP8_B128) have no such inline path — build_layer_ffn
+    // falls through to build_ffn()/build_lora_mm() for them, and gate/up
+    // share the same activation `cur` there, so this is also where FP8_B128
+    // gate+up end up sharing one FP8_QUANT_ROT node via the per-build memo
+    // in build_lora_mm (see llama-ml8-registry.h). Sidecar tensors are
     // already created by load_ml8_sidecars (called just before this at every
     // call site); this only registers the (weight → sidecars) mapping.
     auto register_ffn_fp8 = [&](struct ggml_tensor * weight,
                                 struct ggml_tensor * rotation_h_a,
                                 struct ggml_tensor * rotation_meta,
                                 llm_tensor tensor_id, int il_) {
-        if (!weight || weight->type != GGML_TYPE_ML8_FP8) {
+        if (!weight || (weight->type != GGML_TYPE_ML8_FP8 && weight->type != GGML_TYPE_FP8_B128)) {
             return;
         }
         ml8_sidecars sc{ /*centroids=*/nullptr, rotation_h_a, /*awq_scale=*/nullptr };

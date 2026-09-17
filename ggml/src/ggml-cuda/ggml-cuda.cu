@@ -30,6 +30,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/ml8.cuh"
+#include "ggml-ml8.h"  // FP8_B128 phase 2: GGML_FP8_QUANT_ROT_KIND_* constants
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2877,6 +2878,31 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 }
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // FP8_B128 phase 2: the CUDA buffer interface opportunistically converts
+    // any in-place-eligible FP8_B128 weight into the AITER preshuffle layout
+    // as soon as it's uploaded (ggml_cuda_ml8_inplace_eligible + set_tensor),
+    // regardless of which op ends up consuming it. There is no dedicated
+    // FP8_B128 GEMM wired into this generic cuBLAS path (that's
+    // GGML_OP_FP8_MUL_MAT's job) -- this is only the plain-MUL_MAT dequant
+    // fallback (test-backend-ops' FP8_B128 correctness sweep, and any other
+    // caller that mat-muls an FP8_B128 tensor without going through the
+    // dedicated op). If the weight was already packed on upload, its bytes
+    // are the AITER-shuffled layout, not the on-disk block_fp8_b128 layout
+    // ggml_get_to_fp32/fp16_cuda's generic dequantizer expects. Mirror what
+    // getrows.cu already does for the identical reason: unpack once into a
+    // scratch on-disk-layout buffer and read that instead of the live
+    // (possibly packed) src0->data.
+    ggml_tensor src0_unpacked_storage;
+    void * fp8_b128_unpack_scratch = nullptr;
+    if (src0->type == GGML_TYPE_FP8_B128) {
+        fp8_b128_unpack_scratch = ggml_cuda_ml8_inplace_fp8_b128_unpack_to_device(ctx.stream(), src0);
+        if (fp8_b128_unpack_scratch != nullptr) {
+            src0_unpacked_storage = *src0;
+            src0_unpacked_storage.data = fp8_b128_unpack_scratch;
+            src0 = &src0_unpacked_storage;
+        }
+    }
+
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -2921,6 +2947,14 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             break;
         default:
             GGML_ABORT("fatal error");
+    }
+
+    if (fp8_b128_unpack_scratch != nullptr) {
+        // The dispatch above enqueued its dequant/convert + GEMM work on
+        // ctx.stream(); make sure it's done reading the scratch buffer
+        // before freeing it.
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        CUDA_CHECK(cudaFree(fp8_b128_unpack_scratch));
     }
 }
 
@@ -3866,6 +3900,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ML8_GET_ROWS:
             ggml_cuda_op_ml8_get_rows(ctx, dst);
+            break;
+        case GGML_OP_FP8_QUANT_ROT:
+            ggml_cuda_op_fp8_quant_rot(ctx, dst);
+            break;
+        case GGML_OP_FP8_MUL_MAT:
+            ggml_cuda_op_fp8_mul_mat(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -8279,11 +8319,68 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return true;
             } break;
         case GGML_OP_FP8_QUANT_ROT:
+            {
+                // FP8_B128 phase 2 design section 3(a)/4(c): fused rotate +
+                // block-128 quantize. Runs on any HIP device (the FWHT/H_a^T
+                // primitives it reuses from ML8_FP8/ML8_4 rotation are not
+                // RDNA4-specific); only the paired FP8_MUL_MAT is gated to
+                // gfx1201+AITER, so a mixed-arch build can still run
+                // FP8_QUANT_ROT everywhere but only dispatch the GEMM on the
+                // RDNA4 device (falls back to CPU mul_mat elsewhere).
+                const ggml_tensor * x   = op->src[0];
+                const ggml_tensor * h_a = op->src[1];
+                if (!x) return false;
+                if (x->type   != GGML_TYPE_F32) return false;
+                if (op->type  != GGML_TYPE_I8)  return false;
+                if (!ggml_is_contiguous(x))     return false;
+                if (x->nb[1] != (size_t) x->ne[0] * sizeof(float)) return false;
+                if (x->ne[0] % 128 != 0)        return false;
+                const int32_t * pp    = (const int32_t *) op->op_params;
+                const int32_t   a_dim = pp[0];
+                const int32_t   b_dim = pp[1];
+                const int32_t   kind  = pp[2];
+                if (kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+                    return h_a == nullptr;
+                }
+                if (b_dim < 16 || b_dim > 1024 || (b_dim & (b_dim - 1)) != 0) return false;
+                if (a_dim <= 0 || (int64_t) a_dim * (int64_t) b_dim != x->ne[0]) return false;
+                if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
+                    if (h_a == nullptr || h_a->type != GGML_TYPE_F32) return false;
+                    if (a_dim > 16) return false;  // ml8_h_a_left_multiply_kernel register array
+                    return h_a->ne[0] == a_dim && h_a->ne[1] == a_dim;
+                }
+                if (kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD) {
+                    return h_a == nullptr;
+                }
+                return false;
+            } break;
         case GGML_OP_FP8_MUL_MAT:
-            // FP8_B128 phase 2: no CUDA/HIP kernel yet (a later change adds
-            // the AITER preshuffle GEMM + quant_rot kernel on RDNA4). CPU
-            // handles both ops for now.
-            return false;
+            {
+                // FP8_B128 phase 2 design section 4(b): AITER preshuffle
+                // GEMM, RDNA4 + AITER only. N must be a multiple of 128 —
+                // tighter than the design note's "N%16==0": the packed
+                // weight's [K/128, N/128] scale table is only meaningful in
+                // whole 128-row N tiles (the design's own CONVERTER
+                // INVARIANT for FP8_B128 storage), so an N that isn't
+                // %128 has nowhere consistent to source a tile scale from.
+                // Such shapes (e.g. test-backend-ops' N=16 case) fall back
+                // to the CPU reference instead of aborting.
+#ifdef GGML_HIP_AITER
+                const ggml_tensor * w = op->src[0];
+                const ggml_tensor * a = op->src[1];
+                if (!w || !a) return false;
+                if (w->type   != GGML_TYPE_FP8_B128) return false;
+                if (a->type   != GGML_TYPE_I8)       return false;
+                if (op->type  != GGML_TYPE_F32)      return false;
+                if (w->ne[2] != 1 || w->ne[3] != 1)  return false;
+                if (w->ne[0] % 128 != 0)             return false;
+                if (w->ne[1] % 128 != 0)             return false;
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                return GGML_CUDA_CC_IS_RDNA4(cc);
+#else
+                return false;
+#endif
+            } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:

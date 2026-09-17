@@ -1816,7 +1816,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     // output-channel scale below are unchanged and compose with the ml8 path
     // (AWQ acts input-side, w_s output-side).
     ggml_tensor * res = ml8_reg
-        ? build_ml8_or_mul_mat(ctx0, *ml8_reg, w, cur)
+        ? build_ml8_or_mul_mat(ctx0, *ml8_reg, w, cur, &ml8_fp8b128_qrot_memo)
         : ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {

@@ -1651,7 +1651,9 @@ void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_REST
             if (m_e4m3 == 8) {
                 m_e4m3 = 0;
                 e_out += 1;
-                if (e_out >= 15) {
+                // Only e>15 overflows the finite range; e=15,m=0..6 (256..448)
+                // are valid (same rollover rule as ml8_fp32_to_e4m3 on HIP).
+                if (e_out > 15) {
                     y[i] = (uint8_t)((sign << 7) | (0xFu << 3) | 0x6u);
                     continue;
                 }

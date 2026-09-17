@@ -115,6 +115,8 @@ std::string KernelSpec::cache_key() const {
     std::string composite = source_path + "|" + kernel_name + "|" + target + "|" + signature
                           + "|W" + std::to_string(num_warps)
                           + "|S" + std::to_string(num_stages)
+                          + "|WPE" + std::to_string(waves_per_eu)
+                          + "|MNK" + std::to_string(matrix_instr_nonkdim)
                           + "|M" + std::to_string(file_mtime(source_path));
     return slug(kernel_name) + "__" + slug(target)
          + "__W" + std::to_string(num_warps) + "S" + std::to_string(num_stages)
@@ -263,6 +265,8 @@ bool Registry::ensure_on_disk(const std::string & cache_key, const KernelSpec & 
         << " --signature "   << shellq(spec.signature)
         << " --num-warps "   << spec.num_warps
         << " --num-stages "  << spec.num_stages
+        << " --waves-per-eu "          << spec.waves_per_eu
+        << " --matrix-instr-nonkdim "  << spec.matrix_instr_nonkdim
         << " --out-dir "     << shellq(artifact_dir.string())
         // Capture script stdout+stderr to a per-artifact log file. The C++
         // side reads this back on failure so we can diagnose without losing

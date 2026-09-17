@@ -9,6 +9,8 @@
 #include "ggml.h"
 #include "ggml-ml8.h"
 
+#include <string>
+
 // Apply the optional AWQ scale then the optional rotation to `x`, shared by
 // both the ML8_4 and ML8_FP8 dispatch branches below. Kind is picked by which
 // of rotation_h_a / rotation_block_hadamard is set (they're mutually
@@ -44,9 +46,60 @@ struct ggml_tensor * build_ml8_or_mul_mat(
         struct ggml_context  * ctx,
         const ml8_registry   & reg,
         struct ggml_tensor   * weight,
-        struct ggml_tensor   * x) {
+        struct ggml_tensor   * x,
+        fp8_qrot_memo        * qrot_memo) {
 
     const ml8_sidecars * sc = reg.find(weight);
+
+    if (weight->type == GGML_TYPE_FP8_B128) {
+        // AWQ acts on the raw activation, same as the ML8_4/ML8_FP8 paths
+        // above — apply it BEFORE building/looking up the quant_rot node.
+        // Not emitted by the fp8_b128 converter today (see the design doc),
+        // so this is dead code for the shipping Qwen3.8-27B recipe, but kept
+        // for parity with apply_ml8_input_xform's contract.
+        struct ggml_tensor * x_xf = (sc && sc->awq_scale) ? ggml_mul(ctx, x, sc->awq_scale) : x;
+
+        int32_t kind  = GGML_FP8_QUANT_ROT_KIND_NONE;
+        struct ggml_tensor * h_a = nullptr;
+        int64_t a_dim = 0;
+        int64_t b_dim = 0;
+
+        if (sc && sc->rotation_h_a) {
+            h_a   = sc->rotation_h_a;
+            a_dim = h_a->ne[0];
+            b_dim = sc->rotation_b_dim > 0 ? sc->rotation_b_dim : x_xf->ne[0] / a_dim;
+            kind  = GGML_FP8_QUANT_ROT_KIND_KRONECKER;
+        } else if (sc && sc->rotation_block_hadamard) {
+            GGML_ASSERT(sc->rotation_b_dim > 0 && "block_hadamard rotation missing b_dim (rotation_meta)");
+            b_dim = sc->rotation_b_dim;
+            a_dim = x_xf->ne[0] / b_dim;
+            kind  = GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD;
+        }
+
+        // Memo key uses the ORIGINAL `x` (pre-AWQ), matching the design:
+        // group members share one activation and (per the load-time
+        // assertion in qwen35.cpp) an identical rotation, so any member
+        // reaching this function first builds the shared node.
+        const fp8_qrot_key key{ x, h_a, a_dim, b_dim, kind };
+
+        struct ggml_tensor * qrot = nullptr;
+        if (qrot_memo) {
+            auto it = qrot_memo->find(key);
+            if (it != qrot_memo->end()) {
+                qrot = it->second;
+            }
+        }
+        if (qrot == nullptr) {
+            qrot = ggml_fp8_quant_rot(ctx, x_xf, h_a, a_dim, b_dim, kind);
+            const std::string qrot_name = std::string(weight->name) + ".qrot";
+            ggml_set_name(qrot, qrot_name.c_str());
+            if (qrot_memo) {
+                (*qrot_memo)[key] = qrot;
+            }
+        }
+
+        return ggml_fp8_mul_mat(ctx, weight, qrot);
+    }
 
     if (weight->type == GGML_TYPE_ML8_4) {
         // ML8_4 weights MUST have a centroids sidecar — plain mul_mat cannot

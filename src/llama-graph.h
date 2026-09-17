@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-ml8-registry.h"
 
 #include <cstdint>
 #include <vector>
@@ -1209,6 +1210,15 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     pipe_expert_dispatcher::graph_dispatcher * expert_dispatch;
+
+    // FP8_B128 phase 2: per-graph-build memo for the shared GGML_OP_FP8_QUANT_ROT
+    // node (see fp8_qrot_memo / build_ml8_or_mul_mat in llama-ml8-registry.h).
+    // `ml8_reg` above is owned by the model and lives across every graph build;
+    // this map must NOT — it resets implicitly because llama_model::build_graph
+    // constructs a brand-new unique_ptr<llm_graph_context> (this object) for
+    // every call, so a plain default-constructed member here starts empty each
+    // time. `mutable` because build_lora_mm is const.
+    mutable fp8_qrot_memo ml8_fp8b128_qrot_memo;
 
     // WP_QWEN4EXP_LAYER_CUT (Stage 3): see llm_graph_params::layer_cut/stage_il.
     // Always false/-1 unless the gate in llama_context::layer_cut_eligible() enabled it.

@@ -172,6 +172,7 @@ add_library(aiter_triton_aot STATIC
     wrappers/aiter_runtime_compiler.cpp
     wrappers/mt_ml8_gemm.cpp                  # MAD-223 Phase C.2 — ml8 dense GEMM wrapper
     wrappers/mt_ml8_moe_gemm.cpp              # MAD-223 Phase C.3 — ml8 MoE GEMM wrapper (MAD-244)
+    wrappers/mt_fp8_b128_gemm.cpp             # FP8_B128 phase 2 — AITER preshuffle GEMM wrapper
     # Generated sources added at build time via the AOT_C_FILES vars:
     ${vector_add_AOT_C_FILES}
     ${uattn_3d_AOT_C_FILES}
@@ -285,4 +286,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         wrappers/test_mt_ml8_moe_gemm.cpp
     )
     target_link_libraries(test_mt_ml8_moe_gemm PRIVATE aiter_triton_aot)
+
+    # FP8_B128 phase 2 — preshuffle GEMM vs generic WF=0 ML8_FP8 GEMM bench
+    add_executable(bench_fp8_b128_gemm
+        wrappers/bench_fp8_b128_gemm.cpp
+    )
+    target_link_libraries(bench_fp8_b128_gemm PRIVATE aiter_triton_aot)
 endif()

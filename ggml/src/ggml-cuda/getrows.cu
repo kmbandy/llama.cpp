@@ -477,6 +477,23 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
+    // FP8_B128 phase 2: an in-place packed weight is in the AITER preshuffle
+    // layout (design 4(a)), not the on-disk block_fp8_b128 layout the
+    // generic get_rows_cuda_q<QK_FP8_B128,...> dequantizer below reads.
+    // Unpack once into a scratch device buffer of on-disk blocks and run the
+    // normal dequant path against that instead. Not on any hot path for the
+    // current model (token_embd is Q8_0), so a one-shot unpack is fine.
+    if (src0->type == GGML_TYPE_FP8_B128) {
+        void * unpacked = ggml_cuda_ml8_inplace_fp8_b128_unpack_to_device(stream, src0);
+        if (unpacked != nullptr) {
+            get_rows_cuda(unpacked, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaFree(unpacked));
+            return;
+        }
+    }
+
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));

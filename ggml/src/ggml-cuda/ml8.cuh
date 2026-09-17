@@ -331,3 +331,43 @@ void ggml_cuda_op_ml8_mul_mat_fused(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor *         rot,
     ggml_tensor *               dst);
+
+// ─────────────────────────────────────────────────────────────────────
+// FP8_B128 phase 2 (design doc section 4). GGML_TYPE_FP8_B128 rides the
+// SAME in-place registry as ML8_FP8/ML8_4 above (ggml_cuda_ml8_inplace_*):
+// eligible()/alloc_size()/set()/get() all branch on t->type internally, so
+// none of the ggml-cuda.cu set_tensor/get_tensor/cpy_tensor/get_alloc_size
+// hooks need to change. The packed layout differs from ML8_FP8 though: it
+// is the AITER preshuffled-(16,16) weight layout + a [K/128, N/128] fp32
+// scale table (design 4(a)), not a straight transpose.
+// ─────────────────────────────────────────────────────────────────────
+
+// Execute GGML_OP_FP8_QUANT_ROT on the HIP backend (design 4(c)). Reuses the
+// same FWHT (mt_turbo_fp8_fwht) and H_a^T left-multiply
+// (ml8_h_a_left_multiply_kernel) primitives ggml_cuda_op_ml8_apply_rotation
+// already uses, so the rotation math is byte-for-byte the same kernel code
+// as the ML8_FP8/ML8_4 rotation path; only the final per-128-group e4m3
+// quantize + packed-row layout is new.
+void ggml_cuda_op_fp8_quant_rot(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst);
+
+// Execute GGML_OP_FP8_MUL_MAT on the HIP backend (design 4(b)): looks up the
+// packed weight in the in-place registry (or a cache-keyed second copy when
+// WP_ML8_INPLACE=0 or the weight isn't in-place eligible, e.g. N not a
+// multiple of 128) and launches the AITER preshuffle GEMM
+// (_gemm_a8w8_blockscale_preshuffle_kernel via mt_fp8_b128_gemm).
+void ggml_cuda_op_fp8_mul_mat(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst);
+
+// Unpack a packed in-place (or aliased) GGML_TYPE_FP8_B128 tensor into a
+// freshly cudaMalloc'd device buffer holding the on-disk block_fp8_b128
+// bytes (ggml_nbytes(t) long). Used by the generic GET_ROWS dequant
+// fallback (getrows.cu) so it never reads packed preshuffled bytes as
+// blocks. Caller owns the returned pointer and must cudaFree it. Synchronous
+// on `stream` before returning (the caller reads back through it
+// immediately). Returns nullptr if `t->data` is not a packed FP8_B128 entry.
+void * ggml_cuda_ml8_inplace_fp8_b128_unpack_to_device(
+    cudaStream_t         stream,
+    const ggml_tensor  * t);

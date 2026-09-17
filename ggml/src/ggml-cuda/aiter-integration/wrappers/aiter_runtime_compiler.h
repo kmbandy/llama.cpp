@@ -41,6 +41,14 @@ struct KernelSpec {
     std::string signature;     // Triton signature string
     int         num_warps  = 4;
     int         num_stages = 1;
+    // FP8_B128 phase 2: HIPOptions fields plumbed through to
+    // triton.compile's `options` dict by compile_aiter_kernel.py (0 = don't
+    // override Triton's own default, which is also 0 for both). Needed for
+    // the radiance preshuffle GEMM config (waves_per_eu=2,
+    // matrix_instr_nonkdim=16); harmless no-ops for every other kernel that
+    // leaves them at 0.
+    int         waves_per_eu         = 0;
+    int         matrix_instr_nonkdim = 0;
 
     // Deterministic, human-readable-ish cache key. Includes a hash of the
     // signature so collisions are negligible without bloating directory names.

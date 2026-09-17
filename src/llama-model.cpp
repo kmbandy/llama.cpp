@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1051,6 +1052,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             llama_tp_split_segment(segments[is].first, granularity[is], tensor_split,
                     ud->n_devices, n_dev_eff, tc.rotation, &split_state.ne[is*ud->n_devices]);
             split_state.nr[is] = segments[is].second;
+
+            // FP8_B128 phase 2: block_fp8_b128 covers 128 CONTIGUOUS elements
+            // sharing one scale (ggml_blck_size(FP8_B128) == 128, hence
+            // blck_size == 128 above), on whichever axis this tensor is
+            // split. A slice boundary that isn't 128-aligned would cut a
+            // scale tile in half -- the in-place packer (reads d from row/col
+            // 128*(n/128)) and the preshuffle GEMM would silently read the
+            // wrong scale for the tail of that tile. Every branch of
+            // get_split_granularity above lcm's (implicitly, via blck_size)
+            // or explicitly with 128 once blck_size itself is 128, so this
+            // should always hold -- assert it rather than let it corrupt
+            // results under tensor parallelism.
+            if (tc.tensor_axis_0->type == GGML_TYPE_FP8_B128) {
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    const int64_t ne_j = split_state.ne[is*ud->n_devices + j];
+                    GGML_ASSERT(ne_j % 128 == 0 &&
+                            "FP8_B128 tensor split slice is not 128-aligned; "
+                            "get_split_granularity must lcm this tensor's granularity with 128");
+                }
+            }
         }
         split_state.n_segments = segments.size();
     } else {
@@ -1828,6 +1849,106 @@ static int wp_select_ffn_island_device_index(const llama_model_params & params,
         return WP_NO_FFN_ISLAND;
     }
     return idx;
+}
+
+// FP8_B128 phase 2 (design 2026-09-17, §5 point 3): every weight that
+// consumes the SAME activation (an "input group": {attn_qkv, attn_gate},
+// {ffn_gate, ffn_up}, {attn_q, attn_k, attn_v}) is rotated by the converter
+// with the SAME factor. build_lora_mm's per-graph-build memo (see
+// fp8_qrot_memo / build_ml8_or_mul_mat in llama-ml8-registry.h) depends on
+// this: it builds ONE GGML_OP_FP8_QUANT_ROT node keyed off the shared input
+// tensor and feeds it to every group member's GEMM, so a group whose
+// members disagree on rotation would silently compute wrong results for
+// every member but whichever happens to reach build_lora_mm first. Catch
+// that here, once, at load time.
+//
+// This must run AFTER load_all_data(): load_ml8_sidecars/register_ml8_weight
+// (qwen35.cpp) run during load_arch_tensors, before ANY tensor data --
+// including the sidecar tensors' own bytes -- has been read from disk, so
+// rotation_h_a's data isn't valid yet at that point. By the time
+// llama_model_base::load_tensors calls this (right before it returns), every
+// resident tensor's backing buffer has been populated, so
+// ggml_backend_tensor_get is safe to use even under the meta backend, where
+// sidecars are MIRRORED (see llama_meta_device_get_split_state's
+// pattern_ml8_sidecar handling above) and therefore this rank's copy is a
+// complete, valid comparison for every device.
+static void llama_model_validate_fp8_b128_rotation_groups(const llama_model & model) {
+    // Returns `name` iff it names an FP8_B128 tensor, else nullptr -- every
+    // other case (missing, or present but some other type such as Q8_0,
+    // which is how the converter stores tensors that fail the N%128/K%128
+    // alignment check) is "nothing to validate here".
+    const auto fp8b128 = [&](const std::string & name) -> const ggml_tensor * {
+        const ggml_tensor * t = model.get_tensor(name.c_str());
+        return (t && t->type == GGML_TYPE_FP8_B128) ? t : nullptr;
+    };
+
+    // Bytewise-compare two tensors' resident data. Reads through
+    // ggml_backend_tensor_get so this is correct whether the tensor lives in
+    // host or device memory.
+    const auto bytewise_equal = [](const ggml_tensor * a, const ggml_tensor * b) -> bool {
+        if (a == nullptr || b == nullptr) {
+            return a == b;
+        }
+        const size_t na = ggml_nbytes(a);
+        const size_t nb = ggml_nbytes(b);
+        if (na != nb) {
+            return false;
+        }
+        std::vector<uint8_t> ba(na), bb(nb);
+        ggml_backend_tensor_get(a, ba.data(), 0, na);
+        ggml_backend_tensor_get(b, bb.data(), 0, nb);
+        return ba == bb;
+    };
+
+    const auto check_pair = [&](const std::string & name_a, const std::string & name_b) {
+        const ggml_tensor * wa = fp8b128(name_a);
+        const ggml_tensor * wb = fp8b128(name_b);
+        if (wa == nullptr || wb == nullptr) {
+            return; // one/both absent or not FP8_B128 -- nothing to enforce for this pair
+        }
+        if (wa->buffer == nullptr || wb->buffer == nullptr) {
+            // Not resident yet (e.g. weight paging left it for the pager, or
+            // this is a no_alloc estimation pass with no backing data at
+            // all) -- nothing readable to compare. The caller only invokes
+            // this after load_all_data() for the normal resident-weights
+            // path this design targets (see llama_model_base::load_tensors).
+            return;
+        }
+
+        const ml8_sidecars * sa = model.ml8_reg.find(wa);
+        const ml8_sidecars * sb = model.ml8_reg.find(wb);
+
+        const bool kron_a = sa && sa->rotation_h_a != nullptr;
+        const bool kron_b = sb && sb->rotation_h_a != nullptr;
+        const bool bh_a   = sa && sa->rotation_block_hadamard;
+        const bool bh_b   = sb && sb->rotation_block_hadamard;
+        const int64_t bdim_a = sa ? sa->rotation_b_dim : 0;
+        const int64_t bdim_b = sb ? sb->rotation_b_dim : 0;
+
+        if (kron_a != kron_b || bh_a != bh_b || bdim_a != bdim_b) {
+            GGML_ABORT("FP8_B128 rotation mismatch: '%s' and '%s' consume the same activation "
+                       "(input group) but were converted with different rotation_meta "
+                       "(kronecker=%d/%d, block_hadamard=%d/%d, b_dim=%" PRId64 "/%" PRId64 "). "
+                       "Every weight in an input group must share one rotation -- re-run the "
+                       "fp8_b128 converter.",
+                       name_a.c_str(), name_b.c_str(), (int) kron_a, (int) kron_b,
+                       (int) bh_a, (int) bh_b, bdim_a, bdim_b);
+        }
+        if (kron_a && !bytewise_equal(sa->rotation_h_a, sb->rotation_h_a)) {
+            GGML_ABORT("FP8_B128 rotation mismatch: '%s.rotation_h_a' and '%s.rotation_h_a' differ "
+                       "byte-for-byte -- every weight in an input group must share one rotation "
+                       "factor -- re-run the fp8_b128 converter.",
+                       name_a.c_str(), name_b.c_str());
+        }
+    };
+
+    for (uint32_t il = 0; il < model.hparams.n_layer_all; il++) {
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        check_pair(prefix + "attn_qkv.weight", prefix + "attn_gate.weight");
+        check_pair(prefix + "ffn_gate.weight",  prefix + "ffn_up.weight");
+        check_pair(prefix + "attn_q.weight",    prefix + "attn_k.weight");
+        check_pair(prefix + "attn_q.weight",    prefix + "attn_v.weight");
+    }
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -2903,6 +3024,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // FP8_B128 phase 2: every resident weight is now loaded (see the
+    // load_all_data loop above) -- safe to compare sidecar bytes. Skipped
+    // entirely for the (overwhelmingly common) case of no FP8_B128 tensors:
+    // fp8b128() misses on every lookup and check_pair returns immediately.
+    if (!ml.no_alloc) {
+        llama_model_validate_fp8_b128_rotation_groups(*this);
     }
 
     return true;

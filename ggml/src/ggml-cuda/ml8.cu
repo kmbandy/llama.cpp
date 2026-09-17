@@ -7,6 +7,7 @@
 #include "ggml-common.h"
 
 #include "ggml.h"
+#include "ggml-ml8.h"    // FP8_B128 phase 2: GGML_FP8_QUANT_ROT_KIND_* constants
 #include "common.cuh"
 #include "convert.cuh"
 #include "dequantize.cuh"
@@ -18,6 +19,7 @@
 // cross-arch builds), but the rest of ggml-hip (repack, rotation, the pager) builds.
 #include "mt_ml8_gemm.h"
 #include "mt_ml8_moe_gemm.h"       // G.7: ml8 MoE GEMM Triton wrapper
+#include "mt_fp8_b128_gemm.h"      // FP8_B128 phase 2: AITER preshuffle GEMM
 #endif // GGML_HIP_AITER
 #include "turbo_fp8_hadamard.cuh"  // G.6.f: FWHT for rotation H_b leg
 
@@ -28,6 +30,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 #include <vector>
 #include <algorithm>
 
@@ -177,6 +180,13 @@ std::unordered_map<const void *, cache_entry_t>       g_ml8_cache;
 std::mutex                                       g_ml8_fp8_cache_mu;
 std::unordered_map<const void *, cache_entry_t>  g_ml8_fp8_cache;
 
+// FP8_B128 (design 4(a)) cache-copy fallback repack, mirroring g_ml8_fp8_cache
+// above: used when a FP8_B128 weight isn't in-place eligible (WP_ML8_INPLACE=0
+// or N not a multiple of 128). info.b_packed is the preshuffled [N,K] byte
+// permutation, info.b_scale is the fp32 [K/128, N/128] scale table.
+std::mutex                                       g_fp8_b128_cache_mu;
+std::unordered_map<const void *, cache_entry_t>  g_fp8_b128_cache;
+
 // In-place (load-time) ML8_FP8 repack registry, keyed by the tensor's own
 // device pointer. `staging` holds the on-disk block bytes while a tensor is
 // being written in pieces; once `received == nbytes` the repack kernel
@@ -314,6 +324,14 @@ void ggml_cuda_ml8_clear_cache(void) {
             cudaFree(kv.second.info.b_scale);
         }
         g_ml8_fp8_cache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_fp8_b128_cache_mu);
+        for (auto & kv : g_fp8_b128_cache) {
+            cudaFree(kv.second.info.b_packed);
+            cudaFree(kv.second.info.b_scale);
+        }
+        g_fp8_b128_cache.clear();
     }
 }
 
@@ -536,6 +554,241 @@ static __global__ void ml8_unpack_kernel(
     }
 }
 
+// FP8_B128 phase 2: on-disk block is { ggml_half d; uint8_t qs[128]; }, 130
+// bytes / 128 elems (== block_fp8_b128 in ggml-common.h). blck_size 128.
+static constexpr int FP8_B128_BLOCK_SIZE  = 128;
+static constexpr int FP8_B128_BLOCK_BYTES = (int) sizeof(block_fp8_b128);  // 130
+
+// ─────────────────────────────────────────────────────────────────────
+// FP8_B128 in-place pack/unpack (design 4(a)).
+//
+// Packed layout (bytes [0, N*K)): the raw e4m3 qs bytes of the on-disk
+// [N, K] weight, permuted into AITER's shuffle_weight(layout=(16,16))
+// order: for row-block nb16 (16 rows) and 32-wide K-chunk kc, a 512-byte
+// chunk at offset (nb16*(K/32) + kc)*512 holds, in [half(2)][n_in(16)][k_in(16)]
+// order, W[nb16*16 + n_in, kc*32 + half*16 + k_in]'s raw e4m3 byte.
+//
+// Packed layout (bytes [N*K, N*K + 4*(K/128)*(N/128))): fp32 scale table in
+// kernel order [K/128 (kb, outer), N/128 (tile_n, inner)]: w_scale[kb*(N/128)
+// + tile_n] = f32(on-disk fp16 `d` of block (row tile_n*128, k-group kb)).
+// The converter replicates `d` across all 128 rows of a tile; the packer
+// reads it once from the tile's first row (see WP_FP8B128_CHECK_SCALE
+// below for a debug assert that the other 127 rows agree).
+// ─────────────────────────────────────────────────────────────────────
+
+// One thread per (n, k) output byte. Grid-stride loop over N*K bytes.
+static __global__ void fp8_b128_pack_weight_kernel(
+    const uint8_t * __restrict__ src,   // on-disk (N, n_groups_k * 130) bytes
+    uint8_t       * __restrict__ dst,   // preshuffled [N*K] bytes
+    int N, int K, int n_groups_k) {
+
+    const size_t total = (size_t) N * (size_t) K;
+    const size_t row_bytes = (size_t) n_groups_k * (size_t) FP8_B128_BLOCK_BYTES;
+    for (size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (size_t) gridDim.x * blockDim.x) {
+        const int n = (int) (idx / (size_t) K);
+        const int k = (int) (idx % (size_t) K);
+        const int g = k / FP8_B128_BLOCK_SIZE;
+        const uint8_t qbyte = src[(size_t) n * row_bytes + (size_t) g * FP8_B128_BLOCK_BYTES
+                                   + sizeof(ggml_half) + (k % FP8_B128_BLOCK_SIZE)];
+
+        const int nb16  = n / 16;
+        const int n_in  = n % 16;
+        const int kc    = k / 32;
+        const int half  = (k % 32) / 16;
+        const int k_in  = k % 16;
+        const size_t dst_off = ((size_t) nb16 * (size_t) (K / 32) + (size_t) kc) * 512
+                              + (size_t) half * 256 + (size_t) n_in * 16 + (size_t) k_in;
+        dst[dst_off] = qbyte;
+    }
+}
+
+// One thread per (kb, tile_n) scale-table entry.
+static __global__ void fp8_b128_pack_scale_kernel(
+    const uint8_t * __restrict__ src,     // on-disk blocks
+    float         * __restrict__ b_scale, // [K/128, N/128], kb outer, tile_n inner
+    int N, int K, int n_groups_k) {
+
+    const int tiles_n = N / FP8_B128_BLOCK_SIZE;
+    const int idx     = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total   = n_groups_k * tiles_n;
+    if (idx >= total) return;
+    const int kb = idx / tiles_n;
+    const int tn = idx % tiles_n;
+    const int n0 = tn * FP8_B128_BLOCK_SIZE;
+
+    __half d;
+    memcpy(&d, src + (size_t) n0 * (size_t) n_groups_k * (size_t) FP8_B128_BLOCK_BYTES
+                    + (size_t) kb * (size_t) FP8_B128_BLOCK_BYTES, sizeof(__half));
+    b_scale[(size_t) kb * (size_t) tiles_n + (size_t) tn] = __half2float(d);
+}
+
+// Debug-only (WP_FP8B128_CHECK_SCALE=1): warns if a tile's 128 rows don't
+// actually share the same on-disk scale for a given K-group — expected for
+// converter-produced weights (the CONVERTER INVARIANT), NOT guaranteed for
+// ad-hoc test-quantized tensors (test-backend-ops' test_fp8_mul_mat
+// quantizes each row independently — see ggml-turbo-quant.c
+// quantize_row_fp8_b128_ref). One thread per (tile_n, kb) tile.
+static __global__ void fp8_b128_check_scale_kernel(
+    const uint8_t * __restrict__ src, int N, int K, int n_groups_k) {
+    const int tn = blockIdx.x;
+    const int kb = blockIdx.y;
+    const int n0 = tn * FP8_B128_BLOCK_SIZE;
+    const size_t row_bytes = (size_t) n_groups_k * (size_t) FP8_B128_BLOCK_BYTES;
+    uint16_t d0;
+    memcpy(&d0, src + (size_t) n0 * row_bytes + (size_t) kb * FP8_B128_BLOCK_BYTES, 2);
+    for (int r = 1; r < FP8_B128_BLOCK_SIZE && (n0 + r) < N; r++) {
+        uint16_t dr;
+        memcpy(&dr, src + (size_t) (n0 + r) * row_bytes + (size_t) kb * FP8_B128_BLOCK_BYTES, 2);
+        if (dr != d0) {
+            printf("[fp8_b128] WARNING: tile scale mismatch tile_n=%d (rows %d..%d) kb=%d: "
+                   "row %d scale bits 0x%04x != row %d scale bits 0x%04x\n",
+                   tn, n0, n0 + FP8_B128_BLOCK_SIZE - 1, kb, n0 + r, (unsigned) dr, n0, (unsigned) d0);
+        }
+    }
+}
+
+// Inverse of fp8_b128_pack_weight_kernel: gather the preshuffled bytes back
+// into the on-disk block_fp8_b128 qs[] layout.
+static __global__ void fp8_b128_unpack_weight_kernel(
+    const uint8_t * __restrict__ packed, // preshuffled [N*K] bytes
+    uint8_t       * __restrict__ dst,    // on-disk (N, n_groups_k * 130) bytes
+    int N, int K, int n_groups_k) {
+
+    const size_t total = (size_t) N * (size_t) K;
+    const size_t row_bytes = (size_t) n_groups_k * (size_t) FP8_B128_BLOCK_BYTES;
+    for (size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (size_t) gridDim.x * blockDim.x) {
+        const int n = (int) (idx / (size_t) K);
+        const int k = (int) (idx % (size_t) K);
+        const int nb16  = n / 16;
+        const int n_in  = n % 16;
+        const int kc    = k / 32;
+        const int half  = (k % 32) / 16;
+        const int k_in  = k % 16;
+        const size_t src_off = ((size_t) nb16 * (size_t) (K / 32) + (size_t) kc) * 512
+                              + (size_t) half * 256 + (size_t) n_in * 16 + (size_t) k_in;
+        const uint8_t qbyte = packed[src_off];
+        const int g = k / FP8_B128_BLOCK_SIZE;
+        dst[(size_t) n * row_bytes + (size_t) g * FP8_B128_BLOCK_BYTES
+            + sizeof(ggml_half) + (k % FP8_B128_BLOCK_SIZE)] = qbyte;
+    }
+}
+
+// Inverse of fp8_b128_pack_scale_kernel: broadcast each tile's fp32 scale
+// (narrowed back to fp16) into all 128 on-disk block `d` fields it covers.
+static __global__ void fp8_b128_unpack_scale_kernel(
+    const float * __restrict__ b_scale, uint8_t * __restrict__ dst,
+    int N, int K, int n_groups_k) {
+
+    const int tiles_n = N / FP8_B128_BLOCK_SIZE;
+    const int idx     = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total   = n_groups_k * tiles_n;
+    if (idx >= total) return;
+    const int kb = idx / tiles_n;
+    const int tn = idx % tiles_n;
+    const __half d = __float2half(b_scale[(size_t) kb * (size_t) tiles_n + (size_t) tn]);
+    const size_t row_bytes = (size_t) n_groups_k * (size_t) FP8_B128_BLOCK_BYTES;
+    for (int r = 0; r < FP8_B128_BLOCK_SIZE; r++) {
+        const int n = tn * FP8_B128_BLOCK_SIZE + r;
+        memcpy(dst + (size_t) n * row_bytes + (size_t) kb * FP8_B128_BLOCK_BYTES, &d, sizeof(__half));
+    }
+}
+
+// Cache-keyed FP8_B128 repack (second-copy fallback), mirroring
+// ggml_cuda_ml8_fp8_get_or_repack above. Used by GGML_OP_FP8_MUL_MAT when
+// the weight isn't in-place eligible (WP_ML8_INPLACE=0, or N not a multiple
+// of 128 — e.g. some test-backend-ops shapes) so the AITER preshuffle GEMM
+// still has somewhere to read the preshuffled layout + scale table from.
+// (g_fp8_b128_cache_mu / g_fp8_b128_cache declared near g_ml8_fp8_cache above.)
+static const ml8_weight_repack_t * ggml_cuda_fp8_b128_get_or_repack(
+    cudaStream_t stream, const ggml_tensor * w) {
+
+    if (w == nullptr || w->data == nullptr || w->type != GGML_TYPE_FP8_B128) {
+        return nullptr;
+    }
+    const int32_t K = (int32_t) w->ne[0];
+    const int32_t N = (int32_t) w->ne[1];
+    if (K <= 0 || N <= 0 || K % FP8_B128_BLOCK_SIZE != 0 || N % FP8_B128_BLOCK_SIZE != 0) {
+        return nullptr;
+    }
+    const int32_t n_groups_k = K / FP8_B128_BLOCK_SIZE;
+    const int32_t tiles_n    = N / FP8_B128_BLOCK_SIZE;
+    const void * key = w->data;
+
+    // Prefer the in-place registry if this weight happens to be packed
+    // there already (e.g. it WAS eligible and WP_ML8_INPLACE wasn't 0).
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+        auto it = g_ml8_inplace.find(key);
+        if (it != g_ml8_inplace.end() && it->second.packed && it->second.type == GGML_TYPE_FP8_B128) {
+            return &it->second.info;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_fp8_b128_cache_mu);
+        auto it = g_fp8_b128_cache.find(key);
+        if (it != g_fp8_b128_cache.end()) {
+            return &it->second.info;
+        }
+    }
+
+    void *  d_packed = nullptr;
+    float * d_scale  = nullptr;
+    const size_t packed_bytes = (size_t) K * (size_t) N;
+    const size_t scale_bytes  = (size_t) n_groups_k * (size_t) tiles_n * sizeof(float);
+
+    cudaError_t err = cudaMalloc(&d_packed, packed_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[fp8_b128] cudaMalloc(packed=%zu) failed: %s\n", packed_bytes, cudaGetErrorString(err));
+        return nullptr;
+    }
+    err = cudaMalloc((void **) &d_scale, scale_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[fp8_b128] cudaMalloc(scale=%zu) failed: %s\n", scale_bytes, cudaGetErrorString(err));
+        cudaFree(d_packed);
+        return nullptr;
+    }
+
+    constexpr int TPB = 256;
+    const size_t total_bytes = (size_t) N * (size_t) K;
+    const int grid_x = (int) std::min<size_t>((total_bytes + TPB - 1) / TPB, (size_t) 65535);
+    fp8_b128_pack_weight_kernel<<<grid_x, TPB, 0, stream>>>(
+        (const uint8_t *) w->data, (uint8_t *) d_packed, N, K, n_groups_k);
+    const int scale_total = n_groups_k * tiles_n;
+    fp8_b128_pack_scale_kernel<<<(scale_total + 255) / 256, 256, 0, stream>>>(
+        (const uint8_t *) w->data, d_scale, N, K, n_groups_k);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[fp8_b128] repack kernel launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_packed);
+        cudaFree(d_scale);
+        return nullptr;
+    }
+    if (getenv("WP_FP8B128_CHECK_SCALE") != nullptr) {
+        const dim3 grid_chk((unsigned) tiles_n, (unsigned) n_groups_k, 1);
+        fp8_b128_check_scale_kernel<<<grid_chk, 1, 0, stream>>>((const uint8_t *) w->data, N, K, n_groups_k);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    std::lock_guard<std::mutex> lock(g_fp8_b128_cache_mu);
+    auto it = g_fp8_b128_cache.find(key);
+    if (it != g_fp8_b128_cache.end()) {
+        cudaFree(d_packed);
+        cudaFree(d_scale);
+        return &it->second.info;
+    }
+    cache_entry_t entry{};
+    entry.info.b_packed   = d_packed;
+    entry.info.b_scale    = d_scale;
+    entry.info.N          = N;
+    entry.info.K          = K;
+    entry.info.n_groups_k = n_groups_k;
+    entry.info.group_size = FP8_B128_BLOCK_SIZE;
+    auto [ins_it, _ins_ok] = g_fp8_b128_cache.emplace(key, entry);
+    return &ins_it->second.info;
+}
+
 bool ggml_cuda_ml8_inplace_eligible(const ggml_tensor * t) {
     static const bool disabled = [] {
         const char * e = getenv("WP_ML8_INPLACE");
@@ -544,15 +797,27 @@ bool ggml_cuda_ml8_inplace_eligible(const ggml_tensor * t) {
     if (disabled || t == nullptr || t->view_src != nullptr) {
         return false;
     }
-    if (t->type != GGML_TYPE_ML8_FP8 && t->type != GGML_TYPE_ML8_4) {
+    if (t->type != GGML_TYPE_ML8_FP8 && t->type != GGML_TYPE_ML8_4 && t->type != GGML_TYPE_FP8_B128) {
         return false;
     }
-    const int    qk  = t->type == GGML_TYPE_ML8_4 ? QK_ML8 : QK_ML8_FP8;
-    const size_t bsz = t->type == GGML_TYPE_ML8_4 ? sizeof(block_ml8_4) : (size_t) ML8_FP8_BLOCK_BYTES;
+    const bool is_fp8_b128 = t->type == GGML_TYPE_FP8_B128;
+    const int    qk  = t->type == GGML_TYPE_ML8_4 ? QK_ML8
+                      : is_fp8_b128               ? FP8_B128_BLOCK_SIZE
+                                                    : QK_ML8_FP8;
+    const size_t bsz = t->type == GGML_TYPE_ML8_4 ? sizeof(block_ml8_4)
+                      : is_fp8_b128               ? (size_t) FP8_B128_BLOCK_BYTES
+                                                    : (size_t) ML8_FP8_BLOCK_BYTES;
     if (t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] <= 0 || t->ne[1] <= 0 || t->ne[0] % qk != 0) {
         return false;
     }
     if (t->ne[0] > INT32_MAX || t->ne[1] > INT32_MAX) {
+        return false;
+    }
+    // FP8_B128's preshuffled packed layout (design 4(a)) needs whole 128x128
+    // N x K tiles for the [K/128, N/128] scale table; N not a multiple of
+    // 128 (e.g. some test-backend-ops shapes) falls back to the cache-copy
+    // repack path in ggml_cuda_fp8_b128_get_or_repack instead of in-place.
+    if (is_fp8_b128 && t->ne[1] % 128 != 0) {
         return false;
     }
     // Contiguous rows of whole blocks (the loader never hands us anything else).
@@ -565,6 +830,13 @@ size_t ggml_cuda_ml8_inplace_alloc_size(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_ML8_4) {
         // nibbles [K/2, N] + fp32 scales [K/64, N] == 4.5 bpw, same as on disk
         return K * N / 2 + (K / QK_ML8) * N * sizeof(float);
+    }
+    if (t->type == GGML_TYPE_FP8_B128) {
+        // preshuffled raw e4m3 [N, K] (byte-for-byte permutation of the
+        // on-disk qs bytes, same total count) + fp32 scale table
+        // [K/128, N/128]. Always smaller than ggml_nbytes(t) (== N*K +
+        // 2*N*(K/128) on-disk) since 4*(N/128) < 2*N — see design 4(a).
+        return K * N + 4 * (K / FP8_B128_BLOCK_SIZE) * (N / FP8_B128_BLOCK_SIZE);
     }
     // raw e4m3 [K, N] + fp16 scales [K/32, N] == 8.5 bpw, same as on disk
     // (== ggml_nbytes(t)).
@@ -618,11 +890,14 @@ void ggml_cuda_ml8_inplace_set(
     size_t        stride_data) {
 
     GGML_ASSERT(ggml_cuda_ml8_inplace_eligible(t));
-    const bool    is_ml8_4   = t->type == GGML_TYPE_ML8_4;
+    const bool    is_ml8_4    = t->type == GGML_TYPE_ML8_4;
+    const bool    is_fp8_b128 = t->type == GGML_TYPE_FP8_B128;
     const int32_t K          = (int32_t) t->ne[0];
     const int32_t N          = (int32_t) t->ne[1];
-    const int32_t group_size = is_ml8_4 ? QK_ML8 : QK_ML8_FP8;
+    const int32_t group_size = is_ml8_4 ? QK_ML8 : is_fp8_b128 ? FP8_B128_BLOCK_SIZE : QK_ML8_FP8;
     const int32_t n_groups_k = K / group_size;
+    // FP8_B128's preshuffled bytes are also K*N (a byte permutation, same
+    // count as raw e4m3 [K,N]) — same packed_sz formula as ML8_FP8.
     const size_t  packed_sz  = is_ml8_4 ? (size_t) K * (size_t) N / 2 : (size_t) K * (size_t) N;
     const size_t  nbytes     = ggml_nbytes(t);
     GGML_ASSERT(n_copies >= 1);
@@ -665,17 +940,36 @@ void ggml_cuda_ml8_inplace_set(
     e.received += size * n_copies;
     const bool complete = e.received >= nbytes;
     if (complete) {
-        constexpr int BLOCK_N = 64;
-        const dim3 grid((N + BLOCK_N - 1) / BLOCK_N, n_groups_k, 1);
-        const dim3 block(BLOCK_N, 1, 1);
-        if (is_ml8_4) {
-            ml8_repack_kernel<<<grid, block, 0, stream>>>(
-                staging, (uint8_t *) e.info.b_packed, (float *) e.info.b_scale, N, n_groups_k);
+        if (is_fp8_b128) {
+            constexpr int TPB = 256;
+            const size_t total_bytes = (size_t) N * (size_t) K;
+            const int grid_x = (int) std::min<size_t>((total_bytes + TPB - 1) / TPB, (size_t) 65535);
+            fp8_b128_pack_weight_kernel<<<grid_x, TPB, 0, stream>>>(
+                staging, (uint8_t *) e.info.b_packed, N, K, n_groups_k);
+            CUDA_CHECK(cudaGetLastError());
+            const int tiles_n = N / FP8_B128_BLOCK_SIZE;
+            const int scale_total = n_groups_k * tiles_n;
+            fp8_b128_pack_scale_kernel<<<(scale_total + 255) / 256, 256, 0, stream>>>(
+                staging, (float *) e.info.b_scale, N, K, n_groups_k);
+            CUDA_CHECK(cudaGetLastError());
+            if (getenv("WP_FP8B128_CHECK_SCALE") != nullptr) {
+                const dim3 grid_chk((unsigned) tiles_n, (unsigned) n_groups_k, 1);
+                fp8_b128_check_scale_kernel<<<grid_chk, 1, 0, stream>>>(staging, N, K, n_groups_k);
+                CUDA_CHECK(cudaGetLastError());
+            }
         } else {
-            ml8_fp8_repack_kernel<<<grid, block, 0, stream>>>(
-                staging, (uint8_t *) e.info.b_packed, (__half *) e.info.b_scale, N, n_groups_k);
+            constexpr int BLOCK_N = 64;
+            const dim3 grid((N + BLOCK_N - 1) / BLOCK_N, n_groups_k, 1);
+            const dim3 block(BLOCK_N, 1, 1);
+            if (is_ml8_4) {
+                ml8_repack_kernel<<<grid, block, 0, stream>>>(
+                    staging, (uint8_t *) e.info.b_packed, (float *) e.info.b_scale, N, n_groups_k);
+            } else {
+                ml8_fp8_repack_kernel<<<grid, block, 0, stream>>>(
+                    staging, (uint8_t *) e.info.b_packed, (__half *) e.info.b_scale, N, n_groups_k);
+            }
+            CUDA_CHECK(cudaGetLastError());
         }
-        CUDA_CHECK(cudaGetLastError());
     }
     lock.unlock();
 
@@ -713,20 +1007,76 @@ void ggml_cuda_ml8_inplace_get(
 
     uint8_t * tmp = nullptr;
     CUDA_CHECK(cudaMalloc((void **) &tmp, nbytes));
-    constexpr int BLOCK_N = 64;
-    const dim3 grid((info.N + BLOCK_N - 1) / BLOCK_N, info.n_groups_k, 1);
-    const dim3 block(BLOCK_N, 1, 1);
-    if (type == GGML_TYPE_ML8_4) {
-        ml8_unpack_kernel<<<grid, block, 0, stream>>>(
-            (const uint8_t *) info.b_packed, (const float *) info.b_scale, tmp, info.N, info.n_groups_k);
+    if (type == GGML_TYPE_FP8_B128) {
+        constexpr int TPB = 256;
+        const size_t total_bytes = (size_t) info.N * (size_t) info.K;
+        const int grid_x = (int) std::min<size_t>((total_bytes + TPB - 1) / TPB, (size_t) 65535);
+        fp8_b128_unpack_weight_kernel<<<grid_x, TPB, 0, stream>>>(
+            (const uint8_t *) info.b_packed, tmp, info.N, info.K, info.n_groups_k);
+        CUDA_CHECK(cudaGetLastError());
+        const int tiles_n = info.N / FP8_B128_BLOCK_SIZE;
+        const int scale_total = info.n_groups_k * tiles_n;
+        fp8_b128_unpack_scale_kernel<<<(scale_total + 255) / 256, 256, 0, stream>>>(
+            (const float *) info.b_scale, tmp, info.N, info.K, info.n_groups_k);
+        CUDA_CHECK(cudaGetLastError());
     } else {
-        ml8_fp8_unpack_kernel<<<grid, block, 0, stream>>>(
-            (const uint8_t *) info.b_packed, (const __half *) info.b_scale, tmp, info.N, info.n_groups_k);
+        constexpr int BLOCK_N = 64;
+        const dim3 grid((info.N + BLOCK_N - 1) / BLOCK_N, info.n_groups_k, 1);
+        const dim3 block(BLOCK_N, 1, 1);
+        if (type == GGML_TYPE_ML8_4) {
+            ml8_unpack_kernel<<<grid, block, 0, stream>>>(
+                (const uint8_t *) info.b_packed, (const float *) info.b_scale, tmp, info.N, info.n_groups_k);
+        } else {
+            ml8_fp8_unpack_kernel<<<grid, block, 0, stream>>>(
+                (const uint8_t *) info.b_packed, (const __half *) info.b_scale, tmp, info.N, info.n_groups_k);
+        }
+        CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(data, tmp + offset, size, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(tmp));
+}
+
+// Device-side variant of ggml_cuda_ml8_inplace_get: unpacks into a fresh
+// device buffer instead of copying to a host pointer. Used by the generic
+// GET_ROWS dequant fallback (getrows.cu) so it can read the on-disk block
+// layout without a host round-trip. Returns nullptr if `t->data` isn't a
+// fully-packed FP8_B128 entry.
+void * ggml_cuda_ml8_inplace_fp8_b128_unpack_to_device(
+    cudaStream_t stream, const ggml_tensor * t) {
+
+    ml8_weight_repack_t info;
+    size_t nbytes;
+    ggml_type type;
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+        auto it = g_ml8_inplace.find(t->data);
+        if (it == g_ml8_inplace.end() || !it->second.packed) {
+            return nullptr;
+        }
+        info   = it->second.info;
+        nbytes = it->second.nbytes;
+        type   = it->second.type;
+    }
+    if (type != GGML_TYPE_FP8_B128) {
+        return nullptr;
+    }
+
+    uint8_t * tmp = nullptr;
+    CUDA_CHECK(cudaMalloc((void **) &tmp, nbytes));
+    constexpr int TPB = 256;
+    const size_t total_bytes = (size_t) info.N * (size_t) info.K;
+    const int grid_x = (int) std::min<size_t>((total_bytes + TPB - 1) / TPB, (size_t) 65535);
+    fp8_b128_unpack_weight_kernel<<<grid_x, TPB, 0, stream>>>(
+        (const uint8_t *) info.b_packed, tmp, info.N, info.K, info.n_groups_k);
+    CUDA_CHECK(cudaGetLastError());
+    const int tiles_n = info.N / FP8_B128_BLOCK_SIZE;
+    const int scale_total = info.n_groups_k * tiles_n;
+    fp8_b128_unpack_scale_kernel<<<(scale_total + 255) / 256, 256, 0, stream>>>(
+        (const float *) info.b_scale, tmp, info.N, info.K, info.n_groups_k);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return tmp;
 }
 
 // get_rows over the packed layout: row n of the logical [N, K] weight is
@@ -2009,6 +2359,291 @@ void ggml_cuda_op_ml8_apply_rotation(
         ml8_dump_fp32("/tmp/ml8_hip_x_rotated.bin", (const float *) dst->data,
                       total_elems, stream, 2, shape);
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// FP8_B128 phase 2 — GGML_OP_FP8_QUANT_ROT (design 4(c)).
+// ═════════════════════════════════════════════════════════════════════════
+
+// Bit-exact port of quantize_row_f8_e4m3_ref (ggml-turbo-quant.c) — the CPU
+// oracle test-backend-ops compares FP8_QUANT_ROT against byte-for-byte
+// (kind=0 tolerance is ~1e-7 on the raw I8 output). Same rollover rule as
+// ml8_fp32_to_e4m3 (`e_out > 15`; the CPU codec was fixed to match).
+static __device__ __forceinline__ uint8_t fp8_quant_rot_f32_to_e4m3(float xv) {
+    uint32_t bits;
+    memcpy(&bits, &xv, 4);
+    const uint32_t sign  = (bits >> 31) & 1u;
+    const uint32_t exp_b = (bits >> 23) & 0xFFu;
+    const uint32_t mant  = bits & 0x7FFFFFu;
+
+    // NaN or Inf input → e4m3 NaN (S.1111.111).
+    if (exp_b == 0xFFu) {
+        return (uint8_t)((sign << 7) | 0x7Fu);
+    }
+    // Zero (and fp32 subnormals, which underflow to e4m3 zero).
+    if (exp_b == 0) {
+        return (uint8_t)(sign << 7);
+    }
+
+    const int32_t e_un = (int32_t) exp_b - 127;
+
+    // Saturate to ±448 = e=15, m=6.
+    if (e_un >= 9 || (e_un == 8 && mant >= 0x600000u)) {
+        return (uint8_t)((sign << 7) | (0xFu << 3) | 0x6u);
+    }
+
+    if (e_un >= -6) {
+        const uint32_t e_e4m3 = (uint32_t)(e_un + 7);
+        const uint32_t guard  = (mant >> 19) & 1u;
+        const uint32_t sticky = (mant & ((1u << 19) - 1)) != 0 ? 1u : 0u;
+        const uint32_t lsb    = (mant >> 20) & 1u;
+        uint32_t       m_e4m3 = (mant >> 20) & 0x7u;
+        if (guard && (sticky || lsb)) m_e4m3 += 1;
+        uint32_t e_out = e_e4m3;
+        if (m_e4m3 == 8) {
+            m_e4m3 = 0;
+            e_out += 1;
+            // Same rollover rule as the CPU reference (see comment
+            // above) -- deliberately NOT the `> 15` fix ml8_fp32_to_e4m3 uses.
+            if (e_out > 15) {
+                return (uint8_t)((sign << 7) | (0xFu << 3) | 0x6u);
+            }
+        }
+        if (e_out == 15 && m_e4m3 == 7) m_e4m3 = 6;
+        return (uint8_t)((sign << 7) | (e_out << 3) | m_e4m3);
+    }
+
+    // Subnormal e4m3: |x| < 2^-6. m = round(|x| * 2^9) ∈ {0..7}.
+    const int32_t shift = 23 - (e_un + 9);
+    if (shift > 31) {
+        return (uint8_t)(sign << 7);
+    }
+    const uint32_t implicit = (1u << 23) | mant;
+    const uint32_t guard    = (implicit >> (shift - 1)) & 1u;
+    const uint32_t sticky   = (implicit & ((1u << (shift - 1)) - 1)) != 0 ? 1u : 0u;
+    uint32_t       m_e4m3   = implicit >> shift;
+    const uint32_t lsb      = m_e4m3 & 1u;
+    if (guard && (sticky || lsb)) m_e4m3 += 1;
+    if (m_e4m3 >= 8) {
+        return (uint8_t)((sign << 7) | (1u << 3));
+    }
+    return (uint8_t)((sign << 7) | m_e4m3);
+}
+
+// Per-128-group e4m3 quantize into the packed I8 row layout (design section
+// 3(a)): row m's output bytes [0,K) are the e4m3 qs, [K, K+K/32) are the
+// n_groups fp32 group scales. One block per (row, group), 128 threads (one
+// per element in the group) — bit-identical math to
+// ggml_compute_forward_fp8_quant_rot's per-group loop: same amax reduction
+// (max is associative/exact regardless of reduction order), scale computed
+// as a REAL division `amax / 448.0f` (not a multiply by a precomputed
+// reciprocal — those are not bit-identical in fp32) then clamped to 1e-12,
+// inv_scale = 1/scale computed once and applied by multiplication (mirroring
+// the CPU reference's `scaled[i] = grp[i] * inv_scale` exactly, rather than
+// dividing by scale per element), and fp8_quant_rot_f32_to_e4m3 (NOT the
+// shared ml8_fp32_to_e4m3 — see its comment) for the final rounding step.
+static __global__ void fp8_quant_pack_kernel(
+    const float * __restrict__ x,   // [n_rows, K] row-major, post-rotation
+    int8_t      * __restrict__ y,   // [n_rows, K + 4*n_groups]
+    int K, int n_groups) {
+
+    const int row = blockIdx.x;
+    const int g   = blockIdx.y;
+    const int tid = threadIdx.x;    // 0..127
+
+    const int row_out = K + n_groups * (int) sizeof(float);
+    const float * grp = x + (size_t) row * (size_t) K + (size_t) g * 128;
+
+    __shared__ float s_red[128];
+    const float v = grp[tid];
+    s_red[tid] = fabsf(v);
+    __syncthreads();
+    #pragma unroll
+    for (int off = 64; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_red[tid] = fmaxf(s_red[tid], s_red[tid + off]);
+        }
+        __syncthreads();
+    }
+    // amax / 448.0f: real division, matching ops.cpp's `amax / 448.0f`
+    // exactly (a multiply by a precomputed 1/448 constant rounds
+    // differently in the last bit for some amax values).
+    const float scale     = fmaxf(s_red[0] / ML8_FP8_E4M3_MAX, ML8_ACT_SCALE_EPS);
+    const float inv_scale = 1.0f / scale;
+
+    uint8_t * qs     = (uint8_t *) (y + (size_t) row * (size_t) row_out);
+    float   * scales = (float *) (qs + K);
+    if (tid == 0) {
+        scales[g] = scale;
+    }
+    qs[g * 128 + tid] = fp8_quant_rot_f32_to_e4m3(v * inv_scale);
+}
+
+void ggml_cuda_op_fp8_quant_rot(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst) {
+
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * h_a = dst->src[1];
+
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I8);
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    const int32_t * pp    = (const int32_t *) dst->op_params;
+    const int32_t   a_dim = pp[0];
+    const int32_t   b_dim = pp[1];
+    const int32_t   kind  = pp[2];
+
+    const int64_t K = x->ne[0];
+    GGML_ASSERT(K % 128 == 0);
+    const int64_t n_groups = K / 128;
+    const int64_t row_out  = K + n_groups * (int64_t) sizeof(float);
+    GGML_ASSERT(dst->ne[0] == row_out);
+
+    const int64_t n_rows = x->ne[1] * x->ne[2] * x->ne[3];
+    GGML_ASSERT(dst->ne[1] == x->ne[1] && dst->ne[2] == x->ne[2] && dst->ne[3] == x->ne[3]);
+
+    cudaStream_t stream = ctx.stream();
+
+    const float * rotated_src = (const float *) x->data;
+    ggml_cuda_pool_alloc<float> z_buf(ctx.pool());
+
+    if (kind != GGML_FP8_QUANT_ROT_KIND_NONE) {
+        GGML_ASSERT(b_dim >= 16 && b_dim <= 1024 && (b_dim & (b_dim - 1)) == 0);
+        GGML_ASSERT(a_dim > 0 && (int64_t) a_dim * (int64_t) b_dim == K);
+
+        z_buf.alloc((size_t) n_rows * (size_t) K);
+        CUDA_CHECK(cudaMemcpyAsync(z_buf.get(), x->data,
+            (size_t) n_rows * (size_t) K * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        // Same FWHT primitive ggml_cuda_op_ml8_apply_rotation uses for both
+        // the kronecker and block_hadamard H_b legs.
+        CUDA_CHECK(mt_turbo_fp8_fwht(stream, z_buf.get(),
+            (int) (n_rows * a_dim), b_dim, b_dim));
+
+        if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
+            GGML_ASSERT(h_a != nullptr && h_a->type == GGML_TYPE_F32 && ggml_is_contiguous(h_a));
+            GGML_ASSERT(a_dim <= 16 && "a_dim must fit ml8_h_a_left_multiply_kernel's register array");
+            GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+            // In-place: ml8_h_a_left_multiply_kernel only reads/writes the
+            // column its own thread owns (l = threadIdx.x), so z and y may
+            // alias — see ggml_cuda_op_ml8_apply_rotation's out-of-place use
+            // for the same kernel; aliasing here just skips one buffer.
+            const dim3 grid((unsigned) n_rows, 1, 1);
+            const dim3 block((unsigned) b_dim, 1, 1);
+            ml8_h_a_left_multiply_kernel<<<grid, block, 0, stream>>>(
+                z_buf.get(), (const float *) h_a->data, z_buf.get(), a_dim, b_dim);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            GGML_ASSERT(kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD);
+            GGML_ASSERT(h_a == nullptr);
+        }
+        rotated_src = z_buf.get();
+    } else {
+        GGML_ASSERT(h_a == nullptr);
+    }
+
+    static const bool log_shapes = (std::getenv("FP8_B128_LOG") != nullptr);
+    if (log_shapes) {
+        static std::mutex log_mtx;
+        static std::unordered_map<std::string, int> seen;
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "qrot/%d/%d/%d/%d", (int) n_rows, (int) K, (int) a_dim, kind);
+        std::lock_guard<std::mutex> lk(log_mtx);
+        if (seen.emplace(buf, 1).second) {
+            fprintf(stderr, "[fp8_b128] FP8_QUANT_ROT rows=%d K=%d a_dim=%d b_dim=%d kind=%d\n",
+                    (int) n_rows, (int) K, a_dim, b_dim, kind);
+        }
+    }
+
+    const dim3 grid((unsigned) n_rows, (unsigned) n_groups, 1);
+    const dim3 block(128, 1, 1);
+    fp8_quant_pack_kernel<<<grid, block, 0, stream>>>(
+        rotated_src, (int8_t *) dst->data, (int) K, (int) n_groups);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// FP8_B128 phase 2 — GGML_OP_FP8_MUL_MAT (design 4(b)).
+// ═════════════════════════════════════════════════════════════════════════
+
+void ggml_cuda_op_fp8_mul_mat(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(ctx); GGML_UNUSED(dst);
+    GGML_ABORT("fp8_b128 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
+#else
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * a = dst->src[1];
+
+    GGML_ASSERT(w != nullptr && a != nullptr);
+    GGML_ASSERT(w->type   == GGML_TYPE_FP8_B128);
+    GGML_ASSERT(a->type   == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int32_t K = (int32_t) w->ne[0];
+    const int32_t N = (int32_t) w->ne[1];
+    const int32_t M = (int32_t) (a->ne[1] * a->ne[2] * a->ne[3]);
+
+    GGML_ASSERT(K % 128 == 0);
+    const int32_t n_groups = K / 128;
+    GGML_ASSERT(a->ne[0] == K + n_groups * (int32_t) sizeof(float));
+    GGML_ASSERT(dst->ne[0] == N);
+    GGML_ASSERT((int64_t) dst->ne[1] * dst->ne[2] * dst->ne[3] == (int64_t) M);
+    GGML_ASSERT(N % 16 == 0);
+
+    cudaStream_t stream = ctx.stream();
+
+    // ── 1. Look up the packed weight. ggml_cuda_fp8_b128_get_or_repack checks
+    // the in-place registry first (the common case for a converter-produced
+    // model weight) and falls back to a cache-copy repack otherwise
+    // (WP_ML8_INPLACE=0, or N not a multiple of 128 — some test-backend-ops
+    // shapes).
+    const ml8_weight_repack_t * repack = ggml_cuda_fp8_b128_get_or_repack(stream, w);
+    GGML_ASSERT(repack != nullptr && "fp8_b128 weight repack failed (bad shape or OOM)");
+
+    static const bool log_shapes = (std::getenv("FP8_B128_LOG") != nullptr);
+    if (log_shapes) {
+        static std::mutex log_mtx;
+        static std::unordered_map<std::string, int> seen;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "mm/%d/%d/%d", M, N, K);
+        std::lock_guard<std::mutex> lk(log_mtx);
+        if (seen.emplace(buf, 1).second) {
+            fprintf(stderr, "[fp8_b128] FP8_MUL_MAT M=%d N=%d K=%d\n", M, N, K);
+        }
+    }
+
+    // ── 2. Launch the AITER preshuffle GEMM. No M padding — the kernel masks
+    // stores at offs_cm < M and wraps loads with % M (design 4(b)).
+    mt_fp8_b128_gemm_args_t args{};
+    args.N = N;
+    args.K = K;
+    args.M = M;
+    args.a_packed   = a->data;
+    args.b_preshuffled = repack->b_packed;
+    args.b_scale    = repack->b_scale;
+    args.c          = dst->data;
+
+    args.stride_am = K + K / 32;            // (K + K/32) elements, matches a->ne[0]
+    args.stride_ak = 1;
+    args.stride_bn = K * 16;
+    args.stride_bk = 1;
+    args.stride_cm = N;
+    args.stride_cn = 1;
+    args.stride_ascale_m = (K + K / 32) / 4;  // a_scale is embedded at byte offset K
+    args.stride_ascale_k = 1;
+    args.stride_bscale_k = N / 128;
+    args.stride_bscale_n = 1;
+
+    const hipError_t rc = mt_fp8_b128_gemm(stream, &args);
+    GGML_ASSERT(rc == hipSuccess && "mt_fp8_b128_gemm dispatch failed");
+#endif // GGML_HIP_AITER
 }
 
 // ═════════════════════════════════════════════════════════════════════════

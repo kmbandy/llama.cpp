@@ -10,10 +10,18 @@ artifact pair the C++ side can consume directly:
                                 hipModuleGetFunction), threads/block, shared
                                 memory bytes, compile timing.
 
-We intentionally DO NOT use the generated .c launcher — it has the
-fp32-scalar-truncation bug and is just a convenience wrapper around the same
-HIP API calls that C++ can make directly. Computing the launch grid in C++ also
-lets us skip the C launcher's hardcoded grid expression.
+FP8_B128 phase 2: this used to shell out to `python -m triton.tools.compile`
+and scrape its generated .c launcher for the HSACO bytes + kernel symbol +
+launch params. triton.tools.compile (in Triton 3.8) has no --waves-per-eu /
+--matrix-instr-nonkdim flags, which the radiance preshuffle GEMM config
+needs (waves_per_eu=2, matrix_instr_nonkdim=16) — and it has no reasonable
+way to add them short of forking the script. So this now calls
+triton.compile(ASTSource, target, options={...}) directly, replicating
+compile.py's compile_kernel() logic (same signature/hint parsing, same
+backend.parse_options() call) but reading metadata off the CompiledKernel
+object instead of round-tripping through a generated C file. The .hsaco /
+meta.json OUTPUT CONTRACT is unchanged — the C++ side (aiter_runtime_compiler.cpp)
+does not need to change.
 
 Invocation (all values come from the C++ side via argv):
     compile_aiter_kernel.py \\
@@ -23,6 +31,8 @@ Invocation (all values come from the C++ side via argv):
         --signature "<triton signature string>" \\
         --num-warps 4 \\
         --num-stages 1 \\
+        --waves-per-eu 0 \\
+        --matrix-instr-nonkdim 0 \\
         --out-dir /path/to/cache/<cache-key>/
 
 On success: exits 0 after writing kernel.hsaco + meta.json. On failure:
@@ -31,69 +41,95 @@ exits non-zero and writes the error to stderr.
 This script can be invoked manually for debugging — see --help.
 """
 import argparse
+import importlib.util
 import json
-import re
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 
-# Match the byte-array declaration emitted by triton.tools.compile.
-# Example: `unsigned char HSACO_NAME[21800] = { 0x7f, 0x45, 0x4c, 0x46, ... };`
-_HSACO_DECL_RE = re.compile(
-    r"unsigned\s+char\s+\w+\s*\[\s*(\d+)\s*\]\s*=\s*\{(.*?)\}\s*;",
-    re.DOTALL,
-)
-# Match the kernel symbol name passed to hipModuleGetFunction.
-# Example: `hipModuleGetFunction(&...., ..., "kernel_unified_attention_3d")`
-_KERNEL_SYM_RE = re.compile(r'hipModuleGetFunction\([^,]+,\s*[^,]+,\s*"([^"]+)"\s*\)')
-# Threads/block: hipModuleLaunchKernel(func, gX, gY, gZ, BX, BY, BZ, smem, ...)
-# Triton emits BX = num_warps * warp_size, BY = 1, BZ = 1.
-_LAUNCH_RE = re.compile(
-    r"hipModuleLaunchKernel\([^,]+,\s*\w+,\s*\w+,\s*\w+,"
-    r"\s*([^,]+),\s*(\d+),\s*(\d+),\s*(\d+)\s*,"
-)
+def _constexpr(s: str):
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return None
 
 
-def parse_generated_c(c_text: str) -> dict:
-    """Extract HSACO bytes, kernel symbol, and launch params from Triton's
-    generated C launcher."""
-    m_blob = _HSACO_DECL_RE.search(c_text)
-    if not m_blob:
-        raise RuntimeError("compile_aiter_kernel: no HSACO byte array found in generated .c")
-    declared_len = int(m_blob.group(1))
-    # The body is a comma-separated list of `0xHH`. Extract them as ints.
-    hex_tokens = re.findall(r"0x([0-9a-fA-F]+)", m_blob.group(2))
-    blob = bytes(int(t, 16) for t in hex_tokens)
-    if len(blob) != declared_len:
-        raise RuntimeError(
-            f"compile_aiter_kernel: HSACO size mismatch (declared {declared_len}, "
-            f"got {len(blob)} bytes)"
-        )
+def compile_kernel(args) -> dict:
+    """Compile one Triton kernel specialization via the public
+    triton.compile(ASTSource, ...) API (same code path
+    triton/tools/compile.py's compile_kernel() uses internally, minus the
+    generated-C-launcher step we don't need)."""
+    import triton
+    import triton.backends
 
-    m_sym = _KERNEL_SYM_RE.search(c_text)
-    if not m_sym:
-        raise RuntimeError("compile_aiter_kernel: no kernel symbol found in generated .c")
-    kernel_symbol = m_sym.group(1)
+    arg_path = args.source
+    sys.path.insert(0, str(arg_path.parent))
+    spec = importlib.util.spec_from_file_location(arg_path.stem, arg_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    kernel = getattr(mod, args.kernel_name)
 
-    m_launch = _LAUNCH_RE.search(c_text)
-    if not m_launch:
-        raise RuntimeError("compile_aiter_kernel: no hipModuleLaunchKernel call found")
-    # block_x is `4 * 32`-style expression; eval it. block_y/z are literals.
-    block_x = eval(m_launch.group(1), {"__builtins__": {}})  # noqa: S307 — trusted source
-    block_y = int(m_launch.group(2))
-    block_z = int(m_launch.group(3))
-    smem    = int(m_launch.group(4))
+    signature = [s.strip(" ") for s in args.signature.split(",")]
+
+    hints = {(i,): _constexpr(s.split(":")[1]) for i, s in enumerate(signature) if ":" in s}
+    hints = {k: v for k, v in hints.items() if v is not None}
+    constants = {kernel.arg_names[i]: _constexpr(s) for i, s in enumerate(signature)}
+    constants = {k: v for k, v in constants.items() if v is not None}
+    for key, value in hints.items():
+        if value == 1:
+            constants[kernel.arg_names[key[0]]] = value
+    sig_map = {kernel.arg_names[i]: s.split(":")[0] for i, s in enumerate(signature)}
+    for key in constants:
+        sig_map[key] = "constexpr"
+
+    for h in hints.values():
+        if h not in (1, 16):
+            raise RuntimeError(f"compile_aiter_kernel: only divisibility hints 1/16 are supported, got {h}")
+    attrs = {k: [["tt.divisibility", 16]] for k, v in hints.items() if v == 16}
+
+    src = triton.compiler.ASTSource(fn=kernel, constexprs=constants, signature=sig_map, attrs=attrs)
+
+    target_parts = args.target.split(":")
+    if len(target_parts) != 3:
+        raise RuntimeError(f"compile_aiter_kernel: --target must be '<backend>:<arch>:<warp-size>', got {args.target!r}")
+    target = triton.backends.compiler.GPUTarget(target_parts[0], target_parts[1], int(target_parts[2]))
+    backend = triton.compiler.make_backend(target)
+
+    opt_kwargs = {"num_warps": args.num_warps, "num_stages": args.num_stages}
+    if args.waves_per_eu:
+        opt_kwargs["waves_per_eu"] = args.waves_per_eu
+    if args.matrix_instr_nonkdim:
+        opt_kwargs["matrix_instr_nonkdim"] = args.matrix_instr_nonkdim
+    options = backend.parse_options(opt_kwargs)
+
+    ccinfo = triton.compile(src, target=target, options=options.__dict__)
+
+    if getattr(ccinfo.metadata, "global_scratch_size", 0) > 0:
+        raise RuntimeError("compile_aiter_kernel: kernels with global scratch requirements are not supported")
+    if getattr(ccinfo.metadata, "profile_scratch_size", 0) > 0:
+        raise RuntimeError("compile_aiter_kernel: kernels with profile scratch requirements are not supported")
+
+    hsaco = ccinfo.asm[backend.binary_ext]
+    # metadata.name is the ACTUAL symbol embedded in the ELF (driven by the
+    # kernel's `repr=` if any); our C++ side looks this symbol up via
+    # hipModuleGetFunction, so use it directly rather than assuming it
+    # equals args.kernel_name (only true when repr's config_keys are empty
+    # — see gemm_ml8.py LOCAL PATCH #5/#6 for why that's kept true here).
+    kernel_symbol = getattr(ccinfo.metadata, "name", args.kernel_name)
 
     return {
-        "kernel_symbol": kernel_symbol,
-        "hsaco":         blob,
-        "block_x":       block_x,
-        "block_y":       block_y,
-        "block_z":       block_z,
-        "shared_mem_bytes": smem,
+        "kernel_symbol":    kernel_symbol,
+        "hsaco":            hsaco,
+        "block_x":          args.num_warps * target.warp_size,
+        "block_y":          1,
+        "block_z":          1,
+        "shared_mem_bytes": int(ccinfo.metadata.shared),
     }
 
 
@@ -105,6 +141,8 @@ def main() -> int:
     ap.add_argument("--signature",   required=True,            help="Triton signature string")
     ap.add_argument("--num-warps",   type=int, default=4)
     ap.add_argument("--num-stages",  type=int, default=1)
+    ap.add_argument("--waves-per-eu",          type=int, default=0, help="AMDGPU waves-per-EU hint (0 = Triton default)")
+    ap.add_argument("--matrix-instr-nonkdim",  type=int, default=0, help="MFMA/WMMA K-dim override (0 = Triton default)")
     ap.add_argument("--out-dir",     required=True, type=Path, help="Output directory (will be created)")
     args = ap.parse_args()
 
@@ -115,36 +153,13 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="aiter-aot-") as tmp:
-        tmp_path = Path(tmp)
-        # The grid expression doesn't affect the HSACO content — it's only used
-        # inside the generated launcher (which we discard). Pass a trivial
-        # placeholder; the real grid is computed by the C++ caller at launch.
-        cmd = [
-            sys.executable, "-m", "triton.tools.compile",
-            str(args.source),
-            "--kernel-name", args.kernel_name,
-            "--target",      args.target,
-            "--signature",   args.signature,
-            "--grid",        "1, 1, 1",
-            "--num-warps",   str(args.num_warps),
-            "--num-stages",  str(args.num_stages),
-            "--out-name",    "kern",
-            "--out-path",    str(tmp_path / "kern"),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            print(f"compile_aiter_kernel: triton.tools.compile failed (rc={proc.returncode}):", file=sys.stderr)
-            print(proc.stderr, file=sys.stderr)
-            return 1
-
-        # Find the generated .c file (Triton names it kern.<hash>.c)
-        c_files = list(tmp_path.glob("kern.*.c"))
-        if len(c_files) != 1:
-            print(f"compile_aiter_kernel: expected 1 generated .c, got {len(c_files)}", file=sys.stderr)
-            return 1
-        parsed = parse_generated_c(c_files[0].read_text())
-
+    try:
+        parsed = compile_kernel(args)
+    except Exception as exc:  # noqa: BLE001 — surface any compile failure to the C++ caller
+        print(f"compile_aiter_kernel: compile failed for {args.kernel_name}: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return 1
     compile_secs = time.monotonic() - t0
 
     # Write outputs atomically: stage to .tmp then rename.
@@ -161,11 +176,13 @@ def main() -> int:
         "compile_seconds":  round(compile_secs, 3),
         # Round-trip the spec so the C++ side can sanity-check what it loaded.
         "spec": {
-            "kernel_name": args.kernel_name,
-            "target":      args.target,
-            "signature":   args.signature,
-            "num_warps":   args.num_warps,
-            "num_stages":  args.num_stages,
+            "kernel_name":           args.kernel_name,
+            "target":                args.target,
+            "signature":             args.signature,
+            "num_warps":             args.num_warps,
+            "num_stages":            args.num_stages,
+            "waves_per_eu":          args.waves_per_eu,
+            "matrix_instr_nonkdim":  args.matrix_instr_nonkdim,
         },
     }
     meta_tmp.write_text(json.dumps(meta, indent=2) + "\n")
