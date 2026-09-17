@@ -2297,12 +2297,23 @@ static bool ggml_cuda_ar_allreduce_sync(
         const size_t max_chunk_elems = p->buf_bytes / type_size;
         const size_t input_type_size = ggml_type_size(input_type);
 
-        // Chunked kernel path runs entirely on the caller's compute stream:
-        // since AR is a barrier here, same-stream ordering subsumes any
-        // cross-stream event handshake that the copy-engine path needs, and
-        // skips the cross-stream scheduling overhead that was hurting the
-        // small-tensor (tg) latency on the AR-stream variant.  Only ev.ker is
-        // still recorded at end-of-AR for acquire_slot's pool-wraparound check.
+        // Chunked kernel placement (2026-09-16, the 09-13 "cycle" finding):
+        // this kernel spins in phase 2 until the PEER's arrival token lands.
+        // Launched on the caller's compute stream it sits in the same FIFO as
+        // the duplex path's cross-device cudaStreamWaitEvent()s (dx end()),
+        // so with a dx op in flight (GGML_META_OVERLAP rolling) one rank's
+        // spinner can queue behind a wait that transitively depends on the
+        // other rank draining past ITS spinner -- both cards busy, neither
+        // arrival ring advancing, the 09-13/09-15/09-16 freezes. Running it
+        // on the pipeline's own non-blocking AR stream (the copy-engine path's
+        // existing handshake: ev.app compute->AR, ev.ker AR->compute) keeps
+        // the spinner out of that FIFO. GGML_CUDA_AR_CHUNK_STREAM=0 restores
+        // the compute-stream launch for A/B (it measured a small tg cost on
+        // 09-08, which is why the compute stream was chosen then).
+        static const bool chunk_on_ar_stream = [] {
+            const char * e = std::getenv("GGML_CUDA_AR_CHUNK_STREAM");
+            return e != nullptr && e[0] == '1';   // default off: no effect on the 16k wedge, ~2 t/s tg cost
+        }();
         for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
             const size_t remaining_elems = (size_t) (ne - chunk_start);
             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
@@ -2316,7 +2327,7 @@ static bool ggml_cuda_ar_allreduce_sync(
                 ggml_cuda_set_device(p->devices[i]);
                 auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
                 GGML_ASSERT(cuda_ctx->device == p->devices[i]);
-                cudaStream_t stream = cuda_ctx->stream();
+                cudaStream_t compute_stream = cuda_ctx->stream();
 
                 char * data = static_cast<char *>(tensors[i]->data) + chunk_start * (int64_t) input_type_size;
 
@@ -2324,7 +2335,15 @@ static bool ggml_cuda_ar_allreduce_sync(
                 // zeros.  On the BF16 path the F32 tensor data was already
                 // zeroed up-front (above), so per-chunk zeroing isn't needed.
                 if (!compute_flag[i] && !use_bf16) {
-                    CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, stream));
+                    CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, compute_stream));
+                }
+
+                cudaStream_t stream = compute_stream;
+                if (chunk_on_ar_stream) {
+                    // AR stream picks up after everything queued on the compute
+                    // stream so far (the reduce input is complete).
+                    ggml_cuda_ar_wait_for_compute(p, cuda_ctx, i, slot);
+                    stream = p->streams[i];
                 }
 
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
@@ -2376,7 +2395,12 @@ static bool ggml_cuda_ar_allreduce_sync(
                         (unsigned long long) p->spin_budget_cycles[i]);
                 }
 
-                if (last_chunk) {
+                if (chunk_on_ar_stream) {
+                    // Hand the reduced chunk back: compute stream resumes only
+                    // once this chunk's kernel has completed on the AR stream.
+                    CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+                    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, p->ev_pool[i][slot].ker));
+                } else if (last_chunk) {
                     CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
                 }
             }
