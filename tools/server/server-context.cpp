@@ -6477,6 +6477,13 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        if (spec_phase && spec) {
+            // Diagnostic: how much of the target decode is still in flight when the
+            // speculative process() starts (its first embeddings read would block on it).
+            const int64_t t_sync0 = ggml_time_us();
+            llama_synchronize(ctx_tgt);
+            SRV_INF("SPECPHASE tgt_sync_us=%" PRId64 "\n", ggml_time_us() - t_sync0);
+        }
         const int64_t t_proc0 = spec_phase ? ggml_time_us() : 0;
         const auto wp_pp_proc_t0 = wp_pp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
         if (spec) {

@@ -499,6 +499,29 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 
+#if defined(GGML_USE_HIP)
+    // MAD-LAB 2026-09-16: an RDNA2 card in a multi-GPU process stops draining
+    // a stream while another of its HIP hardware queues holds a barrier on a
+    // cross-device signal (the internal AllReduce), with every dependency of
+    // the stalled stream satisfied -- the "16k wedge". GPU_MAX_HW_QUEUES=2
+    // (read by the HIP runtime at init, so it must be in the environment
+    // before the first HIP call) is what makes it drain; =8 hangs earlier.
+    // This cannot be set from here (the runtime is already initialised), so
+    // say so loudly instead.
+    if (info.device_count > 1) {
+        bool has_rdna2 = false;
+        for (int id = 0; id < info.device_count; ++id) {
+            has_rdna2 = has_rdna2 || GGML_CUDA_CC_IS_RDNA2(info.devices[id].cc);
+        }
+        const char * hwq = getenv("GPU_MAX_HW_QUEUES");
+        if (has_rdna2 && (hwq == nullptr || atoi(hwq) > 2)) {
+            GGML_LOG_WARN("%s: RDNA2 device in a %d-GPU process without GPU_MAX_HW_QUEUES<=2 -- "
+                          "tensor-parallel AllReduce can wedge the RDNA2 card (set GPU_MAX_HW_QUEUES=2 "
+                          "in the process environment)\n", __func__, info.device_count);
+        }
+    }
+#endif
+
     return info;
 }
 

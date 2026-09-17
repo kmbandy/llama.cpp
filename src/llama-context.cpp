@@ -4847,6 +4847,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         // Ragged tail: a shorter sub-batch has a different step
                         // count and cannot be interleaved. Drain the in-flight
                         // slot, then run the tail to completion on its own.
+                        if (getenv("WP_TP_TRACE") != nullptr) {
+                            LLAMA_LOG_WARN("%s: rolling ragged tail (slot a): n_tokens=%u n_steps=%zu vs %zu\n",
+                                           __func__, slot_a.ubatch.n_tokens, slot_a.n_steps, n_steps);
+                        }
                         if (!finish_slot(slot_b, status)) {
                             return fail_slots(slot_a, slot_b, status);
                         }
@@ -4876,6 +4880,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                     if (slot_b.n_steps != n_steps) {
                         // Ragged tail, mirror of the slot_a case above.
+                        if (getenv("WP_TP_TRACE") != nullptr) {
+                            LLAMA_LOG_WARN("%s: rolling ragged tail (slot b): n_tokens=%u n_steps=%zu vs %zu\n",
+                                           __func__, slot_b.ubatch.n_tokens, slot_b.n_steps, n_steps);
+                        }
                         if (!finish_slot(slot_a, status)) {
                             return fail_slots(slot_a, slot_b, status);
                         }

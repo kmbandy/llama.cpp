@@ -1786,7 +1786,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                static const bool s_inject_phase = [] { const char * e = std::getenv("WP_SPEC_PHASE"); return e && e[0] != '0'; }();
+                const int64_t t_inj0 = s_inject_phase ? ggml_time_us() : 0;
                 const int32_t rc_dec = llama_decode(ctx_dft, batch_inject);
+                if (s_inject_phase) {
+                    const int64_t t_inj1 = ggml_time_us();
+                    llama_synchronize(ctx_dft);
+                    SPC_INF("SPECPHASE inject_decode_us=%" PRId64 " sync_us=%" PRId64 " n_rows=%d offset=%d n_ubatch=%d\n",
+                            t_inj1 - t_inj0, ggml_time_us() - t_inj1, (int) n_chunk, (int) offset, (int) n_ubatch);
+                }
                 if (rc_dec != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc_dec, (int) n_chunk, (int) offset);
