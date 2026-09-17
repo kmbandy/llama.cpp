@@ -70,7 +70,14 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 
 static constexpr uint32_t k_meta_overlap_default_split = 2;
 static constexpr uint32_t k_meta_overlap_min_ubatch = 2;
-static constexpr uint32_t k_meta_overlap_min_subbatches = 4;
+// Two sub-batches are enough to overlap (the rolling loop needs a pair). This
+// was 4 ("amortize startup and drain"), which silently ran every batch of
+// 2-3 sub-batches serially -- and the server's end-of-prompt checkpoint
+// split (tools/server: break 4 + n_ubatch before the end) makes the final
+// batch of EVERY prompt exactly n_ubatch tokens = 2 sub-batches. Measured
+// 2026-09-16 (qwen38-27b-q8-tp, 8011-token prompt): the 5959-token first
+// batch overlapped, the 2048-token tail did not.
+static constexpr uint32_t k_meta_overlap_min_subbatches = 2;
 
 enum class meta_overlap_mode {
     rolling,

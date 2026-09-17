@@ -6055,10 +6055,22 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // MAD-LAB: with WP_SPEC_PREFILL_NO_CHECKPOINTS=1 the mid-prompt
+                            // (4 + n_ubatch) checkpoint is dropped even when checkpoints are
+                            // structurally required: only the final one (4 before the end)
+                            // is needed for a continuation to resume, and the extra break
+                            // turns the last n_ubatch tokens of every prompt into their own
+                            // llama_decode call (measured 2026-09-16: that tail batch ran
+                            // without the meta overlap and the batch before it got a ragged
+                            // sub-batch; 3 -> 2 decode calls per request).
+                            static const int checkpoint_offsets_full[] = {4 + n_ubatch, 4};
+                            static const int checkpoint_offsets_tail[] = {4};
+                            const int * checkpoint_offsets = wp_spec_no_checkpoints ? checkpoint_offsets_tail : checkpoint_offsets_full;
+                            const int   n_checkpoint_offsets = wp_spec_no_checkpoints ? 1 : 2;
 
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+                            for (int io = 0; io < n_checkpoint_offsets; ++io) {
+                                const int offset = checkpoint_offsets[io];
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
