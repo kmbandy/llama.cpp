@@ -2655,7 +2655,7 @@ struct ggml_backend_meta_context {
     ggml_backend_buffer_ptr cross_host_buf;
     std::vector<float>      cross_host_buf_fallback;
 
-    // Bounded host run-ahead (GGML_META_RUNAHEAD, default 4 subgraphs, 0 = off).
+    // Bounded host run-ahead (GGML_META_RUNAHEAD, default 0 = off; N = subgraphs).
     //
     // Every submission path here is asynchronous: compute() enqueues a
     // subgraph on each device, begin_reduce()/end_reduce() enqueue the
@@ -2747,7 +2747,11 @@ struct ggml_backend_meta_context {
         name += ")";
 
         if (n_devs > 1) {
-            size_t depth = 4;
+            // Default OFF: measured 2026-09-16 on qwen38-27b-q8-tp, depth 4 cost
+            // ~25% on an aligned 8192-token batch (1350 -> 1000 t/s) because the
+            // host wait lands before the slower device's queue is refilled. Keep
+            // as an opt-in for diagnosing host-side queue-full blocks.
+            size_t depth = 0;
             if (const char * e = getenv("GGML_META_RUNAHEAD")) {
                 depth = (size_t) atoi(e);
             }
