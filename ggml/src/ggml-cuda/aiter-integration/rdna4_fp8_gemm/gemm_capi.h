@@ -1,5 +1,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
+#include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -173,6 +174,193 @@ hipError_t rdna4_gemm_fp8b128_blockscale(const void* a_packed, int stride_am_byt
 hipError_t rdna4_gemm_fp8_trfeed(const void* A, const void* B_shuf, void* C_bf16,
                                  const float* a_scale, const float* b_scale,
                                  int M_pad, int N, int K, hipStream_t stream);
+
+// ─────────────────────────────────────────────────────────────────────────
+// PRODUCTION for workgroup-starved decode shapes only (2026-09-17 bench,
+// 9070 XT, M<=32 tile): N=17408/K=5120 (136 WGs) the frozen bf16 path
+// 0.176 ms beats every split count (n=1: 0.227 ms, 16: 1.147 ms -- the
+// atomic epilogue costs more than the parallelism buys, the kernel is
+// already at ~80% of memory bandwidth there); N=5120/K=17408 (40 WGs) the
+// frozen path is 0.478 ms and n_splits=4 gives 0.224 ms (2.1x). See
+// rdna4_trfeed_splitk_default_splits for the rule (returns 1 = don't split).
+//
+// MAD-305 decode split-K variant of the FROZEN Phase-1 "trfeed" kernel,
+// M_pad==32 (decode/verify tile) ONLY. Same A/B_shuf/a_scale/b_scale
+// contracts as rdna4_gemm_fp8_trfeed above (M_pad must be exactly 32 --
+// the prefill tile is never split-K'd, see below), but:
+//   - grid.z (blockIdx.z) splits K into n_splits slices of
+//     k_tiles_per_split = ceil((K/32)/n_splits) BK=32-wide tiles each, so
+//     n_splits x more workgroups stream the weight matrix in parallel
+//     instead of one workgroup per (N/128) tile serially walking the whole K.
+//   - each workgroup's partial a_scale[m]*b_scale[n]-scaled product for its
+//     K-slice is combined across splits with `atomicAdd` into C_f32 (fp32),
+//     not a plain bf16 store -- so C_f32 must be freshly zeroed before
+//     accumulation begins; this function does that itself with
+//     hipMemsetAsync on `stream` before launching.
+//   - output is fp32 [M_pad, N] directly (no bf16 intermediate), which also
+//     removes the bf16->fp32 convert kernel the non-split-K production path
+//     (rdna4_gemm_fp8_trfeed above) runs afterward.
+// Why M_pad==32 only: the prefill tile (M_pad%128==0) already launches
+// N/128 * M_pad/128 workgroups -- plenty of parallelism at M>32 -- so
+// split-K there would only add atomic-reduction overhead for no
+// occupancy gain. Kernel body: bench/trfeed_splitk_kernels.h's
+// gemm_fp8_trfeed_splitk<32,1>, a separate copy of trfeed_kernels.h's
+// frozen gemm_fp8_trfeed<32,1> body (main K-loop/WMMA sequence identical;
+// only the K-tile range bounds and the epilogue's atomic fp32 store
+// differ -- see that header's top comment).
+// n_splits must be >= 1; the caller may use
+// rdna4_trfeed_splitk_default_splits() below to pick one, or override via
+// its own env var (production wiring: MT_FP8_TRFEED_SPLITS, ml8.cu).
+hipError_t rdna4_gemm_fp8_trfeed_splitk(const void* A, const void* B_shuf, float* C_f32,
+                                        const float* a_scale, const float* b_scale,
+                                        int M_pad, int N, int K, int n_splits, hipStream_t stream);
+
+// Heuristic default split count for rdna4_gemm_fp8_trfeed_splitk above:
+// aims for >= 256 total workgroups (N/128 * n_splits) while keeping each
+// split at least 4 K-tiles (128 K-elements) wide, i.e.
+// n_splits = clamp(ceil(256 / (N/128)), 1, (K/32)/4). Returns 1 (no
+// split) if N or K is non-positive or too small to split further.
+int rdna4_trfeed_splitk_default_splits(int N, int K);
+
+// ─────────────────────────────────────────────────────────────────────────
+// MAD-305 ML8_4 (4.5 bpw) decode + prefill entry points (aiter-integration/
+// rdna4_fp8_gemm/gemm_ml84_prod.hip). NOT wired into ggml_cuda_op_fp8_mul_mat
+// or ml8.cu by this task -- a later task does that wiring. These reuse the
+// FROZEN fp8 trfeed kernel bodies (trfeed_kernels.h) unmodified: the decode
+// path is a separate-copy kernel with the same tile geometry/epilogue
+// structure (bench/trfeed_ml84_kernels.h's gemm_ml84_trfeed<32,1>), and the
+// prefill path is the expander below followed by the UNCHANGED
+// rdna4_gemm_fp8_trfeed.
+//
+// Packed "ML84_TRFEED" layout (bench/ml84_trfeed_layout.h):
+//   B_nib:      N*K/2 bytes. Same b_tile_offset(kt,nt,NT) 16(K)x16(N) tile
+//               addressing as the frozen fp8 B_shuf, but each fp8 byte is
+//               replaced by its 4-bit LUT index, two indices/byte: within
+//               the 4-byte dword a lane would read (nib_dword_addr =
+//               tile_nib_base + lane*4), elements s=0..3 sit in the LOW
+//               nibbles of the dword's 4 bytes and elements s=4..7 in the
+//               HIGH nibbles -- exactly the split the frozen kernel's
+//               tr_load8 v2i32{x,y} return already uses (x=bytes0-3,
+//               y=bytes4-7), so a plain load + LUT expand rebuilds the
+//               identical WMMA B fragment.
+//   b_scale_g:  fp32 [K/64][N] row-major (K-group outer, N inner) -- the
+//               SAME layout ml8.cu's ggml_cuda_ml8_repack_blocks already
+//               produces for block_ml8_4 weights; reused unchanged.
+//   lut:        F8_E4M3 [K/64][16] as stored (16 bytes/group), the model's
+//               per-K-group centroid table (ggml-turbo-quant.c's
+//               dequantize_row_ml8_4_with_lut). Values are OCP e4m3 with
+//               |c| <= 1 by construction of the calibration pipeline.
+// ─────────────────────────────────────────────────────────────────────────
+
+// One-time load-time repack: on-disk block_ml8_4 weight blocks, layout
+// `w[N][K/64]` row-major per output column n (the SAME src_blocks
+// convention ggml_cuda_ml8_repack_blocks/ml8_repack_kernel in ml8.cu
+// consume: N groups of n_groups_k=K/64 consecutive 36-byte block_ml8_4
+// records), into the ML84_TRFEED B_nib + b_scale_g packed layout above.
+// OUT-OF-PLACE ONLY (w_blocks must not alias B_nib/b_scale_g) -- see
+// gemm_ml84_prod.hip's ml84_pack_kernel comment for what an in-place
+// variant would additionally need (that's the later wiring task's problem).
+// K % 64 == 0 (QK_ML8 group width), N % 16 == 0.
+hipError_t rdna4_pack_ml84_trfeed(const void* w_blocks, int N, int K,
+                                  uint8_t* B_nib, float* b_scale_g, hipStream_t stream);
+
+// Decode/verify GEMM: launches bench/trfeed_ml84_kernels.h's
+// gemm_ml84_trfeed_splitk<32,1,ATOMIC=false> with n_splits=1 (one
+// workgroup per (n-tile) walks the WHOLE K range and plain-stores once --
+// see rdna4_gemm_ml84_trfeed_decode_splitk below, which this just calls).
+// ROUND 3: an earlier version launched a separate LDS-staged kernel on the
+// theory that exposed per-group global loads explained a measured
+// 0.31ms-vs-0.176ms gap against the frozen fp8 kernel; that staging measured
+// ZERO improvement (removed -- see trfeed_ml84_kernels.h's HISTORY comment)
+// while unstaged split-K at n_splits=1 measured 0.194 ms, already within
+// 10% of the frozen fp8 kernel's 0.176 ms.
+// This kernel's B feed is a plain load from B_nib + a per-K-group
+// (QK_ML8=64) LUT expand instead of `global_load_tr_b64` from a
+// pre-shuffled fp8 B_shuf, and its per-(64-K-group, column) scale
+// (b_scale_g) is folded into the accumulator once per group (inside the
+// kernel) rather than once at the very end (unlike the fp8 path, where a
+// single per-column scale is applied after the FULL K reduction) -- ML8_4
+// has no single per-column scale, only per-(group,column), so the fold
+// must happen per-group.
+// A: fp8 e4m3 [M_pad, K] row-major, stride exactly K -- same contract as
+//    rdna4_gemm_fp8_trfeed's A (pure weight bytes; caller supplies a_scale
+//    separately). M_pad MUST be exactly 32 (this entry point only ever
+//    dispatches the (32,1) decode tile; see rdna4_gemm_ml84_trfeed_prefill
+//    below for the 128x128 prefill-tile experiment, and
+//    rdna4_expand_ml84_to_trfeed + rdna4_gemm_fp8_trfeed for the
+//    expander+frozen-fp8 prefill path). a_scale: fp32[32].
+// C_f32: fp32 [32, N] row-major, dst->data-shaped -- fp32 output directly
+//    (no bf16 intermediate; ML8_4's per-group scale fold already costs more
+//    VALU than the fp8 path's single post-K multiply, so there is no
+//    argument for adding a bf16 convert pass on top).
+// K % 64 == 0, N % 128 == 0.
+hipError_t rdna4_gemm_ml84_trfeed_decode(const void* A, const uint8_t* B_nib, const uint8_t* lut,
+                                         float* C_f32, const float* a_scale, const float* b_scale_g,
+                                         int M_pad, int N, int K, hipStream_t stream);
+
+// Split-K decode: for workgroup-starved N (N/128 workgroups too few to
+// saturate the GPU at decode's tiny M), splits each (n-tile)'s K-GROUP
+// range (QK_ML8=64-wide groups, not raw K-tiles -- a split boundary
+// mid-group would corrupt the per-group scale fold) across blockIdx.z via
+// bench/trfeed_ml84_kernels.h's gemm_ml84_trfeed_splitk<32,1,ATOMIC>.
+// n_splits==1 uses the ATOMIC=false template path (plain store, no memset,
+// grid.z=1 -- what rdna4_gemm_ml84_trfeed_decode calls); n_splits>1 uses
+// ATOMIC=true, atomicAdd'ing each split's partial
+// a_scale[m]*(sum over its groups of b_scale_g*acc_g) into a caller-zeroed
+// fp32 C (this function zeroes it itself in that case, same as
+// rdna4_gemm_fp8_trfeed_splitk). M_pad MUST be exactly 32. n_splits must be
+// >= 1; rdna4_ml84_trfeed_splitk_default_splits below picks one.
+hipError_t rdna4_gemm_ml84_trfeed_decode_splitk(const void* A, const uint8_t* B_nib, const uint8_t* lut,
+                                                float* C_f32, const float* a_scale, const float* b_scale_g,
+                                                int M_pad, int N, int K, int n_splits, hipStream_t stream);
+
+// Heuristic default split count for rdna4_gemm_ml84_trfeed_decode_splitk
+// above -- ROUND 3, re-derived from measured numbers (9070 XT): N=17408
+// (136 WGs) n_splits=1 was best (0.194 ms/258 GB/s; 2/4/8 all worse);
+// N=5120/K=17408 (40 WGs) n_splits=4 was best (0.177 ms/283 GB/s; 1/2 worse,
+// 8 WORSE than 4). Rule: no split once N/128 >= 128 (comfortably above a
+// 9070 XT's CU count already); otherwise round(160/(N/128)) (160/40=4,
+// exactly the measured-best n=4), capped at n_groups_k/2 (a split needs
+// >=2 groups to amortize its own loop overhead) and at a hard 8 (n=8
+// measured worse than n=4 at the only workgroup-starved shape tested).
+int rdna4_ml84_trfeed_splitk_default_splits(int N, int K);
+
+// Prefill EXPERIMENT: gemm_ml84_trfeed_splitk instantiated at the frozen
+// prefill tile geometry (TBM=128, TWAVES_M=2, ATOMIC=false,
+// groups_per_split=n_groups_k, grid.z=1 -- same "n_splits=1" trick as
+// rdna4_gemm_ml84_trfeed_decode, just at the bigger tile) instead of
+// expander+frozen-fp8. In-kernel LUT expansion is VALU work sharing the
+// issue port with WMMA (ml84_lut_gather4's __builtin_amdgcn_perm calls), so
+// this is expected to lose to expander+rdna4_gemm_fp8_trfeed at large M
+// (where the expander's fixed ~0.4-0.6ms cost is amortized away) but may win
+// at smaller M where that fixed cost dominates -- gemm_ml84_bench.hip
+// measures both at M in {128,512,2048} rather than asserting an answer here.
+// M_pad MUST be a multiple of 128 (the frozen prefill tile's BM). Same
+// A/a_scale/b_scale_g/B_nib/lut contracts as rdna4_gemm_ml84_trfeed_decode,
+// generalized to M_pad rows; C_f32: fp32 [M_pad, N] row-major.
+hipError_t rdna4_gemm_ml84_trfeed_prefill(const void* A, const uint8_t* B_nib, const uint8_t* lut,
+                                          float* C_f32, const float* a_scale, const float* b_scale_g,
+                                          int M_pad, int N, int K, hipStream_t stream);
+
+// Prefill path, step 1: re-expand ML84_TRFEED (B_nib/lut/b_scale_g) into the
+// frozen fp8 kernel's B_shuf (bench/trfeed_common.h's preshuffle_B tile
+// layout -- SAME permutation, provably: both this expander and B_nib derive
+// (lane L, slot s) from tile-local (kl,nl) via the identical formula, see
+// ml84_trfeed_layout.h's ml84_lane_slot) plus a single per-column fp32
+// scale, matching the frozen path's `amax/448` convention exactly:
+//   b_scale_out[n] = (max over K-groups g of b_scale_g[g,n]) / 448
+//   fp8 byte(k,n)  = e4m3_round(centroid(g,idx) * b_scale_g[g,n] / b_scale_out[n])
+// (valid because LUT entries have |c| <= 1, so |w| <= b_scale_g[g,n] <=
+// max_g(...) for every element -- the byte never exceeds e4m3's range).
+// Step 2 is simply the UNCHANGED rdna4_gemm_fp8_trfeed(A, B_shuf_out, ...,
+// b_scale_out, ...) -- no new prefill GEMM kernel exists or is needed.
+// `lut` may already be offset by the caller for a K-slice (tensor-parallel
+// use): this function indexes it as lut[g*16+idx] with g LOCAL to the
+// (possibly-sliced) K range passed in, exactly like the decode path.
+// K % 64 == 0, N % 16 == 0, K % 16 == 0.
+hipError_t rdna4_expand_ml84_to_trfeed(const uint8_t* B_nib, const uint8_t* lut,
+                                       const float* b_scale_g, int N, int K,
+                                       uint8_t* B_shuf_out, float* b_scale_out, hipStream_t stream);
 #ifdef __cplusplus
 }
 #endif

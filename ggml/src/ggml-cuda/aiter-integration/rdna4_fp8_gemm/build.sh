@@ -46,4 +46,15 @@ if [ -f "$HERE/gemm_trfeed_prod.hip" ]; then
     "$HERE/bench/gemm_trfeed_prod_bench.hip" \
     -o "$HERE/out/gemm_trfeed_prod_bench"
 fi
+if [ -f "$HERE/gemm_ml84_prod.hip" ]; then
+  echo "== build gemm_ml84_bench (MAD-305 ML8_4 4.5bpw decode/prefill) =="
+  # Links gemm_blockscale.hip (rdna4_[un]preshuffle_b_ml8fp8 shuffle helpers,
+  # reused by the fp8 B_shuf oracle path) + gemm_trfeed_prod.hip (the
+  # UNCHANGED frozen fp8 trfeed kernel, reused by the prefill path after
+  # gemm_ml84_prod.hip's expander) + gemm_ml84_prod.hip itself.
+  cap hipcc --offload-arch="$ARCH" -O3 -I"$ROCM_INC" -I"$HERE" \
+    "$HERE/gemm_blockscale.hip" "$HERE/gemm_trfeed_prod.hip" "$HERE/gemm_ml84_prod.hip" \
+    "$HERE/bench/gemm_ml84_bench.hip" \
+    -o "$HERE/out/gemm_ml84_bench"
+fi
 echo "== DONE =="

@@ -104,6 +104,15 @@ list(APPEND GGML_SOURCES_ROCM
 # Phase 2/gemm_capi.h). Same gfx1201-only / other-arch-stub guard convention.
 list(APPEND GGML_SOURCES_ROCM
     ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_trfeed_prod.hip)
+# MAD-305 ML8_4 (4.5 bpw) decode + prefill entry points (gemm_capi.h's
+# "ML8_4 decode + prefill" section) -- now the DEFAULT dispatch for dense
+# GGML_TYPE_ML8_4 weights on gfx1201 (ml8.cu's ML8_4_LAYOUT_RDNA4_TRFEED,
+# MT_ML8_4_LAYOUT=triton opts back into the old Triton path). Same
+# gfx1201-only / other-arch-stub guard convention as gemm_trfeed_prod.hip
+# above; reuses the UNCHANGED frozen fp8 trfeed kernel (gemm_trfeed_prod.hip,
+# already in this list) for its prefill path via rdna4_expand_ml84_to_trfeed.
+list(APPEND GGML_SOURCES_ROCM
+    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_prod.hip)
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 # dkq640 tile kernels exceed HIP local memory limit (67584 > 65536) at ncols=32
 list(FILTER SRCS EXCLUDE REGEX "dkq640")
@@ -146,6 +155,19 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+# gemm_ml84_prod.hip (transitively, via bench/trfeed_ml84_kernels.h) includes
+# bench/ml84_trfeed_layout.h, whose own `#include "../../../ggml-common.h"`
+# resolves relative to ITS directory (rdna4_fp8_gemm/bench/), which only
+# reaches ggml/src/ggml-common.h through the compiler's include search path,
+# not the literal 3-dot relative path (that lands one directory short, in
+# ggml-cuda/, which has no ggml-common.h of its own). ml8.cu ALSO now
+# includes this same header directly (for the ML8_4 in-place unpack path),
+# so both need this on the include path -- the standalone bench/build.sh has
+# always passed the identical `-I"$HERE"` (this same directory) for exactly
+# this reason.
+target_include_directories(ggml-hip PRIVATE
+    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm)
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)

@@ -54,7 +54,7 @@ __device__ inline v2i32 tr_load8(const uint8_t* p) {
 }
 
 // ---------------- baseline: byte-gather B feed (B staged in LDS) ----------------
-__global__ void __launch_bounds__(BLOCK_THREADS)
+static __global__ void __launch_bounds__(BLOCK_THREADS)   // static: header is now included by two prod TUs
 gemm_fp8_baseline(const float8_t* __restrict__ A, const float8_t* __restrict__ B,
                   __hip_bfloat16* __restrict__ C,
                   const float* __restrict__ a_scale, const float* __restrict__ b_scale,

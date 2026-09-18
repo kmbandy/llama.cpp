@@ -14,6 +14,7 @@
 #include "ggml-ml8.h"
 #include "ggml-quants.h"
 #include "ggml-common.h"
+#include "ggml-impl.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -274,7 +275,10 @@ struct ggml_tensor * ggml_ml8_mul_mat(
 
     const int64_t n_groups_k = K / QK_ML8;
     GGML_ASSERT(centroids->ne[0] == 16);
-    GGML_ASSERT(centroids->ne[1] == n_groups_k);
+    // Under tensor parallelism the centroid LUT is mirrored in full on every
+    // device while w may hold only a K-slice, so centroids can carry more
+    // groups than this node needs — see lut_group_off below.
+    GGML_ASSERT(centroids->ne[1] >= n_groups_k);
 
     // MAD-223 G.4.c — proper GGML_OP_ML8_MUL_MAT op (replaces previous
     // ggml_custom_4d wiring). Backends (cpu / hip) implement this op directly.
@@ -284,7 +288,17 @@ struct ggml_tensor * ggml_ml8_mul_mat(
     y->src[0] = w;
     y->src[1] = centroids;
     y->src[2] = x;
+    // lut_group_off (op_params[0]): first centroid K-group this node reads.
+    // Always 0 here; the meta backend rewrites it per device for a K-split
+    // weight whose centroid LUT is mirrored in full (see ggml.h).
+    ggml_set_op_params_i32(y, 0, 0);
     return y;
+}
+
+int32_t ggml_ml8_mul_mat_lut_group_off(const struct ggml_tensor * y) {
+    GGML_ASSERT(y != NULL);
+    GGML_ASSERT(y->op == GGML_OP_ML8_MUL_MAT);
+    return ggml_get_op_params_i32(y, 0);
 }
 
 struct ggml_tensor * ggml_ml8_mul_mat_id(

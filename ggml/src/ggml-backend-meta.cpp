@@ -1013,6 +1013,97 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             tensor->name, tensor->src[0]->name, (int) src_ss[0].axis, tensor->src[1]->name, (int) src_ss[1].axis);
     };
 
+    // GGML_OP_ML8_MUL_MAT (MAD-223 G.4.b, "ml8-4 quantized matmul with separate fp8 centroid
+    // LUT"). ggml_ml8_mul_mat (ggml-ml8.c): src[0] = w (GGML_TYPE_ML8_4, [K, N], QK_ML8=64-wide
+    // blocks along K), src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8] LUT sidecar), src[2]
+    // = x (GGML_TYPE_F32, [K, M...]). dst = F32 [N, M...]. The only shape difference from
+    // MUL_MAT/FP8_MUL_MAT is that the activation is src[2] instead of src[1] -- src[1] here is the
+    // LUT sidecar, which under TP is MIRRORED IN FULL on every device (pattern_ml8_sidecar,
+    // src/llama-model.cpp) regardless of how the weight is split, so it is asserted MIRRORED
+    // unconditionally rather than branched on like MUL_MAT's activation. A K-split weight's
+    // per-device offset into that mirrored LUT (op_params[0] = lut_group_off) is derived and
+    // written by the per-device op_params fixup in ggml_backend_meta_buffer_init_tensor_impl, not
+    // here. Otherwise the same split rules as MUL_MAT/FP8_MUL_MAT, with x taking src[1]'s role:
+    //   - w MIRRORED & x MIRRORED -> dst MIRRORED.
+    //   - w N-split (AXIS_1) & x MIRRORED -> dst split on AXIS_0 (each device produces only its
+    //     own N-slice of the output; no reduce needed).
+    //   - w MIRRORED & x token-split (AXIS_1) -> dst follows x's split.
+    //   - w K-split (AXIS_0) & x K-split (AXIS_0) -> dst PARTIAL (accumulate via AllReduce), same
+    //     as MUL_MAT's K-split rule. Unlike FP8_MUL_MAT's packed/scaled activation, x here is plain
+    //     F32 with no extra sidecar bytes, so the per-device element counts of w and x must match
+    //     EXACTLY (not just proportionally); each device's w-slice must also be a whole number of
+    //     QK_ML8=64 blocks so the dequant never straddles a device boundary.
+    //   - anything else -> abort naming the tensor and both axes.
+    auto handle_ml8_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            "ML8_MUL_MAT: centroids sidecar must be MIRRORED (mirrored in full on every device)");
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        // N-split weight, replicated activation -> dst split on axis 0.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            ggml_backend_meta_split_state ret = src_ss[0];
+            ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+            ret.nr[0] = 1;
+            ret.n_segments = 1;
+            return ret;
+        }
+        // Replicated weight, token-split activation.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            return src_ss[2];
+        }
+        // K-split weight x K-split activation -> PARTIAL, reduced via AllReduce.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            const size_t n_bufs_local = ggml_backend_meta_buffer_n_world(tensor->buffer);
+            const int64_t blck = ggml_blck_size(tensor->src[0]->type);
+            // per-device element counts: sum over segments of (slice units x repeats)
+            auto local_elems = [&](const ggml_backend_meta_split_state & ss, size_t j) {
+                int64_t n = 0;
+                for (int is = 0; is < ss.n_segments; is++) {
+                    n += ss.ne[is*n_bufs_local + j] * (int64_t) ss.nr[is];
+                }
+                return n;
+            };
+            for (size_t j = 0; j < n_bufs_local; j++) {
+                const int64_t w_local = local_elems(src_ss[0], j);
+                const int64_t x_local = local_elems(src_ss[2], j);
+                if (x_local != w_local) {
+                    GGML_LOG_ERROR("%s: ML8_MUL_MAT %s: device %zu w=%s w_local=%" PRId64 " nr=%u nseg=%d | x=%s x_local=%" PRId64 " nr=%u nseg=%d\n",
+                        __func__, tensor->name, j, tensor->src[0]->name, w_local, src_ss[0].nr[0], src_ss[0].n_segments,
+                        tensor->src[2]->name, x_local, src_ss[2].nr[0], src_ss[2].n_segments);
+                    GGML_ABORT("ML8_MUL_MAT: K-split activation's per-device element count must equal "
+                        "this device's w-slice K_local exactly (no packed sidecar bytes in the "
+                        "activation, unlike FP8_MUL_MAT)");
+                }
+                GGML_ASSERT(w_local % blck == 0 &&
+                    "ML8_MUL_MAT: K-split weight slice is not a whole number of QK_ML8=64 blocks");
+            }
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        GGML_ABORT("unsupported ml8_mul_mat split states: node=%s src0=%s axis=%d src2=%s axis=%d",
+            tensor->name, tensor->src[0]->name, (int) src_ss[0].axis, tensor->src[2]->name, (int) src_ss[2].axis);
+    };
+
+    // GGML_OP_ML8_GET_ROWS (MAD-223 sibling of ML8_MUL_MAT): src[0] = w (GGML_TYPE_ML8_4,
+    // [K, N] embedding table), src[1] = centroids (GGML_TYPE_F8_E4M3 LUT sidecar), src[2] = ids
+    // (GGML_TYPE_I32). Slot roles are shifted one place from plain GET_ROWS (table/ids ->
+    // table/centroids/ids). Unlike plain GET_ROWS, there is no K-split (row-content-split) case
+    // here: gathering a row requires the WHOLE row (and its LUT) on one device, so both the table
+    // and its sidecar are required MIRRORED, and the result simply follows the ids split -- either
+    // replicated (every device gathers the same rows) or split along a token axis (each device
+    // gathers only the ids it owns, e.g. after a token-parallel split upstream).
+    auto handle_ml8_get_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            "ML8_GET_ROWS: embedding table must be MIRRORED");
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            "ML8_GET_ROWS: centroids sidecar must be MIRRORED");
+        if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            return src_ss[2];
+        }
+        GGML_ABORT("ML8_GET_ROWS %s: unsupported ids split state (axis=%d) -- expected MIRRORED or "
+            "a token-axis split (AXIS_1)", tensor->name, (int) src_ss[2].axis);
+    };
+
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -1382,7 +1473,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // scale that does not belong to the rows this device actually owns. Pin BOTH axes
                 // to 128 for this type so a bad N-split (get_split_granularity's job, src/llama-*)
                 // aborts here instead of silently corrupting tile scales.
+                //
+                // ML8_4 (block_ml8_4, blck_size 64) has no shared cross-row tile scale like
+                // FP8_B128 -- each block's scale is self-contained -- so a K-split only needs the
+                // usual whole-block (64) boundary, already covered by ggml_blck_size below. An
+                // N-split, however, feeds the HIP GEMM's native fp8 WMMA path (mt_ml8_gemm), whose
+                // N tile is 16 rows wide; an N-split not aligned to 16 would hand a device a
+                // partial tile. Pin the N-split granularity to 16 for this type instead of the
+                // generic "1" so a bad N-split aborts here too.
                 const int64_t granularity = tensor->type == GGML_TYPE_FP8_B128 ? 128
+                    : tensor->type == GGML_TYPE_ML8_4 ? (ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 16)
                     : (ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1);
                 int64_t ne_sum = 0;
                 for (size_t s = 0; s < ret.n_segments; s++) {
@@ -1602,6 +1702,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_FP8_MUL_MAT: {
                 split_state = handle_fp8_mul_mat(src_ss);
+            } break;
+            case GGML_OP_ML8_MUL_MAT: {
+                split_state = handle_ml8_mul_mat(src_ss);
+            } break;
+            case GGML_OP_ML8_GET_ROWS: {
+                split_state = handle_ml8_get_rows(src_ss);
             } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
@@ -2002,6 +2108,40 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                         "FP8_QUANT_ROT: this device's local K slice is not a whole multiple of b_dim");
                     const int32_t a_dim_local = (int32_t) (t_ij->src[0]->ne[0] / b_dim);
                     memcpy((char *) t_ij->op_params, &a_dim_local, sizeof(int32_t));
+                }
+            } break;
+            case GGML_OP_ML8_MUL_MAT: {
+                // op_params[0] is lut_group_off (GGML_OP_ML8_MUL_MAT, ggml.h): the index of the
+                // first QK_ML8=64-wide K-group of the centroid LUT this device's weight slice
+                // starts at. The LUT sidecar (t_ij->src[1]) is mirrored in full on every device
+                // (pattern_ml8_sidecar, src/llama-model.cpp), so only a K-split (AXIS_0) weight
+                // needs a nonzero offset -- an N-split or MIRRORED weight slice starts at K offset
+                // 0 and keeps whatever op_params[0] the memcpy above already carried (must be 0:
+                // this op has no notion of a K-split WORLD tensor with a nonzero base offset).
+                const ggml_backend_meta_split_state w_ss =
+                    ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+                if (w_ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                    // Sum of the LOCAL K element counts of every device before this one, using the
+                    // exact same s*n_world + rank_first + j' indexing the split_dim ne[] loop above
+                    // uses to compute THIS device's own local ne[split_dim].
+                    int64_t k_off = 0;
+                    for (size_t jj = 0; jj < j; jj++) {
+                        for (size_t s = 0; s < w_ss.n_segments; s++) {
+                            k_off += w_ss.ne[s*n_world + rank_first + jj] * (int64_t) w_ss.nr[s];
+                        }
+                    }
+                    const int64_t blck = ggml_blck_size(t_ij->src[0]->type);
+                    GGML_ASSERT(k_off % blck == 0 &&
+                        "ML8_MUL_MAT: this device's K offset into the centroid LUT is not a whole QK_ML8=64 group");
+                    GGML_ASSERT(t_ij->src[0]->ne[0] % blck == 0 &&
+                        "ML8_MUL_MAT: this device's local K slice is not a whole number of QK_ML8=64 blocks");
+                    const int32_t lut_group_off = (int32_t) (k_off / blck);
+                    GGML_ASSERT(t_ij->src[1]->ne[1] >= lut_group_off + t_ij->src[0]->ne[0] / blck &&
+                        "ML8_MUL_MAT: centroid LUT sidecar does not cover this device's K-group range");
+                    memcpy((char *) t_ij->op_params, &lut_group_off, sizeof(int32_t));
+                } else {
+                    GGML_ASSERT(((const int32_t *) t_ij->op_params)[0] == 0 &&
+                        "ML8_MUL_MAT: lut_group_off must be 0 for a non-K-split weight");
                 }
             } break;
             default: break;

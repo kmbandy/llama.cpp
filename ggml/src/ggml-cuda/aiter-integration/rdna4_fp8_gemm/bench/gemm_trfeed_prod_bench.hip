@@ -10,6 +10,14 @@
 // at every FP8_MUL_MAT production shape from the MAD-305 handoff plus the
 // M=33/M=2 decode-batch edge cases (both exercise the M_pad path since
 // neither is already a multiple of 128).
+//
+// For every M<=32 (decode/verify tile) shape, also exercises
+// rdna4_gemm_fp8_trfeed_splitk (gemm_capi.h) -- the split-K decode variant
+// that trades atomic-add fp32 reduction for far more workgroups streaming
+// the weight in parallel -- against the same oracle samples, at
+// n_splits in {1,2,4,8,16} plus the rdna4_trfeed_splitk_default_splits()
+// heuristic, printing ms and effective GB/s (N*K weight bytes / time)
+// alongside the non-split-K number above.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp8.h>
 #include "trfeed_common.h"
@@ -135,8 +143,66 @@ static int run_shape(int M, int N, int K, int iters) {
     const double tf = gflop / (ms / 1e3);
     printf("   %8.4f ms  %7.2f TF\n", ms, tf);
 
+    // ---- split-K decode variant (M_pad==32 only -- rdna4_gemm_fp8_trfeed_splitk
+    // is not defined/usable for the prefill tile): same oracle samples, same
+    // bf16-level relative-error tolerance (split-K accumulates in fp32, so it
+    // should be at least as accurate as the frozen kernel's bf16 output), and
+    // per-n_splits timing + effective GB/s (weight bytes N*K streamed / time --
+    // the whole point of split-K is to raise how much of the 640 GB/s the
+    // decode shape's tiny M actually captures).
+    int splitk_failures = 0;
+    if (M_pad == 32) {
+        float* C_f32 = nullptr;
+        HCK(hipMalloc(&C_f32, (size_t)M_pad * N * sizeof(float)));
+
+        const int default_splits = rdna4_trfeed_splitk_default_splits(N, K);
+        static const int try_splits[] = {1, 2, 4, 8, 16};
+        for (int trial = 0; trial < (int)(sizeof(try_splits)/sizeof(try_splits[0])) + 1; trial++) {
+            const bool is_default = trial == (int)(sizeof(try_splits)/sizeof(try_splits[0]));
+            const int n_splits = is_default ? default_splits : try_splits[trial];
+
+            hipError_t rc2 = rdna4_gemm_fp8_trfeed_splitk(A_pad, B_shuf, C_f32, as_pad, bscale,
+                                                          M_pad, N, K, n_splits, stream);
+            if (rc2 != hipSuccess) {
+                fprintf(stderr, "  splitk M=%d N=%d K=%d n_splits=%d: dispatch failed: %s\n",
+                        M, N, K, n_splits, hipGetErrorString(rc2));
+                splitk_failures++;
+                continue;
+            }
+            HCK(hipDeviceSynchronize());
+
+            float mx2 = 0.f;
+            for (const auto & samp : samples) {
+                float gv;
+                HCK(hipMemcpy(&gv, C_f32 + (size_t)samp.i * N + samp.j, 4, hipMemcpyDeviceToHost));
+                float e = fabsf(gv - samp.ref) / (fabsf(samp.ref) + 1e-3f);
+                if (e > mx2) mx2 = e;
+            }
+            const bool pass2 = mx2 < 0.03f;
+            if (!pass2) splitk_failures++;
+
+            for (int i = 0; i < 5; i++)
+                rdna4_gemm_fp8_trfeed_splitk(A_pad, B_shuf, C_f32, as_pad, bscale, M_pad, N, K, n_splits, stream);
+            HCK(hipDeviceSynchronize());
+            hipEvent_t s2, e2; hipEventCreate(&s2); hipEventCreate(&e2);
+            hipEventRecord(s2);
+            for (int i = 0; i < iters; i++)
+                rdna4_gemm_fp8_trfeed_splitk(A_pad, B_shuf, C_f32, as_pad, bscale, M_pad, N, K, n_splits, stream);
+            hipEventRecord(e2); hipEventSynchronize(e2);
+            float ms2 = 0; hipEventElapsedTime(&ms2, s2, e2); ms2 /= iters;
+            hipEventDestroy(s2); hipEventDestroy(e2);
+
+            const double gbytes = (double)N * (double)K / 1e9;
+            const double gbps = gbytes / (ms2 / 1e3);
+            printf("    splitk n_splits=%-3d%s max_rel_err=%.4f  %s   %8.4f ms  %7.1f GB/s\n",
+                   n_splits, is_default ? " (default)" : "          ",
+                   mx2, pass2 ? "PASS" : "*** FAIL ***", ms2, gbps);
+        }
+        hipFree(C_f32);
+    }
+
     hipFree(A_pad); hipFree(B_kn); hipFree(B_shuf); hipFree(as_pad); hipFree(bscale); hipFree(C_bf16);
-    return pass ? 0 : 1;
+    return (pass && splitk_failures == 0) ? 0 : 1;
 }
 
 int main() {
@@ -157,6 +223,7 @@ int main() {
         {  33, 17408, 5120},
         {  16, 17408, 5120},
         {   2, 17408, 5120},
+        {   8,  5120,17408},   // ffn_down-shaped decode: only N/128=40 workgroups
     };
     int failures = 0;
     for (const auto & s : shapes) {

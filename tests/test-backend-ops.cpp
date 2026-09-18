@@ -2391,28 +2391,53 @@ struct test_get_rows : public test_case {
 // ml8-4 tensor), so CPU and HIP read the same codebook; HIP additionally
 // exercises the load-time in-place repack (set_tensor -> kernel layout).
 struct test_ml8_mul_mat : public test_case {
-    const int64_t m; // N (out features)
-    const int64_t n; // M (tokens)
-    const int64_t k; // K (in features), multiple of 64
+    const int64_t m;              // N (out features)
+    const int64_t n;              // M (tokens)
+    const int64_t k;              // K (in features), multiple of 64 — this device's K-slice
+    const int64_t k_world;        // world K the mirrored centroid LUT covers; 0 -> k (no TP split)
+    const int64_t lut_group_off;  // first centroid K-group this node reads
+    const int64_t ne2;            // batch dim, x/out become 3D [k,n,ne2] / [m,n,ne2]
 
     std::string vars() override {
-        return VARS_TO_STR3(m, n, k);
+        return VARS_TO_STR6(m, n, k, k_world, lut_group_off, ne2);
     }
 
     double max_nmse_err() override {
+        // MAD-305: on gfx1201, N%128==0 && M>32 dispatches through the
+        // RDNA4_TRFEED prefill path (ml8_4_layout_for_tensor picks
+        // RDNA4_TRFEED whenever N%128==0; ml8_mul_mat_core's M_pad>32 branch
+        // then calls rdna4_expand_ml84_to_trfeed, gemm_ml84_prod.hip) which
+        // re-rounds each dequantized element (centroid*scale, rescaled by the
+        // column's max group scale) to e4m3 BEFORE the GEMM -- an extra
+        // rounding step the CPU oracle's exact LUT dequant never takes, up to
+        // ~6% per element. The M<=32 decode-splitk path (any N%128==0) and
+        // the TRITON layout (N not a multiple of 128) both read the centroid
+        // table directly with no re-quantization, so keep the tight bound
+        // there.
+        if (m % 128 == 0 && n > 32) {
+            return 2e-2;
+        }
         return 5e-3; // fp8 activations + bf16 output on the HIP path
     }
 
-    test_ml8_mul_mat(int64_t m = 64, int64_t n = 16, int64_t k = 256) : m(m), n(n), k(k) {}
+    test_ml8_mul_mat(int64_t m = 64, int64_t n = 16, int64_t k = 256,
+                      int64_t k_world = 0, int64_t lut_group_off = 0, int64_t ne2 = 1)
+        : m(m), n(n), k(k),
+          k_world(k_world != 0 ? k_world : k),
+          lut_group_off(lut_group_off), ne2(ne2) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_ML8_4, k, m);
         ggml_set_name(w, "w");
-        ggml_tensor * cent = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, k / 64);
+        ggml_tensor * cent = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, k_world / 64);
         ggml_set_name(cent, "centroids");
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, ne2);
         ggml_set_name(x, "x");
         ggml_tensor * out = ggml_ml8_mul_mat(ctx, w, cent, x);
+        // Under tensor parallelism w only holds a [k, m] K-slice while cent
+        // is mirrored in full ([16, k_world/64]); lut_group_off selects
+        // which K-groups of the mirrored LUT this slice's decode should use.
+        out->op_params[0] = (int32_t) lut_group_off;
         ggml_set_name(out, "out");
         return out;
     }
@@ -10004,6 +10029,44 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 256, /*n=M*/ 16, /*k=K*/ 512));
 
+    // MAD-305: the real production decode/prefill shape (N=17408, K=5120 --
+    // ffn_gate/ffn_up at the 9070 XT bench in gemm_capi.h) at M=64 (prefill,
+    // M_pad rounds 64 up to 128 -- exercises the padding path, not just an
+    // exact multiple) and M=2048 (prefill, M_pad==M already a 128-multiple).
+    // Both dispatch through the RDNA4_TRFEED expander path by default on
+    // gfx1201 (N%128==0, M>32) -- see max_nmse_err() above for why the
+    // tolerance widens there.
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 64,   /*k=K*/ 5120));
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 2048, /*k=K*/ 5120));
+
+    // ml8-4 LUT GEMM under tensor parallelism: a K-split weight (w holds only
+    // a [k, m] K-slice) decoded against a centroid LUT mirrored in full
+    // ([16, k_world/64]) via a nonzero lut_group_off. Shapes below are the
+    // production 27B 50/50 TP split: N-split qkv/o_proj/ffn (k unchanged,
+    // lut_group_off=0, k_world defaults to k) and K-split down-proj-style
+    // weights (k_world = 2*k, lut_group_off picking this device's half).
+    for (int M : { 1, 2, 16, 33, 129 }) {
+        // N-split: full K per device, no LUT offset needed.
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ M, /*k=K*/ 5120));
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 3072, /*n=M*/ M, /*k=K*/ 5120));
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 8704, /*n=M*/ M, /*k=K*/ 5120));
+        // K-split: this device's K-slice plus the mirrored world-K LUT and
+        // this device's group offset into it.
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ M, /*k=K*/ 8704,
+            /*k_world=*/ 17408, /*lut_group_off=*/ 136));
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ M, /*k=K*/ 3072,
+            /*k_world=*/ 6144, /*lut_group_off=*/ 48));
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ M, /*k=K*/ 2560,
+            /*k_world=*/ 5120, /*lut_group_off=*/ 40));
+    }
+    // A 3D activation batch (qwen35 ssm_out-style [k, n, ne2]) with a K-split
+    // weight, and the off=0 edge of a K-split shape (first half of the
+    // mirrored LUT — exercises the boundary distinct from mid-LUT offsets).
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ 7, /*k=K*/ 5120,
+        /*k_world=*/ 0, /*lut_group_off=*/ 0, /*ne2=*/ 3));
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ 16, /*k=K*/ 2560,
+        /*k_world=*/ 5120, /*lut_group_off=*/ 0));
+
     // GGML_OP_ML8_APPLY_ROTATION (MAD-266 adds block_hadamard alongside the
     // existing kronecker kind — see ggml-ml8.h). kronecker: h_a present,
     // a_dim <= 16 (HIP register-array bound). block_hadamard: h_a == NULL,
@@ -11258,6 +11321,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // ML8_4 (4.5 bpw LUT) dense GEMM at the same ffn_gate/ffn_down shapes:
+    // M=1 is the ml8 GEMV, M<=16 the Triton decode tier, 2048 the prefill
+    // tier. Decode is weight-bandwidth bound, so compare the M<=32 rows'
+    // GB/s against the card's peak, not their FLOPS.
+    for (int64_t m : {1, 8, 32, 2048}) {
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ m, /*k=K*/ 5120));
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120,  /*n=M*/ m, /*k=K*/ 17408));
+    }
 
     // FP8_B128 preshuffle GEMM vs the ML8_FP8 generic aiter GEMM vs Q8_0 MMQ at
     // Qwen3.8-27B ffn_gate (K=5120, N=17408) and ffn_down (K=17408, N=5120) shapes

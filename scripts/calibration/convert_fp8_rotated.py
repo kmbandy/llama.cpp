@@ -402,17 +402,27 @@ def _bf16_rows_to_fp32_gpu_indices(tensor, device: torch.device,
 def _fit_ml8_centroids(tensor, K: int, N: int, device: torch.device, rotation,
                        fit_rows: int, group_size: int = QK_ML8,
                        n_centroids: int = N_CENTROIDS, n_iter: int = 25,
-                       fit_loss: str = "mag_weighted", mag_weight_p: float = 5.0,
+                       fit_loss: str = "mse", mag_weight_p: float = 5.0,
                        chunk_rows: int = _CHUNK_ROWS) -> torch.Tensor:
     """Fit one shared 16-centroid LUT per K-group (64 columns), pooling the
     scale-normalised ROTATED values of a uniformly-subsampled set of rows (up
     to `fit_rows`, see --ml8-fit-rows) across ALL N rows of the weight.
 
-    Matches CentroidQuantizer.find_params's convention exactly (per-row
-    absmax scale over the group, floor 1e-8, signed Lloyd-Max fit on the
-    normalised values, col_weights=None — i.e. no Hessian, since a data-free
-    conversion has no calibration corpus) except that find_params pools every
-    row of the group while this pools a bounded row subsample — the largest
+    Matches CentroidQuantizer.find_params's convention (per-row absmax
+    scale over the group, floor 1e-8, signed Lloyd-Max fit on the normalised
+    values, col_weights=None — i.e. no Hessian, since a data-free conversion
+    has no calibration corpus) with TWO deliberate departures. (1) fit_loss
+    defaults to plain "mse", NOT the KV cache's "mag_weighted" p=5: the
+    magnitude-weighted fit puts every centroid at |c| >= 0.25*absmax (measured
+    on Qwen3.8-27B blk.0.ffn_gate: no level below 0.25), so the small values
+    that make up most of a weight row all round to +-0.25*absmax -- relL2
+    0.28 vs the rotated source, against 0.09 for the mse fit and 0.10 for a
+    Q4_0-style absmax quant of the same rows. The calibrated (GPTQ) pipeline
+    could afford mag-weighting because its error feedback re-absorbed that
+    bias into later columns; a data-free conversion has no such correction
+    and the 2026-09-17 mag_weighted file produced token-salad output.
+    (2) find_params pools every row of the group while this pools a bounded
+    row subsample — the largest
     weight in this model (output.weight, 248320x5120) can't have its rotated
     fp32 form materialized in full within the 15 GB host RAM budget, and a
     uniform subsample is enough to fit a stable per-group LUT (every row is

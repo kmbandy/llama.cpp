@@ -12235,7 +12235,10 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
 //
 // Tensor layouts (set by ggml_ml8_mul_mat):
 //   dst->src[0] = w         (GGML_TYPE_ML8_4 ,  [K, N])
-//   dst->src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8])
+//   dst->src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8] or more —
+//                            under tensor parallelism the LUT is mirrored in
+//                            full while w holds only a K-slice; op_params[0]
+//                            (lut_group_off) selects which K-groups to use)
 //   dst->src[2] = x         (GGML_TYPE_F32   ,  [K, M])
 //   dst         = y         (GGML_TYPE_F32   ,  [N, M])
 void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_tensor * dst) {
@@ -12247,17 +12250,30 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
     GGML_ASSERT(lut->type == GGML_TYPE_F8_E4M3);
     GGML_ASSERT(x->type   == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
 
     const int64_t K = w->ne[0];
     const int64_t N = w->ne[1];
-    const int64_t M = x->ne[1];
+    // M = total columns across ALL batch dims, not just ne[1]. qwen35's
+    // ssm_out feeds a 3D input [K, n_seq_tokens, n_seqs] (reshape_3d in the
+    // delta-net); with M=ne[1] only the first sequence is computed and the
+    // rest are garbage. 2D inputs have ne[2]=ne[3]=1 so this is unchanged.
+    // Mirrors the fix in ggml-cuda/ml8.cu's ggml_cuda_op_ml8_mul_mat.
+    const int64_t M = x->ne[1] * x->ne[2] * x->ne[3];
     GGML_ASSERT(x->ne[0] == K);
     GGML_ASSERT(K % QK_ML8 == 0);
     const int64_t n_groups_k = K / QK_ML8;
-    GGML_ASSERT(lut->ne[0] == 16 && lut->ne[1] == n_groups_k);
+
+    // lut_group_off: first centroid K-group this node reads (op_params[0],
+    // default 0). Under tensor parallelism w holds only a K-slice while
+    // centroids is mirrored in full, so lut->ne[1] may exceed n_groups_k.
+    const int32_t lut_group_off = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(lut->ne[0] == 16);
+    GGML_ASSERT(lut_group_off >= 0 && lut_group_off + n_groups_k <= lut->ne[1]);
 
     const block_ml8_4 * w_blocks = (const block_ml8_4 *) w->data;
-    const uint8_t     * lut_fp8  = (const uint8_t     *) lut->data;
+    const uint8_t     * lut_fp8  = (const uint8_t     *) lut->data + (size_t) lut_group_off * 16;
     const float       * x_data   = (const float       *) x->data;
     float             * y_data   = (float             *) dst->data;
 

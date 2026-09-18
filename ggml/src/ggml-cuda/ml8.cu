@@ -29,6 +29,18 @@
 // ggml-hip was configured with -DGGML_HIP_AITER=ON. Only the GEMM COMPUTE
 // dispatch (ggml_cuda_op_fp8_mul_mat) is AITER-gated, matching FP8_B128.
 #include "aiter-integration/rdna4_fp8_gemm/gemm_capi.h"
+// ML8_4 RDNA4_TRFEED packed-layout addressing (ml84_trfeed_nk_to_pos /
+// ml84_get_nibble / ml84_set_nibble) -- shared, byte-for-byte, with
+// rdna4_pack_ml84_trfeed's own packer kernel (gemm_ml84_prod.hip) so the
+// unpack path below (ml84_trfeed_unpack_kernel) is provably the same
+// bijection, not an independently-derived inverse. Pure host+device byte
+// arithmetic (no gfx12 intrinsics), so this include is unconditional like
+// gemm_capi.h above. NOTE: this header's own `#include "../../../ggml-common.h"`
+// only resolves once ggml-hip/CMakeLists.txt adds the rdna4_fp8_gemm directory
+// itself to the include path (added alongside gemm_ml84_prod.hip; see that
+// CMakeLists.txt comment) -- the standalone bench/build.sh has always passed
+// this same directory via -I for exactly that reason.
+#include "aiter-integration/rdna4_fp8_gemm/bench/ml84_trfeed_layout.h"
 #include "turbo_fp8_hadamard.cuh"  // G.6.f: FWHT for rotation H_b leg
 
 #include <climits>
@@ -47,10 +59,22 @@
 // for Python-side bit-equivalence comparison. Set env var ML8_DUMP=1 to
 // enable. First-call-only; the static atomics track which dumps have fired.
 namespace {
-std::atomic<bool> g_ml8_dump_rot_done    {false};
-std::atomic<bool> g_ml8_dump_rotdst_done {false};
-std::atomic<bool> g_ml8_dump_mm_done     {false};
-std::atomic<bool> g_ml8_dump_quant_done  {false};
+// ML8_DUMP harness: dumps the first ML8_DUMP_N (env, default 1) rotation /
+// mul_mat calls to /tmp/ml8_hip_{rot,mm}<i>_*.bin and appends one line per
+// call to /tmp/ml8_hip_index.txt (node name, weight name, shape) so a
+// Python check can recompute each from the GGUF's own weights.
+std::atomic<int> g_ml8_dump_rot_n   {0};
+std::atomic<int> g_ml8_dump_mm_n    {0};
+int ml8_dump_limit() {
+    static const int n = std::getenv("ML8_DUMP_N") ? std::atoi(std::getenv("ML8_DUMP_N")) : 1;
+    return n;
+}
+void ml8_dump_index(const char * kind, int i, const char * node, const char * w, int64_t K, int64_t N, int64_t M, int a_dim, int b_dim, bool has_h_a) {
+    FILE * f = std::fopen("/tmp/ml8_hip_index.txt", "a");
+    if (!f) return;
+    std::fprintf(f, "%s %d node=%s w=%s K=%lld N=%lld M=%lld a_dim=%d b_dim=%d h_a=%d\n", kind, i, node, w ? w : "-", (long long) K, (long long) N, (long long) M, a_dim, b_dim, (int) has_h_a);
+    std::fclose(f);
+}
 
 void ml8_dump_u8(const char * path, const uint8_t * d_ptr, size_t n_elems,
                 cudaStream_t stream, int ndim, const int64_t * shape) {
@@ -161,6 +185,89 @@ void ggml_cuda_ml8_repack_blocks(
         dst_b_scale,
         N,
         n_groups_k);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MAD-305 ML8_4 (4.5 bpw) GEMM weight LAYOUT switch (generic "triton" /
+// RDNA4 "trfeed"), the ML8_4 sibling of ML8_FP8_GEMM_LAYOUT_*/FP8_B128_LAYOUT_*
+// further below. Both layouts share the exact same footprint
+// (ggml_cuda_ml8_inplace_alloc_size's ML8_4 formula, (K/2)*N nibbles +
+// (K/64)*N fp32 scales -- rdna4_pack_ml84_trfeed's B_nib is a pure
+// tile-shuffled repacking of the same nibble stream, and b_scale_g is
+// byte-for-byte the SAME [K/64,N] fp32 table ggml_cuda_ml8_repack_blocks's
+// TRITON layout already produces -- see gemm_capi.h's ML84_TRFEED comment):
+//   TRITON (was the only layout): b_packed is the straight [K/2,N] nibble
+//     transpose (ml8_repack_kernel's layout) -- read by mt_ml8_gemm's
+//     WEIGHT_FORMAT=1 LUT path, the M=1 GEMV kernel (ml8_gemv_dispatch_env)
+//     and the native GET_ROWS packed gather (ml8_packed_get_rows_kernel).
+//   RDNA4_TRFEED (new default): b_packed is B_nib, the SAME nibble stream
+//     tile-shuffled into the frozen fp8 trfeed kernel's 16(K)x16(N)
+//     addressing (rdna4_pack_ml84_trfeed, gemm_capi.h) -- read by
+//     rdna4_gemm_ml84_trfeed_decode_splitk (M<=32) and, via
+//     rdna4_expand_ml84_to_trfeed + the UNCHANGED rdna4_gemm_fp8_trfeed,
+//     for M>32 prefill. 9070 XT (2026-09-17 bench, gemm_capi.h): decode
+//     0.158ms vs Triton's 0.304ms at N=17408/K=5120; prefill M=2048 132 TF
+//     vs Triton's 57 TF.
+// Read ONCE (static), same rationale as the sibling layout switches: a live
+// env flip would desync already-packed weights from a dispatch expecting
+// the other layout. Recorded per-tensor in ml8_weight_repack_t::layout.
+// MT_ML8_4_LAYOUT=triton restores the old path; MT_ML8_4_LAYOUT=trfeed (or
+// unset) is the default. The RDNA4_TRFEED prefill expander needs whole
+// 128-wide N tiles (rdna4_expand_ml84_to_trfeed / rdna4_gemm_fp8_trfeed both
+// require N%128==0); a tensor whose N isn't a multiple of 128 (e.g. a TP
+// N-slice sliced to a 16-multiple) is packed TRITON regardless of the env
+// choice -- see ml8_4_layout_for_tensor below, which both repack paths
+// (in-place ggml_cuda_ml8_inplace_set and the cache-copy
+// ggml_cuda_ml8_get_or_repack) call to decide a given tensor's layout once,
+// at pack time, so ml8_mul_mat_core's dispatch can just follow
+// repack->layout with no further shape checks.
+// ─────────────────────────────────────────────────────────────────────
+enum {
+    ML8_4_LAYOUT_TRITON       = 0,
+    ML8_4_LAYOUT_RDNA4_TRFEED = 1,
+};
+
+static int32_t ml8_4_env_layout() {
+    static const int32_t layout = [] {
+        const char * e = getenv("MT_ML8_4_LAYOUT");
+        if (e != nullptr && std::strcmp(e, "triton") == 0) {
+            return (int32_t) ML8_4_LAYOUT_TRITON;
+        }
+        if (e != nullptr && std::strcmp(e, "trfeed") != 0 && std::strlen(e) > 0) {
+            fprintf(stderr, "[ml8-4] MT_ML8_4_LAYOUT=%s not recognized, using 'trfeed'\n", e);
+        }
+        return (int32_t) ML8_4_LAYOUT_RDNA4_TRFEED;   // default: gfx1201 trfeed decode/prefill kernels
+    }();
+    return layout;
+}
+
+static int32_t ml8_4_layout_for_tensor(int32_t N) {
+    if (ml8_4_env_layout() == ML8_4_LAYOUT_RDNA4_TRFEED && N % 128 == 0) {
+        return ML8_4_LAYOUT_RDNA4_TRFEED;
+    }
+    return ML8_4_LAYOUT_TRITON;
+}
+
+// Pack the on-disk ML8_4 blocks into `dst_packed`/`dst_scale` according to
+// `layout`. TRITON reuses the existing straight [K/2,N] repack kernel;
+// RDNA4_TRFEED calls the out-of-place device packer (rdna4_pack_ml84_trfeed,
+// gemm_capi.h) directly against `staging` (the on-disk bytes) -- no
+// intermediate buffer needed, unlike ML8_FP8's RDNA4 layout, since the
+// packer already reads block_ml8_4 rows straight from `staging`.
+static void ml8_4_pack_for_layout(
+    cudaStream_t stream, const uint8_t * staging, uint8_t * dst_packed, float * dst_scale,
+    int32_t N, int32_t K, int32_t n_groups_k, int32_t layout) {
+    if (layout == ML8_4_LAYOUT_TRITON) {
+        constexpr int BLOCK_N = 64;
+        const dim3 grid((N + BLOCK_N - 1) / BLOCK_N, n_groups_k, 1);
+        const dim3 block(BLOCK_N, 1, 1);
+        ml8_repack_kernel<<<grid, block, 0, stream>>>(staging, dst_packed, dst_scale, N, n_groups_k);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const hipError_t rc = rdna4_pack_ml84_trfeed(staging, N, K, dst_packed, dst_scale, stream);
+    CUDA_CHECK(cudaGetLastError());
+    GGML_ASSERT(rc == hipSuccess && "rdna4_pack_ml84_trfeed failed");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -292,14 +399,12 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
         return nullptr;
     }
 
-    ggml_cuda_ml8_repack_blocks(
-        stream,
-        w->data,
-        d_b_packed,
-        d_b_scale,
-        N,
-        K,
-        group_size);
+    // MAD-305: layout-aware, mirroring the in-place path (ggml_cuda_ml8_inplace_set)
+    // -- test-backend-ops and any WP_ML8_INPLACE=0 build take this cache-copy
+    // path, and both must produce the same packed layout the dispatch expects.
+    const int32_t layout = ml8_4_layout_for_tensor(N);
+    ml8_4_pack_for_layout(stream, (const uint8_t *) w->data, (uint8_t *) d_b_packed, d_b_scale,
+        N, K, n_groups_k, layout);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -326,6 +431,7 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     entry.info.K          = K;
     entry.info.n_groups_k = n_groups_k;
     entry.info.group_size = group_size;
+    entry.info.layout     = layout;
     auto [ins_it, _ins_ok] = g_ml8_cache.emplace(key, entry);
     return &ins_it->second.info;
 }
@@ -705,6 +811,53 @@ static __global__ void ml8_unpack_kernel(
     for (int j = 0; j < ML8_GROUP_NIBBLES; ++j) {
         qs[j] = b_packed[((size_t) (k_half_base + j)) * (size_t) N + (size_t) n];
     }
+}
+
+// Inverse of ml84_pack_kernel (gemm_ml84_prod.hip): gather B_nib nibbles +
+// b_scale_g back into the on-disk block_ml8_4 {float scale; uint8_t qs[32]}
+// blocks. One thread per (n, g), mirroring ml8_unpack_kernel's TRITON
+// inverse above but reading through ml84_trfeed_nk_to_pos's tile-shuffled
+// addressing (bench/ml84_trfeed_layout.h) instead of a straight [K/2,N]
+// stride.
+static __global__ void ml84_trfeed_unpack_kernel(
+    const uint8_t * __restrict__ B_nib,      // ML84_TRFEED nibble layout
+    const float   * __restrict__ b_scale_g,  // (n_groups_k, N) row-major
+    uint8_t       * __restrict__ dst,        // (N, n_groups_k * 36) bytes
+    int N, int K, int n_groups_k) {
+
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int g = blockIdx.y;
+    if (n >= N || g >= n_groups_k) {
+        return;
+    }
+    uint8_t * blk = dst + ((size_t) n * (size_t) n_groups_k + (size_t) g) * sizeof(block_ml8_4);
+    const float scale = b_scale_g[(size_t) g * (size_t) N + (size_t) n];
+    memcpy(blk, &scale, sizeof(float));
+    uint8_t * qs = blk + sizeof(float);
+    #pragma unroll
+    for (int i = 0; i < QK_ML8 / 2; ++i) {
+        const int k_lo = g * QK_ML8 + 2 * i;
+        const int k_hi = k_lo + 1;
+        const uint8_t lo_idx = ml84_get_nibble(B_nib, ml84_trfeed_nk_to_pos(n, k_lo, N, K));
+        const uint8_t hi_idx = ml84_get_nibble(B_nib, ml84_trfeed_nk_to_pos(n, k_hi, N, K));
+        qs[i] = (uint8_t) ((hi_idx << 4) | lo_idx);
+    }
+}
+
+// Inverse of ml8_4_pack_for_layout: reconstruct the on-disk block bytes
+// (dst, (N, n_groups_k*36)) from a packed ML8_4 entry of the given layout.
+static void ml8_4_unpack_for_layout(
+    cudaStream_t stream, const uint8_t * src_packed, const float * src_scale, uint8_t * dst,
+    int32_t N, int32_t K, int32_t n_groups_k, int32_t layout) {
+    constexpr int BLOCK_N = 64;
+    const dim3 grid((N + BLOCK_N - 1) / BLOCK_N, n_groups_k, 1);
+    const dim3 block(BLOCK_N, 1, 1);
+    if (layout == ML8_4_LAYOUT_TRITON) {
+        ml8_unpack_kernel<<<grid, block, 0, stream>>>(src_packed, src_scale, dst, N, n_groups_k);
+    } else {
+        ml84_trfeed_unpack_kernel<<<grid, block, 0, stream>>>(src_packed, src_scale, dst, N, K, n_groups_k);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // FP8_B128 phase 2: on-disk block is { ggml_half d; uint8_t qs[128]; }, 130
@@ -1347,6 +1500,7 @@ void ggml_cuda_ml8_inplace_set(
         e.info.group_size = group_size;
         e.info.layout     = is_fp8_b128 ? fp8_b128_current_layout()
                           : (t->type == GGML_TYPE_ML8_FP8) ? ml8_fp8_gemm_current_layout()
+                          : is_ml8_4 ? ml8_4_layout_for_tensor(N)
                           : 0;
         e.type            = t->type;
         e.nbytes          = nbytes;
@@ -1381,11 +1535,11 @@ void ggml_cuda_ml8_inplace_set(
                 N, K, n_groups_k, e.info.layout);
             CUDA_CHECK(cudaGetLastError());
         } else if (is_ml8_4) {
-            constexpr int BLOCK_N = 64;
-            const dim3 grid((N + BLOCK_N - 1) / BLOCK_N, n_groups_k, 1);
-            const dim3 block(BLOCK_N, 1, 1);
-            ml8_repack_kernel<<<grid, block, 0, stream>>>(
-                staging, (uint8_t *) e.info.b_packed, (float *) e.info.b_scale, N, n_groups_k);
+            // MAD-305: layout-aware (RDNA4_TRFEED default on gfx1201, TRITON
+            // via MT_ML8_4_LAYOUT=triton or a non-128-multiple N).
+            ml8_4_pack_for_layout(
+                stream, staging, (uint8_t *) e.info.b_packed, (float *) e.info.b_scale,
+                N, K, n_groups_k, e.info.layout);
             CUDA_CHECK(cudaGetLastError());
         } else {
             // GGML_TYPE_ML8_FP8: layout-aware (MAD-305 Phase 5) -- TRITON packs
@@ -1437,12 +1591,8 @@ void ggml_cuda_ml8_inplace_get(
         fp8_b128_unpack_for_layout(stream, (const uint8_t *) info.b_packed, (const float *) info.b_scale, tmp,
             info.N, info.K, info.n_groups_k, info.layout);
     } else if (type == GGML_TYPE_ML8_4) {
-        constexpr int BLOCK_N = 64;
-        const dim3 grid((info.N + BLOCK_N - 1) / BLOCK_N, info.n_groups_k, 1);
-        const dim3 block(BLOCK_N, 1, 1);
-        ml8_unpack_kernel<<<grid, block, 0, stream>>>(
-            (const uint8_t *) info.b_packed, (const float *) info.b_scale, tmp, info.N, info.n_groups_k);
-        CUDA_CHECK(cudaGetLastError());
+        ml8_4_unpack_for_layout(stream, (const uint8_t *) info.b_packed, (const float *) info.b_scale, tmp,
+            info.N, info.K, info.n_groups_k, info.layout);
     } else {
         // GGML_TYPE_ML8_FP8: layout-aware (MAD-305 Phase 5).
         ml8_fp8_unpack_for_layout(
@@ -2196,7 +2346,13 @@ static void ml8_mul_mat_core(
     const int32_t n_groups_k  = K / group_size;
     const int32_t n_centroids = 16;
     GGML_ASSERT(cent->ne[0] == n_centroids);
-    GGML_ASSERT(cent->ne[1] == n_groups_k);
+    // lut_group_off (op_params[0] on the ML8_MUL_MAT node `dst`): first
+    // centroid K-group this node reads. Under tensor parallelism w holds
+    // only a K-slice while cent is mirrored in full, so cent->ne[1] may
+    // exceed n_groups_k — see ggml.h.
+    const int32_t lut_group_off = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(lut_group_off >= 0 && (int64_t) lut_group_off + n_groups_k <= cent->ne[1]);
+    const uint8_t * cent_data = (const uint8_t *) cent->data + (size_t) lut_group_off * n_centroids;
 
     if (h_a != nullptr) {
         GGML_ASSERT(h_a->type == GGML_TYPE_F32 && ggml_is_contiguous(h_a));
@@ -2215,14 +2371,17 @@ static void ml8_mul_mat_core(
     // BN=16, K_COOP=8, LDS=0, LAYOUT=0 → 30.66 t/s decode (1.51× Triton M=16
     // path at 20.30 t/s, 60% of f16 reference 50.89 t/s). Set ML8_NO_GEMV=1
     // to disable and fall back to the Triton blockscale path (kept for A/B).
+    // GEMV reads repack->b_packed as a straight [K/2,N] nibble stride --
+    // only valid for the TRITON layout; RDNA4_TRFEED's B_nib is tile-shuffled
+    // and falls through to the M<=32 decode-splitk branch below instead.
     static const bool ml8_no_gemv = (std::getenv("ML8_NO_GEMV") != nullptr);
-    if (M == 1 && !ml8_no_gemv && h_a == nullptr) {
+    if (M == 1 && !ml8_no_gemv && h_a == nullptr && repack->layout == ML8_4_LAYOUT_TRITON) {
         const bool ok = ml8_gemv_dispatch_env(
             stream,
             (const float *)   x->data,
             (const uint8_t *) repack->b_packed,
             (const float *)   repack->b_scale,
-            (const uint8_t *) cent->data,
+            cent_data,
             (float *)         dst->data,
             K, N, n_groups_k);
         if (ok) return;
@@ -2233,8 +2392,16 @@ static void ml8_mul_mat_core(
     // Pick the same config the dispatch will pick (decode for M<=16, prefill
     // otherwise) so M_pad % cfg.bm == 0 after padding. Pre-paged paths
     // (M = 1..16) align to 16; prefill (M > 16) aligns to 128.
-    const mt_ml8_tuned_cfg pad_cfg = ml8_pick_config(M, K, N);
-    const int32_t M_pad = ((M + pad_cfg.bm - 1) / pad_cfg.bm) * pad_cfg.bm;
+    // RDNA4_TRFEED uses the frozen trfeed kernel's OWN tile rule instead
+    // (gemm_capi.h): M<=32 -> the (32,1) decode/verify tile exactly (not a
+    // round_up(M,16) -- the frozen kernel's A-tile fill is unguarded against
+    // M), M>32 -> round_up(M,128) prefill tile.
+    const int32_t M_pad = (repack->layout == ML8_4_LAYOUT_RDNA4_TRFEED)
+        ? ((M <= 32) ? 32 : ((M + 127) / 128) * 128)
+        : [&] {
+              const mt_ml8_tuned_cfg pad_cfg = ml8_pick_config(M, K, N);
+              return ((M + pad_cfg.bm - 1) / pad_cfg.bm) * pad_cfg.bm;
+          }();
 
     // ── 3. Quantize fp32 → fp8 + per-row scale. M-padding is folded into
     // the kernels (rows ≥ M emit zero fp8 + eps scale), so no zero-padded
@@ -2246,10 +2413,14 @@ static void ml8_mul_mat_core(
 
     // G.6.g.C: dump pre-quant fp32 activation that the kernel will see.
     // (The fused-rotation path never dumps: can_fuse gates on ML8_DUMP off.)
-    if (ml8_dump_enabled() && !g_ml8_dump_quant_done.load()) {
+    const int dump_i = ml8_dump_enabled() ? g_ml8_dump_mm_n.load() : ml8_dump_limit();
+    const bool dump_this = dump_i < ml8_dump_limit();
+    char dump_path[128];
+    if (dump_this) {
         const int64_t shp[2] = { (int64_t) K, (int64_t) M };
-        ml8_dump_fp32("/tmp/ml8_hip_x_prequant.bin", x_src,
-                      (size_t) M * (size_t) K, stream, 2, shp);
+        std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_x_prequant.bin", dump_i);
+        ml8_dump_fp32(dump_path, x_src, (size_t) M * (size_t) K, stream, 2, shp);
+        ml8_dump_index("mm", dump_i, dst->name, w->name, K, N, M, a_dim, b_dim, h_a != nullptr);
     }
 
     if (h_a != nullptr) {
@@ -2275,13 +2446,74 @@ static void ml8_mul_mat_core(
     }
 
     // G.6.g.C: dump fp8 quantized activations + per-row scale on first call.
-    if (ml8_dump_enabled() && !g_ml8_dump_quant_done.exchange(true)) {
+    if (dump_this) {
         const int64_t shp_fp8[2]   = { (int64_t) K,     (int64_t) M_pad };
         const int64_t shp_scale[1] = { (int64_t) M_pad };
-        ml8_dump_u8("/tmp/ml8_hip_a_fp8.bin", a_fp8.get(),
-                    (size_t) M_pad * (size_t) K, stream, 2, shp_fp8);
-        ml8_dump_fp32("/tmp/ml8_hip_a_scale.bin", a_scale.get(),
-                      (size_t) M_pad, stream, 1, shp_scale);
+        std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_a_fp8.bin", dump_i);
+        ml8_dump_u8(dump_path, a_fp8.get(), (size_t) M_pad * (size_t) K, stream, 2, shp_fp8);
+        std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_a_scale.bin", dump_i);
+        ml8_dump_fp32(dump_path, a_scale.get(), (size_t) M_pad, stream, 1, shp_scale);
+    }
+
+    // ── 4 (RDNA4_TRFEED). Default dispatch on gfx1201: decode/verify
+    // (M_pad==32) via the split-K nibble-native kernel, no fp8 expansion;
+    // prefill (M_pad>32) via the expander + UNCHANGED frozen fp8 trfeed
+    // kernel. See gemm_capi.h's ML84_TRFEED section for both contracts.
+    if (repack->layout == ML8_4_LAYOUT_RDNA4_TRFEED) {
+        GGML_ASSERT(N % 128 == 0 && "ML8_4_LAYOUT_RDNA4_TRFEED requires N%128==0 "
+            "(ml8_4_layout_for_tensor should have picked TRITON otherwise)");
+        if (M_pad == 32) {
+            // Decode/verify: fp32 output straight from the split-K kernel, no
+            // bf16 intermediate (see rdna4_gemm_ml84_trfeed_decode_splitk's
+            // contract). MT_ML8_4_SPLITS overrides the heuristic split count
+            // for A/B; unset uses rdna4_ml84_trfeed_splitk_default_splits.
+            static const int splits_override = [] {
+                const char * e = std::getenv("MT_ML8_4_SPLITS");
+                return e ? std::atoi(e) : 0;
+            }();
+            const int n_splits = splits_override > 0 ? splits_override
+                                                      : rdna4_ml84_trfeed_splitk_default_splits(N, K);
+            ggml_cuda_pool_alloc<float> c_pad(ctx.pool());
+            float * c_ptr;
+            if (M == M_pad) {
+                c_ptr = (float *) dst->data;
+            } else {
+                c_pad.alloc((size_t) M_pad * (size_t) N);
+                c_ptr = c_pad.get();
+            }
+            const hipError_t rc = rdna4_gemm_ml84_trfeed_decode_splitk(
+                a_fp8.get(), (const uint8_t *) repack->b_packed, cent_data,
+                c_ptr, a_scale.get(), (const float *) repack->b_scale,
+                M_pad, N, K, n_splits, stream);
+            GGML_ASSERT(rc == hipSuccess && "rdna4_gemm_ml84_trfeed_decode_splitk dispatch failed");
+            if (c_ptr != (float *) dst->data) {
+                CUDA_CHECK(cudaMemcpyAsync((float *) dst->data, c_ptr, (size_t) M * (size_t) N * sizeof(float),
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+            return;
+        }
+
+        // Prefill: re-expand the 4.5bpw ML8_4 weight into the frozen fp8
+        // trfeed kernel's B_shuf + per-column b_scale, then reuse
+        // rdna4_gemm_fp8_trfeed UNCHANGED. Transient pool scratch -- the
+        // largest weight in this model (N=17408,K=5120) is 89 MB, freed back
+        // to the pool the moment this call returns.
+        ggml_cuda_pool_alloc<uint8_t> b_shuf(ctx.pool(), (size_t) N * (size_t) K);
+        ggml_cuda_pool_alloc<float>   b_scale_out(ctx.pool(), (size_t) N);
+        const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
+            (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
+            N, K, b_shuf.get(), b_scale_out.get(), stream);
+        GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed dispatch failed");
+
+        ggml_cuda_pool_alloc<nv_bfloat16> c_bf16_trfeed(ctx.pool(), (size_t) M_pad * (size_t) N);
+        const hipError_t gemm_rc_trfeed = rdna4_gemm_fp8_trfeed(
+            a_fp8.get(), b_shuf.get(), c_bf16_trfeed.get(), a_scale.get(), b_scale_out.get(), M_pad, N, K, stream);
+        GGML_ASSERT(gemm_rc_trfeed == hipSuccess && "rdna4_gemm_fp8_trfeed dispatch failed");
+
+        const to_fp32_cuda_t bf16_to_fp32_trfeed = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        GGML_ASSERT(bf16_to_fp32_trfeed != nullptr);
+        bf16_to_fp32_trfeed(c_bf16_trfeed.get(), (float *) dst->data, (size_t) M * (size_t) N, stream);
+        return;
     }
 
     // ── 4. Allocate bf16 output (M_pad × N) and launch mt_ml8_gemm.
@@ -2300,7 +2532,7 @@ static void ml8_mul_mat_core(
 
     args.a_scale_fp32      = a_scale.get();
     args.b_scale_fp32      = repack->b_scale;
-    args.centroid_lut_fp8  = cent->data;
+    args.centroid_lut_fp8  = cent_data;
 
     args.M                 = M_pad;
 
@@ -2324,10 +2556,11 @@ static void ml8_mul_mat_core(
                  (size_t) M * (size_t) N, stream);
 
     // G.6.g.C: dump final mul_mat output on first call.
-    if (ml8_dump_enabled() && !g_ml8_dump_mm_done.exchange(true)) {
+    if (dump_this) {
         const int64_t shape[2] = { (int64_t) N, (int64_t) M };
-        ml8_dump_fp32("/tmp/ml8_hip_y_out.bin", (const float *) dst->data,
-                      (size_t) M * (size_t) N, stream, 2, shape);
+        std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_y_out.bin", dump_i);
+        ml8_dump_fp32(dump_path, (const float *) dst->data, (size_t) M * (size_t) N, stream, 2, shape);
+        g_ml8_dump_mm_n.fetch_add(1);
     }
 }
 #endif // GGML_HIP_AITER
@@ -2535,10 +2768,28 @@ void ggml_cuda_op_ml8_get_rows(
                 info = it->second.info; packed = true;
             }
         }
-        if (packed) {
+        if (packed && info.layout == ML8_4_LAYOUT_TRITON) {
             ml8_packed_get_rows_kernel<<<grid, dim3(256), 0, stream>>>(
                 (const uint8_t *) info.b_packed, (const float *) info.b_scale, lut_d, ids_d, y_d, K, N, n_groups_k, nr);
             CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        if (packed) {
+            // RDNA4_TRFEED layout: ml8_packed_get_rows_kernel's straight
+            // [K/2,N] stride would read the wrong bytes against a
+            // tile-shuffled B_nib. Not on any hot path (token_embd is Q8_0
+            // in our model; this only guards a dense ML8_4 weight that
+            // happens to also be GET_ROWS'd) -- unpack once into a temp
+            // on-disk-layout buffer and reuse the raw-block gather kernel.
+            uint8_t * tmp = nullptr;
+            CUDA_CHECK(cudaMalloc((void **) &tmp, (size_t) N * (size_t) n_groups_k * sizeof(block_ml8_4)));
+            ml8_4_unpack_for_layout(stream, (const uint8_t *) info.b_packed, (const float *) info.b_scale, tmp,
+                N, K, n_groups_k, info.layout);
+            ml8_get_rows_kernel<<<grid, dim3(threads > 0 ? threads : 32), 0, stream>>>(
+                (const block_ml8_4 *) tmp, lut_d, ids_d, y_d, K, N, n_groups_k, nr);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            cudaFree(tmp);
             return;
         }
     }
@@ -2779,10 +3030,14 @@ void ggml_cuda_op_ml8_apply_rotation(
     const size_t total_elems = (size_t) n_tokens * (size_t) d_dim;
 
     // G.6.g.C: dump rotation input (pre-rotation activations) on first call.
-    if (ml8_dump_enabled() && !g_ml8_dump_rot_done.exchange(true)) {
+    const int  rot_dump_i    = ml8_dump_enabled() ? g_ml8_dump_rot_n.load() : ml8_dump_limit();
+    const bool rot_dump_this = rot_dump_i < ml8_dump_limit();
+    char rot_dump_path[128];
+    if (rot_dump_this) {
         const int64_t shape[2] = { (int64_t) d_dim, (int64_t) n_tokens };
-        ml8_dump_fp32("/tmp/ml8_hip_x_in.bin", (const float *) x->data,
-                      total_elems, stream, 2, shape);
+        std::snprintf(rot_dump_path, sizeof(rot_dump_path), "/tmp/ml8_hip_rot%d_x_in.bin", rot_dump_i);
+        ml8_dump_fp32(rot_dump_path, (const float *) x->data, total_elems, stream, 2, shape);
+        ml8_dump_index("rot", rot_dump_i, dst->name, nullptr, d_dim, 0, n_tokens, a_dim, b_dim, h_a != nullptr);
     }
 
     // (rotation kernel runs below; output dump happens after the kernel returns)
@@ -2818,10 +3073,11 @@ void ggml_cuda_op_ml8_apply_rotation(
     }
 
     // G.6.g.C: dump rotation output (post-FWHT + H_a^T) on first call.
-    if (ml8_dump_enabled() && !g_ml8_dump_rotdst_done.exchange(true)) {
+    if (rot_dump_this) {
         const int64_t shape[2] = { (int64_t) d_dim, (int64_t) n_tokens };
-        ml8_dump_fp32("/tmp/ml8_hip_x_rotated.bin", (const float *) dst->data,
-                      total_elems, stream, 2, shape);
+        std::snprintf(rot_dump_path, sizeof(rot_dump_path), "/tmp/ml8_hip_rot%d_x_rotated.bin", rot_dump_i);
+        ml8_dump_fp32(rot_dump_path, (const float *) dst->data, total_elems, stream, 2, shape);
+        g_ml8_dump_rot_n.fetch_add(1);
     }
 }
 
@@ -3302,6 +3558,55 @@ void ggml_cuda_op_fp8_mul_mat(
             a_scale_ptr = a_scale_pad.get();
         }
 
+        // MAD-305 decode split-K (2026-09-17): for WORKGROUP-STARVED decode
+        // shapes only. The M_pad==32 frozen tile launches N/128 workgroups
+        // walking the whole K serially. bench/gemm_trfeed_prod_bench on the
+        // 9070 XT: at N=17408/K=5120 (136 WGs) that path already streams B at
+        // ~506 GB/s (~80% of peak) and every split count is slower (atomic
+        // fp32 epilogue + memset cost more than the parallelism buys); at
+        // N=5120/K=17408 (40 WGs, ffn_down/attn_output/ssm_out K-slices)
+        // it does 0.478 ms and rdna4_gemm_fp8_trfeed_splitk with 4 splits
+        // does 0.224 ms (2.1x). rdna4_trfeed_splitk_default_splits encodes
+        // that rule and returns 1 when the base launch is not starved, in
+        // which case the bf16 frozen path below is used unchanged. Split-K
+        // writes fp32 directly (no bf16 intermediate / convert kernel).
+        // MT_FP8_TRFEED_SPLITK=0 disables; MT_FP8_TRFEED_SPLITS=<n> forces a
+        // split count (A/B only).
+        static const bool splitk_enabled = [] {
+            const char * e = std::getenv("MT_FP8_TRFEED_SPLITK");
+            return e == nullptr || std::strcmp(e, "0") != 0;
+        }();
+        static const int splitk_env_override = [] {
+            const char * e = std::getenv("MT_FP8_TRFEED_SPLITS");
+            return e ? std::atoi(e) : 0;
+        }();
+        const int n_splits = !splitk_enabled || M_pad != BM_TRFEED_DECODE ? 1
+            : (splitk_env_override > 0 ? splitk_env_override : rdna4_trfeed_splitk_default_splits(N, K));
+
+        if (n_splits > 1) {
+            // dst is fp32 [N, M] with only the true M rows, but the kernel
+            // writes a full M_pad(==32)-row tile: go through a pooled fp32
+            // scratch unless M == M_pad, then copy the first M*N floats
+            // (dst's rows are a prefix, row-major).
+            ggml_cuda_pool_alloc<float> c_f32_pad(ctx.pool());
+            float * c_ptr;
+            if (M == M_pad) {
+                c_ptr = (float *) dst->data;
+            } else {
+                c_f32_pad.alloc((size_t) M_pad * (size_t) N);
+                c_ptr = c_f32_pad.get();
+            }
+            const hipError_t rc = rdna4_gemm_fp8_trfeed_splitk(
+                a_ptr, repack->b_packed, c_ptr, a_scale_ptr, (const float *) repack->b_scale,
+                M_pad, N, K, n_splits, stream);
+            GGML_ASSERT(rc == hipSuccess && "rdna4_gemm_fp8_trfeed_splitk dispatch failed");
+            if (c_ptr != (float *) dst->data) {
+                CUDA_CHECK(cudaMemcpyAsync((float *) dst->data, c_ptr, (size_t) M * (size_t) N * sizeof(float),
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+            return;
+        }
+
         ggml_cuda_pool_alloc<nv_bfloat16> c_bf16(ctx.pool(), (size_t) M_pad * (size_t) N);
         const hipError_t rc = rdna4_gemm_fp8_trfeed(
             a_ptr, repack->b_packed, c_bf16.get(), a_scale_ptr, (const float *) repack->b_scale,
@@ -3769,6 +4074,9 @@ void ggml_cuda_op_ml8_mul_mat_id(
     args.w_packed           = const_cast<void *>(w_packed_ptr);
     args.x_scale_fp32       = a_scale.get();
     args.w_scale_fp32       = const_cast<float *>(w_scale_ptr);
+    // No lut_group_off here: MoE (mul_mat_id) weights are not K-split under
+    // tensor parallelism in this scheme, only dense ML8_MUL_MAT weights are —
+    // see ml8_mul_mat_core above.
     args.centroid_lut_fp8   = cent->data;
     args.bias               = nullptr;
     args.gammas             = nullptr;

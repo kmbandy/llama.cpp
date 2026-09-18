@@ -190,27 +190,30 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         ml8_reg.register_weight(weight, sc);
     };
 
-    // FFN gate/up/down registry registration, ML8_FP8 and FP8_B128 only
-    // (MAD-266; 2026-09-17 extended to FP8_B128). The ML8_4 FFN path is
-    // handled entirely inline in build_layer_ffn (direct field access on
-    // layer.ffn_*_centroids/rotation_h_a/awq_scale — see qwen35.cpp's
-    // build_layer_ffn), bypassing build_lora_mm/the registry altogether, so
-    // registering ML8_4 weights here would be dead weight. FP8-family FFN
-    // weights (ML8_FP8, FP8_B128) have no such inline path — build_layer_ffn
-    // falls through to build_ffn()/build_lora_mm() for them, and gate/up
-    // share the same activation `cur` there, so this is also where FP8_B128
-    // gate+up end up sharing one FP8_QUANT_ROT node via the per-build memo
-    // in build_lora_mm (see llama-ml8-registry.h). Sidecar tensors are
-    // already created by load_ml8_sidecars (called just before this at every
-    // call site); this only registers the (weight → sidecars) mapping.
-    auto register_ffn_fp8 = [&](struct ggml_tensor * weight,
-                                struct ggml_tensor * rotation_h_a,
-                                struct ggml_tensor * rotation_meta,
-                                llm_tensor tensor_id, int il_) {
-        if (!weight || (weight->type != GGML_TYPE_ML8_FP8 && weight->type != GGML_TYPE_FP8_B128)) {
+    // FFN gate/up/down registry registration for every ML8-family type
+    // (ML8_4, ML8_FP8, FP8_B128). build_layer_ffn routes all of them through
+    // build_ffn()/build_lora_mm()/build_ml8_or_mul_mat, whose
+    // apply_ml8_input_xform applies awq + both rotation kinds from the
+    // registered sidecars (2026-09-18: the former inline ML8_4 FFN path only
+    // knew the kronecker kind and skipped ffn_down's block_hadamard rotation).
+    // ML8_4 needs its centroids (LUT) and awq_scale registered too; the fp8
+    // family carries neither. Sidecar tensors are already created by
+    // load_ml8_sidecars at every call site; this only registers the
+    // (weight -> sidecars) mapping.
+    auto register_ffn = [&](struct ggml_tensor * weight,
+                            struct ggml_tensor * centroids,
+                            struct ggml_tensor * rotation_h_a,
+                            struct ggml_tensor * rotation_meta,
+                            struct ggml_tensor * awq_scale,
+                            llm_tensor tensor_id, int il_) {
+        if (!weight || (weight->type != GGML_TYPE_ML8_4 && weight->type != GGML_TYPE_ML8_FP8 && weight->type != GGML_TYPE_FP8_B128)) {
             return;
         }
-        ml8_sidecars sc{ /*centroids=*/nullptr, rotation_h_a, /*awq_scale=*/nullptr };
+        if (weight->type == GGML_TYPE_ML8_4) {
+            GGML_ASSERT(centroids && "ML8_4 FFN weight missing centroids sidecar");
+        }
+        ml8_sidecars sc{ weight->type == GGML_TYPE_ML8_4 ? centroids : nullptr, rotation_h_a,
+                         weight->type == GGML_TYPE_ML8_4 ? awq_scale : nullptr };
         fill_rotation_meta(sc, rotation_meta, tensor_id, il_);
         ml8_reg.register_weight(weight, sc);
     };
@@ -309,15 +312,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         load_ml8_sidecars(layer.ffn_down, LLM_TENSOR_FFN_DOWN, il, n_ff,
                           &layer.ffn_down_centroids, &layer.ffn_down_rotation_h_a,
                           &layer.ffn_down_rotation_meta, &layer.ffn_down_awq_scale);
-        // FP8 FFN weights need explicit registry registration (see
-        // register_ffn_fp8 above) — ML8_4 stays on its inline build_layer_ffn
-        // path and doesn't need this.
-        register_ffn_fp8(layer.ffn_gate, layer.ffn_gate_rotation_h_a, layer.ffn_gate_rotation_meta,
-                         LLM_TENSOR_FFN_GATE, il);
-        register_ffn_fp8(layer.ffn_up,   layer.ffn_up_rotation_h_a,   layer.ffn_up_rotation_meta,
-                         LLM_TENSOR_FFN_UP,   il);
-        register_ffn_fp8(layer.ffn_down, layer.ffn_down_rotation_h_a, layer.ffn_down_rotation_meta,
-                         LLM_TENSOR_FFN_DOWN, il);
+        register_ffn(layer.ffn_gate, layer.ffn_gate_centroids, layer.ffn_gate_rotation_h_a,
+                     layer.ffn_gate_rotation_meta, layer.ffn_gate_awq_scale, LLM_TENSOR_FFN_GATE, il);
+        register_ffn(layer.ffn_up,   layer.ffn_up_centroids,   layer.ffn_up_rotation_h_a,
+                     layer.ffn_up_rotation_meta,   layer.ffn_up_awq_scale,   LLM_TENSOR_FFN_UP,   il);
+        register_ffn(layer.ffn_down, layer.ffn_down_centroids, layer.ffn_down_rotation_h_a,
+                     layer.ffn_down_rotation_meta, layer.ffn_down_awq_scale, LLM_TENSOR_FFN_DOWN, il);
     };
 
     auto load_block_mtp = [&](int il) {
@@ -356,12 +356,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         load_ml8_sidecars(layer.ffn_down, LLM_TENSOR_FFN_DOWN, il, n_ff,
                           &layer.ffn_down_centroids, &layer.ffn_down_rotation_h_a,
                           &layer.ffn_down_rotation_meta, &layer.ffn_down_awq_scale);
-        register_ffn_fp8(layer.ffn_gate, layer.ffn_gate_rotation_h_a, layer.ffn_gate_rotation_meta,
-                         LLM_TENSOR_FFN_GATE, il);
-        register_ffn_fp8(layer.ffn_up,   layer.ffn_up_rotation_h_a,   layer.ffn_up_rotation_meta,
-                         LLM_TENSOR_FFN_UP,   il);
-        register_ffn_fp8(layer.ffn_down, layer.ffn_down_rotation_h_a, layer.ffn_down_rotation_meta,
-                         LLM_TENSOR_FFN_DOWN, il);
+        register_ffn(layer.ffn_gate, layer.ffn_gate_centroids, layer.ffn_gate_rotation_h_a,
+                     layer.ffn_gate_rotation_meta, layer.ffn_gate_awq_scale, LLM_TENSOR_FFN_GATE, il);
+        register_ffn(layer.ffn_up,   layer.ffn_up_centroids,   layer.ffn_up_rotation_h_a,
+                     layer.ffn_up_rotation_meta,   layer.ffn_up_awq_scale,   LLM_TENSOR_FFN_UP,   il);
+        register_ffn(layer.ffn_down, layer.ffn_down_centroids, layer.ffn_down_rotation_h_a,
+                     layer.ffn_down_rotation_meta, layer.ffn_down_awq_scale, LLM_TENSOR_FFN_DOWN, il);
 
         // NextN-specific tensors that define the MTP block.
         layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
@@ -750,70 +750,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 
     const auto & layer = model.layers[il];
 
-    // ml8-4 FFN path (MAD-223). Triggered when the gate weight is ml8-typed.
-    // Gate runs on the inline ml8 path. Up and down are dispatched per-tensor:
-    // an ml8_4 weight stays inline; a role-uniform fp8 tier (MAD-256
-    // ML8_TIER_OVERRIDE, e.g. ffn_down=fp8) routes through build_lora_mm, which
-    // dispatches fp8 to its own backend op via the registry. Mixed-tier FFNs
-    // (gate/up ml8 + down fp8) are therefore supported — the "tread shaping".
-    if (layer.ffn_gate && layer.ffn_gate->type == GGML_TYPE_ML8_4) {
-        GGML_ASSERT(layer.ffn_gate_centroids && "ml8 ffn_gate missing centroids sidecar");
-
-        auto apply_input_xform = [&](ggml_tensor * x,
-                                     ggml_tensor * awq,
-                                     ggml_tensor * h_a) {
-            if (awq) {
-                x = ggml_mul(ctx0, x, awq);
-            }
-            if (h_a) {
-                const int64_t a = h_a->ne[0];
-                const int64_t b = x->ne[0] / a;
-                x = ggml_ml8_apply_rotation(ctx0, x, h_a, a, b);
-            }
-            return x;
-        };
-
-        // Gate + Up share the same activation `cur`. Each weight has its own
-        // optional AWQ scale and rotation factor (calibrated independently),
-        // so we pre-transform the input separately for each branch.
-        ggml_tensor * gate_in = apply_input_xform(cur,
-                                                  layer.ffn_gate_awq_scale,
-                                                  layer.ffn_gate_rotation_h_a);
-        ggml_tensor * gate    = ggml_ml8_mul_mat(ctx0, layer.ffn_gate,
-                                                  layer.ffn_gate_centroids, gate_in);
-        cb(gate, "ffn_gate", il);
-
-        ggml_tensor * up;
-        if (layer.ffn_up->type == GGML_TYPE_ML8_4) {
-            GGML_ASSERT(layer.ffn_up_centroids && "ml8 ffn_up missing centroids sidecar");
-            ggml_tensor * up_in = apply_input_xform(cur,
-                                                    layer.ffn_up_awq_scale,
-                                                    layer.ffn_up_rotation_h_a);
-            up = ggml_ml8_mul_mat(ctx0, layer.ffn_up, layer.ffn_up_centroids, up_in);
-        } else {
-            // role-uniform fp8 (or other) up — registry helper dispatches by type.
-            up = build_lora_mm(layer.ffn_up, cur, layer.ffn_up_s);
-        }
-        cb(up, "ffn_up", il);
-
-        ggml_tensor * gated   = ggml_silu(ctx0, gate);
-        ggml_tensor * inter   = ggml_mul(ctx0, gated, up);
-        cb(inter, "ffn_inter", il);
-
-        if (layer.ffn_down->type == GGML_TYPE_ML8_4) {
-            GGML_ASSERT(layer.ffn_down_centroids && "ml8 ffn_down missing centroids sidecar");
-            ggml_tensor * down_in = apply_input_xform(inter,
-                                                      layer.ffn_down_awq_scale,
-                                                      layer.ffn_down_rotation_h_a);
-            cur = ggml_ml8_mul_mat(ctx0, layer.ffn_down, layer.ffn_down_centroids, down_in);
-        } else {
-            // role-uniform fp8 (or other) down — registry helper dispatches by type.
-            cur = build_lora_mm(layer.ffn_down, inter, layer.ffn_down_s);
-        }
-        cb(cur, "ffn_out", il);
-        return cur;
-    }
-
+    // ML8_4 / FP8_B128 / ML8_FP8 FFN weights all dispatch through build_ffn ->
+    // build_lora_mm -> build_ml8_or_mul_mat (llama-ml8-registry.cpp), whose
+    // apply_ml8_input_xform reads the registered sidecars and applies BOTH
+    // rotation kinds (kronecker via rotation_h_a, block_hadamard via
+    // rotation_meta) plus awq. An earlier inline ML8_4-only branch here had
+    // its own copy of that transform that only knew the kronecker kind, so a
+    // block_hadamard-rotated ffn_down (the converter's choice for every
+    // K-split weight: rotation_meta kind 2, h_a absent) was multiplied by an
+    // UNROTATED activation in every layer -- token-salad output from an
+    // otherwise numerically-correct file (2026-09-18). One transform
+    // implementation, in the registry, is the rule.
     cur = build_ffn(cur,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
         model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,

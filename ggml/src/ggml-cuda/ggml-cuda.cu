@@ -8255,6 +8255,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (op->type   != GGML_TYPE_F32)      return false;
                 if (w->ne[0] % 64 != 0)               return false;
                 if (w->ne[1] % 16 != 0)               return false;
+                // lut_group_off (op_params[0]): under tensor parallelism w
+                // holds only a K-slice while cent is mirrored in full, so
+                // cent->ne[1] may exceed w->ne[0]/QK_ML8 — see ggml.h.
+                const int32_t off = ggml_get_op_params_i32(op, 0);
+                if (cent->ne[0] != 16 || off < 0 || off + w->ne[0] / 64 > cent->ne[1]) return false;
                 return true;
             } break;
         case GGML_OP_ML8_APPLY_ROTATION:

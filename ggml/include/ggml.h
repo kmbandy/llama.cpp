@@ -618,6 +618,10 @@ extern "C" {
         //   src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8])
         //   src[2] = x (GGML_TYPE_F32, [K, M])
         //   dst    = y (GGML_TYPE_F32, [N, M])
+        //   op_params[0] = lut_group_off (int32, default 0): first centroid
+        //     K-group to use; the meta backend sets this per device for a
+        //     K-split weight whose LUT is mirrored in full. centroids ne[1]
+        //     must be >= lut_group_off + K/QK_ML8.
         // CPU backend dequantizes block-by-block; HIP backend (G.4.f) dispatches
         // to mt_ml8_gemm on the native fp8 WMMA path.
         GGML_OP_ML8_MUL_MAT,

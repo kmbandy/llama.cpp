@@ -23,6 +23,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <map>
 #include <unordered_map>
 
 namespace {
@@ -276,7 +277,7 @@ struct CachedHandles {
     int                          block_q_large_f16  = MT_AITER_UATTN_BLOCK_Q_LARGE;
     // MAD-2026-09-12 garbage-16k fix: lazily grown f16 scratch K/V paged
     // caches for the predequant path. CachedHandles itself is keyed ONLY by
-    // physical device ordinal (get_cached() below) — it is shared by EVERY
+    // physical (device, shape) pair (get_cached() below) — it is shared by EVERY
     // ggml_backend_cuda_context that ever runs on this device, which in
     // practice means both the target llama_context AND any independent
     // draft llama_context (common/speculative.cpp's ctx_dft, e.g. the MTP
@@ -318,35 +319,51 @@ struct CachedHandles {
 // reused the first card's modules and the launch failed with
 // "invalid device ordinal" (and the second arch was never even compiled for).
 //
-// Key by device ordinal. References into the map stay valid across rehash and
-// entries are only ever inserted, so handing out a reference under the lock and
-// using it after is safe.
-CachedHandles & get_cached() {
+// Key by device ordinal AND attention shape (2026-09-17). One shape per
+// device was enough while every llama_context on a device happened to see
+// the same (num_q_heads, num_kv_heads): under tensor parallelism with
+// tensor-split-attn 1,1 the target model's per-device head slice (12/2 of
+// 24/4) coincided with the DFlash2 draft head's own 12/2, so the draft and
+// the target silently shared one entry. Any uneven attention split (65,35 ->
+// 18/3 on one card, 6/1 on the other) breaks that coincidence and the second
+// shape's first call failed the ensure_initialized() memcmp with
+// "shape changed across calls" -> hipErrorInvalidValue -> abort in
+// mt_pagedattn_aiter.cu. Kernel handles are just compiled code and the
+// scratch buffers are already keyed by stream, so a per-(device, shape) entry
+// is the natural unit. std::map keeps references stable across insertions.
+struct CachedKey {
+    int dev;
+    mt_aiter_uattn_shape_t shape;
+    bool operator<(const CachedKey & o) const {
+        if (dev != o.dev) return dev < o.dev;
+        return std::memcmp(&shape, &o.shape, sizeof(shape)) < 0;
+    }
+};
+CachedHandles & get_cached(const mt_aiter_uattn_shape_t & shape) {
     static std::mutex mu_map;
-    static std::unordered_map<int, CachedHandles> per_device;
+    static std::map<CachedKey, CachedHandles> per_device_shape;
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess) {
         dev = 0;
     }
     std::lock_guard<std::mutex> g(mu_map);
-    return per_device[dev];
+    return per_device_shape[CachedKey{dev, shape}];
 }
 
 // Initialize on first call: build signatures from the shape we're handed and
 // request kernel handles from the registry. Subsequent calls must use the
 // same shape — assert and abort otherwise.
 hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
-    CachedHandles & c = get_cached();
+    CachedHandles & c = get_cached(shape);
     static std::mutex mu;
     std::lock_guard<std::mutex> g(mu);
     if (c.initialized) {
-        // Sanity: shape must match. If a single process ever needs multiple
-        // shapes we'll upgrade to a per-shape handle map, but for now this is
-        // a guardrail against silent misdispatch.
+        // Sanity: the entry is keyed by this exact shape (get_cached), so a
+        // mismatch here can only mean the key/compare logic regressed.
         if (std::memcmp(&c.shape, &shape, sizeof(shape)) != 0) {
             std::fprintf(stderr,
                 "mt_aiter_unified_attn: shape changed across calls (was %d/%d/%d/%d, "
-                "now %d/%d/%d/%d). The AITER cache supports one shape per device.\n",
+                "now %d/%d/%d/%d) inside a per-(device, shape) cache entry -- cache key bug.\n",
                 c.shape.head_size, c.shape.num_q_heads, c.shape.num_kv_heads, c.shape.block_size,
                 shape.head_size,   shape.num_q_heads,   shape.num_kv_heads,   shape.block_size);
             return hipErrorInvalidValue;
@@ -874,7 +891,7 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // Non-const: the fp8-predequant path below lazily grows this stream's
     // scratch entry (c.scratch_by_stream[stream]) under c.scratch_mu on
     // (possibly) every call, not just the first.
-    CachedHandles & c = get_cached();
+    CachedHandles & c = get_cached(a->shape);
     if (!c.h_2d || !c.h_2d_large || !c.h_3d || !c.h_3d_md || !c.h_reduce) return hipErrorInvalidImage;
 
     // MAD-199 D3 + MAD-203: three-way dispatch.

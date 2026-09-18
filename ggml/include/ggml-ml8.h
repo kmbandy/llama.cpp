@@ -39,13 +39,22 @@ extern "C" {
 //
 // Constraints:
 //   - K must be a multiple of QK_ML8 (64)
-//   - n_groups_k (centroids ne1) must equal K / QK_ML8
+//   - n_groups_k (centroids ne1) must be >= K / QK_ML8 (may be larger under
+//     tensor parallelism, where centroids is mirrored in full but w holds
+//     only a K-slice — see lut_group_off below)
 //   - centroids ne0 must equal 16
 GGML_API struct ggml_tensor * ggml_ml8_mul_mat(
         struct ggml_context * ctx,
         struct ggml_tensor  * w,
         struct ggml_tensor  * centroids,
         struct ggml_tensor  * x);
+
+// Returns the node's lut_group_off (op_params[0]): the first centroid
+// K-group this node reads, i.e. the effective LUT pointer is
+// `(const uint8_t *) centroids->data + lut_group_off * 16`. Always 0 for a
+// freshly-constructed node; the meta backend rewrites it per device for a
+// K-split weight whose centroid LUT is mirrored in full.
+GGML_API int32_t ggml_ml8_mul_mat_lut_group_off(const struct ggml_tensor * y);
 
 // rotation_meta[3] kind_id values. The GGUF rotation_meta sidecar is
 // I32[4] = [a_dim, b_dim, in_features, kind_id]; kind_id selects which of the

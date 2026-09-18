@@ -1084,6 +1084,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                                 "get_split_granularity must lcm this tensor's granularity with 128");
                     }
                 }
+            } else if (tensor->type == GGML_TYPE_ML8_4) {
+                // ML8_4 (block_ml8_4, blck_size QK_ML8=64) packs 64 CONTIGUOUS elements sharing
+                // one 4-bit-index block, on whichever axis this tensor is split -- a K-split
+                // (AXIS_0) boundary not aligned to 64 would cut a block in half. An N-split
+                // (AXIS_1) instead feeds the HIP fp8-WMMA GEMM (mt_ml8_gemm), whose N tile is 16
+                // rows wide, so an N-split not aligned to 16 would hand a device a partial tile.
+                // get_split_granularity above already lcm's (via blck_size, for K-splits) or is
+                // expected to align to 16 (for N-splits), so this should always hold -- assert it
+                // rather than let it silently corrupt results under tensor parallelism, exactly
+                // like the FP8_B128 check above.
+                const int64_t align = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) ? 64 : 16;
+                int64_t units_total = 0;
+                for (const auto & seg : segments) {
+                    units_total += seg.first * (int64_t) seg.second;
+                }
+                const int64_t unit_elems = tensor->ne[split_state.axis] / units_total;
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    const int64_t ne_j = split_state.ne[is*ud->n_devices + j] * (int64_t) segments[is].second * unit_elems;
+                    if (ne_j % align != 0) {
+                        LLAMA_LOG_ERROR("%s: ML8_4 tensor %s: segment %zu device %zu slice ne=%" PRId64
+                                " (segment %" PRId64 ", granularity %" PRId64 ") is not %" PRId64 "-aligned\n",
+                                __func__, ggml_get_name(tensor), is, j, ne_j, segments[is].first, granularity[is], align);
+                        GGML_ABORT("ML8_4 tensor split slice is not aligned to the required boundary "
+                                "(64 for a K-split, 16 for an N-split); get_split_granularity must "
+                                "produce a properly aligned slice for this tensor");
+                    }
+                }
             }
         }
         split_state.n_segments = segments.size();
@@ -1877,11 +1904,14 @@ static int wp_select_ffn_island_device_index(const llama_model_params & params,
 //
 // Originally FP8_B128-only; generalized to also cover GGML_TYPE_ML8_FP8
 // weights once build_ml8_or_mul_mat's default (non-WP_ML8_FP8_LEGACY) path
-// started routing ML8_FP8 through the same memoized quant_rot node (G=32) --
-// the "every group member must share one rotation" invariant applies
-// identically regardless of which weight format is in play, so a single pair
-// of weights is only ever checked against ITS OWN type (mixed-type pairs
-// within one group are not a case this converter produces).
+// started routing ML8_FP8 through the same memoized quant_rot node (G=32),
+// and again to cover GGML_TYPE_ML8_4 weights for tensor-parallel support
+// (MAD-223 G.4.b): the registry shares one rotation node per input group
+// regardless of which quantized weight format reads it, so the "every group
+// member must share one rotation" invariant applies identically regardless
+// of which weight format is in play, so a single pair of weights is only
+// ever checked against ITS OWN type (mixed-type pairs within one group are
+// not a case this converter produces).
 //
 // This must run AFTER load_all_data(): load_ml8_sidecars/register_ml8_weight
 // (qwen35.cpp) run during load_arch_tensors, before ANY tensor data --
@@ -1894,13 +1924,19 @@ static int wp_select_ffn_island_device_index(const llama_model_params & params,
 // pattern_ml8_sidecar handling above) and therefore this rank's copy is a
 // complete, valid comparison for every device.
 static void llama_model_validate_fp8_rotation_groups(const llama_model & model) {
-    // Returns `name` iff it names an FP8_B128 or ML8_FP8 tensor, else nullptr
-    // -- every other case (missing, or present but some other type such as
-    // Q8_0, which is how the converter stores tensors that fail the
-    // N%128/K%128 alignment check) is "nothing to validate here".
-    const auto fp8_or_ml8fp8 = [&](const std::string & name) -> const ggml_tensor * {
+    // Returns `name` iff it names an FP8_B128, ML8_FP8, or ML8_4 tensor, else
+    // nullptr -- every other case (missing, or present but some other type
+    // such as Q8_0, which is how the converter stores tensors that fail the
+    // N%128/K%128 alignment check) is "nothing to validate here". ML8_4 was
+    // added alongside FP8_B128 tensor-parallel support: the registry shares
+    // one rotation node per input group (e.g. {attn_qkv, attn_gate},
+    // {ffn_gate, ffn_up}) regardless of which quantized weight format reads
+    // it, so the "every group member must share one rotation" invariant
+    // below applies to ML8_4 groups identically.
+    const auto fp8_or_ml8_rotated_weight = [&](const std::string & name) -> const ggml_tensor * {
         const ggml_tensor * t = model.get_tensor(name.c_str());
-        return (t && (t->type == GGML_TYPE_FP8_B128 || t->type == GGML_TYPE_ML8_FP8)) ? t : nullptr;
+        return (t && (t->type == GGML_TYPE_FP8_B128 || t->type == GGML_TYPE_ML8_FP8 ||
+                      t->type == GGML_TYPE_ML8_4)) ? t : nullptr;
     };
 
     // Bytewise-compare two tensors' resident data. Reads through
@@ -1922,10 +1958,10 @@ static void llama_model_validate_fp8_rotation_groups(const llama_model & model) 
     };
 
     const auto check_pair = [&](const std::string & name_a, const std::string & name_b) {
-        const ggml_tensor * wa = fp8_or_ml8fp8(name_a);
-        const ggml_tensor * wb = fp8_or_ml8fp8(name_b);
+        const ggml_tensor * wa = fp8_or_ml8_rotated_weight(name_a);
+        const ggml_tensor * wb = fp8_or_ml8_rotated_weight(name_b);
         if (wa == nullptr || wb == nullptr) {
-            return; // one/both absent or not FP8_B128/ML8_FP8 -- nothing to enforce for this pair
+            return; // one/both absent or not FP8_B128/ML8_FP8/ML8_4 -- nothing to enforce for this pair
         }
         if (wa->type != wb->type) {
             return; // not a same-format group -- the converter never mixes formats within a group

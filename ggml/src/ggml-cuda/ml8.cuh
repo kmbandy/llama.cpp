@@ -48,13 +48,23 @@ struct ml8_weight_repack_t {
     int32_t K;
     int32_t n_groups_k;
     int32_t group_size;   // currently always QK_ML8 = 64
-    // FP8_B128 only (design 4(a)/(b) + generic-layout follow-up): which
-    // packed byte layout b_packed/b_scale are in — 0 = FP8_B128_LAYOUT_GENERIC
-    // (b_packed is e4m3 [K, N] row-major, b_scale is fp32 [K/128, N/128]),
-    // 1 = FP8_B128_LAYOUT_PRESHUFFLE (b_packed is the AITER shuffle_weight
-    // (16,16) permutation, b_scale is the same fp32 [K/128, N/128] table).
-    // Set once at pack time from MT_FP8_B128_LAYOUT; unused (left 0) by
-    // ML8_4/ML8_FP8 producers. See the FP8_B128_LAYOUT_* constants in ml8.cu.
+    // Which packed byte layout b_packed/b_scale are in. The concrete enum
+    // depends on which producer filled this struct (each type's constants
+    // start at 0 so a raw 0 always means "the original/legacy layout" even
+    // when cross-read by mistake):
+    //   ML8_4 (MAD-305, ml8.cu ML8_4_LAYOUT_*): 0 = TRITON (b_packed is the
+    //     straight [K/2, N] nibble transpose), 1 = RDNA4_TRFEED (default on
+    //     gfx1201; b_packed is the tile-shuffled B_nib layout, see
+    //     gemm_capi.h's "ML8_4 decode + prefill" section). Set once at pack
+    //     time from MT_ML8_4_LAYOUT (or downgraded to TRITON when N isn't a
+    //     multiple of 128 -- ml8_4_layout_for_tensor).
+    //   ML8_FP8 (ml8.cu ML8_FP8_GEMM_LAYOUT_*) and FP8_B128 (ml8.cu
+    //   FP8_B128_LAYOUT_*): see those enums' own comments in ml8.cu. FP8_B128
+    //     only: 0 = FP8_B128_LAYOUT_GENERIC (b_packed is e4m3 [K, N]
+    //     row-major, b_scale is fp32 [K/128, N/128]), 1 =
+    //     FP8_B128_LAYOUT_PRESHUFFLE (b_packed is the AITER shuffle_weight
+    //     (16,16) permutation, same b_scale table). Set once at pack time
+    //     from MT_FP8_B128_LAYOUT.
     int32_t layout;
 };
 
