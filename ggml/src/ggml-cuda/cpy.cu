@@ -386,6 +386,25 @@ static void ggml_cpy_f32_iq4_nl_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+// Minimum row width (bytes) for which a 2D device-to-device copy is actually
+// a win over the generic per-element scalar kernel. Below this, a rect copy
+// degenerates into "height" tiny row transfers; some backends' 2D copy path
+// is effectively synchronous and per-row-latency-bound in that regime (e.g.
+// ROCm/HIP's CLR runtime over a slow host link such as Thunderbolt), which
+// can be orders of magnitude slower than a single scalar-kernel launch that
+// parallelizes over all elements regardless of row count.
+// Override with GGML_CUDA_CPY_2D_MIN_WIDTH (0 disables the 2D memcpy path
+// entirely, always falling back to the scalar kernel).
+static size_t ggml_cuda_cpy_2d_min_width() {
+    static const size_t min_width = []() -> size_t {
+        if (const char * env = getenv("GGML_CUDA_CPY_2D_MIN_WIDTH")) {
+            return (size_t) std::strtoull(env, nullptr, 10);
+        }
+        return 256;
+    }();
+    return min_width;
+}
+
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -422,6 +441,14 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     height = src0->ne[d];
     spitch = src0->nb[d];
     dpitch = src1->nb[d];
+
+    const size_t min_width = ggml_cuda_cpy_2d_min_width();
+    if (min_width == 0 || width < min_width) {
+        // degenerate rect: many tiny rows -- let the scalar kernel handle it
+        // in a single launch instead of a per-row-latency-bound 2D copy.
+        // (min_width == 0 means the 2D path is disabled entirely.)
+        return false;
+    }
 
     return spitch >= width && dpitch >= width;
 }

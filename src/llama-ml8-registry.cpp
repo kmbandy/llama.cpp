@@ -41,6 +41,19 @@ static int32_t fp8_b128_layout_G() {
     return G;
 }
 
+// MT_ML8_4_ACT=legacy keeps ML8_4 weights on the pre-quant_rot dispatch path
+// (apply_ml8_input_xform + ggml_ml8_mul_mat with a raw F32 activation, the
+// GEMM quantizing internally) for A/B comparison against the default
+// GGML_OP_FP8_QUANT_ROT(G=0) + GGML_OP_ML8_MUL_MAT(prequantized) path. Read
+// once (env vars don't change mid-run).
+static bool ml8_4_act_legacy_enabled() {
+    static const bool legacy = [] {
+        const char * v = std::getenv("MT_ML8_4_ACT");
+        return v != nullptr && std::string(v) == "legacy";
+    }();
+    return legacy;
+}
+
 // Apply the optional AWQ scale then the optional rotation to `x`, shared by
 // both the ML8_4 and ML8_FP8 dispatch branches below. Kind is picked by which
 // of rotation_h_a / rotation_block_hadamard is set (they're mutually
@@ -72,21 +85,31 @@ static struct ggml_tensor * apply_ml8_input_xform(
     return x_xf;
 }
 
-// Shared quant_rot + fp8_mul_mat dispatch for both FP8_B128 (G=128) and the
-// non-legacy ML8_FP8 path (G=32). See build_ml8_or_mul_mat's doc comment in
-// llama-ml8-registry.h for the full contract.
-static struct ggml_tensor * build_fp8_quant_rot_mul_mat(
+// Shared by build_fp8_quant_rot_mul_mat (below) and build_ml8_quant_rot_mul_mat
+// (ML8_4's default activation path): apply the optional AWQ scale, derive the
+// FP8_QUANT_ROT kind/a_dim/b_dim from `sc` the same way for every weight
+// format, then build (or reuse, via `qrot_memo`) the ggml_fp8_quant_rot node
+// for this input group. Returns the qrot I8 tensor; callers wrap it in
+// whichever *_mul_mat op matches their weight's dequant contract.
+//
+// Memo key uses the ORIGINAL `x` (pre-AWQ) and includes G, matching the
+// design: group members share one activation and (per the load-time
+// assertion in qwen35.cpp) an identical rotation, so any member reaching
+// this function first builds the shared node; G keeps FP8_B128, ML8_FP8 and
+// ML8_4 quant_rot nodes from ever colliding even if they somehow shared the
+// same raw `x` (ML8_4 always uses G=0/per-row — see build_ml8_quant_rot_mul_mat).
+static struct ggml_tensor * get_or_build_fp8_quant_rot(
         struct ggml_context  * ctx,
         struct ggml_tensor   * weight,
         struct ggml_tensor   * x,
         const ml8_sidecars   * sc,
         fp8_qrot_memo        * qrot_memo,
         int32_t                G) {
-    // AWQ acts on the raw activation, same as the ML8_4/legacy-ML8_FP8 paths
-    // above — apply it BEFORE building/looking up the quant_rot node. Not
-    // emitted by the fp8_b128 converter today (see the design doc), so this
-    // is dead code for the shipping Qwen3.8-27B recipe, but kept for parity
-    // with apply_ml8_input_xform's contract.
+    // AWQ acts on the raw activation, same as apply_ml8_input_xform — apply
+    // it BEFORE building/looking up the quant_rot node. Not emitted by the
+    // fp8_b128/ml8_4 converters today (see the design docs), so this is dead
+    // code for the shipping Qwen3.8-27B recipe, but kept for parity with
+    // apply_ml8_input_xform's contract.
     struct ggml_tensor * x_xf = (sc && sc->awq_scale) ? ggml_mul(ctx, x, sc->awq_scale) : x;
 
     int32_t kind  = GGML_FP8_QUANT_ROT_KIND_NONE;
@@ -106,12 +129,6 @@ static struct ggml_tensor * build_fp8_quant_rot_mul_mat(
         kind  = GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD;
     }
 
-    // Memo key uses the ORIGINAL `x` (pre-AWQ) and includes G, matching the
-    // design: group members share one activation and (per the load-time
-    // assertion in qwen35.cpp) an identical rotation, so any member reaching
-    // this function first builds the shared node; G keeps FP8_B128 and
-    // ML8_FP8 quant_rot nodes from ever colliding even if they somehow
-    // shared the same raw `x`.
     const fp8_qrot_key key{ x, h_a, a_dim, b_dim, kind, G };
 
     struct ggml_tensor * qrot = nullptr;
@@ -130,7 +147,38 @@ static struct ggml_tensor * build_fp8_quant_rot_mul_mat(
         }
     }
 
+    return qrot;
+}
+
+// Shared quant_rot + fp8_mul_mat dispatch for both FP8_B128 (G=128) and the
+// non-legacy ML8_FP8 path (G=32). See build_ml8_or_mul_mat's doc comment in
+// llama-ml8-registry.h for the full contract.
+static struct ggml_tensor * build_fp8_quant_rot_mul_mat(
+        struct ggml_context  * ctx,
+        struct ggml_tensor   * weight,
+        struct ggml_tensor   * x,
+        const ml8_sidecars   * sc,
+        fp8_qrot_memo        * qrot_memo,
+        int32_t                G) {
+    struct ggml_tensor * qrot = get_or_build_fp8_quant_rot(ctx, weight, x, sc, qrot_memo, G);
     return ggml_fp8_mul_mat(ctx, weight, qrot);
+}
+
+// ML8_4's default activation path (MAD-3xx): same memoized quant_rot shape
+// as build_fp8_quant_rot_mul_mat, always G=0 (per-row — the only activation
+// scale layout GGML_OP_ML8_MUL_MAT's pre-quantized contract accepts, see
+// ggml-ml8.h), wrapped in ggml_ml8_mul_mat instead of ggml_fp8_mul_mat since
+// ML8_4's GEMM dequantizes the WEIGHT side via the centroid LUT rather than
+// a per-block fp8 scale pair. See build_ml8_or_mul_mat's doc comment in
+// llama-ml8-registry.h for the full contract.
+static struct ggml_tensor * build_ml8_quant_rot_mul_mat(
+        struct ggml_context  * ctx,
+        struct ggml_tensor   * weight,
+        struct ggml_tensor   * x,
+        const ml8_sidecars   * sc,
+        fp8_qrot_memo        * qrot_memo) {
+    struct ggml_tensor * qrot = get_or_build_fp8_quant_rot(ctx, weight, x, sc, qrot_memo, /*G=*/0);
+    return ggml_ml8_mul_mat(ctx, weight, sc->centroids, qrot);
 }
 
 struct ggml_tensor * build_ml8_or_mul_mat(
@@ -153,8 +201,15 @@ struct ggml_tensor * build_ml8_or_mul_mat(
         GGML_ASSERT(sc           && "ML8_4 weight has no registry entry — missing centroids sidecar");
         GGML_ASSERT(sc->centroids && "ML8_4 weight registry entry has null centroids");
 
-        struct ggml_tensor * x_xf = apply_ml8_input_xform(ctx, x, *sc);
-        return ggml_ml8_mul_mat(ctx, weight, sc->centroids, x_xf);
+        if (ml8_4_act_legacy_enabled()) {
+            // Pre-existing behavior, kept for A/B comparison (MT_ML8_4_ACT=legacy).
+            struct ggml_tensor * x_xf = apply_ml8_input_xform(ctx, x, *sc);
+            return ggml_ml8_mul_mat(ctx, weight, sc->centroids, x_xf);
+        }
+        // Default: fused GGML_OP_FP8_QUANT_ROT(G=0) + GGML_OP_ML8_MUL_MAT
+        // (prequantized) path — one launch for the activation pipeline,
+        // shared with every other weight of this input group.
+        return build_ml8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo);
     }
 
     if (weight->type == GGML_TYPE_ML8_FP8) {

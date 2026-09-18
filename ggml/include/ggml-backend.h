@@ -219,6 +219,16 @@ extern "C" {
     typedef bool   (*ggml_backend_comm_allreduce_begin_t)(void * comm_ctx, struct ggml_tensor ** tensors, int i_op);
     typedef bool   (*ggml_backend_comm_allreduce_end_t)(void * comm_ctx, int i_op);
 
+    // Select the backend's current compute stream by small integer index (0 == default). Used by
+    // the meta backend (WP_META_SLOT_STREAMS) so that each rolling tensor-parallel overlap slot
+    // (see ggml_backend_sched_graph_compute_async_meta_begin/_step/_end) dispatches its kernels,
+    // AllReduce included, on its own stream instead of sharing the device's single default stream
+    // with the other slot. Backends without multiple streams (or that don't support this) simply
+    // don't export it from get_proc_address; the caller must treat a null lookup as "stays on
+    // stream 0" and not assume every backend honors this. Not intended for general use outside the
+    // meta backend's slot-dispatch hook.
+    typedef void   (*ggml_backend_set_stream_no_t)(ggml_backend_t backend, int stream_no);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

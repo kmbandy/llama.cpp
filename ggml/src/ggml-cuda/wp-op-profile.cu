@@ -8,6 +8,7 @@
 #include <deque>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -55,6 +56,41 @@ double print_interval_s() {
         return e != nullptr && atof(e) > 0 ? atof(e) : 5.0;
     }();
     return s;
+}
+
+// Row cap for the per-label table; 0 = unlimited.
+int print_rows() {
+    static const int n = [] {
+        const char * e = getenv("WP_OP_PROFILE_ROWS");
+        return e != nullptr && atoi(e) >= 0 ? atoi(e) : 40;
+    }();
+    return n;
+}
+
+// Split a per-label key ("<bucket> <op-name-with-fusion-suffix> <node-label>",
+// or a GAP/GAPg-prefixed variant, or a bucket-only span key with no node
+// label such as "<bucket> AR_END_WAIT") into the (class, op-group) pair used
+// by the by-op aggregated table. GAP/GAPg rows fold into a single "GAP" /
+// "GAPg" group per class regardless of the op that follows.
+std::pair<std::string, std::string> by_op_group(const std::string & key) {
+    const size_t sp = key.find(' ');
+    if (sp == std::string::npos) {
+        return { key, "" };
+    }
+    const std::string cls  = key.substr(0, sp);
+    const std::string rest = key.substr(sp + 1);
+    if (rest.rfind("GAPg>", 0) == 0) {
+        return { cls, "GAPg" };
+    }
+    if (rest.rfind("GAP>", 0) == 0) {
+        return { cls, "GAP" };
+    }
+    const size_t last_sp = rest.rfind(' ');
+    if (last_sp == std::string::npos) {
+        // no trailing per-node label (e.g. AR_END_WAIT, AR_END_UNPACK, GRAPH_REPLAY)
+        return { cls, rest };
+    }
+    return { cls, rest.substr(0, last_sp) };
 }
 
 cudaEvent_t take_event(dev_state & d) {
@@ -151,14 +187,45 @@ void maybe_print(int device, dev_state & d) {
     total -= d.gap_ms_sum;
     fprintf(stderr, "wp op-profile dev=%d window=%.1fs graphs=%llu graph_wall=%.0fms gpu_op_sum=%.0fms gap_sum=%.0fms\n",
             device, since, (unsigned long long) d.n_graphs, d.graph_wall_ms, total, d.gap_ms_sum);
+    const int cap = print_rows();
     int shown = 0;
     for (const auto & r : rows) {
-        if (shown++ >= 40) {
+        if (cap > 0 && shown++ >= cap) {
             break;
         }
         fprintf(stderr, "wp op-profile dev=%d   %7.1fms %5.1f%% n=%-6llu %s\n",
-                device, r.second.ms, 100.0 * r.second.ms / total, (unsigned long long) r.second.n, r.first.c_str());
+                device, r.second.ms, total > 0.0 ? 100.0 * r.second.ms / total : 0.0, (unsigned long long) r.second.n, r.first.c_str());
     }
+
+    // Aggregated by-op table: fold the per-node label out of each key so
+    // identical ops in different layers collapse into one group. GAP/GAPg
+    // rows fold into a single "GAP"/"GAPg" group per class.
+    std::map<std::pair<std::string, std::string>, acc> by_op;
+    double wait_ms = 0.0, unpack_ms = 0.0;
+    for (const auto & r : rows) {
+        const std::pair<std::string, std::string> g = by_op_group(r.first);
+        acc & a = by_op[g];
+        a.ms += r.second.ms;
+        a.n  += r.second.n;
+        if (g.second == "AR_END_WAIT") {
+            wait_ms += r.second.ms;
+        } else if (g.second == "AR_END_UNPACK") {
+            unpack_ms += r.second.ms;
+        }
+    }
+    std::vector<std::pair<std::pair<std::string, std::string>, acc>> by_op_rows(by_op.begin(), by_op.end());
+    std::sort(by_op_rows.begin(), by_op_rows.end(),
+              [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+    fprintf(stderr, "wp op-profile dev=%d by-op:\n", device);
+    for (const auto & r : by_op_rows) {
+        fprintf(stderr, "wp op-profile dev=%d   %7.1fms %5.1f%% n=%-6llu %s %s\n",
+                device, r.second.ms, d.graph_wall_ms > 0.0 ? 100.0 * r.second.ms / d.graph_wall_ms : 0.0,
+                (unsigned long long) r.second.n, r.first.first.c_str(), r.first.second.c_str());
+    }
+
+    const double other_ms = total - wait_ms - unpack_ms;
+    fprintf(stderr, "wp op-profile dev=%d totals: wall=%.0fms ops=%.0fms gap=%.0fms wait=%.0fms unpack=%.0fms other=%.0fms\n",
+            device, d.graph_wall_ms, total, d.gap_ms_sum, wait_ms, unpack_ms, other_ms);
     fflush(stderr);
     d.totals.clear();
     d.graph_wall_ms = 0.0;

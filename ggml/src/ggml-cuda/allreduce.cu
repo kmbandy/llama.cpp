@@ -653,6 +653,7 @@ static void ggml_cuda_ar_codec_unpack_ml8_##K##_dispatch(                       
 
 GGML_CUDA_AR_ML8_DEF(4)
 GGML_CUDA_AR_ML8_DEF(5)
+GGML_CUDA_AR_ML8_DEF(6)
 GGML_CUDA_AR_ML8_DEF(8)
 
 
@@ -710,10 +711,11 @@ static const ggml_cuda_ar_codec GGML_CUDA_AR_CODECS[] = {
     { "f32",   GGML_TYPE_F32,   1, sizeof(float),         ggml_cuda_ar_codec_pack_f32,            ggml_cuda_ar_codec_unpack_f32  },
     { "q8_0",  GGML_TYPE_Q8_0, QK8_0, sizeof(block_q8_0), ggml_cuda_ar_codec_pack_q8_0_dispatch, ggml_cuda_ar_codec_unpack_q8_0_dispatch },
     // ml8 wire tiers are NOT ggml types -- they exist only on this link and are
-    // never serialised. Q4_0/Q5_0 ids are reused as private registry keys so the
-    // end() lookup by op->wire_type works; nothing else may pack those ids here.
+    // never serialised. Q4_0/Q5_0/Q8_1 ids are reused as private registry keys so
+    // the end() lookup by op->wire_type works; nothing else may pack those ids here.
     { "ml8_4", GGML_TYPE_Q4_0, QK_ML8_WIRE, sizeof(block_ml8_4_wire), ggml_cuda_ar_codec_pack_ml8_4_dispatch, ggml_cuda_ar_codec_unpack_ml8_4_dispatch },
     { "ml8_5", GGML_TYPE_Q5_0, QK_ML8_WIRE, sizeof(block_ml8_5_wire), ggml_cuda_ar_codec_pack_ml8_5_dispatch, ggml_cuda_ar_codec_unpack_ml8_5_dispatch },
+    { "ml8_6", GGML_TYPE_Q8_1, QK_ML8_WIRE, sizeof(block_ml8_6_wire), ggml_cuda_ar_codec_pack_ml8_6_dispatch, ggml_cuda_ar_codec_unpack_ml8_6_dispatch },
     { "ml8_8", GGML_TYPE_Q4_1, QK_ML8_WIRE, sizeof(block_ml8_8_wire), ggml_cuda_ar_codec_pack_ml8_8_dispatch, ggml_cuda_ar_codec_unpack_ml8_8_dispatch },
     { "ml8_8r", GGML_TYPE_Q5_1, 1, 1, ggml_cuda_ar_codec_pack_ml8_8r_dispatch, ggml_cuda_ar_codec_unpack_ml8_8r_dispatch },
 };
@@ -843,10 +845,31 @@ struct ggml_cuda_ar_host_mapping {
 //
 //   p2p:  r1's out-stream pushes send1 straight into a receive buffer that
 //         lives in r0's memory (peer access r1 -> r0 enabled at init; the
-//         reverse direction is not required and is not attempted).
-//         r0's out-stream D2H-copies send0 into pinned host staging; r1's
-//         in-stream waits that (cross-device event) and H2D-copies staging
-//         into r1's receive buffer.
+//         reverse direction is not required and is not attempted; a plain
+//         cudaMemcpyPeerAsync with the DESTINATION on r1 has been measured
+//         to segfault on this link, so the push must stay this direction).
+//         dev0 -> dev1 leg, selected by GGML_CUDA_AR_P2P_PULL:
+//           =1: r0 does nothing in begin() -- Phase C launches a
+//               dedicated coalesced copy kernel on r1's IN-STREAM that reads
+//               send0 directly through the peer mapping into r1's receive
+//               buffer, same as the host-staging H2D it replaces (recvd
+//               event, dx_recv[1] fence) -- so this stays off r1's compute
+//               stream and keeps the rolling 2-slot overlap with end().
+//               Measured on the rig: this regresses 8k prefill from ~1024 to
+//               ~852 t/s (the pull kernel occupies the critical card's CUs
+//               on a latency-bound peer read where the host-staging path
+//               below uses idle DMA engines instead) -- kept for A/B, not
+//               the default.
+//           =2: r0 still does nothing in begin(), but there is no Phase C
+//               step either -- r1's unpack_accumulate kernel in end()
+//               dereferences send0 directly (no local recv copy at all).
+//               This puts the transfer on r1's COMPUTE stream, serialising
+//               it with end()'s unpack of the *other* in-flight slot; kept
+//               for A/B against mode 1, not the default.
+//           =0 (default, or peer access unavailable): r0's out-stream
+//               D2H-copies send0 into pinned host staging; r1's in-stream
+//               waits that (cross-device event) and H2D-copies staging into
+//               r1's receive buffer -- the previously shipped behaviour.
 //   host: both ranks D2H into their own staging; each rank's in-stream waits
 //         the peer's D2H event and H2D-copies into its receive buffer.
 //
@@ -854,17 +877,32 @@ struct ggml_cuda_ar_host_mapping {
 // runs duplex.  end() makes the compute stream wait for "own send done" and
 // "peer data landed" and runs the same add kernel as the copy-engine path,
 // i.e. identical numerics: both partials rounded through the wire type, F32
-// accumulate, own + peer order.
+// accumulate, own + peer order.  Under p2p_pull (modes 1 and 2), r0 has no
+// "own send done" event to wait on (nothing was staged out in begin()); its
+// send buffer is instead fenced by r1's consumption of it -- r1's pull-copy
+// kernel completion (ev.recvd, mode 1) or r1's unpack kernel completion
+// (ev.freed, mode 2) -- waited cross-device by the next op to reuse that
+// slot, in begin()'s Phase A.
 //
 // Buffers are double-buffered by slot (DX_SLOTS).  Reuse of a slot is fenced
 // by three events per (rank, slot): sent (out-stream), recvd (in-stream) and
-// freed (compute stream, after the add kernel).  The fences assume the
-// caller ends op N before it begins op N+DX_SLOTS -- asserted at begin().
+// freed (compute stream, after the add kernel) -- except r0's send buffer
+// under p2p_pull, which is fenced by r1's recvd or freed event instead of
+// its own sent (see above).  The fences assume the caller ends op N before
+// it begins op N+DX_SLOTS -- asserted at begin().
 // ---------------------------------------------------------------------------
 enum ggml_cuda_ar_transport {
     GGML_CUDA_AR_TRANSPORT_COPY, // legacy synchronous copy-engine host bounce (+ chunked kernel)
-    GGML_CUDA_AR_TRANSPORT_P2P,  // duplex: r1 pushes into r0 memory, r1 pulls via host staging
+    GGML_CUDA_AR_TRANSPORT_P2P,  // duplex: r1 pushes into r0 memory; r1 pulls (see GGML_CUDA_AR_P2P_PULL)
     GGML_CUDA_AR_TRANSPORT_HOST, // duplex: both directions via host staging
+};
+
+// dev0 -> dev1 leg strategy, p2p transport only.  GGML_CUDA_AR_P2P_PULL env,
+// default 0.  See the transport comment above for the tradeoffs.
+enum ggml_cuda_ar_p2p_pull_mode {
+    GGML_CUDA_AR_P2P_PULL_HOST          = 0, // host-staged D2H + H2D bounce (no peer reads at all) (default)
+    GGML_CUDA_AR_P2P_PULL_COPY_KERNEL   = 1, // dedicated pull-copy kernel on r1's in-stream
+    GGML_CUDA_AR_P2P_PULL_DIRECT_UNPACK = 2, // r1's unpack_accumulate kernel reads send0 directly, in end()
 };
 
 static constexpr int GGML_CUDA_AR_DX_SLOTS = 2;
@@ -938,6 +976,9 @@ struct ggml_cuda_ar_pipeline {
 
     // Duplex transport state (unused when transport == COPY).
     ggml_cuda_ar_transport    transport;
+    // dev0->dev1 leg strategy (see ggml_cuda_ar_p2p_pull_mode above); forced
+    // HOST for any transport other than P2P.
+    ggml_cuda_ar_p2p_pull_mode p2p_pull_mode;
     size_t                    dx_bytes;      // bytes per slot
     uint64_t                  dx_call;       // begin() counter -> slot = dx_call % DX_SLOTS
     int                       dx_in_flight;  // begun-but-not-ended ops
@@ -1719,7 +1760,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->wire_codec_explicit = wire_env && wire_env[0];
     p->wire_codec = ggml_cuda_ar_codec_from_name(wire_env && wire_env[0] ? wire_env : "bf16");
     if (p->wire_codec == nullptr) {
-        GGML_ABORT("%s: unknown GGML_CUDA_AR_WIRE_TYPE='%s' (expected bf16, f16, f32, q8_0, ml8_4, ml8_5, ml8_8, or ml8_8r)",
+        GGML_ABORT("%s: unknown GGML_CUDA_AR_WIRE_TYPE='%s' (expected bf16, f16, f32, q8_0, ml8_4, ml8_5, ml8_6, ml8_8, or ml8_8r)",
                    __func__, wire_env ? wire_env : "");
     }
     if (p->wire_codec->elements_per_block == 0 || p->wire_codec->bytes_per_block == 0 ||
@@ -1917,6 +1958,31 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             p->transport = peer_ok ? GGML_CUDA_AR_TRANSPORT_P2P : GGML_CUDA_AR_TRANSPORT_HOST;
         }
 
+        // dev0 -> dev1 leg strategy.  GGML_CUDA_AR_P2P_PULL: 0 (default) =
+        // host-staged bounce (the previously shipped behaviour), 1 =
+        // dedicated pull-copy kernel on r1's in-stream (measured to regress
+        // 8k prefill from ~1024 to ~852 t/s on the rig -- the pull kernel
+        // occupies the critical card's CUs on a latency-bound peer read
+        // where host staging uses idle DMA engines -- kept for A/B, not the
+        // default), 2 = r1's unpack kernel reads r0's send buffer directly
+        // in end(). Only meaningful when p2p was actually selected above
+        // (peer_ok); an A/B without a rebuild.
+        {
+            const char * pull_env = getenv("GGML_CUDA_AR_P2P_PULL");
+            int pull_mode = 0;
+            if (pull_env && pull_env[0]) {
+                pull_mode = atoi(pull_env);
+                if (pull_mode < 0 || pull_mode > 2) {
+                    GGML_LOG_WARN("%s: GGML_CUDA_AR_P2P_PULL='%s' out of range [0,2]; using default (0)\n",
+                                  __func__, pull_env);
+                    pull_mode = 0;
+                }
+            }
+            p->p2p_pull_mode = p->transport == GGML_CUDA_AR_TRANSPORT_P2P
+                ? static_cast<ggml_cuda_ar_p2p_pull_mode>(pull_mode)
+                : GGML_CUDA_AR_P2P_PULL_HOST;
+        }
+
         // The duplex transports keep the same copy_threshold as the legacy
         // path: below it, small reductions still take the chunked kernel.
         //
@@ -1984,7 +2050,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     const char * transport_name =
-        p->transport == GGML_CUDA_AR_TRANSPORT_P2P  ? "p2p (r1 pushes into r0, r1 pulls via host staging)" :
+        p->transport == GGML_CUDA_AR_TRANSPORT_P2P  ?
+            (p->p2p_pull_mode == GGML_CUDA_AR_P2P_PULL_COPY_KERNEL   ? "p2p (r1 pushes into r0, r1 in-stream pull-copy kernel reads r0's send buffer)" :
+             p->p2p_pull_mode == GGML_CUDA_AR_P2P_PULL_DIRECT_UNPACK ? "p2p (r1 pushes into r0, r1 unpack-kernel reads r0's send buffer directly in end())" :
+                                                                       "p2p (r1 pushes into r0, r1 pulls via host staging)") :
         p->transport == GGML_CUDA_AR_TRANSPORT_HOST ? "host (duplex via host staging)" :
                                                       "copy (legacy copy-engine bounce)";
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
@@ -2675,6 +2744,59 @@ static void ggml_cuda_ar_dump_partials(
                   (unsigned long long) idx, (unsigned long long) this_seen, (long long) ne, keep);
 }
 
+// GGML_CUDA_AR_P2P_PULL=1 (not the default -- see the transport comment above
+// for the measured regression that kept it opt-in): coalesced peer-read copy
+// for the
+// dev0 -> dev1 leg.  Launched on r1's in-stream; reads r0's send buffer
+// directly through the peer mapping (dev1->dev0 peer access) and writes it
+// into r1's local receive buffer -- the plain cudaMemcpyPeerAsync this
+// replaces segfaults with the destination on r1 on this link (Thunderbolt-
+// attached, small BAR), so the transfer engine can't be used for this
+// direction; a kernel-side peer read does work, measured ~2.4-2.5 GB/s.
+//
+// 128-bit (uint4) loads/stores, one lane per 16B chunk.  dx_send/dx_recv
+// slot offsets are NOT guaranteed 16B-aligned (dx_bytes is rounded down to
+// whole codec blocks -- e.g. 34B for q8_0 -- not to 16B), so this peels an
+// unaligned byte prefix around a 16B-aligned middle region rather than
+// assuming the allocator's base alignment survives the offset.  dst and src
+// share the same slot_off and both allocations come from
+// cudaMalloc/hipMalloc (at least 16B aligned), so they have the same
+// misalignment and one prefix length serves both pointers.  Every loop is
+// grid-strided so block/thread count only affects occupancy, not
+// correctness. Grid capped like the codec pack/unpack kernels
+// (GGML_CUDA_AR_CODEC_GRID) so it doesn't starve concurrent compute on r1.
+static __global__ void ggml_cuda_ar_pull_copy_kernel(
+        uint8_t * __restrict__ dst, const uint8_t * __restrict__ src, int nbytes) {
+    const int64_t misalign    = (int64_t) (reinterpret_cast<uintptr_t>(dst) & 15);
+    const int64_t prefix_want = misalign ? 16 - misalign : 0;
+    const int64_t prefix      = prefix_want < nbytes ? prefix_want : nbytes;
+    const int64_t mid_bytes   = (int64_t) nbytes - prefix;
+    const int64_t n_vec       = mid_bytes / 16;
+    const int64_t suffix_off  = prefix + n_vec * 16;
+    const int64_t suffix      = (int64_t) nbytes - suffix_off;
+
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < prefix; i += gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+    const uint4 * src4 = reinterpret_cast<const uint4 *>(src + prefix);
+    uint4 *       dst4 = reinterpret_cast<uint4 *>(dst + prefix);
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_vec; i += gridDim.x * blockDim.x) {
+        dst4[i] = src4[i];
+    }
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < suffix; i += gridDim.x * blockDim.x) {
+        dst[suffix_off + i] = src[suffix_off + i];
+    }
+}
+
+static void ggml_cuda_ar_pull_copy(void * dst, const void * src, size_t nbytes, cudaStream_t stream) {
+    GGML_ASSERT(nbytes <= (size_t) std::numeric_limits<int>::max());
+    const int64_t n_vec_approx = (int64_t) ((nbytes + 15) / 16); // grid-sizing hint only
+    const int      grid = ggml_cuda_ar_codec_lane_grid(n_vec_approx);
+    ggml_cuda_ar_pull_copy_kernel<<<grid, 256, 0, stream>>>(
+        static_cast<uint8_t *>(dst), static_cast<const uint8_t *>(src), (int) nbytes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_ar_allreduce_begin(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -2782,6 +2904,22 @@ bool ggml_cuda_ar_allreduce_begin(
         ggml_cuda_set_device(p->devices[i]);
         cudaStream_t cs   = cuda_ctx[i]->stream();
         char *       send = p->dx_send[i] + slot_off;
+        if (p2p && p->p2p_pull_mode != GGML_CUDA_AR_P2P_PULL_HOST && i == 0 && hp_ok) {
+            // Pull modes (1, 2): r0 never stages this slot's send buffer out
+            // in Phase B/C below, so there is no same-device "out-stream
+            // drained" event to ride on -- the wait has to be explicit and
+            // cross-device, on whatever r1 op last consumed this slot
+            // (op-2) directly: the pull-copy kernel's completion (mode 1)
+            // or the unpack kernel's completion (mode 2).
+            const ggml_cuda_ar_dx_slot & prev = p->dx_ev[1][hp];
+            if (p->p2p_pull_mode == GGML_CUDA_AR_P2P_PULL_COPY_KERNEL) {
+                if (prev.recvd_valid) {
+                    ggml_cuda_ar_wait_logged(cs, prev.recvd, "cs0<-recvd1(pull-copy,op-2)", op_id, p->devices[i]);
+                }
+            } else if (prev.freed_valid) {
+                ggml_cuda_ar_wait_logged(cs, prev.freed, "cs0<-freed1(pull,op-2)", op_id, p->devices[i]);
+            }
+        }
         if (!compute_flag[i]) {
             CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, input_nbytes, cs));
             CUDA_CHECK(cudaMemsetAsync(send, 0, nbytes, cs));
@@ -2802,6 +2940,16 @@ bool ggml_cuda_ar_allreduce_begin(
         cudaStream_t          out  = p->streams[i];
         ggml_cuda_ar_dx_slot & ev  = p->dx_ev[i][h];
         const char *          send = p->dx_send[i] + slot_off;
+
+        if (p2p && p->p2p_pull_mode != GGML_CUDA_AR_P2P_PULL_HOST && i == 0) {
+            // Nothing to enqueue: r1 pulls this slot itself, either via a
+            // pull-copy kernel in Phase C (mode 1) or directly inside its
+            // unpack kernel in end() (mode 2) -- r0 never stages it out.
+            // ev.sent is intentionally left unrecorded for this op -- end()
+            // must not (and does not) wait on it for i==0 in pull mode.
+            ev.sent_valid = false;
+            continue;
+        }
 
         ggml_cuda_ar_wait_logged(out, ev.app, "out<-app(own,this op)", op_id, p->devices[i]);
         if (p2p && i == 1) {
@@ -2826,10 +2974,19 @@ bool ggml_cuda_ar_allreduce_begin(
         p->wd_dx_phase[i][slot].store(2 /* sent */, std::memory_order_relaxed);
     }
 
-    // Phase C (in-streams): pulls from the peer's staging for the ranks that
-    // are not pushed into (r1 on p2p; both on host).
+    // Phase C (in-streams): pulls the peer's partial for the ranks that are
+    // not pushed into and are not doing a direct peer read in end() (r1 on
+    // p2p+pull mode 1 or host transport; r1 on p2p+pull mode 2 does neither
+    // -- handled entirely in end()).
     for (int i = 0; i < n; ++i) {
         if (p2p && i == 0) {
+            continue;
+        }
+        const bool pull_copy_kernel = p2p && p->p2p_pull_mode == GGML_CUDA_AR_P2P_PULL_COPY_KERNEL && i == 1;
+        if (p2p && p->p2p_pull_mode == GGML_CUDA_AR_P2P_PULL_DIRECT_UNPACK && i == 1) {
+            // r1's unpack_accumulate kernel in end() reads dx_send[0]
+            // directly (peer-mapped) instead of pulling into dx_recv[1] via
+            // any copy here.
             continue;
         }
         const int peer = 1 - i;
@@ -2837,12 +2994,26 @@ bool ggml_cuda_ar_allreduce_begin(
         cudaStream_t          in = p->streams_in[i];
         ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][h];
 
-        ggml_cuda_ar_wait_logged(in, p->dx_ev[peer][h].sent, "in<-sent_peer(this op)", op_id, p->devices[i]);
+        if (pull_copy_kernel) {
+            // r0 recorded no "sent" event this op (Phase B skipped its D2H
+            // entirely) -- wait for r0's pack kernel to have finished
+            // writing dx_send[0] instead, cross-device.
+            ggml_cuda_ar_wait_logged(in, p->dx_ev[0][h].app, "in1<-app0(pull-copy,this op)", op_id, p->devices[i]);
+        } else {
+            ggml_cuda_ar_wait_logged(in, p->dx_ev[peer][h].sent, "in<-sent_peer(this op)", op_id, p->devices[i]);
+        }
         if (hp_ok && p->dx_ev[i][hp].freed_valid) {
             ggml_cuda_ar_wait_logged(in, p->dx_ev[i][hp].freed, "in<-freed_own(op-2)", op_id, p->devices[i]);
         }
-        CUDA_CHECK(cudaMemcpyAsync(
-            p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, xfer_nbytes, cudaMemcpyHostToDevice, in));
+        if (pull_copy_kernel) {
+            // Coalesced peer-read copy: reads dx_send[0] (r0, peer-mapped)
+            // directly instead of an H2D from host staging -- see the
+            // kernel comment above ggml_cuda_ar_pull_copy_kernel.
+            ggml_cuda_ar_pull_copy(p->dx_recv[i] + slot_off, p->dx_send[0] + slot_off, xfer_nbytes, in);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(
+                p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, xfer_nbytes, cudaMemcpyHostToDevice, in));
+        }
         CUDA_CHECK(cudaEventRecord(ev.recvd, in));
         ev.recvd_valid = true;
         p->wd_dx_phase[i][slot].store(3 /* recvd */, std::memory_order_relaxed);
@@ -2886,23 +3057,55 @@ bool ggml_cuda_ar_allreduce_end(
         cudaStream_t          cs = cuda_ctx->stream();
         ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][op->hist];
 
+        // Mode 2 (GGML_CUDA_AR_P2P_PULL_DIRECT_UNPACK) only: r1's unpack
+        // kernel below reads dx_send[0] directly instead of a local
+        // dx_recv[1] that Phase C would otherwise have filled. Mode 1 (the
+        // pull-copy kernel) already filled dx_recv[1] in Phase C on
+        // r1's in-stream and recorded ev.recvd there exactly like the
+        // host-staging path does, so it needs none of this special-casing --
+        // end() cannot tell modes 0 and 1 apart, by design (keeps the
+        // transfer off r1's compute stream either way).
+        const bool direct_unpack = p2p && p->p2p_pull_mode == GGML_CUDA_AR_P2P_PULL_DIRECT_UNPACK && i == 1;
+
         // Own outbound done (send slot reusable, and for r0/p2p its staging
         // read is what the peer's pull ordered on) + peer data landed.
         wp_op_profile_span_begin(p->devices[i], cs);
-        ggml_cuda_ar_wait_logged(cs, ev.sent, "cs<-sent_own(end)", op->op_id, p->devices[i]);
+        if (p2p && p->p2p_pull_mode != GGML_CUDA_AR_P2P_PULL_HOST && i == 0) {
+            // r0 recorded no outbound event this op (Phase B skipped the D2H
+            // entirely) -- send-buffer reuse is fenced instead by r1's
+            // consumption of it: the pull-copy kernel's completion (mode 1,
+            // ev.recvd, Phase C above) or the direct-read unpack kernel's
+            // completion (mode 2, ev.freed, below) -- waited cross-device by
+            // the *next* user of this slot in begin()'s Phase A. Nothing to
+            // wait on here.
+        } else {
+            ggml_cuda_ar_wait_logged(cs, ev.sent, "cs<-sent_own(end)", op->op_id, p->devices[i]);
+        }
         if (p2p && i == 0) {
             ggml_cuda_ar_wait_logged(cs, p->dx_ev[peer][op->hist].sent, "cs0<-sent1(end,r1 push)", op->op_id, p->devices[i]);
+        } else if (direct_unpack) {
+            // Peer data landed = r0's pack kernel finished writing dx_send[0];
+            // the unpack kernel below reads it directly (peer-mapped), so
+            // there is no local recv-buffer fill to wait on.
+            ggml_cuda_ar_wait_logged(cs, p->dx_ev[0][op->hist].app, "cs1<-app0(end,pull read)", op->op_id, p->devices[i]);
         } else {
             ggml_cuda_ar_wait_logged(cs, ev.recvd, "cs<-recvd_own(end)", op->op_id, p->devices[i]);
         }
         wp_op_profile_span_end(p->devices[i], cs, "AR_END_WAIT");
 
-        const char * recv = p->dx_recv[i] + slot_off;
+        const char * recv = direct_unpack ? (p->dx_send[0] + slot_off) : (p->dx_recv[i] + slot_off);
         const ggml_cuda_ar_codec * codec = ggml_cuda_ar_codec_from_type(op->wire_type);
         if (codec == nullptr) {
             GGML_ABORT("%s: no codec registered for wire type %d", __func__, (int) op->wire_type);
         }
         wp_op_profile_span_begin(p->devices[i], cs);
+        // direct_unpack (mode 2 only): this unpack_accumulate_fn call is
+        // unmodified from the non-pull path -- only `recv` differs (r0's
+        // device pointer, peer-mapped, instead of r1's local dx_recv[1]).
+        // Note this reads the peer link on r1's COMPUTE stream, serialising
+        // with concurrent work on the other in-flight slot -- mode 1 avoids
+        // that by doing the same peer read earlier, on the
+        // in-stream, via ggml_cuda_ar_pull_copy_kernel in Phase C.
         codec->unpack_accumulate_fn(op->dst[i], op->dst_type, recv, op->ne, cs);
         wp_op_profile_span_end(p->devices[i], cs, "AR_END_UNPACK");
 

@@ -32,7 +32,22 @@ extern "C" {
 // Tensor shapes (ggml row-major convention):
 //   w         : [K, N]      GGML_TYPE_ML8_4   (K = product of K-groups; N = out features)
 //   centroids : [16, n_groups_k]  GGML_TYPE_F8_E4M3 sidecar LUT
-//   x         : [K, M]      GGML_TYPE_F32     activations
+//   x         : EITHER [K, M]     GGML_TYPE_F32  raw fp32 activations (legacy path,
+//                                                 MT_ML8_4_ACT=legacy), the GEMM
+//                                                 quantizes internally;
+//               OR     [K+4, M]   GGML_TYPE_I8   PRE-QUANTIZED per-row activation —
+//                                                 the packed output of
+//                                                 ggml_fp8_quant_rot(..., G=0): bytes
+//                                                 [0,M*K) are every row's e4m3 A bytes
+//                                                 back-to-back (row m at byte m*K), then
+//                                                 bytes [M*K, M*K+4*M) are fp32
+//                                                 a_scale[m] at byte 4*m (see the
+//                                                 GGML_OP_FP8_QUANT_ROT doc comment in
+//                                                 ggml.h for the exact layout). This is
+//                                                 the default path (MAD-3xx activation
+//                                                 fusion): the GEMM skips its internal
+//                                                 quantize pass entirely and consumes
+//                                                 a_fp8/a_scale directly.
 //
 // Output:
 //   y         : [N, M]      GGML_TYPE_F32     (matches plain ggml_mul_mat layout)
@@ -43,6 +58,7 @@ extern "C" {
 //     tensor parallelism, where centroids is mirrored in full but w holds
 //     only a K-slice — see lut_group_off below)
 //   - centroids ne0 must equal 16
+//   - when x is I8 (pre-quantized): x->ne[0] == K + 4 exactly
 GGML_API struct ggml_tensor * ggml_ml8_mul_mat(
         struct ggml_context * ctx,
         struct ggml_tensor  * w,

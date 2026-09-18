@@ -2397,9 +2397,19 @@ struct test_ml8_mul_mat : public test_case {
     const int64_t k_world;        // world K the mirrored centroid LUT covers; 0 -> k (no TP split)
     const int64_t lut_group_off;  // first centroid K-group this node reads
     const int64_t ne2;            // batch dim, x/out become 3D [k,n,ne2] / [m,n,ne2]
+    // MAD-3xx: when true, x is built as GGML_TYPE_I8 [k+4, n, ne2] — the
+    // pre-quantized per-row output of ggml_fp8_quant_rot(..., kind=NONE,
+    // G=0) fed straight into ggml_ml8_mul_mat, exercising the fused
+    // activation path (ML8_MUL_MAT skips its internal quantize pass and
+    // consumes a_fp8/a_scale directly — see ggml-ml8.h). Chaining through
+    // the real FP8_QUANT_ROT op (rather than hand-filling raw I8 bytes)
+    // guarantees every fp8 byte is a valid, correctly-rounded e4m3 code, so
+    // the CPU oracle's dequant-then-matmul path stays exact up to the same
+    // fp8/bf16 tolerance the legacy f32-activation case already uses.
+    const bool prequant;
 
     std::string vars() override {
-        return VARS_TO_STR6(m, n, k, k_world, lut_group_off, ne2);
+        return VARS_TO_STR7(m, n, k, k_world, lut_group_off, ne2, prequant);
     }
 
     double max_nmse_err() override {
@@ -2421,10 +2431,11 @@ struct test_ml8_mul_mat : public test_case {
     }
 
     test_ml8_mul_mat(int64_t m = 64, int64_t n = 16, int64_t k = 256,
-                      int64_t k_world = 0, int64_t lut_group_off = 0, int64_t ne2 = 1)
+                      int64_t k_world = 0, int64_t lut_group_off = 0, int64_t ne2 = 1,
+                      bool prequant = false)
         : m(m), n(n), k(k),
           k_world(k_world != 0 ? k_world : k),
-          lut_group_off(lut_group_off), ne2(ne2) {}
+          lut_group_off(lut_group_off), ne2(ne2), prequant(prequant) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_ML8_4, k, m);
@@ -2433,7 +2444,17 @@ struct test_ml8_mul_mat : public test_case {
         ggml_set_name(cent, "centroids");
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, ne2);
         ggml_set_name(x, "x");
-        ggml_tensor * out = ggml_ml8_mul_mat(ctx, w, cent, x);
+        ggml_tensor * x_for_mm = x;
+        if (prequant) {
+            // kind=NONE, G=0: no rotation, just the fused per-row e4m3
+            // quantize -- exercises ML8_MUL_MAT's pre-quantized I8 contract
+            // without entangling this test with FP8_QUANT_ROT's rotation math
+            // (that's test_fp8_quant_rot's job).
+            x_for_mm = ggml_fp8_quant_rot(ctx, x, /*h_a=*/nullptr, /*a_dim=*/0, /*b_dim=*/0,
+                                           GGML_FP8_QUANT_ROT_KIND_NONE, /*G=*/0);
+            ggml_set_name(x_for_mm, "x_qrot");
+        }
+        ggml_tensor * out = ggml_ml8_mul_mat(ctx, w, cent, x_for_mm);
         // Under tensor parallelism w only holds a [k, m] K-slice while cent
         // is mirrored in full ([16, k_world/64]); lut_group_off selects
         // which K-groups of the mirrored LUT this slice's decode should use.
@@ -3414,13 +3435,20 @@ struct test_cpy : public test_case {
     const std::array<int64_t, 4> permute_src;
     const std::array<int64_t, 4> permute_dst;
     const std::array<int64_t, 4> dst_alloc; // if set, dst is a view into a larger buffer (strided)
+    const std::array<int64_t, 4> src_alloc; // if set, src is a view into a larger buffer (strided);
+                                             // src_alloc[0] > ne_src[0] narrows dim0 to a sub-range of a
+                                             // wider parent row (e.g. ggml_view_3d of a wide-stride parent)
     bool _src_use_permute;
     bool _dst_use_permute;
     bool _src_transpose;
     bool _use_dst_shape;
     bool _use_dst_alloc;
+    bool _use_src_alloc;
 
     std::string vars() override {
+        if (_use_src_alloc) {
+            return VARS_TO_STR8(type_src, type_dst, ne_src, src_alloc, permute_dst, _use_dst_alloc, dst_alloc, _src_transpose);
+        }
         if (_use_dst_alloc) {
             return VARS_TO_STR8(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose, dst_alloc);
         }
@@ -3478,28 +3506,45 @@ struct test_cpy : public test_case {
             std::array<int64_t, 4> permute_src = {0, 0, 0, 0},
             std::array<int64_t, 4> permute_dst = {0, 0, 0, 0},
             bool transpose_src = false,
-            std::array<int64_t, 4> dst_alloc = {0, 0, 0, 0})
+            std::array<int64_t, 4> dst_alloc = {0, 0, 0, 0},
+            std::array<int64_t, 4> src_alloc = {0, 0, 0, 0})
         : type_src(type_src), type_dst(type_dst), ne_src(ne_src), ne_dst(ne_dst), permute_src(permute_src), permute_dst(permute_dst),
-          dst_alloc(dst_alloc),
+          dst_alloc(dst_alloc), src_alloc(src_alloc),
           _src_use_permute(permute_src[0] + permute_src[1] + permute_src[2] + permute_src[3] > 0),
           _dst_use_permute(permute_dst[0] + permute_dst[1] + permute_dst[2] + permute_dst[3] > 0),
           _src_transpose(transpose_src),
           _use_dst_shape(ne_dst[0] >= 0 && ne_dst[1] >= 0 && ne_dst[2] >= 0 && ne_dst[3] >= 0),
-          _use_dst_alloc(dst_alloc[0] > 0){}
+          _use_dst_alloc(dst_alloc[0] > 0),
+          _use_src_alloc(src_alloc[0] > 0){}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * src = ggml_new_tensor(ctx, type_src, 4, ne_src.data());
-        ggml_set_param(src);
-        ggml_set_name(src, "src");
+        ggml_tensor * src;
 
-        if (_src_use_permute) {
-            src = ggml_permute(ctx, src, permute_src[0], permute_src[1], permute_src[2], permute_src[3]);
-            ggml_set_name(src, "src_permuted");
-        }
+        if (_use_src_alloc) {
+            // view a narrow sub-range of dim0 out of a wider parent row -> strided src
+            // (mirrors e.g. ggml_view_3d of a tensor concatenated along dim0: a small
+            // contiguous window per row, with a much wider row stride)
+            GGML_ASSERT(!_src_use_permute && !_src_transpose); // not meaningful combined with src_alloc
+            ggml_tensor * src_buf = ggml_new_tensor(ctx, type_src, 4, src_alloc.data());
+            ggml_set_param(src_buf);
+            ggml_set_name(src_buf, "src_buf");
+            src = ggml_view_4d(ctx, src_buf, ne_src[0], ne_src[1], ne_src[2], ne_src[3],
+                src_buf->nb[1], src_buf->nb[2], src_buf->nb[3], 0);
+            ggml_set_name(src, "src_view");
+        } else {
+            src = ggml_new_tensor(ctx, type_src, 4, ne_src.data());
+            ggml_set_param(src);
+            ggml_set_name(src, "src");
 
-        if (_src_transpose) {
-            src = ggml_transpose(ctx, src);
-            ggml_set_name(src, "src_transposed");
+            if (_src_use_permute) {
+                src = ggml_permute(ctx, src, permute_src[0], permute_src[1], permute_src[2], permute_src[3]);
+                ggml_set_name(src, "src_permuted");
+            }
+
+            if (_src_transpose) {
+                src = ggml_transpose(ctx, src);
+                ggml_set_name(src, "src_transposed");
+            }
         }
 
         std::array<int64_t, 4> dst_ne = _use_dst_shape ? ne_dst : std::array<int64_t, 4>{src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
@@ -9661,6 +9706,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
 
+    // degenerate 2D-memcpy geometry: src is a narrow (few-element) contiguous window
+    // sliced out of a much wider parent row, height in the thousands -- e.g. the
+    // conv_state cache-write cpy in delta-net-style recurrent models (a
+    // ggml_view_3d(conv_kernel_size-1, conv_channels, n_seqs) into a wide-stride
+    // parent). Width here is 3*4=12 bytes, far below any sane 2D-memcpy row width;
+    // exercises the scalar-kernel fallback (and the equivalent all-non-contiguous
+    // variant, dst also a strided view) instead of a degenerate cudaMemcpy2D rect.
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {3, 4096, 1, 1}, {-1,-1,-1,-1},
+        {0, 0, 0, 0}, {0, 0, 0, 0}, false, {0, 0, 0, 0}, {16, 4096, 1, 1})); // strided src, narrow row
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {3, 4096, 1, 1}, {-1,-1,-1,-1},
+        {0, 0, 0, 0}, {0, 0, 0, 0}, false, {8, 4096, 1, 1}, {16, 4096, 1, 1})); // strided src AND dst, narrow row
+
     // CPY f32 -> turbo4_0: bespoke Vulkan quantize shader (self-contained, bundles WHT)
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO4_0, {128, 8, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO4_0, {256, 4, 1, 1}));
@@ -10067,6 +10124,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ 16, /*k=K*/ 2560,
         /*k_world=*/ 5120, /*lut_group_off=*/ 0));
 
+    // MAD-3xx: GGML_OP_ML8_MUL_MAT's pre-quantized activation path (x is the
+    // GGML_OP_FP8_QUANT_ROT(kind=NONE, G=0) per-row I8 output, not raw f32 --
+    // see ggml-ml8.h). Same decode/prefill tiers plus the two production
+    // RDNA4_TRFEED shapes as the f32 cases above (M=64 exercises the
+    // M_pad!=M small memset+memcpy pad path in ml8_mul_mat_core; M=2048 is
+    // already M_pad-aligned, the zero-extra-launch common case), plus a
+    // K-split case with a nonzero lut_group_off (mirrors the meta backend's
+    // K-split a_expected = w_local + 4 rule in handle_ml8_mul_mat).
+    for (int M : { 1, 8, 16, 32 }) {
+        test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 64, /*n=M*/ M, /*k=K*/ 256,
+            /*k_world=*/ 0, /*lut_group_off=*/ 0, /*ne2=*/ 1, /*prequant=*/ true));
+    }
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 64,   /*k=K*/ 5120,
+        /*k_world=*/ 0, /*lut_group_off=*/ 0, /*ne2=*/ 1, /*prequant=*/ true));
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 2048, /*k=K*/ 5120,
+        /*k_world=*/ 0, /*lut_group_off=*/ 0, /*ne2=*/ 1, /*prequant=*/ true));
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ 33, /*k=K*/ 8704,
+        /*k_world=*/ 17408, /*lut_group_off=*/ 136, /*ne2=*/ 1, /*prequant=*/ true));
+    // 3D batch + pre-quantized, same as the f32 ssm_out-style case above.
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ 7, /*k=K*/ 5120,
+        /*k_world=*/ 0, /*lut_group_off=*/ 0, /*ne2=*/ 3, /*prequant=*/ true));
+
     // GGML_OP_ML8_APPLY_ROTATION (MAD-266 adds block_hadamard alongside the
     // existing kronecker kind — see ggml-ml8.h). kronecker: h_a present,
     // a_dim <= 16 (HIP register-array bound). block_hadamard: h_a == NULL,
@@ -10170,8 +10249,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t M : Ms_full) {
             test_cases.emplace_back(new test_fp8_quant_rot(1,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
             test_cases.emplace_back(new test_fp8_quant_rot(2,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
+            // a_dim=40 (K=5120, the production ffn width) already exercises
+            // ml8_fused_blockhad_quant_kernel's one-launch path (LDS =
+            // K*4+4096 = 24576B, well under the 64KB budget) with a_dim well
+            // past the kronecker kernel's a_dim<=16 register-array bound --
+            // this is the case the fused block_hadamard kernel exists for.
             test_cases.emplace_back(new test_fp8_quant_rot(40, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
         }
+        // a_dim=98 (K=12544, an actual TP K-split shard width -- see the
+        // GGML_OP_ML8_APPLY_ROTATION test comment above): still fits the
+        // fused kernel's LDS budget (12544*4+4096=54272B < 64KB).
+        test_cases.emplace_back(new test_fp8_quant_rot(98, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 4, 1, 1, 0));
+        // a_dim=128 (K=16384): 16384*4+4096=69632B > 64KB -- exceeds the
+        // fused kernel's LDS budget, so ggml_cuda_op_fp8_quant_rot falls
+        // through to the generic memcpy+FWHT+fp8_quant_pack_row_kernel path.
+        // Exercises that fallback still produces the right answer on HIP.
+        test_cases.emplace_back(new test_fp8_quant_rot(128, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 4, 1, 1, 0));
     }
 
     // GGML_OP_FP8_MUL_MAT: touches every K in {128, 5120, 17408}, N in

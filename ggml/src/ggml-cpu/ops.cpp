@@ -12239,7 +12239,17 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
 //                            under tensor parallelism the LUT is mirrored in
 //                            full while w holds only a K-slice; op_params[0]
 //                            (lut_group_off) selects which K-groups to use)
-//   dst->src[2] = x         (GGML_TYPE_F32   ,  [K, M])
+//   dst->src[2] = x         EITHER GGML_TYPE_F32 [K, M]   (legacy, raw activations)
+//                           OR     GGML_TYPE_I8   [K+4, M] (pre-quantized per-row —
+//                                  the ggml_fp8_quant_rot(..., G=0) packed output:
+//                                  bytes [0,M*K) are every row's e4m3 A bytes
+//                                  back-to-back, row m at byte m*K, then bytes
+//                                  [M*K, M*K+4*M) are fp32 a_scale[m] at byte 4*m —
+//                                  see the GGML_OP_FP8_QUANT_ROT doc comment in
+//                                  ggml.h for the exact layout). Dequantized here
+//                                  (fp8 row * its own scale) before the reference
+//                                  matmul so the CPU stays an exact oracle for both
+//                                  activation formats.
 //   dst         = y         (GGML_TYPE_F32   ,  [N, M])
 void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * w   = dst->src[0];
@@ -12248,7 +12258,7 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
     GGML_ASSERT(w   && lut && x);
     GGML_ASSERT(w->type   == GGML_TYPE_ML8_4);
     GGML_ASSERT(lut->type == GGML_TYPE_F8_E4M3);
-    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_I8);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(dst));
@@ -12261,7 +12271,13 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
     // rest are garbage. 2D inputs have ne[2]=ne[3]=1 so this is unchanged.
     // Mirrors the fix in ggml-cuda/ml8.cu's ggml_cuda_op_ml8_mul_mat.
     const int64_t M = x->ne[1] * x->ne[2] * x->ne[3];
-    GGML_ASSERT(x->ne[0] == K);
+    const bool x_prequant = (x->type == GGML_TYPE_I8);
+    if (x_prequant) {
+        GGML_ASSERT(x->ne[0] == K + 4 &&
+            "pre-quantized x must be the ggml_fp8_quant_rot(..., G=0) per-row output");
+    } else {
+        GGML_ASSERT(x->ne[0] == K);
+    }
     GGML_ASSERT(K % QK_ML8 == 0);
     const int64_t n_groups_k = K / QK_ML8;
 
@@ -12274,8 +12290,15 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
 
     const block_ml8_4 * w_blocks = (const block_ml8_4 *) w->data;
     const uint8_t     * lut_fp8  = (const uint8_t     *) lut->data + (size_t) lut_group_off * 16;
-    const float       * x_data   = (const float       *) x->data;
+    const float       * x_data   = x_prequant ? NULL : (const float *) x->data;
     float             * y_data   = (float             *) dst->data;
+
+    // Pre-quantized per-row layout base pointers (see doc comment above);
+    // unused when !x_prequant.
+    const uint8_t * const x_qs_base    = x_prequant ? (const uint8_t *) x->data : NULL;
+    const float    * const x_scale_base = x_prequant
+        ? (const float *) ((const uint8_t *) x->data + (size_t) M * (size_t) K)
+        : NULL;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12283,7 +12306,8 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
     const int64_t n_start      = (int64_t) ith * n_per_thread;
     const int64_t n_end        = (n_start + n_per_thread < N) ? (n_start + n_per_thread) : N;
 
-    // Per-thread fp32 scratch for one row of dequantized W (K floats).
+    // Per-thread fp32 scratch for one row of dequantized W (K floats), plus
+    // (when x is pre-quantized) one dequantized activation row.
     // Allocated via plain malloc/free (matches the prior ml8-ml8.c behaviour
     // which ran cleanly under ggml-cpu's threadpool — replacing this with
     // std::vector triggered libgomp "Thread identifier invalid" errors on the
@@ -12294,12 +12318,31 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
         GGML_ABORT("ggml_compute_forward_ml8_mul_mat: malloc(%zu) failed",
                    (size_t) K * sizeof(float));
     }
+    float * x_dec = NULL;
+    if (x_prequant) {
+        x_dec = (float *) malloc((size_t) K * sizeof(float));
+        if (!x_dec) {
+            free(w_row_fp32);
+            GGML_ABORT("ggml_compute_forward_ml8_mul_mat: malloc x_dec(%zu) failed",
+                       (size_t) K * sizeof(float));
+        }
+    }
 
     for (int64_t n = n_start; n < n_end; n++) {
         const block_ml8_4 * w_row = &w_blocks[n * n_groups_k];
         dequantize_row_ml8_4_with_lut(w_row, lut_fp8, w_row_fp32, K);
         for (int64_t m = 0; m < M; m++) {
-            const float * x_col = &x_data[m * K];
+            const float * x_col;
+            if (x_prequant) {
+                dequantize_row_f8_e4m3(x_qs_base + (size_t) m * K, x_dec, K);
+                const float scale = x_scale_base[m];
+                for (int64_t k = 0; k < K; k++) {
+                    x_dec[k] *= scale;
+                }
+                x_col = x_dec;
+            } else {
+                x_col = &x_data[m * K];
+            }
             float sum = 0.0f;
             for (int64_t k = 0; k < K; k++) {
                 sum += w_row_fp32[k] * x_col[k];
@@ -12308,6 +12351,7 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
         }
     }
 
+    free(x_dec);
     free(w_row_fp32);
 }
 

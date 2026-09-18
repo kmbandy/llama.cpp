@@ -7,6 +7,7 @@
 #include "ggml-ml8.h" // GGML_FP8_QUANT_ROT_KIND_* (FP8_B128 phase 2, see handle_fp8_quant_rot below)
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -81,6 +82,28 @@ struct ggml_backend_meta_trace_init_acc {
 };
 
 static ggml_backend_meta_trace_init_acc g_ggml_backend_meta_trace_init;
+
+// ---------------------------------------------------------------------------------------------
+// WP_META_SLOT_STREAMS (default OFF until the ubatch-boundary hole below is closed and the
+// NLL identity gate passes; set =1 to enable): give each rolling overlap slot (i_slot 0/1, see
+// ggml_backend_sched_graph_compute_async_meta_begin/_step/_end and the rolling loop in
+// llama-context.cpp) its own CUDA/HIP compute stream per device instead of sharing the device's
+// single default stream. Root cause this fixes: with one shared stream, slot B's AllReduce
+// end-wait (allreduce.cu's cudaStreamWaitEvent + unpack) is a barrier that stalls slot A's
+// kernels purely from FIFO stream ordering, not a real data dependency -- measured 49% of
+// prefill wall time in AR_END_WAIT on dev0. KNOWN HOLE (2026-09-18): at a ubatch boundary
+// the call order is A_old(n-1), A_new(0), B_old(n-1), B_new(0); B_old(n-1) sees A's latest
+// index reset to 0, takes the "not yet submitted" branch and skips its wait on A_old(n-1).
+// Needs a per-slot ubatch generation counter (wait on the other slot's latest event when its
+// generation is ahead) before this can default on.
+// ---------------------------------------------------------------------------------------------
+static bool ggml_backend_meta_slot_streams_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("WP_META_SLOT_STREAMS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
 
 // WP_TP_TRACE=2: per-subgraph cross-host reduce trace.
 //
@@ -1029,10 +1052,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     //     own N-slice of the output; no reduce needed).
     //   - w MIRRORED & x token-split (AXIS_1) -> dst follows x's split.
     //   - w K-split (AXIS_0) & x K-split (AXIS_0) -> dst PARTIAL (accumulate via AllReduce), same
-    //     as MUL_MAT's K-split rule. Unlike FP8_MUL_MAT's packed/scaled activation, x here is plain
-    //     F32 with no extra sidecar bytes, so the per-device element counts of w and x must match
-    //     EXACTLY (not just proportionally); each device's w-slice must also be a whole number of
-    //     QK_ML8=64 blocks so the dequant never straddles a device boundary.
+    //     as MUL_MAT's K-split rule. Two activation shapes:
+    //       * legacy F32 x: plain, no extra sidecar bytes, so the per-device element counts of w
+    //         and x must match EXACTLY (not just proportionally).
+    //       * MAD-3xx pre-quantized I8 x (ggml_fp8_quant_rot(..., G=0) per-row output, [K+4, M...]):
+    //         mirrors FP8_MUL_MAT's a_per_row K-split rule exactly -- each device's own K-slice
+    //         was quantized (rotated + row-scaled) from that SAME device's own K-slice of the
+    //         pre-rotation activation (kind NONE/BLOCK_HADAMARD only -- KRONECKER mixes across the
+    //         whole K dim and is never K-split, same constraint FP8_QUANT_ROT itself enforces), so
+    //         this device's packed x width must be its w-slice K_local + 4 (one row scale per
+    //         device, not a K_world-wide one), and the PARTIAL dot products it contributes are
+    //         still exact once AllReduce-summed across devices.
+    //     Either way each device's w-slice must also be a whole number of QK_ML8=64 blocks so the
+    //     dequant never straddles a device boundary.
     //   - anything else -> abort naming the tensor and both axes.
     auto handle_ml8_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
@@ -1054,6 +1086,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         // K-split weight x K-split activation -> PARTIAL, reduced via AllReduce.
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            // MAD-3xx: pre-quantized I8 activation carries 4 sidecar bytes (its own
+            // per-row scale) per device slice, mirroring FP8_MUL_MAT's a_per_row rule.
+            const bool x_prequant = (tensor->src[2]->type == GGML_TYPE_I8);
             const size_t n_bufs_local = ggml_backend_meta_buffer_n_world(tensor->buffer);
             const int64_t blck = ggml_blck_size(tensor->src[0]->type);
             // per-device element counts: sum over segments of (slice units x repeats)
@@ -1067,13 +1102,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             for (size_t j = 0; j < n_bufs_local; j++) {
                 const int64_t w_local = local_elems(src_ss[0], j);
                 const int64_t x_local = local_elems(src_ss[2], j);
-                if (x_local != w_local) {
-                    GGML_LOG_ERROR("%s: ML8_MUL_MAT %s: device %zu w=%s w_local=%" PRId64 " nr=%u nseg=%d | x=%s x_local=%" PRId64 " nr=%u nseg=%d\n",
-                        __func__, tensor->name, j, tensor->src[0]->name, w_local, src_ss[0].nr[0], src_ss[0].n_segments,
+                const int64_t x_expected = x_prequant ? (w_local + 4) : w_local;
+                if (x_local != x_expected) {
+                    GGML_LOG_ERROR("%s: ML8_MUL_MAT %s: device %zu prequant=%d w=%s w_local=%" PRId64 " nr=%u nseg=%d | x=%s x_local=%" PRId64 " nr=%u nseg=%d\n",
+                        __func__, tensor->name, j, (int) x_prequant, tensor->src[0]->name, w_local, src_ss[0].nr[0], src_ss[0].n_segments,
                         tensor->src[2]->name, x_local, src_ss[2].nr[0], src_ss[2].n_segments);
                     GGML_ABORT("ML8_MUL_MAT: K-split activation's per-device element count must equal "
-                        "this device's w-slice K_local exactly (no packed sidecar bytes in the "
-                        "activation, unlike FP8_MUL_MAT)");
+                        "this device's w-slice K_local exactly (legacy F32 x, no sidecar bytes) or "
+                        "K_local + 4 (pre-quantized I8 x, one per-device row scale)");
                 }
                 GGML_ASSERT(w_local % blck == 0 &&
                     "ML8_MUL_MAT: K-split weight slice is not a whole number of QK_ML8=64 blocks");
@@ -3077,10 +3113,20 @@ struct ggml_backend_meta_context {
         std::vector<ggml_tensor *>           nodes[n_graph_slots];
         std::vector<ggml_backend_buffer_ptr> bufs[n_graph_slots];
 
+        // WP_META_SLOT_STREAMS: optional per-backend hook to pick which compute stream this
+        // device dispatches to (see ggml_backend_set_stream_no_t in ggml-backend.h). Resolved
+        // once via get_proc_address in the constructor below; null on a backend that doesn't
+        // export it (e.g. CPU, or a CUDA build predating this), in which case every slot keeps
+        // sharing stream 0 exactly as before -- so a mixed-backend meta (the cross-host
+        // CUDA0+Vulkan0 case elsewhere in this file) degrades safely, not incorrectly.
+        ggml_backend_set_stream_no_t set_stream_no = nullptr;
+
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             for (size_t i = 0; i < n_graph_slots; i++) {
                 bufs[i].resize(n_reduce_steps);
             }
+            set_stream_no = (ggml_backend_set_stream_no_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_set_stream_no");
         }
     };
     struct graph_state {
@@ -3172,6 +3218,122 @@ struct ggml_backend_meta_context {
         }
     }
 
+    // WP_META_SLOT_STREAMS cross-slot ordering. Once each rolling overlap slot dispatches to its
+    // own stream (see backend_config::set_stream_no above), the implicit same-stream FIFO
+    // ordering that used to keep slot B's kernels from racing slot A's is gone, and slot B has a
+    // real data dependency on slot A that must be re-established explicitly:
+    //
+    //   - Paged-attention KV scatter: at subgraph i (== one AllReduce-delimited slice of one
+    //     layer, see the AR boundaries this file builds subgraphs around), slot A's ubatch is the
+    //     earlier chunk of the same sequence, so slot B's attention at that same subgraph index i
+    //     reads KV-cache rows that slot A's GGML_OP_PAGED_ATTN_MT / KV-cpy nodes at that same
+    //     subgraph wrote. Same tensor class for the gated-delta-net recurrent state (cache_r /
+    //     cache_s in llm_build_delta_net_base::build_conv_state, src/models/delta-net-base.cpp) --
+    //     slot B's layer reads the state slot A's layer just produced.
+    //   - Ubatch boundary: when the rolling loop calls prepare_slot()/begin_slot() again for a
+    //     slot that just finished a sub-batch (mctx->next()), the NEW sub-batch on that slot is
+    //     the sequence continuation of whichever sub-batch the OTHER slot most recently finished,
+    //     so its very first subgraph depends on everything the other slot has submitted so far.
+    //
+    // Fix: a small RING of CUDA/HIP events per (slot, device) -- NOT a single scalar "last
+    // event". A single scalar is unsafe: fence_record_index() overwrites it every subgraph, and
+    // the rolling loop lets one slot get up to one step ahead of the other's corresponding
+    // check -- most sharply at a sub-batch transition (ggml_backend_meta_graph_compute_step_begin
+    // resets a slot's subgraph index to 0 for its NEXT ubatch, then that slot immediately
+    // resubmits index 0, BEFORE the other slot has host-issued its own trailing final-index call
+    // for the ubatch that just ended) -- so a same-index lookup done even one host call late can
+    // find the scalar already clobbered by an unrelated index and silently skip a real wait.
+    // GGML_META_FENCE_RING in-flight events per (slot,device), keyed by index % RING, survive
+    // exactly this kind of one-step (or a few steps) lag between record and lookup.
+    //
+    //   - Paged-attention KV scatter: at subgraph i (== one AllReduce-delimited slice of one
+    //     layer, see the AR boundaries this file builds subgraphs around), slot A's ubatch is the
+    //     earlier chunk of the same sequence, so slot B's attention at that same subgraph index i
+    //     reads KV-cache rows that slot A's GGML_OP_PAGED_ATTN_MT / KV-cpy nodes at that same
+    //     subgraph wrote. Same tensor class for the gated-delta-net recurrent state (cache_r /
+    //     cache_s in llm_build_delta_net_base::build_conv_state, src/models/delta-net-base.cpp) --
+    //     slot B's layer reads the state slot A's layer just produced.
+    //   - Ubatch boundary: when the rolling loop calls prepare_slot()/begin_slot() again for a
+    //     slot that just finished a sub-batch (mctx->next()), the NEW sub-batch on that slot is
+    //     the sequence continuation of whichever sub-batch the OTHER slot most recently finished,
+    //     so its very first subgraph depends on everything the other slot has submitted so far.
+    //
+    // fence_record_index(j, i), called from compute() right after that subgraph's
+    // ggml_backend_graph_compute_async() submit (i.e. AFTER every op of subgraph i on i_slot's
+    // stream, KV/state-writing ops included, and before any later select_stream() call retargets
+    // curr_stream_no away from i_slot -- see compute()), records into ring[i % RING] and updates
+    // the (slot,device) "latest submitted index" scalar. Waited-on from the consuming slot's
+    // stream in two places:
+    //   - fence_wait_same_index(): before compute(i) on slot X, consult slot (1-X)'s state for
+    //     device j. If (1-X) has not yet submitted index i this pass (its latest index < i, or
+    //     nothing recorded yet), there is nothing to wait on -- (1-X) will only submit index i,
+    //     if at all, strictly after this call returns (the rolling loop always host-issues slot
+    //     A's step i before slot B's corresponding step i within one rolling pass). Otherwise
+    //     ((1-X)'s latest index >= i) its event for exactly index i MUST still be sitting in
+    //     ring[i % RING] -- if it is not (the slot got GGML_META_FENCE_RING or more steps ahead
+    //     of this check without the ring being consulted), that is a real overrun and we abort
+    //     loudly rather than silently compute on a missing dependency.
+    //   - the ubatch-boundary wait in ggml_backend_meta_graph_compute_step_begin(): before a
+    //     slot's first subgraph of a fresh ubatch, wait unconditionally on the other slot's most
+    //     recently recorded event (ring[latest % RING]), covering the "new A depends on old B's
+    //     tail" case above -- coarser (one wait per ubatch, not per subgraph) but correct and
+    //     cheap since it only runs once per sub-batch. Left exactly as it was before this fix.
+    //
+    // Every wait here is a stream-level wait (cudaStreamWaitEvent), not a host block: it costs
+    // nothing when the event is already satisfied and otherwise only defers *that* slot's next
+    // kernel launch, never the host submission thread.
+    //
+    // Not fenced here (no cross-slot data flows through them): begin_reduce()/end_reduce() only
+    // touch this slot's own AllReduce partial, so select_stream_all() (set the right stream) is
+    // sufficient there -- see the call sites below.
+    static constexpr size_t other_slot(size_t s) { return s ^ 1; } // only valid for n_graph_slots == 2
+    static constexpr size_t GGML_META_FENCE_RING = 4;
+
+    struct slot_fence_entry {
+        ggml_backend_event_t ev    = nullptr;
+        size_t                index = 0;
+        bool                  valid = false;
+    };
+
+    // [slot][device][index % GGML_META_FENCE_RING]
+    std::vector<std::array<slot_fence_entry, GGML_META_FENCE_RING>> slot_fence_ring[n_graph_slots];
+    // [slot][device]: index/validity of the MOST RECENT record for that (slot, device),
+    // regardless of which ring slot it landed in -- used by the ubatch-boundary wait (which
+    // always wants "whatever this slot most recently submitted") and by
+    // fence_wait_same_index()'s not-yet-submitted-vs-overrun disambiguation.
+    std::vector<size_t> slot_fence_latest_index[n_graph_slots];
+    std::vector<bool>   slot_fence_latest_valid[n_graph_slots];
+
+    void slot_fence_init() {
+        static_assert(n_graph_slots == 2, "other_slot() assumes exactly 2 slots");
+        const size_t n_devs = backend_configs.size();
+        for (size_t s = 0; s < n_graph_slots; s++) {
+            slot_fence_ring[s].resize(n_devs);
+            slot_fence_latest_index[s].assign(n_devs, 0);
+            slot_fence_latest_valid[s].assign(n_devs, false);
+            for (size_t j = 0; j < n_devs; j++) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend_configs[j].backend);
+                for (size_t k = 0; k < GGML_META_FENCE_RING; k++) {
+                    // May return nullptr on a backend without event support; every use below
+                    // treats that as "nothing to fence" rather than dereferencing it.
+                    slot_fence_ring[s][j][k].ev = ggml_backend_event_new(dev);
+                }
+            }
+        }
+    }
+
+    void slot_fence_free() {
+        for (size_t s = 0; s < n_graph_slots; s++) {
+            for (auto & per_dev : slot_fence_ring[s]) {
+                for (auto & entry : per_dev) {
+                    if (entry.ev != nullptr) {
+                        ggml_backend_event_free(entry.ev);
+                    }
+                }
+            }
+        }
+    }
+
     float * cross_host_staging(size_t nbytes) {
         if (!cross_host_buf || ggml_backend_buffer_get_size(cross_host_buf.get()) < nbytes) {
             ggml_backend_buffer_type_t host_buft =
@@ -3258,6 +3420,8 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_end");
         }
+
+        slot_fence_init();
     }
 
     ~ggml_backend_meta_context() {
@@ -3272,6 +3436,7 @@ struct ggml_backend_meta_context {
                 ggml_backend_event_free(ev);
             }
         }
+        slot_fence_free();
         for (auto & bc : backend_configs) {
             ggml_backend_free(bc.backend);
         }
@@ -4030,6 +4195,87 @@ struct ggml_backend_meta_graph_runner {
     size_t                      i_graph_aux = 0;
     size_t                      i_node_aux  = 0;
 
+    // WP_META_SLOT_STREAMS: point device j's dispatch at this slot's stream. No-op (device stays
+    // on stream 0, as before this change) when the flag is off or the backend doesn't export
+    // ggml_backend_set_stream_no. See backend_config::set_stream_no and the slot_fence_* block
+    // above for the full rationale.
+    void select_stream(size_t j) {
+        if (!ggml_backend_meta_slot_streams_enabled()) {
+            return;
+        }
+        auto & bc = backend_ctx->backend_configs[j];
+        if (bc.set_stream_no != nullptr) {
+            bc.set_stream_no(bc.backend, (int) i_slot);
+        }
+    }
+
+    void select_stream_all() {
+        for (size_t j = 0; j < n_backends; j++) {
+            select_stream(j);
+        }
+    }
+
+    // Cross-slot fence, KV-cache / recurrent-state hazard: before submitting subgraph i on slot
+    // i_slot, device j, wait for the OTHER slot's subgraph i on the same device. Uses the
+    // GGML_META_FENCE_RING ring (see the doc comment on ggml_backend_meta_context), NOT a bare
+    // equality check against a single scalar -- a scalar is provably unsafe here (see that
+    // comment for the exact ubatch-boundary interleaving that defeats it). Must be called AFTER
+    // select_stream(j) so the wait itself lands on i_slot's stream.
+    void fence_wait_same_index(size_t j, size_t i) {
+        if (!ggml_backend_meta_slot_streams_enabled()) {
+            return;
+        }
+        const size_t os = ggml_backend_meta_context::other_slot(i_slot);
+        if (!backend_ctx->slot_fence_latest_valid[os][j] || backend_ctx->slot_fence_latest_index[os][j] < i) {
+            // The other slot has not (yet) submitted index i this pass -- it can only do so,
+            // if at all, strictly after this call returns (see the rolling-loop ordering
+            // guarantee in the class doc comment), so there is nothing to wait on yet.
+            return;
+        }
+        auto & entry = backend_ctx->slot_fence_ring[os][j][i % ggml_backend_meta_context::GGML_META_FENCE_RING];
+        if (entry.valid && entry.index == i) {
+            ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, entry.ev);
+            return;
+        }
+        // The other slot's latest index is >= i, so it DID submit index i at some point, but the
+        // ring slot that should still hold its event has since been overwritten by a later
+        // index without this slot ever consulting it -- a genuine overrun of the assumed <=1-
+        // step skew this ring is sized for. Abort loudly: silently skipping here would let a
+        // KV-cache/recurrent-state read race its writer.
+        GGML_ABORT("%s: WP_META_SLOT_STREAMS fence ring overrun: slot %zu device %zu wanted "
+                   "subgraph index %zu but the other slot's latest submitted index is %zu and "
+                   "ring[%zu] now holds index %zu -- the other slot got more than "
+                   "GGML_META_FENCE_RING=%zu steps ahead of this check; raise "
+                   "ggml_backend_meta_context::GGML_META_FENCE_RING or investigate why the "
+                   "rolling loop's one-step skew bound was violated",
+                   __func__, i_slot, j, i, backend_ctx->slot_fence_latest_index[os][j],
+                   i % ggml_backend_meta_context::GGML_META_FENCE_RING, entry.index,
+                   (size_t) ggml_backend_meta_context::GGML_META_FENCE_RING);
+    }
+
+    // Records that this slot's subgraph i has been submitted (not completed -- the event marks a
+    // point in i_slot's stream that fence_wait_same_index()/the ubatch-boundary wait order
+    // against via cudaStreamWaitEvent, so the *consumer* stream defers until it actually
+    // completes; the host does not block here). Must be called right after the
+    // ggml_backend_graph_compute_async() that submitted subgraph i, with curr_stream_no still
+    // == i_slot (i.e. before any other select_stream() call on this device) -- this is what
+    // guarantees the event covers every op subgraph i put on i_slot's stream, KV/state-writing
+    // ops included.
+    void fence_record_index(size_t j, size_t i) {
+        if (!ggml_backend_meta_slot_streams_enabled()) {
+            return;
+        }
+        auto & entry = backend_ctx->slot_fence_ring[i_slot][j][i % ggml_backend_meta_context::GGML_META_FENCE_RING];
+        if (entry.ev == nullptr) {
+            return;
+        }
+        ggml_backend_event_record(entry.ev, backend_ctx->backend_configs[j].backend);
+        entry.index = i;
+        entry.valid = true;
+        backend_ctx->slot_fence_latest_index[i_slot][j] = i;
+        backend_ctx->slot_fence_latest_valid[i_slot][j] = true;
+    }
+
     ggml_tensor * get_node_aux(ggml_tensor * t) {
         auto & gs = backend_ctx->graph_states[i_slot];
         ggml_tensor * ret = gs.nodes_aux[i_node_aux++];
@@ -4210,10 +4456,13 @@ struct ggml_backend_meta_graph_runner {
         backend_ctx->runahead_before_submit();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            select_stream(j);            // WP_META_SLOT_STREAMS: dispatch on this slot's stream
+            fence_wait_same_index(j, i);  // ...and wait for the other slot's same-index KV/state writes
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i_slot][i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+            fence_record_index(j, i);    // publish: this slot has now submitted subgraph i on device j
             backend_ctx->runahead_after_submit(j);
         }
         backend_ctx->runahead_advance();
@@ -4236,6 +4485,11 @@ struct ggml_backend_meta_graph_runner {
 
     ggml_status begin_reduce(const size_t i, const int i_op, bool & pending) {
         pending = false;
+        // AllReduce only ever touches THIS slot's own partial (attention/FFN output), never the
+        // other slot's data, so no cross-slot fence is needed here -- just make sure the AR
+        // kernels (and, inside comm_allreduce_begin/_end, cuda_ctx->stream()-based event
+        // record/wait, allreduce.cu's `cs`) land on i_slot's stream rather than stream 0.
+        select_stream_all();
         std::vector<ggml_tensor *> nodes;
         nodes.reserve(n_backends);
         for (size_t j = 0; j < n_backends; j++) {
@@ -4260,6 +4514,7 @@ struct ggml_backend_meta_graph_runner {
     }
 
     ggml_status end_reduce(const int i_op) {
+        select_stream_all(); // must match the stream begin_reduce()'s comm_allreduce_begin used
         return backend_ctx->comm_allreduce_end(backend_ctx->comm_ctx, i_op) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
     }
 
@@ -4269,6 +4524,7 @@ struct ggml_backend_meta_graph_runner {
     // allreduce_fallback() directly, so a cross-host run always gets its chance to contribute
     // the peer rank's partial sum before the next subgraph runs.
     ggml_status reduce(const size_t i) {
+        select_stream_all(); // same-slot-partial-only, like begin_reduce/end_reduce above
         if (!blocking_reduce(i) && allreduce_fallback(i) != GGML_STATUS_SUCCESS) {
             return GGML_STATUS_FAILED;
         }
@@ -4434,6 +4690,37 @@ enum ggml_status ggml_backend_meta_graph_compute_step_begin(
 
     ggml_backend_meta_graph_prepare(backend, cgraph, i_slot);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+
+    // WP_META_SLOT_STREAMS ubatch-boundary fence: this call starts a FRESH sub-batch on i_slot
+    // (rolling loop's prepare_slot()+begin_slot(), called again once mctx->next() hands this
+    // slot the next chunk of the sequence). That new sub-batch is the continuation of whichever
+    // sub-batch the OTHER slot most recently processed, so its first subgraph must not start
+    // until everything the other slot has submitted so far (KV-cache / recurrent-state writes
+    // included) is visible -- wait unconditionally on the other slot's latest fence event, one
+    // wait per device, per ubatch (cheap: this runs once per sub-batch, not once per subgraph).
+    // The very first ubatch of the whole rolling pass finds no valid event yet (other slot has
+    // not submitted anything) and this is a no-op, as intended.
+    if (ggml_backend_meta_slot_streams_enabled()) {
+        const size_t os = ggml_backend_meta_context::other_slot(i_slot);
+        for (size_t j = 0; j < backend_ctx->backend_configs.size(); j++) {
+            auto & bc = backend_ctx->backend_configs[j];
+            if (!backend_ctx->slot_fence_latest_valid[os][j]) {
+                continue;
+            }
+            const size_t latest = backend_ctx->slot_fence_latest_index[os][j];
+            auto & entry = backend_ctx->slot_fence_ring[os][j][latest % ggml_backend_meta_context::GGML_META_FENCE_RING];
+            // entry should always match latest here (fence_record_index sets both together in
+            // the same call) -- defensive skip, not a normal path, if it somehow doesn't.
+            if (!entry.valid || entry.index != latest || entry.ev == nullptr) {
+                continue;
+            }
+            if (bc.set_stream_no != nullptr) {
+                bc.set_stream_no(bc.backend, (int) i_slot); // wait must land on i_slot's stream
+            }
+            ggml_backend_event_wait(bc.backend, entry.ev);
+        }
+    }
+
     auto & gs = backend_ctx->graph_states[i_slot];
     gs.next_subgraph = 0;
     *n_steps = gs.n_subgraphs;

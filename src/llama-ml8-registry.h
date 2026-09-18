@@ -135,11 +135,31 @@ using fp8_qrot_memo = std::unordered_map<fp8_qrot_key, struct ggml_tensor *, fp8
 // Build a matmul graph node, dispatching to the ml8 path when appropriate.
 //
 // Dispatch logic:
-//   - GGML_TYPE_ML8_4 + registry entry with non-null centroids:
-//       Apply optional AWQ scale then optional rotation (kronecker if
-//       rotation_h_a is set, else block_hadamard if rotation_block_hadamard
-//       is set) to x, then return ggml_ml8_mul_mat(ctx, weight, centroids,
-//       x_transformed).
+//   - GGML_TYPE_ML8_4 + registry entry with non-null centroids (default,
+//     MT_ML8_4_ACT unset/not "legacy", read once via getenv):
+//       Same memoized quant_rot + ML8_MUL_MAT(prequantized) shape as the
+//       FP8_B128/ML8_FP8 quant_rot path below, but producing an
+//       GGML_OP_ML8_MUL_MAT node instead of GGML_OP_FP8_MUL_MAT: apply the
+//       optional AWQ scale, then build/reuse (via `qrot_memo`, keyed by
+//       fp8_qrot_key on the ORIGINAL `x` with G=0/per-row) a single
+//       ggml_fp8_quant_rot(..., G=0) node per input group (kind KRONECKER if
+//       rotation_h_a is set, BLOCK_HADAMARD if rotation_block_hadamard is
+//       set, else NONE), and return
+//       ggml_ml8_mul_mat(ctx, weight, centroids, qrot) — the pre-quantized
+//       I8 activation contract (see ggml-ml8.h). This collapses the
+//       activation pipeline for the input group to ONE launch (the fused
+//       rotate+quantize kernel) shared by every ML8_4/ML8_FP8/FP8_B128
+//       matmul of that group, vs. the legacy path's separate
+//       ML8_APPLY_ROTATION (f32->f32, its own launch(es) + D2D copy) followed
+//       by ML8_MUL_MAT's own internal quantize pass.
+//   - GGML_TYPE_ML8_4 (MT_ML8_4_ACT=legacy):
+//       The pre-existing behavior, kept for A/B comparison against the
+//       quant_rot path above: apply optional AWQ scale then optional
+//       rotation (kronecker if rotation_h_a is set, else block_hadamard if
+//       rotation_block_hadamard is set) to x via apply_ml8_input_xform
+//       (ggml_ml8_apply_rotation, not quant_rot), then return
+//       ggml_ml8_mul_mat(ctx, weight, centroids, x_transformed) with a raw
+//       F32 activation (the GEMM quantizes internally).
 //   - GGML_TYPE_ML8_4 but sidecars/centroids are absent:
 //       GGML_ASSERT — an ML8_4 weight cannot be dispatched via plain mul_mat.
 //   - GGML_TYPE_ML8_FP8 (default, WP_ML8_FP8_LEGACY unset/0):

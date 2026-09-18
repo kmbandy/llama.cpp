@@ -616,14 +616,22 @@ extern "C" {
         // MAD-223 G.4.b — ml8-4 quantized matmul with separate fp8 centroid LUT.
         //   src[0] = w (GGML_TYPE_ML8_4, [K, N])
         //   src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8])
-        //   src[2] = x (GGML_TYPE_F32, [K, M])
+        //   src[2] = x EITHER (GGML_TYPE_F32, [K, M])   legacy, raw activations
+        //             OR      (GGML_TYPE_I8,  [K+4, M]) MAD-3xx pre-quantized
+        //             per-row activation -- the packed output of
+        //             ggml_fp8_quant_rot(..., G=0) (see ggml-ml8.h and the
+        //             GGML_OP_FP8_QUANT_ROT doc comment below for the exact
+        //             byte layout). Default path: the GEMM skips its
+        //             internal quantize pass and consumes a_fp8/a_scale
+        //             straight from this tensor.
         //   dst    = y (GGML_TYPE_F32, [N, M])
         //   op_params[0] = lut_group_off (int32, default 0): first centroid
         //     K-group to use; the meta backend sets this per device for a
         //     K-split weight whose LUT is mirrored in full. centroids ne[1]
         //     must be >= lut_group_off + K/QK_ML8.
-        // CPU backend dequantizes block-by-block; HIP backend (G.4.f) dispatches
-        // to mt_ml8_gemm on the native fp8 WMMA path.
+        // CPU backend dequantizes block-by-block (dequantizing the I8 x
+        // first, when pre-quantized); HIP backend (G.4.f) dispatches to
+        // mt_ml8_gemm / the RDNA4_TRFEED GEMM on the native fp8 WMMA path.
         GGML_OP_ML8_MUL_MAT,
         // ml8-4 Kronecker rotation (MAD-223 Phase G.4.g). Applies the
         // Hadamard rotation Q = H_a ⊗ H_b to the leading dim of an

@@ -265,12 +265,19 @@ struct ggml_tensor * ggml_ml8_mul_mat(
     GGML_ASSERT(x         != NULL);
     GGML_ASSERT(w->type         == GGML_TYPE_ML8_4);
     GGML_ASSERT(centroids->type == GGML_TYPE_F8_E4M3);
-    GGML_ASSERT(x->type         == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_I8);
 
-    // Shape: w [K, N], x [K, M] → y [N, M]   (ggml row-major)
+    // Shape: w [K, N], x [K, M] (legacy f32) or [K+4, M] (pre-quantized I8,
+    // see ggml-ml8.h) → y [N, M]   (ggml row-major)
     const int64_t K = w->ne[0];
     const int64_t N = w->ne[1];
-    GGML_ASSERT(x->ne[0] == K && "x and w must share leading K dim");
+    if (x->type == GGML_TYPE_F32) {
+        GGML_ASSERT(x->ne[0] == K && "x and w must share leading K dim");
+    } else {
+        GGML_ASSERT(x->ne[0] == K + 4 &&
+            "pre-quantized I8 x must be K+4 wide (fp8 row + fp32 per-row "
+            "scale) — the ggml_fp8_quant_rot(..., G=0) per-row output");
+    }
     GGML_ASSERT(K % QK_ML8 == 0 && "K must be a multiple of QK_ML8=64");
 
     const int64_t n_groups_k = K / QK_ML8;

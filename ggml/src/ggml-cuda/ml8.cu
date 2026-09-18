@@ -2297,6 +2297,104 @@ static __global__ void ml8_fused_rot_quant_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// MAD-3xx — fused block_hadamard rotation + per-row quantize (sibling of
+// ml8_fused_rot_quant_kernel above, with the H_a^T left-multiply stage
+// removed). block_hadamard (Q = I_a ⊗ H_b) has no cross-a_dim mixing, so
+// unlike the kronecker kernel this does NOT need a per-thread a_dim-sized
+// register array (which would have to be sized for the largest a_dim seen
+// in practice, e.g. 38 or 98 for the 4864/12544-wide K-split shards) — every
+// output element only ever depends on its own b_dim-wide slice. That lets
+// this kernel support ANY a_dim, at the cost of doing the FWHT one a-slice
+// at a time (a_dim * 2*log2(b_dim) syncthreads instead of the kronecker
+// kernel's 2*log2(b_dim) syncs shared across all slices) — a deliberate
+// trade of some sync overhead for no register-array bound. Replaces the
+// unfused chain memcpy(z) → mt_turbo_fp8_fwht → [pad] → quantize with one
+// launch, same as the kronecker fused kernel does for its case.
+//
+// blockDim.x = b_dim (pow2, 16..1024); dynamic LDS = K fp32 (same budget
+// gate as the kronecker kernel — see ggml_cuda_op_fp8_quant_rot's dispatch).
+// Rows m >= M_valid are GEMM padding: zero fp8 + eps scale, src not read.
+static __global__ void ml8_fused_blockhad_quant_kernel(
+    const float * __restrict__ x,        // [M_valid, K] row-major, pre-rotation
+    uint8_t     * __restrict__ a_fp8,    // [M, K] row-major
+    float       * __restrict__ a_scale,  // [M]
+    int K,
+    int a_dim,
+    int b_dim,
+    int M_valid) {
+
+    extern __shared__ float s_z[];       // K floats: slice a at s_z[a*b_dim ..]
+    __shared__ float s_red[1024];        // absmax reduce, blockDim <= 1024
+
+    const int m   = blockIdx.x;
+    const int tid = threadIdx.x;         // lane l in [0, b_dim)
+
+    uint8_t * row_out = a_fp8 + (size_t) m * (size_t) K;
+
+    if (m >= M_valid) {
+        for (int k = tid; k < K; k += b_dim) {
+            row_out[k] = 0;
+        }
+        if (tid == 0) {
+            a_scale[m] = ML8_ACT_SCALE_EPS;
+        }
+        return;
+    }
+
+    const float * row_in = x + (size_t) m * (size_t) K;
+    for (int k = tid; k < K; k += b_dim) {
+        s_z[k] = row_in[k];
+    }
+    __syncthreads();
+
+    // FWHT, one a-slice at a time (see the kernel-level comment above for
+    // why this trades sync count for no a_dim register-array bound). Each
+    // slice's butterfly is the exact same pairing/assignment/stage order as
+    // mt_turbo_fp8_fwht_kernel and ml8_fused_rot_quant_kernel's per-a loop.
+    for (int a = 0; a < a_dim; a++) {
+        float * slice = s_z + a * b_dim;
+        for (int stride = 1; stride < b_dim; stride <<= 1) {
+            const int partner = tid ^ stride;
+            const float v = slice[tid];
+            const float p = slice[partner];
+            const float newval = ((tid & stride) == 0) ? (v + p) : (p - v);
+            __syncthreads();
+            slice[tid] = newval;
+            __syncthreads();
+        }
+    }
+
+    // Normalize, then per-row absmax over the WHOLE rotated row (all a_dim
+    // slices) — no H_a mixing, so we read straight out of s_z.
+    const float inv_sqrt_b = rsqrtf((float) b_dim);
+    float local_max = 0.0f;
+    for (int a = 0; a < a_dim; a++) {
+        const float v = s_z[a * b_dim + tid] * inv_sqrt_b;
+        s_z[a * b_dim + tid] = v;
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+
+    s_red[tid] = local_max;
+    __syncthreads();
+    for (int off = b_dim / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_red[tid] = fmaxf(s_red[tid], s_red[tid + off]);
+        }
+        __syncthreads();
+    }
+
+    const float scale     = fmaxf(s_red[0] * (1.0f / ML8_FP8_E4M3_MAX), ML8_ACT_SCALE_EPS);
+    const float inv_scale = 1.0f / scale;
+    if (tid == 0) {
+        a_scale[m] = scale;
+    }
+
+    for (int a = 0; a < a_dim; a++) {
+        row_out[a * b_dim + tid] = ml8_fp32_to_e4m3(s_z[a * b_dim + tid] * inv_scale);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // GGML_OP_ML8_MUL_MAT HIP dispatch.
 // ─────────────────────────────────────────────────────────────────────
 
@@ -2319,7 +2417,7 @@ static void ml8_mul_mat_core(
     GGML_ASSERT(w    != nullptr && cent != nullptr && x != nullptr);
     GGML_ASSERT(w->type    == GGML_TYPE_ML8_4);
     GGML_ASSERT(cent->type == GGML_TYPE_F8_E4M3);
-    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_I8);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(w));
     GGML_ASSERT(ggml_is_contiguous(cent));
@@ -2335,7 +2433,23 @@ static void ml8_mul_mat_core(
     // unchanged. Mirrors the ml8_apply_rotation fix (n_tokens = ne[1]*ne[2]*ne[3]).
     const int32_t M = (int32_t) (x->ne[1] * x->ne[2] * x->ne[3]);
 
-    GGML_ASSERT(x->ne[0]   == K);
+    // MAD-3xx activation fusion: x is EITHER the legacy raw fp32 activation
+    // [K, M] (this function quantizes it below) OR the pre-quantized per-row
+    // I8 output of ggml_fp8_quant_rot(..., G=0), [K+4, M] — bytes [0,M*K) are
+    // every row's e4m3 A bytes back-to-back (row m at byte m*K), then bytes
+    // [M*K, M*K+4*M) are fp32 a_scale[m] at byte 4*m (see the
+    // GGML_OP_FP8_QUANT_ROT doc comment in ggml.h). The two are mutually
+    // exclusive with h_a (the legacy fused-rotation path): a pre-quantized x
+    // has already had its rotation applied by FP8_QUANT_ROT.
+    const bool x_prequant = (x->type == GGML_TYPE_I8);
+    if (x_prequant) {
+        GGML_ASSERT(h_a == nullptr &&
+            "pre-quantized activation path is mutually exclusive with the h_a fused-rotation path");
+        GGML_ASSERT(x->ne[0] == K + 4 &&
+            "pre-quantized x must be the ggml_fp8_quant_rot(..., G=0) per-row output");
+    } else {
+        GGML_ASSERT(x->ne[0] == K);
+    }
     GGML_ASSERT(dst->ne[0] == N);
     GGML_ASSERT((int64_t) dst->ne[1] * dst->ne[2] * dst->ne[3] == (int64_t) M);
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
@@ -2375,7 +2489,7 @@ static void ml8_mul_mat_core(
     // only valid for the TRITON layout; RDNA4_TRFEED's B_nib is tile-shuffled
     // and falls through to the M<=32 decode-splitk branch below instead.
     static const bool ml8_no_gemv = (std::getenv("ML8_NO_GEMV") != nullptr);
-    if (M == 1 && !ml8_no_gemv && h_a == nullptr && repack->layout == ML8_4_LAYOUT_TRITON) {
+    if (M == 1 && !ml8_no_gemv && h_a == nullptr && !x_prequant && repack->layout == ML8_4_LAYOUT_TRITON) {
         const bool ok = ml8_gemv_dispatch_env(
             stream,
             (const float *)   x->data,
@@ -2403,56 +2517,103 @@ static void ml8_mul_mat_core(
               return ((M + pad_cfg.bm - 1) / pad_cfg.bm) * pad_cfg.bm;
           }();
 
-    // ── 3. Quantize fp32 → fp8 + per-row scale. M-padding is folded into
-    // the kernels (rows ≥ M emit zero fp8 + eps scale), so no zero-padded
-    // fp32 staging copy of x is needed.
-    ggml_cuda_pool_alloc<uint8_t> a_fp8(ctx.pool(),    (size_t) M_pad * (size_t) K);
-    ggml_cuda_pool_alloc<float>   a_scale(ctx.pool(), (size_t) M_pad);
+    // ── 3. Obtain fp8 activation + per-row scale at M_pad rows.
+    //
+    // Pre-quantized (x_prequant): x already IS the fp8+scale pair (produced
+    // upstream by FP8_QUANT_ROT, G=0) — no quantize kernel, no allocation, no
+    // launch at all when the caller's M is already M_pad-aligned (the common
+    // prefill case). When M isn't tile-aligned (ragged prefill ubatch /
+    // decode), pad into a small scratch buffer with a zero-memset + 2 D2D
+    // memcpys — the same pattern ggml_cuda_op_fp8_mul_mat's per-row (G=0)
+    // branch uses to pad an unpadded FP8_QUANT_ROT output for FP8_B128/
+    // ML8_FP8 GEMMs; the copies here move only K+4 bytes/row (fp8+scale)
+    // instead of a fresh quantize pass, and never move the pre-rotation fp32
+    // activation at all (that memcpy is what this whole change eliminates).
+    //
+    // Legacy (!x_prequant): quantize fp32 → fp8 + per-row scale here, same as
+    // before — either the h_a!=nullptr fused rotate+quantize prologue or the
+    // plain quantize kernel. M-padding is folded into those kernels (rows ≥
+    // M emit zero fp8 + eps scale), so no zero-padded fp32 staging copy of x
+    // is needed in that branch.
+    ggml_cuda_pool_alloc<uint8_t> a_fp8_scratch(ctx.pool());
+    ggml_cuda_pool_alloc<float>   a_scale_scratch(ctx.pool());
+    const uint8_t * a_fp8_ptr;
+    const float   * a_scale_ptr;
 
-    const float * x_src = (const float *) x->data;
-
-    // G.6.g.C: dump pre-quant fp32 activation that the kernel will see.
-    // (The fused-rotation path never dumps: can_fuse gates on ML8_DUMP off.)
-    const int dump_i = ml8_dump_enabled() ? g_ml8_dump_mm_n.load() : ml8_dump_limit();
+    // G.6.g.C dump harness only covers the legacy fp32 path (it dumps the
+    // pre-quant fp32 activation, which doesn't exist when x is already
+    // pre-quantized).
+    const int dump_i = (!x_prequant && ml8_dump_enabled()) ? g_ml8_dump_mm_n.load() : ml8_dump_limit();
     const bool dump_this = dump_i < ml8_dump_limit();
     char dump_path[128];
-    if (dump_this) {
-        const int64_t shp[2] = { (int64_t) K, (int64_t) M };
-        std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_x_prequant.bin", dump_i);
-        ml8_dump_fp32(dump_path, x_src, (size_t) M * (size_t) K, stream, 2, shp);
-        ml8_dump_index("mm", dump_i, dst->name, w->name, K, N, M, a_dim, b_dim, h_a != nullptr);
-    }
 
-    if (h_a != nullptr) {
-        // G.6.d fused prologue: FWHT + H_a^T + quantize in one launch.
-        const dim3   grid((unsigned) M_pad, 1, 1);
-        const dim3   block((unsigned) b_dim, 1, 1);
-        const size_t lds_bytes = (size_t) K * sizeof(float);
-        ml8_fused_rot_quant_kernel<<<grid, block, lds_bytes, stream>>>(
-            x_src,
-            (const float *) h_a->data,
-            a_fp8.get(),
-            a_scale.get(),
-            K, a_dim, b_dim, M);
+    if (x_prequant) {
+        const uint8_t * qs_base    = (const uint8_t *) x->data;
+        const float   * scale_base = (const float *) ((const uint8_t *) x->data + (size_t) M * (size_t) K);
+        if (M_pad == M) {
+            a_fp8_ptr   = qs_base;
+            a_scale_ptr = scale_base;
+        } else {
+            a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
+            a_scale_scratch.alloc((size_t) M_pad);
+            CUDA_CHECK(cudaMemsetAsync(a_fp8_scratch.get(), 0, (size_t) M_pad * (size_t) K, stream));
+            CUDA_CHECK(cudaMemsetAsync(a_scale_scratch.get(), 0, (size_t) M_pad * sizeof(float), stream));
+            CUDA_CHECK(cudaMemcpyAsync(a_fp8_scratch.get(), qs_base, (size_t) M * (size_t) K,
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(a_scale_scratch.get(), scale_base, (size_t) M * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, stream));
+            a_fp8_ptr   = a_fp8_scratch.get();
+            a_scale_ptr = a_scale_scratch.get();
+        }
     } else {
-        ggml_cuda_ml8_quantize_activations(
-            stream,
-            x_src,
-            a_fp8.get(),
-            a_scale.get(),
-            M_pad,
-            K,
-            M);
-    }
+        a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
+        a_scale_scratch.alloc((size_t) M_pad);
 
-    // G.6.g.C: dump fp8 quantized activations + per-row scale on first call.
-    if (dump_this) {
-        const int64_t shp_fp8[2]   = { (int64_t) K,     (int64_t) M_pad };
-        const int64_t shp_scale[1] = { (int64_t) M_pad };
-        std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_a_fp8.bin", dump_i);
-        ml8_dump_u8(dump_path, a_fp8.get(), (size_t) M_pad * (size_t) K, stream, 2, shp_fp8);
-        std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_a_scale.bin", dump_i);
-        ml8_dump_fp32(dump_path, a_scale.get(), (size_t) M_pad, stream, 1, shp_scale);
+        const float * x_src = (const float *) x->data;
+
+        // G.6.g.C: dump pre-quant fp32 activation that the kernel will see.
+        // (The fused-rotation path never dumps: can_fuse gates on ML8_DUMP off.)
+        if (dump_this) {
+            const int64_t shp[2] = { (int64_t) K, (int64_t) M };
+            std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_x_prequant.bin", dump_i);
+            ml8_dump_fp32(dump_path, x_src, (size_t) M * (size_t) K, stream, 2, shp);
+            ml8_dump_index("mm", dump_i, dst->name, w->name, K, N, M, a_dim, b_dim, h_a != nullptr);
+        }
+
+        if (h_a != nullptr) {
+            // G.6.d fused prologue: FWHT + H_a^T + quantize in one launch.
+            const dim3   grid((unsigned) M_pad, 1, 1);
+            const dim3   block((unsigned) b_dim, 1, 1);
+            const size_t lds_bytes = (size_t) K * sizeof(float);
+            ml8_fused_rot_quant_kernel<<<grid, block, lds_bytes, stream>>>(
+                x_src,
+                (const float *) h_a->data,
+                a_fp8_scratch.get(),
+                a_scale_scratch.get(),
+                K, a_dim, b_dim, M);
+        } else {
+            ggml_cuda_ml8_quantize_activations(
+                stream,
+                x_src,
+                a_fp8_scratch.get(),
+                a_scale_scratch.get(),
+                M_pad,
+                K,
+                M);
+        }
+
+        // G.6.g.C: dump fp8 quantized activations + per-row scale on first call.
+        if (dump_this) {
+            const int64_t shp_fp8[2]   = { (int64_t) K,     (int64_t) M_pad };
+            const int64_t shp_scale[1] = { (int64_t) M_pad };
+            std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_a_fp8.bin", dump_i);
+            ml8_dump_u8(dump_path, a_fp8_scratch.get(), (size_t) M_pad * (size_t) K, stream, 2, shp_fp8);
+            std::snprintf(dump_path, sizeof(dump_path), "/tmp/ml8_hip_mm%d_a_scale.bin", dump_i);
+            ml8_dump_fp32(dump_path, a_scale_scratch.get(), (size_t) M_pad, stream, 1, shp_scale);
+        }
+
+        a_fp8_ptr   = a_fp8_scratch.get();
+        a_scale_ptr = a_scale_scratch.get();
     }
 
     // ── 4 (RDNA4_TRFEED). Default dispatch on gfx1201: decode/verify
@@ -2482,8 +2643,8 @@ static void ml8_mul_mat_core(
                 c_ptr = c_pad.get();
             }
             const hipError_t rc = rdna4_gemm_ml84_trfeed_decode_splitk(
-                a_fp8.get(), (const uint8_t *) repack->b_packed, cent_data,
-                c_ptr, a_scale.get(), (const float *) repack->b_scale,
+                a_fp8_ptr, (const uint8_t *) repack->b_packed, cent_data,
+                c_ptr, a_scale_ptr, (const float *) repack->b_scale,
                 M_pad, N, K, n_splits, stream);
             GGML_ASSERT(rc == hipSuccess && "rdna4_gemm_ml84_trfeed_decode_splitk dispatch failed");
             if (c_ptr != (float *) dst->data) {
@@ -2507,7 +2668,7 @@ static void ml8_mul_mat_core(
 
         ggml_cuda_pool_alloc<nv_bfloat16> c_bf16_trfeed(ctx.pool(), (size_t) M_pad * (size_t) N);
         const hipError_t gemm_rc_trfeed = rdna4_gemm_fp8_trfeed(
-            a_fp8.get(), b_shuf.get(), c_bf16_trfeed.get(), a_scale.get(), b_scale_out.get(), M_pad, N, K, stream);
+            a_fp8_ptr, b_shuf.get(), c_bf16_trfeed.get(), a_scale_ptr, b_scale_out.get(), M_pad, N, K, stream);
         GGML_ASSERT(gemm_rc_trfeed == hipSuccess && "rdna4_gemm_fp8_trfeed dispatch failed");
 
         const to_fp32_cuda_t bf16_to_fp32_trfeed = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
@@ -2526,11 +2687,11 @@ static void ml8_mul_mat_core(
     args.shape.n_centroids   = n_centroids;
     args.shape.weight_format = 1;  // ml8-4 LUT path
 
-    args.a_fp8             = a_fp8.get();
+    args.a_fp8             = a_fp8_ptr;
     args.b_packed          = repack->b_packed;
     args.c                 = c_bf16.get();
 
-    args.a_scale_fp32      = a_scale.get();
+    args.a_scale_fp32      = a_scale_ptr;
     args.b_scale_fp32      = repack->b_scale;
     args.centroid_lut_fp8  = cent_data;
 
@@ -3317,11 +3478,12 @@ void ggml_cuda_op_fp8_quant_rot(
     // existing LDS check (K fp32 dynamic + the kernel's 1024-fp32 static
     // reduce array must fit 64KB) and a_dim<=16 (its register array size);
     // kind==NONE has no rotation at all (this fused kernel unconditionally
-    // rotates, so it cannot serve that case) and BLOCK_HADAMARD has no H_a,
-    // so both of those -- and an over-large KRONECKER K -- fall through to
-    // the generic path below, which now dispatches the vectorized
+    // rotates, so it cannot serve that case) and falls through to the
+    // generic path below, which dispatches the vectorized
     // fp8_quant_pack_row_kernel above for per_row instead of a second
-    // separate quantize launch.
+    // separate quantize launch. BLOCK_HADAMARD gets its OWN fused fast path
+    // (ml8_fused_blockhad_quant_kernel) right below this one -- only an
+    // over-large K (LDS budget) falls all the way through to generic.
     if (per_row && kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER && a_dim > 0 && a_dim <= 16 &&
         (size_t) K * sizeof(float) + 1024 * sizeof(float) <= 64 * 1024) {
         GGML_ASSERT(h_a != nullptr && h_a->type == GGML_TYPE_F32 && ggml_is_contiguous(h_a));
@@ -3335,6 +3497,32 @@ void ggml_cuda_op_fp8_quant_rot(
         ml8_fused_rot_quant_kernel<<<grid, block, lds_bytes, stream>>>(
             (const float *) x->data,
             (const float *) h_a->data,
+            (uint8_t *) dst->data,                                                  // a_fp8 [n_rows, K]
+            (float *) ((uint8_t *) dst->data + (size_t) n_rows * (size_t) K),        // a_scale [n_rows]
+            (int) K, a_dim, b_dim, (int) n_rows);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // MAD-3xx — per-row (G=0) + BLOCK_HADAMARD fusion, sibling of the
+    // KRONECKER fast path above: reuses ml8_fused_blockhad_quant_kernel
+    // (FWHT-per-a-slice + per-row absmax + e4m3 quantize in ONE launch, no
+    // H_a leg) instead of the generic path's memcpy + mt_turbo_fp8_fwht +
+    // fp8_quant_pack_row_kernel three-launch chain. No a_dim<=16 bound here
+    // (see the kernel's own comment) — only the LDS budget gates it, same
+    // check as the KRONECKER branch. An over-large K falls through to the
+    // generic path below.
+    if (per_row && kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD &&
+        (size_t) K * sizeof(float) + 1024 * sizeof(float) <= 64 * 1024) {
+        GGML_ASSERT(h_a == nullptr);
+        GGML_ASSERT(b_dim >= 16 && b_dim <= 1024 && (b_dim & (b_dim - 1)) == 0);
+        GGML_ASSERT(a_dim > 0 && (int64_t) a_dim * (int64_t) b_dim == K);
+
+        const dim3   grid((unsigned) n_rows, 1, 1);
+        const dim3   block((unsigned) b_dim, 1, 1);
+        const size_t lds_bytes = (size_t) K * sizeof(float);
+        ml8_fused_blockhad_quant_kernel<<<grid, block, lds_bytes, stream>>>(
+            (const float *) x->data,
             (uint8_t *) dst->data,                                                  // a_fp8 [n_rows, K]
             (float *) ((uint8_t *) dst->data + (size_t) n_rows * (size_t) K),        // a_scale [n_rows]
             (int) K, a_dim, b_dim, (int) n_rows);

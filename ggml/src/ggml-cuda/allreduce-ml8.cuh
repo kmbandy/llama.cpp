@@ -32,6 +32,19 @@ typedef struct {
 } block_ml8_5_wire;                     // 22 bytes = 5.50 bits/element
 static_assert(sizeof(block_ml8_5_wire) == 22, "ml8_5 wire block must be 22 bytes");
 
+// ml8-6 needs 2 high bits per index (bits 4-5), not the 1 high bit ml8-5's
+// qh bitmask carries -- so qh here is a packed 2-bit-per-element plane
+// (4 indices/byte) rather than ml8-5's 1-bit-per-element OR'd bitmask
+// (8 indices/byte). This does NOT generalize from ml8-5's qh layout by
+// just widening the array; see ml8_6_quantize/dequantize below for the
+// (j%4)*2 packing this requires instead of ml8-5's (j%8) bit-OR.
+typedef struct {
+    half    d;                          //  2 bytes: fp16 absmax scale
+    uint8_t qh[QK_ML8_WIRE / 4];        //  8 bytes: bits 4-5 of each index, 2 bits/elem
+    uint8_t qs[QK_ML8_WIRE / 2];        // 16 bytes: low nibbles (bits 0-3)
+} block_ml8_6_wire;                     // 26 bytes = 6.50 bits/element
+static_assert(sizeof(block_ml8_6_wire) == 26, "ml8_6 wire block must be 26 bytes");
+
 static __device__ __forceinline__ int ml8_nearest(float v, const float * cb, int n) {
     int   best = 0;
     float bd   = fabsf(v - cb[0]);
@@ -102,6 +115,43 @@ static __device__ __forceinline__ void ml8_5_dequantize(const block_ml8_5_wire *
         const int lo = (j % 2 == 0) ? (b->qs[j / 2] & 0xF) : (b->qs[j / 2] >> 4);
         const int hi = (b->qh[j / 8] >> (j % 8)) & 1;
         v[j] = ML8_5_CENTROIDS[lo | (hi << 4)] * d;
+    }
+}
+
+// ---- ml8-6 -------------------------------------------------------------------
+// Same block/scale scheme as ml8-4/ml8-5. 6-bit index = 4 low bits (nibble,
+// packed exactly like ml8-4/ml8-5's qs) + 2 high bits. ml8-5's high-bit plane
+// is a 1-bit-per-element bitmask (qh[QK/8], OR'd in with `1u << (j % 8)`) --
+// that scheme is SPECIALISED to exactly 1 high bit and does not generalize to
+// 2. Instead qh here packs 2 bits/element, 4 elements per byte, at bit offset
+// (j % 4) * 2 -- so it's an independent 2-bit field, not a widened bitmask.
+static __device__ __forceinline__ void ml8_6_quantize(const float * v, block_ml8_6_wire * b) {
+    const float amax = ml8_block_scale(v);
+    const half  dh   = __float2half(amax);
+    const float d    = __half2float(dh);
+    const float inv  = d > 0.0f ? 1.0f / d : 0.0f;
+    b->d = dh;
+    for (int j = 0; j < QK_ML8_WIRE / 4; ++j) {
+        b->qh[j] = 0;
+    }
+    for (int j = 0; j < QK_ML8_WIRE; ++j) {
+        const int idx = ml8_nearest(v[j] * inv, ML8_6_CENTROIDS, ML8_6_N_CENT);
+        if (j % 2 == 0) {
+            b->qs[j / 2] = (uint8_t) (idx & 0xF);
+        } else {
+            b->qs[j / 2] |= (uint8_t) ((idx & 0xF) << 4);
+        }
+        const int hi = (idx >> 4) & 0x3;
+        b->qh[j / 4] |= (uint8_t) (hi << ((j % 4) * 2));
+    }
+}
+
+static __device__ __forceinline__ void ml8_6_dequantize(const block_ml8_6_wire * b, float * v) {
+    const float d = __half2float(b->d);
+    for (int j = 0; j < QK_ML8_WIRE; ++j) {
+        const int lo = (j % 2 == 0) ? (b->qs[j / 2] & 0xF) : (b->qs[j / 2] >> 4);
+        const int hi = (b->qh[j / 4] >> ((j % 4) * 2)) & 0x3;
+        v[j] = ML8_6_CENTROIDS[lo | (hi << 4)] * d;
     }
 }
 

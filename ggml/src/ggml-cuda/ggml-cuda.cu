@@ -8241,17 +8241,25 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ML8_MUL_MAT:
             {
                 // MAD-223 G.4.f: ml8-4 dense GEMM via mt_ml8_gemm. Requires
-                // ml8_4 weights + f8_e4m3 centroid LUT + fp32 activations +
-                // fp32 output. mt_ml8_gemm wraps the kernel for any shape
-                // where N is a multiple of MT_ML8_BLOCK_SIZE_N (16) and K
-                // is a multiple of QK_ML8 (64). M is padded internally.
+                // ml8_4 weights + f8_e4m3 centroid LUT + fp32 output.
+                // mt_ml8_gemm wraps the kernel for any shape where N is a
+                // multiple of MT_ML8_BLOCK_SIZE_N (16) and K is a multiple of
+                // QK_ML8 (64). M is padded internally.
+                //
+                // MAD-3xx activation fusion: x is EITHER GGML_TYPE_F32 [K, M]
+                // (legacy, the GEMM quantizes internally) OR GGML_TYPE_I8
+                // [K+4, M] — pre-quantized per-row, the packed output of
+                // ggml_fp8_quant_rot(..., G=0) (see ggml-ml8.h). The GEMM
+                // consumes a_fp8/a_scale straight from that buffer, skipping
+                // its own quantize pass.
                 const ggml_tensor * w    = op->src[0];
                 const ggml_tensor * cent = op->src[1];
                 const ggml_tensor * x    = op->src[2];
                 if (!w || !cent || !x) return false;
                 if (w->type    != GGML_TYPE_ML8_4)    return false;
                 if (cent->type != GGML_TYPE_F8_E4M3)  return false;
-                if (x->type    != GGML_TYPE_F32)      return false;
+                if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_I8) return false;
+                if (x->type == GGML_TYPE_I8 && x->ne[0] != w->ne[0] + 4) return false;
                 if (op->type   != GGML_TYPE_F32)      return false;
                 if (w->ne[0] % 64 != 0)               return false;
                 if (w->ne[1] % 16 != 0)               return false;
@@ -8994,6 +9002,25 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// WP_META_SLOT_STREAMS: select which of this device's compute streams (see
+// ggml_backend_cuda_context::stream(device, curr_stream_no) in common.cuh) subsequent work on
+// `backend` is dispatched to -- cublas handle, cuda_pool()/scratch, and cuda_ctx->stream() (which
+// is what AllReduce's `cs` and ggml_backend_cuda_event_record/_wait resolve to) all key off
+// curr_stream_no already, per-[device][stream], so flipping this one field is sufficient; nothing
+// else needs to change per stream. Used exclusively by the meta backend
+// (ggml-backend-meta.cpp) to give each rolling tensor-parallel overlap slot (0 = "sched", 1 =
+// "sched_overlap" in llama_context) its own stream per device instead of both slots funneling
+// through stream 0, which is the actual cause of the AR_END_WAIT stall documented at the
+// WP_META_SLOT_STREAMS call sites: the two slots' AllReduce end-wait/unpack used to be FIFO-
+// ordered against the OTHER slot's kernels purely because they shared one stream, not because of
+// a real dependency.
+static void ggml_backend_cuda_set_stream_no(ggml_backend_t backend, int stream_no) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->curr_stream_no = stream_no;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -9019,6 +9046,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_set_stream_no") == 0) {
+        return (void *)ggml_backend_cuda_set_stream_no;
     }
     return nullptr;
 }
