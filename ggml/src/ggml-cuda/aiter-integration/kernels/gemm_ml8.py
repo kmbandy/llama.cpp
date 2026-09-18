@@ -30,6 +30,27 @@
 #      the B-load + post-tl.dot dequant block, per
 #      ML8_WMMA_KERNEL_DESIGN.md §"The ml8 modification".
 #
+#   #7 (FP8_B128 BLOCK_SIZE_K=32 decouple, 2026-09-17): in
+#      _gemm_a8w8_blockscale_kernel, decouple GROUP_K from BLOCK_SIZE_K when
+#      GROUP_K is an integer multiple of BLOCK_SIZE_K (GROUP_K > BLOCK_SIZE_K).
+#      Fixes a latent bug where `offs_ks_step = BLOCK_SIZE_K // GROUP_K`
+#      integer-divides to 0 and freezes the scale at group 0 for the whole K
+#      loop. tl.constexpr `if GROUP_K == BLOCK_SIZE_K: <old>` branch keeps
+#      ML8_4/ML8_FP8 (GROUP_K == BLOCK_SIZE_K == 32) byte-identical — that
+#      branch is a compile-time constant, so the `else` body is never traced
+#      for those kernels. The `else` branch keeps a single loop-carried
+#      a_scale_ptrs/b_scale_ptrs pointer-vector pair (set up once before the
+#      loop, same formula as the GROUP_K==BLOCK_SIZE_K case) and advances it
+#      by `+= stride_*scale_k` only every `KSTEP = GROUP_K // BLOCK_SIZE_K`
+#      iterations (`if (k + 1) % KSTEP == 0`) instead of recomputing the
+#      pointer vectors from a group index every iteration — measured: the
+#      naive recompute-every-iteration version was numerically correct but
+#      cost 256 VGPR / 13 spills vs. 179 VGPR / 0 spills for
+#      GROUP_K==BLOCK_SIZE_K on the same tiles; this version is
+#      register-neutral with the old scheme. Enables FP8_B128 generic-layout
+#      block-128 scales to run with BLOCK_SIZE_K=32 instead of 128
+#      (mt_fp8_b128_gemm.cpp's MT_FP8_BK).
+#
 # ─────────────────────────────────────────────────────────────────────────
 
 # SPDX-License-Identifier: MIT
@@ -293,9 +314,13 @@ def _gemm_a8w8_blockscale_kernel(
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
 
-    For this kernel implementation, GROUP_K must equal BLOCK_K.
+    For this kernel implementation, GROUP_K must equal BLOCK_SIZE_K, OR (WEIGHT_FORMAT=0
+    only — see LOCAL PATCH #7) GROUP_K must be an integer multiple of BLOCK_SIZE_K
+    (GROUP_K % BLOCK_SIZE_K == 0), letting BLOCK_SIZE_K be tuned smaller than the scale
+    group width for occupancy/register-pressure reasons while every BLOCK_SIZE_K-wide
+    K-tile within a GROUP_K group still applies the same scale value.
     For WEIGHT_FORMAT=1, calibration constraint requires group_size == BLOCK_SIZE_K
-    (one LUT per K-tile iter).
+    (one LUT per K-tile iter) — the decoupled path is not used there.
     """
 
     tl.assume(stride_am > 0)
@@ -362,17 +387,66 @@ def _gemm_a8w8_blockscale_kernel(
             )
 
         # Create pointers for the scales
-        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
-        a_scale_ptrs = (
-            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
-        )
         offs_b_scale_n = offs_bn // GROUP_N
-        b_scale_ptrs = (
-            b_scale_ptr
-            + offs_k_scale * stride_bscale_k
-            + offs_b_scale_n * stride_bscale_n
-        )
-        offs_ks_step = BLOCK_SIZE_K // GROUP_K
+
+        # ─── LOCAL PATCH #7 (FP8_B128 BLOCK_SIZE_K=32 decouple, 2026-09-17):
+        # GROUP_K (the scale-group width) can now be a multiple of
+        # BLOCK_SIZE_K instead of strictly equal to it (e.g. GROUP_K=128
+        # scale groups tiled with BLOCK_SIZE_K=32 K-blocks). When
+        # GROUP_K == BLOCK_SIZE_K (ML8_4 / ML8_FP8 paths) this is the
+        # untouched upstream fixed-step pointer-advance scheme — bit-
+        # identical IR (this whole `if` is a compile-time constexpr branch:
+        # Triton specializes on GROUP_K/BLOCK_SIZE_K, so the `else` body
+        # below is never even traced for those kernels).
+        #
+        # `offs_ks_step = BLOCK_SIZE_K // GROUP_K` would be 0 when
+        # GROUP_K > BLOCK_SIZE_K (integer division), silently freezing
+        # a_scale_ptrs/b_scale_ptrs at group 0 for the whole K loop — that
+        # was the original bug. The first fix attempt recomputed the full
+        # a_scale/b_scale pointer VECTORS from `group_idx` every iteration,
+        # which was numerically correct but ballooned VGPR usage (256 VGPR /
+        # 13 spills vs. 179 VGPR / 0 spills for GROUP_K==BLOCK_SIZE_K on the
+        # same tile shapes) because `offs_am * stride_ascale_m` /
+        # `offs_b_scale_n * stride_bscale_n` were redone every iteration on
+        # top of the loop-carried state instead of being loop-invariant.
+        #
+        # Fixed version: keep ONE loop-carried a_scale_ptrs/b_scale_ptrs
+        # vector pair, set up once before the loop exactly like the
+        # GROUP_K==BLOCK_SIZE_K case (same formula — offs_k_scale is the
+        # group at the split-K start regardless of the BLOCK_SIZE_K/GROUP_K
+        # ratio), and advance it by a plain `+= stride` only when the
+        # scale group actually changes — every
+        # `KSTEP = GROUP_K // BLOCK_SIZE_K` iterations — instead of every
+        # iteration. `k` is the absolute BLOCK_SIZE_K-block index (starts at
+        # pid_k * num_k_iter), so `(k + 1) % KSTEP == 0` correctly detects
+        # the last K-block of each GROUP_K-wide group (assumes split-K
+        # boundaries stay group-aligned; true for NUM_KSPLIT == 1, our only
+        # user). Between group boundaries the same a_scale_ptrs/b_scale_ptrs
+        # are simply reloaded unchanged — register cost is identical to the
+        # GROUP_K==BLOCK_SIZE_K path (one loop-carried pointer vector pair,
+        # a scalar compare, and a conditional scalar-strided add).
+        if GROUP_K == BLOCK_SIZE_K:
+            offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+            a_scale_ptrs = (
+                a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
+            )
+            b_scale_ptrs = (
+                b_scale_ptr
+                + offs_k_scale * stride_bscale_k
+                + offs_b_scale_n * stride_bscale_n
+            )
+            offs_ks_step = BLOCK_SIZE_K // GROUP_K
+        else:
+            offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+            a_scale_ptrs = (
+                a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
+            )
+            b_scale_ptrs = (
+                b_scale_ptr
+                + offs_k_scale * stride_bscale_k
+                + offs_b_scale_n * stride_bscale_n
+            )
+            KSTEP: tl.constexpr = GROUP_K // BLOCK_SIZE_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -394,6 +468,10 @@ def _gemm_a8w8_blockscale_kernel(
             # copied through verbatim from the on-disk scale by ml8.cu, so the
             # only conversion here is the upcast to fp32 before the epilogue
             # multiply (a no-op for the already-fp32 WF=1 case).
+            # LOCAL PATCH #7: unconditional — both the GROUP_K == BLOCK_SIZE_K
+            # and decoupled branches maintain a_scale_ptrs/b_scale_ptrs as a
+            # single loop-carried pointer vector pair (see the pointer-setup
+            # comment above); only how often they're advanced differs.
             b_scale = tl.load(b_scale_ptrs).to(tl.float32)
 
             # ─── LOCAL PATCH #2: WEIGHT_FORMAT-branched B-load + dequant ──
@@ -442,8 +520,20 @@ def _gemm_a8w8_blockscale_kernel(
 
             # Advance the ptrs to the next K block (SHARED for A + scales).
             a_ptrs += BLOCK_SIZE_K * stride_ak
-            a_scale_ptrs += offs_ks_step * stride_ascale_k
-            b_scale_ptrs += offs_ks_step * stride_bscale_k
+            # LOCAL PATCH #7: GROUP_K == BLOCK_SIZE_K advances every
+            # iteration (offs_ks_step == 1, untouched upstream code). The
+            # decoupled (GROUP_K > BLOCK_SIZE_K) branch advances by exactly
+            # one group-stride only on the last K-block of each GROUP_K-wide
+            # group — every KSTEP iterations — reusing the same loaded
+            # a_scale/b_scale on the KSTEP-1 iterations in between (correct,
+            # since all BLOCK_SIZE_K-tiles within a group share one scale).
+            if GROUP_K == BLOCK_SIZE_K:
+                a_scale_ptrs += offs_ks_step * stride_ascale_k
+                b_scale_ptrs += offs_ks_step * stride_bscale_k
+            else:
+                if (k + 1) % KSTEP == 0:
+                    a_scale_ptrs += stride_ascale_k
+                    b_scale_ptrs += stride_bscale_k
 
             # Path-specific B-pointer advance (Triton DCEs the unused branch).
             if WEIGHT_FORMAT == tl.constexpr(0):

@@ -870,18 +870,30 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     //
     // This follows GGML_OP_ML8_APPLY_ROTATION's split rules EXACTLY (same rotation math, same
     // per-kind locality) even though, unlike ML8_APPLY_ROTATION, the dst tensor here is NOT
-    // src[0]'s ne[] verbatim -- it is I8 [K + K/32, n1, n2, n3] (K/128 fp32 scale bytes appended
-    // per row). Returning src_ss[0] as-is (same axis, same per-device ne) is still correct: the
-    // generic epilogue below (the "take over ratio from src" block) recomputes
-    // split_state.ne[j] by scaling src[0]'s per-device ne (K_local) by
-    // tensor->ne[axis]/src[0]->ne[axis] == (K + K/32)/K, i.e. split_state.ne[j] becomes
-    // K_local * (K + K/32) / K. Because K_local % 32 == 0 (K % 128 == 0 is a hard constraint on
-    // this op, and any K-split boundary is itself a multiple of 128 -- see get_split_granularity
-    // and the 128-alignment enforced below for FP8_B128 weights), that arithmetic is exact and
-    // yields precisely K_local + K_local/32: the per-device dst ne0 is derived from the
-    // per-device SRC ne0, not from a naive proportional split of dst->ne[0] against the
-    // (K + K/32)-wide WORLD dst, which would not equal K_local + K_local/32 in general (it does
-    // here only because the epilogue's scaling factor is applied to src's ne, not dst's).
+    // src[0]'s ne[] verbatim -- it is I8 [K + 4*K/G, n1, n2, n3] (K/G fp32 scale bytes appended
+    // per row; G = op_params[3], 0 meaning PER-ROW, not "128" -- see the GGML_OP_FP8_QUANT_ROT doc
+    // comment in ggml.h; G must be passed explicitly, the historical 0-aliases-128 behaviour is
+    // gone). Returning src_ss[0] as-is (same axis, same per-device ne) is still correct for the
+    // grouped case (G == 32 or 128): the generic epilogue below (the "take over ratio from src"
+    // block) recomputes split_state.ne[j] by scaling src[0]'s per-device ne (K_local) by
+    // tensor->ne[axis]/src[0]->ne[axis] == (K + 4*K/G)/K, i.e. split_state.ne[j] becomes
+    // K_local * (K + 4*K/G) / K. Because K_local % G == 0 for G in {32, 128} (K % 128 == 0 is a
+    // hard constraint on this op, and any K-split boundary is itself a multiple of 128 -- see
+    // get_split_granularity and the 128-alignment enforced below for FP8_B128/ML8_FP8 weights),
+    // that arithmetic is exact and yields precisely K_local + 4*K_local/G: the per-device dst
+    // ne0 is derived from the per-device SRC ne0, not from a naive proportional split of
+    // dst->ne[0] against the (K + 4*K/G)-wide WORLD dst, which would not equal
+    // K_local + 4*K_local/G in general (it does here only because the epilogue's scaling
+    // factor is applied to src's ne, not dst's).
+    //   - PER-ROW (G == 0) on a K-split (AXIS_0) activation: the same ratio arithmetic gives
+    //     K_local * (K + 4) / K, which is NOT an integer in general (unlike the grouped case,
+    //     K + 4 need not divide evenly against a K-split boundary). Each device instead rescales
+    //     its OWN K slice independently (one local per-row scale over just that slice), which is
+    //     mathematically exact because that scale multiplies the corresponding PARTIAL dot
+    //     product before the K-split FP8_MUL_MAT results are allreduced. So this case is handled
+    //     explicitly, bypassing the generic ratio epilogue entirely: this device's dst ne0 is
+    //     simply src0_local_ne0 + 4 (see the special case right after the main switch below,
+    //     keyed on tensor->op == GGML_OP_FP8_QUANT_ROT && axis == AXIS_0 && G == 0).
     //   - kronecker (kind 1): mixes across the WHOLE of ne[0], so it is only well-defined when
     //     every device already holds x in full (src[0] MIRRORED); h_a is MIRRORED too.
     //   - block_hadamard (kind 2): independent per b_dim-wide (128) block, so it is purely local
@@ -917,20 +929,38 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     // GGML_OP_FP8_MUL_MAT (FP8_B128 phase 2). ggml_fp8_mul_mat (ggml-ml8.c): src[0] = w
-    // (GGML_TYPE_FP8_B128, [K, N]), src[1] = a (GGML_TYPE_I8, [K + K/32, n1, n2, n3], the packed
-    // output of GGML_OP_FP8_QUANT_ROT). dst = F32 [N, n1, n2, n3]. Same slot roles as
-    // GGML_OP_MUL_MAT (src[0] weight, src[1] activation) and the same split rules:
+    // (GGML_TYPE_FP8_B128 or GGML_TYPE_ML8_FP8, [K, N]), src[1] = a (GGML_TYPE_I8,
+    // [K + 4*K/G, n1, n2, n3] grouped, or [K + 4, n1, n2, n3] per-row -- the packed output of
+    // GGML_OP_FP8_QUANT_ROT). dst = F32 [N, n1, n2, n3]. G is the activation scale-group width:
+    // 128 for FP8_B128 weights, 32 for ML8_FP8 weights (used for the weight-side dequant and for
+    // the grouped-layout width check) -- but the activation itself may instead be PER-ROW
+    // (src[1]'s own op_params[3] == 0, when src[1] is a GGML_OP_FP8_QUANT_ROT node; else inferred
+    // from src[1]->ne[0] == src[0]->ne[0] + 4), in which case its row width is K + 4 regardless of
+    // G. Same slot roles as GGML_OP_MUL_MAT (src[0] weight, src[1] activation) and the same split
+    // rules:
     //   - N-split weight (AXIS_1, e.g. attn_qkv/attn_gate/ffn_gate/ffn_up/output) with a
     //     MIRRORED (or replicated) activation -> dst split on AXIS_0 (each device produces its
     //     own N-slice of the output; no reduce needed).
     //   - K-split weight (AXIS_0, e.g. attn_output/ssm_out/ffn_down) -> the activation MUST be
     //     the K-split QUANT_ROT output, i.e. also AXIS_0 with per-device ne0 == this device's
-    //     w-slice ne0 + w-slice ne0/32 (asserted below); dst is PARTIAL (accumulate via
-    //     AllReduce), matching plain MUL_MAT's K-split rule exactly.
+    //     w-slice ne0 + 4*w-slice ne0/G (grouped) or w-slice ne0 + 4 (per-row), asserted below;
+    //     dst is PARTIAL (accumulate via AllReduce), matching plain MUL_MAT's K-split rule
+    //     exactly -- per-row is exact here too since each device's own per-slice scale multiplies
+    //     that device's own partial dot product before the AllReduce sums them.
     //   - Token-split activations (weight MIRRORED, activation split on a token/batch axis) and
     //     the fully-MIRRORED (single-device / no TP) case follow MUL_MAT's existing behaviour
     //     unchanged.
     auto handle_fp8_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        int32_t G;
+        bool a_per_row;
+        if (tensor->src[1]->op == GGML_OP_FP8_QUANT_ROT) {
+            const int32_t a_G = ggml_get_op_params_i32(tensor->src[1], 3);
+            a_per_row = (a_G == 0);
+            G = a_per_row ? ((tensor->src[0]->type == GGML_TYPE_ML8_FP8) ? 32 : 128) : a_G;
+        } else {
+            G = (tensor->src[0]->type == GGML_TYPE_ML8_FP8) ? 32 : 128;
+            a_per_row = (tensor->src[1]->ne[0] == tensor->src[0]->ne[0] + 4);
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
@@ -960,13 +990,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             for (size_t j = 0; j < n_bufs_local; j++) {
                 const int64_t w_local = local_elems(src_ss[0], j);
                 const int64_t a_local = local_elems(src_ss[1], j);
-                if (a_local != w_local + w_local / 32) {
-                    GGML_LOG_ERROR("%s: FP8_MUL_MAT %s: device %zu w=%s ne0=%" PRId64 " w_local=%" PRId64 " nr=%u nseg=%d | a=%s ne0=%" PRId64 " a_local=%" PRId64 " nr=%u nseg=%d\n",
-                        __func__, tensor->name, j, tensor->src[0]->name, tensor->src[0]->ne[0], w_local, src_ss[0].nr[0], src_ss[0].n_segments,
+                const int64_t a_expected = a_per_row ? (w_local + 4) : (w_local + 4 * w_local / G);
+                if (a_local != a_expected) {
+                    GGML_LOG_ERROR("%s: FP8_MUL_MAT %s: device %zu G=%d per_row=%d w=%s ne0=%" PRId64 " w_local=%" PRId64 " nr=%u nseg=%d | a=%s ne0=%" PRId64 " a_local=%" PRId64 " nr=%u nseg=%d\n",
+                        __func__, tensor->name, j, G, (int) a_per_row, tensor->src[0]->name, tensor->src[0]->ne[0], w_local, src_ss[0].nr[0], src_ss[0].n_segments,
                         tensor->src[1]->name, tensor->src[1]->ne[0], a_local, src_ss[1].nr[0], src_ss[1].n_segments);
                     GGML_ABORT("FP8_MUL_MAT: K-split activation's per-device packed width must be "
-                        "this device's w-slice K_local + K_local/32 (the QUANT_ROT packing on the "
-                        "SAME K-split as the weight)");
+                        "this device's w-slice K_local + 4*K_local/G (grouped) or K_local + 4 "
+                        "(per-row) -- the QUANT_ROT packing on the SAME K-split as the weight");
                 }
             }
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
@@ -1603,6 +1634,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             } break;
         }
+
+        // FP8_QUANT_ROT per-row (G==0) on a K-split (AXIS_0) activation: see the long comment on
+        // handle_fp8_quant_rot above. The generic ratio epilogue below would compute
+        // split_state.ne[j] as src0_local_ne0 * tensor->ne[axis]/src0->ne[axis], i.e.
+        // K_local*(K+4)/K, which is not an integer in general (unlike the grouped case's
+        // K_local*(K+4*K/G)/K, which always is). Bypass the epilogue entirely for this one case
+        // and set the per-device dst ne0 directly: this device's own K slice plus 4 (one fp32
+        // per-row scale, computed only over that device's local K slice -- see
+        // ggml_compute_forward_fp8_quant_rot / the ggml.h doc comment for the exact byte layout).
+        if (tensor->op == GGML_OP_FP8_QUANT_ROT && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                ggml_get_op_params_i32(tensor, 3) == 0) {
+            const size_t n_bufs_pr = ggml_backend_meta_buffer_n_world(tensor->buffer);
+            for (uint32_t s = 0; s < split_state.n_segments; s++) {
+                for (size_t j = 0; j < n_bufs_pr; j++) {
+                    split_state.ne[s*n_bufs_pr + j] = src_ss[0].ne[s*n_bufs_pr + j] + 4;
+                }
+            }
+            return split_state;
+        }
+
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_world(tensor->buffer); // world stride, see above

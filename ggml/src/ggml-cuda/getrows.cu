@@ -472,9 +472,22 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ne13 == 1);
 
     // In-place packed ML8_FP8 weights (token_embd) are in the FP8-GEMM layout,
-    // not the block layout the generic dequantizer reads.
-    if (src0->type == GGML_TYPE_ML8_FP8 && ggml_cuda_ml8_inplace_get_rows(ctx, dst)) {
-        return;
+    // not the block layout the generic dequantizer reads. The fast path only
+    // understands the TRITON [K,N]-transpose sub-layout; an RDNA4-layout
+    // weight (MAD-305 Phase 5) declines it and falls through to a one-shot
+    // device-side unpack + the normal dequant path below (mirrors FP8_B128).
+    if (src0->type == GGML_TYPE_ML8_FP8) {
+        if (ggml_cuda_ml8_inplace_get_rows(ctx, dst)) {
+            return;
+        }
+        void * unpacked = ggml_cuda_ml8_inplace_ml8fp8_unpack_to_device(stream, src0);
+        if (unpacked != nullptr) {
+            get_rows_cuda(unpacked, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaFree(unpacked));
+            return;
+        }
     }
 
     // FP8_B128 phase 2: an in-place packed weight is in the AITER preshuffle

@@ -2501,15 +2501,17 @@ struct test_fp8_quant_rot : public test_case {
     const int64_t n_tokens; // ne[1]
     const int64_t ne2;
     const int64_t ne3;
+    const int32_t G; // activation scale-group width: 32 (ML8_FP8), 128 (FP8_B128), or 0 (per-row, RDNA4)
 
     std::string vars() override {
-        return VARS_TO_STR6(a_dim, b_dim, kind, n_tokens, ne2, ne3);
+        return VARS_TO_STR7(a_dim, b_dim, kind, n_tokens, ne2, ne3, G);
     }
 
     test_fp8_quant_rot(int64_t a_dim = 5, int64_t b_dim = 128,
                         int32_t kind = GGML_FP8_QUANT_ROT_KIND_KRONECKER,
-                        int64_t n_tokens = 4, int64_t ne2 = 1, int64_t ne3 = 1)
-        : a_dim(a_dim), b_dim(b_dim), kind(kind), n_tokens(n_tokens), ne2(ne2), ne3(ne3) {}
+                        int64_t n_tokens = 4, int64_t ne2 = 1, int64_t ne3 = 1,
+                        int32_t G = 128)
+        : a_dim(a_dim), b_dim(b_dim), kind(kind), n_tokens(n_tokens), ne2(ne2), ne3(ne3), G(G) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t d = a_dim * b_dim;
@@ -2520,7 +2522,7 @@ struct test_fp8_quant_rot : public test_case {
             h_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a_dim, a_dim);
             ggml_set_name(h_a, "h_a");
         }
-        ggml_tensor * out = ggml_fp8_quant_rot(ctx, x, h_a, a_dim, b_dim, kind);
+        ggml_tensor * out = ggml_fp8_quant_rot(ctx, x, h_a, a_dim, b_dim, kind, G);
         ggml_set_name(out, "out");
         return out;
     }
@@ -2582,8 +2584,43 @@ struct test_fp8_quant_rot : public test_case {
             return test_case::err(a, b, n);
         }
 
-        const int64_t d         = a_dim * b_dim;
-        const int64_t n_groups  = d / 128;
+        const int64_t d = a_dim * b_dim;
+
+        if (G == 0) {
+            // Per-row (G=0): NOT row-contiguous -- the (d+4)*n_rows-byte
+            // buffer holds all rows' d e4m3 bytes first (row r at byte
+            // r*d), then all rows' fp32 scales (row r's scale at byte
+            // n_rows*d + 4*r). See the GGML_OP_FP8_QUANT_ROT doc comment in
+            // ggml.h. a/b are tensor_to_float()'s output for the I8 tensor,
+            // i.e. exactly that byte order.
+            const int64_t row_out = d + (int64_t) sizeof(float);
+            if ((int64_t) n % row_out != 0) {
+                return test_case::err(a, b, n);
+            }
+            const int64_t n_rows = (int64_t) n / row_out;
+
+            auto decode = [&](const float * bytes, float * out) {
+                for (int64_t r = 0; r < n_rows; r++) {
+                    uint8_t sbytes[4];
+                    for (int j = 0; j < 4; j++) {
+                        sbytes[j] = (uint8_t) (int8_t) (int) bytes[n_rows * d + r * 4 + j];
+                    }
+                    float scale;
+                    memcpy(&scale, sbytes, 4);
+                    for (int64_t i = 0; i < d; i++) {
+                        const uint8_t qb = (uint8_t) (int8_t) (int) bytes[r * d + i];
+                        out[r * d + i] = e4m3_to_f32_for_cmp(qb) * scale;
+                    }
+                }
+            };
+
+            std::vector<float> da((size_t) n_rows * d), db((size_t) n_rows * d);
+            decode(a, da.data());
+            decode(b, db.data());
+            return nmse(da.data(), db.data(), da.size());
+        }
+
+        const int64_t n_groups  = d / G;
         const int64_t row_out   = d + n_groups * (int64_t) sizeof(float);
         if ((int64_t) n % row_out != 0) {
             // not the packed output (the harness also compares its sentinel nodes)
@@ -2594,7 +2631,7 @@ struct test_fp8_quant_rot : public test_case {
         // a/b are tensor_to_float()'s output for a GGML_TYPE_I8 tensor: each
         // entry is one packed byte reinterpreted as (float)(int8_t)byte, in
         // row-major memory order -- i.e. exactly the on-wire row layout
-        // (K e4m3 bytes, then K/128 little-endian fp32 group scales).
+        // (K e4m3 bytes, then K/G little-endian fp32 group scales).
         auto decode_row = [&](const float * row_bytes, float * out) {
             for (int64_t g = 0; g < n_groups; g++) {
                 uint8_t sbytes[4];
@@ -2603,9 +2640,9 @@ struct test_fp8_quant_rot : public test_case {
                 }
                 float scale;
                 memcpy(&scale, sbytes, 4);
-                for (int i = 0; i < 128; i++) {
-                    const uint8_t qb = (uint8_t) (int8_t) (int) row_bytes[g * 128 + i];
-                    out[g * 128 + i] = e4m3_to_f32_for_cmp(qb) * scale;
+                for (int i = 0; i < G; i++) {
+                    const uint8_t qb = (uint8_t) (int8_t) (int) row_bytes[g * G + i];
+                    out[g * G + i] = e4m3_to_f32_for_cmp(qb) * scale;
                 }
             }
         };
@@ -2619,47 +2656,61 @@ struct test_fp8_quant_rot : public test_case {
     }
 };
 
-// GGML_OP_FP8_MUL_MAT (FP8_B128 phase 2) — block-128 fp8 weight x packed-fp8
-// activation matmul. The weight is a real GGML_TYPE_FP8_B128 tensor,
-// initialized the normal test-harness way (init_tensor_uniform quantizes it
-// via ggml_quantize_chunk / quantize_row_fp8_b128_ref, so the 128x128-tile-
-// shared-scale invariant the production converter enforces is NOT required
-// here). The packed I8 activation is produced by a GGML_OP_FP8_QUANT_ROT
-// (kind NONE, no rotation) node built INSIDE this test's graph, so CPU and
-// the backend under test see byte-identical fp32 input `x` and there is no
-// separate "prepare an I8 tensor" step to keep in sync between backends.
+// GGML_OP_FP8_MUL_MAT (FP8_B128 phase 2) — block-fp8 weight x packed-fp8
+// activation matmul. The weight is a real GGML_TYPE_FP8_B128 or
+// GGML_TYPE_ML8_FP8 tensor, initialized the normal test-harness way
+// (init_tensor_uniform quantizes it via ggml_quantize_chunk, so the
+// 128x128-tile-shared-scale invariant the production FP8_B128 converter
+// enforces is NOT required here for FP8_B128 -- and ML8_FP8 has no such tile
+// invariant to begin with, since its scale is per-(n, 32-K-group), not
+// shared across rows). The packed I8 activation is produced by a
+// GGML_OP_FP8_QUANT_ROT (kind NONE, no rotation) node built INSIDE this
+// test's graph with the weight-implied G (or G=0 when `per_row` is set --
+// the frozen gfx1201 GEMM kernel's fixed per-row activation contract, valid
+// for either weight type since the weight side dequantizes the same way
+// regardless), so CPU and the backend under test see byte-identical fp32
+// input `x` and there is no separate "prepare an I8 tensor" step to keep in
+// sync between backends.
 struct test_fp8_mul_mat : public test_case {
     const int64_t k; // K (in features), multiple of 128
     const int64_t n; // N (out features)
     const int64_t m; // M (tokens)
+    const ggml_type weight_type; // GGML_TYPE_FP8_B128 (G=128) or GGML_TYPE_ML8_FP8 (G=32)
+    const bool per_row; // activation packed with G=0 (per-row, RDNA4 GEMM contract) instead of weight-implied G
 
     std::string vars() override {
-        return VARS_TO_STR3(k, n, m);
+        return VARS_TO_STR5(k, n, m, weight_type, per_row);
     }
 
     double max_nmse_err() override {
         return 5e-3; // fp8 weight + fp8 activation quantization noise
     }
 
-    test_fp8_mul_mat(int64_t k = 128, int64_t n = 16, int64_t m = 16) : k(k), n(n), m(m) {}
+    test_fp8_mul_mat(int64_t k = 128, int64_t n = 16, int64_t m = 16,
+                      ggml_type weight_type = GGML_TYPE_FP8_B128, bool per_row = false)
+        : k(k), n(n), m(m), weight_type(weight_type), per_row(per_row) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_FP8_B128, k, n);
+        const int32_t G = per_row ? 0 : ((weight_type == GGML_TYPE_ML8_FP8) ? 32 : 128);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, weight_type, k, n);
         ggml_set_name(w, "w");
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
         ggml_set_name(x, "x");
-        ggml_tensor * qrot = ggml_fp8_quant_rot(ctx, x, nullptr, 1, k, GGML_FP8_QUANT_ROT_KIND_NONE);
+        ggml_tensor * qrot = ggml_fp8_quant_rot(ctx, x, nullptr, 1, k, GGML_FP8_QUANT_ROT_KIND_NONE, G);
         ggml_set_name(qrot, "qrot");
         ggml_tensor * out = ggml_fp8_mul_mat(ctx, w, qrot);
         ggml_set_name(out, "out");
         return out;
     }
 
-    // Enforce the converter's tile invariant on the harness-quantized weight:
-    // every block_fp8_b128 in an aligned 128x128 tile carries the scale of the
-    // tile's first row. The HIP packer dedups the scale table from row
-    // tile_n*128, so without this the two backends would legitimately compute
-    // different products. Same bytes are uploaded to both backends.
+    // Enforce the FP8_B128 converter's tile invariant on the harness-quantized
+    // weight: every block_fp8_b128 in an aligned 128x128 tile carries the
+    // scale of the tile's first row. The HIP packer dedups the scale table
+    // from row tile_n*128, so without this the two backends would
+    // legitimately compute different products. Same bytes are uploaded to
+    // both backends. ML8_FP8 has no such tile invariant (its scale is
+    // per-row, per-32-K-group) so init_tensor_uniform's own quantization is
+    // already consistent between backends -- no fixup needed.
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             init_tensor_uniform(t);
@@ -10012,6 +10063,52 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_fp8_quant_rot(2,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M));
             test_cases.emplace_back(new test_fp8_quant_rot(40, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M));
         }
+
+        // G=32 (ML8_FP8 activation packing): mirror the G=128 cases above at
+        // K in {128, 256, 5120}, same kinds and M lists. The a_dim/b_dim
+        // factorizations are unrelated to G (G only governs the activation
+        // quantize group width, not the rotation), so reuse the exact same
+        // (a_dim, b_dim) pairs, just with G passed explicitly as 32.
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 128,  GGML_FP8_QUANT_ROT_KIND_NONE, M, 1, 1, 32));
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 256,  GGML_FP8_QUANT_ROT_KIND_NONE, M, 1, 1, 32));
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 5120, GGML_FP8_QUANT_ROT_KIND_NONE, M, 1, 1, 32));
+        }
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 128, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M, 1, 1, 32));
+            test_cases.emplace_back(new test_fp8_quant_rot(2, 128, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M, 1, 1, 32));
+        }
+        for (int64_t M : Ms_small) {
+            test_cases.emplace_back(new test_fp8_quant_rot(5, 1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M, 1, 1, 32));
+        }
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 32));
+            test_cases.emplace_back(new test_fp8_quant_rot(2,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 32));
+            test_cases.emplace_back(new test_fp8_quant_rot(40, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 32));
+        }
+
+        // G=0 (per-row, RDNA4 GEMM contract): mirror the same K in
+        // {128, 256, 5120} / (a_dim, b_dim) factorizations / kinds / M lists
+        // as G=128/32 above -- G only changes the activation quantize
+        // packing (row-contiguous-grouped vs. flat-per-row), not the
+        // rotation, so the same shapes exercise it.
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 128,  GGML_FP8_QUANT_ROT_KIND_NONE, M, 1, 1, 0));
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 256,  GGML_FP8_QUANT_ROT_KIND_NONE, M, 1, 1, 0));
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 5120, GGML_FP8_QUANT_ROT_KIND_NONE, M, 1, 1, 0));
+        }
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1, 128, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M, 1, 1, 0));
+            test_cases.emplace_back(new test_fp8_quant_rot(2, 128, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M, 1, 1, 0));
+        }
+        for (int64_t M : Ms_small) {
+            test_cases.emplace_back(new test_fp8_quant_rot(5, 1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M, 1, 1, 0));
+        }
+        for (int64_t M : Ms_full) {
+            test_cases.emplace_back(new test_fp8_quant_rot(1,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
+            test_cases.emplace_back(new test_fp8_quant_rot(2,  128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
+            test_cases.emplace_back(new test_fp8_quant_rot(40, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
+        }
     }
 
     // GGML_OP_FP8_MUL_MAT: touches every K in {128, 5120, 17408}, N in
@@ -10030,7 +10127,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_fp8_mul_mat(K, N, Ms[i]));
         }
         test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/5120,  /*n=*/5120, /*m=*/16));
+        // Qwen3.8-27B TP (72/28, attn 50/50) per-device slice shapes, decode M
+        for (int64_t m : {1, 2, 5, 16, 20, 33, 40, 129}) {
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/5120,  /*n=*/7040,  m));   // attn_qkv dev0
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/5120,  /*n=*/3200,  m));   // attn_qkv dev1
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/5120,  /*n=*/1920,  m));   // attn_gate dev1
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/4224,  /*n=*/5120,  m));   // ssm_out dev0 (K-split)
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/1920,  /*n=*/5120,  m));   // ssm_out dev1
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/5120,  /*n=*/12416, m));   // ffn_gate dev0
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/12416, /*n=*/5120,  m));   // ffn_down dev0
+            test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/3072,  /*n=*/5120,  m));   // attn_output 50/50
+        }
         test_cases.emplace_back(new test_fp8_mul_mat(/*k=*/17408, /*n=*/16,   /*m=*/1));
+
+        // GGML_TYPE_ML8_FP8 weights (G=32, 34-byte blocks) at the Qwen3.8-27B
+        // TP slice (K,N) pairs, full M sweep. init_tensor_uniform via
+        // ggml_quantize_chunk is enough here -- unlike FP8_B128, ML8_FP8 has
+        // no cross-row tile-scale invariant to fix up (see test_fp8_mul_mat's
+        // initialize_tensors comment).
+        {
+            const std::pair<int64_t, int64_t> kn_pairs[] = {
+                {5120, 7040}, {5120, 3200}, {5120, 1920}, {4224, 5120},
+                {1920, 5120}, {5120, 12416}, {12416, 5120}, {3072, 5120},
+            };
+            for (int64_t m : {1, 2, 5, 16, 20, 33, 129, 2048}) {
+                for (const auto & kn : kn_pairs) {
+                    test_cases.emplace_back(new test_fp8_mul_mat(kn.first, kn.second, m, GGML_TYPE_ML8_FP8));
+                }
+            }
+        }
+
+        // Per-row (G=0) activation packing for FP8_B128 weights -- the frozen
+        // gfx1201 GEMM kernel's fixed contract (MT_FP8_B128_LAYOUT=rdna4, the
+        // default). Same Qwen3.8-27B TP slice (K,N) pairs as above, full M sweep.
+        {
+            const std::pair<int64_t, int64_t> kn_pairs[] = {
+                {5120, 7040}, {5120, 3200}, {5120, 1920}, {4224, 5120},
+                {1920, 5120}, {5120, 12416}, {12416, 5120}, {3072, 5120},
+            };
+            for (int64_t m : {1, 2, 5, 16, 20, 33, 129, 2048}) {
+                for (const auto & kn : kn_pairs) {
+                    test_cases.emplace_back(new test_fp8_mul_mat(kn.first, kn.second, m, GGML_TYPE_FP8_B128, /*per_row=*/true));
+                }
+            }
+        }
     }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
@@ -11124,6 +11264,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {16, 64, 512, 2048}) {
         test_cases.emplace_back(new test_fp8_mul_mat(5120, 17408, m));
         test_cases.emplace_back(new test_fp8_mul_mat(17408, 5120, m));
+        // GGML_OP_FP8_MUL_MAT with an ML8_FP8 weight (G=32) at the same
+        // ffn_gate/ffn_down shapes, so the preshuffle-vs-generic-vs-ML8_FP8-
+        // via-plain-MUL_MAT comparison below has a same-op reference point.
+        test_cases.emplace_back(new test_fp8_mul_mat(5120, 17408, m, GGML_TYPE_ML8_FP8));
+        test_cases.emplace_back(new test_fp8_mul_mat(17408, 5120, m, GGML_TYPE_ML8_FP8));
+        // Per-row (G=0) activation packing for the FP8_B128 weight at the same
+        // shapes -- the production RDNA4 gfx1201 GEMM kernel's contract
+        // (MT_FP8_B128_LAYOUT=rdna4, the default).
+        test_cases.emplace_back(new test_fp8_mul_mat(5120, 17408, m, GGML_TYPE_FP8_B128, /*per_row=*/true));
+        test_cases.emplace_back(new test_fp8_mul_mat(17408, 5120, m, GGML_TYPE_FP8_B128, /*per_row=*/true));
         for (ggml_type type : {GGML_TYPE_ML8_FP8, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17408, m, 5120, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, m, 17408, {1, 1}, {1, 1}));

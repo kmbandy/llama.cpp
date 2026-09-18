@@ -15,6 +15,7 @@
 #include "ggml-quants.h"
 #include "ggml-common.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -367,12 +368,26 @@ struct ggml_tensor * ggml_fp8_quant_rot(
         struct ggml_tensor  * h_a,
         int64_t a_dim,
         int64_t b_dim,
-        int32_t kind) {
+        int32_t kind,
+        int32_t G) {
     GGML_ASSERT(x != NULL);
     GGML_ASSERT(x->type == GGML_TYPE_F32);
 
+    // G == 0 means per-row (one scale per whole row, the RDNA4 gfx1201 GEMM
+    // kernel's contract); G == 32/128 means grouped. 0 no longer aliases 128
+    // -- callers that want 128 must pass it explicitly (every existing
+    // caller already does, via this function's 7-arg form or the 6-arg
+    // back-compat overload below, which passes 128 literally).
+    GGML_ASSERT((G == 0 || G == 32 || G == 128) && "G must be 0 (per-row), 32, or 128");
+
     const int64_t K = x->ne[0];
-    GGML_ASSERT(K % QK_FP8_B128 == 0 && "K must be a multiple of 128");
+    int64_t n_groups;
+    if (G == 0) {
+        n_groups = 1; // per-row: exactly one scale per row
+    } else {
+        GGML_ASSERT(K % G == 0 && "K must be a multiple of G");
+        n_groups = K / G;
+    }
 
     switch (kind) {
         case GGML_FP8_QUANT_ROT_KIND_NONE:
@@ -394,7 +409,6 @@ struct ggml_tensor * ggml_fp8_quant_rot(
             GGML_ABORT("ggml_fp8_quant_rot: unknown kind %d", kind);
     }
 
-    const int64_t n_groups = K / QK_FP8_B128;
     const int64_t ne[4] = { K + n_groups * (int64_t) sizeof(float), x->ne[1], x->ne[2], x->ne[3] };
     struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_I8, 4, ne);
     y->op     = GGML_OP_FP8_QUANT_ROT;
@@ -404,6 +418,7 @@ struct ggml_tensor * ggml_fp8_quant_rot(
     params[0] = (int32_t) a_dim;
     params[1] = (int32_t) b_dim;
     params[2] = kind;
+    params[3] = G;
     return y;
 }
 
@@ -413,14 +428,38 @@ struct ggml_tensor * ggml_fp8_mul_mat(
         struct ggml_tensor  * a) {
     GGML_ASSERT(w != NULL);
     GGML_ASSERT(a != NULL);
-    GGML_ASSERT(w->type == GGML_TYPE_FP8_B128);
+    GGML_ASSERT(w->type == GGML_TYPE_FP8_B128 || w->type == GGML_TYPE_ML8_FP8);
     GGML_ASSERT(a->type == GGML_TYPE_I8);
 
-    // Shape: w [K, N], a [K + K/32, n1, n2, n3] -> y [N, n1, n2, n3]
+    // G is implied by the weight type: FP8_B128 -> 128, ML8_FP8 -> 32.
+    const int32_t G = (w->type == GGML_TYPE_ML8_FP8) ? 32 : 128;
+
+    // If `a` is itself a GGML_OP_FP8_QUANT_ROT node, cross-check its G
+    // (op_params[3]: 0 means per-row, else must match the weight's implied
+    // G) rather than just trusting the shape. Otherwise (a built by hand,
+    // e.g. a test harness) infer per-row purely from shape.
+    bool a_per_row;
+    if (a->op == GGML_OP_FP8_QUANT_ROT) {
+        const int32_t * ap = (const int32_t *) a->op_params;
+        const int32_t a_G = ap[3];
+        a_per_row = (a_G == 0);
+        if (!a_per_row) {
+            GGML_ASSERT(a_G == G && "activation quant_rot G does not match weight type's implied G");
+        }
+    } else {
+        a_per_row = (a->ne[0] == w->ne[0] + 4);
+    }
+
+    // Shape: w [K, N], a [K + 4*K/G, n1, n2, n3] (grouped) or [K + 4, ...]
+    // (per-row) -> y [N, n1, n2, n3]
     const int64_t K = w->ne[0];
     const int64_t N = w->ne[1];
-    GGML_ASSERT(K % QK_FP8_B128 == 0 && "K must be a multiple of 128");
-    GGML_ASSERT(a->ne[0] == K + K / 32 && "a's packed row width must be K + K/32");
+    GGML_ASSERT(K % G == 0 && "K must be a multiple of G");
+    if (a_per_row) {
+        GGML_ASSERT(a->ne[0] == K + 4 && "per-row activation row width must be K + 4");
+    } else {
+        GGML_ASSERT(a->ne[0] == K + 4 * K / G && "a's packed row width must be K + 4*K/G");
+    }
 
     const int64_t ne[4] = { N, a->ne[1], a->ne[2], a->ne[3] };
     struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);

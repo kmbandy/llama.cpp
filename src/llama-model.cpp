@@ -1875,6 +1875,14 @@ static int wp_select_ffn_island_device_index(const llama_model_params & params,
 // every member but whichever happens to reach build_lora_mm first. Catch
 // that here, once, at load time.
 //
+// Originally FP8_B128-only; generalized to also cover GGML_TYPE_ML8_FP8
+// weights once build_ml8_or_mul_mat's default (non-WP_ML8_FP8_LEGACY) path
+// started routing ML8_FP8 through the same memoized quant_rot node (G=32) --
+// the "every group member must share one rotation" invariant applies
+// identically regardless of which weight format is in play, so a single pair
+// of weights is only ever checked against ITS OWN type (mixed-type pairs
+// within one group are not a case this converter produces).
+//
 // This must run AFTER load_all_data(): load_ml8_sidecars/register_ml8_weight
 // (qwen35.cpp) run during load_arch_tensors, before ANY tensor data --
 // including the sidecar tensors' own bytes -- has been read from disk, so
@@ -1885,14 +1893,14 @@ static int wp_select_ffn_island_device_index(const llama_model_params & params,
 // sidecars are MIRRORED (see llama_meta_device_get_split_state's
 // pattern_ml8_sidecar handling above) and therefore this rank's copy is a
 // complete, valid comparison for every device.
-static void llama_model_validate_fp8_b128_rotation_groups(const llama_model & model) {
-    // Returns `name` iff it names an FP8_B128 tensor, else nullptr -- every
-    // other case (missing, or present but some other type such as Q8_0,
-    // which is how the converter stores tensors that fail the N%128/K%128
-    // alignment check) is "nothing to validate here".
-    const auto fp8b128 = [&](const std::string & name) -> const ggml_tensor * {
+static void llama_model_validate_fp8_rotation_groups(const llama_model & model) {
+    // Returns `name` iff it names an FP8_B128 or ML8_FP8 tensor, else nullptr
+    // -- every other case (missing, or present but some other type such as
+    // Q8_0, which is how the converter stores tensors that fail the
+    // N%128/K%128 alignment check) is "nothing to validate here".
+    const auto fp8_or_ml8fp8 = [&](const std::string & name) -> const ggml_tensor * {
         const ggml_tensor * t = model.get_tensor(name.c_str());
-        return (t && t->type == GGML_TYPE_FP8_B128) ? t : nullptr;
+        return (t && (t->type == GGML_TYPE_FP8_B128 || t->type == GGML_TYPE_ML8_FP8)) ? t : nullptr;
     };
 
     // Bytewise-compare two tensors' resident data. Reads through
@@ -1914,10 +1922,13 @@ static void llama_model_validate_fp8_b128_rotation_groups(const llama_model & mo
     };
 
     const auto check_pair = [&](const std::string & name_a, const std::string & name_b) {
-        const ggml_tensor * wa = fp8b128(name_a);
-        const ggml_tensor * wb = fp8b128(name_b);
+        const ggml_tensor * wa = fp8_or_ml8fp8(name_a);
+        const ggml_tensor * wb = fp8_or_ml8fp8(name_b);
         if (wa == nullptr || wb == nullptr) {
-            return; // one/both absent or not FP8_B128 -- nothing to enforce for this pair
+            return; // one/both absent or not FP8_B128/ML8_FP8 -- nothing to enforce for this pair
+        }
+        if (wa->type != wb->type) {
+            return; // not a same-format group -- the converter never mixes formats within a group
         }
         if (wa->buffer == nullptr || wb->buffer == nullptr) {
             // Not resident yet (e.g. weight paging left it for the pager, or
@@ -1939,7 +1950,7 @@ static void llama_model_validate_fp8_b128_rotation_groups(const llama_model & mo
         const int64_t bdim_b = sb ? sb->rotation_b_dim : 0;
 
         if (kron_a != kron_b || bh_a != bh_b || bdim_a != bdim_b) {
-            GGML_ABORT("FP8_B128 rotation mismatch: '%s' and '%s' consume the same activation "
+            GGML_ABORT("FP8 rotation mismatch: '%s' and '%s' consume the same activation "
                        "(input group) but were converted with different rotation_meta "
                        "(kronecker=%d/%d, block_hadamard=%d/%d, b_dim=%" PRId64 "/%" PRId64 "). "
                        "Every weight in an input group must share one rotation -- re-run the "
@@ -1948,7 +1959,7 @@ static void llama_model_validate_fp8_b128_rotation_groups(const llama_model & mo
                        (int) bh_a, (int) bh_b, bdim_a, bdim_b);
         }
         if (kron_a && !bytewise_equal(sa->rotation_h_a, sb->rotation_h_a)) {
-            GGML_ABORT("FP8_B128 rotation mismatch: '%s.rotation_h_a' and '%s.rotation_h_a' differ "
+            GGML_ABORT("FP8 rotation mismatch: '%s.rotation_h_a' and '%s.rotation_h_a' differ "
                        "byte-for-byte -- every weight in an input group must share one rotation "
                        "factor -- re-run the fp8_b128 converter.",
                        name_a.c_str(), name_b.c_str());
@@ -3044,7 +3055,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // entirely for the (overwhelmingly common) case of no FP8_B128 tensors:
     // fp8b128() misses on every lookup and check_pair returns immediately.
     if (!ml.no_alloc) {
-        llama_model_validate_fp8_b128_rotation_groups(*this);
+        llama_model_validate_fp8_rotation_groups(*this);
     }
 
     return true;

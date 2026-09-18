@@ -8334,7 +8334,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (op->type  != GGML_TYPE_I8)  return false;
                 if (!ggml_is_contiguous(x))     return false;
                 if (x->nb[1] != (size_t) x->ne[0] * sizeof(float)) return false;
-                if (x->ne[0] % 128 != 0)        return false;
+                {
+                    // MAD-305 Phase 5 (round 3): op_params[3] == 0 is now a
+                    // genuine "per-row" mode (a single scale for the whole
+                    // row, not an alias of G=128) -- only K%32==0 is needed,
+                    // there is no scale-group alignment requirement.
+                    const int32_t G_raw = ((const int32_t *) op->op_params)[3];
+                    if (G_raw == 0) {
+                        if (x->ne[0] % 32 != 0) return false;
+                    } else {
+                        if (G_raw != 32 && G_raw != 128) return false;
+                        if (x->ne[0] % G_raw != 0)       return false;
+                    }
+                }
                 const int32_t * pp    = (const int32_t *) op->op_params;
                 const int32_t   a_dim = pp[0];
                 const int32_t   b_dim = pp[1];
@@ -8369,14 +8381,54 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const ggml_tensor * w = op->src[0];
                 const ggml_tensor * a = op->src[1];
                 if (!w || !a) return false;
-                if (w->type   != GGML_TYPE_FP8_B128) return false;
                 if (a->type   != GGML_TYPE_I8)       return false;
                 if (op->type  != GGML_TYPE_F32)      return false;
                 if (w->ne[2] != 1 || w->ne[3] != 1)  return false;
-                if (w->ne[0] % 128 != 0)             return false;
-                if (w->ne[1] % 128 != 0)             return false;
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
-                return GGML_CUDA_CC_IS_RDNA4(cc);
+                if (w->type == GGML_TYPE_FP8_B128) {
+                    // K%32==0 covers both activation contracts below; the
+                    // block-packing one additionally self-asserts K%128==0
+                    // in ggml_cuda_op_fp8_mul_mat (needed for its n_groups=
+                    // K/128 to be exact) -- true for every production shape.
+                    if (w->ne[0] % 32 != 0)              return false;
+                    if (w->ne[1] % 128 != 0)             return false;
+                    // MAD-305 Phase 5 (round 3, default): src1->ne[0] ==
+                    // K + 4 is the per-row (G=0) contract, dispatched to the
+                    // frozen rdna4 trfeed kernel. K + K/32 is the legacy
+                    // block-packing (G=128, K/128 groups * 4 bytes) contract
+                    // the Triton generic/preshuffle/rdna4-tile layouts serve.
+                    const bool per_row = (a->ne[0] == w->ne[0] + 4);
+                    const bool block   = (a->ne[0] == w->ne[0] + w->ne[0] / 32);
+                    if (!per_row && !block)              return false;
+                    // The packed weight layout is fixed at load (MT_FP8_B128_LAYOUT):
+                    // the trfeed layout carries one scale per row and serves only
+                    // the per-row activation contract; the Triton layouts carry the
+                    // [K/128,N/128] table and serve only the block contract. A
+                    // mismatch (e.g. test-backend-ops running both) goes to CPU.
+                    // The trfeed pack also needs K >= 256 to fit in place (N*K+4N
+                    // <= 130*N*K/128) -- the cache-copy path covers smaller K, but
+                    // keep it out of the kernel path entirely.
+                    if (ggml_cuda_fp8_b128_layout_is_per_row()) {
+                        if (!per_row)                    return false;
+                        if (w->ne[0] < 256)              return false;
+                    } else {
+                        if (!block)                      return false;
+                    }
+                    return GGML_CUDA_CC_IS_RDNA4(cc);
+                }
+                // ML8_FP8 weight (G=32 scale groups): same gating as the
+                // existing ML8_FP8 MUL_MAT path (RDNA4 + AITER, K%32==0,
+                // N%16==0) -- see deliverable (2) in the FP8_B128 phase 2 design.
+                // src1 (the FP8_QUANT_ROT output) must carry exactly K raw
+                // e4m3 bytes plus K/32 fp32 per-group scales per row (MAD-305
+                // Phase 5 production-integration contract).
+                if (w->type == GGML_TYPE_ML8_FP8) {
+                    if (w->ne[0] % 32 != 0)              return false;
+                    if (w->ne[1] % 16 != 0)              return false;
+                    if (a->ne[0] != w->ne[0] + w->ne[0] / 8) return false;
+                    return GGML_CUDA_CC_IS_RDNA4(cc);
+                }
+                return false;
 #else
                 return false;
 #endif

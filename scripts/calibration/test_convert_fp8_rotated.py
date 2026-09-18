@@ -18,7 +18,7 @@ from convert_fp8_rotated import (  # noqa: E402
     _sidecar_base,
     build_plan, classify_tensor, convert, tensor_role, _quantize_q8_0_gpu,
     _CHUNK_ROWS, _row_chunk_bounds,
-    _quantize_fp8_b128_gpu, role_group_key, _group_seed, _parse_layer,
+    _quantize_fp8_b128_gpu, _rotate_and_fp8_b128, role_group_key, _group_seed, _parse_layer,
     _FP8B128_TILE, _FP8B128_BLOCK_BYTES, _FP8B128_MAX,
     _fit_ml8_centroids, _assign_ml8_indices, _process_rotate_ml8_4_chunked,
     _ML8_FIT_ROWS_DEFAULT,
@@ -915,6 +915,180 @@ def test_convert_ml8_4_k_fallback(tmp_path):
     assert "blk.0.attn_qkv.centroids" not in names
     assert "blk.0.attn_qkv.rotation_meta" not in names
     print("  PASS test_convert_ml8_4_k_fallback")
+
+
+def test_quantize_fp8_b128_channel_scale_and_roundtrip():
+    """--scale-mode channel: byte size/layout identical to tile mode, but
+    every block in a ROW carries the identical fp16 scale (row absmax over
+    all K / 448), and decoding the e4m3 bytes (independent numpy decoder)
+    reproduces the quantized tensor with codebook-level error."""
+    torch.manual_seed(6)
+    N, K = 256, 256   # 2x2 tiles
+    w = torch.randn(N, K, dtype=torch.float32) * 2.0
+    packed = _quantize_fp8_b128_gpu(w, scale_mode="channel")
+
+    n_col_blocks = K // _FP8B128_TILE
+    assert packed.shape == (N, n_col_blocks * _FP8B128_BLOCK_BYTES)
+    assert packed.nbytes == _FP8B128_BLOCK_BYTES * N * K // _FP8B128_TILE
+
+    packed3 = packed.reshape(N, n_col_blocks, _FP8B128_BLOCK_BYTES)
+    scale_bytes = packed3[:, :, :2]
+    qs_bytes = packed3[:, :, 2:]
+    scales = scale_bytes.reshape(N, n_col_blocks, 2).view(np.float16).astype(np.float32).reshape(N, n_col_blocks)
+
+    # All blocks of a given row share the identical stored scale.
+    for row in range(N):
+        row_scales = scales[row]
+        assert np.all(row_scales == row_scales[0]), f"row {row} scale not uniform across blocks"
+        assert row_scales[0] > 0   # always positive, even for a degenerate row
+
+    # Independently recompute the expected per-row scale and cross-check.
+    expected_scale = (np.abs(w.numpy()).max(axis=1) / _FP8B128_MAX).astype(np.float32)
+    expected_scale = np.maximum(expected_scale, 1e-6).astype(np.float16).astype(np.float32)
+    np.testing.assert_array_equal(scales[:, 0], expected_scale)
+
+    decoded_e4m3 = _decode_e4m3_bytes_numpy(qs_bytes.reshape(-1)).reshape(N, n_col_blocks, _FP8B128_TILE)
+    dequant = decoded_e4m3 * scales[:, :, None]
+    dequant = dequant.reshape(N, K)
+    err = _nmse(dequant, w.numpy())
+    assert err < 3e-2, f"fp8_b128 channel round-trip NMSE {err:.3e} too high"
+    print("  PASS test_quantize_fp8_b128_channel_scale_and_roundtrip")
+
+
+def test_quantize_fp8_b128_channel_degenerate_zero_row():
+    """An all-zero row must get a tiny positive scale (never zero/NaN) and
+    decode back to all-zero e4m3 bytes, one row inside an otherwise nonzero
+    tile (channel scale is per-row, unlike tile mode's per-tile scale)."""
+    torch.manual_seed(9)
+    w = torch.randn(128, 256, dtype=torch.float32)
+    w[5, :] = 0.0
+    packed = _quantize_fp8_b128_gpu(w, scale_mode="channel")
+    n_col_blocks = 256 // _FP8B128_TILE
+    packed3 = packed.reshape(128, n_col_blocks, _FP8B128_BLOCK_BYTES)
+    row5_scale = packed3[5, :, :2].reshape(n_col_blocks, 2).view(np.float16).astype(np.float32)
+    assert np.all(row5_scale > 0.0)
+    row5_qs = packed3[5, :, 2:]
+    assert np.all(row5_qs == 0)   # +0.0 e4m3 encodes as byte 0x00
+    print("  PASS test_quantize_fp8_b128_channel_degenerate_zero_row")
+
+
+def test_quantize_fp8_b128_invalid_scale_mode():
+    with pytest.raises(ValueError):
+        _quantize_fp8_b128_gpu(torch.randn(128, 128), scale_mode="bogus")
+    print("  PASS test_quantize_fp8_b128_invalid_scale_mode")
+
+
+def test_dry_run_classification_fp8_b128_channel_scale_mode(synthetic_gguf_b128):
+    """--scale-mode has no bearing on classification: build_plan/classify_tensor
+    don't take a scale_mode argument at all, so the plan for --format fp8_b128
+    is identical regardless of the scale mode that convert() will later use."""
+    src, _ = synthetic_gguf_b128
+    reader = gguf.GGUFReader(src)
+    plan = build_plan(reader, rotation_seed=0, local_b=128, max_b=1024, format="fp8_b128")
+    by_name = {e["name"]: e for e in plan}
+    assert by_name["blk.0.attn_qkv.weight"]["action"] == "rotate_kronecker"
+    assert by_name["blk.0.attn_v.weight"]["action"] == "q8_0"   # unaligned fallback, unaffected
+    print("  PASS test_dry_run_classification_fp8_b128_channel_scale_mode")
+
+
+def test_convert_fp8_b128_channel_end_to_end(synthetic_gguf_b128, tmp_path):
+    """convert(..., format="fp8_b128", scale_mode="channel") produces the same
+    tensor types/sidecars as tile mode, but every block of a row shares the
+    identical stored fp16 scale."""
+    src, weights = synthetic_gguf_b128
+    out = tmp_path / "tiny_fp8b128_channel.gguf"
+    convert(src, out, rotation_seed=1234, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128", scale_mode="channel")
+    reader = gguf.GGUFReader(out)
+    names = {t.name: t for t in reader.tensors}
+
+    for role_name in ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight",
+                      "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight",
+                      "blk.0.attn_output.weight", "blk.0.ffn_down.weight",
+                      "blk.0.ssm_out.weight", "output.weight"]:
+        assert names[role_name].tensor_type == GGMLQuantizationType.FP8_B128, role_name
+
+    assert names["blk.0.attn_v.weight"].tensor_type == GGMLQuantizationType.Q8_0
+    assert names["token_embd.weight"].tensor_type == GGMLQuantizationType.Q8_0
+
+    block_size, block_bytes = gguf.constants.GGML_QUANT_SIZES[GGMLQuantizationType.FP8_B128]
+    for name, K in [("blk.0.ffn_gate.weight", D_B128), ("blk.0.attn_output.weight", FFN_B128)]:
+        t = names[name]
+        raw = np.ascontiguousarray(t.data)
+        N = raw.shape[0]
+        n_blocks = raw.shape[1] // block_bytes
+        raw3 = raw.reshape(N, n_blocks, block_bytes)
+        scale_bytes = raw3[:, :, :2].reshape(N, n_blocks, 2)
+        scales = scale_bytes.view(np.float16).astype(np.float32).reshape(N, n_blocks)
+        for row in range(N):
+            row_scales = scales[row]
+            assert np.all(row_scales == row_scales[0]), f"{name} row {row}: scale not uniform across blocks"
+    print("  PASS test_convert_fp8_b128_channel_end_to_end")
+
+
+def test_convert_fp8_b128_default_scale_mode_is_tile(synthetic_gguf_b128, tmp_path):
+    """convert() with format="fp8_b128" and no --scale-mode given must be
+    byte-identical to explicit scale_mode="tile" — the default is unchanged
+    from today's tile-scaled behaviour."""
+    src, _ = synthetic_gguf_b128
+    out_default = tmp_path / "default.gguf"
+    out_tile = tmp_path / "tile.gguf"
+    convert(src, out_default, rotation_seed=55, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128")
+    convert(src, out_tile, rotation_seed=55, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128", scale_mode="tile")
+
+    r1, r2 = gguf.GGUFReader(out_default), gguf.GGUFReader(out_tile)
+    names1 = {t.name: t for t in r1.tensors}
+    names2 = {t.name: t for t in r2.tensors}
+    assert set(names1) == set(names2)
+    for name in names1:
+        b1 = np.ascontiguousarray(names1[name].data)
+        b2 = np.ascontiguousarray(names2[name].data)
+        np.testing.assert_array_equal(b1, b2, err_msg=f"{name}: default scale_mode differs from explicit 'tile'")
+    print("  PASS test_convert_fp8_b128_default_scale_mode_is_tile")
+
+
+def test_convert_fp8_b128_channel_differs_from_tile(synthetic_gguf_b128, tmp_path):
+    """Sanity check the channel-mode tests above aren't vacuous: channel and
+    tile scale modes must actually produce different bytes for a rotated
+    weight (a>1 kronecker weight in this fixture has genuinely non-uniform
+    per-tile absmax vs. per-row absmax)."""
+    src, _ = synthetic_gguf_b128
+    out_tile = tmp_path / "tile.gguf"
+    out_channel = tmp_path / "channel.gguf"
+    convert(src, out_tile, rotation_seed=7, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128", scale_mode="tile")
+    convert(src, out_channel, rotation_seed=7, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128", scale_mode="channel")
+    r1, r2 = gguf.GGUFReader(out_tile), gguf.GGUFReader(out_channel)
+    t1 = next(t for t in r1.tensors if t.name == "blk.0.ffn_gate.weight")
+    t2 = next(t for t in r2.tensors if t.name == "blk.0.ffn_gate.weight")
+    b1 = np.ascontiguousarray(t1.data)
+    b2 = np.ascontiguousarray(t2.data)
+    assert not np.array_equal(b1, b2)
+    print("  PASS test_convert_fp8_b128_channel_differs_from_tile")
+
+
+def test_seed_determinism_fp8_b128_channel(synthetic_gguf_b128, tmp_path):
+    """Two runs with the same --rotation-seed and --scale-mode channel give
+    bit-identical bytes."""
+    src, _ = synthetic_gguf_b128
+    out1 = tmp_path / "run1_channel.gguf"
+    out2 = tmp_path / "run2_channel.gguf"
+    convert(src, out1, rotation_seed=42, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128", scale_mode="channel")
+    convert(src, out2, rotation_seed=42, device_str="cpu", local_b=128, max_b=1024,
+           format="fp8_b128", scale_mode="channel")
+    r1, r2 = gguf.GGUFReader(out1), gguf.GGUFReader(out2)
+    names1 = {t.name: t for t in r1.tensors}
+    names2 = {t.name: t for t in r2.tensors}
+    assert set(names1) == set(names2)
+    for name in names1:
+        b1 = np.ascontiguousarray(names1[name].data)
+        b2 = np.ascontiguousarray(names2[name].data)
+        np.testing.assert_array_equal(b1, b2, err_msg=f"{name}: bytes differ across runs")
+    print("  PASS test_seed_determinism_fp8_b128_channel")
 
 
 def test_seed_determinism_ml8_4(synthetic_gguf, tmp_path):

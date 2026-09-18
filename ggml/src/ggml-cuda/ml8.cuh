@@ -48,6 +48,14 @@ struct ml8_weight_repack_t {
     int32_t K;
     int32_t n_groups_k;
     int32_t group_size;   // currently always QK_ML8 = 64
+    // FP8_B128 only (design 4(a)/(b) + generic-layout follow-up): which
+    // packed byte layout b_packed/b_scale are in — 0 = FP8_B128_LAYOUT_GENERIC
+    // (b_packed is e4m3 [K, N] row-major, b_scale is fp32 [K/128, N/128]),
+    // 1 = FP8_B128_LAYOUT_PRESHUFFLE (b_packed is the AITER shuffle_weight
+    // (16,16) permutation, b_scale is the same fp32 [K/128, N/128] table).
+    // Set once at pack time from MT_FP8_B128_LAYOUT; unused (left 0) by
+    // ML8_4/ML8_FP8 producers. See the FP8_B128_LAYOUT_* constants in ml8.cu.
+    int32_t layout;
 };
 
 // Pure repack helper. All pointers are device (HIP) pointers. Caller owns
@@ -355,8 +363,14 @@ void ggml_cuda_op_fp8_quant_rot(
 // Execute GGML_OP_FP8_MUL_MAT on the HIP backend (design 4(b)): looks up the
 // packed weight in the in-place registry (or a cache-keyed second copy when
 // WP_ML8_INPLACE=0 or the weight isn't in-place eligible, e.g. N not a
-// multiple of 128) and launches the AITER preshuffle GEMM
-// (_gemm_a8w8_blockscale_preshuffle_kernel via mt_fp8_b128_gemm).
+// multiple of 128) and launches the GEMM matching how the weight was
+// packed (ml8_weight_repack_t::layout, decided once at load time by
+// MT_FP8_B128_LAYOUT):
+//   generic (default):  _gemm_a8w8_blockscale_kernel (WEIGHT_FORMAT=0) via
+//                        mt_fp8_b128_gemm_generic — measured faster on
+//                        gfx1201.
+//   preshuffle:          _gemm_a8w8_blockscale_preshuffle_kernel via
+//                        mt_fp8_b128_gemm — kept selectable for A/B.
 void ggml_cuda_op_fp8_mul_mat(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);
@@ -371,3 +385,21 @@ void ggml_cuda_op_fp8_mul_mat(
 void * ggml_cuda_ml8_inplace_fp8_b128_unpack_to_device(
     cudaStream_t         stream,
     const ggml_tensor  * t);
+
+// MAD-305 Phase 5 -- ML8_FP8 sibling of the above, needed once ML8_FP8 gained
+// a second packed layout (RDNA4 trfeed, alongside the original TRITON [K,N]
+// transpose): unpacks a packed in-place GGML_TYPE_ML8_FP8 entry into a
+// freshly cudaMalloc'd device buffer holding the on-disk block_ml8_fp8 bytes
+// (ggml_nbytes(t) long), regardless of which layout it was packed in. Used by
+// the GET_ROWS dequant fallback (getrows.cu) when the packed-layout fast path
+// (ggml_cuda_ml8_inplace_get_rows) declines an RDNA4-layout weight. Caller
+// owns the returned pointer and must cudaFree it. Returns nullptr if
+// `t->data` is not a fully-packed ML8_FP8 entry.
+void * ggml_cuda_ml8_inplace_ml8fp8_unpack_to_device(
+    cudaStream_t         stream,
+    const ggml_tensor  * t);
+
+// True when the FP8_B128 packed layout selected at load (MT_FP8_B128_LAYOUT,
+// default rdna4 = frozen trfeed kernel) consumes the per-row (G=0) activation
+// packing; false for the Triton layouts (block-128 activation packing).
+bool ggml_cuda_fp8_b128_layout_is_per_row(void);

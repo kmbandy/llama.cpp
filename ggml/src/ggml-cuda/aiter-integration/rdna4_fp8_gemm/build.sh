@@ -28,4 +28,22 @@ if [ -f "$HERE/gemm_wmma.hip" ]; then
   cap hipcc --offload-arch="$ARCH" -O3 -fPIC --shared -I"$ROCM_INC" \
     "$HERE/gemm_wmma.hip" -o "$HERE/out/librdna4_gemm.so"
 fi
+
+if [ -f "$HERE/gemm_blockscale.hip" ]; then
+  echo "== build gemm_ml8fp8_blockscale_bench (MAD-305 Phase 5, abandoned kernels — kept for A/B only) =="
+  cap hipcc --offload-arch="$ARCH" -O3 -I"$ROCM_INC" \
+    "$HERE/gemm_blockscale.hip" "$HERE/bench/gemm_ml8fp8_blockscale_bench.hip" \
+    -o "$HERE/out/gemm_ml8fp8_blockscale_bench"
+fi
+
+if [ -f "$HERE/gemm_trfeed_prod.hip" ]; then
+  echo "== build gemm_trfeed_prod_bench (MAD-305 Phase 5 round 3 — production entry point) =="
+  # Links gemm_blockscale.hip only for its rdna4_[un]preshuffle_b_ml8fp8 byte-
+  # shuffle helpers (reused unchanged by the frozen trfeed kernel's weight
+  # packing); its two abandoned GEMM kernels are unused dead code in this bin.
+  cap hipcc --offload-arch="$ARCH" -O3 -I"$ROCM_INC" -I"$HERE" \
+    "$HERE/gemm_blockscale.hip" "$HERE/gemm_trfeed_prod.hip" \
+    "$HERE/bench/gemm_trfeed_prod_bench.hip" \
+    -o "$HERE/out/gemm_trfeed_prod_bench"
+fi
 echo "== DONE =="

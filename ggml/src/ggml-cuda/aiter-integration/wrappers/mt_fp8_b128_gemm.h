@@ -101,6 +101,57 @@ hipError_t mt_fp8_b128_gemm(hipStream_t stream, const struct mt_fp8_b128_gemm_ar
 // concurrent mt_fp8_b128_gemm calls).
 void mt_fp8_b128_gemm_reset_cache(void);
 
+// ─────────────────────────────────────────────────────────────────────────
+// GENERIC layout GEMM (default): launches the non-preshuffle
+// `_gemm_a8w8_blockscale_kernel` (WEIGHT_FORMAT=0) from the SAME vendored
+// gemm_ml8.py against the FP8_B128 generic packed layout (b_transposed is
+// e4m3 [K, N] row-major — the ML8_FP8 WEIGHT_FORMAT=0 b_packed convention —
+// plus the same [K/128, N/128] fp32 b_scale table the preshuffle path
+// uses). MEASURED faster than the preshuffle kernel on gfx1201 (4.36ms vs
+// 5.2-9.5ms at K=5120 N=17408 M=2048), hence the default
+// (MT_FP8_B128_LAYOUT=generic).
+//
+// Unlike mt_fp8_b128_gemm_args_t, a_scale's per-128-K-group stride
+// (stride_ascale_k) is a REAL runtime arg here (must be 1) rather than a
+// ":1"-hinted/dropped constant — the generic kernel's tl.assume(stride_
+// ascale_k > 0) requires a genuine positive value, and unlike the ml8-4/
+// ml8-fp8 WEIGHT_FORMAT=0 dense path (mt_ml8_gemm, which has no per-K-group
+// activation scale and always passes 0) this GEMM's activation scale truly
+// has one entry per GROUP_K(=128)-wide K-group. BLOCK_SIZE_K (the kernel's
+// tiling width) is a separate, decoupled tuning knob (MT_FP8_BK, default
+// 32) as of gemm_ml8.py LOCAL PATCH #7 — several BLOCK_SIZE_K-wide K-tiles
+// can share one GROUP_K-wide scale group; see mt_fp8_b128_gemm.cpp's
+// build_signature_fp8_b128_generic.
+struct mt_fp8_b128_gemm_generic_args_t {
+    int32_t     N, K, M;
+
+    const void *a_packed;       // fp8_e4m3 bytes [M, K + K/32] — same packed
+                                 // activation row FP8_QUANT_ROT produces
+                                 // (a_scale lives at byte offset K).
+    const void *b_transposed;   // fp8_e4m3 [K, N] row-major (generic layout
+                                 // weight bytes).
+    const void *b_scale;        // fp32 [K/128, N/128] row-major (kb outer,
+                                 // tile_n inner) — same table as preshuffle.
+    void       *c;              // fp32 [M, N] row-major.
+
+    // Strides, in elements (Triton convention), NOT bytes.
+    int32_t     stride_am, stride_ak;
+    int32_t     stride_bk, stride_bn;
+    int32_t     stride_cm, stride_cn;
+    int32_t     stride_ascale_m, stride_ascale_k;
+    int32_t     stride_bscale_k, stride_bscale_n;
+};
+
+// Launch the FP8_B128 generic-layout GEMM on the given stream. Returns
+// hipSuccess on success, or the first non-success hipError_t. First call for
+// a given (N, K, M-tier) JIT-compiles via Triton (cached to
+// ${AITER_CACHE_DIR}/<key>/); subsequent calls reuse the cached handle.
+hipError_t mt_fp8_b128_gemm_generic(hipStream_t stream, const struct mt_fp8_b128_gemm_generic_args_t *args);
+
+// Reset the cached kernel handle (tests only; not thread-safe with
+// concurrent mt_fp8_b128_gemm_generic calls).
+void mt_fp8_b128_gemm_generic_reset_cache(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

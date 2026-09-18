@@ -652,7 +652,7 @@ extern "C" {
         //   dst    = y (GGML_TYPE_F32, [K, n_rows, ...])
         GGML_OP_ML8_GET_ROWS,
 
-        // FP8_B128 phase 2 — fused activation rotate + block-128 fp8 quantize.
+        // FP8_B128 phase 2 — fused activation rotate + block-G fp8 quantize.
         // Computed ONCE per input tensor and shared by all GEMMs of the input
         // group (rotation is per input-group, not per weight).
         //   src[0] = x   (GGML_TYPE_F32, [K, n1, n2, n3]; rows contiguous, nb[1]==K*4)
@@ -662,21 +662,50 @@ extern "C" {
         //   op_params[2] = kind  (int32: 0 = no rotation, 1 = kronecker
         //                  (h_a required, K == a_dim*b_dim), 2 = block_hadamard
         //                  (h_a NULL, K % b_dim == 0))
-        //   dst = y (GGML_TYPE_I8, [K + K/32, n1, n2, n3]). Row m layout (bytes):
-        //     [0, K)       = e4m3 of rotated x[m], quantized per 128-wide K group
-        //     [K, K+K/32)  = K/128 fp32 scales (4-byte aligned; K%128==0),
-        //                    scale g = absmax(group g)/448, eps-clamped (>=1e-12)
-        //   Rotation math is bit-identical to GGML_OP_ML8_APPLY_ROTATION (FWHT
-        //   with 1/sqrt(b) normalize; kronecker H_a^T left multiply).
-        //   Constraint: K % 128 == 0.
+        //   op_params[3] = G (int32: activation scale-group width: 32 or 128
+        //                  (grouped), or 0 = PER-ROW (one scale per row, the
+        //                  RDNA4 gfx1201 GEMM kernel's contract). G must be
+        //                  passed explicitly now -- 0 no longer aliases 128;
+        //                  every existing 32/128 caller/test is unaffected
+        //                  since they already pass that value explicitly.)
+        //
+        //   Grouped (G == 32 or 128):
+        //     dst = y (GGML_TYPE_I8, [K + 4*K/G, n1, n2, n3]). Row m layout
+        //     (bytes), each row CONTIGUOUS at row stride K + 4*K/G:
+        //       [0, K)         = e4m3 of rotated x[m], quantized per G-wide K group
+        //       [K, K+4*K/G)   = K/G fp32 scales (4-byte aligned; K%G==0),
+        //                        scale g = absmax(group g)/448, eps-clamped (>=1e-12)
+        //     Constraint: K % G == 0.
+        //
+        //   Per-row (G == 0):
+        //     dst = y (GGML_TYPE_I8, [K + 4, n1, n2, n3]) sized to match
+        //     (K+4)*M_total bytes (M_total = n1*n2*n3), but the BYTE LAYOUT is
+        //     NOT the row-contiguous [K bytes][scale] pattern above -- it
+        //     matches the frozen gfx1201 GEMM kernel's fixed contract (A fp8
+        //     [M,K] contiguous with row stride exactly K, a_scale fp32 [M]):
+        //       all A rows first: e4m3 A[m][k] at byte m*K + k, for flattened
+        //         row index m over M_total = n1*n2*n3, k in [0, K)
+        //       then all scales: fp32 a_scale[m] at byte M_total*K + 4*m
+        //     scale m = absmax(row m)/448, eps-clamped (>=1e-12) -- same
+        //     e4m3 codec/eps as the grouped modes, just one scale per whole
+        //     row instead of per G-wide group. No K%G constraint (any K).
+        //   Rotation math (kinds 1/2) is unchanged by G and is bit-identical
+        //   to GGML_OP_ML8_APPLY_ROTATION (FWHT with 1/sqrt(b) normalize;
+        //   kronecker H_a^T left multiply); the packing described above is
+        //   applied to the rotated row.
         GGML_OP_FP8_QUANT_ROT,
-        // FP8_B128 phase 2 — block-128 fp8 weight x packed-fp8 activation matmul.
-        //   src[0] = w (GGML_TYPE_FP8_B128, [K, N])
-        //   src[1] = a (GGML_TYPE_I8, [K + K/32, n1, n2, n3]) — produced by
-        //            GGML_OP_FP8_QUANT_ROT
+        // FP8_B128 phase 2 — block-fp8 weight x packed-fp8 activation matmul.
+        //   src[0] = w (GGML_TYPE_FP8_B128 [K, N], G=128, 130-byte blocks, or
+        //            GGML_TYPE_ML8_FP8 [K, N], G=32, 34-byte blocks)
+        //   src[1] = a (GGML_TYPE_I8, [K + 4*K/G, n1, n2, n3] grouped, or
+        //            [K + 4, n1, n2, n3] per-row) — produced by
+        //            GGML_OP_FP8_QUANT_ROT with the SAME G as src[0]'s type
+        //            implies, OR with G == 0 (per-row; a's row width is then
+        //            K + 4 regardless of src[0]'s implied G, and the weight
+        //            side still dequantizes per its own native block size)
         //   dst    = y (GGML_TYPE_F32, [N, n1, n2, n3])
-        //   out[m,n] = sum_g ( a_scale[m,g] * w_scale[n/128,g] *
-        //              sum_{k in g} a_q[m,k] * w_q[n,k] ), g = 128-wide K
+        //   out[m,n] = sum_g ( a_scale[m,g] * w_scale[n/G,g] *
+        //              sum_{k in g} a_q[m,k] * w_q[n,k] ), g = G-wide K
         //   groups, fp32 accumulate.
         //   supports_op on CUDA: only when w is 2D, K%128==0, N%16==0, device
         //   is RDNA4 (gfx1201) with GGML_HIP_AITER; else CPU handles it

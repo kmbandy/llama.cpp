@@ -83,6 +83,27 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+# MAD-305 Phase 5: hand-written gfx1201 WMMA "trfeed" block-scale GEMM for
+# GGML_TYPE_ML8_FP8 (rdna4_fp8_gemm/RESULT.md). Not picked up by the *.cu glob
+# above (lives under aiter-integration/rdna4_fp8_gemm/ with a .hip extension,
+# matching this repo's convention for the other hand-written kernels in that
+# dir). Compiled unconditionally -- it has no Triton/AITER dependency of its
+# own (only ml8.cu's USE of the GEMM dispatch is gated on GGML_HIP_AITER, to
+# match the existing FP8_B128 dispatch shape); its production kernel body is
+# internally guarded with `#if defined(__gfx1201__)` so other offload-arch
+# device-code passes in the same fat binary (e.g. gfx1030) compile it down to
+# an inert stub instead of failing on an unknown gfx12 matrix-core intrinsic.
+list(APPEND GGML_SOURCES_ROCM
+    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_blockscale.hip)
+# MAD-305 Phase 5 (round 3): production entry point for the FROZEN Phase-1
+# "trfeed" kernel (rdna4_gemm_fp8_trfeed, gemm_capi.h) -- the kernel GGML_OP_
+# FP8_MUL_MAT's HIP dispatch (ml8.cu) now uses by default; gemm_blockscale.hip
+# above stays in the build (its rdna4_[un]preshuffle_b_ml8fp8 byte-shuffle
+# helpers are still reused here) but its two in-loop-scale-fold GEMM kernels
+# are no longer called from ml8.cu's default dispatch (abandoned, RESULT.md
+# Phase 2/gemm_capi.h). Same gfx1201-only / other-arch-stub guard convention.
+list(APPEND GGML_SOURCES_ROCM
+    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_trfeed_prod.hip)
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 # dkq640 tile kernels exceed HIP local memory limit (67584 > 65536) at ncols=32
 list(FILTER SRCS EXCLUDE REGEX "dkq640")

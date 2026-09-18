@@ -12583,12 +12583,21 @@ void ggml_compute_forward_ml8_mul_mat_id(const ggml_compute_params * params, ggm
 // ml8_rotate_row_cpu/ml8_build_sylvester_cpu helpers above) + block-128 e4m3
 // quantize into the packed I8 row layout described in ggml.h.
 //
-// op_params: int32_t[0]=a_dim, [1]=b_dim, [2]=kind
+// op_params: int32_t[0]=a_dim, [1]=b_dim, [2]=kind, [3]=G
 //   kind 0 = no rotation (copy); 1 = kronecker (h_a required, K==a_dim*b_dim);
 //   2 = block_hadamard (h_a NULL, K==a_dim*b_dim, i.e. a_dim = K/b_dim).
 // src[0]=x F32 [K, n1, n2, n3] (rows contiguous); src[1]=h_a F32 [a,a] or NULL.
-// dst=y I8 [K + K/32, n1, n2, n3]. Row layout: [0,K) e4m3 bytes (128-wide
-// groups), [K, K+K/32) K/128 fp32 scales (4-byte aligned since K%128==0).
+//
+// G == 32 or 128 (grouped): dst=y I8 [K + 4*K/G, n1, n2, n3], each row
+// CONTIGUOUS at stride K+4*K/G. Row layout: [0,K) e4m3 bytes (G-wide groups),
+// [K, K+4*K/G) K/G fp32 scales (4-byte aligned since K%G==0).
+//
+// G == 0 (per-row): dst=y I8 [K + 4, n1, n2, n3], but NOT row-contiguous --
+// see the GGML_OP_FP8_QUANT_ROT doc comment in ggml.h. Byte layout of the
+// whole (K+4)*M_total-byte buffer (M_total = n1*n2*n3): all M_total*K bytes
+// of e4m3 A data first (A[m][k] at byte m*K+k), then M_total*4 bytes of fp32
+// a_scale (a_scale[m] at byte M_total*K + 4*m) -- the frozen gfx1201 GEMM
+// kernel's fixed contract (A fp8 [M,K] row stride exactly K, a_scale fp32 [M]).
 void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * x   = dst->src[0];
     const ggml_tensor * h_a = dst->src[1];
@@ -12601,10 +12610,18 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
     const int64_t   a_dim = (int64_t) pp[0];
     const int64_t   b_dim = (int64_t) pp[1];
     const int32_t   kind  = pp[2];
+    const int32_t   G     = pp[3];
+    GGML_ASSERT(G == 0 || G == 32 || G == 128);
+    const bool per_row = (G == 0);
 
     const int64_t K = x->ne[0];
-    GGML_ASSERT(K % 128 == 0);
-    const int64_t n_groups = K / 128;
+    int64_t n_groups;
+    if (per_row) {
+        n_groups = 1;
+    } else {
+        GGML_ASSERT(K % G == 0);
+        n_groups = K / G;
+    }
 
     const float * h_a_data = NULL;
     if (kind == 1) {
@@ -12626,6 +12643,15 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
     const int64_t n_rows = x->ne[1] * x->ne[2] * x->ne[3];
     const float * x_data = (const float *) x->data;
     int8_t      * y_data = (int8_t *) dst->data;
+
+    // Per-row (G==0): the whole row is one "group" of width K (instead of
+    // G-wide groups), and the packed output is NOT row-contiguous -- see the
+    // ggml.h doc comment. qs_base/scales_base below point at the start of
+    // each of the two flat regions; per-row addressing is done explicitly
+    // per r instead of via a fixed row_out_i8 stride.
+    const int64_t   group_width = per_row ? K : G;
+    uint8_t * const qs_base     = per_row ? (uint8_t *) y_data : NULL;
+    float   * const scales_base = per_row ? (float *) (y_data + n_rows * K) : NULL;
 
     float * h_b  = NULL;
     float * xp   = NULL;
@@ -12656,11 +12682,17 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
     const int64_t r_start    = (int64_t) params->ith * per_thread;
     const int64_t r_end      = (r_start + per_thread < n_rows) ? (r_start + per_thread) : n_rows;
 
-    float scaled[128];
+    float * scaled = (float *) malloc((size_t) group_width * sizeof(float));
+    if (!scaled) {
+        free(yrot);
+        free(xp);
+        free(h_b);
+        GGML_ABORT("ggml_compute_forward_fp8_quant_rot: malloc scaled(%zu) failed",
+                   (size_t) group_width * sizeof(float));
+    }
 
     for (int64_t r = r_start; r < r_end; r++) {
         const float * xt = x_data + r * K;
-        int8_t      * yt = y_data + r * row_out_i8;
 
         const float * rotated = xt;
         if (kind != 0) {
@@ -12668,13 +12700,25 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
             rotated = yrot;
         }
 
-        uint8_t * qs     = (uint8_t *) yt;
-        float   * scales = (float *) (yt + K);
+        // Per-row: qs for row r lives at qs_base + r*K (flat, all rows
+        // packed back-to-back); its one scale lives at scales_base[r] (after
+        // ALL rows' A data). Grouped: qs/scales are the row's own contiguous
+        // [K bytes][n_groups*4 bytes] slice, as before.
+        uint8_t * qs;
+        float   * scales;
+        if (per_row) {
+            qs     = qs_base + r * K;
+            scales = scales_base + r;
+        } else {
+            int8_t * yt = y_data + r * row_out_i8;
+            qs     = (uint8_t *) yt;
+            scales = (float *) (yt + K);
+        }
 
         for (int64_t g = 0; g < n_groups; g++) {
-            const float * grp = rotated + g * 128;
+            const float * grp = rotated + g * group_width;
             float amax = 0.0f;
-            for (int i = 0; i < 128; i++) {
+            for (int i = 0; i < group_width; i++) {
                 const float av = fabsf(grp[i]);
                 if (av > amax) amax = av;
             }
@@ -12684,13 +12728,14 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
             }
             scales[g] = scale;
             const float inv_scale = 1.0f / scale;
-            for (int i = 0; i < 128; i++) {
+            for (int i = 0; i < group_width; i++) {
                 scaled[i] = grp[i] * inv_scale;
             }
-            quantize_row_f8_e4m3_ref(scaled, qs + g * 128, 128);
+            quantize_row_f8_e4m3_ref(scaled, qs + g * group_width, group_width);
         }
     }
 
+    free(scaled);
     free(yrot);
     free(xp);
     free(h_b);
@@ -12704,31 +12749,66 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
 // activation's own group scale, accumulating in fp32.
 //
 //   dst->src[0] = w (GGML_TYPE_FP8_B128, [K, N])
-//   dst->src[1] = a (GGML_TYPE_I8,       [K + K/32, n1, n2, n3])
+//   dst->src[1] = a (GGML_TYPE_I8,       [K + K/32, n1, n2, n3] grouped, or
+//                                        [K + 4, n1, n2, n3] per-row)
 //   dst         = y (GGML_TYPE_F32,      [N, n1, n2, n3])
+//
+// Per-row activation (a produced with G=0): a is NOT row-contiguous -- its
+// buffer holds all rows' K e4m3 bytes first (row r at byte r*K), then all
+// rows' fp32 scales (row r's scale at byte n_rows*K + 4*r); see the
+// GGML_OP_FP8_QUANT_ROT doc comment in ggml.h. The weight side dequantizes
+// exactly as in the grouped case regardless.
 void ggml_compute_forward_fp8_mul_mat(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * a = dst->src[1];
     GGML_ASSERT(w && a);
-    GGML_ASSERT(w->type   == GGML_TYPE_FP8_B128);
+    GGML_ASSERT(w->type == GGML_TYPE_FP8_B128 || w->type == GGML_TYPE_ML8_FP8);
     GGML_ASSERT(a->type   == GGML_TYPE_I8);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
+    const bool is_ml8 = (w->type == GGML_TYPE_ML8_FP8);
+    const int64_t G = is_ml8 ? 32 : 128;
+
     const int64_t K = w->ne[0];
     const int64_t N = w->ne[1];
-    GGML_ASSERT(K % 128 == 0);
-    const int64_t n_groups = K / 128;
-    GGML_ASSERT(a->ne[0] == K + n_groups * (int64_t) sizeof(float));
+    GGML_ASSERT(K % G == 0);
+    const int64_t n_groups = K / G;
+
+    // a_per_row: prefer the producing FP8_QUANT_ROT node's own G (op_params[3]
+    // == 0 means per-row); fall back to a shape heuristic if `a` was not
+    // built by that op (matches ggml_fp8_mul_mat's constructor-time check).
+    bool a_per_row;
+    if (a->op == GGML_OP_FP8_QUANT_ROT) {
+        const int32_t * ap = (const int32_t *) a->op_params;
+        a_per_row = (ap[3] == 0);
+    } else {
+        a_per_row = (a->ne[0] == K + 4);
+    }
+    if (a_per_row) {
+        GGML_ASSERT(a->ne[0] == K + 4);
+    } else {
+        GGML_ASSERT(a->ne[0] == K + n_groups * (int64_t) sizeof(float));
+    }
     GGML_ASSERT(dst->ne[0] == N);
     GGML_ASSERT(dst->ne[1] == a->ne[1] && dst->ne[2] == a->ne[2] && dst->ne[3] == a->ne[3]);
 
     const int64_t n_rows = a->ne[1] * a->ne[2] * a->ne[3];
 
-    const block_fp8_b128 * w_blocks = (const block_fp8_b128 *) w->data;
+    // Per-row: one "group" spanning the whole row (width K); grouped: G-wide.
+    const int64_t a_group_width = a_per_row ? K : G;
+    const int64_t a_n_groups    = a_per_row ? 1   : n_groups;
+
+    const block_fp8_b128 * w_blocks     = is_ml8 ? NULL : (const block_fp8_b128 *) w->data;
+    const block_ml8_fp8  * w_blocks_ml8 = is_ml8 ? (const block_ml8_fp8  *) w->data : NULL;
     const int8_t          * a_data  = (const int8_t *) a->data;
     float                  * y_data = (float *) dst->data;
 
     const int64_t a_row_i8 = a->ne[0];
+
+    // Per-row flat layout base pointers (see doc comment above); unused when
+    // !a_per_row.
+    const uint8_t * const a_qs_base    = (const uint8_t *) a_data;
+    const float    * const a_scale_base = (const float *) (a_data + n_rows * K);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12742,23 +12822,38 @@ void ggml_compute_forward_fp8_mul_mat(const ggml_compute_params * params, ggml_t
     if (!w_dec) {
         GGML_ABORT("ggml_compute_forward_fp8_mul_mat: malloc(%zu) failed", (size_t) K * sizeof(float));
     }
-    float a_dec[128];
+    float * a_dec = (float *) malloc((size_t) a_group_width * sizeof(float));
+    if (!a_dec) {
+        free(w_dec);
+        GGML_ABORT("ggml_compute_forward_fp8_mul_mat: malloc a_dec(%zu) failed",
+                   (size_t) a_group_width * sizeof(float));
+    }
 
     for (int64_t n = n_start; n < n_end; n++) {
-        const block_fp8_b128 * w_row = w_blocks + (size_t) n * n_groups;
-        dequantize_row_fp8_b128(w_row, w_dec, K);
+        if (is_ml8) {
+            dequantize_row_ml8_fp8(w_blocks_ml8 + (size_t) n * n_groups, w_dec, K);
+        } else {
+            dequantize_row_fp8_b128(w_blocks + (size_t) n * n_groups, w_dec, K);
+        }
 
         for (int64_t r = 0; r < n_rows; r++) {
-            const int8_t  * a_row    = a_data + (size_t) r * a_row_i8;
-            const uint8_t * a_qs     = (const uint8_t *) a_row;
-            const float    * a_scale = (const float *) (a_row + K);
+            const uint8_t * a_qs;
+            const float    * a_scale;
+            if (a_per_row) {
+                a_qs    = a_qs_base + (size_t) r * K;
+                a_scale = a_scale_base + r;
+            } else {
+                const int8_t * a_row = a_data + (size_t) r * a_row_i8;
+                a_qs    = (const uint8_t *) a_row;
+                a_scale = (const float *) (a_row + K);
+            }
 
             float sum = 0.0f;
-            for (int64_t g = 0; g < n_groups; g++) {
-                dequantize_row_f8_e4m3(a_qs + g * 128, a_dec, 128);
-                const float * wgrp = w_dec + g * 128;
+            for (int64_t g = 0; g < a_n_groups; g++) {
+                dequantize_row_f8_e4m3(a_qs + g * a_group_width, a_dec, a_group_width);
+                const float * wgrp = w_dec + g * a_group_width;
                 float gsum = 0.0f;
-                for (int i = 0; i < 128; i++) {
+                for (int64_t i = 0; i < a_group_width; i++) {
                     gsum += wgrp[i] * a_dec[i];
                 }
                 sum += gsum * a_scale[g];
@@ -12767,6 +12862,7 @@ void ggml_compute_forward_fp8_mul_mat(const ggml_compute_params * params, ggml_t
         }
     }
 
+    free(a_dec);
     free(w_dec);
 }
 

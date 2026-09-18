@@ -15,7 +15,7 @@ ported onto the gfx12 WMMA path. Each phase gated on the fp8 e4m3 oracle.
 | 2 | async double-buffer + 7 adjacent levers | 140 (no gain) | 46% | 0.98× | PASS — **wall = WMMA-issue-rate** |
 | 3 | dyn-VGPR / WMMA-per-cycle (in progress) | _open_ | | | — |
 | 4 | ml8 4-bit LUT front-end | _pending_ | | | |
-| 5 | production integration + PPL-neutral | _pending_ | | | |
+| 5 | production integration (GGML_TYPE_ML8_FP8 × GGML_OP_FP8_MUL_MAT) | done (perf TBD) | | | PASS (bench oracle) |
 
 **rocprof ground truth (GRBM cycles, timer-independent):** `wmma_peak` ceiling = **15.9 WMMA/cycle**
 (307 TF); the wide-feed GEMM = **7.35 WMMA/cycle** (142 TF) = **46% of the matrix unit's issue rate**.
@@ -110,3 +110,23 @@ cd spike/dvgpr_occ && ./build.sh
 timeout 60  ./occ_dispatch --timercheck   # REALTIME = 100 MHz (PM4 numbers are real)
 timeout 260 ./occ_dispatch --combined     # unroll×ILP×feed×dyn; NACC=8→64TF, NACC=16→127TF (codegen-limited)
 ```
+
+## Phase 5 — production integration: GGML_TYPE_ML8_FP8 × GGML_OP_FP8_MUL_MAT
+
+Wires the Phase-1 trfeed kernel design into ggml: `gemm_blockscale.hip` adds
+`rdna4_gemm_ml8fp8_blockscale` (BM=128/BN=128/BK=32, BK==the G=32 scale group
+so the per-K-tile WMMA accumulator IS the per-group partial — no group ever
+spans a tile boundary) plus a device-side `rdna4_preshuffle_b_ml8fp8` /
+`rdna4_unshuffle_b_ml8fp8` pair for the load-time weight repack, both gfx1201-
+gated internally (`#if defined(__gfx1201__)`) so the fat binary's other
+offload-arch passes compile a build-safety stub instead of failing to lower
+the gfx12-only intrinsics. `ml8.cu` gained a second ML8_FP8 packed layout
+(`MT_ML8_FP8_GEMM=rdna4`, default, alongside the original `triton` [K,N]
+transpose) selected once at load time and recorded per-tensor, mirroring how
+FP8_B128's GENERIC/PRESHUFFLE pair is handled — get_tensor/cpy_tensor/
+GET_ROWS all invert whichever layout a weight was actually packed in.
+`GGML_OP_FP8_MUL_MAT` on an `ML8_FP8` weight now dispatches straight to this
+kernel; `supports_op` already gated this (RDNA4 + `GGML_HIP_AITER`, K%32==0,
+N%16==0). Bench: `bench/gemm_ml8fp8_blockscale_bench.hip` (oracle-gated,
+shape-parameterised M/N/K/iters). TFLOPS at production shapes not yet
+measured on hardware — see the top-level report for exact commands.

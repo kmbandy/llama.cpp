@@ -40,6 +40,13 @@ rotation per input group (role_group_key/_group_seed): weights that consume
 the same activation (e.g. attn_qkv+attn_gate, ffn_gate+ffn_up) get the
 identical h_a. --format ml8_fp8 (the default) is unaffected and remains
 byte-identical to this script's behaviour before --format existed.
+
+--scale-mode {tile,channel} (--format fp8_b128 only, default tile = today's
+behaviour): "channel" replaces the per-128x128-tile fp16 scale with a single
+per-output-row fp16 scale (row absmax over all K / 448), replicated into
+every block_fp8_b128 of that row — the on-disk layout is unchanged, and the
+tile invariant (every block in a tile shares one scale) holds trivially
+since it's now shared row-wide. See _quantize_fp8_b128_gpu.
 """
 from __future__ import annotations
 
@@ -324,10 +331,14 @@ def _row_chunk_bounds(N: int, chunk_rows: int) -> list[tuple[int, int]]:
 
 
 def _process_rotate_chunked(tensor, e: dict, device: torch.device, rotation,
-                            chunk_rows: int = _CHUNK_ROWS, fmt: str = "ml8_fp8") -> np.ndarray:
-    """Rotate + quantize (ML8_FP8 scaled-fp8 or FP8_B128 tile-scaled fp8,
-    per `fmt`) one GEMM weight, one row-chunk of the GPU at a time. Returns
-    the fully assembled packed bytes (CPU numpy).
+                            chunk_rows: int = _CHUNK_ROWS, fmt: str = "ml8_fp8",
+                            scale_mode: str = "tile") -> np.ndarray:
+    """Rotate + quantize (ML8_FP8 scaled-fp8 or FP8_B128 tile/channel-scaled
+    fp8, per `fmt`/`scale_mode`) one GEMM weight, one row-chunk of the GPU at
+    a time. Returns the fully assembled packed bytes (CPU numpy). `scale_mode`
+    is only consulted for fmt="fp8_b128" ("tile" = one fp16 scale per aligned
+    128x128 tile, "channel" = one fp16 scale per output row, replicated into
+    every block of that row — see _quantize_fp8_b128_gpu).
 
     For fmt="fp8_b128", chunk_rows must be a multiple of 128: a tile's scale
     spans all 128 rows of a row-tile, so a chunk boundary must never split a
@@ -336,7 +347,9 @@ def _process_rotate_chunked(tensor, e: dict, device: torch.device, rotation,
     every _row_chunk_bounds chunk (including the last) is itself a multiple
     of 128 rows — the remainder of two multiples of 128 is a multiple of 128,
     so the "merge lone trailing row" special case in _row_chunk_bounds can
-    never fire in this mode."""
+    never fire in this mode. (channel mode's per-row scale doesn't strictly
+    need this — a row's scale never spans a chunk boundary — but the same
+    128-aligned chunking is kept for both scale modes for uniformity.)"""
     K, N = e["shape"]
     group_size, block_bytes, _raw_dtype = _rotate_dtype_params(fmt)
     if fmt == "fp8_b128" and chunk_rows % 128 != 0:
@@ -346,7 +359,7 @@ def _process_rotate_chunked(tensor, e: dict, device: torch.device, rotation,
     for start, end in _row_chunk_bounds(N, chunk_rows):
         w = _bf16_rows_to_fp32_gpu(tensor, device, start, end)
         if fmt == "fp8_b128":
-            out[start:end] = _rotate_and_fp8_b128(w, rotation)
+            out[start:end] = _rotate_and_fp8_b128(w, rotation, scale_mode=scale_mode)
         else:
             out[start:end] = _rotate_and_fp8(w, rotation)
         del w
@@ -525,32 +538,57 @@ def _rotate_and_fp8(w: torch.Tensor, rotation, group_size: int = _FP8_GROUP_SIZE
     return pack_scaled_fp8_blocks(q["e4m3"], q["scale"])
 
 
-def _quantize_fp8_b128_gpu(w: torch.Tensor) -> np.ndarray:
-    """Quantize w [N, K] (N, K both %128==0) into packed FP8_B128 bytes:
-    one fp16 scale per aligned 128x128 tile (tile_absmax/448), replicated
-    into every row's block for that tile, e4m3 = torch.float8_e4m3fn
-    round-to-nearest of v/scale clamped to +-448. Returns [N, (K/128)*130]
-    uint8, matching gguf.GGML_QUANT_SIZES[FP8_B128] byte layout (fp16 d then
-    128 e4m3 bytes per block). Stays entirely on `w`'s device except for the
-    final .cpu() — only the packed bytes reach the host, same discipline as
-    _quantize_q8_0_gpu."""
+def _quantize_fp8_b128_gpu(w: torch.Tensor, scale_mode: str = "tile") -> np.ndarray:
+    """Quantize w [N, K] (N, K both %128==0) into packed FP8_B128 bytes,
+    e4m3 = torch.float8_e4m3fn round-to-nearest of v/scale clamped to +-448.
+    Returns [N, (K/128)*130] uint8, matching gguf.GGML_QUANT_SIZES[FP8_B128]
+    byte layout (fp16 d then 128 e4m3 bytes per block). Stays entirely on
+    `w`'s device except for the final .cpu() — only the packed bytes reach
+    the host, same discipline as _quantize_q8_0_gpu.
+
+    scale_mode="tile" (default): one fp16 scale per aligned 128x128 tile
+    (tile_absmax/448), replicated into every row's block for that tile.
+
+    scale_mode="channel": one fp16 scale per output ROW n (row_absmax over
+    all K / 448), replicated into EVERY block of that row (so every block in
+    a row shares the identical stored `d` — the 128x128 tile invariant, that
+    every block within a tile shares one scale, holds trivially since it's
+    now shared row-wide). Still requires N%128==0/K%128==0 like tile mode —
+    channel mode reuses the same on-disk block_fp8_b128 layout and the same
+    classify_tensor 128-alignment fallback rule, it just computes the scale
+    per row instead of per tile.
+
+    Either way, degenerate (all-zero) rows/tiles get the tiny positive
+    _FP8B128_EPS floor rather than a zero scale."""
     N, K = w.shape
     if N % _FP8B128_TILE != 0 or K % _FP8B128_TILE != 0:
         raise ValueError(f"fp8_b128 requires N%128==0 and K%128==0, got N={N} K={K}")
     n_row_tiles = N // _FP8B128_TILE
     n_col_blocks = K // _FP8B128_TILE
-    wt = w.reshape(n_row_tiles, _FP8B128_TILE, n_col_blocks, _FP8B128_TILE)
 
-    tile_absmax = wt.abs().amax(dim=(1, 3))                       # [row_tiles, col_blocks]
-    scale_fp32 = (tile_absmax / _FP8B128_MAX).clamp_min(_FP8B128_EPS)
-    scale_fp16 = scale_fp32.to(torch.float16)                     # the value actually stored
-    # Quantize with the *fp16-rounded* scale (not the fp32 pre-round value) so
-    # decode(qs) * stored_scale reproduces v up to e4m3 rounding only.
-    scale_bcast = scale_fp16.to(torch.float32).reshape(n_row_tiles, 1, n_col_blocks, 1)
-    v = (wt / scale_bcast).clamp(-_FP8B128_MAX, _FP8B128_MAX)
-    e4m3 = v.to(torch.float8_e4m3fn).reshape(N, n_col_blocks, _FP8B128_TILE)
+    if scale_mode == "channel":
+        row_absmax = w.abs().amax(dim=1, keepdim=True)            # [N, 1]
+        scale_fp32 = (row_absmax / _FP8B128_MAX).clamp_min(_FP8B128_EPS)
+        scale_fp16 = scale_fp32.to(torch.float16)                 # the value actually stored
+        # Quantize with the *fp16-rounded* scale (not the fp32 pre-round
+        # value) so decode(qs) * stored_scale reproduces v up to e4m3
+        # rounding only — same discipline as tile mode.
+        scale_bcast = scale_fp16.to(torch.float32)                # [N, 1]
+        v = (w / scale_bcast).clamp(-_FP8B128_MAX, _FP8B128_MAX)
+        e4m3 = v.to(torch.float8_e4m3fn).reshape(N, n_col_blocks, _FP8B128_TILE)
+        scale_per_row = scale_fp16.repeat(1, n_col_blocks)        # [N, col_blocks] — same d in every block of the row
+    elif scale_mode == "tile":
+        wt = w.reshape(n_row_tiles, _FP8B128_TILE, n_col_blocks, _FP8B128_TILE)
+        tile_absmax = wt.abs().amax(dim=(1, 3))                       # [row_tiles, col_blocks]
+        scale_fp32 = (tile_absmax / _FP8B128_MAX).clamp_min(_FP8B128_EPS)
+        scale_fp16 = scale_fp32.to(torch.float16)                     # the value actually stored
+        scale_bcast = scale_fp16.to(torch.float32).reshape(n_row_tiles, 1, n_col_blocks, 1)
+        v = (wt / scale_bcast).clamp(-_FP8B128_MAX, _FP8B128_MAX)
+        e4m3 = v.to(torch.float8_e4m3fn).reshape(N, n_col_blocks, _FP8B128_TILE)
+        scale_per_row = scale_fp16.repeat_interleave(_FP8B128_TILE, dim=0)  # [N, col_blocks]
+    else:
+        raise ValueError(f"scale_mode must be 'tile' or 'channel', got {scale_mode!r}")
 
-    scale_per_row = scale_fp16.repeat_interleave(_FP8B128_TILE, dim=0)  # [N, col_blocks]
     scale_bytes = scale_per_row.contiguous().cpu().numpy().view(np.uint8).reshape(
         N, n_col_blocks, 2)
     qs_bytes = e4m3.contiguous().cpu().view(torch.uint8).numpy().reshape(
@@ -559,10 +597,10 @@ def _quantize_fp8_b128_gpu(w: torch.Tensor) -> np.ndarray:
         N, n_col_blocks * _FP8B128_BLOCK_BYTES)
 
 
-def _rotate_and_fp8_b128(w: torch.Tensor, rotation) -> np.ndarray:
+def _rotate_and_fp8_b128(w: torch.Tensor, rotation, scale_mode: str = "tile") -> np.ndarray:
     """Apply `rotation.forward` along K (last dim), quantize to FP8_B128."""
     w_rot = rotation.forward(w)
-    return _quantize_fp8_b128_gpu(w_rot)
+    return _quantize_fp8_b128_gpu(w_rot, scale_mode=scale_mode)
 
 
 def _round_away_from_zero(x: torch.Tensor) -> torch.Tensor:
@@ -743,7 +781,8 @@ def print_plan(plan: list[dict]) -> None:
 
 def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
            local_b: int, max_b: int, chunk_rows: int = _CHUNK_ROWS,
-           format: str = "ml8_fp8", ml8_fit_rows: int = _ML8_FIT_ROWS_DEFAULT) -> dict:
+           format: str = "ml8_fp8", ml8_fit_rows: int = _ML8_FIT_ROWS_DEFAULT,
+           scale_mode: str = "tile") -> dict:
     reader = gguf.GGUFReader(src)
     arch = reader.fields["general.architecture"].contents()
     print(f"[base] {src}  arch={arch!r}  fields={len(reader.fields)}  tensors={len(reader.tensors)}")
@@ -829,7 +868,8 @@ def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
                 writer.write_tensor_data(packed)
                 writer.write_tensor_data(centroids_bytes)
             else:
-                packed = _process_rotate_chunked(tensor, e, device, rot, chunk_rows=chunk_rows, fmt=format)
+                packed = _process_rotate_chunked(tensor, e, device, rot, chunk_rows=chunk_rows,
+                                                 fmt=format, scale_mode=scale_mode)
                 writer.write_tensor_data(packed)
             meta = np.array([e["a"], e["b"], K, KRONECKER_ORTH_SYLVESTER_KIND_ID], dtype=np.int32)
             writer.write_tensor_data(h_a.detach().cpu().contiguous().numpy())
@@ -847,7 +887,8 @@ def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
                 writer.write_tensor_data(packed)
                 writer.write_tensor_data(centroids_bytes)
             else:
-                packed = _process_rotate_chunked(tensor, e, device, rot, chunk_rows=chunk_rows, fmt=format)
+                packed = _process_rotate_chunked(tensor, e, device, rot, chunk_rows=chunk_rows,
+                                                 fmt=format, scale_mode=scale_mode)
                 writer.write_tensor_data(packed)
             meta = np.array([e["a"], e["b"], K, BLOCK_HADAMARD_KIND_ID], dtype=np.int32)
             writer.write_tensor_data(meta)
@@ -919,6 +960,15 @@ def main() -> None:
                         "(no calibration data); K not a multiple of 64 falls "
                         "back to unrotated Q8_0; same input-group rotation "
                         "sharing as fp8_b128.")
+    p.add_argument("--scale-mode", type=str, default="tile",
+                   choices=["tile", "channel"],
+                   help="--format fp8_b128 only: how the per-block fp16 scale "
+                        "is computed (default tile, today's behaviour: one "
+                        "scale per aligned 128x128 tile). channel: one fp16 "
+                        "scale per output row (row absmax over all K / 448), "
+                        "replicated into every block of that row — same "
+                        "on-disk block_fp8_b128 layout, just row-wide instead "
+                        "of tile-wide scaling. Ignored for --format ml8_fp8/ml8_4.")
     p.add_argument("--ml8-fit-rows", type=int, default=_ML8_FIT_ROWS_DEFAULT,
                    help="--format ml8_4 only: number of rows to uniformly "
                         f"subsample per weight for the Lloyd-Max centroid fit "
@@ -935,7 +985,8 @@ def main() -> None:
         return
 
     convert(args.src, args.out, args.rotation_seed, args.device, args.local_b, args.max_b,
-           chunk_rows=args.chunk_rows, format=args.format, ml8_fit_rows=args.ml8_fit_rows)
+           chunk_rows=args.chunk_rows, format=args.format, ml8_fit_rows=args.ml8_fit_rows,
+           scale_mode=args.scale_mode)
 
 
 if __name__ == "__main__":

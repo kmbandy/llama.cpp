@@ -98,15 +98,21 @@ private:
 // member there resets itself automatically. Do not make this map static or
 // hang it off the (long-lived, per-model) ml8_registry — that would leak
 // stale tensor pointers across graph builds.
+// G (the activation scale-group width, 32 for ML8_FP8 weights / 128 for
+// FP8_B128 weights) is part of the key: the two weight formats can in
+// principle share the same raw input tensor `x` (e.g. during an A/B
+// migration) but must never share a quant_rot node across them, since their
+// packed row layouts differ.
 struct fp8_qrot_key {
     const struct ggml_tensor * x   = nullptr; // the raw input tensor (pre-AWQ)
     const struct ggml_tensor * h_a = nullptr; // nullptr for NONE/BLOCK_HADAMARD
     int64_t a_dim = 0;
     int64_t b_dim = 0;
     int32_t kind  = 0;
+    int32_t G     = 128;
 
     bool operator==(const fp8_qrot_key & o) const {
-        return x == o.x && h_a == o.h_a && a_dim == o.a_dim && b_dim == o.b_dim && kind == o.kind;
+        return x == o.x && h_a == o.h_a && a_dim == o.a_dim && b_dim == o.b_dim && kind == o.kind && G == o.G;
     }
 };
 
@@ -117,6 +123,7 @@ struct fp8_qrot_key_hash {
         h = h * 1000003u ^ std::hash<int64_t>()(k.a_dim);
         h = h * 1000003u ^ std::hash<int64_t>()(k.b_dim);
         h = h * 1000003u ^ std::hash<int32_t>()(k.kind);
+        h = h * 1000003u ^ std::hash<int32_t>()(k.G);
         return h;
     }
 };
@@ -135,22 +142,35 @@ using fp8_qrot_memo = std::unordered_map<fp8_qrot_key, struct ggml_tensor *, fp8
 //       x_transformed).
 //   - GGML_TYPE_ML8_4 but sidecars/centroids are absent:
 //       GGML_ASSERT — an ML8_4 weight cannot be dispatched via plain mul_mat.
-//   - GGML_TYPE_ML8_FP8:
-//       Apply the same optional AWQ+rotation transform (no centroids — the
-//       FP8 GEMM has no LUT), then return ggml_mul_mat(ctx, weight, x_xf).
-//       Registry miss or a registry entry with no rotation info is a plain
-//       ggml_mul_mat(ctx, weight, x) — byte-identical to before this
-//       transform existed (backend auto-dispatches FP8 off src0->type).
+//   - GGML_TYPE_ML8_FP8 (default, WP_ML8_FP8_LEGACY unset/0):
+//       Same memoized quant_rot + fp8_mul_mat path as FP8_B128 below, but
+//       with G=32 (ML8_FP8's 34-byte, 32-wide-K-group blocks) — i.e. apply
+//       the optional AWQ scale, then build/reuse (via `qrot_memo`, keyed by
+//       fp8_qrot_key on the ORIGINAL `x` with G=32) a single
+//       ggml_fp8_quant_rot(..., G=32) node per input group, and return
+//       ggml_fp8_mul_mat(ctx, weight, qrot). A registry miss uses
+//       GGML_FP8_QUANT_ROT_KIND_NONE, same as FP8_B128.
+//   - GGML_TYPE_ML8_FP8 (WP_ML8_FP8_LEGACY=1, read once via getenv):
+//       The pre-existing behavior, kept for A/B comparison against the
+//       quant_rot path above: apply the optional AWQ+rotation transform via
+//       apply_ml8_input_xform (ggml_ml8_apply_rotation, not quant_rot), then
+//       return ggml_mul_mat(ctx, weight, x_xf). Registry miss or a registry
+//       entry with no rotation info is a plain ggml_mul_mat(ctx, weight, x).
 //   - GGML_TYPE_FP8_B128:
 //       Apply the optional AWQ scale (as today), then build/reuse (via
 //       `qrot_memo`, keyed by fp8_qrot_key on the ORIGINAL `x` — i.e. before
-//       AWQ) a single ggml_fp8_quant_rot node per input group, named
-//       "<weight>.qrot" the first time it's created, and return
+//       AWQ — with G picked by env `MT_FP8_B128_LAYOUT`, read once: "rdna4"
+//       (default) -> G=0, per-row, matching the frozen gfx1201 GEMM kernel's
+//       fixed contract; "generic"/"preshuffle" -> G=128, the historical
+//       grouped layout) a single ggml_fp8_quant_rot node per input group,
+//       named "<weight>.qrot" the first time it's created, and return
 //       ggml_fp8_mul_mat(ctx, weight, qrot). A registry miss (no rotation
 //       sidecars) uses GGML_FP8_QUANT_ROT_KIND_NONE. `qrot_memo == nullptr`
 //       disables sharing (every call builds its own node) — used by the
 //       single-shot output-projection path in llama-context.cpp where there
-//       is only one weight and nothing to share with.
+//       is only one weight and nothing to share with. The memo key includes
+//       G, so switching MT_FP8_B128_LAYOUT never collides quant_rot nodes
+//       across the two layouts.
 //   - Any other type:
 //       return ggml_mul_mat(ctx, weight, x)
 //
