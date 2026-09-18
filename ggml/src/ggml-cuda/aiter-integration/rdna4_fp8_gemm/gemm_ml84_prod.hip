@@ -253,6 +253,176 @@ extern "C" hipError_t rdna4_expand_ml84_to_trfeed(const uint8_t* B_nib, const ui
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// 3b. Dual-source (gate+up) expander (MAD-305 fused FFN task, 2026-09-18;
+// interleave changed to 32-column granularity 2026-09-18 -- see below).
+// See gemm_capi.h's rdna4_expand_ml84_pair_to_trfeed doc for the fused
+// B_shuf column-interleave contract. Implemented as two kernels,
+// structurally identical to ml84_scale_colmax_kernel / ml84_expand_kernel
+// above (same "per-column max, then per-(kt,nt,L) coalesced 4-byte B_nib
+// load, trperm(L,s) fp8 write" shape) with one added piece of address
+// arithmetic: which source (gate or up) and which of that source's OWN
+// [N_half]-wide tiles a given fused column/tile maps to.
+//
+// ROUND 2 (perf bug, 2026-09-18): the FIRST version interleaved at 64-column
+// granularity (tile-local pos<64 = all of gate, pos>=64 = all of up), which
+// put a tile's gate half in one wavefront (wave_n=0) and its up half in
+// ANOTHER (wave_n=1) under the GEMM's WAVES_N=2 split -- the SwiGLU
+// epilogue then needed a __syncthreads() + cross-wave scratch exchange per
+// output tile, measured a 4-5x SLOWDOWN vs the two plain GEMMs it replaced
+// (bench/gemm_trfeed_prod_bench.hip, R9700). Fix: interleave at
+// 32-COLUMN granularity instead, so gate and its MATCHING up channel always
+// land in the SAME wave's two fragments (see trfeed_kernels.h's SwiGLU
+// epilogue comment) -- the GEMM K-loop doesn't change at all, only this
+// column placement rule.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Fused column j (0..N_fused-1) -> (source, source column n_src). Within
+// each 128-fused-column block: pos in [0,32) -> gate channel [0,32); [32,64)
+// -> up channel [0,32) (the SAME channel as the gate slot 32 positions
+// earlier -- paired); [64,96) -> gate channel [32,64); [96,128) -> up
+// channel [32,64). Equivalently: half = pos/64 selects which 32-wide
+// channel-half of the block (and, not coincidentally, which GEMM wave_n
+// owns that tile-local range under WAVES_N=2/BN=128 -- see
+// trfeed_kernels.h), sub = pos%64 < 32 selects gate vs up within that half.
+// NOT tied to the 16-wide tile grid, so this is usable both here
+// (whole-column indexing) and, via the same block/pos split, inside the
+// per-tile expand kernel below.
+__host__ __device__ inline void ml84_pair_col_src(int j, int* is_gate, int* n_src) {
+    const int block = j / 128, pos = j % 128;
+    const int half = pos / 64, sub = pos % 64;
+    *is_gate = sub < 32;
+    const int channel = half * 32 + (*is_gate ? sub : sub - 32);
+    *n_src = block * 64 + channel;
+}
+
+__global__ void ml84_pair_scale_colmax_kernel(
+    const float* __restrict__ gate_scale_g, const uint8_t* __restrict__ gate_lut,
+    const float* __restrict__ up_scale_g,   const uint8_t* __restrict__ up_lut,
+    float* __restrict__ b_scale_out, int N_half, int n_groups_k) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int N_fused = 2 * N_half;
+    if (j >= N_fused) return;
+    int is_gate, n_src;
+    ml84_pair_col_src(j, &is_gate, &n_src);
+    const float*   scale_g = is_gate ? gate_scale_g : up_scale_g;
+    const uint8_t* lut     = is_gate ? gate_lut     : up_lut;
+    float mx = 0.f;
+    for (int g = 0; g < n_groups_k; ++g) {
+        float lut_amax = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            lut_amax = fmaxf(lut_amax, fabsf(ml84_decode_e4m3(lut[(size_t) g * 16 + i])));
+        }
+        mx = fmaxf(mx, scale_g[(size_t) g * (size_t) N_half + (size_t) n_src] * lut_amax);
+    }
+    b_scale_out[j] = fmaxf(mx / 448.0f, 1e-12f);
+}
+
+// One thread per (kt, nt_fused, L) of the FUSED tile grid (NT_fused =
+// N_fused/16), mirroring ml84_expand_kernel's iteration domain exactly.
+// nt_fused's block/pos-within-block split (8 nt-tiles = 128 fused columns
+// per block, matching ml84_pair_col_src's 128-column block) picks the
+// source and that source's own nt (NT_half = N_half/16 -wide tile grid),
+// then re-uses that source's B_nib tile addressing (ml84_tile_nib_base
+// with NT_half, not NT_fused) to load the SAME 4-byte dword the
+// single-source expander/decode kernel would read for that source at that
+// (kt, src_nt, L) -- only the OUTPUT tile offset (b_tile_offset(kt,
+// nt_fused, NT_fused)) is in fused space.
+__global__ void ml84_pair_expand_kernel(
+    const uint8_t* __restrict__ gate_nib, const uint8_t* __restrict__ gate_lut, const float* __restrict__ gate_scale_g,
+    const uint8_t* __restrict__ up_nib,   const uint8_t* __restrict__ up_lut,   const float* __restrict__ up_scale_g,
+    const float* __restrict__ b_scale_out, int K, int N_half,
+    uint8_t* __restrict__ B_shuf_out) {
+    const int N_fused = 2 * N_half;
+    const int KT = K / 16, NT_fused = N_fused / 16, NT_half = N_half / 16;
+    const size_t total_threads = (size_t) KT * (size_t) NT_fused * 32;
+    for (size_t tix = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+         tix < total_threads; tix += (size_t) gridDim.x * blockDim.x) {
+        const int L = (int) (tix % 32);
+        const size_t tile_idx = tix / 32;
+        const int nt = (int) (tile_idx % (size_t) NT_fused);
+        const int kt = (int) (tile_idx / (size_t) NT_fused);
+
+        // 8 nt-tiles (16 cols each) per 128-fused-column interleave block.
+        // half = p/4 selects the 32-col (2-tile) channel-half (also the
+        // GEMM's wave_n, under WAVES_N=2 -- see trfeed_kernels.h), pp = p%4
+        // then splits gate (pp<2) from up (pp>=2) WITHIN that half; both
+        // land on the SAME channel_tile (gate pp and up pp+2 pair), so
+        // src_nt is identical for the two tiles that get combined at GEMM
+        // time -- e.g. p=0 (half0,gate,pp=0) and p=2 (half0,up,pp=2) both
+        // map to channel_tile=0, i.e. the SAME source column range for
+        // gate and up (that's the whole point: silu(gate[c])*up[c] needs
+        // the SAME c on both sides).
+        const int block = nt / 8, p = nt % 8;
+        const int half = p / 4, pp = p % 4;
+        const bool is_gate = pp < 2;
+        const int channel_tile = half * 2 + (is_gate ? pp : pp - 2);
+        const int src_nt = block * 4 + channel_tile;
+
+        const uint8_t* nib     = is_gate ? gate_nib     : up_nib;
+        const uint8_t* lut     = is_gate ? gate_lut     : up_lut;
+        const float*   scale_g = is_gate ? gate_scale_g : up_scale_g;
+
+        // Same coalesced 4-byte B_nib dword the single-source expander reads
+        // for this source at (kt, src_nt, L) -- NT_half is that source's OWN
+        // (un-fused) tile-grid width, not the fused NT_fused used for the
+        // OUTPUT tile offset below.
+        const size_t src_nib_base = ml84_tile_nib_base(kt, src_nt, NT_half);
+        const uint32_t w = *reinterpret_cast<const uint32_t*>(nib + src_nib_base + (size_t) L * 4);
+
+        const int g = (kt * 16) / QK_ML8;   // constant across the whole tile, same as ml84_expand_kernel
+        const uint8_t* lut_g = lut + (size_t) g * 16;
+        const size_t tile_off = b_tile_offset(kt, nt, NT_fused);   // FUSED addressing for the write
+        const int nl_src = L & 15;
+        const int n_src = src_nt * 16 + nl_src;
+        // Fused column this (L, s-independent) lane maps to, for the b_scale
+        // lookup -- constant across s (nl doesn't depend on s, only kl does).
+        const int n_fused = block * 128 + p * 16 + nl_src;
+
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            const uint8_t idx4 = (s < 4) ? (uint8_t) ((w >> (s * 8)) & 0x0Fu)
+                                          : (uint8_t) ((w >> ((s - 4) * 8 + 4)) & 0x0Fu);
+            const float centroid = ml84_decode_e4m3(lut_g[idx4]);
+            const float w_val = centroid * scale_g[(size_t) g * (size_t) N_half + (size_t) n_src];
+            const float denom = b_scale_out[n_fused] > 0.f ? b_scale_out[n_fused] : 1.f;
+            B_shuf_out[tile_off + (size_t) trperm(L, s)] = ml84_encode_e4m3(w_val / denom);
+        }
+    }
+}
+
+extern "C" hipError_t rdna4_expand_ml84_pair_to_trfeed(const uint8_t* gate_packed, const uint8_t* gate_lut,
+                                                        const float* gate_scale_g,
+                                                        const uint8_t* up_packed, const uint8_t* up_lut,
+                                                        const float* up_scale_g,
+                                                        int N_half, int K,
+                                                        uint8_t* b_shuf_out, float* b_scale_out, hipStream_t stream) {
+    if (N_half <= 0 || K <= 0 || (K % QK_ML8) != 0 || (N_half % 64) != 0) {
+        return hipErrorInvalidValue;
+    }
+    const int n_groups_k = K / QK_ML8;
+    const int N_fused = 2 * N_half;
+    constexpr int TPB = 256;
+
+    const int grid_n = (N_fused + TPB - 1) / TPB;
+    ml84_pair_scale_colmax_kernel<<<grid_n, TPB, 0, stream>>>(
+        gate_scale_g, gate_lut, up_scale_g, up_lut, b_scale_out, N_half, n_groups_k);
+    hipError_t rc = hipGetLastError();
+    if (rc != hipSuccess) {
+        return rc;
+    }
+
+    const int KT = K / 16, NT_fused = N_fused / 16;
+    const size_t total_threads = (size_t) KT * (size_t) NT_fused * 32;
+    const size_t grid64 = (total_threads + TPB - 1) / TPB;
+    const int grid_e = (int) (grid64 > 65535u ? 65535u : grid64);
+    ml84_pair_expand_kernel<<<grid_e, TPB, 0, stream>>>(
+        gate_packed, gate_lut, gate_scale_g, up_packed, up_lut, up_scale_g,
+        b_scale_out, K, N_half, b_shuf_out);
+    return hipGetLastError();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // 4. Split-K decode: for workgroup-starved N (N/128 workgroups << the GPU's
 // CU count -- e.g. the (8,5120,17408) shape's N/128=40 WGs measured 51 GB/s
 // vs the (…,17408,…) shapes' 136 WGs at 161 GB/s), split each (n-tile)'s

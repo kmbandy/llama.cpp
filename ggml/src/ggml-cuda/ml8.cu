@@ -1840,6 +1840,16 @@ static constexpr float ML8_FP8_E4M3_MAX = 448.0f;
 // (every element rounds to fp8 zero).
 static constexpr float ML8_ACT_SCALE_EPS = 1e-12f;
 
+// MT_FP8_TRFEED_F32OUT=0 restores the bf16-store + convert path of the
+// frozen trfeed prefill GEMM (A/B against the fp32 epilogue).
+static bool ml8_trfeed_f32out_disabled() {
+    static const bool off = [] {
+        const char * e = std::getenv("MT_FP8_TRFEED_F32OUT");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    return off;
+}
+
 // One block per row M. Each block:
 //   1. Cooperatively reads K fp32 elements, computing per-thread |x|max.
 //   2. Block-reduces to row absmax via shared memory.
@@ -2404,6 +2414,171 @@ static __global__ void ml8_fused_blockhad_quant_kernel(
 // (rot->src[0]) and the fused rotation+quantize prologue runs instead of the
 // plain quantize (G.6.d). Shape/gate validation for the fused case happens
 // in ggml_cuda_ml8_can_fuse_rot_mm before the graph picks this path.
+// ---------------------------------------------------------------------------
+// ML8_4 prefill expander prefetch (see the call site in ml8_mul_mat_core).
+//
+// Two device buffers per GPU (B_shuf fp8 [N*K] + b_scale [N], sized to the
+// largest weight seen), a side stream, and per-slot events:
+//   ready[s] -- recorded on the side stream after the expand into slot s
+//   done[s]  -- recorded on the compute stream after the GEMM that read slot s
+// Successor prediction: next_of[w] = the prefill ML8_4 weight that followed w
+// last time (the graph order is static per ubatch, so this is exact from the
+// second ubatch on; a miss just expands synchronously on the compute stream).
+// Acquire(w): if slot s was prefetched for w -> compute stream waits ready[s];
+// else expand w into the free slot on the compute stream. Release(w): record
+// done[s]; look up w_next; if it has a repack in TRFEED layout, side stream
+// waits done[other] then expands w_next into the other slot, records ready.
+// Disabled while the compute stream is being captured into a graph (the
+// cross-stream fork/join would need explicit capture plumbing) and by
+// MT_ML8_4_PREFETCH=0.
+// ---------------------------------------------------------------------------
+struct ml8_expand_prefetch_slot {
+    uint8_t *      b_shuf  = nullptr;
+    float *        b_scale = nullptr;
+    size_t         cap_nk  = 0;      // bytes allocated for b_shuf
+    size_t         cap_n   = 0;      // floats allocated for b_scale
+    const void *   w       = nullptr; // weight prefetched into this slot (nullptr = none)
+    bool           pending = false;   // expand enqueued on side stream, ready[] valid
+    cudaEvent_t    ready   = nullptr;
+    cudaEvent_t    done    = nullptr;
+    bool           done_valid = false;
+};
+
+// What a prefill ML8_4 GEMM needs to expand its weight: the (weight, LUT
+// slice, packed layout) triple. cent_data is per NODE (lut_group_off under
+// TP), so it is recorded per call, not derived from the weight.
+struct ml8_expand_prefetch_src {
+    const ggml_tensor *         w         = nullptr;
+    const uint8_t *             cent_data = nullptr;
+    const ml8_weight_repack_t * repack    = nullptr;
+    int                         N = 0, K = 0;
+};
+
+struct ml8_expand_prefetch_state {
+    int                       device = -1;
+    cudaStream_t              side   = nullptr;
+    ml8_expand_prefetch_slot  slot[2];
+    const void *              last_w = nullptr;
+    std::unordered_map<const void *, ml8_expand_prefetch_src> next_of;
+};
+
+static ml8_expand_prefetch_state * ml8_expand_prefetch_get(int device) {
+    static const bool disabled = [] {
+        const char * e = std::getenv("MT_ML8_4_PREFETCH");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    if (disabled) {
+        return nullptr;
+    }
+    static ml8_expand_prefetch_state states[GGML_CUDA_MAX_DEVICES];
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    ml8_expand_prefetch_state & st = states[device];
+    if (st.device < 0) {
+        st.device = device;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&st.side, cudaStreamNonBlocking));
+        for (auto & sl : st.slot) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&sl.ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&sl.done,  cudaEventDisableTiming));
+        }
+    }
+    return &st;
+}
+
+static void ml8_expand_prefetch_reserve(ml8_expand_prefetch_slot & sl, size_t nk, size_t n) {
+    if (sl.cap_nk < nk) {
+        if (sl.b_shuf) { CUDA_CHECK(cudaFree(sl.b_shuf)); }
+        CUDA_CHECK(cudaMalloc(&sl.b_shuf, nk));
+        sl.cap_nk = nk;
+    }
+    if (sl.cap_n < n) {
+        if (sl.b_scale) { CUDA_CHECK(cudaFree(sl.b_scale)); }
+        CUDA_CHECK(cudaMalloc(&sl.b_scale, n * sizeof(float)));
+        sl.cap_n = n;
+    }
+}
+
+// Returns the slot holding w's expansion, valid on `stream` after this call.
+static int ml8_expand_prefetch_acquire(
+    ml8_expand_prefetch_state * st, const ggml_tensor * w, const uint8_t * cent_data,
+    const ml8_weight_repack_t * repack, int N, int K, cudaStream_t stream) {
+    for (int s = 0; s < 2; s++) {
+        ml8_expand_prefetch_slot & sl = st->slot[s];
+        if (sl.w == w && sl.pending) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, sl.ready, 0));
+            sl.pending = false;
+            return s;
+        }
+    }
+    // miss: pick the slot not holding last_w's expansion... any slot whose
+    // pending expand we won't need. Prefer a slot with no pending expand.
+    int s = 0;
+    if (st->slot[0].pending && !st->slot[1].pending) { s = 1; }
+    else if (st->slot[0].pending && st->slot[1].pending) {
+        // both pending (prediction went wrong twice): drain the side stream
+        // ordering by waiting on both readies, reuse slot 0
+        CUDA_CHECK(cudaStreamWaitEvent(stream, st->slot[0].ready, 0));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, st->slot[1].ready, 0));
+        st->slot[0].pending = st->slot[1].pending = false;
+    }
+    ml8_expand_prefetch_slot & sl = st->slot[s];
+    // the compute stream is FIFO, so any earlier GEMM that read this slot is
+    // ordered before this expand; a pending side-stream expand into it is
+    // ordered by the ready wait above.
+    if (sl.pending) { CUDA_CHECK(cudaStreamWaitEvent(stream, sl.ready, 0)); sl.pending = false; }
+    ml8_expand_prefetch_reserve(sl, (size_t) N * (size_t) K, (size_t) N);
+    const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
+        (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
+        N, K, sl.b_shuf, sl.b_scale, stream);
+    GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed dispatch failed");
+    sl.w = w;
+    return s;
+}
+
+static void ml8_expand_prefetch_release(
+    ml8_expand_prefetch_state * st, int s, const ml8_expand_prefetch_src & cur, cudaStream_t stream) {
+    const ggml_tensor * w = cur.w;
+    ml8_expand_prefetch_slot & sl = st->slot[s];
+    CUDA_CHECK(cudaEventRecord(sl.done, stream));
+    sl.done_valid = true;
+
+    // learn the successor of the previous weight, then predict ours
+    if (st->last_w != nullptr && st->last_w != w) {
+        st->next_of[st->last_w] = cur;
+    }
+    st->last_w = w;
+
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    auto it = st->next_of.find(w);
+    if (it == st->next_of.end()) {
+        return;
+    }
+    const ml8_expand_prefetch_src & nx = it->second;
+    const ggml_tensor * wn = nx.w;
+    const int o = 1 - s;
+    ml8_expand_prefetch_slot & os = st->slot[o];
+    if (os.pending) {
+        return; // already prefetched something into the other slot
+    }
+    const int Nn = nx.N;
+    const int Kn = nx.K;
+    ml8_expand_prefetch_reserve(os, (size_t) Nn * (size_t) Kn, (size_t) Nn);
+    // the side stream must not overwrite slot o before the GEMM that last
+    // read it (recorded in done[o]) has finished
+    if (os.done_valid) {
+        CUDA_CHECK(cudaStreamWaitEvent(st->side, os.done, 0));
+    }
+    const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
+        (const uint8_t *) nx.repack->b_packed, nx.cent_data, (const float *) nx.repack->b_scale,
+        Nn, Kn, os.b_shuf, os.b_scale, st->side);
+    GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed (prefetch) dispatch failed");
+    CUDA_CHECK(cudaEventRecord(os.ready, st->side));
+    os.w = wn;
+    os.pending = true;
+}
+
 static void ml8_mul_mat_core(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst,
@@ -2659,21 +2834,58 @@ static void ml8_mul_mat_core(
         // rdna4_gemm_fp8_trfeed UNCHANGED. Transient pool scratch -- the
         // largest weight in this model (N=17408,K=5120) is 89 MB, freed back
         // to the pool the moment this call returns.
-        ggml_cuda_pool_alloc<uint8_t> b_shuf(ctx.pool(), (size_t) N * (size_t) K);
-        ggml_cuda_pool_alloc<float>   b_scale_out(ctx.pool(), (size_t) N);
-        const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
-            (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
-            N, K, b_shuf.get(), b_scale_out.get(), stream);
-        GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed dispatch failed");
+        // Expander prefetch (2026-09-18): the expander is memory-bound (0.40 s
+        // of a 7.2 s 8k prefill, serial before every compute-bound GEMM). The
+        // graph's ML8_MUL_MAT order is identical every ubatch, so after the
+        // first pass we know which weight follows this one and expand it on a
+        // side stream while this GEMM runs (double-buffered, event-fenced).
+        // MT_ML8_4_PREFETCH=0 disables (synchronous pool-scratch expand).
+        ml8_expand_prefetch_state * pf = ml8_expand_prefetch_get(ctx.device);
+        const uint8_t * b_shuf_ptr      = nullptr;
+        const float   * b_scale_out_ptr = nullptr;
+        ggml_cuda_pool_alloc<uint8_t> b_shuf(ctx.pool());
+        ggml_cuda_pool_alloc<float>   b_scale_out(ctx.pool());
+        int use_slot = -1;
+        if (pf != nullptr) {
+            use_slot = ml8_expand_prefetch_acquire(pf, w, cent_data, repack, N, K, stream);
+            b_shuf_ptr      = pf->slot[use_slot].b_shuf;
+            b_scale_out_ptr = pf->slot[use_slot].b_scale;
+        } else {
+            b_shuf.alloc((size_t) N * (size_t) K);
+            b_scale_out.alloc((size_t) N);
+            const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
+                (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
+                N, K, b_shuf.get(), b_scale_out.get(), stream);
+            GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed dispatch failed");
+            b_shuf_ptr      = b_shuf.get();
+            b_scale_out_ptr = b_scale_out.get();
+        }
 
-        ggml_cuda_pool_alloc<nv_bfloat16> c_bf16_trfeed(ctx.pool(), (size_t) M_pad * (size_t) N);
-        const hipError_t gemm_rc_trfeed = rdna4_gemm_fp8_trfeed(
-            a_fp8_ptr, b_shuf.get(), c_bf16_trfeed.get(), a_scale_ptr, b_scale_out.get(), M_pad, N, K, stream);
-        GGML_ASSERT(gemm_rc_trfeed == hipSuccess && "rdna4_gemm_fp8_trfeed dispatch failed");
+        // fp32 epilogue straight into dst (M_valid = M rows): no bf16
+        // scratch, no convert launch. Measured 2026-09-18 (out/gemm_trfeed_prod_bench,
+        // R9700): bit-exact vs the fp32 reference and 2-8% faster than the
+        // bf16 store; the convert_unary<bf16,float> it replaces was 0.385 s
+        // of a 7.2 s 8k prefill. MT_FP8_TRFEED_F32OUT=0 restores the bf16 path.
+        if (!ml8_trfeed_f32out_disabled()) {
+            const hipError_t gemm_rc_trfeed = rdna4_gemm_fp8_trfeed_f32(
+                (const uint8_t *) a_fp8_ptr, b_shuf_ptr, (float *) dst->data, a_scale_ptr, b_scale_out_ptr,
+                M_pad, M, N, K, stream);
+            GGML_ASSERT(gemm_rc_trfeed == hipSuccess && "rdna4_gemm_fp8_trfeed_f32 dispatch failed");
+        } else {
+            ggml_cuda_pool_alloc<nv_bfloat16> c_bf16_trfeed(ctx.pool(), (size_t) M_pad * (size_t) N);
+            const hipError_t gemm_rc_trfeed = rdna4_gemm_fp8_trfeed(
+                a_fp8_ptr, b_shuf_ptr, c_bf16_trfeed.get(), a_scale_ptr, b_scale_out_ptr, M_pad, N, K, stream);
+            GGML_ASSERT(gemm_rc_trfeed == hipSuccess && "rdna4_gemm_fp8_trfeed dispatch failed");
 
-        const to_fp32_cuda_t bf16_to_fp32_trfeed = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-        GGML_ASSERT(bf16_to_fp32_trfeed != nullptr);
-        bf16_to_fp32_trfeed(c_bf16_trfeed.get(), (float *) dst->data, (size_t) M * (size_t) N, stream);
+            const to_fp32_cuda_t bf16_to_fp32_trfeed = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            GGML_ASSERT(bf16_to_fp32_trfeed != nullptr);
+            bf16_to_fp32_trfeed(c_bf16_trfeed.get(), (float *) dst->data, (size_t) M * (size_t) N, stream);
+        }
+        if (pf != nullptr) {
+            ml8_expand_prefetch_src cur;
+            cur.w = w; cur.cent_data = cent_data; cur.repack = repack; cur.N = N; cur.K = K;
+            ml8_expand_prefetch_release(pf, use_slot, cur, stream);
+        }
         return;
     }
 
@@ -2806,6 +3018,234 @@ void ggml_cuda_op_ml8_mul_mat_fused(
     }
     const int32_t * pp = (const int32_t *) rot->op_params;
     ml8_mul_mat_core(ctx, dst, rot->src[0], rot->src[1], pp[0], pp[1]);
+#endif // GGML_HIP_AITER
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MAD-305 fused-FFN task (2026-09-18): {ML8_MUL_MAT(gate), ML8_MUL_MAT(up),
+// GLU(swiglu)} -> one fused GEMM (gemm_capi.h's rdna4_gemm_fp8_trfeed_swiglu_f32
+// over rdna4_expand_ml84_pair_to_trfeed's fused B_shuf). See ml8.cuh for the
+// full contract; this mirrors ggml_cuda_ml8_can_fuse_rot_mm /
+// ggml_cuda_op_ml8_mul_mat_fused's split (cheap boolean gate + a separate
+// execute function) one node-pattern up.
+// ─────────────────────────────────────────────────────────────────────
+
+bool ggml_cuda_ml8_can_fuse_ffn_swiglu(
+    const ggml_tensor * mm_gate,
+    const ggml_tensor * mm_up,
+    const ggml_tensor * glu) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(mm_gate); GGML_UNUSED(mm_up); GGML_UNUSED(glu);
+    return false;
+#else
+    // Default OFF (2026-09-18): the fused kernel is exact but measures a wash on the R9700 --
+    // 5.07 ms vs 4.72 (two GEMMs) + 0.28 (GLU kernel) at M=2048/N_half=17408/K=5120 -- because
+    // the SwiGLU epilogue costs +42 VGPRs (occupancy 9 -> 7 waves/SIMD). Enable with
+    // MT_ML8_FFN_FUSE=1; revisit with the bf16-output epilogue (halves the store bytes).
+    static const bool no_fuse = [] {
+        const char * e = std::getenv("MT_ML8_FFN_FUSE");
+        return e == nullptr || std::strcmp(e, "1") != 0;
+    }();
+    if (no_fuse || ml8_dump_enabled()) {   // ML8_DUMP harness expects the unfused chain
+        return false;
+    }
+    if (mm_gate == nullptr || mm_up == nullptr || glu == nullptr) {
+        return false;
+    }
+    if (mm_gate->op != GGML_OP_ML8_MUL_MAT || mm_up->op != GGML_OP_ML8_MUL_MAT || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(glu, 1) != 0) {   // swapped
+        return false;
+    }
+    // ggml_swiglu(a,b) always builds src0=a (SiLU'd), src1=b (multiplied) --
+    // the caller (ggml-cuda.cu's fusion match) is responsible for handing
+    // this function mm_gate/mm_up in the order that matches glu's actual
+    // src0/src1 (the graph may emit the two ML8_MUL_MAT nodes in either
+    // index order relative to which is gate vs up); this function does not
+    // itself try both orders, it just verifies the one it was given.
+    if (glu->src[0] != mm_gate || glu->src[1] != mm_up) {
+        return false;
+    }
+    const ggml_tensor * x = mm_gate->src[2];
+    if (x == nullptr || x != mm_up->src[2]) {
+        return false;   // must be literally the same shared activation tensor
+    }
+    if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_I8) {
+        return false;
+    }
+    if (!ggml_is_contiguous(x)) {
+        return false;
+    }
+    const ggml_tensor * w_gate = mm_gate->src[0];
+    const ggml_tensor * w_up   = mm_up->src[0];
+    const ggml_tensor * c_gate = mm_gate->src[1];
+    const ggml_tensor * c_up   = mm_up->src[1];
+    if (w_gate == nullptr || w_up == nullptr || c_gate == nullptr || c_up == nullptr) {
+        return false;
+    }
+    if (w_gate->type != GGML_TYPE_ML8_4 || w_up->type != GGML_TYPE_ML8_4) {
+        return false;
+    }
+    if (w_gate->ne[0] != w_up->ne[0] || w_gate->ne[1] != w_up->ne[1]) {
+        return false;   // K, N must match between gate and up
+    }
+    const int32_t K      = (int32_t) w_gate->ne[0];
+    const int32_t N_half = (int32_t) w_gate->ne[1];
+    if (K <= 0 || K % QK_ML8 != 0 || N_half <= 0 || N_half % 64 != 0) {
+        return false;
+    }
+    // Same lut_group_off (op_params[0]) -- fusing across mismatched TP
+    // K-slice offsets would silently mix centroid tables.
+    if (ggml_get_op_params_i32(mm_gate, 0) != ggml_get_op_params_i32(mm_up, 0)) {
+        return false;
+    }
+    // Both weights must land in the RDNA4_TRFEED layout at this N (a TP
+    // N-slice not a multiple of 128 packs TRITON instead and this fusion
+    // does not apply -- ml8_4_layout_for_tensor is the same pure function
+    // ggml_cuda_ml8_get_or_repack itself consults, so this is exactly the
+    // layout the repack will actually produce, not a guess).
+    if (ml8_4_layout_for_tensor(N_half) != ML8_4_LAYOUT_RDNA4_TRFEED) {
+        return false;
+    }
+    // M_pad rule mirrors ml8_mul_mat_core's RDNA4_TRFEED branch: M<=32 stays
+    // the decode/verify split-K path (never fused here), M>32 is the 128-wide
+    // prefill tile this fusion targets.
+    const int64_t M = x->ne[1] * x->ne[2] * x->ne[3];
+    if (M <= 32) {
+        return false;
+    }
+    return true;
+#endif // GGML_HIP_AITER
+}
+
+void ggml_cuda_op_ml8_ffn_gate_up_swiglu(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         mm_gate,
+    const ggml_tensor *         mm_up,
+    ggml_tensor *               glu_dst) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(ctx); GGML_UNUSED(mm_gate); GGML_UNUSED(mm_up); GGML_UNUSED(glu_dst);
+    GGML_ABORT("ml8 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
+#else
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        fprintf(stderr, "[ml8-fuse] ffn gate/up swiglu fusion ACTIVE (first hit: %s)\n", glu_dst->name);
+    }
+
+    const ggml_tensor * w_gate = mm_gate->src[0];
+    const ggml_tensor * c_gate = mm_gate->src[1];
+    const ggml_tensor * w_up   = mm_up->src[0];
+    const ggml_tensor * c_up   = mm_up->src[1];
+    const ggml_tensor * x      = mm_gate->src[2];
+
+    GGML_ASSERT(w_gate->type == GGML_TYPE_ML8_4 && w_up->type == GGML_TYPE_ML8_4);
+    GGML_ASSERT(c_gate->type == GGML_TYPE_F8_E4M3 && c_up->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_I8);
+    GGML_ASSERT(ggml_is_contiguous(w_gate) && ggml_is_contiguous(w_up));
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(glu_dst));
+
+    const int32_t K      = (int32_t) w_gate->ne[0];
+    const int32_t N_half = (int32_t) w_gate->ne[1];
+    GGML_ASSERT(w_up->ne[0] == K && w_up->ne[1] == N_half);
+    const int32_t M = (int32_t) (x->ne[1] * x->ne[2] * x->ne[3]);
+
+    const bool x_prequant = (x->type == GGML_TYPE_I8);
+    if (x_prequant) {
+        GGML_ASSERT(x->ne[0] == K + 4 &&
+            "pre-quantized x must be the ggml_fp8_quant_rot(..., G=0) per-row output");
+    } else {
+        GGML_ASSERT(x->ne[0] == K);
+    }
+    GGML_ASSERT(glu_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT((int64_t) glu_dst->ne[0] == N_half);
+    GGML_ASSERT((int64_t) glu_dst->ne[1] * glu_dst->ne[2] * glu_dst->ne[3] == (int64_t) M);
+
+    const int32_t group_size  = QK_ML8;
+    const int32_t n_groups_k  = K / group_size;
+    const int32_t n_centroids = 16;
+    GGML_ASSERT(c_gate->ne[0] == n_centroids && c_up->ne[0] == n_centroids);
+    const int32_t lut_group_off = ggml_get_op_params_i32(mm_gate, 0);
+    GGML_ASSERT(lut_group_off == ggml_get_op_params_i32(mm_up, 0));
+    GGML_ASSERT(lut_group_off >= 0 && (int64_t) lut_group_off + n_groups_k <= c_gate->ne[1]
+                                    && (int64_t) lut_group_off + n_groups_k <= c_up->ne[1]);
+    const uint8_t * cent_gate_data = (const uint8_t *) c_gate->data + (size_t) lut_group_off * n_centroids;
+    const uint8_t * cent_up_data   = (const uint8_t *) c_up->data   + (size_t) lut_group_off * n_centroids;
+
+    cudaStream_t stream = ctx.stream();
+
+    const ml8_weight_repack_t * repack_gate = ggml_cuda_ml8_get_or_repack(stream, w_gate);
+    const ml8_weight_repack_t * repack_up   = ggml_cuda_ml8_get_or_repack(stream, w_up);
+    GGML_ASSERT(repack_gate != nullptr && repack_up != nullptr);
+    GGML_ASSERT(repack_gate->layout == ML8_4_LAYOUT_RDNA4_TRFEED && repack_up->layout == ML8_4_LAYOUT_RDNA4_TRFEED &&
+        "ggml_cuda_ml8_can_fuse_ffn_swiglu should have already rejected a non-RDNA4_TRFEED weight");
+
+    // M padding: same rule as ml8_mul_mat_core's RDNA4_TRFEED prefill branch
+    // (M>32 -> round_up(M,128); this fusion never sees M<=32, see
+    // ggml_cuda_ml8_can_fuse_ffn_swiglu).
+    GGML_ASSERT(M > 32);
+    const int32_t M_pad = ((M + 127) / 128) * 128;
+
+    // Shared activation: quantize/pad ONCE for both gate and up -- the
+    // un-fused chain pays this cost TWICE (once inside each
+    // ml8_mul_mat_core call on the same x), so this fusion also removes
+    // that redundant work, not only the two GEMM stores + GLU pass.
+    ggml_cuda_pool_alloc<uint8_t> a_fp8_scratch(ctx.pool());
+    ggml_cuda_pool_alloc<float>   a_scale_scratch(ctx.pool());
+    const uint8_t * a_fp8_ptr;
+    const float   * a_scale_ptr;
+    if (x_prequant) {
+        const uint8_t * qs_base    = (const uint8_t *) x->data;
+        const float   * scale_base = (const float *) ((const uint8_t *) x->data + (size_t) M * (size_t) K);
+        if (M_pad == M) {
+            a_fp8_ptr   = qs_base;
+            a_scale_ptr = scale_base;
+        } else {
+            a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
+            a_scale_scratch.alloc((size_t) M_pad);
+            CUDA_CHECK(cudaMemsetAsync(a_fp8_scratch.get(), 0, (size_t) M_pad * (size_t) K, stream));
+            CUDA_CHECK(cudaMemsetAsync(a_scale_scratch.get(), 0, (size_t) M_pad * sizeof(float), stream));
+            CUDA_CHECK(cudaMemcpyAsync(a_fp8_scratch.get(), qs_base, (size_t) M * (size_t) K,
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(a_scale_scratch.get(), scale_base, (size_t) M * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, stream));
+            a_fp8_ptr   = a_fp8_scratch.get();
+            a_scale_ptr = a_scale_scratch.get();
+        }
+    } else {
+        a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
+        a_scale_scratch.alloc((size_t) M_pad);
+        ggml_cuda_ml8_quantize_activations(
+            stream, (const float *) x->data, a_fp8_scratch.get(), a_scale_scratch.get(), M_pad, K, M);
+        a_fp8_ptr   = a_fp8_scratch.get();
+        a_scale_ptr = a_scale_scratch.get();
+    }
+
+    // Dual-source expand: gate+up ML84_TRFEED -> ONE fused B_shuf + fused
+    // per-column b_scale (rdna4_expand_ml84_pair_to_trfeed, gemm_ml84_prod.hip).
+    // No prefetch double-buffering for this path yet (unlike
+    // ml8_mul_mat_core's single-weight prefill path): the existing
+    // ml8_expand_prefetch_* machinery is keyed on one weight per slot, and
+    // this expander reads two per call -- wiring a pair-aware prefetch is
+    // left to a follow-up (noted in the task report), not done here.
+    const int32_t N_fused = 2 * N_half;
+    ggml_cuda_pool_alloc<uint8_t> b_shuf_fused(ctx.pool(), (size_t) N_fused * (size_t) K);
+    ggml_cuda_pool_alloc<float>   b_scale_fused(ctx.pool(), (size_t) N_fused);
+    const hipError_t exp_rc = rdna4_expand_ml84_pair_to_trfeed(
+        (const uint8_t *) repack_gate->b_packed, cent_gate_data, (const float *) repack_gate->b_scale,
+        (const uint8_t *) repack_up->b_packed,   cent_up_data,   (const float *) repack_up->b_scale,
+        N_half, K, b_shuf_fused.get(), b_scale_fused.get(), stream);
+    GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_pair_to_trfeed dispatch failed");
+
+    // ONE fused GEMM: silu(gate)*up straight into glu_dst->data, fp32
+    // [M, N_half] -- no intermediate GEMM output, no separate GLU kernel.
+    const hipError_t gemm_rc = rdna4_gemm_fp8_trfeed_swiglu_f32(
+        a_fp8_ptr, b_shuf_fused.get(), (float *) glu_dst->data, a_scale_ptr, b_scale_fused.get(),
+        M_pad, M, N_fused, K, stream);
+    GGML_ASSERT(gemm_rc == hipSuccess && "rdna4_gemm_fp8_trfeed_swiglu_f32 dispatch failed");
 #endif // GGML_HIP_AITER
 }
 
@@ -3431,6 +3871,459 @@ static __global__ void fp8_quant_pack_row_kernel(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// MAD-3xx round 4 (V2) — single per-row (G=0) fused rotate+quantize family
+// for BOTH kronecker and block_hadamard, replacing:
+//   * ml8_fused_rot_quant_kernel      (kronecker, K-sized LDS)
+//   * ml8_fused_blockhad_quant_kernel (block_hadamard, K-sized LDS)
+//   * the generic memcpy + mt_turbo_fp8_fwht + fp8_quant_pack_row_kernel
+//     three-launch chain (block_hadamard K too large for the old LDS gate)
+//
+// Root cause of the old kernels' 54-244 GB/s: LDS usage scales with K (the
+// WHOLE row lives in shared memory), which (a) caps occupancy long before
+// bandwidth saturates and (b) simply doesn't fit for K=17408 (17408*4 +
+// 4096 > 64KB), forcing that shape onto the slow 3-launch generic path with
+// a full extra D2D memcpy of the 42MB input.
+//
+// Fix: blockDim.x = b_dim * ROWS_PER_BLOCK (one thread == one (row-in-block,
+// lane) pair, same lane-owns-column convention as the old fused kernels so
+// the kronecker H_a^T stage stays register-local exactly as before), and
+// the FWHT butterfly stages through a LDS scratch sized ONLY
+// b_dim*ROWS_PER_BLOCK floats (<=1024 floats = 4KB), reused across all
+// a_dim slice iterations instead of holding all a_dim slices simultaneously.
+// LDS is therefore O(b_dim), NEVER O(K) -- the gate on K disappears entirely
+// for this path. ROWS_PER_BLOCK = min(8, 1024/b_dim) packs multiple rows
+// into one block for the b_dim=128 shapes (6144, 17408) to keep bytes/block
+// (and therefore concurrent DRAM requests) high even though each row is
+// "only" 24-70KB.
+//
+// Register footprint: each thread keeps a per-thread array of the row's
+// a_dim values at its own lane (one float per slice) live across the whole
+// kernel -- this is what lets quantization run without ever re-reading X or
+// spilling the rotated row back to DRAM (the old generic path's second
+// full-tensor round trip). MAX_A bounds this array at compile time; two
+// instantiations are provided (16 and 160) so shapes with small a_dim (the
+// kronecker path, and small block_hadamard a_dim) don't pay for registers
+// they don't use. a_dim=136 (K=17408, the (c) shape from the problem
+// statement) needs ~136 live floats/thread in the MAX_A=160 instantiation --
+// a real amount of VGPR pressure that likely limits occupancy to very few
+// waves/CU; this is a knowingly-untested trade (no GPU available to profile
+// from this box) accepted because the alternative (spilling the row to DRAM
+// between the absmax pass and the quantize pass) provably cannot hit the
+// 600 GB/s effective target -- see the design-rationale comment in the
+// dispatcher below for the traffic accounting.
+//
+// Quantize math: real division by 448 (not a reciprocal multiply) and
+// fp8_quant_rot_f32_to_e4m3 (the FP8_QUANT_ROT-specific rounding function,
+// NOT the shared ml8_fp32_to_e4m3 the OLD fused kernels used) -- matches
+// fp8_quant_pack_row_kernel above exactly, which is the generic per-row
+// path's own quantizer and therefore the thing this kernel must agree with
+// for kind=NONE-adjacent behavior and for the CPU oracle's rounding rule.
+// Reduction order (row-segment tree max, one slice at a time through LDS
+// instead of the old kernels' whole-row-at-once butterfly) is a legitimate
+// fp32 reordering vs. both the CPU reference and the old GPU kernels; the
+// FP8_QUANT_ROT KRONECKER/BLOCK_HADAMARD test tolerance (1e-4 nmse on
+// dequantized values, not raw bytes -- see test_fp8_quant_rot::err) exists
+// exactly to absorb this.
+template <int MAX_A, bool HAS_HA>
+static __global__ void ml8_fp8_qrot_v2_kernel(
+    const float * __restrict__ x,        // [n_rows, K] row-major, pre-rotation
+    const float * __restrict__ h_a,      // [a_dim, a_dim] row-major, or nullptr when !HAS_HA
+    uint8_t     * __restrict__ a_fp8,    // [n_rows, K] row-major
+    float       * __restrict__ a_scale,  // [n_rows]
+    int K, int a_dim, int b_dim, int n_rows, int rows_per_block) {
+
+    // Dynamic shared mem: [0, blockDim) = per-slice butterfly scratch,
+    // [blockDim, 2*blockDim) = absmax reduce scratch. Both sized to
+    // blockDim.x (== b_dim*rows_per_block), never to K.
+    extern __shared__ float smem[];
+    float * s_slice = smem;
+    float * s_red   = smem + blockDim.x;
+
+    const int tid          = threadIdx.x;
+    const int row_in_block = tid / b_dim;
+    const int lane         = tid % b_dim;
+    const int base         = row_in_block * b_dim;
+    const int row          = blockIdx.x * rows_per_block + row_in_block;
+    const bool row_valid   = row < n_rows;
+
+    const float inv_sqrt_b = rsqrtf((float) b_dim);
+
+    // Per-thread register-resident state: this thread's own lane across all
+    // a_dim slices. Invalid (padding) rows still run the full butterfly
+    // schedule (with a dummy zero input) so every thread in the block hits
+    // the same sequence of __syncthreads() -- only the final write is guarded.
+    float reg[MAX_A];
+    for (int a = 0; a < a_dim; a++) {
+        s_slice[tid] = row_valid ? x[(size_t) row * (size_t) K + (size_t) a * b_dim + lane] : 0.0f;
+        __syncthreads();
+        // In-place FWHT on this row's b_dim-wide segment [base, base+b_dim)
+        // of s_slice -- same pairing/assignment/stage order as
+        // mt_turbo_fp8_fwht_kernel (partner = lane ^ stride; lower gets
+        // v+p, upper gets p-v), just done one slice at a time through a
+        // b_dim-sized (not K-sized) scratch buffer.
+        for (int stride = 1; stride < b_dim; stride <<= 1) {
+            const int partner_tid = base + (lane ^ stride);
+            const float v = s_slice[tid];
+            const float p = s_slice[partner_tid];
+            __syncthreads();
+            s_slice[tid] = ((lane & stride) == 0) ? (v + p) : (p - v);
+            __syncthreads();
+        }
+        reg[a] = s_slice[tid] * inv_sqrt_b;
+        // No extra sync needed here: every cross-thread read of s_slice[*]
+        // for this slice already happened before the last __syncthreads()
+        // above, and the next iteration only ever writes s_slice[tid] (this
+        // thread's own slot) before any thread reads it again.
+    }
+
+    // H_a^T left-multiply (kronecker only) or pass-through (block_hadamard):
+    // same index convention as ml8_h_a_left_multiply_kernel /
+    // ml8_fused_rot_quant_kernel (Y[k] = sum_i H_a[i,k] * Z[i]).
+    float local_max = 0.0f;
+    float y[HAS_HA ? MAX_A : 1];
+    if constexpr (HAS_HA) {
+        for (int k = 0; k < a_dim; k++) {
+            float s = 0.0f;
+            for (int i = 0; i < a_dim; i++) {
+                s += h_a[i * a_dim + k] * reg[i];
+            }
+            y[k] = s;
+            local_max = fmaxf(local_max, fabsf(s));
+        }
+    } else {
+        for (int a = 0; a < a_dim; a++) {
+            local_max = fmaxf(local_max, fabsf(reg[a]));
+        }
+    }
+
+    // Per-row (per-segment) absmax tree reduction: rows are laid out as
+    // contiguous, power-of-2-sized b_dim segments of tid-space, so a
+    // strided tree reduction bounded by `lane < off` never crosses a row
+    // boundary.
+    s_red[tid] = local_max;
+    __syncthreads();
+    for (int off = b_dim / 2; off > 0; off >>= 1) {
+        if (lane < off) {
+            s_red[tid] = fmaxf(s_red[tid], s_red[tid + off]);
+        }
+        __syncthreads();
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    // Real division (not a reciprocal multiply) + eps-clamp, matching
+    // fp8_quant_pack_row_kernel / the CPU reference's `amax / 448.0f`.
+    const float scale     = fmaxf(s_red[base] / ML8_FP8_E4M3_MAX, ML8_ACT_SCALE_EPS);
+    const float inv_scale = 1.0f / scale;
+    if (lane == 0) {
+        a_scale[row] = scale;
+    }
+
+    uint8_t * row_out = a_fp8 + (size_t) row * (size_t) K;
+    if constexpr (HAS_HA) {
+        for (int k = 0; k < a_dim; k++) {
+            row_out[k * b_dim + lane] = fp8_quant_rot_f32_to_e4m3(y[k] * inv_scale);
+        }
+    } else {
+        for (int a = 0; a < a_dim; a++) {
+            row_out[a * b_dim + lane] = fp8_quant_rot_f32_to_e4m3(reg[a] * inv_scale);
+        }
+    }
+}
+
+// Host launcher: picks ROWS_PER_BLOCK (packs multiple rows into one block
+// when b_dim is small, so bytes-in-flight per block stays high even for
+// small-K shapes) and the dynamic LDS size (always O(b_dim), never O(K)).
+template <int MAX_A, bool HAS_HA>
+static void ml8_launch_qrot_v2(
+    cudaStream_t stream,
+    const float * x, const float * h_a,
+    uint8_t * a_fp8, float * a_scale,
+    int K, int a_dim, int b_dim, int n_rows) {
+    const int rows_per_block = std::max(1, std::min(8, 1024 / b_dim));
+    const int block          = b_dim * rows_per_block;
+    const int grid           = (n_rows + rows_per_block - 1) / rows_per_block;
+    const size_t smem_bytes  = (size_t) 2 * block * sizeof(float);
+    ml8_fp8_qrot_v2_kernel<MAX_A, HAS_HA><<<grid, block, smem_bytes, stream>>>(
+        x, h_a, a_fp8, a_scale, K, a_dim, b_dim, n_rows, rows_per_block);
+}
+
+
+// ---------------------------------------------------------------------------
+// FP8_QUANT_ROT per-row (G=0) V3 -- wave-shuffle FWHT, register-resident row.
+//
+// Why a third version (2026-09-18, rocprofv3 on the R9700, 2048-row ubatch):
+// V2 (LDS-staged, one __syncthreads per butterfly stage per slice) measured
+// 139 GB/s at K=17408 (136 slices x 7 stages x 2 barriers = 1904 barriers
+// per row). The transform itself is trivial; the barriers are the cost.
+//
+// V3 layout: one WAVE owns one b_dim-wide Hadamard block. Lane l holds the
+// E = b_dim/32 CONTIGUOUS elements [l*E, l*E+E) of that block, loaded as
+// float4s (consecutive lanes -> consecutive 16E bytes -> fully coalesced).
+// Butterfly stages with stride < E pair elements inside the lane's own
+// register array; stages with stride >= E pair lane l with lane l^(stride/E)
+// via __shfl_xor -- no LDS, no barriers. Same pairing/assignment as
+// mt_turbo_fp8_fwht_kernel (lower partner gets v+p, upper gets p-v, ascending
+// stride order, one 1/sqrt(b) normalize at the end), so the numerics differ
+// from the LDS kernels only by fp32 reassociation.
+//
+//   BLOCK_HADAMARD: a workgroup of NW waves owns one row; wave w owns blocks
+//     w, w+NW, ... (<= MAXAW of them) and keeps them in registers
+//     (MAXAW*E floats/lane: K=17408 -> 34*4 = 136, K=6144 -> 12*4 = 48).
+//     Row absmax = lane max -> wave reduce -> NW floats through LDS ->
+//     quantize straight from registers. One read of x, one write of the
+//     fp8 row. Zero barriers except the single absmax exchange.
+//   KRONECKER: one wave per row (NW=1), all a_dim <= MAXAW blocks resident
+//     (a=5, b=1024 -> 5*32 = 160 floats/lane), so the H_a^T mix across
+//     blocks (Y[k] = sum_i H_a[i,k] Z[i], same index convention as
+//     ml8_h_a_left_multiply_kernel) is register-local, then absmax + quant.
+// Everything is compile-time bounded (b_dim, NW, MAXAW are template
+// parameters) so the arrays stay in VGPRs; the dispatcher picks the
+// instantiation and falls through to V2 for shapes without one.
+// ---------------------------------------------------------------------------
+template <int B, int NW, int MAXAW, bool HAS_HA>
+__launch_bounds__(32 * NW)
+static __global__ void ml8_fp8_qrot_v3_kernel(
+    const float * __restrict__ x,        // [n_rows, K]
+    const float * __restrict__ h_a,      // [a_dim, a_dim] or nullptr
+    uint8_t     * __restrict__ a_fp8,    // [n_rows, K]
+    float       * __restrict__ a_scale,  // [n_rows]
+    int K, int a_dim, int n_rows) {
+
+    constexpr int E = B / 32;            // elements per lane per block
+    static_assert(E >= 1 && (E & (E - 1)) == 0, "b_dim must be a power of two >= 32");
+    static_assert(!HAS_HA || NW == 1, "kronecker mixing needs the whole row in one wave");
+
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    // BLOCK_HADAMARD: one row per workgroup, waves stride over its blocks.
+    // KRONECKER: one row per wave (NW == 1 so wave == 0 and the workgroup
+    // is one wave); grid.x indexes rows in both cases.
+    const int row = blockIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const float * xrow = x + (size_t) row * (size_t) K;
+
+    float v[MAXAW][E];
+    float local_max = 0.0f;
+
+    #pragma unroll
+    for (int j = 0; j < MAXAW; j++) {
+        const int a = wave + j * NW;     // block index within the row
+        if (a < a_dim) {
+            const float * blk = xrow + (size_t) a * B + lane * E;
+            #pragma unroll
+            for (int e = 0; e < E; e += 4) {
+                if constexpr (E >= 4) {
+                    const float4 t = *reinterpret_cast<const float4 *>(blk + e);
+                    v[j][e] = t.x; v[j][e + 1] = t.y; v[j][e + 2] = t.z; v[j][e + 3] = t.w;
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < E; q++) { v[j][e + q] = blk[e + q]; }
+                }
+            }
+            // in-lane stages: stride < E
+            #pragma unroll
+            for (int stride = 1; stride < E; stride <<= 1) {
+                #pragma unroll
+                for (int e = 0; e < E; e++) {
+                    if ((e & stride) == 0) {
+                        const float lo = v[j][e];
+                        const float hi = v[j][e + stride];
+                        v[j][e]          = lo + hi;
+                        v[j][e + stride] = lo - hi;
+                    }
+                }
+            }
+            // cross-lane stages: stride >= E -> partner lane l ^ (stride/E)
+            #pragma unroll
+            for (int ls = 1; ls < 32; ls <<= 1) {
+                const bool upper = (lane & ls) != 0;
+                #pragma unroll
+                for (int e = 0; e < E; e++) {
+                    const float mine = v[j][e];
+                    const float p    = __shfl_xor_sync(0xffffffff, mine, ls, 32);
+                    v[j][e] = upper ? (p - mine) : (mine + p);
+                }
+            }
+            const float inv_sqrt_b = rsqrtf((float) B);
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                v[j][e] *= inv_sqrt_b;
+                if constexpr (!HAS_HA) {
+                    local_max = fmaxf(local_max, fabsf(v[j][e]));
+                }
+            }
+        }
+    }
+
+    if constexpr (HAS_HA) {
+        // Y[k] = sum_i H_a[i,k] * Z[i] per element; a_dim <= MAXAW, all
+        // blocks of the row are in this wave (NW == 1).
+        float y[MAXAW][E];
+        #pragma unroll
+        for (int k = 0; k < MAXAW; k++) {
+            if (k < a_dim) {
+                #pragma unroll
+                for (int e = 0; e < E; e++) { y[k][e] = 0.0f; }
+                #pragma unroll
+                for (int i = 0; i < MAXAW; i++) {
+                    if (i < a_dim) {
+                        const float h = h_a[i * a_dim + k];
+                        #pragma unroll
+                        for (int e = 0; e < E; e++) { y[k][e] = fmaf(h, v[i][e], y[k][e]); }
+                    }
+                }
+                #pragma unroll
+                for (int e = 0; e < E; e++) { local_max = fmaxf(local_max, fabsf(y[k][e])); }
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < MAXAW; k++) {
+            #pragma unroll
+            for (int e = 0; e < E; e++) { v[k][e] = y[k][e]; }
+        }
+    }
+
+    // row absmax: wave reduce, then across the NW waves through LDS.
+    local_max = warp_reduce_max<32>(local_max);
+    float row_max = local_max;
+    if constexpr (NW > 1) {
+        __shared__ float s_max[NW];
+        if (lane == 0) { s_max[wave] = local_max; }
+        __syncthreads();
+        row_max = s_max[0];
+        #pragma unroll
+        for (int w = 1; w < NW; w++) { row_max = fmaxf(row_max, s_max[w]); }
+    }
+    // Real division + eps clamp, matching fp8_quant_pack_row_kernel / CPU ref.
+    const float scale     = fmaxf(row_max / ML8_FP8_E4M3_MAX, ML8_ACT_SCALE_EPS);
+    const float inv_scale = 1.0f / scale;
+    if (threadIdx.x == 0) {
+        a_scale[row] = scale;
+    }
+
+    uint8_t * orow = a_fp8 + (size_t) row * (size_t) K;
+    #pragma unroll
+    for (int j = 0; j < MAXAW; j++) {
+        const int a = wave + j * NW;
+        if (a < a_dim) {
+            uint8_t * ob = orow + (size_t) a * B + lane * E;
+            #pragma unroll
+            for (int e = 0; e < E; e += 4) {
+                if constexpr (E >= 4) {
+                    const uint32_t packed =
+                          (uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e]     * inv_scale)
+                        | ((uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e + 1] * inv_scale) << 8)
+                        | ((uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e + 2] * inv_scale) << 16)
+                        | ((uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e + 3] * inv_scale) << 24);
+                    *reinterpret_cast<uint32_t *>(ob + e) = packed;
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < E; q++) { ob[e + q] = fp8_quant_rot_f32_to_e4m3(v[j][e + q] * inv_scale); }
+                }
+            }
+        }
+    }
+}
+
+// Returns true if a V3 instantiation covers (kind, a_dim, b_dim) and launched it.
+static bool ml8_launch_qrot_v3(
+    cudaStream_t stream, bool kronecker,
+    const float * x, const float * h_a, uint8_t * a_fp8, float * a_scale,
+    int K, int a_dim, int b_dim, int n_rows) {
+    const dim3 grid((unsigned) n_rows);
+    if (kronecker) {
+        // one wave per row; a_dim*E floats/lane resident
+        if (b_dim == 1024 && a_dim <= 5) {
+            ml8_fp8_qrot_v3_kernel<1024, 1, 5, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            return true;
+        }
+        if (b_dim == 1024 && a_dim <= 8) {
+            ml8_fp8_qrot_v3_kernel<1024, 1, 8, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            return true;
+        }
+        if (b_dim == 512 && a_dim <= 16) {
+            ml8_fp8_qrot_v3_kernel<512, 1, 16, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            return true;
+        }
+        if (b_dim == 256 && a_dim <= 16) {
+            ml8_fp8_qrot_v3_kernel<256, 1, 16, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            return true;
+        }
+        return false;
+    }
+    if (b_dim == 128) {
+        // Keep <= ~12 blocks (48 floats) per lane resident: more waves per
+        // row, shorter per-wave dependency chains, more bytes in flight.
+        static const int nw_env = [] { const char * e = std::getenv("MT_FP8_QROT_V3_NW"); return e ? std::atoi(e) : 0; }();
+        if (a_dim <= 16 && nw_env == 0) {
+            ml8_fp8_qrot_v3_kernel<128, 4, 4, false><<<grid, 32 * 4, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true;
+        }
+        const int nw = nw_env ? nw_env : 16;   // measured 2026-09-18 K=17408: NW=4 0.744 ms, 8 0.832, 16 0.463 (359 GB/s)
+        #define ML8_QROT_V3_B128(NW_) \
+            if (nw == NW_) { \
+                const int per_wave = (a_dim + NW_ - 1) / NW_; \
+                if (per_wave <= 4)  { ml8_fp8_qrot_v3_kernel<128, NW_,  4, false><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 12) { ml8_fp8_qrot_v3_kernel<128, NW_, 12, false><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 34) { ml8_fp8_qrot_v3_kernel<128, NW_, 34, false><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                return false; \
+            }
+        ML8_QROT_V3_B128(4)
+        ML8_QROT_V3_B128(8)
+        ML8_QROT_V3_B128(16)
+        #undef ML8_QROT_V3_B128
+        return false;
+    }
+    if (b_dim == 64) {
+        constexpr int NW = 4;
+        const int per_wave = (a_dim + NW - 1) / NW;
+        if (per_wave <= 8)  { ml8_fp8_qrot_v3_kernel<64, NW,  8, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 32) { ml8_fp8_qrot_v3_kernel<64, NW, 32, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        return false;
+    }
+    if (b_dim == 32) {
+        constexpr int NW = 4;
+        const int per_wave = (a_dim + NW - 1) / NW;
+        if (per_wave <= 16) { ml8_fp8_qrot_v3_kernel<32, NW, 16, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 64) { ml8_fp8_qrot_v3_kernel<32, NW, 64, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        return false;
+    }
+    return false;
+}
+
+// MT_FP8_QROT_V3=0 forces V2 (then V2's own switch applies) for A/B.
+static bool ggml_cuda_fp8_qrot_v3_disabled() {
+    static const bool off = [] {
+        const char * e = std::getenv("MT_FP8_QROT_V3");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    return off;
+}
+
+// Largest a_dim the block_hadamard V2 path's "big" register-array
+// instantiation supports before falling back to the old paths. Chosen to
+// comfortably cover the production TP K-split shard widths seen elsewhere
+// in this file (a_dim=98 for 12544, a_dim=136 for 17408) with headroom;
+// above this the register footprint of a MAX_A-sized per-thread array is
+// judged not worth it vs. just falling through to the generic path.
+static constexpr int ML8_QROT_V2_BLOCKHAD_MAX_A = 160;
+
+// MT_FP8_QROT_V2=0 forces the old (round-3) per-row paths for A/B testing
+// against this round-4 kernel; unset or any other value keeps V2 on (the
+// default).
+static bool ggml_cuda_fp8_qrot_v2_disabled() {
+    static const bool off = [] {
+        const char * e = std::getenv("MT_FP8_QROT_V2");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    return off;
+}
+
 void ggml_cuda_op_fp8_quant_rot(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst) {
@@ -3464,6 +4357,72 @@ void ggml_cuda_op_fp8_quant_rot(
     GGML_ASSERT(dst->ne[1] == x->ne[1] && dst->ne[2] == x->ne[2] && dst->ne[3] == x->ne[3]);
 
     cudaStream_t stream = ctx.stream();
+
+    // MAD-3xx round 4 (V2) — single fused kernel family for BOTH per-row
+    // kinds, replacing all three round-3 paths below (kronecker fused,
+    // block_hadamard fused, and the generic 3-launch chain block_hadamard's
+    // large-K shapes fell back to). See ml8_fp8_qrot_v2_kernel's comment for
+    // why its LDS is O(b_dim) instead of O(K) -- that's what lets it cover
+    // the K=17408 shape the round-3 fused block_hadamard kernel couldn't.
+    //
+    // Traffic accounting for why this MUST stay a single launch with the
+    // rotated row held on-chip (registers), not round-tripped through DRAM:
+    // a K=17408, n_rows=2048 row is 42MB in / 10.5MB out (52.5MB "useful").
+    // At the 600 GB/s effective floor that's an 87.5us budget. Any design
+    // that re-reads X a second time (to avoid holding the rotated row
+    // on-chip between the absmax pass and the quantize pass) already moves
+    // >=84MB of physical traffic before even writing the output, which caps
+    // effective throughput at <350 GB/s regardless of how fast the reads
+    // are -- provably short of the target. So the row's rotated values must
+    // survive on-chip (in per-thread registers here) from the absmax pass
+    // straight into the quantize pass.
+    //
+    // Gate: KRONECKER needs a_dim<=16 (H_a register array, same bound the
+    // round-3 kernel already had); BLOCK_HADAMARD needs a_dim<=160 (the V2
+    // kernel's own register-array bound -- see ML8_QROT_V2_BLOCKHAD_MAX_A).
+    // b_dim must be the power-of-two 16..1024 the FWHT butterfly requires.
+    // Anything outside this (plus kind==NONE, which never rotates) falls
+    // through to the round-3 paths below unchanged. MT_FP8_QROT_V2=0 forces
+    // that fallback unconditionally, for A/B comparison against this kernel.
+    if (per_row && !ggml_cuda_fp8_qrot_v2_disabled() &&
+        b_dim >= 16 && b_dim <= 1024 && (b_dim & (b_dim - 1)) == 0 &&
+        ((kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER && a_dim > 0 && a_dim <= 16) ||
+         (kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD && a_dim > 0 && a_dim <= ML8_QROT_V2_BLOCKHAD_MAX_A))) {
+        GGML_ASSERT((int64_t) a_dim * (int64_t) b_dim == K);
+        uint8_t * out_qs    = (uint8_t *) dst->data;
+        float   * out_scale = (float *) ((uint8_t *) dst->data + (size_t) n_rows * (size_t) K);
+
+        if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
+            GGML_ASSERT(h_a != nullptr && h_a->type == GGML_TYPE_F32 && ggml_is_contiguous(h_a));
+            GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+        }
+        if (!ggml_cuda_fp8_qrot_v3_disabled() &&
+            ml8_launch_qrot_v3(stream, kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER,
+                               (const float *) x->data, h_a ? (const float *) h_a->data : nullptr,
+                               out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows)) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+
+        if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
+            ml8_launch_qrot_v2<16, true>(
+                stream, (const float *) x->data, (const float *) h_a->data,
+                out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows);
+        } else {
+            GGML_ASSERT(h_a == nullptr);
+            if (a_dim <= 16) {
+                ml8_launch_qrot_v2<16, false>(
+                    stream, (const float *) x->data, nullptr,
+                    out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows);
+            } else {
+                ml8_launch_qrot_v2<ML8_QROT_V2_BLOCKHAD_MAX_A, false>(
+                    stream, (const float *) x->data, nullptr,
+                    out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows);
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     // MAD-305 Phase 5 (round 3) — per-row (G=0) + KRONECKER fusion: skip the
     // separate FWHT + H_a^T launches (mt_turbo_fp8_fwht_kernel measured
@@ -3795,6 +4754,14 @@ void ggml_cuda_op_fp8_mul_mat(
             return;
         }
 
+        // fp32 epilogue into dst (see the ML8_4 prefill call site above).
+        if (!ml8_trfeed_f32out_disabled()) {
+            const hipError_t rc = rdna4_gemm_fp8_trfeed_f32(
+                (const uint8_t *) a_ptr, (const uint8_t *) repack->b_packed, (float *) dst->data,
+                a_scale_ptr, (const float *) repack->b_scale, M_pad, M, N, K, stream);
+            GGML_ASSERT(rc == hipSuccess && "rdna4_gemm_fp8_trfeed_f32 dispatch failed");
+            return;
+        }
         ggml_cuda_pool_alloc<nv_bfloat16> c_bf16(ctx.pool(), (size_t) M_pad * (size_t) N);
         const hipError_t rc = rdna4_gemm_fp8_trfeed(
             a_ptr, repack->b_packed, c_bf16.get(), a_scale_ptr, (const float *) repack->b_scale,

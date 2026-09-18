@@ -351,6 +351,46 @@ void ggml_cuda_op_ml8_mul_mat_fused(
     ggml_tensor *               dst);
 
 // ─────────────────────────────────────────────────────────────────────
+// MAD-305 fused-FFN task (2026-09-18): {ML8_MUL_MAT(gate), ML8_MUL_MAT(up),
+// GLU(swiglu)} -> ONE fused GEMM whose epilogue computes silu(gate)*up and
+// stores it once, eliding both intermediate GEMM output stores (2x142 MB at
+// Qwen3.8-27B ML8_4 prefill shapes) and the GLU kernel's own read/write pass
+// (~430 MB). See gemm_capi.h's rdna4_gemm_fp8_trfeed_swiglu_f32 /
+// rdna4_expand_ml84_pair_to_trfeed for the kernel-level design.
+//
+// can_fuse gate (cheap, called from ggml_cuda_try_fuse): both mm_gate/mm_up
+// are GGML_OP_ML8_MUL_MAT reading the SAME x (mm_gate->src[2] ==
+// mm_up->src[2]) with the SAME lut_group_off op_param (fusing across a TP
+// K-slice boundary would silently mix centroid tables), both weights
+// GGML_TYPE_ML8_4 repacked into the RDNA4_TRFEED layout with the SAME N
+// (gate/up always share it in every FFN this repo builds, but checked, not
+// assumed), glu is GGML_GLU_OP_SWIGLU (not swapped) with src[{0,1}] wired to
+// {mm_gate,mm_up} in either order, M_pad > 32 (prefill only -- the decode
+// split-K path stays unfused), and neither mul_mat has a fused rotation
+// (h_a) prologue (that is a separate, mutually exclusive fusion already
+// handled by ggml_cuda_ml8_can_fuse_rot_mm; combining all three into one
+// kernel is out of scope here). Node use-count / single-consumer checks are
+// the CALLER's job (ggml_can_fuse_subgraph in ggml-cuda.cu), not this
+// function's. MT_ML8_FFN_FUSE=0 disables (A/B).
+bool ggml_cuda_ml8_can_fuse_ffn_swiglu(
+    const ggml_tensor * mm_gate,
+    const ggml_tensor * mm_up,
+    const ggml_tensor * glu);
+
+// `mm_gate`/`mm_up` are the two ML8_MUL_MAT nodes, in EITHER order relative
+// to glu_dst->src[0]/src[1] -- this function re-derives which is gate/up
+// from glu_dst itself, the same way ggml_cuda_ml8_can_fuse_ffn_swiglu
+// checked it, so the caller does not need to pre-sort them. `glu_dst` is the
+// GGML_OP_GLU(swiglu) node; its shape/data pointer (glu_dst->data) is what
+// the fused kernel actually writes -- mm_gate->data/mm_up->data are never
+// touched (those two mul_mat nodes' own dst tensors are elided).
+void ggml_cuda_op_ml8_ffn_gate_up_swiglu(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         mm_gate,
+    const ggml_tensor *         mm_up,
+    ggml_tensor *               glu_dst);
+
+// ─────────────────────────────────────────────────────────────────────
 // FP8_B128 phase 2 (design doc section 4). GGML_TYPE_FP8_B128 rides the
 // SAME in-place registry as ML8_FP8/ML8_4 above (ggml_cuda_ml8_inplace_*):
 // eligible()/alloc_size()/set()/get() all branch on t->type internally, so

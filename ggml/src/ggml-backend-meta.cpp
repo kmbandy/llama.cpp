@@ -3303,6 +3303,32 @@ struct ggml_backend_meta_context {
     // fence_wait_same_index()'s not-yet-submitted-vs-overrun disambiguation.
     std::vector<size_t> slot_fence_latest_index[n_graph_slots];
     std::vector<bool>   slot_fence_latest_valid[n_graph_slots];
+    // Per-slot ubatch generation, bumped in ggml_backend_meta_graph_compute_step_begin() when
+    // the slot starts a fresh sub-batch (its subgraph index resets to 0). Closes the boundary
+    // hole in fence_wait_same_index(): the host order at a boundary is A_old(n-1), A_new(0),
+    // B_old(n-1), B_new(0) -- when B_old(n-1) looks up A's "latest index" it sees 0 (< n-1) and
+    // would wrongly conclude A never submitted n-1. If the other slot's generation is AHEAD of
+    // ours, everything it submitted for our generation is already on its stream, so waiting on
+    // its latest event (FIFO on that stream) covers subgraph i and is at most one subgraph of
+    // over-synchronization.
+    // Generation bookkeeping (replaces the "same index == same layer of the paired ubatch"
+    // assumption, which only holds while the other slot is still on the ubatch we depend on):
+    //   slot_gen[s]     = value of slot_gen_counter when slot s last started a sub-batch.
+    //   slot_dep_gen[s] = slot_gen of the OTHER slot at that moment = the sub-batch whose
+    //                     KV/state writes this sub-batch consumes (the previous chunk).
+    //   slot_end_ev[s][g % 2] / slot_end_gen = event recorded on every device after slot s's
+    //                     LAST subgraph of generation g.
+    // fence_wait_same_index(): while slot_gen[other] == slot_dep_gen[me] the other slot is still
+    // submitting the ubatch I depend on -> same-index ring wait. Once it has moved on, that whole
+    // ubatch is submitted -> one wait on its end event (exact, no over-synchronization), done
+    // once per (slot, device) per ubatch. A slot never depends on a NEWER sub-batch of the other
+    // slot, so the ring is never consulted across generations (that was the overrun abort).
+    size_t slot_gen_counter = 0;
+    size_t slot_gen[n_graph_slots]     = { 0, 0 };
+    size_t slot_dep_gen[n_graph_slots] = { 0, 0 };
+    std::vector<ggml_backend_event_t> slot_end_ev[n_graph_slots][2];  // [slot][parity][device]
+    size_t                            slot_end_gen[n_graph_slots][2] = { { 0, 0 }, { 0, 0 } };
+    std::vector<bool>                 slot_dep_waited[n_graph_slots]; // [slot][device]
 
     void slot_fence_init() {
         static_assert(n_graph_slots == 2, "other_slot() assumes exactly 2 slots");
@@ -3311,6 +3337,10 @@ struct ggml_backend_meta_context {
             slot_fence_ring[s].resize(n_devs);
             slot_fence_latest_index[s].assign(n_devs, 0);
             slot_fence_latest_valid[s].assign(n_devs, false);
+            slot_dep_waited[s].assign(n_devs, false);
+            for (int par = 0; par < 2; par++) {
+                slot_end_ev[s][par].assign(n_devs, nullptr);
+            }
             for (size_t j = 0; j < n_devs; j++) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(backend_configs[j].backend);
                 for (size_t k = 0; k < GGML_META_FENCE_RING; k++) {
@@ -3318,12 +3348,23 @@ struct ggml_backend_meta_context {
                     // treats that as "nothing to fence" rather than dereferencing it.
                     slot_fence_ring[s][j][k].ev = ggml_backend_event_new(dev);
                 }
+                for (int par = 0; par < 2; par++) {
+                    slot_end_ev[s][par][j] = ggml_backend_event_new(dev);
+                }
             }
         }
     }
 
     void slot_fence_free() {
         for (size_t s = 0; s < n_graph_slots; s++) {
+            for (int par = 0; par < 2; par++) {
+                for (auto & ev : slot_end_ev[s][par]) {
+                    if (ev != nullptr) {
+                        ggml_backend_event_free(ev);
+                        ev = nullptr;
+                    }
+                }
+            }
             for (auto & per_dev : slot_fence_ring[s]) {
                 for (auto & entry : per_dev) {
                     if (entry.ev != nullptr) {
@@ -4225,7 +4266,40 @@ struct ggml_backend_meta_graph_runner {
         if (!ggml_backend_meta_slot_streams_enabled()) {
             return;
         }
-        const size_t os = ggml_backend_meta_context::other_slot(i_slot);
+        const size_t os  = ggml_backend_meta_context::other_slot(i_slot);
+        const size_t dep = backend_ctx->slot_dep_gen[i_slot];
+        if (dep == 0) {
+            return; // first sub-batch ever on this slot pair: nothing to depend on
+        }
+        const bool dep_fully_submitted =
+            backend_ctx->slot_gen[os] != dep ||                          // other slot moved on
+            backend_ctx->slot_end_gen[os][dep % 2] == dep;               // or finished it in place
+        if (dep_fully_submitted) {
+            // The sub-batch we depend on is fully submitted (the other slot moved past it, or it
+            // ran to completion before we started -- decode steps and tail ubatches do that, the
+            // slots are not always in lockstep). Wait once (per device, per ubatch) on that
+            // sub-batch's end event. If that event has since been reused (the other slot ran two
+            // more ubatches), fall back to its latest event -- FIFO-after everything older, at
+            // worst a harmless over-sync.
+            if (backend_ctx->slot_dep_waited[i_slot][j]) {
+                return;
+            }
+            backend_ctx->slot_dep_waited[i_slot][j] = true;
+            const int par = (int) (dep % 2);
+            ggml_backend_event_t ev = backend_ctx->slot_end_ev[os][par][j];
+            if (backend_ctx->slot_end_gen[os][par] == dep && ev != nullptr) {
+                ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, ev);
+                return;
+            }
+            if (backend_ctx->slot_fence_latest_valid[os][j]) {
+                const size_t latest = backend_ctx->slot_fence_latest_index[os][j];
+                auto & le = backend_ctx->slot_fence_ring[os][j][latest % ggml_backend_meta_context::GGML_META_FENCE_RING];
+                if (le.valid && le.index == latest && le.ev != nullptr) {
+                    ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, le.ev);
+                }
+            }
+            return;
+        }
         if (!backend_ctx->slot_fence_latest_valid[os][j] || backend_ctx->slot_fence_latest_index[os][j] < i) {
             // The other slot has not (yet) submitted index i this pass -- it can only do so,
             // if at all, strictly after this call returns (see the rolling-loop ordering
@@ -4237,20 +4311,25 @@ struct ggml_backend_meta_graph_runner {
             ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, entry.ev);
             return;
         }
-        // The other slot's latest index is >= i, so it DID submit index i at some point, but the
-        // ring slot that should still hold its event has since been overwritten by a later
-        // index without this slot ever consulting it -- a genuine overrun of the assumed <=1-
-        // step skew this ring is sized for. Abort loudly: silently skipping here would let a
-        // KV-cache/recurrent-state read race its writer.
-        GGML_ABORT("%s: WP_META_SLOT_STREAMS fence ring overrun: slot %zu device %zu wanted "
-                   "subgraph index %zu but the other slot's latest submitted index is %zu and "
-                   "ring[%zu] now holds index %zu -- the other slot got more than "
-                   "GGML_META_FENCE_RING=%zu steps ahead of this check; raise "
-                   "ggml_backend_meta_context::GGML_META_FENCE_RING or investigate why the "
-                   "rolling loop's one-step skew bound was violated",
-                   __func__, i_slot, j, i, backend_ctx->slot_fence_latest_index[os][j],
-                   i % ggml_backend_meta_context::GGML_META_FENCE_RING, entry.index,
-                   (size_t) ggml_backend_meta_context::GGML_META_FENCE_RING);
+        // The other slot's latest index is >= i but ring[i % RING] no longer holds i: the slots
+        // are not in the <=1-step lockstep this ring assumes (the state model missed a case).
+        // Always-correct fallback: wait on the other slot's LATEST event, which is FIFO-after its
+        // subgraph i -- over-synchronizes, never races. Logged once so the case can be studied.
+        {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 4) {
+                fprintf(stderr, "%s: WP_META_SLOT_STREAMS ring miss: slot %zu dev %zu idx %zu other_latest %zu ring_idx %zu "
+                        "gen me %zu dep %zu other %zu end_gen[%zu]=%zu -- waiting on other's latest event\n",
+                        __func__, i_slot, j, i, backend_ctx->slot_fence_latest_index[os][j], entry.index,
+                        backend_ctx->slot_gen[i_slot], dep, backend_ctx->slot_gen[os], dep % 2,
+                        backend_ctx->slot_end_gen[os][dep % 2]);
+            }
+            const size_t latest = backend_ctx->slot_fence_latest_index[os][j];
+            auto & le = backend_ctx->slot_fence_ring[os][j][latest % ggml_backend_meta_context::GGML_META_FENCE_RING];
+            if (le.valid && le.index == latest && le.ev != nullptr) {
+                ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, le.ev);
+            }
+        }
     }
 
     // Records that this slot's subgraph i has been submitted (not completed -- the event marks a
@@ -4274,6 +4353,14 @@ struct ggml_backend_meta_graph_runner {
         entry.valid = true;
         backend_ctx->slot_fence_latest_index[i_slot][j] = i;
         backend_ctx->slot_fence_latest_valid[i_slot][j] = true;
+        if (i + 1 == backend_ctx->graph_states[i_slot].n_subgraphs) {
+            const size_t g = backend_ctx->slot_gen[i_slot];
+            ggml_backend_event_t ev = backend_ctx->slot_end_ev[i_slot][g % 2][j];
+            if (ev != nullptr) {
+                ggml_backend_event_record(ev, backend_ctx->backend_configs[j].backend);
+                backend_ctx->slot_end_gen[i_slot][g % 2] = g;
+            }
+        }
     }
 
     ggml_tensor * get_node_aux(ggml_tensor * t) {
@@ -4691,34 +4778,15 @@ enum ggml_status ggml_backend_meta_graph_compute_step_begin(
     ggml_backend_meta_graph_prepare(backend, cgraph, i_slot);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
-    // WP_META_SLOT_STREAMS ubatch-boundary fence: this call starts a FRESH sub-batch on i_slot
-    // (rolling loop's prepare_slot()+begin_slot(), called again once mctx->next() hands this
-    // slot the next chunk of the sequence). That new sub-batch is the continuation of whichever
-    // sub-batch the OTHER slot most recently processed, so its first subgraph must not start
-    // until everything the other slot has submitted so far (KV-cache / recurrent-state writes
-    // included) is visible -- wait unconditionally on the other slot's latest fence event, one
-    // wait per device, per ubatch (cheap: this runs once per sub-batch, not once per subgraph).
-    // The very first ubatch of the whole rolling pass finds no valid event yet (other slot has
-    // not submitted anything) and this is a no-op, as intended.
+    // WP_META_SLOT_STREAMS generation bookkeeping (see slot_gen/slot_dep_gen in the context):
+    // this call starts a FRESH sub-batch on i_slot; it depends on whatever sub-batch the other
+    // slot is on right now (the previous chunk of the sequence, or an unrelated sequence --
+    // over-synchronizing on that is harmless). fence_wait_same_index() does the waiting.
     if (ggml_backend_meta_slot_streams_enabled()) {
         const size_t os = ggml_backend_meta_context::other_slot(i_slot);
-        for (size_t j = 0; j < backend_ctx->backend_configs.size(); j++) {
-            auto & bc = backend_ctx->backend_configs[j];
-            if (!backend_ctx->slot_fence_latest_valid[os][j]) {
-                continue;
-            }
-            const size_t latest = backend_ctx->slot_fence_latest_index[os][j];
-            auto & entry = backend_ctx->slot_fence_ring[os][j][latest % ggml_backend_meta_context::GGML_META_FENCE_RING];
-            // entry should always match latest here (fence_record_index sets both together in
-            // the same call) -- defensive skip, not a normal path, if it somehow doesn't.
-            if (!entry.valid || entry.index != latest || entry.ev == nullptr) {
-                continue;
-            }
-            if (bc.set_stream_no != nullptr) {
-                bc.set_stream_no(bc.backend, (int) i_slot); // wait must land on i_slot's stream
-            }
-            ggml_backend_event_wait(bc.backend, entry.ev);
-        }
+        backend_ctx->slot_gen[i_slot]     = ++backend_ctx->slot_gen_counter;
+        backend_ctx->slot_dep_gen[i_slot] = backend_ctx->slot_gen[os];
+        std::fill(backend_ctx->slot_dep_waited[i_slot].begin(), backend_ctx->slot_dep_waited[i_slot].end(), false);
     }
 
     auto & gs = backend_ctx->graph_states[i_slot];

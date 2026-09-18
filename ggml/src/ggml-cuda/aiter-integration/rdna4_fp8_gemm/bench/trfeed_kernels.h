@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <vector>
 #include <cmath>
+#include <type_traits>
 // rocwmma's config static-asserts on non-WMMA offload archs (gfx1030 device
 // pass in the multi-arch libggml-hip build); it is only needed where the kernel
 // bodies are compiled (host pass + gfx1201 device pass).
@@ -148,12 +149,60 @@ gemm_fp8_baseline(const float8_t* __restrict__ A, const float8_t* __restrict__ B
 // variant bm256 (TBM=256,TWAVES_M=4) share one body. N-tiling fixed: BN=128, WAVES_N=2.
 // Larger TBM serves each B column tile across more M-rows -> fewer distinct B-tile DRAM
 // fetches per output tile (amortizes B re-fetch).
-template <int TBM, int TWAVES_M>
+//
+// COut (added, MAD-305 fp32-output task, freeze lifted 2026-09-18): output element
+// type, defaulted to __hip_bfloat16 so every EXISTING instantiation/call site
+// (gemm_fp8_trfeed<128,2>, <32,1>, ...) is untouched byte-for-byte -- the K-loop
+// above this comment is unmodified, and the epilogue's bf16 branch below is the
+// OLD code moved under `if constexpr`, not rewritten. COut=float is the new path:
+// the ggml consumer of C is always fp32, so this lets the caller skip the
+// bf16->fp32 `convert_unary` pass entirely by writing fp32 directly, AND (via the
+// added M_valid param) into a destination sized to the caller's true M rather than
+// the padded M_pad the frozen kernel's ungapped A-tile fill requires -- no scratch.
+// M_valid is honored ONLY on the float path: the bf16 path's existing callers pass
+// M_pad as `M` (see gemm_trfeed_prod.hip), making `gr < M` trivially true for the
+// whole tile (an "unguarded full-tile store" in effect), and M_valid must not
+// change that -- it defaults to INT_MAX and the bf16 branch never reads it.
+//
+// SwiGLU (added, MAD-305 fused-FFN-epilogue task; interleave changed to
+// 32-column granularity 2026-09-18, see the epilogue's own comment below for
+// why): when true, this is no longer a plain GEMM epilogue -- `N` is a FUSED
+// gate/up column count (N = 2*N_half, N%128==0) whose 128-wide B_shuf tiles
+// interleave gate/up at 32-column granularity (see
+// rdna4_expand_ml84_pair_to_trfeed, gemm_ml84_prod.hip: tile-local pos
+// [0,32) is gate channel [0,32), [32,64) is up channel [0,32) -- the SAME
+// channel, paired -- [64,96) is gate channel [32,64), [96,128) is up
+// channel [32,64)), `b_scale` is indexed over that same fused N, and `C` is
+// [M_valid, N/2] (HALF the fused N): out[m][64t+c] =
+// silu(gate_acc[m][c]*a_scale[m]*b_scale[...]) * (up_acc[m][c]*a_scale[m]*b_scale[...]),
+// c in [0,64) (see the epilogue below for the exact b_scale index formula).
+// The K-loop above this comment is BYTE-IDENTICAL whether SwiGLU is true or
+// false -- it has no idea gate/up are interleaved, it just WMMAs whatever
+// fp8 bytes tr_load8 hands it, exactly like the plain path. Only the
+// epilogue differs, selected at compile time (no new kernel body).
+//
+// At 32-column granularity, wave_n=0's 4 fragments (TFRAGS_N=4, WAVES_N=2,
+// BN=128) are [gate ch.0-15, gate ch.16-31, up ch.0-15, up ch.16-31] and
+// wave_n=1's are [gate ch.32-47, gate ch.48-63, up ch.32-47, up ch.48-63]
+// -- i.e. fragment ni (0,1) is gate and ni+TFRAGS_N/2 (2,3) is its MATCHING
+// up fragment, both WITHIN THE SAME WAVE. Since every thread already
+// computes all TFRAGS_N fragments of its own wave in the K-loop above
+// (nothing there branches on ni), acc[mi][ni] and acc[mi][ni+TFRAGS_N/2]
+// are simply two elements of THIS thread's own local array -- a pure
+// register-local pairing, no cross-wave read and no __syncthreads() at all
+// (a change from the first version of this epilogue, which interleaved at
+// 64-column granularity and needed a cross-wave scratch exchange + barrier
+// per (mi,ni); that measured a 4-5x SLOWDOWN vs the two plain GEMMs it
+// replaced -- see ROUND 2 in the epilogue body below). Requires WAVES_N==2
+// (asserted below); this file hardcodes WAVES_N=2 everywhere so that's
+// always true.
+template <int TBM, int TWAVES_M, typename COut = __hip_bfloat16, bool SwiGLU = false>
 __global__ void __launch_bounds__(TWAVES_M * WAVES_N * WAVE_SIZE)
 gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshuf,
-                __hip_bfloat16* __restrict__ C,
+                COut* __restrict__ C,
                 const float* __restrict__ a_scale, const float* __restrict__ b_scale,
-                int M, int N, int K) {
+                int M, int N, int K, int M_valid = 0x7fffffff) {
+    static_assert(!SwiGLU || WAVES_N == 2, "SwiGLU epilogue assumes a 2-wide N wave split (gate/up halves)");
     constexpr int TWAVES   = TWAVES_M * WAVES_N;
     constexpr int TBLOCK   = TWAVES * WAVE_SIZE;
     constexpr int TFRAGS_M = (TBM / TWAVES_M) / 16;
@@ -200,21 +249,136 @@ gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshu
         __syncthreads();                              // A LDS reuse barrier
     }
 
-    // ---- epilogue (identical to baseline) ----
+    // ---- epilogue ----
+    // bf16/float branches: BYTE-IDENTICAL to the pre-existing code -- same
+    // scratch write, same `gr < M && gc < N` guard (trivially true for every
+    // existing caller), same store loops. See the class comment above for
+    // why the float branch's read-back pattern (row,quad) differs from the
+    // write pattern (e_rowbase,e_col): it is a within-WAVE lane
+    // redistribution through `ws` that needs no barrier (same 32 lanes
+    // write then read, in program order), purely to turn 16 scalar
+    // stores/lane into 4 coalesced float4 stores/lane -- the SwiGLU branch
+    // below reuses this exact trick, just combining two fragments' worth of
+    // register data into `ws` instead of copying one.
     __shared__ float scratch[TWAVES][16 * 16];
     float* ws = scratch[wid];
     const int e_col = lane & 0xF, e_rowbase = ((lane >> 4) & 1) * 8;
+    if constexpr (SwiGLU) {
+        // ROUND 2 (2026-09-18 perf bug): the FIRST SwiGLU epilogue paired
+        // gate (wave_n=0's 64 tile-local columns) with up (wave_n=1's 64
+        // columns) -- two DIFFERENT physical wavefronts -- via a
+        // __syncthreads() + cross-wave scratch read every (mi,ni) iteration.
+        // Measured 22.50ms vs 4.73ms for the two plain GEMMs it replaces
+        // (M=2048/N_half=17408/K=5120, R9700): the repeated block-wide
+        // barrier serializes the whole workgroup 2*TFRAGS_M*TFRAGS_N times
+        // (32 barriers) while only half the threads (the gate wave) do any
+        // work after each one.
+        //
+        // Fix: rdna4_expand_ml84_pair_to_trfeed's fused B_shuf now
+        // interleaves gate/up at 32-COLUMN (not 64-column) granularity
+        // within each 128-wide tile: tile-local pos in [0,32) is gate
+        // channel [0,32), [32,64) is up channel [0,32) (the SAME channel,
+        // paired), [64,96) is gate channel [32,64), [96,128) is up channel
+        // [32,64). Since WAVES_N=2/TFRAGS_N=4 assigns wave_n=0 tile-local
+        // cols [0,64) and wave_n=1 cols [64,128), this puts fragment ni=0
+        // (gate, tile-local [0,16)) and ni=2 (up, tile-local [32,48), SAME
+        // channel [0,16)) in the SAME wave -- and since every thread in a
+        // wave computes ALL TFRAGS_N fragments of its wave already (the
+        // K-loop above never branched on ni), acc[mi][0] (gate) and
+        // acc[mi][2] (up) are just two elements of THIS thread's own local
+        // acc[][] array. No cross-wave read, no barrier: ni pairs with
+        // ni+TFRAGS_N/2, both register-local. Each wave now produces
+        // BN/WAVES_N/2 = 32 output (half-width) columns per row instead of
+        // reading/writing another wave's 64.
+        static_assert(TFRAGS_N % 2 == 0, "SwiGLU epilogue pairs ni with ni+TFRAGS_N/2");
+        constexpr int HALF_N = TFRAGS_N / 2;
+        for (int mi = 0; mi < TFRAGS_M; ++mi) {
+            const int row0 = tm + (wave_m * TFRAGS_M + mi) * 16;
+            for (int ni = 0; ni < HALF_N; ++ni) {
+                const int ni_up    = ni + HALF_N;
+                // Fused-N b_scale indices: gate at fragment ni's tile-local
+                // slot, up at fragment ni_up's -- SAME formula the plain
+                // path already uses for col0, just evaluated at two ni
+                // values instead of one (both are this thread's own
+                // fragments now, per the interleave above).
+                const int gc_gate0 = tn + (wave_n * TFRAGS_N + ni)    * 16;
+                const int gc_up0   = tn + (wave_n * TFRAGS_N + ni_up) * 16;
+                // Combine THIS thread's own gate/up fragments (pure register
+                // reads, acc[mi][ni] and acc[mi][ni_up]) and stage the
+                // COMBINED silu(gate)*up value into ws -- one write per
+                // (mi,ni), same scratch buffer/size the plain float branch
+                // uses, no second buffer needed since gate+up are already
+                // combined before the write.
+                #pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    const int   row = e_rowbase + s;
+                    const float az  = a_scale[row0 + row];
+                    const float g   = acc[mi][ni][s]    * az * b_scale[gc_gate0 + e_col];
+                    const float u   = acc[mi][ni_up][s] * az * b_scale[gc_up0   + e_col];
+                    // silu(g) = g * sigmoid(g) -- same formula, bit for bit, as
+                    // ggml-cuda/unary.cuh's ggml_cuda_op_silu_single (not #included:
+                    // this directory's kernels compile standalone via a direct hipcc
+                    // invocation, independent of the ggml build -- see the bench build
+                    // command in this task's report).
+                    const float silu_g = g / (1.0f + expf(-g));
+                    ws[row * 16 + e_col] = silu_g * u;
+                }
+                // Same within-wave coalesced float4 read-back as the plain
+                // float branch (no barrier -- this wave's own 32 lanes wrote
+                // ws above, in program order); output is HALF-width (N/2),
+                // and this wave's 32-column slice starts at
+                // block*64 + wave_n*32 + ni*16 (block = tn/128, i.e. tn>>1
+                // in half-width units == block*64).
+                const int col0_out = (tn >> 1) + wave_n * (BN / WAVES_N / 2) + ni * 16;
+                for (int t2 = lane; t2 < 64; t2 += WAVE_SIZE) {
+                    const int row = t2 >> 2, quad = t2 & 3;
+                    const int gr  = row0 + row;
+                    if (gr < M_valid) {
+                        const float* wr = ws + row * 16 + quad * 4;
+                        const int    gc = col0_out + quad * 4;
+                        if constexpr (std::is_same<COut, float>::value) {
+                            float4 v{wr[0], wr[1], wr[2], wr[3]};
+                            *reinterpret_cast<float4*>(C + (size_t) gr * (N / 2) + gc) = v;
+                        } else {
+                            #pragma unroll
+                            for (int kk = 0; kk < 4; ++kk) {
+                                C[(size_t) gr * (N / 2) + gc + kk] = (COut) wr[kk];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     for (int mi = 0; mi < TFRAGS_M; ++mi) {
         for (int ni = 0; ni < TFRAGS_N; ++ni) {
             #pragma unroll
             for (int s = 0; s < 8; ++s) ws[(e_rowbase + s) * 16 + e_col] = acc[mi][ni][s];
             int row0 = tm + (wave_m * TFRAGS_M + mi) * 16;
             int col0 = tn + (wave_n * TFRAGS_N + ni) * 16;
-            for (int t = lane; t < 256; t += WAVE_SIZE) {
-                int gr = row0 + t / 16, gc = col0 + t % 16;
-                if (gr < M && gc < N) {
-                    float v = ws[t] * a_scale[gr] * b_scale[gc];
-                    C[gr * N + gc] = (__hip_bfloat16)v;
+            if constexpr (std::is_same<COut, __hip_bfloat16>::value) {
+                for (int t = lane; t < 256; t += WAVE_SIZE) {
+                    int gr = row0 + t / 16, gc = col0 + t % 16;
+                    if (gr < M && gc < N) {
+                        float v = ws[t] * a_scale[gr] * b_scale[gc];
+                        C[gr * N + gc] = (__hip_bfloat16)v;
+                    }
+                }
+            } else {
+                for (int t2 = lane; t2 < 64; t2 += WAVE_SIZE) {
+                    int row = t2 >> 2, quad = t2 & 3;
+                    int gr = row0 + row, gc = col0 + quad * 4;
+                    if (gr < M_valid) {
+                        const float az = a_scale[gr];
+                        const float* wr = ws + row * 16 + quad * 4;
+                        float4 v;
+                        v.x = wr[0] * az * b_scale[gc + 0];
+                        v.y = wr[1] * az * b_scale[gc + 1];
+                        v.z = wr[2] * az * b_scale[gc + 2];
+                        v.w = wr[3] * az * b_scale[gc + 3];
+                        *reinterpret_cast<float4*>(C + (size_t) gr * N + gc) = v;
+                    }
                 }
             }
         }
@@ -604,10 +768,10 @@ gemm_fp8_trfeed_rb(const float8_t* __restrict__ A, const uint8_t* __restrict__ B
 }
 
 #else
-template <int TBM, int TWAVES_M>
+template <int TBM, int TWAVES_M, typename COut = __hip_bfloat16>
 __global__ void __launch_bounds__(TWAVES_M * WAVES_N * WAVE_SIZE)
 gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshuf,
-                __hip_bfloat16* __restrict__ C,
+                COut* __restrict__ C,
                 const float* __restrict__ a_scale, const float* __restrict__ b_scale,
-                int M, int N, int K);
+                int M, int N, int K, int M_valid = 0x7fffffff);
 #endif

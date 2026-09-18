@@ -3933,7 +3933,10 @@ enum ggml_rms_norm_fuse_op {
     GGML_RMS_NORM_FUSE_OP_MUL,
 };
 
-template <ggml_rms_norm_fuse_op FUSE_OP>
+// BF16 activation coverage (2026-09-18): src0/dst are templated on T (f32 or bf16);
+// the mul weight (src1, when FUSE_OP == MUL) stays f32, mirroring the CUDA kernel.
+// Internal reduction/scale math stays fp32 via type_conversion_table<T>.
+template <ggml_rms_norm_fuse_op FUSE_OP, typename T = float>
 static void ggml_compute_forward_rms_norm_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
@@ -3950,7 +3953,7 @@ static void ggml_compute_forward_rms_norm_f32(
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
-    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[0] == sizeof(T));
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -3965,12 +3968,13 @@ static void ggml_compute_forward_rms_norm_f32(
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const T * x = (const T *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
                 ggml_float sum = 0.0;
                 // worth switching to explicit SIMD?
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
+                    const float xi = type_conversion_table<T>::to_f32(x[i00]);
+                    sum += (ggml_float)(xi * xi);
                 }
 
                 const float mean  = sum/ne00;
@@ -3979,7 +3983,7 @@ static void ggml_compute_forward_rms_norm_f32(
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
 
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+                T * y = (T *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
                 if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
                     const int64_t i11 = i01 % ne11;
@@ -3988,11 +3992,17 @@ static void ggml_compute_forward_rms_norm_f32(
                     const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
+                        const float xi = type_conversion_table<T>::to_f32(x[i00]);
+                        y[i00] = type_conversion_table<T>::from_f32(xi * scale * w[i00]);
                     }
-                } else {
+                } else if constexpr (std::is_same_v<T, float>) {
                     memcpy(y, x, ne00 * sizeof(float));
                     ggml_vec_scale_f32(ne00, y, scale);
+                } else {
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        const float xi = type_conversion_table<T>::to_f32(x[i00]);
+                        y[i00] = type_conversion_table<T>::from_f32(xi * scale);
+                    }
                 }
             }
         }
@@ -4009,6 +4019,11 @@ void ggml_compute_forward_rms_norm(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_NONE>(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                // BF16 activation coverage (2026-09-18)
+                ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_NONE, ggml_bf16_t>(params, dst);
             } break;
         default:
             {
@@ -4033,6 +4048,11 @@ void ggml_compute_forward_rms_norm_mul_fused(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL>(params, dst_rms_norm, dst_mul);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                // BF16 activation coverage (2026-09-18)
+                ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL, ggml_bf16_t>(params, dst_rms_norm, dst_mul);
             } break;
         default:
             {
@@ -6229,7 +6249,8 @@ static void ggml_compute_forward_rope_flt(
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    // BF16 activation coverage (2026-09-18)
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
 
     float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
@@ -6389,6 +6410,11 @@ void ggml_compute_forward_rope(
             {
                 ggml_compute_forward_rope_flt<ggml_fp16_t>(params, dst, true);
             } break;
+        case GGML_TYPE_BF16:
+            {
+                // BF16 activation coverage (2026-09-18)
+                ggml_compute_forward_rope_flt<ggml_bf16_t>(params, dst, true);
+            } break;
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_rope_flt<float>(params, dst, true);
@@ -6412,6 +6438,11 @@ void ggml_compute_forward_rope_back(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_rope_flt<ggml_fp16_t>(params, dst, false);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                // BF16 activation coverage (2026-09-18)
+                ggml_compute_forward_rope_flt<ggml_bf16_t>(params, dst, false);
             } break;
         case GGML_TYPE_F32:
             {

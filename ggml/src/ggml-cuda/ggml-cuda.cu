@@ -6079,6 +6079,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // ml8: FFN {gate mul_mat, up mul_mat, swiglu} -> one fused GEMM whose
+    // epilogue computes silu(gate)*up and stores it once (MAD-305 fused-FFN
+    // task). Only the pattern shape is matched here (both node[i]/node[i+1]
+    // being ML8_MUL_MAT feeding node[i+2]'s GLU, with no other consumer of
+    // either mul_mat's output -- ggml_can_fuse_subgraph enforces that);
+    // every actual eligibility check (same shared x, same N/K, RDNA4_TRFEED
+    // layout, M>32 prefill-only, SWIGLU not swapped, matching lut_group_off,
+    // etc.) lives in ggml_cuda_ml8_can_fuse_ffn_swiglu (ml8.cu) so it stays
+    // in one place. glu->src[0] is always the SiLU'd operand and src[1] the
+    // multiplied one (ggml_swiglu(a,b) never swaps them), but the GRAPH may
+    // emit the gate/up ML8_MUL_MAT nodes in either index order, so try both
+    // assignments of {node[i], node[i+1]} to {gate, up} rather than assuming
+    // node[i] is gate.
+    if (node->op == GGML_OP_ML8_MUL_MAT && i + 2 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_ML8_MUL_MAT &&
+        cgraph->nodes[i + 2]->op == GGML_OP_GLU &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ML8_MUL_MAT, GGML_OP_ML8_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {
+        ggml_tensor * mm0 = cgraph->nodes[i];
+        ggml_tensor * mm1 = cgraph->nodes[i + 1];
+        ggml_tensor * glu = cgraph->nodes[i + 2];
+        ggml_tensor * mm_gate = (glu->src[0] == mm0) ? mm0 : mm1;
+        ggml_tensor * mm_up   = (glu->src[0] == mm0) ? mm1 : mm0;
+        if (ggml_cuda_ml8_can_fuse_ffn_swiglu(mm_gate, mm_up, glu)) {
+            ggml_cuda_op_ml8_ffn_gate_up_swiglu(*cuda_ctx, mm_gate, mm_up, glu);
+            return 2;
+        }
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
@@ -8700,9 +8728,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
-                   (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
+            // BF16 activation coverage (2026-09-18)
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16) &&
+                   (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16 || op->type         == GGML_TYPE_BF16);
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
 

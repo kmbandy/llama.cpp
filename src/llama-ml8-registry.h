@@ -76,6 +76,17 @@ struct ml8_registry {
         return &it->second;
     }
 
+    // Mutable lookup, for the post-load pass that canonicalizes a group's
+    // rotation_h_a pointer (llama_model_validate_fp8_rotation_groups): the
+    // quant_rot memo key is the h_a POINTER, so group members that carry
+    // byte-identical but separately loaded h_a tensors must be pointed at
+    // one of them or the shared input gets rotated+quantized once per member.
+    ml8_sidecars * find_mut(const struct ggml_tensor * w) {
+        auto it = entries.find(w);
+        if (it == entries.end()) return nullptr;
+        return &it->second;
+    }
+
 private:
     std::unordered_map<const struct ggml_tensor *, ml8_sidecars> entries;
 };

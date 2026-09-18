@@ -176,6 +176,102 @@ hipError_t rdna4_gemm_fp8_trfeed(const void* A, const void* B_shuf, void* C_bf16
                                  int M_pad, int N, int K, hipStream_t stream);
 
 // ─────────────────────────────────────────────────────────────────────────
+// fp32-output sibling of rdna4_gemm_fp8_trfeed above (MAD-305, freeze lifted
+// 2026-09-18): the frozen Phase-1 "trfeed" kernel body is UNCHANGED (its
+// K-loop and WMMA sequence are identical bytes to the bf16 instantiation --
+// see bench/trfeed_kernels.h's template comment); only the epilogue's output
+// branch differs, selected at compile time via
+// gemm_fp8_trfeed<TBM,TWAVES_M,float>. Motivation: every production caller's
+// consumer of C is fp32 (ggml_cuda_op_fp8_mul_mat writes dst->data, fp32), so
+// the bf16 path costs both a bf16 rounding pass AND a full
+// convert_unary<bf16,float> kernel copying M_pad x N elements back out
+// (measured 0.385s of a 7.2s 8192-token prefill on an R9700, MAD-305
+// 2026-09-18 rocprofv3 trace) -- this entry point removes both.
+//
+// Same A/B_shuf/a_scale/b_scale contracts and M_pad/tile-selection rules as
+// rdna4_gemm_fp8_trfeed (M_pad==32 -> decode/verify tile; else M_pad must be
+// an exact multiple of BM=128 -> prefill tile), PLUS:
+//   c_f32:    fp32 [M_valid, N] row-major, stride N -- sized to the CALLER's
+//             true M, NOT M_pad. No padded scratch is needed or read: the
+//             epilogue's float branch (unlike the bf16 branch, which the
+//             existing callers make an effectively-unguarded full-tile
+//             store by always passing M=M_pad) masks every store against
+//             M_valid, so rows in [M_valid, M_pad) -- the padding the
+//             frozen kernel's A-tile LDS fill still computes results for --
+//             are computed but never written.
+//   M_valid:  the caller's true M (1 <= M_valid <= M_pad). Rows >= M_valid
+//             within the dispatched tile are silently dropped by the
+//             epilogue; this is the ONLY new required parameter versus the
+//             bf16 entry point above.
+// Returns hipErrorInvalidValue if M_valid is <= 0 or > M_pad, in addition to
+// every bf16-path validity check (N % 128 == 0, K % 32 == 0, M_pad tile
+// rules).
+hipError_t rdna4_gemm_fp8_trfeed_f32(const uint8_t* a_fp8, const uint8_t* b_shuf, float* c_f32,
+                                     const float* a_scale, const float* b_scale,
+                                     int M_pad, int M_valid, int N, int K, hipStream_t stream);
+
+// ─────────────────────────────────────────────────────────────────────────
+// SwiGLU-epilogue sibling of rdna4_gemm_fp8_trfeed_f32 above (MAD-305 fused
+// FFN task, 2026-09-18): fuses ffn_gate/ffn_up's two ML8_4 GEMMs and the
+// swiglu(gate,up) GLU into ONE kernel launch, so the two GEMM output
+// stores (2x142 MB at Qwen3.8-27B ML8_4 prefill shapes) and the GLU's own
+// read/write pass (~430 MB) never happen -- see ml8.cu's
+// ggml_cuda_op_ml8_ffn_gate_up_swiglu, the sole caller.
+//
+// The K-loop is BYTE-IDENTICAL to rdna4_gemm_fp8_trfeed_f32's (same frozen
+// gemm_fp8_trfeed<TBM,TWAVES_M> body, only instantiated with the added
+// SwiGLU=true template flag).
+//
+// ROUND 2 (perf bug, 2026-09-18): the FIRST version of this fusion
+// interleaved gate/up at 64-COLUMN granularity within each 128-wide tile
+// (tile t's first 64 columns all gate, second 64 all up). Under
+// WAVES_N=2/BN=128 that put a tile's gate half in wave_n=0 and its up half
+// in a DIFFERENT wavefront (wave_n=1), so the epilogue needed a
+// __syncthreads() + cross-wave shared-memory exchange per output tile --
+// measured 22.50ms vs 4.73ms for the two plain GEMMs it replaced
+// (M=2048/N_half=17408/K=5120, R9700 bench). Fixed by interleaving at
+// 32-COLUMN granularity instead (see rdna4_expand_ml84_pair_to_trfeed and
+// b_shuf_fused below): gate and its matching up channel then always land
+// in the SAME wave's two fragments (ni and ni+TFRAGS_N/2), a pure
+// register-local read with no cross-wave traffic and no barrier at all --
+// see trfeed_kernels.h's epilogue comment for the full derivation. The
+// K-loop itself never changed between the two versions; only this column
+// placement rule did.
+//
+// a_fp8/a_scale: SAME single activation contract as every other trfeed
+//   entry point (one shared `x` GEMV operand for both gate and up -- this
+//   is what makes the fusion legal in the first place: both ML8_MUL_MATs
+//   the caller is fusing must read the identical x).
+// b_shuf_fused: N_fused*K bytes, built by rdna4_expand_ml84_pair_to_trfeed
+//   (gemm_ml84_prod.hip) from the gate and up ML8_4 weights: N_fused =
+//   2*N_half, and each of b_shuf_fused's 128-wide B_shuf tiles interleaves
+//   gate/up at 32-column granularity within the (shared) output width
+//   N_half: tile-local pos in [0,32) is gate channel [0,32), [32,64) is up
+//   channel [0,32) (the SAME channel as the gate slot 32 positions
+//   earlier), [64,96) is gate channel [32,64), [96,128) is up channel
+//   [32,64).
+// b_scale_fused: fp32[N_fused], ALSO produced by rdna4_expand_ml84_pair_to_trfeed,
+//   indexed in the SAME interleaved fused-N space as b_shuf_fused -- gate
+//   and up have independent per-column scales, applied to their own
+//   accumulator BEFORE silu/mul, exactly as the un-fused
+//   rdna4_gemm_fp8_trfeed_f32 epilogue applies a_scale[m]*b_scale[n] before
+//   ANY other op.
+// c_f32: fp32 [M_valid, N_half] row-major (N_half = N_fused/2) -- HALF the
+//   fused width, one silu(gate)*up value per output column. No bf16
+//   scratch, no separate GLU pass: this is the ONLY store of the fused
+//   FFN's ffn_gate/ffn_up/glu subgraph.
+// M_pad/M_valid: same rules as rdna4_gemm_fp8_trfeed_f32 (M_pad==32 ->
+//   decode/verify tile, but this fusion is NOT wired for M_pad==32 by
+//   ml8.cu -- decode stays two separate un-fused split-K GEMMs plus the
+//   existing GLU kernel; M_pad>32 -> exact multiple of BM=128, the prefill
+//   tile, which IS what ml8.cu fuses).
+// N_fused % 128 == 0 (so N_half % 64 == 0, satisfying
+// rdna4_expand_ml84_pair_to_trfeed's own N_half%64==0 requirement), K % 32 == 0.
+hipError_t rdna4_gemm_fp8_trfeed_swiglu_f32(const uint8_t* a_fp8, const uint8_t* b_shuf_fused,
+                                            float* c_f32, const float* a_scale, const float* b_scale_fused,
+                                            int M_pad, int M_valid, int N_fused, int K, hipStream_t stream);
+
+// ─────────────────────────────────────────────────────────────────────────
 // PRODUCTION for workgroup-starved decode shapes only (2026-09-17 bench,
 // 9070 XT, M<=32 tile): N=17408/K=5120 (136 WGs) the frozen bf16 path
 // 0.176 ms beats every split count (n=1: 0.227 ms, 16: 1.147 ms -- the
@@ -361,6 +457,69 @@ hipError_t rdna4_gemm_ml84_trfeed_prefill(const void* A, const uint8_t* B_nib, c
 hipError_t rdna4_expand_ml84_to_trfeed(const uint8_t* B_nib, const uint8_t* lut,
                                        const float* b_scale_g, int N, int K,
                                        uint8_t* B_shuf_out, float* b_scale_out, hipStream_t stream);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Dual-source expander (MAD-305 fused FFN task, 2026-09-18; interleave
+// granularity changed to 32 columns 2026-09-18, see below): the SAME
+// re-expansion rdna4_expand_ml84_to_trfeed does for one ML8_4 weight, but
+// for a (gate, up) PAIR sharing the same [N_half, K] shape, producing ONE
+// fused B_shuf of width N_fused = 2*N_half whose 128-column tiles
+// interleave the two sources at 32-COLUMN granularity: within each
+// 128-fused-column block (fused column j = 128*block + pos, pos in
+// [0,128)), pos in [0,32) is gate channel [0,32), [32,64) is up channel
+// [0,32) (the SAME channel, paired -- silu(gate[c])*up[c] needs matching
+// c), [64,96) is gate channel [32,64), [96,128) is up channel [32,64).
+//
+// ROUND 2 (perf bug): the FIRST version interleaved at 64-column
+// granularity (tile t's first 64 columns all gate, second 64 all up).
+// Under the GEMM's WAVES_N=2/BN=128 split that put a tile's gate half in
+// wave_n=0 and its up half in a DIFFERENT physical wavefront (wave_n=1),
+// so the SwiGLU epilogue needed a __syncthreads() + cross-wave
+// shared-memory exchange per output tile -- measured a 4-5x SLOWDOWN vs
+// the two plain GEMMs it replaced (bench/gemm_trfeed_prod_bench.hip,
+// R9700: 22.50ms vs 4.73ms at M=2048/N_half=17408/K=5120). The 32-column
+// scheme instead puts gate channel c and its matching up channel c in the
+// SAME wave's two fragments (ni and ni+TFRAGS_N/2 under TFRAGS_N=4) for
+// every 128-wide N-tile the GEMM processes -- a pure register-local
+// pairing at epilogue time, no cross-wave traffic, no barrier -- see
+// trfeed_kernels.h's SwiGLU epilogue comment for the full derivation. The
+// GEMM K-loop is unaffected either way; only this column placement rule
+// changed.
+//
+// Each source keeps its OWN LUT and per-(K-group,column) scale (the LUT is
+// per-K-group PER WEIGHT, not shared -- gate and up are trained/calibrated
+// independently), selected by which 32-column slot of the fused tile a
+// given output column falls in; this function's dispatch has no notion of
+// "combine the two LUTs", it just picks gate's or up's verbatim per
+// element, exactly like rdna4_expand_ml84_to_trfeed picks its single
+// source's LUT per element.
+//
+// Fused per-column b_scale is emitted the SAME "amax/448" way as the
+// single-source expander (b_scale_out[j] = (max over K-groups of that
+// source's own b_scale_g for j's source column) / 448), just computed
+// against whichever source j's 32-column slot selects -- so a downstream
+// GEMM epilogue can index b_scale_out[j] directly with no extra
+// indirection to figure out which source's scale table j belongs to.
+//
+// gate_packed/gate_lut/gate_scale_g, up_packed/up_lut/up_scale_g: each is
+// exactly one weight's ML84_TRFEED B_nib/lut/b_scale_g triple (see this
+// header's ML84_TRFEED section above), both shaped [N_half, K] (same
+// N_half, K for both -- ggml's FFN gate/up projections always share both
+// dims; the caller, ml8.cu's fusion match, checks this before calling).
+// b_shuf_out: N_fused*K bytes (N_fused = 2*N_half), fused B_shuf as
+//   described above -- feeds gemm_fp8_trfeed_swiglu_f32.
+// b_scale_out: fp32[N_fused], fused per-column scale as described above.
+// N_half % 64 == 0 (so N_fused % 128 == 0, the GEMM's own tiling
+// requirement -- N_half's OWN N%128==0 requirement from the single-source
+// path does NOT apply here: N_half only needs to be a multiple of 64, two
+// 32-column gate/up pairs per 128-wide GEMM tile), K % 64 == 0 (QK_ML8),
+// K % 16 == 0.
+hipError_t rdna4_expand_ml84_pair_to_trfeed(const uint8_t* gate_packed, const uint8_t* gate_lut,
+                                            const float* gate_scale_g,
+                                            const uint8_t* up_packed, const uint8_t* up_lut,
+                                            const float* up_scale_g,
+                                            int N_half, int K,
+                                            uint8_t* b_shuf_out, float* b_scale_out, hipStream_t stream);
 #ifdef __cplusplus
 }
 #endif

@@ -2493,6 +2493,107 @@ struct test_ml8_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_ML8_MUL_MAT(gate) + GGML_OP_ML8_MUL_MAT(up) + GGML_OP_GLU(swiglu)
+// fusion (MAD-305 fused-FFN task): on the HIP backend the op-fusion pass in
+// ggml-cuda.cu (ggml_cuda_ml8_can_fuse_ffn_swiglu / ggml_cuda_op_ml8_ffn_gate_up_swiglu)
+// replaces this exact 3-node subgraph with ONE fused GEMM
+// (rdna4_gemm_fp8_trfeed_swiglu_f32 over rdna4_expand_ml84_pair_to_trfeed's
+// fused B_shuf) whenever N%128==0 and M>32 (RDNA4_TRFEED prefill tile, the
+// only case this test's shapes below exercise). This test builds exactly
+// that literal subgraph (two independent ML8_4 weights sharing ONE
+// activation tensor, then ggml_swiglu_split) and relies on the harness's
+// normal HIP-vs-CPU numeric comparison to catch any mismatch: the CPU
+// backend has no such fusion pass and always runs the three ops unfused, so
+// this is an end-to-end check of the fused kernel's math against the
+// reference semantics of the un-fused graph, not a hand-rolled oracle. It
+// also exercises the fusion match logic itself (ggml_can_fuse_subgraph's
+// single-consumer requirement, the shared-x check, etc.) since a wiring bug
+// there would either silently fail to fuse (still numerically correct, just
+// not exercising the new kernel) or fuse something it shouldn't and produce
+// wrong numbers -- this test cannot distinguish those two failure modes by
+// itself; MT_ML8_FFN_FUSE=0 forces the unfused path for an A/B run when
+// investigating a mismatch here.
+struct test_ml8_ffn_gate_up_swiglu : public test_case {
+    const int64_t n_half;   // N per weight (gate/up); also the GLU output width
+    const int64_t n;        // M (tokens)
+    const int64_t k;        // K (in features), multiple of 64
+    const bool    prequant; // x is the FP8_QUANT_ROT(kind=NONE, G=0) I8 output
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_half, n, k, prequant);
+    }
+
+    double max_nmse_err() override {
+        // Same re-quantization-before-GEMM tolerance as test_ml8_mul_mat's
+        // RDNA4_TRFEED prefill branch (m%128==0 && n>32 there) -- every shape
+        // this test registers satisfies that condition, so it's the only
+        // bound needed; the swiglu epilogue's silu/mul happens in fp32
+        // registers on top of that, no additional rounding.
+        return 2e-2;
+    }
+
+    test_ml8_ffn_gate_up_swiglu(int64_t n_half = 256, int64_t n = 64, int64_t k = 256, bool prequant = false)
+        : n_half(n_half), n(n), k(k), prequant(prequant) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_ML8_4, k, n_half);
+        ggml_set_name(w_gate, "w_gate");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_ML8_4, k, n_half);
+        ggml_set_name(w_up, "w_up");
+        ggml_tensor * cent_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, k / 64);
+        ggml_set_name(cent_gate, "cent_gate");
+        ggml_tensor * cent_up = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, k / 64);
+        ggml_set_name(cent_up, "cent_up");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * x_for_mm = x;
+        if (prequant) {
+            x_for_mm = ggml_fp8_quant_rot(ctx, x, /*h_a=*/nullptr, /*a_dim=*/0, /*b_dim=*/0,
+                                           GGML_FP8_QUANT_ROT_KIND_NONE, /*G=*/0);
+            ggml_set_name(x_for_mm, "x_qrot");
+        }
+        // gate and up MUST read the literal same x_for_mm tensor -- the fuse
+        // gate (ggml_cuda_ml8_can_fuse_ffn_swiglu) requires
+        // mm_gate->src[2] == mm_up->src[2], not merely equal shapes/values.
+        ggml_tensor * gate = ggml_ml8_mul_mat(ctx, w_gate, cent_gate, x_for_mm);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_ml8_mul_mat(ctx, w_up, cent_up, x_for_mm);
+        ggml_set_name(up, "up");
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_ML8_4) {
+                // {float scale; uint8_t qs[32]} blocks: scale in [0.5, 1.5], random nibbles.
+                const size_t nbytes = ggml_nbytes(t);
+                std::vector<uint8_t> data(nbytes);
+                const size_t nblk = nbytes / 36;
+                for (size_t b = 0; b < nblk; b++) {
+                    const float scale = 0.5f + (float) (rand() % 1000) / 1000.0f;
+                    memcpy(data.data() + b * 36, &scale, sizeof(float));
+                    for (int j = 0; j < 32; j++) {
+                        data[b * 36 + 4 + j] = (uint8_t) (rand() & 0xFF);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, nbytes);
+            } else if (t->type == GGML_TYPE_F8_E4M3) {
+                // e4m3fn bytes with exponent <= 7 (no NaN encodings, realistic magnitudes), either sign.
+                const size_t nbytes = ggml_nbytes(t);
+                std::vector<uint8_t> data(nbytes);
+                for (size_t i = 0; i < nbytes; i++) {
+                    data[i] = (uint8_t) ((rand() & 0x80) | (rand() % 0x40)); // magnitude <= 1.875 like real centroids
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, nbytes);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ML8_APPLY_ROTATION — two rotation kinds selected by whether h_a is
 // present (see ggml-ml8.h / MAD-266):
 //   with_h_a=true  -> kronecker_orth_sylvester, Q = H_a ⊗ H_b (a_dim <= 16
@@ -4977,6 +5078,20 @@ struct test_gated_delta_net : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+
+    double max_nmse_err() override {
+        // !kda with n_seq_tokens > GGML_CUDA_GDN_CHUNK_MAX (16) routes through the CUDA/HIP
+        // backend's long-prefill chunked kernel (gated_delta_net_prefill_cuda in
+        // gated_delta_net.cu), which stages K/Q/P operands through shared memory as fp16 to
+        // fit the running state + chunk tiles in a 64 KB workgroup LDS budget. Every dot
+        // product still accumulates in fp32; only the stored operands round to fp16, but
+        // that's enough to need a looser bound than every other path in this op (which is
+        // exact fp32 end to end and holds the default 1e-7).
+        if (!kda && n_seq_tokens > 16) {
+            return 1e-4;
+        }
+        return test_case::max_nmse_err();
     }
 };
 
@@ -10146,6 +10261,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120, /*n=M*/ 7, /*k=K*/ 5120,
         /*k_world=*/ 0, /*lut_group_off=*/ 0, /*ne2=*/ 3, /*prequant=*/ true));
 
+    // MAD-305 fused-FFN task: ML8_MUL_MAT(gate)+ML8_MUL_MAT(up)+GLU(swiglu)
+    // -> one fused GEMM. The real production prefill shape (Qwen3.8-27B
+    // ML8_4, N_half=17408, K=5120, M=2048 -- the exact numbers in the task's
+    // measured rocprofv3 trace) plus a small ragged one (M=300 exercises the
+    // M_pad!=M padding path, M_pad rounds 300 up to 384) at a much smaller
+    // N_half/K so the test suite doesn't pay the full 17408-wide shape's
+    // cost twice. Both f32-activation and pre-quantized (FP8_QUANT_ROT)
+    // activation variants of the small shape; only f32 at the big one (the
+    // pre-quantized path is already covered by test_ml8_mul_mat at this size).
+    test_cases.emplace_back(new test_ml8_ffn_gate_up_swiglu(/*n_half=*/ 17408, /*n=M*/ 2048, /*k=K*/ 5120));
+    test_cases.emplace_back(new test_ml8_ffn_gate_up_swiglu(/*n_half=*/ 256, /*n=M*/ 300, /*k=K*/ 1024));
+    test_cases.emplace_back(new test_ml8_ffn_gate_up_swiglu(/*n_half=*/ 256, /*n=M*/ 300, /*k=K*/ 1024,
+        /*prequant=*/ true));
+
     // GGML_OP_ML8_APPLY_ROTATION (MAD-266 adds block_hadamard alongside the
     // existing kronecker kind — see ggml-ml8.h). kronecker: h_a present,
     // a_dim <= 16 (HIP register-array bound). block_hadamard: h_a == NULL,
@@ -10261,10 +10390,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // fused kernel's LDS budget (12544*4+4096=54272B < 64KB).
         test_cases.emplace_back(new test_fp8_quant_rot(98, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 4, 1, 1, 0));
         // a_dim=128 (K=16384): 16384*4+4096=69632B > 64KB -- exceeds the
-        // fused kernel's LDS budget, so ggml_cuda_op_fp8_quant_rot falls
-        // through to the generic memcpy+FWHT+fp8_quant_pack_row_kernel path.
-        // Exercises that fallback still produces the right answer on HIP.
+        // round-3 fused kernel's LDS budget, so ggml_cuda_op_fp8_quant_rot
+        // falls through to the generic memcpy+FWHT+fp8_quant_pack_row_kernel
+        // path when MT_FP8_QROT_V2=0. With V2 on (the default) it hits the
+        // V2 kernel instead (a_dim=128 <= ML8_QROT_V2_BLOCKHAD_MAX_A=160),
+        // whose LDS is O(b_dim) so it never hits this budget at all -- this
+        // case now exercises the boundary between the two only via the env
+        // switch, not via shape.
         test_cases.emplace_back(new test_fp8_quant_rot(128, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 4, 1, 1, 0));
+
+        // MAD-3xx round 4 (V2) production shapes from the R9700 prefill
+        // profile (Qwen3.8-27B ML8_4, ubatch 2048): the exact (K, kind,
+        // b_dim) triples the V2 kernel family exists to speed up, at row
+        // counts 1 (decode-ish), 7 (small prefill chunk) and 2048 (the
+        // profiled prefill ubatch).
+        for (int64_t M : { (int64_t) 1, (int64_t) 7, (int64_t) 2048 }) {
+            // (a) K=5120, kronecker a_dim=5 b_dim=1024 (ffn_gate/up width).
+            test_cases.emplace_back(new test_fp8_quant_rot(5, 1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER, M, 1, 1, 0));
+            // (b) K=6144, block_hadamard b_dim=128 (a_dim=48).
+            test_cases.emplace_back(new test_fp8_quant_rot(48, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
+            // (c) K=17408, block_hadamard b_dim=128 (a_dim=136) -- the shape
+            // that missed the round-3 fused path's LDS gate entirely.
+            test_cases.emplace_back(new test_fp8_quant_rot(136, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, M, 1, 1, 0));
+        }
+        // K=4096, kronecker a=4 b=1024 -- a kronecker shape with a_dim a
+        // power of two (distinct from the a_dim=5 production shape above).
+        test_cases.emplace_back(new test_fp8_quant_rot(4, 1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER, 16, 1, 1, 0));
+        // K=2048, block_hadamard b=128 (a_dim=16), rows=33 -- exercises the
+        // V2 kernel's ROWS_PER_BLOCK>1 packing (1024/128=8 rows/block) with
+        // a row count that doesn't divide evenly by it (33 % 8 != 0), so the
+        // last block's row-in-block padding/masking path also gets covered.
+        test_cases.emplace_back(new test_fp8_quant_rot(16, 128, GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 33, 1, 1, 0));
     }
 
     // GGML_OP_FP8_MUL_MAT: touches every K in {128, 5120, 17408}, N in
@@ -11364,6 +11520,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
 
+    // long-prefill chunked path (gated_delta_net_prefill_cuda, chunk width 64): n_tokens >
+    // GGML_CUDA_GDN_CHUNK_MAX with a scalar gate. Covers exact multiples of the chunk width,
+    // ragged tails, a permuted (non-contiguous-row) layout, multi-sequence, and a K>1 tail
+    // composed with the autoregressive kernel.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  64, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 100, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 257, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 130, 1, 3, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  70, 1, 1, true));
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -11405,6 +11572,115 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // BF16 activation coverage (2026-09-18)
+    // Phase 1 of the bf16-activation-stream project: op-level support for running the
+    // elementwise/activation ops (residual, norm, attention/GDN in-out) in bf16 so that a
+    // later phase can switch the model graph's activation stream from f32 to bf16.
+    // Shapes: ne0 in {5120, 17408} (typical ffn hidden sizes) with 2048 rows, plus a small
+    // odd shape (37 x 13 x 2) to exercise non-power-of-two / partial-block paths.
+    // Tolerance: default max_nmse_err() (1e-7) is kept for these cases. Both the CPU and
+    // CUDA/HIP kernels added here do all reduction/accumulation math in fp32 and only
+    // round to bf16 on the final store, so nmse between the two backends (not vs. an f64
+    // reference) reflects only last-bit rounding-mode differences -- the same situation
+    // the existing GGML_TYPE_F16 sweeps above already pass at this tolerance. If real
+    // hardware runs show this is too tight for a particular op (e.g. because of summation
+    // order differences in the RMS_NORM reduction), relax that op's max_nmse_err() to the
+    // 1e-5..1e-4 range implied by bf16's 8 mantissa bits.
+    {
+        const std::array<int64_t, 4> ne_big1 = {5120, 2048, 1, 1};
+        const std::array<int64_t, 4> ne_big2 = {17408, 2048, 1, 1};
+        const std::array<int64_t, 4> ne_odd  = {37, 13, 2, 1};
+
+        // GGML_OP_RMS_NORM (plain + fused RMS_NORM*MUL(+ADD) paths)
+        for (const auto & ne : {ne_big1, ne_big2, ne_odd}) {
+            test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, ne));
+            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, ne));
+            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, ne, 1e-6f, /*broadcast=*/true));
+            test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_BF16, ne));
+        }
+
+        // GGML_OP_L2_NORM, GGML_OP_SCALE: the CUDA/HIP kernels above were templated for
+        // bf16 (see l2_norm_f32_cuda<>/scale_f32<> in norm.cu/scale.cu), but no bf16 test
+        // cases are added here because ggml_backend_cpu_device_supports_op() has no type
+        // gate for these ops (falls through to `default: return true`) while
+        // ggml_compute_forward_l2_norm()/ggml_compute_forward_scale() GGML_ABORT on
+        // anything but F32 -- adding a bf16 case would crash the CPU reference backend
+        // that test-backend-ops always compares against, rather than fail gracefully.
+        // See the report's "CPU backend gaps" section for the blocker.
+
+        // GGML_OP_ADD / SUB / MUL / DIV (bf16 op bf16 -> bf16, incl. broadcasting)
+        for (const auto & ne : {ne_big1, ne_big2, ne_odd}) {
+            for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
+                test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, ne, {1, 1, 1, 1}));
+                test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, ne, {1, 2, 1, 1}));
+            }
+        }
+        // mixed bf16 activation + f32 addend (ADD+ADD residual-chain fusion path)
+        test_cases.emplace_back(new test_add_add(GGML_TYPE_BF16, GGML_TYPE_F32, ne_big1));
+        test_cases.emplace_back(new test_add_add(GGML_TYPE_BF16, GGML_TYPE_BF16, ne_odd));
+
+        // GGML_OP_UNARY (activation functions). Only RELU is exercised here: the CUDA/HIP
+        // unary_op_kernel<> in unary.cu was templated for bf16 for ALL of SILU / GELU /
+        // GELU_ERF / GELU_QUICK / RELU (see ggml_cuda_op_unary()'s BF16 branch), but on
+        // the CPU side SILU/GELU/GELU_ERF/GELU_QUICK have dedicated, non-templated
+        // F32/F16-only implementations (ggml_compute_forward_silu/_gelu/_gelu_erf/
+        // _gelu_quick in ggml-cpu/ops.cpp, backed by ggml_vec_silu_f16()/ggml_vec_gelu_f16()
+        // in vec.h with no bf16 counterpart) that GGML_ABORT on bf16 -- adding those here
+        // would crash the CPU reference backend. RELU routes through the generic
+        // apply_unary_op<> template in unary-ops.cpp, which already has a bf16
+        // instantiation, so it is safe to test cross-backend today.
+        for (const auto & ne : {ne_big1, ne_big2, ne_odd}) {
+            test_cases.emplace_back(new test_unary(GGML_UNARY_OP_RELU, GGML_TYPE_BF16, ne));
+        }
+
+        // GGML_OP_GLU (reglu/geglu/swiglu + swapped variant): the CUDA/HIP
+        // ggml_cuda_op_unary_gated<>() dispatcher was templated for bf16, but every CPU
+        // GLU implementation (ggml_compute_forward_reglu/_geglu/_swiglu/..., mirroring the
+        // unary case above) is F32/F16-only and GGML_ABORTs on bf16. No bf16 GLU test case
+        // is added here to avoid crashing the CPU reference; see the report's "CPU
+        // backend gaps" section for what CPU-side work would unblock this.
+
+        // GGML_OP_ROPE (normal, neox, mrope) -- bf16 in/out
+        for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE}) {
+            test_cases.emplace_back(new test_rope(GGML_TYPE_BF16, {128, 32, 2, 1}, 128, mode, 512));
+            test_cases.emplace_back(new test_rope(GGML_TYPE_BF16, {80, 16, 2, 1}, 20, mode, 512));
+        }
+        test_cases.emplace_back(new test_rope(GGML_TYPE_BF16, {14, 5, 2, 1}, 14, GGML_ROPE_TYPE_NEOX, 512)); // odd/small
+
+        // GGML_OP_SSM_CONV: ggml_cuda_op_ssm_conv() was extended to accept a bf16 conv_x
+        // (and/or bf16 weight) -- see SSM_CONV_DISPATCH in ssm-conv.cu. No bf16 test case
+        // is added here for the same reason as L2_NORM/SCALE above: the CPU reference
+        // (ggml_compute_forward_ssm_conv_f32) is F32-only and would abort, and
+        // ggml_ssm_conv() in ggml.c additionally hard-codes a GGML_TYPE_F32 result type
+        // regardless of its inputs' types, which is a second, front-end-level blocker to
+        // ever exercising a genuine bf16-out SSM_CONV through the normal graph builder.
+        // See the report's "CPU backend gaps" section.
+
+        // GGML_OP_CPY / DUP / CONT (f32<->bf16, bf16<->bf16, contiguous + strided)
+        for (const auto & ne : {ne_big1, ne_odd}) {
+            test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_BF16, ne));
+            test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_F32, ne));
+            test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, ne));
+            test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, ne, {-1,-1,-1,-1}, {0, 2, 1, 3})); // cpy by rows (non-contig)
+        }
+        test_cases.emplace_back(new test_cont(GGML_TYPE_BF16, ne_big1));
+        test_cases.emplace_back(new test_cont(GGML_TYPE_BF16, ne_odd));
+
+        // GGML_OP_CONCAT
+        for (int dim = 0; dim < 3; ++dim) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_BF16, ne_odd, ne_odd[dim], dim));
+        }
+        test_cases.emplace_back(new test_concat(GGML_TYPE_BF16, ne_big1, ne_big1[0], 0));
+
+        // GGML_OP_GET_ROWS (src bf16 -> dst bf16, and dst f32 via test_get_rows_to_f32-style
+        // usage of test_get_rows below with a f32 "in" cast is not applicable here since
+        // test_get_rows fixes dst type to src type; dst==f32 is covered by test_cpy above
+        // composed with get_rows in real graphs, and directly by the existing GET_ROWS
+        // type sweep which already includes GGML_TYPE_BF16).
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 5120, 2048, 16, 1, 1, false));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 37, 13, 5, 1, 1, false));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -11423,6 +11699,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ m, /*k=K*/ 5120));
         test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 5120,  /*n=M*/ m, /*k=K*/ 17408));
     }
+
+    // MAD-3xx round 4 (V2) — GGML_OP_FP8_QUANT_ROT per-row (G=0) fused
+    // rotate+quantize at the three R9700 prefill-profile production shapes
+    // (rocprofv3, Qwen3.8-27B ML8_4, ubatch 2048): 640 GB/s HBM, 600 GB/s
+    // effective floor target ((bytes_in + bytes_out) / time).
+    //   (a) K=5120,  kronecker a=5   b=1024 (ffn_gate/up): 42MB in, 10.5MB out
+    //   (b) K=6144,  block_hadamard  b=128  (a=48):        50.3MB in, 12.6MB out
+    //   (c) K=17408, block_hadamard  b=128  (a=136):       142.7MB in, 35.7MB out
+    test_cases.emplace_back(new test_fp8_quant_rot(5,   1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER,      2048, 1, 1, 0));
+    test_cases.emplace_back(new test_fp8_quant_rot(48,  128,  GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 2048, 1, 1, 0));
+    test_cases.emplace_back(new test_fp8_quant_rot(136, 128,  GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 2048, 1, 1, 0));
 
     // FP8_B128 preshuffle GEMM vs the ML8_FP8 generic aiter GEMM vs Q8_0 MMQ at
     // Qwen3.8-27B ffn_gate (K=5120, N=17408) and ffn_down (K=17408, N=5120) shapes
@@ -11857,6 +12144,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // Long-prefill chunked kernel: measured shape (Qwen3.8-27B GDN layer, R9700, 2026-09-18
+    // rocprofv3 profile) -- 16 value heads (neqk1=16 via v_repeat=3), S_v=128, 2048-token
+    // ubatch. This is the case the chunked prefill kernel in gated_delta_net.cu targets.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3)); // GDN long-prefill PP-2048
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {

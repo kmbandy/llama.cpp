@@ -1923,7 +1923,7 @@ static int wp_select_ffn_island_device_index(const llama_model_params & params,
 // sidecars are MIRRORED (see llama_meta_device_get_split_state's
 // pattern_ml8_sidecar handling above) and therefore this rank's copy is a
 // complete, valid comparison for every device.
-static void llama_model_validate_fp8_rotation_groups(const llama_model & model) {
+static void llama_model_validate_fp8_rotation_groups(llama_model & model) {
     // Returns `name` iff it names an FP8_B128, ML8_FP8, or ML8_4 tensor, else
     // nullptr -- every other case (missing, or present but some other type
     // such as Q8_0, which is how the converter stores tensors that fail the
@@ -1999,6 +1999,15 @@ static void llama_model_validate_fp8_rotation_groups(const llama_model & model) 
                        "byte-for-byte -- every weight in an input group must share one rotation "
                        "factor -- re-run the fp8_b128 converter.",
                        name_a.c_str(), name_b.c_str());
+        }
+        // Proven identical: make b's sidecar point at a's h_a tensor so the
+        // graph-build quant_rot memo (keyed on the h_a pointer, see
+        // fp8_qrot_key) shares ONE FP8_QUANT_ROT node across the group.
+        // Measured 2026-09-18 (rocprofv3, ml84-single, 8k prefill): 272
+        // ml8_fused_rot_quant launches per ubatch instead of 128 before this.
+        if (kron_a && sa->rotation_h_a != sb->rotation_h_a) {
+            ml8_sidecars * sb_mut = model.ml8_reg.find_mut(wb);
+            sb_mut->rotation_h_a = sa->rotation_h_a;
         }
     };
 

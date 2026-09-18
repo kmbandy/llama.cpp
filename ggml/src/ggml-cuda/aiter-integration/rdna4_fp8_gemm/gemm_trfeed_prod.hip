@@ -71,6 +71,79 @@ hipError_t rdna4_gemm_fp8_trfeed(const void* A, const void* B_shuf, void* C_bf16
     return hipGetLastError();
 }
 
+// fp32-output launcher (MAD-305, freeze lifted 2026-09-18): SAME grid/tile
+// rules as rdna4_gemm_fp8_trfeed above (M_pad==32 selects the decode/verify
+// tile, else M_pad must be an exact multiple of BM=128 for the prefill
+// tile) -- copied verbatim from the bf16 launcher, not re-derived -- just
+// instantiating gemm_fp8_trfeed<TBM,TWAVES_M,float> instead of the default
+// <TBM,TWAVES_M> (== <TBM,TWAVES_M,__hip_bfloat16>), and threading M_valid
+// (the caller's true M) through so the epilogue's float branch never writes
+// past the caller's un-padded fp32 destination. Removes the
+// convert_unary<bf16,float> pass the bf16 path's caller otherwise needs.
+hipError_t rdna4_gemm_fp8_trfeed_f32(const uint8_t* a_fp8, const uint8_t* b_shuf, float* c_f32,
+                                     const float* a_scale, const float* b_scale,
+                                     int M_pad, int M_valid, int N, int K, hipStream_t stream) {
+    if (M_pad <= 0 || N <= 0 || K <= 0 || (N % BN) != 0 || (K % BK) != 0) {
+        return hipErrorInvalidValue;
+    }
+    if (M_valid <= 0 || M_valid > M_pad) {
+        return hipErrorInvalidValue;
+    }
+    if (M_pad == TBM_DECODE) {
+        constexpr int TBLOCK = TWAVES_M_DECODE * WAVES_N * WAVE_SIZE;
+        const dim3 grid(N / BN, M_pad / TBM_DECODE);
+        gemm_fp8_trfeed<TBM_DECODE, TWAVES_M_DECODE, float><<<grid, TBLOCK, 0, stream>>>(
+            (const float8_t*) a_fp8, b_shuf, c_f32, a_scale, b_scale, M_pad, N, K, M_valid);
+        return hipGetLastError();
+    }
+    if ((M_pad % BM) != 0) {
+        return hipErrorInvalidValue;
+    }
+    constexpr int TBM = BM, TWAVES_M = WAVES_M;   // the frozen 128x128/4-wave prefill tile
+    constexpr int TBLOCK = TWAVES_M * WAVES_N * WAVE_SIZE;
+    const dim3 grid(N / BN, M_pad / TBM);
+    gemm_fp8_trfeed<TBM, TWAVES_M, float><<<grid, TBLOCK, 0, stream>>>(
+        (const float8_t*) a_fp8, b_shuf, c_f32, a_scale, b_scale, M_pad, N, K, M_valid);
+    return hipGetLastError();
+}
+
+// SwiGLU-epilogue launcher (MAD-305 fused-FFN task): SAME grid/tile rules as
+// rdna4_gemm_fp8_trfeed_f32 above, but N_fused is the interleaved gate/up
+// column count (see trfeed_kernels.h's SwiGLU epilogue comment and
+// rdna4_expand_ml84_pair_to_trfeed in gemm_ml84_prod.hip for how B_shuf_fused
+// / b_scale_fused are built) and c_f32 is [M_valid, N_fused/2] -- HALF the
+// fused width, one value per (gate,up) pair. Only the prefill tile is wired
+// here (the decode M_pad==32 tile is never fused -- see the caller,
+// ml8.cu's fusion match, which only takes this path for M_pad>32); the
+// TBM_DECODE branch below still exists so a future decode-side fusion has
+// somewhere to plug in, but is untested and not called by anything yet.
+hipError_t rdna4_gemm_fp8_trfeed_swiglu_f32(const uint8_t* a_fp8, const uint8_t* b_shuf_fused,
+                                            float* c_f32, const float* a_scale, const float* b_scale_fused,
+                                            int M_pad, int M_valid, int N_fused, int K, hipStream_t stream) {
+    if (M_pad <= 0 || N_fused <= 0 || K <= 0 || (N_fused % BN) != 0 || (K % BK) != 0) {
+        return hipErrorInvalidValue;
+    }
+    if (M_valid <= 0 || M_valid > M_pad) {
+        return hipErrorInvalidValue;
+    }
+    if (M_pad == TBM_DECODE) {
+        constexpr int TBLOCK = TWAVES_M_DECODE * WAVES_N * WAVE_SIZE;
+        const dim3 grid(N_fused / BN, M_pad / TBM_DECODE);
+        gemm_fp8_trfeed<TBM_DECODE, TWAVES_M_DECODE, float, /*SwiGLU=*/true><<<grid, TBLOCK, 0, stream>>>(
+            (const float8_t*) a_fp8, b_shuf_fused, c_f32, a_scale, b_scale_fused, M_pad, N_fused, K, M_valid);
+        return hipGetLastError();
+    }
+    if ((M_pad % BM) != 0) {
+        return hipErrorInvalidValue;
+    }
+    constexpr int TBM = BM, TWAVES_M = WAVES_M;   // the frozen 128x128/4-wave prefill tile
+    constexpr int TBLOCK = TWAVES_M * WAVES_N * WAVE_SIZE;
+    const dim3 grid(N_fused / BN, M_pad / TBM);
+    gemm_fp8_trfeed<TBM, TWAVES_M, float, /*SwiGLU=*/true><<<grid, TBLOCK, 0, stream>>>(
+        (const float8_t*) a_fp8, b_shuf_fused, c_f32, a_scale, b_scale_fused, M_pad, N_fused, K, M_valid);
+    return hipGetLastError();
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Decode split-K variant (gemm_capi.h): only the M_pad==32 decode/verify
 // tile has few enough workgroups (N/128 = 40..136 at production N) to leave
