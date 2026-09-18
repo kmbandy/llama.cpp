@@ -1323,6 +1323,383 @@ gated_delta_net_prefill_wmma_cuda(const float * q,
     }
 }
 
+
+// ---------------------------------------------------------------------------------------
+// Chunked GDN prefill v2 (2026-09-18, gfx12 WMMA f16 -> f32).
+//
+// One workgroup per (v-head, sequence); NW = S/16 waves; wave w owns the state stripe
+// S[:, 16w..16w+16) as S/16 accumulator tiles (16x16 f32, 8 VGPRs each) for the whole token
+// loop. Chunks of C = 32 tokens, processed sequentially. gfx12 WMMA fragment layouts
+// (verified with a standalone probe on the R9700):
+//   A[m][k]: lane holds m = lane%16, k = (lane/16)*8 + 0..7   (8 consecutive k)
+//   B[k][n]: lane holds n = lane%16, k = (lane/16)*8 + 0..7
+//   D[m][n]: lane holds n = lane%16, m = (lane/16)*8 + 0..7
+// so a D tile IS a B fragment for the next product (rows -> k): the state stripe and the
+// chunk's delta d feed the following WMMAs straight from registers, never through LDS.
+//
+// Per chunk (recurrence and notation as in the doc comment above gated_delta_net_chunked_cuda;
+// G_t = inclusive prefix of the raw log-gate, c_t = exp(G_t), everything below per head):
+//   A[t][j] = beta_t exp(G_t - G_j) k_t.k_j (j<t),  P[t][j] = exp(G_t - G_j) q_t.k_j (j<=t)
+//   T = (I + A)^-1                     (forward substitution, one wave, T columns in VGPRs)
+//   u = T (beta (.) V)                 [C x S]   (wave stripe)
+//   w = T W0,  W0[t] = beta_t c_t k_t  [C x S]   (all waves -> LDS, negated)
+//   d = u - w S                        [C x S]   (wave stripe; S from registers)
+//   o = scale ( (c (.) Q) S + P d )    [C x S]
+//   S = exp(G_C) S + K'^T d,  K'[t] = exp(G_C - G_t) k_t
+// All decay factors are exp() of DIFFERENCES of prefix sums (never ratios of exps): a
+// 32-token chunk with gates near -20 underflows exp(G_t) to 0 in fp32, which is the correct
+// limit (the pre-chunk state is forgotten), while exp(G_C - G_t) <= 1 stays exact.
+// Ragged final chunk: tokens t >= n_valid get k = q = v = 0, gate 0, beta 0 -> they leave S
+// and every valid output untouched; their outputs are not written.
+// ---------------------------------------------------------------------------------------
+namespace gdn_wmma2 {
+typedef _Float16 h8_t __attribute__((ext_vector_type(8)));
+typedef float    f8_t __attribute__((ext_vector_type(8)));
+
+static __device__ __forceinline__ f8_t wmma16(const h8_t & a, const h8_t & b, const f8_t & c) {
+#if defined(__gfx1201__) || defined(__gfx1200__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    (void) a; (void) b; return c;
+#endif
+}
+static __device__ __forceinline__ h8_t to_h8(const f8_t & v) {
+    h8_t r;
+#pragma unroll
+    for (int i = 0; i < 8; i++) { r[i] = (_Float16) v[i]; }
+    return r;
+}
+// 8 consecutive halves at a 16-byte aligned LDS address
+static __device__ __forceinline__ h8_t ld_h8(const _Float16 * p) {
+    return *reinterpret_cast<const h8_t *>(p);
+}
+} // namespace gdn_wmma2
+
+template <int S>
+__launch_bounds__(32 * (S / 16))
+static __global__ void gated_delta_net_prefill_wmma2_cuda(
+        const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+        const float * __restrict__ g, const float * __restrict__ beta,
+        const float * __restrict__ curr_state,
+        float * __restrict__ dst, float * __restrict__ state_out,
+        int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        const uint3 neqk1_magic, const uint3 rq3_magic,
+        float scale, int64_t dst_seq_stride) {
+    using namespace gdn_wmma2;
+    constexpr int C   = 32;          // chunk (tokens)
+    constexpr int NW  = S / 16;      // waves = state column stripes
+    constexpr int KS  = S / 16;      // k-steps over the head dim
+    constexpr int CT  = C / 16;      // token tiles per chunk (2)
+    constexpr int LDS_S = S + 8;     // padded row length (halves) for [.][S] arrays
+    constexpr int LDS_C = C + 8;     // padded row length for [.][C] arrays
+    static_assert(S % 16 == 0 && S >= 16 && S <= 128, "S");
+
+    __shared__ __align__(16) _Float16 sK [C * LDS_S];   // K[t][i]
+    __shared__ __align__(16) _Float16 sQ [C * LDS_S];   // Q[t][i]
+    __shared__ __align__(16) _Float16 sKt[S * LDS_C];   // K[t][i] transposed: [i][t]
+    __shared__ __align__(16) _Float16 sVt[S * LDS_C];   // V[t][col] transposed: [col][t]
+    __shared__ __align__(16) _Float16 sW [C * LDS_S];   // -w[t][i]
+    __shared__ __align__(16) _Float16 sT [C * LDS_C];   // T[t][j] (fp16)
+    __shared__ __align__(16) _Float16 sP [C * LDS_C];   // P[t][j] (fp16)
+    __shared__ float sA[C * C];                          // A[t][j] (fp32)
+    __shared__ float sG[C], sBeta[C], sC[C], sBC[C], sDC[C];
+    __shared__ float sCC;                                // exp(G_C)
+
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int h    = blockIdx.x;
+    const int seq  = blockIdx.y;
+    const uint32_t iq1 = fastmodulo((uint32_t) h, neqk1_magic);
+    const uint32_t iq3 = fastdiv((uint32_t) seq, rq3_magic);
+
+    const float * qh = q + iq3 * sq3 + iq1 * sq1;   // + t*sq2
+    const float * kh = k + iq3 * sq3 + iq1 * sq1;
+    const float * vh = v + seq * sv3 + h * sv1;      // + t*sv2
+    const int64_t gb0 = seq * sb3 + h * sb1;         // + t*sb2
+    float * oh = dst + ((int64_t) seq * dst_seq_stride * H + h) * S;   // + t*S*H + col
+    const float * s_in  = curr_state + ((int64_t) seq * H + h) * (int64_t) S * S;
+    float *       s_out = state_out  + ((int64_t) seq * H + h) * (int64_t) S * S;
+
+    const int l16 = lane & 15;
+    const int lhi = lane >> 4;          // 0/1: which 8-element half of the k range
+
+    // ---- state stripe: acc_S[r] = S[i = r*16 + lhi*8 + e][col = 16*wave + l16] ----
+    f8_t acc_S[KS];
+    {
+        const int col = 16 * wave + l16;
+#pragma unroll
+        for (int r = 0; r < KS; r++) {
+            const float4 * p = reinterpret_cast<const float4 *>(s_in + (int64_t) col * S + r * 16 + lhi * 8);
+            const float4 a = p[0], b = p[1];
+            acc_S[r][0] = a.x; acc_S[r][1] = a.y; acc_S[r][2] = a.z; acc_S[r][3] = a.w;
+            acc_S[r][4] = b.x; acc_S[r][5] = b.y; acc_S[r][6] = b.z; acc_S[r][7] = b.w;
+        }
+    }
+
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += C) {
+        const int n_valid = (int) min((int64_t) C, n_tokens - t0);
+
+        // ---- 0. gates / beta / prefix sums (wave 0) ----
+        if (wave == 0) {
+            const int t = lane;                          // C == 32 == wave size
+            float gl = 0.0f, bt = 0.0f;
+            if (t < n_valid) {
+                const int64_t gb = gb0 + (t0 + t) * sb2;
+                gl = g[gb];
+                bt = beta[gb];
+            }
+            float G = gl;                                // inclusive scan over 32 lanes
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                const float o = __shfl_up_sync(0xffffffff, G, off, 32);
+                if (lane >= off) { G += o; }
+            }
+            const float GC = __shfl_sync(0xffffffff, G, 31, 32);
+            sG[t]    = G;
+            sBeta[t] = bt;
+            sC[t]    = expf(G);
+            sBC[t]   = bt * expf(G);
+            sDC[t]   = expf(GC - G);
+            if (lane == 0) { sCC = expf(GC); }
+        }
+        // ---- 1. stage K, Q (row-major), Kt, Vt (transposed) as fp16 ----
+        // K/Q: C*S elements, 8 per thread-iteration as float4 x2
+        for (int idx = tid; idx < C * S / 8; idx += 32 * NW) {
+            const int t = idx / (S / 8);
+            const int i = (idx % (S / 8)) * 8;
+            h8_t hk, hq;
+            if (t < n_valid) {
+                const float * kp = kh + (t0 + t) * sq2 + i;
+                const float * qp = qh + (t0 + t) * sq2 + i;
+#pragma unroll
+                for (int e = 0; e < 8; e++) { hk[e] = (_Float16) kp[e]; hq[e] = (_Float16) qp[e]; }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; e++) { hk[e] = (_Float16) 0.0f; hq[e] = (_Float16) 0.0f; }
+            }
+            *reinterpret_cast<h8_t *>(sK + t * LDS_S + i) = hk;
+            *reinterpret_cast<h8_t *>(sQ + t * LDS_S + i) = hq;
+            // transposed copy of K: sKt[i+e][t]
+#pragma unroll
+            for (int e = 0; e < 8; e++) { sKt[(i + e) * LDS_C + t] = hk[e]; }
+        }
+        // V transposed: sVt[col][t]
+        for (int idx = tid; idx < C * S / 8; idx += 32 * NW) {
+            const int t   = idx / (S / 8);
+            const int col = (idx % (S / 8)) * 8;
+            if (t < n_valid) {
+                const float * vp = vh + (t0 + t) * sv2 + col;
+#pragma unroll
+                for (int e = 0; e < 8; e++) { sVt[(col + e) * LDS_C + t] = (_Float16) vp[e]; }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; e++) { sVt[(col + e) * LDS_C + t] = (_Float16) 0.0f; }
+            }
+        }
+        __syncthreads();
+
+        // ---- 2. A = K K^T (tiles 0..3) and P = Q K^T (tiles 4..7), 16x16 tiles over K=S ----
+        for (int tile = wave; tile < 2 * CT * CT; tile += NW) {
+            const bool isP = tile >= CT * CT;
+            const int  tt  = tile & (CT * CT - 1);
+            const int  tm  = tt / CT, tn = tt % CT;      // rows t (tm), cols j (tn)
+            f8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
+            const _Float16 * arow = (isP ? sQ : sK) + (tm * 16 + l16) * LDS_S + lhi * 8;
+            const _Float16 * brow = sK + (tn * 16 + l16) * LDS_S + lhi * 8;
+#pragma unroll
+            for (int ks = 0; ks < KS; ks++) {
+                acc = wmma16(ld_h8(arow + ks * 16), ld_h8(brow + ks * 16), acc);
+            }
+            // epilogue: D[t = tm*16 + lhi*8 + e][j = tn*16 + l16]
+            const int j = tn * 16 + l16;
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int t = tm * 16 + lhi * 8 + e;
+                float val = 0.0f;
+                if (isP ? (j <= t) : (j < t)) {
+                    val = acc[e] * expf(sG[t] - sG[j]);
+                    if (!isP) { val *= sBeta[t]; }
+                }
+                if (isP) { sP[t * LDS_C + j] = (_Float16) val; }
+                else     { sA[t * C + j]     = val; }
+            }
+        }
+        __syncthreads();
+
+        // ---- 3. T = (I + A)^-1 by forward substitution; lane c owns column c of T ----
+        if (wave == 0) {
+            float Tc[C];
+#pragma unroll
+            for (int t = 0; t < C; t++) {
+                float val = (t == lane) ? 1.0f : 0.0f;
+#pragma unroll
+                for (int j = 0; j < t; j++) {
+                    val -= sA[t * C + j] * Tc[j];       // sA[t][j] broadcast, Tc[j] register
+                }
+                Tc[t] = val;
+            }
+#pragma unroll
+            for (int t = 0; t < C; t++) { sT[t * LDS_C + lane] = (_Float16) Tc[t]; }
+        }
+        __syncthreads();
+
+        // ---- 4. u = T (beta V) [stripe] and w = T W0 [stripe of i] -> -w to LDS ----
+        f8_t acc_d[CT];   // becomes d after step 5
+        {
+            const int col = 16 * wave + l16;             // this lane's output column (u) / i (w)
+            f8_t acc_w[CT];
+#pragma unroll
+            for (int tm = 0; tm < CT; tm++) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) { acc_d[tm][e] = 0.0f; acc_w[tm][e] = 0.0f; }
+            }
+#pragma unroll
+            for (int kk = 0; kk < CT; kk++) {
+                // B fragments: k = token j = kk*16 + lhi*8 + e, n = col
+                h8_t bv, bw;
+                const _Float16 * vrow = sVt + col * LDS_C + kk * 16 + lhi * 8;
+                const _Float16 * krow = sKt + col * LDS_C + kk * 16 + lhi * 8;
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int j = kk * 16 + lhi * 8 + e;
+                    bv[e] = (_Float16) ((float) vrow[e] * sBeta[j]);
+                    bw[e] = (_Float16) ((float) krow[e] * sBC[j]);
+                }
+#pragma unroll
+                for (int tm = 0; tm < CT; tm++) {
+                    const h8_t a = ld_h8(sT + (tm * 16 + l16) * LDS_C + kk * 16 + lhi * 8);
+                    acc_d[tm] = wmma16(a, bv, acc_d[tm]);
+                    acc_w[tm] = wmma16(a, bw, acc_w[tm]);
+                }
+            }
+            // -w -> sW[t][i], D layout: t = tm*16 + lhi*8 + e, i = col
+#pragma unroll
+            for (int tm = 0; tm < CT; tm++) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    sW[(tm * 16 + lhi * 8 + e) * LDS_S + col] = (_Float16) (-acc_w[tm][e]);
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- 5. d = u - w S : A = -w (LDS), B = S stripe (registers) ----
+        {
+            h8_t bS[KS];
+#pragma unroll
+            for (int r = 0; r < KS; r++) { bS[r] = to_h8(acc_S[r]); }
+#pragma unroll
+            for (int tm = 0; tm < CT; tm++) {
+                const _Float16 * wrow = sW + (tm * 16 + l16) * LDS_S + lhi * 8;
+#pragma unroll
+                for (int r = 0; r < KS; r++) {
+                    acc_d[tm] = wmma16(ld_h8(wrow + r * 16), bS[r], acc_d[tm]);
+                }
+            }
+
+            // ---- 6. o = scale ( (c Q) S + P d ) ----
+            f8_t acc_o[CT];
+#pragma unroll
+            for (int tm = 0; tm < CT; tm++) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) { acc_o[tm][e] = 0.0f; }
+                const int t_a = tm * 16 + l16;           // A-fragment row (token) of this lane
+                const float ct = sC[t_a];
+                const _Float16 * qrow = sQ + t_a * LDS_S + lhi * 8;
+#pragma unroll
+                for (int r = 0; r < KS; r++) {
+                    h8_t a = ld_h8(qrow + r * 16);
+#pragma unroll
+                    for (int e = 0; e < 8; e++) { a[e] = (_Float16) ((float) a[e] * ct); }
+                    acc_o[tm] = wmma16(a, bS[r], acc_o[tm]);
+                }
+                const _Float16 * prow = sP + t_a * LDS_C + lhi * 8;
+#pragma unroll
+                for (int kk = 0; kk < CT; kk++) {
+                    acc_o[tm] = wmma16(ld_h8(prow + kk * 16), to_h8(acc_d[kk]), acc_o[tm]);
+                }
+            }
+            // write o: D layout t = tm*16 + lhi*8 + e, col = 16*wave + l16
+            const int col = 16 * wave + l16;
+#pragma unroll
+            for (int tm = 0; tm < CT; tm++) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int t = tm * 16 + lhi * 8 + e;
+                    if (t < n_valid) {
+                        oh[(t0 + t) * (int64_t) S * H + col] = acc_o[tm][e] * scale;
+                    }
+                }
+            }
+
+            // ---- 7. S = exp(G_C) S + K'^T d ----
+            const float cC = sCC;
+            h8_t bd[CT];
+#pragma unroll
+            for (int kk = 0; kk < CT; kk++) { bd[kk] = to_h8(acc_d[kk]); }
+#pragma unroll
+            for (int r = 0; r < KS; r++) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) { acc_S[r][e] *= cC; }
+                const int i_a = r * 16 + l16;            // A row = state row i
+                const _Float16 * ktrow = sKt + i_a * LDS_C + lhi * 8;
+#pragma unroll
+                for (int kk = 0; kk < CT; kk++) {
+                    h8_t a = ld_h8(ktrow + kk * 16);
+#pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        a[e] = (_Float16) ((float) a[e] * sDC[kk * 16 + lhi * 8 + e]);
+                    }
+                    acc_S[r] = wmma16(a, bd[kk], acc_S[r]);
+                }
+            }
+        }
+        __syncthreads();   // next chunk restages LDS
+    }
+
+    // ---- final state: same [col][i] layout as the input ----
+    {
+        const int col = 16 * wave + l16;
+#pragma unroll
+        for (int r = 0; r < KS; r++) {
+            float4 * p = reinterpret_cast<float4 *>(s_out + (int64_t) col * S + r * 16 + lhi * 8);
+            p[0] = make_float4(acc_S[r][0], acc_S[r][1], acc_S[r][2], acc_S[r][3]);
+            p[1] = make_float4(acc_S[r][4], acc_S[r][5], acc_S[r][6], acc_S[r][7]);
+        }
+    }
+}
+
+static void launch_gated_delta_net_prefill_wmma2(
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d,
+        int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1,   int64_t sq2, int64_t sq3,
+        int64_t sv1,   int64_t sv2, int64_t sv3,
+        int64_t sb1,   int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, int64_t dst_seq_stride, cudaStream_t stream) {
+    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq3_magic   = init_fastdiv_values(rq3);
+    const dim3 grid((unsigned) H, (unsigned) n_seqs, 1);
+#define GDN_WMMA2_LAUNCH(SV) \
+    gated_delta_net_prefill_wmma2_cuda<SV><<<grid, dim3(32 * (SV / 16)), 0, stream>>>( \
+        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, \
+        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, dst_seq_stride)
+    switch (S_v) {
+        case  16: GDN_WMMA2_LAUNCH(16);  break;
+        case  32: GDN_WMMA2_LAUNCH(32);  break;
+        case  64: GDN_WMMA2_LAUNCH(64);  break;
+        case 128: GDN_WMMA2_LAUNCH(128); break;
+        default: GGML_ABORT("gdn wmma2: unsupported S_v");
+    }
+#undef GDN_WMMA2_LAUNCH
+}
+
 static void launch_gated_delta_net_prefill_wmma(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -1385,15 +1762,13 @@ static void launch_gated_delta_net_prefill_wmma(
 }
 
 
-// GGML_GDN_PREFILL_WMMA=1 opts into the WMMA chunked-prefill kernel. Default OFF
-// (2026-09-18): as written it FAILS test-backend-ops (NMSE ~1.5 on every n_tokens>16 case)
-// and measures 21.7 ms at (16 heads, S_v=128, 2048 tokens, v_repeat 3) vs 4.2 ms for the
-// autoregressive kernel on the R9700. Kept for the rewrite; the autoregressive kernel is
-// the shipping prefill path until a chunk kernel passes the suite AND beats it.
+// GGML_GDN_PREFILL_WMMA=0 disables the WMMA chunked-prefill kernel (gated_delta_net_prefill_wmma2_cuda).
+// Default ON (2026-09-18): 53/53 GATED_DELTA_NET cases and 0.84 ms at (16 q-heads, S_v=128,
+// 2048 tokens, v_repeat 3) vs 4.20 ms for the autoregressive kernel on the R9700.
 static bool ggml_cuda_gdn_prefill_wmma_enabled() {
     static const bool enabled = []() {
         const char * s = std::getenv("GGML_GDN_PREFILL_WMMA");
-        return s != nullptr && std::atoi(s) != 0;
+        return s == nullptr || std::atoi(s) != 0;
     }();
     return enabled;
 }
@@ -1620,7 +1995,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
 
         if (wmma_ok) {
-            launch_gated_delta_net_prefill_wmma(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefill_state_out,
+            launch_gated_delta_net_prefill_wmma2(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefill_state_out,
                 S_v, H, T0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, n_tokens, stream);
         } else {
