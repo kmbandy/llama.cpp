@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/wp-tp-trace.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1769,6 +1770,14 @@ static bool ggml_backend_cuda_comm_allreduce_begin(void * comm_ctx_v, struct ggm
     GGML_ASSERT(i_op >= 0 && i_op < GGML_BACKEND_COMM_MAX_OPS);
     ggml_cuda_ar_op & op = comm_ctx->ar_ops[i_op];
     GGML_ASSERT(!op.pending && "AllReduce op slot begun again before end()");
+    // WP_TP_TRACE_FILE only: i_op IS the rolling-loop i_slot in this codebase
+    // (every call site passes i_op == (int) slot.i_slot -- see
+    // ggml_backend_meta_graph_runner::begin_reduce/end_reduce and their
+    // callers). Stashed on the op so allreduce.cu's begin()/end(), which do
+    // not otherwise see i_op, can tag AR_PACK_DONE/AR_SENT/AR_RECVD/
+    // AR_UNPACK_DONE rows with the right slot (and, via
+    // wp_tp_trace_current_ubatch/_subgraph, ubatch_idx/subgraph_idx).
+    op.trace_slot = i_op;
 
     if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal) {
         return false;
@@ -1779,7 +1788,19 @@ static bool ggml_backend_cuda_comm_allreduce_begin(void * comm_ctx_v, struct ggm
     if (ggml_nelements(tensors[0]) == 0) {
         return true;
     }
+    const bool tracing = wp_tp_trace_enabled();
+    if (tracing) {
+        wp_tp_trace_log_host(WP_TPT_AR_BEGIN_HOST, wp_tp_trace_current_ubatch(i_op), i_op,
+                              wp_tp_trace_current_subgraph(i_op), -1, "phase=enter");
+    }
     const bool ok = ggml_cuda_ar_allreduce_begin(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors, &op);
+    if (tracing) {
+        char extra[64];
+        snprintf(extra, sizeof(extra), "phase=exit;op_id=%llu;ok=%d;pending=%d",
+                 (unsigned long long) op.op_id, (int) ok, (int) op.pending);
+        wp_tp_trace_log_host(WP_TPT_AR_BEGIN_HOST, wp_tp_trace_current_ubatch(i_op), i_op,
+                              wp_tp_trace_current_subgraph(i_op), -1, extra);
+    }
     // WP_AR_TRACE=N: print the first N AllReduces (tensor, shape, bytes, path) so the
     // per-layer reduce structure can be read off the log.
     static const int trace_n = [] { const char * e = getenv("WP_AR_TRACE"); return e ? atoi(e) : 0; }();
@@ -1805,7 +1826,17 @@ static bool ggml_backend_cuda_comm_allreduce_end(void * comm_ctx_v, int i_op) {
     if (!op.pending) {
         return true;
     }
-    return ggml_cuda_ar_allreduce_end(comm_ctx->ar_pipeline, comm_ctx->backends.data(), &op);
+    const bool tracing = wp_tp_trace_enabled();
+    if (tracing) {
+        wp_tp_trace_log_host(WP_TPT_AR_END_HOST, wp_tp_trace_current_ubatch(i_op), i_op,
+                              wp_tp_trace_current_subgraph(i_op), -1, "phase=enter");
+    }
+    const bool ok = ggml_cuda_ar_allreduce_end(comm_ctx->ar_pipeline, comm_ctx->backends.data(), &op);
+    if (tracing) {
+        wp_tp_trace_log_host(WP_TPT_AR_END_HOST, wp_tp_trace_current_ubatch(i_op), i_op,
+                              wp_tp_trace_current_subgraph(i_op), -1, "phase=exit");
+    }
+    return ok;
 }
 
 // host buffer type
@@ -8293,7 +8324,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (cent->type != GGML_TYPE_F8_E4M3)  return false;
                 if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_I8) return false;
                 if (x->type == GGML_TYPE_I8 && x->ne[0] != w->ne[0] + 4) return false;
-                if (op->type   != GGML_TYPE_F32)      return false;
+                // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 dst is only wired
+                // for the ML8_4 RDNA4_TRFEED prefill tile (M>32); see
+                // ggml_cuda_ml8_4_mul_mat_supports_bf16_out (ml8.cu) — the
+                // M<=32 decode split-K kernel writes fp32 only.
+                if (op->type != GGML_TYPE_F32 &&
+                    !(op->type == GGML_TYPE_BF16 &&
+                      ggml_cuda_ml8_4_mul_mat_supports_bf16_out(w->ne[1], x->ne[1]))) {
+                    return false;
+                }
                 if (w->ne[0] % 64 != 0)               return false;
                 if (w->ne[1] % 16 != 0)               return false;
                 // lut_group_off (op_params[0]): under tensor parallelism w
@@ -8376,10 +8415,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const ggml_tensor * x   = op->src[0];
                 const ggml_tensor * h_a = op->src[1];
                 if (!x) return false;
-                if (x->type   != GGML_TYPE_F32) return false;
+                // LLAMA_ACT_BF16 (2026-09-18 phase 2): the V3/V4 per-row
+                // kernels are templated on the input element type (see
+                // ml8_fp8_qrot_v3_kernel / ml8_fp8_qrot_v4_kernel in ml8.cu),
+                // so a bf16 residual/activation row can be quantized directly
+                // without an f32 round-trip.
+                if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_BF16) return false;
                 if (op->type  != GGML_TYPE_I8)  return false;
                 if (!ggml_is_contiguous(x))     return false;
-                if (x->nb[1] != (size_t) x->ne[0] * sizeof(float)) return false;
+                if (x->nb[1] != (size_t) x->ne[0] * ggml_type_size(x->type)) return false;
                 {
                     // MAD-305 Phase 5 (round 3): op_params[3] == 0 is now a
                     // genuine "per-row" mode (a single scale for the whole
@@ -8398,10 +8442,32 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int32_t   b_dim = pp[1];
                 const int32_t   kind  = pp[2];
                 if (kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
-                    return h_a == nullptr;
+                    return h_a == nullptr && x->type == GGML_TYPE_F32;
                 }
                 if (b_dim < 16 || b_dim > 1024 || (b_dim & (b_dim - 1)) != 0) return false;
                 if (a_dim <= 0 || (int64_t) a_dim * (int64_t) b_dim != x->ne[0]) return false;
+                // LLAMA_ACT_BF16 (2026-09-18 phase 2): a bf16 src is only
+                // dispatched through ml8_launch_qrot_v4/v3 (ml8.cu), which are
+                // the only kernels templated on the input type. Rather than
+                // duplicate their full internal shape-coverage tables (V3's
+                // b_dim==128 path in particular chooses among several
+                // NW/per_wave instantiations at runtime, incl. via the
+                // MT_FP8_QROT_V3_NW env override), gate bf16 to the exact
+                // shapes qwen35's activation stream uses (KRONECKER a<=5,
+                // b_dim=1024; BLOCK_HADAMARD b_dim=128) plus a generous a_dim
+                // margin under V3's b=128 register-array bound; ml8.cu's
+                // ggml_cuda_op_fp8_quant_rot GGML_ABORTs defensively if a
+                // shape ever slips through without a matching instantiation.
+                if (x->type == GGML_TYPE_BF16) {
+                    if (((const int32_t *) op->op_params)[3] != 0) return false;  // per-row (G=0) only
+                    if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
+                        if (b_dim != 1024 || a_dim > 5) return false;
+                    } else if (kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD) {
+                        if (b_dim != 128 || a_dim > 160) return false;
+                    } else {
+                        return false;
+                    }
+                }
                 if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
                     if (h_a == nullptr || h_a->type != GGML_TYPE_F32) return false;
                     if (a_dim > 16) return false;  // ml8_h_a_left_multiply_kernel register array
@@ -8428,7 +8494,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const ggml_tensor * a = op->src[1];
                 if (!w || !a) return false;
                 if (a->type   != GGML_TYPE_I8)       return false;
-                if (op->type  != GGML_TYPE_F32)      return false;
                 if (w->ne[2] != 1 || w->ne[3] != 1)  return false;
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (w->type == GGML_TYPE_FP8_B128) {
@@ -8446,6 +8511,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     const bool per_row = (a->ne[0] == w->ne[0] + 4);
                     const bool block   = (a->ne[0] == w->ne[0] + w->ne[0] / 32);
                     if (!per_row && !block)              return false;
+                    // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 dst is only
+                    // wired for the per-row trfeed epilogue, and only for
+                    // M>32 (prefill) — see rdna4_gemm_fp8_trfeed_bf16's
+                    // caller in ggml_cuda_op_fp8_mul_mat.
+                    if (op->type != GGML_TYPE_F32 &&
+                        !(op->type == GGML_TYPE_BF16 && per_row && a->ne[1] * a->ne[2] * a->ne[3] > 32)) {
+                        return false;
+                    }
                     // The packed weight layout is fixed at load (MT_FP8_B128_LAYOUT):
                     // the trfeed layout carries one scale per row and serves only
                     // the per-row activation contract; the Triton layouts carry the
@@ -8469,6 +8542,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 // e4m3 bytes plus K/32 fp32 per-group scales per row (MAD-305
                 // Phase 5 production-integration contract).
                 if (w->type == GGML_TYPE_ML8_FP8) {
+                    // LLAMA_ACT_BF16 does not extend to this weight type.
+                    if (op->type != GGML_TYPE_F32)       return false;
                     if (w->ne[0] % 32 != 0)              return false;
                     if (w->ne[1] % 16 != 0)              return false;
                     if (a->ne[0] != w->ne[0] + w->ne[0] / 8) return false;
@@ -9083,6 +9158,19 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_stream_no") == 0) {
         return (void *)ggml_backend_cuda_set_stream_no;
+    }
+    // WP_TP_TRACE_FILE: proc-address bridges into wp-tp-trace.cu for
+    // ggml-backend-meta.cpp, which is backend-agnostic and cannot link CUDA
+    // directly -- resolved once per backend_config, same pattern as
+    // ggml_backend_set_stream_no above.
+    if (strcmp(name, "wp_tp_trace_mark") == 0) {
+        return (void *)wp_tp_trace_mark;
+    }
+    if (strcmp(name, "wp_tp_trace_mark_global") == 0) {
+        return (void *)wp_tp_trace_mark_global;
+    }
+    if (strcmp(name, "wp_tp_trace_gpu_mark") == 0) {
+        return (void *)wp_tp_trace_gpu_mark;
     }
     return nullptr;
 }

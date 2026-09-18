@@ -1808,15 +1808,23 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          enum ggml_type out_type) const {
     // Route the base matmul through the ml8 helper when a registry is present.
     // For non-ml8 weights and registry misses build_ml8_or_mul_mat is a pure
     // pass-through to ggml_mul_mat(ctx0, w, cur), so this is byte-identical for
     // every bf16/quantized weight and every non-ml8 model. LoRA and the w_s
     // output-channel scale below are unchanged and compose with the ml8 path
     // (AWQ acts input-side, w_s output-side).
+    // out_type (LLAMA_ACT_BF16): see this function's declaration in
+    // llama-graph.h; ml8_reg absent + out_type != F32 asserts inside
+    // build_ml8_or_mul_mat's plain-mul_mat fallback would fire if it were
+    // reached, but there's no ml8 registry to reach it through here, so
+    // assert directly at this call boundary instead for a clearer message.
+    GGML_ASSERT((ml8_reg || out_type == GGML_TYPE_F32) &&
+        "build_lora_mm: bf16 out_type requires an ml8 registry (ML8_4/FP8_B128/ML8_FP8 weight)");
     ggml_tensor * res = ml8_reg
-        ? build_ml8_or_mul_mat(ctx0, *ml8_reg, w, cur, &ml8_fp8b128_qrot_memo)
+        ? build_ml8_or_mul_mat(ctx0, *ml8_reg, w, cur, &ml8_fp8b128_qrot_memo, out_type)
         : ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {

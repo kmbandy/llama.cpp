@@ -207,9 +207,20 @@ using fp8_qrot_memo = std::unordered_map<fp8_qrot_key, struct ggml_tensor *, fp8
 //
 // This is a pure function over the registry (and, for FP8_B128, the caller-
 // supplied per-build memo) — no global state.
+// out_type (LLAMA_ACT_BF16, 2026-09-18 phase 2): GGML_TYPE_F32 (default,
+// byte-identical to every existing caller) or GGML_TYPE_BF16 to request a
+// bf16 dst from the ML8_4/FP8_B128/ML8_FP8 GEMM (via ggml_ml8_mul_mat_bf16 /
+// ggml_fp8_mul_mat_bf16 -- see ggml-ml8.h). Only honored for those three
+// weight types; the "any other type" plain-ggml_mul_mat fallback always
+// returns f32 regardless of out_type (asserted below), since plain mul_mat
+// has no bf16-dst variant here. Callers requesting bf16 must independently
+// confirm the CUDA backend's supports_op will actually accept it for the
+// resulting op's shape (ggml_cuda_ml8_4_mul_mat_supports_bf16_out et al. in
+// ggml-cuda.cu) -- this function does not check device support itself.
 struct ggml_tensor * build_ml8_or_mul_mat(
         struct ggml_context  * ctx,
         const ml8_registry   & reg,
         struct ggml_tensor   * weight,
         struct ggml_tensor   * x,
-        fp8_qrot_memo        * qrot_memo = nullptr);
+        fp8_qrot_memo        * qrot_memo = nullptr,
+        enum ggml_type         out_type = GGML_TYPE_F32);

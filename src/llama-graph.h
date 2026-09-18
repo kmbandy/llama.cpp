@@ -1259,11 +1259,21 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
-    // do mat_mul, while optionally apply lora and per-tensor scale
+    // do mat_mul, while optionally apply lora and per-tensor scale.
+    // out_type (LLAMA_ACT_BF16, 2026-09-18 phase 2): default GGML_TYPE_F32 is
+    // byte-identical to every existing caller; GGML_TYPE_BF16 requests a bf16
+    // dst from the underlying ml8 GEMM (build_ml8_or_mul_mat) when `w` is an
+    // ML8_4/FP8_B128/ML8_FP8 weight -- asserts otherwise (see
+    // build_ml8_or_mul_mat's doc comment in llama-ml8-registry.h). w_s (a
+    // post-GEMM elementwise scale) and LoRA are applied AFTER the matmul in
+    // whatever type it produced; a bf16-dst caller combining those with a
+    // LoRA/scale, if a model ever needed to, would need to check those ops'
+    // own bf16 support -- not exercised by qwen35's use of this.
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              enum ggml_type out_type = GGML_TYPE_F32) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(

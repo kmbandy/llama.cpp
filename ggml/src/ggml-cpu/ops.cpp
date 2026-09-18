@@ -12694,7 +12694,10 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
     const ggml_tensor * h_a = dst->src[1];
 
     GGML_ASSERT(x != NULL);
-    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): accept a bf16 src for test-backend-ops
+    // parity with the CUDA backend's Tin-templated V3/V4 kernels (ml8.cu) --
+    // converted to f32 per element below, same math as the f32 path otherwise.
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_BF16);
     GGML_ASSERT(dst->type == GGML_TYPE_I8);
 
     const int32_t * pp    = (const int32_t *) dst->op_params;
@@ -12732,7 +12735,23 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
     GGML_ASSERT(dst->ne[0] == row_out_i8);
 
     const int64_t n_rows = x->ne[1] * x->ne[2] * x->ne[3];
-    const float * x_data = (const float *) x->data;
+    // LLAMA_ACT_BF16: materialize a full f32 copy up front when src is bf16
+    // (simplest correct reference; no attempt at the CUDA kernels' on-the-fly
+    // per-element convert-during-load, since this is a correctness oracle,
+    // not a perf path).
+    float * x_f32_bf16_conv = NULL;
+    const float * x_data;
+    if (x->type == GGML_TYPE_BF16) {
+        x_f32_bf16_conv = (float *) malloc((size_t) n_rows * (size_t) K * sizeof(float));
+        if (!x_f32_bf16_conv) {
+            GGML_ABORT("ggml_compute_forward_fp8_quant_rot: malloc bf16->f32(%zu) failed",
+                       (size_t) n_rows * (size_t) K * sizeof(float));
+        }
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) x->data, x_f32_bf16_conv, n_rows * K);
+        x_data = x_f32_bf16_conv;
+    } else {
+        x_data = (const float *) x->data;
+    }
     int8_t      * y_data = (int8_t *) dst->data;
 
     // Per-row (G==0): the whole row is one "group" of width K (instead of
@@ -12830,6 +12849,7 @@ void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml
     free(yrot);
     free(xp);
     free(h_b);
+    free(x_f32_bf16_conv);
 }
 
 // ─── ggml_compute_forward_fp8_mul_mat (FP8_B128 phase 2) ──────────────────

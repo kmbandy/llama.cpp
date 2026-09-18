@@ -211,6 +211,21 @@ hipError_t rdna4_gemm_fp8_trfeed_f32(const uint8_t* a_fp8, const uint8_t* b_shuf
                                      int M_pad, int M_valid, int N, int K, hipStream_t stream);
 
 // ─────────────────────────────────────────────────────────────────────────
+// bf16-output sibling of rdna4_gemm_fp8_trfeed_f32 above (LLAMA_ACT_BF16,
+// 2026-09-18 phase 2): same frozen K-loop, same M_valid-guarded epilogue
+// contract as the f32 entry point, but writes bf16 -- for the qwen35
+// BF16-activation-stream mode, where the ML8_MUL_MAT/FP8_MUL_MAT consumer
+// wants a bf16 dst directly (half the write traffic vs f32, and no
+// convert_unary<bf16,float> pass is needed since nothing reads a scratch
+// fp32 buffer). Same M_pad/M_valid/N/K contracts as rdna4_gemm_fp8_trfeed_f32
+// (c_bf16 is [M_valid, N], NOT [M_pad, N] -- rows >= M_valid are silently
+// dropped by the epilogue, see trfeed_kernels.h's M_valid comment on the
+// bf16 branch).
+hipError_t rdna4_gemm_fp8_trfeed_bf16(const uint8_t* a_fp8, const uint8_t* b_shuf, void* c_bf16,
+                                      const float* a_scale, const float* b_scale,
+                                      int M_pad, int M_valid, int N, int K, hipStream_t stream);
+
+// ─────────────────────────────────────────────────────────────────────────
 // SwiGLU-epilogue sibling of rdna4_gemm_fp8_trfeed_f32 above (MAD-305 fused
 // FFN task, 2026-09-18): fuses ffn_gate/ffn_up's two ML8_4 GEMMs and the
 // swiglu(gate,up) GLU into ONE kernel launch, so the two GEMM output

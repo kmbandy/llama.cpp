@@ -159,9 +159,12 @@ static struct ggml_tensor * build_fp8_quant_rot_mul_mat(
         struct ggml_tensor   * x,
         const ml8_sidecars   * sc,
         fp8_qrot_memo        * qrot_memo,
-        int32_t                G) {
+        int32_t                G,
+        enum ggml_type         out_type = GGML_TYPE_F32) {
     struct ggml_tensor * qrot = get_or_build_fp8_quant_rot(ctx, weight, x, sc, qrot_memo, G);
-    return ggml_fp8_mul_mat(ctx, weight, qrot);
+    return out_type == GGML_TYPE_BF16
+        ? ggml_fp8_mul_mat_bf16(ctx, weight, qrot)
+        : ggml_fp8_mul_mat(ctx, weight, qrot);
 }
 
 // ML8_4's default activation path (MAD-3xx): same memoized quant_rot shape
@@ -176,9 +179,12 @@ static struct ggml_tensor * build_ml8_quant_rot_mul_mat(
         struct ggml_tensor   * weight,
         struct ggml_tensor   * x,
         const ml8_sidecars   * sc,
-        fp8_qrot_memo        * qrot_memo) {
+        fp8_qrot_memo        * qrot_memo,
+        enum ggml_type         out_type = GGML_TYPE_F32) {
     struct ggml_tensor * qrot = get_or_build_fp8_quant_rot(ctx, weight, x, sc, qrot_memo, /*G=*/0);
-    return ggml_ml8_mul_mat(ctx, weight, sc->centroids, qrot);
+    return out_type == GGML_TYPE_BF16
+        ? ggml_ml8_mul_mat_bf16(ctx, weight, sc->centroids, qrot)
+        : ggml_ml8_mul_mat(ctx, weight, sc->centroids, qrot);
 }
 
 struct ggml_tensor * build_ml8_or_mul_mat(
@@ -186,12 +192,13 @@ struct ggml_tensor * build_ml8_or_mul_mat(
         const ml8_registry   & reg,
         struct ggml_tensor   * weight,
         struct ggml_tensor   * x,
-        fp8_qrot_memo        * qrot_memo) {
+        fp8_qrot_memo        * qrot_memo,
+        enum ggml_type         out_type) {
 
     const ml8_sidecars * sc = reg.find(weight);
 
     if (weight->type == GGML_TYPE_FP8_B128) {
-        return build_fp8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, fp8_b128_layout_G());
+        return build_fp8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, fp8_b128_layout_G(), out_type);
     }
 
     if (weight->type == GGML_TYPE_ML8_4) {
@@ -203,13 +210,15 @@ struct ggml_tensor * build_ml8_or_mul_mat(
 
         if (ml8_4_act_legacy_enabled()) {
             // Pre-existing behavior, kept for A/B comparison (MT_ML8_4_ACT=legacy).
+            // LLAMA_ACT_BF16 does not extend to this legacy path.
+            GGML_ASSERT(out_type == GGML_TYPE_F32 && "MT_ML8_4_ACT=legacy has no bf16-dst variant");
             struct ggml_tensor * x_xf = apply_ml8_input_xform(ctx, x, *sc);
             return ggml_ml8_mul_mat(ctx, weight, sc->centroids, x_xf);
         }
         // Default: fused GGML_OP_FP8_QUANT_ROT(G=0) + GGML_OP_ML8_MUL_MAT
         // (prequantized) path — one launch for the activation pipeline,
         // shared with every other weight of this input group.
-        return build_ml8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo);
+        return build_ml8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, out_type);
     }
 
     if (weight->type == GGML_TYPE_ML8_FP8) {
@@ -221,14 +230,16 @@ struct ggml_tensor * build_ml8_or_mul_mat(
             // GEMM has no LUT) — only the optional AWQ+rotation input transform
             // applies. A registry miss (sc == nullptr) is the pre-existing
             // behavior: plain ggml_mul_mat on the untransformed x.
+            GGML_ASSERT(out_type == GGML_TYPE_F32 && "WP_ML8_FP8_LEGACY=1 has no bf16-dst variant");
             struct ggml_tensor * x_xf = sc ? apply_ml8_input_xform(ctx, x, *sc) : x;
             return ggml_mul_mat(ctx, weight, x_xf);
         }
         // Default: same memoized quant_rot + fp8_mul_mat path as FP8_B128,
         // with G=32 (ML8_FP8's 34-byte, 32-wide-K-group blocks).
-        return build_fp8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, /*G=*/32);
+        return build_fp8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, /*G=*/32, out_type);
     }
 
-    // All other weight types (F32, BF16, Q4_0, …) — plain mul_mat.
+    // All other weight types (F32, BF16, Q4_0, …) — plain mul_mat, f32 only.
+    GGML_ASSERT(out_type == GGML_TYPE_F32 && "bf16-dst is only wired for ML8_4/FP8_B128/ML8_FP8 weights");
     return ggml_mul_mat(ctx, weight, x);
 }

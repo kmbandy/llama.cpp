@@ -750,6 +750,47 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 
     const auto & layer = model.layers[il];
 
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2, read once): when set AND this is a
+    // prefill ubatch (n_tokens > 32 -- the same threshold
+    // ggml_cuda_ml8_4_mul_mat_supports_bf16_out in ml8.cu gates the
+    // RDNA4_TRFEED bf16-dst GEMM path on, since the M_pad==32 decode kernel
+    // has no bf16 epilogue), run the ffn_up/ffn_gate GEMM outputs and the
+    // SwiGLU combine in bf16 instead of f32: halves the GEMM-output write
+    // traffic and the GLU's read+write traffic (both already have CUDA-backend
+    // bf16 support from Phase 1's BF16 activation coverage).
+    //
+    // SCOPE NOTE: this is deliberately narrower than the full
+    // residual-stream-in-bf16 mode the phase-2 task describes. `cur` going
+    // in and ffn_down's output are both left f32, so the residual stream and
+    // every other op (attention, rope, GATED_DELTA_NET, norms, the LM head)
+    // are completely unchanged by this switch -- only the three tensors
+    // between ffn_up/ffn_gate and ffn_down run in bf16. Extending bf16
+    // through the rest of the graph (build_norm's RMS_NORM+MUL, Qcur/Kcur/
+    // Vcur, the residual adds) was not completed in this pass; see the report.
+    static const bool act_bf16_env = [] {
+        const char * e = std::getenv("LLAMA_ACT_BF16");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    const bool use_bf16_ffn = act_bf16_env && n_tokens > 32 &&
+        layer.ffn_up->type   == GGML_TYPE_ML8_4 &&
+        layer.ffn_gate->type == GGML_TYPE_ML8_4 &&
+        layer.ffn_down->type == GGML_TYPE_ML8_4 &&
+        !layer.ffn_up_s && !layer.ffn_gate_s && !layer.ffn_down_s;
+
+    if (use_bf16_ffn) {
+        ggml_tensor * up_b = build_lora_mm(layer.ffn_up, cur, nullptr, GGML_TYPE_BF16);
+        cb(up_b, "ffn_up", il);
+        ggml_tensor * gate_b = build_lora_mm(layer.ffn_gate, cur, nullptr, GGML_TYPE_BF16);
+        cb(gate_b, "ffn_gate", il);
+        // Same operand order as build_ffn's LLM_FFN_SILU/LLM_FFN_PAR case:
+        // gate first (silu applied to it), up second.
+        ggml_tensor * act = ggml_swiglu_split(ctx0, gate_b, up_b);
+        cb(act, "ffn_swiglu", il);
+        cur = build_lora_mm(layer.ffn_down, act);
+        cb(cur, "ffn_out", il);
+        return cur;
+    }
+
     // ML8_4 / FP8_B128 / ML8_FP8 FFN weights all dispatch through build_ffn ->
     // build_lora_mm -> build_ml8_or_mul_mat (llama-ml8-registry.cpp), whose
     // apply_ml8_input_xform reads the registered sidecars and applies BOTH

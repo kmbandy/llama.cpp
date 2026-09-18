@@ -693,6 +693,14 @@ endif()
 
 # MAD-135: mt:: int4 quant round-trip tests
 llama_build_and_test(test-mt-quant.cpp)
+if (GGML_HIP AND GGML_HIP_AITER)
+    # MT_PAGED_ATTN_WMMA A/B bench (mt_pagedattn_wmma_fp8.cu vs the AITER
+    # oracle) — needs the AITER build (mt_turbo_fp8_lut_registry symbols)
+    # and a paged-attn-capable HIP backend, so only registered there.
+    llama_build_and_test(test-mt-pagedattn-wmma-bench.cpp)
+    # mt_turbo_fp8_lut_registry.h lives under ggml-cuda/, not a public include dir.
+    target_include_directories(test-mt-pagedattn-wmma-bench PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cuda)
+endif()
 
 # MAD-223 Phase G.2: ml8-4 + f8_e4m3 CPU dequant round-trip tests.
 # Needs ggml/src on the include path since ggml-quants.h + ggml-common.h are

@@ -358,9 +358,17 @@ gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshu
             int row0 = tm + (wave_m * TFRAGS_M + mi) * 16;
             int col0 = tn + (wave_n * TFRAGS_N + ni) * 16;
             if constexpr (std::is_same<COut, __hip_bfloat16>::value) {
+                // M_valid (MAD-305 phase 2 LLAMA_ACT_BF16, 2026-09-18): every
+                // EXISTING caller passes M_valid's default (INT_MAX) and M ==
+                // M_pad, so `gr < M_valid` is trivially true and this is
+                // byte-identical to the prior unguarded-tile store. A new
+                // bf16-direct-to-dst caller can now pass M_valid == the true
+                // M (< M_pad) to write straight into an [M_valid, N] bf16
+                // destination with no M_pad-sized scratch, mirroring the
+                // float branch below.
                 for (int t = lane; t < 256; t += WAVE_SIZE) {
                     int gr = row0 + t / 16, gc = col0 + t % 16;
-                    if (gr < M && gc < N) {
+                    if (gr < M && gc < N && gr < M_valid) {
                         float v = ws[t] * a_scale[gr] * b_scale[gc];
                         C[gr * N + gc] = (__hip_bfloat16)v;
                     }

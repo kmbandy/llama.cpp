@@ -65,6 +65,16 @@ GGML_API struct ggml_tensor * ggml_ml8_mul_mat(
         struct ggml_tensor  * centroids,
         struct ggml_tensor  * x);
 
+// LLAMA_ACT_BF16 (2026-09-18 phase 2): same op, dst tensor is GGML_TYPE_BF16
+// instead of GGML_TYPE_F32. Only the CUDA backend's ML8_4 RDNA4_TRFEED
+// prefill path (M_pad > 32) can produce bf16 directly; check supports_op
+// before routing a graph through this for a given shape/ubatch.
+GGML_API struct ggml_tensor * ggml_ml8_mul_mat_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * centroids,
+        struct ggml_tensor  * x);
+
 // Returns the node's lut_group_off (op_params[0]): the first centroid
 // K-group this node reads, i.e. the effective LUT pointer is
 // `(const uint8_t *) centroids->data + lut_group_off * 16`. Always 0 for a
@@ -260,6 +270,13 @@ static inline struct ggml_tensor * ggml_fp8_quant_rot(
 //   - K % G == 0 (G = 128 for FP8_B128, 32 for ML8_FP8)
 //   - a->ne[0] == w->ne[0] + 4 * w->ne[0] / G, or a->ne[0] == w->ne[0] + 4 (per-row)
 GGML_API struct ggml_tensor * ggml_fp8_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * a);
+
+// LLAMA_ACT_BF16 bf16-dst variant of ggml_fp8_mul_mat above -- see supports_op
+// in ggml-cuda.cu for which (weight type, layout) combinations accept it.
+GGML_API struct ggml_tensor * ggml_fp8_mul_mat_bf16(
         struct ggml_context * ctx,
         struct ggml_tensor  * w,
         struct ggml_tensor  * a);

@@ -107,6 +107,40 @@ hipError_t rdna4_gemm_fp8_trfeed_f32(const uint8_t* a_fp8, const uint8_t* b_shuf
     return hipGetLastError();
 }
 
+// bf16-output launcher (LLAMA_ACT_BF16, 2026-09-18 phase 2): SAME grid/tile
+// rules as rdna4_gemm_fp8_trfeed_f32 above -- copied verbatim, instantiating
+// gemm_fp8_trfeed<TBM,TWAVES_M,__hip_bfloat16> (the bf16 epilogue, now
+// M_valid-guarded -- see trfeed_kernels.h) instead of <TBM,TWAVES_M,float>,
+// and writing directly into the caller's [M_valid, N] bf16 destination (no
+// M_pad-sized scratch needed, same as the f32 sibling).
+hipError_t rdna4_gemm_fp8_trfeed_bf16(const uint8_t* a_fp8, const uint8_t* b_shuf, void* c_bf16,
+                                      const float* a_scale, const float* b_scale,
+                                      int M_pad, int M_valid, int N, int K, hipStream_t stream) {
+    if (M_pad <= 0 || N <= 0 || K <= 0 || (N % BN) != 0 || (K % BK) != 0) {
+        return hipErrorInvalidValue;
+    }
+    if (M_valid <= 0 || M_valid > M_pad) {
+        return hipErrorInvalidValue;
+    }
+    __hip_bfloat16* C = (__hip_bfloat16*) c_bf16;
+    if (M_pad == TBM_DECODE) {
+        constexpr int TBLOCK = TWAVES_M_DECODE * WAVES_N * WAVE_SIZE;
+        const dim3 grid(N / BN, M_pad / TBM_DECODE);
+        gemm_fp8_trfeed<TBM_DECODE, TWAVES_M_DECODE, __hip_bfloat16><<<grid, TBLOCK, 0, stream>>>(
+            (const float8_t*) a_fp8, b_shuf, C, a_scale, b_scale, M_pad, N, K, M_valid);
+        return hipGetLastError();
+    }
+    if ((M_pad % BM) != 0) {
+        return hipErrorInvalidValue;
+    }
+    constexpr int TBM = BM, TWAVES_M = WAVES_M;   // the frozen 128x128/4-wave prefill tile
+    constexpr int TBLOCK = TWAVES_M * WAVES_N * WAVE_SIZE;
+    const dim3 grid(N / BN, M_pad / TBM);
+    gemm_fp8_trfeed<TBM, TWAVES_M, __hip_bfloat16><<<grid, TBLOCK, 0, stream>>>(
+        (const float8_t*) a_fp8, b_shuf, C, a_scale, b_scale, M_pad, N, K, M_valid);
+    return hipGetLastError();
+}
+
 // SwiGLU-epilogue launcher (MAD-305 fused-FFN task): SAME grid/tile rules as
 // rdna4_gemm_fp8_trfeed_f32 above, but N_fused is the interleaved gate/up
 // column count (see trfeed_kernels.h's SwiGLU epilogue comment and

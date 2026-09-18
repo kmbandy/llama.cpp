@@ -1,6 +1,7 @@
 #include "allreduce.cuh"
 #include "wp-op-profile.cuh"
 #include "wp-node-trace.cuh"
+#include "wp-tp-trace.cuh"
 
 #include <vector>
 
@@ -983,6 +984,7 @@ struct ggml_cuda_ar_pipeline {
     uint64_t                  dx_call;       // begin() counter -> slot = dx_call % DX_SLOTS
     int                       dx_in_flight;  // begun-but-not-ended ops
     cudaStream_t              streams_in[GGML_CUDA_MAX_DEVICES];  // inbound H2D (non-blocking)
+    bool                      streams_in_shared = false;           // streams_in[i] == streams[i] (see init)
     char *                    dx_send[GGML_CUDA_MAX_DEVICES];     // device: DX_SLOTS * dx_bytes, wire-typed partial
     char *                    dx_recv[GGML_CUDA_MAX_DEVICES];     // device: DX_SLOTS * dx_bytes, peer's partial
     ggml_cuda_ar_host_mapping dx_staging[GGML_CUDA_MAX_DEVICES];  // pinned host: DX_SLOTS * dx_bytes
@@ -2012,9 +2014,25 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->dx_in_flight = 0;
     if (p->transport != GGML_CUDA_AR_TRANSPORT_COPY) {
         const size_t dx_total = (size_t) GGML_CUDA_AR_DX_SLOTS * p->dx_bytes;
+        // GGML_CUDA_AR_SINGLE_STREAM (default 1, 2026-09-18): run the inbound (H2D pull /
+        // peer-recv) work on the SAME stream as the outbound work instead of a third
+        // stream. gfx12 gives a process ~3 usable compute queues per device before the HWS
+        // time-slices (KFD num_cp_queues=4, one taken by the runtime's own queue); with
+        // GPU_MAX_HW_QUEUES=2 a third stream lands on the compute queue by round-robin and
+        // its cross-device waits ("in<-sent_peer") become barrier packets in front of the
+        // other slot's compute. Measured on qwen38-27b-ml84-tp 8k: every extra stream on
+        // the TB3 card costs (expander side stream -160 pp; priority AR streams -50%).
+        // =0 restores the separate in-stream.
+        static const bool single_stream = [] {
+            const char * e = std::getenv("GGML_CUDA_AR_SINGLE_STREAM");
+            return e == nullptr || std::strcmp(e, "0") != 0;
+        }();
         for (size_t i = 0; i < n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
-            if (ggml_cuda_ar_stream_create(&p->streams_in[i]) != cudaSuccess) {
+            if (single_stream) {
+                p->streams_in[i] = p->streams[i];
+                p->streams_in_shared = true;
+            } else if (ggml_cuda_ar_stream_create(&p->streams_in[i]) != cudaSuccess) {
                 GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags (in) failed for device %d\n", __func__, p->devices[i]);
                 ggml_cuda_ar_pipeline_free(p);
                 return nullptr;
@@ -2175,7 +2193,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             if (ev.recvd) { cudaEventDestroy(ev.recvd); }
             if (ev.freed) { cudaEventDestroy(ev.freed); }
         }
-        if (p->streams_in[i]) { cudaStreamDestroy(p->streams_in[i]); }
+        if (p->streams_in[i] && !p->streams_in_shared) { cudaStreamDestroy(p->streams_in[i]); }
     }
 
     for (int i = 0; i < p->n_devices; ++i) {
@@ -2806,6 +2824,15 @@ bool ggml_cuda_ar_allreduce_begin(
     GGML_ASSERT(op != nullptr);
     op->pending = false;
 
+    // WP_TP_TRACE_FILE only: trace_slot was set by the caller
+    // (ggml_backend_cuda_comm_allreduce_begin) before this call; ubatch_idx/
+    // subgraph_idx are looked up from what the meta backend last noted for
+    // that slot (see wp-tp-trace.cuh).
+    const bool      wp_tracing        = wp_tp_trace_enabled();
+    const long long wp_trace_slot     = wp_tracing ? (long long) op->trace_slot : -1;
+    const long long wp_trace_ubatch   = wp_tracing ? wp_tp_trace_current_ubatch(wp_trace_slot) : -1;
+    const long long wp_trace_subgraph = wp_tracing ? wp_tp_trace_current_subgraph(wp_trace_slot) : -1;
+
     const int n = p->n_devices;
     GGML_ASSERT(n == 2);
 
@@ -2929,6 +2956,15 @@ bool ggml_cuda_ar_allreduce_begin(
         CUDA_CHECK(cudaEventRecord(p->dx_ev[i][h].app, cs));
         p->wd_dx_slot_call[i][slot].store(p->dx_call, std::memory_order_relaxed);
         p->wd_dx_phase[i][slot].store(1 /* begun */, std::memory_order_relaxed);
+        if (wp_tracing) {
+            // p->dx_ev[i][h].app is cudaEventDisableTiming -- record our own
+            // timing-enabled event on the same stream right after it instead
+            // of reusing it (see wp-tp-trace.cuh).
+            char extra[64];
+            snprintf(extra, sizeof(extra), "op_id=%llu;bytes=%zu", (unsigned long long) op_id, xfer_nbytes);
+            wp_tp_trace_log_gpu(WP_TPT_AR_PACK_DONE, wp_trace_ubatch, wp_trace_slot, wp_trace_subgraph,
+                                 p->devices[i], cs, extra);
+        }
     }
 
     ggml_cuda_ar_dump_partials(p, tensors, n, ne);
@@ -2972,6 +3008,12 @@ bool ggml_cuda_ar_allreduce_begin(
         CUDA_CHECK(cudaEventRecord(ev.sent, out));
         ev.sent_valid = true;
         p->wd_dx_phase[i][slot].store(2 /* sent */, std::memory_order_relaxed);
+        if (wp_tracing) {
+            char extra[64];
+            snprintf(extra, sizeof(extra), "op_id=%llu;bytes=%zu", (unsigned long long) op_id, xfer_nbytes);
+            wp_tp_trace_log_gpu(WP_TPT_AR_SENT, wp_trace_ubatch, wp_trace_slot, wp_trace_subgraph,
+                                 p->devices[i], out, extra);
+        }
     }
 
     // Phase C (in-streams): pulls the peer's partial for the ranks that are
@@ -3017,6 +3059,12 @@ bool ggml_cuda_ar_allreduce_begin(
         CUDA_CHECK(cudaEventRecord(ev.recvd, in));
         ev.recvd_valid = true;
         p->wd_dx_phase[i][slot].store(3 /* recvd */, std::memory_order_relaxed);
+        if (wp_tracing) {
+            char extra[64];
+            snprintf(extra, sizeof(extra), "op_id=%llu;bytes=%zu", (unsigned long long) op_id, xfer_nbytes);
+            wp_tp_trace_log_gpu(WP_TPT_AR_RECVD, wp_trace_ubatch, wp_trace_slot, wp_trace_subgraph,
+                                 p->devices[i], in, extra);
+        }
     }
 
     op->pending   = true;
@@ -3043,6 +3091,12 @@ bool ggml_cuda_ar_allreduce_end(
     }
     GGML_ASSERT(p->transport != GGML_CUDA_AR_TRANSPORT_COPY);
     GGML_ASSERT(p->dx_in_flight > 0);
+
+    // WP_TP_TRACE_FILE only: see the matching block in ggml_cuda_ar_allreduce_begin above.
+    const bool      wp_tracing        = wp_tp_trace_enabled();
+    const long long wp_trace_slot     = wp_tracing ? (long long) op->trace_slot : -1;
+    const long long wp_trace_ubatch   = wp_tracing ? wp_tp_trace_current_ubatch(wp_trace_slot) : -1;
+    const long long wp_trace_subgraph = wp_tracing ? wp_tp_trace_current_subgraph(wp_trace_slot) : -1;
 
     const int    n        = p->n_devices;
     const int    slot     = op->slot;
@@ -3112,6 +3166,12 @@ bool ggml_cuda_ar_allreduce_end(
         CUDA_CHECK(cudaEventRecord(ev.freed, cs));
         ev.freed_valid = true;
         p->wd_dx_phase[i][slot].store(4 /* ended */, std::memory_order_relaxed);
+        if (wp_tracing) {
+            char extra[64];
+            snprintf(extra, sizeof(extra), "op_id=%llu", (unsigned long long) op->op_id);
+            wp_tp_trace_log_gpu(WP_TPT_AR_UNPACK_DONE, wp_trace_ubatch, wp_trace_slot, wp_trace_subgraph,
+                                 p->devices[i], cs, extra);
+        }
     }
 
     p->dx_in_flight--;

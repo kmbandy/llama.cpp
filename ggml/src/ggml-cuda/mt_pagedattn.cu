@@ -14,6 +14,7 @@
 #include "mt_pagedattn_aiter.cuh" // GGML_HIP_AITER-gated AITER backend (no-op stubs otherwise)
 #include "mt_pagedattn_tile.cuh" // tile FA kernel dispatch entry (launch_paged_attn_tile)
 #include "mt_pagedattn_decode.cuh" // flash-decode kernel dispatch entry (launch_paged_attn_decode, MAD-185)
+#include "mt_pagedattn_wmma_fp8.cuh" // hand-written WMMA prefill kernel for TURBO4_FP8_BS256/GQA-6/head256 (MT_PAGED_ATTN_WMMA)
 #include "turbo-quant.cuh"   // TURBO_CENTROIDS_4BIT, TURBO_WHT_SIGNS{1,2}, turbo_nearest_centroid_4bit
 
 #include <cmath>
@@ -1757,6 +1758,34 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const bool   probe_on    = probe_env != nullptr;
     const bool   probe_verbose = probe_on && std::strncmp(probe_env, "verbose", 7) == 0;
     static std::atomic<int> probe_tile{0}, probe_decode{0}, probe_scalar{0}, probe_aiter{0};
+
+    // Hand-written WMMA prefill kernel for the (head_dim=256, GQA-6,
+    // TURBO4_FP8_BS256) shape — see mt_pagedattn_wmma_fp8.cu. Only takes
+    // over when explicitly opted in (MT_PAGED_ATTN_WMMA=1) AND the runtime
+    // shape matches exactly; every other shape (including decode on this
+    // same model) falls through to the AITER path below unchanged. Checked
+    // BEFORE aiter_backend_enabled()'s early-return since this shape would
+    // otherwise always be claimed by AITER first.
+    if (paged_attn_wmma_fp8_env_enabled()) {
+        const ggml_tensor * wmma_q         = dst->src[0];
+        const ggml_tensor * wmma_k_cache   = dst->src[1];
+        const int32_t * wmma_op_params_i32 = (const int32_t *)(dst->op_params);
+        const int32_t   wmma_n_kv_heads    = wmma_op_params_i32[3];
+        const int32_t   wmma_max_q_len     = wmma_op_params_i32[4];
+        const int        wmma_head_size    = wmma_q->ne[0];
+        const int        wmma_n_heads      = wmma_q->ne[1];
+        const int        wmma_cc           = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (paged_attn_wmma_fp8_shape_ok(wmma_cc, wmma_head_size, wmma_k_cache->type,
+                                          wmma_n_heads, wmma_n_kv_heads, wmma_max_q_len)) {
+            if (probe_on) {
+                std::fprintf(stderr, "[probe-wmma-fp8] dispatching to WMMA prefill kernel "
+                                      "(head_size=%d n_heads=%d n_kv_heads=%d max_q_len=%d)\n",
+                              wmma_head_size, wmma_n_heads, (int) wmma_n_kv_heads, (int) wmma_max_q_len);
+            }
+            ggml_cuda_op_paged_attn_mt_wmma_fp8(ctx, dst);
+            return;
+        }
+    }
 
     // MAD-188: if the AITER backend is enabled and compiled in, route the
     // whole op through it. Scatter and attention both use AITER's KV layout

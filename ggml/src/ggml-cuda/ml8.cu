@@ -248,6 +248,15 @@ static int32_t ml8_4_layout_for_tensor(int32_t N) {
     return ML8_4_LAYOUT_TRITON;
 }
 
+// LLAMA_ACT_BF16 (2026-09-18 phase 2): see declaration in ml8.cuh. Only the
+// RDNA4_TRFEED prefill tile (M_pad > 32, N%128==0) has a bf16 epilogue that
+// writes straight to dst — see the M_pad==32 branch of
+// ggml_cuda_op_ml8_mul_mat below, which stays fp32-only (split-K decode
+// kernel, no bf16 output).
+bool ggml_cuda_ml8_4_mul_mat_supports_bf16_out(int64_t N, int64_t M) {
+    return M > 32 && ml8_4_layout_for_tensor((int32_t) N) == ML8_4_LAYOUT_RDNA4_TRFEED;
+}
+
 // Pack the on-disk ML8_4 blocks into `dst_packed`/`dst_scale` according to
 // `layout`. TRITON reuses the existing straight [K/2,N] repack kernel;
 // RDNA4_TRFEED calls the out-of-place device packer (rdna4_pack_ml84_trfeed,
@@ -2463,9 +2472,17 @@ struct ml8_expand_prefetch_state {
 };
 
 static ml8_expand_prefetch_state * ml8_expand_prefetch_get(int device) {
+    // Default: ON for a single GPU (hides the 0.4 s expander behind the GEMMs on the R9700),
+    // OFF for multi-GPU tensor parallelism: the side stream is a third stream per device and
+    // under the gfx12 2-queue budget it lands on the compute queue of the TB3 card --
+    // measured 2026-09-18 on qwen38-27b-ml84-tp 8k: prefetch on 1182 pp, off 1345 pp.
+    // MT_ML8_4_PREFETCH=1/0 forces either way.
     static const bool disabled = [] {
         const char * e = std::getenv("MT_ML8_4_PREFETCH");
-        return e != nullptr && std::strcmp(e, "0") == 0;
+        if (e != nullptr) {
+            return std::strcmp(e, "0") == 0;
+        }
+        return ggml_cuda_info().device_count > 1;
     }();
     if (disabled) {
         return nullptr;
@@ -2593,7 +2610,11 @@ static void ml8_mul_mat_core(
     GGML_ASSERT(w->type    == GGML_TYPE_ML8_4);
     GGML_ASSERT(cent->type == GGML_TYPE_F8_E4M3);
     GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_I8);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 dst only reachable through
+    // the RDNA4_TRFEED prefill (M_pad>32) branch below — supports_op's
+    // ggml_cuda_ml8_4_mul_mat_supports_bf16_out already gated this at graph
+    // build time, so any other path hitting bf16 here is a caller bug.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(ggml_is_contiguous(w));
     GGML_ASSERT(ggml_is_contiguous(cent));
     GGML_ASSERT(ggml_is_contiguous(x));
@@ -2801,7 +2822,12 @@ static void ml8_mul_mat_core(
         if (M_pad == 32) {
             // Decode/verify: fp32 output straight from the split-K kernel, no
             // bf16 intermediate (see rdna4_gemm_ml84_trfeed_decode_splitk's
-            // contract). MT_ML8_4_SPLITS overrides the heuristic split count
+            // contract). LLAMA_ACT_BF16 does not extend to this path (M<=32
+            // is never a prefill ubatch, see
+            // ggml_cuda_ml8_4_mul_mat_supports_bf16_out's M>32 gate) — dst
+            // must be fp32 here.
+            GGML_ASSERT(dst->type == GGML_TYPE_F32);
+            // MT_ML8_4_SPLITS overrides the heuristic split count
             // for A/B; unset uses rdna4_ml84_trfeed_splitk_default_splits.
             static const int splits_override = [] {
                 const char * e = std::getenv("MT_ML8_4_SPLITS");
@@ -2861,6 +2887,24 @@ static void ml8_mul_mat_core(
             b_scale_out_ptr = b_scale_out.get();
         }
 
+        // LLAMA_ACT_BF16 (2026-09-18 phase 2): dst is GGML_TYPE_BF16 (only
+        // reachable when supports_op's ggml_cuda_ml8_4_mul_mat_supports_bf16_out
+        // gate passed, i.e. this same RDNA4_TRFEED/M_pad>32 branch) — write
+        // bf16 straight into dst->data via the M_valid-guarded bf16 epilogue,
+        // no fp32 intermediate and no convert pass.
+        if (dst->type == GGML_TYPE_BF16) {
+            const hipError_t gemm_rc_trfeed = rdna4_gemm_fp8_trfeed_bf16(
+                (const uint8_t *) a_fp8_ptr, b_shuf_ptr, dst->data, a_scale_ptr, b_scale_out_ptr,
+                M_pad, M, N, K, stream);
+            GGML_ASSERT(gemm_rc_trfeed == hipSuccess && "rdna4_gemm_fp8_trfeed_bf16 dispatch failed");
+            if (pf != nullptr) {
+                ml8_expand_prefetch_src cur;
+                cur.w = w; cur.cent_data = cent_data; cur.repack = repack; cur.N = N; cur.K = K;
+                ml8_expand_prefetch_release(pf, use_slot, cur, stream);
+            }
+            return;
+        }
+
         // fp32 epilogue straight into dst (M_valid = M rows): no bf16
         // scratch, no convert launch. Measured 2026-09-18 (out/gemm_trfeed_prod_bench,
         // R9700): bit-exact vs the fp32 reference and 2-8% faster than the
@@ -2890,6 +2934,11 @@ static void ml8_mul_mat_core(
     }
 
     // ── 4. Allocate bf16 output (M_pad × N) and launch mt_ml8_gemm.
+    // LLAMA_ACT_BF16 does not extend to the TRITON layout / mt_ml8_gemm path
+    // (only RDNA4_TRFEED prefill has a bf16 dst wired above) — dst must be
+    // fp32 here; supports_op's ggml_cuda_ml8_4_mul_mat_supports_bf16_out
+    // already restricts bf16 dst to shapes that pick the RDNA4_TRFEED layout.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
     ggml_cuda_pool_alloc<nv_bfloat16> c_bf16(ctx.pool(), (size_t) M_pad * (size_t) N);
 
     mt_ml8_gemm_args_t args{};
@@ -4053,6 +4102,19 @@ static void ml8_launch_qrot_v2(
 
 
 
+// LLAMA_ACT_BF16 (2026-09-18 phase 2): scalar element->float conversion used
+// by the V3/V4 per-row kernels' input-type-templated load path below. float
+// is the identity (existing behavior, unchanged); nv_bfloat16 lets those two
+// kernels read a bf16 residual/activation row directly instead of requiring
+// an f32 round-trip before FP8_QUANT_ROT. NOT a vectorized 16-byte bf16
+// load (that would read 8 elements/instruction, matching the float4 float
+// path's 4) -- this is a per-element scalar convert, simpler and correct,
+// but leaves the bf16 input path's memory-bandwidth win on the table versus
+// the float path at the same E. See the report for this tradeoff.
+template <typename T> static __device__ __forceinline__ float ml8_qrot_elem_to_float(T v);
+template <> __device__ __forceinline__ float ml8_qrot_elem_to_float<float>(float v) { return v; }
+template <> __device__ __forceinline__ float ml8_qrot_elem_to_float<nv_bfloat16>(nv_bfloat16 v) { return __bfloat162float(v); }
+
 // Packed hardware fp32 -> e4m3 (gfx12 v_cvt_pk_fp8_f32, RNE): validated bit-identical to
 // fp8_quant_rot_f32_to_e4m3 over 4M values incl. +-448, zeros and the subnormal edges
 // (2026-09-18, scratch probe cvt2.hip). Inputs are clamped to +-448 first (the row scale
@@ -4101,10 +4163,10 @@ static __device__ __forceinline__ uint32_t fp8_quant_rot_pack4_hw(float a, float
 // parameters) so the arrays stay in VGPRs; the dispatcher picks the
 // instantiation and falls through to V2 for shapes without one.
 // ---------------------------------------------------------------------------
-template <int B, int NW, int MAXAW, bool HAS_HA>
+template <int B, int NW, int MAXAW, bool HAS_HA, typename Tin = float>
 __launch_bounds__(32 * NW)
 static __global__ void ml8_fp8_qrot_v3_kernel(
-    const float * __restrict__ x,        // [n_rows, K]
+    const Tin   * __restrict__ x,        // [n_rows, K]
     const float * __restrict__ h_a,      // [a_dim, a_dim] or nullptr
     uint8_t     * __restrict__ a_fp8,    // [n_rows, K]
     float       * __restrict__ a_scale,  // [n_rows]
@@ -4123,7 +4185,7 @@ static __global__ void ml8_fp8_qrot_v3_kernel(
     if (row >= n_rows) {
         return;
     }
-    const float * xrow = x + (size_t) row * (size_t) K;
+    const Tin * xrow = x + (size_t) row * (size_t) K;
 
     float v[MAXAW][E];
     float local_max = 0.0f;
@@ -4132,15 +4194,18 @@ static __global__ void ml8_fp8_qrot_v3_kernel(
     for (int j = 0; j < MAXAW; j++) {
         const int a = wave + j * NW;     // block index within the row
         if (a < a_dim) {
-            const float * blk = xrow + (size_t) a * B + lane * E;
+            const Tin * blk = xrow + (size_t) a * B + lane * E;
             #pragma unroll
             for (int e = 0; e < E; e += 4) {
-                if constexpr (E >= 4) {
+                if constexpr (std::is_same<Tin, float>::value && E >= 4) {
                     const float4 t = *reinterpret_cast<const float4 *>(blk + e);
                     v[j][e] = t.x; v[j][e + 1] = t.y; v[j][e + 2] = t.z; v[j][e + 3] = t.w;
                 } else {
+                    // Tin != float (bf16): scalar per-element convert, no
+                    // vectorized load (see ml8_qrot_elem_to_float's comment).
+                    constexpr int qn = E >= 4 ? 4 : E;
                     #pragma unroll
-                    for (int q = 0; q < E; q++) { v[j][e + q] = blk[e + q]; }
+                    for (int q = 0; q < qn; q++) { v[j][e + q] = ml8_qrot_elem_to_float(blk[e + q]); }
                 }
             }
             // in-lane stages: stride < E
@@ -4262,10 +4327,10 @@ static __global__ void ml8_fp8_qrot_v3_kernel(
 // tensor (x_norm = x * rsqrt(mean(x^2) + eps) * w), same math as
 // rms_norm_f32 + the MUL it fuses.
 // ---------------------------------------------------------------------------
-template <int B, int MAXA, bool HAS_HA, bool FUSE_NORM>
+template <int B, int MAXA, bool HAS_HA, bool FUSE_NORM, typename Tin = float>
 __launch_bounds__(128)
 static __global__ void ml8_fp8_qrot_v4_kernel(
-    const float * __restrict__ x, const float * __restrict__ h_a,
+    const Tin   * __restrict__ x, const float * __restrict__ h_a,
     const float * __restrict__ norm_w, float norm_eps,
     uint8_t * __restrict__ a_fp8, float * __restrict__ a_scale,
     int K, int a_dim, int n_rows) {
@@ -4282,7 +4347,7 @@ static __global__ void ml8_fp8_qrot_v4_kernel(
     const int lane = L & 31;
     const int wave = L >> 5;
     if (row >= n_rows) { return; }
-    const float * xrow = x + (size_t) row * (size_t) K;
+    const Tin * xrow = x + (size_t) row * (size_t) K;
     if constexpr (HAS_HA) {
         if (L < a_dim * a_dim) { s_ha[L] = h_a[L] * rsqrtf((float) B); }
     }
@@ -4293,11 +4358,18 @@ static __global__ void ml8_fp8_qrot_v4_kernel(
     #pragma unroll
     for (int a = 0; a < MAXA; a++) {
         if (a < a_dim) {
-            const float * blk = xrow + (size_t) a * B + L * E;
-            #pragma unroll
-            for (int e = 0; e < E; e += 4) {
-                const float4 t = *reinterpret_cast<const float4 *>(blk + e);
-                v[a][e] = t.x; v[a][e + 1] = t.y; v[a][e + 2] = t.z; v[a][e + 3] = t.w;
+            const Tin * blk = xrow + (size_t) a * B + L * E;
+            if constexpr (std::is_same<Tin, float>::value) {
+                #pragma unroll
+                for (int e = 0; e < E; e += 4) {
+                    const float4 t = *reinterpret_cast<const float4 *>(blk + e);
+                    v[a][e] = t.x; v[a][e + 1] = t.y; v[a][e + 2] = t.z; v[a][e + 3] = t.w;
+                }
+            } else {
+                // Tin != float (bf16): scalar per-element convert -- see
+                // ml8_qrot_elem_to_float's comment on the V3 kernel above.
+                #pragma unroll
+                for (int e = 0; e < E; e++) { v[a][e] = ml8_qrot_elem_to_float(blk[e]); }
             }
             if constexpr (FUSE_NORM) {
                 #pragma unroll
@@ -4437,15 +4509,23 @@ static __global__ void ml8_fp8_qrot_v4_kernel(
 }
 
 // V4 launcher: kronecker (b in {512, 1024}, a <= 8) and block_hadamard with the same b.
+// LLAMA_ACT_BF16 (2026-09-18 phase 2): templated on the input element type
+// (Tin=float, unchanged default, or Tin=nv_bfloat16 for a bf16
+// residual/activation row -- see ml8_fp8_qrot_v4_kernel's Tin-templated load
+// above). Only the non-fused (norm_w==nullptr) call path is exercised with
+// Tin=nv_bfloat16 today (ggml_cuda_op_fp8_quant_rot's bf16 branch); the fused
+// RMSNorm entry point (ggml_cuda_op_fp8_quant_rot_fused_norm) still requires
+// an f32 residual (see its own GGML_ASSERT).
+template <typename Tin = float>
 static bool ml8_launch_qrot_v4(
     cudaStream_t stream, bool kronecker,
-    const float * x, const float * h_a, const float * norm_w, float norm_eps,
+    const Tin * x, const float * h_a, const float * norm_w, float norm_eps,
     uint8_t * a_fp8, float * a_scale, int K, int a_dim, int b_dim, int n_rows) {
     const dim3 grid((unsigned) n_rows);
     const bool fuse = norm_w != nullptr;
 #define ML8_QROT_V4(B_, MAXA_, HA_) \
-    if (fuse) { ml8_fp8_qrot_v4_kernel<B_, MAXA_, HA_, true ><<<grid, 128, 0, stream>>>(x, h_a, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); } \
-    else      { ml8_fp8_qrot_v4_kernel<B_, MAXA_, HA_, false><<<grid, 128, 0, stream>>>(x, h_a, nullptr, 0.0f,    a_fp8, a_scale, K, a_dim, n_rows); } \
+    if (fuse) { ml8_fp8_qrot_v4_kernel<B_, MAXA_, HA_, true, Tin ><<<grid, 128, 0, stream>>>(x, h_a, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); } \
+    else      { ml8_fp8_qrot_v4_kernel<B_, MAXA_, HA_, false, Tin><<<grid, 128, 0, stream>>>(x, h_a, nullptr, 0.0f,    a_fp8, a_scale, K, a_dim, n_rows); } \
     return true;
     if (b_dim == 1024) {
         if (kronecker  && a_dim <= 5) { ML8_QROT_V4(1024, 5, true)  }
@@ -4461,27 +4541,30 @@ static bool ml8_launch_qrot_v4(
 }
 
 // Returns true if a V3 instantiation covers (kind, a_dim, b_dim) and launched it.
+// LLAMA_ACT_BF16 (2026-09-18 phase 2): templated on the input element type,
+// same rationale as ml8_launch_qrot_v4 above.
+template <typename Tin = float>
 static bool ml8_launch_qrot_v3(
     cudaStream_t stream, bool kronecker,
-    const float * x, const float * h_a, uint8_t * a_fp8, float * a_scale,
+    const Tin * x, const float * h_a, uint8_t * a_fp8, float * a_scale,
     int K, int a_dim, int b_dim, int n_rows) {
     const dim3 grid((unsigned) n_rows);
     if (kronecker) {
         // one wave per row; a_dim*E floats/lane resident
         if (b_dim == 1024 && a_dim <= 5) {
-            ml8_fp8_qrot_v3_kernel<1024, 1, 5, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<1024, 1, 5, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         if (b_dim == 1024 && a_dim <= 8) {
-            ml8_fp8_qrot_v3_kernel<1024, 1, 8, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<1024, 1, 8, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         if (b_dim == 512 && a_dim <= 16) {
-            ml8_fp8_qrot_v3_kernel<512, 1, 16, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<512, 1, 16, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         if (b_dim == 256 && a_dim <= 16) {
-            ml8_fp8_qrot_v3_kernel<256, 1, 16, true><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<256, 1, 16, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         return false;
@@ -4491,15 +4574,15 @@ static bool ml8_launch_qrot_v3(
         // row, shorter per-wave dependency chains, more bytes in flight.
         static const int nw_env = [] { const char * e = std::getenv("MT_FP8_QROT_V3_NW"); return e ? std::atoi(e) : 0; }();
         if (a_dim <= 16 && nw_env == 0) {
-            ml8_fp8_qrot_v3_kernel<128, 4, 4, false><<<grid, 32 * 4, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true;
+            ml8_fp8_qrot_v3_kernel<128, 4, 4, false, Tin><<<grid, 32 * 4, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true;
         }
         const int nw = nw_env ? nw_env : 16;   // measured 2026-09-18 K=17408: NW=4 0.744 ms, 8 0.832, 16 0.463 (359 GB/s)
         #define ML8_QROT_V3_B128(NW_) \
             if (nw == NW_) { \
                 const int per_wave = (a_dim + NW_ - 1) / NW_; \
-                if (per_wave <= 4)  { ml8_fp8_qrot_v3_kernel<128, NW_,  4, false><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
-                if (per_wave <= 12) { ml8_fp8_qrot_v3_kernel<128, NW_, 12, false><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
-                if (per_wave <= 34) { ml8_fp8_qrot_v3_kernel<128, NW_, 34, false><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 4)  { ml8_fp8_qrot_v3_kernel<128, NW_,  4, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 12) { ml8_fp8_qrot_v3_kernel<128, NW_, 12, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 34) { ml8_fp8_qrot_v3_kernel<128, NW_, 34, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
                 return false; \
             }
         ML8_QROT_V3_B128(4)
@@ -4511,15 +4594,15 @@ static bool ml8_launch_qrot_v3(
     if (b_dim == 64) {
         constexpr int NW = 4;
         const int per_wave = (a_dim + NW - 1) / NW;
-        if (per_wave <= 8)  { ml8_fp8_qrot_v3_kernel<64, NW,  8, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
-        if (per_wave <= 32) { ml8_fp8_qrot_v3_kernel<64, NW, 32, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 8)  { ml8_fp8_qrot_v3_kernel<64, NW,  8, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 32) { ml8_fp8_qrot_v3_kernel<64, NW, 32, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
         return false;
     }
     if (b_dim == 32) {
         constexpr int NW = 4;
         const int per_wave = (a_dim + NW - 1) / NW;
-        if (per_wave <= 16) { ml8_fp8_qrot_v3_kernel<32, NW, 16, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
-        if (per_wave <= 64) { ml8_fp8_qrot_v3_kernel<32, NW, 64, false><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 16) { ml8_fp8_qrot_v3_kernel<32, NW, 16, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 64) { ml8_fp8_qrot_v3_kernel<32, NW, 64, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
         return false;
     }
     return false;
@@ -4574,8 +4657,16 @@ bool ggml_cuda_op_fp8_quant_rot_fused_norm(
     if (dst->src[0] != mul || mul->src[0] != rms_norm) {
         return false;                       // only the (norm, w) operand order
     }
-    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
-        mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): x/rms_norm/mul may ALL be bf16
+    // together (the residual stream running in bf16 -- see qwen35.cpp), but
+    // the norm weight `w` stays f32 (the task's "keep the norm weight f32"
+    // requirement) -- ml8_fp8_qrot_v4_kernel's norm_w parameter is
+    // unconditionally `const float *`, unaffected by the Tin (x) template
+    // parameter, so this needs no kernel change.
+    const bool act_bf16 = x->type == GGML_TYPE_BF16 && rms_norm->type == GGML_TYPE_BF16 && mul->type == GGML_TYPE_BF16;
+    const bool act_f32  = x->type == GGML_TYPE_F32  && rms_norm->type == GGML_TYPE_F32  && mul->type == GGML_TYPE_F32;
+    if (!(act_bf16 || act_f32) || w->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
         w->ne[0] != x->ne[0] || ggml_nelements(w) != w->ne[0]) {
         return false;                       // weight must be a plain [K] broadcast row
     }
@@ -4598,9 +4689,13 @@ bool ggml_cuda_op_fp8_quant_rot_fused_norm(
     if (kron && (h_a == nullptr || h_a->type != GGML_TYPE_F32 || !ggml_is_contiguous(h_a))) {
         return false;
     }
-    const bool ok = ml8_launch_qrot_v4(ctx.stream(), kron,
-        (const float *) x->data, h_a ? (const float *) h_a->data : nullptr,
-        (const float *) w->data, eps, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows);
+    const bool ok = act_bf16
+        ? ml8_launch_qrot_v4<nv_bfloat16>(ctx.stream(), kron,
+              (const nv_bfloat16 *) x->data, h_a ? (const float *) h_a->data : nullptr,
+              (const float *) w->data, eps, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows)
+        : ml8_launch_qrot_v4<float>(ctx.stream(), kron,
+              (const float *) x->data, h_a ? (const float *) h_a->data : nullptr,
+              (const float *) w->data, eps, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows);
     if (ok) {
         CUDA_CHECK(cudaGetLastError());
     }
@@ -4615,7 +4710,9 @@ void ggml_cuda_op_fp8_quant_rot(
     const ggml_tensor * h_a = dst->src[1];
 
     GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 input, handled by a dedicated
+    // branch below (V3/V4 kernels only -- see ml8_qrot_elem_to_float).
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_BF16);
     GGML_ASSERT(dst->type == GGML_TYPE_I8);
     GGML_ASSERT(ggml_is_contiguous(x));
 
@@ -4640,6 +4737,41 @@ void ggml_cuda_op_fp8_quant_rot(
     GGML_ASSERT(dst->ne[1] == x->ne[1] && dst->ne[2] == x->ne[2] && dst->ne[3] == x->ne[3]);
 
     cudaStream_t stream = ctx.stream();
+
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 input only goes through the
+    // Tin-templated V4/V3 per-row kernels -- V2 and the fused-fast-path
+    // kernels below are float-only (out of scope for this phase; see the
+    // report). supports_op (ggml-cuda.cu) restricts the bf16 dst-eligible
+    // shapes it advertises to exactly what V4/V3 cover, so the GGML_ABORT
+    // below is a defensive check, not an expected runtime path.
+    if (x->type == GGML_TYPE_BF16) {
+        GGML_ASSERT(per_row && "LLAMA_ACT_BF16 FP8_QUANT_ROT only supports per-row (G=0) mode");
+        GGML_ASSERT(kind != GGML_FP8_QUANT_ROT_KIND_NONE && "LLAMA_ACT_BF16 FP8_QUANT_ROT requires a rotation kind");
+        GGML_ASSERT((int64_t) a_dim * (int64_t) b_dim == K);
+        uint8_t * out_qs    = (uint8_t *) dst->data;
+        float   * out_scale = (float *) ((uint8_t *) dst->data + (size_t) n_rows * (size_t) K);
+        const bool kron = kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER;
+        if (kron) {
+            GGML_ASSERT(h_a != nullptr && h_a->type == GGML_TYPE_F32 && ggml_is_contiguous(h_a));
+            GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+        } else {
+            GGML_ASSERT(kind == GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD && h_a == nullptr);
+        }
+        const nv_bfloat16 * xb = (const nv_bfloat16 *) x->data;
+        const float * h_ap = kron ? (const float *) h_a->data : nullptr;
+        if (ml8_launch_qrot_v4<nv_bfloat16>(stream, kron, xb, h_ap, nullptr, 0.0f,
+                                             out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows)) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        if (ml8_launch_qrot_v3<nv_bfloat16>(stream, kron, xb, h_ap,
+                                             out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows)) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        GGML_ABORT("LLAMA_ACT_BF16 FP8_QUANT_ROT: no V3/V4 instantiation covers a_dim=%d b_dim=%d kind=%d "
+                    "(supports_op should have kept this shape on the CPU backend)", a_dim, b_dim, kind);
+    }
 
     // MAD-3xx round 4 (V2) — single fused kernel family for BOTH per-row
     // kinds, replacing all three round-3 paths below (kronecker fused,
@@ -4868,7 +5000,11 @@ void ggml_cuda_op_fp8_mul_mat(
     GGML_ASSERT(w != nullptr && a != nullptr);
     GGML_ASSERT(w->type   == GGML_TYPE_FP8_B128 || w->type == GGML_TYPE_ML8_FP8);
     GGML_ASSERT(a->type   == GGML_TYPE_I8);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 dst is only wired for the
+    // FP8_B128 per-row (G=0) RDNA4_TRFEED prefill branch below (M>32) — every
+    // other branch (blockscale, generic/preshuffle/rdna4-tile) asserts F32
+    // itself where it returns.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(ggml_is_contiguous(w));
     GGML_ASSERT(ggml_is_contiguous(a));
     GGML_ASSERT(ggml_is_contiguous(dst));
@@ -4877,6 +5013,9 @@ void ggml_cuda_op_fp8_mul_mat(
     // gfx1201 "trfeed" block-scale WMMA kernel (rdna4_fp8_gemm/gemm_blockscale.hip)
     // instead of the AITER Triton FP8_B128 path below.
     if (w->type == GGML_TYPE_ML8_FP8) {
+        // LLAMA_ACT_BF16 does not extend to this weight type/path — bf16 dst
+        // is only wired for the FP8_B128 per-row RDNA4_TRFEED branch below.
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
         const int32_t K = (int32_t) w->ne[0];
         const int32_t N = (int32_t) w->ne[1];
         const int32_t M = (int32_t) (a->ne[1] * a->ne[2] * a->ne[3]);
@@ -5021,6 +5160,11 @@ void ggml_cuda_op_fp8_mul_mat(
             : (splitk_env_override > 0 ? splitk_env_override : rdna4_trfeed_splitk_default_splits(N, K));
 
         if (n_splits > 1) {
+            // Split-K decode path (M<=32) writes fp32 only -- LLAMA_ACT_BF16's
+            // bf16 dst is gated to M>32 (see the M>32 assert on the bf16
+            // branch below, which this path never reaches: n_splits>1 only
+            // when M_pad==BM_TRFEED_DECODE).
+            GGML_ASSERT(dst->type == GGML_TYPE_F32);
             // dst is fp32 [N, M] with only the true M rows, but the kernel
             // writes a full M_pad(==32)-row tile: go through a pooled fp32
             // scratch unless M == M_pad, then copy the first M*N floats
@@ -5041,6 +5185,19 @@ void ggml_cuda_op_fp8_mul_mat(
                 CUDA_CHECK(cudaMemcpyAsync((float *) dst->data, c_ptr, (size_t) M * (size_t) N * sizeof(float),
                                            cudaMemcpyDeviceToDevice, stream));
             }
+            return;
+        }
+
+        // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 dst straight from the
+        // trfeed epilogue, only reachable via supports_op's M>32 gate (n_splits
+        // == 1 is guaranteed there — see the n_splits formula above, which
+        // forces 1 whenever M_pad != BM_TRFEED_DECODE i.e. M > 32).
+        if (dst->type == GGML_TYPE_BF16) {
+            GGML_ASSERT(M > BM_TRFEED_DECODE && "FP8_MUL_MAT bf16 dst only wired for M>32 (prefill)");
+            const hipError_t rc = rdna4_gemm_fp8_trfeed_bf16(
+                (const uint8_t *) a_ptr, (const uint8_t *) repack->b_packed, dst->data,
+                a_scale_ptr, (const float *) repack->b_scale, M_pad, M, N, K, stream);
+            GGML_ASSERT(rc == hipSuccess && "rdna4_gemm_fp8_trfeed_bf16 dispatch failed");
             return;
         }
 
@@ -5066,6 +5223,11 @@ void ggml_cuda_op_fp8_mul_mat(
         bf16_to_fp32(c_bf16.get(), (float *) dst->data, (size_t) M * (size_t) N, stream);
         return;
     }
+
+    // LLAMA_ACT_BF16 does not extend to the K+K/32 block-packing contract's
+    // generic/preshuffle/rdna4-tile branches below — bf16 dst is only wired
+    // for the per-row (G=0) RDNA4_TRFEED branch above.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     const int32_t K = (int32_t) w->ne[0];
     const int32_t N = (int32_t) w->ne[1];

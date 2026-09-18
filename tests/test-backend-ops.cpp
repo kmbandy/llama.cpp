@@ -2407,9 +2407,17 @@ struct test_ml8_mul_mat : public test_case {
     // the CPU oracle's dequant-then-matmul path stays exact up to the same
     // fp8/bf16 tolerance the legacy f32-activation case already uses.
     const bool prequant;
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): F32 (default) or BF16 dst, via
+    // ggml_ml8_mul_mat_bf16 -- only meaningful (accepted by supports_op) when
+    // N%128==0 && M>32 (the RDNA4_TRFEED prefill path -- see
+    // ggml_cuda_ml8_4_mul_mat_supports_bf16_out in ml8.cu); other shapes fall
+    // back to the CPU backend, which computes the same op in f32 internally
+    // and stores through the BF16 dst tensor, so it's still a valid (if not
+    // perf-representative) correctness check off that shape.
+    const ggml_type out_type;
 
     std::string vars() override {
-        return VARS_TO_STR7(m, n, k, k_world, lut_group_off, ne2, prequant);
+        return VARS_TO_STR8(m, n, k, k_world, lut_group_off, ne2, prequant, out_type);
     }
 
     double max_nmse_err() override {
@@ -2425,17 +2433,17 @@ struct test_ml8_mul_mat : public test_case {
         // table directly with no re-quantization, so keep the tight bound
         // there.
         if (m % 128 == 0 && n > 32) {
-            return 2e-2;
+            return out_type == GGML_TYPE_BF16 ? 3e-2 : 2e-2; // bf16 dst adds one more rounding step
         }
         return 5e-3; // fp8 activations + bf16 output on the HIP path
     }
 
     test_ml8_mul_mat(int64_t m = 64, int64_t n = 16, int64_t k = 256,
                       int64_t k_world = 0, int64_t lut_group_off = 0, int64_t ne2 = 1,
-                      bool prequant = false)
+                      bool prequant = false, ggml_type out_type = GGML_TYPE_F32)
         : m(m), n(n), k(k),
           k_world(k_world != 0 ? k_world : k),
-          lut_group_off(lut_group_off), ne2(ne2), prequant(prequant) {}
+          lut_group_off(lut_group_off), ne2(ne2), prequant(prequant), out_type(out_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_ML8_4, k, m);
@@ -2454,7 +2462,9 @@ struct test_ml8_mul_mat : public test_case {
                                            GGML_FP8_QUANT_ROT_KIND_NONE, /*G=*/0);
             ggml_set_name(x_for_mm, "x_qrot");
         }
-        ggml_tensor * out = ggml_ml8_mul_mat(ctx, w, cent, x_for_mm);
+        ggml_tensor * out = out_type == GGML_TYPE_BF16
+            ? ggml_ml8_mul_mat_bf16(ctx, w, cent, x_for_mm)
+            : ggml_ml8_mul_mat(ctx, w, cent, x_for_mm);
         // Under tensor parallelism w only holds a [k, m] K-slice while cent
         // is mirrored in full ([16, k_world/64]); lut_group_off selects
         // which K-groups of the mirrored LUT this slice's decode should use.
@@ -2649,20 +2659,21 @@ struct test_fp8_quant_rot : public test_case {
     const int64_t ne2;
     const int64_t ne3;
     const int32_t G; // activation scale-group width: 32 (ML8_FP8), 128 (FP8_B128), or 0 (per-row, RDNA4)
+    const ggml_type x_type; // LLAMA_ACT_BF16 (2026-09-18): F32 (default) or BF16 src; h_a stays F32.
 
     std::string vars() override {
-        return VARS_TO_STR7(a_dim, b_dim, kind, n_tokens, ne2, ne3, G);
+        return VARS_TO_STR8(a_dim, b_dim, kind, n_tokens, ne2, ne3, G, x_type);
     }
 
     test_fp8_quant_rot(int64_t a_dim = 5, int64_t b_dim = 128,
                         int32_t kind = GGML_FP8_QUANT_ROT_KIND_KRONECKER,
                         int64_t n_tokens = 4, int64_t ne2 = 1, int64_t ne3 = 1,
-                        int32_t G = 128)
-        : a_dim(a_dim), b_dim(b_dim), kind(kind), n_tokens(n_tokens), ne2(ne2), ne3(ne3), G(G) {}
+                        int32_t G = 128, ggml_type x_type = GGML_TYPE_F32)
+        : a_dim(a_dim), b_dim(b_dim), kind(kind), n_tokens(n_tokens), ne2(ne2), ne3(ne3), G(G), x_type(x_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t d = a_dim * b_dim;
-        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_tokens, ne2, ne3);
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, x_type, d, n_tokens, ne2, ne3);
         ggml_set_name(x, "x");
         ggml_tensor * h_a = nullptr;
         if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
@@ -10211,6 +10222,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 64,   /*k=K*/ 5120));
     test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 2048, /*k=K*/ 5120));
 
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): same production shape, bf16 dst
+    // (ggml_ml8_mul_mat_bf16 / GGML_OP_ML8_MUL_MAT dst=BF16) -- exercises the
+    // RDNA4_TRFEED prefill epilogue's M_valid-guarded bf16 store
+    // (trfeed_kernels.h / rdna4_gemm_fp8_trfeed_bf16). M=64/2048 both use the
+    // prefill (M>32) tile; supports_op requires M>32 for bf16 dst, so no M<=32
+    // bf16 case is added here (that stays fp32-only, see
+    // ggml_cuda_ml8_4_mul_mat_supports_bf16_out).
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 64,   /*k=K*/ 5120,
+        0, 0, 1, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_ml8_mul_mat(/*m=N*/ 17408, /*n=M*/ 2048, /*k=K*/ 5120,
+        0, 0, 1, false, GGML_TYPE_BF16));
+
     // ml8-4 LUT GEMM under tensor parallelism: a K-split weight (w holds only
     // a [k, m] K-slice) decoded against a centroid LUT mirrored in full
     // ([16, k_world/64]) via a nonzero lut_group_off. Shapes below are the
@@ -11710,6 +11733,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_fp8_quant_rot(5,   1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER,      2048, 1, 1, 0));
     test_cases.emplace_back(new test_fp8_quant_rot(48,  128,  GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 2048, 1, 1, 0));
     test_cases.emplace_back(new test_fp8_quant_rot(136, 128,  GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, 2048, 1, 1, 0));
+
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): same three production shapes, bf16
+    // src -- exercises the CUDA V4/V3 kernels' Tin-templated load path
+    // (ml8_fp8_qrot_v4_kernel / ml8_fp8_qrot_v3_kernel) plus the CPU
+    // reference's bf16->f32 conversion; also probe prefill (2048) and a
+    // small decode-shaped n_tokens (1) since supports_op gates bf16 dst
+    // elsewhere on M>32 but FP8_QUANT_ROT itself has no such gate.
+    for (int64_t m : {1, 2048}) {
+        test_cases.emplace_back(new test_fp8_quant_rot(5,   1024, GGML_FP8_QUANT_ROT_KIND_KRONECKER,      m, 1, 1, 0, GGML_TYPE_BF16));
+        test_cases.emplace_back(new test_fp8_quant_rot(48,  128,  GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, m, 1, 1, 0, GGML_TYPE_BF16));
+        test_cases.emplace_back(new test_fp8_quant_rot(136, 128,  GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD, m, 1, 1, 0, GGML_TYPE_BF16));
+    }
 
     // FP8_B128 preshuffle GEMM vs the ML8_FP8 generic aiter GEMM vs Q8_0 MMQ at
     // Qwen3.8-27B ffn_gate (K=5120, N=17408) and ffn_down (K=17408, N=5120) shapes

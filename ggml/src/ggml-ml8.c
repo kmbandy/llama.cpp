@@ -255,17 +255,22 @@ struct ggml_tensor * ggml_ml8_apply_rotation(
     return y;
 }
 
-struct ggml_tensor * ggml_ml8_mul_mat(
+// Phase-2 BF16-activation switch (LLAMA_ACT_BF16): shared implementation for
+// ggml_ml8_mul_mat / ggml_ml8_mul_mat_bf16 so the default (F32-out) builder
+// stays byte-identical and the bf16-out variant is just a different `y` type.
+static struct ggml_tensor * ggml_ml8_mul_mat_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * w,
         struct ggml_tensor  * centroids,
-        struct ggml_tensor  * x) {
+        struct ggml_tensor  * x,
+        enum ggml_type        out_type) {
     GGML_ASSERT(w         != NULL);
     GGML_ASSERT(centroids != NULL);
     GGML_ASSERT(x         != NULL);
     GGML_ASSERT(w->type         == GGML_TYPE_ML8_4);
     GGML_ASSERT(centroids->type == GGML_TYPE_F8_E4M3);
     GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_I8);
+    GGML_ASSERT(out_type == GGML_TYPE_F32 || out_type == GGML_TYPE_BF16);
 
     // Shape: w [K, N], x [K, M] (legacy f32) or [K+4, M] (pre-quantized I8,
     // see ggml-ml8.h) → y [N, M]   (ggml row-major)
@@ -290,7 +295,7 @@ struct ggml_tensor * ggml_ml8_mul_mat(
     // MAD-223 G.4.c — proper GGML_OP_ML8_MUL_MAT op (replaces previous
     // ggml_custom_4d wiring). Backends (cpu / hip) implement this op directly.
     const int64_t ne[4] = { N, x->ne[1], x->ne[2], x->ne[3] };
-    struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * y = ggml_new_tensor(ctx, out_type, 4, ne);
     y->op     = GGML_OP_ML8_MUL_MAT;
     y->src[0] = w;
     y->src[1] = centroids;
@@ -300,6 +305,27 @@ struct ggml_tensor * ggml_ml8_mul_mat(
     // weight whose centroid LUT is mirrored in full (see ggml.h).
     ggml_set_op_params_i32(y, 0, 0);
     return y;
+}
+
+struct ggml_tensor * ggml_ml8_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * centroids,
+        struct ggml_tensor  * x) {
+    return ggml_ml8_mul_mat_impl(ctx, w, centroids, x, GGML_TYPE_F32);
+}
+
+// LLAMA_ACT_BF16 prefill path: same op, dst tensor is GGML_TYPE_BF16. The CUDA
+// backend's ML8_4 RDNA4_TRFEED prefill path (M_pad > 32) writes bf16 straight
+// from the trfeed GEMM's existing bf16 epilogue; the M_pad==32 decode split-K
+// kernel has no bf16 output path, so this must only be used for prefill
+// ubatches (see supports_op in ggml-cuda.cu and qwen35.cpp's use-site).
+struct ggml_tensor * ggml_ml8_mul_mat_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * centroids,
+        struct ggml_tensor  * x) {
+    return ggml_ml8_mul_mat_impl(ctx, w, centroids, x, GGML_TYPE_BF16);
 }
 
 int32_t ggml_ml8_mul_mat_lut_group_off(const struct ggml_tensor * y) {
@@ -392,7 +418,11 @@ struct ggml_tensor * ggml_fp8_quant_rot(
         int32_t kind,
         int32_t G) {
     GGML_ASSERT(x != NULL);
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    // LLAMA_ACT_BF16 (2026-09-18 phase 2): a bf16 x is only actually dispatched
+    // on the CUDA backend for the per-row (G=0) KRONECKER/BLOCK_HADAMARD V3/V4
+    // kernel shapes -- see supports_op in ggml-cuda.cu; anything else falls
+    // back to the CPU reference, which also now accepts bf16 (ggml-cpu/ops.cpp).
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_BF16);
 
     // G == 0 means per-row (one scale per whole row, the RDNA4 gfx1201 GEMM
     // kernel's contract); G == 32/128 means grouped. 0 no longer aliases 128
@@ -443,12 +473,14 @@ struct ggml_tensor * ggml_fp8_quant_rot(
     return y;
 }
 
-struct ggml_tensor * ggml_fp8_mul_mat(
+static struct ggml_tensor * ggml_fp8_mul_mat_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * w,
-        struct ggml_tensor  * a) {
+        struct ggml_tensor  * a,
+        enum ggml_type        out_type) {
     GGML_ASSERT(w != NULL);
     GGML_ASSERT(a != NULL);
+    GGML_ASSERT(out_type == GGML_TYPE_F32 || out_type == GGML_TYPE_BF16);
     GGML_ASSERT(w->type == GGML_TYPE_FP8_B128 || w->type == GGML_TYPE_ML8_FP8);
     GGML_ASSERT(a->type == GGML_TYPE_I8);
 
@@ -483,9 +515,26 @@ struct ggml_tensor * ggml_fp8_mul_mat(
     }
 
     const int64_t ne[4] = { N, a->ne[1], a->ne[2], a->ne[3] };
-    struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * y = ggml_new_tensor(ctx, out_type, 4, ne);
     y->op     = GGML_OP_FP8_MUL_MAT;
     y->src[0] = w;
     y->src[1] = a;
     return y;
+}
+
+struct ggml_tensor * ggml_fp8_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * a) {
+    return ggml_fp8_mul_mat_impl(ctx, w, a, GGML_TYPE_F32);
+}
+
+// LLAMA_ACT_BF16: bf16-dst variant. Only cheap/wired where the CUDA backend's
+// supports_op accepts it (see ggml-cuda.cu) -- callers should not assume every
+// FP8_MUL_MAT shape/weight-type combination has a bf16 epilogue.
+struct ggml_tensor * ggml_fp8_mul_mat_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * a) {
+    return ggml_fp8_mul_mat_impl(ctx, w, a, GGML_TYPE_BF16);
 }

@@ -27,6 +27,52 @@
 #include <utility>
 #include <vector>
 
+// WP_TP_TRACE_FILE: this file is backend-agnostic (it must build and run
+// with any mix of backends, not just CUDA/HIP), so it cannot include
+// ggml-cuda/wp-tp-trace.cuh (vendor CUDA types) or even
+// ggml-cuda/wp-tp-trace-kinds.h -- it reaches the tracer purely through
+// proc-address function pointers resolved via ggml_backend_reg_get_proc_address
+// (see backend_config::wp_tp_trace_mark/_gpu_mark and
+// ggml_backend_meta_context::wp_tp_trace_mark_global below), the same
+// mechanism already used for ggml_backend_set_stream_no and
+// ggml_backend_comm_allreduce_begin/_end. The kind values below MUST stay in
+// exact sync with ggml/src/ggml-cuda/wp-tp-trace-kinds.h (wp_tp_trace_kind).
+enum wp_tp_trace_kind_mirror {
+    WP_TPT_UBATCH_BEGIN = 0,
+    WP_TPT_UBATCH_END,
+    WP_TPT_COMPUTE_SUBMIT_BEGIN,
+    WP_TPT_COMPUTE_SUBMIT_END,
+    WP_TPT_COMPUTE_GPU_START,
+    WP_TPT_COMPUTE_GPU_END,
+    WP_TPT_AR_BEGIN_HOST,
+    WP_TPT_AR_END_HOST,
+    WP_TPT_AR_PACK_DONE,
+    WP_TPT_AR_SENT,
+    WP_TPT_AR_RECVD,
+    WP_TPT_AR_UNPACK_DONE,
+    WP_TPT_FENCE_WAIT,
+    WP_TPT_HEADER,
+};
+
+// Cached getenv("WP_TP_TRACE_FILE") check, mirroring wp_tp_trace_enabled() in
+// wp-tp-trace.cu -- checked here too so every call site below can skip
+// touching backend_config/context fields entirely (not just the eventual
+// proc-address call) when tracing is off. Zero cost when unset.
+static bool ggml_backend_meta_wp_tp_trace_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("WP_TP_TRACE_FILE");
+        return e != nullptr && e[0] != '\0';
+    }();
+    return on;
+}
+
+typedef void (*wp_tp_trace_mark_t)(ggml_backend_t backend, int kind, long long ubatch_idx, long long slot,
+                                    long long subgraph_idx, const char * extra);
+typedef void (*wp_tp_trace_mark_global_t)(int kind, long long ubatch_idx, long long slot, long long subgraph_idx,
+                                           const char * extra);
+typedef void (*wp_tp_trace_gpu_mark_t)(ggml_backend_t backend, int kind, long long ubatch_idx, long long slot,
+                                        long long subgraph_idx, const char * extra);
+
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
@@ -3121,12 +3167,23 @@ struct ggml_backend_meta_context {
         // CUDA0+Vulkan0 case elsewhere in this file) degrades safely, not incorrectly.
         ggml_backend_set_stream_no_t set_stream_no = nullptr;
 
+        // WP_TP_TRACE_FILE only: resolved once here (like set_stream_no above), null on a
+        // backend that doesn't export them -- in which case that device's rows are silently
+        // absent from the trace rather than the run failing.
+        wp_tp_trace_mark_t     wp_tp_trace_mark     = nullptr;
+        wp_tp_trace_gpu_mark_t wp_tp_trace_gpu_mark = nullptr;
+
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             for (size_t i = 0; i < n_graph_slots; i++) {
                 bufs[i].resize(n_reduce_steps);
             }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
             set_stream_no = (ggml_backend_set_stream_no_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_set_stream_no");
+                reg, "ggml_backend_set_stream_no");
+            wp_tp_trace_mark = (wp_tp_trace_mark_t) ggml_backend_reg_get_proc_address(
+                reg, "wp_tp_trace_mark");
+            wp_tp_trace_gpu_mark = (wp_tp_trace_gpu_mark_t) ggml_backend_reg_get_proc_address(
+                reg, "wp_tp_trace_gpu_mark");
         }
     };
     struct graph_state {
@@ -3330,6 +3387,18 @@ struct ggml_backend_meta_context {
     size_t                            slot_end_gen[n_graph_slots][2] = { { 0, 0 }, { 0, 0 } };
     std::vector<bool>                 slot_dep_waited[n_graph_slots]; // [slot][device]
 
+    // WP_TP_TRACE_FILE only. wp_tp_trace_next_ubatch is a global (cross-slot) counter,
+    // bumped once per ggml_backend_meta_graph_compute_step_begin() call -- i.e. once per
+    // fresh sub-batch on EITHER slot, in host call order, which is exactly the ubatch_idx
+    // llama_context's rolling loop assigns implicitly (slot 0 gets ubatch 0, 2, 4, ...;
+    // slot 1 gets 1, 3, 5, ... in the steady state). wp_tp_trace_ubatch_idx[slot] is the
+    // value last assigned to that slot, read by compute()/begin_reduce()/fence_wait_same_index()
+    // to tag their rows. wp_tp_trace_mark_global has no per-device concept (device is forced
+    // to -1 by the callee) so it is resolved once here rather than per backend_config.
+    size_t                    wp_tp_trace_next_ubatch                 = 0;
+    long long                 wp_tp_trace_ubatch_idx[n_graph_slots]   = { -1, -1 };
+    wp_tp_trace_mark_global_t wp_tp_trace_mark_global                 = nullptr;
+
     void slot_fence_init() {
         static_assert(n_graph_slots == 2, "other_slot() assumes exactly 2 slots");
         const size_t n_devs = backend_configs.size();
@@ -3460,6 +3529,14 @@ struct ggml_backend_meta_context {
             comm_allreduce_end = (ggml_backend_comm_allreduce_end_t)
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_end");
+        }
+
+        if (!simple_backends.empty()) {
+            // WP_TP_TRACE_FILE only: any device's reg will do (device is forced to -1 by the
+            // callee), so use [0] unconditionally -- unlike comm_allreduce above this does not
+            // require n_devs > 1.
+            wp_tp_trace_mark_global = (wp_tp_trace_mark_global_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "wp_tp_trace_mark_global");
         }
 
         slot_fence_init();
@@ -4266,6 +4343,15 @@ struct ggml_backend_meta_graph_runner {
         if (!ggml_backend_meta_slot_streams_enabled()) {
             return;
         }
+        auto & bcj = backend_ctx->backend_configs[j];
+        const bool tp_trace = ggml_backend_meta_wp_tp_trace_enabled() && bcj.wp_tp_trace_mark != nullptr;
+        const long long trace_ubatch = tp_trace ? backend_ctx->wp_tp_trace_ubatch_idx[i_slot] : -1;
+        auto trace_wait = [&](const char * tag) {
+            if (tp_trace) {
+                bcj.wp_tp_trace_mark(bcj.backend, WP_TPT_FENCE_WAIT, trace_ubatch,
+                                      (long long) i_slot, (long long) i, tag);
+            }
+        };
         const size_t os  = ggml_backend_meta_context::other_slot(i_slot);
         const size_t dep = backend_ctx->slot_dep_gen[i_slot];
         if (dep == 0) {
@@ -4289,6 +4375,7 @@ struct ggml_backend_meta_graph_runner {
             ggml_backend_event_t ev = backend_ctx->slot_end_ev[os][par][j];
             if (backend_ctx->slot_end_gen[os][par] == dep && ev != nullptr) {
                 ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, ev);
+                trace_wait("same_index_end_ev");
                 return;
             }
             if (backend_ctx->slot_fence_latest_valid[os][j]) {
@@ -4296,6 +4383,7 @@ struct ggml_backend_meta_graph_runner {
                 auto & le = backend_ctx->slot_fence_ring[os][j][latest % ggml_backend_meta_context::GGML_META_FENCE_RING];
                 if (le.valid && le.index == latest && le.ev != nullptr) {
                     ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, le.ev);
+                    trace_wait("same_index_latest_fallback_from_end");
                 }
             }
             return;
@@ -4309,6 +4397,7 @@ struct ggml_backend_meta_graph_runner {
         auto & entry = backend_ctx->slot_fence_ring[os][j][i % ggml_backend_meta_context::GGML_META_FENCE_RING];
         if (entry.valid && entry.index == i) {
             ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, entry.ev);
+            trace_wait("same_index_ring_i");
             return;
         }
         // The other slot's latest index is >= i but ring[i % RING] no longer holds i: the slots
@@ -4328,6 +4417,7 @@ struct ggml_backend_meta_graph_runner {
             auto & le = backend_ctx->slot_fence_ring[os][j][latest % ggml_backend_meta_context::GGML_META_FENCE_RING];
             if (le.valid && le.index == latest && le.ev != nullptr) {
                 ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, le.ev);
+                trace_wait("ring_miss_latest_fallback");
             }
         }
     }
@@ -4541,11 +4631,32 @@ struct ggml_backend_meta_graph_runner {
 
     ggml_status compute(const size_t i) {
         backend_ctx->runahead_before_submit();
+        const bool tp_trace = ggml_backend_meta_wp_tp_trace_enabled();
+        const long long trace_ubatch = tp_trace ? backend_ctx->wp_tp_trace_ubatch_idx[i_slot] : -1;
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             select_stream(j);            // WP_META_SLOT_STREAMS: dispatch on this slot's stream
             fence_wait_same_index(j, i);  // ...and wait for the other slot's same-index KV/state writes
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i_slot][i].cgraph_main);
+            ggml_cgraph * cgraph_ij = bcj.cgraphs[i_slot][i].cgraph_main;
+            if (tp_trace && bcj.wp_tp_trace_mark != nullptr) {
+                char extra[32];
+                snprintf(extra, sizeof(extra), "n_nodes=%d", cgraph_ij->n_nodes);
+                bcj.wp_tp_trace_mark(bcj.backend, WP_TPT_COMPUTE_SUBMIT_BEGIN, trace_ubatch,
+                                      (long long) i_slot, (long long) i, extra);
+            }
+            if (tp_trace && bcj.wp_tp_trace_gpu_mark != nullptr) {
+                bcj.wp_tp_trace_gpu_mark(bcj.backend, WP_TPT_COMPUTE_GPU_START, trace_ubatch,
+                                          (long long) i_slot, (long long) i, nullptr);
+            }
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_ij);
+            if (tp_trace && bcj.wp_tp_trace_gpu_mark != nullptr) {
+                bcj.wp_tp_trace_gpu_mark(bcj.backend, WP_TPT_COMPUTE_GPU_END, trace_ubatch,
+                                          (long long) i_slot, (long long) i, nullptr);
+            }
+            if (tp_trace && bcj.wp_tp_trace_mark != nullptr) {
+                bcj.wp_tp_trace_mark(bcj.backend, WP_TPT_COMPUTE_SUBMIT_END, trace_ubatch,
+                                      (long long) i_slot, (long long) i, nullptr);
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -4789,6 +4900,19 @@ enum ggml_status ggml_backend_meta_graph_compute_step_begin(
         std::fill(backend_ctx->slot_dep_waited[i_slot].begin(), backend_ctx->slot_dep_waited[i_slot].end(), false);
     }
 
+    // WP_TP_TRACE_FILE: this call is host-issued right after llama-context.cpp's
+    // prepare_slot()+begin_slot() for a FRESH sub-batch on i_slot -- close enough to the
+    // rolling loop's actual ubatch boundary (llama-context.cpp itself is not touched for this,
+    // to avoid threading a ubatch_idx parameter through ggml_backend_sched_graph_compute_async_meta_*
+    // and the public ggml-backend.h signatures) that it stands in for UBATCH_BEGIN. See the
+    // matching approximation for UBATCH_END in ggml_backend_meta_graph_compute_step below, and
+    // the report note on both.
+    if (ggml_backend_meta_wp_tp_trace_enabled() && backend_ctx->wp_tp_trace_mark_global != nullptr) {
+        const long long ubatch_idx = (long long) backend_ctx->wp_tp_trace_next_ubatch++;
+        backend_ctx->wp_tp_trace_ubatch_idx[i_slot] = ubatch_idx;
+        backend_ctx->wp_tp_trace_mark_global((int) WP_TPT_UBATCH_BEGIN, ubatch_idx, (long long) i_slot, -1, nullptr);
+    }
+
     auto & gs = backend_ctx->graph_states[i_slot];
     gs.next_subgraph = 0;
     *n_steps = gs.n_subgraphs;
@@ -4821,6 +4945,15 @@ enum ggml_status ggml_backend_meta_graph_compute_step(
         }
     }
     *finished = gs.next_subgraph == gs.n_subgraphs;
+    // WP_TP_TRACE_FILE: fires when the last subgraph's compute()+begin_reduce() have been
+    // issued -- an approximation of the true ubatch-end boundary (which is
+    // ggml_backend_meta_graph_compute_step_end()'s end_reduce() completing, followed by
+    // llama-context.cpp's extract_slot()) chosen for the same reason as the UBATCH_BEGIN
+    // approximation above: no ubatch_idx parameter threaded through the public sched wrapper.
+    if (*finished && ggml_backend_meta_wp_tp_trace_enabled() && backend_ctx->wp_tp_trace_mark_global != nullptr) {
+        backend_ctx->wp_tp_trace_mark_global((int) WP_TPT_UBATCH_END, backend_ctx->wp_tp_trace_ubatch_idx[i_slot],
+                                              (long long) i_slot, (long long) i, nullptr);
+    }
     return GGML_STATUS_SUCCESS;
 }
 

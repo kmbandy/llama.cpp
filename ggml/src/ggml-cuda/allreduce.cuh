@@ -41,6 +41,15 @@ struct ggml_cuda_ar_op {
     ggml_type dst_type  = GGML_TYPE_F32;   // tensor / accumulator type
     ggml_type wire_type = GGML_TYPE_F32;   // on-wire type (BF16 for F32 inputs by default)
     void *    dst[GGML_CUDA_MAX_DEVICES] = {};
+
+    // WP_TP_TRACE_FILE only: the rolling-loop i_slot this op belongs to (== i_op
+    // in ggml_backend_cuda_comm_allreduce_begin/_end, which sets this before
+    // calling ggml_cuda_ar_allreduce_begin/_end below) -- NOT the same thing
+    // as `slot` above (that's the pinned-staging double-buffer slot). -1 when
+    // unset (tracing disabled, or a caller that never set it); begin()/end()
+    // treat that as "unknown" and omit slot/ubatch/subgraph correlation on
+    // their AR_* trace rows.
+    int trace_slot = -1;
 };
 
 bool ggml_cuda_ar_allreduce_begin(

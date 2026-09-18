@@ -223,6 +223,15 @@ void ggml_cuda_op_ml8_mul_mat(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);
 
+// LLAMA_ACT_BF16 (2026-09-18 phase 2): true iff ggml_cuda_op_ml8_mul_mat can
+// write a GGML_TYPE_BF16 dst directly for a weight with this N (output
+// feature count) and this many valid rows M — i.e. the ML8_4 RDNA4_TRFEED
+// prefill path (M > 32; the M<=32 decode/verify path is a split-K kernel with
+// no bf16 epilogue). Mirrors ml8_4_layout_for_tensor's pure-function-of-N
+// layout choice (declared static in ml8.cu) so supports_op in ggml-cuda.cu
+// can gate the bf16 dst variant without duplicating that logic.
+bool ggml_cuda_ml8_4_mul_mat_supports_bf16_out(int64_t N, int64_t M);
+
 // GGML_OP_ML8_GET_ROWS dispatch — native 4-bit token-embedding gather.
 // Unlike ggml_cuda_op_ml8_mul_mat this needs NO AITER GEMM: it gathers row
 // ids[i] from the ml8-4 weight and dequantizes via the per-K-group centroid
