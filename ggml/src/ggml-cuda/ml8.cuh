@@ -406,6 +406,11 @@ void ggml_cuda_op_ml8_ffn_gate_up_swiglu(
 // already uses, so the rotation math is byte-for-byte the same kernel code
 // as the ML8_FP8/ML8_4 rotation path; only the final per-128-group e4m3
 // quantize + packed-row layout is new.
+// RMS_NORM -> MUL -> FP8_QUANT_ROT fused launch; false = not eligible, run the ops separately.
+bool ggml_cuda_op_fp8_quant_rot_fused_norm(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * rms_norm, const ggml_tensor * mul, ggml_tensor * dst);
+
 void ggml_cuda_op_fp8_quant_rot(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);

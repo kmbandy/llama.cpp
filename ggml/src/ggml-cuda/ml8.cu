@@ -4052,6 +4052,23 @@ static void ml8_launch_qrot_v2(
 }
 
 
+
+// Packed hardware fp32 -> e4m3 (gfx12 v_cvt_pk_fp8_f32, RNE): validated bit-identical to
+// fp8_quant_rot_f32_to_e4m3 over 4M values incl. +-448, zeros and the subnormal edges
+// (2026-09-18, scratch probe cvt2.hip). Inputs are clamped to +-448 first (the row scale
+// guarantees |v*inv_scale| <= 448 up to fp32 rounding; the clamp is 2 v_med3 per pair).
+static __device__ __forceinline__ uint32_t fp8_quant_rot_pack4_hw(float a, float b, float c, float d) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    a = fminf(fmaxf(a, -448.0f), 448.0f); b = fminf(fmaxf(b, -448.0f), 448.0f);
+    c = fminf(fmaxf(c, -448.0f), 448.0f); d = fminf(fmaxf(d, -448.0f), 448.0f);
+    const uint32_t lo = (uint32_t) __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+    const uint32_t hi = (uint32_t) __builtin_amdgcn_cvt_pk_fp8_f32(c, d, 0, false);
+    return (lo & 0xFFFFu) | (hi << 16);
+#else
+    return (uint32_t) fp8_quant_rot_f32_to_e4m3(a) | ((uint32_t) fp8_quant_rot_f32_to_e4m3(b) << 8)
+         | ((uint32_t) fp8_quant_rot_f32_to_e4m3(c) << 16) | ((uint32_t) fp8_quant_rot_f32_to_e4m3(d) << 24);
+#endif
+}
 // ---------------------------------------------------------------------------
 // FP8_QUANT_ROT per-row (G=0) V3 -- wave-shuffle FWHT, register-resident row.
 //
@@ -4216,11 +4233,7 @@ static __global__ void ml8_fp8_qrot_v3_kernel(
             #pragma unroll
             for (int e = 0; e < E; e += 4) {
                 if constexpr (E >= 4) {
-                    const uint32_t packed =
-                          (uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e]     * inv_scale)
-                        | ((uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e + 1] * inv_scale) << 8)
-                        | ((uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e + 2] * inv_scale) << 16)
-                        | ((uint32_t) fp8_quant_rot_f32_to_e4m3(v[j][e + 3] * inv_scale) << 24);
+                    const uint32_t packed = fp8_quant_rot_pack4_hw(v[j][e] * inv_scale, v[j][e + 1] * inv_scale, v[j][e + 2] * inv_scale, v[j][e + 3] * inv_scale);
                     *reinterpret_cast<uint32_t *>(ob + e) = packed;
                 } else {
                     #pragma unroll
@@ -4229,6 +4242,222 @@ static __global__ void ml8_fp8_qrot_v3_kernel(
             }
         }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// FP8_QUANT_ROT per-row KRONECKER V4 (2026-09-18): the V3 one-wave-per-row
+// kronecker instantiation measured 0.373 ms/call at K=5120 (a=5, b=1024,
+// 2048 rows) on the router chain -- SLOWER than the old LDS kernel (0.215):
+// one wave holding 160 floats/lane is latency-bound with only 2048 waves.
+// V4 uses a 4-wave workgroup per row: lane L (0..127) owns the E = b/128
+// contiguous elements [E*L, E*L+E) of EVERY a-slice (E = 8 at b = 1024, two
+// float4 loads per slice), so the H_a^T mix across slices stays lane-local.
+// FWHT-b: strides < E in registers, strides E..16E across lanes of the wave
+// via __shfl_xor (5 stages), and the last two stages (32E, 64E = partner
+// lanes L^32, L^64, L^96 in the other waves) as ONE LDS exchange + a 4-point
+// butterfly in registers. Optional fused RMSNorm (norm_w != nullptr): the
+// row's sum of squares is reduced first from the same registers, so the
+// kernel reads the RESIDUAL row and the norm weight instead of the normed
+// tensor (x_norm = x * rsqrt(mean(x^2) + eps) * w), same math as
+// rms_norm_f32 + the MUL it fuses.
+// ---------------------------------------------------------------------------
+template <int B, int MAXA, bool HAS_HA, bool FUSE_NORM>
+__launch_bounds__(128)
+static __global__ void ml8_fp8_qrot_v4_kernel(
+    const float * __restrict__ x, const float * __restrict__ h_a,
+    const float * __restrict__ norm_w, float norm_eps,
+    uint8_t * __restrict__ a_fp8, float * __restrict__ a_scale,
+    int K, int a_dim, int n_rows) {
+    constexpr int NT = 128;              // threads per row
+    constexpr int E  = B / NT;           // contiguous elements per lane per slice
+    static_assert(E >= 4 && (E & (E - 1)) == 0, "b_dim must be 512 or 1024 here");
+    __shared__ float s_x[MAXA * B];      // whole row for the cross-wave exchange
+    __shared__ float s_red[4];
+    __shared__ float s_ha[MAXA * MAXA];  // H_a staged once (global loads inside the mix loop
+                                         // serialized on latency: 0.30 ms/call before this)
+
+    const int row  = blockIdx.x;
+    const int L    = threadIdx.x;
+    const int lane = L & 31;
+    const int wave = L >> 5;
+    if (row >= n_rows) { return; }
+    const float * xrow = x + (size_t) row * (size_t) K;
+    if constexpr (HAS_HA) {
+        if (L < a_dim * a_dim) { s_ha[L] = h_a[L] * rsqrtf((float) B); }
+    }
+
+    float v[MAXA][E];
+    // ---- load (+ fused RMSNorm) ----
+    float ss = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < MAXA; a++) {
+        if (a < a_dim) {
+            const float * blk = xrow + (size_t) a * B + L * E;
+            #pragma unroll
+            for (int e = 0; e < E; e += 4) {
+                const float4 t = *reinterpret_cast<const float4 *>(blk + e);
+                v[a][e] = t.x; v[a][e + 1] = t.y; v[a][e + 2] = t.z; v[a][e + 3] = t.w;
+            }
+            if constexpr (FUSE_NORM) {
+                #pragma unroll
+                for (int e = 0; e < E; e++) { ss += v[a][e] * v[a][e]; }
+            }
+        }
+    }
+    if constexpr (FUSE_NORM) {
+        ss = warp_reduce_sum<32>(ss);
+        if (lane == 0) { s_red[wave] = ss; }
+        __syncthreads();
+        const float tot = s_red[0] + s_red[1] + s_red[2] + s_red[3];
+        const float rms = rsqrtf(tot / (float) K + norm_eps);
+        __syncthreads();   // s_red reused below
+        #pragma unroll
+        for (int a = 0; a < MAXA; a++) {
+            if (a < a_dim) {
+                const float * wb = norm_w + (size_t) a * B + L * E;
+                #pragma unroll
+                for (int e = 0; e < E; e++) { v[a][e] = v[a][e] * rms * wb[e]; }
+            }
+        }
+    }
+    // ---- FWHT-B per slice ----
+    #pragma unroll
+    for (int a = 0; a < MAXA; a++) {
+        if (a < a_dim) {
+            #pragma unroll
+            for (int stride = 1; stride < E; stride <<= 1) {       // in-lane
+                #pragma unroll
+                for (int e = 0; e < E; e++) {
+                    if ((e & stride) == 0) {
+                        const float lo = v[a][e], hi = v[a][e + stride];
+                        v[a][e] = lo + hi; v[a][e + stride] = lo - hi;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int ls = 1; ls < 32; ls <<= 1) {                  // in-wave: strides E..16E
+                const bool upper = (lane & ls) != 0;
+                #pragma unroll
+                for (int e = 0; e < E; e++) {
+                    const float mine = v[a][e];
+                    const float p    = __shfl_xor_sync(0xffffffff, mine, ls, 32);
+                    v[a][e] = upper ? (p - mine) : (mine + p);
+                }
+            }
+            // cross-wave: strides 32E and 64E -> lanes L^32 (wave^1) and L^64 (wave^2).
+            // float4 LDS traffic (scalar 32 B-strided accesses were 8-way bank conflicted).
+            #pragma unroll
+            for (int e = 0; e < E; e += 4) {
+                *reinterpret_cast<float4 *>(s_x + a * B + L * E + e) = make_float4(v[a][e], v[a][e + 1], v[a][e + 2], v[a][e + 3]);
+            }
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int a = 0; a < MAXA; a++) {
+        if (a < a_dim) {
+            const float * r1 = s_x + a * B + (L ^ 32) * E;
+            const float * r2 = s_x + a * B + (L ^ 64) * E;
+            const float * r3 = s_x + a * B + (L ^ 96) * E;
+            const bool up1 = (wave & 1) != 0;   // stage 32E: upper partner gets p - v
+            const bool up2 = (wave & 2) != 0;   // stage 64E
+            #pragma unroll
+            for (int e = 0; e < E; e += 4) {
+                const float4 p1 = *reinterpret_cast<const float4 *>(r1 + e);
+                const float4 p2 = *reinterpret_cast<const float4 *>(r2 + e);
+                const float4 p3 = *reinterpret_cast<const float4 *>(r3 + e);
+                const float a1[4] = { p1.x, p1.y, p1.z, p1.w };
+                const float a2[4] = { p2.x, p2.y, p2.z, p2.w };
+                const float a3[4] = { p3.x, p3.y, p3.z, p3.w };
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    // stage 32E on (v, p1) and on (p2, p3); then stage 64E on the two results
+                    const float t0  = up1 ? (a1[q] - v[a][e + q]) : (v[a][e + q] + a1[q]);
+                    const float t0p = up1 ? (a3[q] - a2[q])       : (a2[q] + a3[q]);
+                    v[a][e + q] = up2 ? (t0p - t0) : (t0 + t0p);
+                }
+            }
+        }
+    }
+    const float inv_sqrt_b = rsqrtf((float) B);
+    float local_max = 0.0f;
+    if constexpr (HAS_HA) {
+        float y[MAXA][E];
+        #pragma unroll
+        for (int k = 0; k < MAXA; k++) {
+            if (k < a_dim) {
+                #pragma unroll
+                for (int e = 0; e < E; e++) { y[k][e] = 0.0f; }
+                #pragma unroll
+                for (int i = 0; i < MAXA; i++) {
+                    if (i < a_dim) {
+                        const float h = s_ha[i * a_dim + k];
+                        #pragma unroll
+                        for (int e = 0; e < E; e++) { y[k][e] = fmaf(h, v[i][e], y[k][e]); }
+                    }
+                }
+                #pragma unroll
+                for (int e = 0; e < E; e++) { local_max = fmaxf(local_max, fabsf(y[k][e])); }
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < MAXA; k++) {
+            #pragma unroll
+            for (int e = 0; e < E; e++) { v[k][e] = y[k][e]; }
+        }
+    } else {
+        #pragma unroll
+        for (int a = 0; a < MAXA; a++) {
+            if (a < a_dim) {
+                #pragma unroll
+                for (int e = 0; e < E; e++) { v[a][e] *= inv_sqrt_b; local_max = fmaxf(local_max, fabsf(v[a][e])); }
+            }
+        }
+    }
+    local_max = warp_reduce_max<32>(local_max);
+    if (lane == 0) { s_red[wave] = local_max; }
+    __syncthreads();
+    const float row_max = fmaxf(fmaxf(s_red[0], s_red[1]), fmaxf(s_red[2], s_red[3]));
+    const float scale     = fmaxf(row_max / ML8_FP8_E4M3_MAX, ML8_ACT_SCALE_EPS);
+    const float inv_scale = 1.0f / scale;
+    if (L == 0) { a_scale[row] = scale; }
+    uint8_t * orow = a_fp8 + (size_t) row * (size_t) K;
+    #pragma unroll
+    for (int a = 0; a < MAXA; a++) {
+        if (a < a_dim) {
+            uint8_t * ob = orow + (size_t) a * B + L * E;
+            #pragma unroll
+            for (int e = 0; e < E; e += 4) {
+                const uint32_t packed = fp8_quant_rot_pack4_hw(v[a][e] * inv_scale, v[a][e + 1] * inv_scale, v[a][e + 2] * inv_scale, v[a][e + 3] * inv_scale);
+                *reinterpret_cast<uint32_t *>(ob + e) = packed;
+            }
+        }
+    }
+}
+
+// V4 launcher: kronecker (b in {512, 1024}, a <= 8) and block_hadamard with the same b.
+static bool ml8_launch_qrot_v4(
+    cudaStream_t stream, bool kronecker,
+    const float * x, const float * h_a, const float * norm_w, float norm_eps,
+    uint8_t * a_fp8, float * a_scale, int K, int a_dim, int b_dim, int n_rows) {
+    const dim3 grid((unsigned) n_rows);
+    const bool fuse = norm_w != nullptr;
+#define ML8_QROT_V4(B_, MAXA_, HA_) \
+    if (fuse) { ml8_fp8_qrot_v4_kernel<B_, MAXA_, HA_, true ><<<grid, 128, 0, stream>>>(x, h_a, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); } \
+    else      { ml8_fp8_qrot_v4_kernel<B_, MAXA_, HA_, false><<<grid, 128, 0, stream>>>(x, h_a, nullptr, 0.0f,    a_fp8, a_scale, K, a_dim, n_rows); } \
+    return true;
+    if (b_dim == 1024) {
+        if (kronecker  && a_dim <= 5) { ML8_QROT_V4(1024, 5, true)  }
+        if (kronecker  && a_dim <= 8) { ML8_QROT_V4(1024, 8, true)  }
+        if (!kronecker && a_dim <= 8) { ML8_QROT_V4(1024, 8, false) }
+    }
+    if (b_dim == 512) {
+        if (kronecker  && a_dim <= 8)  { ML8_QROT_V4(512, 8, true)   }
+        if (!kronecker && a_dim <= 16) { ML8_QROT_V4(512, 16, false) }
+    }
+#undef ML8_QROT_V4
+    return false;
 }
 
 // Returns true if a V3 instantiation covers (kind, a_dim, b_dim) and launched it.
@@ -4324,6 +4553,60 @@ static bool ggml_cuda_fp8_qrot_v2_disabled() {
     return off;
 }
 
+// RMS_NORM -> MUL(w) -> FP8_QUANT_ROT fusion (2026-09-18): the V4 quant kernel reads the
+// residual row, normalizes it in registers and quantizes -- the normed f32 tensor is never
+// written or re-read (42 MB each way per call at 2048x5120) and the rms_norm launch goes
+// away. Only when the normed tensor has no other consumer (ggml_can_fuse guarantees that
+// at the call site) and the shape has a V4 instantiation. Returns false to let the caller
+// fall back to the separate ops. MT_FP8_QROT_NORM_FUSE=0 disables.
+bool ggml_cuda_op_fp8_quant_rot_fused_norm(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * rms_norm, const ggml_tensor * mul, ggml_tensor * dst) {
+    static const bool off = [] {
+        const char * e = std::getenv("MT_FP8_QROT_NORM_FUSE");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    if (off || ggml_cuda_fp8_qrot_v3_disabled()) {
+        return false;
+    }
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (dst->src[0] != mul || mul->src[0] != rms_norm) {
+        return false;                       // only the (norm, w) operand order
+    }
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+        w->ne[0] != x->ne[0] || ggml_nelements(w) != w->ne[0]) {
+        return false;                       // weight must be a plain [K] broadcast row
+    }
+    const ggml_tensor * h_a = dst->src[1];
+    const int32_t * pp    = (const int32_t *) dst->op_params;
+    const int32_t   a_dim = pp[0], b_dim = pp[1], kind = pp[2], G_raw = pp[3];
+    if (G_raw != 0 || kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+        return false;
+    }
+    const int64_t K      = x->ne[0];
+    const int64_t n_rows = x->ne[1] * x->ne[2] * x->ne[3];
+    if ((int64_t) a_dim * b_dim != K || dst->ne[0] != K + (int64_t) sizeof(float)) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    uint8_t * out_qs    = (uint8_t *) dst->data;
+    float   * out_scale = (float *) ((uint8_t *) dst->data + (size_t) n_rows * (size_t) K);
+    const bool kron = kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER;
+    if (kron && (h_a == nullptr || h_a->type != GGML_TYPE_F32 || !ggml_is_contiguous(h_a))) {
+        return false;
+    }
+    const bool ok = ml8_launch_qrot_v4(ctx.stream(), kron,
+        (const float *) x->data, h_a ? (const float *) h_a->data : nullptr,
+        (const float *) w->data, eps, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows);
+    if (ok) {
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return ok;
+}
+
 void ggml_cuda_op_fp8_quant_rot(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst) {
@@ -4395,6 +4678,13 @@ void ggml_cuda_op_fp8_quant_rot(
         if (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER) {
             GGML_ASSERT(h_a != nullptr && h_a->type == GGML_TYPE_F32 && ggml_is_contiguous(h_a));
             GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+        }
+        if (!ggml_cuda_fp8_qrot_v3_disabled() &&
+            ml8_launch_qrot_v4(stream, kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER,
+                               (const float *) x->data, h_a ? (const float *) h_a->data : nullptr,
+                               nullptr, 0.0f, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows)) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
         }
         if (!ggml_cuda_fp8_qrot_v3_disabled() &&
             ml8_launch_qrot_v3(stream, kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER,
