@@ -4708,6 +4708,8 @@ __launch_bounds__(32 * NW)
 static __global__ void ml8_fp8_qrot_v3_kernel(
     const Tin   * __restrict__ x,        // [n_rows, K]
     const float * __restrict__ h_a,      // [a_dim, a_dim] or nullptr
+    const float * __restrict__ norm_w,   // [K] or nullptr — fused RMSNorm+weight
+    float                      norm_eps,
     uint8_t     * __restrict__ a_fp8,    // [n_rows, K]
     float       * __restrict__ a_scale,  // [n_rows]
     int K, int a_dim, int n_rows) {
@@ -4748,6 +4750,44 @@ static __global__ void ml8_fp8_qrot_v3_kernel(
                     for (int q = 0; q < qn; q++) { v[j][e + q] = ml8_qrot_elem_to_float(blk[e + q]); }
                 }
             }
+        }
+    }
+    if (norm_w != nullptr) {
+        float ss = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < MAXAW; j++) {
+            const int a = wave + j * NW;
+            if (a < a_dim) {
+                #pragma unroll
+                for (int e = 0; e < E; e++) { ss += v[j][e] * v[j][e]; }
+            }
+        }
+        ss = warp_reduce_sum<32>(ss);
+        float tot = ss;
+        if constexpr (NW > 1) {
+            __shared__ float s_ss[NW];
+            if (lane == 0) { s_ss[wave] = ss; }
+            __syncthreads();
+            tot = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < NW; w++) { tot += s_ss[w]; }
+            __syncthreads();
+        }
+        const float rms = rsqrtf(tot / (float) K + norm_eps);
+        #pragma unroll
+        for (int j = 0; j < MAXAW; j++) {
+            const int a = wave + j * NW;
+            if (a < a_dim) {
+                const float * wb = norm_w + (size_t) a * B + lane * E;
+                #pragma unroll
+                for (int e = 0; e < E; e++) { v[j][e] = v[j][e] * rms * wb[e]; }
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < MAXAW; j++) {
+        const int a = wave + j * NW;
+        if (a < a_dim) {
             // in-lane stages: stride < E
             #pragma unroll
             for (int stride = 1; stride < E; stride <<= 1) {
@@ -5087,24 +5127,25 @@ template <typename Tin = float>
 static bool ml8_launch_qrot_v3(
     cudaStream_t stream, bool kronecker,
     const Tin * x, const float * h_a, uint8_t * a_fp8, float * a_scale,
-    int K, int a_dim, int b_dim, int n_rows) {
+    int K, int a_dim, int b_dim, int n_rows,
+    const float * norm_w = nullptr, float norm_eps = 0.0f) {
     const dim3 grid((unsigned) n_rows);
     if (kronecker) {
         // one wave per row; a_dim*E floats/lane resident
         if (b_dim == 1024 && a_dim <= 5) {
-            ml8_fp8_qrot_v3_kernel<1024, 1, 5, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<1024, 1, 5, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         if (b_dim == 1024 && a_dim <= 8) {
-            ml8_fp8_qrot_v3_kernel<1024, 1, 8, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<1024, 1, 8, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         if (b_dim == 512 && a_dim <= 16) {
-            ml8_fp8_qrot_v3_kernel<512, 1, 16, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<512, 1, 16, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         if (b_dim == 256 && a_dim <= 16) {
-            ml8_fp8_qrot_v3_kernel<256, 1, 16, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, a_fp8, a_scale, K, a_dim, n_rows);
+            ml8_fp8_qrot_v3_kernel<256, 1, 16, true, Tin><<<grid, 32, 0, stream>>>(x, h_a, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows);
             return true;
         }
         return false;
@@ -5114,15 +5155,15 @@ static bool ml8_launch_qrot_v3(
         // row, shorter per-wave dependency chains, more bytes in flight.
         static const int nw_env = [] { const char * e = std::getenv("MT_FP8_QROT_V3_NW"); return e ? std::atoi(e) : 0; }();
         if (a_dim <= 16 && nw_env == 0) {
-            ml8_fp8_qrot_v3_kernel<128, 4, 4, false, Tin><<<grid, 32 * 4, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true;
+            ml8_fp8_qrot_v3_kernel<128, 4, 4, false, Tin><<<grid, 32 * 4, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true;
         }
         const int nw = nw_env ? nw_env : 16;   // measured 2026-09-18 K=17408: NW=4 0.744 ms, 8 0.832, 16 0.463 (359 GB/s)
         #define ML8_QROT_V3_B128(NW_) \
             if (nw == NW_) { \
                 const int per_wave = (a_dim + NW_ - 1) / NW_; \
-                if (per_wave <= 4)  { ml8_fp8_qrot_v3_kernel<128, NW_,  4, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
-                if (per_wave <= 12) { ml8_fp8_qrot_v3_kernel<128, NW_, 12, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
-                if (per_wave <= 34) { ml8_fp8_qrot_v3_kernel<128, NW_, 34, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 4)  { ml8_fp8_qrot_v3_kernel<128, NW_,  4, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 12) { ml8_fp8_qrot_v3_kernel<128, NW_, 12, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
+                if (per_wave <= 34) { ml8_fp8_qrot_v3_kernel<128, NW_, 34, false, Tin><<<grid, 32 * NW_, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true; } \
                 return false; \
             }
         ML8_QROT_V3_B128(4)
@@ -5134,15 +5175,15 @@ static bool ml8_launch_qrot_v3(
     if (b_dim == 64) {
         constexpr int NW = 4;
         const int per_wave = (a_dim + NW - 1) / NW;
-        if (per_wave <= 8)  { ml8_fp8_qrot_v3_kernel<64, NW,  8, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
-        if (per_wave <= 32) { ml8_fp8_qrot_v3_kernel<64, NW, 32, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 8)  { ml8_fp8_qrot_v3_kernel<64, NW,  8, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 32) { ml8_fp8_qrot_v3_kernel<64, NW, 32, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true; }
         return false;
     }
     if (b_dim == 32) {
         constexpr int NW = 4;
         const int per_wave = (a_dim + NW - 1) / NW;
-        if (per_wave <= 16) { ml8_fp8_qrot_v3_kernel<32, NW, 16, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
-        if (per_wave <= 64) { ml8_fp8_qrot_v3_kernel<32, NW, 64, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 16) { ml8_fp8_qrot_v3_kernel<32, NW, 16, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true; }
+        if (per_wave <= 64) { ml8_fp8_qrot_v3_kernel<32, NW, 64, false, Tin><<<grid, 32 * NW, 0, stream>>>(x, nullptr, norm_w, norm_eps, a_fp8, a_scale, K, a_dim, n_rows); return true; }
         return false;
     }
     return false;
@@ -5230,12 +5271,20 @@ bool ggml_cuda_op_fp8_quant_rot_fused_norm(
         return false;
     }
     const bool ok = act_bf16
-        ? ml8_launch_qrot_v4<nv_bfloat16>(ctx.stream(), kron,
+        ? (ml8_launch_qrot_v4<nv_bfloat16>(ctx.stream(), kron,
               (const nv_bfloat16 *) x->data, h_a ? (const float *) h_a->data : nullptr,
               (const float *) w->data, eps, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows)
-        : ml8_launch_qrot_v4<float>(ctx.stream(), kron,
+           || ml8_launch_qrot_v3<nv_bfloat16>(ctx.stream(), kron,
+              (const nv_bfloat16 *) x->data, h_a ? (const float *) h_a->data : nullptr,
+              out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows,
+              (const float *) w->data, eps))
+        : (ml8_launch_qrot_v4<float>(ctx.stream(), kron,
               (const float *) x->data, h_a ? (const float *) h_a->data : nullptr,
-              (const float *) w->data, eps, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows);
+              (const float *) w->data, eps, out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows)
+           || ml8_launch_qrot_v3<float>(ctx.stream(), kron,
+              (const float *) x->data, h_a ? (const float *) h_a->data : nullptr,
+              out_qs, out_scale, (int) K, a_dim, b_dim, (int) n_rows,
+              (const float *) w->data, eps));
     if (ok) {
         CUDA_CHECK(cudaGetLastError());
     }

@@ -171,6 +171,14 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
+    // libr4d's fp8 paged KV layout (K|V interleaved per slot, single
+    // combined tensor) only makes sense against the paged cache's per-block
+    // scatter path (llama_kv_cache_paged); this non-paged unified/SWA cache
+    // has no notion of blocks/slots to scatter into.
+    if (type_k == GGML_TYPE_R4D_FP8_KV || type_v == GGML_TYPE_R4D_FP8_KV) {
+        throw std::runtime_error("r4d_fp8 KV cache type is paged-cache only (use --kv-tier-paged-blocks); not supported by the non-paged llama_kv_cache");
+    }
+
     const uint32_t n_layer = hparams.n_layer_all;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:

@@ -549,6 +549,28 @@ typedef struct {
 } block_fp8_b128;
 static_assert(sizeof(block_fp8_b128) == 130, "fp8_b128 block must be 130 bytes");
 
+// libr4d paged fp8 KV cache block (K|V interleaved per slot).
+//
+// External attention library libr4d reads a paged KV cache laid out as ONE
+// tensor per layer: kv[num_blocks][kv_heads][block_size][2*head_dim] in raw
+// (descale=1.0) OCP e4m3fn bytes, where each 512-byte slot is K[0..255]
+// followed by V[0..255]. To let llama-kv-cache-paged.cpp size a single flat
+// k_cache tensor that holds BOTH K and V for this layout, the block covers
+// one head's worth of K elements (256) but its type_size is the FULL 512-byte
+// K|V slot -- i.e. this "row" is twice as wide in bytes as a plain 256-elt
+// fp8 row would be. v_cache is still allocated (same type, same size) by the
+// generic sizing path but is UNUSED: libr4d only ever touches k_cache. This
+// wastes one full k_cache-sized allocation of VRAM per layer; accepted as the
+// cost of reusing the existing per-tensor-per-layer allocator unmodified.
+//
+// Never goes through the generic quantize/dequantize path (mt_r4d_scatter_kv
+// writes the bytes directly on device); to_float/from_float are abort stubs.
+#define QK_R4D_FP8_KV 256   // one block = one head's K row (== half of one 512-byte K|V slot)
+typedef struct {
+    uint8_t kv[2 * QK_R4D_FP8_KV];  // raw OCP e4m3fn bytes: K[0..255] then V[0..255]
+} block_r4d_fp8_kv;                 // 512 bytes total
+static_assert(sizeof(block_r4d_fp8_kv) == 2 * QK_R4D_FP8_KV, "wrong block_r4d_fp8_kv size");
+
 // TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max for N(0,1))
 // Block size 32, dual half-block scales (d0 for [0..15], d1 for [16..31])
 // Per block: d0(fp16) + d1(fp16) + 3-bit indices packed (12 bytes) = 16 bytes per 32 values

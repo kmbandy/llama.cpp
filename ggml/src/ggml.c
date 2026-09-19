@@ -904,6 +904,25 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_fp8_b128,
         .from_float_ref           = (ggml_from_float_t) quantize_row_fp8_b128_ref,
     },
+    // libr4d paged fp8 KV cache. blck_size=256 matches one head's K row
+    // (head_dim=256); type_size=512 is the FULL K|V slot (256 K bytes +
+    // 256 V bytes), so a k_cache tensor sized by the normal
+    // ggml_row_size(type, n_elts) math holds both halves of libr4d's
+    // combined per-slot layout. v_cache of this type is allocated by the
+    // generic paged-cache sizing path but never written/read — that's a
+    // full extra k_cache-sized VRAM allocation wasted per layer, accepted
+    // to avoid a bespoke allocator just for this type. to_float/from_float
+    // are abort stubs: fill goes through the device-side scatter kernel
+    // mt_r4d_scatter_kv (ggml-cuda/mt_pagedattn_r4d_scatter.cu), not this
+    // generic API.
+    [GGML_TYPE_R4D_FP8_KV] = {
+        .type_name                = "r4d_fp8",
+        .blck_size                = QK_R4D_FP8_KV,
+        .type_size                = sizeof(block_r4d_fp8_kv),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_r4d_fp8_kv,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_r4d_fp8_kv_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,

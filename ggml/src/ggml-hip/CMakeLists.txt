@@ -113,6 +113,58 @@ list(APPEND GGML_SOURCES_ROCM
 # already in this list) for its prefill path via rdna4_expand_ml84_to_trfeed.
 list(APPEND GGML_SOURCES_ROCM
     ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_prod.hip)
+
+# R4D vendored attention kernels (ggml-cuda/r4d/, see r4d/README-ORIGIN.txt for provenance --
+# radiance-libr4d commit b9e42ab-rx6). fp8-KV and bf16-KV paged, causal, GQA-6 attention at
+# head_dim 256: r4d_attn_{prefill,decode}_h256_gqa6_{fp8kv,bf16kv} plus
+# r4d_attn_decode_h256_gqa6_scratch_bytes / r4d_attn_dims. Reachable from other ggml-cuda
+# translation units through ggml-cuda/r4d/ggml-r4d.h, which also declares
+# ggml_cuda_r4d_available() (true only when this is compiled in AND the current device is
+# gfx1201). Compiled ONLY for gfx1201, both because the vendored kernels are hand-tuned for
+# exactly that WMMA ISA (they reject anything else at the call site, but there is no reason to
+# pay the compile time or fat-binary size for an arch that can never dispatch into them) and
+# because gfx1201 is the only arch this vendoring has been validated against.
+#
+# Default ON iff gfx1201 is one of the requested offload archs (AMDGPU_TARGETS is what the
+# CMAKE_HIP_ARCHITECTURES forwarding above reads; GPU_TARGETS is its CMake-native alias -- check
+# both, matching the forwarding logic itself). GGML_HIP_R4D can still be forced OFF explicitly, or
+# forced ON, but forcing it ON without gfx1201 in the arch list is refused below: r4d_attn_paged_
+# h256_gqa6.hip has no other-arch stub (unlike the rdna4_fp8_gemm units above, whose production
+# kernel bodies are individually `#if defined(__gfx1201__)`-guarded) and would either fail to
+# build or build dead code for an offload target gfx1201-only WMMA intrinsics don't exist on.
+set(_r4d_targets "${AMDGPU_TARGETS}${GPU_TARGETS}")
+if (_r4d_targets MATCHES "gfx1201")
+    set(GGML_HIP_R4D_DEFAULT ON)
+else()
+    set(GGML_HIP_R4D_DEFAULT OFF)
+endif()
+option(GGML_HIP_R4D "Enable vendored R4D fp8/bf16-KV paged attention kernels (gfx1201 only)" ${GGML_HIP_R4D_DEFAULT})
+if (GGML_HIP_R4D)
+    if (NOT _r4d_targets MATCHES "gfx1201")
+        message(FATAL_ERROR
+            "GGML_HIP_R4D=ON but gfx1201 is not in AMDGPU_TARGETS/GPU_TARGETS "
+            "('${AMDGPU_TARGETS}' / '${GPU_TARGETS}'). The vendored R4D kernels are compiled "
+            "only for gfx1201 and have no stub for other architectures. Add gfx1201 to the "
+            "offload-arch list or reconfigure with -DGGML_HIP_R4D=OFF.")
+    endif()
+    list(APPEND GGML_SOURCES_ROCM
+        ../ggml-cuda/r4d/r4d_attn_paged_h256_gqa6.hip)
+    add_compile_definitions(GGML_HIP_R4D)
+    # Upstream (r4d/build.sh) compiles this unit with:
+    #   -O3 -std=c++17 -fPIC --offload-arch=gfx1201 -Wno-unused-result -ffp-contract=off
+    # -O3 / -std=c++17 / -fPIC / --offload-arch already match what the rest of ggml-hip's build
+    # uses (CMAKE_BUILD_TYPE=Release, CMAKE_CXX_STANDARD 17 set in ggml/CMakeLists.txt, shared
+    # libs implying -fPIC, CMAKE_HIP_ARCHITECTURES from AMDGPU_TARGETS) so nothing extra is
+    # needed for those. -Wno-unused-result is harmless and applied below for parity.
+    # -ffp-contract=off is NOT applied: it exists upstream only for the quantized all-reduce unit
+    # (r4d_ar_oneshot_2rank_wht6.hip, not vendored here) whose correctness depends on FMA NOT
+    # merging two independently-scaled products; the attention kernels have no such site, so
+    # applying it here would just forgo FMA contraction on this TU's ordinary float math for no
+    # reason. Left off to match the rest of ggml-hip, which does not set it either.
+    set_source_files_properties(../ggml-cuda/r4d/r4d_attn_paged_h256_gqa6.hip
+        PROPERTIES COMPILE_OPTIONS "-Wno-unused-result")
+endif()
+
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 # dkq640 tile kernels exceed HIP local memory limit (67584 > 65536) at ncols=32
 list(FILTER SRCS EXCLUDE REGEX "dkq640")

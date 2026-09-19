@@ -12,6 +12,7 @@
 #include "mt_pagedattn.cuh"
 #include "mt_pagedattn_ops.cuh"   // paged_cache_ops template + specializations (shared with mt_pagedattn_tile.cu)
 #include "mt_pagedattn_aiter.cuh" // GGML_HIP_AITER-gated AITER backend (no-op stubs otherwise)
+#include "mt_pagedattn_r4d.cuh"  // GGML_HIP_R4D-gated R4D backend (no-op stubs otherwise; MAD-406)
 #include "mt_pagedattn_tile.cuh" // tile FA kernel dispatch entry (launch_paged_attn_tile)
 #include "mt_pagedattn_decode.cuh" // flash-decode kernel dispatch entry (launch_paged_attn_decode, MAD-185)
 #include "mt_pagedattn_wmma_fp8.cuh" // hand-written WMMA prefill kernel for TURBO4_FP8_BS256/GQA-6/head256 (MT_PAGED_ATTN_WMMA)
@@ -1785,6 +1786,22 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
             ggml_cuda_op_paged_attn_mt_wmma_fp8(ctx, dst);
             return;
         }
+    }
+
+    // MAD-406: if the R4D backend is enabled, compiled in, and this call's KV
+    // cache/shape is one it claims (GGML_TYPE_R4D_FP8_KV, head_dim 256,
+    // GQA-6, block_size 16, uniform q_len across active seqs — see
+    // mt_pagedattn_r4d.cu's eligibility gate), route the whole op through
+    // it. Checked BEFORE the AITER gate below: both are mutually-exclusive
+    // whole-op takeovers keyed off the cache's ggml type, and a false return
+    // here means R4D declined (wrong cache type / shape / a one-time
+    // capture-safety deferral) — the caller falls through exactly as if
+    // this check were absent, all the way to AITER and beyond.
+    if (r4d_backend_enabled() && ggml_cuda_op_paged_attn_mt_r4d(ctx, dst)) {
+        if (probe_on) {
+            std::fprintf(stderr, "[probe-r4d] dispatched to R4D backend\n");
+        }
+        return;
     }
 
     // MAD-188: if the AITER backend is enabled and compiled in, route the

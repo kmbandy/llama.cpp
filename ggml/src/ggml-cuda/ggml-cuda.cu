@@ -102,6 +102,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -5661,6 +5662,29 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // RMS_NORM+MUL+FP8_QUANT_ROT cannot go through ggml_can_fuse: that helper
+    // requires identical shapes, and per-row QUANT_ROT is [K+4] I8 vs MUL [K].
+    std::initializer_list<enum ggml_op> rms_norm_mul_qrot_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_FP8_QUANT_ROT };
+    if (is_equal(rms_norm_mul_qrot_ops, ops)) {
+        if (node_idx + 3 > cgraph->n_nodes) {
+            return false;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * rms  = cgraph->nodes[node_idx];
+        const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * qrot = cgraph->nodes[node_idx + 2];
+        if (qrot->src[0] != mul) {
+            return false;
+        }
+        if (mul->src[0] != rms && mul->src[1] != rms) {
+            return false;
+        }
+        int out_nodes[] = { node_idx + 2 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -5982,6 +6006,25 @@ static int ggml_cuda_try_fuse_bcast_mul_add(ggml_backend_cuda_context * cuda_ctx
     ggml_cuda_op_fused_bcast_mul_add(*cuda_ctx, a, b, c, add, mul_first);
 
     return with_repeat ? 2 : 1;
+}
+
+// QUANT_ROT nodes fused early (RMS+MUL consumer is not the next graph node).
+// Cleared at the start of each host-side graph walk. thread_local: two GPUs
+// can evaluate on two host threads.
+static thread_local std::unordered_set<const ggml_tensor *> g_fused_qrot_skip;
+
+static ggml_tensor * ggml_cuda_find_qrot_consumer(const ggml_cgraph * cgraph, int mul_idx) {
+    if (!ggml_node_has_n_uses(cgraph, mul_idx, 1)) {
+        return nullptr;
+    }
+    const ggml_tensor * mul = cgraph->nodes[mul_idx];
+    for (int j = mul_idx + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * cand = cgraph->nodes[j];
+        if (cand->op == GGML_OP_FP8_QUANT_ROT && cand->src[0] == mul) {
+            return cand;
+        }
+    }
+    return nullptr;
 }
 
 // try and fuse nodes and return the number of nodes to skip
@@ -6770,6 +6813,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // qwen35 expands attn_norm (RMS+MUL) before QKV creates QUANT_ROT, so the
+    // 3-op pattern is often not consecutive. MUL still has a single QUANT consumer.
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        ggml_tensor * qrot = ggml_cuda_find_qrot_consumer(cgraph, i + 1);
+        const bool already_tried_consecutive = (i + 2 < cgraph->n_nodes && qrot == cgraph->nodes[i + 2]);
+        if (qrot && !already_tried_consecutive &&
+            ggml_cuda_op_fp8_quant_rot_fused_norm(*cuda_ctx, node, cgraph->nodes[i + 1], qrot)) {
+            g_fused_qrot_skip.insert(qrot);
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -6907,6 +6962,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
+            g_fused_qrot_skip.clear();
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -6972,6 +7028,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (g_fused_qrot_skip.count(node)) {
+                    prev_i = i;
+                    continue;
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -8948,7 +9008,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     || op->src[1]->type == GGML_TYPE_TURBO4_64          // MAD-301C Lever B
                     || op->src[1]->type == GGML_TYPE_TURBO4_64_OL      // SP2.5 fixed-outlier-channel
                     || op->src[1]->type == GGML_TYPE_TURBO4_64_OL8     // outlier-matrix sweep
-                    || op->src[1]->type == GGML_TYPE_TURBO4_64_OL12)   // outlier-matrix sweep
+                    || op->src[1]->type == GGML_TYPE_TURBO4_64_OL12    // outlier-matrix sweep
+                    || op->src[1]->type == GGML_TYPE_R4D_FP8_KV)       // libr4d paged fp8 KV
                 && op->src[6]                          // k_cur (fused scatter)
                 && op->src[6]->type == GGML_TYPE_F16
                 && op->src[7]                          // v_cur (fused scatter)

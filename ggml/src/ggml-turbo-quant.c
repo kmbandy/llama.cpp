@@ -1415,6 +1415,20 @@ void dequantize_row_ml8_4(const block_ml8_4 * GGML_RESTRICT x, float * GGML_REST
     GGML_ABORT("ml8_4: generic dequantize_row not supported — use dequantize_row_ml8_4_with_lut (requires per-K-group centroid LUT sidecar)");
 }
 
+// libr4d paged fp8 KV cache stubs. Fill/drain is a device-side scatter
+// (mt_r4d_scatter_kv, ggml-cuda/mt_pagedattn_r4d_scatter.cu) writing raw
+// OCP e4m3fn bytes straight into the k_cache tensor; there is no host-side
+// float<->fp8 conversion in the generic ggml_type API for this type.
+void quantize_row_r4d_fp8_kv_ref(const float * GGML_RESTRICT x, block_r4d_fp8_kv * GGML_RESTRICT y, int64_t k) {
+    (void) x; (void) y; (void) k;
+    GGML_ABORT("r4d_fp8_kv: generic quantize_row not supported — fill goes through mt_r4d_scatter_kv");
+}
+
+void dequantize_row_r4d_fp8_kv(const block_r4d_fp8_kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    (void) x; (void) y; (void) k;
+    GGML_ABORT("r4d_fp8_kv: generic dequantize_row not supported — libr4d reads the cache directly");
+}
+
 void dequantize_row_ml8_4_with_lut(const block_ml8_4 * GGML_RESTRICT x,
                                    const uint8_t * GGML_RESTRICT lut_fp8,
                                    float * GGML_RESTRICT y,

@@ -463,11 +463,24 @@ static int ggml_cuda_ar_codec_grid(int64_t n) {
 // compute kernel is running (measured 2026-09-17: an uncapped 20k-CTA pack
 // made the 9070 XT's paged attention 1.9 -> 7.2 ms/call). GGML_CUDA_AR_CODEC_GRID
 // overrides.
-static int ggml_cuda_ar_codec_lane_grid(int64_t ne) {
-    static const int cap = [] {
+static int ggml_cuda_ar_codec_lane_grid(int64_t ne, bool unpack = false) {
+    static const int pack_cap = [] {
         const char * e = std::getenv("GGML_CUDA_AR_CODEC_GRID");
         return e != nullptr && atoi(e) > 0 ? atoi(e) : 512;
     }();
+    // Unpack runs on the compute stream AFTER recvd, so it does not starve
+    // overlapping GEMM the way pack does (pack cap 512: 2026-09-17, 20k CTAs
+    // made 9070 paged-attn 1.9 -> 7.2 ms). 9070 quiet-link floor is ~80 us at
+    // 256-1024 blocks; 4096 blocks reaches R9700 parity (quiet_link.hip).
+    // GGML_CUDA_AR_UNPACK_GRID overrides; 0 = same as pack.
+    static const int unpack_cap = [] {
+        const char * e = std::getenv("GGML_CUDA_AR_UNPACK_GRID");
+        if (e != nullptr && atoi(e) > 0) {
+            return atoi(e);
+        }
+        return pack_cap;
+    }();
+    const int cap = unpack ? unpack_cap : pack_cap;
     return (int) std::max<int64_t>(1, std::min<int64_t>((ne + 255) / 256, cap));
 }
 
@@ -485,7 +498,7 @@ template <typename T_dst>
 static void ggml_cuda_ar_codec_unpack_q8_0(
         void * dst, const void * src, int64_t ne, cudaStream_t stream) {
     const int n_blocks = (int) (ne / QK8_0);
-    const int grid = ggml_cuda_ar_codec_lane_grid(ne);
+    const int grid = ggml_cuda_ar_codec_lane_grid(ne, /*unpack=*/true);
     ggml_cuda_ar_codec_unpack_q8_0_kernel<T_dst><<<grid, 256, 0, stream>>>(
         static_cast<T_dst *>(dst), static_cast<const block_q8_0 *>(src), n_blocks);
     CUDA_CHECK(cudaGetLastError());
@@ -2833,6 +2846,46 @@ static void ggml_cuda_ar_pull_copy(void * dst, const void * src, size_t nbytes, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Phase C H2D into r1: one cudaMemcpyAsync of the whole payload stalls 9070
+// kernels 5.5x (h2d_size.hip, 2026-09-18). Same 100% link duty cycle at 64 KiB
+// transactions is only 1.55x. GGML_CUDA_AR_H2D_CHUNK_KB=0 (default) keeps the
+// single copy; set 64 to issue back-to-back 64 KiB H2Ds on the in-stream.
+static size_t ggml_cuda_ar_h2d_chunk_bytes() {
+    static const size_t chunk = []() -> size_t {
+        const char * e = std::getenv("GGML_CUDA_AR_H2D_CHUNK_KB");
+        if (e == nullptr || e[0] == '\0' || std::strcmp(e, "0") == 0) {
+            return 0;
+        }
+        char * end = nullptr;
+        const unsigned long kb = std::strtoul(e, &end, 10);
+        if (end == e || *end != '\0' || kb == 0) {
+            return 0;
+        }
+        return (size_t) kb * 1024;
+    }();
+    return chunk;
+}
+
+static void ggml_cuda_ar_h2d(void * dst, const void * src, size_t nbytes, cudaStream_t stream) {
+    const size_t chunk = ggml_cuda_ar_h2d_chunk_bytes();
+    if (chunk == 0 || nbytes <= chunk) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, stream));
+        return;
+    }
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_INFO("ggml_cuda_ar: H2D chunked at %zu KiB (GGML_CUDA_AR_H2D_CHUNK_KB)\n",
+                      chunk / 1024);
+    }
+    auto *       d = static_cast<char *>(dst);
+    const auto * s = static_cast<const char *>(src);
+    for (size_t off = 0; off < nbytes; ) {
+        const size_t n = std::min(chunk, nbytes - off);
+        CUDA_CHECK(cudaMemcpyAsync(d + off, s + off, n, cudaMemcpyHostToDevice, stream));
+        off += n;
+    }
+}
+
 bool ggml_cuda_ar_allreduce_begin(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -3071,8 +3124,7 @@ bool ggml_cuda_ar_allreduce_begin(
             // kernel comment above ggml_cuda_ar_pull_copy_kernel.
             ggml_cuda_ar_pull_copy(p->dx_recv[i] + slot_off, p->dx_send[0] + slot_off, xfer_nbytes, in);
         } else {
-            CUDA_CHECK(cudaMemcpyAsync(
-                p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, xfer_nbytes, cudaMemcpyHostToDevice, in));
+            ggml_cuda_ar_h2d(p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, xfer_nbytes, in);
         }
         CUDA_CHECK(cudaEventRecord(ev.recvd, in));
         ev.recvd_valid = true;

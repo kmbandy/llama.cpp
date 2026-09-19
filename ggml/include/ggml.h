@@ -449,7 +449,8 @@ extern "C" {
         // will not load as-is on this fork (it would be read as TURBO3_0); reconvert.
         GGML_TYPE_Q2_0    = 56,
         GGML_TYPE_FP8_B128 = 57, // FP8_B128 phase 2: e4m3 weight quant, 128-element blocks, fp16 per-block scale + 128 e4m3 bytes (130 bytes/block). Converter enforces a 128x128-tile-shared scale invariant (not checked by the type itself). See scripts/calibration/convert_fp8_rotated.py --format fp8_b128.
-        GGML_TYPE_COUNT   = 58,
+        GGML_TYPE_R4D_FP8_KV = 58, // libr4d paged fp8 KV cache: K|V interleaved per slot, raw OCP e4m3fn bytes (no scale, descale=1.0). Block covers one head's 256-elt K row but type_size is the full 512-byte K|V slot, so k_cache alone (sized by llama-kv-cache-paged.cpp's row math) holds both K and V; v_cache of the same type is allocated but unused. Runtime KV-cache-only type (never serialized to GGUF); fill goes through mt_r4d_scatter_kv (ggml-cuda/mt_pagedattn_r4d_scatter.cu).
+        GGML_TYPE_COUNT   = 59,
     };
 
     // precision

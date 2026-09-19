@@ -202,6 +202,15 @@ GGML_API void dequantize_row_fp8_b128(const block_fp8_b128 * GGML_RESTRICT x, fl
 GGML_API void quantize_row_fp8_b128_ref(const float * GGML_RESTRICT x, block_fp8_b128 * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_fp8_b128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// libr4d paged fp8 KV cache (GGML_TYPE_R4D_FP8_KV). The block holds raw K|V
+// bytes written directly by the device-side scatter kernel
+// (mt_r4d_scatter_kv, ggml-cuda/mt_pagedattn_r4d_scatter.cu); there is no
+// generic float<->fp8 conversion for this type. These stubs exist solely to
+// satisfy the ggml_type type-trait table and abort if anything else tries
+// the standard API.
+GGML_API void quantize_row_r4d_fp8_kv_ref(const float * GGML_RESTRICT x, block_r4d_fp8_kv * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_r4d_fp8_kv(const block_r4d_fp8_kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);
