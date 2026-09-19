@@ -9250,6 +9250,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "wp_tp_trace_gpu_mark") == 0) {
         return (void *)wp_tp_trace_gpu_mark;
     }
+    // mad-lab: MAD_META_GPUTIME -- ggml-backend-meta.cpp is backend-agnostic
+    // (see the header comment on mad_meta_gputime_mark in allreduce.cuh) and
+    // reaches this file's implementation (allreduce.cu) purely through this
+    // proc-address, the same mechanism already used for
+    // ggml_backend_set_stream_no and wp_tp_trace_mark/_gpu_mark above.
+    if (strcmp(name, "mad_meta_gputime_mark") == 0) {
+        return (void *)mad_meta_gputime_mark;
+    }
     return nullptr;
 }
 

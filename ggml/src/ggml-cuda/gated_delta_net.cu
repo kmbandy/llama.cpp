@@ -1,6 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 #include "mma.cuh"
+#include "mt_gdn_r4d.cuh"
 
 #include <cstdlib>
 
@@ -1994,14 +1995,54 @@ static void ggml_cuda_op_gated_delta_net_impl(
             prefill_state_out = inter_state.get();
         }
 
-        if (wmma_ok) {
-            launch_gated_delta_net_prefill_wmma2(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefill_state_out,
-                S_v, H, T0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, n_tokens, stream);
-        } else {
-            launch_gated_delta_net_prefill(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefill_state_out,
-                S_v, H, T0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, n_tokens, stream);
+        // MAD-406: try libr4d over the largest 64-token-aligned PREFIX [0, P) of [0, T0) before
+        // falling back to the existing wmma/scalar chunked-prefill kernel for the whole [0, T0).
+        // ggml_cuda_gdn_r4d_prefix (mt_gdn_r4d.cu) does all further eligibility checking
+        // (geometry, GQA shape, stride canonicality) and is a clean no-op on decline -- nothing
+        // below has touched dst_d/prefill_state_out yet in that case, so falling through to the
+        // unchanged wmma/scalar path is exactly what ran before this integration existed.
+        const int64_t P = r4d_gdn_enabled() ? (T0 / 64) * 64 : 0;
+        bool r4d_took_prefix = false;
+        if (P >= 64) {
+            ggml_cuda_pool_alloc<float> r4d_prefix_state(ctx.pool());
+            r4d_prefix_state.alloc(S_v * S_v * H * n_seqs);
+            r4d_took_prefix = ggml_cuda_gdn_r4d_prefix(
+                ctx, dst, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, r4d_prefix_state.get(),
+                S_v, H, P, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                neqk1, rq3, scale, /*dst_seq_stride=*/n_tokens, stream);
+            if (r4d_took_prefix) {
+                if (P < T0) {
+                    // [P, T0) is at most 63 tokens -- the WMMA/scalar chunked-prefill kernels take
+                    // no tok_offset or state-in (they always start their own [0,n_tokens) window
+                    // at token 0 with s_d as the initial state), so this remainder runs through
+                    // the EXISTING plain autoregressive kernel instead, which already supports
+                    // both (same kernel the K-snapshot tail below reuses). state_slot_stride/K are
+                    // unused by the kernel body when keep_rs_t is false (compile-time branch),
+                    // so any values are harmless; passed as 0/1 for clarity.
+                    launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, r4d_prefix_state.get(),
+                        dst_d, prefill_state_out, S_v, H, T0 - P, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1, rq3, scale, /*state_slot_stride=*/0, /*K=*/1, stream,
+                        /*tok_offset=*/P, /*dst_seq_stride=*/n_tokens);
+                } else {
+                    // P == T0 exactly: r4d's own P-token state IS the T0-token state the tail
+                    // step below needs as curr_state.
+                    CUDA_CHECK(cudaMemcpyAsync(prefill_state_out, r4d_prefix_state.get(),
+                        S_v * S_v * H * n_seqs * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+        }
+        r4d_gdn_prefix_log(P, n_tokens, K, r4d_took_prefix);
+
+        if (!r4d_took_prefix) {
+            if (wmma_ok) {
+                launch_gated_delta_net_prefill_wmma2(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefill_state_out,
+                    S_v, H, T0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, n_tokens, stream);
+            } else {
+                launch_gated_delta_net_prefill(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefill_state_out,
+                    S_v, H, T0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, n_tokens, stream);
+            }
         }
 
         if (tail > 0) {
@@ -2037,6 +2078,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // No R4D gate here: this entry is not on the production dispatch path -- the GDN cache-fusion
+    // pass (ggml_cuda_try_gdn_cache_fusion, ggml-cuda.cu) rewrites every GGML_OP_GATED_DELTA_NET
+    // node reachable in a real forward pass to call ggml_cuda_op_gated_delta_net_fused_cache below
+    // instead, so a gate here never saw a call (measured: MAD_USE_R4D_GDN=1 produced zero
+    // mt_gdn_r4d log lines on a real chain run). See mt_gdn_r4d.cuh's header comment on
+    // ggml_cuda_op_gated_delta_net_r4d for detail, and ggml_cuda_op_gated_delta_net_impl's
+    // use_prefill_chunked branch below for the entry point that IS on the production path.
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
 }
 

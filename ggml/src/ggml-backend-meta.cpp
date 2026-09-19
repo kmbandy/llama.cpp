@@ -73,6 +73,38 @@ typedef void (*wp_tp_trace_mark_global_t)(int kind, long long ubatch_idx, long l
 typedef void (*wp_tp_trace_gpu_mark_t)(ggml_backend_t backend, int kind, long long ubatch_idx, long long slot,
                                         long long subgraph_idx, const char * extra);
 
+// mad-lab: MAD_META_GPUTIME -- same rationale/mechanism as the WP_TP_TRACE_FILE
+// block above (this file is backend-agnostic and reaches the CUDA/HIP-side
+// implementation, ggml/src/ggml-cuda/allreduce.cu, purely through this
+// proc-address). Kind values below MUST stay in exact sync with
+// mad_meta_gputime::Kind in allreduce.cu and the doc comment on
+// mad_meta_gputime_mark() in allreduce.cuh.
+enum mad_meta_gputime_kind_mirror {
+    MAD_MGT_COMPUTE  = 0,
+    MAD_MGT_AR_PACK  = 1,
+    MAD_MGT_AR_XFER  = 2,
+    MAD_MGT_AR_UNPACK = 3,
+    MAD_MGT_HOSTWAIT = 4,
+};
+
+// Returns a 1-based row id for phase 0 (begin), to be passed back as
+// row_id_in for the matching phase 1 (end) call; see the full contract on
+// mad_meta_gputime_mark() in allreduce.cuh.
+typedef uint64_t (*mad_meta_gputime_mark_t)(ggml_backend_t backend, long long device_hint, int kind, int phase,
+                                             long long slot, long long subgraph, long long step,
+                                             uint64_t row_id_in);
+
+// Cached getenv("MAD_META_GPUTIME") check, mirroring
+// mad_meta_gputime::enabled() in allreduce.cu -- checked here too so call
+// sites below can skip the proc-address call entirely when the probe is off.
+static bool ggml_backend_meta_gputime_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("MAD_META_GPUTIME");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
@@ -3173,6 +3205,12 @@ struct ggml_backend_meta_context {
         wp_tp_trace_mark_t     wp_tp_trace_mark     = nullptr;
         wp_tp_trace_gpu_mark_t wp_tp_trace_gpu_mark = nullptr;
 
+        // MAD_META_GPUTIME only: resolved once here, same pattern as
+        // set_stream_no/wp_tp_trace_* above -- null on a backend that
+        // doesn't export it (e.g. CPU), in which case that device's rows
+        // are silently absent from the probe rather than the run failing.
+        mad_meta_gputime_mark_t mad_meta_gputime_mark = nullptr;
+
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             for (size_t i = 0; i < n_graph_slots; i++) {
                 bufs[i].resize(n_reduce_steps);
@@ -3184,6 +3222,8 @@ struct ggml_backend_meta_context {
                 reg, "wp_tp_trace_mark");
             wp_tp_trace_gpu_mark = (wp_tp_trace_gpu_mark_t) ggml_backend_reg_get_proc_address(
                 reg, "wp_tp_trace_gpu_mark");
+            mad_meta_gputime_mark = (mad_meta_gputime_mark_t) ggml_backend_reg_get_proc_address(
+                reg, "mad_meta_gputime_mark");
         }
     };
     struct graph_state {
@@ -3399,6 +3439,21 @@ struct ggml_backend_meta_context {
     long long                 wp_tp_trace_ubatch_idx[n_graph_slots]   = { -1, -1 };
     wp_tp_trace_mark_global_t wp_tp_trace_mark_global                 = nullptr;
 
+    // MAD_META_GPUTIME only: monotonic counter, bumped once per compute()
+    // call (i.e. once per subgraph submission across both slots) -- the
+    // "step" column in the probe's CSV, letting the reader place COMPUTE and
+    // HOSTWAIT rows from different slots/AR ops on one shared sequence even
+    // though subgraph index `i` alone resets per ubatch and AR's own op_id
+    // is a separate counter (see allreduce.cu's ggml_cuda_ar_allreduce_begin).
+    uint64_t mgt_step_counter = 0;
+
+    // MAD_META_GPUTIME only: a HOSTWAIT span (blocking_reduce()/
+    // cross_host_reduce_step() below) has no single device to resolve the
+    // proc-address through, so stash whichever backend_config resolved one
+    // first -- calling it with backend=nullptr routes to allreduce.cu's
+    // host-only path regardless of which device's registry answered.
+    mad_meta_gputime_mark_t mgt_mark_any = nullptr;
+
     void slot_fence_init() {
         static_assert(n_graph_slots == 2, "other_slot() assumes exactly 2 slots");
         const size_t n_devs = backend_configs.size();
@@ -3537,6 +3592,16 @@ struct ggml_backend_meta_context {
             // require n_devs > 1.
             wp_tp_trace_mark_global = (wp_tp_trace_mark_global_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "wp_tp_trace_mark_global");
+        }
+
+        // MAD_META_GPUTIME only: first backend_config that resolved the
+        // proc-address stands in for HOSTWAIT spans, which have no single
+        // device of their own (see mgt_mark_any's doc comment).
+        for (auto & bc : backend_configs) {
+            if (bc.mad_meta_gputime_mark != nullptr) {
+                mgt_mark_any = bc.mad_meta_gputime_mark;
+                break;
+            }
         }
 
         slot_fence_init();
@@ -4715,6 +4780,10 @@ struct ggml_backend_meta_graph_runner {
         backend_ctx->runahead_before_submit();
         const bool tp_trace = ggml_backend_meta_wp_tp_trace_enabled();
         const long long trace_ubatch = tp_trace ? backend_ctx->wp_tp_trace_ubatch_idx[i_slot] : -1;
+        // MAD_META_GPUTIME: one step per compute() call (i.e. per subgraph
+        // submission, across both slots) -- see the field's doc comment.
+        const bool     gputime = ggml_backend_meta_gputime_enabled();
+        const uint64_t gt_step = gputime ? backend_ctx->mgt_step_counter++ : 0;
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             select_stream(j);            // WP_META_SLOT_STREAMS: dispatch on this slot's stream
@@ -4730,7 +4799,20 @@ struct ggml_backend_meta_graph_runner {
                 bcj.wp_tp_trace_gpu_mark(bcj.backend, WP_TPT_COMPUTE_GPU_START, trace_ubatch,
                                           (long long) i_slot, (long long) i, nullptr);
             }
+            // MAD_META_GPUTIME: record (beg,end) on device j's own stream
+            // (the same one ggml_backend_graph_compute_async dispatches to,
+            // per select_stream(j) above) bracketing exactly this
+            // submission -- never a host wait.
+            uint64_t gt_row = 0;
+            if (gputime && bcj.mad_meta_gputime_mark != nullptr) {
+                gt_row = bcj.mad_meta_gputime_mark(bcj.backend, -1, MAD_MGT_COMPUTE, /*phase=*/0,
+                                                    (long long) i_slot, (long long) i, (long long) gt_step, 0);
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_ij);
+            if (gputime && bcj.mad_meta_gputime_mark != nullptr) {
+                bcj.mad_meta_gputime_mark(bcj.backend, -1, MAD_MGT_COMPUTE, /*phase=*/1,
+                                           (long long) i_slot, (long long) i, (long long) gt_step, gt_row);
+            }
             if (tp_trace && bcj.wp_tp_trace_gpu_mark != nullptr) {
                 bcj.wp_tp_trace_gpu_mark(bcj.backend, WP_TPT_COMPUTE_GPU_END, trace_ubatch,
                                           (long long) i_slot, (long long) i, nullptr);
@@ -4805,7 +4887,28 @@ struct ggml_backend_meta_graph_runner {
     // the peer rank's partial sum before the next subgraph runs.
     ggml_status reduce(const size_t i) {
         select_stream_all(); // same-slot-partial-only, like begin_reduce/end_reduce above
-        if (!blocking_reduce(i) && allreduce_fallback(i) != GGML_STATUS_SUCCESS) {
+        // MAD_META_GPUTIME: blocking_reduce() is the SYNCHRONOUS reduce path
+        // (legacy-copy/NCCL/butterfly transports, or whenever the async
+        // comm_allreduce_begin/_end split isn't installed) -- tagged
+        // HOSTWAIT because, unlike the split path's AR_PACK/AR_XFER/AR_UNPACK
+        // (bracketed directly in allreduce.cu around each device's own
+        // enqueue), this call can genuinely block the ONE host thread across
+        // both devices before returning. device_hint=-1: no single device
+        // owns this wait.
+        const bool     gputime = ggml_backend_meta_gputime_enabled();
+        uint64_t       gt_row  = 0;
+        if (gputime && backend_ctx->mgt_mark_any != nullptr) {
+            gt_row = backend_ctx->mgt_mark_any(nullptr, -1, MAD_MGT_HOSTWAIT, /*phase=*/0,
+                                                (long long) i_slot, (long long) i,
+                                                (long long) backend_ctx->mgt_step_counter, 0);
+        }
+        const bool blocked = !blocking_reduce(i) && allreduce_fallback(i) != GGML_STATUS_SUCCESS;
+        if (gputime && backend_ctx->mgt_mark_any != nullptr) {
+            backend_ctx->mgt_mark_any(nullptr, -1, MAD_MGT_HOSTWAIT, /*phase=*/1,
+                                       (long long) i_slot, (long long) i,
+                                       (long long) backend_ctx->mgt_step_counter, gt_row);
+        }
+        if (blocked) {
             return GGML_STATUS_FAILED;
         }
         return cross_host_reduce_step(i);
@@ -4826,6 +4929,27 @@ struct ggml_backend_meta_graph_runner {
             return GGML_STATUS_SUCCESS;
         }
 
+        // MAD_META_GPUTIME: this whole body is host-blocking by construction
+        // (ggml_backend_synchronize() below, plus whatever the installed
+        // cross_host_reduce hook itself does -- typically a network
+        // exchange with the peer rank) -- tagged HOSTWAIT, device_hint=-1.
+        const bool     gputime = ggml_backend_meta_gputime_enabled();
+        uint64_t       gt_row  = 0;
+        if (gputime && backend_ctx->mgt_mark_any != nullptr) {
+            gt_row = backend_ctx->mgt_mark_any(nullptr, -1, MAD_MGT_HOSTWAIT, /*phase=*/0,
+                                                (long long) i_slot, (long long) i,
+                                                (long long) backend_ctx->mgt_step_counter, 0);
+        }
+        const ggml_status ret = cross_host_reduce_step_body(i);
+        if (gputime && backend_ctx->mgt_mark_any != nullptr) {
+            backend_ctx->mgt_mark_any(nullptr, -1, MAD_MGT_HOSTWAIT, /*phase=*/1,
+                                       (long long) i_slot, (long long) i,
+                                       (long long) backend_ctx->mgt_step_counter, gt_row);
+        }
+        return ret;
+    }
+
+    ggml_status cross_host_reduce_step_body(const size_t i) {
         ggml_cgraph * cgraph_i0 = backend_ctx->backend_configs[0].cgraphs[i_slot][i].cgraph_main;
         ggml_tensor * node0     = cgraph_i0->nodes[cgraph_i0->n_nodes - 1];
         GGML_ASSERT(node0->type == GGML_TYPE_F32);

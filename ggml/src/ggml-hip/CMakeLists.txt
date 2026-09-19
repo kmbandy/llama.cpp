@@ -113,6 +113,27 @@ list(APPEND GGML_SOURCES_ROCM
 # already in this list) for its prefill path via rdna4_expand_ml84_to_trfeed.
 list(APPEND GGML_SOURCES_ROCM
     ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_prod.hip)
+# ML8_4 decode-band GEMM v2 (task brief: "a new decode-band GEMM for ml8-4
+# weights ... replacing gemm_ml84_trfeed_splitk<32,1,*>"). NOT wired into
+# ml8.cu by this task -- a separate wiring task substitutes
+# rdna4_gemm_ml84_decode_v2 (gemm_ml84_decode_v2.h) for the
+# rdna4_gemm_ml84_trfeed_decode_splitk call site. Same gfx1201-only /
+# other-arch-stub guard convention as gemm_ml84_prod.hip above; reuses
+# bench/trfeed_ml84_kernels.h's ml84_lut_gather4/ml84_expand_frag and
+# bench/ml84_trfeed_layout.h's ml84_tile_nib_base UNCHANGED (see
+# gemm_ml84_decode_v2.hip's header comment), so it needs the exact same
+# `-I` (this directory) gemm_ml84_prod.hip already gets below.
+list(APPEND GGML_SOURCES_ROCM
+    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_decode_v2.hip)
+# ML8_4 prefill GEMM ported from radiance's atiled MXFP4xFP8 kernel
+# (gemm_ml84_radiance.h/.hip -- see that header's own comment for the port
+# provenance and the ml8-4 numerics adaptation). Wired into ml8.cu's prefill
+# dispatch behind MT_ML8_4_PREFILL_RADIANCE (default 0 = unused; the
+# expand+gemm_fp8_trfeed path above is untouched). Same gfx1201-only /
+# other-arch-stub guard convention and `-I` (this directory) requirement as
+# gemm_ml84_prod.hip / gemm_ml84_decode_v2.hip above.
+list(APPEND GGML_SOURCES_ROCM
+    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.hip)
 
 # R4D vendored attention kernels (ggml-cuda/r4d/, see r4d/README-ORIGIN.txt for provenance --
 # radiance-libr4d commit b9e42ab-rx6). fp8-KV and bf16-KV paged, causal, GQA-6 attention at
@@ -148,7 +169,21 @@ if (GGML_HIP_R4D)
             "offload-arch list or reconfigure with -DGGML_HIP_R4D=OFF.")
     endif()
     list(APPEND GGML_SOURCES_ROCM
-        ../ggml-cuda/r4d/r4d_attn_paged_h256_gqa6.hip)
+        ../ggml-cuda/r4d/r4d_attn_paged_h256_gqa6.hip
+        # Gated DeltaNet: the two kernels mt_gdn_r4d.cu (ggml-cuda/, globbed above) actually calls
+        # -- kkt_solve (the chunk KKT preamble) and chunk_scan (the WY-transform chunked scan
+        # itself). See mt_gdn_r4d.cu's header comment for the ggml<->libr4d ABI mapping and why
+        # the conv/gate-prep, gated-rmsnorm and recurrent_update kernels are not vendored here:
+        # none of them map 1:1 onto GGML_OP_GATED_DELTA_NET's tensor boundary without graph
+        # changes or per-layer weights (A_log/dt_bias) this op's srcs don't carry.
+        ../ggml-cuda/r4d/r4d_gdn_kkt_solve_k128_c64_bf16.hip
+        ../ggml-cuda/r4d/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
+        # The remaining libr4d GDN units are vendored as-is too so the whole library is linkable
+        # (tests/test-r4d-gdn exercises recurrent_update directly).
+        ../ggml-cuda/r4d/r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip
+        ../ggml-cuda/r4d/r4d_gdn_conv_w4_h128_bf16.hip
+        ../ggml-cuda/r4d/r4d_gdn_gated_rmsnorm_h128_bf16.hip
+        ../ggml-cuda/r4d/r4d_gdn_fused_update_w4k128v128.hip)
     add_compile_definitions(GGML_HIP_R4D)
     # Upstream (r4d/build.sh) compiles this unit with:
     #   -O3 -std=c++17 -fPIC --offload-arch=gfx1201 -Wno-unused-result -ffp-contract=off
@@ -162,6 +197,14 @@ if (GGML_HIP_R4D)
     # applying it here would just forgo FMA contraction on this TU's ordinary float math for no
     # reason. Left off to match the rest of ggml-hip, which does not set it either.
     set_source_files_properties(../ggml-cuda/r4d/r4d_attn_paged_h256_gqa6.hip
+        PROPERTIES COMPILE_OPTIONS "-Wno-unused-result")
+    set_source_files_properties(
+        ../ggml-cuda/r4d/r4d_gdn_kkt_solve_k128_c64_bf16.hip
+        ../ggml-cuda/r4d/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
+        ../ggml-cuda/r4d/r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip
+        ../ggml-cuda/r4d/r4d_gdn_conv_w4_h128_bf16.hip
+        ../ggml-cuda/r4d/r4d_gdn_gated_rmsnorm_h128_bf16.hip
+        ../ggml-cuda/r4d/r4d_gdn_fused_update_w4k128v128.hip
         PROPERTIES COMPILE_OPTIONS "-Wno-unused-result")
 endif()
 

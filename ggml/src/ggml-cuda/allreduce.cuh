@@ -96,3 +96,26 @@ cudaStream_t ggml_cuda_ar_stream_for_device(int device);
 // plain/atomic loads and snprintf+write(2), no locks, no allocation.
 void ggml_cuda_ar_dump_state(const char * reason);
 
+// mad-lab: MAD_META_GPUTIME -- per-device compute/AllReduce busy-vs-idle probe
+// for the meta (tensor-parallel step-loop) backend. See the .cu definition
+// for the full contract; summary here is just enough for callers.
+//
+// One function serves every call site (COMPUTE brackets from
+// ggml-backend-meta.cpp's compute() via the "mad_meta_gputime_mark"
+// proc-address, and AR_PACK/AR_XFER/AR_UNPACK brackets called directly from
+// this TU around ggml_cuda_ar_allreduce_begin/_end's per-device enqueues).
+//
+// `backend` non-null: GPU-timed span -- an event is recorded on
+// static_cast<ggml_backend_cuda_context*>(backend->context)->stream() (the
+// SAME stream the bracketed work was just enqueued on), never a host wait.
+// `backend` null: host-only span (HOSTWAIT) -- `device_hint` tags the row
+// (-1 for a cross-device/global wait); only steady_clock is used.
+//
+// `phase` 0 = begin (row_id_in ignored; returns a new row id, 0 if the probe
+// is disabled or the record table is full) and 1 = end (row_id_in is the id
+// `phase==0` returned; return value is unused). Kinds mirror
+// mad_meta_gputime::Kind in allreduce.cu: 0=COMPUTE, 1=AR_PACK, 2=AR_XFER,
+// 3=AR_UNPACK, 4=HOSTWAIT.
+uint64_t mad_meta_gputime_mark(ggml_backend_t backend, long long device_hint, int kind, int phase,
+                                long long slot, long long subgraph, long long step, uint64_t row_id_in);
+

@@ -46,6 +46,70 @@
 #include "aiter-integration/rdna4_fp8_gemm/bench/ml84_trfeed_layout.h"
 #include "turbo_fp8_hadamard.cuh"  // G.6.f: FWHT for rotation H_b leg
 
+// MT_ML8_4_DECODE_V2: optional second decode-splitk launcher, written
+// concurrently by another agent (gemm_ml84_decode_v2.h/.hip — not this
+// file's to create/edit). Per gemm_ml84_decode_v2.h's own header comment,
+// its arguments are the rdna4_gemm_ml84_trfeed_decode_splitk call site's
+// (A, B_nib, lut, C_f32, a_scale, b_scale_g, M_pad, N, K, n_splits, stream)
+// verbatim, with real `M` added as a new LEADING argument (needed because
+// it sizes its own DTM tile off real M instead of always doing 32-row
+// work) -- so the call is
+// rdna4_gemm_ml84_decode_v2(M, A, B_nib, lut, C_f32, a_scale, b_scale_g,
+//                            M_pad, N, K, n_splits, stream).
+// It returns bool, not hipError_t: false means "shape unsupported / scratch
+// not sized for N, no launch, no side effects -- fall back to
+// rdna4_gemm_ml84_trfeed_decode_splitk"; true means a kernel WAS launched
+// (same as the old launcher's hipGetLastError()-returning contract), so the
+// caller must still hipGetLastError()/GGML_ASSERT after a true return.
+// Contract: writes exactly M rows of N directly into dst (no M_pad padding
+// rows touched), fp32, same row-major/stride-N layout as every other path
+// here -- no hipMemsetAsync, no M!=M_pad D2D copy-out needed on this branch.
+// If the header does not exist yet (built concurrently), compile against a
+// stub matching that same signature that always returns false, so the tree
+// builds either way and MT_ML8_4_DECODE_V2=1 is a no-op until it lands.
+#if __has_include("aiter-integration/rdna4_fp8_gemm/gemm_ml84_decode_v2.h")
+#include "aiter-integration/rdna4_fp8_gemm/gemm_ml84_decode_v2.h"
+#define ML8_4_DECODE_V2_AVAILABLE 1
+#else
+#define ML8_4_DECODE_V2_AVAILABLE 0
+static inline bool rdna4_gemm_ml84_decode_v2(
+    int /*M*/, const void * /*A*/, const uint8_t * /*B_nib*/, const uint8_t * /*lut*/,
+    float * /*C_f32*/, const float * /*a_scale*/, const float * /*b_scale_g*/,
+    int /*M_pad*/, int /*N*/, int /*K*/, int /*n_splits*/, hipStream_t /*stream*/) {
+    return false;
+}
+#endif
+
+// MT_ML8_4_PREFILL_RADIANCE: ported radiance prefill GEMM
+// (gemm_ml84_radiance.h/.hip -- also not this file's to create/edit). Same
+// __has_include guard pattern as gemm_ml84_decode_v2.h above, for the same
+// reason (this file must keep building even if that pair is mid-flight on
+// another branch). See gemm_ml84_radiance.h's own header comment for the
+// full contract of all three entry points; stubs below always decline
+// (return false) so MT_ML8_4_PREFILL_RADIANCE is a no-op until the header
+// is present.
+#if __has_include("aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.h")
+#include "aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.h"
+#define ML8_4_RADIANCE_AVAILABLE 1
+#else
+#define ML8_4_RADIANCE_AVAILABLE 0
+static inline bool rdna4_gemm_ml84_radiance_prep(
+    const uint8_t * /*B_nib*/, const uint8_t * /*lut*/, const float * /*b_scale_g*/,
+    int /*N*/, int /*K*/, uint8_t * /*T_out*/, float * /*colscale_out*/, hipStream_t /*stream*/) {
+    return false;
+}
+static inline bool rdna4_gemm_ml84_radiance_retile_a(
+    int /*M*/, int /*K*/, const uint8_t * /*A_rowmajor_fp8*/, uint8_t * /*AT_out*/, hipStream_t /*stream*/) {
+    return false;
+}
+static inline bool rdna4_gemm_ml84_radiance(
+    int /*M*/, const void * /*A_fp8*/, const float * /*a_scale*/, const uint8_t * /*B_nib*/,
+    const uint8_t * /*T*/, const float * /*colscale*/, float * /*C_f32*/, int /*N*/, int /*K*/,
+    hipStream_t /*stream*/) {
+    return false;
+}
+#endif
+
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -448,6 +512,118 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     return &ins_it->second.info;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// MT_ML8_4_PREFILL_RADIANCE=2 (cached mode): per-weight cache of the
+// radiance conversion table T + colscale (gemm_ml84_radiance.h's
+// rdna4_gemm_ml84_radiance_prep output), built once and reused on every
+// subsequent prefill call against the same weight -- mirroring
+// g_ml8_cache's device-pointer-keyed lifetime/invalidation above, but kept
+// as its own map (not folded into cache_entry_t) since cache_entry_t's
+// info also backs g_ml8_fp8_cache/g_fp8_b128_cache and the in-place ML8_4
+// registry, whose entries can be pointer-adjusted on buffer reuse
+// (ggml_cuda_ml8_inplace_set) -- a table cache keyed the same way as those
+// but independent of their bookkeeping is simplest to get right and to
+// tear down. Freed by ggml_cuda_ml8_clear_cache() below alongside every
+// other ml8 cache, so a paged-out/reloaded weight never reads a stale
+// table.
+namespace {
+struct ml8_4_radiance_cache_entry {
+    uint8_t * T        = nullptr;
+    float   * colscale = nullptr;
+    int32_t   N = 0;
+    int32_t   K = 0;
+};
+std::mutex                                                   g_ml8_4_radiance_cache_mu;
+std::unordered_map<const void *, ml8_4_radiance_cache_entry> g_ml8_4_radiance_cache;
+std::atomic<uint64_t>                                        g_ml8_4_radiance_cache_bytes{0};
+std::atomic<uint64_t>                                        g_ml8_4_radiance_cache_count{0};
+} // namespace
+
+// Look up (or build, on first call for this weight) the cached T/colscale
+// pair. `key` is the weight's device pointer, same convention as every
+// other cache in this file. Returns false if the ported prep kernel
+// declines the shape (same contract as rdna4_gemm_ml84_radiance_prep
+// itself) or a device allocation fails -- either way the caller falls
+// through to the existing expand+frozen prefill path.
+static bool ml8_4_radiance_cache_get_or_build(
+    const void * key, const uint8_t * b_packed, const uint8_t * lut, const float * b_scale_g,
+    int32_t N, int32_t K, hipStream_t stream, const uint8_t ** out_T, const float ** out_colscale) {
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_4_radiance_cache_mu);
+        auto it = g_ml8_4_radiance_cache.find(key);
+        if (it != g_ml8_4_radiance_cache.end() && it->second.N == N && it->second.K == K) {
+            *out_T        = it->second.T;
+            *out_colscale = it->second.colscale;
+            return true;
+        }
+    }
+    if (N <= 0 || K <= 0 || K % QK_ML8 != 0 || N % 16 != 0) {
+        return false;
+    }
+    const size_t n_groups_k     = (size_t) K / (size_t) QK_ML8;
+    const size_t t_bytes        = n_groups_k * (size_t) N * 16;
+    const size_t colscale_bytes = (size_t) N * sizeof(float);
+
+    uint8_t * d_T        = nullptr;
+    float   * d_colscale = nullptr;
+    if (cudaMalloc(&d_T, t_bytes) != cudaSuccess) {
+        return false;
+    }
+    if (cudaMalloc((void **) &d_colscale, colscale_bytes) != cudaSuccess) {
+        cudaFree(d_T);
+        return false;
+    }
+    const bool prep_ok = rdna4_gemm_ml84_radiance_prep(b_packed, lut, b_scale_g, N, K, d_T, d_colscale, stream);
+    if (!prep_ok) {
+        cudaFree(d_T);
+        cudaFree(d_colscale);
+        return false;
+    }
+    const hipError_t prep_rc = cudaGetLastError();
+    GGML_ASSERT(prep_rc == hipSuccess && "rdna4_gemm_ml84_radiance_prep (cache build) dispatch failed");
+
+    std::lock_guard<std::mutex> lock(g_ml8_4_radiance_cache_mu);
+    auto it = g_ml8_4_radiance_cache.find(key);
+    if (it != g_ml8_4_radiance_cache.end()) {
+        // Raced with another thread building the same weight's table.
+        // Free ours, keep theirs (weights don't change shape at runtime,
+        // so N/K matching is just defensive).
+        cudaFree(d_T);
+        cudaFree(d_colscale);
+        *out_T        = it->second.T;
+        *out_colscale = it->second.colscale;
+        return it->second.N == N && it->second.K == K;
+    }
+    ml8_4_radiance_cache_entry entry;
+    entry.T = d_T; entry.colscale = d_colscale; entry.N = N; entry.K = K;
+    g_ml8_4_radiance_cache.emplace(key, entry);
+
+    const uint64_t total_bytes = g_ml8_4_radiance_cache_bytes.fetch_add(
+        t_bytes + colscale_bytes, std::memory_order_relaxed) + t_bytes + colscale_bytes;
+    const uint64_t n_weights = g_ml8_4_radiance_cache_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    // GGML_LOG_INFO is dropped by llama-server's logging config, so use
+    // fprintf directly -- this is the only way the cached table's VRAM
+    // cost is visible outside a profiler. Fires once per newly-cached
+    // weight (not per call -- repeat lookups above return early).
+    fprintf(stderr, "ml8-4 radiance T cache: %llu bytes for %llu weights\n",
+            (unsigned long long) total_bytes, (unsigned long long) n_weights);
+
+    *out_T        = d_T;
+    *out_colscale = d_colscale;
+    return true;
+}
+
+static void ml8_4_radiance_cache_clear_all(void) {
+    std::lock_guard<std::mutex> lock(g_ml8_4_radiance_cache_mu);
+    for (auto & kv : g_ml8_4_radiance_cache) {
+        cudaFree(kv.second.T);
+        cudaFree(kv.second.colscale);
+    }
+    g_ml8_4_radiance_cache.clear();
+    g_ml8_4_radiance_cache_bytes.store(0, std::memory_order_relaxed);
+    g_ml8_4_radiance_cache_count.store(0, std::memory_order_relaxed);
+}
+
 // Forward decl: ml8_expand_cache_clear_all() is defined much later in this
 // file (it needs ml8_expand_cache_entry, declared alongside the ML8_4
 // prefill expander below) but must be invoked from
@@ -486,6 +662,7 @@ void ggml_cuda_ml8_clear_cache(void) {
         }
         g_ml8_fp8_triton_view.clear();
     }
+    ml8_4_radiance_cache_clear_all();
 #ifdef GGML_HIP_AITER
     // Weight paging / buffer reload: a cached expand-cache entry's w_data key
     // could otherwise alias a freshly-loaded weight at the same address.
@@ -1871,6 +2048,36 @@ static bool ml8_trfeed_f32out_disabled() {
         return e != nullptr && std::strcmp(e, "0") == 0;
     }();
     return off;
+}
+
+// MT_ML8_4_GEMM_LOG=1: log once per distinct (M, N, K, path) which ML8_4
+// RDNA4_TRFEED GEMM path was taken and its split count, to stderr -- lets
+// engagement of the env-gated dispatch branches below (MT_ML8_4_PREFILL_FUSED,
+// MT_ML8_4_DECODE_V2) be verified from the router journal (e.g. grepped out
+// of a captured stderr log) without instrumenting the caller.
+static bool ml8_gemm_log_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("MT_ML8_4_GEMM_LOG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+static void ml8_gemm_log_once(const char * path, int64_t M, int32_t N, int32_t K, int splits) {
+    if (!ml8_gemm_log_enabled()) {
+        return;
+    }
+    static std::mutex mu;
+    static std::unordered_map<std::string, bool> seen;
+    char key_buf[160];
+    std::snprintf(key_buf, sizeof(key_buf), "%s|%lld|%d|%d", path, (long long) M, N, K);
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = seen.find(key_buf);
+    if (it == seen.end()) {
+        seen.emplace(key_buf, true);
+        fprintf(stderr, "[ml8-4][gemm-log] path=%s M=%lld N=%d K=%d splits=%d\n",
+                path, (long long) M, N, K, splits);
+    }
 }
 
 // One block per row M. Each block:
@@ -3351,6 +3558,41 @@ static void ml8_mul_mat_core(
             }();
             const int n_splits = splits_override > 0 ? splits_override
                                                       : rdna4_ml84_trfeed_splitk_default_splits(N, K);
+
+            // MT_ML8_4_DECODE_V2=1 (default 0): try the v2 split-K launcher
+            // first. Its contract (see the declaration/stub near the top of
+            // this file): it owns its own scratch and writes exactly M rows
+            // of N directly into dst with the same layout/dtype as this
+            // function's own final dst (fp32, dst->data-shaped, row-major
+            // stride N) -- so unlike the path below, NO hipMemsetAsync and
+            // NO M!=M_pad D2D copy-out here; dst->data is passed straight
+            // through. Returns false ("not handled") when unavailable
+            // (header not yet present -- see ML8_4_DECODE_V2_AVAILABLE) or
+            // when it declines a shape/config at runtime; either way we fall
+            // through to the existing production split-K path unchanged.
+            static const bool decode_v2_enabled = [] {
+                const char * e = std::getenv("MT_ML8_4_DECODE_V2");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            if (decode_v2_enabled) {
+                // Argument order per gemm_ml84_decode_v2.h: real M leads,
+                // then the decode-splitk call site's own args verbatim.
+                const bool v2_ok = rdna4_gemm_ml84_decode_v2(
+                    (int) M, a_fp8_ptr, (const uint8_t *) repack->b_packed, cent_data,
+                    (float *) dst->data, a_scale_ptr, (const float *) repack->b_scale,
+                    M_pad, N, K, n_splits, stream);
+                if (v2_ok) {
+                    // A `true` return means a kernel WAS launched (v2 has no
+                    // hipError_t return of its own) -- check for an async
+                    // launch/execution error same as every other launcher here.
+                    const hipError_t rc_v2 = cudaGetLastError();
+                    GGML_ASSERT(rc_v2 == hipSuccess && "rdna4_gemm_ml84_decode_v2 dispatch failed");
+                    ml8_gemm_log_once("decode-v2", M, N, K, n_splits);
+                    return;
+                }
+                // fall through to the existing split-K path below
+            }
+
             ggml_cuda_pool_alloc<float> c_pad(ctx.pool());
             float * c_ptr;
             if (M == M_pad) {
@@ -3368,7 +3610,148 @@ static void ml8_mul_mat_core(
                 CUDA_CHECK(cudaMemcpyAsync((float *) dst->data, c_ptr, (size_t) M * (size_t) N * sizeof(float),
                                            cudaMemcpyDeviceToDevice, stream));
             }
+            ml8_gemm_log_once("decode-splitk", M, N, K, n_splits);
             return;
+        }
+
+        // MT_ML8_4_PREFILL_FUSED=1 (default 0): skip the expand+colmax pass
+        // entirely (measured 14% of GEMM time -- 30us colmax + 216us expand
+        // vs 1509us for the frozen fp8 GEMM at 16k prefill/Qwen3.8-27B
+        // ml8-4) and dispatch straight to rdna4_gemm_ml84_trfeed_prefill
+        // (gemm_ml84_prod.hip), the in-kernel-LUT-expand kernel that reuses
+        // gemm_ml84_trfeed_splitk<128,2,false> at the frozen prefill tile
+        // geometry -- see gemm_capi.h's declaration comment and
+        // bench/gemm_ml84_bench.hip's bench_prefill_experiment (the only
+        // existing call site, mirrored here) for its contract:
+        //   A: fp8 e4m3 [M_pad, K] row-major (== a_fp8_ptr, same buffer the
+        //      frozen path feeds); a_scale: fp32[M_pad] (== a_scale_ptr).
+        //   B_nib/lut: the RAW ML8_4 repack (repack->b_packed, cent_data) --
+        //      NOT the expander's B_shuf, since this kernel dequantizes
+        //      in-loop instead of consuming a pre-expanded fp8 B.
+        //   b_scale_g: the RAW per-(64-K-group,column) scale array
+        //      (repack->b_scale) -- NOT the expander's derived per-column
+        //      b_scale_out; this is the same repack->b_scale the decode-
+        //      splitk call above and the expander call below both read, so
+        //      no separate scale buffer is needed on this branch.
+        //   C_f32: fp32 [M_pad, N] row-major; the launcher itself only takes
+        //      M_pad (no separate real-M param, unlike rdna4_gemm_fp8_trfeed_f32
+        //      below) so M!=M_pad is handled the same way as the decode
+        //      path above: scratch-alloc + D2D copy-out of the real M rows.
+        //   Preconditions (asserted inside the launcher, returns
+        //      hipErrorInvalidValue otherwise): M_pad % 128 == 0, N % BN
+        //      (==128 here, already asserted above) == 0, K % QK_ML8 (64)
+        //      == 0.
+        // Only wired for fp32 dst -- the fused kernel has no bf16 epilogue
+        // variant (it is a single f32-output launcher, no rdna4_gemm_ml84_
+        // trfeed_prefill_bf16 exists), so a BF16 dst (LLAMA_ACT_BF16) falls
+        // through to the existing expand+frozen path below, which does have
+        // a bf16 epilogue.
+        // NUMERICS: this kernel does NOT re-quantize the dequantized weight
+        // to fp8 (unlike the frozen path's expand step, which re-encodes
+        // each LUT-dequantized weight into an e4m3 byte against a per-
+        // column absmax/448 scale before the frozen GEMM). It keeps the
+        // per-64-K-group scale (b_scale_g) applied in fp32 in-loop
+        // (ml84_trfeed_group_body/gemm_ml84_trfeed_splitk in
+        // trfeed_ml84_kernels.h: `acc[mi][ni] += scale * acc_g[mi][ni]`,
+        // scale read straight from b_scale_g per group) and only applies
+        // a_scale once in the epilogue (`a_scale[gr] * ws[t]`) -- so it is
+        // NOT expected to be bit-exact against the frozen path (which goes
+        // through an extra fp8 round-trip on the weight); it should if
+        // anything be marginally MORE accurate. Flagged for the task
+        // report, not asserted as a correctness risk.
+        static const bool prefill_fused_enabled = [] {
+            const char * e = std::getenv("MT_ML8_4_PREFILL_FUSED");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        if (prefill_fused_enabled && dst->type == GGML_TYPE_F32) {
+            ggml_cuda_pool_alloc<float> c_pad_prefill(ctx.pool());
+            float * c_ptr_prefill;
+            if (M == M_pad) {
+                c_ptr_prefill = (float *) dst->data;
+            } else {
+                c_pad_prefill.alloc((size_t) M_pad * (size_t) N);
+                c_ptr_prefill = c_pad_prefill.get();
+            }
+            const hipError_t rc_fused = rdna4_gemm_ml84_trfeed_prefill(
+                a_fp8_ptr, (const uint8_t *) repack->b_packed, cent_data,
+                c_ptr_prefill, a_scale_ptr, (const float *) repack->b_scale,
+                M_pad, N, K, stream);
+            GGML_ASSERT(rc_fused == hipSuccess && "rdna4_gemm_ml84_trfeed_prefill dispatch failed");
+            if (c_ptr_prefill != (float *) dst->data) {
+                CUDA_CHECK(cudaMemcpyAsync((float *) dst->data, c_ptr_prefill, (size_t) M * (size_t) N * sizeof(float),
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+            ml8_gemm_log_once("prefill-fused", M, N, K, 1);
+            return;
+        }
+
+        // MT_ML8_4_PREFILL_RADIANCE (default 0): route prefill through the
+        // ported radiance GEMM (gemm_ml84_radiance.h -- bench-verified
+        // bit-identical to the expand+gemm_fp8_trfeed path below, max rel
+        // diff 1.5e-7, 1.4-2.0x faster end-to-end) instead of
+        // expand+gemm_fp8_trfeed. 1 = build the per-(group,column) T table
+        // and colscale from pool scratch on every call; 2 = build them once
+        // per weight and cache (ml8_4_radiance_cache_get_or_build above),
+        // amortizing the prep kernel across calls. Only wired for fp32 dst
+        // -- like MT_ML8_4_PREFILL_FUSED above, the ported GEMM has no bf16
+        // epilogue, so a BF16 dst (LLAMA_ACT_BF16) falls through to the
+        // existing expand+frozen path, which does. Deliberately independent
+        // of MT_ML8_4_EXPAND_CACHE: this path never reads that cache's
+        // expanded-fp8 B_shuf (it dequantizes B on the fly via T/colscale,
+        // same as the raw repack the frozen path's own expander reads from).
+        // Any decline (prep/retile/gemm returning false -- wrong shape) or
+        // an allocation failure falls straight through to that same
+        // existing path, unchanged.
+        static const int prefill_radiance_mode = [] {
+            const char * e = std::getenv("MT_ML8_4_PREFILL_RADIANCE");
+            return e ? std::atoi(e) : 0;
+        }();
+        if (prefill_radiance_mode != 0 && dst->type == GGML_TYPE_F32) {
+            const uint8_t * radiance_T        = nullptr;
+            const float   * radiance_colscale = nullptr;
+            ggml_cuda_pool_alloc<uint8_t> radiance_T_scratch(ctx.pool());
+            ggml_cuda_pool_alloc<float>   radiance_colscale_scratch(ctx.pool());
+            bool radiance_table_ready = false;
+
+            if (prefill_radiance_mode == 2) {
+                radiance_table_ready = ml8_4_radiance_cache_get_or_build(
+                    w->data, (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
+                    N, K, stream, &radiance_T, &radiance_colscale);
+            } else {
+                const size_t n_groups_k = (size_t) K / (size_t) QK_ML8;
+                radiance_T_scratch.alloc(n_groups_k * (size_t) N * 16);
+                radiance_colscale_scratch.alloc((size_t) N);
+                radiance_table_ready = rdna4_gemm_ml84_radiance_prep(
+                    (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
+                    N, K, radiance_T_scratch.get(), radiance_colscale_scratch.get(), stream);
+                if (radiance_table_ready) {
+                    const hipError_t prep_rc = cudaGetLastError();
+                    GGML_ASSERT(prep_rc == hipSuccess && "rdna4_gemm_ml84_radiance_prep dispatch failed");
+                    radiance_T        = radiance_T_scratch.get();
+                    radiance_colscale = radiance_colscale_scratch.get();
+                }
+            }
+
+            if (radiance_table_ready) {
+                const size_t m_pad16 = ((size_t) M + 15) / 16 * 16;
+                ggml_cuda_pool_alloc<uint8_t> a_tiled(ctx.pool(), m_pad16 * (size_t) K);
+                const bool retile_ok = rdna4_gemm_ml84_radiance_retile_a(
+                    (int) M, (int) K, a_fp8_ptr, a_tiled.get(), stream);
+                if (retile_ok) {
+                    const hipError_t retile_rc = cudaGetLastError();
+                    GGML_ASSERT(retile_rc == hipSuccess && "rdna4_gemm_ml84_radiance_retile_a dispatch failed");
+                    const bool gemm_ok = rdna4_gemm_ml84_radiance(
+                        (int) M, a_tiled.get(), a_scale_ptr, (const uint8_t *) repack->b_packed,
+                        radiance_T, radiance_colscale, (float *) dst->data, N, K, stream);
+                    if (gemm_ok) {
+                        const hipError_t gemm_rc = cudaGetLastError();
+                        GGML_ASSERT(gemm_rc == hipSuccess && "rdna4_gemm_ml84_radiance dispatch failed");
+                        ml8_gemm_log_once("prefill-radiance", M, N, K, 0);
+                        return;
+                    }
+                }
+            }
+            // fall through to the existing expand+frozen path below
         }
 
         // Prefill: re-expand the 4.5bpw ML8_4 weight into the frozen fp8
@@ -3433,6 +3816,7 @@ static void ml8_mul_mat_core(
                 (const uint8_t *) a_fp8_ptr, b_shuf_ptr, dst->data, a_scale_ptr, b_scale_out_ptr,
                 M_pad, M, N, K, stream);
             GGML_ASSERT(gemm_rc_trfeed == hipSuccess && "rdna4_gemm_fp8_trfeed_bf16 dispatch failed");
+            ml8_gemm_log_once("frozen-expand-bf16", M, N, K, 1);
             if (pf != nullptr) {
                 ml8_expand_prefetch_src cur;
                 cur.w = w; cur.cent_data = cent_data; cur.repack = repack; cur.N = N; cur.K = K;
@@ -3463,6 +3847,7 @@ static void ml8_mul_mat_core(
             GGML_ASSERT(bf16_to_fp32_trfeed != nullptr);
             bf16_to_fp32_trfeed(c_bf16_trfeed.get(), (float *) dst->data, (size_t) M * (size_t) N, stream);
         }
+        ml8_gemm_log_once("frozen-expand", M, N, K, 1);
         if (pf != nullptr) {
             ml8_expand_prefetch_src cur;
             cur.w = w; cur.cent_data = cent_data; cur.repack = repack; cur.N = N; cur.K = K;

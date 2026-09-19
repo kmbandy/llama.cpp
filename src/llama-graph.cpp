@@ -581,6 +581,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         // cache's static n_seq_max width). See the declaration comment on
         // update_paged_attn_n_seqs_active() (llama-graph.h) for why.
         update_paged_attn_n_seqs_active(ubatch->n_seqs_unq);
+        update_paged_attn_q_lens((uint32_t) ubatch->n_tokens);
         ggml_backend_tensor_set(paged_slot_mapping, slots.data(), 0,
                                 sizeof(int32_t) * slots.size());
         ggml_backend_tensor_set(paged_context_lens, paged_parent->h_context_lens_data(), 0,
@@ -673,6 +674,72 @@ void llm_graph_input_attn_kv::update_paged_attn_n_seqs_active(uint32_t n_seqs_ac
     const uint32_t n_seqs_active_clamped = n_seqs_active > n_seq_max ? n_seq_max : n_seqs_active;
     for (ggml_tensor * op : paged_attn_ops) {
         ggml_backend_meta_buffer_set_op_param_i32(op, 6, (int32_t) n_seqs_active_clamped);
+    }
+}
+
+void llm_graph_input_attn_kv::update_paged_attn_q_lens(uint32_t n_tokens_total) {
+    // See the declaration comment in llama-graph.h for the full contract. Computed straight from
+    // the host-side q_lens mirror the paged cache already maintains (h_q_lens_data()) — the same
+    // source paged_max_ctx_len() reads above — so this needs no device readback, and is pushed
+    // through ggml_backend_meta_buffer_set_op_param_i32() so it reaches every per-device meta
+    // clone already materialized under tensor-split-attn, exactly like op_params[5]/[6].
+    GGML_ASSERT(mctx_paged != nullptr);
+    const auto * paged_parent = mctx_paged->parent();
+    const size_t     n_seqs = paged_parent->h_q_lens_size();
+    const int32_t * q_lens = paged_parent->h_q_lens_data();
+
+    int32_t uniform_q_len = 0;
+    bool    uniform       = true;
+    bool    all_decode    = true;
+    bool    have_active   = false;
+    for (size_t s = 0; s < n_seqs; ++s) {
+        const int32_t ql = q_lens[s];
+        if (ql <= 0) {
+            continue; // slot not live this call
+        }
+        have_active = true;
+        if (ql != 1) {
+            all_decode = false;
+        }
+        if (uniform_q_len == 0) {
+            uniform_q_len = ql;
+        } else if (ql != uniform_q_len) {
+            uniform = false;
+        }
+    }
+    uniform = uniform && have_active;
+
+    // n_seq_max <= 8: op_params[8..15] has room for one int32 per slot. Above that there's
+    // nowhere to put them — flag it (bit2) and leave [8..15] at 0 so a stale/partial read can't
+    // be mistaken for real per-seq values.
+    const bool too_many_slots = n_seqs > 8;
+
+    int32_t flags = 0;
+    if (uniform) {
+        flags |= 1; // bit0: q_lens uniform across active seqs (op_params[4] is meaningful)
+    }
+    if (have_active && all_decode) {
+        flags |= 2; // bit1: pure decode (every active seq has q_len==1)
+    }
+    if (too_many_slots) {
+        flags |= 4; // bit2: n_seq_max > 8, op_params[8..15] not populated
+    }
+
+    // op_params[4]'s value semantics stay exactly what build_attn's graph-build-time assignment
+    // already set (equal_seqs() ? n_seq_tokens : n_tokens, llama-graph.cpp ~3565): the shared
+    // q_len when uniform, else the ubatch's total token count — an always-safe, always-oversized
+    // upper bound. This is deliberately NOT 0 in the non-uniform case, so ggml-cuda/
+    // mt_pagedattn.cu's tile/decode gates (which read op_params[4] purely as that upper bound,
+    // never as a uniformity signal) see no behavior change. op_params[7] bit0 is the ONLY
+    // uniformity signal a consumer (ggml-cuda/mt_pagedattn_r4d.cu) should branch on.
+    const int32_t q_len_param = uniform ? uniform_q_len : (int32_t) n_tokens_total;
+    for (ggml_tensor * op : paged_attn_ops) {
+        ggml_backend_meta_buffer_set_op_param_i32(op, 4, q_len_param);
+        ggml_backend_meta_buffer_set_op_param_i32(op, 7, flags);
+        for (size_t s = 0; s < 8; ++s) {
+            const int32_t v = (!too_many_slots && s < n_seqs) ? q_lens[s] : 0;
+            ggml_backend_meta_buffer_set_op_param_i32(op, 8 + (int) s, v);
+        }
     }
 }
 
@@ -1306,6 +1373,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ok && "paged hybrid set_input: compute_slot_mapping failed");
 
         inp_attn->update_paged_attn_max_ctx_len();
+        inp_attn->update_paged_attn_q_lens((uint32_t) ubatch->n_tokens);
         ggml_backend_tensor_set(inp_attn->paged_slot_mapping, slots.data(), 0,
                                 sizeof(int32_t) * slots.size());
         ggml_backend_tensor_set(inp_attn->paged_context_lens, paged_parent->h_context_lens_data(), 0,

@@ -20,8 +20,482 @@
 #include <cstring>
 #include <chrono>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
+
+// mad-lab: MAD_META_GPUTIME
+//
+// Per-device wall-time attribution for the meta-backend's tensor-parallel
+// step loop: for every ggml_backend_graph_compute_async() a device runs, and
+// every AllReduce phase (pack/xfer/unpack) it enqueues, record a (beg,end)
+// event pair on the SAME stream the work was just enqueued on. Nothing
+// synchronizes during serving -- events are pooled per device and grown in
+// chunks; readout (cudaEventSynchronize + cudaEventElapsedTime against a
+// per-device epoch event) happens once, at atexit (mirrors
+// mt_pagedattn.cu's MAD_PAGEDATTN_GPUTIME probe: RAII-free here since spans
+// cross a proc-address call boundary, but the same "record on the op's
+// stream, resolve at exit" contract).
+//
+// Why per-device and not just per-op: on a two-GPU TP prefill (rocprofv3
+// kernel-trace disables the AR p2p pipeline entirely -- ar_pipeline_init
+// never fires under trace -- so no vendor profiler can see this
+// configuration), the question is where EACH device's wall time goes:
+// compute-stream busy, AllReduce-stream busy, or idle waiting on the other
+// device / the host. See ggml-backend-meta.cpp's compute()/begin_reduce()/
+// end_reduce() for the COMPUTE and HOSTWAIT call sites (reached through the
+// "mad_meta_gputime_mark" proc-address -- that TU is backend-agnostic and
+// cannot include this header) and this file's
+// ggml_cuda_ar_allreduce_begin()/_end() for the AR_PACK/AR_XFER/AR_UNPACK
+// call sites (direct calls -- already the same translation unit).
+namespace mad_meta_gputime {
+
+// Kinds -- MUST stay numerically in sync with the mirror enum in
+// ggml-backend-meta.cpp (mad_meta_gputime_kind_mirror) and the doc comment
+// on mad_meta_gputime_mark() in allreduce.cuh.
+enum Kind {
+    KIND_COMPUTE  = 0,
+    KIND_AR_PACK  = 1,
+    KIND_AR_XFER  = 2,
+    KIND_AR_UNPACK = 3,
+    KIND_HOSTWAIT = 4,
+};
+
+constexpr int    MAX_DEVICES  = GGML_CUDA_MAX_DEVICES;
+constexpr size_t POOL_CHUNK   = 4096;     // events allocated per growth chunk, per device
+constexpr size_t MAX_ROWS     = 1 << 20;  // 1,048,576 spans; further spans are dropped and counted
+
+struct DeviceState {
+    bool                     inited       = false;
+    cudaEvent_t              base_event   = nullptr; // epoch marker, recorded once on stream 0
+    int64_t                  base_host_us = 0;       // host steady_clock time at the epoch
+    std::vector<cudaEvent_t> free_events;             // pool of events not currently in use
+    size_t                   n_created    = 0;
+};
+
+// One row per (begin,end) span. `device == -1` rows are host-only (HOSTWAIT)
+// and never touch a cudaEvent; their t_*_ms are derived straight from
+// host_us_beg/host_us_end relative to the global epoch at report() time.
+struct Row {
+    int         device      = -1;
+    int         kind        = 0;
+    long long   slot        = -1;
+    long long   subgraph    = -1;
+    long long   step        = -1;
+    cudaEvent_t ev_beg       = nullptr;
+    cudaEvent_t ev_end       = nullptr;
+    int64_t     host_us_beg = 0;
+    int64_t     host_us_end = 0;
+    double      t_beg_ms    = -1.0; // resolved at report() time
+    double      t_end_ms    = -1.0;
+};
+
+struct State {
+    std::mutex            mu;
+    DeviceState            devs[MAX_DEVICES];
+    std::vector<Row>       rows;
+    std::atomic<uint64_t>  dropped{0};
+    bool                   atexit_armed = false;
+    std::string            dump_path;
+};
+
+static State & state() {
+    static State s;
+    return s;
+}
+
+static bool enabled() {
+    static const bool on = []() {
+        const char * e = std::getenv("MAD_META_GPUTIME");
+        return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
+static int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static const char * kind_name(int kind) {
+    switch (kind) {
+        case KIND_COMPUTE:   return "COMPUTE";
+        case KIND_AR_PACK:   return "AR_PACK";
+        case KIND_AR_XFER:   return "AR_XFER";
+        case KIND_AR_UNPACK: return "AR_UNPACK";
+        case KIND_HOSTWAIT:  return "HOSTWAIT";
+        default:             return "UNKNOWN";
+    }
+}
+
+// Must be called with state().mu held and `dev` already cudaSetDevice()'d.
+static void ensure_device_inited_locked(int dev) {
+    if (dev < 0 || dev >= MAX_DEVICES) {
+        return;
+    }
+    DeviceState & d = state().devs[dev];
+    if (d.inited) {
+        return;
+    }
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreate(&ev) != cudaSuccess) {
+        return;
+    }
+    // Stream 0 (the device's null/default stream): only used to anchor an
+    // epoch on this device's timeline, never to bracket real work, so it
+    // does not need to be the compute or AR stream.
+    if (cudaEventRecord(ev, 0) != cudaSuccess) {
+        cudaEventDestroy(ev);
+        return;
+    }
+    d.base_event   = ev;
+    d.base_host_us = now_us();
+    d.inited       = true;
+}
+
+// Must be called with state().mu held and `dev` already cudaSetDevice()'d
+// (cudaEventCreate binds to whatever device is current). A row's events are
+// only ever returned to a device's free list at report()
+// time (the whole point is "never synchronize during serving", so nothing
+// recycles an event early), which means acquisitions during a run always
+// drain the free list and refill it from a fresh POOL_CHUNK-sized batch
+// here -- amortizing cudaEventCreate to once per POOL_CHUNK acquisitions
+// per device instead of once per call, so it is off the hot path after the
+// first chunk's worth of warm-up.
+static cudaEvent_t acquire_event_locked(int dev) {
+    DeviceState & d = state().devs[dev];
+    if (d.free_events.empty()) {
+        d.free_events.reserve(POOL_CHUNK);
+        for (size_t i = 0; i < POOL_CHUNK; i++) {
+            cudaEvent_t ev = nullptr;
+            if (cudaEventCreate(&ev) != cudaSuccess) {
+                break; // exhausted -- return what we managed to make, if anything
+            }
+            d.free_events.push_back(ev);
+            d.n_created++;
+        }
+        if (d.free_events.empty()) {
+            return nullptr;
+        }
+    }
+    cudaEvent_t ev = d.free_events.back();
+    d.free_events.pop_back();
+    return ev;
+}
+
+static void report(); // fwd decl, registered with atexit()
+
+// Must be called with state().mu held.
+static void init_atexit_once_locked() {
+    if (state().atexit_armed) {
+        return;
+    }
+    state().atexit_armed = true;
+    const char * p = std::getenv("MAD_META_GPUTIME_DUMP");
+    state().dump_path = p != nullptr ? p : "";
+    state().rows.reserve(65536);
+    std::atexit([]() { mad_meta_gputime::report(); });
+}
+
+// Records the begin or end half of a span. `backend` non-null => GPU-timed
+// (device + stream resolved from it); `backend` null => host-only, tagged
+// with `device_hint` (often -1, "no single device"). Returns a 1-based row
+// id for phase 0 (begin); the caller must pass that id back as `row_id_in`
+// for the matching phase 1 (end) call. Returns 0 (and does nothing) when the
+// probe is disabled, or when the row table is full (the drop is counted).
+uint64_t mark(ggml_backend_t backend, long long device_hint, int kind, int phase,
+              long long slot, long long subgraph, long long step, uint64_t row_id_in) {
+    if (!enabled()) {
+        return 0;
+    }
+
+    int          dev    = -1;
+    cudaStream_t stream = nullptr;
+    if (backend != nullptr) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+        dev    = cuda_ctx->device;
+        stream = cuda_ctx->stream();
+    } else {
+        dev = (int) device_hint;
+    }
+    const int64_t t = now_us();
+
+    std::lock_guard<std::mutex> lock(state().mu);
+    init_atexit_once_locked();
+
+    if (phase == 0) {
+        if (state().rows.size() >= MAX_ROWS) {
+            state().dropped.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        Row r;
+        r.device      = dev;
+        r.kind        = kind;
+        r.slot        = slot;
+        r.subgraph    = subgraph;
+        r.step        = step;
+        r.host_us_beg = t;
+        if (dev >= 0 && dev < MAX_DEVICES && stream != nullptr) {
+            int prev_dev = 0;
+            cudaGetDevice(&prev_dev);
+            ggml_cuda_set_device(dev);
+            ensure_device_inited_locked(dev);
+            cudaEvent_t ev = acquire_event_locked(dev);
+            if (ev != nullptr) {
+                if (cudaEventRecord(ev, stream) == cudaSuccess) {
+                    r.ev_beg = ev;
+                } else {
+                    cudaEventDestroy(ev);
+                }
+            }
+            cudaSetDevice(prev_dev);
+        }
+        state().rows.push_back(r);
+        return state().rows.size(); // 1-based
+    }
+
+    // phase == 1 (end)
+    if (row_id_in == 0 || row_id_in > state().rows.size()) {
+        return 0; // begin() was disabled/dropped, or a stray call -- nothing to close
+    }
+    Row & r = state().rows[row_id_in - 1];
+    r.host_us_end = t;
+    if (dev >= 0 && dev < MAX_DEVICES && stream != nullptr) {
+        int prev_dev = 0;
+        cudaGetDevice(&prev_dev);
+        ggml_cuda_set_device(dev);
+        cudaEvent_t ev = acquire_event_locked(dev);
+        if (ev != nullptr) {
+            if (cudaEventRecord(ev, stream) == cudaSuccess) {
+                r.ev_end = ev;
+            } else {
+                cudaEventDestroy(ev);
+            }
+        }
+        cudaSetDevice(prev_dev);
+    }
+    return 0;
+}
+
+// Convenience for this TU's own call sites (AR_PACK/AR_XFER/AR_UNPACK),
+// which always have `backend` in hand and never need the cross-TU
+// proc-address indirection.
+static inline uint64_t mark_begin(ggml_backend_t backend, int kind, long long slot, long long subgraph, long long step) {
+    return mark(backend, -1, kind, /*phase=*/0, slot, subgraph, step, 0);
+}
+static inline void mark_end(ggml_backend_t backend, uint64_t row_id) {
+    mark(backend, -1, /*kind unused on end*/ 0, /*phase=*/1, -1, -1, -1, row_id);
+}
+
+// Union of [beg,end) ms intervals -- sorts a copy, merges overlaps, returns
+// total covered ms. Intervals with unresolved timestamps (t_beg_ms < 0 or
+// t_end_ms < 0) are skipped.
+static double union_busy_ms(std::vector<std::pair<double, double>> ivs) {
+    if (ivs.empty()) {
+        return 0.0;
+    }
+    std::sort(ivs.begin(), ivs.end());
+    double total = 0.0;
+    double cur_beg = ivs[0].first;
+    double cur_end = ivs[0].second;
+    for (size_t i = 1; i < ivs.size(); i++) {
+        if (ivs[i].first <= cur_end) {
+            cur_end = std::max(cur_end, ivs[i].second);
+        } else {
+            total += cur_end - cur_beg;
+            cur_beg = ivs[i].first;
+            cur_end = ivs[i].second;
+        }
+    }
+    total += cur_end - cur_beg;
+    return total;
+}
+
+// Longest run of intervals (from `ivs`, already known-good/resolved) where
+// consecutive gaps stay under `gap_ms` -- the "prefill burst" heuristic.
+// Returns the [beg,end] ms bounds of that run, or {-1,-1} if `ivs` is empty.
+static std::pair<double, double> longest_burst(std::vector<std::pair<double, double>> ivs, double gap_ms) {
+    if (ivs.empty()) {
+        return {-1.0, -1.0};
+    }
+    std::sort(ivs.begin(), ivs.end());
+    double best_beg = ivs[0].first, best_end = ivs[0].second, best_len = best_end - best_beg;
+    double cur_beg  = ivs[0].first, cur_end  = ivs[0].second;
+    for (size_t i = 1; i < ivs.size(); i++) {
+        if (ivs[i].first - cur_end < gap_ms) {
+            cur_end = std::max(cur_end, ivs[i].second);
+        } else {
+            cur_beg = ivs[i].first;
+            cur_end = ivs[i].second;
+        }
+        if (cur_end - cur_beg > best_len) {
+            best_len = cur_end - cur_beg;
+            best_beg = cur_beg;
+            best_end = cur_end;
+        }
+    }
+    return {best_beg, best_end};
+}
+
+static void report() {
+    std::lock_guard<std::mutex> lock(state().mu);
+    State & s = state();
+    if (s.rows.empty()) {
+        return;
+    }
+
+    // Resolve every GPU-timed row's t_*_ms against its device's epoch.
+    // Already-completed (long since retired) events resolve immediately;
+    // this is the one place the probe synchronizes, and only once, at exit.
+    int prev_dev = 0;
+    cudaGetDevice(&prev_dev);
+    for (Row & r : s.rows) {
+        if (r.device < 0 || r.device >= MAX_DEVICES || !s.devs[r.device].inited) {
+            continue; // host-only row -- resolved below via host_us_*
+        }
+        ggml_cuda_set_device(r.device);
+        cudaEvent_t base = s.devs[r.device].base_event;
+        if (r.ev_beg != nullptr) {
+            if (cudaEventSynchronize(r.ev_beg) == cudaSuccess) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, base, r.ev_beg) == cudaSuccess) {
+                    r.t_beg_ms = (double) ms;
+                }
+            } else {
+                cudaGetLastError();
+            }
+        }
+        if (r.ev_end != nullptr) {
+            if (cudaEventSynchronize(r.ev_end) == cudaSuccess) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, base, r.ev_end) == cudaSuccess) {
+                    r.t_end_ms = (double) ms;
+                }
+            } else {
+                cudaGetLastError();
+            }
+        }
+    }
+    cudaSetDevice(prev_dev);
+
+    // Global epoch (ms==0 reference for host-only rows): the earliest
+    // per-device base_host_us, so host rows land on the same timeline as GPU
+    // rows without needing their own device.
+    int64_t global_epoch_us = -1;
+    for (int d = 0; d < MAX_DEVICES; d++) {
+        if (s.devs[d].inited && (global_epoch_us < 0 || s.devs[d].base_host_us < global_epoch_us)) {
+            global_epoch_us = s.devs[d].base_host_us;
+        }
+    }
+    if (global_epoch_us < 0) {
+        // No GPU-timed row ever landed (host-only run, e.g. a single-device
+        // world with no AllReduce) -- anchor on the first row's own host time.
+        global_epoch_us = s.rows.empty() ? 0 : s.rows[0].host_us_beg;
+    }
+    for (Row & r : s.rows) {
+        if (r.device < 0) {
+            r.t_beg_ms = (double) (r.host_us_beg - global_epoch_us) / 1000.0;
+            r.t_end_ms = r.host_us_end > 0 ? (double) (r.host_us_end - global_epoch_us) / 1000.0 : r.t_beg_ms;
+        }
+    }
+
+    // CSV dump (optional).
+    if (!s.dump_path.empty()) {
+        FILE * f = std::fopen(s.dump_path.c_str(), "w");
+        if (f != nullptr) {
+            std::fprintf(f, "device,kind,slot,subgraph,step,t_beg_ms,t_end_ms\n");
+            for (const Row & r : s.rows) {
+                std::fprintf(f, "%d,%s,%lld,%lld,%lld,%.3f,%.3f\n",
+                             r.device, kind_name(r.kind), r.slot, r.subgraph, r.step, r.t_beg_ms, r.t_end_ms);
+            }
+            std::fclose(f);
+        } else {
+            std::fprintf(stderr, "mad-meta-gputime: could not open MAD_META_GPUTIME_DUMP path '%s'\n",
+                         s.dump_path.c_str());
+        }
+    }
+
+    // stderr summary, per device.
+    std::fprintf(stderr, "mad-meta-gputime: %zu records, %llu dropped\n",
+                 s.rows.size(), (unsigned long long) s.dropped.load());
+    for (int d = 0; d < MAX_DEVICES; d++) {
+        if (!s.devs[d].inited) {
+            continue;
+        }
+        std::vector<std::pair<double, double>> compute_iv, ar_iv, all_iv;
+        std::map<long long, double> per_slot_compute_ms;
+        double wall_beg = -1.0, wall_end = -1.0;
+        int    n_rows   = 0;
+        for (const Row & r : s.rows) {
+            if (r.device != d || r.t_beg_ms < 0.0 || r.t_end_ms < 0.0) {
+                continue;
+            }
+            n_rows++;
+            if (wall_beg < 0.0 || r.t_beg_ms < wall_beg) wall_beg = r.t_beg_ms;
+            if (wall_end < 0.0 || r.t_end_ms > wall_end) wall_end = r.t_end_ms;
+            all_iv.emplace_back(r.t_beg_ms, r.t_end_ms);
+            if (r.kind == KIND_COMPUTE) {
+                compute_iv.emplace_back(r.t_beg_ms, r.t_end_ms);
+                per_slot_compute_ms[r.slot] += (r.t_end_ms - r.t_beg_ms);
+            } else if (r.kind == KIND_AR_PACK || r.kind == KIND_AR_XFER || r.kind == KIND_AR_UNPACK) {
+                ar_iv.emplace_back(r.t_beg_ms, r.t_end_ms);
+            }
+        }
+        if (n_rows == 0) {
+            continue;
+        }
+        const double wall         = wall_end - wall_beg;
+        const double compute_busy = union_busy_ms(compute_iv);
+        const double ar_busy      = union_busy_ms(ar_iv);
+        const double union_all    = union_busy_ms(all_iv);
+        const double idle         = wall - union_all;
+        std::fprintf(stderr,
+            "mad-meta-gputime: device %d  wall=%.1fms  compute_busy=%.1fms  ar_busy=%.1fms  "
+            "union_busy=%.1fms  idle=%.1fms (%.1f%%)  records=%d\n",
+            d, wall, compute_busy, ar_busy, union_all, idle, wall > 0.0 ? 100.0 * idle / wall : 0.0, n_rows);
+        for (const auto & kv : per_slot_compute_ms) {
+            std::fprintf(stderr, "mad-meta-gputime:   device %d slot %lld compute_busy=%.1fms\n",
+                         d, kv.first, kv.second);
+        }
+
+        // Longest burst (the prefill): intervals separated by < 200ms are
+        // one burst; report the same summary restricted to it.
+        const auto burst = longest_burst(all_iv, 200.0);
+        if (burst.first >= 0.0) {
+            std::vector<std::pair<double, double>> b_compute, b_ar, b_all;
+            for (const Row & r : s.rows) {
+                if (r.device != d || r.t_beg_ms < burst.first || r.t_end_ms > burst.second) {
+                    continue;
+                }
+                b_all.emplace_back(r.t_beg_ms, r.t_end_ms);
+                if (r.kind == KIND_COMPUTE) {
+                    b_compute.emplace_back(r.t_beg_ms, r.t_end_ms);
+                } else if (r.kind == KIND_AR_PACK || r.kind == KIND_AR_XFER || r.kind == KIND_AR_UNPACK) {
+                    b_ar.emplace_back(r.t_beg_ms, r.t_end_ms);
+                }
+            }
+            const double b_wall    = burst.second - burst.first;
+            const double b_compute_busy = union_busy_ms(b_compute);
+            const double b_ar_busy = union_busy_ms(b_ar);
+            const double b_union   = union_busy_ms(b_all);
+            const double b_idle    = b_wall - b_union;
+            std::fprintf(stderr,
+                "mad-meta-gputime:   device %d BURST[%.1f..%.1f]ms  wall=%.1fms  compute_busy=%.1fms  "
+                "ar_busy=%.1fms  union_busy=%.1fms  idle=%.1fms (%.1f%%)\n",
+                d, burst.first, burst.second, b_wall, b_compute_busy, b_ar_busy, b_union,
+                b_idle, b_wall > 0.0 ? 100.0 * b_idle / b_wall : 0.0);
+        }
+    }
+}
+
+} // namespace mad_meta_gputime
+
+// Exported: see the doc comment on this signature in allreduce.cuh.
+uint64_t mad_meta_gputime_mark(ggml_backend_t backend, long long device_hint, int kind, int phase,
+                                long long slot, long long subgraph, long long step, uint64_t row_id_in) {
+    return mad_meta_gputime::mark(backend, device_hint, kind, phase, slot, subgraph, step, row_id_in);
+}
 
 #if defined(__linux__)
 #include <unistd.h>
@@ -3002,6 +3476,10 @@ bool ggml_cuda_ar_allreduce_begin(
         ggml_cuda_set_device(p->devices[i]);
         cudaStream_t cs   = cuda_ctx[i]->stream();
         char *       send = p->dx_send[i] + slot_off;
+        // mad-lab: MAD_META_GPUTIME -- brackets Phase A (pack) for device i on
+        // its compute stream. No-op unless MAD_META_GPUTIME=1.
+        const uint64_t mgt_pack_row = mad_meta_gputime::mark_begin(
+            backends[i], mad_meta_gputime::KIND_AR_PACK, op->trace_slot, -1, (long long) op_id);
         if (p2p && p->p2p_pull_mode != GGML_CUDA_AR_P2P_PULL_HOST && i == 0 && hp_ok) {
             // Pull modes (1, 2): r0 never stages this slot's send buffer out
             // in Phase B/C below, so there is no same-device "out-stream
@@ -3025,6 +3503,7 @@ bool ggml_cuda_ar_allreduce_begin(
             codec->pack_fn(tensors[i]->data, input_type, send, ne, cs);
         }
         CUDA_CHECK(cudaEventRecord(p->dx_ev[i][h].app, cs));
+        mad_meta_gputime::mark_end(backends[i], mgt_pack_row);
         p->wd_dx_slot_call[i][slot].store(p->dx_call, std::memory_order_relaxed);
         p->wd_dx_phase[i][slot].store(1 /* begun */, std::memory_order_relaxed);
         if (wp_tracing) {
@@ -3058,6 +3537,10 @@ bool ggml_cuda_ar_allreduce_begin(
             continue;
         }
 
+        // mad-lab: MAD_META_GPUTIME -- brackets Phase B (outbound transfer)
+        // for device i on its out-stream.
+        const uint64_t mgt_xfer_out_row = mad_meta_gputime::mark_begin(
+            backends[i], mad_meta_gputime::KIND_AR_XFER, op->trace_slot, -1, (long long) op_id);
         ggml_cuda_ar_wait_logged(out, ev.app, "out<-app(own,this op)", op_id, p->devices[i]);
         if (p2p && i == 1) {
             // Push straight into r0's receive slot.  r0's add kernel from the
@@ -3077,6 +3560,7 @@ bool ggml_cuda_ar_allreduce_begin(
                 p->dx_staging[i].host + slot_off, send, xfer_nbytes, cudaMemcpyDeviceToHost, out));
         }
         CUDA_CHECK(cudaEventRecord(ev.sent, out));
+        mad_meta_gputime::mark_end(backends[i], mgt_xfer_out_row);
         ev.sent_valid = true;
         p->wd_dx_phase[i][slot].store(2 /* sent */, std::memory_order_relaxed);
         if (wp_tracing) {
@@ -3107,6 +3591,10 @@ bool ggml_cuda_ar_allreduce_begin(
         cudaStream_t          in = p->streams_in[i];
         ggml_cuda_ar_dx_slot & ev = p->dx_ev[i][h];
 
+        // mad-lab: MAD_META_GPUTIME -- brackets Phase C (inbound transfer)
+        // for device i on its in-stream.
+        const uint64_t mgt_xfer_in_row = mad_meta_gputime::mark_begin(
+            backends[i], mad_meta_gputime::KIND_AR_XFER, op->trace_slot, -1, (long long) op_id);
         if (pull_copy_kernel) {
             // r0 recorded no "sent" event this op (Phase B skipped its D2H
             // entirely) -- wait for r0's pack kernel to have finished
@@ -3127,6 +3615,7 @@ bool ggml_cuda_ar_allreduce_begin(
             ggml_cuda_ar_h2d(p->dx_recv[i] + slot_off, p->dx_staging[peer].host + slot_off, xfer_nbytes, in);
         }
         CUDA_CHECK(cudaEventRecord(ev.recvd, in));
+        mad_meta_gputime::mark_end(backends[i], mgt_xfer_in_row);
         ev.recvd_valid = true;
         p->wd_dx_phase[i][slot].store(3 /* recvd */, std::memory_order_relaxed);
         if (wp_tracing) {
@@ -3223,6 +3712,10 @@ bool ggml_cuda_ar_allreduce_end(
             GGML_ABORT("%s: no codec registered for wire type %d", __func__, (int) op->wire_type);
         }
         wp_op_profile_span_begin(p->devices[i], cs);
+        // mad-lab: MAD_META_GPUTIME -- brackets the unpack/accumulate kernel
+        // for device i on its compute stream.
+        const uint64_t mgt_unpack_row = mad_meta_gputime::mark_begin(
+            backends[i], mad_meta_gputime::KIND_AR_UNPACK, op->trace_slot, -1, (long long) op->op_id);
         // direct_unpack (mode 2 only): this unpack_accumulate_fn call is
         // unmodified from the non-pull path -- only `recv` differs (r0's
         // device pointer, peer-mapped, instead of r1's local dx_recv[1]).
@@ -3231,6 +3724,7 @@ bool ggml_cuda_ar_allreduce_end(
         // that by doing the same peer read earlier, on the
         // in-stream, via ggml_cuda_ar_pull_copy_kernel in Phase C.
         codec->unpack_accumulate_fn(op->dst[i], op->dst_type, recv, op->ne, cs);
+        mad_meta_gputime::mark_end(backends[i], mgt_unpack_row);
         wp_op_profile_span_end(p->devices[i], cs, "AR_END_UNPACK");
 
         CUDA_CHECK(cudaEventRecord(ev.freed, cs));

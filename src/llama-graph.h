@@ -378,6 +378,45 @@ public:
     // draft-kv-paged-0912.txt "MEASURED + REVISION (part 2)" for the full trace.
     void update_paged_attn_n_seqs_active(uint32_t n_seqs_active);
 
+    // MAD-LAB (r4d per-seq q_len propagation, 2026-09-19): op_params[4]/[6] alone are not enough
+    // for ggml-cuda/mt_pagedattn_r4d.cu to know, from the host, whether every active seq in this
+    // ubatch shares one q_len -- R4D's attention kernels take a single q_len for the whole batch
+    // (r4d.h: "All seqs share ONE q_len"), but this op's own contract lets q_lens vary per seq,
+    // and under tensor-split-attn a plain `op_params[4] = ...` field write at graph-build time
+    // (llama-graph.cpp's build_attn, ~3565) never reaches a per-device meta clone materialized
+    // after that write (ggml-backend-meta.cpp's op_params memcpy happens once, at clone-creation
+    // time). This helper, called every set_input like update_paged_attn_max_ctx_len() /
+    // update_paged_attn_n_seqs_active() above, fixes both gaps at once: it computes uniformity
+    // straight from the host-side q_lens mirror the paged cache already maintains
+    // (h_q_lens_data(), same source paged_max_ctx_len() reads) -- no device readback -- and
+    // pushes the result through ggml_backend_meta_buffer_set_op_param_i32() so every already-
+    // materialized per-device clone gets it too, same mechanism as op_params[5]/[6].
+    //
+    // Pushes:
+    //   op_params[4] = the shared q_len, if every active seq (q_lens[s] > 0) has the same q_len;
+    //                  n_tokens_total (the ubatch's total token count) otherwise -- deliberately
+    //                  NOT 0 in the non-uniform case: this keeps op_params[4]'s value semantics
+    //                  identical to what build_attn's graph-build-time assignment already used
+    //                  (equal_seqs() ? n_seq_tokens : n_tokens, llama-graph.cpp ~3565) so
+    //                  ggml-cuda/mt_pagedattn.cu's tile/decode gates (which read op_params[4] as
+    //                  an always-safe, always-oversized upper bound, never as a uniformity
+    //                  signal) see no behavior change from this helper -- only op_params[7]'s
+    //                  bit0 below is the uniformity signal a consumer should branch on.
+    //   op_params[7] = flag bitfield: bit0 = q_lens uniform (op_params[4] holds the exact shared
+    //                  value; when clear, op_params[4] is only a safe upper bound, not the true
+    //                  per-seq q_len), bit1 = pure decode (every active seq has q_len==1), bit2 =
+    //                  too many live slots (n_seq_max > 8) to pack op_params[8..15] below. 0 (all
+    //                  bits clear) only happens for a cold graph/clone that hasn't gone through
+    //                  this helper yet (same "0 means unset" convention as op_params[4]/[5]/[6]).
+    //   op_params[8..15] = per-seq q_len for cache slots 0..7 (0 for an inactive slot), populated
+    //                  only when n_seq_max <= 8 (left 0, with bit2 set above, otherwise).
+    //
+    // Consumed by ggml-cuda/mt_pagedattn_r4d.cu, which runs libr4d once per active sequence when
+    // op_params[7] bit0 is clear (see that file's header comment for the full contract) -- it
+    // must decide uniform-vs-per-seq from that flag alone, never by inspecting op_params[4]'s
+    // value, since op_params[4] is non-zero in both the uniform and non-uniform cases now.
+    void update_paged_attn_q_lens(uint32_t n_tokens_total);
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
