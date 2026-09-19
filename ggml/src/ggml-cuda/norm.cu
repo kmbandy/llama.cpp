@@ -100,7 +100,8 @@ static __global__ void rms_norm_f32(const src_dst_t * x,
                                     const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
-                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+                                    const bool    wide_sumsq            = false) {
     ggml_cuda_pdl_lc();
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
@@ -132,9 +133,41 @@ static __global__ void rms_norm_f32(const src_dst_t * x,
     float tmp = 0.0f; // partial sum for thread in warp
 
     ggml_cuda_pdl_sync();
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = (float) x[col];
-        tmp += xi * xi;
+
+    // MT_WIDE_KERNELS: at the production shape (ncols=5120, block_size=1024)
+    // the scalar loop below is a 5-iteration SEQUENTIAL grid-stride chain per
+    // thread (load -> accumulate -> load -> ...), exactly the pattern the
+    // gfx1201 microbench found ~3.5x slower per-wave than the same work done
+    // with <=2 independent loads per thread. Fixed-order reduction over
+    // ncols is unavoidable (one block per row), but each "iteration" can
+    // carry VEC elements via one 128-bit load instead of 1: VEC=16/sizeof(T)
+    // (4 for f32, 8 for f16/bf16) cuts iterations to
+    // ceil(ncols/(block_size*VEC)) = ceil(5120/4096) = 2 for f32 at this
+    // shape. The 16B load is issued once per iteration and its VEC scalars
+    // are then summed independently (no re-load between them) -- "issued
+    // before use". Requires ncols and the row stride both VEC-aligned (true
+    // for the contiguous hidden-dim rows this fires on); falls back to the
+    // scalar loop otherwise. Changes the thread-to-column assignment (and
+    // hence the FP summation order) vs. the scalar path -- within rms_norm's
+    // existing test tolerance, not required to be bit-exact.
+    constexpr int vec_elems = 16 / (int) sizeof(src_dst_t);
+    if (wide_sumsq && vec_elems > 1 && (ncols % vec_elems) == 0 &&
+        (stride_row % vec_elems) == 0 && (((uintptr_t) x) % 16) == 0) {
+        const int ncols_vec = ncols / vec_elems;
+        for (int cv = tid; cv < ncols_vec; cv += block_size) {
+            const uint4 raw = *reinterpret_cast<const uint4 *>(x + (size_t) cv * vec_elems);
+            const src_dst_t * xs = reinterpret_cast<const src_dst_t *>(&raw);
+            #pragma unroll
+            for (int j = 0; j < vec_elems; ++j) {
+                const float xi = (float) xs[j];
+                tmp += xi * xi;
+            }
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = (float) x[col];
+            tmp += xi * xi;
+        }
     }
 
     // sum up partial sums
@@ -156,6 +189,197 @@ static __global__ void rms_norm_f32(const src_dst_t * x,
             dst[col] = (src_dst_t) (scale * (float) x[col]);
         }
     }
+}
+
+// ── MT_WIDE_KERNELS two-pass wide rms_norm (2026-09-18) ─────────────────────
+//
+// The wide_sumsq vectorized-load path above measured NO effect (105 -> 103 ms
+// over 1161 launches at the production 1024x5120 shape): it cuts iterations
+// per thread (~5 -> ~2, via 128-bit loads) but does NOT change the grid --
+// still exactly one block per row (1024 blocks at this shape). The gfx1201
+// microbench behind this task is unambiguous that block COUNT, not just
+// per-thread iteration count, is what gates throughput here: a kernel
+// reading 20 MB with ~8 sequential iterations/thread at 1024 blocks x 256
+// threads runs 2.3-2.8x slower on the RX 9070 XT than the R9700, while the
+// same bytes at 8192 blocks x 256 threads x ~1 iteration/thread run at
+// parity; read-only reproduces the slowdown, write-only does not. So only
+// the sum-of-squares READ needs more blocks; the scale+write pass (which the
+// microbench says is not the culprit) can stay a plain flat vectorized copy.
+//
+// Two passes:
+//   pass 1 (rms_norm_f32_wide_pass1_sumsq): grid (nrows, RMS_NORM_WIDE_CHUNKS)
+//     -- RMS_NORM_WIDE_CHUNKS=8 blocks per row, 256 threads/block, each doing
+//     <=2 128-bit loads (chosen so nrows=1024 lands exactly on the
+//     microbench's 8192-block/~1-iteration-per-thread sweet spot). Writes one
+//     partial sum-of-squares per (row, chunk) into a small ctx-pool scratch
+//     buffer (nrows*RMS_NORM_WIDE_CHUNKS floats).
+//   pass 2 (rms_norm_f32_wide_pass2_scale): a single flat 1-D grid over every
+//     output float4 (grid = total_float4s / 256) -- each thread locates its
+//     row, sums that row's RMS_NORM_WIDE_CHUNKS partials (a handful of floats,
+//     cheap relative to the 128-bit x load it's about to do anyway),
+//     computes rsqrt(mean+eps), and does one 128-bit load + optional
+//     column-broadcast mul + one 128-bit store.
+//
+// Only wired for do_add==false (mul is optional, add is not) -- the report's
+// regression is specifically in the fused-mul instantiation
+// (rms_norm_f32<1024, ..., /*do_multiply=*/true, /*do_add=*/false>); the
+// fused mul+add path is untouched and keeps the original single-pass kernel.
+// Dispatch gating (rms_norm_wide_two_pass_eligible, below) requires
+// MT_WIDE_KERNELS=1, nchannels==nsamples==1 (keeps pass 2's row/dst indexing
+// exact -- see its "dst is always contiguous" note), ncols*nrows >= 1<<20
+// (so decode's 1-row shape keeps the old kernel: nothing to widen when a
+// single row already gets its own dedicated block), and the same 128-bit
+// alignment/divisibility preconditions the existing wide_sumsq flag already
+// required (ncols % vec_elems == 0, stride_row % vec_elems == 0, x 16B-aligned).
+constexpr int RMS_NORM_WIDE_CHUNKS = 8;
+
+template <typename src_dst_t>
+static __global__ void rms_norm_f32_wide_pass1_sumsq(
+        const src_dst_t * __restrict__ x, float * __restrict__ partial,
+        const int ncols, const int64_t stride_row, const int chunks_per_row) {
+    constexpr int block_size = 256;
+    constexpr int vec_elems  = 16 / (int) sizeof(src_dst_t);
+    const int row   = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int tid    = threadIdx.x;
+
+    const src_dst_t * xr = x + (size_t) row * stride_row;
+    const int ncols_vec      = ncols / vec_elems;
+    const int chunk_vec_size = (ncols_vec + chunks_per_row - 1) / chunks_per_row;
+    const int vec_begin      = chunk * chunk_vec_size;
+    const int vec_end        = min(vec_begin + chunk_vec_size, ncols_vec);
+
+    float tmp = 0.0f;
+    for (int cv = vec_begin + tid; cv < vec_end; cv += block_size) {
+        const uint4 raw = *reinterpret_cast<const uint4 *>(xr + (size_t) cv * vec_elems);
+        const src_dst_t * xs = reinterpret_cast<const src_dst_t *>(&raw);
+        #pragma unroll
+        for (int j = 0; j < vec_elems; ++j) {
+            const float xi = (float) xs[j];
+            tmp += xi * xi;
+        }
+    }
+
+    extern __shared__ float s_sum_wide[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum_wide);
+    if (tid == 0) {
+        partial[(size_t) row * chunks_per_row + chunk] = tmp;
+    }
+}
+
+template <typename src_dst_t, typename mul_add_t, bool do_multiply>
+static __global__ void rms_norm_f32_wide_pass2_scale(
+        const src_dst_t * __restrict__ x, src_dst_t * __restrict__ dst,
+        const mul_add_t * __restrict__ mul, const float * __restrict__ partial,
+        const int ncols, const int nrows, const int64_t stride_row, const int chunks_per_row,
+        const float eps, const int64_t mul_stride_row,
+        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed) {
+    constexpr int vec_elems = 16 / (int) sizeof(src_dst_t);
+    const int    ncols_vec  = ncols / vec_elems;
+    const size_t total_vec  = (size_t) nrows * (size_t) ncols_vec;
+
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total_vec;
+         i += (size_t) gridDim.x * blockDim.x) {
+        const int row = (int) (i / ncols_vec);
+        const int cv  = (int) (i % ncols_vec);
+
+        // A handful of floats (RMS_NORM_WIDE_CHUNKS, typically 8) -- cheap
+        // next to the 128-bit x load below, and L2-resident after pass 1.
+        float sumsq = 0.0f;
+        const float * prow = partial + (size_t) row * chunks_per_row;
+        #pragma unroll 8
+        for (int c = 0; c < chunks_per_row; ++c) {
+            sumsq += prow[c];
+        }
+        const float mean  = sumsq / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+        const src_dst_t * xr  = x + (size_t) row * stride_row;
+        const uint4       raw = *reinterpret_cast<const uint4 *>(xr + (size_t) cv * vec_elems);
+        const src_dst_t * xs  = reinterpret_cast<const src_dst_t *>(&raw);
+
+        uint4       out;
+        src_dst_t * outs = reinterpret_cast<src_dst_t *>(&out);
+
+        const mul_add_t * mul_row_ptr = nullptr;
+        if constexpr (do_multiply) {
+            const uint32_t mul_row = fastmodulo((uint32_t) row, mul_nrows_packed);
+            mul_row_ptr = mul + (size_t) mul_row * mul_stride_row;
+        }
+
+        #pragma unroll
+        for (int j = 0; j < vec_elems; ++j) {
+            float v = scale * (float) xs[j];
+            if constexpr (do_multiply) {
+                const int col     = cv * vec_elems + j;
+                const uint32_t mul_col = fastmodulo((uint32_t) col, mul_ncols_packed);
+                v *= (float) mul_row_ptr[mul_col];
+            }
+            outs[j] = (src_dst_t) v;
+        }
+
+        // dst is always laid out contiguous-per-row here (see the callers'
+        // "((sample*nchannels + channel)*nrows + row)*ncols" offset in the
+        // single-pass kernel above, which -- with the nchannels==nsamples==1
+        // gate this path requires -- reduces to exactly row*ncols).
+        src_dst_t * dstr = dst + (size_t) row * ncols;
+        *reinterpret_cast<uint4 *>(dstr + (size_t) cv * vec_elems) = out;
+    }
+}
+
+// Gate for the two-pass path: everything that must hold for pass 1/2's
+// addressing and alignment assumptions above to be valid.
+template <typename src_dst_t>
+static bool rms_norm_wide_two_pass_eligible(
+        const int ncols, const int64_t nrows, const int64_t nchannels, const int64_t nsamples,
+        const int64_t stride_row, const void * x_ptr) {
+    if (!ggml_cuda_mt_wide_kernels_enabled()) {
+        return false;
+    }
+    if (nchannels != 1 || nsamples != 1) {
+        return false;
+    }
+    if ((int64_t) ncols * nrows < (1 << 20)) {
+        return false;
+    }
+    constexpr int vec_elems = 16 / (int) sizeof(src_dst_t);
+    if (vec_elems <= 1) {
+        return false;
+    }
+    if ((ncols % vec_elems) != 0 || (stride_row % vec_elems) != 0) {
+        return false;
+    }
+    if ((((uintptr_t) x_ptr) % 16) != 0) {
+        return false;
+    }
+    return true;
+}
+
+template <typename src_dst_t, typename mul_add_t, bool do_multiply>
+static void rms_norm_f32_wide_dispatch(
+        ggml_backend_cuda_context & ctx,
+        const src_dst_t * x, src_dst_t * dst, const mul_add_t * mul,
+        const int ncols, const int nrows, const int64_t stride_row,
+        const int64_t mul_stride_row, const uint3 mul_ncols_packed, const uint3 mul_nrows_packed,
+        const float eps, cudaStream_t stream) {
+    constexpr int chunks_per_row = RMS_NORM_WIDE_CHUNKS;
+    constexpr int pass1_block    = 256;
+    constexpr int pass2_block    = 256;
+    constexpr int vec_elems      = 16 / (int) sizeof(src_dst_t);
+
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) nrows * (size_t) chunks_per_row);
+
+    const dim3 grid1(nrows, chunks_per_row, 1);
+    rms_norm_f32_wide_pass1_sumsq<src_dst_t><<<grid1, pass1_block, 32 * sizeof(float), stream>>>(
+        x, partial.get(), ncols, stride_row, chunks_per_row);
+
+    const size_t total_vec = (size_t) nrows * (size_t) (ncols / vec_elems);
+    const size_t grid2_sz  = (total_vec + pass2_block - 1) / pass2_block;
+    const int    grid2     = (int) (grid2_sz > (size_t) INT32_MAX ? (size_t) INT32_MAX : grid2_sz);
+
+    rms_norm_f32_wide_pass2_scale<src_dst_t, mul_add_t, do_multiply><<<grid2, pass2_block, 0, stream>>>(
+        x, dst, mul, partial.get(), ncols, nrows, stride_row, chunks_per_row, eps,
+        mul_stride_row, mul_ncols_packed, mul_nrows_packed);
 }
 
 template <int block_size>
@@ -309,6 +533,7 @@ static void group_norm_f32_cuda(
 // BF16 activation coverage (2026-09-18)
 template <typename src_dst_t>
 static void rms_norm_f32_cuda(
+        ggml_backend_cuda_context & ctx,
         const src_dst_t * x, src_dst_t * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
@@ -319,20 +544,27 @@ static void rms_norm_f32_cuda(
             x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
         (const src_dst_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
-        (const src_dst_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        (const src_dst_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        ggml_cuda_mt_wide_kernels_enabled());
+    } else if (rms_norm_wide_two_pass_eligible<src_dst_t>(ncols, nrows, nchannels, nsamples, stride_row, x)) {
+        rms_norm_f32_wide_dispatch<src_dst_t, src_dst_t, false>(
+            ctx, x, dst, /*mul=*/(const src_dst_t *) nullptr, ncols, nrows, stride_row,
+            /*mul_stride_row=*/0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), eps, stream);
     } else {
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
         ggml_cuda_kernel_launch(rms_norm_f32<1024, src_dst_t, src_dst_t, false>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
         (const src_dst_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
-        (const src_dst_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        (const src_dst_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        ggml_cuda_mt_wide_kernels_enabled());
     }
 }
 
 // BF16 activation coverage (2026-09-18)
 template <typename src_dst_t, typename mul_add_t>
-static void rms_norm_mul_f32_cuda(const src_dst_t *  x,
+static void rms_norm_mul_f32_cuda(ggml_backend_cuda_context & ctx,
+                                  const src_dst_t *  x,
                                   const mul_add_t *  mul,
                                   const mul_add_t *  add,
                                   src_dst_t *        dst,
@@ -361,7 +593,7 @@ static void rms_norm_mul_f32_cuda(const src_dst_t *  x,
                                   cudaStream_t   stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
-        rms_norm_f32_cuda<src_dst_t>(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+        rms_norm_f32_cuda<src_dst_t>(ctx, x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
         return;
     }
     if (add == nullptr) {
@@ -376,7 +608,19 @@ static void rms_norm_mul_f32_cuda(const src_dst_t *  x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
-            (const mul_add_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+            (const mul_add_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+            ggml_cuda_mt_wide_kernels_enabled());
+        } else if (mul_stride_channel == 0 && mul_stride_sample == 0 &&
+                   rms_norm_wide_two_pass_eligible<src_dst_t>(ncols, nrows, nchannels, nsamples, stride_row, x)) {
+            // mul_stride_channel/mul_stride_sample == 0 here is redundant with
+            // nchannels==nsamples==1 (checked inside the eligibility gate) for
+            // every real caller, but is asserted explicitly since pass 2 never
+            // reads them -- silently ignoring a nonzero one would be a latent
+            // correctness bug if a future caller ever passed nchannels==1 with
+            // a channel-broadcasting mul stride.
+            rms_norm_f32_wide_dispatch<src_dst_t, mul_add_t, true>(
+                ctx, x, dst, mul, ncols, nrows, stride_row,
+                mul_stride_row, mul_ncols_packed, mul_nrows_packed, eps, stream);
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
@@ -384,7 +628,8 @@ static void rms_norm_mul_f32_cuda(const src_dst_t *  x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
-            (const mul_add_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+            (const mul_add_t *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+            ggml_cuda_mt_wide_kernels_enabled());
         }
     } else {
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
@@ -403,7 +648,7 @@ static void rms_norm_mul_f32_cuda(const src_dst_t *  x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
-                add_nchannels_packed, add_nsamples_packed);
+                add_nchannels_packed, add_nsamples_packed, ggml_cuda_mt_wide_kernels_enabled());
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
@@ -411,7 +656,7 @@ static void rms_norm_mul_f32_cuda(const src_dst_t *  x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
-                add_nchannels_packed, add_nsamples_packed);
+                add_nchannels_packed, add_nsamples_packed, ggml_cuda_mt_wide_kernels_enabled());
         }
     }
 }
@@ -507,10 +752,10 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     if (src0->type == GGML_TYPE_BF16) {
-        rms_norm_f32_cuda<nv_bfloat16>((const nv_bfloat16 *) src0->data, (nv_bfloat16 *) dst->data,
+        rms_norm_f32_cuda<nv_bfloat16>(ctx, (const nv_bfloat16 *) src0->data, (nv_bfloat16 *) dst->data,
             ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
     } else {
-        rms_norm_f32_cuda<float>((const float *) src0->data, (float *) dst->data,
+        rms_norm_f32_cuda<float>(ctx, (const float *) src0->data, (float *) dst->data,
             ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
     }
 }
@@ -569,15 +814,15 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nsamples  = mul_src->ne[3];
 
     if (rms_norm_src->type == GGML_TYPE_BF16 && mul_src->type == GGML_TYPE_BF16) {
-        rms_norm_mul_f32_cuda<nv_bfloat16, nv_bfloat16>((const nv_bfloat16 *) src0_d, (const nv_bfloat16 *) mul_d, nullptr, (nv_bfloat16 *) dst_d,
+        rms_norm_mul_f32_cuda<nv_bfloat16, nv_bfloat16>(ctx, (const nv_bfloat16 *) src0_d, (const nv_bfloat16 *) mul_d, nullptr, (nv_bfloat16 *) dst_d,
             ne00, ne01, ne02, ne03, s01, s02, s03, mul_s01, mul_s02, mul_s03,
             mul_ncols, mul_nrows, mul_nchannels, mul_nsamples, 0, 0, 0, 0, 0, 0, 0, eps, stream);
     } else if (rms_norm_src->type == GGML_TYPE_BF16 && mul_src->type == GGML_TYPE_F32) {
-        rms_norm_mul_f32_cuda<nv_bfloat16, float>((const nv_bfloat16 *) src0_d, (const float *) mul_d, nullptr, (nv_bfloat16 *) dst_d,
+        rms_norm_mul_f32_cuda<nv_bfloat16, float>(ctx, (const nv_bfloat16 *) src0_d, (const float *) mul_d, nullptr, (nv_bfloat16 *) dst_d,
             ne00, ne01, ne02, ne03, s01, s02, s03, mul_s01, mul_s02, mul_s03,
             mul_ncols, mul_nrows, mul_nchannels, mul_nsamples, 0, 0, 0, 0, 0, 0, 0, eps, stream);
     } else {
-        rms_norm_mul_f32_cuda<float, float>((const float *) src0_d, (const float *) mul_d, nullptr, (float *) dst_d,
+        rms_norm_mul_f32_cuda<float, float>(ctx, (const float *) src0_d, (const float *) mul_d, nullptr, (float *) dst_d,
             ne00, ne01, ne02, ne03, s01, s02, s03, mul_s01, mul_s02, mul_s03,
             mul_ncols, mul_nrows, mul_nchannels, mul_nsamples, 0, 0, 0, 0, 0, 0, 0, eps, stream);
     }
@@ -667,17 +912,17 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
     const int add_nsamples  = add_src->ne[3];
 
     if (rms_norm_src->type == GGML_TYPE_BF16 && mul_src->type == GGML_TYPE_BF16) {
-        rms_norm_mul_f32_cuda<nv_bfloat16, nv_bfloat16>((const nv_bfloat16 *) src0_d, (const nv_bfloat16 *) mul_d, (const nv_bfloat16 *) add_d, (nv_bfloat16 *) dst_d,
+        rms_norm_mul_f32_cuda<nv_bfloat16, nv_bfloat16>(ctx, (const nv_bfloat16 *) src0_d, (const nv_bfloat16 *) mul_d, (const nv_bfloat16 *) add_d, (nv_bfloat16 *) dst_d,
             ne00, ne01, ne02, ne03, s01, s02, s03, mul_s01, mul_s02, mul_s03,
             mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
             add_s01, add_s02, add_s03, add_ncols, add_nrows, add_nchannels, add_nsamples, eps, stream);
     } else if (rms_norm_src->type == GGML_TYPE_BF16 && mul_src->type == GGML_TYPE_F32) {
-        rms_norm_mul_f32_cuda<nv_bfloat16, float>((const nv_bfloat16 *) src0_d, (const float *) mul_d, (const float *) add_d, (nv_bfloat16 *) dst_d,
+        rms_norm_mul_f32_cuda<nv_bfloat16, float>(ctx, (const nv_bfloat16 *) src0_d, (const float *) mul_d, (const float *) add_d, (nv_bfloat16 *) dst_d,
             ne00, ne01, ne02, ne03, s01, s02, s03, mul_s01, mul_s02, mul_s03,
             mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
             add_s01, add_s02, add_s03, add_ncols, add_nrows, add_nchannels, add_nsamples, eps, stream);
     } else {
-        rms_norm_mul_f32_cuda<float, float>((const float *) src0_d, (const float *) mul_d, (const float *) add_d, (float *) dst_d,
+        rms_norm_mul_f32_cuda<float, float>(ctx, (const float *) src0_d, (const float *) mul_d, (const float *) add_d, (float *) dst_d,
             ne00, ne01, ne02, ne03, s01, s02, s03, mul_s01, mul_s02, mul_s03,
             mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
             add_s01, add_s02, add_s03, add_ncols, add_nrows, add_nchannels, add_nsamples, eps, stream);

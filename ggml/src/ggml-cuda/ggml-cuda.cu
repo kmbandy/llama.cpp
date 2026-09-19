@@ -7045,11 +7045,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // WP_HOST_STALL_LOG=<us>: report any node whose HOST-side launch
+                // (not GPU time) exceeds the threshold -- a launch that spins in
+                // the runtime shows up here with the op that triggered it.
+                static const int64_t wp_host_stall_us = [] {
+                    const char * e = getenv("WP_HOST_STALL_LOG");
+                    return e ? (int64_t) atoll(e) : (int64_t) 0;
+                }();
+                const int64_t wp_hs_t0 = wp_host_stall_us > 0 ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (wp_host_stall_us > 0) {
+                    const int64_t dt = ggml_time_us() - wp_hs_t0;
+                    if (dt > wp_host_stall_us) {
+                        fprintf(stderr, "wp host-stall dev=%d %lld us op=%s name=%s ne=[%lld,%lld,%lld] src0=%s\n",
+                                cuda_ctx->device, (long long) dt, ggml_op_name(node->op), node->name,
+                                (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                                node->src[0] ? ggml_op_name(node->src[0]->op) : "-");
+                    }
+                }
                 wp_op_profile_end_node(cuda_ctx->device, cuda_ctx->stream(), node, 1, wp_prof_capture);
 
                 if (wp_node_trace_enabled()) {

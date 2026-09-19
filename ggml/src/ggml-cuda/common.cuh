@@ -584,6 +584,28 @@ static __device__ __forceinline__ half2 warp_prefix_inclusive_sum(half2 a) {
 #endif // FP16_AVAILABLE
 }
 
+// ---------------------------------------------------------------------------
+// MT_WIDE_KERNELS: opt-in A/B switch for the "wide grid, <=2 sequential
+// per-thread memory ops" retuning of the small memory-bound glue kernels that
+// sit on the RDNA4 TP prefill critical path (AR codec pack/unpack, cpy,
+// rms_norm, fp8 qrot, ml84 colmax, bin_bcast add, scale). Root cause: a
+// microbench on gfx1201 (RX 9070 XT vs R9700, clocks/power/latency/bandwidth
+// verified equal) found that per-wave SEQUENTIAL chains of memory ops are
+// ~3.5x slower on the 9070 XT specifically (1024 blocks x 256 threads x ~8
+// sequential grid-stride iterations: 89-111 us vs 25-48 us for the SAME 20 MB
+// of work laid out as 8192 blocks x 256 threads x ~1 iteration: 17 vs 14 us,
+// i.e. parity). Default OFF (0): every kernel below keeps its original,
+// already-tuned launch geometry. Set MT_WIDE_KERNELS=1 to switch all of them
+// to the wide-grid path so the orchestrator can A/B the two on the production
+// TP run. Read once per process (mirrors GGML_CUDA_PDL's env-cache pattern).
+static inline bool ggml_cuda_mt_wide_kernels_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("MT_WIDE_KERNELS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 enum class block_reduce_method {
     MAX,
     SUM,

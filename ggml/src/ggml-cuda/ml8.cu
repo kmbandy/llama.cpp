@@ -29,6 +29,9 @@
 // ggml-hip was configured with -DGGML_HIP_AITER=ON. Only the GEMM COMPUTE
 // dispatch (ggml_cuda_op_fp8_mul_mat) is AITER-gated, matching FP8_B128.
 #include "aiter-integration/rdna4_fp8_gemm/gemm_capi.h"
+#include "allreduce.cuh"       // MT_ML8_4_EXPAND_ON_AR_STREAM: reuse the AR pipeline's
+                               // per-device stream as the expand-cache lookahead's
+                               // second queue (ggml_cuda_ar_stream_for_device)
 // ML8_4 RDNA4_TRFEED packed-layout addressing (ml84_trfeed_nk_to_pos /
 // ml84_get_nibble / ml84_set_nibble) -- shared, byte-for-byte, with
 // rdna4_pack_ml84_trfeed's own packer kernel (gemm_ml84_prod.hip) so the
@@ -445,6 +448,12 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     return &ins_it->second.info;
 }
 
+// Forward decl: ml8_expand_cache_clear_all() is defined much later in this
+// file (it needs ml8_expand_cache_entry, declared alongside the ML8_4
+// prefill expander below) but must be invoked from
+// ggml_cuda_ml8_clear_cache() here, on every CUDA device buffer teardown.
+static void ml8_expand_cache_clear_all(void);
+
 void ggml_cuda_ml8_clear_cache(void) {
     {
         std::lock_guard<std::mutex> lock(g_ml8_cache_mu);
@@ -477,6 +486,11 @@ void ggml_cuda_ml8_clear_cache(void) {
         }
         g_ml8_fp8_triton_view.clear();
     }
+#ifdef GGML_HIP_AITER
+    // Weight paging / buffer reload: a cached expand-cache entry's w_data key
+    // could otherwise alias a freshly-loaded weight at the same address.
+    ml8_expand_cache_clear_all();
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2596,6 +2610,508 @@ static void ml8_expand_prefetch_release(
     os.pending = true;
 }
 
+// ---------------------------------------------------------------------------
+// ML8_4 prefill expander in-stream cache (multi-GPU tensor-parallel path).
+//
+// The prefetch machinery above is disabled whenever device_count > 1 (see
+// ml8_expand_prefetch_get) because the side stream it needs costs more than
+// it saves on the 2-GPU TP path (measured -160 pp). But the TP driver runs
+// two 1024-token sub-batches ("slots") interleaved one subgraph step apart:
+// slot A computes subgraph i (expand weight W into trfeed layout, run the
+// GEMM), then ~4 ms later slot B computes ITS subgraph i, which expands the
+// SAME device-resident weight W again (same ggml_tensor, same w->data, same
+// per-node cent_data/lut_group_off — TP splits the weight across devices,
+// not the LUT or the graph position) and runs its own GEMM. So every weight
+// is expanded twice back-to-back on the same device and the same compute
+// stream — rocprof chain 141 (8k prompt, per device): 3200 ml84_expand_kernel
+// launches / 428-448 ms vs. 1600 for the same prompt single-GPU. Half of that
+// is pure waste and, unlike the single-GPU case, sits on the critical path
+// (no side stream in TP).
+//
+// Fix: a small per-device, in-stream cache of the expanded trfeed buffer. If
+// the immediately-preceding-or-still-resident expansion for weight W is
+// still valid, skip the expand kernel and hand the GEMM the cached buffer
+// directly. Everything happens on the single compute stream ctx.stream() —
+// same stream as the GEMM that reads it (verified: every rdna4_gemm_fp8_trfeed*
+// call in the branch below launches on `stream`, the same variable passed to
+// the expand call; there is no side stream on this path), so same-stream FIFO
+// ordering alone guarantees the previous GEMM has finished reading a cache
+// entry's buffer before this call could overwrite it — no extra sync needed.
+//
+// Key = (w_data, cent_data, N, K): everything that determines the expansion
+// bytes, and nothing else. w->data changes across weight paging / buffer
+// reuse, and MT_ML8_4_EXPAND_CACHE hooks the same invalidation point as the
+// repack cache (ggml_cuda_ml8_clear_cache, called whenever a CUDA device
+// buffer backing a weight is freed — see ggml-cuda.cu) so a paged-out
+// weight's stale entry can never alias a new weight at the same address.
+// Deliberately NOT keyed on the ggml_tensor * `w`: the two interleaved
+// sub-batch slots in the multi-GPU TP graph run as separate graph instances
+// (separate ggml_backend_sched, separate tensor objects) for what is the
+// same underlying weight, so `w` differs between the two consecutive
+// expansions of one weight even though w->data, cent_data, N and K are
+// identical — keying on `w` made every second lookup miss (measured: cache
+// enabled but ml84_expand_kernel launch count unchanged at 3200/device,
+// i.e. every call missed). `w` is retained on the entry purely for
+// diagnostics/logging, never compared.
+//
+// MT_ML8_4_EXPAND_CACHE=<n> overrides the entry count (0 disables); default
+// is 2 when device_count > 1, 0 (off) on a single GPU where the prefetch path
+// above already hides the expander behind the GEMMs on a side stream.
+//
+// MT_ML8_4_EXPAND_CACHE_LOG=1 logs one "[ml8-4] expand cache: N hits, N
+// misses (of N lookups)" line to stderr every 512 lookups (per process),
+// so the orchestrator can confirm hit rate from the server log without
+// instrumenting anything else.
+struct ml8_expand_cache_entry {
+    const ggml_tensor * w         = nullptr;
+    const void *         w_data    = nullptr; // weight device data ptr (paging key)
+    const uint8_t *       cent_data = nullptr; // per-node LUT slice pointer
+    int32_t              N = 0, K = 0;
+    uint8_t *            b_shuf  = nullptr;   // owned (not pool), sized to largest seen
+    float *              b_scale = nullptr;   // owned (not pool), sized to largest seen
+    size_t               cap_nk  = 0;         // bytes allocated for b_shuf
+    size_t               cap_n   = 0;         // floats allocated for b_scale
+    bool                 valid   = false;
+    uint64_t             last_use = 0;
+
+    // --- MT_ML8_4_EXPAND_ON_AR_STREAM additions (see the big comment above
+    // ml8_expand_cache_acquire_ar) ---
+    // `ready`: recorded on the AR stream right after a lookahead expand fills
+    // this entry for a call that hasn't happened yet. `ready_pending` is true
+    // from the moment the lookahead is enqueued until the compute stream has
+    // waited on `ready` once; every synchronously-filled entry (the plain
+    // cache path, or this path's own miss fallback) leaves it false, so a
+    // stream-wait is only ever issued when one is actually needed.
+    cudaEvent_t          ready          = nullptr;
+    bool                 ready_pending  = false;
+    // `consumed`: recorded on the compute stream immediately after the GEMM
+    // that read this entry is launched. The AR-stream lookahead must wait on
+    // an entry's `consumed` before overwriting it for a different key --
+    // unlike the plain cache (same stream as the GEMM, FIFO ordering is
+    // enough), the AR stream is a different queue and could otherwise race
+    // ahead of a GEMM still reading the buffer it's about to overwrite.
+    cudaEvent_t          consumed       = nullptr;
+    bool                 consumed_valid = false;
+};
+
+// What ml8_expand_cache_acquire_ar's successor prediction needs to launch the
+// lookahead expand for the weight that follows `key` w_data -- mirrors
+// ml8_expand_prefetch_src (same rationale), but keyed on w_data instead of
+// the ggml_tensor* (see the big comment above ml8_expand_cache_entry's
+// definition for why `w` differs across the two interleaved TP sub-batch
+// graph instances while w_data does not).
+struct ml8_expand_cache_next {
+    const ggml_tensor *         w         = nullptr; // diagnostics only, never compared
+    const void *                w_data    = nullptr;
+    const uint8_t *              cent_data = nullptr;
+    const ml8_weight_repack_t *  repack    = nullptr;
+    int32_t                     N = 0, K = 0;
+};
+
+struct ml8_expand_cache_state {
+    int                                    device = -1;
+    std::vector<ml8_expand_cache_entry>    entries;
+    uint64_t                               clock = 0;
+    uint64_t                               hits  = 0; // MT_ML8_4_EXPAND_CACHE_LOG stats
+    uint64_t                               misses = 0;
+
+    // MT_ML8_4_EXPAND_ON_AR_STREAM successor learning: last_w_data is the
+    // w_data seen on the previous acquire_ar() call on this device;
+    // next_of[last_w_data] records what followed it, so from the second time
+    // a given weight is seen the lookahead can be launched with everything
+    // it needs (repack pointers etc.) before the successor call ever
+    // happens. A miss on next_of (first pass, or prediction genuinely wrong)
+    // just skips the lookahead for that step -- exactness is unaffected
+    // either way, only how much of the expander is hidden.
+    const void *                                             last_w_data = nullptr;
+    std::unordered_map<const void *, ml8_expand_cache_next>  next_of;
+};
+
+static int ml8_expand_cache_size() {
+    static const int n = [] {
+        const char * e = std::getenv("MT_ML8_4_EXPAND_CACHE");
+        if (e != nullptr) {
+            const int v = std::atoi(e);
+            return v < 0 ? 0 : v;
+        }
+        return ggml_cuda_info().device_count > 1 ? 2 : 0;
+    }();
+    return n;
+}
+
+// File-scope so ml8_expand_cache_clear_all() (called from
+// ggml_cuda_ml8_clear_cache() on weight-buffer teardown) can reach every
+// device's entries regardless of whether ml8_expand_cache_get() has been
+// called for that device yet.
+static ml8_expand_cache_state g_ml8_expand_cache_states[GGML_CUDA_MAX_DEVICES];
+
+static ml8_expand_cache_state * ml8_expand_cache_get(int device) {
+    const int n = ml8_expand_cache_size();
+    if (n <= 0) {
+        return nullptr;
+    }
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    ml8_expand_cache_state & st = g_ml8_expand_cache_states[device];
+    if (st.device < 0) {
+        st.device = device;
+        st.entries.resize((size_t) n);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "[ml8-4] expand cache enabled: %d entries/device "
+                    "(MT_ML8_4_EXPAND_CACHE)\n", n);
+        }
+    }
+    return &st;
+}
+
+static void ml8_expand_cache_reserve(ml8_expand_cache_entry & e, size_t nk, size_t n) {
+    if (e.cap_nk < nk) {
+        if (e.b_shuf) { CUDA_CHECK(cudaFree(e.b_shuf)); }
+        CUDA_CHECK(cudaMalloc(&e.b_shuf, nk));
+        e.cap_nk = nk;
+    }
+    if (e.cap_n < n) {
+        if (e.b_scale) { CUDA_CHECK(cudaFree(e.b_scale)); }
+        CUDA_CHECK(cudaMalloc(&e.b_scale, n * sizeof(float)));
+        e.cap_n = n;
+    }
+}
+
+// Returns the (b_shuf, b_scale) trfeed buffers for w's expansion, valid on
+// `stream` after this call: either a cache hit (kernel skipped entirely) or a
+// fresh expand into the LRU entry.
+static bool ml8_expand_cache_log_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("MT_ML8_4_EXPAND_CACHE_LOG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+static void ml8_expand_cache_acquire(
+    ml8_expand_cache_state * st, const ggml_tensor * w, const void * w_data,
+    const uint8_t * cent_data, const ml8_weight_repack_t * repack, int32_t N, int32_t K,
+    cudaStream_t stream, const uint8_t ** out_b_shuf, const float ** out_b_scale) {
+    st->clock++;
+    for (auto & e : st->entries) {
+        // Key on (w_data, cent_data, N, K) only — never on `w` (the
+        // ggml_tensor pointer), which differs between the two interleaved
+        // sub-batch graph instances that expand the same weight back to
+        // back. See the comment above this struct's definition.
+        if (e.valid && e.w_data == w_data && e.cent_data == cent_data &&
+            e.N == N && e.K == K) {
+            e.last_use = st->clock;
+            e.w        = w; // diagnostics only
+            *out_b_shuf  = e.b_shuf;
+            *out_b_scale = e.b_scale;
+            if (ml8_expand_cache_log_enabled()) {
+                st->hits++;
+                if ((st->hits + st->misses) % 512 == 0) {
+                    fprintf(stderr, "[ml8-4] expand cache: %llu hits, %llu misses (of %llu lookups)\n",
+                            (unsigned long long) st->hits, (unsigned long long) st->misses,
+                            (unsigned long long) (st->hits + st->misses));
+                }
+            }
+            return;
+        }
+    }
+    // Miss: evict the LRU entry (an invalid/never-used entry has last_use==0
+    // and sorts first).
+    int      victim = 0;
+    uint64_t best   = UINT64_MAX;
+    for (size_t i = 0; i < st->entries.size(); i++) {
+        if (!st->entries[i].valid) { victim = (int) i; best = 0; break; }
+        if (st->entries[i].last_use < best) { best = st->entries[i].last_use; victim = (int) i; }
+    }
+    ml8_expand_cache_entry & e = st->entries[victim];
+    ml8_expand_cache_reserve(e, (size_t) N * (size_t) K, (size_t) N);
+    const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
+        (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
+        N, K, e.b_shuf, e.b_scale, stream);
+    GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed (cache) dispatch failed");
+    e.w         = w;
+    e.w_data    = w_data;
+    e.cent_data = cent_data;
+    e.N         = N;
+    e.K         = K;
+    e.valid     = true;
+    e.last_use  = st->clock;
+    *out_b_shuf  = e.b_shuf;
+    *out_b_scale = e.b_scale;
+    if (ml8_expand_cache_log_enabled()) {
+        st->misses++;
+        if ((st->hits + st->misses) % 512 == 0) {
+            fprintf(stderr, "[ml8-4] expand cache: %llu hits, %llu misses (of %llu lookups)\n",
+                    (unsigned long long) st->hits, (unsigned long long) st->misses,
+                    (unsigned long long) (st->hits + st->misses));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MT_ML8_4_EXPAND_ON_AR_STREAM=1 (default 0): hide the expand-cache's
+// remaining misses (the 50% of ml84_expand_kernel launches the cache above
+// doesn't dedupe -- the FIRST of the two interleaved TP sub-batch slots to
+// touch each weight) under GEMM execution, without a third HW queue.
+//
+// On this rig every device has only two hardware queues; the single-GPU
+// ml8_expand_prefetch_* mechanism's side stream is disabled for
+// device_count > 1 for exactly that reason (see the comment above
+// ml8_expand_prefetch_get: a third stream lands on the compute queue via
+// time-slicing, measured -160 pp). But each device already runs a SECOND
+// stream for AllReduce (allreduce.cu's per-device `streams[i]`, shared for
+// both directions under GGML_CUDA_AR_SINGLE_STREAM) -- reusing it costs no
+// extra queue.
+//
+// Design: same LRU entry table as the plain expand cache above (so a normal
+// same-stream hit still works exactly as before), plus:
+//   - Successor learning keyed on w_data (ml8_expand_cache_next / next_of),
+//     exactly mirroring ml8_expand_prefetch_state's next_of but keyed the way
+//     the rest of this cache is (w_data, not the ggml_tensor* -- see the
+//     big comment above ml8_expand_cache_entry).
+//   - acquire_ar(): same lookup as ml8_expand_cache_acquire, except a hit
+//     whose `ready_pending` is set (filled by a previous lookahead, not yet
+//     waited on) makes the COMPUTE stream wait on that entry's `ready` event
+//     before the caller reads b_shuf/b_scale. A miss expands synchronously
+//     on the compute stream (same cost as MT_ML8_4_EXPAND_ON_AR_STREAM=0) --
+//     a misprediction never makes this path slower than the plain cache, it
+//     just doesn't get hidden that step.
+//   - release_ar(): called right after the caller launches the GEMM that
+//     read the entry from acquire_ar(). Records that entry's `consumed`
+//     event on the COMPUTE stream (so a later lookahead into this same slot
+//     for a different key knows the GEMM has been launched), learns
+//     next_of[this w_data] = (whatever call happens next), then -- if a
+//     successor is already known for THIS w_data -- launches that
+//     successor's expand on the AR STREAM into a different (LRU, excluding
+//     the entry just used) slot, after making the AR stream wait on that
+//     slot's own `consumed` event (WAR: the AR stream is a different queue
+//     than the compute stream, so unlike the plain cache, FIFO ordering
+//     alone does not guarantee the last GEMM to read that slot has been
+//     launched, let alone finished being scheduled ahead of the AR-stream
+//     write).
+//
+// Exactness: the lookahead call is byte-for-byte the same
+// rdna4_expand_ml84_to_trfeed() call as every other expand path, only
+// enqueued on a different stream with an explicit event fence around it --
+// the expanded bytes do not depend on which stream produced them.
+//
+// Falls back to ml8_expand_cache_acquire() (this file, above) whenever no AR
+// pipeline is live for the device (single GPU, NCCL transport, or comm not
+// yet initialized) -- see ggml_cuda_ar_stream_for_device (allreduce.cuh).
+// ---------------------------------------------------------------------------
+static bool ml8_expand_on_ar_stream_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("MT_ML8_4_EXPAND_ON_AR_STREAM");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// Returns the index into st->entries used to satisfy this call (pass to
+// ml8_expand_cache_release_ar after launching the GEMM that reads it).
+static int ml8_expand_cache_acquire_ar(
+    ml8_expand_cache_state * st, const ggml_tensor * w, const void * w_data,
+    const uint8_t * cent_data, const ml8_weight_repack_t * repack, int32_t N, int32_t K,
+    cudaStream_t stream, const uint8_t ** out_b_shuf, const float ** out_b_scale) {
+    st->clock++;
+
+    // Learn: whatever followed last_w_data last time is st->next_of's entry
+    // for it; this call IS what followed it, so record it now (mirrors
+    // ml8_expand_prefetch_release's "learn the successor of the previous
+    // weight" -- done here instead of in release_ar so it's keyed on the
+    // (w_data) that's actually in scope at both call sites without needing
+    // to plumb it back out).
+    if (st->last_w_data != nullptr && st->last_w_data != w_data) {
+        ml8_expand_cache_next & nx = st->next_of[st->last_w_data];
+        nx.w = w; nx.w_data = w_data; nx.cent_data = cent_data; nx.repack = repack;
+        nx.N = N; nx.K = K;
+    }
+    st->last_w_data = w_data;
+
+    for (int i = 0; i < (int) st->entries.size(); i++) {
+        ml8_expand_cache_entry & e = st->entries[i];
+        if (e.valid && e.w_data == w_data && e.cent_data == cent_data && e.N == N && e.K == K) {
+            e.last_use = st->clock;
+            e.w        = w; // diagnostics only
+            if (e.ready_pending) {
+                // Filled by an earlier lookahead on the AR stream -- the
+                // compute stream (about to read b_shuf/b_scale, then launch
+                // the GEMM on them) must wait for that expand to finish.
+                CUDA_CHECK(cudaStreamWaitEvent(stream, e.ready, 0));
+                e.ready_pending = false;
+            }
+            *out_b_shuf  = e.b_shuf;
+            *out_b_scale = e.b_scale;
+            if (ml8_expand_cache_log_enabled()) {
+                st->hits++;
+                if ((st->hits + st->misses) % 512 == 0) {
+                    fprintf(stderr, "[ml8-4] expand cache (ar-stream): %llu hits, %llu misses (of %llu lookups)\n",
+                            (unsigned long long) st->hits, (unsigned long long) st->misses,
+                            (unsigned long long) (st->hits + st->misses));
+                }
+            }
+            return i;
+        }
+    }
+
+    // Miss: expand synchronously on the compute stream, same as the plain
+    // cache's miss path -- a wrong prediction costs nothing extra.
+    int      victim = 0;
+    uint64_t best   = UINT64_MAX;
+    for (int i = 0; i < (int) st->entries.size(); i++) {
+        if (!st->entries[i].valid) { victim = i; best = 0; break; }
+        if (st->entries[i].last_use < best) { best = st->entries[i].last_use; victim = i; }
+    }
+    ml8_expand_cache_entry & e = st->entries[victim];
+    if (e.ready_pending) {
+        // Evicting a slot a lookahead is still (or was) filling for some
+        // other key -- the compute stream must still wait for that write to
+        // land before this synchronous expand overwrites the same buffer.
+        CUDA_CHECK(cudaStreamWaitEvent(stream, e.ready, 0));
+        e.ready_pending = false;
+    }
+    ml8_expand_cache_reserve(e, (size_t) N * (size_t) K, (size_t) N);
+    const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
+        (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
+        N, K, e.b_shuf, e.b_scale, stream);
+    GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed (ar-cache miss) dispatch failed");
+    e.w         = w;
+    e.w_data    = w_data;
+    e.cent_data = cent_data;
+    e.N         = N;
+    e.K         = K;
+    e.valid     = true;
+    e.last_use  = st->clock;
+    *out_b_shuf  = e.b_shuf;
+    *out_b_scale = e.b_scale;
+    if (ml8_expand_cache_log_enabled()) {
+        st->misses++;
+        if ((st->hits + st->misses) % 512 == 0) {
+            fprintf(stderr, "[ml8-4] expand cache (ar-stream): %llu hits, %llu misses (of %llu lookups)\n",
+                    (unsigned long long) st->hits, (unsigned long long) st->misses,
+                    (unsigned long long) (st->hits + st->misses));
+        }
+    }
+    return victim;
+}
+
+// Call once, immediately after launching the GEMM that consumed the entry
+// ml8_expand_cache_acquire_ar returned `idx` for. `device` is ctx.device
+// (used to look up the AR stream again -- cheap linear scan, see
+// ggml_cuda_ar_stream_for_device).
+static void ml8_expand_cache_release_ar(
+    ml8_expand_cache_state * st, int idx, int device, cudaStream_t stream) {
+    ml8_expand_cache_entry & used = st->entries[idx];
+    if (used.consumed == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&used.consumed, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(used.consumed, stream));
+    used.consumed_valid = true;
+
+    // Same rule as ml8_expand_prefetch_release: no cross-stream lookahead
+    // while the compute stream is being captured into a graph (the
+    // AR-stream fork/join would need explicit capture plumbing this doesn't
+    // have).
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) {
+        return;
+    }
+
+    auto it = st->next_of.find(used.w_data);
+    if (it == st->next_of.end()) {
+        return; // successor not learned yet (first pass), or genuinely none
+    }
+    const ml8_expand_cache_next & nx = it->second;
+
+    // Already resident or already being fetched for nx's key? Nothing to do.
+    for (auto & e : st->entries) {
+        if (e.valid && e.w_data == nx.w_data && e.cent_data == nx.cent_data &&
+            e.N == nx.N && e.K == nx.K) {
+            return;
+        }
+    }
+
+    cudaStream_t ar_stream = ggml_cuda_ar_stream_for_device(device);
+    if (ar_stream == nullptr) {
+        return; // no AR pipeline live for this device -- nothing to reuse
+    }
+
+    // Victim: LRU entry other than the one just used (that one's GEMM was
+    // only just launched -- it's the least safe to touch).
+    int victim = -1;
+    uint64_t best = UINT64_MAX;
+    for (int i = 0; i < (int) st->entries.size(); i++) {
+        if (i == idx) {
+            continue;
+        }
+        if (!st->entries[i].valid) { victim = i; best = 0; break; }
+        if (st->entries[i].last_use < best) { best = st->entries[i].last_use; victim = i; }
+    }
+    if (victim < 0) {
+        return; // only one entry configured (MT_ML8_4_EXPAND_CACHE=1) -- no room to prefetch into
+    }
+    ml8_expand_cache_entry & v = st->entries[victim];
+    if (v.ready_pending) {
+        return; // a lookahead is already in flight for this slot
+    }
+    if (v.consumed_valid) {
+        // WAR: the AR stream is a different queue than the compute stream,
+        // so (unlike the plain cache's same-stream FIFO guarantee) it could
+        // otherwise overwrite this slot's buffer while a GEMM launched
+        // earlier is still reading it.
+        CUDA_CHECK(cudaStreamWaitEvent(ar_stream, v.consumed, 0));
+    }
+    ml8_expand_cache_reserve(v, (size_t) nx.N * (size_t) nx.K, (size_t) nx.N);
+    const hipError_t exp_rc = rdna4_expand_ml84_to_trfeed(
+        (const uint8_t *) nx.repack->b_packed, nx.cent_data, (const float *) nx.repack->b_scale,
+        nx.N, nx.K, v.b_shuf, v.b_scale, ar_stream);
+    GGML_ASSERT(exp_rc == hipSuccess && "rdna4_expand_ml84_to_trfeed (ar lookahead) dispatch failed");
+    if (v.ready == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&v.ready, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(v.ready, ar_stream));
+    v.w             = nx.w;
+    v.w_data        = nx.w_data;
+    v.cent_data     = nx.cent_data;
+    v.N             = nx.N;
+    v.K             = nx.K;
+    v.valid         = true;
+    v.ready_pending = true;
+    v.last_use      = st->clock; // claim it now so the next acquire's LRU scan doesn't immediately evict it
+}
+
+// Invalidate every device's expand cache. Wired into ggml_cuda_ml8_clear_cache()
+// (called whenever a CUDA device buffer is freed, ggml-cuda.cu) so a weight
+// paged out from under a cached w->data pointer can never alias a stale entry.
+// Frees the owned device buffers rather than just clearing `valid`, mirroring
+// ggml_cuda_ml8_clear_cache()'s own repack-buffer teardown.
+static void ml8_expand_cache_clear_all(void) {
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+        ml8_expand_cache_state & st = g_ml8_expand_cache_states[d];
+        if (st.device < 0) {
+            continue;
+        }
+        for (auto & e : st.entries) {
+            if (e.b_shuf)  { CUDA_CHECK(cudaFree(e.b_shuf));  e.b_shuf  = nullptr; }
+            if (e.b_scale) { CUDA_CHECK(cudaFree(e.b_scale)); e.b_scale = nullptr; }
+            // MT_ML8_4_EXPAND_ON_AR_STREAM events, if this entry ever had a
+            // lookahead land in it -- must be destroyed here, not just
+            // default-reset below, or they leak on every weight-buffer
+            // teardown (each cudaEventCreate above is unconditional-once,
+            // never reused across an `e = {}` reset).
+            if (e.ready)    { CUDA_CHECK(cudaEventDestroy(e.ready));    e.ready    = nullptr; }
+            if (e.consumed) { CUDA_CHECK(cudaEventDestroy(e.consumed)); e.consumed = nullptr; }
+            e = ml8_expand_cache_entry{};
+        }
+        // w_data keys in next_of (and last_w_data) can alias a freshly loaded
+        // weight at the same address after paging, exactly like the entries
+        // above -- drop the learned successors along with them.
+        st.last_w_data = nullptr;
+        st.next_of.clear();
+    }
+}
+
 static void ml8_mul_mat_core(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst,
@@ -2872,10 +3388,30 @@ static void ml8_mul_mat_core(
         ggml_cuda_pool_alloc<uint8_t> b_shuf(ctx.pool());
         ggml_cuda_pool_alloc<float>   b_scale_out(ctx.pool());
         int use_slot = -1;
+        // MT_ML8_4_EXPAND_ON_AR_STREAM path state: non-null/non-negative only
+        // when this call is using the AR-stream cache, so the two GEMM-branch
+        // release call sites below know whether/how to release.
+        ml8_expand_cache_state * ec_ar     = nullptr;
+        int                      ec_ar_idx = -1;
         if (pf != nullptr) {
             use_slot = ml8_expand_prefetch_acquire(pf, w, cent_data, repack, N, K, stream);
             b_shuf_ptr      = pf->slot[use_slot].b_shuf;
             b_scale_out_ptr = pf->slot[use_slot].b_scale;
+        } else if (ml8_expand_on_ar_stream_enabled() &&
+                   (ec_ar = ml8_expand_cache_get(ctx.device)) != nullptr) {
+            // Multi-GPU TP path, prefetch disabled, AR-stream reuse enabled:
+            // hide the cache's remaining misses (see the big comment above
+            // ml8_expand_cache_acquire_ar) under the AR pipeline's existing
+            // per-device stream instead of the compute stream.
+            ec_ar_idx = ml8_expand_cache_acquire_ar(ec_ar, w, w->data, cent_data, repack, N, K, stream,
+                                                     &b_shuf_ptr, &b_scale_out_ptr);
+        } else if (ml8_expand_cache_state * ec = ml8_expand_cache_get(ctx.device)) {
+            // Multi-GPU TP path (prefetch disabled): the two interleaved
+            // sub-batch "slots" re-expand the same device-resident weight
+            // back to back on this same compute stream. Skip the redundant
+            // expand kernel on the second hit.
+            ml8_expand_cache_acquire(ec, w, w->data, cent_data, repack, N, K, stream,
+                                      &b_shuf_ptr, &b_scale_out_ptr);
         } else {
             b_shuf.alloc((size_t) N * (size_t) K);
             b_scale_out.alloc((size_t) N);
@@ -2901,6 +3437,8 @@ static void ml8_mul_mat_core(
                 ml8_expand_prefetch_src cur;
                 cur.w = w; cur.cent_data = cent_data; cur.repack = repack; cur.N = N; cur.K = K;
                 ml8_expand_prefetch_release(pf, use_slot, cur, stream);
+            } else if (ec_ar_idx >= 0) {
+                ml8_expand_cache_release_ar(ec_ar, ec_ar_idx, ctx.device, stream);
             }
             return;
         }
@@ -2929,6 +3467,8 @@ static void ml8_mul_mat_core(
             ml8_expand_prefetch_src cur;
             cur.w = w; cur.cent_data = cent_data; cur.repack = repack; cur.N = N; cur.K = K;
             ml8_expand_prefetch_release(pf, use_slot, cur, stream);
+        } else if (ec_ar_idx >= 0) {
+            ml8_expand_cache_release_ar(ec_ar, ec_ar_idx, ctx.device, stream);
         }
         return;
     }

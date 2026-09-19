@@ -1358,6 +1358,44 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // MAD-LAB (WP_CKPT_ASYNC=1): opaque llama_ckpt_async_handle_t (see
+    // src/llama-ext.h), non-null while update_tgt()/update_dft() has issued an
+    // async D2H capture that hasn't landed in data_tgt/data_dft yet. data_tgt/
+    // data_dft are already resized to their final size the moment update_tgt()/
+    // update_dft() returns (so size()/empty() are correct immediately, async or
+    // not) -- they just aren't byte-valid until wait_tgt()/wait_dft() runs.
+    // Every ACTUAL reader of the raw bytes (load_tgt()/load_dft(), and the
+    // copy ctor/assignment reading a SOURCE object's bytes) calls the
+    // matching wait_*() first, so WP_CKPT_ASYNC=0 behavior (data_tgt/data_dft
+    // valid the instant update_tgt()/update_dft() returns) is unchanged for
+    // every reading caller. Everywhere this object's OWN bytes are merely
+    // being discarded instead -- the destructor, update_tgt()/update_dft()'s
+    // own resize() guard, and a move/copy target's own prior capture -- calls
+    // abandon_tgt()/abandon_dft() instead, which detaches without blocking
+    // (see the field's own comment further down for why waiting there is
+    // both unnecessary and was measured costing up to ~0.9 s). mutable:
+    // waiting/abandoning is a cache-fill, not a logical mutation, and
+    // load_tgt()/load_dft() are const.
+    mutable void * tgt_async = nullptr;
+    mutable void * dft_async = nullptr;
+
+    common_prompt_checkpoint() = default;
+    ~common_prompt_checkpoint();
+
+    // Copyable (server_prompt::clone() copies a std::list<common_prompt_checkpoint>
+    // by value) but not movable -- nothing needs to move one (std::list::erase()/
+    // emplace_back() never relocate existing elements), and a naive move of
+    // tgt_async/dft_async would leave two objects racing to wait on/free the same
+    // pending capture.
+    common_prompt_checkpoint(const common_prompt_checkpoint & other);
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & other);
+    // Movable: server_slot holds one by value and lives in a std::vector, which
+    // needs to relocate slots. A move transfers ownership of any pending async
+    // capture (the source is left with null handles, so exactly one object ever
+    // waits on / frees it).
+    common_prompt_checkpoint(common_prompt_checkpoint && other) noexcept;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint && other) noexcept;
+
     size_t size() const;
 
     bool empty() const;
@@ -1390,4 +1428,35 @@ struct common_prompt_checkpoint {
 
     void clear_tgt();
     void clear_dft();
+
+    // Blocks until a pending async capture (if any) has landed in data_tgt /
+    // data_dft. No-op if nothing is pending (including the WP_CKPT_ASYNC=0
+    // default, where nothing is ever pending in the first place). Use this
+    // ONLY when the bytes are about to be read (load_tgt()/load_dft(), or
+    // copying FROM another checkpoint whose bytes must be valid first) --
+    // for every other case (this object's OWN bytes are being discarded:
+    // destroyed, overwritten by a fresh capture, or replaced by a move/copy)
+    // use abandon_tgt()/abandon_dft() below instead, which does not block.
+    // `reason` is only used for the WP_CKPT_ASYNC_LOG=1 trace (a WARN log line
+    // naming who forced the wait and why) -- pass a short static string
+    // identifying the call site; ignored entirely when nothing is pending.
+    void wait_tgt(const char * reason = "unspecified") const;
+    void wait_dft(const char * reason = "unspecified") const;
+
+    // Non-blocking counterpart of wait_tgt()/wait_dft(): detaches a pending
+    // capture instead of waiting for it, for every call site where this
+    // object's OWN data_tgt/data_dft bytes are being discarded rather than
+    // read (destructor / eviction, update_tgt()/update_dft()'s resize()
+    // guard, move/copy assignment overwriting this object's own capture).
+    // MEASURED (wp-ckpt-async-evict-block-0918): evicting an in-flight
+    // checkpoint via wait_tgt() cost up to ~0.9 s on the decode thread for
+    // data nobody was ever going to read again -- a destroyed/overwritten
+    // checkpoint's bytes are moot, so there is nothing to wait FOR. The D2H
+    // copy keeps running in the background; whatever event-wait it still
+    // owes is paid later, off this call's critical path, by whichever of {a
+    // later capture reclaiming its pinned pool slot, or the owning
+    // llama_context's teardown} comes first (see llama_ckpt_async_abandon()
+    // in src/llama-ext.h). No-op if nothing is pending.
+    void abandon_tgt(const char * reason = "unspecified") const;
+    void abandon_dft(const char * reason = "unspecified") const;
 };

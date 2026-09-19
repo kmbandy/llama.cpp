@@ -73,6 +73,23 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// Read-only accessor into a live AllReduce pipeline's existing per-device
+// stream (searches the pipeline registry used by ggml_cuda_ar_dump_state).
+// `device` is a CUDA device id (as passed to ggml_cuda_set_device), not a TP
+// rank. Returns nullptr if no internal-AllReduce pipeline is live for that
+// device (single GPU, NCCL transport, or comm not yet initialized).
+//
+// Intended for MT_ML8_4_EXPAND_ON_AR_STREAM (ml8.cu): on a 2-hardware-queue
+// device, adding a third stream for the ML8_4 expander's lookahead causes
+// queue time-slicing (measured -160 pp), so the expander lookahead instead
+// shares the AR stream already used for allreduce's H2D/D2H legs
+// (GGML_CUDA_AR_SINGLE_STREAM). The returned stream must only be used to
+// enqueue work that is fenced (via caller-managed events) against both the
+// AR pipeline's own use of the stream and the compute stream's reads of
+// whatever buffer the enqueued work writes -- this accessor does not
+// serialize anything on its own.
+cudaStream_t ggml_cuda_ar_stream_for_device(int device);
+
 // PRINT-ONLY diagnostic: dump a host-side heartbeat of every live pipeline's
 // state (call_count, pool slot/token, spin-watchdog fields, etc.) to stderr.
 // Safe to call from a SIGABRT handler (see the .cu definition) -- uses only

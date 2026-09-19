@@ -165,6 +165,21 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    // Wait for lid's embd_layer_inp copy to land, then return it (same
+    // return value/contract as get_embeddings_layer_inp() above -- this is
+    // what llama_get_embeddings_layer_inp() actually calls). Behind
+    // WP_LAYER_INP_NARROW_SYNC=1 (default: unset), narrows that wait to
+    // embd_layer_inp_event[lid]/embd_layer_inp_backend[lid] instead of a
+    // full synchronize() -- but only when output_reorder() has nothing
+    // pending: a pending reorder touches EVERY output buffer (logits, embd,
+    // embd_nextn, sampling, as well as embd_layer_inp for every OTHER lid),
+    // most of which this narrow wait says nothing about, and output_reorder()
+    // consumes output_swaps on its first call -- so falls back to a full
+    // synchronize() whenever output_swaps is non-empty, or when this lid has
+    // never been extracted (no event/backend recorded yet). See
+    // embd_layer_inp_event/embd_layer_inp_backend below.
+    float * sync_embeddings_layer_inp(uint32_t lid);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -250,6 +265,64 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // MAD-LAB (WP_CKPT_ASYNC): implementation of llama_ckpt_async_capture() (llama-ext.h).
+    // A member function (not a free function) only because it needs state_seq_write_data(),
+    // which is private below -- everything else about it lives at namespace scope in
+    // llama-context.cpp, right next to state_seq_get_data(). `is_dft` selects which
+    // persistent pinned ring (ckpt_pinned_tgt/ckpt_pinned_dft below) this capture uses.
+    llama_ckpt_async_handle_t ckpt_async_capture(llama_seq_id seq_id, llama_state_seq_flags flags, uint8_t * dst, size_t size, bool is_dft);
+
+    // MAD-LAB (WP_CKPT_ASYNC): persistent pinned host staging for context-checkpoint
+    // capture. MEASURED (wp-ckpt-async-pinned-alloc-0918): allocating (and freeing) a
+    // fresh ~150 MiB pinned buffer per capture cost 90 ms in the best case and
+    // 1.3-2.6 s when a prior pinned allocation/DMA was still outstanding -- pinned
+    // host memory registration is a driver-wide, effectively-serializing operation on
+    // CUDA/HIP, not something to do on a per-checkpoint hot path. So: allocate each
+    // ring slot's buffer ONCE (grow-only -- see ckpt_async_capture()), never free it
+    // back per capture; only llama_context's own destruction frees it (via
+    // ggml_backend_buffer_ptr). Two rotating slots per direction, not one, because the
+    // common shape that motivated this feature is TWO checkpoints created back-to-back
+    // in the same prompt (near-end + tail) -- with 2 slots they land in DIFFERENT
+    // buffers and never have to wait on each other's still-in-flight DMA just to start;
+    // only the 3rd capture in a row (rare -- n_ctx_checkpoints defaults to far fewer
+    // per prompt) would need to wait for slot 0's 2-captures-ago occupant, which by
+    // then has had a full checkpoint's worth of time to land.
+    struct pinned_slot {
+        ggml_backend_buffer_ptr  buf;
+        size_t                   cap   = 0;
+        llama_ckpt_async_state * owner = nullptr; // non-owning; see llama-context.cpp
+    };
+    pinned_slot ckpt_pinned_tgt[2];
+    pinned_slot ckpt_pinned_dft[2];
+    uint32_t    ckpt_pinned_next_tgt = 0;
+    uint32_t    ckpt_pinned_next_dft = 0;
+
+    // MAD-LAB (WP_CKPT_ASYNC): registry of every llama_ckpt_async_state currently
+    // outstanding (captured, not yet landed-and-detached by a wait or a pool slot
+    // reclaim) through THIS context. Non-owning -- each state is heap-owned by
+    // whichever common_prompt_checkpoint holds its handle.
+    //
+    // Why this exists (crash fixed 2026-09-18): tools/server's
+    // server_context_impl frees its llama_context BEFORE destroying its
+    // server_slot objects, whose std::list<common_prompt_checkpoint> can still
+    // hold outstanding handles -- ~common_prompt_checkpoint() unconditionally
+    // waits (wait_tgt()/wait_dft(), the "slot release" deadline), and that wait
+    // used to dereference ckpt_pinned_tgt/dft above, which is already-freed
+    // memory by then. ckpt_async_teardown() (called first thing in
+    // ~llama_context(), while the pool/backends are still alive) finishes every
+    // entry here for real (lands the bytes -- still safe: the checkpoints that
+    // own them have NOT been destroyed yet in this ordering) and then detaches
+    // it (state->owner_ctx = state->slot = nullptr) so a LATER wait -- from a
+    // checkpoint destructor running after this llama_context is gone -- finds
+    // llama_ckpt_async_state::done already true and touches neither the pool
+    // nor this (by-then-dangling) llama_context* again. Safe regardless of
+    // which order the caller destroys things in: if a checkpoint is destroyed
+    // (and waits) BEFORE this context is, that wait already removed itself
+    // from this registry (see llama_ckpt_async_wait()), so teardown here simply
+    // finds fewer entries.
+    std::vector<llama_ckpt_async_state *> ckpt_async_live;
+    void ckpt_async_teardown();
 
     bool state_load_file(
             const char * filepath,
@@ -562,6 +635,30 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // MAD-LAB (WP_LAYER_INP_NARROW_SYNC): per-layer backend event, recorded
+    // immediately after extract_layer_inputs()'s ggml_backend_tensor_get_async()
+    // D2H copy for that layer, on the SAME backend the copy itself ran on
+    // (which may be a meta backend spanning both GPUs under TP -- the meta
+    // backend/device now implements event_new/event_record/event_synchronize
+    // by fanning out to each simple device's own event, see
+    // ggml-backend-meta.cpp's ggml_backend_meta_device_event_new(), so this
+    // does not need the nextn-staging device-0-mirror workaround above).
+    // Lets sync_embeddings_layer_inp() wait for exactly this layer's copy
+    // (ggml_backend_event_synchronize()) instead of synchronize() draining
+    // sched, sched_overlap AND every WP_GRAPH_RESULT_SLOTS slot scheduler on
+    // every device. Sized in step with embd_layer_inp; nullptr until the
+    // first extraction for that lid, and left nullptr (falling back to
+    // ggml_backend_synchronize() on embd_layer_inp_backend[lid] instead) if
+    // ggml_backend_event_new() ever returns null for that layer's device.
+    std::vector<ggml_backend_event_t> embd_layer_inp_event;
+
+    // The backend extract_layer_inputs() last issued the D2H copy on, per
+    // layer -- the WP_LAYER_INP_NARROW_SYNC fallback (see
+    // embd_layer_inp_event above) when no event could be created: a plain
+    // ggml_backend_synchronize() of just this one backend, still far
+    // narrower than draining every scheduler on every device.
+    std::vector<ggml_backend_t> embd_layer_inp_backend;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

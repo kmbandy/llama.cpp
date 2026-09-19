@@ -191,10 +191,53 @@ static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const
     dst[i] = ggml_cuda_cast<dst_t>(x[i]);
 }
 
+// MT_WIDE_KERNELS same-type fast path: this is a pure byte copy (no cast, so
+// bit-exact trivially), rewritten as 128-bit (uint4) loads/stores, 4 elements
+// (16 B) per thread, one independent load issued and one store -- <=1
+// sequential memory op per iteration instead of the scalar kernel's 1
+// element/thread at CUDA_CPY_BLOCK_SIZE=64 threads/block (2 waves/block on
+// gfx1201's wave32). Falls back to the scalar tail for the non-16B-aligned
+// remainder (same unaligned-prefix/suffix peeling as ggml_cuda_ar_pull_copy
+// in allreduce.cu). Only used when src_t and dst_t are the same width (the
+// common contiguous-reorder case in the TP codec path); mismatched-width
+// casts keep using the scalar kernel below.
+template<typename T>
+static __global__ void cpy_contiguous_vec16(const char * __restrict__ cx, char * __restrict__ cdst, const int64_t nbytes) {
+    const int64_t misalign    = (int64_t) (reinterpret_cast<uintptr_t>(cx) & 15);
+    const int64_t prefix_want = misalign ? 16 - misalign : 0;
+    const int64_t prefix      = prefix_want < nbytes ? prefix_want : nbytes;
+    const int64_t mid_bytes   = nbytes - prefix;
+    const int64_t n_vec       = mid_bytes / 16;
+    const int64_t suffix_off  = prefix + n_vec * 16;
+    const int64_t suffix      = nbytes - suffix_off;
+
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < prefix; i += stride) {
+        cdst[i] = cx[i];
+    }
+    const uint4 * src4 = reinterpret_cast<const uint4 *>(cx + prefix);
+    uint4 *       dst4 = reinterpret_cast<uint4 *>(cdst + prefix);
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n_vec; i += stride) {
+        dst4[i] = src4[i];
+    }
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < suffix; i += stride) {
+        cdst[suffix_off + i] = cx[suffix_off + i];
+    }
+}
+
 template<typename src_t, typename dst_t>
 static void ggml_cpy_scalar_contiguous_cuda(
     const char * cx, char * cdst, const int64_t ne,
 cudaStream_t stream) {
+
+    if (ggml_cuda_mt_wide_kernels_enabled() && std::is_same_v<src_t, dst_t>) {
+        const int64_t nbytes = ne * (int64_t) sizeof(src_t);
+        const int64_t n_vec_approx = (nbytes + 15) / 16;
+        constexpr int block = 256; // 8 waves/block on gfx1201 wave32, vs the scalar path's 64
+        const int64_t num_blocks = std::max<int64_t>(1, std::min<int64_t>((n_vec_approx + block - 1) / block, 65535));
+        cpy_contiguous_vec16<src_t><<<(unsigned) num_blocks, block, 0, stream>>>(cx, cdst, nbytes);
+        return;
+    }
 
     const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);

@@ -408,6 +408,69 @@ static void repeat_back_cuda(
         (src, dst, ne00, ne01, ne02, ne03, s00, s01, s02, s03, ne0, ne1, ne2, ne3);
 }
 
+// MT_WIDE_KERNELS fast path for plain elementwise add (no broadcast): the
+// general k_bin_bcast already gets ~2 grid-stride iterations at the
+// production shape (hne0 = ne0/2, block=128 -> grid.x = ceil(hne0/128), so
+// stride = 128*grid.x covers ne0 in ceil(ne0/stride) = 2 steps for ne0=5120)
+// but every element still pays fastmodulo/fastdiv broadcast-index math it
+// doesn't need for the un-broadcast residual-add case on the TP critical
+// path. This dedicated flat kernel skips the broadcast machinery entirely
+// and reads/writes 128-bit (VEC-element) chunks -- <=2 sequential loads per
+// thread with none of the per-element index overhead. Only used when both
+// inputs, in the same dtype, are fully contiguous and identically shaped
+// (i.e. a pure a+b, not a broadcast); the general path handles everything
+// else unchanged.
+template <typename T>
+static __global__ void k_add_flat_vec16(const T * __restrict__ a, const T * __restrict__ b,
+                                        T * __restrict__ dst, int64_t ne) {
+    constexpr int VEC = 16 / (int) sizeof(T);
+    const int64_t ne_vec = ne / VEC;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    for (int64_t iv = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; iv < ne_vec; iv += stride) {
+        const uint4 av = *reinterpret_cast<const uint4 *>(a + (size_t) iv * VEC);
+        const uint4 bv = *reinterpret_cast<const uint4 *>(b + (size_t) iv * VEC);
+        const T * as = reinterpret_cast<const T *>(&av);
+        const T * bs = reinterpret_cast<const T *>(&bv);
+        T out[VEC];
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            out[j] = (T) ((float) as[j] + (float) bs[j]);
+        }
+        *reinterpret_cast<uint4 *>(dst + (size_t) iv * VEC) = *reinterpret_cast<const uint4 *>(out);
+    }
+    for (int64_t i = ne_vec * VEC + (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < ne; i += stride) {
+        dst[i] = (T) ((float) a[i] + (float) b[i]);
+    }
+}
+
+template <typename T>
+static bool ggml_cuda_try_add_flat_vec16(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                                         const T * a, const T * b, T * d, cudaStream_t stream) {
+    if (!ggml_cuda_mt_wide_kernels_enabled()) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, dst)) {
+        return false;
+    }
+    constexpr int VEC = 16 / (int) sizeof(T);
+    const int64_t ne = ggml_nelements(dst);
+    if (ne < VEC || (ne % VEC) != 0) {
+        return false;
+    }
+    if ((((uintptr_t) a) % 16) != 0 || (((uintptr_t) b) % 16) != 0 || (((uintptr_t) d) % 16) != 0) {
+        return false;
+    }
+    const int64_t ne_vec = ne / VEC;
+    constexpr int block = 256;
+    const int64_t grid = std::max<int64_t>(1, std::min<int64_t>((ne_vec + block - 1) / block, 65535));
+    k_add_flat_vec16<T><<<(unsigned) grid, block, 0, stream>>>(a, b, d, ne);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 template<class op>
 static void ggml_cuda_op_bin_bcast(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
@@ -442,7 +505,32 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    cudaStream_t stream = ctx.stream();
+
+    // MT_WIDE_KERNELS: try the flat vectorized fast path first (only fires
+    // for the un-broadcast, same-dtype, contiguous case -- see
+    // ggml_cuda_try_add_flat_vec16 above); falls through to the general
+    // broadcast-capable kernel otherwise, unchanged.
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (ggml_cuda_try_add_flat_vec16<float>(src0, src1, dst,
+                (const float *) src0->data, (const float *) src1->data, (float *) dst->data, stream)) {
+            return;
+        }
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+        if (ggml_cuda_try_add_flat_vec16<half>(src0, src1, dst,
+                (const half *) src0->data, (const half *) src1->data, (half *) dst->data, stream)) {
+            return;
+        }
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+        if (ggml_cuda_try_add_flat_vec16<nv_bfloat16>(src0, src1, dst,
+                (const nv_bfloat16 *) src0->data, (const nv_bfloat16 *) src1->data, (nv_bfloat16 *) dst->data, stream)) {
+            return;
+        }
+    }
+
+    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(src0, src1, dst, src0->data, src1->data, dst->data, stream);
 }
 
 void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -3643,12 +3643,94 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     const size_t n_world    = ggml_backend_meta_buffer_n_world(tensor->buffer);
     const size_t rank_first = ggml_backend_meta_buffer_rank_first(tensor->buffer);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    // Segmented split (e.g. a hybrid/recurrent model's per-layer conv/delta-net
+    // state under TP: attention heads land in more than one contiguous run per
+    // device, so it isn't "one chunk per device" any more). Mirrors
+    // ggml_backend_meta_buffer_get_tensor's segmented branch exactly -- same
+    // per-segment/per-rank loop, same row-stride math, same asserts, same
+    // offset support -- just ggml_backend_tensor_get_2d_async() on each simple
+    // backend instead of the blocking ggml_backend_tensor_get_2d().
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
+        GGML_ASSERT(split_state.nr[0] != 0);
+        GGML_ASSERT(tensor->ne[3] == 1);
+
+        size_t offset_data = 0;
+        std::vector<size_t> simple_offsets(n_backends, 0);
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_ASSERT(tensor->ne[2] == 1);
+
+            const size_t row_stride = tensor->nb[1];
+            GGML_ASSERT(offset % row_stride == 0);
+            GGML_ASSERT(size   % row_stride == 0);
+            const int64_t row_start = offset / row_stride;
+            const int64_t row_count = size   / row_stride;
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+
+            const int64_t blck_size = ggml_blck_size(tensor->type);
+            for (size_t s = 0; s < split_state.n_segments; s++) {
+                for (size_t r = 0; r < split_state.nr[s]; r++) {
+                    for (size_t jw = 0; jw < n_world; jw++) {
+                        const int64_t ne_jw = split_state.ne[s*n_world + jw];
+                        GGML_ASSERT(ne_jw % blck_size == 0);
+                        const size_t nbytes = ne_jw/blck_size * tensor->nb[0];
+                        if (jw >= rank_first && jw < rank_first + n_backends) {
+                            const size_t j = jw - rank_first;
+                            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_data,
+                                simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
+                                row_count, simple_tensor->nb[1], tensor->nb[1]);
+                            simple_offsets[j] += nbytes;
+                        } else {
+                            GGML_ASSERT(ne_jw == 0 && "cannot read back a remote slice of a split tensor");
+                        }
+                        offset_data += nbytes;
+                    }
+                }
+            }
+            GGML_ASSERT(offset_data*row_count == size);
+            return;
+        }
+        GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
+
+        const size_t row_stride = tensor->nb[2];
+        GGML_ASSERT(offset % row_stride == 0);
+        GGML_ASSERT(size   % row_stride == 0);
+        const int64_t row_start = offset / row_stride;
+        const int64_t row_count = size   / row_stride;
+        GGML_ASSERT(row_start + row_count <= tensor->ne[2]);
+
+        for (size_t s = 0; s < split_state.n_segments; s++) {
+            for (size_t r = 0; r < split_state.nr[s]; r++) {
+                for (size_t jw = 0; jw < n_world; jw++) {
+                    const int64_t ne_jw = split_state.ne[s*n_world + jw];
+                    const size_t nbytes = ne_jw * tensor->nb[1];
+                    if (jw >= rank_first && jw < rank_first + n_backends) {
+                        const size_t j = jw - rank_first;
+                        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                        ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_data,
+                            simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
+                            row_count, simple_tensor->nb[2], tensor->nb[2]);
+                        simple_offsets[j] += nbytes;
+                    } else {
+                        GGML_ASSERT(ne_jw == 0 && "cannot read back a remote slice of a split tensor");
+                    }
+                    offset_data += nbytes;
+                }
+            }
+        }
+        GGML_ASSERT(offset_data*row_count == size);
+        return;
+    }
+
+    // Fast path: single segment, one contiguous chunk per device (unchanged).
+    GGML_ASSERT(offset == 0);
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:

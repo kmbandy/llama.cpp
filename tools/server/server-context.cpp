@@ -6088,7 +6088,27 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // Under WP_SPEC_PREFILL_NO_CHECKPOINTS the offset break loop above only
+                    // stops the prompt {4} tokens before the end (checkpoint_offsets_tail)
+                    // instead of also stopping at {4 + n_ubatch} (checkpoint_offsets_full).
+                    // Left at n_ubatch here, "near the end" fires far too early relative to
+                    // that narrower offset: e.g. an 8204-token prompt with n_batch = 8192,
+                    // n_ubatch = 2048 hits the natural end of its first (n_batch-sized) decode
+                    // with 12 tokens left; 12 < n_ubatch so near_prompt_end was true, and it
+                    // both defeats the "skip ordinary mid-prompt checkpoints" gate below and
+                    // bypasses the min-checkpoint-spacing gate further down, forcing a full
+                    // checkpoint at n_tokens=8192 -- 8 tokens before the loop breaks again for
+                    // the real {4}-offset checkpoint at n_tokens=8200. checkpoints_required
+                    // (see ~line 5941) says whether checkpoints are needed for this memory
+                    // type AT ALL, not whether this particular early one is: it is not, since
+                    // the {4}-offset break already guarantees a checkpoint at the true end for
+                    // any continuation/rollback to resume from. Narrowing the "near the end"
+                    // window to the same {4} used by that offset removes the redundant early
+                    // checkpoint (0.3-0.36s of recurrent-state serialization) while leaving the
+                    // real end-of-prompt checkpoint -- and default behaviour with the env var
+                    // unset -- untouched.
+                    const int near_prompt_end_window = wp_spec_no_checkpoints ? 4 : n_ubatch;
+                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + near_prompt_end_window;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;

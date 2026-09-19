@@ -366,3 +366,72 @@ LLAMA_API bool llama_dspark_kv_census(llama_memory_t mem,
                                       int32_t      * out_n_dup,
                                       llama_pos    * out_pos_min,
                                       llama_pos    * out_pos_max);
+
+// MAD-LAB (WP_CKPT_ASYNC): async context-checkpoint capture.
+//
+// common_prompt_checkpoint::update_tgt()/update_dft() (common/common.cpp) call
+// llama_state_seq_get_data_ext() synchronously today: for a recurrent/hybrid
+// model that is a per-tensor blocking cudaMemcpy (D2H) for every layer's
+// conv/delta-net state, issued serially on the caller's thread -- see
+// llama_io_write_host in llama-context.cpp. Measured on a 2-GPU TP alias
+// (Qwen3.8-27B gated-delta-net, 48 layers x 2 tensors = 96 copies, ~150 MiB):
+// ~300-360 ms per checkpoint, paid twice per 8k-token prompt, entirely inside
+// the decode loop before the next (tiny, tail) llama_decode() can be issued.
+//
+// llama_ckpt_async_capture() issues the same set of D2H copies asynchronously
+// into pinned host staging (ggml_backend_tensor_get_async(), one completion
+// event per backend/device actually touched, recorded after that device's
+// LAST copy -- CUDA/HIP stream FIFO order means that event only fires once
+// every copy issued to that device has landed) and returns immediately: the
+// caller's decode loop can issue its next llama_decode() right away, and the
+// checkpoint capture finishes in the background. `dst` is NOT valid until
+// llama_ckpt_async_wait() is called on the returned handle -- call it only
+// when the checkpoint is actually about to be read (a restore) or when the
+// checkpoint owning `dst` is being destroyed/evicted, never eagerly.
+//
+// The pinned staging buffer is NOT allocated per call: llama_context keeps a
+// small persistent, grow-only pool (2 rotating slots for `is_dft=false`
+// captures, 2 more for `is_dft=true`) and this call never allocates on the
+// steady-state path -- (re)allocating pinned host memory per capture was
+// measured at 90 ms-2.6 s per call (pinned-memory registration serializes
+// against other outstanding pinned ops in the CUDA/HIP driver), which
+// defeated the whole point of going async. `is_dft` just selects which of
+// the two pools/rings this capture rotates through -- pass false from
+// common_prompt_checkpoint::update_tgt(), true from update_dft().
+//
+// Returns nullptr if async capture is not available (no pinned host buffer
+// type on this context's device(s), event creation failed, or a write
+// error) -- the caller must fall back to llama_state_seq_get_data_ext() in
+// that case, which remains byte-identical to before this feature.
+typedef struct llama_ckpt_async_state * llama_ckpt_async_handle_t;
+
+LLAMA_API llama_ckpt_async_handle_t llama_ckpt_async_capture(
+        struct llama_context   * ctx,
+        llama_seq_id              seq_id,
+        llama_state_seq_flags     flags,
+        uint8_t                 * dst,
+        size_t                    size,
+        bool                      is_dft);
+
+// Blocks until the capture behind `h` has landed on its device(s) and copies
+// it into the `dst` passed to llama_ckpt_async_capture(), then frees `h`
+// itself (idempotent-safe: a slot rotation may already have forced this same
+// completion in the background -- see the pinned pool note above -- in which
+// case this just frees the small bookkeeping object). The pinned staging
+// buffer itself is never freed here; it belongs to llama_context's pool and
+// is reused by a later capture. Safe no-op if `h` is nullptr.
+LLAMA_API void llama_ckpt_async_wait(llama_ckpt_async_handle_t h);
+
+// Non-blocking counterpart of llama_ckpt_async_wait(): use this when the
+// `dst` passed to llama_ckpt_async_capture() is being discarded -- the
+// checkpoint that owns it is destroyed/evicted, or a fresh capture is about
+// to overwrite it -- so nobody will ever read the landed bytes. Detaches `h`
+// from `dst` (so a later finish is a no-op memcpy-wise) and returns
+// immediately WITHOUT synchronizing its event(s): the D2H copy keeps running
+// in the background, and whatever wait it still owes is paid later, off this
+// caller's critical path, by whichever of {a later capture reclaiming this
+// capture's pinned pool slot, or the owning llama_context's teardown} comes
+// first -- both already know how to free `h` once that happens, so the
+// caller must not touch `h` again after this call. Safe no-op if `h` is
+// nullptr.
+LLAMA_API void llama_ckpt_async_abandon(llama_ckpt_async_handle_t h);

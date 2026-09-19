@@ -22,8 +22,21 @@
 #include "bench/trfeed_ml84_kernels.h"   // gemm_ml84_trfeed<TBM,TWAVES_M>; pulls in trfeed_kernels.h + ml84_trfeed_layout.h
 #include "gemm_capi.h"
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
+
+// This translation unit is built standalone (not through ggml-cuda's
+// common.cuh), so it gets its own copy of the same MT_WIDE_KERNELS env-var
+// toggle used there (ggml_cuda_mt_wide_kernels_enabled in common.cuh) --
+// same name, same semantics, independent implementation.
+static inline bool mt_wide_kernels_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("MT_WIDE_KERNELS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // 1. Device packer: on-disk block_ml8_4[N][n_groups_k] -> B_nib + b_scale_g.
@@ -165,6 +178,47 @@ __global__ void ml84_scale_colmax_kernel(const float* __restrict__ b_scale_g, co
     b_scale_out[n] = fmaxf(mx / 448.0f, 1e-12f);
 }
 
+// MT_WIDE_KERNELS=1 wide variant: one 256-thread BLOCK per column instead of
+// one thread per column looping over all n_groups_k groups sequentially --
+// at the production FFN shapes (n_groups_k = K/64 = 136 at K=8704, 272 at
+// K=17408) the loop above is a 136-272 iteration SEQUENTIAL per-thread
+// memory chain over a narrow grid (grid_n = ceil(N/256), e.g. 34 blocks at
+// N=8704) -- exactly the "many sequential loads/thread, narrow grid"
+// geometry the gfx1201 microbench found ~3.5x slower per-wave than a wide,
+// <=2-iteration launch. Splitting n_groups_k across the block's 256 threads
+// caps each thread at ceil(n_groups_k/256) <= 2 iterations at both shapes,
+// and grid = N blocks (8704 or 5120, both >>4096) is now genuinely wide.
+// Finished with a shared-memory tree-max reduction (max is associative and
+// commutative, so this is numerically identical to the scalar kernel, not
+// just within tolerance).
+__global__ void ml84_scale_colmax_kernel_wide(const float* __restrict__ b_scale_g, const uint8_t* __restrict__ lut,
+                                              float* __restrict__ b_scale_out, int N, int n_groups_k) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int tid = threadIdx.x;
+    float mx = 0.f;
+    for (int g = tid; g < n_groups_k; g += blockDim.x) {
+        float lut_amax = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            lut_amax = fmaxf(lut_amax, fabsf(ml84_decode_e4m3(lut[(size_t) g * 16 + i])));
+        }
+        mx = fmaxf(mx, b_scale_g[(size_t) g * (size_t) N + (size_t) n] * lut_amax);
+    }
+    __shared__ float s_max[256];
+    s_max[tid] = mx;
+    __syncthreads();
+    for (int ofs = blockDim.x / 2; ofs > 0; ofs >>= 1) {
+        if (tid < ofs) {
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + ofs]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        b_scale_out[n] = fmaxf(s_max[0] / 448.0f, 1e-12f);
+    }
+}
+
 // REWRITTEN (was per-(n,k)-element, iterating (n,k) then inverting to
 // (L,s); the coordinator's bench run found the old version numerically
 // wrong AND ~6x slower than bandwidth). This version iterates one thread
@@ -237,6 +291,24 @@ extern "C" hipError_t rdna4_expand_ml84_to_trfeed(const uint8_t* B_nib, const ui
     const int n_groups_k = K / QK_ML8;
     constexpr int TPB = 256;
 
+    // REVERTED (2026-09-18): ml84_scale_colmax_kernel_wide regressed
+    // measured colmax time under MT_WIDE_KERNELS=1 (rocprof, 8k prompt,
+    // 3200 launches/device: 124->249 ms on the 9070 XT, 75->127 ms on the
+    // R9700). One 256-thread block per column turns out to cost more in
+    // block-launch + shared-memory-tree-reduction overhead than it saves --
+    // at N=8704/17408 columns the "grid" is already wide (8704-17408
+    // blocks), so the wide kernel's real effect was trading the original's
+    // few-blocks/long-sequential-loop geometry for a many-blocks/tiny-loop
+    // one that then pays a full __syncthreads() tree (log2(256)=8 rounds)
+    // per column for a max of only 136-272 values -- reduction overhead
+    // dominates the tiny per-thread work. Falling back to the original
+    // kernel unconditionally here; ml84_scale_colmax_kernel_wide is left
+    // in the file (unused) rather than deleted, in case a future revision
+    // -- e.g. splitting K across blockIdx.y with an atomicMax instead of a
+    // full block per column -- wants to reuse the scaffolding. Do NOT
+    // re-enable this dispatch on mt_wide_kernels_enabled() without new
+    // measurements showing an actual win on both GPUs.
+    (void) mt_wide_kernels_enabled();
     const int grid_n = (N + TPB - 1) / TPB;
     ml84_scale_colmax_kernel<<<grid_n, TPB, 0, stream>>>(b_scale_g, lut, b_scale_out, N, n_groups_k);
     hipError_t rc = hipGetLastError();

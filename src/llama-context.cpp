@@ -38,6 +38,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -298,6 +299,17 @@ static bool wp_spine_layer_profile_enabled() {
 static bool wp_spec_prefill_stats_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_SPEC_PREFILL_STATS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+// MAD-LAB: gates the narrow, per-layer wait in sync_embeddings_layer_inp()
+// (see llama-context.h). Default (unset) is byte-for-byte the original
+// llama_get_embeddings_layer_inp() behaviour: a full ctx->synchronize().
+static bool wp_layer_inp_narrow_sync_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_LAYER_INP_NARROW_SYNC");
         return value != nullptr && value[0] == '1';
     }();
     return enabled;
@@ -1206,12 +1218,27 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // MAD-LAB (WP_CKPT_ASYNC): finish + detach every still-outstanding async
+    // checkpoint capture before the pinned pool (ckpt_pinned_tgt/dft) and the
+    // backends below go away -- see ckpt_async_teardown()'s comment for the
+    // segfault this fixes (tools/server frees this context before destroying
+    // the server_slot objects whose checkpoints can still hold a handle).
+    ckpt_async_teardown();
+
     // MAD-LAB (pinned-host nextn staging): free any cached nextn_stage_event[]
     // handles before the pinned buffers/device go away below. No-op for every
     // context that never enabled pinned staging.
     for (int slot = 0; slot < 2; slot++) {
         if (nextn_stage_event[slot] != nullptr) {
             ggml_backend_event_free(nextn_stage_event[slot]);
+        }
+    }
+
+    // MAD-LAB (WP_LAYER_INP_NARROW_SYNC): free any per-layer events created
+    // by extract_layer_inputs(). No-op unless the env var was set.
+    for (ggml_backend_event_t ev : embd_layer_inp_event) {
+        if (ev != nullptr) {
+            ggml_backend_event_free(ev);
         }
     }
 
@@ -2315,6 +2342,36 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
 
     return embd_layer_inp[lid].data;
+}
+
+float * llama_context::sync_embeddings_layer_inp(uint32_t lid) {
+    // A pending reorder touches every output buffer -- logits, embd,
+    // embd_nextn, sampling, and embd_layer_inp for every OTHER lid too --
+    // most of which this lid's event/backend says nothing about, and
+    // output_reorder() consumes output_swaps on its first call (see
+    // llama-context.h). So the narrow wait is only safe when there is
+    // nothing pending for output_reorder() to do; otherwise fall back to the
+    // original full synchronize(), which is also what covers the
+    // WP_LAYER_INP_NARROW_SYNC-unset default path below.
+    bool waited_narrow = false;
+    if (wp_layer_inp_narrow_sync_enabled() && output_swaps.empty() &&
+            lid < embd_layer_inp_backend.size() && embd_layer_inp_backend[lid] != nullptr) {
+        if (lid < embd_layer_inp_event.size() && embd_layer_inp_event[lid] != nullptr) {
+            ggml_backend_event_synchronize(embd_layer_inp_event[lid]);
+        } else {
+            // No event for this lid (ggml_backend_event_new() returned null
+            // for its device) -- still far narrower than draining every
+            // scheduler on every device.
+            ggml_backend_synchronize(embd_layer_inp_backend[lid]);
+        }
+        waited_narrow = true;
+    }
+
+    if (!waited_narrow) {
+        synchronize();
+    }
+
+    return get_embeddings_layer_inp(lid);
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
@@ -5334,6 +5391,35 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         }
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+
+        // MAD-LAB (WP_LAYER_INP_NARROW_SYNC): record an event on the SAME
+        // backend right after issuing the copy above, so
+        // sync_embeddings_layer_inp() can wait for exactly this layer's copy
+        // instead of a full ctx->synchronize(). Always track the backend
+        // (cheap, needed as the fallback below); only pay for event_new()
+        // when the narrow path is actually enabled. Events are created once
+        // per lid and re-recorded (not reallocated) on every later
+        // extraction, same pattern as nextn_stage_event in llama-context.h --
+        // waiting on the latest recording implies every earlier one on that
+        // backend's stream already completed (streams execute in issue
+        // order), so this is correct even if extraction for a given lid
+        // happens more than once before it is read.
+        if (embd_layer_inp_backend.size() <= il) {
+            embd_layer_inp_backend.resize(embd_layer_inp.size(), nullptr);
+        }
+        embd_layer_inp_backend[il] = backend;
+
+        if (wp_layer_inp_narrow_sync_enabled()) {
+            if (embd_layer_inp_event.size() <= il) {
+                embd_layer_inp_event.resize(embd_layer_inp.size(), nullptr);
+            }
+            if (embd_layer_inp_event[il] == nullptr) {
+                embd_layer_inp_event[il] = ggml_backend_event_new(ggml_backend_get_device(backend));
+            }
+            if (embd_layer_inp_event[il] != nullptr) {
+                ggml_backend_event_record(embd_layer_inp_event[il], backend);
+            }
+        }
     }
 }
 
@@ -5938,6 +6024,104 @@ private:
     std::vector<write_info> winfos;
 };
 
+// MAD-LAB (WP_CKPT_ASYNC): async twin of llama_io_write_host, used only by
+// llama_ckpt_async_capture() below. Writes plain bytes (magic/seq_id) into
+// pinned host staging synchronously (cheap, a handful of bytes), but issues
+// every write_tensor() as ggml_backend_tensor_get_async() on that tensor's
+// OWN backend/stream instead of a blocking ggml_backend_tensor_get(). No
+// per-copy wait here: the caller (llama_ckpt_async_capture) calls finish()
+// once, after every write_tensor() has been issued, to record ONE
+// completion event per backend actually touched -- CUDA/HIP streams execute
+// in issue order, so an event recorded after the LAST copy to a given
+// backend only fires once every earlier copy to that same backend has
+// landed too. Bytes land in `ptr` (pinned) at the exact same offsets a
+// llama_io_write_host would have used, so the resulting buffer is
+// byte-identical once the caller waits on those events.
+class llama_io_write_host_async : public llama_io_write_i {
+public:
+    llama_io_write_host_async(ggml_backend_sched_t sched, uint8_t * p, size_t len)
+        : sched(sched), ptr(p), buf_size(len) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+        if (backend == nullptr) {
+            // Not part of the scheduled graph (shouldn't happen for live KV/recurrent
+            // state tensors) -- fall back to a blocking copy rather than leave the
+            // region unfilled.
+            ggml_backend_tensor_get(tensor, ptr, offset, size);
+        } else {
+            ggml_backend_tensor_get_async(backend, tensor, ptr, offset, size);
+            touched.insert(backend);
+        }
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+    // Call once, after every write()/write_tensor() call has been issued.
+    // Returns one completion event per backend actually used; empty (but
+    // still valid -- everything already landed) if no backend supported
+    // events, in which case this already synchronously drained whichever
+    // backends lacked one.
+    //
+    // Transparently correct for `backend == the meta/TP backend` (recurrent/
+    // hybrid state under tensor-split lands there, see
+    // ggml_backend_meta_get_tensor_async's segmented branch above): the meta
+    // device's event iface (ggml-backend-meta.cpp's
+    // ggml_backend_meta_device_event_new/_free/_synchronize, wired at
+    // ggml_backend_meta_device_iface) allocates one real event PER SIMPLE
+    // DEVICE and ggml_backend_event_record()/synchronize() fan out to every
+    // one of them (ggml_backend_meta_event_record/_wait, wired at
+    // ggml_backend_meta_i) -- so calling ggml_backend_get_device()/
+    // ggml_backend_event_new()/ggml_backend_event_record() on the meta
+    // backend here already does the "one event per simple backend touched"
+    // that a hand-rolled ggml_backend_meta_simple_backend() loop would, with
+    // no special-casing needed.
+    std::vector<ggml_backend_event_t> finish() {
+        std::vector<ggml_backend_event_t> events;
+        events.reserve(touched.size());
+        for (ggml_backend_t backend : touched) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_event_t ev = dev != nullptr ? ggml_backend_event_new(dev) : nullptr;
+            if (ev != nullptr) {
+                ggml_backend_event_record(ev, backend);
+                events.push_back(ev);
+            } else {
+                // No event support on this device -- the only safe fallback is to
+                // drain it here, synchronously, before finish() returns.
+                ggml_backend_synchronize(backend);
+            }
+        }
+        return events;
+    }
+
+private:
+    ggml_backend_sched_t sched;
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+    std::set<ggml_backend_t> touched;
+};
+
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
@@ -6404,6 +6588,321 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+// MAD-LAB (WP_CKPT_ASYNC): opaque handle returned by llama_ckpt_async_capture()
+// (declared in llama-ext.h). Does NOT own pinned memory -- `pinned_base`/
+// `slot` point into one of llama_context's persistent pinned pool slots
+// (llama_context::ckpt_pinned_tgt/dft, llama-context.h) -- only the small
+// bookkeeping (events + where the final bytes go) is owned here. `done`
+// makes finish() idempotent: whichever runs first, an explicit
+// llama_ckpt_async_wait() (checkpoint consumed/evicted) or the pinned pool
+// reclaiming `slot` for a later capture (llama_context::ckpt_async_capture()),
+// correctly lands the bytes exactly once; the other becomes a no-op.
+struct llama_ckpt_async_state {
+    std::vector<ggml_backend_event_t> events;
+    uint8_t *                         dst         = nullptr;
+    size_t                            size        = 0;
+    void *                            pinned_base = nullptr;
+    llama_context::pinned_slot *      slot        = nullptr; // non-owning; may outlive this state
+    llama_context *                   owner_ctx   = nullptr; // non-owning; nulled by ckpt_async_teardown() before it can dangle -- see llama-context.h's ckpt_async_live
+    bool                              done        = false;
+    // Set by llama_ckpt_async_abandon(): nobody owns/will-wait-on this handle
+    // any more, so whichever of {a pool slot reclaim, context teardown} next
+    // calls llama_ckpt_async_state_finish() on it must also delete it and
+    // deregister it from ckpt_async_live -- see both call sites below.
+    bool                              abandoned   = false;
+};
+
+// MAD-LAB (WP_CKPT_ASYNC_LOG=1): trace who forces a wait on an async
+// checkpoint capture and why -- read once, shared by every wait site in this
+// file and in common/common.cpp's wait_tgt()/wait_dft().
+static bool llama_ckpt_async_log_enabled() {
+    static const bool v = [] {
+        const char * env = std::getenv("WP_CKPT_ASYNC_LOG");
+        return env != nullptr && env[0] == '1';
+    }();
+    return v;
+}
+
+// Lands `state`'s bytes into its `dst` if not already done: synchronizes and
+// frees its events, then does the (fast, host-to-host) copy out of the pinned
+// slot. Never touches `state->slot` itself (the pool's ggml_backend_buffer_ptr
+// is not owned here) or deletes `state` (the caller decides that -- see
+// llama_ckpt_async_wait() and the reclaim step in ckpt_async_capture()).
+static void llama_ckpt_async_state_finish(llama_ckpt_async_state * state, const char * reason) {
+    if (state == nullptr || state->done) {
+        return;
+    }
+
+    if (!state->events.empty() && llama_ckpt_async_log_enabled()) {
+        LLAMA_LOG_WARN("WP_CKPT_ASYNC_LOG: forced wait on a checkpoint capture, reason=%s, %zu event(s), %.1f MiB\n",
+                        reason ? reason : "?", state->events.size(), state->size / (1024.0 * 1024.0));
+    }
+
+    for (ggml_backend_event_t ev : state->events) {
+        ggml_backend_event_synchronize(ev);
+        ggml_backend_event_free(ev);
+    }
+    state->events.clear();
+
+    if (state->dst != nullptr && state->size > 0 && state->pinned_base != nullptr) {
+        memcpy(state->dst, state->pinned_base, state->size);
+    }
+
+    state->done = true;
+}
+
+// Deregisters and deletes `state` if (and only if) llama_ckpt_async_abandon()
+// was called on it: an abandoned state is one nothing else references any
+// more (its owning common_prompt_checkpoint discarded it without waiting),
+// so whichever of {a pool slot reclaim, context teardown} finishes it next --
+// see the two call sites below -- is also the one responsible for freeing it,
+// since llama_ckpt_async_wait() will never be called on it by anyone.
+// `state` must already be detached from its pool slot (state->slot ==
+// nullptr) before this is called -- both call sites do that first.
+static void llama_ckpt_async_state_reap_if_abandoned(llama_ckpt_async_state * state) {
+    if (state == nullptr || !state->abandoned) {
+        return;
+    }
+    if (state->owner_ctx != nullptr) {
+        auto & live = state->owner_ctx->ckpt_async_live;
+        live.erase(std::remove(live.begin(), live.end(), state), live.end());
+    }
+    delete state;
+}
+
+llama_ckpt_async_handle_t llama_context::ckpt_async_capture(
+        llama_seq_id seq_id, llama_state_seq_flags flags, uint8_t * dst, size_t size, bool is_dft) {
+    if (size == 0 || backends.empty()) {
+        return nullptr;
+    }
+
+    // Two rotating slots per direction -- see the pinned_slot comment in
+    // llama-context.h for why 2, not 1 or a per-checkpoint allocation.
+    pinned_slot * ring  = is_dft ? ckpt_pinned_dft : ckpt_pinned_tgt;
+    uint32_t &    next  = is_dft ? ckpt_pinned_next_dft : ckpt_pinned_next_tgt;
+    pinned_slot & slot  = ring[next % 2];
+    next++;
+
+    // Reclaim: if this slot's previous occupant hasn't landed yet, finish it
+    // now -- an event wait scoped to ONE prior capture, not a device sync.
+    // In steady state (2 checkpoints/prompt, 2 slots/direction) this never
+    // actually blocks: this slot's previous occupant is 2 captures old by
+    // the time it is reused. WP_CKPT_ASYNC_LOG=1 reports it when it does.
+    if (slot.owner != nullptr) {
+        llama_ckpt_async_state_finish(slot.owner, "pinned slot reclaimed by a newer capture");
+        llama_ckpt_async_state * old = slot.owner;
+        old->slot  = nullptr; // the reclaiming capture below takes over the slot
+        slot.owner = nullptr;
+        llama_ckpt_async_state_reap_if_abandoned(old); // frees `old` if abandon_tgt()/abandon_dft() already ran on it
+    }
+
+    // Grow-only, allocated at most once per slot in steady state (a given
+    // model/context always asks for the same ckpt_size): NO allocation on the
+    // hot path once every slot has seen its first (largest) request. This is
+    // the fix for the 90 ms-2.6 s per-capture cost of allocating/freeing a
+    // fresh pinned buffer every time -- see the llama-ext.h comment.
+    // Growing sizes EVERY idle slot in the ring, not just the one this capture
+    // lands in: a 150 MiB pinned allocation costs ~1.3 s on ROCm (it is
+    // registered with every device), and growing one slot per capture meant
+    // the warmup prompt paid slot 0 while the FIRST REAL prompt paid slot 1
+    // (chain 177: 2515 ms then 1391 ms captures, then 64 ms). Sizing the whole
+    // ring on the first grow moves all of it into warmup.
+    if (!slot.buf || slot.cap < size) {
+        ggml_backend_dev_t dev0 = ggml_backend_get_device(backends[0].get());
+        ggml_backend_buffer_type_t host_buft = dev0 != nullptr ? ggml_backend_dev_host_buffer_type(dev0) : nullptr;
+        if (host_buft == nullptr) {
+            return nullptr;
+        }
+
+        for (int i = 0; i < 2; ++i) {
+            pinned_slot & s = ring[i];
+            if (s.buf && s.cap >= size) {
+                continue;
+            }
+            if (&s != &slot && s.owner != nullptr) {
+                continue; // in flight -- it grows on its own turn
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, size);
+            if (buf == nullptr) {
+                if (&s == &slot) {
+                    LLAMA_LOG_WARN("%s: failed to grow the pinned checkpoint staging pool to %.1f MiB -- "
+                                    "falling back to the synchronous capture for this checkpoint\n",
+                                    __func__, size / (1024.0 * 1024.0));
+                    return nullptr;
+                }
+                break; // the other slot can retry when it is used
+            }
+
+            s.buf.reset(buf);
+            s.cap = size;
+
+            if (llama_ckpt_async_log_enabled()) {
+                LLAMA_LOG_WARN("WP_CKPT_ASYNC_LOG: grew pinned pool slot %d (is_dft=%d) to %.1f MiB "
+                                "(one-time cost, not paid again for this slot)\n",
+                                i, (int) is_dft, size / (1024.0 * 1024.0));
+            }
+        }
+    }
+
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(slot.buf.get());
+
+    auto state = std::make_unique<llama_ckpt_async_state>();
+    state->dst         = dst;
+    state->size        = size;
+    state->pinned_base = base;
+    state->slot        = &slot;
+    state->owner_ctx   = this;
+
+    llama_io_write_host_async io(sched.get(), base, size);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        const size_t n = state_seq_write_data(io, seq_id, flags);
+        if (n != size) {
+            LLAMA_LOG_WARN("%s: async checkpoint size mismatch: expected %zu, got %zu -- "
+                            "falling back to the synchronous capture for this checkpoint\n",
+                            __func__, size, n);
+            return nullptr;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error issuing async checkpoint capture: %s\n", __func__, err.what());
+        return nullptr;
+    }
+
+    state->events = io.finish();
+
+    slot.owner = state.get();
+    ckpt_async_live.push_back(state.get());
+
+    return state.release();
+}
+
+llama_ckpt_async_handle_t llama_ckpt_async_capture(
+        llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, uint8_t * dst, size_t size, bool is_dft) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    return ctx->ckpt_async_capture(seq_id, flags, dst, size, is_dft);
+}
+
+// MAD-LAB (WP_CKPT_ASYNC): called first thing in ~llama_context(), BEFORE any
+// member (sched, backends, the ckpt_pinned_tgt/dft pool) is torn down. Fixes a
+// segfault: tools/server's server_context_impl frees its llama_context before
+// destroying its server_slot objects. ~common_prompt_checkpoint() itself no
+// longer blocks on a still-outstanding capture (it calls abandon_tgt()/
+// abandon_dft(), not wait_tgt()/wait_dft() -- see common/common.cpp), so a
+// checkpoint destructor running AFTER this llama_context is gone no longer
+// tries to memcpy out of it either way. But an abandoned-and-still-slot-owned
+// state's GPU event is still real and still outstanding, and its destination
+// is still ckpt_pinned_tgt/dft's memory -- if this llama_context were simply
+// destroyed with no teardown, that pinned host memory could be unmapped/freed
+// while the device's DMA engine is still actively writing into it (real
+// corruption, not just a dangling pointer), and the small llama_ckpt_async_state
+// bookkeeping struct itself would leak (nothing left to reclaim its slot and
+// free it). So: while backends/devices/the pool are still alive, actually
+// synchronize + land (or, for an abandoned one, just synchronize and free)
+// every outstanding capture here, THEN detach it (owner_ctx = slot = nullptr,
+// and delete it outright if abandoned) so nothing later touches this
+// (by-then-dangling) llama_context* or its pool again -- see
+// llama_ckpt_async_wait()/llama_ckpt_async_abandon() below, both of which
+// check owner_ctx/slot for exactly that. If a checkpoint is instead destroyed
+// (and abandons, or a restore waits) BEFORE this context is torn down, that
+// call already erased/freed itself via ckpt_async_live, so this loop simply
+// finds fewer entries -- correct regardless of teardown order on the
+// caller's side.
+void llama_context::ckpt_async_teardown() {
+    for (llama_ckpt_async_state * state : ckpt_async_live) {
+        llama_ckpt_async_state_finish(state, "context teardown");
+        state->owner_ctx = nullptr;
+        state->slot       = nullptr;
+        // An abandoned state (llama_ckpt_async_abandon() already ran on it --
+        // its owning checkpoint discarded/destroyed it without waiting) will
+        // never have llama_ckpt_async_wait() called on it by anyone, so this
+        // is the last chance to free it. (Bulk-cleared from ckpt_async_live
+        // below, so no per-element erase needed here the way the pool's
+        // reclaim-path reaper does it.)
+        if (state->abandoned) {
+            delete state;
+        }
+    }
+    ckpt_async_live.clear();
+}
+
+void llama_ckpt_async_wait(llama_ckpt_async_handle_t h) {
+    if (h == nullptr) {
+        return;
+    }
+
+    // Callers: load_tgt()/load_dft() (a real restore -- the bytes ARE about
+    // to be read) and common_prompt_checkpoint's copy ctor/assignment
+    // reading a SOURCE object's bytes before copying them. Destruction/
+    // eviction/overwrite of a checkpoint's OWN bytes goes through
+    // llama_ckpt_async_abandon() below instead, which does not block.
+    llama_ckpt_async_state_finish(h, "checkpoint consumed (restore, or copied as another checkpoint's source)");
+
+    // Break the pool's back-reference before freeing `h` -- if the pinned
+    // slot hasn't been reclaimed by a newer capture yet, `slot->owner` still
+    // points at `h`; leaving it dangling would use-after-free the next time
+    // that slot is reclaimed.
+    if (h->slot != nullptr && h->slot->owner == h) {
+        h->slot->owner = nullptr;
+    }
+
+    // Deregister from the owning context's live-capture list -- but only if
+    // that context hasn't already torn itself down (ckpt_async_teardown()
+    // nulls owner_ctx precisely so this branch is skipped once it has, since
+    // by then owner_ctx would otherwise be a dangling llama_context*).
+    if (h->owner_ctx != nullptr) {
+        auto & live = h->owner_ctx->ckpt_async_live;
+        live.erase(std::remove(live.begin(), live.end(), h), live.end());
+    }
+
+    delete h;
+}
+
+void llama_ckpt_async_abandon(llama_ckpt_async_handle_t h) {
+    if (h == nullptr) {
+        return;
+    }
+
+    // Nobody will read h->dst again -- it's about to be resized, freed, or
+    // reused by whoever is discarding this handle. Detach it so that
+    // whenever finish() DOES eventually run (a pool slot reclaim, or context
+    // teardown -- see both below), it skips the memcpy instead of writing
+    // into memory that may no longer mean what it did.
+    h->dst = nullptr;
+
+    if (h->slot == nullptr) {
+        // Already detached from the pinned pool (a slot reclaim or context
+        // teardown already ran finish() on it) -- there is nothing left to
+        // do in the background, so free it right here.
+        if (llama_ckpt_async_log_enabled() && !h->done) {
+            LLAMA_LOG_WARN("WP_CKPT_ASYNC_LOG: abandon of an already-detached checkpoint capture "
+                            "(finishing/freeing it now instead of blocking)\n");
+        }
+        llama_ckpt_async_state_finish(h, "abandoned checkpoint, already detached from pinned pool");
+        if (h->owner_ctx != nullptr) {
+            auto & live = h->owner_ctx->ckpt_async_live;
+            live.erase(std::remove(live.begin(), live.end(), h), live.end());
+        }
+        delete h;
+        return;
+    }
+
+    // Still slot-owned: do NOT touch its event(s) or ckpt_async_live here --
+    // that is precisely the synchronous work this function exists to avoid
+    // on the caller's thread. Leave `h` exactly where it is (still
+    // slot.owner, still in ckpt_async_live) and mark it abandoned so that
+    // whichever of {a later capture reclaiming this slot,
+    // llama_context::ckpt_async_teardown()} finishes it next also frees it
+    // (llama_ckpt_async_state_reap_if_abandoned(), llama-context.cpp) --
+    // since nothing else references `h` any more, and llama_ckpt_async_wait()
+    // will never be called on it again.
+    h->abandoned = true;
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
@@ -7363,9 +7862,12 @@ const float * llama_get_embeddings_nextn_staged_at(llama_context * ctx, int slot
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
-
-    return ctx->get_embeddings_layer_inp(lid);
+    // MAD-LAB (WP_LAYER_INP_NARROW_SYNC): sync_embeddings_layer_inp() narrows
+    // the wait to this layer's own copy instead of ctx->synchronize()'s full
+    // drain of every scheduler on every device (default, env var unset,
+    // behaves identically to the old ctx->synchronize() + get_embeddings_layer_inp()
+    // pair below).
+    return ctx->sync_embeddings_layer_inp(lid);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

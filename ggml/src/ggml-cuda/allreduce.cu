@@ -1055,6 +1055,24 @@ static void ggml_cuda_ar_registry_remove(ggml_cuda_ar_pipeline * p) {
     }
 }
 
+// See allreduce.cuh for the contract. Linear scan of a fixed 8-slot table --
+// this is not a hot-path call (once per ML8_4 GEMM's expand-cache lookahead
+// at most, not per GEMM), so no need for a device->pipeline index.
+cudaStream_t ggml_cuda_ar_stream_for_device(int device) {
+    for (int i = 0; i < GGML_CUDA_AR_MAX_PIPELINES; ++i) {
+        ggml_cuda_ar_pipeline * p = g_ar_pipeline_registry[i].load(std::memory_order_acquire);
+        if (p == nullptr) {
+            continue;
+        }
+        for (int r = 0; r < p->n_devices; ++r) {
+            if (p->devices[r] == device) {
+                return p->streams[r];
+            }
+        }
+    }
+    return nullptr;
+}
+
 // Raw stderr write, usable from a SIGABRT handler: write(2) of a
 // pre-formatted (snprintf'd) buffer, no fprintf/iostreams (those buffer and
 // lock internally and are not async-signal-safe).
@@ -3215,6 +3233,9 @@ bool ggml_cuda_ar_allreduce_end(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_
     return false;
 }
 void ggml_cuda_ar_dump_state(const char *) {
+}
+cudaStream_t ggml_cuda_ar_stream_for_device(int) {
+    return nullptr;
 }
 
 #endif // !defined(GGML_USE_MUSA)

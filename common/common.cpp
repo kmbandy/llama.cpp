@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "../src/llama-ext.h" // llama_ckpt_async_capture/llama_ckpt_async_wait (WP_CKPT_ASYNC)
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -2418,7 +2419,19 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// MAD-LAB (WP_CKPT_ASYNC): read once, applies to every checkpoint capture in
+// this process. Default off -- byte-identical to pre-existing behavior.
+static bool common_ckpt_async_enabled() {
+    static const bool v = [] {
+        const char * env = std::getenv("WP_CKPT_ASYNC");
+        return env != nullptr && env[0] == '1';
+    }();
+    return v;
+}
+
 size_t common_prompt_checkpoint::size() const {
+    // Correct without waiting: data_tgt/data_dft are resized to their final
+    // size synchronously in update_tgt()/update_dft(), async capture or not.
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
 
@@ -2427,6 +2440,10 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 void common_prompt_checkpoint::clear() {
+    // Non-blocking: every byte this object holds is about to be discarded.
+    abandon_tgt("clear()");
+    abandon_dft("clear()");
+
     n_tokens = 0;
 
     pos_min = 0;
@@ -2454,9 +2471,29 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
+    // Guard resize() below against a still-in-flight PREVIOUS capture into this
+    // same checkpoint object (not expected in the current server-context.cpp
+    // usage -- update_tgt() is called once per freshly emplace_back()'d
+    // checkpoint -- but cheap to make safe unconditionally). Non-blocking:
+    // the previous capture's bytes are about to be overwritten by the new one
+    // below, so nothing needs to WAIT for them -- abandon just detaches them
+    // (see abandon_tgt()'s comment) so their eventual background finish
+    // never writes into this (possibly since-reallocated) data_tgt.
+    abandon_tgt("update_tgt(): resize() guard (unexpected -- same object captured twice)");
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_tgt.resize(ckpt_size);
+
+    if (common_ckpt_async_enabled()) {
+        tgt_async = llama_ckpt_async_capture(ctx, seq_id, flags, data_tgt.data(), ckpt_size, /*is_dft=*/ false);
+        if (tgt_async != nullptr) {
+            return;
+        }
+        // Async setup declined (no pinned host buffer type / no event support /
+        // write error) -- fall through to the synchronous path below, exactly
+        // as if WP_CKPT_ASYNC had not been set.
+    }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2472,9 +2509,18 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
+    abandon_dft("update_dft(): resize() guard (unexpected -- same object captured twice)");
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_dft.resize(ckpt_size);
+
+    if (common_ckpt_async_enabled()) {
+        dft_async = llama_ckpt_async_capture(ctx, seq_id, flags, data_dft.data(), ckpt_size, /*is_dft=*/ true);
+        if (dft_async != nullptr) {
+            return;
+        }
+    }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2489,6 +2535,8 @@ void common_prompt_checkpoint::load_tgt(
     if (ctx == nullptr) {
         return;
     }
+
+    wait_tgt("load_tgt(): restore");
 
     if (data_tgt.empty()) {
         return;
@@ -2508,6 +2556,8 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
+    wait_dft("load_dft(): restore");
+
     if (data_dft.empty()) {
         return;
     }
@@ -2519,10 +2569,158 @@ void common_prompt_checkpoint::load_dft(
 }
 
 void common_prompt_checkpoint::clear_tgt() {
+    // Non-blocking: data_tgt is being discarded, not read.
+    abandon_tgt("clear_tgt()");
     data_tgt.clear();
 }
 
 void common_prompt_checkpoint::clear_dft() {
+    abandon_dft("clear_dft()");
     data_dft.clear();
     data_spec.clear();
+}
+
+// MAD-LAB (WP_CKPT_ASYNC_LOG=1): read once, shared by wait_tgt()/wait_dft() --
+// separate from (but the same env var as) llama-context.cpp's own
+// llama_ckpt_async_log_enabled(), which traces the pinned-pool side (slot
+// reclaim / one-time grow) of the same story.
+static bool common_ckpt_async_log_enabled() {
+    static const bool v = [] {
+        const char * env = std::getenv("WP_CKPT_ASYNC_LOG");
+        return env != nullptr && env[0] == '1';
+    }();
+    return v;
+}
+
+void common_prompt_checkpoint::wait_tgt(const char * reason) const {
+    if (tgt_async == nullptr) {
+        return;
+    }
+    if (common_ckpt_async_log_enabled()) {
+        LOG_WRN("WP_CKPT_ASYNC_LOG: common_prompt_checkpoint::wait_tgt forced, reason=%s, n_tokens=%" PRId64 "\n",
+                reason, n_tokens);
+    }
+    llama_ckpt_async_wait((llama_ckpt_async_handle_t) tgt_async);
+    tgt_async = nullptr;
+}
+
+void common_prompt_checkpoint::wait_dft(const char * reason) const {
+    if (dft_async == nullptr) {
+        return;
+    }
+    if (common_ckpt_async_log_enabled()) {
+        LOG_WRN("WP_CKPT_ASYNC_LOG: common_prompt_checkpoint::wait_dft forced, reason=%s, n_tokens=%" PRId64 "\n",
+                reason, n_tokens);
+    }
+    llama_ckpt_async_wait((llama_ckpt_async_handle_t) dft_async);
+    dft_async = nullptr;
+}
+
+void common_prompt_checkpoint::abandon_tgt(const char * reason) const {
+    if (tgt_async == nullptr) {
+        return;
+    }
+    if (common_ckpt_async_log_enabled()) {
+        LOG_WRN("WP_CKPT_ASYNC_LOG: common_prompt_checkpoint::abandon_tgt (non-blocking), reason=%s, n_tokens=%" PRId64 "\n",
+                reason, n_tokens);
+    }
+    llama_ckpt_async_abandon((llama_ckpt_async_handle_t) tgt_async);
+    tgt_async = nullptr;
+}
+
+void common_prompt_checkpoint::abandon_dft(const char * reason) const {
+    if (dft_async == nullptr) {
+        return;
+    }
+    if (common_ckpt_async_log_enabled()) {
+        LOG_WRN("WP_CKPT_ASYNC_LOG: common_prompt_checkpoint::abandon_dft (non-blocking), reason=%s, n_tokens=%" PRId64 "\n",
+                reason, n_tokens);
+    }
+    llama_ckpt_async_abandon((llama_ckpt_async_handle_t) dft_async);
+    dft_async = nullptr;
+}
+
+common_prompt_checkpoint::~common_prompt_checkpoint() {
+    // Non-blocking (MEASURED wp-ckpt-async-evict-block-0918: waiting here cost
+    // up to ~0.9 s on the decode thread evicting a still-in-flight
+    // checkpoint). A destroyed checkpoint's bytes are never read again by
+    // anyone, so there is nothing to wait FOR -- abandon_tgt()/abandon_dft()
+    // just detach the capture; its D2H copy keeps running in the background
+    // and whatever event-wait it still owes is paid later, off this
+    // destructor's critical path (a later pinned-pool slot reclaim, or the
+    // owning llama_context's own teardown -- see llama_ckpt_async_abandon()
+    // in src/llama-ext.h).
+    abandon_tgt("~common_prompt_checkpoint() (evicted / slot released)");
+    abandon_dft("~common_prompt_checkpoint() (evicted / slot released)");
+}
+
+common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & other) :
+        n_tokens(other.n_tokens),
+        id_task(other.id_task),
+        pos_min(other.pos_min),
+        pos_max(other.pos_max) {
+    other.wait_tgt("copy ctor (server_prompt::clone())");
+    other.wait_dft("copy ctor (server_prompt::clone())");
+    data_tgt  = other.data_tgt;
+    data_dft  = other.data_dft;
+    data_spec = other.data_spec;
+    // tgt_async/dft_async stay null: the bytes just copied are already final.
+}
+
+common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && other) noexcept :
+        n_tokens(other.n_tokens),
+        id_task(other.id_task),
+        pos_min(other.pos_min),
+        pos_max(other.pos_max),
+        data_tgt(std::move(other.data_tgt)),
+        data_dft(std::move(other.data_dft)),
+        data_spec(std::move(other.data_spec)),
+        tgt_async(other.tgt_async),
+        dft_async(other.dft_async) {
+    other.tgt_async = nullptr;
+    other.dft_async = nullptr;
+}
+
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_checkpoint && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    // Drop any capture we still own before taking over the other's -- non-
+    // blocking: this object's own bytes are about to be overwritten, not read.
+    abandon_tgt("move assignment (dropping this object's own pending capture)");
+    abandon_dft("move assignment (dropping this object's own pending capture)");
+    n_tokens  = other.n_tokens;
+    id_task   = other.id_task;
+    pos_min   = other.pos_min;
+    pos_max   = other.pos_max;
+    data_tgt  = std::move(other.data_tgt);
+    data_dft  = std::move(other.data_dft);
+    data_spec = std::move(other.data_spec);
+    tgt_async = other.tgt_async;
+    dft_async = other.dft_async;
+    other.tgt_async = nullptr;
+    other.dft_async = nullptr;
+    return *this;
+}
+
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prompt_checkpoint & other) {
+    if (this == &other) {
+        return *this;
+    }
+
+    other.wait_tgt("copy assignment (source, server_prompt::clone())");
+    other.wait_dft("copy assignment (source, server_prompt::clone())");
+    // Non-blocking: this object's own bytes are about to be overwritten, not read.
+    abandon_tgt("copy assignment (dropping this object's own pending capture)");
+    abandon_dft("copy assignment (dropping this object's own pending capture)");
+
+    n_tokens  = other.n_tokens;
+    id_task   = other.id_task;
+    pos_min   = other.pos_min;
+    pos_max   = other.pos_max;
+    data_tgt  = other.data_tgt;
+    data_dft  = other.data_dft;
+    data_spec = other.data_spec;
+
+    return *this;
 }
