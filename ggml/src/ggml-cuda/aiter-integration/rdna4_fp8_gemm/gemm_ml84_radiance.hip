@@ -572,6 +572,18 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
       }
 }
 
+#else
+// Other-arch device pass: declaration-only stub so the (unconditionally parsed)
+// host launcher below still resolves the template name. The launcher can never
+// run on a non-gfx1201 device -- ml8.cu gates the radiance path on gfx1201 --
+// so no body is ever needed here. Same convention as trfeed_kernels.h.
+template <int TN, int LBK>
+__global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
+    const unsigned char *__restrict__ AT, const unsigned char *__restrict__ B_nib,
+    const unsigned char *__restrict__ lut, const float *__restrict__ b_scale_g,
+    const float *__restrict__ colscale,
+    const float *__restrict__ As, float *__restrict__ C, int M, int N, int K,
+    int pb1, int pb2, long astride);
 #endif   // __gfx1201__ || host pass
 
 // ─────────────────────────────────────────────────────────────────────────

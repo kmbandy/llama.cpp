@@ -776,7 +776,7 @@ gemm_fp8_trfeed_rb(const float8_t* __restrict__ A, const uint8_t* __restrict__ B
 }
 
 #else
-template <int TBM, int TWAVES_M, typename COut = __hip_bfloat16>
+template <int TBM, int TWAVES_M, typename COut = __hip_bfloat16, bool SwiGLU = false>
 __global__ void __launch_bounds__(TWAVES_M * WAVES_N * WAVE_SIZE)
 gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshuf,
                 COut* __restrict__ C,
