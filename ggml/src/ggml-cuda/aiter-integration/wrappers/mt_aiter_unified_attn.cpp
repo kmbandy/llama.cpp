@@ -17,10 +17,12 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <map>
@@ -275,39 +277,13 @@ struct CachedHandles {
     const aiter::KernelHandle  * h_2d_large_f16     = nullptr;  // F16 shadow of h_2d_large, same cache key
                                                                   // a real F16 call of this shape would use
     int                          block_q_large_f16  = MT_AITER_UATTN_BLOCK_Q_LARGE;
-    // MAD-2026-09-12 garbage-16k fix: lazily grown f16 scratch K/V paged
-    // caches for the predequant path. CachedHandles itself is keyed ONLY by
-    // physical (device, shape) pair (get_cached() below) — it is shared by EVERY
-    // ggml_backend_cuda_context that ever runs on this device, which in
-    // practice means both the target llama_context AND any independent
-    // draft llama_context (common/speculative.cpp's ctx_dft, e.g. the MTP
-    // "nextn" head, which calls llama_encode()/llama_decode() on its OWN
-    // llama_context and therefore its OWN hipStream_t — see
-    // ggml_backend_cuda_init()/new_pool_for_device(), each call gets a fresh
-    // ggml_backend_cuda_context with its own streams[] array). A single
-    // shared scratch_k/scratch_v buffer written and read by two independent
-    // streams with no cross-stream ordering is a genuine data race: ctx_dft's
-    // own turbo4_fp8 2D-large prefill (it uses the same paged cache type,
-    // just a smaller SWA ring) can dequant-write into the SAME physical
-    // scratch buffer ctx_tgt's prefill is concurrently dequant-writing/
-    // reading on its own stream, with nothing but scratch_mu (which only
-    // guards the malloc/free bookkeeping below, not kernel execution)
-    // between them. Bigger prompts -> longer-running dequant/attention
-    // kernels -> a wider overlap window -> more likely to lose the race,
-    // which matches the observed size-dependence (garbage above ~32 blocks,
-    // clean below). Fix: key the scratch buffers by the ISSUING STREAM, not
-    // just the device, so two contexts on the same device never share the
-    // same physical scratch memory. Kernel handles (h_2d/h_3d/.../h_dequant)
-    // are stateless compiled code and stay safely shared across streams —
-    // only this mutable buffer needed isolating.
-    struct ScratchBuf {
-        void   *k      = nullptr;
-        void   *v      = nullptr;
-        size_t  blocks = 0;
-        bool    logged = false;
-    };
-    std::mutex                                  scratch_mu;
-    std::unordered_map<hipStream_t, ScratchBuf> scratch_by_stream;
+    // MAD-2026-09-20 predequant-pool: the K/V scratch itself is no longer
+    // owned here — it is caller-owned, per-call, from the caller's ggml CUDA
+    // pool (mt_aiter_uattn_args_t::predq_scratch_k/v; see mt_pagedattn_
+    // aiter.cu). This is only a high-water-mark, used purely to rate-limit
+    // the "fp8-predequant path active" diagnostic below (print on first call
+    // and whenever the per-call size grows past what was already printed).
+    std::atomic<size_t> predequant_bytes_hwm{0};
 };
 
 // Per-DEVICE handle cache.
@@ -693,96 +669,27 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     return c.init_err;
 }
 
-// MAD-2026-09-12 predequant-scratch + garbage-16k fix: lazily grow the f16
-// scratch K/V paged cache for THIS ISSUING STREAM to at least
-// `num_scratch_blocks` slots. Never shrinks — a later call needing fewer
-// slots just reuses the existing (larger) buffer, so the high-water mark is
-// the largest single call's compacted slot count seen so far (e.g. the
-// largest prefill batch), NOT the paged cache's total physical block
-// capacity — see predequant-scratch-0912.txt for why that distinction
-// matters (512 MiB/cache x2 permanently vs. a few tens of MiB scaled to the
-// actual prefill).
+// MAD-2026-09-12 predequant-scratch / garbage-16k fix (superseded MAD-2026-
+// 09-20 predequant-pool, see mt_aiter_unified_attn() below): the fp8-
+// predequant f16 K/V scratch used to be a persistent, grow-only, per-
+// (device, issuing stream) cache owned right here — keyed by stream (not
+// just device) because CachedHandles is shared per PHYSICAL DEVICE across
+// every ggml_backend_cuda_context on it (in particular the target
+// llama_context and any independent draft llama_context, e.g. the MTP
+// "nextn" head, each with its own hipStream_t even on the same device), and
+// the old design never freed a buffer on growth (a blocking hipFree can
+// deadlock the meta-overlap host thread — see mt_pagedattn_aiter.cu's own
+// predequant-sync-fix-0912 note for the same class of deadlock) — so every
+// context-length grow leaked its predecessor, unbounded over a long-running
+// process. It has been replaced with a caller-owned, per-call allocation
+// from the ggml CUDA pool (mt_aiter_uattn_args_t::predq_scratch_k/v,
+// allocated in mt_pagedattn_aiter.cu via ctx.pool()): this scratch is live
+// only inside one op call (the dequant pre-pass writes it, the immediately
+// following f16 attention launch on the same stream reads it, nothing
+// references it after), so it needs no cross-call caching at all — the
+// pool's own high-water-mark reuse bounds the footprint to the largest
+// single call and returns the memory at op end, with no leak.
 //
-// Keyed by `stream`, not just by device (garbage-16k-0912.txt): CachedHandles
-// is shared per PHYSICAL DEVICE across every ggml_backend_cuda_context that
-// ever runs on it — in particular both the target llama_context and any
-// independent draft llama_context (common/speculative.cpp's ctx_dft, e.g.
-// the MTP "nextn" head), each of which owns its own hipStream_t even on the
-// same device. Before this fix a single scratch_k/scratch_v pair was shared
-// by both: ctx_dft's own turbo4_fp8 2D-large prefill (same cache type, just
-// a smaller SWA-ring context) could dequant-write into the exact buffer
-// ctx_tgt's prefill was concurrently writing/reading on its own stream, with
-// nothing serializing the two streams against each other — scratch_mu only
-// ever guarded the malloc/free bookkeeping, never actual kernel execution.
-// Keying the buffer by stream gives each context its own physical scratch
-// memory, so there is nothing left to race on.
-//
-// Returns false (leaving any previous buffer for this stream untouched) on
-// allocation failure; the caller falls back to the in-kernel fp8 dequant
-// path for that call rather than aborting.
-bool ensure_predequant_scratch(CachedHandles & c, const mt_aiter_uattn_shape_t & shape,
-                                int32_t num_scratch_blocks, hipStream_t stream,
-                                void ** out_k, void ** out_v) {
-    std::lock_guard<std::mutex> g(c.scratch_mu);
-    CachedHandles::ScratchBuf & sb = c.scratch_by_stream[stream];
-    if ((size_t) num_scratch_blocks <= sb.blocks && sb.k && sb.v) {
-        *out_k = sb.k;
-        *out_v = sb.v;
-        return true;
-    }
-    // Grow geometrically: the previous buffer is leaked (see below), so linear
-    // +128-block growth would leak O(n^2) -- ~2 GB per device by 32k context,
-    // which OOM'd both (full) cards on 2026-09-17. Doubling bounds the total
-    // leak to < 2x the final size.
-    const size_t grow_blocks = std::max<size_t>((size_t) num_scratch_blocks, sb.blocks * 2);
-    const size_t bytes_per_cache = grow_blocks * (size_t) shape.block_size
-        * (size_t) shape.num_kv_heads * (size_t) shape.head_size * sizeof(uint16_t);
-    void * new_k = nullptr;
-    void * new_v = nullptr;
-    if (hipMalloc(&new_k, bytes_per_cache) != hipSuccess) return false;
-    if (hipMalloc(&new_v, bytes_per_cache) != hipSuccess) { (void) hipFree(new_k); return false; }
-    // The previous scratch is deliberately LEAKED, never hipFree'd here:
-    // hipFree implicitly device-synchronizes, and under GGML_META_OVERLAP
-    // the single meta-backend host thread must never block on one device
-    // while the other device's subgraph -- including its half of the
-    // AllReduce this device's stream is already waiting on -- is still
-    // unsubmitted (the same host-level deadlock predequant-sync-fix-0912
-    // removed from mt_pagedattn_aiter.cu). Growth is monotone and bounded
-    // by the context length, so the leaked total is < 2x the final size.
-    sb.k      = new_k;
-    sb.v      = new_v;
-    sb.blocks = grow_blocks;
-    *out_k = new_k;
-    *out_v = new_v;
-    // MAD-2026-09-12 predequant-overflow-guard / draft-ubatch-split-0912.txt
-    // "VERIFY-BATCH FAULT" FIX item 3: this used to be gated on `!sb.logged`
-    // -- a one-shot latch that printed only the FIRST-EVER allocation for
-    // this stream and then never again, even though this function is
-    // grow-only and DOES reallocate to a larger size later in the same
-    // session (e.g. a draft-mtp stream's first catch-up ubatch genuinely
-    // only needs ~32 blocks at position ~256-512, then grows to hundreds of
-    // blocks as the real sequence depth grows past that). An operator
-    // reading logs saw only that first, small "num_scratch_blocks=32" line
-    // and had no way to see that the buffer had since grown to cover the
-    // real depth -- this is a logging gap, not evidence that the live
-    // buffer stayed undersized. Every actual (re)allocation reached this
-    // point already ONLY on real growth (the early return above at
-    // `num_scratch_blocks <= sb.blocks` handles the no-growth case), so
-    // logging unconditionally here reports every genuine growth event,
-    // exactly once each, with no added log spam on the (much more common)
-    // reuse path.
-    {
-        int dev = 0;
-        (void) hipGetDevice(&dev);
-        std::fprintf(stderr,
-            "mt_aiter_unified_attn: fp8-predequant path active on device %d stream=%p "
-            "(num_scratch_blocks=%d, allocated %zu blocks, scratch=%zu B/cache x2)\n",
-            dev, (void*) stream, num_scratch_blocks, grow_blocks, bytes_per_cache);
-        sb.logged = true;
-    }
-    return true;
-}
-
 // MAD-2026-09-12 dispatch-fix: per-device CU count, queried once and cached.
 // Used only by mt_aiter_uattn_should_use_2d()'s occupancy test below —
 // separate from CachedHandles/get_cached() because this must be callable
@@ -812,6 +719,38 @@ int cached_cu_count_for_current_device() {
 }
 
 }  // anonymous namespace
+
+// MAD-2026-09-20 predequant-cap: hard ceiling on the per-cache scratch size
+// (K and V are each capped independently at this many MB), default 512 MiB.
+// 0 or negative disables the cap. Read once (same style as the other env
+// reads in this file). Exposed (mt_aiter_unified_attn.h) so the caller
+// (mt_pagedattn_aiter.cu) can apply the SAME limit when deciding whether to
+// allocate predq_scratch_k/v from its pool at all.
+size_t mt_aiter_predequant_max_bytes_per_cache() {
+    static const size_t v = [] {
+        long mb = 512;
+        if (const char * s = std::getenv("MT_AITER_PREDEQUANT_MAX_MB")) {
+            mb = std::atol(s);
+        }
+        return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 0;
+    }();
+    return v;
+}
+
+// MAD-2026-09-20 predequant-pool: exact-fit bytes for one (K or V) scratch
+// cache holding `num_scratch_blocks` compacted slots at this shape. No
+// padding — unlike the old grow-only cache, the caller allocates fresh from
+// its pool every call, so there is no future grow step to amortize against;
+// the pool's own high-water-mark reuse (not this function) is what avoids
+// repeated malloc/free churn across calls.
+size_t mt_aiter_predequant_scratch_bytes_per_cache(const mt_aiter_uattn_shape_t * shape,
+                                                    int32_t num_scratch_blocks) {
+    if (!shape || num_scratch_blocks <= 0) {
+        return 0;
+    }
+    return (size_t) num_scratch_blocks * (size_t) shape->block_size
+        * (size_t) shape->num_kv_heads * (size_t) shape->head_size * sizeof(uint16_t);
+}
 
 // MAD-2026-09-12 dispatch-fix (decode-depth-scaling-0912.txt): occupancy-
 // driven 2D/3D dispatch predicate — see the declaration comment in
@@ -888,9 +827,9 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
                                   const mt_aiter_uattn_args_t *a) {
     hipError_t init_err = ensure_initialized(a->shape);
     if (init_err != hipSuccess) return init_err;
-    // Non-const: the fp8-predequant path below lazily grows this stream's
-    // scratch entry (c.scratch_by_stream[stream]) under c.scratch_mu on
-    // (possibly) every call, not just the first.
+    // Non-const: the fp8-predequant path below updates c.predequant_bytes_hwm
+    // (diagnostic rate-limiting only — the scratch buffers themselves are
+    // caller-owned per-call, not cached here).
     CachedHandles & c = get_cached(a->shape);
     if (!c.h_2d || !c.h_2d_large || !c.h_3d || !c.h_3d_md || !c.h_reduce) return hipErrorInvalidImage;
 
@@ -1030,24 +969,51 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
         unsigned int g2_y = (unsigned int)(num_q_tokens / block_q_for_grid + num_seqs);
         unsigned int g2_z = 1;
 
-        // MAD-2026-09-11 fp8-predequant, MAD-2026-09-12 predequant-scratch:
-        // 2D-large-prefill only. Dequant the production turbo4_fp8 K/V cache
-        // into an f16 scratch paged cache — COMPACTED block indices
-        // (a->scratch_block_tables), not the physical ones, since
-        // predequant-scratch-0912.txt — standard f16 layout otherwise, then
-        // launch the UNMODIFIED F16 2D-large kernel against the scratch
-        // cache (indexed by that same compacted table) — bit-identical to
-        // the fp8 in-kernel-dequant path by construction (see
-        // dequant_turbo4_fp8_bs256_to_f16_2d's docstring in
+        // MAD-2026-09-11 fp8-predequant, MAD-2026-09-12 predequant-scratch,
+        // MAD-2026-09-20 predequant-pool: 2D-large-prefill only. Dequant the
+        // production turbo4_fp8 K/V cache into an f16 scratch paged cache —
+        // COMPACTED block indices (a->scratch_block_tables), not the
+        // physical ones, since predequant-scratch-0912.txt — standard f16
+        // layout otherwise, then launch the UNMODIFIED F16 2D-large kernel
+        // against the scratch cache (indexed by that same compacted table)
+        // — bit-identical to the fp8 in-kernel-dequant path by construction
+        // (see dequant_turbo4_fp8_bs256_to_f16_2d's docstring in
         // kernels/unified_attention.py). Falls through to the normal fp8
-        // launch below if scratch growth fails for this call.
-        void * scratch_k_this_stream = nullptr;
-        void * scratch_v_this_stream = nullptr;
+        // launch below whenever the caller didn't provide scratch for this
+        // call (over the MT_AITER_PREDEQUANT_MAX_MB cap, or the caller's own
+        // pool allocation failed) — a per-call decision, never cached.
+        //
+        // The scratch pointers themselves are caller-owned, per-call (see
+        // mt_aiter_uattn_args_t::predq_scratch_k/v — allocated from
+        // ggml_backend_cuda_context::pool() in mt_pagedattn_aiter.cu, freed
+        // automatically at the end of that call). This wrapper does NOT
+        // cache them across calls; the size check below is a defensive
+        // re-check of the same cap the caller already applies before
+        // allocating, not the primary enforcement.
+        const size_t predq_bytes_per_cache =
+            mt_aiter_predequant_scratch_bytes_per_cache(&a->shape, a->num_scratch_blocks);
+        const size_t predq_cap = mt_aiter_predequant_max_bytes_per_cache();
+        const bool   predq_size_ok = (predq_cap == 0) || (predq_bytes_per_cache <= predq_cap);
         if (use_2d_large && c.predequant_enabled && a->num_scratch_blocks > 0 && a->scratch_block_tables
-            && ensure_predequant_scratch(c, a->shape, a->num_scratch_blocks, stream,
-                                          &scratch_k_this_stream, &scratch_v_this_stream)) {
-            hipDeviceptr_t p_k_f16 = (hipDeviceptr_t) scratch_k_this_stream;
-            hipDeviceptr_t p_v_f16 = (hipDeviceptr_t) scratch_v_this_stream;
+            && a->predq_scratch_k && a->predq_scratch_v && predq_size_ok) {
+            // Rate-limited diagnostic: print on the first call that takes
+            // this path and again whenever the per-call size grows past the
+            // largest one already reported — mirrors what the old grow-only
+            // cache's log used to convey, without implying anything is
+            // cached here.
+            size_t prev_hwm = c.predequant_bytes_hwm.load(std::memory_order_relaxed);
+            if (predq_bytes_per_cache > prev_hwm) {
+                c.predequant_bytes_hwm.store(predq_bytes_per_cache, std::memory_order_relaxed);
+                int dev = 0;
+                (void) hipGetDevice(&dev);
+                std::fprintf(stderr,
+                    "mt_aiter_unified_attn: fp8-predequant path active on device %d stream=%p "
+                    "(num_scratch_blocks=%d, live_seqs=%d, %zu B/cache x2, cap=%zu B/cache)\n",
+                    dev, (void*) stream, a->num_scratch_blocks, a->num_seqs_active,
+                    predq_bytes_per_cache, predq_cap);
+            }
+            hipDeviceptr_t p_k_f16 = (hipDeviceptr_t) a->predq_scratch_k;
+            hipDeviceptr_t p_v_f16 = (hipDeviceptr_t) a->predq_scratch_v;
             int64_t        bt_stride_dq = a->block_table_stride;
             // MAD-2026-09-12 predequant-scratch: compacted [num_seqs,
             // block_table_stride] table (prefix[seq]+slot, or -1) built on
@@ -1083,9 +1049,10 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
             }
             if (dq_err == hipSuccess) {
                 // F16-shadow strides: the scratch cache is a fresh, tightly
-                // packed [num_blocks_allocated, BLOCK_SIZE, n_kv_heads,
-                // HEAD_SIZE] f16 buffer (ensure_predequant_scratch), so the
-                // element strides are the standard contiguous f16 formula —
+                // packed [num_scratch_blocks, BLOCK_SIZE, n_kv_heads,
+                // HEAD_SIZE] f16 buffer (see mt_aiter_predequant_scratch_
+                // bytes_per_cache's layout), so the element strides are the
+                // standard contiguous f16 formula —
                 // identical to what mt_pagedattn_aiter.cu computes for a real
                 // F16 k_cache/v_cache of this shape.
                 int64_t ks0_f16 = (int64_t) a->shape.block_size * a->shape.num_kv_heads * a->shape.head_size;

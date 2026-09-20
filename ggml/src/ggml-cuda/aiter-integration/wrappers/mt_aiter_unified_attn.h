@@ -289,6 +289,21 @@ struct mt_aiter_uattn_args_t {
     // path.
     const int32_t *scratch_block_tables;
     int32_t        num_scratch_blocks;
+    // MAD-2026-09-20 predequant-pool: caller-owned f16 K/V scratch for the
+    // fp8-predequant pre-pass, sized via mt_aiter_predequant_scratch_bytes_
+    // per_cache() below (num_scratch_blocks slots at this shape) and valid
+    // ONLY for the duration of THIS call — the predequant fill kernel writes
+    // it and the immediately-following 2D-large f16 attention launch on the
+    // SAME stream reads it; nothing references it afterwards. Replaces the
+    // old persistent, never-freed per-(device,stream) grow-only cache (the
+    // measured cause of unbounded per-round VRAM growth under long-running
+    // TP serving) — the intended caller is mt_pagedattn_aiter.cu, allocating
+    // from ggml_backend_cuda_context::pool() each call the way every other
+    // op's temporaries do. NULL (either pointer) disables the pre-dequant
+    // path for this call, same as num_scratch_blocks == 0 / scratch_block_
+    // tables == NULL.
+    void          *predq_scratch_k;
+    void          *predq_scratch_v;
     // Strides
     int64_t        q_stride_0;     // bytes per row in q = NUM_Q_HEADS * HEAD_SIZE
     int64_t        output_stride_0;
@@ -333,6 +348,22 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
 size_t mt_aiter_uattn_segm_output_bytes(const struct mt_aiter_uattn_shape_t *shape, int num_q_tokens);
 size_t mt_aiter_uattn_segm_max_bytes(const struct mt_aiter_uattn_shape_t *shape, int num_q_tokens);
 size_t mt_aiter_uattn_segm_expsum_bytes(const struct mt_aiter_uattn_shape_t *shape, int num_q_tokens);
+
+// MAD-2026-09-20 predequant-pool. Bytes needed for ONE of the two (K, V)
+// fp8-predequant scratch caches to hold `num_scratch_blocks` compacted slots
+// at this shape — exact-fit, no padding (the caller allocates fresh from its
+// pool every call; there is no grow-step to amortize against). Only
+// meaningful when shape->cache_type == MT_AITER_CACHE_TURBO4_FP8_BS256; other
+// cache types never take the pre-dequant path.
+size_t mt_aiter_predequant_scratch_bytes_per_cache(const struct mt_aiter_uattn_shape_t *shape,
+                                                    int32_t num_scratch_blocks);
+
+// Hard per-cache byte ceiling (env MT_AITER_PREDEQUANT_MAX_MB, default 512
+// MiB; <=0 disables the cap). Both the wrapper (its own defensive re-check)
+// and the caller (to decide whether to allocate predq_scratch_k/v at all —
+// skip allocating, and pass NULL/0, when over cap) must use this same
+// accessor so they agree on the limit.
+size_t mt_aiter_predequant_max_bytes_per_cache(void);
 
 #ifdef __cplusplus
 }  // extern "C"

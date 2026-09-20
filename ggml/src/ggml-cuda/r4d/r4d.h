@@ -48,6 +48,10 @@ struct R4DArgs {
     const float* k_descale;     // (num_seqs, kv_heads)
     const float* v_descale;     // (num_seqs, kv_heads)
     const float* q_descale;     // unused: the query is bf16
+    const void*  v_cache;       // KVP=2 (turbo4) only: V records; `kv` then holds the K records
+    const unsigned char* k_lut; // KVP=2 only: 16 e4m3 magnitude centroids for K
+    const unsigned char* v_lut; // KVP=2 only: same for V
+    long kv_slot_stride;        // KVP=2 only: BYTES between consecutive slots inside a block (= kv_heads*162); kv_block_stride and kv_head_stride are then also in BYTES
     void*        scratch;       // split-KV partials (decode only), or null
     int num_seqs, q_len, q_heads, kv_heads, head_dim, block_size, max_blocks;
     long kv_block_stride;       // elements between consecutive blocks
@@ -62,11 +66,17 @@ extern "C" {
 // Compiled for head_dim 256, 6 queries per KV head, paged block size 16, bf16 query. The prefill
 // kernel tiles the query; the decode kernel splits the KV and takes at most 64 query rows
 // (q_len * gqa), the band a speculative-decode verify step falls in.
+// KVP=2 (turbo4_fp8_bs256): K and V live in SEPARATE caches of 162-byte records per (block, slot,
+// kv head) -- fp16 per-vector scale, 128 bytes of 4-bit centroid indices, 32 sign bytes -- with a
+// 16-entry e4m3 magnitude LUT per (layer, K/V) passed via k_lut/v_lut. Step A: prefill and decode.
 // Return 0 on success, negative on a shape this instantiation does not serve.
 int  r4d_attn_prefill_h256_gqa6_fp8kv (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_h256_gqa6_turbo4kv(const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa6_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa6_bf16kv (const R4DArgs* a, hipStream_t stream);
+// KVP=2 (turbo4_fp8_bs256) decode: K read straight from the paged cache (no sK LDS staging).
+int  r4d_attn_decode_h256_gqa6_turbo4kv(const R4DArgs* a, hipStream_t stream);
 // Bytes of split-KV partial buffer one decode launch of this shape needs. Independent of the cache
 // dtype: the partials are f16 either way.
 long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);

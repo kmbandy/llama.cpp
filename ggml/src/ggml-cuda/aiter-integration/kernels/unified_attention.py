@@ -93,6 +93,40 @@
 #    load_turbo4_fp8_kv_tile_bs256_v2 (patch 5) unchanged — no decode logic
 #    duplicated.
 #
+# 7. fp8-fold-after-dot (MAD-2026-09-20): the CACHE_TYPE={14,24,34}/
+#    USE_FP8_WMMA=0 branch in kernel_unified_attention_{2d,3d} no longer
+#    multiplies K/V by their per-row fp16 scale before the dot. It now
+#    dequants LUT bytes to UNSCALED f16 K/V tiles and folds the per-key-row
+#    scale into S (S = qk_scale * tl.dot(Q, K) * K_scales[None, :]) and the
+#    per-value-row scale into P before the P·V dot (P_scaled = P *
+#    V_scales[None, :]) — the same fold-after-dot structure the
+#    USE_FP8_WMMA=1 branch already uses (patch 3), just with a plain f16
+#    tl.dot instead of an FP8 WMMA tl.dot. This removes the per-element
+#    scale-multiply FMA (and the extra live scaled-tile register set
+#    alongside the raw dequant registers) that made the branch register-
+#    hungry, which was the whole reason patch 6's fp8-predequant pre-pass
+#    existed; the pre-pass is kept as a bounded opt-in fallback (see
+#    wrappers/mt_aiter_unified_attn.cpp + mt_pagedattn_aiter.cu) rather than
+#    a load-bearing path. Numerics differ from the prior fold-before-dot
+#    order at fp16-rounding granularity — see the inline comment at each
+#    branch site for the precise statement. CACHE_TYPE=0 and the
+#    USE_FP8_WMMA=1 branch are untouched by this patch.
+#
+#    Considered and NOT done: replacing the fp8-bitcast+.to(f16) elementwise
+#    convert with a 16-entry f16 LUT (pre-convert the 16 e4m3 centroid bytes
+#    to f16 once, gather f16 directly, apply sign via bit-15 OR instead of
+#    XOR-into-fp8-sign-then-convert). That would avoid gfx1030's emulated
+#    e4m3->f16 conversion running per K/V element (up to 256/tile) instead
+#    of once per 16-entry LUT, and is very likely cheaper — but the fp8
+#    bytes returned by load_turbo_fp8_kv_tile_{K,V}_bs256(_v2) are already
+#    LUT-gathered+sign-XOR'd inside those shared loaders (also used by the
+#    USE_FP8_WMMA=1 path and by patch 6's pre-pass), so doing this would
+#    mean threading raw idx/sign out of every one of those loaders (or
+#    duplicating them) rather than a localized change at the dot sites.
+#    Left as a follow-up given the fold-after-dot change above is the
+#    higher-leverage, lower-risk fix and this vendor cannot be exercised
+#    (AOT-compiled + run) from a code-only pass.
+#
 # Validated: AITER 2D + 3D + reduce_segments AOT-compile cleanly for
 #            gfx1201 (R9700) and gfx1030 (6900XT) from this vendor.
 #            See docs/aiter-integration/ARCHITECTURE.md §7 + MAD-188.
@@ -1513,14 +1547,32 @@ def kernel_unified_attention_2d(
                     IDX_BITS, BYTES_PER_FP8_BLOCK,
                     dim_mask, tile_mask,
                 )
-            # gfx1030: fold the LUT decode into f16 tiles here so the dot
-            # sites below can share the F16 tl.dot path. gfx1201 keeps the
-            # fp8 bytes for WMMA.
+            # MAD-2026-09-20 fp8-fold-after-dot: gfx1030 has no FP8 WMMA, so
+            # this branch dequants LUT-decoded fp8 bytes to UNSCALED f16
+            # tiles here — NO per-element scale multiply. The per-key /
+            # per-value row scale is folded into the FP32 accumulator AFTER
+            # the plain f16 tl.dot instead (see the S / acc computation
+            # below), the same structural fold-after-dot the
+            # USE_FP8_WMMA=1 branch already uses. This removes the extra
+            # per-element FMA against a live scaled-tile register set that
+            # made this branch register-hungry (the original motivation for
+            # the MAD-2026-09-11 fp8-predequant pre-pass above, now
+            # unnecessary — see wrapper/host-side change making the
+            # pre-pass a bounded, opt-in fallback instead of load-bearing).
+            #
+            # Numerics: this changes rounding vs the prior fold-BEFORE-dot
+            # order (K/V multiplied by fp16(scale) per element, then summed
+            # in fp32 by tl.dot). Here the dot sums unscaled fp16 K/V into a
+            # fp32 accumulator first, and the row scale (kept fp32, not
+            # rounded to fp16) is multiplied in once, after the sum. Results
+            # differ at the fp16-rounding level from the previous
+            # fold-before-dot output — this matches the already-shipped
+            # USE_FP8_WMMA=1 path's own fold-after-dot rounding behavior
+            # (patch 3 above), so both USE_FP8_WMMA settings now round the
+            # same way relative to each other.
             if not USE_FP8_WMMA:
-                K = (K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-                     * K_scales[None, :].to(tl.float16))
-                V = (V_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-                     * V_scales[:, None].to(tl.float16))
+                K = K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                V = V_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -1532,6 +1584,11 @@ def kernel_unified_attention_2d(
             K_fp8_view = K_fp8.to(tl.float8e4nv, bitcast=True)              # (HEAD, TILE)
             S_partial_fp8 = tl.dot(Q_fp8_tensor, K_fp8_view, out_dtype=tl.float32)
             S = qk_scale * S_partial_fp8 * Q_scale_fp8[:, None] * K_scales[None, :]
+        elif IS_TURBO_FP8:
+            # MAD-2026-09-20 fp8-fold-after-dot (gfx1030, USE_FP8_WMMA=0):
+            # dot on UNSCALED f16 K, fold the per-key-row scale into the
+            # FP32 accumulator after the dot — see numerics note above.
+            S = qk_scale * tl.dot(Q, K) * K_scales[None, :]
         else:
             S = qk_scale * tl.dot(Q, K)
 
@@ -1607,6 +1664,15 @@ def kernel_unified_attention_2d(
             V_fp8_view     = V_fp8.to(tl.float8e4nv, bitcast=True)  # (TILE, HEAD)
             acc_partial    = tl.dot(P_fp8, V_fp8_view, out_dtype=tl.float32)
             acc            = acc + acc_partial * P_scale_fp8[:, None]
+        elif IS_TURBO_FP8:
+            # MAD-2026-09-20 fp8-fold-after-dot (gfx1030, USE_FP8_WMMA=0):
+            # fold the per-V-token scale into P (fp32) BEFORE the dot —
+            # same fold site the WMMA branch uses (P_scaled = P *
+            # V_scales[None, :]) — then a plain f16 tl.dot against the
+            # UNSCALED V tile instead of an FP8-quantized one. See numerics
+            # note at the S computation above.
+            P_scaled = P * V_scales[None, :]                     # (BLOCK_M, TILE) fp32
+            acc = tl.dot(P_scaled.to(V.dtype), V, acc=acc)
         else:
             acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
@@ -1979,11 +2045,13 @@ def kernel_unified_attention_3d(
                     IDX_BITS, BYTES_PER_FP8_BLOCK,
                     dim_mask, tile_mask,
                 )
+            # MAD-2026-09-20 fp8-fold-after-dot: mirror of 2D kernel's same
+            # patch — see that kernel's comment above `if not USE_FP8_WMMA:`
+            # for the full rationale and numerics note. Unscaled f16 tiles
+            # here; scale folds into the FP32 accumulator after the dot.
             if not USE_FP8_WMMA:
-                K = (K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-                     * K_scales[None, :].to(tl.float16))
-                V = (V_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-                     * V_scales[:, None].to(tl.float16))
+                K = K_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                V = V_fp8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
@@ -1994,6 +2062,11 @@ def kernel_unified_attention_3d(
             K_fp8_view = K_fp8.to(tl.float8e4nv, bitcast=True)              # (HEAD, TILE)
             S_partial_fp8 = tl.dot(Q_fp8_tensor, K_fp8_view, out_dtype=tl.float32)
             S = qk_scale * S_partial_fp8 * Q_scale_fp8[:, None] * K_scales[None, :]
+        elif IS_TURBO_FP8:
+            # MAD-2026-09-20 fp8-fold-after-dot (gfx1030, USE_FP8_WMMA=0):
+            # mirror of 2D kernel — dot on UNSCALED f16 K, fold per-key-row
+            # scale into the FP32 accumulator after the dot.
+            S = qk_scale * tl.dot(Q, K) * K_scales[None, :]
         else:
             S = qk_scale * tl.dot(Q, K)
 
@@ -2066,6 +2139,12 @@ def kernel_unified_attention_3d(
             V_fp8_view     = V_fp8.to(tl.float8e4nv, bitcast=True)  # (TILE, HEAD)
             acc_partial    = tl.dot(P_fp8, V_fp8_view, out_dtype=tl.float32)
             acc            = acc + acc_partial * P_scale_fp8[:, None]
+        elif IS_TURBO_FP8:
+            # MAD-2026-09-20 fp8-fold-after-dot (gfx1030, USE_FP8_WMMA=0):
+            # mirror of 2D kernel — fold V's per-token scale into P (fp32)
+            # before the dot, then a plain f16 tl.dot against unscaled V.
+            P_scaled = P * V_scales[None, :]                     # (BLOCK_M, TILE) fp32
+            acc = tl.dot(P_scaled.to(V.dtype), V, acc=acc)
         else:
             acc = tl.dot(P.to(V.dtype), V, acc=acc)
 

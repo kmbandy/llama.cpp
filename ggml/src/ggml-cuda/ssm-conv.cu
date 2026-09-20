@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
+#include "mt_gdn_r4d.cuh"  // GGML_HIP_R4D-gated R4D conv-side hook (no-op stub otherwise; MAD-406)
 
 // BF16 activation coverage (2026-09-18): src0 (conv_x), the conv weight (src1) and dst
 // are each independently templated (f32 or bf16); bias stays f32. Internal math is fp32.
@@ -160,6 +161,13 @@ static void ssm_conv_f32_cuda(const T * src0, const W * src1, const float * bias
 }
 
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
+    // MAD-406: R4D conv-prep hook (mt_gdn_r4d.cu), gated by MAD_USE_R4D_GDN_CONV=1 -- mirrors the
+    // mt_pagedattn.cu r4d gate pattern. Always declines today (op-boundary miss: a/b/A_log/dt_bias
+    // are not reachable from this op's srcs; see mt_gdn_r4d.cu's header comment), so this falls
+    // straight through to the existing body below unless something re-wires the gate inputs.
+    if (r4d_gdn_conv_enabled() && ggml_cuda_op_ssm_conv_r4d(ctx, dst, bias_add_node, silu_dst)) {
+        return;
+    }
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     const bool fuse_bias = bias_add_node != nullptr;

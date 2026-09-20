@@ -3,6 +3,7 @@
 #include "mma.cuh"
 #include "mt_gdn_r4d.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace mma = ggml_cuda_mma;
@@ -1995,34 +1996,175 @@ static void ggml_cuda_op_gated_delta_net_impl(
             prefill_state_out = inter_state.get();
         }
 
-        // MAD-406: try libr4d over the largest 64-token-aligned PREFIX [0, P) of [0, T0) before
-        // falling back to the existing wmma/scalar chunked-prefill kernel for the whole [0, T0).
-        // ggml_cuda_gdn_r4d_prefix (mt_gdn_r4d.cu) does all further eligibility checking
-        // (geometry, GQA shape, stride canonicality) and is a clean no-op on decline -- nothing
-        // below has touched dst_d/prefill_state_out yet in that case, so falling through to the
-        // unchanged wmma/scalar path is exactly what ran before this integration existed.
-        const int64_t P = r4d_gdn_enabled() ? (T0 / 64) * 64 : 0;
+        // MAD-406 follow-up (chain 251): if conv_prep already primed buffers covering this WHOLE
+        // call (n_tokens = T0 + tail rows) for this exact GATED_DELTA_NET node, run the r4d
+        // chunk_scan portion over the FULL [0, T0) in ONE call (P = T0 itself, no 64-token-
+        // alignment floor, no remainder loop) and the K-token tail via the recurrent kernel
+        // straight from the same primed buffers (ggml_cuda_gdn_r4d_tail, below) -- because
+        // conv_prep's identity-skip (ggml_cuda_try_gdn_conv_prep_fusion) left q_d/k_d/v_d/g_d/b_d
+        // themselves UNWRITTEN for every row of this call when it ran, so ANY code path that
+        // would otherwise read those tensors directly (the old floor(T0/64)*64-prefix-plus-
+        // remainder composition below, or the plain launch_gated_delta_net<false,true> tail) is
+        // unsafe once conv_prep has fired. r4d_gdn_conv_prep_query_primed only ever returns true
+        // for n_seqs==1 (see that function's callers in mt_gdn_r4d.cu for why: the primed buffers
+        // are laid out [T_total=T*n_seqs] with sequences concatenated, and a straight row window
+        // is only correct for exactly one sequence).
+        //
+        // When NOT primed, this is byte-for-byte the pre-chain-251 composition: try libr4d over
+        // the largest 64-token-aligned PREFIX [0, P) of [0, T0), falling back to the existing
+        // wmma/scalar chunked-prefill kernel for the whole [0, T0) on decline. Either way,
+        // ggml_cuda_gdn_r4d_prefix does all further eligibility checking (geometry, GQA shape,
+        // stride canonicality) and is a clean no-op on decline -- nothing below has touched
+        // dst_d/prefill_state_out yet in that case.
+        const bool primed = r4d_gdn_enabled() && n_seqs == 1 &&
+                             r4d_gdn_conv_prep_query_primed(ctx.device, stream, dst, n_tokens, n_seqs, H, neqk1);
+        // MAD_USE_R4D_GDN_VERIFY=1 (2026-09-20 follow-up, chain 270): production gave a wrong
+        // first token with conv_prep+prefix on despite the synthetic primed-tail test passing --
+        // meaning the divergence is in something the synthetic test doesn't reproduce (real
+        // strides/contents, not the tail math itself). Verify mode never lets the r4d/primed path
+        // touch the REAL dst_d/state_d -- `use_primed_path` (not `primed`) gates every decision
+        // below that would otherwise write there, so P stays 0 and the untouched wmma/scalar +
+        // autoregressive-tail path runs exactly as it would with conv_prep off, into the real
+        // buffers, unconditionally. `primed` itself stays as computed (conv_prep still primes in
+        // verify mode -- see ggml_cuda_try_gdn_conv_prep_fusion's own verify branch) so the
+        // separate verify block below (r4d_gdn_verify_compare) can still run the r4d path into
+        // scratch and diff it against the real ground truth this block just computed.
+        const bool verify_mode     = r4d_gdn_verify_enabled();
+        const bool use_primed_path = primed && !verify_mode;
+        // chain 313 tg regression follow-up: the NON-primed composition below (P = a 64-aligned
+        // PREFIX of T0, remainder [P,T0) up to 63 tokens re-run via launch_gated_delta_net_chunked
+        // pieces) was validated at chain 218/222's shape -- a LARGE prefill (T0 in the thousands)
+        // where P dominates and the remainder is a small tail correction. It was never validated
+        // for T0 itself being small (the decode-ish / short-verify-batch regime this call can also
+        // reach whenever n_tokens > GGML_CUDA_GDN_CHUNK_MAX but the call is otherwise short): there
+        // P=64 (the only aligned prefix available) is a SMALL fraction of T0, the remainder is a
+        // LARGE fraction of it, and rocprofv3 (chain 313) measured launch_gated_delta_net_chunked's
+        // per-piece cost (~234us in this regime, vs the ~52us the large-prefill case saw) far
+        // exceeding what running the WHOLE T0 through the plain wmma2/scalar prefill kernel in ONE
+        // call costs -- exactly what happens below when r4d_took_prefix is false. Require T0 to be
+        // at least 2 chunks (128) before bothering with the non-primed r4d prefix at all: below
+        // that, P=0 makes this call take the IDENTICAL path (wmma2 over the whole T0, autoregressive
+        // tail) the ggml-only build already takes for it, byte-identical numerics either way since
+        // it is the same code, just reached without ever having tried an undersized r4d prefix.
+        // The PRIMED path (P=T0 exactly, no remainder split at all) is untouched -- it has no
+        // remainder-composition cost to begin with, so this regression does not apply to it.
+        const int64_t P = use_primed_path ? T0
+                         : ((r4d_gdn_enabled() && !verify_mode && T0 >= 2 * 64) ? (T0 / 64) * 64 : 0);
         bool r4d_took_prefix = false;
-        if (P >= 64) {
+        if (P >= 64 || use_primed_path) {
             ggml_cuda_pool_alloc<float> r4d_prefix_state(ctx.pool());
             r4d_prefix_state.alloc(S_v * S_v * H * n_seqs);
             r4d_took_prefix = ggml_cuda_gdn_r4d_prefix(
                 ctx, dst, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, r4d_prefix_state.get(),
                 S_v, H, P, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-                neqk1, rq3, scale, /*dst_seq_stride=*/n_tokens, stream);
+                neqk1, rq3, scale, /*dst_seq_stride=*/n_tokens, /*K_tail=*/tail, stream);
             if (r4d_took_prefix) {
                 if (P < T0) {
-                    // [P, T0) is at most 63 tokens -- the WMMA/scalar chunked-prefill kernels take
-                    // no tok_offset or state-in (they always start their own [0,n_tokens) window
-                    // at token 0 with s_d as the initial state), so this remainder runs through
-                    // the EXISTING plain autoregressive kernel instead, which already supports
-                    // both (same kernel the K-snapshot tail below reuses). state_slot_stride/K are
-                    // unused by the kernel body when keep_rs_t is false (compile-time branch),
-                    // so any values are harmless; passed as 0/1 for clarity.
-                    launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, r4d_prefix_state.get(),
-                        dst_d, prefill_state_out, S_v, H, T0 - P, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                        sb1, sb2, sb3, neqk1, rq3, scale, /*state_slot_stride=*/0, /*K=*/1, stream,
-                        /*tok_offset=*/P, /*dst_seq_stride=*/n_tokens);
+                    // [P, T0) is at most 63 tokens (P is the largest 64-aligned prefix of T0).
+                    // Historically this ran through the per-token autoregressive kernel -- an
+                    // O(remainder) SERIAL chain of cross-lane reductions that, at the production
+                    // ub=4096 shape (remainder up to 56 tokens), measured in the ~ms range per
+                    // GDN layer and ate essentially the whole win the r4d prefix produced
+                    // (rocprof, chain 222: 9.0 ms/layer native vs 2.8 ms/layer r4d kkt+scan for
+                    // the SAME 16k prefill; chain 218 with MAD_USE_R4D_GDN=1 measured -4% overall
+                    // despite r4d handling P=4032 of 4088 tokens -- see chain 218's log line
+                    // "use_prefill_chunked P=4032 n_tokens=4096 K=8 r4d_prefix=yes").
+                    //
+                    // gated_delta_net_chunked_cuda (the existing short-block UT-transform kernel,
+                    // ~52 us/launch in the same trace -- the MTP-verify kernel, already compiled
+                    // for TM up to GGML_CUDA_GDN_CHUNK_MAX) takes RAW per-token g exactly like the
+                    // autoregressive kernel (both read sh_gl[t]/g_t = g[gb] with no cumsum applied
+                    // by the caller -- gated_delta_net_chunked_cuda computes its own inclusive
+                    // prefix sum internally, phase 0-1 above), so no gate-preprocessing differs
+                    // between the two kernels; only the kernel choice below changes.
+                    //
+                    // Unlike the autoregressive kernel, gated_delta_net_chunked_cuda / its
+                    // launcher (launch_gated_delta_net_chunked, gated_delta_net.cu above) take NO
+                    // tok_offset or dst_seq_stride -- its own `n_tokens` argument doubles as BOTH
+                    // the loop bound and the per-sequence dst stride (`dst + (sequence * n_tokens
+                    // * H + h_idx) * S_v`). For n_seqs==1, `sequence` is always 0, so that
+                    // per-sequence term vanishes and a PLAIN POINTER OFFSET on q/k/v/g/beta/dst by
+                    // P tokens (P*sq2 / P*sv2 / P*sb2 / P*S_v*H respectively -- sq3/sv3/sb3, the
+                    // per-sequence terms the kernel itself adds, are untouched by this) reproduces
+                    // exactly the same addressing the autoregressive kernel's explicit tok_offset
+                    // parameter gives. For n_seqs>1 this does NOT generalize: the kernel would
+                    // multiply `sequence` by ITS OWN n_tokens argument (the remainder length) for
+                    // both q/k/v/g/beta reads (fine, since sq3/sv3/sb3 are added separately and
+                    // unaffected by a base-pointer shift) but ALSO for the dst write's per-sequence
+                    // stride, and a single base-pointer offset cannot simultaneously make that
+                    // stride equal the remainder length (what the kernel assumes) AND the real,
+                    // full op n_tokens (what the correct output layout needs) for every sequence
+                    // at once -- there is no per-call constant that reconciles the two when they
+                    // differ, which they do whenever n_tokens != remainder length (always, in
+                    // production). Fixing that would need a dst_seq_stride parameter added to
+                    // gated_delta_net_chunked_cuda/launch_gated_delta_net_chunked themselves, which
+                    // are shared with the MTP-verify use_chunked branch above and so outside this
+                    // change's scope (use_prefill_chunked only). So: n_seqs>1 declines this
+                    // optimization and keeps the autoregressive kernel exactly as before; n_seqs==1
+                    // takes the chunked kernel over the WHOLE remainder (up to 63 tokens -- P is
+                    // the largest 64-aligned prefix of T0), split into <=GGML_CUDA_GDN_CHUNK_MAX
+                    // (16) -sized PIECES chained through the same recurrent-state carry the
+                    // autoregressive path itself relies on: piece 0 reads curr_state=r4d's own
+                    // P-token state and writes its own [P+piece_len)-token state to a scratch
+                    // buffer; piece 1 reads that scratch as ITS curr_state and writes to the
+                    // other scratch buffer; ...; the LAST piece writes prefill_state_out directly
+                    // (no extra copy needed -- same trick P==T0 above already uses for r4d's own
+                    // output). gated_delta_net_chunked_cuda's curr_state/state indexing (this
+                    // file, ~line 372: `state_in_offset = sequence*H*S_v*S_v + h_idx*S_v*S_v`,
+                    // `state_out_offset = (sequence*H+h_idx)*S_v*S_v`) is IDENTICAL to the
+                    // autoregressive kernel's own (~line 61-64) for n_seqs==1 (sequence is always
+                    // 0, so both reduce to h_idx*S_v*S_v) -- same [S_v,S_v,H,n_seqs] layout
+                    // r4d_prefix_state/prefill_state_out already use, confirmed by reading both
+                    // kernel bodies rather than assumed. At chain 218's shape (remainder=56) this
+                    // is 4 pieces of 16/16/16/8 tokens, ~52 us/launch each (measured trace) --
+                    // ~0.2 ms total against the single serial 56-token autoregressive kernel this
+                    // replaces (which measured in the ~ms range per GDN layer, per the header
+                    // comment above).
+                    const int64_t remainder = T0 - P;
+                    const bool    use_chunked_remainder = n_seqs == 1 && remainder >= 1;
+                    int64_t       n_pieces = 0;
+                    if (use_chunked_remainder) {
+                        n_pieces = (remainder + GGML_CUDA_GDN_CHUNK_MAX - 1) / GGML_CUDA_GDN_CHUNK_MAX;
+                        if (n_pieces <= 1) {
+                            launch_gated_delta_net_chunked<false>(
+                                q_d + P * sq2, k_d + P * sq2, v_d + P * sv2, g_d + P * sb2, b_d + P * sb2,
+                                r4d_prefix_state.get(), dst_d + P * S_v * H, prefill_state_out,
+                                S_v, H, remainder, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                                sb1, sb2, sb3, neqk1, rq3, scale, /*state_slot_stride=*/0, /*K=*/1, stream);
+                        } else {
+                            // Two ping-pong scratch states -- a piece never reads and writes the
+                            // same buffer (its curr_state is the PREVIOUS piece's output), so two
+                            // buffers alternating by parity suffice regardless of n_pieces.
+                            ggml_cuda_pool_alloc<float> piece_state_a(ctx.pool());
+                            ggml_cuda_pool_alloc<float> piece_state_b(ctx.pool());
+                            piece_state_a.alloc(S_v * S_v * H * n_seqs);
+                            piece_state_b.alloc(S_v * S_v * H * n_seqs);
+                            float *       scratch[2] = { piece_state_a.get(), piece_state_b.get() };
+                            const float * cur_state   = r4d_prefix_state.get();
+                            int64_t       off         = 0;
+                            for (int64_t p = 0; p < n_pieces; ++p) {
+                                const int64_t piece_len = std::min<int64_t>(GGML_CUDA_GDN_CHUNK_MAX, remainder - off);
+                                float * out_state = (p == n_pieces - 1) ? prefill_state_out : scratch[p & 1];
+                                launch_gated_delta_net_chunked<false>(
+                                    q_d + (P + off) * sq2, k_d + (P + off) * sq2, v_d + (P + off) * sv2,
+                                    g_d + (P + off) * sb2, b_d + (P + off) * sb2,
+                                    cur_state, dst_d + (P + off) * S_v * H, out_state,
+                                    S_v, H, piece_len, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                                    sb1, sb2, sb3, neqk1, rq3, scale, /*state_slot_stride=*/0, /*K=*/1, stream);
+                                cur_state = out_state;
+                                off += piece_len;
+                            }
+                        }
+                    } else {
+                        // state_slot_stride/K are unused by the kernel body when keep_rs_t is
+                        // false (compile-time branch), so any values are harmless; passed as 0/1
+                        // for clarity.
+                        launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, r4d_prefix_state.get(),
+                            dst_d, prefill_state_out, S_v, H, remainder, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1, rq3, scale, /*state_slot_stride=*/0, /*K=*/1, stream,
+                            /*tok_offset=*/P, /*dst_seq_stride=*/n_tokens);
+                    }
+                    r4d_gdn_remainder_log(remainder, n_seqs, use_chunked_remainder, n_pieces);
                 } else {
                     // P == T0 exactly: r4d's own P-token state IS the T0-token state the tail
                     // step below needs as curr_state.
@@ -2046,13 +2188,79 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
 
         if (tail > 0) {
-            // prefill_state_out is laid out exactly like this op's own `state` input
-            // ([S_v, S_v, H, n_seqs]): it's written through the same state_out_offset formula
-            // as the plain (!keep_rs_t) autoregressive path, which is what curr_state expects.
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, prefill_state_out, dst_d, state_d,
-                S_v, H, tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream,
-                /*tok_offset=*/T0, /*dst_seq_stride=*/n_tokens);
+            // MAD-406 follow-up (chain 251): when the [0,T0) portion above was served from
+            // conv_prep's primed buffers, q_d/k_d/v_d/g_d/b_d are unwritten for the tail rows
+            // too (same reason as the [0,T0) portion) -- ggml_cuda_gdn_r4d_tail reads the tail
+            // straight from those same primed buffers instead. It declines (false, no side
+            // effects) whenever n_seqs != 1 or the primed entry doesn't cover this call, in which
+            // case q_d/k_d/v_d/g_d/b_d are guaranteed to be the REAL, correctly-computed ggml
+            // tensors (conv_prep's fusion only ever fires at n_seqs==1 -- see
+            // ggml_cuda_try_gdn_conv_prep_fusion's own Nseq==1 gate -- so `primed` here is false
+            // in exactly the cases where reading them directly is safe) and the existing
+            // autoregressive kernel below is exactly as correct as it always was.
+            bool tail_done = false;
+            if (r4d_took_prefix && use_primed_path) {
+                tail_done = ggml_cuda_gdn_r4d_tail(ctx, dst, prefill_state_out, state_d, state_slot_stride,
+                    dst_d, S_v, H, neqk1, T0, tail, n_seqs, scale, /*dst_seq_stride=*/n_tokens, stream);
+            }
+            if (!tail_done) {
+                // prefill_state_out is laid out exactly like this op's own `state` input
+                // ([S_v, S_v, H, n_seqs]): it's written through the same state_out_offset formula
+                // as the plain (!keep_rs_t) autoregressive path, which is what curr_state expects.
+                launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, prefill_state_out, dst_d, state_d,
+                    S_v, H, tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream,
+                    /*tok_offset=*/T0, /*dst_seq_stride=*/n_tokens);
+            }
+        }
+        // MAD_USE_R4D_GDN_VERIFY=1 (chain 270 follow-up): the block above just computed the REAL
+        // ggml result into dst_d/state_d (verify_mode forced use_primed_path=false, so none of it
+        // touched conv_prep's primed buffers). Now separately run the r4d/primed path into
+        // scratch and diff -- everything this needs (the primed q/k/v/g/beta scratch, and how to
+        // read/permute it) lives in mt_gdn_r4d.cu, so the actual comparison is one call out to
+        // r4d_gdn_verify_compare there; this file only owns allocating the scratch and passing
+        // through the real ggml tensors/strides it already has in scope.
+        if (verify_mode && primed) {
+            ggml_cuda_pool_alloc<float> verify_dst(ctx.pool());
+            ggml_cuda_pool_alloc<float> verify_prefix_state(ctx.pool());
+            ggml_cuda_pool_alloc<float> verify_state_snap(ctx.pool());
+            verify_dst.alloc((size_t) S_v * H * n_tokens * n_seqs);
+            verify_prefix_state.alloc((size_t) S_v * S_v * H * n_seqs);
+            const int64_t verify_slot_stride = S_v * S_v * H * n_seqs;
+            const int64_t n_slots            = std::max<int64_t>(tail, 1);
+            verify_state_snap.alloc((size_t) n_slots * verify_slot_stride);
+
+            const bool v_took_prefix = ggml_cuda_gdn_r4d_prefix(
+                ctx, dst, q_d, k_d, v_d, g_d, b_d, s_d, verify_dst.get(), verify_prefix_state.get(),
+                S_v, H, T0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                neqk1, rq3, scale, /*dst_seq_stride=*/n_tokens, /*K_tail=*/tail, stream);
+            bool v_tail_ok = true;
+            if (v_took_prefix && tail > 0) {
+                v_tail_ok = ggml_cuda_gdn_r4d_tail(ctx, dst, verify_prefix_state.get(), verify_state_snap.get(),
+                    verify_slot_stride, verify_dst.get(), S_v, H, neqk1, T0, tail, n_seqs, scale,
+                    /*dst_seq_stride=*/n_tokens, stream);
+            }
+            if (v_took_prefix && v_tail_ok) {
+                r4d_gdn_verify_compare(
+                    ctx, dst, q_d, k_d, v_d, g_d, b_d,
+                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1,
+                    dst_d, state_d, state_slot_stride,
+                    verify_dst.get(), verify_state_snap.get(), verify_slot_stride,
+                    verify_prefix_state.get(),
+                    S_v, H, T0, tail, n_seqs, n_tokens, P,
+                    cache != nullptr, cache != nullptr ? cache->slot_stride : 0, stream);
+            } else {
+                std::fprintf(stderr, "[mt_gdn_r4d] MAD_USE_R4D_GDN_VERIFY: r4d path declined in verify mode "
+                             "(v_took_prefix=%d v_tail_ok=%d) -- nothing to compare\n",
+                             (int) v_took_prefix, (int) v_tail_ok);
+            }
+        }
+        if (primed) {
+            // Both consumers of this call's primed entry (the [0,T0) chunk_scan portion above
+            // and, when tail>0, the K-token tail just above) are done -- release it so a later,
+            // unrelated GATED_DELTA_NET dispatch on this same stream can never mistake a stale
+            // entry for its own (see r4d_gdn_conv_prep_primed's header comment, mt_gdn_r4d.cu).
+            r4d_gdn_conv_prep_release_primed(ctx.device, stream);
         }
     } else if (kda) {
         if (keep_rs) {

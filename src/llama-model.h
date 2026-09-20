@@ -391,6 +391,17 @@ struct llama_layer {
     struct ggml_tensor * ssm_a      = nullptr;
     struct ggml_tensor * ssm_d      = nullptr;
 
+    // MAD-406 (R4D GDN conv_prep): raw A_log = log(-ssm_a), derived once on the
+    // host at load time (llama_model_build_ssm_a_log_sidecars, llama-model.cpp).
+    // ssm_a itself already holds -exp(A_log) folded in at conversion (see
+    // LLM_TENSOR_SSM_A_NOSCAN's comment in llama-arch.cpp), which is what the
+    // plain (non-R4D) GDN path wants; libr4d's r4d_gdn_conv_prep_w4_h128_bf16
+    // computes exp(A_log) itself and needs the raw log, hence this sidecar.
+    // Same shape as ssm_a ({ssm_dt_rank} == {n_v_heads}); null for any layer
+    // that isn't a GDN (recurrent) layer or whose arch this sidecar doesn't
+    // cover yet.
+    struct ggml_tensor * ssm_a_log  = nullptr;
+
     // mamba bias
     struct ggml_tensor * ssm_conv1d_b = nullptr;
     struct ggml_tensor * ssm_dt_b     = nullptr;
@@ -798,6 +809,24 @@ struct llama_model {
     // through the ml8 helper. Empty for non-ml8 models → every find() misses →
     // build_ml8_or_mul_mat falls back to a plain ggml_mul_mat (zero impact).
     ml8_registry ml8_reg;
+
+    // MAD-406 (R4D GDN conv_prep): owns the backing store for every layer's
+    // ssm_a_log sidecar above (llama_model_build_ssm_a_log_sidecars,
+    // llama-model.cpp). One ggml_context/buffer pair for the whole model
+    // (not per layer) — freed in ~llama_model. Null when the model has no
+    // GDN layers (nothing was allocated).
+    struct ggml_context * ssm_a_log_ctx = nullptr;
+    ggml_backend_buffer_t ssm_a_log_buf = nullptr;
+
+    // MAD-406 follow-up (rocprof chain 257): owns the backing store for every GDN layer's
+    // ssm_alpha/ssm_beta F16 sidecar (llama_model_build_ssm_ab_f16_sidecars, llama-model.cpp),
+    // dequantized once from the checkpoint's Q8_0 weight so build_lora_mm's plain ggml_mul_mat
+    // takes the F16 (hipBLAS/mul_mat_f16) path instead of mul_mat_q's N=48 MMQ shape. Gated by
+    // env MAD_GDN_AB_F16=1 (default off) — both stay null when unset or the model has no GDN
+    // layers to dequantize (nothing was allocated). Freed in ~llama_model. The ORIGINAL Q8_0
+    // tensors are left resident (not freed) when this fires — see that function's comment.
+    struct ggml_context * ssm_ab_f16_ctx = nullptr;
+    ggml_backend_buffer_t ssm_ab_f16_buf = nullptr;
 
     // weight paging for NVMe→VRAM demand paging.
     //

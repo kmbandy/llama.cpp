@@ -501,6 +501,44 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
+        // NOTE: this loop cannot be collapsed into a single repeat+cpy. Each
+        // iteration's s_idx = max(0, n_tokens - K + t) advances by one column
+        // per t (n_tokens is always >> K in practice, so the clamp is a no-op),
+        // so the K per-slot views are a *sliding* W-wide window over the last
+        // K+W-1 columns of conv_input, each overlapping-but-distinct from its
+        // neighbors by one time step -- not K copies of the same state. Every
+        // slot must therefore get its own genuinely different data; the K
+        // separate ggml_cpy launches are required for correctness.
+        //
+        // It also cannot be collapsed into a single *strided* ggml_cpy either
+        // (checked 2026-09-20, MAD_GDN_SNAP_BATCH follow-up). The K reads
+        // from conv_input *are* expressible as one overlapping view:
+        //   src(w, c, j) = conv_input[s_idx0 + j + w, c],  j = 0..K-1
+        //   ggml_view_3d(conv_input, W, C, K, /*nb1=*/conv_input->nb[1],
+        //                /*nb2=*/conv_input->nb[0], /*offset=*/row_size(s_idx0))
+        //   where s_idx0 = n_tokens - K + 1 (j = t - 1).
+        // And the K destination slots *are* at a uniform stride:
+        //   dst(slot) = conv_states_all + (slot*mem_size + kv_head)*row_size.
+        // But the mapping between them is order-REVERSED, not a simple
+        // reindex: s_idx(t) = n_tokens - K + t increases with t, while
+        // s_slot(t) = K - t decreases with t. So the lowest destination
+        // address (slot 0) must receive the *last* source column (j = K-1,
+        // the most recent state) and the highest destination address
+        // (slot K-1) the *first* source column (j = 0, the oldest). A single
+        // ggml_view/ggml_cpy computes every address as base + index*nb with
+        // nb >= 0 (as does every non-contiguous CUDA kernel in this codebase,
+        // e.g. concat_non_cont / cpy's strided path), so address is
+        // monotonically non-decreasing in the loop index on both sides --
+        // there is no non-negative nb2 that reverses one side relative to the
+        // other, and ggml has no reverse/flip view primitive to compose in
+        // between. Faking a negative stride via unsigned-wraparound pointer
+        // arithmetic would work arithmetically on this hardware but is an
+        // unsupported, untested pattern with no precedent anywhere in
+        // ggml/llama.cpp, and this is on the hot correctness path for every
+        // GDN layer's recurrent state -- not something to introduce without
+        // being able to run and verify it. So this stays a K-iteration loop;
+        // no MAD_GDN_SNAP_BATCH gate was added since there is no batched
+        // implementation to gate.
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;

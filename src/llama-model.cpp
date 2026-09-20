@@ -1491,6 +1491,23 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    // MAD-406: the ssm_a_log sidecar buffer/context are this model's own
+    // allocation (not owned by ml/pimpl's weight contexts) -- see
+    // llama_model_build_ssm_a_log_sidecars.
+    if (ssm_a_log_buf) {
+        ggml_backend_buffer_free(ssm_a_log_buf);
+    }
+    if (ssm_a_log_ctx) {
+        ggml_free(ssm_a_log_ctx);
+    }
+    // MAD-406 follow-up: same reasoning, for the ssm_alpha/ssm_beta F16 sidecars -- see
+    // llama_model_build_ssm_ab_f16_sidecars.
+    if (ssm_ab_f16_buf) {
+        ggml_backend_buffer_free(ssm_ab_f16_buf);
+    }
+    if (ssm_ab_f16_ctx) {
+        ggml_free(ssm_ab_f16_ctx);
+    }
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2018,6 +2035,262 @@ static void llama_model_validate_fp8_rotation_groups(llama_model & model) {
         check_pair(prefix + "attn_q.weight",    prefix + "attn_k.weight");
         check_pair(prefix + "attn_q.weight",    prefix + "attn_v.weight");
     }
+}
+
+// MAD-406 (R4D GDN conv_prep, task 1). Every GDN (recurrent) layer's ssm_a
+// leaf already holds -exp(A_log) folded in at conversion time (see
+// LLM_TENSOR_SSM_A_NOSCAN's arch comment and qwen35.cpp build_layer_attn_
+// linear's "gate = -A_log.exp() * softplus" comment) -- that is what ggml's
+// own (non-R4D) GDN path wants, computed as a plain MUL against a leaf.
+// libr4d's r4d_gdn_conv_prep_w4_h128_bf16 (r4d_gdn_conv_w4_h128_bf16.hip)
+// wants the OTHER thing: the raw A_log, and computes exp(A_log) itself
+// on-device. Since A_log = log(-ssm_a) and ssm_a is, by construction,
+// strictly negative (it is -exp(x) for real x), this recovers A_log once,
+// on the host, right after ssm_a's own bytes are resident -- same timing
+// as llama_model_validate_fp8_rotation_groups above (after load_all_data,
+// before load_tensors returns), for the same reason: reading ssm_a's data
+// via ggml_backend_tensor_get is only valid once its buffer is populated.
+//
+// One shared ggml_context/buffer holds every layer's sidecar (mirrors the
+// ml8 registry's sidecar tensors and the rope-factor pattern elsewhere in
+// this file: a small derived tensor lives beside the weight it derives
+// from, on the same buffer type/device, rather than growing a whole new
+// per-tensor context). Skipped entirely (ctx/buf stay null) when the model
+// has no GDN layers or no arch this sidecar is wired for -- ssm_a_log stays
+// nullptr on every layer, and every consumer (the conv_prep fusion
+// detector) already treats a null sidecar as "not available" and declines.
+static void llama_model_build_ssm_a_log_sidecars(llama_model & model) {
+    const llm_arch arch = model.arch;
+    if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN3NEXT) {
+        return; // the only arches this sidecar is verified against today
+    }
+
+    // Pass 1: which layers actually have a resident ssm_a leaf (recurrent/
+    // GDN layers only -- attention layers in these hybrid arches have none).
+    std::vector<uint32_t> gdn_layers;
+    gdn_layers.reserve(model.hparams.n_layer_all);
+    for (uint32_t il = 0; il < model.layers.size(); il++) {
+        const ggml_tensor * a = model.layers[il].ssm_a;
+        if (a != nullptr && a->buffer != nullptr) {
+            gdn_layers.push_back(il);
+        }
+    }
+    if (gdn_layers.empty()) {
+        return;
+    }
+
+    // One context (metadata only, no_alloc) sized for exactly these tensors,
+    // one real buffer sized+allocated from ssm_a's own buffer type so the
+    // sidecar lands on the same device as the weight it derives from.
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(model.layers[gdn_layers[0]].ssm_a->buffer);
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ gdn_layers.size() * ggml_tensor_overhead() + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to allocate ssm_a_log sidecar context, R4D GDN conv_prep stays "
+                        "unavailable for this model\n", __func__);
+        return;
+    }
+
+    std::vector<ggml_tensor *> sidecars;
+    sidecars.reserve(gdn_layers.size());
+    for (uint32_t il : gdn_layers) {
+        ggml_tensor * a = model.layers[il].ssm_a;
+        ggml_tensor * a_log = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+        const std::string name = "blk." + std::to_string(il) + ".ssm_a_log";
+        ggml_set_name(a_log, name.c_str());
+        sidecars.push_back(a_log);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to allocate ssm_a_log sidecar buffer, R4D GDN conv_prep stays "
+                        "unavailable for this model\n", __func__);
+        ggml_free(ctx);
+        return;
+    }
+
+    // Compute log(-ssm_a) on the host, one layer at a time, and verify the
+    // round trip -exp(log(-x)) == x survives fp32 rounding before trusting
+    // the sidecar -- a cheap, one-time check per layer (task 1's "verify ...
+    // add an assert/one-time check").
+    std::vector<float> buf_f32;
+    for (size_t i = 0; i < gdn_layers.size(); i++) {
+        const uint32_t il = gdn_layers[i];
+        ggml_tensor * a     = model.layers[il].ssm_a;
+        ggml_tensor * a_log = sidecars[i];
+        const int64_t n = ggml_nelements(a);
+        GGML_ASSERT(ggml_nelements(a_log) == n);
+        GGML_ASSERT(a->type == GGML_TYPE_F32 && "ssm_a sidecar derivation assumes fp32 leaves");
+
+        buf_f32.resize((size_t) n);
+        ggml_backend_tensor_get(a, buf_f32.data(), 0, n * sizeof(float));
+
+        std::vector<float> log_a(n);
+        for (int64_t j = 0; j < n; j++) {
+            const float x = buf_f32[j];
+            GGML_ASSERT(x < 0.0f && "ssm_a leaf is not strictly negative -- it should hold "
+                                     "-exp(A_log) folded in at conversion time");
+            const float lx = logf(-x);
+            log_a[j] = lx;
+            // Round-trip check, fp32 rounding only: -exp(log(-x)) must land
+            // back on x (or within a couple ULP of it -- log/exp are not
+            // exact inverses in floating point, but the error here is
+            // orders of magnitude below the tolerances the GDN math itself
+            // already runs at).
+            const float back = -expf(lx);
+            const float tol  = std::max(1e-5f, std::fabs(x) * 1e-4f);
+            if (std::fabs(back - x) > tol) {
+                GGML_ABORT("%s: ssm_a_log round-trip failed for blk.%u.ssm_a[%" PRId64 "]: "
+                           "x=%.9g -> log(-x)=%.9g -> -exp(...)=%.9g (|diff|=%.3g > tol=%.3g)",
+                           __func__, il, j, (double) x, (double) lx, (double) back,
+                           (double) std::fabs(back - x), (double) tol);
+            }
+        }
+        ggml_backend_tensor_set(a_log, log_a.data(), 0, n * sizeof(float));
+        model.layers[il].ssm_a_log = a_log;
+    }
+
+    model.ssm_a_log_ctx = ctx;
+    model.ssm_a_log_buf = buf;
+    LLAMA_LOG_INFO("%s: derived ssm_a_log for %zu GDN layer(s) (R4D conv_prep sidecar)\n",
+                   __func__, gdn_layers.size());
+}
+
+// MAD-406 follow-up (rocprof, chain 257): ssm_alpha.weight/ssm_beta.weight are Q8_0
+// [n_embd x n_v_heads] (n_v_heads=48 in production) -- a terrible MMQ shape (N=48): rocprof
+// measured 116 ms/16k-prefill through quantize_mmq_q8_1 + mul_mat_q for these two projections
+// alone, where radiance's own harness runs the identical math as a plain bf16 GEMM in 16 ms.
+// Dequantizing to F16 once at load time (same sidecar mechanism as
+// llama_model_build_ssm_a_log_sidecars above: one shared ggml_context/buffer, one sidecar per
+// GDN layer, on the SAME buffer type as the original weight) lets build_lora_mm's plain
+// ggml_mul_mat take the F16 path (hipBLAS / mul_mat_f16) instead -- ssm_alpha/ssm_beta were never
+// registered in the ml8 sidecar registry (register_ml8_weight is only called for wqkv/wqkv_gate/
+// ssm_out in qwen35.cpp's tensor creation), so build_lora_mm already falls through to a plain
+// ggml_mul_mat for them; only the weight's OWN dtype needs to change for that call to pick a
+// different kernel family.
+//
+// Gated by env MAD_GDN_AB_F16=1 (default OFF, for an A/B against the Q8_0 path) -- when unset,
+// this function returns immediately and model.layers[il].ssm_alpha/ssm_beta keep pointing at the
+// original Q8_0 tensors exactly as loaded, a zero-cost no-op.
+//
+// The ORIGINAL Q8_0 tensors are left resident (NOT freed) when this fires: they typically live in
+// a shared multi-tensor backend buffer allocated as one block for the whole model (or a whole
+// weight-loading context), and freeing an individual tensor's sub-region out of that block is not
+// a supported operation without a custom sub-allocator -- doing so safely is out of scope here.
+// The extra cost is small (Q8_0 at [5120,48] is ~245 KB per tensor; at ~47 MB total for the F16
+// sidecars across every GDN layer/both tensors, the Q8_0 originals staying resident too adds
+// roughly a quarter of that, single-digit MB for a full 48-layer model) and is a one-time,
+// load-time-only concern, not a runtime cost.
+static void llama_model_build_ssm_ab_f16_sidecars(llama_model & model) {
+    const char * env = std::getenv("MAD_GDN_AB_F16");
+    if (env == nullptr || env[0] != '1') {
+        return;
+    }
+    const llm_arch arch = model.arch;
+    if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN3NEXT) {
+        return; // the only arches this sidecar is verified against today
+    }
+
+    // Pass 1: which (layer, alpha-or-beta) pairs actually need dequantizing -- resident tensors
+    // that are not already F16/F32 (an unquantized checkpoint has nothing to do here).
+    struct ssm_ab_target {
+        uint32_t      il;
+        bool          is_alpha;
+        ggml_tensor * src;
+    };
+    std::vector<ssm_ab_target> targets;
+    for (uint32_t il = 0; il < model.layers.size(); il++) {
+        ggml_tensor * a = model.layers[il].ssm_alpha;
+        ggml_tensor * b = model.layers[il].ssm_beta;
+        if (a != nullptr && a->buffer != nullptr && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_F32) {
+            targets.push_back({il, true, a});
+        }
+        if (b != nullptr && b->buffer != nullptr && b->type != GGML_TYPE_F16 && b->type != GGML_TYPE_F32) {
+            targets.push_back({il, false, b});
+        }
+    }
+    if (targets.empty()) {
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(targets[0].src->buffer);
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ targets.size() * ggml_tensor_overhead() + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to allocate ssm_alpha/beta F16 sidecar context; "
+                        "MAD_GDN_AB_F16 stays off for this model\n", __func__);
+        return;
+    }
+
+    std::vector<ggml_tensor *> sidecars;
+    sidecars.reserve(targets.size());
+    for (const auto & t : targets) {
+        ggml_tensor * f16 = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, t.src->ne);
+        const std::string name = "blk." + std::to_string(t.il) + (t.is_alpha ? ".ssm_alpha_f16" : ".ssm_beta_f16");
+        ggml_set_name(f16, name.c_str());
+        sidecars.push_back(f16);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to allocate ssm_alpha/beta F16 sidecar buffer; "
+                        "MAD_GDN_AB_F16 stays off for this model\n", __func__);
+        ggml_free(ctx);
+        return;
+    }
+
+    // Dequantize on the host: ggml_get_type_traits(src->type)->to_float is the generic CPU
+    // dequant every block-quantized ggml type provides (Q8_0 in production; this works for
+    // whatever other quantized type a differently-converted checkpoint might use too, as long as
+    // it has a to_float callback -- everything block-quantized does).
+    std::vector<uint8_t>     raw;
+    std::vector<float>       f32;
+    std::vector<ggml_fp16_t> f16buf;
+    for (size_t i = 0; i < targets.size(); i++) {
+        ggml_tensor * src = targets[i].src;
+        ggml_tensor * dst = sidecars[i];
+        const int64_t n   = ggml_nelements(src);
+        GGML_ASSERT(ggml_nelements(dst) == n);
+
+        const size_t nbytes = ggml_nbytes(src);
+        raw.resize(nbytes);
+        ggml_backend_tensor_get(src, raw.data(), 0, nbytes);
+
+        const ggml_type_traits * tt = ggml_get_type_traits(src->type);
+        if (tt == nullptr || tt->to_float == nullptr) {
+            GGML_ABORT("%s: blk.%u.%s has no CPU dequantization (type=%d) -- cannot build the F16 "
+                       "sidecar MAD_GDN_AB_F16=1 was asked for",
+                       __func__, targets[i].il, targets[i].is_alpha ? "ssm_alpha" : "ssm_beta",
+                       (int) src->type);
+        }
+        f32.resize((size_t) n);
+        tt->to_float(raw.data(), f32.data(), n);
+
+        f16buf.resize((size_t) n);
+        ggml_fp32_to_fp16_row(f32.data(), f16buf.data(), n);
+        ggml_backend_tensor_set(dst, f16buf.data(), 0, (size_t) n * sizeof(ggml_fp16_t));
+
+        if (targets[i].is_alpha) {
+            model.layers[targets[i].il].ssm_alpha = dst;
+        } else {
+            model.layers[targets[i].il].ssm_beta = dst;
+        }
+    }
+
+    model.ssm_ab_f16_ctx = ctx;
+    model.ssm_ab_f16_buf = buf;
+    LLAMA_LOG_INFO("%s: dequantized %zu ssm_alpha/ssm_beta tensor(s) to F16 (MAD_GDN_AB_F16=1)\n",
+                   __func__, targets.size());
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -3101,6 +3374,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // fp8b128() misses on every lookup and check_pair returns immediately.
     if (!ml.no_alloc) {
         llama_model_validate_fp8_rotation_groups(*this);
+        llama_model_build_ssm_a_log_sidecars(*this);
+        llama_model_build_ssm_ab_f16_sidecars(*this);
     }
 
     return true;

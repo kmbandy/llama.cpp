@@ -232,6 +232,35 @@ void ggml_cuda_op_ml8_mul_mat(
 // can gate the bf16 dst variant without duplicating that logic.
 bool ggml_cuda_ml8_4_mul_mat_supports_bf16_out(int64_t N, int64_t M);
 
+// MT_ML8_4_RADIANCE_FUSE: pre-quantized-A entry point for the ML8_4 GEMM,
+// used by ggml-cuda.cu's graph fusion (add+rms_norm+quant / silu+mul+quant /
+// gdn_norm+quant, each producing radiance's tiled fp8 activation directly
+// into pool scratch instead of a fp32 activation tensor). Does exactly what
+// the MT_ML8_4_PREFILL_RADIANCE=2 path in ml8.cu does from the point where
+// A_tiled/a_scale already exist (per-weight T-table cache lookup/build,
+// then rdna4_gemm_ml84_radiance) — no repack-cache miss should ever occur on
+// this path since ggml_cuda_op_ml8_mul_mat (or a prior prequant call) always
+// runs on every weight first. `w` is the ML8_4 weight tensor and `dst` is
+// the fp32 [N, M] GGML_OP_ML8_MUL_MAT node whose src[1] (centroids) and
+// op_params[0] (lut_group_off) this reads, exactly as ggml_cuda_op_ml8_mul_mat
+// does — `dst->src[2]` (the fp32/pre-quant activation) is NOT read; A_tiled/
+// a_scale substitute for it. `A_tiled` is radiance's tiled fp8 layout (what
+// rdna4_gemm_ml84_radiance consumes as its A operand — M padded up to a
+// multiple of 16 rows, size ceil(M/16)*16*K bytes) and `a_scale` is
+// fp32[M]. Returns false (no side effects — dst->data is untouched) when the
+// weight isn't ML8_4/RDNA4_TRFEED layout, dst isn't F32, or the radiance
+// T-table build/GEMM itself declines/fails to launch a kernel — in every
+// false case the caller must run the normal (unfused) op instead. Returns
+// true iff a kernel was launched and dst->data was written (M rows of N,
+// fp32, row-major, same layout as ggml_cuda_op_ml8_mul_mat's own output).
+bool ggml_cuda_ml8_4_mul_mat_prequant(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         w,
+    const uint8_t *             A_tiled,
+    const float *               a_scale,
+    int                         M,
+    ggml_tensor *               dst);
+
 // GGML_OP_ML8_GET_ROWS dispatch — native 4-bit token-embedding gather.
 // Unlike ggml_cuda_op_ml8_mul_mat this needs NO AITER GEMM: it gathers row
 // ids[i] from the ml8-4 weight and dequantizes via the per-K-group centroid
@@ -467,3 +496,28 @@ void * ggml_cuda_ml8_inplace_ml8fp8_unpack_to_device(
 // default rdna4 = frozen trfeed kernel) consumes the per-row (G=0) activation
 // packing; false for the Triton layouts (block-128 activation packing).
 bool ggml_cuda_fp8_b128_layout_is_per_row(void);
+
+// GGML_OP_FP8_QUANT_ROT op_params[4] ("flags", 2026-09-19): a fifth int32
+// slot on top of op_params[0..3] (a_dim, b_dim, kind, G — see ggml.h's
+// GGML_OP_FP8_QUANT_ROT doc comment). GGML_MAX_OP_PARAMS is 64 bytes / 16
+// int32 slots, so [4] was free. Only meaningful for per-row (G=0) output;
+// zero (the default a freshly-built op_params always has, since
+// ggml_fp8_quant_rot only ever sets [0..3]) for every existing caller.
+//
+//   bit 0 (ML8_QROT_FLAG_TILED): dst->data holds radiance's fragment-TILED
+//     A layout (see radiance_quant.h's TILED LAYOUT doc comment) instead of
+//     the row-major [K bytes fp8][per-row scale] layout the doc comment
+//     above describes. Byte budget is IDENTICAL either way — M*K bytes of
+//     A followed by M*4 bytes of fp32 a_scale — because this bit is only
+//     ever set when M %% 16 == 0 (so radiance's "pad every tile up to a
+//     multiple of 16 rows" requirement costs zero extra bytes; the ggml
+//     graph allocator already sized dst for the untiled M*(K+4) layout and
+//     cannot be asked for more from here). Set by
+//     ggml_cuda_op_fp8_quant_rot[_fused_norm] in ml8.cu iff
+//     rdna4_ml8_qrot_tiled/rdna4_ml8_qrot_add_tiled itself accepted the
+//     shape (radiance_quant.h); read by ml8_mul_mat_core's x_prequant
+//     branch to skip rdna4_gemm_ml84_radiance_retile_a and feed the tiled
+//     data straight to rdna4_gemm_ml84_radiance. Never set on a grouped
+//     (G!=0) or ungated (MT_ML8_4_PREFILL_RADIANCE=0) dst.
+#define ML8_QROT_OP_PARAM_FLAGS 4
+#define ML8_QROT_FLAG_TILED     (1 << 0)

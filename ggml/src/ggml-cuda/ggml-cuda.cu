@@ -32,6 +32,126 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/ml8.cuh"
 #include "ggml-ml8.h"  // FP8_B128 phase 2: GGML_FP8_QUANT_ROT_KIND_* constants
+
+// MT_ML8_4_RADIANCE_FUSE: ml8-4 activation-pipeline fusion straight into
+// radiance's tiled fp8 A layout (radiance_quant.h -- another agent's file
+// under ggml-cuda/ml8.cu's aiter-integration/rdna4_fp8_gemm/ directory, not
+// this file's to create/edit). Same __has_include guard pattern ml8.cu uses
+// for gemm_ml84_decode_v2.h/gemm_ml84_radiance.h: stubs below always
+// decline (return false) so MT_ML8_4_RADIANCE_FUSE is a no-op if this file
+// is ever built against a tree where radiance_quant.h hasn't landed yet.
+// Real contract (radiance_quant.h's own header comment has the full detail
+// -- rot_kind/a_dim/b_dim/norm_w mirror GGML_OP_FP8_QUANT_ROT's own
+// op_params/src[1] exactly, see ggml.h and ggml_cuda_op_fp8_quant_rot_fused_norm
+// in ml8.cu):
+//   rdna4_ml8_qrot_tiled(x, h_a, rot_kind, a_dim, b_dim, norm_w, norm_eps,
+//                        M, K, A_tiled, a_scale, stream, y_out=nullptr)
+//     -- norm(optional)+rotate+per-row-e4m3-quant straight into radiance's
+//        TILED A layout (ceil(M/16)*16*K bytes) + a_scale[M]. `y_out`
+//        (nullable, trailing, defaulted) additionally writes the fp32
+//        normalized (unrotated) row -- what the RMS_NORM*w MUL node would
+//        have produced -- so a second, non-fused consumer of that same MUL
+//        output (pattern A's multi-use case below) still sees correct
+//        data even though the MUL node itself is skipped.
+//   rdna4_ml8_qrot_add_tiled(x, residual, residual_out, h_a, rot_kind,
+//                            a_dim, b_dim, norm_w, norm_eps, M, K, A_tiled,
+//                            a_scale, stream, y_out=nullptr)
+//     -- same, with a fused residual add at the load (r = x + residual,
+//        residual may be null); if residual_out != null, r is also written
+//        there in fp32 for the next residual add in the chain. `y_out` as
+//        above.
+//   rdna4_ml8_qrot_silu_mul_tiled(gate_up, gate_first, h_a, rot_kind, a_dim,
+//                                 b_dim, M, N, A_tiled, a_scale, stream)
+//     -- silu(gate)*up (ggml's fused-GLU [M,2*N] layout, gate_first per
+//        ggml_glu's `swapped` op_param) + rotate + per-row-e4m3-quant into
+//        the tiled A layout (N plays K's role) + a_scale[M]. No norm_w (the
+//        GLU output is never renormalized in these models).
+//   rdna4_ml8_qrot_silu_mul_split_tiled(gate, up, h_a, rot_kind, a_dim,
+//                                       b_dim, M, N, A_tiled, a_scale,
+//                                       stream)
+//     -- same as rdna4_ml8_qrot_silu_mul_tiled but for ggml_glu_split's
+//        SEPARATE gate/up tensors (two independent ML8_MUL_MAT outputs,
+//        not one concatenated [M,2*N] tensor) -- see pattern B's split
+//        variant below. gate/up are each fp32 [M,N]; no gate_first (the
+//        split form's operand order is unambiguous: gate is always the
+//        SiLU-activated operand -- ggml_glu_split() hardcodes swapped=false
+//        and unary.cu's split-form kernel ignores op_params[1] whenever
+//        src[1] is non-null, see ggml.c:3181-3187 and
+//        ggml_cuda_op_unary_gated in unary.cu).
+//   rdna4_ml8_qrot_gated_norm_tiled(o, z, z_nb1, z_nb2, norm_w, norm_eps,
+//                                   head_dim, n_heads, h_a, rot_kind, a_dim,
+//                                   b_dim, M, A_tiled, a_scale, stream,
+//                                   y_out=nullptr)
+//     -- pattern C (the GDN OUTPUT gated RMSNorm feeding ssm_out,
+//        src/models/qwen35.cpp's build_norm_gated): normalized =
+//        rmsnorm_per_head(o, head_dim, n_heads, eps) * norm_w[head_dim];
+//        gated = normalized * silu(z) (z read via its own nb1/nb2 -- may be
+//        a genuinely strided view of a larger fused projection, only
+//        head_dim's own per-element stride is required contiguous); rotate
+//        + per-row-e4m3-quant into the tiled A layout (K = head_dim*n_heads
+//        plays the other entry points' K) + a_scale[M]. `y_out` as above.
+//   rdna4_ml8_qrot_gated_norm_tiled_r4d(o_bf16, o_nb_head, o_nb_tok, head_src,
+//                                       z, z_nb1, z_nb2, norm_w, norm_eps,
+//                                       head_dim, n_heads, h_a, rot_kind,
+//                                       a_dim, b_dim, M, A_tiled, a_scale,
+//                                       stream, y_out=nullptr)
+//     -- same math as rdna4_ml8_qrot_gated_norm_tiled, but reads `o` bf16
+//        straight out of libr4d's own chunk_scan output (mt_gdn_r4d.cu's
+//        GDN adapter, MAD_USE_R4D_GDN_RAW_OUT=1) instead of ggml's
+//        unpermuted fp32 tensor: o_bf16[row, head_src[h], d] (head_src NULL
+//        = identity) in place of o[row, h, d], skipping that adapter's own
+//        fp32 un-permute-cast pass for sites this fuses. See ggml-cuda.cu's
+//        pattern C / mt_gdn_r4d.cuh's r4d_gdn_raw_out for the handshake.
+// All six return false ("not handled", A_tiled/a_scale untouched) when
+// they decline a shape; a `true` return means a kernel was launched.
+#if __has_include("ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.h")
+#include "ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.h"
+#define ML8_4_RADIANCE_QUANT_AVAILABLE 1
+#else
+#define ML8_4_RADIANCE_QUANT_AVAILABLE 0
+#define RDNA4_ML8_QROT_KIND_KRONECKER      1
+#define RDNA4_ML8_QROT_KIND_BLOCK_HADAMARD 2
+static inline bool rdna4_ml8_qrot_tiled(
+    const float * /*x*/, const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/,
+    const float * /*norm_w*/, float /*norm_eps*/, int /*M*/, int /*K*/, uint8_t * /*A_tiled*/,
+    float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    return false;
+}
+static inline bool rdna4_ml8_qrot_add_tiled(
+    const float * /*x*/, const float * /*residual*/, float * /*residual_out*/,
+    const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/,
+    const float * /*norm_w*/, float /*norm_eps*/, int /*M*/, int /*K*/,
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    return false;
+}
+static inline bool rdna4_ml8_qrot_silu_mul_tiled(
+    const float * /*gate_up*/, int /*gate_first*/, const void * /*h_a*/,
+    int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/, int /*N*/,
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/) {
+    return false;
+}
+static inline bool rdna4_ml8_qrot_silu_mul_split_tiled(
+    const float * /*gate*/, const float * /*up*/, const void * /*h_a*/,
+    int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/, int /*N*/,
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/) {
+    return false;
+}
+static inline bool rdna4_ml8_qrot_gated_norm_tiled(
+    const float * /*o*/, const float * /*z*/, size_t /*z_nb1*/, size_t /*z_nb2*/,
+    const float * /*norm_w*/, float /*norm_eps*/, int /*head_dim*/, int /*n_heads*/,
+    const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/,
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    return false;
+}
+static inline bool rdna4_ml8_qrot_gated_norm_tiled_r4d(
+    const void * /*o_bf16*/, size_t /*o_nb_head*/, size_t /*o_nb_tok*/, const int32_t * /*head_src*/,
+    const float * /*z*/, size_t /*z_nb1*/, size_t /*z_nb2*/,
+    const float * /*norm_w*/, float /*norm_eps*/, int /*head_dim*/, int /*n_heads*/,
+    const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/,
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    return false;
+}
+#endif
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -65,6 +185,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/mt_gdn_r4d.cuh"  // ggml_cuda_try_gdn_conv_prep_fusion (MAD-406 follow-up; no-op unless MAD_USE_R4D_GDN_CONV=1)
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -102,6 +223,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -799,6 +921,21 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 if (!ggml_cuda_vram_budget_check("pool_vmm_grow", device, reserve_size, &free_b)) {
                     throw ggml_cuda_pool_oom(device, reserve_size, free_b);
                 }
+                // MAD-LAB 2026-09-20 diag: this is the VMM pool's cuMemCreate/cuMemMap
+                // growth path -- the active pool on any device with VMM support
+                // (GGML_USE_VMM, ggml_cuda_info().devices[device].vmm), which on
+                // gfx1201 is virtually always. It bypasses ggml_cuda_device_malloc
+                // entirely, so WP_ALLOC_LOG=1 runs before this line saw NONE of this
+                // pool's growth -- only ggml_cuda_vram_budget_check's separate
+                // WP_VRAM_LOG=1 gate did, under a different journal key
+                // ("vram-budget: pool_vmm_grow ..."). This pool is also
+                // monotonic/never-shrinking (freed only in the pool's destructor at
+                // context teardown, see ~ggml_cuda_pool_vmm above), so any per-round
+                // growth here is permanent for the process's lifetime. Log it under
+                // the same "wp alloc-log" format/journal key as device_malloc/
+                // pool_miss/graph_capture/graph_instantiate so one grep finds all
+                // growing allocators.
+                wp_alloc_log("pool_vmm_grow", device, reserve_size, free_b);
             }
 
             // allocate more physical memory
@@ -920,6 +1057,56 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#ifdef USE_CUDA_GRAPH
+// vram-budget (2026-09-20 regression): contexts sharing a device -- main
+// model + DFlash draft context, or one context per GGML_META_OVERLAP_SPLIT
+// rolling slot -- each keep their OWN cuda_graphs map, but
+// ggml_cuda_wp_graph_counters::exec_bytes_live (below) is a per-DEVICE
+// total. The 2026-09-14 budget fix evicted only the instantiating context's
+// own LRU entries; verified working that day because only one context lived
+// on a device then. With tensor-parallel + GGML_META_OVERLAP_SPLIT=2 +
+// DFlash now putting several contexts on device 0, a context whose own map
+// is small (or already down to its one just-captured entry) simply runs out
+// of things to evict -- ggml_cuda_graph_enforce_vram_budget's old
+// `cuda_ctx->cuda_graphs.size() > 1` guard goes false -- while the device
+// total, dominated by a SIBLING context's map, stays over budget forever.
+// That is why free VRAM never recovered: the eviction loop kept exiting
+// with n_evicted == 0 instead of ever reaching a graph_free/evict log line.
+// Fix: track every live context per device so the budget can walk all of
+// them and evict the globally-oldest entry, wherever it lives.
+//
+// No extra locking around the maps themselves: host-side access to a given
+// ggml_backend_cuda_context is already single-threaded by design (only the
+// GPU-side work overlaps -- see mt_pagedattn_aiter.cu, "the meta backend's
+// single host thread" under GGML_META_OVERLAP=1, and DFlash draft/target
+// evaluation runs on that same decode-loop thread), so walking several
+// contexts' maps from that one thread is no new race. The registry itself
+// (construction/destruction can race with an in-flight instantiate on
+// another device's thread in principle) is mutex-protected.
+static std::mutex                                     ggml_cuda_wp_ctx_registry_mtx;
+static std::vector<ggml_backend_cuda_context *>       ggml_cuda_wp_ctx_registry[GGML_CUDA_MAX_DEVICES];
+
+static void ggml_cuda_graph_register_ctx(ggml_backend_cuda_context * ctx) {
+    if (ctx->device < 0 || ctx->device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_wp_ctx_registry_mtx);
+    auto & v = ggml_cuda_wp_ctx_registry[ctx->device];
+    if (std::find(v.begin(), v.end(), ctx) == v.end()) {
+        v.push_back(ctx);
+    }
+}
+
+static void ggml_cuda_graph_unregister_ctx(ggml_backend_cuda_context * ctx) {
+    if (ctx->device < 0 || ctx->device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_wp_ctx_registry_mtx);
+    auto & v = ggml_cuda_wp_ctx_registry[ctx->device];
+    v.erase(std::remove(v.begin(), v.end(), ctx), v.end());
+}
+#endif // USE_CUDA_GRAPH
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -929,6 +1116,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     // stream sync is acceptable here (teardown), and necessary -- nothing
     // else will drive these events to completion after this point.
     ggml_cuda_graph_drain_retired(true);
+    // vram-budget: stop being a target for cross-context budget eviction
+    // before this context's cuda_graphs map goes away.
+    ggml_cuda_graph_unregister_ctx(this);
 #endif
 
     if (copy_event != nullptr) {
@@ -4105,6 +4295,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     return true;
 }
 
+// Non-static wrapper around the per-node executor above, exported so
+// mt_gdn_r4d.cu (GGML_HIP_R4D's GDN conv-prep fusion) can run a node's
+// compute out of the main graph-walk order -- the GDN a/b projection
+// MUL_MAT nodes sit AFTER SSM_CONV in the cgraph, but conv_prep needs their
+// results before SSM_CONV's own turn. Declared in mt_gdn_r4d.cuh; no header
+// change needed on this file's side. Same contract as
+// ggml_cuda_compute_forward itself: returns false (nothing further
+// dispatched) if the op's own dispatch declined, true otherwise -- CUDA/HIP
+// errors from within the op's launch already surface via CUDA_CHECK inside
+// ggml_cuda_compute_forward before this returns.
+bool ggml_cuda_compute_node_now(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+    return ggml_cuda_compute_forward(ctx, node);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 // backend
@@ -6027,6 +6231,2387 @@ static ggml_tensor * ggml_cuda_find_qrot_consumer(const ggml_cgraph * cgraph, in
     return nullptr;
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// MT_ML8_4_RADIANCE_FUSE (default 0): fold the ml8-4 activation pipeline
+// straight into radiance's tiled fp8 A layout, replacing:
+//   Pattern A: [ADD(x, residual)] -> RMS_NORM -> MUL(norm_w) -> FP8_QUANT_ROT
+//              -> ML8_MUL_MAT (one or more, memo-shared, e.g. q/k/v)
+//   Pattern C: RMS_NORM -> MUL(norm_w) -> MUL(silu(z)) -> FP8_QUANT_ROT
+//              -> ML8_MUL_MAT (ssm_out) -- the GDN output gated norm
+//   Pattern B(split): ML8_MUL_MAT(gate)/ML8_MUL_MAT(up) -> GLU(swiglu,
+//              split) -> FP8_QUANT_ROT -> ML8_MUL_MAT (down)
+// with one load-fused kernel (rdna4_ml8_qrot_{add_,silu_mul_,gated_norm_,}tiled)
+// per pattern that writes radiance's TILED A + a_scale straight into the
+// qrot's OWN dst buffer (qrot->data; see ml8.cuh's ML8_QROT_FLAG_TILED doc
+// comment for the exact layout) and sets that flag, so every consumer
+// ML8_MUL_MAT reads it via ml8_mul_mat_core's own existing x_prequant/
+// x_tiled branch (ml8.cu) -- no separate pool scratch, no eager consumer
+// dispatch.
+//
+// Chain-227 EXECUTION MODEL (2026-09-19 rework): the fused kernel does NOT
+// run at the chain's head (the ADD/RMS_NORM/GLU anchor). ggml's graph
+// allocator assumes in-order execution when it assigns/reuses buffers --
+// running the kernel (and, in the pre-227 design, the consumer GEMMs too)
+// at the head's position executes them before every node strictly between
+// the head and the qrot has run, so a still-live intermediate in that span
+// can share a buffer with the early-executed write (and any pool scratch
+// held across nodes is freed LIFO at return, outliving nothing). Instead:
+// the pattern functions below only DETECT the chain at its head and
+// register a deferred ml8_radiance_plan (keyed by the qrot tensor) plus
+// mark every matched node skipped; the plan actually RUNS later, at the
+// qrot's own normal cgraph turn (ggml_cuda_try_ml8_radiance_exec_copy),
+// by which point every node in between has genuinely executed and the
+// allocator's assumption holds. Declining anywhere along the chain (at
+// either detection or, in principle, execution -- see that function's own
+// comment) leaves every node untouched: nothing is skipped, no plan is
+// registered, no partial state.
+//
+// 2026-09-19 rework: the first cut required each hop (ADD->RMS_NORM->MUL->
+// FP8_QUANT_ROT, or gate_up->GLU->FP8_QUANT_ROT) to sit at exact adjacent
+// cgraph indices, and only logged decline reasons from INSIDE the pattern
+// functions -- so a graph whose real shape didn't even reach the adjacency
+// pre-check (checked in ggml_cuda_try_fuse itself) silently never fired,
+// with zero diagnostics (this is exactly what happened for the attention
+// qkv group and the FFN gate_up/down pair on chain 223: pattern A fired
+// only for the GDN in_proj group, pattern B never fired at all, and NOTHING
+// was logged for either miss). Two changes fix that:
+//   1. Every early-out, in both the trigger site and the pattern bodies,
+//      now goes through ml8_4_radiance_fuse_log_once with the concrete op
+//      sequence it actually saw (op name + tensor name), not just a static
+//      message. MT_ML8_4_GEMM_LOG=2 additionally dumps the full node
+//      sequence around the first M>32 ML8_MUL_MAT once, so the real graph
+//      shape is visible without guessing.
+//   2. The next-hop lookups (RMS_NORM's consumer, MUL's consumer, gate_up's
+//      consumer, GLU's consumer) no longer require index adjacency: they
+//      walk forward through ml8_radiance_find_real_consumer, which follows
+//      a chain of single-use VIEW/RESHAPE/TRANSPOSE/PERMUTE/NONE wrappers
+//      (ggml_cuda_is_view_or_noop -- already dispatched as pure no-ops by
+//      the main graph-walk loop, so folding them into our own nodes_to_skip
+//      range changes nothing about what actually runs) to the first REAL
+//      op that consumes the tensor, wherever it sits. Anything else in the
+//      way (an AWQ-scale MUL, a real CONT, two unrelated ops interleaved,
+//      an unexpected op) is NOT bridged -- it is a correctness requirement
+//      that everything our nodes_to_skip range spans either IS part of the
+//      matched chain or was already a no-op, since ggml_cuda_try_fuse's
+//      return value can only skip a contiguous range and anything skipped
+//      that wasn't actually one of those two things would silently never
+//      execute. Declining logs the actual op found so the reason is
+//      diagnosable (AWQ scale vs. an unrelated op vs. two-tensor GLU, etc.)
+//      instead of a guess.
+// MT_ML8_4_RADIANCE_FUSE is a bitmask: 1=pattern A, 4=pattern B(split),
+// 8=pattern C. Bit 2 (the fused, non-split gate_up form, "pattern B") is
+// dead -- production graphs never build that shape (ggml_glu_split is
+// always used), so that pattern was removed entirely rather than kept
+// unreachable; the bit is reserved (no-op) for numbering stability. Any
+// nonzero value that only sets bits outside {1,4,8} (e.g. the historical
+// "=1") means pattern A only; use 13 (1|4|8) for everything.
+static int ml8_4_radiance_fuse_mask() {
+    static const int mask = [] {
+        const char * e = std::getenv("MT_ML8_4_RADIANCE_FUSE");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return mask;
+}
+static bool ml8_4_radiance_fuse_enabled() {
+    return ml8_4_radiance_fuse_mask() != 0;
+}
+
+static bool ml8_4_prefill_radiance_active() {
+    static const bool on = [] {
+        const char * e = std::getenv("MT_ML8_4_PREFILL_RADIANCE");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// MT_ML8_4_RADIANCE_VERIFY=1: every pattern still runs its fused kernel at
+// the head, into a scratch slot, exactly as in normal mode -- but registers
+// only a verify plan (never a real copy/skip plan) and touches NO graph
+// node's skip state at all. Every original node (add/rms/mul/silu/mul_gate/
+// glu, and the qrot itself) executes completely normally; at the qrot's own
+// turn the plain path's own result is compared against our scratch,
+// reported once per site, and left untouched -- verify mode never changes
+// what the graph actually computes.
+static bool ml8_4_radiance_verify_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("MT_ML8_4_RADIANCE_VERIFY");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// MT_ML8_4_RADIANCE_DIRECT=1 (default OFF): chain 258's direct-write
+// optimization -- writing A_tiled/a_scale (and, when a chain has y_out,
+// the plain-normalized row) straight into the real destination tensor's
+// own buffer instead of a scratch slot + deferred D2D copy. Chain 274
+// rocprof showed this net LOSING ~80us/16k-prefill-token versus plain
+// scratch+copy (copyBuffer time saved was more than offset by a per-kernel
+// slowdown writing into qrot->data directly -- plausibly its weaker 128B
+// buffer-pool alignment guarantee versus a dedicated cudaMalloc's, see the
+// pattern A/C direct-write comments -- plus one MUL no longer being
+// skipped at some pattern C sites). Default OFF reproduces plain
+// chain-258 scratch+copy behavior exactly (the refcount/leak fixes from
+// chains 269/271 stay in effect either way -- they are about the scratch
+// path's own correctness, not the direct-write decision). Gated
+// independently per call site below rather than short-circuited once,
+// so `ml8_radiance_direct_write_safe` is never even invoked when off.
+static bool ml8_4_radiance_direct_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("MT_ML8_4_RADIANCE_DIRECT");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// MT_ML8_4_GEMM_LOG=1: decline reasons + first-fusion lines (used by ml8.cu
+// too, same env var). =2: also the one-shot full graph-shape dump below.
+static int ml8_4_radiance_fuse_log_level() {
+    static const int lvl = [] {
+        const char * e = std::getenv("MT_ML8_4_GEMM_LOG");
+        return e ? std::atoi(e) : 0;
+    }();
+    return lvl;
+}
+static bool ml8_4_radiance_fuse_log_enabled() { return ml8_4_radiance_fuse_log_level() >= 1; }
+
+// Log `msg` under key `key` at most once per process (decline reasons and
+// the first-fusion-per-pattern line share this — MT_ML8_4_GEMM_LOG=1).
+static void ml8_4_radiance_fuse_log_once(const std::string & key, const std::string & msg) {
+    if (!ml8_4_radiance_fuse_log_enabled()) {
+        return;
+    }
+    static std::mutex                            mu;
+    static std::unordered_map<std::string, bool> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    if (seen.emplace(key, true).second) {
+        fprintf(stderr, "[ml8-4][radiance-fuse] %s\n", msg.c_str());
+    }
+}
+
+static const char * ml8_radiance_tname(const ggml_tensor * t) {
+    return t ? (t->name[0] ? t->name : ggml_op_name(t->op)) : "(null)";
+}
+
+// Diagnostic-only (chain 243 item 4b): when a hop's own bounded/single-use
+// walk (ml8_radiance_find_real_consumer / ml8_radiance_find_op_multiuse)
+// fails to find ANY consumer at all, that walk's own `why` string can't say
+// what the tensor's real consumer actually is (it never found one under its
+// own single-use/target-op constraints). This does an unconstrained scan of
+// the WHOLE graph for the first node that has `t` as any src, purely to
+// name it in a decline log -- never used to gate a fusion decision.
+static std::string ml8_radiance_describe_any_consumer(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * cand = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (cand->src[k] == t) {
+                return "real consumer: " + std::string(ggml_op_name(cand->op)) + " '" +
+                       std::string(ml8_radiance_tname(cand)) + "' (node[" + std::to_string(j) + "])";
+            }
+        }
+    }
+    return "no consumer anywhere in the graph (possibly a graph output)";
+}
+
+// MT_ML8_4_GEMM_LOG=2: once per process, dump the node sequence from the
+// first M>32 ML8_MUL_MAT node through the following 40 nodes (index, op
+// name, tensor name, ne[0..2], src names) so the real layer shape can be
+// read off directly instead of guessed at from decline messages.
+static void ml8_4_radiance_maybe_dump_graph_shape(const ggml_cgraph * cgraph, int mm_idx) {
+    static std::atomic<bool> dumped{false};
+    if (ml8_4_radiance_fuse_log_level() < 2 || dumped.exchange(true)) {
+        return;
+    }
+    const ggml_tensor * mm = cgraph->nodes[mm_idx];
+    const int64_t        M = mm->ne[1] * mm->ne[2] * mm->ne[3];
+    if (M <= 32) {
+        dumped = false; // decode-only graph so far -- try again on a later (prefill) graph
+        return;
+    }
+    fprintf(stderr, "[ml8-4][radiance-fuse] graph dump: M=%lld, starting at ML8_MUL_MAT node[%d] (%s)\n",
+            (long long) M, mm_idx, ml8_radiance_tname(mm));
+    const int end = std::min(cgraph->n_nodes, mm_idx + 40);
+    for (int j = mm_idx; j < end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        fprintf(stderr, "  [%3d] %-16s name=%-28s ne=(%lld,%lld,%lld) src=(%s,%s,%s,%s)\n",
+                j, ggml_op_name(n->op), ml8_radiance_tname(n),
+                (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2],
+                ml8_radiance_tname(n->src[0]), ml8_radiance_tname(n->src[1]),
+                ml8_radiance_tname(n->src[2]), ml8_radiance_tname(n->src[3]));
+    }
+}
+
+// Walk forward from `src` (cgraph index `src_idx`) through a chain of
+// single-use, view-or-noop wrapper nodes (ggml_cuda_is_view_or_noop --
+// VIEW/RESHAPE/TRANSPOSE/PERMUTE/NONE; these are already treated as pure
+// no-ops by the main graph-walk loop, so any of them our own nodes_to_skip
+// range spans changes nothing about what actually executes) to the first
+// REAL (non-view/noop) node that consumes it, searched within `search_from`
+// .. `max_idx` inclusive. A VIEW with a nonzero byte offset is refused (its
+// data pointer is NOT `src`'s own -- reading `src->data` directly, which is
+// what every rdna4_ml8_qrot_* launcher call site below does, would be
+// wrong), as is any node with more than one use (ggml_node_has_n_uses) or a
+// tensor with more than one direct consumer. Returns the found node's
+// cgraph index, or -1 (nothing within the window / not single-use / an
+// offset view / it fans out) -- `*why` gets a short, human-readable reason
+// and `*found_op`/`*found_name` describe whatever WAS actually found there
+// (for the caller's decline log), when non-null.
+static int ml8_radiance_find_real_consumer(
+        const ggml_cgraph * cgraph, const ggml_tensor * src, int src_idx, int max_idx,
+        std::string * why, std::vector<int> * hops = nullptr) {
+    const ggml_tensor * cur     = src;
+    int                  cur_idx = src_idx;
+    for (int hop = 0; hop < 8; ++hop) { // bounded: real graphs never need more than a couple of reshape hops
+        if (!ggml_node_has_n_uses(cgraph, cur_idx, 1)) {
+            if (why) *why = "'" + std::string(ml8_radiance_tname(cur)) + "' has more than one use";
+            return -1;
+        }
+        ggml_tensor * next     = nullptr;
+        int           next_idx = -1;
+        for (int j = cur_idx + 1; j < cgraph->n_nodes && j <= max_idx; ++j) {
+            ggml_tensor * cand    = cgraph->nodes[j];
+            bool           is_use = false;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (cand->src[k] == cur) { is_use = true; break; }
+            }
+            if (is_use) {
+                if (next != nullptr) {
+                    if (why) *why = "'" + std::string(ml8_radiance_tname(cur)) + "' fans out to more than one consumer";
+                    return -1;
+                }
+                next     = cand;
+                next_idx = j;
+            }
+        }
+        if (next == nullptr) {
+            if (why) *why = "no consumer of '" + std::string(ml8_radiance_tname(cur)) +
+                             "' found within the search window";
+            return -1;
+        }
+        if (!ggml_cuda_is_view_or_noop(next)) {
+            return next_idx;
+        }
+        if (next->op == GGML_OP_VIEW && next->view_offs != 0) {
+            if (why) *why = "'" + std::string(ml8_radiance_tname(next)) + "' is a VIEW with a nonzero byte offset (a slice, not a reshape)";
+            return -1;
+        }
+        if (hops) hops->push_back(next_idx);
+        cur     = next;
+        cur_idx = next_idx;
+    }
+    if (why) *why = "more than 8 reshape/view hops";
+    return -1;
+}
+
+// Task-2 relaxation: `ml8_radiance_find_real_consumer` refuses as soon as
+// `src` has more than one use -- correct for every hop except two observed
+// on chain 224: pattern A's RMS_NORM*w MUL output ('attn_norm-0' feeds both
+// the Q/K/V group's memoized qrot AND a second, unrelated consumer -- an
+// AWQ-scale MUL, a non-fusable grouped qrot, or the attention output gate
+// reading the plain normalized row) and pattern B's gate_up ML8_MUL_MAT
+// ('linear_attn_qkv_mixed-0', the GDN in_proj output, feeds both the conv
+// path and the b/a projections -- never a GLU at all). This walks every
+// DIRECT consumer of `src`, resolves each one through its own single-use
+// view/noop chain (same rule as every other hop -- a branch that itself fans
+// out further is refused, not silently ignored), and requires exactly one
+// branch to land on `target_op` (GGML_OP_FP8_QUANT_ROT for pattern A's MUL
+// hop, GGML_OP_GLU for pattern B's gate_up hop). Every other branch is left
+// completely alone (not part of `matched`, never skipped) -- for pattern A
+// this is safe because the caller arranges for the fused kernel to also
+// write the plain fp32 row into `src`'s own dst buffer (`y_out`), so any
+// node still reading `src` directly sees exactly what it would have read
+// had the MUL actually run; for pattern B's gate_up hop no such buffer is
+// needed since gate_up's OWN GEMM still runs normally regardless (it is
+// never skipped -- only the GLU+qrot span is). Sets `*any_other_consumer`
+// when such a branch exists. Returns `target_op`'s cgraph index, or -1
+// (why set) if no branch resolves to it, more than one does, or some OTHER
+// branch itself can't be resolved (fans out further / an offset-VIEW slice /
+// no consumer at all within the window) -- that branch's own op/name go in
+// `*why` so the decline log names the actual blocker, not a guess.
+// Recursive worker for ml8_radiance_find_op_multiuse: explores every DIRECT
+// consumer of `node`. A view/noop consumer is recursed INTO (so multi-use
+// is tolerated at ANY depth, not just at the root -- chain 226 hit this one
+// level down: pattern C's MUL(gate) -> 'final_output-0' (a RESHAPE) ->
+// {FP8_QUANT_ROT, a second real consumer}, i.e. the VIEW itself had 2 uses,
+// not the MUL). A real (non-view) consumer is recorded as the `target_op`
+// match (at most one across the whole tree, else decline -- ambiguous) or
+// as an "other" leaf (left completely untouched; the caller's y_out /
+// residual_out mechanism is what makes that safe).
+static bool ml8_radiance_walk_multiuse(
+        const ggml_cgraph * cgraph, const ggml_tensor * node, int node_idx, int max_idx,
+        ggml_op target_op, int * found_idx, bool * other, std::vector<int> * other_indices,
+        std::string * why, int depth) {
+    if (depth > 8) {
+        if (why) *why = "more than 8 reshape/view hops";
+        return false;
+    }
+    bool any = false;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= max_idx; ++j) {
+        ggml_tensor * cand    = cgraph->nodes[j];
+        bool           is_use = false;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (cand->src[k] == node) { is_use = true; break; }
+        }
+        if (!is_use) {
+            continue;
+        }
+        any = true;
+        if (ggml_cuda_is_view_or_noop(cand)) {
+            if (cand->op == GGML_OP_VIEW && cand->view_offs != 0) {
+                if (why) *why = "'" + std::string(ml8_radiance_tname(cand)) + "' is a VIEW with a nonzero byte offset";
+                return false;
+            }
+            if (!ml8_radiance_walk_multiuse(cgraph, cand, j, max_idx, target_op, found_idx, other, other_indices, why, depth + 1)) {
+                return false;
+            }
+        } else if (cand->op == target_op) {
+            if (*found_idx >= 0) {
+                if (why) *why = "more than one " + std::string(ggml_op_name(target_op)) + " branch off '" +
+                                 std::string(ml8_radiance_tname(node)) + "'";
+                return false;
+            }
+            *found_idx = j;
+        } else {
+            if (other) *other = true; // a plain reader of the root's data -- left untouched
+            if (other_indices) other_indices->push_back(j);
+        }
+    }
+    if (!any) {
+        if (why) *why = "no consumer of '" + std::string(ml8_radiance_tname(node)) + "' found within the search window";
+        return false;
+    }
+    return true;
+}
+
+// `other_indices` (optional): cgraph index of every "other" (non-target_op)
+// leaf found -- chain 226's execute-at-qrot rework needs these to enforce
+// "an other-consumer's own index must be AFTER the qrot" (its y_out data is
+// only written when the deferred kernel runs, at the qrot's own node
+// position -- see ggml_cuda_try_ml8_radiance_pattern_a/_c).
+static int ml8_radiance_find_op_multiuse(
+        const ggml_cgraph * cgraph, const ggml_tensor * src, int src_idx, int max_idx,
+        ggml_op target_op, std::string * why, bool * any_other_consumer, std::vector<int> * other_indices = nullptr) {
+    int  found_idx = -1;
+    bool other      = false;
+    if (!ml8_radiance_walk_multiuse(cgraph, src, src_idx, max_idx, target_op, &found_idx, &other, other_indices, why, 0)) {
+        return -1;
+    }
+    if (found_idx < 0 && why) {
+        *why = "no consumer of '" + std::string(ml8_radiance_tname(src)) + "' found within the search window";
+    }
+    if (any_other_consumer) *any_other_consumer = other;
+    return found_idx;
+}
+
+// Chain-227 execution-model rework: patterns no longer run their kernel (or
+// skip via a contiguous index range) at the chain HEAD. ggml's graph
+// allocator assigns/reuses buffers assuming in-order execution -- running
+// the fused kernel AND the consumer ML8_MUL_MATs early (at the head's
+// position) executes them before every node between the head and the qrot
+// has run, so a still-live intermediate in that span can own the same
+// buffer the allocator later hands the early-executed consumer's dst (or
+// the qrot's own pool scratch, freed LIFO at return, outliving nothing).
+// New model: detect the whole chain at the head (this function), but ONLY
+// register a deferred ml8_radiance_plan (keyed by the qrot tensor pointer)
+// and mark every matched node's tensor -- EXCEPT the qrot itself -- into
+// `g_fused_qrot_skip so the main graph-walk loop skips them in their normal
+// position, in order. The qrot node's OWN normal turn (later, once every
+// node between the head and it has actually run) is where
+// ggml_cuda_try_ml8_radiance_exec_copy looks the plan up and runs the
+// deferred kernel, writing straight into qrot->data (radiance's TILED
+// layout) and setting ML8_QROT_FLAG_TILED -- the qrot's own plain dispatch
+// never runs, but every consumer ML8_MUL_MAT still runs in ITS own normal
+// (later) turn, taking the tiled-consumer branch in ml8_mul_mat_core
+// because the flag is now set.
+static void ml8_radiance_mark_chain_skipped(
+        const ggml_cgraph * cgraph, ggml_tensor * head, const std::vector<int> & matched) {
+    g_fused_qrot_skip.insert(head);
+    for (int idx : matched) {
+        g_fused_qrot_skip.insert(cgraph->nodes[idx]);
+    }
+    // qrot is deliberately NOT inserted -- it still runs, via
+    // ggml_cuda_try_ml8_radiance_exec_copy, at its own normal turn.
+}
+
+#ifdef GGML_HIP_R4D
+// Exported so mt_gdn_r4d.cu's conv_prep fusion can skip matched producers by
+// identity the same way the radiance patterns do, instead of a contiguous
+// index count (production graphs interleave unrelated nodes between
+// SSM_CONV and GATED_DELTA_NET). Declared in mt_gdn_r4d.cuh.
+void ggml_cuda_mark_fused_skip(const ggml_tensor * node) {
+    if (node != nullptr) {
+        g_fused_qrot_skip.insert(node);
+    }
+}
+#endif
+
+// Best-effort label for the per-layer-type "first fusion" log lines
+// (MT_ML8_4_GEMM_LOG=1) -- strips a "blk.<N>." prefix and a trailing
+// ".weight"/".weight.qrot"/".qrot" suffix off a tensor name so
+// 'blk.0.ffn_up.weight.qrot' reads as "ffn_up", 'blk.0.attn_qkv.weight.qrot'
+// as "attn_qkv", etc. Purely cosmetic (for grepping the journal to see which
+// of the ~6 ml8 GEMM sites per layer are covered) -- never used for matching.
+static std::string ml8_radiance_site_label(const char * name) {
+    std::string s = name ? name : "";
+    const size_t dot1 = s.find('.');
+    if (dot1 != std::string::npos) {
+        const size_t dot2 = s.find('.', dot1 + 1);
+        if (dot2 != std::string::npos && s.compare(0, 4, "blk.") == 0) {
+            s = s.substr(dot2 + 1);
+        }
+    }
+    for (const char * suffix : { ".weight.qrot", ".qrot", ".weight" }) {
+        const size_t slen = strlen(suffix);
+        if (s.size() > slen && s.compare(s.size() - slen, slen, suffix) == 0) {
+            s = s.substr(0, s.size() - slen);
+            break;
+        }
+    }
+    return s;
+}
+
+// Chain 226 item (d): a GLU's gate/up operand is not always the
+// GGML_OP_ML8_MUL_MAT tensor itself -- build_lora_mm's own w_s (output-
+// channel scale, a MUL) or a LoRA residual (an ADD) can wrap it. Peels
+// through view_src (a pure VIEW/RESHAPE/... alias, same underlying data),
+// CONT/CPY/DUP (a real copy, but single-src so trivially "the same value
+// elsewhere"), and ADD (try each operand; an ADD's bias/LoRA operand won't
+// itself resolve to ML8_MUL_MAT, so trying both is enough to find the base
+// GEMM term without needing to know which operand is which). Returns
+// whatever real node it bottoms out at (which the caller checks for
+// GGML_OP_ML8_MUL_MAT) -- this is validation-only, never used to pick which
+// buffer's data gets read (that's always `gate`/`up` themselves, unmodified).
+static const ggml_tensor * ml8_radiance_peel_to_mul_mat(const ggml_tensor * t, int depth = 0) {
+    if (!t || depth > 8) {
+        return t;
+    }
+    if (t->op == GGML_OP_ML8_MUL_MAT) {
+        return t;
+    }
+    if (t->view_src) {
+        return ml8_radiance_peel_to_mul_mat(t->view_src, depth + 1);
+    }
+    if ((t->op == GGML_OP_CONT || t->op == GGML_OP_CPY || t->op == GGML_OP_DUP) && t->src[0]) {
+        return ml8_radiance_peel_to_mul_mat(t->src[0], depth + 1);
+    }
+    if (t->op == GGML_OP_ADD) {
+        for (int k = 0; k < 2; ++k) {
+            if (t->src[k]) {
+                const ggml_tensor * r = ml8_radiance_peel_to_mul_mat(t->src[k], depth + 1);
+                if (r && r->op == GGML_OP_ML8_MUL_MAT) {
+                    return r;
+                }
+            }
+        }
+    }
+    return t;
+}
+
+// Every node whose src[k] (any k) points at `qrot` must be a
+// GGML_OP_ML8_MUL_MAT reading it as src[2] -- qrot's memo key (see
+// get_or_build_fp8_quant_rot in llama-ml8-registry.cpp) does not include
+// the weight type, so a G=0 quant_rot node CAN in principle be shared with
+// an FP8_MUL_MAT (FP8_B128 weight) consumer; that mixed case can't be
+// satisfied by ggml_cuda_ml8_4_mul_mat_prequant, so decline the whole
+// fusion rather than guess. `expected_uses` is qrot's own ggml use-count
+// (ggml_node_get_use_count) -- every use must be accounted for by an
+// ML8_MUL_MAT we found, or we may be missing one.
+static bool ml8_4_radiance_collect_mul_mat_consumers(
+        const ggml_cgraph * cgraph, const ggml_tensor * qrot, int32_t expected_uses,
+        std::vector<ggml_tensor *> & out, std::string * why) {
+    out.clear();
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        bool touches_qrot = false;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (n->src[k] == qrot) {
+                touches_qrot = true;
+                break;
+            }
+        }
+        if (!touches_qrot) {
+            continue;
+        }
+        if (n->op != GGML_OP_ML8_MUL_MAT || n->src[2] != qrot) {
+            if (why) *why = "consumer '" + std::string(ml8_radiance_tname(n)) + "' is " +
+                             std::string(ggml_op_name(n->op)) + ", not ML8_MUL_MAT(src[2]=qrot)";
+            return false;
+        }
+        out.push_back(n);
+    }
+    if (out.empty()) {
+        if (why) *why = "no ML8_MUL_MAT consumer found at all";
+        return false;
+    }
+    if ((int32_t) out.size() != expected_uses) {
+        if (why) *why = "found " + std::to_string(out.size()) + " ML8_MUL_MAT consumer(s) but qrot's use-count is " +
+                         std::to_string(expected_uses);
+        return false;
+    }
+    return true;
+}
+
+// Chain-227: the pool a_tiled/a_scale scratch + eager-dispatch-every-consumer
+// idiom is gone -- consumers now run in their own NORMAL later turn (no
+// early dispatch, no skip-marking for them at all); ml8_4_radiance_dispatch_consumers
+// is deleted. What used to be its job (drive the prequant GEMM directly) is
+// now just "set ML8_QROT_FLAG_TILED on qrot and let ml8_mul_mat_core's own
+// x_prequant/x_tiled branch handle it" -- see ggml_cuda_try_ml8_radiance_exec_copy.
+
+// Chain-241 aliasing fix: executing the fused kernel (or even just
+// deferring ITS materialization) at the QROT's own position is unsafe --
+// ggml's allocator frees each input buffer at the position of ITS OWN last
+// consumer (the ADD/RMS_NORM/GLU/SILU node this fusion skips), so the
+// qrot's dst buffer -- allocated separately, at the qrot's LATER position
+// -- can be handed the exact same memory the allocator just freed one of
+// our inputs from. Reading and writing overlapping memory in one kernel
+// launch is undefined (row-major in, tiled out -- a real cross-row
+// clobber, not just a stale-read hazard).
+//
+// New model: the fused kernel runs immediately, AT THE HEAD's own cgraph
+// position -- the one point every one of its inputs (add->src[0/1],
+// rms->src[0], gate/up) is guaranteed live, since the head node is each
+// one's own normal consumer (z is the one exception -- see pattern C's own
+// comment for its explicit index check). It writes A_tiled+a_scale into a
+// dedicated, persistent scratch slot -- NOT the LIFO pool (a slot must
+// outlive the pool-alloc/free scope of every node between the head and the
+// qrot) and NOT qrot->data (that allocation doesn't reliably exist yet as
+// the SAME buffer at the head's position, and is exactly the aliasing-prone
+// target this fix avoids). At the qrot's own later turn, the slot is
+// copied (D2D) into qrot->data and released.
+//
+// y_out is UNSUPPORTED as a result: it would need to write into `mul`'s (or
+// `mul_gate`'s) own dst buffer, which is allocated at MUL's position --
+// AFTER the head -- so at head-execution time that buffer isn't
+// (reliably) the right one yet. If `mul`/`mul_gate` has another consumer,
+// pattern A/C decline outright for that site instead (logged once).
+// residual_out is UNAFFECTED: add->data is allocated at the ADD's own
+// position, which IS the head -- writing it there is exactly what the
+// ADD's own (skipped) dispatch would have done.
+//
+// Chain 258: the scratch+copy path above costs a real D2D memcpy per site
+// per layer per ubatch (measured: 1258 calls, 182ms total, ~145us each --
+// __amd_rocclr_copyBuffer in rocprof). It is provably UNNECESSARY whenever
+// qrot->data's own byte range doesn't overlap anything the head-time kernel
+// reads, or anything any OTHER real (non-skipped, non-view) node writes
+// between the head and the qrot -- because in that case qrot's buffer is
+// simply idle, untouched memory for that whole span, and writing the final
+// TILED bytes into it immediately (instead of into scratch, then copying
+// them there later) produces the identical end state. Same reasoning for
+// y_out directly into mul's/mul_gate's own buffer. See
+// ml8_radiance_direct_write_safe below for the exact overlap test.
+struct ml8_byte_range {
+    const uint8_t * lo = nullptr;
+    const uint8_t * hi = nullptr; // [lo, hi)
+};
+static ml8_byte_range ml8_radiance_tensor_range(const ggml_tensor * t) {
+    if (!t || !t->data) {
+        return {};
+    }
+    const uint8_t * p = (const uint8_t *) t->data;
+    return { p, p + ggml_nbytes(t) };
+}
+static ml8_byte_range ml8_radiance_raw_range(const void * p, size_t n) {
+    if (!p || n == 0) {
+        return {};
+    }
+    const uint8_t * b = (const uint8_t *) p;
+    return { b, b + n };
+}
+static bool ml8_radiance_ranges_overlap(const ml8_byte_range & a, const ml8_byte_range & b) {
+    if (!a.lo || !b.lo) {
+        return false;
+    }
+    return a.lo < b.hi && b.lo < a.hi;
+}
+
+// Is it safe to write `target` (qrot->data's own range, or mul's/mul_gate's
+// own range for y_out) directly, AT THE HEAD, instead of into scratch?
+// Safe iff `target` overlaps NONE of:
+//   - `reads`: every tensor the head-time kernel actually reads (data
+//     pointers are final by compute time, so this is exact, not an
+//     estimate);
+//   - `other_writes`: the OTHER destination(s) this SAME kernel launch
+//     writes simultaneously (qrot's own range when checking mul, and vice
+//     versa) -- concurrent writes to overlapping memory are broken
+//     regardless of "read" semantics;
+//   - the dst buffer of any REAL (non-view, not already in the skip set,
+//     not one of THIS chain's own about-to-be-skipped `matched` nodes)
+//     node strictly between `head_idx` and `qrot_idx`. That last check is
+//     the crux: the only way the allocator could have handed `target`'s
+//     memory to something else in that span is if it went to one of the
+//     head's own (still-live, checked via `reads`) inputs, or to an
+//     intermediate we're skipping (never written, so harmless) -- so if
+//     some OTHER real node's own dst genuinely overlaps, direct-write is
+//     not safe: the allocator's in-order-execution assumption would be
+//     violated exactly the way chain 243's aliasing bug was.
+static bool ml8_radiance_direct_write_safe(
+        const ggml_cgraph * cgraph, int head_idx, int qrot_idx, const std::vector<int> & matched,
+        const ml8_byte_range & target, const std::vector<ml8_byte_range> & reads,
+        const std::vector<ml8_byte_range> & other_writes, std::string * why) {
+    if (!target.lo) {
+        if (why) *why = "null target";
+        return false;
+    }
+    for (const ml8_byte_range & r : reads) {
+        if (ml8_radiance_ranges_overlap(target, r)) {
+            if (why) *why = "overlaps a read range";
+            return false;
+        }
+    }
+    for (const ml8_byte_range & r : other_writes) {
+        if (ml8_radiance_ranges_overlap(target, r)) {
+            if (why) *why = "overlaps another simultaneous write target of the same kernel launch";
+            return false;
+        }
+    }
+    for (int j = head_idx + 1; j < qrot_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue; // owns no backing memory of its own
+        }
+        if (std::find(matched.begin(), matched.end(), j) != matched.end() || g_fused_qrot_skip.count(n)) {
+            continue; // this chain's own (or an earlier chain's) skipped intermediate -- never written
+        }
+        if (ml8_radiance_ranges_overlap(target, ml8_radiance_tensor_range(n))) {
+            if (why) {
+                *why = "node[" + std::to_string(j) + "] " + std::string(ggml_op_name(n->op)) + " '" +
+                       std::string(ml8_radiance_tname(n)) + "' writes into the same range";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// Process-wide totals (chain 258 item: "count both per process") --
+// reported inline in each site's own once-per-site "fused" log line.
+static std::atomic<uint64_t> g_ml8_radiance_direct_writes{0};
+static std::atomic<uint64_t> g_ml8_radiance_scratch_writes{0};
+
+struct ml8_radiance_scratch_slot {
+    void * ptr      = nullptr;
+    size_t capacity = 0;
+    bool   in_use   = false;
+    int    refcount = 0; // outstanding copies still to fire -- see ml8_radiance_release_scratch_slot
+};
+// thread_local: two GPUs can evaluate on two host threads, each with its
+// own device context. A small fixed ring -- only a handful of these chains
+// are ever "in flight" (claimed at their head, released at their qrot)
+// simultaneously; if every slot is claimed, that specific plan declines
+// (logged once) rather than growing the ring or blocking.
+static thread_local std::array<ml8_radiance_scratch_slot, 4> g_ml8_radiance_scratch_slots;
+
+// Claims a free slot with at least `bytes` capacity, growing it (via
+// cudaFree+cudaMalloc -- lazy, monotonic, never shrinks) if its current
+// capacity is too small. Returns the slot index, or -1 if every slot is
+// currently claimed or the allocation itself fails.
+// Retired (outgrown) slot buffers are NEVER freed: a HIP graph captured
+// while they were live replays the recorded pointers, so freeing one is a
+// use-after-free on the next replay (chain 242, RC2). Growth is rare (a
+// slot is outgrown at most a couple of times per process: K=5120 -> 6144 ->
+// N=17408 at ubatch M) and best-fit claiming below keeps it to a bounded
+// few hundred MB worst case.
+static thread_local std::vector<void *> g_ml8_radiance_retired_scratch;
+// `refcount`: how many independent copies will be made FROM this claim
+// before it goes back on the free list (see ml8_radiance_release_scratch_slot)
+// -- 1 for the ordinary single-copy case (B_SPLIT, or pattern A/C without
+// y_out), 2 when a y_out region shares the slot (the qrot's own copy AND
+// the mul's/mul_gate's y_out copy each release it once).
+static int ml8_radiance_claim_scratch_slot(size_t bytes, int refcount = 1) {
+    // Best fit: the smallest free slot that already fits.
+    int best = -1;
+    for (int i = 0; i < (int) g_ml8_radiance_scratch_slots.size(); ++i) {
+        const ml8_radiance_scratch_slot & slot = g_ml8_radiance_scratch_slots[i];
+        if (slot.in_use || slot.capacity < bytes) {
+            continue;
+        }
+        if (best < 0 || slot.capacity < g_ml8_radiance_scratch_slots[best].capacity) {
+            best = i;
+        }
+    }
+    if (best < 0) {
+        // No fit: grow the free slot with the SMALLEST capacity (an empty
+        // one first), so large slots stay large and growth events stay rare.
+        for (int i = 0; i < (int) g_ml8_radiance_scratch_slots.size(); ++i) {
+            const ml8_radiance_scratch_slot & slot = g_ml8_radiance_scratch_slots[i];
+            if (slot.in_use) {
+                continue;
+            }
+            if (best < 0 || slot.capacity < g_ml8_radiance_scratch_slots[best].capacity) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            // Chain 269 fix 4: every slot is in_use -- the ring is
+            // genuinely exhausted (as opposed to a per-call cudaMalloc
+            // failure below). Log the ring's own state once so a leaked
+            // reference (refcount never reaching 0, chain 269 journal)
+            // shows up immediately instead of as a string of unrelated
+            // "no free scratch slot" declines several layers apart.
+            std::string ring_state;
+            for (int i = 0; i < (int) g_ml8_radiance_scratch_slots.size(); ++i) {
+                const ml8_radiance_scratch_slot & s = g_ml8_radiance_scratch_slots[i];
+                if (!ring_state.empty()) ring_state += ", ";
+                ring_state += "slot" + std::to_string(i) + "[in_use=" + (s.in_use ? "1" : "0") +
+                              " refcount=" + std::to_string(s.refcount) +
+                              " capacity=" + std::to_string(s.capacity) + "]";
+            }
+            ml8_4_radiance_fuse_log_once("bug-ring-exhausted",
+                "ml8-4 radiance BUG (chain 269): scratch-slot ring exhausted (all " +
+                std::to_string(g_ml8_radiance_scratch_slots.size()) + " slots in_use) -- " + ring_state);
+            return -1;
+        }
+        ml8_radiance_scratch_slot & slot = g_ml8_radiance_scratch_slots[best];
+        if (slot.ptr) {
+            g_ml8_radiance_retired_scratch.push_back(slot.ptr); // never freed, see above
+            slot.ptr      = nullptr;
+            slot.capacity = 0;
+        }
+        void *      p   = nullptr;
+        cudaError_t err = cudaMalloc(&p, bytes);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError(); // clear the sticky error -- an alloc failure is a normal decline here
+            return -1;
+        }
+        // MAD-LAB 2026-09-20 diag: this cudaMalloc bypasses ggml_cuda_device_malloc
+        // (thread_local ring, never freed on growth -- see g_ml8_radiance_retired_scratch
+        // above), so WP_ALLOC_LOG=1 never saw it before this line. Comment above claims
+        // growth is rare/bounded ("a few hundred MB worst case"); log it so a run that
+        // shows unexplained per-round VRAM growth can confirm or rule that out --
+        // 3 concurrent long requests likely means 3 host threads, i.e. up to 3x this
+        // thread_local ring's growth, not accounted for anywhere else.
+        {
+            int dev = 0;
+            (void) cudaGetDevice(&dev);
+            wp_alloc_log("ml8_radiance_scratch_grow", dev, bytes, 0);
+        }
+        slot.ptr      = p;
+        slot.capacity = bytes;
+    }
+    g_ml8_radiance_scratch_slots[best].in_use   = true;
+    g_ml8_radiance_scratch_slots[best].refcount = refcount;
+    return best;
+}
+// Chain 243 addendum: claiming for a y_out-bearing plan reserves the slot
+// for TWO independent copies (the qrot's own A_tiled+a_scale region AND
+// mul's/mul_gate's y_out region) that fire at two different, unrelated
+// node turns -- the slot can only truly go back on the free list once BOTH
+// have happened. `refcount` defaults to 1 (the single-copy case, e.g.
+// B_SPLIT or a single-use mul); pattern A/C pass 2 when y_out is needed.
+static void ml8_radiance_release_scratch_slot(int idx) {
+    if (idx < 0) {
+        return;
+    }
+    ml8_radiance_scratch_slot & slot = g_ml8_radiance_scratch_slots[idx];
+    if (--slot.refcount <= 0) {
+        slot.in_use   = false;
+        slot.refcount = 0;
+    }
+}
+
+// One outstanding copy per (slot, destination) pair: the slot already holds
+// the FINISHED bytes (the kernel ran at head-detection time, not deferred)
+// -- all that's left, at the destination tensor's own normal cgraph turn,
+// is the D2D copy from `slot.ptr + offset` for `bytes`, then releasing the
+// slot (see refcount above). Two plans can share one slot: `dst == qrot`
+// (offset 0, the A_tiled+a_scale region, `is_qrot` true -- also sets
+// ML8_QROT_FLAG_TILED) and, when y_out is needed, `dst == mul`/`mul_gate`
+// (the region right after, `is_qrot` false -- just the copy, no flag).
+// Keyed by the destination tensor pointer in `g_ml8_radiance_plans` below;
+// cleared alongside g_fused_qrot_skip at the start of each graph compute.
+struct ml8_radiance_plan {
+    int    slot;
+    size_t offset;
+    size_t bytes;
+    bool   is_qrot;
+    // Chain 269: the OTHER plan sharing this same slot (qrot's plan points
+    // at mul's/mul_gate's tensor when both share a slot; null otherwise).
+    // Only ever set on the qrot-side plan -- mul's own turn always comes
+    // first in cgraph order, so qrot is the only side that can usefully
+    // act as a backstop if its sibling's own turn never fired. See
+    // ggml_cuda_try_ml8_radiance_exec_copy.
+    const ggml_tensor * sibling = nullptr;
+};
+static thread_local std::unordered_map<const ggml_tensor *, ml8_radiance_plan> g_ml8_radiance_plans;
+
+// Called from ggml_cuda_try_fuse for EVERY node (cheap map lookup) while the
+// radiance fuse is enabled: if a copy plan was registered for THIS node's
+// own tensor (by pattern A/C/B_SPLIT's detection, at the chain's head,
+// keyed either by the qrot itself or -- for a y_out-bearing chain -- by the
+// multi-use MUL/mul_gate too), copy the finished bytes from scratch into
+// this node's own dst buffer now (this IS the one point that buffer is
+// guaranteed to be the right, live allocation: qrot's own turn for the
+// qrot-copy, mul's/mul_gate's own turn for the y_out-copy), mark the node
+// skipped (its own plain dispatch -- FP8_QUANT_ROT's quant kernel, or MUL's
+// elementwise multiply -- must not also run and clobber what we just
+// copied), and release the slot's reference. Returns 0 always (the actual
+// "don't dispatch me" signal goes through g_fused_qrot_skip, checked by the
+// main loop both before AND after calling ggml_cuda_try_fuse -- returning a
+// nonzero COUNT here would skip whatever node happens to sit right after
+// this one in cgraph order, e.g. the qrot's own consumer ML8_MUL_MAT: chain
+// 242's garbage).
+static int ggml_cuda_try_ml8_radiance_exec_copy(
+        ggml_backend_cuda_context * cuda_ctx, ggml_tensor * node) {
+    auto it = g_ml8_radiance_plans.find(node);
+    if (it == g_ml8_radiance_plans.end()) {
+        return 0;
+    }
+    const ml8_radiance_plan plan = it->second;
+    g_ml8_radiance_plans.erase(it);
+
+    // Chain 266: a plan registered with the wrong offset for the slot's
+    // ACTUAL layout (e.g. hardcoding "y_out always sits at qrot_bytes" when
+    // qrot was actually written directly, so the slot holds ONLY y_out at
+    // offset 0) reads/writes past the slot or off a null base -- catch it
+    // here instead of letting hipMemcpyAsync fail with an opaque
+    // "invalid argument" deep inside the driver.
+    GGML_ASSERT(plan.slot >= 0 && (size_t) plan.slot < g_ml8_radiance_scratch_slots.size());
+    const ml8_radiance_scratch_slot & slot_info = g_ml8_radiance_scratch_slots[plan.slot];
+    const uint8_t * src = (const uint8_t *) slot_info.ptr + plan.offset;
+    GGML_ASSERT(src != nullptr && slot_info.ptr != nullptr &&
+                plan.offset + plan.bytes <= slot_info.capacity &&
+                "ml8-4 radiance exec_copy: plan offset/bytes do not fit the slot's actual layout");
+    CUDA_CHECK(cudaMemcpyAsync(node->data, src, plan.bytes, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+    ml8_radiance_release_scratch_slot(plan.slot);
+    if (plan.is_qrot) {
+        ggml_set_op_params_i32(node, ML8_QROT_OP_PARAM_FLAGS, ML8_QROT_FLAG_TILED);
+    }
+    g_fused_qrot_skip.insert(node);
+
+    // Chain 269 backstop: `plan.sibling` is only ever set on the qrot-side
+    // plan of a y_out-bearing chain (see pattern A/C's commit blocks). mul's
+    // /mul_gate's own turn always comes first in cgraph order, so by the
+    // time we're here (qrot's turn) it should already have fired and erased
+    // itself from the map. If it is STILL present, its own turn never
+    // consumed it -- an unrelated fusion's contiguous skip could have
+    // jumped over its index, or some other ordering accident raced it --
+    // force it now instead of leaking its half of this slot's refcount
+    // forever (chain 269 journal: "no free scratch slot" by ~layer 9, the
+    // 4-slot ring silently exhausted one leaked reference at a time).
+    if (plan.sibling != nullptr) {
+        auto sib_it = g_ml8_radiance_plans.find(plan.sibling);
+        if (sib_it != g_ml8_radiance_plans.end()) {
+            const ml8_radiance_plan sib_plan = sib_it->second;
+            g_ml8_radiance_plans.erase(sib_it);
+            ggml_tensor * sib_node = const_cast<ggml_tensor *>(plan.sibling);
+            GGML_ASSERT(sib_plan.slot >= 0 && (size_t) sib_plan.slot < g_ml8_radiance_scratch_slots.size());
+            const ml8_radiance_scratch_slot & sib_slot_info = g_ml8_radiance_scratch_slots[sib_plan.slot];
+            const uint8_t * sib_src = (const uint8_t *) sib_slot_info.ptr + sib_plan.offset;
+            GGML_ASSERT(sib_src != nullptr && sib_slot_info.ptr != nullptr &&
+                        sib_plan.offset + sib_plan.bytes <= sib_slot_info.capacity &&
+                        "ml8-4 radiance exec_copy backstop: sibling plan offset/bytes do not fit the slot");
+            CUDA_CHECK(cudaMemcpyAsync(sib_node->data, sib_src, sib_plan.bytes, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+            ml8_radiance_release_scratch_slot(sib_plan.slot);
+            if (sib_plan.is_qrot) {
+                ggml_set_op_params_i32(sib_node, ML8_QROT_OP_PARAM_FLAGS, ML8_QROT_FLAG_TILED);
+            }
+            g_fused_qrot_skip.insert(sib_node);
+            ml8_4_radiance_fuse_log_once(
+                std::string("bug-plan-backstop-") + ml8_radiance_tname(sib_node),
+                "ml8-4 radiance BUG (chain 269): '" + std::string(ml8_radiance_tname(sib_node)) +
+                "' plan never fired at its own cgraph turn -- forced here instead, at its sibling '" +
+                std::string(ml8_radiance_tname(node)) + "'s own turn, to avoid leaking its scratch-slot reference");
+        }
+        // Both halves of this slot's refcount are now accounted for --
+        // either both fired naturally, or the second was just forced above.
+        GGML_ASSERT(g_ml8_radiance_scratch_slots[plan.slot].refcount == 0 &&
+                    "ml8-4 radiance: y_out-sharing slot's refcount did not reach 0 after both plans were consumed");
+    }
+    return 0;
+}
+
+// MT_ML8_4_RADIANCE_VERIFY=1: registered instead of the real copy plan(s)
+// above -- everything a pattern needs to compare its own scratch result
+// against the plain path's independently-computed result at the qrot's own
+// turn, plus the diagnostic values requested (shapes, strides, pointers).
+// `yout_ref`/`residual_ref` are null when that pattern/site has none.
+struct ml8_radiance_verify_plan {
+    std::string site;
+    int         slot;
+    int32_t     M = 0, K = 0;
+    int32_t     a_dim = 0, b_dim = 0, rot_kind = 0;
+    float       eps = 0.0f;
+    int32_t     head_dim = 0, n_heads = 0; // pattern C only; 0 elsewhere
+    const void * o_ptr    = nullptr;
+    const void * z_ptr    = nullptr; // pattern C only
+    const void * normw_ptr = nullptr;
+    size_t       z_nb1 = 0, z_nb2 = 0; // pattern C only
+    ggml_tensor * yout_ref     = nullptr; // mul (A) or mul_gate (C); now ALWAYS set (chain 249 item 1)
+    size_t        yout_offset  = 0;
+    ggml_tensor * residual_ref = nullptr; // add, pattern A(add) only; null otherwise
+    size_t        residual_offset = 0;
+
+    // Chain 249 items 3/4: pure shape/structure diagnostics, no GPU access
+    // needed -- printed as-is from these tensor pointers at report time.
+    ggml_tensor * rms_t   = nullptr;
+    ggml_tensor * mul_w_t = nullptr; // pattern C's MUL(norm_w); null for A (yout_ref itself plays that role)
+    ggml_tensor * silu_t  = nullptr; // pattern C only
+    ggml_tensor * qrot_t  = nullptr;
+    int32_t        norm_w_ne0 = 0;
+    int            silu_src_of_yout = -1; // which src index of yout_ref (mul_gate) is the SILU -- pattern C only
+};
+static thread_local std::unordered_map<const ggml_tensor *, ml8_radiance_verify_plan> g_ml8_radiance_verify_plans;
+
+static std::string ml8_radiance_ptr_str(const void * p) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%p", p);
+    return std::string(buf);
+}
+
+static std::string ml8_radiance_ne_str(const ggml_tensor * t) {
+    if (!t) return "(null)";
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "(%lld,%lld,%lld,%lld)",
+                  (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+    return std::string(buf);
+}
+
+// Chain 249 item 1: float-precision comparison of the y_out/residual fp32
+// [K,M] region -- max |diff|, max relative diff (|diff|/|ref|, guarding a
+// near-zero denominator), how many elements exceed 1e-3 relative diff, and
+// the first 8 floats of row 0 and row 1 from both sides (a per-row SCALE
+// error shows up here as a near-constant ratio across all 8 -- eyeballable).
+static void ml8_radiance_verify_append_float_diff(
+        const char * label, const void * slot_ptr, size_t slot_off, const ggml_tensor * ref,
+        int32_t M, int32_t K, std::string & out) {
+    const size_t n = (size_t) M * (size_t) K;
+    std::vector<float> ours(n), theirs(n);
+    CUDA_CHECK(cudaMemcpy(ours.data(), (const uint8_t *) slot_ptr + slot_off, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(theirs.data(), ref->data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    float  max_abs = 0.0f, max_rel = 0.0f;
+    size_t cnt_rel = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float d  = ours[i] - theirs[i];
+        const float ad = d < 0.0f ? -d : d;
+        max_abs        = std::max(max_abs, ad);
+        const float ref_abs = theirs[i] < 0.0f ? -theirs[i] : theirs[i];
+        const float rel      = ref_abs > 1e-12f ? ad / ref_abs : ad;
+        max_rel               = std::max(max_rel, rel);
+        if (rel > 1e-3f) ++cnt_rel;
+    }
+    out += std::string(label) + " max|diff|=" + std::to_string(max_abs) + " max_rel_diff=" + std::to_string(max_rel) +
+           " elems_rel>1e-3=" + std::to_string(cnt_rel) + "/" + std::to_string(n) + "; ";
+    auto append_row = [&](int32_t row) {
+        out += std::string(label) + " row" + std::to_string(row) + " ours=[";
+        for (int32_t k = 0; k < 8 && k < K; ++k) {
+            out += std::to_string(ours[(size_t) row * (size_t) K + k]) + (k < 7 && k + 1 < K ? "," : "");
+        }
+        out += "] theirs=[";
+        for (int32_t k = 0; k < 8 && k < K; ++k) {
+            out += std::to_string(theirs[(size_t) row * (size_t) K + k]) + (k < 7 && k + 1 < K ? "," : "");
+        }
+        out += "]; ";
+    };
+    append_row(0);
+    if (M > 1) append_row(1);
+}
+
+// MAD_USE_R4D_GDN_RAW_OUT=1 follow-up: pattern C's own _r4d-vs-plain cross-check compares two
+// scratch buffers this function ALREADY computed on-device (unlike ml8_radiance_verify_append_
+// float_diff above, whose `theirs` side is a real ggml_tensor's ->data) -- these two variants take
+// raw device pointers on both sides instead.
+static void ml8_radiance_verify_append_raw_diff(
+        const char * label, const void * a, const void * b, size_t n_bytes, std::string & out) {
+    std::vector<uint8_t> ha(n_bytes), hb(n_bytes);
+    CUDA_CHECK(cudaMemcpy(ha.data(), a, n_bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hb.data(), b, n_bytes, cudaMemcpyDeviceToHost));
+    size_t diffs = 0;
+    for (size_t i = 0; i < n_bytes; ++i) {
+        if (ha[i] != hb[i]) ++diffs;
+    }
+    out += std::string(label) + " byte_diffs=" + std::to_string(diffs) + "/" + std::to_string(n_bytes) + "; ";
+}
+
+static void ml8_radiance_verify_append_float_diff_raw(
+        const char * label, const float * a, const float * b, size_t n, std::string & out) {
+    std::vector<float> ha(n), hb(n);
+    CUDA_CHECK(cudaMemcpy(ha.data(), a, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hb.data(), b, n * sizeof(float), cudaMemcpyDeviceToHost));
+    float  max_abs = 0.0f, max_rel = 0.0f;
+    size_t cnt_rel = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float d  = ha[i] - hb[i];
+        const float ad = d < 0.0f ? -d : d;
+        max_abs        = std::max(max_abs, ad);
+        const float ref_abs = hb[i] < 0.0f ? -hb[i] : hb[i];
+        const float rel      = ref_abs > 1e-12f ? ad / ref_abs : ad;
+        max_rel               = std::max(max_rel, rel);
+        if (rel > 1e-3f) ++cnt_rel;
+    }
+    out += std::string(label) + " max|diff|=" + std::to_string(max_abs) + " max_rel_diff=" + std::to_string(max_rel) +
+           " elems_rel>1e-3=" + std::to_string(cnt_rel) + "/" + std::to_string(n) + "; ";
+}
+
+// Called from ggml_cuda_try_fuse for every node while MT_ML8_4_RADIANCE_VERIFY=1:
+// if a verify plan is pending for THIS node (always the qrot -- registered
+// by pattern A/C/B_SPLIT's detection at the chain's head), run the qrot's
+// OWN plain dispatch ourselves right here (ggml_cuda_compute_node_now --
+// ggml_cuda_try_fuse is normally called BEFORE the main loop's own normal
+// dispatch, so "after the plain qrot op has run" has to happen inside this
+// hook), then diff our scratch against whatever it produced, print the
+// report, and mark the node skipped so the main loop doesn't dispatch it a
+// second time. Nothing about the graph's real result is touched.
+static int ggml_cuda_try_ml8_radiance_exec_verify(ggml_backend_cuda_context * cuda_ctx, ggml_tensor * qrot) {
+    auto it = g_ml8_radiance_verify_plans.find(qrot);
+    if (it == g_ml8_radiance_verify_plans.end()) {
+        return 0;
+    }
+    const ml8_radiance_verify_plan plan = it->second;
+    g_ml8_radiance_verify_plans.erase(it);
+
+    (void) ggml_cuda_compute_node_now(*cuda_ctx, qrot);
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    const bool plain_tiled =
+        (ggml_get_op_params_i32(qrot, ML8_QROT_OP_PARAM_FLAGS) & ML8_QROT_FLAG_TILED) != 0;
+
+    std::string report = "[verify] " + plan.site + ": M=" + std::to_string(plan.M) + " K=" + std::to_string(plan.K);
+    if (plan.head_dim) {
+        report += " head_dim=" + std::to_string(plan.head_dim) + " n_heads=" + std::to_string(plan.n_heads);
+    }
+    report += " a_dim=" + std::to_string(plan.a_dim) + " b_dim=" + std::to_string(plan.b_dim) +
+              " kind=" + std::to_string(plan.rot_kind) + " eps=" + std::to_string(plan.eps);
+    if (plan.z_ptr) {
+        report += " z_nb1=" + std::to_string(plan.z_nb1) + " z_nb2=" + std::to_string(plan.z_nb2);
+    }
+    report += " o_ptr=" + ml8_radiance_ptr_str(plan.o_ptr) + " z_ptr=" + ml8_radiance_ptr_str(plan.z_ptr) +
+              " normw_ptr=" + ml8_radiance_ptr_str(plan.normw_ptr) + "; ";
+
+    // Chain 249 items 3/4: shape/structure diagnostics -- pure host-side
+    // metadata, no GPU access.
+    report += "shapes: rms=" + ml8_radiance_ne_str(plan.rms_t);
+    if (plan.mul_w_t) report += " mul_w=" + ml8_radiance_ne_str(plan.mul_w_t);
+    if (plan.silu_t) report += " silu=" + ml8_radiance_ne_str(plan.silu_t);
+    report += " yout_ref(mul/mul_gate)=" + ml8_radiance_ne_str(plan.yout_ref) +
+              " qrot=" + ml8_radiance_ne_str(plan.qrot_t) + " norm_w_ne0=" + std::to_string(plan.norm_w_ne0);
+    if (plan.silu_src_of_yout >= 0) {
+        report += " silu_is_src[" + std::to_string(plan.silu_src_of_yout) + "]_of_yout_ref";
+    }
+    if (plan.rms_t && plan.rms_t->src[0]) {
+        const ggml_tensor * s0 = plan.rms_t->src[0];
+        report += " rms->src[0]_op=" + std::string(ggml_op_name(s0->op)) +
+                   " rms->src[0]->view_src_op=" + std::string(s0->view_src ? ggml_op_name(s0->view_src->op) : "(none)");
+    }
+    report += "; ";
+
+    void * slot_ptr = g_ml8_radiance_scratch_slots[plan.slot].ptr;
+    if (!plain_tiled) {
+        report += "plain path did NOT produce TILED layout (MT_ML8_4_QROT_TILED off, or the shape declined "
+                   "there) -- skipping the A/a_scale byte compare (layouts differ, not comparable); ";
+    } else {
+        const size_t a_bytes = (size_t) plan.M * (size_t) plan.K;
+        std::vector<uint8_t> ours(a_bytes + (size_t) plan.M * sizeof(float));
+        std::vector<uint8_t> theirs(ours.size());
+        CUDA_CHECK(cudaMemcpy(ours.data(), slot_ptr, ours.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(theirs.data(), qrot->data, theirs.size(), cudaMemcpyDeviceToHost));
+        size_t a_diff = 0, first_diff = SIZE_MAX;
+        std::vector<uint8_t> row_diff((size_t) plan.M, 0);
+        for (size_t i = 0; i < a_bytes; ++i) {
+            if (ours[i] != theirs[i]) {
+                ++a_diff;
+                if (first_diff == SIZE_MAX) first_diff = i;
+                row_diff[i / (size_t) plan.K] = 1;
+            }
+        }
+        size_t rows_diff = 0;
+        for (uint8_t d : row_diff) rows_diff += d;
+        const float * our_scale   = (const float *) (ours.data() + a_bytes);
+        const float * their_scale = (const float *) (theirs.data() + a_bytes);
+        float max_scale_diff = 0.0f;
+        for (int32_t m = 0; m < plan.M; ++m) {
+            const float d = our_scale[m] - their_scale[m];
+            max_scale_diff = std::max(max_scale_diff, d < 0.0f ? -d : d);
+        }
+        report += "A bytes differ " + std::to_string(a_diff) + "/" + std::to_string(a_bytes);
+        if (first_diff != SIZE_MAX) {
+            report += ", first diff at byte " + std::to_string(first_diff) + " (row " +
+                       std::to_string(first_diff / (size_t) plan.K) + ")";
+        }
+        report += ", a_scale max diff " + std::to_string(max_scale_diff) + ", rows with any diff " +
+                   std::to_string(rows_diff) + "/" + std::to_string(plan.M) + "; ";
+
+        // Chain 249 item 2: raw first-few values from both sides, row 0.
+        report += "a_scale[0..3] fused=[";
+        for (int32_t m = 0; m < 4 && m < plan.M; ++m) report += std::to_string(our_scale[m]) + (m < 3 ? "," : "");
+        report += "] plain=[";
+        for (int32_t m = 0; m < 4 && m < plan.M; ++m) report += std::to_string(their_scale[m]) + (m < 3 ? "," : "");
+        report += "]; A[0][0..7] fused=[";
+        for (int32_t k = 0; k < 8 && k < plan.K; ++k) report += std::to_string((int) ours[k]) + (k < 7 ? "," : "");
+        report += "] plain=[";
+        for (int32_t k = 0; k < 8 && k < plan.K; ++k) report += std::to_string((int) theirs[k]) + (k < 7 ? "," : "");
+        report += "]; ";
+    }
+
+    // Chain 249 item 1: y_out is now ALWAYS computed into scratch (see the
+    // pattern bodies), so this always runs when the pattern has a
+    // norm*w/gated stage at all -- comparing it isolates whether the
+    // norm/gate stage or the rotate/quant stage produced a wrong result.
+    if (plan.yout_ref != nullptr) {
+        ml8_radiance_verify_append_float_diff("y_out", slot_ptr, plan.yout_offset, plan.yout_ref, plan.M, plan.K, report);
+    }
+    if (plan.residual_ref != nullptr) {
+        ml8_radiance_verify_append_float_diff("residual", slot_ptr, plan.residual_offset, plan.residual_ref, plan.M, plan.K, report);
+    }
+
+    ml8_4_radiance_fuse_log_once("verify-" + plan.site, report);
+
+    ml8_radiance_release_scratch_slot(plan.slot);
+    g_fused_qrot_skip.insert(qrot); // already ran it above -- the main loop must not dispatch it again
+    return 0;
+}
+
+static int g_ml8_4_radiance_pattern_a_count = 0;
+static int g_ml8_4_radiance_pattern_b_count = 0;
+static int g_ml8_4_radiance_pattern_c_count = 0;
+
+// Pattern A. `anchor_idx` (the chain's HEAD) is either an ADD node
+// (residual form) or a RMS_NORM node (no-residual form, e.g. first layer,
+// or the fallback call at the RMS_NORM's own index -- see the trigger
+// site). DETECTION ONLY (chain-227 rework): no kernel runs here. On success
+// this registers a deferred ml8_radiance_plan keyed by the qrot tensor
+// (executed later, at the qrot's own normal turn, by
+// ggml_cuda_try_ml8_radiance_exec_copy) and marks every matched node
+// (head, RMS_NORM if via ADD, MUL) skipped via g_fused_qrot_skip -- the
+// qrot itself is NOT marked skipped, it still runs (just not its plain
+// dispatch). Returns nonzero purely as an internal "did this fire" signal
+// for the trigger site; 0 to decline (no side effects; every decline path
+// logs the concrete reason, or is a documented silent not-applicable/hand-off).
+static int ggml_cuda_try_ml8_radiance_pattern_a(
+        ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int anchor_idx) {
+    ggml_tensor * anchor = cgraph->nodes[anchor_idx];
+    const bool    has_add = anchor->op == GGML_OP_ADD;
+    ggml_tensor * add     = has_add ? anchor : nullptr;
+    std::string   why;
+    std::vector<int> matched; // every real node this plan accounts for (the span-check's allow-list)
+
+    // Hop 1: anchor -> RMS_NORM (only meaningful for the residual-add form;
+    // the no-residual form's anchor IS already the RMS_NORM).
+    ggml_tensor * rms;
+    int            rms_idx;
+    if (has_add) {
+        // Production chain 226: the residual sum is NORMALLY consumed by
+        // BOTH the norm AND the next layer's own residual add -- that's not
+        // an edge case, it's the common case. The add-variant kernel
+        // (rdna4_ml8_qrot_add_tiled) already has residual_out for exactly
+        // this (written when the deferred plan runs, based on ADD's own
+        // independent use-count/OUTPUT-flag check below), so tolerate add
+        // having more than one use here the same way pattern A's own MUL
+        // hop already tolerates it. (ADD's own "other consumer" doesn't need
+        // the rule-1 after-qrot check -- it's always the NEXT layer's own
+        // residual add, structurally guaranteed to run later.)
+        bool add_has_other_consumer = false; // informational only -- residual_out's own check below is independent
+        rms_idx = ml8_radiance_find_op_multiuse(cgraph, add, anchor_idx, cgraph->n_nodes - 1,
+                                                 GGML_OP_RMS_NORM, &why, &add_has_other_consumer);
+        if (rms_idx < 0 || cgraph->nodes[rms_idx]->op != GGML_OP_RMS_NORM) {
+            // Task 3: an ADD feeding straight into a UNARY (e.g. GDN's a =
+            // dt_bias + a_raw -> softplus gate-prep branch) is structurally
+            // never going to reach an RMS_NORM -- it isn't an ml8 input-norm
+            // site at all, so don't spam a decline for it.
+            if (rms_idx >= 0 && cgraph->nodes[rms_idx]->op == GGML_OP_UNARY) {
+                return 0;
+            }
+            // Chain 243 item 4b: when our own bounded walk found no
+            // consumer at all, name the ADD's ACTUAL (unconstrained) real
+            // consumer -- diagnostic only, not part of the fusion decision
+            // -- so it's clear whether this is a too-short search window or
+            // genuinely not-applicable.
+            const std::string detail =
+                rms_idx < 0 ? (why + " -- " + ml8_radiance_describe_any_consumer(cgraph, add))
+                            : ("found " + std::string(ggml_op_name(cgraph->nodes[rms_idx]->op)) + " '" +
+                               ml8_radiance_tname(cgraph->nodes[rms_idx]) + "' instead");
+            ml8_4_radiance_fuse_log_once("decline-a-add-to-norm",
+                "pattern A decline: ADD '" + std::string(ml8_radiance_tname(add)) +
+                "' -> RMS_NORM not found (" + detail + ")");
+            return 0;
+        }
+        rms = cgraph->nodes[rms_idx];
+        matched.push_back(rms_idx);
+    } else {
+        rms     = anchor;
+        rms_idx = anchor_idx;
+    }
+
+    // Hop 2: RMS_NORM -> MUL(norm_w).
+    const int mul_idx = ml8_radiance_find_real_consumer(cgraph, rms, rms_idx, cgraph->n_nodes - 1, &why, &matched);
+    if (mul_idx < 0 || cgraph->nodes[mul_idx]->op != GGML_OP_MUL) {
+        // Task 3: a weightless RMS_NORM feeding a SCALE (the GDN q/k L2-norm
+        // + scale path, e.g. 'q_conv_predelta') is not an ml8 input norm --
+        // this fuse requires RMS_NORM -> MUL(norm_w) specifically. Not
+        // applicable, not a decline: no log.
+        if (mul_idx >= 0 && cgraph->nodes[mul_idx]->op == GGML_OP_SCALE) {
+            return 0;
+        }
+        ml8_4_radiance_fuse_log_once("decline-a-norm-to-mul",
+            "pattern A decline: RMS_NORM '" + std::string(ml8_radiance_tname(rms)) +
+            "' -> MUL not found (" + (mul_idx < 0 ? why : ("found " + std::string(ggml_op_name(cgraph->nodes[mul_idx]->op)) + " '" + ml8_radiance_tname(cgraph->nodes[mul_idx]) + "' instead")) + ")");
+        return 0;
+    }
+    ggml_tensor * mul = cgraph->nodes[mul_idx];
+    // NOTE: mul_idx is pushed into `matched` (the head-time skip-list)
+    // further down, AFTER we know whether y_out is needed -- when it is,
+    // mul must NOT be pre-skipped at head time; its own normal turn is
+    // where ggml_cuda_try_ml8_radiance_exec_copy runs the y_out copy (see
+    // the tail of this function).
+    ggml_tensor * norm_w = (mul->src[0] == rms) ? mul->src[1] : (mul->src[1] == rms ? mul->src[0] : nullptr);
+    if (norm_w == nullptr) {
+        ml8_4_radiance_fuse_log_once("decline-a-mul-operand",
+            "pattern A decline: MUL '" + std::string(ml8_radiance_tname(mul)) + "' does not have RMS_NORM '" +
+            std::string(ml8_radiance_tname(rms)) + "' as either operand (post-reshape identity mismatch)");
+        return 0;
+    }
+
+    // Hop 3: MUL -> FP8_QUANT_ROT (an AWQ-scale MUL, if the model has one,
+    // would land here as a REAL non-view op and correctly decline -- this
+    // fuse has no AWQ-scale support). Chain 243 item 1: `mul` having
+    // another use is the NORMAL case for a GDN in_proj norm (attn_norm
+    // feeds both the qkvz qrot AND the ssm_alpha/ssm_beta MUL_MATs reading
+    // the plain normalized row) -- handled via y_out, written into scratch
+    // alongside A_tiled/a_scale and copied into mul->data at MUL'S OWN turn
+    // (see the tail of this function and ggml_cuda_try_ml8_radiance_exec_copy).
+    bool      mul_has_other_consumer = false;
+    const int qrot_idx = ml8_radiance_find_op_multiuse(cgraph, mul, mul_idx, cgraph->n_nodes - 1,
+                                                         GGML_OP_FP8_QUANT_ROT, &why, &mul_has_other_consumer);
+    if (qrot_idx < 0 || cgraph->nodes[qrot_idx]->op != GGML_OP_FP8_QUANT_ROT) {
+        // Chain 226 item (e): a second MUL here whose OTHER operand is a
+        // SILU is pattern C's own site (the GDN output gated norm: MUL(norm_w)
+        // -> MUL(gated_silu)) reached via pattern A's shared first two hops
+        // (both patterns start RMS_NORM -> MUL(norm_w)). That's not a decline
+        // for pattern A, it's a hand-off -- pattern C is tried separately on
+        // the SAME rms_idx right after pattern A at the trigger site.
+        if (qrot_idx >= 0 && cgraph->nodes[qrot_idx]->op == GGML_OP_MUL) {
+            ggml_tensor * other_mul = cgraph->nodes[qrot_idx];
+            ggml_tensor * other_operand =
+                (other_mul->src[0] == mul) ? other_mul->src[1] : (other_mul->src[1] == mul ? other_mul->src[0] : nullptr);
+            if (other_operand != nullptr && other_operand->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(other_operand) == GGML_UNARY_OP_SILU) {
+                return 0; // silent hand-off to pattern C
+            }
+        }
+        // Chain 243 item 4a: MUL -> ROPE is the q/k-norm site (RMSNorm
+        // applied per-head to Q/K before rotary embedding) -- not an ml8
+        // input norm at all, not a decline.
+        if (qrot_idx >= 0 && cgraph->nodes[qrot_idx]->op == GGML_OP_ROPE) {
+            return 0;
+        }
+        ml8_4_radiance_fuse_log_once("decline-a-mul-to-qrot",
+            "pattern A decline: MUL '" + std::string(ml8_radiance_tname(mul)) +
+            "' -> FP8_QUANT_ROT not found (" + (qrot_idx < 0 ? why : ("found " + std::string(ggml_op_name(cgraph->nodes[qrot_idx]->op)) + " '" + ml8_radiance_tname(cgraph->nodes[qrot_idx]) + "' instead -- e.g. an AWQ-scale MUL, which this fuse doesn't support")) + ")");
+        return 0;
+    }
+    ggml_tensor * qrot = cgraph->nodes[qrot_idx];
+    if (!mul_has_other_consumer) {
+        matched.push_back(mul_idx);
+    }
+
+    if (rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || qrot->type != GGML_TYPE_I8 ||
+        !ggml_is_contiguous(rms->src[0]) || !ggml_is_contiguous(rms) || !ggml_is_contiguous(mul)) {
+        ml8_4_radiance_fuse_log_once("decline-a-types",
+            "pattern A decline (" + std::string(ml8_radiance_tname(rms)) + "): non-f32/non-contiguous norm chain "
+            "(bf16 residual stream not covered by this fuse)");
+        return 0;
+    }
+    if (norm_w->type != GGML_TYPE_F32 || !ggml_is_contiguous(norm_w) ||
+        norm_w->ne[0] != rms->ne[0] || ggml_nelements(norm_w) != norm_w->ne[0]) {
+        ml8_4_radiance_fuse_log_once("decline-a-normw",
+            "pattern A decline (" + std::string(ml8_radiance_tname(rms)) + "): norm weight '" +
+            std::string(ml8_radiance_tname(norm_w)) + "' isn't a plain [K] f32 broadcast row");
+        return 0;
+    }
+
+    const int32_t * pp    = (const int32_t *) qrot->op_params;
+    const int32_t   a_dim = pp[0], b_dim = pp[1], kind = pp[2], G = pp[3];
+    const ggml_tensor * h_a = qrot->src[1];
+    if (G != 0 || kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+        ml8_4_radiance_fuse_log_once("decline-a-qrot",
+            "pattern A decline (" + std::string(ml8_radiance_tname(qrot)) + "): FP8_QUANT_ROT is grouped (G=" +
+            std::to_string(G) + ") or has no rotation (kind=" + std::to_string(kind) +
+            ") -- rdna4_ml8_qrot_{add_,}tiled require G=0 and a Kronecker/block-Hadamard rotation");
+        return 0;
+    }
+    const int32_t K = (int32_t) rms->ne[0];
+    if ((int64_t) a_dim * (int64_t) b_dim != K || K % 16 != 0) {
+        ml8_4_radiance_fuse_log_once("decline-a-kdim",
+            "pattern A decline (" + std::string(ml8_radiance_tname(qrot)) + "): K=" + std::to_string(K) +
+            " a_dim=" + std::to_string(a_dim) + " b_dim=" + std::to_string(b_dim) +
+            " (a_dim*b_dim!=K, or K%16!=0 -- radiance's tiled A requirement)");
+        return 0;
+    }
+    const int32_t M = (int32_t) (mul->ne[1] * mul->ne[2] * mul->ne[3]);
+    if (M <= 32) {
+        return 0; // decode tile -- not worth logging, this fires every decode step
+    }
+    if (M % 16 != 0) {
+        ml8_4_radiance_fuse_log_once("decline-a-mpad",
+            "pattern A decline (" + std::string(ml8_radiance_tname(qrot)) + "): M=" + std::to_string(M) +
+            " is not a multiple of 16 -- the TILED layout (A_tiled=qrot->data, a_scale=qrot->data+M*K) "
+            "only fits qrot's own M*(K+4)-byte buffer when M%16==0");
+        return 0;
+    }
+
+    std::vector<ggml_tensor *> consumers;
+    if (!ml8_4_radiance_collect_mul_mat_consumers(cgraph, qrot, ggml_node_get_use_count(cgraph, qrot_idx), consumers, &why)) {
+        ml8_4_radiance_fuse_log_once("decline-a-consumers",
+            "pattern A decline (" + std::string(ml8_radiance_tname(qrot)) + ", K=" + std::to_string(K) + "): " + why);
+        return 0;
+    }
+
+    const bool   verify     = ml8_4_radiance_verify_enabled();
+    // Chain 249 item 1: in verify mode, ALWAYS compute y_out into scratch
+    // (not just when mul actually has another consumer) so it can be
+    // compared against mul->data regardless -- isolates whether the
+    // norm/gate stage or the rotate/quant stage is the one producing a
+    // wrong result.
+    const bool   need_yout  = mul_has_other_consumer || verify;
+    const size_t qrot_bytes = (size_t) M * (size_t) K + (size_t) M * sizeof(float);
+    const size_t yout_bytes = need_yout ? (size_t) M * (size_t) K * sizeof(float) : 0;
+    const size_t resid_bytes = (verify && add != nullptr) ? (size_t) M * (size_t) K * sizeof(float) : 0;
+
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const void * h_a_data = h_a ? h_a->data : nullptr;
+
+    // Chain 258: decide direct-vs-scratch BEFORE claiming anything -- never
+    // in verify mode (verify must never touch the real buffers early; it
+    // needs the plain path's OWN independent computation intact). See
+    // ml8_radiance_direct_write_safe's own comment for the exact test.
+    std::vector<ml8_byte_range> reads;
+    reads.push_back(ml8_radiance_tensor_range(norm_w));
+    if (h_a) reads.push_back(ml8_radiance_tensor_range(h_a));
+    if (add != nullptr) {
+        reads.push_back(ml8_radiance_tensor_range(add->src[0]));
+        reads.push_back(ml8_radiance_tensor_range(add->src[1]));
+    } else {
+        reads.push_back(ml8_radiance_tensor_range(rms->src[0]));
+    }
+    const ml8_byte_range qrot_range = ml8_radiance_raw_range(qrot->data, qrot_bytes);
+    const ml8_byte_range mul_range  = need_yout ? ml8_radiance_tensor_range(mul) : ml8_byte_range{};
+    std::string why_direct;
+    // Chain 267/268: `mul_idx` is only pushed into `matched` further down
+    // (deferred until we know need_yout), but it is ALWAYS "ours" -- either
+    // eagerly skipped (single-use) or lazily skipped via its own deferred
+    // copy plan at its own turn (multi-use/y_out) -- never a genuinely
+    // foreign node the interstitial span-scan should treat as unaccounted.
+    // Scan with it included from the start so the safety check's verdict
+    // doesn't depend on an ordering accident of when `matched` gets mul_idx.
+    std::vector<int> matched_for_scan = matched;
+    matched_for_scan.push_back(mul_idx);
+    const bool direct_enabled = ml8_4_radiance_direct_enabled();
+    const bool qrot_direct = direct_enabled && !verify && ml8_radiance_direct_write_safe(
+        cgraph, anchor_idx, qrot_idx, matched_for_scan, qrot_range, reads,
+        need_yout ? std::vector<ml8_byte_range>{ mul_range } : std::vector<ml8_byte_range>{}, &why_direct);
+    const bool yout_direct = direct_enabled && !verify && need_yout && ml8_radiance_direct_write_safe(
+        cgraph, anchor_idx, qrot_idx, matched_for_scan, mul_range, reads, { qrot_range }, &why_direct);
+
+    const size_t qrot_scratch_bytes = qrot_direct ? 0 : qrot_bytes;
+    const size_t yout_scratch_bytes = (need_yout && !yout_direct) ? yout_bytes : 0;
+    const size_t total_scratch      = qrot_scratch_bytes + yout_scratch_bytes + resid_bytes;
+    // Chain 271: refcount must equal the number of plans that will ACTUALLY
+    // be registered against this slot, not just "y_out is present at all".
+    // The old `(need_yout && !yout_direct) ? 2 : 1` claimed 2 references
+    // whenever y_out used scratch, even when qrot was ALSO direct (so qrot
+    // never gets a plan of its own) -- that slot only ever has ONE plan
+    // (mul's y_out copy) to release it, so the refcount could never reach
+    // 0 and the slot stayed in_use forever (chain 271 journal: 4/4 slots
+    // stuck at refcount=1, all y_out-only capacities). In verify mode the
+    // slot is a single unit released once by ggml_cuda_try_ml8_radiance_
+    // exec_verify regardless of how many regions it holds, so that case
+    // keeps its own fixed refcount of 1.
+    const int qrot_plans  = qrot_direct ? 0 : 1;
+    const int yout_plans  = (need_yout && !yout_direct) ? 1 : 0;
+    const int refcount = verify ? 1 : (qrot_plans + yout_plans);
+    int slot = -1;
+    if (total_scratch > 0) {
+        GGML_ASSERT(refcount > 0 && "ml8-4 radiance: claiming a scratch slot with a zero refcount would leak it forever");
+        slot = ml8_radiance_claim_scratch_slot(total_scratch, refcount);
+        if (slot < 0) {
+            ml8_4_radiance_fuse_log_once("decline-a-noslot",
+                "pattern A decline (" + std::string(ml8_radiance_tname(qrot)) + "): no free scratch slot for " +
+                std::to_string(total_scratch) + " bytes -- too many ml8-4 radiance chains in flight, or the "
+                "allocation failed");
+            return 0;
+        }
+    }
+    int plans_registered_for_slot = 0; // Chain 271: must equal `refcount` exactly once this chain commits
+    // Chain 266: each region's SCRATCH offset must be tracked explicitly
+    // (not assumed to be a fixed layout like "qrot always at 0, y_out
+    // always at qrot_bytes") -- whichever regions actually land in scratch
+    // pack from offset 0, in whatever order they're assigned below, and the
+    // plan registered for each one (further down) must use ITS OWN actual
+    // offset, not a hardcoded one that silently assumed qrot was also in
+    // scratch.
+    uint8_t * scratch_base   = slot >= 0 ? (uint8_t *) g_ml8_radiance_scratch_slots[slot].ptr : nullptr;
+    size_t    scratch_cursor = 0;
+    size_t    qrot_scratch_off = 0, yout_scratch_off = 0;
+    uint8_t * a_tiled;
+    if (qrot_direct) {
+        a_tiled = (uint8_t *) qrot->data;
+    } else {
+        qrot_scratch_off = scratch_cursor;
+        a_tiled          = scratch_base + scratch_cursor;
+        scratch_cursor  += qrot_bytes;
+    }
+    float * a_scale = (float *) (a_tiled + (size_t) M * (size_t) K);
+    float * y_out   = nullptr;
+    if (need_yout) {
+        if (yout_direct) {
+            y_out = (float *) mul->data;
+        } else {
+            yout_scratch_off = scratch_cursor;
+            y_out            = (float *) (scratch_base + scratch_cursor);
+            scratch_cursor  += yout_bytes;
+        }
+    }
+    float * resid_scratch = nullptr;
+    size_t  resid_scratch_off = 0;
+    if (resid_bytes) {
+        resid_scratch_off = scratch_cursor;
+        resid_scratch     = (float *) (scratch_base + scratch_cursor);
+        scratch_cursor   += resid_bytes;
+    }
+
+    bool ok;
+    if (add != nullptr) {
+        // RC3 (chain 242 review): the fused add kernel reads both ADD
+        // operands as dense float rows of exactly K; the earlier contiguity
+        // checks only covered rms/mul. Release the slot and decline otherwise.
+        for (int si = 0; si < 2; ++si) {
+            const ggml_tensor * asrc = add->src[si];
+            if (asrc == nullptr || asrc->type != GGML_TYPE_F32 || !ggml_is_contiguous(asrc) ||
+                asrc->ne[0] != K || ggml_nrows(asrc) != M || asrc->data == nullptr) {
+                if (slot >= 0) {
+                    ml8_radiance_release_scratch_slot(slot);
+                    if (refcount > 1) ml8_radiance_release_scratch_slot(slot); // drop the 2nd ref
+                }
+                ml8_4_radiance_fuse_log_once("decline-a-add-src",
+                    "pattern A(add) decline (" + std::string(ml8_radiance_tname(qrot)) + "): ADD src[" +
+                    std::to_string(si) + "] '" + ml8_radiance_tname(asrc) + "' is not a contiguous f32 [K, M] tensor");
+                return 0;
+            }
+        }
+        // Normal mode: residual is consumed elsewhere iff ADD is a graph
+        // output or has more than the one use we're about to fuse away --
+        // add->data is allocated at the ADD's own position (the head), so
+        // writing it here is exactly what the ADD's own dispatch would
+        // have done. Verify mode: ADD runs normally regardless, so
+        // residual_out must go to scratch (resid_scratch), never add->data.
+        const bool need_residual_out = (add->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                                        ggml_node_get_use_count(cgraph, anchor_idx) > 1;
+        float * residual_out = verify ? resid_scratch : (need_residual_out ? (float *) add->data : nullptr);
+        ok = rdna4_ml8_qrot_add_tiled(
+            (const float *) add->src[0]->data, (const float *) add->src[1]->data, residual_out,
+            h_a_data, kind, a_dim, b_dim, (const float *) norm_w->data, eps,
+            M, K, a_tiled, a_scale, cuda_ctx->stream(), y_out);
+    } else {
+        ok = rdna4_ml8_qrot_tiled(
+            (const float *) rms->src[0]->data, h_a_data, kind, a_dim, b_dim,
+            (const float *) norm_w->data, eps, M, K, a_tiled, a_scale, cuda_ctx->stream(), y_out);
+    }
+    if (!ok) {
+        if (slot >= 0) {
+            ml8_radiance_release_scratch_slot(slot);
+            if (refcount > 1) ml8_radiance_release_scratch_slot(slot); // drop the 2nd ref too
+        }
+        ml8_4_radiance_fuse_log_once("decline-a-kernel",
+            "pattern A decline (" + std::string(ml8_radiance_tname(qrot)) + "): rdna4_ml8_qrot_{add_,}tiled itself "
+            "declined M=" + std::to_string(M) + " K=" + std::to_string(K) + " a_dim=" + std::to_string(a_dim) +
+            " b_dim=" + std::to_string(b_dim) + " kind=" + std::to_string(kind) +
+            " -- if that shape looks legitimate, this is the quant kernel's own (a_dim,b_dim)/K "
+            "dispatch-table coverage, not a graph-pattern-matching problem");
+        return 0;
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    if (verify) {
+        ml8_radiance_verify_plan vplan;
+        vplan.site          = "pattern A" + std::string(has_add ? "(add)" : "") + ": " +
+                               ml8_radiance_site_label(ml8_radiance_tname(qrot));
+        vplan.slot          = slot;
+        vplan.M             = M;
+        vplan.K             = K;
+        vplan.a_dim         = a_dim;
+        vplan.b_dim         = b_dim;
+        vplan.rot_kind      = kind;
+        vplan.eps           = eps;
+        vplan.o_ptr         = add ? add->src[0]->data : rms->src[0]->data;
+        vplan.normw_ptr     = norm_w->data;
+        vplan.rms_t         = rms;
+        vplan.qrot_t        = qrot;
+        vplan.norm_w_ne0    = (int32_t) norm_w->ne[0];
+        // y_out is now always computed (need_yout); always compare it,
+        // regardless of whether mul ACTUALLY has another consumer.
+        vplan.yout_ref    = mul;
+        vplan.yout_offset = yout_scratch_off;
+        if (add != nullptr) {
+            vplan.residual_ref    = add;
+            vplan.residual_offset = resid_scratch_off;
+        }
+        g_ml8_radiance_verify_plans[qrot] = vplan;
+        // Do NOT mark anything skipped -- every original node (add/rms/mul
+        // and qrot) must run its own normal dispatch for verify mode to
+        // have something independent to compare against.
+        return 1;
+    }
+
+    // Chain 258: commit whichever mode each target actually used. Direct
+    // targets need no deferred plan at all -- the correct bytes are already
+    // sitting in the real tensor's own buffer, so just flag/skip immediately
+    // (qrot) or fold into the ordinary single-use skip (mul).
+    if (qrot_direct) {
+        ggml_set_op_params_i32(qrot, ML8_QROT_OP_PARAM_FLAGS, ML8_QROT_FLAG_TILED);
+        g_fused_qrot_skip.insert(qrot);
+        g_ml8_radiance_direct_writes.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_ml8_radiance_plans[qrot] = ml8_radiance_plan{ slot, qrot_scratch_off, qrot_bytes, /*is_qrot=*/true };
+        g_ml8_radiance_scratch_writes.fetch_add(1, std::memory_order_relaxed);
+        ++plans_registered_for_slot;
+    }
+    if (need_yout) {
+        if (yout_direct) {
+            matched.push_back(mul_idx); // correct value already in mul->data -- skip its own redundant dispatch
+            g_ml8_radiance_direct_writes.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // Chain 266 fix: use THIS region's own scratch offset -- when
+            // qrot is direct (writes straight to qrot->data), the slot
+            // holds ONLY y_out (at offset 0), not "y_out after qrot_bytes".
+            g_ml8_radiance_plans[mul] = ml8_radiance_plan{ slot, yout_scratch_off, yout_bytes, /*is_qrot=*/false };
+            g_ml8_radiance_scratch_writes.fetch_add(1, std::memory_order_relaxed);
+            ++plans_registered_for_slot;
+            // Chain 269: if qrot ALSO ended up scratch, both plans share
+            // this slot but fire at two different, independent node turns
+            // (mul's own turn, always earlier in cgraph order, then qrot's).
+            // Link qrot's plan -> mul so that if mul's own turn somehow
+            // never consumes it (an unrelated fusion's contiguous skip
+            // jumping over its index, or any other ordering accident), the
+            // backstop in ggml_cuda_try_ml8_radiance_exec_copy forces it at
+            // qrot's turn instead of leaking this slot's second reference
+            // forever (chain 269 journal: ring exhausted by ~layer 9).
+            auto qrot_plan_it = g_ml8_radiance_plans.find(qrot);
+            if (qrot_plan_it != g_ml8_radiance_plans.end()) {
+                qrot_plan_it->second.sibling = mul;
+            }
+        }
+    }
+    // Chain 271: the slot's claimed refcount must equal exactly the number
+    // of plans just registered against it -- a mismatch (e.g. the old
+    // "y_out present => refcount 2" rule, which over-counted whenever qrot
+    // was direct and only the y_out plan actually existed) means the slot
+    // can never fully release, permanently shrinking the 4-slot ring.
+    if (slot >= 0) {
+        GGML_ASSERT(plans_registered_for_slot == refcount &&
+                    "ml8-4 radiance: number of plans registered against this slot does not match its claimed refcount");
+    }
+    ml8_radiance_mark_chain_skipped(cgraph, anchor, matched);
+
+    ++g_ml8_4_radiance_pattern_a_count;
+    // One line per SITE (not just once globally) so the journal shows which
+    // of the ~6 ml8 GEMM sites per layer are actually covered.
+    const std::string site = ml8_radiance_site_label(ml8_radiance_tname(qrot));
+    ml8_4_radiance_fuse_log_once("fused-a-first-" + site,
+        "pattern A" + std::string(has_add ? "(add)" : "") + ": " + site + " fused (RMS_NORM/MUL/FP8_QUANT_ROT '" +
+        std::string(ml8_radiance_tname(qrot)) + "', K=" + std::to_string(K) + " -> " + std::to_string(consumers.size()) +
+        " ML8_MUL_MAT consumer(s), qrot=" + std::string(qrot_direct ? "direct" : "scratch") +
+        (need_yout ? (std::string(", y_out=") + (yout_direct ? "direct" : "scratch")) : "") +
+        " [process totals: direct=" + std::to_string(g_ml8_radiance_direct_writes.load(std::memory_order_relaxed)) +
+        " scratch=" + std::to_string(g_ml8_radiance_scratch_writes.load(std::memory_order_relaxed)) + "])");
+    return 1; // internal "detected" signal only -- see ml8_radiance_mark_chain_skipped's comment
+}
+
+// Pattern C: the GDN OUTPUT gated RMSNorm feeding ssm_out (qwen35.cpp's
+// build_norm_gated, src/models/qwen35.cpp:521-529, called at :743):
+//   RMS_NORM(output) [per-head, ne[0]=head_dim, ne[1]=n_heads]
+//     -> MUL(norm_w [head_dim])                          -- "normalized"
+//     -> MUL(gated_silu)                                 -- gated_silu is a
+//        SIBLING branch: UNARY/SILU(z), NOT reachable by walking forward
+//        from the norm*w MUL (z is an independent input, the fused qkvz
+//        gate projection, possibly a strided view -- see below)
+//     -> [optional RESHAPE, e.g. reshape_3d to flatten head_dim*n_heads]
+//     -> FP8_QUANT_ROT (K = head_dim*n_heads, e.g. 6144 = 128*48, Kronecker)
+//     -> one or more ML8_MUL_MAT(ssm_out) consumers.
+// `rms_idx` is the RMS_NORM's own index (this has no residual-add form in
+// the source graph -- build_norm_gated's `input` is build_recurrent_attn's
+// raw output, not an ADD). Unlike patterns A/B, the SILU branch is NOT
+// discovered by walking forward from any node already in our chain (it
+// consumes `z`, not `mul_w`) -- it is read directly off MUL(gate)'s own
+// non-mul_w operand, then located in the cgraph by pointer search so it can
+// be added to `matched` (skipped, since the fused kernel recomputes
+// silu(z) itself from raw z) if and only if its own index falls inside our
+// eventual [rms_idx, qrot_idx] span; if it sits OUTSIDE that span (already
+// dispatched by an earlier main-loop turn, which is where it normally lives
+// since z's projection long predates the end-of-layer output norm), it is
+// left alone -- redundant separate execution, harmless, not our concern.
+// `plan_only` (MAD_USE_R4D_GDN_RAW_OUT=1 follow-up): when true, this runs ONLY the structural
+// detection below (shapes/types/op_params -- never tensor data) far enough to know whether this
+// RMS_NORM chain WOULD be fused, then returns without touching g_fused_qrot_skip/
+// g_ml8_radiance_plans/scratch or dispatching any kernel. Used by a whole-cgraph PLAN prepass
+// (ggml-cuda.cu's graph-compute entry, before any node has run) so the r4d GDN adapter
+// (mt_gdn_r4d.cu), whose own turn sits EARLIER in cgraph order than this RMS_NORM, can decide
+// -- ahead of time -- whether it may skip writing its fp32 un-permuted output for this call. See
+// mt_gdn_r4d.cuh's r4d_gdn_raw_out doc comment for the full handshake. Decline logging is
+// suppressed in this mode (see `log_decline` below) so it never steals the real exec-time pass's
+// once-only diagnostic message.
+static int ggml_cuda_try_ml8_radiance_pattern_c(
+        ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int rms_idx, bool plan_only = false) {
+    ggml_tensor * rms = cgraph->nodes[rms_idx];
+    std::string   why;
+    std::vector<int> matched;
+    const auto log_decline = [plan_only](const std::string & key, const std::string & msg) {
+        if (!plan_only) {
+            ml8_4_radiance_fuse_log_once(key, msg);
+        }
+    };
+
+    // Chain 226 item (c) / chain 243 item 2: this RMS_NORM anchor is ALSO
+    // tried by pattern A (both patterns share the RMS_NORM trigger), so
+    // most RMS_NORM nodes pattern C sees are NOT the GDN output site at all
+    // (attn_norm, ffn_norm, ...). `rms->ne[1] > 1` alone is NOT a reliable
+    // per-head signal -- for a 3D-batched input (multi-token prefill) a
+    // perfectly ordinary flat full-embd-width norm ALSO has ne[1] (token
+    // count) > 1, which is exactly why attn_norm was reaching hop 1 here.
+    // Gate on the strong positive signal (src[0] a GATED_DELTA_NET output)
+    // OR the genuine per-head shape this model's build_norm_gated actually
+    // has: ne[0] == head_dim (128, this architecture's fixed GDN head_dim
+    // -- see the K=6144=128*48 comments elsewhere in this file) AND
+    // ne[1] == n_heads (> 1) specifically, not just "some second dim > 1".
+    const bool looks_like_gdn_out =
+        (rms->src[0] && rms->src[0]->op == GGML_OP_GATED_DELTA_NET) || (rms->ne[0] == 128 && rms->ne[1] > 1);
+    if (!looks_like_gdn_out) {
+        // Chain 241 item 4: this used to be silent ("not this site, not a
+        // decline") to avoid spamming once per attn_norm/ffn_norm in every
+        // layer -- but with pattern C never firing at all in production,
+        // logging is more useful than quiet here too. Keyed per rms name so
+        // it's still only once per SITE, not once per token/layer-visit.
+        log_decline("decline-c-not-eligible-" + ml8_radiance_site_label(ml8_radiance_tname(rms)),
+            "gdn_out decline: RMS_NORM '" + std::string(ml8_radiance_tname(rms)) + "' not eligible (ne=(" +
+            std::to_string(rms->ne[0]) + "," + std::to_string(rms->ne[1]) + "), src[0]=" +
+            std::string(rms->src[0] ? ggml_op_name(rms->src[0]->op) : "(null)") +
+            " -- needs ne[0]==128 && ne[1]>1, or a GATED_DELTA_NET src[0])");
+        return 0;
+    }
+
+    // Hop 1: RMS_NORM -> MUL(norm_w).
+    const int mul_w_idx = ml8_radiance_find_real_consumer(cgraph, rms, rms_idx, cgraph->n_nodes - 1, &why, &matched);
+    if (mul_w_idx < 0 || cgraph->nodes[mul_w_idx]->op != GGML_OP_MUL) {
+        // Same not-applicable case pattern A's own hop 2 already silences:
+        // the GDN q/k L2-norm's weightless RMS_NORM -> SCALE path (e.g.
+        // 'q_conv_predelta') is also per-head-shaped (ne[1]>1) but isn't
+        // this site either.
+        if (mul_w_idx >= 0 && cgraph->nodes[mul_w_idx]->op == GGML_OP_SCALE) {
+            return 0;
+        }
+        log_decline("decline-c-norm-to-mul",
+            "gdn_out decline: RMS_NORM '" + std::string(ml8_radiance_tname(rms)) +
+            "' -> MUL not found (" + (mul_w_idx < 0 ? why : ("found " + std::string(ggml_op_name(cgraph->nodes[mul_w_idx]->op)) + " '" + ml8_radiance_tname(cgraph->nodes[mul_w_idx]) + "' instead")) + ")");
+        return 0;
+    }
+    ggml_tensor * mul_w = cgraph->nodes[mul_w_idx];
+    matched.push_back(mul_w_idx);
+    ggml_tensor * norm_w = (mul_w->src[0] == rms) ? mul_w->src[1] : (mul_w->src[1] == rms ? mul_w->src[0] : nullptr);
+    if (norm_w == nullptr) {
+        log_decline("decline-c-mul-operand",
+            "gdn_out decline: MUL '" + std::string(ml8_radiance_tname(mul_w)) + "' does not have RMS_NORM '" +
+            std::string(ml8_radiance_tname(rms)) + "' as either operand (post-reshape identity mismatch)");
+        return 0;
+    }
+
+    // Hop 2: MUL(norm_w) -> MUL(gated_silu). The gate operand (gated_silu)
+    // is read directly off this MUL's OTHER src, not discovered by walking
+    // forward -- see the function comment.
+    const int mul_gate_idx = ml8_radiance_find_real_consumer(cgraph, mul_w, mul_w_idx, cgraph->n_nodes - 1, &why, &matched);
+    if (mul_gate_idx < 0 || cgraph->nodes[mul_gate_idx]->op != GGML_OP_MUL) {
+        log_decline("decline-c-mulw-to-mulgate",
+            "gdn_out decline: MUL(norm_w) '" + std::string(ml8_radiance_tname(mul_w)) + "' -> MUL(gate) not found (" +
+            (mul_gate_idx < 0 ? why : ("found " + std::string(ggml_op_name(cgraph->nodes[mul_gate_idx]->op)) + " '" + ml8_radiance_tname(cgraph->nodes[mul_gate_idx]) + "' instead")) + ")");
+        return 0;
+    }
+    ggml_tensor * mul_gate = cgraph->nodes[mul_gate_idx];
+    // NOTE: mul_gate_idx is pushed into `matched` further down (hop 3),
+    // AFTER we know whether y_out is needed -- see that hop's own comment.
+    ggml_tensor * gated_silu =
+        (mul_gate->src[0] == mul_w) ? mul_gate->src[1] : (mul_gate->src[1] == mul_w ? mul_gate->src[0] : nullptr);
+    if (gated_silu == nullptr) {
+        log_decline("decline-c-mulgate-operand",
+            "gdn_out decline: MUL '" + std::string(ml8_radiance_tname(mul_gate)) + "' does not have MUL(norm_w) '" +
+            std::string(ml8_radiance_tname(mul_w)) + "' as either operand");
+        return 0;
+    }
+    if (gated_silu->op != GGML_OP_UNARY || ggml_get_unary_op(gated_silu) != GGML_UNARY_OP_SILU) {
+        log_decline("decline-c-not-silu",
+            "gdn_out decline: MUL(gate)'s other operand '" + std::string(ml8_radiance_tname(gated_silu)) +
+            "' is " + std::string(ggml_op_name(gated_silu->op)) + ", not UNARY/SILU");
+        return 0;
+    }
+    ggml_tensor * z = gated_silu->src[0];
+    if (z == nullptr) {
+        log_decline("decline-c-no-z",
+            "gdn_out decline: SILU '" + std::string(ml8_radiance_tname(gated_silu)) + "' has no src[0]");
+        return 0;
+    }
+
+    // Locate SILU's own cgraph index (it is NOT reachable by the forward
+    // find_real_consumer walk -- it consumes z, not anything already in our
+    // chain) to check its use-count and, if it falls inside our span,
+    // declare it matched (intentionally skipped: the fused kernel
+    // recomputes silu(z) itself from raw z, see rdna4_ml8_qrot_gated_norm_tiled).
+    int silu_idx = -1;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        if (cgraph->nodes[j] == gated_silu) { silu_idx = j; break; }
+    }
+    if (silu_idx < 0) {
+        log_decline("decline-c-silu-not-found",
+            "gdn_out decline: SILU '" + std::string(ml8_radiance_tname(gated_silu)) + "' not found in cgraph (unexpected)");
+        return 0;
+    }
+    if (!ggml_node_has_n_uses(cgraph, silu_idx, 1)) {
+        log_decline("decline-c-silu-multiuse",
+            "gdn_out decline: SILU '" + std::string(ml8_radiance_tname(gated_silu)) + "' has more than one use");
+        return 0;
+    }
+    if (silu_idx >= mul_gate_idx) {
+        log_decline("decline-c-silu-order",
+            "gdn_out decline: SILU '" + std::string(ml8_radiance_tname(gated_silu)) +
+            "' does not precede its own consumer MUL(gate) '" + std::string(ml8_radiance_tname(mul_gate)) +
+            "' in cgraph order (unexpected)");
+        return 0;
+    }
+    // Chain 241 addendum: the fused kernel now runs AT THE HEAD (rms_idx),
+    // reading z directly there -- so z's underlying buffer must still be
+    // live at that position. z's only consumer is this SILU (the use-count
+    // check above already proved that); the allocator keeps a buffer alive
+    // through its last consumer's own position, so z is only guaranteed
+    // live at rms_idx if that consumer's index is >= rms_idx. Every OTHER
+    // input this pattern reads (rms->src[0], norm_w) is safe by
+    // construction (the head IS RMS_NORM's own consumer of src[0]).
+    // z's PRODUCER (through views) must already have run when the head-time
+    // kernel reads it -- chain 254: the z GEMM sat after the RMS_NORM in
+    // cgraph order and the fused kernel read zeros. (qwen35.cpp now expands z
+    // early; this guard keeps the fusion correct for any graph that doesn't.)
+    {
+        const ggml_tensor * zp = z;
+        while (zp && zp->view_src && (zp->op == GGML_OP_VIEW || zp->op == GGML_OP_RESHAPE ||
+                                      zp->op == GGML_OP_PERMUTE || zp->op == GGML_OP_TRANSPOSE)) {
+            zp = zp->view_src;
+        }
+        if (zp && zp->op != GGML_OP_NONE) {
+            int zp_idx = -1;
+            for (int j = 0; j < cgraph->n_nodes; ++j) { if (cgraph->nodes[j] == zp) { zp_idx = j; break; } }
+            if (zp_idx < 0 || zp_idx > rms_idx) {
+                log_decline("decline-c-z-producer",
+                    "gdn_out decline: z producer '" + std::string(ml8_radiance_tname(zp)) + "' (node[" +
+                    std::to_string(zp_idx) + "]) does not precede the RMS_NORM head (node[" + std::to_string(rms_idx) +
+                    "]) -- z would be read before it is written");
+                return 0;
+            }
+        }
+    }
+    if (silu_idx < rms_idx) {
+        log_decline("decline-c-z-precedes-head",
+            "gdn_out decline: z consumed before head -- SILU '" + std::string(ml8_radiance_tname(gated_silu)) +
+            "' (node[" + std::to_string(silu_idx) + "]) precedes the RMS_NORM head '" +
+            std::string(ml8_radiance_tname(rms)) + "' (node[" + std::to_string(rms_idx) + "]); z's buffer may "
+            "already have been reused by the time the head-execution kernel needs to read it");
+        return 0;
+    }
+    // Skipped (the fused kernel recomputes silu(z) itself from raw z).
+    matched.push_back(silu_idx);
+
+    // Hop 3: MUL(gate) -> FP8_QUANT_ROT (an optional RESHAPE, e.g. flattening
+    // [head_dim,n_heads,T,seqs] -> [K,T*seqs], is handled transparently, and
+    // that RESHAPE ('final_output-0' in production) can itself have more
+    // than one use -- e.g. also feeding ssm_out's own LoRA branch directly
+    // through the view. Chain 243 item 1: served via y_out (same scratch
+    // trick as pattern A's attn_norm), copied into mul_gate->data at
+    // mul_gate's OWN turn -- any consumer reading mul_gate's data through
+    // that view (or directly) then sees exactly what MUL(gate) would have
+    // produced.
+    bool             mul_gate_has_other_consumer = false;
+    const int        qrot_idx = ml8_radiance_find_op_multiuse(cgraph, mul_gate, mul_gate_idx, cgraph->n_nodes - 1,
+                                                                GGML_OP_FP8_QUANT_ROT, &why, &mul_gate_has_other_consumer);
+    if (qrot_idx < 0 || cgraph->nodes[qrot_idx]->op != GGML_OP_FP8_QUANT_ROT) {
+        log_decline("decline-c-mulgate-to-qrot",
+            "gdn_out decline: MUL(gate) '" + std::string(ml8_radiance_tname(mul_gate)) +
+            "' -> FP8_QUANT_ROT not found (" + (qrot_idx < 0 ? why : ("found " + std::string(ggml_op_name(cgraph->nodes[qrot_idx]->op)) + " '" + ml8_radiance_tname(cgraph->nodes[qrot_idx]) + "' instead")) + ")");
+        return 0;
+    }
+    ggml_tensor * qrot = cgraph->nodes[qrot_idx];
+    // Chain 274: pattern A's own hop 3 (its identical spot) eagerly pushes
+    // its single-use MUL into `matched` right here when it has no other
+    // consumer -- this function was missing that same push for the
+    // single-use (need_yout == false) case, meaning a mul_gate with no
+    // other consumer was NEVER added to `matched` by ANY path (the only
+    // other push lives further down, inside `if (yout_direct)`, which is
+    // unreachable when need_yout is false) and so never landed in
+    // g_fused_qrot_skip -- it always ran its own normal dispatch. When
+    // mul_gate DOES have another consumer (need_yout == true, the common
+    // production shape at ssm_out -- the 'final_output' reshape view also
+    // feeding the GDN's own LoRA branch), this push is skipped exactly as
+    // before and mul_gate_idx is instead pushed further down, once we know
+    // whether y_out ends up direct-written into mul_gate->data (chain 258)
+    // or copied from scratch at mul_gate's own turn -- see that decision.
+    if (!mul_gate_has_other_consumer) {
+        matched.push_back(mul_gate_idx);
+    }
+
+    if (rms->type != GGML_TYPE_F32 || mul_w->type != GGML_TYPE_F32 || mul_gate->type != GGML_TYPE_F32 ||
+        qrot->type != GGML_TYPE_I8 || !ggml_is_contiguous(rms->src[0]) || !ggml_is_contiguous(rms) ||
+        !ggml_is_contiguous(mul_w) || !ggml_is_contiguous(mul_gate)) {
+        log_decline("decline-c-types",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(rms)) + "): non-f32/non-contiguous norm/gate chain");
+        return 0;
+    }
+    if (norm_w->type != GGML_TYPE_F32 || !ggml_is_contiguous(norm_w) ||
+        norm_w->ne[0] != rms->ne[0] || ggml_nelements(norm_w) != norm_w->ne[0]) {
+        log_decline("decline-c-normw",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(rms)) + "): norm weight '" +
+            std::string(ml8_radiance_tname(norm_w)) + "' isn't a plain [head_dim] f32 broadcast row");
+        return 0;
+    }
+    // z: head_dim must be contiguous (the kernel takes nb1/nb2 as-is for
+    // whatever stride the graph actually has between heads/tokens -- it may
+    // be a genuinely strided view of a larger fused projection, per the
+    // graph comment above; only the innermost (per-element) stride matters
+    // here).
+    if (z->type != GGML_TYPE_F32 || z->nb[0] != ggml_element_size(z)) {
+        log_decline("decline-c-z",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(qrot)) + "): z '" +
+            std::string(ml8_radiance_tname(z)) + "' isn't a contiguous-per-head-dim f32 tensor");
+        return 0;
+    }
+
+    const int32_t * pp    = (const int32_t *) qrot->op_params;
+    const int32_t   a_dim = pp[0], b_dim = pp[1], kind = pp[2], G = pp[3];
+    const ggml_tensor * h_a = qrot->src[1];
+    if (G != 0 || kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+        log_decline("decline-c-qrot",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(qrot)) + "): FP8_QUANT_ROT is grouped (G=" +
+            std::to_string(G) + ") or has no rotation (kind=" + std::to_string(kind) + ")");
+        return 0;
+    }
+    const int32_t head_dim = (int32_t) rms->ne[0];
+    const int32_t n_heads  = (int32_t) rms->ne[1];
+    const int32_t K        = head_dim * n_heads;
+    if ((int64_t) a_dim * (int64_t) b_dim != K || K % 16 != 0 ||
+        mul_gate->ne[0] * mul_gate->ne[1] != K || head_dim % 16 != 0) {
+        log_decline("decline-c-kdim",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(qrot)) + "): head_dim=" + std::to_string(head_dim) +
+            " n_heads=" + std::to_string(n_heads) + " K=" + std::to_string(K) + " a_dim=" + std::to_string(a_dim) +
+            " b_dim=" + std::to_string(b_dim) + " (a_dim*b_dim!=K, K%16!=0, or head_dim%16!=0)");
+        return 0;
+    }
+    const int32_t M = (int32_t) (mul_gate->ne[2] * mul_gate->ne[3]);
+    if (M <= 32) {
+        return 0; // decode tile
+    }
+    if (M % 16 != 0) {
+        log_decline("decline-c-mpad",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(qrot)) + "): M=" + std::to_string(M) +
+            " is not a multiple of 16 -- the TILED layout only fits qrot's own M*(K+4)-byte buffer when M%16==0");
+        return 0;
+    }
+
+    std::vector<ggml_tensor *> consumers;
+    if (!ml8_4_radiance_collect_mul_mat_consumers(cgraph, qrot, ggml_node_get_use_count(cgraph, qrot_idx), consumers, &why)) {
+        log_decline("decline-c-consumers",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(qrot)) + ", K=" + std::to_string(K) + "): " + why);
+        return 0;
+    }
+
+    // PLAN step (MAD_USE_R4D_GDN_RAW_OUT=1 follow-up): every check above this point reads only
+    // tensor ne/nb/type/op_params, never data, so it is safe to run this far before the graph has
+    // executed at all. Everything below this point either dispatches a kernel or mutates
+    // g_fused_qrot_skip/g_ml8_radiance_plans/scratch state, none of which plan_only may touch --
+    // stop here, having confirmed this chain WOULD be fused, and hand that fact to the r4d GDN
+    // adapter (mt_gdn_r4d.cu) if its output feeds this site and the raw-out feature is on.
+    // skip_fp32 is false under verify (mt_gdn_r4d.cuh's protocol: verify mode wants the fp32 copy
+    // produced too, so this same function's exec-time turn can cross-check the _r4d kernel
+    // against the plain one -- see that block further down).
+    if (plan_only) {
+        if (r4d_gdn_raw_out_enabled() && rms->src[0]->op == GGML_OP_GATED_DELTA_NET) {
+            ggml_cuda_gdn_r4d_mark_raw_wanted(rms->src[0], /*skip_fp32=*/!ml8_4_radiance_verify_enabled());
+        }
+        return 1;
+    }
+
+    const bool   verify     = ml8_4_radiance_verify_enabled();
+    // Chain 249 item 1: always compute y_out in verify mode -- see pattern
+    // A's own comment on `need_yout`.
+    const bool   need_yout  = mul_gate_has_other_consumer || verify;
+    const size_t qrot_bytes = (size_t) M * (size_t) K + (size_t) M * sizeof(float);
+    const size_t yout_bytes = need_yout ? (size_t) M * (size_t) K * sizeof(float) : 0;
+
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    // Chain 258: direct-vs-scratch decision -- see pattern A's own comment
+    // for the full reasoning (identical here). z is deliberately NOT in
+    // `reads` for the interstitial-write scan target comparison beyond
+    // being a read range like any other -- it's already proven live at the
+    // head by the z-precedes-head check above; here it's just one more
+    // buffer the qrot/y_out write targets must not alias.
+    std::vector<ml8_byte_range> reads;
+    reads.push_back(ml8_radiance_tensor_range(norm_w));
+    reads.push_back(ml8_radiance_tensor_range(rms->src[0]));
+    reads.push_back(ml8_radiance_tensor_range(z));
+    if (h_a) reads.push_back(ml8_radiance_tensor_range(h_a));
+    const ml8_byte_range qrot_range = ml8_radiance_raw_range(qrot->data, qrot_bytes);
+    const ml8_byte_range mul_range  = need_yout ? ml8_radiance_tensor_range(mul_gate) : ml8_byte_range{};
+    std::string why_direct;
+    // Chain 267/268: mul_gate_idx is only pushed into `matched` further down
+    // (deferred until we know need_yout) -- see pattern A's identical
+    // comment. Include it in the span-scan's allow-list from the start so
+    // the safety verdict never depends on that ordering.
+    std::vector<int> matched_for_scan = matched;
+    matched_for_scan.push_back(mul_gate_idx);
+    const bool direct_enabled = ml8_4_radiance_direct_enabled();
+    const bool qrot_direct = direct_enabled && !verify && ml8_radiance_direct_write_safe(
+        cgraph, rms_idx, qrot_idx, matched_for_scan, qrot_range, reads,
+        need_yout ? std::vector<ml8_byte_range>{ mul_range } : std::vector<ml8_byte_range>{}, &why_direct);
+    const bool yout_direct = direct_enabled && !verify && need_yout && ml8_radiance_direct_write_safe(
+        cgraph, rms_idx, qrot_idx, matched_for_scan, mul_range, reads, { qrot_range }, &why_direct);
+
+    const size_t qrot_scratch_bytes = qrot_direct ? 0 : qrot_bytes;
+    const size_t yout_scratch_bytes = (need_yout && !yout_direct) ? yout_bytes : 0;
+    const size_t total_scratch      = qrot_scratch_bytes + yout_scratch_bytes;
+    // Chain 271: refcount = number of plans ACTUALLY registered against
+    // this slot -- see pattern A's identical comment (this is the fix for
+    // the ssm_out mul_gate y_out-only slots the chain 271 journal named
+    // stuck at refcount=1/K=6144).
+    const int qrot_plans  = qrot_direct ? 0 : 1;
+    const int yout_plans  = (need_yout && !yout_direct) ? 1 : 0;
+    const int refcount = verify ? 1 : (qrot_plans + yout_plans);
+    int slot = -1;
+    if (total_scratch > 0) {
+        GGML_ASSERT(refcount > 0 && "ml8-4 radiance: claiming a scratch slot with a zero refcount would leak it forever");
+        slot = ml8_radiance_claim_scratch_slot(total_scratch, refcount);
+        if (slot < 0) {
+            ml8_4_radiance_fuse_log_once("decline-c-noslot",
+                "gdn_out decline (" + std::string(ml8_radiance_tname(qrot)) + "): no free scratch slot for " +
+                std::to_string(total_scratch) + " bytes -- too many ml8-4 radiance chains in flight, or the "
+                "allocation failed");
+            return 0;
+        }
+    }
+    int plans_registered_for_slot = 0; // Chain 271: must equal `refcount` exactly once this chain commits
+    // Chain 266: track each region's own scratch offset explicitly -- see
+    // pattern A's identical comment.
+    uint8_t * scratch_base   = slot >= 0 ? (uint8_t *) g_ml8_radiance_scratch_slots[slot].ptr : nullptr;
+    size_t    scratch_cursor = 0;
+    size_t    qrot_scratch_off = 0, yout_scratch_off = 0;
+    uint8_t * a_tiled;
+    if (qrot_direct) {
+        a_tiled = (uint8_t *) qrot->data;
+    } else {
+        qrot_scratch_off = scratch_cursor;
+        a_tiled          = scratch_base + scratch_cursor;
+        scratch_cursor  += qrot_bytes;
+    }
+    float * a_scale = (float *) (a_tiled + (size_t) M * (size_t) K);
+    float * y_out   = nullptr;
+    if (need_yout) {
+        if (yout_direct) {
+            y_out = (float *) mul_gate->data;
+        } else {
+            yout_scratch_off = scratch_cursor;
+            y_out            = (float *) (scratch_base + scratch_cursor);
+            scratch_cursor  += yout_bytes;
+        }
+    }
+
+    // Raw-output handoff (MAD_USE_R4D_GDN_RAW_OUT=1): take_raw_out is CONSUMING -- by this point
+    // every eligibility check this function performs has already passed (only the kernel's own
+    // dispatch-table coverage remains), so this is the correct, final place to claim the record.
+    // Not verify: use it as the PRIMARY (only) path, since the r4d GDN adapter may already have
+    // skipped writing rms->src[0]'s fp32 data for this exact call (see mt_gdn_r4d.cuh's
+    // r4d_gdn_raw_out protocol) -- there is no valid fp32 to fall back to read here. Verify: never
+    // used as primary (the plain kernel below still runs first, into `a_tiled`/`y_out`, using the
+    // fp32 the adapter was told to keep in that mode); the raw kernel instead runs as a SEPARATE
+    // cross-check further down, diffed against this call's own output.
+    r4d_gdn_raw_out raw{};
+    const bool have_raw = rms->src[0]->op == GGML_OP_GATED_DELTA_NET &&
+                          ggml_cuda_gdn_r4d_take_raw_out(rms->src[0], &raw);
+    const bool use_raw_primary = have_raw && !verify;
+    const bool ok = use_raw_primary
+        ? rdna4_ml8_qrot_gated_norm_tiled_r4d(
+              raw.o_bf16, raw.o_nb_head, raw.o_nb_tok, raw.head_src,
+              (const float *) z->data, z->nb[1], z->nb[2], (const float *) norm_w->data, eps,
+              raw.head_dim, raw.n_heads, h_a ? h_a->data : nullptr, kind, a_dim, b_dim, M,
+              a_tiled, a_scale, cuda_ctx->stream(), y_out)
+        : rdna4_ml8_qrot_gated_norm_tiled(
+              (const float *) rms->src[0]->data, (const float *) z->data, z->nb[1], z->nb[2],
+              (const float *) norm_w->data, eps, head_dim, n_heads,
+              h_a ? h_a->data : nullptr, kind, a_dim, b_dim, M, a_tiled, a_scale, cuda_ctx->stream(), y_out);
+    if (!ok) {
+        if (use_raw_primary) {
+            // The PLAN pass (this same detection, run identically over the identical graph
+            // before any node executed) already told the r4d GDN adapter to skip rms->src[0]'s
+            // fp32 write for this call -- there is no valid data to fall back to reading. Both
+            // passes run the same deterministic shape checks, so this kernel decision must agree
+            // with the PLAN pass's; a mismatch is a real bug, not an expected runtime condition.
+            GGML_ABORT("ml8-4 radiance pattern C: rdna4_ml8_qrot_gated_norm_tiled_r4d declined for '%s' "
+                       "(head_dim=%d n_heads=%d M=%d a_dim=%d b_dim=%d kind=%d) after the r4d GDN adapter "
+                       "already skipped this call's fp32 output -- PLAN/EXEC detection mismatch",
+                       ml8_radiance_tname(qrot), head_dim, n_heads, M, a_dim, b_dim, kind);
+        }
+        if (slot >= 0) {
+            ml8_radiance_release_scratch_slot(slot);
+            if (refcount > 1) ml8_radiance_release_scratch_slot(slot); // drop the 2nd ref too
+        }
+        ml8_4_radiance_fuse_log_once("decline-c-kernel",
+            "gdn_out decline (" + std::string(ml8_radiance_tname(qrot)) + "): rdna4_ml8_qrot_gated_norm_tiled itself "
+            "declined M=" + std::to_string(M) + " head_dim=" + std::to_string(head_dim) + " n_heads=" +
+            std::to_string(n_heads) + " a_dim=" + std::to_string(a_dim) + " b_dim=" + std::to_string(b_dim) +
+            " kind=" + std::to_string(kind) + " -- if that shape looks legitimate, this is the quant kernel's "
+            "own dispatch-table coverage, not a graph-pattern-matching problem");
+        return 0;
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // Raw-out cross-check (verify mode only): also run the _r4d kernel against libr4d's raw bf16
+    // output and diff it against the plain kernel's result just computed above -- a DIFFERENT
+    // check from the verify plan registered below (which diffs the plain-fused kernel against a
+    // real, unfused dispatch of the whole RMS_NORM/MUL/MUL/FP8_QUANT_ROT chain); this one diffs
+    // the two FUSED variants against each other. Diagnostic only, using a throwaway scratch slot
+    // released immediately after -- never touches g_ml8_radiance_verify_plans/g_fused_qrot_skip.
+    if (verify && have_raw) {
+        const size_t r4d_bytes = qrot_bytes + yout_bytes; // verify always claims both (need_yout, !qrot_direct)
+        const int    r4d_slot  = ml8_radiance_claim_scratch_slot(r4d_bytes, 1);
+        if (r4d_slot < 0) {
+            ml8_4_radiance_fuse_log_once("decline-c-raw-verify-noslot",
+                "gdn_out raw-verify (" + std::string(ml8_radiance_tname(qrot)) + "): no free scratch slot for the "
+                "_r4d cross-check -- skipped this call's comparison (not a correctness issue, just missed coverage)");
+        } else {
+            uint8_t * r4d_base  = (uint8_t *) g_ml8_radiance_scratch_slots[r4d_slot].ptr;
+            uint8_t * r4d_tiled = r4d_base;
+            float *   r4d_scale = (float *) (r4d_tiled + (size_t) M * (size_t) K);
+            float *   r4d_yout  = (float *) (r4d_base + qrot_bytes);
+            const bool ok_r4d = rdna4_ml8_qrot_gated_norm_tiled_r4d(
+                raw.o_bf16, raw.o_nb_head, raw.o_nb_tok, raw.head_src,
+                (const float *) z->data, z->nb[1], z->nb[2], (const float *) norm_w->data, eps,
+                raw.head_dim, raw.n_heads, h_a ? h_a->data : nullptr, kind, a_dim, b_dim, M,
+                r4d_tiled, r4d_scale, cuda_ctx->stream(), r4d_yout);
+            if (ok_r4d) {
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                std::string report = "pattern C _r4d cross-check " + std::string(ml8_radiance_tname(qrot)) + ": ";
+                ml8_radiance_verify_append_raw_diff("A_tiled", r4d_tiled, a_tiled, (size_t) M * (size_t) K, report);
+                ml8_radiance_verify_append_float_diff_raw("a_scale", r4d_scale, a_scale, (size_t) M, report);
+                ml8_radiance_verify_append_float_diff_raw("y_out", r4d_yout, y_out, (size_t) M * (size_t) K, report);
+                ml8_4_radiance_fuse_log_once("verify-r4d-" + ml8_radiance_site_label(ml8_radiance_tname(qrot)), report);
+            } else {
+                ml8_4_radiance_fuse_log_once("decline-c-raw-verify-kernel",
+                    "gdn_out raw-verify (" + std::string(ml8_radiance_tname(qrot)) + "): "
+                    "rdna4_ml8_qrot_gated_norm_tiled_r4d declined during the cross-check (dispatch-table "
+                    "coverage, not a plan bug -- the plain kernel above already succeeded for this same shape)");
+            }
+            ml8_radiance_release_scratch_slot(r4d_slot);
+        }
+    }
+
+    if (verify) {
+        ml8_radiance_verify_plan vplan;
+        vplan.site      = "pattern C: " + ml8_radiance_site_label(ml8_radiance_tname(qrot));
+        vplan.slot      = slot;
+        vplan.M         = M;
+        vplan.K         = K;
+        vplan.a_dim     = a_dim;
+        vplan.b_dim     = b_dim;
+        vplan.rot_kind  = kind;
+        vplan.eps       = eps;
+        vplan.head_dim  = head_dim;
+        vplan.n_heads   = n_heads;
+        vplan.o_ptr     = rms->src[0]->data;
+        vplan.z_ptr     = z->data;
+        vplan.z_nb1     = z->nb[1];
+        vplan.z_nb2     = z->nb[2];
+        vplan.normw_ptr = norm_w->data;
+        vplan.rms_t     = rms;
+        vplan.mul_w_t   = mul_w;
+        vplan.silu_t    = gated_silu;
+        vplan.qrot_t    = qrot;
+        vplan.norm_w_ne0 = (int32_t) norm_w->ne[0];
+        vplan.silu_src_of_yout = (mul_gate->src[0] == gated_silu) ? 0 : 1;
+        // y_out is now always computed (need_yout); always compare it.
+        vplan.yout_ref    = mul_gate;
+        vplan.yout_offset = yout_scratch_off;
+        // Chain 252: fused y_out/a_scale/A were ALL ZERO at this site -- sample the
+        // kernel's inputs right here, at head time, on this stream, to see which
+        // input is not yet materialized when the head-time kernel reads it.
+        {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            float ho[8] = {0}, hz[8] = {0}, hw[8] = {0};
+            CUDA_CHECK(cudaMemcpy(ho, rms->src[0]->data, sizeof(ho), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hz, z->data, sizeof(hz), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hw, norm_w->data, sizeof(hw), cudaMemcpyDeviceToHost));
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                "[verify-head] pattern C %s: stream_no=%d o[0..7]=%g,%g,%g,%g,%g,%g,%g,%g z[0..7]=%g,%g,%g,%g,%g,%g,%g,%g w[0..3]=%g,%g,%g,%g",
+                ml8_radiance_tname(qrot), cuda_ctx->curr_stream_no,
+                ho[0],ho[1],ho[2],ho[3],ho[4],ho[5],ho[6],ho[7], hz[0],hz[1],hz[2],hz[3],hz[4],hz[5],hz[6],hz[7], hw[0],hw[1],hw[2],hw[3]);
+            ml8_4_radiance_fuse_log_once(std::string("verify-head-c-") + ml8_radiance_tname(qrot), buf);
+        }
+        g_ml8_radiance_verify_plans[qrot] = vplan;
+        return 1; // nothing marked skipped -- every original node runs normally
+    }
+
+    // Chain 258: commit whichever mode each target actually used -- see
+    // pattern A's own comment on this same commit shape.
+    if (qrot_direct) {
+        ggml_set_op_params_i32(qrot, ML8_QROT_OP_PARAM_FLAGS, ML8_QROT_FLAG_TILED);
+        g_fused_qrot_skip.insert(qrot);
+        g_ml8_radiance_direct_writes.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_ml8_radiance_plans[qrot] = ml8_radiance_plan{ slot, qrot_scratch_off, qrot_bytes, /*is_qrot=*/true };
+        g_ml8_radiance_scratch_writes.fetch_add(1, std::memory_order_relaxed);
+        ++plans_registered_for_slot;
+    }
+    if (need_yout) {
+        if (yout_direct) {
+            matched.push_back(mul_gate_idx); // correct value already in mul_gate->data -- skip its own dispatch
+            g_ml8_radiance_direct_writes.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // Chain 266 fix: this region's OWN scratch offset (0 when qrot
+            // is direct and y_out is the slot's only occupant).
+            g_ml8_radiance_plans[mul_gate] = ml8_radiance_plan{ slot, yout_scratch_off, yout_bytes, /*is_qrot=*/false };
+            g_ml8_radiance_scratch_writes.fetch_add(1, std::memory_order_relaxed);
+            ++plans_registered_for_slot;
+            // Chain 269: link qrot's plan -> mul_gate as a backstop, same
+            // reasoning as pattern A's identical comment.
+            auto qrot_plan_it = g_ml8_radiance_plans.find(qrot);
+            if (qrot_plan_it != g_ml8_radiance_plans.end()) {
+                qrot_plan_it->second.sibling = mul_gate;
+            }
+        }
+    }
+    // Chain 271: see pattern A's identical assertion/comment.
+    if (slot >= 0) {
+        GGML_ASSERT(plans_registered_for_slot == refcount &&
+                    "ml8-4 radiance: number of plans registered against this slot does not match its claimed refcount");
+    }
+    ml8_radiance_mark_chain_skipped(cgraph, rms, matched);
+
+    ++g_ml8_4_radiance_pattern_c_count;
+    ml8_4_radiance_fuse_log_once("fused-c-first-" + ml8_radiance_site_label(ml8_radiance_tname(qrot)),
+        "pattern C: ssm_out fused (RMS_NORM/MUL/MUL(SILU)/FP8_QUANT_ROT '" + std::string(ml8_radiance_tname(qrot)) +
+        "', head_dim=" + std::to_string(head_dim) + " n_heads=" + std::to_string(n_heads) + " K=" + std::to_string(K) +
+        " -> " + std::to_string(consumers.size()) + " ML8_MUL_MAT(ssm_out) consumer(s), qrot=" +
+        std::string(qrot_direct ? "direct" : "scratch") +
+        (need_yout ? (std::string(", y_out=") + (yout_direct ? "direct" : "scratch")) : "") +
+        " [process totals: direct=" + std::to_string(g_ml8_radiance_direct_writes.load(std::memory_order_relaxed)) +
+        " scratch=" + std::to_string(g_ml8_radiance_scratch_writes.load(std::memory_order_relaxed)) + "])");
+    return 1; // internal "detected" signal only -- see ml8_radiance_mark_chain_skipped's comment
+}
+
+// Task 1: Pattern B, ggml_glu_split form -- GLU(swiglu, src[0]=gate,
+// src[1]=up), each an independent ML8_MUL_MAT output (no single fused
+// [M,2N] gate_up tensor to anchor the combined pattern's trigger on), ->
+// FP8_QUANT_ROT (no norm) -> one or more ML8_MUL_MAT(down) consumers.
+// `glu_idx` is the GLU node's own index -- this is triggered directly off
+// GGML_OP_GLU (see ggml_cuda_try_fuse below), not off either producing
+// ML8_MUL_MAT, since there is no single "the" gate_up matmul for the split
+// form. The two producing GEMMs (gate, up) run completely normally -- they
+// sit at earlier cgraph indices than `glu_idx` and are never touched by this
+// function's own skip range (which only ever starts AT glu_idx); only the
+// GLU and its FP8_QUANT_ROT are fused away and skipped.
+static int ggml_cuda_try_ml8_radiance_pattern_b_split(
+        ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int glu_idx) {
+    ggml_tensor * glu = cgraph->nodes[glu_idx];
+    if (glu->src[1] == nullptr) {
+        return 0; // combined (non-split) form -- never observed in production; not handled (pattern B removed)
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-gluop",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(glu)) + "'): GLU op is " +
+            std::to_string((int) ggml_get_glu_op(glu)) + ", not SWIGLU");
+        return 0;
+    }
+    // ggml_glu_split (ggml.c:3181-3187) always calls ggml_glu_impl with
+    // swapped=false, and unary.cu's split-form kernel (ggml_cuda_op_unary_gated
+    // / ggml_cuda_op_swiglu's src0_p/src1_p offset dance) only ever consults
+    // op_params[1] when src[1] is null -- when both srcs are present (our
+    // case here) it is unconditionally `dst[i] = silu(src0[j0]) * src1[j1]`.
+    // So src[0] is unconditionally the SiLU-activated "gate" operand and
+    // src[1] the linear "up" multiplier for the split form; there is no
+    // swapped-based reordering to apply. (Read, not guessed -- see the two
+    // file/line refs above.)
+    ggml_tensor * gate = glu->src[0];
+    ggml_tensor * up   = glu->src[1];
+    // Chain 243 item 3: computed early so the notmm decline below can name
+    // M and suppress the M<=32 decode-graph case entirely (ML8_MUL_MAT is
+    // dispatched differently -- or not at all -- for the decode tile, so
+    // plain MUL_MAT there is expected, not a genuine "not ml8" finding).
+    const int32_t bsplit_M_early = (int32_t) (glu->ne[1] * glu->ne[2] * glu->ne[3]);
+    // Chain 226 item (d): gate/up are NOT necessarily the ML8_MUL_MAT nodes
+    // themselves -- e.g. an output-channel scale (ffn_gate_s/ffn_up_s, a
+    // MUL) or a LoRA residual add can sit between build_lora_mm's raw
+    // ml8_mul_mat() result and what the GLU actually reads. We still read
+    // gate->data/up->data AS-IS below (whatever wrapper computed there is
+    // the value SiLU/MUL would have read in the unfused graph) -- this walk
+    // is validation-only, confirming the pairing traces back to a genuine
+    // ml8 GEMM pair rather than an unrelated MUL_MAT.
+    const ggml_tensor * gate_producer = ml8_radiance_peel_to_mul_mat(gate);
+    const ggml_tensor * up_producer   = ml8_radiance_peel_to_mul_mat(up);
+    if (!gate_producer || gate_producer->op != GGML_OP_ML8_MUL_MAT ||
+        !up_producer || up_producer->op != GGML_OP_ML8_MUL_MAT) {
+        if (bsplit_M_early <= 32) {
+            return 0; // decode graph -- ML8_MUL_MAT dispatch differs there; plain MUL_MAT is expected, not applicable
+        }
+        ml8_4_radiance_fuse_log_once("decline-bsplit-notmm-" + ml8_radiance_site_label(ml8_radiance_tname(glu)),
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(glu)) + "', M=" +
+            std::to_string(bsplit_M_early) + "): gate '" + std::string(ml8_radiance_tname(gate)) +
+            "' traces back to " + std::string(gate_producer ? ggml_op_name(gate_producer->op) : "(null)") +
+            " / up '" + std::string(ml8_radiance_tname(up)) + "' traces back to " +
+            std::string(up_producer ? ggml_op_name(up_producer->op) : "(null)") +
+            " -- neither resolves (through view_src / CONT / CPY / DUP / an ADD-bias operand) to an ML8_MUL_MAT "
+            "(likely this layer's FFN weights are not ML8-quantized)");
+        return 0;
+    }
+    if (glu->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up)) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-types",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(glu)) + "'): non-f32/non-contiguous gate/up/GLU");
+        return 0;
+    }
+
+    // GLU's output must have no OTHER consumer besides our FP8_QUANT_ROT --
+    // find_real_consumer already enforces single-use on `glu` itself before
+    // even searching, so a second consumer declines right here with a log.
+    std::string       why;
+    std::vector<int>  matched;
+    const int qrot_idx = ml8_radiance_find_real_consumer(cgraph, glu, glu_idx, cgraph->n_nodes - 1, &why, &matched);
+    if (qrot_idx < 0 || cgraph->nodes[qrot_idx]->op != GGML_OP_FP8_QUANT_ROT) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-glu-to-qrot",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(glu)) + "'): GLU -> FP8_QUANT_ROT not found (" +
+            (qrot_idx < 0 ? why : ("found " + std::string(ggml_op_name(cgraph->nodes[qrot_idx]->op)) + " '" + ml8_radiance_tname(cgraph->nodes[qrot_idx]) + "' instead")) + ")");
+        return 0;
+    }
+    ggml_tensor * qrot = cgraph->nodes[qrot_idx];
+    if (qrot->type != GGML_TYPE_I8) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-qrot-type",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(qrot)) + "'): unexpected dst type");
+        return 0;
+    }
+
+    const int32_t * pp    = (const int32_t *) qrot->op_params;
+    const int32_t   a_dim = pp[0], b_dim = pp[1], kind = pp[2], G = pp[3];
+    const ggml_tensor * h_a = qrot->src[1];
+    if (G != 0 || kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-qrot",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(qrot)) + "'): FP8_QUANT_ROT after the GLU is "
+            "grouped (G=" + std::to_string(G) + ") or has no rotation (kind=" + std::to_string(kind) + ")");
+        return 0;
+    }
+    const int32_t N = (int32_t) gate->ne[0];
+    if (gate->ne[0] != up->ne[0] || (int64_t) a_dim * (int64_t) b_dim != N || N % 16 != 0) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-ndim",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(qrot)) + "'): gate width=" +
+            std::to_string(gate->ne[0]) + " up width=" + std::to_string(up->ne[0]) + " N=" + std::to_string(N) +
+            " a_dim=" + std::to_string(a_dim) + " b_dim=" + std::to_string(b_dim) +
+            " (gate/up widths must match and N==a_dim*b_dim, N%16==0)");
+        return 0;
+    }
+    const int32_t M = (int32_t) (glu->ne[1] * glu->ne[2] * glu->ne[3]);
+    if (M <= 32) {
+        return 0; // decode tile
+    }
+    if (M % 16 != 0) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-mpad",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(qrot)) + "'): M=" + std::to_string(M) +
+            " is not a multiple of 16 -- the TILED layout only fits qrot's own M*(N+4)-byte buffer when M%16==0");
+        return 0;
+    }
+
+    std::vector<ggml_tensor *> consumers;
+    if (!ml8_4_radiance_collect_mul_mat_consumers(cgraph, qrot, ggml_node_get_use_count(cgraph, qrot_idx), consumers, &why)) {
+        ml8_4_radiance_fuse_log_once("decline-bsplit-consumers",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(qrot)) + "', N=" + std::to_string(N) + "): " + why);
+        return 0;
+    }
+
+    // gate/up are read here, at the head (glu_idx) -- glu is their own
+    // normal consumer, so both buffers are guaranteed live at this position
+    // regardless of how the allocator reused anything between glu_idx and
+    // qrot_idx (no aliasing hazard for this pattern's inputs).
+    const size_t bytes = (size_t) M * (size_t) N + (size_t) M * sizeof(float);
+
+    // Chain 258: direct-vs-scratch -- see pattern A's own comment. Never
+    // direct in verify mode (it must never touch qrot->data early).
+    const bool verify = ml8_4_radiance_verify_enabled();
+    const std::vector<ml8_byte_range> reads = {
+        ml8_radiance_tensor_range(gate), ml8_radiance_tensor_range(up),
+        h_a ? ml8_radiance_tensor_range(h_a) : ml8_byte_range{}
+    };
+    const ml8_byte_range qrot_range = ml8_radiance_raw_range(qrot->data, bytes);
+    std::string why_direct;
+    const bool qrot_direct = ml8_4_radiance_direct_enabled() && !verify && ml8_radiance_direct_write_safe(
+        cgraph, glu_idx, qrot_idx, matched, qrot_range, reads, {}, &why_direct);
+
+    int slot = -1;
+    if (!qrot_direct) {
+        slot = ml8_radiance_claim_scratch_slot(bytes);
+        if (slot < 0) {
+            ml8_4_radiance_fuse_log_once("decline-bsplit-noslot",
+                "pattern B(split) decline ('" + std::string(ml8_radiance_tname(qrot)) + "'): no free scratch slot for " +
+                std::to_string(bytes) + " bytes -- too many ml8-4 radiance chains in flight, or the allocation failed");
+            return 0;
+        }
+    }
+    uint8_t * a_tiled = qrot_direct ? (uint8_t *) qrot->data : (uint8_t *) g_ml8_radiance_scratch_slots[slot].ptr;
+    float   * a_scale = (float *) (a_tiled + (size_t) M * (size_t) N);
+
+    const bool ok = rdna4_ml8_qrot_silu_mul_split_tiled(
+        (const float *) gate->data, (const float *) up->data, h_a ? h_a->data : nullptr, kind, a_dim, b_dim,
+        M, N, a_tiled, a_scale, cuda_ctx->stream());
+    if (!ok) {
+        if (slot >= 0) ml8_radiance_release_scratch_slot(slot);
+        ml8_4_radiance_fuse_log_once("decline-bsplit-kernel",
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(qrot)) + "'): rdna4_ml8_qrot_silu_mul_split_tiled "
+            "itself declined M=" + std::to_string(M) + " N=" + std::to_string(N) + " a_dim=" + std::to_string(a_dim) +
+            " b_dim=" + std::to_string(b_dim) + " kind=" + std::to_string(kind) +
+            " -- if that shape looks legitimate, this is the quant kernel's own dispatch-table coverage, "
+            "not a graph-pattern-matching problem");
+        return 0;
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    if (verify) {
+        ml8_radiance_verify_plan vplan;
+        vplan.site      = "pattern B(split): " + ml8_radiance_site_label(ml8_radiance_tname(qrot));
+        vplan.slot      = slot;
+        vplan.M         = M;
+        vplan.K         = N;
+        vplan.a_dim     = a_dim;
+        vplan.b_dim     = b_dim;
+        vplan.rot_kind  = kind;
+        vplan.o_ptr     = gate->data; // B_SPLIT has no single "o"/z/norm_w -- gate/up reported via the log line below
+        g_ml8_radiance_verify_plans[qrot] = vplan;
+        ml8_4_radiance_fuse_log_once("verify-bsplit-ptrs-" + ml8_radiance_site_label(ml8_radiance_tname(qrot)),
+            "[verify] " + vplan.site + " inputs: gate_ptr=" + ml8_radiance_ptr_str(gate->data) + " up_ptr=" +
+            ml8_radiance_ptr_str(up->data));
+        return 1; // nothing marked skipped -- gate/up/glu/qrot all run normally
+    }
+
+    // Chain 258: commit whichever mode qrot actually used.
+    if (qrot_direct) {
+        ggml_set_op_params_i32(qrot, ML8_QROT_OP_PARAM_FLAGS, ML8_QROT_FLAG_TILED);
+        g_fused_qrot_skip.insert(qrot);
+        g_ml8_radiance_direct_writes.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_ml8_radiance_plans[qrot] = ml8_radiance_plan{ slot, 0, bytes, /*is_qrot=*/true };
+        g_ml8_radiance_scratch_writes.fetch_add(1, std::memory_order_relaxed);
+    }
+    ml8_radiance_mark_chain_skipped(cgraph, glu, matched);
+
+    ++g_ml8_4_radiance_pattern_b_count;
+    ml8_4_radiance_fuse_log_once("fused-bsplit-first-" + ml8_radiance_site_label(ml8_radiance_tname(qrot)),
+        "pattern B(split): " + ml8_radiance_site_label(ml8_radiance_tname(qrot)) +
+        " fused (GLU(split)/FP8_QUANT_ROT '" + std::string(ml8_radiance_tname(qrot)) + "', N=" + std::to_string(N) +
+        " -> " + std::to_string(consumers.size()) + " ML8_MUL_MAT(down) consumer(s), gate='" +
+        std::string(ml8_radiance_tname(gate)) + "' up='" + std::string(ml8_radiance_tname(up)) + "', qrot=" +
+        std::string(qrot_direct ? "direct" : "scratch") +
+        " [process totals: direct=" + std::to_string(g_ml8_radiance_direct_writes.load(std::memory_order_relaxed)) +
+        " scratch=" + std::to_string(g_ml8_radiance_scratch_writes.load(std::memory_order_relaxed)) + "])");
+    return 1; // internal "detected" signal only -- see ml8_radiance_mark_chain_skipped's comment
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -6041,6 +8626,117 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         std::atoi(getenv("GGML_CUDA_DISABLE_SCALE_UNARY_FUSION"));
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // MT_ML8_4_GEMM_LOG=2: one-shot graph-shape dump, independent of whether
+    // the fuse itself is enabled (diagnostic only).
+    if (node->op == GGML_OP_ML8_MUL_MAT) {
+        ml8_4_radiance_maybe_dump_graph_shape(cgraph, i);
+    }
+
+    // MT_ML8_4_RADIANCE_FUSE (default 0), only when MT_ML8_4_PREFILL_RADIANCE!=0
+    // (this fusion only ever feeds that GEMM path) -- see the doc comment above
+    // ggml_cuda_try_ml8_radiance_pattern_a for the full contract. Checked
+    // ahead of every other pattern below that could also match GGML_OP_ADD,
+    // GGML_OP_RMS_NORM or GGML_OP_GLU (the existing RMS_NORM/MUL/FP8_QUANT_ROT
+    // and RMS_NORM/MUL fusions further down) so it gets first refusal;
+    // declining (env off, M<=32 decode, or any shape mismatch -- always
+    // logged under MT_ML8_4_GEMM_LOG=1, see the pattern bodies) falls
+    // straight through to those, unchanged. Bitmask: 1=pattern A (both the
+    // ADD and no-add/RMS_NORM forms), 4=pattern B(split), 8=pattern C; bit 2
+    // (the fused, non-split gate_up form) is dead -- the graph never
+    // produces it, so pattern B (combined) was removed entirely.
+    //
+    // Chain-227 execution-model rework: these patterns only DETECT and
+    // register a deferred plan at the chain's HEAD (see
+    // ggml_cuda_try_ml8_radiance_pattern_a/_c/_b_split's own comments for
+    // why -- ggml's graph allocator assumes in-order execution, so running
+    // the fused kernel this early, before every node between the head and
+    // the qrot has actually run, can read/write memory a still-live
+    // intermediate in that span also owns). A nonzero return here means
+    // only "this pattern's detection fired" -- we return a literal 0 to OUR
+    // OWN caller (the main graph-walk loop), which then finds `node` (the
+    // head) in g_fused_qrot_skip (inserted by the pattern function itself,
+    // see ml8_radiance_mark_chain_skipped) via the check right after that
+    // loop's own call to this function, and skips its normal dispatch that
+    // way. The deferred kernel itself runs later, at the qrot's own normal
+    // turn -- see the GGML_OP_FP8_QUANT_ROT branch below.
+    if (ml8_4_radiance_fuse_enabled() && ml8_4_prefill_radiance_active()) {
+        // Any node's own normal turn where a deferred COPY plan was
+        // registered for IT specifically (by pattern A/C's own detection,
+        // at the chain's head) -- the qrot's own copy (A_tiled+a_scale,
+        // also sets ML8_QROT_FLAG_TILED) AND, for a y_out-bearing chain,
+        // the multi-use MUL's/mul_gate's own y_out copy (chain 243 item 1)
+        // -- are both serviced here, keyed by `node`'s own tensor pointer,
+        // regardless of its op. A cheap, usually-empty map lookup; always
+        // returns 0, but inserts `node` into g_fused_qrot_skip on a hit so
+        // the main loop skips just this one node's own (now-redundant)
+        // dispatch, in place, without touching whatever sits after it in
+        // cgraph order (chain 242: a literal skip-count would have skipped
+        // the qrot's own consumer ML8_MUL_MAT -- garbage).
+        (void) ggml_cuda_try_ml8_radiance_exec_copy(cuda_ctx, node);
+        if (g_fused_qrot_skip.count(node)) {
+            return 0;
+        }
+        // MT_ML8_4_RADIANCE_VERIFY=1: same idiom, but for the verify plan
+        // map instead -- this ACTUALLY RUNS the qrot's own plain dispatch
+        // itself (ggml_cuda_compute_node_now) before comparing, then marks
+        // it skipped so the main loop doesn't dispatch it a second time.
+        if (ml8_4_radiance_verify_enabled()) {
+            (void) ggml_cuda_try_ml8_radiance_exec_verify(cuda_ctx, node);
+            if (g_fused_qrot_skip.count(node)) {
+                return 0;
+            }
+        }
+        if ((ml8_4_radiance_fuse_mask() & 1) && (node->op == GGML_OP_ADD || node->op == GGML_OP_RMS_NORM)) {
+            if (ggml_cuda_try_ml8_radiance_pattern_a(cuda_ctx, cgraph, i) != 0) {
+                return 0;
+            }
+        }
+        // Pattern C: the GDN output gated RMSNorm feeding ssm_out -- same
+        // RMS_NORM anchor as pattern A (this site has no residual-add form),
+        // tried after A declines for it (A's own hop 3 hands off here
+        // silently when it detects the gdn gate MUL -- see pattern A's own
+        // hop 3 comment -- instead of logging a decline).
+        if ((ml8_4_radiance_fuse_mask() & 8) && node->op == GGML_OP_RMS_NORM) {
+            if (ggml_cuda_try_ml8_radiance_pattern_c(cuda_ctx, cgraph, i) != 0) {
+                return 0;
+            }
+        }
+        // ggml_glu_split form -- no single gate_up ML8_MUL_MAT to anchor on
+        // (that's the dead, removed combined form), so this triggers off
+        // the GLU node itself; gate/up (earlier indices) run normally.
+        if ((ml8_4_radiance_fuse_mask() & 4) && node->op == GGML_OP_GLU) {
+            if (ggml_cuda_try_ml8_radiance_pattern_b_split(cuda_ctx, cgraph, i) != 0) {
+                return 0;
+            }
+        }
+    }
+
+    // MAD-406 follow-up (chain 313): GDN concat elision, gated internally by MAD_USE_R4D_GDN and
+    // MAD_USE_R4D_GDN_CONV. Must run at GGML_OP_CONCAT's OWN turn -- earlier in cgraph->nodes than
+    // the SSM_CONV hook below, since identity-skip cannot retroactively un-execute an
+    // already-dispatched node. See ggml_cuda_try_gdn_concat_elide's own comment (mt_gdn_r4d.cuh)
+    // for the full design.
+    if (node->op == GGML_OP_CONCAT) {
+        if (ggml_cuda_try_gdn_concat_elide(cgraph, i, *cuda_ctx) != 0) {
+            return 0;
+        }
+    }
+
+    // MAD-406 follow-up: GDN conv-prep fusion, gated internally by
+    // MAD_USE_R4D_GDN_CONV=1. Matched producers are skipped by identity
+    // (g_fused_qrot_skip), not a contiguous index range. Placed before the
+    // existing SSM_CONV+SILU fusion checks so it gets first refusal.
+    if (node->op == GGML_OP_SSM_CONV) {
+        // Nonzero = fired. Matched nodes are already in g_fused_qrot_skip
+        // (identity skip, not a contiguous range -- same as the radiance
+        // patterns above). Return 0 so the main loop skips this SSM_CONV
+        // via that set instead of i += N.
+        if (ggml_cuda_try_gdn_conv_prep_fusion(cgraph, i, *cuda_ctx) != 0) {
+            return 0;
+        }
+    }
+
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -6830,6 +9526,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // RMS_NORM -> SCALE (the delta-net q/k L2-normalize, models.h build_gdn_l2_norm):
+    // one launch instead of two, bit-identical (see ggml_cuda_op_rms_norm_fused_scale).
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
+        cgraph->nodes[i + 1]->src[0] == node &&
+        ggml_cuda_op_rms_norm_fused_scale(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -6898,30 +9602,93 @@ static size_t ggml_cuda_graph_vram_budget_bytes() {
     return budget_bytes;
 }
 
+// vram-budget: floor charge (MiB) applied to graph->exec_bytes when the
+// measured cudaMemGetInfo delta around cudaGraphInstantiate reads exactly 0
+// -- i.e. when the runtime doesn't expose this device's real per-exec cost
+// (see the instantiate site's else-if below and the device-1 note in the
+// GGML_CUDA_GRAPH_VRAM_BUDGET_MB comment above). Default 2 MiB, matching the
+// smallest real charge measured on gfx1201. GGML_CUDA_GRAPH_EXEC_FLOOR_MB=0
+// restores the old (blind) behavior for that case.
+static size_t ggml_cuda_graph_exec_floor_bytes() {
+    static const size_t floor_bytes = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_EXEC_FLOOR_MB");
+        long mb = 2;
+        if (e != nullptr) {
+            mb = atol(e);
+            if (mb < 0) {
+                mb = 2;
+            }
+        }
+        return (size_t) mb * 1024ull * 1024ull;
+    }();
+    return floor_bytes;
+}
+
 // vram-budget: called right after a successful hipGraphInstantiate for
-// `keep_key`'s graph. While this device's exec_bytes_live total exceeds the
-// configured budget and the cache holds more than just the entry we just
-// captured/are about to replay, evict THIS context's single LRU entry
-// through the existing retire_fn path (ggml_backend_cuda_context::
-// ggml_cuda_graph_retire(), common.cuh) -- the same deferred-destroy
-// machinery TTL/cap eviction already use, so there is no second erase path
-// and no extra synchronization beyond what retire already does. Reusing
-// ggml_cuda_graph_cache_evict_lru() with cap == current size makes it evict
-// exactly one entry per call: the loop's `size() >= cap` is true once, before
-// the eviction, and false immediately after size drops by one.
+// `keep_key`'s graph. While this DEVICE's exec_bytes_live total exceeds the
+// configured budget, evict the globally-oldest cache entry among every
+// context registered on this device (never the entry we just captured/are
+// about to replay) through the existing retire_fn path
+// (ggml_backend_cuda_context::ggml_cuda_graph_retire(), common.cuh) -- the
+// same deferred-destroy machinery TTL/cap eviction already use, so there is
+// no second erase path and no extra synchronization beyond what retire
+// already does.
+//
+// 2026-09-20: this used to call ggml_cuda_graph_cache_evict_lru() on
+// cuda_ctx->cuda_graphs alone. That is correct only when a device hosts a
+// single context. With several contexts sharing a device (see the registry
+// comment above ggml_backend_cuda_context::~ggml_backend_cuda_context()),
+// the instantiating context can run out of its OWN entries
+// (cuda_graphs.size() <= 1) while sibling contexts still hold the bulk of
+// exec_bytes_live -- the old loop then broke out having evicted nothing,
+// silently leaving the device over budget for the rest of the run.
 static void ggml_cuda_graph_enforce_vram_budget(ggml_backend_cuda_context * cuda_ctx, const void * keep_key) {
     const size_t budget_bytes = ggml_cuda_graph_vram_budget_bytes();
     if (budget_bytes == 0) {
         return; // 0 = disabled
     }
+    ggml_cuda_graph_register_ctx(cuda_ctx);
+
+    std::vector<ggml_backend_cuda_context *> ctxs;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_wp_ctx_registry_mtx);
+        ctxs = ggml_cuda_wp_ctx_registry[cuda_ctx->device]; // handful of pointers, rare copy
+    }
+
     auto & counts = ggml_cuda_wp_graph_counts[cuda_ctx->device];
-    auto retire_fn = [cuda_ctx](std::unique_ptr<ggml_cuda_graph> g) { cuda_ctx->ggml_cuda_graph_retire(std::move(g)); };
-    while (counts.exec_bytes_live.load(std::memory_order_relaxed) > budget_bytes &&
-           cuda_ctx->cuda_graphs.size() > 1) {
-        const size_t n_evicted = ggml_cuda_graph_cache_evict_lru(cuda_ctx->cuda_graphs, cuda_ctx->cuda_graphs.size(), keep_key, retire_fn);
-        if (n_evicted == 0) {
-            break; // nothing left to evict besides keep_key
+    while (counts.exec_bytes_live.load(std::memory_order_relaxed) > budget_bytes) {
+        ggml_backend_cuda_context * victim_ctx = nullptr;
+        const void *                victim_key = nullptr;
+        int64_t                     oldest     = 0;
+        for (ggml_backend_cuda_context * c : ctxs) {
+            for (auto & kv : c->cuda_graphs) {
+                if (c == cuda_ctx && kv.first == keep_key) {
+                    continue; // never evict the entry we just instantiated
+                }
+                if (victim_ctx == nullptr || kv.second->last_used_time < oldest) {
+                    victim_ctx = c;
+                    victim_key = kv.first;
+                    oldest     = kv.second->last_used_time;
+                }
+            }
         }
+        if (victim_ctx == nullptr) {
+            break; // nothing evictable left anywhere on this device
+        }
+        auto it = victim_ctx->cuda_graphs.find(victim_key);
+        if (it == victim_ctx->cuda_graphs.end()) {
+            break; // defensive; should not happen (single decode thread)
+        }
+        static std::atomic<int> wp_budget_evict_log_budget{100};
+        if (ggml_cuda_wp_hip_graphs_log_enabled() && wp_budget_evict_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            fprintf(stderr, GGML_CUDA_NAME " vram-budget: budget_evict device %d cross_ctx=%d exec_mb_live=%.1f budget_mb=%.1f\n",
+                    cuda_ctx->device, victim_ctx != cuda_ctx,
+                    counts.exec_bytes_live.load(std::memory_order_relaxed) / 1048576.0,
+                    budget_bytes / 1048576.0);
+        }
+        std::unique_ptr<ggml_cuda_graph> victim = std::move(it->second);
+        victim_ctx->cuda_graphs.erase(it);
+        victim_ctx->ggml_cuda_graph_retire(std::move(victim));
         counts.budget_evicted.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -6963,6 +9730,83 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
             g_fused_qrot_skip.clear();
+            // Chain-227: deferred ml8-4 radiance plans (pattern A/C/B_SPLIT)
+            // are registered at a chain's head and consumed at its qrot's
+            // own turn WITHIN one graph compute -- nothing should ever
+            // survive across compute calls, but clear defensively anyway
+            // (a decline between head and qrot detection, or a qrot that
+            // never gets visited for some reason, must not leak a stale
+            // plan into the next graph).
+            //
+            // Chain 269 fix 3: a plan surviving to here means SOMETHING
+            // upstream (fix 1's pre-skip exec_copy call and fix 2's
+            // sibling backstop should now make this unreachable in
+            // practice, but this is the last line of defense) never
+            // consumed it and never released its scratch-slot reference --
+            // silently clearing the map without releasing the slot would
+            // leave it permanently marked in_use, which is exactly how the
+            // 4-slot ring was seen to exhaust itself by ~layer 9 (chain 269
+            // journal). Release every leaked plan's slot reference and log
+            // once, by name, so a recurrence is loud instead of a slow
+            // "no free scratch slot" decline several layers later.
+            if (!g_ml8_radiance_plans.empty()) {
+                std::string names;
+                for (const auto & [dst, plan] : g_ml8_radiance_plans) {
+                    if (!names.empty()) names += ", ";
+                    names += ml8_radiance_tname(dst);
+                    ml8_radiance_release_scratch_slot(plan.slot);
+                }
+                ml8_4_radiance_fuse_log_once("bug-plans-leaked",
+                    "ml8-4 radiance BUG (chain 269): " + std::to_string(g_ml8_radiance_plans.size()) +
+                    " plan(s) leaked across graph computes -- released their scratch-slot refs and cleared: " + names);
+                g_ml8_radiance_plans.clear();
+            }
+            g_ml8_radiance_verify_plans.clear(); // MT_ML8_4_RADIANCE_VERIFY=1 -- same lifetime reasoning
+            // Chain 271 belt-and-braces: g_ml8_radiance_plans is now fully
+            // empty (either it always was, or it was just swept above), so
+            // NOTHING references any slot anymore. Any slot still marked
+            // in_use at this point is orphaned no matter how it got that
+            // way -- a refcount that over-counted at claim time (chain 271:
+            // "y_out present => refcount 2" even when qrot was direct and
+            // only one plan ever existed to decrement it, so the slot never
+            // reached refcount 0 despite every plan firing correctly) is
+            // exactly this shape: no leaked plan to sweep above, just a
+            // slot stuck in_use forever. Force it back onto the free list
+            // and log once with its state so a recurrence is unambiguous.
+            for (int si = 0; si < (int) g_ml8_radiance_scratch_slots.size(); ++si) {
+                ml8_radiance_scratch_slot & s = g_ml8_radiance_scratch_slots[si];
+                if (s.in_use) {
+                    ml8_4_radiance_fuse_log_once("bug-slot-orphaned-" + std::to_string(si),
+                        "ml8-4 radiance BUG (chain 271): scratch slot " + std::to_string(si) +
+                        " was still in_use with no pending plan referencing it (refcount=" +
+                        std::to_string(s.refcount) + " capacity=" + std::to_string(s.capacity) +
+                        ") at the start of a graph compute -- a refcount/plan-count mismatch at claim time, "
+                        "not a genuinely leaked plan. Forcing it back onto the free list.");
+                    s.in_use   = false;
+                    s.refcount = 0;
+                }
+            }
+
+            // ml8-4 radiance pattern C raw-out follow-up (MAD_USE_R4D_GDN_RAW_OUT=1): a whole-
+            // cgraph PLAN prepass, run once per graph compute BEFORE any node's own turn. Needed
+            // because the r4d GDN adapter's own turn (mt_gdn_r4d.cu's ggml_cuda_gdn_r4d_prefix,
+            // called from GGML_OP_GATED_DELTA_NET's dispatch) sits EARLIER in cgraph order than
+            // the RMS_NORM node pattern C detects on -- the adapter has to know, before it runs,
+            // whether pattern C will end up consuming its output raw, in order to (maybe) skip
+            // its fp32 un-permute write. ggml_cuda_try_ml8_radiance_pattern_c's own detection
+            // reads only tensor ne/nb/type/op_params (never data), so running the whole walk here
+            // -- before the graph has executed at all -- is safe. Reset first: tensor pointers
+            // are only stable within one cgraph build, so marks/records from a PREVIOUS compute
+            // must never survive into this one (cheap no-op when the feature is off).
+            ggml_cuda_gdn_r4d_reset_raw_out_state();
+            if (r4d_gdn_raw_out_enabled() && ml8_4_radiance_fuse_enabled() && ml8_4_prefill_radiance_active() &&
+                (ml8_4_radiance_fuse_mask() & 8)) {
+                for (int plan_i = 0; plan_i < cgraph->n_nodes; ++plan_i) {
+                    if (cgraph->nodes[plan_i]->op == GGML_OP_RMS_NORM) {
+                        (void) ggml_cuda_try_ml8_radiance_pattern_c(cuda_ctx, cgraph, plan_i, /*plan_only=*/true);
+                    }
+                }
+            }
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -7028,6 +9872,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                // Chain 269 fix 1: service any pending deferred copy plan
+                // for `node` BEFORE the skip check below, not only from
+                // inside ggml_cuda_try_fuse (which this same skip check
+                // would prevent from ever being called for a node that is
+                // -- for whatever reason -- already in g_fused_qrot_skip by
+                // the time its own turn comes around). A plan left unfired
+                // never releases its half of its scratch slot's refcount,
+                // and the 4-slot ring silently fills up over the run (chain
+                // 269 journal: "no free scratch slot" by ~layer 9). Cheap
+                // (usually-empty map lookup) and idempotent -- ggml_cuda_
+                // try_fuse's own call further down simply finds nothing.
+                if (ml8_4_radiance_fuse_enabled() && ml8_4_prefill_radiance_active()) {
+                    (void) ggml_cuda_try_ml8_radiance_exec_copy(cuda_ctx, node);
+                }
                 if (g_fused_qrot_skip.count(node)) {
                     prev_i = i;
                     continue;
@@ -7088,6 +9946,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     i += nodes_to_skip;
                     continue;
                 }
+                if (g_fused_qrot_skip.count(node)) {
+                    // ggml_cuda_try_fuse returned 0 (no CONTIGUOUS range to
+                    // skip) but may have already fully computed `node` itself
+                    // via one of the ml8-4 radiance patterns (A/B/B-split/C),
+                    // which register every matched tensor -- anchor included
+                    // -- in this set instead of relying on a contiguous
+                    // index range (production graphs interleave unrelated
+                    // real nodes at arbitrary indices between an anchor and
+                    // its qrot). Same skip idiom as the top-of-loop check
+                    // above, just re-checked here since `node` may have only
+                    // just been inserted during THIS iteration's own
+                    // ggml_cuda_try_fuse call.
+                    prev_i = i;
+                    continue;
+                }
 #ifndef NDEBUG
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
@@ -7113,6 +9986,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     return e ? (int64_t) atoll(e) : (int64_t) 0;
                 }();
                 const int64_t wp_hs_t0 = wp_host_stall_us > 0 ? ggml_time_us() : 0;
+                // Chain 267/268 diagnostic: `node` is about to run its own
+                // normal dispatch -- verify it isn't secretly one of ours
+                // (a lazily-skipped multi-use mul/mul_gate with a still-
+                // pending deferred copy plan, or one still awaiting its
+                // verify-mode plan). Both g_fused_qrot_skip checks above
+                // this point (top-of-loop and post-try_fuse) already say
+                // "no" for this node, so reaching here with an outstanding
+                // plan would mean exec_copy/exec_verify never actually
+                // fired for it this turn -- exactly the failure mode the
+                // coordinator's chain 267/268 rocprof evidence describes
+                // (RMS_NORM/MUL/ADD dispatched normally IN ADDITION to the
+                // fused kernel). Log once per tensor name so a recurrence
+                // is unambiguous instead of being buried in a launch count.
+                if (ml8_4_radiance_fuse_enabled() && ml8_4_prefill_radiance_active() &&
+                    (g_ml8_radiance_plans.count(node) || g_ml8_radiance_verify_plans.count(node))) {
+                    ml8_4_radiance_fuse_log_once(
+                        std::string("bug-stale-plan-") + ml8_radiance_tname(node),
+                        "ml8-4 radiance BUG: '" + std::string(ml8_radiance_tname(node)) + "' (" +
+                        std::string(ggml_op_name(node->op)) + ") reached normal dispatch with a still-pending "
+                        "deferred plan -- exec_copy/exec_verify did not consume it this turn; this node is about "
+                        "to be computed a second time (double-dispatch)");
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -7282,6 +10177,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 wp_used / 1048576.0, cuda_ctx->device);
                     }
                     wp_charge = 0;
+                } else if (wp_charge == 0) {
+                    // vram-budget: on some devices (observed: gfx1201 9070 XT,
+                    // "device 1" here) cudaMemGetInfo's free-memory delta around
+                    // cudaGraphInstantiate reads exactly 0 for every exec, even
+                    // though the identical architecture on device 0 shows a
+                    // consistent ~2 MiB/exec. Charging 0 there makes
+                    // exec_bytes_live -- and therefore the whole budget -- blind
+                    // on that device: graphs pile up with nothing ever crossing
+                    // GGML_CUDA_GRAPH_VRAM_BUDGET_MB to trigger eviction. Apply a
+                    // floor charge instead of trusting the measured delta alone,
+                    // so the budget always has *some* signal even when the
+                    // runtime doesn't expose the real cost.
+                    wp_charge = ggml_cuda_graph_exec_floor_bytes();
                 }
                 graph->exec_bytes = wp_charge;
                 if (wp_charge != 0) {
@@ -8500,6 +11408,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_BF16) return false;
                 if (op->type  != GGML_TYPE_I8)  return false;
                 if (!ggml_is_contiguous(x))     return false;
+                if (op->src[2] != nullptr) {
+                    // gated variant (ggml_fp8_quant_rot_gated): f32 x, per-row, rotated only
+                    const ggml_tensor * gate = op->src[2];
+                    if (x->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32) return false;
+                    if (gate->nb[0] != sizeof(float)) return false;
+                    if (((const int32_t *) op->op_params)[3] != 0) return false;
+                    if (((const int32_t *) op->op_params)[2] == GGML_FP8_QUANT_ROT_KIND_NONE) return false;
+                }
                 if (x->nb[1] != (size_t) x->ne[0] * ggml_type_size(x->type)) return false;
                 {
                     // MAD-305 Phase 5 (round 3): op_params[3] == 0 is now a

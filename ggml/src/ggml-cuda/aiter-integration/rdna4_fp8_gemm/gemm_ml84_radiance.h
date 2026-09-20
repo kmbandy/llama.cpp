@@ -62,35 +62,31 @@ extern "C" {
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────
-// Load-time prep: builds the per-(group,column) conversion table T and the
-// per-column colscale from the ml8-4 weight's own LUT + b_scale_g -- NOT a
-// per-token/per-inference-step cost. Call once after
-// rdna4_pack_ml84_trfeed (gemm_ml84_prod.hip) produces B_nib/b_scale_g for
-// this weight, before any rdna4_gemm_ml84_radiance call against it.
-//
-// B_nib is accepted (not read) only for interface symmetry with the other
-// ml8-4 entry points in this directory (gemm_capi.h) and to leave room for
-// a future variant that validates T against the packed weight; the current
-// implementation only reads lut and b_scale_g.
+// Load-time prep: builds the per-column colscale from the ml8-4 weight's
+// own LUT + b_scale_g -- NOT a per-token/per-inference-step cost. The
+// per-(group,column) 16-entry conversion table is NOT built here; it is
+// built per K-slab in LDS from lut + b_scale_g inside the kernel. Call
+// once after rdna4_pack_ml84_trfeed (gemm_ml84_prod.hip) produces
+// B_nib/b_scale_g for this weight, before any rdna4_gemm_ml84_radiance
+// call against it.
 //
 // Sizes:
 //   lut:            F8_E4M3 [K/64][16]        (K/64 * 16 bytes)
 //   b_scale_g:      fp32    [K/64][N]          (K/64 * N floats)
-//   T_out:          uint8   [K/64][N][16]      (K/64 * N * 16 bytes)  -- caller-allocated
-//   colscale_out:   fp32    [N]                (N floats)            -- caller-allocated
+//   colscale_out /* float[2N]: [0,N) colscale, [N,2N) 1/colscale */:   fp32    [N]                (N floats)            -- caller-allocated
 //
 // Returns false (nothing launched) if N<=0, K<=0, K % 64 != 0 (QK_ML8) or
 // N % 16 != 0. Errors after a `true` return are async HIP errors, same
 // convention as every other launcher in this directory (pick up with the
 // caller's own hipGetLastError()).
-bool rdna4_gemm_ml84_radiance_prep(const uint8_t* B_nib, const uint8_t* lut, const float* b_scale_g,
-                                    int N, int K, uint8_t* T_out, float* colscale_out, hipStream_t stream);
+bool rdna4_gemm_ml84_radiance_prep(const uint8_t* lut, const float* b_scale_g,
+                                    int N, int K, float* colscale_out, hipStream_t stream);
 
 // Host (CPU) fallback for rdna4_gemm_ml84_radiance_prep -- bit-identical
 // formula, used by the bench oracle so the oracle does not depend on the
 // device kernel it is meant to check. Synchronous; no stream.
 void rdna4_ml84_radiance_prep_host(const uint8_t* lut, const float* b_scale_g,
-                                    int N, int K, uint8_t* T_out, float* colscale_out);
+                                    int N, int K, float* colscale_out);
 
 // ─────────────────────────────────────────────────────────────────────────
 // Retile a row-major fp8 e4m3 activation A[M,K] (per-row a_scale, applied
@@ -118,8 +114,9 @@ void rdna4_ml84_radiance_retile_a_host(int M, int K, const uint8_t* A_rowmajor_f
 
 // ─────────────────────────────────────────────────────────────────────────
 // The ported GEMM. C[M,N] fp32 = A_fp8[M,K] (fragment-tiled, per-row
-// a_scale) . dequant(ml8-4 B)[N,K]^T, dequant via the T/colscale tables
-// rdna4_gemm_ml84_radiance_prep built.
+// a_scale) . dequant(ml8-4 B)[N,K]^T, dequant via the per-column colscale
+// (rdna4_gemm_ml84_radiance_prep) and the 16-entry conversion table built
+// per K-slab in LDS from lut + b_scale_g.
 //
 //   A_fp8:     fragment-tiled fp8 e4m3 operand, EXACTLY the layout
 //              rdna4_gemm_ml84_radiance_retile_a produces (radiance's own
@@ -130,8 +127,10 @@ void rdna4_ml84_radiance_retile_a_host(int M, int K, const uint8_t* A_rowmajor_f
 //              ml84_trfeed_layout.h's b_tile_offset(kt,nt,N/16)/2 tile
 //              addressing -- the SAME buffer every other ml8-4 entry point
 //              in this directory uses).
-//   T:         the per-(group,column) conversion table from
-//              rdna4_gemm_ml84_radiance_prep, uint8 [K/64][N][16].
+//   lut:       F8_E4M3 [K/64][16] centroid codebook, shared across all N
+//              columns; with b_scale_g it is used to build the 16-entry
+//              per-(group,column) conversion table in LDS per K-slab.
+//   b_scale_g: fp32 [K/64][N] per-(group,column) block scale.
 //   colscale:  the per-column scale from rdna4_gemm_ml84_radiance_prep,
 //              fp32[N].
 //   C_f32:     fp32 [M,N] row-major output (dst-shaped, like every other
@@ -149,8 +148,8 @@ void rdna4_ml84_radiance_retile_a_host(int M, int K, const uint8_t* A_rowmajor_f
 // launcher in this directory (errors after a `true` return are async HIP
 // errors the caller picks up with its own hipGetLastError()).
 bool rdna4_gemm_ml84_radiance(int M, const void* A_fp8, const float* a_scale, const uint8_t* B_nib,
-                               const uint8_t* T, const float* colscale, float* C_f32, int N, int K,
-                               hipStream_t stream);
+                               const uint8_t* lut, const float* b_scale_g, const float* colscale, float* C_f32,
+                               int N, int K, hipStream_t stream);
 
 #ifdef __cplusplus
 }

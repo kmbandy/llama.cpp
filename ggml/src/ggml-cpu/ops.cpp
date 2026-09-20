@@ -12690,6 +12690,8 @@ void ggml_compute_forward_ml8_mul_mat_id(const ggml_compute_params * params, ggm
 // a_scale (a_scale[m] at byte M_total*K + 4*m) -- the frozen gfx1201 GEMM
 // kernel's fixed contract (A fp8 [M,K] row stride exactly K, a_scale fp32 [M]).
 void ggml_compute_forward_fp8_quant_rot(const ggml_compute_params * params, ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[2] == NULL && "gated FP8_QUANT_ROT (ggml_fp8_quant_rot_gated) is CUDA-only");
+
     const ggml_tensor * x   = dst->src[0];
     const ggml_tensor * h_a = dst->src[1];
 

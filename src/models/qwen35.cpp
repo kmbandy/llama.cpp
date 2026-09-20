@@ -632,6 +632,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
+    // Pin z's GEMM into the graph HERE. ggml's DFS emits mul_gate's src[0]
+    // subgraph (conv -> GDN -> RMS_NORM -> MUL) before its src[1] subgraph
+    // (z GEMM -> SILU), so without this z is materialized AFTER the gated
+    // norm's RMS_NORM -- the ml8-radiance pattern-C fusion (ggml-cuda.cu),
+    // which runs at that RMS_NORM, read an unwritten z (chain 254: all zeros).
+    ggml_build_forward_expand(gf, z);
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
@@ -668,6 +674,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
+
+    // MAD-406 (R4D GDN conv_prep, task 4). Expose the layer's raw-A_log sidecar
+    // (llama_model_build_ssm_a_log_sidecars, llama-model.cpp; task 1) as an EXTRA src on this
+    // SSM_CONV node so ggml-cuda's graph-level conv_prep fusion detector
+    // (ggml_cuda_try_gdn_conv_prep_fusion, mt_gdn_r4d.cu) can find it without any dispatcher or
+    // graph-shape change: every existing SSM_CONV consumer (CPU, plain CUDA/HIP compute paths,
+    // ggml-cuda.cu's own SSM_CONV+SiLU fusion) reads only src[0]/src[1] and ignores src[2..], and
+    // ssm_a_log is already a fully-resident, pre-allocated leaf (not something this graph needs to
+    // compute or schedule) -- so this costs nothing beyond one more visited-leaf hash entry on the
+    // R4D build. Left null (as it already is) for any layer/arch the sidecar wasn't derived for;
+    // the detector treats a null src[2] as "not available" and declines.
+    conv_output_proper->src[2] = model.layers[il].ssm_a_log;
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);

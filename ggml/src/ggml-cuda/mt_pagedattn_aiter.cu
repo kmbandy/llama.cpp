@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <ctime>
 #include <atomic>
 #include <mutex>
 #include <set>
@@ -514,6 +515,46 @@ __global__ void mt_scatter_kv_turbo4_fp8_aiter_kernel(
     }
 }
 
+// Non-static export of parse_layer_from_kv_cache_name (declared in
+// mt_pagedattn_aiter.cuh) for the R4D adapter's turbo4kv path
+// (mt_pagedattn_r4d.cu), which needs to bind the same per-layer centroid
+// LUTs this file uses without duplicating the tensor-name parse.
+int mt_aiter_parse_layer_from_kv_cache_name(const char * name) {
+    return parse_layer_from_kv_cache_name(name);
+}
+
+// Non-static export of the turbo4_fp8 scatter launch (declared in
+// mt_pagedattn_aiter.cuh) for the R4D adapter's turbo4kv path. Reproduces the
+// AITER call site's launch exactly (mt_pagedattn_aiter.cu, MT_AITER_CACHE_
+// TURBO4_FP8 scatter branch above): LUT pointers via get_lut_device_ptr,
+// Hadamard flag via hadamard_required() picking the kernel template, grid
+// (n_tokens, n_kv_heads, 2_for_K_and_V), 256 threads.
+void mt_aiter_scatter_kv_turbo4_fp8_launch(
+        void * k_cache, void * v_cache,
+        const __half * k_cur, const __half * v_cur,
+        const int32_t * slot_mapping,
+        int n_tokens, int n_kv_heads, int head_size, int block_size,
+        int layer, cudaStream_t stream) {
+    GGML_ASSERT(head_size == 256 && block_size == 16 &&
+                "mt_aiter_scatter_kv_turbo4_fp8_launch: only (head_size=256, block_size=16) wired");
+
+    const uint8_t * d_centroids_k = mt_turbo_fp8::get_lut_device_ptr(layer, mt_turbo_fp8::KV_K);
+    const uint8_t * d_centroids_v = mt_turbo_fp8::get_lut_device_ptr(layer, mt_turbo_fp8::KV_V);
+    GGML_ASSERT(d_centroids_k && d_centroids_v &&
+                "mt_aiter_scatter_kv_turbo4_fp8_launch: centroid LUT lookup returned null");
+
+    const bool apply_h = mt_turbo_fp8::hadamard_required();
+    dim3 grid(n_tokens, n_kv_heads, 2);
+    dim3 block(256);
+    if (apply_h) {
+        mt_scatter_kv_turbo4_fp8_aiter_kernel<256, 16, true><<<grid, block, 0, stream>>>(
+            k_cache, v_cache, k_cur, v_cur, slot_mapping, d_centroids_k, d_centroids_v, n_kv_heads);
+    } else {
+        mt_scatter_kv_turbo4_fp8_aiter_kernel<256, 16, false><<<grid, block, 0, stream>>>(
+            k_cache, v_cache, k_cur, v_cur, slot_mapping, d_centroids_k, d_centroids_v, n_kv_heads);
+    }
+}
+
 // Build the AITER `query_start_len` cu-seqlens tensor [num_seqs+1] on device
 // from q_lens [num_seqs]. Tiny — one thread block.
 __global__ void mt_build_cu_seqlens_kernel(
@@ -935,19 +976,92 @@ enum mt_aiter_persist_slot {
 static std::mutex g_mt_aiter_persist_mutex;
 static std::map<std::pair<int, cudaStream_t>, std::array<mt_aiter_persist_buf, MT_AITER_PERSIST_COUNT>> g_mt_aiter_persist;
 
+static const char * mt_aiter_persist_slot_name(mt_aiter_persist_slot slot) {
+    switch (slot) {
+        case MT_AITER_PERSIST_SEGM_OUT:       return "MT_AITER_PERSIST_SEGM_OUT";
+        case MT_AITER_PERSIST_SEGM_MAX:       return "MT_AITER_PERSIST_SEGM_MAX";
+        case MT_AITER_PERSIST_SEGM_EXP:       return "MT_AITER_PERSIST_SEGM_EXP";
+        case MT_AITER_PERSIST_CU_SEQLENS:     return "MT_AITER_PERSIST_CU_SEQLENS";
+        case MT_AITER_PERSIST_PREDQ_COUNTS:   return "MT_AITER_PERSIST_PREDQ_COUNTS";
+        case MT_AITER_PERSIST_PREDQ_PREFIX:   return "MT_AITER_PERSIST_PREDQ_PREFIX";
+        case MT_AITER_PERSIST_PREDQ_TOTAL:    return "MT_AITER_PERSIST_PREDQ_TOTAL";
+        case MT_AITER_PERSIST_PREDQ_TABLE:    return "MT_AITER_PERSIST_PREDQ_TABLE";
+        case MT_AITER_PERSIST_Q_ROT:          return "MT_AITER_PERSIST_Q_ROT";
+        case MT_AITER_PERSIST_COUNT:          return "MT_AITER_PERSIST_COUNT";
+    }
+    return "MT_AITER_PERSIST_?";
+}
+
+// MAD-2026-09-20 diag: WP_ALLOC_LOG=1 attribution for this grow-only, never-
+// freed cache (see the design note above). Mirrors ggml-cuda.cu's
+// wp_alloc_log() format exactly ("wp alloc-log HH:MM:SS.mmm <what>
+// device=N size=..MiB extra=..MiB") so the same journal grep finds both;
+// that helper has internal linkage there and isn't reachable from this
+// translation unit, so this is a small local twin, diagnostic-only (no
+// behavior change -- the old buffer is still deliberately leaked, per the
+// comment above mt_aiter_persist_buf).
+static void mt_aiter_persist_alloc_log(int device, size_t old_bytes, size_t new_bytes) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_ALLOC_LOG");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv; localtime_r(&ts.tv_sec, &tmv);
+    std::fprintf(stderr, "wp alloc-log %02d:%02d:%02d.%03ld mt_aiter_persist_grow device=%d size=%.1fMiB extra=%.1fMiB\n",
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts.tv_nsec / 1000000, device,
+                 new_bytes / 1048576.0, old_bytes / 1048576.0);
+}
+
+// Per-slot cap (MT_AITER_PERSIST_MAX_MB, default 1024): a hard ceiling on a
+// single slot's per-(device,stream) buffer. Returns nullptr when need
+// exceeds it (logged once per slot) instead of growing without bound -- the
+// 2026-07-16 serving OOM: SEGM_OUT alone reached ~864 MB/slot on the R9700
+// at num_q_tokens=2048, and the doubling growth below (now exact-fit)
+// leaked ~1x that again per grow step. Callers must treat nullptr as a
+// clean, explicit abort with the slot name, never dereference it.
+static size_t mt_aiter_persist_max_bytes() {
+    static const size_t max_bytes = [] {
+        const char * e = std::getenv("MT_AITER_PERSIST_MAX_MB");
+        long mb = (e && e[0]) ? std::atol(e) : 1024;
+        if (mb <= 0) {
+            mb = 1024;
+        }
+        return (size_t) mb * 1024u * 1024u;
+    }();
+    return max_bytes;
+}
+
 template <typename T>
 static T * mt_aiter_persist_get(int device, cudaStream_t stream, mt_aiter_persist_slot slot, size_t n_elems) {
     const size_t need = n_elems * sizeof(T);
+    const size_t max_bytes = mt_aiter_persist_max_bytes();
+    if (need > max_bytes) {
+        static std::array<bool, MT_AITER_PERSIST_COUNT> cap_logged = {};
+        if (!cap_logged[slot]) {
+            cap_logged[slot] = true;
+            std::fprintf(stderr, "mt_aiter_persist_get: slot %d needs %zu B > MT_AITER_PERSIST_MAX_MB cap on device %d\n",
+                         (int) slot, need, device);
+        }
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lock(g_mt_aiter_persist_mutex);
     mt_aiter_persist_buf & b = g_mt_aiter_persist[std::make_pair(device, stream)][slot];
     if (need > b.bytes) {
-        // Round up so a slowly growing shape (num_seqs, live blocks) does not
-        // reallocate every call; the old allocation is kept alive on purpose.
-        size_t bytes = std::max(need, b.bytes * 2);
-        bytes = (bytes + (1u << 20) - 1) & ~(size_t) ((1u << 20) - 1);
+        // Exact-fit growth with a +12.5% pad (rounded up to 256) -- mirrors
+        // ensure_predequant_scratch's predequant-cap (mt_aiter_unified_attn.cpp,
+        // MAD-2026-09-20). The old doubling growth (max(need, b.bytes*2))
+        // permanently overshot: every later still-growing-but-smaller call
+        // re-doubled off an already-inflated floor instead of off what THIS
+        // call actually needs, and each step leaked the old buffer on top.
+        size_t bytes = need + need / 8;
+        bytes = (bytes + 255) & ~(size_t) 255;
         void * ptr = nullptr;
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        mt_aiter_persist_alloc_log(device, b.bytes, bytes);
         b.ptr   = ptr;
         b.bytes = bytes;
     }
@@ -1328,7 +1442,14 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     }
 
     // MAD-288: persistent scratch (see mt_aiter_persist_get above); nullptr
-    // where the 2D path does not use the segment buffers, as before.
+    // where the 2D path does not use the segment buffers, as before. The
+    // SEGM_* split-KV partials are ONLY requested here, inside the 3D
+    // (!use_2d) branch: the 2D prefill paths (use_2d / use_2d_large) never
+    // touch those slots, so a large prefill ubatch cannot inflate them --
+    // the 2026-07-16 serving OOM grew them via 3D decode-shaped calls and
+    // the old doubling growth; mt_aiter_persist_get now grows exact-fit and
+    // caps per slot (MT_AITER_PERSIST_MAX_MB). A nullptr return (slot cap
+    // hit) aborts cleanly with the slot name instead of dereferencing.
     const int dev = ctx.device;
     float * segm_out_ptr = nullptr;
     float * segm_max_ptr = nullptr;
@@ -1337,8 +1458,21 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
         segm_out_ptr = mt_aiter_persist_get<float>(dev, stream, MT_AITER_PERSIST_SEGM_OUT, mt_aiter_uattn_segm_output_bytes(&shape, num_q_tokens) / sizeof(float));
         segm_max_ptr = mt_aiter_persist_get<float>(dev, stream, MT_AITER_PERSIST_SEGM_MAX, mt_aiter_uattn_segm_max_bytes(&shape, num_q_tokens)    / sizeof(float));
         segm_exp_ptr = mt_aiter_persist_get<float>(dev, stream, MT_AITER_PERSIST_SEGM_EXP, mt_aiter_uattn_segm_expsum_bytes(&shape, num_q_tokens) / sizeof(float));
+        if (!segm_out_ptr || !segm_max_ptr || !segm_exp_ptr) {
+            GGML_ABORT("AITER paged-attn: 3D split-KV persist scratch unavailable on device %d "
+                       "(MT_AITER_PERSIST_MAX_MB cap; null slot: %s%s%s) -- refusing to launch",
+                       dev,
+                       segm_out_ptr ? "" : "MT_AITER_PERSIST_SEGM_OUT ",
+                       segm_max_ptr ? "" : "MT_AITER_PERSIST_SEGM_MAX ",
+                       segm_exp_ptr ? "" : "MT_AITER_PERSIST_SEGM_EXP");
+        }
     }
     int32_t * cu_seqlens_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_CU_SEQLENS, (size_t)(num_seqs + 1));
+    if (!cu_seqlens_ptr) {
+        GGML_ABORT("AITER paged-attn: persist scratch %s unavailable "
+                   "(MT_AITER_PERSIST_MAX_MB cap) on device %d",
+                   mt_aiter_persist_slot_name(MT_AITER_PERSIST_CU_SEQLENS), dev);
+    }
 
     mt_build_cu_seqlens_kernel<<<1, 1, 0, stream>>>(
         cu_seqlens_ptr, (const int32_t*) q_lens->data, num_seqs);
@@ -1402,22 +1536,43 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
         // length across all seqs, computed host-side at set_input() from
         // the paged cache's own host mirrors (src/llama-graph.cpp:550-574,
         // MAD-378) -- strictly earlier than this op ever launches. Bound:
-        //   num_scratch_blocks = num_seqs * ceil(max_ctx_len / block_size)
-        // For the production shape (num_seqs==1 prefill) this equals the
-        // exact live-block total the old scan kernel computed -- no VRAM
+        //   num_scratch_blocks = num_seqs_dispatch * ceil(max_ctx_len / block_size)
+        // (originally num_seqs here -- see MAD-2026-09-20 predequant-cap
+        // note just below for why that over-counted). For the production
+        // shape (num_seqs_dispatch==1 prefill) this equals the exact
+        // live-block total the old scan kernel computed -- no VRAM
         // regression in the case that matters. 0 (unset -- a cold graph run
         // before its first set_input, e.g. warmup) falls back to the old
-        // pre-0912 conservative bound (num_seqs * max_bps, i.e. the paged
-        // cache's full allocated capacity for these seqs).
+        // pre-0912 conservative bound (num_seqs_dispatch * max_bps, i.e. the
+        // paged cache's full allocated capacity for these live seqs).
+        // MAD-2026-09-20 predequant-cap: bound by the REAL live-sequence
+        // count (num_seqs_dispatch — the same op_params[6]-derived value the
+        // 2D/3D dispatch heuristic above already uses, analogous to the R4D
+        // adapter's `num_active`), NOT the cache's static num_seqs (n_seq_max).
+        // A cache provisioned for parallel=N but currently serving fewer live
+        // slots (e.g. one active prefill under n_seq_max=3) used to size this
+        // scratch buffer at N x the true requirement — observed 3x inflation
+        // at parallel=3 with a single live slot (predequant-cap-0920.txt).
+        // num_seqs_dispatch <= num_seqs always (clamped at its declaration
+        // above), so this can only ever shrink the bound relative to the old
+        // formula, never grow it.
         const int32_t ctx_len_bound =
             max_ctx_len_param > 0 ? max_ctx_len_param : (int32_t) max_bps * block_size;
         const int32_t blocks_per_seq_bound = (ctx_len_bound + block_size - 1) / block_size;
-        num_scratch_blocks = num_seqs * blocks_per_seq_bound;
+        num_scratch_blocks = num_seqs_dispatch * blocks_per_seq_bound;
 
         if (num_scratch_blocks > 0) {
             predq_counts_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_COUNTS, (size_t) num_seqs);
             predq_prefix_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_PREFIX, (size_t) num_seqs);
             predq_total_ptr  = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_TOTAL, 1);
+            if (!predq_counts_ptr || !predq_prefix_ptr || !predq_total_ptr) {
+                GGML_ABORT("AITER paged-attn: fp8-predequant persist scratch unavailable on device %d "
+                           "(MT_AITER_PERSIST_MAX_MB cap; null slot: %s%s%s) -- refusing to launch",
+                           dev,
+                           predq_counts_ptr ? "" : "MT_AITER_PERSIST_PREDQ_COUNTS ",
+                           predq_prefix_ptr ? "" : "MT_AITER_PERSIST_PREDQ_PREFIX ",
+                           predq_total_ptr  ? "" : "MT_AITER_PERSIST_PREDQ_TOTAL");
+            }
             // Kernel A still runs, fully device-side: it produces the exact
             // per-seq counts/prefix the fill kernel below needs to keep the
             // compacted table DENSE (packed by actual live blocks, not the
@@ -1430,6 +1585,11 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
                 predq_counts_ptr, predq_prefix_ptr, predq_total_ptr);
 
             predq_scratch_table_ptr = mt_aiter_persist_get<int32_t>(dev, stream, MT_AITER_PERSIST_PREDQ_TABLE, (size_t) num_seqs * (size_t) max_bps);
+            if (!predq_scratch_table_ptr) {
+                GGML_ABORT("AITER paged-attn: persist scratch %s unavailable on device %d "
+                           "(MT_AITER_PERSIST_MAX_MB cap) -- refusing to launch",
+                           mt_aiter_persist_slot_name(MT_AITER_PERSIST_PREDQ_TABLE), dev);
+            }
             const dim3 fill_grid((unsigned) num_seqs, (unsigned) ((max_bps + 255) / 256));
             // MAD-2026-09-12 predequant-overflow-guard: `counts`/`prefix`
             // above are exact (real context_lens), but num_scratch_blocks is
@@ -1449,6 +1609,63 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
                 num_scratch_blocks, predequant_overflow_flag,
                 predq_scratch_table_ptr);
             mt_aiter_predequant_overflow_guard_end(stream);
+        }
+    }
+
+    // MAD-2026-09-20 predequant-pool: per-call f16 K/V dequant scratch from
+    // the ggml CUDA pool, replacing the old persistent, never-freed per-
+    // (device, stream) grow-only cache that used to live inside
+    // mt_aiter_unified_attn.cpp's ensure_predequant_scratch() (deleted) —
+    // measured root cause of unbounded per-round VRAM growth under
+    // long-running TP serving (WP_ALLOC_LOG=1: predequant_scratch_grow
+    // leaking every grow step, two (device, stream) keys, ~2 GB over 7
+    // rounds). This scratch is live ONLY for the duration of THIS call: the
+    // predequant fill kernel writes it and the immediately-following
+    // h_2d_large_f16 launch on the SAME stream reads it inside
+    // mt_aiter_unified_attn() below; nothing references it afterwards. That
+    // makes it exactly the kind of per-call temporary ctx.pool() is for
+    // (unlike the persistent MT_AITER_PERSIST_* slots above, which exist
+    // because THOSE buffers must keep a stable address across HIP graph
+    // replays — see the MAD-288 comment on mt_aiter_persist_get). Declared
+    // here (not deeper in this function) so the ggml_cuda_pool_alloc
+    // destructors release the memory back to the pool right after this
+    // function's mt_aiter_unified_attn() call returns, on every path
+    // (including the size-cap-skip and non-predequant paths below, where
+    // they simply stay unallocated).
+    ggml_cuda_pool_alloc<uint8_t> predq_scratch_k(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> predq_scratch_v(ctx.pool());
+    if (want_predequant_scratch && num_scratch_blocks > 0) {
+        const size_t predq_bytes_per_cache =
+            mt_aiter_predequant_scratch_bytes_per_cache(&shape, num_scratch_blocks);
+        const size_t predq_cap = mt_aiter_predequant_max_bytes_per_cache();
+        if (predq_cap > 0 && predq_bytes_per_cache > predq_cap) {
+            // Mirrors the old ensure_predequant_scratch cap message: log once,
+            // skip allocating (predq_scratch_k/v stay null), so
+            // mt_aiter_unified_attn() falls back to the in-kernel fp8 dequant
+            // path for this call instead of aborting.
+            static std::atomic<bool> cap_logged{false};
+            if (!cap_logged.exchange(true)) {
+                std::fprintf(stderr,
+                    "AITER paged-attn: fp8-predequant scratch would need %zu B/cache "
+                    "(num_scratch_blocks=%d) > MT_AITER_PREDEQUANT_MAX_MB cap (%zu B) on "
+                    "device %d -- skipping predequant for this call, falling back to the "
+                    "in-kernel fp8 dequant path. (Logged once; this can repeat silently "
+                    "for later calls.)\n",
+                    predq_bytes_per_cache, num_scratch_blocks, predq_cap, dev);
+            }
+        } else {
+            // Bucket the request to a power of two (>= 16 MiB). The legacy
+            // CUDA pool never frees and only reuses a parked buffer that is
+            // >= the request, so an exact-fit size that grows with the live
+            // context would park one buffer per distinct size (measured:
+            // 28 hipMallocs / 1.9 GB retained in 4 minutes as K/V requests
+            // stepped 43,65 -> 47,70 -> 50,75 -> ... MiB). Power-of-two
+            // buckets bound the distinct sizes to O(log n) and the retained
+            // total to < 2x the largest request.
+            size_t predq_bucket = (size_t) 16u << 20;
+            while (predq_bucket < predq_bytes_per_cache) predq_bucket <<= 1;
+            predq_scratch_k.alloc(predq_bucket);
+            predq_scratch_v.alloc(predq_bucket);
         }
     }
 
@@ -1539,6 +1756,13 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     // cache_type == TURBO4_FP8_BS256 && the 2D-large tile is selected).
     args.scratch_block_tables = num_scratch_blocks > 0 ? predq_scratch_table_ptr : nullptr;
     args.num_scratch_blocks   = num_scratch_blocks;
+    // MAD-2026-09-20 predequant-pool: per-call pool scratch allocated above;
+    // null whenever it wasn't requested (not turbo4_fp8/2D-large this call)
+    // or was skipped over the MT_AITER_PREDEQUANT_MAX_MB cap — either way
+    // mt_aiter_unified_attn() treats a null pointer as "take the in-kernel
+    // fp8 dequant path instead," exactly like num_scratch_blocks == 0.
+    args.predq_scratch_k      = predq_scratch_k.get();
+    args.predq_scratch_v      = predq_scratch_v.get();
     args.q_stride_0         = (int64_t) n_heads * head_size;
     args.output_stride_0    = args.q_stride_0;
     args.k_stride_0         = (int64_t) block_size * n_kv_heads * head_size;

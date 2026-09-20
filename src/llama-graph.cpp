@@ -1877,7 +1877,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s,
-          enum ggml_type out_type) const {
+          enum ggml_type out_type,
+          ggml_tensor * gate) const {
+    if (gate && (!ml8_reg || !loras->empty())) {
+        // no in-kernel gate available (plain mul_mat, or LoRA needs the gated activation too)
+        ggml_tensor * g = ggml_cont_2d(ctx0, gate, cur->ne[0], ggml_nelements(gate) / cur->ne[0]);
+        cur  = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, g));
+        gate = nullptr;
+    }
     // Route the base matmul through the ml8 helper when a registry is present.
     // For non-ml8 weights and registry misses build_ml8_or_mul_mat is a pure
     // pass-through to ggml_mul_mat(ctx0, w, cur), so this is byte-identical for
@@ -1892,7 +1899,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     GGML_ASSERT((ml8_reg || out_type == GGML_TYPE_F32) &&
         "build_lora_mm: bf16 out_type requires an ml8 registry (ML8_4/FP8_B128/ML8_FP8 weight)");
     ggml_tensor * res = ml8_reg
-        ? build_ml8_or_mul_mat(ctx0, *ml8_reg, w, cur, &ml8_fp8b128_qrot_memo, out_type)
+        ? build_ml8_or_mul_mat(ctx0, *ml8_reg, w, cur, &ml8_fp8b128_qrot_memo, out_type, gate)
         : ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {

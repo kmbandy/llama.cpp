@@ -58,7 +58,12 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     constexpr int CTG   = (OPT & O_CONTIG) ? 1 : 0;
     constexpr int PF    = 1 << ((OPT >> 10) & 3);
     constexpr int SGB   = (OPT & O_SGB) ? 1 : 0;
-    constexpr int DOT2  = ((OPT & O_DOT2) && (OPT & O_F16)) ? 1 : 0;
+    // turbo4 (KVP == 2) excludes DOT2 for the same reason prefill's PV8 does: the row-sum has to
+    // be taken over UNSCALED P (the per-key V scale folds in afterwards, see the PV step below),
+    // and DOT2 sums the ALREADY-PACKED p fragment that also feeds the PV matmul -- there is no
+    // single packed fragment that is both the pre-fold sum input and the post-fold PV input. The
+    // plain lsum accumulation (the !DOT2 path already below) has no such conflict.
+    constexpr int DOT2  = ((OPT & O_DOT2) && (OPT & O_F16) && KVP != 2) ? 1 : 0;
     constexpr int BTS   = (OPT & O_BTS)  ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB) ? 1 : 0;
     typedef DT16<F16> D;
@@ -70,18 +75,36 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     constexpr int VSTR  = TILE + (CTG ? 8 : 4);
     constexpr int NTHR  = NWARPS * 32;
     constexpr int NB    = TILE / BS;
-    constexpr int NTR   = (TILE / 8) * (HEAD_DIM / (KVP ? 32 : 64));
+    constexpr int NTR   = (TILE / 8) * (HEAD_DIM / (KVP == 1 ? 32 : 64));
     constexpr int VREGS = (NTR + NWARPS - 1) / NWARPS;
     // A V prefetch costs VREGS x 4 VGPRs and this leg already carries a 128-VGPR accumulator and a
     // 64-VGPR query. Measured: at two uint4 (fp8 KV, TILE 16) it is worth 6-8% at depth; at four
     // (fp8 TILE 32, or bf16 TILE 16, whose V is twice the bytes) it spills and LOSES 10%. So the
     // geometry decides, not the flag.
-    constexpr int GPREV = ((OPT & O_GPREV) && VREGS <= 2) ? 1 : 0;
+    // turbo4 (KVP == 2) never prefetches: its V item count (NTQ below) and per-thread register
+    // count (VQREGS) are unrelated to VREGS <= 2, so this is a fresh geometry the measurement
+    // above says nothing about -- ship the correct, unprefetched form first.
+    constexpr int GPREV = ((OPT & O_GPREV) && VREGS <= 2 && KVP != 2) ? 1 : 0;
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = D::GROW;
+    // turbo4: one thread owns a 4-key x 4-d V item, same map as the prefill turbo4 fetchV/storeV
+    // -- but prefill's NTHR is pinned to exactly TILE/4 * HEAD_DIM/4 threads (one item per
+    // thread, no loop); decode's NWARPS varies with q_len*gqa, so here NTQ items are looped over
+    // VQREGS passes per thread instead.
+    constexpr int NTQ    = (TILE / 4) * (HEAD_DIM / 4);
+    constexpr int VQREGS = (NTQ + NTHR - 1) / NTHR;
+    static_assert(KVP != 2 || (TILE % 4 == 0 && HEAD_DIM % 4 == 0),
+                  "turbo4 V load body assumes 4-key x 4-d items");
+    // turbo4's K load (below) is written only for KLDS0 (K read straight from the paged cache,
+    // never staged into sK) -- the only K-staging mode D_OPT actually uses. The dead `if (KLDS)`
+    // branch below still has to compile for a KVP == 2 instantiation; it is not implemented for
+    // turbo4 and stays unreachable behind this assert.
+    static_assert(KVP != 2 || !KLDS, "turbo4 K load is only written for KLDS0");
 
     __shared__ uint16_t sK[KLDS ? TILE * KSTR : 1];
     __shared__ uint16_t sV16[HEAD_DIM * VSTR];
+    __shared__ float sKs[KVP == 2 ? TILE : 1];   // turbo4: per-key K scale for this m-tile
+    __shared__ float sVs[KVP == 2 ? TILE : 1];   // turbo4: per-key V scale for this m-tile
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int c = lane & 15, h = lane >> 4;
@@ -106,6 +129,15 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
     const float mul   = a.scale * kdesc * 1.44269504089f;
 
+    uint32_t kL[4] = {0,0,0,0}, vL[4] = {0,0,0,0};   // turbo4: 16 e4m3 centroids as 4 dwords
+    if constexpr (KVP == 2) {
+        const uint4 kl = *(const uint4*)a.k_lut; kL[0]=kl.x; kL[1]=kl.y; kL[2]=kl.z; kL[3]=kl.w;
+        const uint4 vl = *(const uint4*)a.v_lut; vL[0]=vl.x; vL[1]=vl.y; vL[2]=vl.z; vL[3]=vl.w;
+    }
+    // kL/vL are consumed by fetchV/storeV and the K load below when KVP == 2; for KVP != 2 they
+    // stay zero-initialized and genuinely unused, hence the cast.
+    if constexpr (KVP != 2) { (void)kL; (void)vL; }
+
     frag16 qf[NKS];
     {
         const uint16_t* qp = (const uint16_t*)a.q
@@ -125,43 +157,126 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
     float l_i   = 0.0f;
+    // turbo4 (KVP == 2): running V-scale reference -- see the prefill kernel. P is folded with
+    // sVs[key] / v_ref (<= 1) so the f16 P fragment stays under its PGROW budget (2^14 < 65504);
+    // acc is rescaled when v_ref grows and the partial written below is multiplied back by it.
+    float v_ref = 0.0f;
     v8f acc[NKS];
     #pragma unroll
     for (int t = 0; t < NKS; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
 
     const int vg = lane >> 3, vj = lane & 7;
     uint4 vreg[VREGS];
+    // turbo4: one thread's 4 keys x 4 d-item, a completely different map from vreg's
+    // transposing-load one (see fetchV/storeV below), so it gets its own register array.
+    uint32_t vreg2[KVP == 2 ? 4 * VQREGS : 1];
+    float    vscale2[KVP == 2 ? 4 * VQREGS : 1];
 
     auto fetchV = [&](int k0, const int* blks) {
+        if constexpr (KVP == 2) {
+            // turbo4: V has its own record buffer (a.v_cache) and its own item map -- one thread
+            // per (key-quad, d-quad), 4 keys per item, looped VQREGS times to cover NTQ items
+            // (prefill's turbo4 fetchV assumes exactly one item per thread; decode's NTHR does
+            // not always divide NTQ, hence the loop). Nibble-packed data can't use the
+            // transposing global loads the other KVP legs use, so this is scalar loads,
+            // transposed at store time instead of load time.
+            #pragma unroll
+            for (int r = 0; r < VQREGS; ++r) {
+                const int idx = tid + r * NTHR;
+                if (NTQ % NTHR == 0 || idx < NTQ) {
+                    const int kq = idx % (TILE / 4), dq = idx / (TILE / 4);
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        const int kk  = min(k0 + 4 * kq + t, ctx - 1);
+                        const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                        const uint8_t* rec = (const uint8_t*)a.v_cache
+                                           + (size_t)blk * a.kv_block_stride
+                                           + (size_t)(kk % BS) * a.kv_slot_stride
+                                           + (size_t)kvh * a.kv_head_stride;
+                        // 4 nibbles, elements 4dq..4dq+3.
+                        const uint32_t nib16 = *(const uint16_t*)(rec + 2 + 2 * dq);
+                        const uint32_t sgn   = (rec[130 + dq / 2] >> ((dq & 1) * 4)) & 0xFu;
+                        vreg2[4 * r + t] = nib16 | (sgn << 16);
+                        if (dq == 0) vscale2[4 * r + t] = r4d_f16_to_f32(*(const uint16_t*)rec);
+                    }
+                }
+            }
+            return;
+        }
         #pragma unroll
         for (int r = 0; r < VREGS; ++r) {
             const int idx = warp + r * NWARPS;
             if (NTR % NWARPS == 0 || idx < NTR) {
-                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
+                constexpr int DG = HEAD_DIM / (KVP == 1 ? 32 : 64);
                 const int kg = idx / DG, dg = idx - kg * DG;
                 const int kk = min(k0 + kg * 8 + vj, ctx - 1);
-                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
+                const int d0 = dg * (KVP == 1 ? 32 : 64) + vg * (KVP == 1 ? 8 : 16);
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)blk * a.kv_block_stride
                                + (size_t)kvh * a.kv_head_stride
                                + (size_t)(kk % BS) * (2 * HEAD_DIM) + HEAD_DIM + d0;
-                const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
-                                    : (const void*)((const uint8_t*)a.kv + o);
+                const void* p = KVP == 1 ? (const void*)((const uint16_t*)a.kv + o)
+                                         : (const void*)((const uint8_t*)a.kv + o);
                 vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
             }
         }
     };
 
     auto storeV = [&]() {
+        if constexpr (KVP == 2) {
+            // turbo4: dequantise this thread's up-to-4 items (kq,dq), each 4 keys x 4 d, via the
+            // e4m3 LUT, then transpose the 4x4 byte matrix (element-major, from fetchV) into
+            // sV16's d-major layout -- same transpose prefill's storeV does into sV8, except
+            // decode has no PV8 leg, so every transposed row of 4 e4m3 bytes is immediately
+            // widened to 4 16-bit values with the SAME fp8x8_to_16x4w the fp8 leg uses (called on
+            // one dword at a time: it widens 8 fp8 in 2 dwords to 8 16-bit in 4 dwords, so a
+            // single 4-byte row uses only its first dword's output, w4[0]/w4[1]).
+            #pragma unroll
+            for (int r = 0; r < VQREGS; ++r) {
+                const int idx = tid + r * NTHR;
+                if (NTQ % NTHR == 0 || idx < NTQ) {
+                    const int kq = idx % (TILE / 4), dq = idx / (TILE / 4);
+                    uint32_t g[4];
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        const uint32_t nib16 = vreg2[4 * r + t] & 0xFFFFu;
+                        const uint32_t sgn   = (vreg2[4 * r + t] >> 16) & 0xFu;
+                        // 4 nibbles -> one index per byte, element order.
+                        const uint32_t sel = (nib16 & 0x000Fu)
+                                           | ((nib16 & 0x00F0u) << 4)
+                                           | ((nib16 & 0x0F00u) << 8)
+                                           | ((nib16 & 0xF000u) << 12);
+                        g[t] = r4d_lut_gather4(sel, vL[0], vL[1], vL[2], vL[3]) | r4d_sign_spread4(sgn);
+                    }
+                    // g[t] byte e = element (4dq+e) of key (4kq+t); out_e byte t = element
+                    // (4dq+e) of key (4kq+t) -- a 4x4 byte transpose, same as prefill's.
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const uint32_t out_e = ((g[0] >> (8 * e)) & 0xFFu)
+                                             | (((g[1] >> (8 * e)) & 0xFFu) << 8)
+                                             | (((g[2] >> (8 * e)) & 0xFFu) << 16)
+                                             | (((g[3] >> (8 * e)) & 0xFFu) << 24);
+                        uint32_t w4[4];
+                        fp8x8_to_16x4w<D>(make_uint2(out_e, 0u), w4);
+                        *(uint2*)(&sV16[(4 * dq + e) * VSTR + 4 * kq]) = make_uint2(w4[0], w4[1]);
+                    }
+                    if (dq == 0) {
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) sVs[4 * kq + t] = vscale2[4 * r + t];
+                    }
+                }
+            }
+            return;
+        }
         #pragma unroll
         for (int r = 0; r < VREGS; ++r) {
             const int idx = warp + r * NWARPS;
             if (NTR % NWARPS == 0 || idx < NTR) {
-                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
+                constexpr int DG = HEAD_DIM / (KVP == 1 ? 32 : 64);
                 const int kg = idx / DG, dg = idx - kg * DG;
-                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
+                const int d0 = dg * (KVP == 1 ? 32 : 64) + vg * (KVP == 1 ? 8 : 16);
                 const uint4 v = vreg[r];
-                if (KVP) {
+                if constexpr (KVP == 1) {
                     uint16_t* dst = &sV16[(d0 + vj) * VSTR + kg * 8];
                     *(uint2*)(dst)     = make_uint2(D::from_bf16w(v.x), D::from_bf16w(v.y));
                     *(uint2*)(dst + 4) = make_uint2(D::from_bf16w(v.z), D::from_bf16w(v.w));
@@ -209,7 +324,9 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                                + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM);
                 uint16_t* kd = &sK[key * KSTR];
                 uint32_t w4[4];
-                if (KVP) {
+                // KVP == 2 never reaches here (see the static_assert above): this branch stays
+                // the bf16/fp8 pair it always was rather than gaining an unreachable turbo4 leg.
+                if constexpr (KVP == 1) {
                     const uint4 r = *(const uint4*)((const uint16_t*)a.kv + o + ch * 8);
                     w4[0] = D::from_bf16w(r.x); w4[1] = D::from_bf16w(r.y);
                     w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
@@ -224,6 +341,21 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
         storeV();
         if (LDSB) lds_barrier(); else __syncthreads();
         if (GPREV && ti + 1 < t_hi) fetchV(k0 + TILE, blkn);
+        float inv_vref = 0.0f;
+        if constexpr (KVP == 2) {
+            float vsmax = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < TILE; ++i) vsmax = fmaxf(vsmax, sVs[i]);
+            if (vsmax > v_ref) {                    // uniform across the CTA: sVs is tile-wide
+                const float r = (v_ref > 0.0f) ? (v_ref / vsmax) : 0.0f;
+                #pragma unroll
+                for (int dt = 0; dt < NKS; ++dt)
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[dt][e] *= r;
+                v_ref = vsmax;
+            }
+            inv_vref = (v_ref > 0.0f) ? (1.0f / v_ref) : 0.0f;
+        }
 
         #pragma unroll 1
         for (int mt = 0; mt < MT; ++mt) {
@@ -231,10 +363,27 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
             if (!KLDS) {
                 const int kk = min(k0 + mt * 16 + c, ctx - 1);
                 const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
-                grow = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
-                     + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM))
-                     * (KVP ? 2 : 1);
+                if constexpr (KVP == 2) {
+                    // turbo4: K record is 162 B, byte-addressed with a byte-unit stride (see
+                    // r4d.h) -- no *(2*HEAD_DIM) element stride like the fp8/bf16 legs. Lane c
+                    // owns key (k0 + mt*16 + c)'s whole record; its fp16 scale (rec[0..1]) is the
+                    // same for every t below, so read it once here into sKs, same index the QK
+                    // step below reads it back at (mt*16 + 8*h + e is the OUTPUT key; this lane's
+                    // OWN key mt*16+c is what it just fetched the scale for).
+                    grow = (const uint8_t*)a.kv + (size_t)kb * a.kv_block_stride
+                         + (size_t)(kk % BS) * a.kv_slot_stride + (size_t)kvh * a.kv_head_stride;
+                    sKs[mt * 16 + c] = r4d_f16_to_f32(*(const uint16_t*)grow);
+                } else {
+                    grow = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
+                         + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM))
+                         * (KVP == 1 ? 2 : 1);
+                }
             }
+            // turbo4: every lane in the warp just wrote sKs[mt*16 + <its own c>], covering all
+            // TILE keys (c spans 0..15 across the warp's 32 lanes); the QK step below reads
+            // sKs at a DIFFERENT index (the output key, not this lane's own), so the write has
+            // to be visible workgroup-wide before that read.
+            if constexpr (KVP == 2) { if (LDSB) lds_barrier(); else __syncthreads(); }
             v8f s = (v8f){0,0,0,0,0,0,0,0};
             #pragma unroll
             for (int g = 0; g < NKS; g += PF) {
@@ -250,12 +399,30 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                         } else {
                             kb[j] = D::mk(*(const uint2*)(kp + 4 * h), *(const uint2*)(kp + 8 + 4 * h));
                         }
-                    } else if (KVP) {
+                    } else if constexpr (KVP == 1) {
                         const uint16_t* kp = (const uint16_t*)grow + 16 * t;
                         const uint2 l0 = *(const uint2*)(kp + (CTG ? 8 * h : 4 * h));
                         const uint2 h0 = *(const uint2*)(kp + (CTG ? 8 * h + 4 : 8 + 4 * h));
                         kb[j] = D::mk(make_uint2(D::from_bf16w(l0.x), D::from_bf16w(l0.y)),
                                       make_uint2(D::from_bf16w(h0.x), D::from_bf16w(h0.y)));
+                    } else if constexpr (KVP == 2) {
+                        // turbo4: this lane's own key (grow) holds elements [16*t+8*h, +8) as 4
+                        // nibble bytes (8 indices) + 1 sign byte -- dequantise via the e4m3 LUT
+                        // with the same gather/perm/sign-spread sequence the prefill storeK
+                        // turbo4 branch uses (there it does 16 elements/2 halves at once from a
+                        // wide cooperative K fetch; here it is 8 elements/1 half per lane,
+                        // straight from the paged record), then feed the SAME fp8x8_to_16x4w
+                        // conversion the fp8 leg below uses unchanged.
+                        const uint16_t* nib = (const uint16_t*)(grow + 2 + 8 * t + 4 * h);
+                        const uint32_t n4  = (uint32_t)nib[0] | ((uint32_t)nib[1] << 16);
+                        const uint32_t sgn = *(const uint8_t*)(grow + 130 + 2 * t + h);
+                        const uint32_t ge = r4d_lut_gather4(n4 & 0x0F0F0F0Fu, kL[0], kL[1], kL[2], kL[3]);
+                        const uint32_t go = r4d_lut_gather4((n4 >> 4) & 0x0F0F0F0Fu, kL[0], kL[1], kL[2], kL[3]);
+                        const uint32_t o0 = __builtin_amdgcn_perm(go, ge, 0x05010400u) | r4d_sign_spread4(sgn & 0xFu);
+                        const uint32_t o1 = __builtin_amdgcn_perm(go, ge, 0x07030602u) | r4d_sign_spread4((sgn >> 4) & 0xFu);
+                        uint32_t w4[4];
+                        fp8x8_to_16x4w<D>(make_uint2(o0, o1), w4);
+                        kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
                     } else {
                         const uint8_t* kp = grow + 16 * t;
                         uint32_t w4[4];
@@ -274,6 +441,12 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
             float sc[8];
             #pragma unroll
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
+            if constexpr (KVP == 2) {
+                // turbo4: S = q . (lut[idx]*sign) accumulated per key; the per-key fp16 scale
+                // multiplies the score for that key, before the mask (same place/order as prefill).
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) sc[e] *= sKs[mt * 16 + 8 * h + e];
+            }
 
             const int kbase = k0 + mt * 16 + 8 * h;
             if (!MSKIP || wave_any(kbase + 7 > klimit)) {
@@ -304,6 +477,14 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 if (!DOT2) lsum += p;
             }
             if (!DOT2) l_i += lsum;
+            if constexpr (KVP == 2) {
+                // turbo4: fold the per-key V scale into P AFTER the row-sum (softmax
+                // normalisation above used unscaled P) and BEFORE the PV accumulation below.
+                // DOT2 is forced off for KVP == 2 (see its definition), so l_i above always came
+                // from the unscaled lsum, never from a packed fragment built after this fold.
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) pf[e] *= sVs[mt * 16 + 8 * h + e] * inv_vref;
+            }
 
             {
                 uint32_t pw[4];
@@ -352,6 +533,13 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     }
 
     if (!live) return;
+    if constexpr (KVP == 2) {
+        // turbo4: undo the v_ref normalisation so the partial is in V's true units for the merge.
+        #pragma unroll
+        for (int dt = 0; dt < NKS; ++dt)
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) acc[dt][e] *= v_ref;
+    }
     const float lrow = l_i + swap16(l_i);
     const int tok = seq * a.q_len + qrow;
     const size_t idx = (size_t)(tok * a.q_heads + qhead) * splits + sp;

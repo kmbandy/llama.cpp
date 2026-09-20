@@ -41,6 +41,96 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+// Row-oriented, vectorized same-type cpy for the "same shape, different
+// pitch" case (e.g. writing a token's activations into a strided cache slot,
+// or copying out of a strided view whose innermost dimension is still a
+// contiguous run). cpy_scalar<cpy_1_scalar<T,T>> computes i03/i02/i01/i00 (and
+// the matching i1x set) from a single flattened index via three integer
+// divisions per thread, then does a scalar element copy; when the shapes
+// match 1:1 (ne0x == ne1x for every dim) that decomposition is unnecessary --
+// blockIdx directly gives the row, exactly like concat's row kernel -- and
+// when the row is contiguous on both ends (nb00/nb10 == sizeof(T)) it can be
+// copied with 16-byte (uint4) loads/stores instead of one element at a time.
+// Falls back to a scalar per-element loop within the row when 16B alignment
+// isn't available. Same-type only (no cast), so this is bit-identical to the
+// scalar kernel it replaces.
+template <typename T>
+static __device__ __forceinline__ void cpy_row_copy(const T * __restrict__ src, T * __restrict__ dst, int64_t n) {
+    constexpr int64_t vec_elems = 16 / sizeof(T);
+    const bool aligned16 = vec_elems > 1 &&
+        ((reinterpret_cast<uintptr_t>(src) & 15) == 0) &&
+        ((reinterpret_cast<uintptr_t>(dst) & 15) == 0);
+    if (aligned16 && n >= vec_elems) {
+        const int64_t n_vec = n / vec_elems;
+        const uint4 * __restrict__ src4 = reinterpret_cast<const uint4 *>(src);
+        uint4 *       __restrict__ dst4 = reinterpret_cast<uint4 *>(dst);
+        for (int64_t i = threadIdx.x; i < n_vec; i += blockDim.x) {
+            dst4[i] = src4[i];
+        }
+        for (int64_t i = n_vec * vec_elems + threadIdx.x; i < n; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+template <typename T>
+static __global__ void __launch_bounds__(256) cpy_row_vec(
+        const char * __restrict__ cx, char * __restrict__ cdst,
+        int64_t ne00,
+        uint64_t nb01, uint64_t nb02, uint64_t nb03,
+        uint64_t nb11, uint64_t nb12, uint64_t nb13) {
+    const int64_t i3 = blockIdx.z;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i1 = blockIdx.x;
+
+    const T * src = (const T *) (cx   + i3*nb03 + i2*nb02 + i1*nb01);
+    T *       dst = (T *)       (cdst + i3*nb13 + i2*nb12 + i1*nb11);
+
+    ggml_cuda_pdl_sync();
+    cpy_row_copy<T>(src, dst, ne00);
+}
+
+// Applicable whenever a same-type cpy has matching shape (so the per-row
+// mapping needs no reshaping) and a contiguous row on both src and dst --
+// including the case where nb00/nb10 are contiguous but the *tensors* aren't
+// (e.g. dst rows are padded to a larger cache stride), which is exactly the
+// class of copy that lands in the plain (non-transposed) cpy_scalar path
+// today instead of the fully-contiguous cudaMemcpyAsync fast path.
+template <typename T>
+static bool ggml_cpy_row_vec_supported(
+    const int64_t ne00, const int64_t ne01, const int64_t ne02,
+    const int64_t nb00, const int64_t nb10,
+    const int64_t ne10, const int64_t ne11, const int64_t ne12,
+    const int64_t ne03, const int64_t ne13) {
+    if (nb00 != (int64_t) sizeof(T) || nb10 != (int64_t) sizeof(T)) {
+        return false;
+    }
+    if (ne00 != ne10 || ne01 != ne11 || ne02 != ne12 || ne03 != ne13) {
+        return false;
+    }
+    // grid.y/z are limited to 65535 on both CUDA and HIP.
+    if (ne01 > 65535 || ne02 > 65535 || ne03 > 65535) {
+        return false;
+    }
+    return true;
+}
+
+template <typename T>
+static void ggml_cpy_row_vec_cuda(
+    const char * cx, char * cdst,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    const int64_t nb01, const int64_t nb02, const int64_t nb03,
+    const int64_t nb11, const int64_t nb12, const int64_t nb13,
+    cudaStream_t stream) {
+    const dim3 grid_dim((unsigned) ne01, (unsigned) ne02, (unsigned) ne03);
+    cpy_row_vec<T><<<grid_dim, 256, 0, stream>>>(
+        cx, cdst, ne00, nb01, nb02, nb03, nb11, nb12, nb13);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -550,6 +640,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        } else if (ggml_cpy_row_vec_supported<float>(ne00, ne01, ne02, nb00, nb10, ne10, ne11, ne12, src0->ne[3], src1->ne[3])) {
+            ggml_cpy_row_vec_cuda<float>
+                (src0_ddc, src1_ddc, ne00, ne01, ne02, src0->ne[3], nb01, nb02, nb03, nb11, nb12, nb13, main_stream);
         } else {
             ggml_cpy_scalar_cuda<float, float>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);

@@ -271,13 +271,17 @@ __global__ void ml84_expand_kernel(const uint8_t* __restrict__ B_nib, const uint
             (void) kl;   // only needed for documentation/debug -- k itself is never used below (g already known)
 
             const float centroid = ml84_decode_e4m3(lut_g[idx4]);
-            const float w_val = centroid * b_scale_g[(size_t) g * (size_t) N + (size_t) n];
+            const float bsg   = b_scale_g[(size_t) g * (size_t) N + (size_t) n];
             const float denom = b_scale_out[n] > 0.f ? b_scale_out[n] : 1.f;   // degenerate all-zero column guard
+            // centroid * (bsg / denom): one division per (group, column), the same
+            // association the radiance port's per-slab LDS table uses, so the two
+            // paths stay bit-identical.
+            const float w_val = centroid * (bsg * (1.0f / denom));
 
             // Same (kt,nt,L,s) -> trperm(L,s) mapping as trfeed_common.h's
             // preshuffle_B (identical iteration structure, not just identical
             // formula), so this is provably the same permutation as the fp8 path.
-            B_shuf_out[tile_off + (size_t) trperm(L, s)] = ml84_encode_e4m3(w_val / denom);
+            B_shuf_out[tile_off + (size_t) trperm(L, s)] = ml84_encode_e4m3(w_val);
         }
     }
 }
@@ -456,9 +460,9 @@ __global__ void ml84_pair_expand_kernel(
             const uint8_t idx4 = (s < 4) ? (uint8_t) ((w >> (s * 8)) & 0x0Fu)
                                           : (uint8_t) ((w >> ((s - 4) * 8 + 4)) & 0x0Fu);
             const float centroid = ml84_decode_e4m3(lut_g[idx4]);
-            const float w_val = centroid * scale_g[(size_t) g * (size_t) N_half + (size_t) n_src];
             const float denom = b_scale_out[n_fused] > 0.f ? b_scale_out[n_fused] : 1.f;
-            B_shuf_out[tile_off + (size_t) trperm(L, s)] = ml84_encode_e4m3(w_val / denom);
+            const float w_val = centroid * (scale_g[(size_t) g * (size_t) N_half + (size_t) n_src] * (1.0f / denom));
+            B_shuf_out[tile_off + (size_t) trperm(L, s)] = ml84_encode_e4m3(w_val);
         }
     }
 }

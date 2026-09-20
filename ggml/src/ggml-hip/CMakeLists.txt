@@ -133,7 +133,8 @@ list(APPEND GGML_SOURCES_ROCM
 # other-arch-stub guard convention and `-I` (this directory) requirement as
 # gemm_ml84_prod.hip / gemm_ml84_decode_v2.hip above.
 list(APPEND GGML_SOURCES_ROCM
-    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.hip)
+    ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.hip)
 
 # R4D vendored attention kernels (ggml-cuda/r4d/, see r4d/README-ORIGIN.txt for provenance --
 # radiance-libr4d commit b9e42ab-rx6). fp8-KV and bf16-KV paged, causal, GQA-6 attention at
@@ -196,16 +197,33 @@ if (GGML_HIP_R4D)
     # merging two independently-scaled products; the attention kernels have no such site, so
     # applying it here would just forgo FMA contraction on this TU's ordinary float math for no
     # reason. Left off to match the rest of ggml-hip, which does not set it either.
+    # 2026-09-19 (chain 258 rocprof): the comment above assumed CMAKE_BUILD_TYPE=Release, but
+    # build-hip is RelWithDebInfo (-O2 -g), so every vendored unit was compiled at -O2 while
+    # radiance's r4d.so is -O3 -- and r4d/build.sh builds the chunk_scan unit with -mcumode
+    # ("60 KB LDS per workgroup, tuned and validated with one workgroup per CU"), which was
+    # never carried over. Identical kernels measured 1.5x (attention) / 2.5x (chunk_scan)
+    # slower in our binary than in radiance's trace. Pin the upstream flags explicitly.
     set_source_files_properties(../ggml-cuda/r4d/r4d_attn_paged_h256_gqa6.hip
-        PROPERTIES COMPILE_OPTIONS "-Wno-unused-result")
+        PROPERTIES COMPILE_OPTIONS "-O3;-Wno-unused-result")
     set_source_files_properties(
         ../ggml-cuda/r4d/r4d_gdn_kkt_solve_k128_c64_bf16.hip
-        ../ggml-cuda/r4d/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
         ../ggml-cuda/r4d/r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip
         ../ggml-cuda/r4d/r4d_gdn_conv_w4_h128_bf16.hip
         ../ggml-cuda/r4d/r4d_gdn_gated_rmsnorm_h128_bf16.hip
         ../ggml-cuda/r4d/r4d_gdn_fused_update_w4k128v128.hip
-        PROPERTIES COMPILE_OPTIONS "-Wno-unused-result")
+        PROPERTIES COMPILE_OPTIONS "-O3;-Wno-unused-result")
+    set_source_files_properties(
+        ../ggml-cuda/r4d/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
+        PROPERTIES COMPILE_OPTIONS "-O3;-mcumode;-Wno-unused-result")
+    # Our own radiance-derived units were benched at -O3 by hand; build them the same way.
+    set_source_files_properties(
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_decode_v2.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_prod.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_trfeed_prod.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_blockscale.hip
+        PROPERTIES COMPILE_OPTIONS "-O3")
 endif()
 
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")

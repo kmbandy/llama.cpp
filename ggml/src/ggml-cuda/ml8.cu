@@ -94,8 +94,8 @@ static inline bool rdna4_gemm_ml84_decode_v2(
 #else
 #define ML8_4_RADIANCE_AVAILABLE 0
 static inline bool rdna4_gemm_ml84_radiance_prep(
-    const uint8_t * /*B_nib*/, const uint8_t * /*lut*/, const float * /*b_scale_g*/,
-    int /*N*/, int /*K*/, uint8_t * /*T_out*/, float * /*colscale_out*/, hipStream_t /*stream*/) {
+    const uint8_t * /*lut*/, const float * /*b_scale_g*/, int /*N*/, int /*K*/,
+    float * /*colscale_out*/, hipStream_t /*stream*/) {
     return false;
 }
 static inline bool rdna4_gemm_ml84_radiance_retile_a(
@@ -104,8 +104,32 @@ static inline bool rdna4_gemm_ml84_radiance_retile_a(
 }
 static inline bool rdna4_gemm_ml84_radiance(
     int /*M*/, const void * /*A_fp8*/, const float * /*a_scale*/, const uint8_t * /*B_nib*/,
-    const uint8_t * /*T*/, const float * /*colscale*/, float * /*C_f32*/, int /*N*/, int /*K*/,
-    hipStream_t /*stream*/) {
+    const uint8_t * /*lut*/, const float * /*b_scale_g*/, const float * /*colscale*/,
+    float * /*C_f32*/, int /*N*/, int /*K*/, hipStream_t /*stream*/) {
+    return false;
+}
+#endif
+
+// radiance_quant.h (also not this file's to create/edit): the bandwidth-
+// oriented, TILED-store rewrite of this file's OWN ml8_fp8_qrot_v3_kernel
+// (see radiance_quant.hip's header comment) -- ggml_cuda_op_fp8_quant_rot[
+// _fused_norm] below prefer rdna4_ml8_qrot_tiled/_add_tiled over the
+// v3/v4 launchers when MT_ML8_4_PREFILL_RADIANCE!=0 and the shape/M%16==0
+// gate holds (see the ML8_QROT_FLAG_TILED doc comment in ml8.cuh for why
+// M%16==0 specifically). Same __has_include guard pattern as the two
+// headers above: stubs always decline so this file keeps building even if
+// radiance_quant.{h,hip} are mid-flight on another branch.
+#if __has_include("aiter-integration/rdna4_fp8_gemm/radiance_quant.h")
+#include "aiter-integration/rdna4_fp8_gemm/radiance_quant.h"
+#define ML8_4_RADIANCE_QUANT_AVAILABLE 1
+#else
+#define ML8_4_RADIANCE_QUANT_AVAILABLE 0
+#define RDNA4_ML8_QROT_KIND_KRONECKER      1
+#define RDNA4_ML8_QROT_KIND_BLOCK_HADAMARD 2
+static inline bool rdna4_ml8_qrot_tiled(
+    const float * /*x*/, const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/,
+    const float * /*norm_w*/, float /*norm_eps*/, int /*M*/, int /*K*/, uint8_t * /*A_tiled*/,
+    float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
     return false;
 }
 #endif
@@ -514,8 +538,10 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
 
 // ─────────────────────────────────────────────────────────────────────
 // MT_ML8_4_PREFILL_RADIANCE=2 (cached mode): per-weight cache of the
-// radiance conversion table T + colscale (gemm_ml84_radiance.h's
-// rdna4_gemm_ml84_radiance_prep output), built once and reused on every
+// radiance per-column colscale only (gemm_ml84_radiance.h's
+// rdna4_gemm_ml84_radiance_prep output -- the per-K-slab conversion
+// table is now built in LDS from lut + b_scale_g inside the kernel),
+// built once and reused on every
 // subsequent prefill call against the same weight -- mirroring
 // g_ml8_cache's device-pointer-keyed lifetime/invalidation above, but kept
 // as its own map (not folded into cache_entry_t) since cache_entry_t's
@@ -528,7 +554,6 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
 // table.
 namespace {
 struct ml8_4_radiance_cache_entry {
-    uint8_t * T        = nullptr;
     float   * colscale = nullptr;
     int32_t   N = 0;
     int32_t   K = 0;
@@ -539,20 +564,19 @@ std::atomic<uint64_t>                                        g_ml8_4_radiance_ca
 std::atomic<uint64_t>                                        g_ml8_4_radiance_cache_count{0};
 } // namespace
 
-// Look up (or build, on first call for this weight) the cached T/colscale
-// pair. `key` is the weight's device pointer, same convention as every
+// Look up (or build, on first call for this weight) the cached colscale
+// buffer. `key` is the weight's device pointer, same convention as every
 // other cache in this file. Returns false if the ported prep kernel
 // declines the shape (same contract as rdna4_gemm_ml84_radiance_prep
 // itself) or a device allocation fails -- either way the caller falls
 // through to the existing expand+frozen prefill path.
 static bool ml8_4_radiance_cache_get_or_build(
-    const void * key, const uint8_t * b_packed, const uint8_t * lut, const float * b_scale_g,
-    int32_t N, int32_t K, hipStream_t stream, const uint8_t ** out_T, const float ** out_colscale) {
+    const void * key, const uint8_t * lut, const float * b_scale_g,
+    int32_t N, int32_t K, hipStream_t stream, const float ** out_colscale) {
     {
         std::lock_guard<std::mutex> lock(g_ml8_4_radiance_cache_mu);
         auto it = g_ml8_4_radiance_cache.find(key);
         if (it != g_ml8_4_radiance_cache.end() && it->second.N == N && it->second.K == K) {
-            *out_T        = it->second.T;
             *out_colscale = it->second.colscale;
             return true;
         }
@@ -560,22 +584,14 @@ static bool ml8_4_radiance_cache_get_or_build(
     if (N <= 0 || K <= 0 || K % QK_ML8 != 0 || N % 16 != 0) {
         return false;
     }
-    const size_t n_groups_k     = (size_t) K / (size_t) QK_ML8;
-    const size_t t_bytes        = n_groups_k * (size_t) N * 16;
-    const size_t colscale_bytes = (size_t) N * sizeof(float);
+    const size_t colscale_bytes = (size_t) 2 * (size_t) N * sizeof(float);
 
-    uint8_t * d_T        = nullptr;
-    float   * d_colscale = nullptr;
-    if (cudaMalloc(&d_T, t_bytes) != cudaSuccess) {
-        return false;
-    }
+    float * d_colscale = nullptr;
     if (cudaMalloc((void **) &d_colscale, colscale_bytes) != cudaSuccess) {
-        cudaFree(d_T);
         return false;
     }
-    const bool prep_ok = rdna4_gemm_ml84_radiance_prep(b_packed, lut, b_scale_g, N, K, d_T, d_colscale, stream);
+    const bool prep_ok = rdna4_gemm_ml84_radiance_prep(lut, b_scale_g, N, K, d_colscale, stream);
     if (!prep_ok) {
-        cudaFree(d_T);
         cudaFree(d_colscale);
         return false;
     }
@@ -585,30 +601,27 @@ static bool ml8_4_radiance_cache_get_or_build(
     std::lock_guard<std::mutex> lock(g_ml8_4_radiance_cache_mu);
     auto it = g_ml8_4_radiance_cache.find(key);
     if (it != g_ml8_4_radiance_cache.end()) {
-        // Raced with another thread building the same weight's table.
+        // Raced with another thread building the same weight's colscale.
         // Free ours, keep theirs (weights don't change shape at runtime,
         // so N/K matching is just defensive).
-        cudaFree(d_T);
         cudaFree(d_colscale);
-        *out_T        = it->second.T;
         *out_colscale = it->second.colscale;
         return it->second.N == N && it->second.K == K;
     }
     ml8_4_radiance_cache_entry entry;
-    entry.T = d_T; entry.colscale = d_colscale; entry.N = N; entry.K = K;
+    entry.colscale = d_colscale; entry.N = N; entry.K = K;
     g_ml8_4_radiance_cache.emplace(key, entry);
 
     const uint64_t total_bytes = g_ml8_4_radiance_cache_bytes.fetch_add(
-        t_bytes + colscale_bytes, std::memory_order_relaxed) + t_bytes + colscale_bytes;
+        colscale_bytes, std::memory_order_relaxed) + colscale_bytes;
     const uint64_t n_weights = g_ml8_4_radiance_cache_count.fetch_add(1, std::memory_order_relaxed) + 1;
     // GGML_LOG_INFO is dropped by llama-server's logging config, so use
-    // fprintf directly -- this is the only way the cached table's VRAM
+    // fprintf directly -- this is the only way the cached colscale's VRAM
     // cost is visible outside a profiler. Fires once per newly-cached
     // weight (not per call -- repeat lookups above return early).
-    fprintf(stderr, "ml8-4 radiance T cache: %llu bytes for %llu weights\n",
+    fprintf(stderr, "ml8-4 radiance colscale cache: %llu bytes for %llu weights\n",
             (unsigned long long) total_bytes, (unsigned long long) n_weights);
 
-    *out_T        = d_T;
     *out_colscale = d_colscale;
     return true;
 }
@@ -616,7 +629,6 @@ static bool ml8_4_radiance_cache_get_or_build(
 static void ml8_4_radiance_cache_clear_all(void) {
     std::lock_guard<std::mutex> lock(g_ml8_4_radiance_cache_mu);
     for (auto & kv : g_ml8_4_radiance_cache) {
-        cudaFree(kv.second.T);
         cudaFree(kv.second.colscale);
     }
     g_ml8_4_radiance_cache.clear();
@@ -2080,6 +2092,44 @@ static void ml8_gemm_log_once(const char * path, int64_t M, int32_t N, int32_t K
     }
 }
 
+// MT_ML8_4_PREFILL_RADIANCE: shared accessor so both the qrot dispatch
+// (ggml_cuda_op_fp8_quant_rot[_fused_norm], below) and ml8_mul_mat_core's
+// own prefill-radiance GEMM branch read the SAME cached value of the SAME
+// env var -- the qrot side only sets ML8_QROT_FLAG_TILED when this is
+// nonzero, and the consumer side only trusts that bit when this is nonzero
+// too, so the two can never disagree about whether radiance routing is on.
+static int ggml_cuda_ml8_4_prefill_radiance_mode() {
+    static const int mode = [] {
+        const char * e = std::getenv("MT_ML8_4_PREFILL_RADIANCE");
+        return e ? std::atoi(e) : 0;
+    }();
+    return mode;
+}
+
+// MT_ML8_4_GEMM_LOG=1 logging for the qrot TILED fast path (ml8_cuh's
+// ML8_QROT_FLAG_TILED): one "active" line the first time it fires at all,
+// and one line per DISTINCT decline reason (so a run that never engages it
+// still says why, without spamming once per call).
+static void ml8_qrot_tiled_log_active(int K, int a_dim, int b_dim) {
+    if (!ml8_gemm_log_enabled()) return;
+    static std::atomic<bool> logged{false};
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true)) {
+        fprintf(stderr, "[ml8-4] qrot: tiled path active (K=%d, a=%d, b=%d)\n", K, a_dim, b_dim);
+    }
+}
+static void ml8_qrot_tiled_log_decline(const char * reason) {
+    if (!ml8_gemm_log_enabled()) return;
+    static std::mutex mu;
+    static std::unordered_map<std::string, bool> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = seen.find(reason);
+    if (it == seen.end()) {
+        seen.emplace(reason, true);
+        fprintf(stderr, "[ml8-4] qrot: tiled path declined (%s)\n", reason);
+    }
+}
+
 // One block per row M. Each block:
 //   1. Cooperatively reads K fp32 elements, computing per-thread |x|max.
 //   2. Block-reduces to row absmax via shared memory.
@@ -3319,6 +3369,41 @@ static void ml8_expand_cache_clear_all(void) {
     }
 }
 
+// Shared tail of the MT_ML8_4_PREFILL_RADIANCE dispatch: given an already-
+// built radiance colscale and an already-tiled fp8 A (radiance's
+// tiled layout, M padded to a multiple of 16 rows), launch the ported
+// radiance GEMM and write fp32 dst. Used by both the fp32-activation
+// PREFILL_RADIANCE branch in ml8_mul_mat_core (which retiles a_fp8_ptr
+// itself first) and ggml_cuda_ml8_4_mul_mat_prequant (whose caller already
+// hands it radiance-tiled A, e.g. the ggml-cuda.cu graph-fusion kernels).
+// Returns false ("not handled", no side effects) iff rdna4_gemm_ml84_radiance
+// itself declines the shape; a `true` return means a kernel was launched,
+// dst->data was written, and the caller must not run any fallback path.
+static bool ml8_4_radiance_gemm_tail(
+    int32_t              M,
+    const uint8_t *      a_tiled,
+    const float *        a_scale,
+    const uint8_t *      b_packed,
+    const uint8_t *      lut,
+    const float *        b_scale_g,
+    const float *        radiance_colscale,
+    int32_t              N,
+    int32_t              K,
+    ggml_tensor *        dst,
+    cudaStream_t         stream,
+    const char *         log_tag) {
+    const bool gemm_ok = rdna4_gemm_ml84_radiance(
+        (int) M, a_tiled, a_scale, b_packed,
+        lut, b_scale_g, radiance_colscale, (float *) dst->data, N, K, stream);
+    if (!gemm_ok) {
+        return false;
+    }
+    const hipError_t gemm_rc = cudaGetLastError();
+    GGML_ASSERT(gemm_rc == hipSuccess && "rdna4_gemm_ml84_radiance dispatch failed");
+    ml8_gemm_log_once(log_tag, M, N, K, 0);
+    return true;
+}
+
 static void ml8_mul_mat_core(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst,
@@ -3361,6 +3446,12 @@ static void ml8_mul_mat_core(
     // exclusive with h_a (the legacy fused-rotation path): a pre-quantized x
     // has already had its rotation applied by FP8_QUANT_ROT.
     const bool x_prequant = (x->type == GGML_TYPE_I8);
+    // ML8_QROT_FLAG_TILED: FP8_QUANT_ROT already wrote radiance's fragment-TILED
+    // A into x->data (M*K bytes) with a_scale at +M*K. ml8_mul_mat_core must
+    // skip rdna4_gemm_ml84_radiance_retile_a and must NOT fall through to any
+    // row-major consumer (decode-v2, frozen trfeed, Triton). See ml8.cuh.
+    const bool x_tiled = x_prequant &&
+        (ggml_get_op_params_i32(x, ML8_QROT_OP_PARAM_FLAGS) & ML8_QROT_FLAG_TILED);
     if (x_prequant) {
         GGML_ASSERT(h_a == nullptr &&
             "pre-quantized activation path is mutually exclusive with the h_a fused-rotation path");
@@ -3542,6 +3633,47 @@ static void ml8_mul_mat_core(
     if (repack->layout == ML8_4_LAYOUT_RDNA4_TRFEED) {
         GGML_ASSERT(N % 128 == 0 && "ML8_4_LAYOUT_RDNA4_TRFEED requires N%128==0 "
             "(ml8_4_layout_for_tensor should have picked TRITON otherwise)");
+        if (x_tiled) {
+            // Producer already wrote tiled A. The only legal consumer is the
+            // radiance prefill GEMM; every other branch in this function
+            // treats a_fp8_ptr as row-major (and the retile below would
+            // scramble an already-tiled buffer). Chain 228: greedy garbage
+            // until this skip-retile landed.
+            GGML_ASSERT(dst->type == GGML_TYPE_F32 &&
+                "ML8_QROT_FLAG_TILED is only produced for the fp32 prefill-radiance path");
+            GGML_ASSERT(M > 32 && (M % 16) == 0 &&
+                "ML8_QROT_FLAG_TILED is only set when M>32 && M%16==0");
+            const int prefill_radiance_mode = ggml_cuda_ml8_4_prefill_radiance_mode();
+            GGML_ASSERT(prefill_radiance_mode != 0 &&
+                "ML8_QROT_FLAG_TILED cannot be set when MT_ML8_4_PREFILL_RADIANCE=0");
+            const float   * radiance_colscale = nullptr;
+            ggml_cuda_pool_alloc<float>   radiance_colscale_scratch(ctx.pool());
+            bool radiance_table_ready = false;
+            if (prefill_radiance_mode == 2) {
+                radiance_table_ready = ml8_4_radiance_cache_get_or_build(
+                    w->data, cent_data, (const float *) repack->b_scale,
+                    N, K, stream, &radiance_colscale);
+            } else {
+                radiance_colscale_scratch.alloc((size_t) 2 * N);
+                radiance_table_ready = rdna4_gemm_ml84_radiance_prep(
+                    cent_data, (const float *) repack->b_scale,
+                    N, K, radiance_colscale_scratch.get(), stream);
+                if (radiance_table_ready) {
+                    const hipError_t prep_rc = cudaGetLastError();
+                    GGML_ASSERT(prep_rc == hipSuccess && "rdna4_gemm_ml84_radiance_prep dispatch failed");
+                    radiance_colscale = radiance_colscale_scratch.get();
+                }
+            }
+            if (!radiance_table_ready ||
+                !ml8_4_radiance_gemm_tail(
+                    M, a_fp8_ptr, a_scale_ptr, (const uint8_t *) repack->b_packed,
+                    cent_data, (const float *) repack->b_scale, radiance_colscale, N, K, dst, stream,
+                    "prefill-radiance-tiled")) {
+                GGML_ABORT("rdna4_gemm_ml84_radiance declined ML8_QROT_FLAG_TILED input; "
+                           "the row-major fallback cannot consume a tiled A");
+            }
+            return;
+        }
         if (M_pad == 32) {
             // Decode/verify: fp32 output straight from the split-K kernel, no
             // bf16 intermediate (see rdna4_gemm_ml84_trfeed_decode_splitk's
@@ -3707,29 +3839,49 @@ static void ml8_mul_mat_core(
             return e ? std::atoi(e) : 0;
         }();
         if (prefill_radiance_mode != 0 && dst->type == GGML_TYPE_F32) {
-            const uint8_t * radiance_T        = nullptr;
             const float   * radiance_colscale = nullptr;
-            ggml_cuda_pool_alloc<uint8_t> radiance_T_scratch(ctx.pool());
             ggml_cuda_pool_alloc<float>   radiance_colscale_scratch(ctx.pool());
             bool radiance_table_ready = false;
 
             if (prefill_radiance_mode == 2) {
                 radiance_table_ready = ml8_4_radiance_cache_get_or_build(
-                    w->data, (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
-                    N, K, stream, &radiance_T, &radiance_colscale);
+                    w->data, cent_data, (const float *) repack->b_scale,
+                    N, K, stream, &radiance_colscale);
             } else {
-                const size_t n_groups_k = (size_t) K / (size_t) QK_ML8;
-                radiance_T_scratch.alloc(n_groups_k * (size_t) N * 16);
-                radiance_colscale_scratch.alloc((size_t) N);
+                radiance_colscale_scratch.alloc((size_t) 2 * N);
                 radiance_table_ready = rdna4_gemm_ml84_radiance_prep(
-                    (const uint8_t *) repack->b_packed, cent_data, (const float *) repack->b_scale,
-                    N, K, radiance_T_scratch.get(), radiance_colscale_scratch.get(), stream);
+                    cent_data, (const float *) repack->b_scale,
+                    N, K, radiance_colscale_scratch.get(), stream);
                 if (radiance_table_ready) {
                     const hipError_t prep_rc = cudaGetLastError();
                     GGML_ASSERT(prep_rc == hipSuccess && "rdna4_gemm_ml84_radiance_prep dispatch failed");
-                    radiance_T        = radiance_T_scratch.get();
                     radiance_colscale = radiance_colscale_scratch.get();
                 }
+            }
+
+            // ggml_cuda_ml8_qrot_try_tiled already wrote radiance's fragment-
+            // TILED A into x->data and set ML8_QROT_FLAG_TILED. Retiling that
+            // buffer as if it were row-major is the chain-228 garbage-text
+            // bug (doc comment on the flag promised this skip; it was not
+            // wired). No row-major fallback is valid for a tiled src.
+            const bool already_tiled = x_prequant &&
+                (ggml_get_op_params_i32(x, ML8_QROT_OP_PARAM_FLAGS) & ML8_QROT_FLAG_TILED);
+            if (already_tiled) {
+                GGML_ASSERT((M % 16) == 0 &&
+                    "ML8_QROT_FLAG_TILED is only set when M%16==0");
+                if (!radiance_table_ready) {
+                    GGML_ABORT("ML8_QROT_FLAG_TILED activation but radiance colscale was not ready");
+                }
+                const uint8_t * tiled_ptr   = (const uint8_t *) x->data;
+                const float   * tiled_scale = (const float *) ((const uint8_t *) x->data
+                    + (size_t) M * (size_t) K);
+                if (ml8_4_radiance_gemm_tail(
+                        M, tiled_ptr, tiled_scale, (const uint8_t *) repack->b_packed,
+                        cent_data, (const float *) repack->b_scale, radiance_colscale, N, K, dst, stream,
+                        "prefill-radiance-tiled")) {
+                    return;
+                }
+                GGML_ABORT("rdna4_gemm_ml84_radiance declined a ML8_QROT_FLAG_TILED activation -- no row-major fallback is valid");
             }
 
             if (radiance_table_ready) {
@@ -3740,13 +3892,10 @@ static void ml8_mul_mat_core(
                 if (retile_ok) {
                     const hipError_t retile_rc = cudaGetLastError();
                     GGML_ASSERT(retile_rc == hipSuccess && "rdna4_gemm_ml84_radiance_retile_a dispatch failed");
-                    const bool gemm_ok = rdna4_gemm_ml84_radiance(
-                        (int) M, a_tiled.get(), a_scale_ptr, (const uint8_t *) repack->b_packed,
-                        radiance_T, radiance_colscale, (float *) dst->data, N, K, stream);
-                    if (gemm_ok) {
-                        const hipError_t gemm_rc = cudaGetLastError();
-                        GGML_ASSERT(gemm_rc == hipSuccess && "rdna4_gemm_ml84_radiance dispatch failed");
-                        ml8_gemm_log_once("prefill-radiance", M, N, K, 0);
+                    if (ml8_4_radiance_gemm_tail(
+                            M, a_tiled.get(), a_scale_ptr, (const uint8_t *) repack->b_packed,
+                            cent_data, (const float *) repack->b_scale, radiance_colscale, N, K, dst,
+                            stream, "prefill-radiance")) {
                         return;
                     }
                 }
@@ -3858,6 +4007,9 @@ static void ml8_mul_mat_core(
         return;
     }
 
+    GGML_ASSERT(!x_tiled &&
+        "ML8_QROT_FLAG_TILED input reached the TRITON GEMM path; tiled A is radiance-only");
+
     // ── 4. Allocate bf16 output (M_pad × N) and launch mt_ml8_gemm.
     // LLAMA_ACT_BF16 does not extend to the TRITON layout / mt_ml8_gemm path
     // (only RDNA4_TRFEED prefill has a bf16 dst wired above) — dst must be
@@ -3923,6 +4075,93 @@ void ggml_cuda_op_ml8_mul_mat(
     GGML_ABORT("ml8 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
 #else
     ml8_mul_mat_core(ctx, dst, dst->src[2], /*h_a=*/nullptr, 0, 0);
+#endif // GGML_HIP_AITER
+}
+
+// MT_ML8_4_RADIANCE_FUSE: pre-quantized-A entry point for ggml-cuda.cu's
+// graph fusion — see ml8.cuh's doc comment for the full contract. Not built
+// under GGML_HIP_AITER (like ggml_cuda_op_ml8_mul_mat above): the graph
+// fusion call site only ever reaches this when MT_ML8_4_RADIANCE_FUSE=1,
+// which is itself gated on MT_ML8_4_PREFILL_RADIANCE!=0, an AITER-only knob
+// — so declining unconditionally here (no GGML_ABORT; this is a normal
+// "not handled, fall back" return, unlike ggml_cuda_op_ml8_mul_mat's hard
+// abort) is the correct behaviour for a non-AITER build.
+bool ggml_cuda_ml8_4_mul_mat_prequant(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         w,
+    const uint8_t *             A_tiled,
+    const float *               a_scale,
+    int                         M,
+    ggml_tensor *               dst) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(ctx); GGML_UNUSED(w); GGML_UNUSED(A_tiled); GGML_UNUSED(a_scale);
+    GGML_UNUSED(M); GGML_UNUSED(dst);
+    return false;
+#else
+    if (w == nullptr || dst == nullptr || A_tiled == nullptr || a_scale == nullptr) {
+        return false;
+    }
+    if (w->type != GGML_TYPE_ML8_4 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(w) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const ggml_tensor * cent = dst->src[1];
+    if (cent == nullptr || cent->type != GGML_TYPE_F8_E4M3 || !ggml_is_contiguous(cent)) {
+        return false;
+    }
+
+    const int32_t K = (int32_t) w->ne[0];
+    const int32_t N = (int32_t) w->ne[1];
+    if (K % QK_ML8 != 0 || N % MT_ML8_BLOCK_SIZE_N != 0 || N % 128 != 0) {
+        return false;
+    }
+    GGML_ASSERT(dst->ne[0] == N);
+    GGML_ASSERT((int64_t) dst->ne[1] * dst->ne[2] * dst->ne[3] == (int64_t) M);
+
+    const int32_t n_groups_k  = K / QK_ML8;
+    const int32_t n_centroids = 16;
+    if (cent->ne[0] != n_centroids) {
+        return false;
+    }
+    const int32_t lut_group_off = ggml_get_op_params_i32(dst, 0);
+    if (lut_group_off < 0 || (int64_t) lut_group_off + n_groups_k > cent->ne[1]) {
+        return false;
+    }
+    const uint8_t * cent_data = (const uint8_t *) cent->data + (size_t) lut_group_off * n_centroids;
+
+    cudaStream_t stream = ctx.stream();
+
+    // Weight repack cache: every ML8_4 weight is repacked (once) by whichever
+    // GEMM entry point (this one or ggml_cuda_op_ml8_mul_mat) touches it
+    // first — same cache, same key (w's device pointer), so this never
+    // duplicates work.
+    const ml8_weight_repack_t * repack = ggml_cuda_ml8_get_or_repack(stream, w);
+    if (repack == nullptr || repack->layout != ML8_4_LAYOUT_RDNA4_TRFEED) {
+        // Radiance only ever ran the RDNA4_TRFEED path (see
+        // MT_ML8_4_PREFILL_RADIANCE above) — a TRITON-layout weight has no
+        // radiance colscale story, decline and let the caller run the normal
+        // (unfused) op instead.
+        return false;
+    }
+
+    // Same cache the MT_ML8_4_PREFILL_RADIANCE=2 path uses (mode 2 — build
+    // once per weight, reuse on every call): lookup or build the
+    // per-column colscale.
+    const float   * radiance_colscale = nullptr;
+    const bool table_ready = ml8_4_radiance_cache_get_or_build(
+        w->data, cent_data, (const float *) repack->b_scale,
+        N, K, stream, &radiance_colscale);
+    if (!table_ready) {
+        return false;
+    }
+
+    return ml8_4_radiance_gemm_tail(
+        (int32_t) M, A_tiled, a_scale, (const uint8_t *) repack->b_packed,
+        cent_data, (const float *) repack->b_scale, radiance_colscale, N, K, dst, stream,
+        "prefill-radiance-prequant");
 #endif // GGML_HIP_AITER
 }
 
@@ -4131,6 +4370,15 @@ void ggml_cuda_op_ml8_ffn_gate_up_swiglu(
     if (x_prequant) {
         GGML_ASSERT(x->ne[0] == K + 4 &&
             "pre-quantized x must be the ggml_fp8_quant_rot(..., G=0) per-row output");
+        // ggml_cuda_ml8_qrot_try_tiled (this file) may have written x->data
+        // in radiance's fragment-TILED layout instead of row-major -- this
+        // fusion has no code path for that layout (unlike ml8_mul_mat_core's
+        // own x_prequant branch). Fail loudly rather than silently read
+        // tiled bytes as row-major fp8.
+        GGML_ASSERT(!(ggml_get_op_params_i32(x, ML8_QROT_OP_PARAM_FLAGS) & ML8_QROT_FLAG_TILED) &&
+            "ggml_cuda_op_ml8_ffn_gate_up_swiglu: x is ML8_QROT_FLAG_TILED, which this fusion cannot "
+            "consume yet -- ggml_cuda_ml8_qrot_try_tiled's gate needs to exclude whatever graph shape "
+            "routes a qrot output here instead of to ml8_mul_mat_core");
     } else {
         GGML_ASSERT(x->ne[0] == K);
     }
@@ -5602,6 +5850,86 @@ static bool ggml_cuda_fp8_qrot_v2_disabled() {
     return off;
 }
 
+// Try radiance_quant.h's rdna4_ml8_qrot_tiled (see radiance_quant.hip's
+// header comment: this file's OWN ml8_fp8_qrot_v3_kernel restructured for
+// bandwidth, storing straight into radiance's fragment-TILED A layout)
+// before falling back to the v3/v4 launchers below. `norm_w`/`norm_eps`
+// let both call sites (the plain op and the RMS_NORM-fusion entry point)
+// share this — rdna4_ml8_qrot_tiled already supports an optional per-row
+// RMSNorm*w prologue, so the norm-fusion caller gets the same fast path.
+//
+// Returns true iff it launched (dst fully written; the caller must not run
+// ANY fallback for this call). On true, sets ML8_QROT_FLAG_TILED on
+// dst->op_params[ML8_QROT_OP_PARAM_FLAGS] (ml8.cuh has the full doc
+// comment) so ml8_mul_mat_core's x_prequant consumer knows dst->data holds
+// the TILED layout instead of row-major, and can skip
+// rdna4_gemm_ml84_radiance_retile_a.
+//
+// Gating (all required): MT_ML8_4_PREFILL_RADIANCE!=0 (same env var/cached
+// value ml8_mul_mat_core's own prefill-radiance branch reads, via
+// ggml_cuda_ml8_4_prefill_radiance_mode -- so the qrot and its consumer
+// can never disagree about whether radiance routing is on); M>32 (TRFEED
+// decode is M_pad==32 i.e. M<=32 and still expects row-major A; the
+// radiance GEMM that consumes tiled A is the M_pad>32 prefill branch);
+// M%16==0 and K%16==0 (see the M%16==0 note in ML8_QROT_FLAG_TILED's doc
+// comment -- radiance's TILED layout pads every 16-row tile regardless, so
+// this is the only M for which the tiled A fits in the SAME M*(K+4)-byte
+// budget ggml already allocated for dst); rot_kind != NONE
+// (rdna4_ml8_qrot_tiled requires a rotation, same as ml8_fp8_qrot_v3_kernel
+// always did for this per-row path); and rdna4_ml8_qrot_tiled itself
+// accepting the (a_dim,b_dim) shape (its own dispatch-table coverage,
+// radiance_quant.h).
+static bool ggml_cuda_ml8_qrot_try_tiled(
+    cudaStream_t stream, ggml_tensor * dst,
+    const float * x, const void * h_a, int rot_kind, int a_dim, int b_dim,
+    const float * norm_w, float norm_eps, int64_t K, int64_t n_rows) {
+    if (ggml_cuda_ml8_4_prefill_radiance_mode() == 0) {
+        ml8_qrot_tiled_log_decline("MT_ML8_4_PREFILL_RADIANCE=0");
+        return false;
+    }
+    {
+        static const int tiled_env = [] {
+            const char * e = std::getenv("MT_ML8_4_QROT_TILED");
+            // Default OFF. Chain 232 (skip-retile consumer) was coherent
+            // Kiss You text but not greedy-equal to chain 221 ("album's" vs
+            // "record's") at 2396 vs 2374 pp. Enable with =1 only if a later
+            // run matches chain 221 AND raises pp.
+            return e ? std::atoi(e) : 0;
+        }();
+        if (tiled_env == 0) {
+            ml8_qrot_tiled_log_decline("MT_ML8_4_QROT_TILED=0");
+            return false;
+        }
+    }
+    if (n_rows <= 32) {
+        ml8_qrot_tiled_log_decline("decode path (M<=32)");
+        return false;
+    }
+    if ((n_rows % 16) != 0) {
+        ml8_qrot_tiled_log_decline("M % 16 != 0 (tiled A would need more bytes than dst has)");
+        return false;
+    }
+    if ((K % 16) != 0) {
+        ml8_qrot_tiled_log_decline("K % 16 != 0");
+        return false;
+    }
+    if (rot_kind == GGML_FP8_QUANT_ROT_KIND_NONE) {
+        ml8_qrot_tiled_log_decline("kind == NONE (no rotation)");
+        return false;
+    }
+    uint8_t * a_tiled = (uint8_t *) dst->data;
+    float   * a_scale = (float *) ((uint8_t *) dst->data + (size_t) n_rows * (size_t) K);
+    if (!rdna4_ml8_qrot_tiled(x, h_a, rot_kind, a_dim, b_dim, norm_w, norm_eps,
+                              (int) n_rows, (int) K, a_tiled, a_scale, stream)) {
+        ml8_qrot_tiled_log_decline("rdna4_ml8_qrot_tiled declined the shape (its own dispatch coverage)");
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    ggml_set_op_params_i32(dst, ML8_QROT_OP_PARAM_FLAGS, ML8_QROT_FLAG_TILED);
+    ml8_qrot_tiled_log_active((int) K, a_dim, b_dim);
+    return true;
+}
+
 // RMS_NORM -> MUL(w) -> FP8_QUANT_ROT fusion (2026-09-18): the V4 quant kernel reads the
 // residual row, normalizes it in registers and quantizes -- the normed f32 tensor is never
 // written or re-read (42 MB each way per call at 2048x5120) and the rms_norm launch goes
@@ -5655,6 +5983,18 @@ bool ggml_cuda_op_fp8_quant_rot_fused_norm(
     if (kron && (h_a == nullptr || h_a->type != GGML_TYPE_F32 || !ggml_is_contiguous(h_a))) {
         return false;
     }
+    ggml_set_op_params_i32(dst, ML8_QROT_OP_PARAM_FLAGS, 0);
+    // TILED fast path (act_f32 only -- rdna4_ml8_qrot_tiled is fp32-input
+    // only, same restriction the plain op below applies). Passes this
+    // fusion's own norm_w/eps straight through, per the task's "keep the
+    // norm fusion semantics identical" -- rdna4_ml8_qrot_tiled's norm_w
+    // prologue is the same per-row RMSNorm*w math ml8_fp8_qrot_v4/v3's
+    // norm_w argument already does.
+    if (act_f32 && ggml_cuda_ml8_qrot_try_tiled(ctx.stream(), dst, (const float *) x->data,
+                                                 kron ? (const void *) h_a->data : nullptr, kind,
+                                                 a_dim, b_dim, (const float *) w->data, eps, K, n_rows)) {
+        return true;
+    }
     const bool ok = act_bf16
         ? (ml8_launch_qrot_v4<nv_bfloat16>(ctx.stream(), kron,
               (const nv_bfloat16 *) x->data, h_a ? (const float *) h_a->data : nullptr,
@@ -5674,6 +6014,20 @@ bool ggml_cuda_op_fp8_quant_rot_fused_norm(
         CUDA_CHECK(cudaGetLastError());
     }
     return ok;
+}
+
+// ggml_fp8_quant_rot_gated fallback: y[row, h*hd+d] = x * sigmoid(gate[row*nb2 + h*nb1 + d*4])
+// into a scratch f32 buffer, used when the tiled gated kernel declines the shape.
+static __global__ void ml8_qrot_apply_sigmoid_gate_kernel(
+        const float * __restrict__ x, const char * __restrict__ gate, float * __restrict__ y,
+        const int K, const int head_dim, const size_t nb1, const size_t nb2, const int64_t n_rows) {
+    const int64_t row = blockIdx.y;
+    if (row >= n_rows) return;
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < K; k += gridDim.x * blockDim.x) {
+        const int h = k / head_dim, d = k - h * head_dim;
+        const float g = *(const float *) (gate + row * nb2 + (size_t) h * nb1 + (size_t) d * sizeof(float));
+        y[row * K + k] = x[row * K + k] * (1.0f / (1.0f + expf(-g)));
+    }
 }
 
 void ggml_cuda_op_fp8_quant_rot(
@@ -5711,6 +6065,68 @@ void ggml_cuda_op_fp8_quant_rot(
     GGML_ASSERT(dst->ne[1] == x->ne[1] && dst->ne[2] == x->ne[2] && dst->ne[3] == x->ne[3]);
 
     cudaStream_t stream = ctx.stream();
+
+    // FLAG_TILED is a runtime marker on this tensor object. Clear it so a
+    // reused graph node from a previous prefill cannot make a later
+    // row-major (decode) write look tiled to the GEMM.
+    ggml_set_op_params_i32(dst, ML8_QROT_OP_PARAM_FLAGS, 0);
+
+    // ggml_fp8_quant_rot_gated (src[2] = strided gate view, op_params[5] = mode):
+    // fold x * sigmoid(gate) into the load stage of the tiled kernel; otherwise
+    // materialize the gated row into a pool scratch and continue on the plain paths.
+    ggml_cuda_pool_alloc<float> gated_scratch(ctx.pool());
+    if (dst->src[2] != nullptr) {
+        const ggml_tensor * gate = dst->src[2];
+        GGML_ASSERT(x->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 && per_row);
+        GGML_ASSERT(((const int32_t *) dst->op_params)[5] == GGML_FP8_QUANT_ROT_GATE_SIGMOID);
+        const int head_dim = (int) gate->ne[0];
+        const int n_heads  = (int) gate->ne[1];
+        GGML_ASSERT((int64_t) head_dim * n_heads == K);
+        bool tiled_ok = false;
+        if (ggml_cuda_ml8_4_prefill_radiance_mode() != 0 && n_rows > 32 && (n_rows % 16) == 0 && (K % 16) == 0 &&
+            kind != GGML_FP8_QUANT_ROT_KIND_NONE) {
+            static const int tiled_env = [] { const char * e = std::getenv("MT_ML8_4_QROT_TILED"); return e ? std::atoi(e) : 0; }();
+            if (tiled_env != 0) {
+                uint8_t * a_tiled = (uint8_t *) dst->data;
+                float   * a_scale = (float *) ((uint8_t *) dst->data + (size_t) n_rows * (size_t) K);
+                tiled_ok = rdna4_ml8_qrot_gate_sigmoid_tiled(
+                    (const float *) x->data, (const float *) gate->data, gate->nb[1], gate->nb[2], head_dim, n_heads,
+                    (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER && h_a) ? (const void *) h_a->data : nullptr,
+                    kind, a_dim, b_dim, (int) n_rows, a_tiled, a_scale, stream);
+                if (tiled_ok) {
+                    CUDA_CHECK(cudaGetLastError());
+                    ggml_set_op_params_i32(dst, ML8_QROT_OP_PARAM_FLAGS, ML8_QROT_FLAG_TILED);
+                    static bool logged = false;
+                    if (!logged) { logged = true; fprintf(stderr, "[ml8-4][qrot-gate] fused sigmoid gate (tiled) K=%lld M=%lld\n", (long long) K, (long long) n_rows); }
+                    return;
+                }
+            }
+        }
+        // fallback: gate into scratch, then the regular paths below read the scratch as x
+        float * y = gated_scratch.alloc((size_t) n_rows * (size_t) K);
+        const dim3 grid((unsigned) std::min<int64_t>((K + 255) / 256, 64), (unsigned) n_rows, 1);
+        ml8_qrot_apply_sigmoid_gate_kernel<<<grid, 256, 0, stream>>>(
+            (const float *) x->data, (const char *) gate->data, y, (int) K, head_dim, gate->nb[1], gate->nb[2], n_rows);
+        CUDA_CHECK(cudaGetLastError());
+        static bool logged_fb = false;
+        if (!logged_fb) { logged_fb = true; fprintf(stderr, "[ml8-4][qrot-gate] sigmoid gate via scratch fallback K=%lld M=%lld\n", (long long) K, (long long) n_rows); }
+        // shadow x with a scratch-backed view for the rest of this function
+        ggml_tensor x_shadow = *x;
+        x_shadow.data = y;
+        x = &x_shadow;
+    }
+
+    // TILED fast path (plain op, no norm fusion here -- norm_w=nullptr,
+    // matching this op's own contract of never carrying a norm). f32/
+    // per-row only; see ggml_cuda_ml8_qrot_try_tiled's own doc comment for
+    // the full gating list (MT_ML8_4_PREFILL_RADIANCE, M>32 && M%16==0,
+    // K%16==0, kind!=NONE, plus rdna4_ml8_qrot_tiled's own shape coverage).
+    if (x->type == GGML_TYPE_F32 && per_row &&
+        ggml_cuda_ml8_qrot_try_tiled(stream, dst, (const float *) x->data,
+                                      (kind == GGML_FP8_QUANT_ROT_KIND_KRONECKER && h_a) ? (const void *) h_a->data : nullptr,
+                                      kind, a_dim, b_dim, /*norm_w=*/nullptr, /*norm_eps=*/0.0f, K, n_rows)) {
+        return;
+    }
 
     // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 input only goes through the
     // Tin-templated V4/V3 per-row kernels -- V2 and the fused-fast-path

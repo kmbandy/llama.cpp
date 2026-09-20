@@ -7,6 +7,10 @@
 // paired 8-bit LDS read that only those needed, the S-split, and a layout permutation that CONTIG
 // made redundant. What is left is the two families that ship: all-16-bit (bf16 KV) and 16/8 mixed
 // (bf16 query, fp8 KV).
+// KVP=2 adds a third cache family, turbo4_fp8_bs256 (the production ml8-4 KV cache): the load
+// stage converts each record's nibble indices + sign bytes + 16-entry e4m3 LUT into e4m3 bytes,
+// and the per-key fp16 scales are folded into S (after the QK dot) and P (after the row-sum);
+// everything after the load stage is the fp8 legs unchanged.
 //
 // The surviving options. Each is a measured step and each stays separable, so any one of them can
 // be ablated again after a geometry change:
@@ -98,6 +102,29 @@ __device__ __forceinline__ uint32_t pk_fp8x4(float a, float b, float c, float d)
     return __builtin_amdgcn_cvt_pk_fp8_f32(c, d, w, true);
 }
 
+// turbo4: fp16 scale -> float. No fp16 helper exists elsewhere in r4d_common.h/r4d_dt16.h (every
+// other 16-bit path here is bf16 or the WMMA f16 format), so it lives next to its only caller.
+__device__ __forceinline__ float r4d_f16_to_f32(uint16_t h) {
+    return (float)__builtin_bit_cast(_Float16, h);
+}
+
+// turbo4 LUT gather: sel holds one nibble index (0..15) per byte; L0..L3 are the 16 e4m3
+// magnitude centroids as 4 dwords (entry i = byte i of Li/4 ... byte i%4 of L[i/4]). Returns one
+// dword of 4 gathered e4m3 magnitude bytes. This is the proven gather from the GEMM side -- do not
+// rederive it.
+__device__ __forceinline__ uint32_t r4d_lut_gather4(uint32_t sel, uint32_t L0, uint32_t L1, uint32_t L2, uint32_t L3) {
+    const uint32_t lo = __builtin_amdgcn_perm(L1, L0, sel);                 // sel bytes in 0..7 -> L0/L1
+    const uint32_t hi = __builtin_amdgcn_perm(L3, L2, sel & 0x07070707u);   // sel-8 in 0..7 -> L2/L3
+    const uint32_t mask = ((sel >> 3) & 0x01010101u) * 0xFFu;
+    return (hi & mask) | (lo & ~mask);
+}
+
+// turbo4 sign spread: b holds 4 sign bits (bit i = element i, set = negative); spread each to bit 7
+// of its own byte, which is the e4m3 sign bit position -- ORs straight onto a gathered magnitude.
+__device__ __forceinline__ uint32_t r4d_sign_spread4(uint32_t b) {
+    return ((b * 0x00204081u) & 0x01010101u) << 7;
+}
+
 // bf16 dword -> 16-bit dword in the target format, optionally scaled. Used once per kernel on Q.
 template<class D, int FOLDQ, int F16>
 __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
@@ -121,9 +148,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int GPREV = (OPT & O_GPREV) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
-    constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
-    constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
-    static_assert(!(OPT & (O_QK8 | O_PV8)) || !KVP, "8-bit legs need the fp8 KV cache");
+    constexpr int QK8   = ((OPT & O_QK8) && KVP != 1) ? 1 : 0;
+    constexpr int PV8   = ((OPT & O_PV8) && KVP != 1) ? 1 : 0;
+    static_assert(!(OPT & (O_QK8 | O_PV8)) || KVP != 1, "8-bit legs need the fp8 KV cache");
     static_assert(!(OPT & O_QK8) || KWIDE, "QK8 raw-byte staging is written for the wide K fetch");
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
@@ -139,8 +166,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int KEL     = KWIDE ? 16 : 8;                  // K elements fetched per thread-pass
     constexpr int KITEMS  = TILE * (HEAD_DIM / KEL);          // K passes needed for one tile
     constexpr int KPASS   = (KITEMS + NTHR - 1) / NTHR;        // passes per thread
-    constexpr int KREGS   = KPASS * (KVP ? 2 : 1);             // uint4 of raw K per thread
-    constexpr int NTR     = (TILE / 8) * (HEAD_DIM / (KVP ? 32 : 64));
+    constexpr int KREGS   = KPASS * (KVP == 1 ? 2 : 1);        // uint4 of raw K per thread
+    constexpr int NTR     = (TILE / 8) * (HEAD_DIM / (KVP == 1 ? 32 : 64));
     constexpr int VREGS   = (NTR + NWARPS - 1) / NWARPS;        // uint4 of raw V per thread
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = PV8 ? 8.0f : D::GROW;   // e4m3 max is 448 = 2^8.8
@@ -149,6 +176,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     // extends verbatim, so larger tiles just take more passes. Bound it to keep kreg honest.
     static_assert(!KWIDE || KPASS <= 2, "the wide K fetch covers at most two passes");
     static_assert((!QK8 && !PV8) || CTG, "the 8-bit fragment maps are written for CONTIG");
+    static_assert(KVP != 2 || (QK8 && PV8), "turbo4 KV is only written for the 8-bit legs (R4D_ATTN_FP8=3)");
+    // turbo4's V item map is one thread per (key-quad, d-quad) exactly -- no VREGS-style folding.
+    static_assert(KVP != 2 || (TILE % 4 == 0 && (TILE / 4) * (HEAD_DIM / 4) == NTHR),
+                  "turbo4 V load body assumes one thread per 4-key x 4-d item");
 
     // The K and V tiles are BYTES under the 8-bit legs and the allocation is sized accordingly
     // -- this is what unlocks TILE > 48 (bf16 tiles at TILE 64 need 68 KB > the 64 KB limit;
@@ -159,6 +190,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int KSTR8 = HEAD_DIM + 8, VSTR8 = TILE + 8;
     __shared__ uint16_t sK[QK8 ? (TILE * KSTR8 + 1) / 2 : TILE * KSTR];
     __shared__ uint16_t sV16[PV8 ? (HEAD_DIM * VSTR8 + 1) / 2 : HEAD_DIM * VSTR];
+    __shared__ float sKs[KVP == 2 ? TILE : 1];   // turbo4: per-key K scale for this tile
+    __shared__ float sVs[KVP == 2 ? TILE : 1];   // turbo4: per-key V scale for this tile
     uint8_t* const sK8 = (uint8_t*)sK;
     uint8_t* const sV8 = (uint8_t*)sV16;
 
@@ -181,6 +214,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
     const float vdesc = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
     const float mul   = a.scale * kdesc * 1.44269504089f;
+
+    uint32_t kL[4] = {0,0,0,0}, vL[4] = {0,0,0,0};   // turbo4: 16 e4m3 centroids as 4 dwords
+    if constexpr (KVP == 2) {
+        const uint4 kl = *(const uint4*)a.k_lut; kL[0]=kl.x; kL[1]=kl.y; kL[2]=kl.z; kL[3]=kl.w;
+        const uint4 vl = *(const uint4*)a.v_lut; vL[0]=vl.x; vL[1]=vl.y; vL[2]=vl.z; vL[3]=vl.w;
+    }
+    // kL/vL are consumed by storeK/storeV below when KVP == 2; for KVP != 2 they stay
+    // zero-initialized and genuinely unused, hence the cast.
+    if constexpr (KVP != 2) { (void)kL; (void)vL; }
 
     frag16 qf[NKS];
     v2i32_r4d qf8[QK8 ? NKS : 1];
@@ -215,6 +257,12 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
     float l_i   = 0.0f;
+    // turbo4 (KVP == 2): running reference for the per-key V scales. P is folded with
+    // sVs[key] / v_ref (<= 1) instead of the raw scale, so the fp8 P fragment keeps the
+    // e4m3 headroom the lazy-rescale (PGROW) budget assumes (p <= 2^8 < 448); v_ref is
+    // raised tile by tile like m_ref, rescaling acc the same way, and multiplied back in the
+    // epilogue. Folding the raw scale overflowed e4m3 (NaN) on real V (max|v| >> 1).
+    float v_ref = 0.0f;
     v8f acc[NKS];
     #pragma unroll
     for (int t = 0; t < NKS; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
@@ -228,6 +276,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     // the two run back to back and the generated code is the same shape as it was before GPRE.
     const int vg = lane >> 3, vj = lane & 7;
     uint4 kreg[KREGS], vreg[VREGS];
+    // turbo4: one thread owns a 4-key x 4-d item (see the static_assert above); a completely
+    // different map from vreg's transposing-load one, so it gets its own register array.
+    uint32_t vreg2[KVP == 2 ? 4 : 1];
+    float    vscale2[KVP == 2 ? 4 : 1];
 
     auto fetchK = [&](int k0, const int* blks) {
         #pragma unroll
@@ -239,12 +291,27 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 if (KWIDE && key >= TILE) continue;
                 const int kk  = min(k0 + key, ctx - 1);
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                if constexpr (KVP == 2) {
+                    // turbo4: K record is 162 B and only 2-byte aligned -- no uint2/uint4 loads on
+                    // it. ch*16 elements -> 8 nibble bytes at rec+2+ch*8, 2 sign bytes at
+                    // rec+130+ch*2, one fp16 scale at rec (kreg[p].w; only meaningful at ch == 0).
+                    const uint8_t* rec = (const uint8_t*)a.kv
+                                       + (size_t)blk * a.kv_block_stride
+                                       + (size_t)(kk % BS) * a.kv_slot_stride
+                                       + (size_t)kvh * a.kv_head_stride;
+                    const uint16_t* nib = (const uint16_t*)(rec + 2 + ch * 8);
+                    kreg[p].x = (uint32_t)nib[0] | ((uint32_t)nib[1] << 16);
+                    kreg[p].y = (uint32_t)nib[2] | ((uint32_t)nib[3] << 16);
+                    kreg[p].z = *(const uint16_t*)(rec + 130 + ch * 2);
+                    kreg[p].w = *(const uint16_t*)rec;
+                    continue;
+                }
                 const size_t o = (size_t)blk * a.kv_block_stride
                                + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM);
-                if (KVP) {
+                if (KVP == 1) {
                     const uint16_t* g = (const uint16_t*)a.kv + o + ch * KEL;
                     #pragma unroll
-                    for (int q = 0; q < (KVP ? (KEL / 8) : 1); ++q)
+                    for (int q = 0; q < (KVP == 1 ? (KEL / 8) : 1); ++q)
                         kreg[p * (KEL / 8) + q] = *(const uint4*)(g + 8 * q);
                 } else if (KWIDE) {
                     kreg[p] = *(const uint4*)((const uint8_t*)a.kv + o + ch * 16);
@@ -257,20 +324,41 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     };
 
     auto fetchV = [&](int k0, const int* blks) {
+        if constexpr (KVP == 2) {
+            // turbo4: V has its own record buffer (a.v_cache) and its own item map -- one thread
+            // per (key-quad, d-quad), 4 keys per item. Nibble-packed data can't use the
+            // transposing global loads the other KVP legs use, so this is scalar loads, transposed
+            // at store time instead of load time.
+            const int kq = tid % (TILE / 4), dq = tid / (TILE / 4);
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int kk  = min(k0 + 4 * kq + t, ctx - 1);
+                const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                const uint8_t* rec = (const uint8_t*)a.v_cache
+                                   + (size_t)blk * a.kv_block_stride
+                                   + (size_t)(kk % BS) * a.kv_slot_stride
+                                   + (size_t)kvh * a.kv_head_stride;
+                const uint32_t nib16 = *(const uint16_t*)(rec + 2 + 2 * dq);   // 4 nibbles, elements 4dq..4dq+3
+                const uint32_t sgn   = (rec[130 + dq / 2] >> ((dq & 1) * 4)) & 0xFu;
+                vreg2[t] = nib16 | (sgn << 16);
+                if (dq == 0) vscale2[t] = r4d_f16_to_f32(*(const uint16_t*)rec);
+            }
+            return;
+        }
         #pragma unroll
         for (int r = 0; r < VREGS; ++r) {
             const int idx = warp + r * NWARPS;
             if (NTR % NWARPS == 0 || idx < NTR) {
-                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
+                constexpr int DG = HEAD_DIM / (KVP == 1 ? 32 : 64);
                 const int kg = idx / DG, dg = idx - kg * DG;
                 const int kk = min(k0 + kg * 8 + vj, ctx - 1);
-                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
+                const int d0 = dg * (KVP == 1 ? 32 : 64) + vg * (KVP == 1 ? 8 : 16);
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)blk * a.kv_block_stride
                                + (size_t)kvh * a.kv_head_stride
                                + (size_t)(kk % BS) * (2 * HEAD_DIM) + HEAD_DIM + d0;
-                const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
-                                    : (const void*)((const uint8_t*)a.kv + o);
+                const void* p = KVP == 1 ? (const void*)((const uint16_t*)a.kv + o)
+                                         : (const void*)((const uint8_t*)a.kv + o);
                 vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
             }
         }
@@ -284,6 +372,23 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const int key = KWIDE ? (2 * (i >> 5) + (i & 1)) : (i / (HEAD_DIM / KEL));
                 const int ch  = KWIDE ? ((i & 31) >> 1) : (i - key * (HEAD_DIM / KEL));
                 if (KWIDE && key >= TILE) continue;
+                if constexpr (KVP == 2) {
+                    // turbo4: dequantise the 16 nibble indices + sign bits gathered in fetchK via
+                    // the e4m3 LUT, in two 8-wide (nx/ny) halves, and store as one uint4 of e4m3
+                    // bytes -- the exact address the QK8 path above uses.
+                    const uint32_t nx = kreg[p].x, ny = kreg[p].y, s16 = kreg[p].z;
+                    const uint32_t ge0 = r4d_lut_gather4(nx & 0x0F0F0F0Fu, kL[0], kL[1], kL[2], kL[3]);
+                    const uint32_t go0 = r4d_lut_gather4((nx >> 4) & 0x0F0F0F0Fu, kL[0], kL[1], kL[2], kL[3]);
+                    const uint32_t ge1 = r4d_lut_gather4(ny & 0x0F0F0F0Fu, kL[0], kL[1], kL[2], kL[3]);
+                    const uint32_t go1 = r4d_lut_gather4((ny >> 4) & 0x0F0F0F0Fu, kL[0], kL[1], kL[2], kL[3]);
+                    const uint32_t o0 = __builtin_amdgcn_perm(go0, ge0, 0x05010400u) | r4d_sign_spread4(s16 & 0xFu);
+                    const uint32_t o1 = __builtin_amdgcn_perm(go0, ge0, 0x07030602u) | r4d_sign_spread4((s16 >> 4) & 0xFu);
+                    const uint32_t o2 = __builtin_amdgcn_perm(go1, ge1, 0x05010400u) | r4d_sign_spread4((s16 >> 8) & 0xFu);
+                    const uint32_t o3 = __builtin_amdgcn_perm(go1, ge1, 0x07030602u) | r4d_sign_spread4((s16 >> 12) & 0xFu);
+                    *(uint4*)(&sK8[key * KSTR8 + ch * KEL]) = make_uint4(o0, o1, o2, o3);
+                    if (ch == 0) sKs[key] = r4d_f16_to_f32((uint16_t)kreg[p].w);
+                    continue;
+                }
                 if constexpr (QK8) {
                     // K stays e4m3: no upconvert, one b128 store, sK footprint halves.
                     *(uint4*)(&sK8[key * KSTR8 + ch * KEL]) = kreg[p];
@@ -293,7 +398,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 #pragma unroll
                 for (int q = 0; q < KEL / 8; ++q) {
                     uint32_t w4[4];
-                    if (KVP) {
+                    if (KVP == 1) {
                         const uint4 r = kreg[p * (KEL / 8) + q];
                         w4[0] = D::from_bf16w(r.x); w4[1] = D::from_bf16w(r.y);
                         w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
@@ -309,15 +414,47 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     };
 
     auto storeV = [&]() {
+        if constexpr (KVP == 2) {
+            // turbo4: dequantise this thread's 4 keys x 4 d via the e4m3 LUT, then transpose the
+            // 4x4 byte matrix (element-major, from fetchV) into sV8's d-major layout.
+            const int kq = tid % (TILE / 4), dq = tid / (TILE / 4);
+            uint32_t g[4];
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const uint32_t nib16 = vreg2[t] & 0xFFFFu;
+                const uint32_t sgn   = (vreg2[t] >> 16) & 0xFu;
+                // 4 nibbles -> one index per byte, element order.
+                const uint32_t sel = (nib16 & 0x000Fu)
+                                   | ((nib16 & 0x00F0u) << 4)
+                                   | ((nib16 & 0x0F00u) << 8)
+                                   | ((nib16 & 0xF000u) << 12);
+                g[t] = r4d_lut_gather4(sel, vL[0], vL[1], vL[2], vL[3]) | r4d_sign_spread4(sgn);
+            }
+            // g[t] byte e = element (4dq+e) of key (4kq+t); out_e byte t = element (4dq+e) of key
+            // (4kq+t) -- a 4x4 byte transpose.
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const uint32_t out_e = ((g[0] >> (8 * e)) & 0xFFu)
+                                     | (((g[1] >> (8 * e)) & 0xFFu) << 8)
+                                     | (((g[2] >> (8 * e)) & 0xFFu) << 16)
+                                     | (((g[3] >> (8 * e)) & 0xFFu) << 24);
+                *(uint32_t*)(&sV8[(4 * dq + e) * VSTR8 + 4 * kq]) = out_e;
+            }
+            if (dq == 0) {
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) sVs[4 * kq + t] = vscale2[t];
+            }
+            return;
+        }
         #pragma unroll
         for (int r = 0; r < VREGS; ++r) {
             const int idx = warp + r * NWARPS;
             if (NTR % NWARPS == 0 || idx < NTR) {
-                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
+                constexpr int DG = HEAD_DIM / (KVP == 1 ? 32 : 64);
                 const int kg = idx / DG, dg = idx - kg * DG;
-                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
+                const int d0 = dg * (KVP == 1 ? 32 : 64) + vg * (KVP == 1 ? 8 : 16);
                 const uint4 v = vreg[r];
-                if (KVP) {
+                if (KVP == 1) {
                     uint16_t* dst = &sV16[(d0 + vj) * VSTR + kg * 8];
                     *(uint2*)(dst)     = make_uint2(D::from_bf16w(v.x), D::from_bf16w(v.y));
                     *(uint2*)(dst + 4) = make_uint2(D::from_bf16w(v.z), D::from_bf16w(v.w));
@@ -371,6 +508,21 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
         // The next tile's global loads are issued HERE, before the 96 WMMAs below, and the wait
         // that consumes them does not appear until after the next barrier.
         if (GPREV && ti + 1 < ntiles) fetchV(k0 + TILE, blkn);
+        float inv_vref = 0.0f;
+        if constexpr (KVP == 2) {
+            float vsmax = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < TILE; ++i) vsmax = fmaxf(vsmax, sVs[i]);
+            if (vsmax > v_ref) {                    // uniform across the CTA: sVs is tile-wide
+                const float r = (v_ref > 0.0f) ? (v_ref / vsmax) : 0.0f;
+                #pragma unroll
+                for (int dt = 0; dt < NKS; ++dt)
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[dt][e] *= r;
+                v_ref = vsmax;
+            }
+            inv_vref = (v_ref > 0.0f) ? (1.0f / v_ref) : 0.0f;
+        }
 
         #pragma unroll 1
         for (int mt = 0; mt < MT; ++mt) {
@@ -415,6 +567,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             float sc[8];
             #pragma unroll
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
+            if constexpr (KVP == 2) {
+                // turbo4: S = q . (lut[idx]*sign) accumulated per key; the per-key fp16 scale multiplies the score
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) sc[e] *= sKs[mt * 16 + 8 * h + e];
+            }
 
             const int kbase = k0 + mt * 16 + 8 * h;
             if (!MSKIP || wave_any(kbase + 7 > klimit)) {
@@ -446,6 +603,12 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 if (!DOT2) lsum += p;
             }
             if (!DOT2) l_i += lsum;
+            if constexpr (KVP == 2) {
+                // turbo4: fold the per-key V scale (relative to the running v_ref, so <= 1) into P
+                // AFTER the row-sum (softmax normalisation uses unscaled P)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) pf[e] *= sVs[mt * 16 + 8 * h + e] * inv_vref;
+            }
 
             if constexpr (PV8) {
                 const v2i32_r4d p8 = (v2i32_r4d){(int)pk_fp8x4(pf[0], pf[1], pf[2], pf[3]),
@@ -512,7 +675,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
 
     if (!live) return;
     l_i += swap16(l_i);
-    const float inv = (l_i > 0.0f) ? (vdesc / l_i) : 0.0f;
+    const float inv = (l_i > 0.0f) ? ((KVP == 2 ? v_ref : 1.0f) * vdesc / l_i) : 0.0f;
     uint16_t* op = (uint16_t*)a.out
                  + ((size_t)(seq * a.q_len + qpos) * a.q_heads + qhead) * HEAD_DIM;
     #pragma unroll

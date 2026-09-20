@@ -1738,6 +1738,53 @@ struct mt_paged_gputime_scope {
         mt_paged_gputime::recs().push_back({dev, beg, end});
     }
 };
+
+// MAD_R4D_ATTN_VERIFY=1: after the R4D backend has produced dst, re-run the AITER backend on the
+// SAME op into a scratch buffer and report max |r4d - aiter| per call (eager calls only -- the
+// readback needs a stream sync, so this is a graphs-off diagnostic). Both backends write the
+// identical turbo4_fp8_bs256 cache layout, so the AITER re-scatter is idempotent.
+__global__ void r4d_verify_diff_kernel(const half * a, const half * b, size_t n, unsigned int * stats) {
+    // stats[0] = max|a-b| bits, stats[1] = max|b| bits (non-negative floats order as uints),
+    // stats[2] = NaN count in a, stats[3] = NaN count in b.
+    float md = 0.0f, mr = 0.0f; unsigned int na = 0, nb = 0;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const float x = __half2float(a[i]), y = __half2float(b[i]);
+        if (x != x) { ++na; continue; }
+        if (y != y) { ++nb; continue; }
+        md = fmaxf(md, fabsf(x - y)); mr = fmaxf(mr, fabsf(y));
+    }
+    atomicMax(&stats[0], __float_as_uint(md));
+    atomicMax(&stats[1], __float_as_uint(mr));
+    if (na) atomicAdd(&stats[2], na);
+    if (nb) atomicAdd(&stats[3], nb);
+}
+
+static void r4d_verify_against_aiter(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) std::fprintf(stderr, "[r4d-verify] skipped: call under graph capture (run with graphs off)\n");
+        return;
+    }
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+    const size_t n = ggml_nelements(dst);
+    ggml_cuda_pool_alloc<half>         ref(ctx.pool(), n);
+    ggml_cuda_pool_alloc<unsigned int> stats(ctx.pool(), 4);
+    void * saved = dst->data;
+    dst->data = ref.get();
+    ggml_cuda_op_paged_attn_mt_aiter(ctx, dst);
+    dst->data = saved;
+    CUDA_CHECK(cudaMemsetAsync(stats.get(), 0, 4 * sizeof(unsigned int), stream));
+    r4d_verify_diff_kernel<<<1024, 256, 0, stream>>>((const half *) dst->data, ref.get(), n, stats.get());
+    unsigned int h[4];
+    CUDA_CHECK(cudaMemcpyAsync(h, stats.get(), sizeof(h), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    float md, mr; std::memcpy(&md, &h[0], 4); std::memcpy(&mr, &h[1], 4);
+    const int32_t * opi = (const int32_t *) dst->op_params;
+    std::fprintf(stderr, "[r4d-verify] %s q_tokens=%d q_len=%d max_ctx=%d n_active=%d maxdiff=%.5f maxref=%.4f rel=%.4f nan_r4d=%u nan_aiter=%u\n",
+                 dst->src[1]->name, (int) dst->src[0]->ne[2], opi[4], opi[5], opi[6], md, mr, mr > 0 ? md / mr : 0.0f, h[2], h[3]);
+}
 } // namespace
 
 void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1800,6 +1847,10 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     if (r4d_backend_enabled() && ggml_cuda_op_paged_attn_mt_r4d(ctx, dst)) {
         if (probe_on) {
             std::fprintf(stderr, "[probe-r4d] dispatched to R4D backend\n");
+        }
+        static const bool verify = [] { const char * e = std::getenv("MAD_R4D_ATTN_VERIFY"); return e && *e && *e != '0'; }();
+        if (verify) {
+            r4d_verify_against_aiter(ctx, dst);
         }
         return;
     }

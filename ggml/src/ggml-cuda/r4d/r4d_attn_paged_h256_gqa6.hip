@@ -50,9 +50,14 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 #define P_TILE   48
 #define P_OPT    3955211
 
-// KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache. Reached only through the two named wrappers below.
+// KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache, 2 = turbo4_fp8_bs256 cache (K/V separate 162-byte
+// records + 16-entry e4m3 LUTs, step A of the ml8-4 load stage -- prefill only). Reached only
+// through the named wrappers below.
 template <int KVP>
 static int prefill_launch(const R4DArgs* a, hipStream_t s) {
+    if constexpr (KVP == 2) {
+        if (!a->v_cache || !a->k_lut || !a->v_lut || a->kv_slot_stride <= 0) return -5;
+    }
     if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
     constexpr int BQ = (P_NWARPS * 16) / A_GQA;
@@ -64,7 +69,7 @@ static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     // what the serving gates (ppl + GSM8K paired) decide; kernel-level parity already decided the
     // default, which is why these are bits and not the baseline.
     int fp8mode = 0;
-    if constexpr (!KVP) {
+    if constexpr (KVP != 1) {
         static const int m = [] {
             const char* e = getenv("R4D_ATTN_FP8");
             return e ? atoi(e) : 0;
@@ -77,7 +82,13 @@ static int prefill_launch(const R4DArgs* a, hipStream_t s) {
                                                     A_BLOCK_SIZE, KVP, OPTX>),                    \
                            grid, dim3(P_NWARPS * 32), 0, s, *a);                                  \
     } while (0)
-    if constexpr (!KVP) {
+    if constexpr (KVP == 2) {
+        // turbo4_fp8_bs256 always dequantises straight into the 8-bit K/V legs; R4D_ATTN_FP8 is
+        // not consulted (there is no 16-bit leg to fall back to for this cache format), so only
+        // the QK8|PV8 variant is instantiated -- avoids compiling the other three fp8mode arms
+        // that r4d_attn_prefill_h256_gqa6.hip's static_assert(KVP != 2 || (QK8 && PV8)) rejects.
+        P_LAUNCH(P_OPT | O_QK8 | O_PV8);
+    } else if constexpr (KVP != 1) {
         if (fp8mode == 3)      P_LAUNCH(P_OPT | O_QK8 | O_PV8);
         else if (fp8mode == 2) P_LAUNCH(P_OPT | O_PV8);
         else if (fp8mode == 1) P_LAUNCH(P_OPT | O_QK8);
@@ -92,6 +103,9 @@ static int prefill_launch(const R4DArgs* a, hipStream_t s) {
 
 extern "C" int r4d_attn_prefill_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) {
     return prefill_launch<0>(a, s);
+}
+extern "C" int r4d_attn_prefill_h256_gqa6_turbo4kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_launch<2>(a, s);
 }
 extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
     return prefill_launch<1>(a, s);
@@ -135,6 +149,9 @@ extern "C" long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a) {
 
 template <int KVP>
 static int decode_launch(const R4DArgs* a, hipStream_t s) {
+    if constexpr (KVP == 2) {
+        if (!a->v_cache || !a->k_lut || !a->v_lut || a->kv_slot_stride <= 0) return -5;
+    }
     if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
     const int rows = a->q_len * A_GQA;
@@ -169,4 +186,7 @@ extern "C" int r4d_attn_decode_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) 
 }
 extern "C" int r4d_attn_decode_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
     return decode_launch<1>(a, s);
+}
+extern "C" int r4d_attn_decode_h256_gqa6_turbo4kv(const R4DArgs* a, hipStream_t s) {
+    return decode_launch<2>(a, s);
 }

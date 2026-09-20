@@ -63,6 +63,11 @@
 //                                         function's own header comment
 //                                         explains the perm-selector
 //                                         convention this reuses). The
+//                                         16-entry table is now built per
+//                                         K-slab in LDS from the weight's
+//                                         own lut and b_scale_g (inlined
+//                                         in the kernel) instead of read
+//                                         from a precomputed T. The
 //                                         sMag/kMag shared-memory constant
 //                                         table and the per-row wref/wsv
 //                                         reference-byte arrays (radiance's
@@ -177,13 +182,23 @@ static __device__ __forceinline__ void radp_lds_barrier() {
 template <int TN, int LBK>
 __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ B_nib,
-    const unsigned char *__restrict__ T, const float *__restrict__ colscale,
+    const unsigned char *__restrict__ lut, const float *__restrict__ b_scale_g,
+    const float *__restrict__ colscale,
     const float *__restrict__ As, float *__restrict__ C, int M, int N, int K,
     int pb1, int pb2, long astride) {
   constexpr int NS = LBK / 16;
   constexpr int LWSTR = LBK + RADP_PAD;
   constexpr int BNF_T = RADP_WN * TN * 16;
   __shared__ unsigned char sW[BNF_T * LWSTR];
+  // sT is double-buffered: the K loop builds slab k0+LBK's table (sT[buf^1])
+  // during slab k0's WMMA phase, so the loop's existing trailing barrier
+  // publishes it for the next iteration -- no extra barrier needed. The build
+  // is split in two: prefetch_sT issues the global loads (b_scale_g, the 8-byte
+  // lut dword pair, the colscale inverse) early in the iteration so the
+  // latency hides behind staging + WMMA; convert_sT does the VALU decode/encode
+  // and the LDS store afterwards (pf_bsg/pf_lw are written at the top and
+  // consumed at the bottom of the same iteration).
+  __shared__ unsigned char sT[2][(LBK / QK_ML8) * BNF_T * 16];
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / RADP_WN, wn = wave % RADP_WN;
@@ -239,7 +254,158 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
 #pragma unroll
       for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
 
-  for (int k0 = 0; k0 < K; k0 += LBK) {
+  // Per-slab 16-byte codebook table in LDS, built from the ml8-4 weight's
+  // OWN lut (shared across all N) + per-(group,column) b_scale_g. Same
+  // bit-identical formula as the former radp_table_kernel (now inlined).
+  // Double-buffered + split: the loop PREFETCHES slab k0+LBK's b_scale_g
+  // and lut bytes (global loads issued at the TOP of the iteration, so the
+  // latency hides behind staging + WMMA), then CONVERTs them (VALU
+  // decode/encode + LDS store) at the BOTTOM. The loop's existing trailing
+  // barrier publishes sT[buf^1] for the next iteration -- no extra barrier.
+  constexpr int GS = LBK / QK_ML8;
+  constexpr int HALF_TABLES = GS * BNF_T * 2;   // 8-entry halves of the 16-byte tables
+  static_assert(HALF_TABLES == RADP_NTHREADS, "one half-table per thread");
+  const int h = tid;
+  // Per-thread half-table geometry, hoisted out of the K loop (k0-independent).
+  const int c0  = (h & 1) * 8;                  // entries c0..c0+7
+  const int nl  = (h >> 1) % BNF_T;
+  const int gl  = (h >> 1) / BNF_T;
+  int n = n0 + nl; n = n < N ? n : N - 1;
+  const float inv = colscale[N + n];            // colscale[N..2N) = 1/denom (prep)
+  // Decoded-centroid cache: the 16 fp8 codebook entries for a K-group decode
+  // to the SAME f32 values for every column (the codebook `lut` is indexed
+  // by K-group only, per the header comment -- "one 16-byte codebook per
+  // K-group of 64", NOT per column). The old per-thread code had all
+  // BNF_T*2 threads sharing a (group,half) independently re-run
+  // __builtin_amdgcn_cvt_f32_fp8 on the SAME 8 bytes -- BNF_T-way redundant
+  // decode work AND BNF_T-way redundant `lut` global loads. Table sized by
+  // GS (K-slab-local group count, 1 or 2) alone, not by N or K*N, so this
+  // stays tiny (<=128 B) regardless of the GEMM shape -- see goal note "a
+  // table sized by N or by K alone is fine". Single-buffered (not double
+  // like sT[2][..]): unlike sT, which is read by the sW-staging step in the
+  // FOLLOWING iteration and so must survive across the iteration boundary,
+  // sCent is written near the top of an iteration and consumed by that same
+  // iteration's convert_sT() call below the loop's existing mid-loop
+  // radp_lds_barrier() -- no cross-iteration lifetime, so no second buffer
+  // is needed (verified: the next iteration's decode_sT() write cannot
+  // execute until this iteration's trailing barrier has passed, by which
+  // point this iteration's convert_sT() read has already happened).
+  __shared__ float sCent[GS][16];
+  // Per-slab global loads, issued early so the latency hides behind staging + WMMA.
+  float      pf_bsg;      // prefetched b_scale_g[g][n] for the slab being prefetched
+  uint2_radp pf_lw;       // prefetched 8 codebook bytes lut[g*16 + c0 .. +7] (nl==0 threads only)
+  auto prefetch_sT = [&](int kslab) {
+    const int g = kslab / QK_ML8 + gl;
+    pf_bsg = b_scale_g[(size_t)g * (size_t)N + n];
+    // Only ONE (gl,c0) pair per group/half needs the raw codebook bytes --
+    // the thread at nl==0 decodes for the whole column-tile (see decode_sT).
+    // Skipping this global load on the other (BNF_T-1) threads per (gl,c0)
+    // cuts the redundant `lut` VMEM traffic the old code issued on every
+    // one of the RADP_NTHREADS threads.
+    if (nl == 0) pf_lw = *(const uint2_radp *)(lut + (size_t)g * 16 + c0);
+  };
+  // Decode this group/half's 8 codebook bytes to f32 ONCE (nl==0 threads
+  // only) and publish into sCent for every column's thread to read back.
+  // Same hardware fp8->f32 conversion as before (v_cvt_f32_fp8, byte select
+  // 0..3), just executed by 2*GS threads instead of RADP_NTHREADS -- the
+  // decoded VALUES are identical (decode depends only on the group's lut
+  // bytes, never on the column), so this changes nothing about convert_sT's
+  // output, only how many threads redundantly compute it.
+  auto decode_sT = [&]() {
+    if (nl != 0) return;
+    const float f0 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[0], 0), f1 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[0], 1);
+    const float f2 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[0], 2), f3 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[0], 3);
+    const float f4 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[1], 0), f5 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[1], 1);
+    const float f6 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[1], 2), f7 = __builtin_amdgcn_cvt_f32_fp8(pf_lw[1], 3);
+    sCent[gl][c0 + 0] = f0; sCent[gl][c0 + 1] = f1; sCent[gl][c0 + 2] = f2; sCent[gl][c0 + 3] = f3;
+    sCent[gl][c0 + 4] = f4; sCent[gl][c0 + 5] = f5; sCent[gl][c0 + 6] = f6; sCent[gl][c0 + 7] = f7;
+  };
+  // convert_sT is split into two independent HALVES (convert_lo: this
+  // thread's elements 0-3 -> o0; convert_hi: elements 4-7 -> o1) that used
+  // to be one lambda issued as a single ~20-VALU-op block AFTER the whole
+  // WMMA step loop had finished (see the call-site history below). Bench
+  // data showed that placement cost 4-5% of kernel time even after the
+  // decode-hoist above removed the redundant `lut` loads/decode -- the
+  // convert work was a serial VALU block sitting between the WMMA loop and
+  // the trailing barrier, not overlapped with anything. Splitting it lets
+  // each half be issued from WITHIN the step loop, between two WMMA
+  // steps' `__builtin_amdgcn_sched_barrier(0)` fences (which block reorder
+  // only AT that fence, not between one step's WMMA and a later step's
+  // fence), so the scheduler can interleave these VALU ops with the
+  // matrix-core instruction stream instead of appending them after it.
+  // Math and byte layout are UNCHANGED from the original single lambda --
+  // same per-element clamp (see the rejected-optimization note kept on
+  // convert_lo below), same 2-call cvt_pk_fp8_f32 pairing, same
+  // destination bytes -- only WHEN each half's instructions are issued
+  // changes.
+  auto convert_lo = [&](unsigned char *dstT) {
+    const float s = pf_bsg * inv;
+    // Read this thread's already-decoded centroids back from sCent
+    // (broadcast LDS reads: every thread's address depends only on (gl,c0),
+    // so the BNF_T threads sharing a (group,half) all hit the SAME 2
+    // addresses per wave -- no bank conflict, no re-decode).
+    //
+    // NOT hoisted: clamping s itself (s_c = min(s,448)) instead of each
+    // product was evaluated per the goal note's proof obligation and
+    // REJECTED -- it is not bit-identical. Centroids are bounded to
+    // [-1,1] (scripts/calibration/centroid_quantizer.py fits Lloyd-Max
+    // centroids on rows normalized by their own per-row abs-max, so
+    // |x_norm|<=1 by construction; centroids lie in the convex hull of
+    // that data and the subsequent E4M3 snap cannot push a value <=1.0
+    // past the 1.0 rounding boundary up to 1.0625), so |f[e]*s| <= s
+    // always. But when s > 448 (a real case: s = b_scale_g*inv can exceed
+    // 448 for a group whose OWN lut_amax is well under 1 while a
+    // DIFFERENT group sets colscale[n]'s max), per-entry clamping keeps
+    // f[e]*s for f[e] with small |f[e]| (which never approached 448 in
+    // the first place) UNCHANGED, whereas clamping s first would rescale
+    // that same small product down to f[e]*448 -- a different, wrong
+    // value. Example: f[e]=0.1, s=500 -> per-entry clamp keeps 50; a
+    // clamped-s version would give 44.8. So the per-entry clamp is kept
+    // (one v_med3_f32 per element, same as before).
+    const float f0 = fminf(fmaxf(sCent[gl][c0 + 0] * s, -448.f), 448.f);
+    const float f1 = fminf(fmaxf(sCent[gl][c0 + 1] * s, -448.f), 448.f);
+    const float f2 = fminf(fmaxf(sCent[gl][c0 + 2] * s, -448.f), 448.f);
+    const float f3 = fminf(fmaxf(sCent[gl][c0 + 3] * s, -448.f), 448.f);
+    // scale, then encode pairs with the hardware f32->fp8 pack (v_cvt_pk_fp8_f32, RNE): (lo, hi, old, write_hi)
+    // v_cvt_pk_fp8_f32 does NOT saturate (|x| > 448 -> NaN byte); the
+    // software __hip_fp8_e4m3 the old table used clamps to +-448, hence
+    // the per-element clamp above.
+    uint32_t o0 = __builtin_amdgcn_cvt_pk_fp8_f32(f0, f1, 0u, false);
+    o0          = __builtin_amdgcn_cvt_pk_fp8_f32(f2, f3, o0, true);
+    *(uint32_t *)(&dstT[((gl * BNF_T) + nl) * 16 + c0 + 0]) = o0;
+  };
+  auto convert_hi = [&](unsigned char *dstT) {
+    const float s = pf_bsg * inv;   // same s as convert_lo -- see its comment for why per-entry clamp is kept
+    const float f4 = fminf(fmaxf(sCent[gl][c0 + 4] * s, -448.f), 448.f);
+    const float f5 = fminf(fmaxf(sCent[gl][c0 + 5] * s, -448.f), 448.f);
+    const float f6 = fminf(fmaxf(sCent[gl][c0 + 6] * s, -448.f), 448.f);
+    const float f7 = fminf(fmaxf(sCent[gl][c0 + 7] * s, -448.f), 448.f);
+    uint32_t o1 = __builtin_amdgcn_cvt_pk_fp8_f32(f4, f5, 0u, false);
+    o1          = __builtin_amdgcn_cvt_pk_fp8_f32(f6, f7, o1, true);
+    *(uint32_t *)(&dstT[((gl * BNF_T) + nl) * 16 + c0 + 4]) = o1;
+  };
+  // One-time prologue: prefetch + decode + convert slab 0's table before the
+  // loop. This is the only place that needs an EXTRA barrier (between
+  // decode_sT's publish and the converts' read) -- inside the K loop below,
+  // decode_sT()'s publish for slab k0+LBK is placed before the loop's
+  // existing mid-loop radp_lds_barrier() (the one that already gates the
+  // sW build), so that barrier does double duty and the converts need no
+  // additional synchronization. The prologue runs once per launch (no WMMA
+  // to interleave with yet), so convert_lo/convert_hi just run back to
+  // back here; this one extra barrier is not on the per-slab critical path.
+  prefetch_sT(0);
+  decode_sT();
+  radp_lds_barrier();
+  convert_lo(sT[0]);
+  convert_hi(sT[0]);
+  radp_lds_barrier();
+  for (int k0 = 0, buf = 0; k0 < K; k0 += LBK, buf ^= 1) {
+    // Prefetch the NEXT slab's global loads first so their latency hides
+    // behind this slab's staging + WMMA (consumed by convert_sT at the
+    // bottom). decode_sT() runs right after: it only needs pf_lw (nl==0
+    // threads), and its sCent write is published by the mid-loop barrier
+    // below -- no separate barrier needed for it.
+    if (k0 + LBK < K) { prefetch_sT(k0 + LBK); decode_sT(); }
     // A fragments straight from global: radiance_mxfp4_fp8.hip:628-634, verbatim.
     int2_radp af[RADP_TM][NS];
 #pragma unroll
@@ -302,11 +468,10 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
       // when LBK==128 -- same "blk" pattern radiance's own
       // non-WPERM/WPERM-scale read used at line 646/652, just at group
       // width 64 instead of MX's 32).
-      const int g = (k0 + wkst[it] * 16) / QK_ML8;
+      const int gl = (wkst[it] * 16) / QK_ML8;     // group within slab
 #pragma unroll
       for (int q = 0; q < WSLOTS; ++q) {
-        const int n = wrc[it] + q;
-        const unsigned char *Tqn = T + ((size_t)g * N + n) * 16;
+        const unsigned char *Tqn = &sT[buf][((gl * BNF_T) + (wrow[it] + q)) * 16];
         const uint32_t L0 = *(const uint32_t *)(Tqn + 0);
         const uint32_t L1 = *(const uint32_t *)(Tqn + 4);
         const uint32_t L2 = *(const uint32_t *)(Tqn + 8);
@@ -325,7 +490,22 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
     }
     radp_lds_barrier();
 
-    // radiance_mxfp4_fp8.hip:703-718, verbatim.
+    // radiance_mxfp4_fp8.hip:703-718, verbatim, EXCEPT for the two
+    // convert_lo/convert_hi calls interleaved at steps 0 and 1 (see the
+    // lambda-definition comment above for why): NS is LBK/16, i.e. 4 for
+    // TN=4/LBK=64 and 8 for TN=2/LBK=128, so step 1 always exists and both
+    // calls land in the FIRST HALF of the step loop, leaving the remaining
+    // NS-2 steps' WMMA instructions (2 or 6 of them) after each call as
+    // overlap window -- vs. the old placement where the whole convert_sT
+    // body ran strictly after ALL NS steps, back to back with nothing to
+    // hide its latency behind. Each call sits between step i's WMMA (just
+    // issued above it in program order) and step i+1's `sched_barrier(0)`
+    // (below it), i.e. inside one scheduling region together with step i's
+    // WMMA -- sched_barrier(0) blocks reorder AT that fence, not between a
+    // completed step and a later step's fence, so the backend is free to
+    // interleave/dual-issue these VALU ops against the surrounding
+    // matrix-core instructions instead of them forming their own serial
+    // block. Guarded the same way convert_sT was (only on non-final slabs).
 #pragma unroll
     for (int step = 0; step < NS; ++step) {
       const int kk = step * 16 + kb8;
@@ -341,7 +521,15 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
 #pragma unroll
         for (int j = 0; j < TN; ++j)
           acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][step], wf[j], acc[i][j]);
+      if (k0 + LBK < K) {
+        if (step == 0) convert_lo(sT[buf ^ 1]);
+        if (step == 1) convert_hi(sT[buf ^ 1]);
+      }
     }
+    // sT[buf^1] is now fully written (both halves, for every (gl,c0)
+    // thread) by the interleaved calls above; the trailing barrier below
+    // publishes it for the next iteration -- no extra barrier (same
+    // double-buffering contract as before, just filled earlier).
     radp_lds_barrier();
   }
 
@@ -460,44 +648,22 @@ __global__ void radp_colscale_kernel(const float* __restrict__ b_scale_g, const 
         for (int i = 0; i < 16; ++i) lut_amax = fmaxf(lut_amax, fabsf(ml84_decode_e4m3(lut[(size_t)g * 16 + i])));
         mx = fmaxf(mx, b_scale_g[(size_t)g * (size_t)N + n] * lut_amax);
     }
-    colscale_out[n] = fmaxf(mx / 448.0f, 1e-12f);
+    const float cs = fmaxf(mx / 448.0f, 1e-12f);
+    colscale_out[n]     = cs;
+    colscale_out[N + n] = 1.0f / (cs > 0.f ? cs : 1.f);   // inverse for the per-slab table build
 }
 
-__global__ void radp_table_kernel(const float* __restrict__ b_scale_g, const uint8_t* __restrict__ lut,
-                                   const float* __restrict__ colscale, uint8_t* __restrict__ T_out,
-                                   int N, int n_groups_k) {
-    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t total = (size_t)n_groups_k * (size_t)N;
-    if (idx >= total) return;
-    const int n = (int)(idx % (size_t)N);
-    const int g = (int)(idx / (size_t)N);
-    const uint8_t* lut_g = lut + (size_t)g * 16;
-    const float bsg = b_scale_g[(size_t)g * (size_t)N + n];
-    const float denom = colscale[n] > 0.f ? colscale[n] : 1.f;
-    uint8_t* Tg = T_out + idx * 16;
-#pragma unroll
-    for (int c = 0; c < 16; ++c) {
-        const float centroid = ml84_decode_e4m3(lut_g[c]);
-        Tg[c] = ml84_encode_e4m3(centroid * bsg / denom);
-    }
-}
-
-bool rdna4_gemm_ml84_radiance_prep(const uint8_t* B_nib, const uint8_t* lut, const float* b_scale_g,
-                                    int N, int K, uint8_t* T_out, float* colscale_out, hipStream_t stream) {
-    (void)B_nib;   // not read -- see header comment
+bool rdna4_gemm_ml84_radiance_prep(const uint8_t* lut, const float* b_scale_g,
+                                    int N, int K, float* colscale_out, hipStream_t stream) {
     if (N <= 0 || K <= 0 || (K % QK_ML8) != 0 || (N % 16) != 0) return false;
     const int n_groups_k = K / QK_ML8;
     constexpr int TPB = 256;
     radp_colscale_kernel<<<(N + TPB - 1) / TPB, TPB, 0, stream>>>(b_scale_g, lut, colscale_out, N, n_groups_k);
-    if (hipGetLastError() != hipSuccess) return false;
-    const size_t total = (size_t)n_groups_k * (size_t)N;
-    const int blocks = (int)std::min<size_t>((total + TPB - 1) / TPB, 65535 * 8u);
-    radp_table_kernel<<<blocks, TPB, 0, stream>>>(b_scale_g, lut, colscale_out, T_out, N, n_groups_k);
     return hipGetLastError() == hipSuccess;
 }
 
 void rdna4_ml84_radiance_prep_host(const uint8_t* lut, const float* b_scale_g,
-                                    int N, int K, uint8_t* T_out, float* colscale_out) {
+                                    int N, int K, float* colscale_out) {
     const int n_groups_k = K / QK_ML8;
     std::vector<float> lut_amax_g(n_groups_k, 0.f);
     for (int g = 0; g < n_groups_k; ++g) {
@@ -508,18 +674,9 @@ void rdna4_ml84_radiance_prep_host(const uint8_t* lut, const float* b_scale_g,
     for (int n = 0; n < N; ++n) {
         float mx = 0.f;
         for (int g = 0; g < n_groups_k; ++g) mx = std::max(mx, b_scale_g[(size_t)g * (size_t)N + n] * lut_amax_g[g]);
-        colscale_out[n] = std::max(mx / 448.0f, 1e-12f);
-    }
-    for (int g = 0; g < n_groups_k; ++g) {
-        for (int n = 0; n < N; ++n) {
-            const float denom = colscale_out[n] > 0.f ? colscale_out[n] : 1.f;
-            const float bsg = b_scale_g[(size_t)g * (size_t)N + n];
-            uint8_t* Tg = T_out + ((size_t)g * N + n) * 16;
-            for (int c = 0; c < 16; ++c) {
-                const float centroid = ml84_decode_e4m3(lut[(size_t)g * 16 + c]);
-                Tg[c] = ml84_encode_e4m3(centroid * bsg / denom);
-            }
-        }
+        const float cs = std::max(mx / 448.0f, 1e-12f);
+        colscale_out[n]     = cs;
+        colscale_out[N + n] = 1.0f / (cs > 0.f ? cs : 1.f);
     }
 }
 
@@ -529,8 +686,8 @@ void rdna4_ml84_radiance_prep_host(const uint8_t* lut, const float* b_scale_g,
 // arguments swapped for T/colscale/B_nib per the format change.
 // ─────────────────────────────────────────────────────────────────────────
 bool rdna4_gemm_ml84_radiance(int M, const void* A_fp8, const float* a_scale, const uint8_t* B_nib,
-                               const uint8_t* T, const float* colscale, float* C_f32, int N, int K,
-                               hipStream_t stream) {
+                               const uint8_t* lut, const float* b_scale_g, const float* colscale, float* C_f32,
+                               int N, int K, hipStream_t stream) {
     if (M <= 0 || N <= 0 || K <= 0) return false;
     if (K % 128) return false;          // radiance_mxfp4_fp8.hip:1663, "tiled A needs K % 128 == 0"
     if (K % QK_ML8) return false;       // group granularity
@@ -545,12 +702,12 @@ bool rdna4_gemm_ml84_radiance(int M, const void* A_fp8, const float* a_scale, co
         constexpr int B_ = RADP_BNF_OF(4);
         const dim3 grid((N + B_ - 1) / B_, (M + RADP_BMF - 1) / RADP_BMF);
         hipLaunchKernelGGL((radp_gemm_ml84_atiled<4, 64>), grid, block, 0, stream,
-                            AT, B_nib, T, colscale, a_scale, C_f32, M, N, K, 1 << 30, 1 << 30, 0L);
+                            AT, B_nib, lut, b_scale_g, colscale, a_scale, C_f32, M, N, K, 1 << 30, 1 << 30, 0L);
     } else {
         constexpr int B_ = RADP_BNF_OF(2);
         const dim3 grid((N + B_ - 1) / B_, (M + RADP_BMF - 1) / RADP_BMF);
         hipLaunchKernelGGL((radp_gemm_ml84_atiled<2, 128>), grid, block, 0, stream,
-                            AT, B_nib, T, colscale, a_scale, C_f32, M, N, K, 1 << 30, 1 << 30, 0L);
+                            AT, B_nib, lut, b_scale_g, colscale, a_scale, C_f32, M, N, K, 1 << 30, 1 << 30, 0L);
     }
     return hipGetLastError() == hipSuccess;
 }

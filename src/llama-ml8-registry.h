@@ -121,9 +121,10 @@ struct fp8_qrot_key {
     int64_t b_dim = 0;
     int32_t kind  = 0;
     int32_t G     = 128;
+    const struct ggml_tensor * gate = nullptr; // ggml_fp8_quant_rot_gated's sigmoid gate view (nullptr = ungated)
 
     bool operator==(const fp8_qrot_key & o) const {
-        return x == o.x && h_a == o.h_a && a_dim == o.a_dim && b_dim == o.b_dim && kind == o.kind && G == o.G;
+        return x == o.x && h_a == o.h_a && a_dim == o.a_dim && b_dim == o.b_dim && kind == o.kind && G == o.G && gate == o.gate;
     }
 };
 
@@ -134,6 +135,7 @@ struct fp8_qrot_key_hash {
         h = h * 1000003u ^ std::hash<int64_t>()(k.a_dim);
         h = h * 1000003u ^ std::hash<int64_t>()(k.b_dim);
         h = h * 1000003u ^ std::hash<int32_t>()(k.kind);
+        h = h * 1000003u ^ std::hash<const void *>()(k.gate);
         h = h * 1000003u ^ std::hash<int32_t>()(k.G);
         return h;
     }
@@ -217,10 +219,16 @@ using fp8_qrot_memo = std::unordered_map<fp8_qrot_key, struct ggml_tensor *, fp8
 // confirm the CUDA backend's supports_op will actually accept it for the
 // resulting op's shape (ggml_cuda_ml8_4_mul_mat_supports_bf16_out et al. in
 // ggml-cuda.cu) -- this function does not check device support itself.
+// `gate` (optional): a strided f32 [head_dim, n_heads, n_tokens] view; x is
+// multiplied by sigmoid(gate) inside the quant kernel (ggml_fp8_quant_rot_gated)
+// on the ML8_4 per-row path. Every other weight type applies it explicitly
+// (ggml_cont + ggml_sigmoid + ggml_mul) before the matmul, so callers may pass
+// it unconditionally.
 struct ggml_tensor * build_ml8_or_mul_mat(
         struct ggml_context  * ctx,
         const ml8_registry   & reg,
         struct ggml_tensor   * weight,
         struct ggml_tensor   * x,
         fp8_qrot_memo        * qrot_memo = nullptr,
-        enum ggml_type         out_type = GGML_TYPE_F32);
+        enum ggml_type         out_type = GGML_TYPE_F32,
+        struct ggml_tensor   * gate = nullptr);

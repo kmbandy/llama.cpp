@@ -99,6 +99,37 @@
 // single q_len and per-seq q_lens weren't packed.
 // flags==0 (old graph / cold clone never touched by update_paged_attn_q_lens()) falls back to
 // the pre-existing op_params[4]/[6]/q->ne[2] derivation, kept verbatim below.
+//
+// ── turbo4kv mode: serving GGML_TYPE_TURBO4_FP8_BS256 (MAD_USE_R4D_ATTN_TURBO4=1) ──────────────
+//
+// Everything above this point was written against GGML_TYPE_R4D_FP8_KV, R4D's own combined-K|V
+// fp8 cache. This adapter can ALSO serve the production KV cache, GGML_TYPE_TURBO4_FP8_BS256, via
+// r4d_attn_{prefill,decode}_h256_gqa6_turbo4kv — the same R4D library, a different pair of kernel
+// entries compiled for turbo4's on-disk layout. Gated by r4d_turbo4_enabled() (env
+// MAD_USE_R4D_ATTN_TURBO4) independently of MAD_USE_R4D, and tracked throughout the dispatch
+// function by the local `turbo4` bool. Three differences from the R4D_FP8_KV path, all confined
+// to the places this file's helper `turbo4` bool is read:
+//   (1) Cache layout: turbo4 keeps K and V in SEPARATE cache buffers (dst->src[1]/src[2] — v_cache,
+//       unused for R4D_FP8_KV, is live here) of 162-byte records per (paged block, slot, kv head):
+//       fp16 per-vector scale, 128 bytes of 4-bit centroid indices, 32 sign bytes, addressed at
+//       byte offset ((block*16 + slot_in_block)*n_kv_heads + kv_head) * 162. R4DArgs' KVP=2 fields
+//       (v_cache, k_lut, v_lut, kv_slot_stride) carry this layout in; kv_block_stride/kv_head_stride
+//       switch from R4D_FP8_KV's ELEMENT strides to BYTE strides for this mode (r4d.h). The scatter
+//       itself is NOT this file's own kernel — it calls back into the AITER path's exported
+//       mt_aiter_scatter_kv_turbo4_fp8_launch (mt_pagedattn_aiter.cu) so both adapters write bit-
+//       identical records, rather than maintaining a second copy of that kernel here.
+//   (2) Per-(layer, K|V) centroid LUTs: mt_turbo_fp8::get_lut_device_ptr(il, KV_K/KV_V), il parsed
+//       from k_cache's tensor name via the AITER path's exported mt_aiter_parse_layer_from_kv_cache_
+//       name — same registry, same parser, same layer binding the AITER path uses for this cache
+//       type, so a mixed AITER/R4D deployment can never disagree about which LUTs a layer gets.
+//   (3) Optional Hadamard Q pre-rotation: when mt_turbo_fp8::hadamard_required() is true, K was
+//       FWHT-rotated at scatter time (inside mt_aiter_scatter_kv_turbo4_fp8_launch); Q must be
+//       rotated identically before attention for (QH)·(KH)^T = QK^T to hold. Done once, up front,
+//       over the WHOLE packed Q buffer (both the uniform and per-seq launch bodies below read out
+//       of the same rotated copy, at their own offsets) — mirrors the AITER path's own Q rotation
+//       exactly. V is never rotated. R4D_FP8_KV never takes this branch: it has no Hadamard mode.
+// Nothing else changes: eligibility's shape/GQA/q_len gates, the expand/compact/cast kernels, the
+// uniform-vs-per-seq split, and MAD_R4D_ATTN_CALLFIX all apply identically to both cache types.
 
 #include "common.cuh"
 #include "mt_pagedattn_r4d.cuh"
@@ -107,12 +138,20 @@
 
 #include "r4d/ggml-r4d.h"
 #include "mt_pagedattn_r4d_scatter.cuh"
+// turbo4kv mode (MAD_USE_R4D_ATTN_TURBO4=1): reuses the AITER path's turbo4_fp8 scatter kernel and
+// layer-name parser (mt_pagedattn_aiter.cu) so both adapters write the exact same on-disk record
+// layout, plus the centroid-LUT registry and the Hadamard Q pre-rotation helper it depends on. See
+// this file's header comment for the mode's layout and rotation contract.
+#include "mt_pagedattn_aiter.cuh"
+#include "mt_turbo_fp8_lut_registry.h"
+#include "turbo_fp8_hadamard.cuh"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <mutex>
 #include <set>
@@ -134,6 +173,24 @@ bool r4d_backend_enabled() {
     return enabled;
 }
 
+// MAD_USE_R4D_ATTN_TURBO4=1: let this adapter also serve GGML_TYPE_TURBO4_FP8_BS256 (the
+// production KV cache type), via the r4d_*_turbo4kv entries and the AITER path's turbo4_fp8
+// scatter kernel (mt_aiter_scatter_kv_turbo4_fp8_launch, mt_pagedattn_aiter.cu). Gated separately
+// from r4d_backend_enabled() (MAD_USE_R4D) since this mode has its own, independently-rolled-out
+// eligibility. Only meaningful when built with GGML_HIP_AITER — the scatter launch this mode calls
+// into only exists for real then (mt_pagedattn_aiter.cuh's stub otherwise).
+bool r4d_turbo4_enabled() {
+#ifdef GGML_HIP_AITER
+    static const bool enabled = [] {
+        const char * env = std::getenv("MAD_USE_R4D_ATTN_TURBO4");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 namespace {
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -153,10 +210,52 @@ enum r4d_persist_slot {
     R4D_PERSIST_SEQUSED_K,    // int32, one per seq slot
     R4D_PERSIST_CU_SEQLENS,   // int32, num_seqs+1 — prefix sum of q_lens (packed-row offsets)
     R4D_PERSIST_DECODE_SCRATCH, // split-KV partials, decode only, sized in bytes
+    R4D_PERSIST_Q_ROT,       // turbo4kv + mt_turbo_fp8::hadamard_required() only: FWHT-rotated
+                             // copy of the whole packed F16 Q buffer (K was rotated at scatter
+                             // time by mt_aiter_scatter_kv_turbo4_fp8_launch)
+    // MAD_R4D_ATTN_CALLFIX=1 only (see r4d_callfix_enabled() below): compact grid.z from the
+    // cache's static n_seq_max down to the actual live-sequence count, mirroring radiance's
+    // R4DAttentionMetadataBuilder._plan() which only ever launches with num_seqs==num_active.
+    // See mt_pagedattn_r4d.cu's header-adjacent comment and tests/test-r4d-attn.hip.cpp's
+    // "production prefill bench" for the investigation this closes.
+    R4D_PERSIST_SEQ_MAP,            // int32, num_active — compacted slot j -> original slot id
+    R4D_PERSIST_SEQUSED_COMPACT,    // int32, num_active — seqused_k reindexed by compacted j
+    R4D_PERSIST_BLOCK_TABLE_COMPACT, // int32, num_active*max_blocks — block_table rows reindexed by j
     R4D_PERSIST_COUNT
 };
 static std::mutex g_r4d_persist_mutex;
 static std::map<std::pair<int, cudaStream_t>, std::array<r4d_persist_buf, R4D_PERSIST_COUNT>> g_r4d_persist;
+
+// MAD-LAB 2026-09-20 diag: WP_ALLOC_LOG=1 attribution for this grow-only
+// cache, mirroring mt_aiter_persist_alloc_log's format/reasoning exactly
+// (mt_pagedattn_aiter.cu) so the same journal grep finds both. wp_alloc_log
+// has internal linkage in ggml-cuda.cu and is not reachable from this TU,
+// hence the local twin. NOTE (unlike the aiter twin): this path (a) has no
+// MT_AITER_PERSIST_MAX_MB-style cap -- a single slot can grow without bound
+// if n_elems ever tracks something unbounded (e.g. context length rather
+// than a fixed num_seqs/head_dim shape) -- and (b) still uses the OLD
+// doubling growth (max(need, b.bytes*2)) that the aiter twin's 2026-09-20
+// comment (mt_pagedattn_aiter.cu) says permanently overshoots and, on top
+// of that, LEAKS the old buffer on every grow step (b.ptr is overwritten
+// below with no cudaFree of the previous allocation -- same bug the aiter
+// twin used to have before that fix). Diagnostic-only here: no behavior
+// change, since this file is gated behind MAD_USE_R4D=1/GGML_HIP_R4D and a
+// fix belongs with whoever owns this integration (see the "duplicated here
+// rather than shared" comment above r4d_persist_buf).
+static void r4d_persist_alloc_log(int device, size_t old_bytes, size_t new_bytes) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_ALLOC_LOG");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv; localtime_r(&ts.tv_sec, &tmv);
+    std::fprintf(stderr, "wp alloc-log %02d:%02d:%02d.%03ld r4d_persist_grow device=%d size=%.1fMiB extra=%.1fMiB\n",
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts.tv_nsec / 1000000, device,
+                 new_bytes / 1048576.0, old_bytes / 1048576.0);
+}
 
 template <typename T>
 static T * r4d_persist_get(int device, cudaStream_t stream, r4d_persist_slot slot, size_t n_elems) {
@@ -169,6 +268,7 @@ static T * r4d_persist_get(int device, cudaStream_t stream, r4d_persist_slot slo
         void * ptr = nullptr;
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        r4d_persist_alloc_log(device, b.bytes, bytes);
         b.ptr   = ptr;
         b.bytes = bytes;
     }
@@ -291,12 +391,140 @@ __global__ void r4d_cast_bf16_to_f16_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// MAD_R4D_ATTN_CALLFIX=1 (default off) — grid.z compaction, A/B-gated.
+//
+// mt_pagedattn_r4d.cu always passes R4DArgs.num_seqs = block_tables->ne[1], the paged cache's
+// STATIC n_seq_max (see the uniform-path comment at its use below and the identical, older
+// precedent in mt_pagedattn_aiter.cu's num_seqs_dispatch, ~:1021-1034) — required because R4D's
+// block_table / seqused_k / slot-indexed Q are addressed by absolute seq-SLOT id, not compacted,
+// and a live sequence can sit at any slot. radiance_r4d_attn.py's R4DAttentionMetadataBuilder
+// never has this problem: its `_plan()` and `R4DAttentionImpl.forward()` pass num_seqs = the
+// ACTUAL live-sequence count for that launch (vLLM's own block_table/seq_lens tensors are already
+// packed to only the live requests), so grid.z there is never padded with idle, immediately-
+// returning workgroups (r4d_attn_prefill_kernel: "if (ctx <= 0) return;"). tests/test-r4d-attn.
+// hip.cpp's "production prefill bench" isolated exactly this field as the one remaining,
+// verifiable difference between the two call sites once max_ctx/splits/scratch (all read-but-
+// unused by prefill) and kv strides/descales/q_len were confirmed identical.
+//
+// This is deliberately NOT the always-on behavior: shrinking grid.z to the live count while still
+// addressing block_table/seqused_k by absolute slot index would read the WRONG sequences'
+// context whenever live slots are not packed at 0..num_active-1 (not guaranteed by llama.cpp's
+// paged cache in general). So instead of narrowing grid.z directly, this gate REMAPS: it builds a
+// compacted (block_table, seqused_k) — one row per LIVE slot, in the same slot-ascending order the
+// packed Q/out layout already uses — via r4d_build_compact_seqmap_kernel +
+// r4d_gather_block_table_kernel, and expands/compacts Q/out against that compacted indexing via
+// r4d_expand_q_compact_kernel / r4d_compact_out_compact_kernel. R4DArgs.num_seqs then becomes the
+// true live count, matching radiance's grid.z exactly, with no risk of cross-slot misreads.
+//
+// Off by default (MAD_R4D_ATTN_CALLFIX unset or not "1") so the existing, always-correct padded
+// path stays the default; set it to A/B this specific fix in isolation.
+bool r4d_callfix_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("MAD_R4D_ATTN_CALLFIX");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+// Single-thread sequential scan (num_seqs is small — the cache's static n_seq_max — so this is
+// cheap, alloc- and sync-free, and capture-safe, same reasoning as
+// r4d_build_cu_seqlens_and_seqused_kernel above). Writes, for each live slot in ascending slot
+// order, its original slot id into seq_map[j] and its context length into seqused_compact[j].
+// j runs 0..num_active-1 by construction (num_active live slots among num_seqs), matching the
+// order the packed Q/out rows are already laid out in (cu_seqlens/expand_q iterate slots the same
+// way).
+__global__ void r4d_build_compact_seqmap_kernel(
+        const int32_t * __restrict__ q_lens,
+        const int32_t * __restrict__ context_lens,
+        int32_t * __restrict__ seq_map,
+        int32_t * __restrict__ seqused_compact,
+        int num_seqs) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+    int32_t j = 0;
+    for (int s = 0; s < num_seqs; ++s) {
+        if (q_lens[s] > 0) {
+            seq_map[j]          = s;
+            seqused_compact[j]  = context_lens[s];
+            ++j;
+        }
+    }
+}
+
+// Reindex block_table rows from original slot id to compacted j. grid = (num_active); each block
+// copies one row (max_blocks ints) via seq_map[j] -> original slot id.
+__global__ void r4d_gather_block_table_kernel(
+        const int32_t * __restrict__ block_table_full,
+        const int32_t * __restrict__ seq_map,
+        int32_t * __restrict__       block_table_compact,
+        int max_blocks) {
+    const int j = blockIdx.x;
+    const int s = seq_map[j];
+    const int32_t * __restrict__ src = block_table_full     + (size_t) s * (size_t) max_blocks;
+    int32_t *       __restrict__ dst = block_table_compact  + (size_t) j * (size_t) max_blocks;
+    for (int b = threadIdx.x; b < max_blocks; b += blockDim.x) {
+        dst[b] = src[b];
+    }
+}
+
+// r4d_expand_q_kernel's compacted twin: same packed-F16 -> slot-indexed-bf16 job, but the
+// destination slot is the compacted index j (blockIdx.x, 0..num_active-1) rather than the
+// original seq slot id — seq_map[j] gives the original id needed to read q_lens/cu_seqlens (the
+// packed source layout is still keyed by original slot id, unchanged by this gate).
+__global__ void r4d_expand_q_compact_kernel(
+        const __half * __restrict__ q_packed,
+        nv_bfloat16 * __restrict__  q_slot,
+        const int32_t * __restrict__ q_lens,
+        const int32_t * __restrict__ cu_seqlens,
+        const int32_t * __restrict__ seq_map,
+        int q_len, int row_elems) {
+    const int j   = blockIdx.x;
+    const int r   = blockIdx.y;
+    const int seq = seq_map[j];
+    if (q_lens[seq] <= 0) {
+        return; // defensive; seq_map only ever names live slots by construction
+    }
+    const long src_row = (long) cu_seqlens[seq] + r;
+    const long dst_row = (long) j * q_len + r;
+    const __half   * src = q_packed + src_row * row_elems;
+    nv_bfloat16    * dst = q_slot   + dst_row * row_elems;
+    for (int e = threadIdx.x; e < row_elems; e += blockDim.x) {
+        dst[e] = r4d_f16_to_bf16(src[e]);
+    }
+}
+
+// r4d_compact_out_kernel's compacted twin — the reverse of the kernel above.
+__global__ void r4d_compact_out_compact_kernel(
+        const nv_bfloat16 * __restrict__ out_slot,
+        __half * __restrict__            out_packed,
+        const int32_t * __restrict__ q_lens,
+        const int32_t * __restrict__ cu_seqlens,
+        const int32_t * __restrict__ seq_map,
+        int q_len, int row_elems) {
+    const int j   = blockIdx.x;
+    const int r   = blockIdx.y;
+    const int seq = seq_map[j];
+    if (q_lens[seq] <= 0) {
+        return;
+    }
+    const long src_row = (long) j * q_len + r;
+    const long dst_row = (long) cu_seqlens[seq] + r;
+    const nv_bfloat16 * src = out_slot   + src_row * row_elems;
+    __half            * dst = out_packed + dst_row * row_elems;
+    for (int e = threadIdx.x; e < row_elems; e += blockDim.x) {
+        dst[e] = r4d_bf16_to_f16(src[e]);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Diagnostics — MAD_R4D_LOG=1: log once per distinct (q_len, num_seqs, max_ctx) the path taken.
 bool r4d_log_enabled() {
     static const bool e = [] { const char * v = std::getenv("MAD_R4D_LOG"); return v && v[0] == '1'; }();
     return e;
 }
-void r4d_log_once(int q_len, int num_seqs, int max_ctx, bool decode, int splits, long scratch_bytes, int rc) {
+void r4d_log_once(int q_len, int num_seqs, int max_ctx, bool decode, int splits, long scratch_bytes, int rc,
+                   const char * kernel_name) {
     if (!r4d_log_enabled()) {
         return;
     }
@@ -308,8 +536,25 @@ void r4d_log_once(int q_len, int num_seqs, int max_ctx, bool decode, int splits,
         return;
     }
     std::fprintf(stderr,
-        "[mt_pagedattn_r4d] mode=uniform q_len=%d num_seqs=%d max_ctx=%d path=%s splits=%d scratch_bytes=%ld rc=%d\n",
-        q_len, num_seqs, max_ctx, decode ? "decode" : "prefill", splits, scratch_bytes, rc);
+        "[mt_pagedattn_r4d] mode=uniform q_len=%d num_seqs=%d max_ctx=%d path=%s kernel=%s splits=%d scratch_bytes=%ld rc=%d\n",
+        q_len, num_seqs, max_ctx, decode ? "decode" : "prefill", kernel_name, splits, scratch_bytes, rc);
+}
+
+// MAD_R4D_LOG=1: log once per distinct (num_seqs_static, num_active) pair that MAD_R4D_ATTN_CALLFIX
+// actually compacted (i.e. num_active < num_seqs_static — nothing to log when the cache's static
+// n_seq_max already equals the live count, since the gate is then a no-op).
+void r4d_log_callfix_once(int num_seqs_static, int num_active) {
+    if (!r4d_log_enabled()) {
+        return;
+    }
+    static std::mutex mu;
+    static std::set<std::pair<int, int>> seen;
+    const auto key = std::make_pair(num_seqs_static, num_active);
+    std::lock_guard<std::mutex> lock(mu);
+    if (!seen.insert(key).second) {
+        return;
+    }
+    std::fprintf(stderr, "r4d attn callfix: num_seqs %d -> %d\n", num_seqs_static, num_active);
 }
 
 // Per-seq mode: one libr4d launch per active sequence, each with its own q_len/decode-vs-prefill
@@ -366,7 +611,9 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_cache       = dst->src[1];
     // v_cache (dst->src[2]) is allocated but unused for GGML_TYPE_R4D_FP8_KV — k_cache holds the
-    // combined K|V tensor (see this file's header comment and mt_pagedattn_r4d.cuh).
+    // combined K|V tensor (see this file's header comment and mt_pagedattn_r4d.cuh). For turbo4kv
+    // mode (GGML_TYPE_TURBO4_FP8_BS256) it IS used: K and V live in separate cache buffers there.
+    const ggml_tensor * v_cache       = dst->src[2];
     const ggml_tensor * block_tables  = dst->src[3];
     const ggml_tensor * context_lens  = dst->src[4];
     const ggml_tensor * q_lens        = dst->src[5];
@@ -402,9 +649,16 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
     const int num_seqs   = (int) block_tables->ne[1];
 
     // ── Eligibility (return false => caller falls through to the existing paths) ──────────────
-    if (k_cache->type != GGML_TYPE_R4D_FP8_KV) {
-        r4d_log_reject_once("k_cache_type", "k_cache->type=%d (need GGML_TYPE_R4D_FP8_KV=%d)",
-                             (int) k_cache->type, (int) GGML_TYPE_R4D_FP8_KV);
+    // turbo4kv mode (MAD_USE_R4D_ATTN_TURBO4=1): also accept the production KV cache type,
+    // GGML_TYPE_TURBO4_FP8_BS256, alongside the existing R4D_FP8_KV cache. `turbo4` is read
+    // everywhere below that the two modes' cache layouts / R4DArgs fields / kernel entries differ
+    // (scatter, Q rotation, args, launch selection).
+    const bool turbo4 = k_cache->type == GGML_TYPE_TURBO4_FP8_BS256 && r4d_turbo4_enabled();
+    if (k_cache->type != GGML_TYPE_R4D_FP8_KV && !turbo4) {
+        r4d_log_reject_once("k_cache_type",
+                             "k_cache->type=%d (need GGML_TYPE_R4D_FP8_KV=%d, or GGML_TYPE_TURBO4_FP8_BS256=%d "
+                             "with MAD_USE_R4D_ATTN_TURBO4=1)",
+                             (int) k_cache->type, (int) GGML_TYPE_R4D_FP8_KV, (int) GGML_TYPE_TURBO4_FP8_BS256);
         return false;
     }
     if (head_dim != 256 || block_size != 16) {
@@ -539,21 +793,38 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
     const int dev = ctx.device;
     const int n_tokens = (int) k_cur->ne[2];
 
+    // turbo4kv mode: the layer index the centroid-LUT registry keys on, parsed from the k_cache
+    // tensor's name (llama_kv_cache names it "cache_k_l<N>") — same parser the AITER path uses,
+    // exported non-static for this purpose (mt_pagedattn_aiter.cuh). Not meaningful/used otherwise.
+    const int il = turbo4 ? mt_aiter_parse_layer_from_kv_cache_name(k_cache->name) : -1;
+    GGML_ASSERT((!turbo4 || il >= 0) &&
+                "mt_pagedattn_r4d: turbo4kv mode failed to parse layer index from k_cache tensor name");
+
     // Debug-only overread guard, mirroring the aiter path's check (mt_pagedattn_aiter.cu:1093-1131):
     // everything below reads exactly total_q_tokens*n_heads*head_dim F16 elements out of q.
     GGML_ASSERT((size_t) total_q_tokens * (size_t) n_heads * (size_t) head_dim * sizeof(__half)
                     <= ggml_nbytes(q) &&
                 "mt_pagedattn_r4d: q tensor too small for (total_q_tokens, n_heads, head_dim)");
 
-    // ── 1. Fused scatter: K_cur/V_cur (F16) -> R4D's fp8 (num_blocks, kv_heads, 16, 2*head_dim)
-    //       layout, via slot_mapping. Must run before the attention call below (same ordering as
-    //       the AITER path: scatter, then attend against the just-written cache).
-    mt_r4d_scatter_kv(
-        (const half *) k_cur->data, (const half *) v_cur->data,
-        (uint8_t *) k_cache->data,
-        (const int32_t *) slot_mapping->data,
-        (const int32_t *) q_lens->data,
-        num_seqs, n_tokens, n_kv_heads, head_dim, block_size, stream);
+    // ── 1. Fused scatter: K_cur/V_cur (F16) -> the cache's paged fp8 layout, via slot_mapping.
+    //       Must run before the attention call below (same ordering as the AITER path: scatter,
+    //       then attend against the just-written cache). turbo4kv reuses the AITER path's scatter
+    //       kernel (mt_pagedattn_aiter.cu) so both adapters write the identical on-disk layout;
+    //       the R4D_FP8_KV path keeps its own combined-K|V scatter (mt_pagedattn_r4d_scatter.cuh).
+    if (turbo4) {
+        mt_aiter_scatter_kv_turbo4_fp8_launch(
+            k_cache->data, v_cache->data,
+            (const __half *) k_cur->data, (const __half *) v_cur->data,
+            (const int32_t *) slot_mapping->data,
+            n_tokens, n_kv_heads, head_dim, block_size, il, stream);
+    } else {
+        mt_r4d_scatter_kv(
+            (const half *) k_cur->data, (const half *) v_cur->data,
+            (uint8_t *) k_cache->data,
+            (const int32_t *) slot_mapping->data,
+            (const int32_t *) q_lens->data,
+            num_seqs, n_tokens, n_kv_heads, head_dim, block_size, stream);
+    }
 
     // ── 2. cu_seqlens (packed-row prefix sum) + seqused_k (context_lens gated by liveness) ──────
     int32_t * cu_seqlens_ptr = r4d_persist_get<int32_t>(dev, stream, R4D_PERSIST_CU_SEQLENS, (size_t) num_seqs + 1);
@@ -565,41 +836,113 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
     const int row_elems = n_heads * head_dim;
     const int max_ctx   = max_ctx_len_param > 0 ? (int) max_ctx_len_param : (int) max_bps * block_size;
 
+    // ── turbo4kv + Hadamard: K was FWHT-rotated at scatter time by mt_aiter_scatter_kv_turbo4_fp8_
+    // launch above (whenever the LUT registry says hadamard_required()) — (QH)·(KH)^T = QK^T only
+    // holds if Q is rotated identically before attention. Mirrors the AITER path's Q pre-rotation
+    // exactly (mt_pagedattn_aiter.cu:~1583-1618): copy the WHOLE packed Q buffer into scratch, FWHT
+    // it in place, then feed that copy (not q->data) to whichever launch body runs below — both the
+    // uniform and per-seq bodies read out of this same packed buffer, just at different offsets, so
+    // one rotation upfront covers both. V is never rotated.
+    const __half * q_data = (const __half *) q->data;
+    if (turbo4 && mt_turbo_fp8::hadamard_required()) {
+        const size_t q_elts = (size_t) total_q_tokens * (size_t) n_heads * (size_t) head_dim;
+        __half * q_rot = r4d_persist_get<__half>(dev, stream, R4D_PERSIST_Q_ROT, q_elts);
+        CUDA_CHECK(cudaMemcpyAsync(q_rot, q->data, q_elts * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+        const cudaError_t herr = mt_turbo_fp8_fwht_half(stream, q_rot, total_q_tokens * n_heads, head_dim, head_dim);
+        if (herr != cudaSuccess) {
+            GGML_ABORT("mt_pagedattn_r4d: mt_turbo_fp8_fwht_half(Q) launch failed: %s", cudaGetErrorString(herr));
+        }
+        q_data = q_rot;
+    }
+
     if (!use_per_seq) {
+        // ── MAD_R4D_ATTN_CALLFIX gate: compact grid.z from the static n_seq_max down to the
+        // actual live count — see r4d_callfix_enabled()'s comment above for why this exists and
+        // why it is a remap rather than a plain narrowing. A no-op (r4d_num_seqs == num_seqs)
+        // whenever the cache's static n_seq_max already equals num_active.
+        const bool do_compact = r4d_callfix_enabled() && num_active < num_seqs;
+        const int  r4d_num_seqs = do_compact ? num_active : num_seqs;
+        if (do_compact) {
+            r4d_log_callfix_once(num_seqs, num_active);
+        }
+
+        int32_t *      seq_map_ptr             = nullptr;
+        const int32_t * seqused_active_ptr     = seqused_k_ptr;
+        const int *     block_table_active_ptr = (const int *) block_tables->data;
+        if (do_compact) {
+            seq_map_ptr = r4d_persist_get<int32_t>(dev, stream, R4D_PERSIST_SEQ_MAP, (size_t) num_active);
+            int32_t * seqused_compact_ptr = r4d_persist_get<int32_t>(dev, stream, R4D_PERSIST_SEQUSED_COMPACT, (size_t) num_active);
+            int32_t * block_table_compact_ptr = r4d_persist_get<int32_t>(
+                dev, stream, R4D_PERSIST_BLOCK_TABLE_COMPACT, (size_t) num_active * (size_t) max_bps);
+
+            r4d_build_compact_seqmap_kernel<<<1, 1, 0, stream>>>(
+                (const int32_t *) q_lens->data, (const int32_t *) context_lens->data,
+                seq_map_ptr, seqused_compact_ptr, num_seqs);
+            {
+                const int threads = std::min(256, max_bps);
+                r4d_gather_block_table_kernel<<<num_active, threads, 0, stream>>>(
+                    (const int32_t *) block_tables->data, seq_map_ptr, block_table_compact_ptr, max_bps);
+            }
+
+            seqused_active_ptr     = seqused_compact_ptr;
+            block_table_active_ptr = (const int *) block_table_compact_ptr;
+        }
+
         // ── 3. Expand packed F16 Q -> slot-indexed bf16 Q ─────────────────────────────────────
-        const size_t   slot_rows = (size_t) num_seqs * (size_t) q_len;
+        const size_t   slot_rows = (size_t) r4d_num_seqs * (size_t) q_len;
         nv_bfloat16 *  q_bf16    = r4d_persist_get<nv_bfloat16>(dev, stream, R4D_PERSIST_Q_BF16, slot_rows * (size_t) row_elems);
         nv_bfloat16 *  out_bf16  = r4d_persist_get<nv_bfloat16>(dev, stream, R4D_PERSIST_OUT_BF16, slot_rows * (size_t) row_elems);
         {
-            const dim3 grid((unsigned) num_seqs, (unsigned) q_len);
+            const dim3 grid((unsigned) r4d_num_seqs, (unsigned) q_len);
             const int  threads = std::min(256, row_elems);
-            r4d_expand_q_kernel<<<grid, threads, 0, stream>>>(
-                (const __half *) q->data, q_bf16,
-                (const int32_t *) q_lens->data, cu_seqlens_ptr, q_len, row_elems);
+            if (do_compact) {
+                r4d_expand_q_compact_kernel<<<grid, threads, 0, stream>>>(
+                    q_data, q_bf16,
+                    (const int32_t *) q_lens->data, cu_seqlens_ptr, seq_map_ptr, q_len, row_elems);
+            } else {
+                r4d_expand_q_kernel<<<grid, threads, 0, stream>>>(
+                    q_data, q_bf16,
+                    (const int32_t *) q_lens->data, cu_seqlens_ptr, q_len, row_elems);
+            }
         }
 
         // ── 4. Fill R4DArgs ────────────────────────────────────────────────────────────────────
         R4DArgs args{};
         args.q             = q_bf16;
         args.kv            = k_cache->data;
-        args.block_table   = (const int *) block_tables->data;
-        args.seqused_k     = seqused_k_ptr;
+        args.block_table   = block_table_active_ptr;
+        args.seqused_k     = seqused_active_ptr;
         args.out           = out_bf16;
         args.k_descale     = nullptr;  // NULL => 1.0 (r4d.h)
         args.v_descale     = nullptr;
         args.q_descale     = nullptr;  // unused: query is bf16
         args.scratch       = nullptr;  // filled below for decode
-        args.num_seqs      = num_seqs;
+        args.num_seqs      = r4d_num_seqs;
         args.q_len         = q_len;
         args.q_heads       = n_heads;
         args.kv_heads      = n_kv_heads;
         args.head_dim      = head_dim;
         args.block_size    = block_size;
         args.max_blocks    = max_bps;
-        // kv layout: (num_blocks, kv_heads, block_size, 2*head_dim), fp8 e4m3, K then V per slot
-        // — strides in ELEMENTS (r4d.h). block_size and head_dim are already gated to 16/256.
-        args.kv_block_stride = (long) n_kv_heads * (long) block_size * (long) (2 * head_dim);
-        args.kv_head_stride  = (long) block_size * (long) (2 * head_dim);
+        if (turbo4) {
+            // Separate K/V caches, 162-byte records per (block, slot, kv head) — see this file's
+            // header comment and mt_scatter_kv_turbo4_fp8_aiter_kernel (mt_pagedattn_aiter.cu) for
+            // the exact layout. Strides are in BYTES for this mode (r4d.h).
+            args.kv              = k_cache->data;
+            args.v_cache         = v_cache->data;
+            args.k_lut           = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_K);
+            args.v_lut           = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_V);
+            GGML_ASSERT(args.k_lut && args.v_lut &&
+                        "mt_pagedattn_r4d: turbo4kv centroid LUT lookup returned null");
+            args.kv_block_stride = 16L * (long) n_kv_heads * 162L;
+            args.kv_slot_stride  = (long) n_kv_heads * 162L;
+            args.kv_head_stride  = 162L;
+        } else {
+            // kv layout: (num_blocks, kv_heads, block_size, 2*head_dim), fp8 e4m3, K then V per
+            // slot — strides in ELEMENTS (r4d.h). block_size/head_dim already gated to 16/256.
+            args.kv_block_stride = (long) n_kv_heads * (long) block_size * (long) (2 * head_dim);
+            args.kv_head_stride  = (long) block_size * (long) (2 * head_dim);
+        }
         args.scale         = scale;
         args.splits        = 0;  // let R4D's split law choose
         args.max_ctx       = max_ctx;
@@ -614,11 +957,16 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
         }
 
         // ── 5. Launch ──────────────────────────────────────────────────────────────────────────
-        const int rc = is_decode
-            ? r4d_attn_decode_h256_gqa6_fp8kv(&args, stream)
-            : r4d_attn_prefill_h256_gqa6_fp8kv(&args, stream);
+        const char * kernel_name = turbo4
+            ? (is_decode ? "r4d_attn_decode_h256_gqa6_turbo4kv" : "r4d_attn_prefill_h256_gqa6_turbo4kv")
+            : (is_decode ? "r4d_attn_decode_h256_gqa6_fp8kv"    : "r4d_attn_prefill_h256_gqa6_fp8kv");
+        const int rc = turbo4
+            ? (is_decode ? r4d_attn_decode_h256_gqa6_turbo4kv(&args, stream)
+                         : r4d_attn_prefill_h256_gqa6_turbo4kv(&args, stream))
+            : (is_decode ? r4d_attn_decode_h256_gqa6_fp8kv(&args, stream)
+                         : r4d_attn_prefill_h256_gqa6_fp8kv(&args, stream));
 
-        r4d_log_once(q_len, num_seqs, args.max_ctx, is_decode, args.splits, scratch_bytes, rc);
+        r4d_log_once(q_len, r4d_num_seqs, args.max_ctx, is_decode, args.splits, scratch_bytes, rc, kernel_name);
 
         if (rc != 0) {
             // No fallback here: the scatter above has already committed the cache to R4D's fp8
@@ -628,19 +976,24 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
             // than produce silently-wrong attention output.
             GGML_ABORT("mt_pagedattn_r4d: %s launch rejected shape (rc=%d, q_len=%d num_seqs=%d "
                        "n_heads=%d n_kv_heads=%d max_ctx=%d max_blocks=%d)",
-                       is_decode ? "r4d_attn_decode_h256_gqa6_fp8kv" : "r4d_attn_prefill_h256_gqa6_fp8kv",
-                       rc, q_len, num_seqs, n_heads, n_kv_heads, args.max_ctx, max_bps);
+                       kernel_name, rc, q_len, r4d_num_seqs, n_heads, n_kv_heads, args.max_ctx, max_bps);
         }
 
         g_r4d_warmed_up.store(true, std::memory_order_release);
 
         // ── 6. Compact slot-indexed bf16 output -> packed F16 dst ─────────────────────────────
         {
-            const dim3 grid((unsigned) num_seqs, (unsigned) q_len);
+            const dim3 grid((unsigned) r4d_num_seqs, (unsigned) q_len);
             const int  threads = std::min(256, row_elems);
-            r4d_compact_out_kernel<<<grid, threads, 0, stream>>>(
-                out_bf16, (__half *) dst->data,
-                (const int32_t *) q_lens->data, cu_seqlens_ptr, q_len, row_elems);
+            if (do_compact) {
+                r4d_compact_out_compact_kernel<<<grid, threads, 0, stream>>>(
+                    out_bf16, (__half *) dst->data,
+                    (const int32_t *) q_lens->data, cu_seqlens_ptr, seq_map_ptr, q_len, row_elems);
+            } else {
+                r4d_compact_out_kernel<<<grid, threads, 0, stream>>>(
+                    out_bf16, (__half *) dst->data,
+                    (const int32_t *) q_lens->data, cu_seqlens_ptr, q_len, row_elems);
+            }
         }
     } else {
         // ── Per-seq dispatch ───────────────────────────────────────────────────────────────────
@@ -671,7 +1024,7 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
             ++n_launched;
 
             const long     row_base = row_off[s];
-            const __half * q_src    = (const __half *) q->data   + row_base * (long) row_elems;
+            const __half * q_src    = q_data                     + row_base * (long) row_elems;
             __half *       out_dst  = (__half *)       dst->data + row_base * (long) row_elems;
 
             const size_t  rows     = (size_t) q_len_s;
@@ -701,8 +1054,20 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
             args_s.head_dim      = head_dim;
             args_s.block_size    = block_size;
             args_s.max_blocks    = max_bps;
-            args_s.kv_block_stride = (long) n_kv_heads * (long) block_size * (long) (2 * head_dim);
-            args_s.kv_head_stride  = (long) block_size * (long) (2 * head_dim);
+            if (turbo4) {
+                args_s.kv              = k_cache->data;
+                args_s.v_cache         = v_cache->data;
+                args_s.k_lut           = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_K);
+                args_s.v_lut           = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_V);
+                GGML_ASSERT(args_s.k_lut && args_s.v_lut &&
+                            "mt_pagedattn_r4d: turbo4kv centroid LUT lookup returned null");
+                args_s.kv_block_stride = 16L * (long) n_kv_heads * 162L;
+                args_s.kv_slot_stride  = (long) n_kv_heads * 162L;
+                args_s.kv_head_stride  = 162L;
+            } else {
+                args_s.kv_block_stride = (long) n_kv_heads * (long) block_size * (long) (2 * head_dim);
+                args_s.kv_head_stride  = (long) block_size * (long) (2 * head_dim);
+            }
             args_s.scale         = scale;
             args_s.splits        = 0;
             args_s.max_ctx       = max_ctx;
@@ -716,17 +1081,21 @@ bool ggml_cuda_op_paged_attn_mt_r4d(ggml_backend_cuda_context & ctx, ggml_tensor
                 }
             }
 
-            const int rc_s = is_decode_s
-                ? r4d_attn_decode_h256_gqa6_fp8kv(&args_s, stream)
-                : r4d_attn_prefill_h256_gqa6_fp8kv(&args_s, stream);
+            const char * kernel_name_s = turbo4
+                ? (is_decode_s ? "r4d_attn_decode_h256_gqa6_turbo4kv" : "r4d_attn_prefill_h256_gqa6_turbo4kv")
+                : (is_decode_s ? "r4d_attn_decode_h256_gqa6_fp8kv"    : "r4d_attn_prefill_h256_gqa6_fp8kv");
+            const int rc_s = turbo4
+                ? (is_decode_s ? r4d_attn_decode_h256_gqa6_turbo4kv(&args_s, stream)
+                               : r4d_attn_prefill_h256_gqa6_turbo4kv(&args_s, stream))
+                : (is_decode_s ? r4d_attn_decode_h256_gqa6_fp8kv(&args_s, stream)
+                               : r4d_attn_prefill_h256_gqa6_fp8kv(&args_s, stream));
 
             if (rc_s != 0) {
                 // Same reasoning as the uniform path's abort: the scatter has already committed
                 // the cache to R4D's fp8 layout, so there's no falling back partway through.
                 GGML_ABORT("mt_pagedattn_r4d: %s launch rejected shape (per-seq slot=%d, rc=%d, "
                            "q_len=%d n_heads=%d n_kv_heads=%d max_ctx=%d max_blocks=%d)",
-                           is_decode_s ? "r4d_attn_decode_h256_gqa6_fp8kv" : "r4d_attn_prefill_h256_gqa6_fp8kv",
-                           s, rc_s, q_len_s, n_heads, n_kv_heads, args_s.max_ctx, max_bps);
+                           kernel_name_s, s, rc_s, q_len_s, n_heads, n_kv_heads, args_s.max_ctx, max_bps);
             }
 
             {

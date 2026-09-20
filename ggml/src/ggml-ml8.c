@@ -473,6 +473,29 @@ struct ggml_tensor * ggml_fp8_quant_rot(
     return y;
 }
 
+struct ggml_tensor * ggml_fp8_quant_rot_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        int32_t gate_mode,
+        struct ggml_tensor  * h_a,
+        int64_t a_dim,
+        int64_t b_dim,
+        int32_t kind,
+        int32_t G) {
+    GGML_ASSERT(gate != NULL);
+    GGML_ASSERT(gate_mode == GGML_FP8_QUANT_ROT_GATE_SIGMOID);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->nb[0] == sizeof(float) && "gate's innermost dim must be contiguous");
+    GGML_ASSERT(gate->ne[0] * gate->ne[1] == x->ne[0] && "gate [head_dim, n_heads, ...] must cover x's row");
+    GGML_ASSERT(gate->ne[2] * gate->ne[3] == x->ne[1] * x->ne[2] * x->ne[3] && "gate rows must match x rows");
+    struct ggml_tensor * y = ggml_fp8_quant_rot(ctx, x, h_a, a_dim, b_dim, kind, G);
+    y->src[2] = gate;
+    int32_t * params = (int32_t *) y->op_params;
+    params[5] = gate_mode;
+    return y;
+}
+
 static struct ggml_tensor * ggml_fp8_mul_mat_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * w,

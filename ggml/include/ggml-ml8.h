@@ -235,6 +235,28 @@ GGML_API struct ggml_tensor * ggml_fp8_quant_rot(
         int32_t kind,
         int32_t G);
 
+// Gated variant (2026-09-20): x is multiplied elementwise by gate_fn(gate) in the
+// kernel's load stage before the rotation/quant -- fuses the attention output
+// gating (cur * sigmoid(gate), where gate is a STRIDED view of the fused Q|gate
+// projection) into the quant kernel, replacing ggml_cont + ggml_sigmoid + ggml_mul.
+// `gate` is f32 with the same element count per row as x, laid out as
+// [head_dim, n_heads, n_tokens] with any nb[1]/nb[2] (nb[0] must be 4): element
+// (h*head_dim + d) of row t reads gate->data + t*nb[2] + h*nb[1] + d*4.
+// gate_mode: GGML_FP8_QUANT_ROT_GATE_SIGMOID. Stored as src[2] + op_params[5].
+// CUDA-only (the CPU reference aborts on a gated node).
+#define GGML_FP8_QUANT_ROT_GATE_NONE    0
+#define GGML_FP8_QUANT_ROT_GATE_SIGMOID 1
+GGML_API struct ggml_tensor * ggml_fp8_quant_rot_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        int32_t gate_mode,
+        struct ggml_tensor  * h_a,
+        int64_t a_dim,
+        int64_t b_dim,
+        int32_t kind,
+        int32_t G);
+
 // Back-compat 6-arg overload (C++ only) — existing callers keep compiling
 // unchanged and get G=128 (the historical FP8_B128 behaviour).
 #ifdef __cplusplus

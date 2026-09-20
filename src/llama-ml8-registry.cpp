@@ -104,7 +104,8 @@ static struct ggml_tensor * get_or_build_fp8_quant_rot(
         struct ggml_tensor   * x,
         const ml8_sidecars   * sc,
         fp8_qrot_memo        * qrot_memo,
-        int32_t                G) {
+        int32_t                G,
+        struct ggml_tensor   * gate = nullptr) {
     // AWQ acts on the raw activation, same as apply_ml8_input_xform — apply
     // it BEFORE building/looking up the quant_rot node. Not emitted by the
     // fp8_b128/ml8_4 converters today (see the design docs), so this is dead
@@ -129,7 +130,7 @@ static struct ggml_tensor * get_or_build_fp8_quant_rot(
         kind  = GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD;
     }
 
-    const fp8_qrot_key key{ x, h_a, a_dim, b_dim, kind, G };
+    const fp8_qrot_key key{ x, h_a, a_dim, b_dim, kind, G, gate };
 
     struct ggml_tensor * qrot = nullptr;
     if (qrot_memo) {
@@ -139,7 +140,8 @@ static struct ggml_tensor * get_or_build_fp8_quant_rot(
         }
     }
     if (qrot == nullptr) {
-        qrot = ggml_fp8_quant_rot(ctx, x_xf, h_a, a_dim, b_dim, kind, G);
+        qrot = gate ? ggml_fp8_quant_rot_gated(ctx, x_xf, gate, GGML_FP8_QUANT_ROT_GATE_SIGMOID, h_a, a_dim, b_dim, kind, G)
+                    : ggml_fp8_quant_rot(ctx, x_xf, h_a, a_dim, b_dim, kind, G);
         const std::string qrot_name = std::string(weight->name) + ".qrot";
         ggml_set_name(qrot, qrot_name.c_str());
         if (qrot_memo) {
@@ -180,8 +182,9 @@ static struct ggml_tensor * build_ml8_quant_rot_mul_mat(
         struct ggml_tensor   * x,
         const ml8_sidecars   * sc,
         fp8_qrot_memo        * qrot_memo,
-        enum ggml_type         out_type = GGML_TYPE_F32) {
-    struct ggml_tensor * qrot = get_or_build_fp8_quant_rot(ctx, weight, x, sc, qrot_memo, /*G=*/0);
+        enum ggml_type         out_type = GGML_TYPE_F32,
+        struct ggml_tensor   * gate = nullptr) {
+    struct ggml_tensor * qrot = get_or_build_fp8_quant_rot(ctx, weight, x, sc, qrot_memo, /*G=*/0, gate);
     return out_type == GGML_TYPE_BF16
         ? ggml_ml8_mul_mat_bf16(ctx, weight, sc->centroids, qrot)
         : ggml_ml8_mul_mat(ctx, weight, sc->centroids, qrot);
@@ -193,9 +196,19 @@ struct ggml_tensor * build_ml8_or_mul_mat(
         struct ggml_tensor   * weight,
         struct ggml_tensor   * x,
         fp8_qrot_memo        * qrot_memo,
-        enum ggml_type         out_type) {
+        enum ggml_type         out_type,
+        struct ggml_tensor   * gate) {
 
     const ml8_sidecars * sc = reg.find(weight);
+
+    // The in-kernel gate exists only on the ML8_4 per-row quant_rot path; every
+    // other path gets the explicit ops (identical math, three extra launches).
+    const bool gate_in_kernel = gate && weight->type == GGML_TYPE_ML8_4 && !ml8_4_act_legacy_enabled();
+    if (gate && !gate_in_kernel) {
+        struct ggml_tensor * g = ggml_cont_2d(ctx, gate, x->ne[0], ggml_nelements(gate) / x->ne[0]);
+        x = ggml_mul(ctx, x, ggml_sigmoid(ctx, g));
+        gate = nullptr;
+    }
 
     if (weight->type == GGML_TYPE_FP8_B128) {
         return build_fp8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, fp8_b128_layout_G(), out_type);
@@ -218,7 +231,7 @@ struct ggml_tensor * build_ml8_or_mul_mat(
         // Default: fused GGML_OP_FP8_QUANT_ROT(G=0) + GGML_OP_ML8_MUL_MAT
         // (prequantized) path — one launch for the activation pipeline,
         // shared with every other weight of this input group.
-        return build_ml8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, out_type);
+        return build_ml8_quant_rot_mul_mat(ctx, weight, x, sc, qrot_memo, out_type, gate);
     }
 
     if (weight->type == GGML_TYPE_ML8_FP8) {

@@ -2,6 +2,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include <cstdlib>
 
 struct rope_corr_dims {
     float v[2];
@@ -617,6 +618,23 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
         GGML_ASSERT(sections.v[0] > 0 || sections.v[1] > 0 || sections.v[2] > 0);
     }
 
+    // Dispatch adapter: some archs (e.g. Qwen3.x text models) unconditionally request an
+    // (I)MROPE rope mode even when they never feed multi-axis (t/h/w) positions, i.e. the
+    // section split is degenerate/trivial. This mirrors llama_hparams::use_mrope(), which
+    // already treats "sections[0] > 0 && sections[1] > 0" as the threshold for genuine
+    // multi-axis rope; when sections[1] <= 0 the mrope_multi kernel's h/w branches (and the
+    // is_imrope interleave-by-3 branches) can never be taken for a real "h" or "w" section,
+    // so every rotated pair is meant to use the single position stream at pos[i2] - exactly
+    // what rope_neox already computes, just without the extra per-thread branch divergence
+    // and section/sector bookkeeping that rope_multi carries for the general multi-axis case.
+    // This only changes the dispatch target, never the math for genuinely multi-axis inputs
+    // (sections[1] > 0), so real M-RoPE (e.g. vision/video) models are unaffected.
+    // MAD_ROPE_TRIVIAL_MROPE_NEOX=1 opt-in (default OFF, unverified on GPU): route
+    // (I)MROPE with trivial sections (sections[1] <= 0, e.g. Qwen3.5/3.8 text) to the
+    // plain neox kernel instead of rope_multi (measured 63 ms / 16k prefill).
+    static const bool trivial_mrope_neox = [] { const char * e = getenv("MAD_ROPE_TRIVIAL_MROPE_NEOX"); return e && atoi(e) != 0; }();
+    const bool is_mrope_trivial = trivial_mrope_neox && is_mrope && !is_vision && sections.v[1] <= 0;
+
     if (is_vision) {
         GGML_ASSERT(n_dims == ne00/2);
         GGML_ASSERT(n_offs == 0); // offset not supported for vision, as the rotated pairs span the whole row
@@ -633,7 +651,7 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
 
     // compute
-    if (is_neox) {
+    if (is_neox || is_mrope_trivial) {
         if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
             rope_neox_cuda<forward, float, float>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02,
                                                   s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
@@ -659,6 +677,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
             GGML_ABORT("fatal error");
         }
     } else if (is_mrope && !is_vision) {
+        // is_mrope_trivial (sections[1] <= 0) was already routed to the rope_neox_cuda
+        // dispatch above; only genuine multi-axis mrope configs reach rope_multi_cuda here.
         if (src0->type == GGML_TYPE_F32) {
             rope_multi_cuda<forward>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                      s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,

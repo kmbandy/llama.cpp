@@ -74,8 +74,9 @@ static double gflops_per_launch(int M, int N, int K, double us) {
 // quantization is bit-for-bit the same formula the old path's own
 // B_shuf/b_scale_out double-quantization uses -- see run_shape).
 // ─────────────────────────────────────────────────────────────────────────
-static bool ml84_radiance_stagecheck(const std::vector<uint8_t>& B_nib_h, const std::vector<uint8_t>& T_h,
-                                      const std::vector<float>& colscale_h, int N, int K,
+static bool ml84_radiance_stagecheck(const std::vector<uint8_t>& B_nib_h, const std::vector<uint8_t>& lut_h,
+                                      const std::vector<float>& b_scale_g_h, const std::vector<float>& colscale_h,
+                                      int N, int K,
                                       const std::function<float(int, int)>& dequant_old_ref,
                                       int M, int N_full) {
     (void) M; (void) N_full;
@@ -105,9 +106,13 @@ static bool ml84_radiance_stagecheck(const std::vector<uint8_t>& B_nib_h, const 
                                                 : (int) ((wq >> ((s - 4) * 8 + 4)) & 0xF);
                     const int k = kt * 16 + half * 8 + s;
                     if (n >= N || k >= K) continue;
-                    const size_t tidx = ((size_t) g * N + n) * 16 + nibble;
-                    if (tidx >= T_h.size()) continue;
-                    const uint8_t byte = T_h[tidx];
+                    // T table is no longer precomputed: build the 16-entry
+                    // table entry for (group g, column n, entry nibble) the
+                    // same way the kernel does, from lut + b_scale_g.
+                    const uint8_t byte = ml84_encode_e4m3(
+                        ml84_decode_e4m3(lut_h[(size_t) g * 16 + nibble]) *
+                        (b_scale_g_h[(size_t) g * N + n] *
+                         (1.0f / (colscale_h[n] > 0.f ? colscale_h[n] : 1.f))));
                     const float got = ml84_decode_e4m3(byte) * colscale_h[n];
                     const float want = dequant_old_ref(n, k);
                     ++nchecked;
@@ -311,9 +316,16 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
         b_scale_out_host[n] = std::max(mx / 448.0f, 1e-12f);
     }
     auto dequant_w_old = [&](int n, int k) -> float {
-        const float w_val = dequant_w(n, k);
+        const int g = k / QK_ML8;
+        const block_ml8_4& blk = w[(size_t) n * n_groups_k + g];
+        const int kk = k % QK_ML8;
+        const uint8_t packed = blk.qs[kk / 2];
+        const uint8_t idx = (kk & 1) ? ((packed >> 4) & 0x0Fu) : (packed & 0x0Fu);
+        const float centroid = ml84_decode_e4m3(lut[(size_t) g * 16 + idx]);
         const float denom = b_scale_out_host[n];
-        return ml84_decode_e4m3(ml84_encode_e4m3(w_val / denom)) * denom;
+        // centroid * (scale / denom): same association as the expand kernel and
+        // the radiance port's per-slab table.
+        return ml84_decode_e4m3(ml84_encode_e4m3(centroid * (blk.scale * (1.0f / denom)))) * denom;
     };
 
     // ---- oracle samples: BOTH targets are computed, but unlike
@@ -363,10 +375,9 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
     // device launch. Builds T/colscale via the host prep fallback so this
     // needs no GPU at all. ----
     if (std::getenv("ML84_RADIANCE_STAGECHECK")) {
-        std::vector<uint8_t> T_h((size_t) n_groups_k * N * 16);
-        std::vector<float> colscale_h(N);
-        rdna4_ml84_radiance_prep_host(lut.data(), b_scale_g_h.data(), N, K, T_h.data(), colscale_h.data());
-        const bool stage_ok = ml84_radiance_stagecheck(B_nib_h, T_h, colscale_h, N, K, dequant_w_old, M, N);
+        std::vector<float> colscale_h(2 * (size_t) N);
+        rdna4_ml84_radiance_prep_host(lut.data(), b_scale_g_h.data(), N, K, colscale_h.data());
+        const bool stage_ok = ml84_radiance_stagecheck(B_nib_h, lut, b_scale_g_h, colscale_h, N, K, dequant_w_old, M, N);
         const bool pairing_ok = ml84_radiance_wmma_pairing_check(N, K);
         if (!stage_ok || !pairing_ok) {
             fprintf(stderr, "  ML84_RADIANCE_STAGECHECK found mismatches at M=%d N=%d K=%d -- refusing to launch\n", M, N, K);
@@ -374,7 +385,7 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
         }
     }
 
-    uint8_t *d_lut = nullptr, *d_B_nib = nullptr, *d_A = nullptr, *d_B_shuf = nullptr, *d_AT = nullptr, *d_T = nullptr;
+    uint8_t *d_lut = nullptr, *d_B_nib = nullptr, *d_A = nullptr, *d_B_shuf = nullptr, *d_AT = nullptr;
     float *d_b_scale_g = nullptr, *d_a_scale = nullptr, *d_C_old = nullptr, *d_C_rad = nullptr;
     float *d_b_scale_out = nullptr, *d_colscale = nullptr;
     HCK(hipMalloc(&d_lut, lut.size()));
@@ -389,8 +400,7 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
     const size_t Mt = (size_t) (M + 15) / 16;
     const size_t at_bytes = Mt * 16 * (size_t) K;
     HCK(hipMalloc(&d_AT, at_bytes));
-    HCK(hipMalloc(&d_T, (size_t) n_groups_k * N * 16));
-    HCK(hipMalloc(&d_colscale, (size_t) N * sizeof(float)));
+    HCK(hipMalloc(&d_colscale, (size_t) 2 * N * sizeof(float)));
     HCK(hipMemcpy(d_lut, lut.data(), lut.size(), hipMemcpyHostToDevice));
     HCK(hipMemcpy(d_B_nib, B_nib_h.data(), B_nib_h.size(), hipMemcpyHostToDevice));
     HCK(hipMemcpy(d_b_scale_g, b_scale_g_h.data(), b_scale_g_h.size() * sizeof(float), hipMemcpyHostToDevice));
@@ -413,12 +423,12 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
     if (out->old_ok) HCK(hipStreamSynchronize(stream));
 
     // RADIANCE-PORT path: load-time prep (colscale + T), retile A, then GEMM.
-    out->rad_ok = rdna4_gemm_ml84_radiance_prep(d_B_nib, d_lut, d_b_scale_g, N, K, d_T, d_colscale, stream);
+    out->rad_ok = rdna4_gemm_ml84_radiance_prep(d_lut, d_b_scale_g, N, K, d_colscale, stream);
     if (out->rad_ok) out->rad_ok = rdna4_gemm_ml84_radiance_retile_a(M, K, d_A, d_AT, stream);
     if (out->rad_ok) {
         HCK(hipGetLastError());
         HCK(hipStreamSynchronize(stream));
-        out->rad_ok = rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_T, d_colscale, d_C_rad, N, K, stream);
+        out->rad_ok = rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_lut, d_b_scale_g, d_colscale, d_C_rad, N, K, stream);
     }
     if (out->rad_ok) {
         HCK(hipGetLastError());
@@ -430,18 +440,15 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
     // check below (same "don't trust a launch that returned true"
     // discipline as gemm_ml84_decode_v2_bench.hip's ml84_v2_selfcheck). ----
     if (out->rad_ok && std::getenv("ML84_RADIANCE_SELFCHECK")) {
-        std::vector<float> colscale_h(N), colscale_dev(N);
-        std::vector<uint8_t> T_h((size_t) n_groups_k * N * 16), T_dev((size_t) n_groups_k * N * 16);
+        std::vector<float> colscale_h(2 * (size_t) N), colscale_dev(2 * (size_t) N);
         std::vector<uint8_t> AT_h(at_bytes), AT_dev(at_bytes);
-        rdna4_ml84_radiance_prep_host(lut.data(), b_scale_g_h.data(), N, K, T_h.data(), colscale_h.data());
+        rdna4_ml84_radiance_prep_host(lut.data(), b_scale_g_h.data(), N, K, colscale_h.data());
         rdna4_ml84_radiance_retile_a_host(M, K, Ah.data(), AT_h.data());
-        HCK(hipMemcpy(colscale_dev.data(), d_colscale, N * sizeof(float), hipMemcpyDeviceToHost));
-        HCK(hipMemcpy(T_dev.data(), d_T, T_h.size(), hipMemcpyDeviceToHost));
+        HCK(hipMemcpy(colscale_dev.data(), d_colscale, 2 * (size_t) N * sizeof(float), hipMemcpyDeviceToHost));
         HCK(hipMemcpy(AT_dev.data(), d_AT, at_bytes, hipMemcpyDeviceToHost));
         bool ok = true;
         for (int n = 0; n < N; ++n)
             if (std::fabs(colscale_h[n] - colscale_dev[n]) > 1e-6f * std::max(1.0f, std::fabs(colscale_h[n]))) { ok = false; break; }
-        if (ok && std::memcmp(T_h.data(), T_dev.data(), T_h.size()) != 0) ok = false;
         if (ok && std::memcmp(AT_h.data(), AT_dev.data(), at_bytes) != 0) ok = false;
         printf("--- ML84_RADIANCE_SELFCHECK M=%d N=%d K=%d %s ---\n", M, N, K, ok ? "PASS" : "*** FAIL ***");
         if (!ok) { out->rad_ok = false; }
@@ -512,17 +519,17 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
     }
     if (out->rad_ok) {
         for (int i = 0; i < 5; i++) {
-            rdna4_gemm_ml84_radiance_prep(d_B_nib, d_lut, d_b_scale_g, N, K, d_T, d_colscale, stream);
+            rdna4_gemm_ml84_radiance_prep(d_lut, d_b_scale_g, N, K, d_colscale, stream);
             rdna4_gemm_ml84_radiance_retile_a(M, K, d_A, d_AT, stream);
-            rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_T, d_colscale, d_C_rad, N, K, stream);
+            rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_lut, d_b_scale_g, d_colscale, d_C_rad, N, K, stream);
         }
         HCK(hipDeviceSynchronize());
         hipEvent_t s1, e1; hipEventCreate(&s1); hipEventCreate(&e1);
         hipEventRecord(s1, stream);
         for (int i = 0; i < iters; i++) {
-            rdna4_gemm_ml84_radiance_prep(d_B_nib, d_lut, d_b_scale_g, N, K, d_T, d_colscale, stream);
+            rdna4_gemm_ml84_radiance_prep(d_lut, d_b_scale_g, N, K, d_colscale, stream);
             rdna4_gemm_ml84_radiance_retile_a(M, K, d_A, d_AT, stream);
-            rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_T, d_colscale, d_C_rad, N, K, stream);
+            rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_lut, d_b_scale_g, d_colscale, d_C_rad, N, K, stream);
         }
         hipEventRecord(e1, stream); hipEventSynchronize(e1);
         float ms = 0; hipEventElapsedTime(&ms, s1, e1);
@@ -533,14 +540,14 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
         // ISOLATED ported-kernel-only timing: prep/retile run ONCE up
         // front (load-time), the timed loop launches only
         // rdna4_gemm_ml84_radiance.
-        rdna4_gemm_ml84_radiance_prep(d_B_nib, d_lut, d_b_scale_g, N, K, d_T, d_colscale, stream);
+        rdna4_gemm_ml84_radiance_prep(d_lut, d_b_scale_g, N, K, d_colscale, stream);
         rdna4_gemm_ml84_radiance_retile_a(M, K, d_A, d_AT, stream);
         HCK(hipDeviceSynchronize());
-        for (int i = 0; i < 5; i++) rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_T, d_colscale, d_C_rad, N, K, stream);
+        for (int i = 0; i < 5; i++) rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_lut, d_b_scale_g, d_colscale, d_C_rad, N, K, stream);
         HCK(hipDeviceSynchronize());
         hipEvent_t s2, e2; hipEventCreate(&s2); hipEventCreate(&e2);
         hipEventRecord(s2, stream);
-        for (int i = 0; i < iters; i++) rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_T, d_colscale, d_C_rad, N, K, stream);
+        for (int i = 0; i < iters; i++) rdna4_gemm_ml84_radiance(M, d_AT, d_a_scale, d_B_nib, d_lut, d_b_scale_g, d_colscale, d_C_rad, N, K, stream);
         hipEventRecord(e2, stream); hipEventSynchronize(e2);
         float ms2 = 0; hipEventElapsedTime(&ms2, s2, e2);
         hipEventDestroy(s2); hipEventDestroy(e2);
@@ -550,7 +557,7 @@ static int run_shape(int M, int N, int K, int iters, ShapeStat* out) {
 
     hipFree(d_lut); hipFree(d_B_nib); hipFree(d_b_scale_g); hipFree(d_A); hipFree(d_a_scale);
     hipFree(d_C_old); hipFree(d_C_rad); hipFree(d_B_shuf); hipFree(d_b_scale_out);
-    hipFree(d_AT); hipFree(d_T); hipFree(d_colscale);
+    hipFree(d_AT); hipFree(d_colscale);
     return 0;
 }
 

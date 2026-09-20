@@ -1308,11 +1308,15 @@ struct llm_graph_context {
     // whatever type it produced; a bf16-dst caller combining those with a
     // LoRA/scale, if a model ever needed to, would need to check those ops'
     // own bf16 support -- not exercised by qwen35's use of this.
+    // gate (optional): strided [head_dim, n_heads, n_tokens] f32 view; cur is
+    // multiplied by sigmoid(gate) before the matmul -- in-kernel on the ML8_4
+    // path (see build_ml8_or_mul_mat), explicit ops otherwise.
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr,
-              enum ggml_type out_type = GGML_TYPE_F32) const;
+              enum ggml_type out_type = GGML_TYPE_F32,
+              ggml_tensor * gate = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
