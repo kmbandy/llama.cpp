@@ -404,6 +404,12 @@ target_link_libraries(test-wp-expert-worker PRIVATE
 target_compile_features(test-wp-expert-worker PRIVATE cxx_std_17)
 llama_test(test-wp-expert-worker)
 
+add_executable(test-wp-host-arena test-wp-host-arena.cpp)
+target_include_directories(test-wp-host-arena PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-wp-host-arena PRIVATE llama llama-common ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-wp-host-arena PRIVATE cxx_std_17)
+llama_test(test-wp-host-arena)
+
 # POSIX expert shared-memory ring: pure byte-ring and wraparound coverage.
 add_executable(
     test-pipe-expert-shm
