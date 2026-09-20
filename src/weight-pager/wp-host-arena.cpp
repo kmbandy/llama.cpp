@@ -111,30 +111,28 @@ size_t HostArena::pinned_cap_entries_() const {
 }
 
 // Evict a single entry, preferring a speculative victim (a misprediction
-// must never displace a page the caller actually demanded). Only the front
-// (least-recently-used) entry of the applicable list is ever considered: if
-// it is borrowed, this attempt is refused rather than scanning past it for a
-// later unborrowed entry, so an in-flight borrow can only ever delay -- never
-// reorder -- eviction. SpecOnly refuses outright if spec_lru_'s front is
-// unusable rather than falling back to a demand victim, because a full spec
-// budget must be relieved from the spec side, never the demand side.
+// must never displace a page the caller actually demanded). Scans the
+// applicable list from the front, skipping a borrowed entry IN PLACE
+// (neither removed nor reordered -- a later attempt sees it in the same
+// spot), and evicts the first unborrowed entry found. SpecOnly refuses
+// outright if spec_lru_ has no unborrowed entry rather than falling back to
+// a demand victim, because a full spec budget must be relieved from the
+// spec side, never the demand side.
 bool HostArena::evict_one_locked_(EvictScope scope) {
     size_t idx    = 0;
     bool   found  = false;
     bool   from_spec = false;
 
-    if (!spec_lru_.empty()) {
-        size_t cand = spec_lru_.front();
+    for (size_t cand : spec_lru_) {
         if (entries_[cand].borrows == 0) {
-            idx = cand; found = true; from_spec = true;
+            idx = cand; found = true; from_spec = true; break;
         }
     }
     if (!found) {
         if (scope == EvictScope::SpecOnly) return false;
-        if (!lru_.empty()) {
-            size_t cand = lru_.front();
+        for (size_t cand : lru_) {
             if (entries_[cand].borrows == 0) {
-                idx = cand; found = true; from_spec = false;
+                idx = cand; found = true; from_spec = false; break;
             }
         }
     }
@@ -144,11 +142,13 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
     const int page_idx = e.page_idx;
 
     if (from_spec) {
-        spec_lru_.pop_front();
+        spec_lru_.erase(e.lru_pos);
         spec_bytes_ -= cfg_.entry_bytes;
-        ++spec_evicted_unused_;   // still speculative when evicted => never used
+        // Still speculative when evicted: only "unused" if a demand or
+        // peek borrow() never touched it (see ever_borrowed).
+        if (!e.ever_borrowed) ++spec_evicted_unused_;
     } else {
-        lru_.pop_front();
+        lru_.erase(e.lru_pos);
     }
     e.loc = ListLoc::None;
 
@@ -227,12 +227,13 @@ bool HostArena::begin_read(int page_idx, bool speculative, void ** data_out, Han
         }
     }
 
-    Entry & e    = entries_[idx];
+    Entry & e     = entries_[idx];
     e.page_idx    = page_idx;
     e.state       = State::Reading;
     e.borrows     = 0;
     e.speculative = speculative;
     e.pinned      = false;
+    e.ever_borrowed = false;
     e.gen         = next_gen_++;
     e.loc         = ListLoc::None;
 
@@ -283,6 +284,7 @@ bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out,
     if (e.state != State::Resident) return false;   // miss or Reading
 
     ++e.borrows;
+    e.ever_borrowed = true;   // any borrow, demand or peek, counts as "used"
 
     if (!e.pinned) {
         if (demand && e.speculative) {
@@ -329,6 +331,14 @@ bool HostArena::pin(int page_idx) {
     if (pinned_bytes_ + cfg_.entry_bytes > cap_bytes) return false;
 
     remove_from_list_locked_(idx);   // LRU skips pinned entries
+    if (e.speculative) {
+        // A pinned page is a demand page by definition: pinning it is a
+        // promotion out of the speculative side, same accounting as a
+        // demand borrow() hit.
+        e.speculative = false;
+        spec_bytes_ -= cfg_.entry_bytes;
+        ++spec_promotions_;
+    }
     e.pinned = true;
     pinned_bytes_ += cfg_.entry_bytes;
     return true;

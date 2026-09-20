@@ -111,14 +111,18 @@ private:
     enum class ListLoc : uint8_t { None, Lru, SpecLru };
 
     struct Entry {
-        int      page_idx    = -1;
-        State    state       = State::Free;
-        int      borrows     = 0;
-        bool     speculative = false;
-        bool     pinned      = false;
-        Handle   gen         = kInvalidHandle;
-        uint8_t * data       = nullptr;
-        ListLoc  loc         = ListLoc::None;
+        int      page_idx     = -1;
+        State    state        = State::Free;
+        int      borrows      = 0;
+        bool     speculative  = false;
+        bool     pinned       = false;
+        bool     ever_borrowed = false;   // set by any borrow() (demand or peek), reset
+                                           // when the entry becomes Reading again; an
+                                           // eviction while still speculative only counts
+                                           // as "unused" (spec_evicted_unused_) when false
+        Handle   gen          = kInvalidHandle;
+        uint8_t * data        = nullptr;
+        ListLoc  loc          = ListLoc::None;
         std::list<size_t>::iterator lru_pos;   // valid iff loc != None
     };
 
@@ -127,20 +131,18 @@ private:
         size_t    bytes = 0;
     };
 
-    // Which side of the partition an eviction may take from. Any tries
-    // spec_lru_'s front first, falling back to lru_'s front; SpecOnly
-    // restricts the victim to spec_lru_ (used when a new speculative read
-    // needs a victim and the spec cap is already full -- it must not steal
-    // room from a demand page just to seat a guess).
+    // Which side of the partition an eviction may take from. Any scans
+    // spec_lru_ first, falling back to lru_; SpecOnly restricts the victim to
+    // spec_lru_ (used when a new speculative read needs a victim and the
+    // spec cap is already full -- it must not steal room from a demand page
+    // just to seat a guess).
     //
-    // Eviction only ever looks at the single LRU-least (front) candidate of
-    // the applicable list(s) -- it does not scan past a borrowed front entry
-    // to find a later unborrowed one. A borrowed front entry blocks that
-    // eviction attempt entirely (the entry is left "in place": neither
-    // removed nor reordered), so the caller sees a refusal and can retry
-    // once the borrow is released. This keeps eviction O(1) and matches the
-    // observable contract: eviction order is exactly LRU order, never
-    // reordered to skip around an in-use entry.
+    // Eviction is a scan: walk the applicable list from the front, skipping
+    // a borrowed entry IN PLACE (it is neither removed nor reordered, so a
+    // later attempt sees it in the same spot), and evict the first unborrowed
+    // entry found. Refuse only when the scan reaches the end of both lists
+    // without finding one. This keeps eviction order exactly LRU order among
+    // the entries that are actually evictable at the moment.
     enum class EvictScope { Any, SpecOnly };
 
     bool     evict_one_locked_(EvictScope scope);
