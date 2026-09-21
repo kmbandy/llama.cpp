@@ -9486,12 +9486,24 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
-        static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+        // NOTE: this used to additionally require `neq1 >= Q_TILE_SZ` (i.e. only use the
+        // tiled GEMM path when a single flash-attn call carries at least a full Q tile of
+        // query rows), falling back to the scalar per-row `_one_chunk` path otherwise. Both
+        // paths compute the identical mathematical operation, but with different summation
+        // order (blocked GEMM reduction over KV tiles vs. per-row vec_dot accumulation), so
+        // they round differently: swapping between them for the SAME absolute token, purely
+        // because of how many OTHER tokens happen to share its ubatch/llama_decode() call, is
+        // an observable, provable (~1e-3 abs on this port's tiny fixture; see
+        // tests/test-dsv41-decode.cpp check2/check3) source of ubatch-size-dependent output
+        // for any model, worst-case whenever a small batch (e.g. a 1-token decode step, or a
+        // small n_ubatch) is mixed with larger single-shot prefills against the same KV cache.
+        // The tiled kernel already tolerates any row count via its `tile_rows` padding/masking
+        // (see below), so making it the only path removes the discrepancy instead of masking
+        // it behind a tolerance: the result no longer depends on `neq1` at all.
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
-                                k->type == v->type &&
-                                neq1 >= Q_TILE_SZ);
+                                k->type == v->type);
 #ifdef GGML_SIMD
 #if defined(__ARM_FEATURE_SVE)
         const int64_t f32_epr = svcntw();
