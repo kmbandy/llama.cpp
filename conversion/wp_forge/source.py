@@ -36,7 +36,7 @@ class Source(Protocol):
     def is_gguf(self) -> bool: ...
     def hparams(self) -> dict: ...
     def tensor_index(self) -> dict[str, str]: ...
-    def layer_shards(self, layer: int) -> list[str]: ...
+    def layer_shards(self, layer: int, prefix: str = "layers") -> list[str]: ...
     def open_shard(self, shard_id: str): ...
     def release_shard(self, shard_id: str) -> None: ...
 
@@ -86,6 +86,24 @@ class HFSource:
             path = self.fetch(self.repo, filename, self.cache_dir)
         return path
 
+    # non-weight files the stock converter needs beside the peeled shards
+    AUX_FILES = (
+        "tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
+        "special_tokens_map.json", "generation_config.json", "chat_template.jinja",
+        "chat_template.json", "preprocessor_config.json", "video_preprocessor_config.json",
+        "tokenizer.model",
+    )
+
+    def aux_files(self) -> list[Path]:
+        """Fetch whichever of AUX_FILES the repo has (missing ones are skipped)."""
+        out: list[Path] = []
+        for name in self.AUX_FILES:
+            try:
+                out.append(self._ensure(name))
+            except Exception:  # noqa: BLE001 -- 404 on a file this repo does not ship
+                continue
+        return out
+
     def hparams(self) -> dict:
         if self._hparams is None:
             self._hparams = flatten_hparams(json.loads(self._ensure("config.json").read_text()))
@@ -96,11 +114,13 @@ class HFSource:
             self._index = dict(json.loads(self._ensure("model.safetensors.index.json").read_text())["weight_map"])
         return self._index
 
-    def layer_shards(self, layer: int) -> list[str]:
-        prefix = f"layers.{layer}."
+    def layer_shards(self, layer: int, prefix: str = "layers") -> list[str]:
+        # prefix is the arch's main-stack layer prefix ("layers" for the
+        # DeepSeek repos, "model.language_model.layers" for Qwen3.8)
+        want = f"{prefix}.{layer}."
         seen: list[str] = []
         for name, shard in self.tensor_index().items():
-            if name.startswith(prefix) and shard not in seen:
+            if name.startswith(want) and shard not in seen:
                 seen.append(shard)
         return seen
 
@@ -128,6 +148,24 @@ class GGUFSource:
         self.path = Path(spec)
         self._hparams: dict | None = None
 
+    # non-weight files the stock converter needs beside the peeled shards
+    AUX_FILES = (
+        "tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
+        "special_tokens_map.json", "generation_config.json", "chat_template.jinja",
+        "chat_template.json", "preprocessor_config.json", "video_preprocessor_config.json",
+        "tokenizer.model",
+    )
+
+    def aux_files(self) -> list[Path]:
+        """Fetch whichever of AUX_FILES the repo has (missing ones are skipped)."""
+        out: list[Path] = []
+        for name in self.AUX_FILES:
+            try:
+                out.append(self._ensure(name))
+            except Exception:  # noqa: BLE001 -- 404 on a file this repo does not ship
+                continue
+        return out
+
     def hparams(self) -> dict:
         if self._hparams is None:
             r = gguf.GGUFReader(str(self.path))
@@ -149,7 +187,7 @@ class GGUFSource:
     def tensor_index(self) -> dict[str, str]:
         raise NotImplementedError("GGUF sources are read by the C++ tools")
 
-    def layer_shards(self, layer: int) -> list[str]:
+    def layer_shards(self, layer: int, prefix: str = "layers") -> list[str]:
         raise NotImplementedError("GGUF sources are read by the C++ tools")
 
     def open_shard(self, shard_id: str):

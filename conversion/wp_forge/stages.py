@@ -37,6 +37,7 @@ the sink.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -48,7 +49,7 @@ import numpy as np
 
 from .arch import ArchSpec, classify, expert_tensor_names, expert_tensor_names_stage
 from .plan import ResolvedPlan, SetSpec
-from .quant import lossless_repack, quantize_expert
+from .quant import QuantError, lossless_repack, quantize_expert
 from .sink import Sink
 from .source import Source
 from .stitch import LayerOutput, layer_outputs_from_repack, stitch
@@ -121,9 +122,11 @@ class ExpertStage:
         self.n_ff = int(self.hp[self.arch.n_ff_exp_key])
         self.n_embd = int(self.hp[self.arch.hidden_key])
         self.n_expert_used = int(self.hp["num_experts_per_tok"])
+        # spec-head experts: their own count when the arch names one (DeepSeek
+        # DSpark: 128 of 384), else the main stack's (Qwen3.8 MTP: all 512)
         self.n_expert = (
             int(self.hp[self.arch.spec_head_n_expert_key])
-            if role == "spec_head"
+            if role == "spec_head" and self.arch.spec_head_n_expert_key
             else int(self.hp[self.arch.n_expert_key])
         )
         self.quant_dtype = gguf.GGMLQuantizationType[self.quant.upper()]
@@ -157,7 +160,10 @@ class ExpertStage:
             gate = w * row_bytes(self.n_embd)
             up = w * row_bytes(self.n_embd)
             down = self.n_embd * row_bytes(w)
-        return self.n_expert * (gate + up + down)
+        # every page (v1 whole expert or v2 slice) is zero-padded to 4096
+        page = gate + up + down
+        page += (-page) % 4096
+        return self.n_expert * page
 
     def _needs(self, set_spec: SetSpec, pos: int) -> bool:
         dst = self._dst_name(set_spec, pos)
@@ -169,22 +175,52 @@ class ExpertStage:
 
     def _shards_for(self, L: int) -> list[str]:
         if self.role == "experts":
-            return self.source.layer_shards(L)
-        # Spec-head tensors are named mtp.{stage}.*; layer_shards only keys off
-        # layers.{L}.*, so pick the shards that actually hold them.
+            return self.source.layer_shards(L, self.arch.experts.prefix)
+        # Spec-head tensors are named {prefix}.{stage}.* (deepseek41: mtp.,
+        # qwen4exp: mtp.layers.); layer_shards only keys off the main stack,
+        # so pick the shards that actually hold them.
         idx = self.source.tensor_index()
         stage = L - self.n_layer
-        prefix = f"mtp.{stage}."
+        assert self.arch.spec_head_experts is not None
+        prefix = f"{self.arch.spec_head_experts.prefix}.{stage}."
         seen: list[str] = []
         for name, shard in idx.items():
             if name.startswith(prefix) and shard not in seen:
                 seen.append(shard)
         if not seen:
-            raise KeyError(f"no shards hold spec-head tensors for layer {L} (mtp.{stage})")
+            raise KeyError(f"no shards hold spec-head tensors for layer {L} ({prefix}*)")
         return seen
+
+    def _release_after(self, L: int, shards: list[str]) -> None:
+        """Drop cached shards that hold no expert tensor of a layer past L (of
+        any set: a later set re-fetches). Without this the cache grows by every
+        layer's shards until the whole set is done (~155 GB for Qwen3.8 L0-30)."""
+        idx = self.source.tensor_index()
+        by_shard: dict[str, int] = {}
+        for name, shard in idx.items():
+            if shard not in shards:
+                continue
+            cls = classify(self.arch, name)
+            if cls == "experts":
+                m = re.search(r"\.(\d+)\.", name[len(self.arch.experts.prefix):])
+                layer = int(m.group(1)) if m else -1
+            elif cls == "spec_head.experts":
+                assert self.arch.spec_head_experts is not None
+                m = re.search(r"\.(\d+)\.", name[len(self.arch.spec_head_experts.prefix):])
+                layer = self.n_layer + (int(m.group(1)) if m else 0)
+            else:
+                continue
+            by_shard[shard] = max(by_shard.get(shard, -1), layer)
+        for shard in shards:
+            if by_shard.get(shard, -1) <= L:
+                self.source.release_shard(shard)
 
     def _gather(self, L: int) -> dict[str, np.ndarray]:
         """Packed per-role stacks [n_expert, rows, bytes_per_row] uint8."""
+        fused = self.arch.fused_experts if self.role == "experts" else self.arch.fused_spec_head_experts
+        if fused is not None:
+            return self._gather_fused(L, fused)
+
         if self.role == "experts":
             names_by_eid = [expert_tensor_names(self.arch, L, eid) for eid in range(self.n_expert)]
         else:
@@ -213,6 +249,58 @@ class ExpertStage:
         for role in ("gate", "up", "down"):
             if role not in stacks:
                 raise KeyError(f"role {role} has no experts for layer {L}")
+        self._release_after(L, self._shards_for(L))
+        return stacks
+
+    def _gather_fused(self, L: int, fused) -> dict[str, np.ndarray]:
+        """Fused-tensor sources: one [n_expert, 2*n_ff, n_embd] gate_up and one
+        [n_expert, n_embd, n_ff] down per layer. Each role is quantized as a
+        single 2-D [n_expert*rows, cols] pass (one pool spin per role) and
+        reshaped back to the per-expert stack."""
+        stage = L if self.role == "experts" else L - self.n_layer
+        gate_up_name, down_name = fused.names(stage)
+        stacks: dict[str, np.ndarray] = {}
+
+        def pack(role: str, arr: np.ndarray) -> np.ndarray:
+            n_e, rows, cols = arr.shape
+            packed = quantize_expert(
+                {role: np.ascontiguousarray(arr.reshape(n_e * rows, cols))},
+                self.quant, workers=self.workers,
+            )[role]
+            return np.ascontiguousarray(packed.reshape(n_e, rows, packed.shape[-1]))
+
+        # exactly the shards holding the two fused tensors (Qwen3.8 spreads a
+        # stage's MTP tensors over ~28 files; opening them all would fetch ~94 GB)
+        idx = self.source.tensor_index()
+        try:
+            shards = sorted({idx[gate_up_name], idx[down_name]})
+        except KeyError as exc:
+            raise KeyError(f"fused expert tensor missing from the index for layer {L}: {exc}") from exc
+        for shard in shards:
+            with self.source.open_shard(shard) as reader:
+                keys = set(reader.keys())
+                if gate_up_name in keys:
+                    gu = reader.get_tensor(gate_up_name)  # f32 [n_expert, 2*n_ff, n_embd]
+                    if gu.ndim != 3 or gu.shape[0] != self.n_expert or gu.shape[1] != 2 * self.n_ff \
+                            or gu.shape[2] != self.n_embd:
+                        raise QuantError(f"{gate_up_name}: shape {gu.shape} != "
+                                         f"[{self.n_expert}, {2 * self.n_ff}, {self.n_embd}]")
+                    # the stock converter's split: gate rows first, then up
+                    stacks["gate"] = pack("gate", gu[:, : self.n_ff, :])
+                    stacks["up"] = pack("up", gu[:, self.n_ff :, :])
+                    del gu
+                if down_name in keys:
+                    dn = reader.get_tensor(down_name)  # f32 [n_expert, n_embd, n_ff]
+                    if dn.ndim != 3 or dn.shape[0] != self.n_expert or dn.shape[1] != self.n_embd \
+                            or dn.shape[2] != self.n_ff:
+                        raise QuantError(f"{down_name}: shape {dn.shape} != "
+                                         f"[{self.n_expert}, {self.n_embd}, {self.n_ff}]")
+                    stacks["down"] = pack("down", dn)
+                    del dn
+        for role in ("gate", "up", "down"):
+            if role not in stacks:
+                raise KeyError(f"role {role} has no experts for layer {L}")
+        self._release_after(L, shards)
         return stacks
 
     def _write_gguf(self, L: int, stacks: dict[str, np.ndarray], path: Path) -> None:
@@ -314,7 +402,7 @@ class ExpertStage:
                 sink.put_text(plan.index_text, idx_rel)
 
         descriptor_rel: str | None = f"{s.output_base}-experts-manifest.expert-descriptor.json"
-        spine_local = Path(self.rplan.spine_path)
+        spine_local = Path(self.rplan.spine_path).expanduser()
         if not spine_local.exists():
             raise AssertionError(f"spine not local: {spine_local}")
         try:
@@ -495,26 +583,54 @@ class SpineStage:
         peel_dir.mkdir(parents=True, exist_ok=True)
         arch = self.rplan.arch
         index = self.source.tensor_index()
-        shards = sorted(set(index.values()))
+        # only the shards the index says hold dense tensors are fetched: on a
+        # real repo (Qwen3.8: 131 files, 360 GB) most files hold only experts
+        # or a sidecar table, and opening them here would download all of it
+        dense_names = {
+            n for n in index if classify(arch, n) in ("dense", "spec_head.dense")
+        }
+        shards = sorted({index[n] for n in dense_names})
         weight_map: dict[str, str] = {}
         for shard in shards:
+            # resume: a shard already peeled keeps its file; rebuild its map entries
+            if (peel_dir / shard).is_file():
+                from safetensors import safe_open
+                with safe_open(str(peel_dir / shard), framework="pt", device="cpu") as f:
+                    for name in f.keys():
+                        weight_map[name] = shard
+                continue
             tensors: dict[str, "torch.Tensor"] = {}
             with self.source.open_shard(shard) as reader:
                 for name in reader.keys():
-                    if classify(arch, name) not in ("dense", "spec_head.dense"):
+                    if name not in dense_names:
                         continue
                     # reader.get_tensor f32-casts; back to bf16 for the peel
                     # (dsv41_experts_from_hf peels raw, the synthetic repo is
-                    # bf16 so the round trip is lossless there)
-                    tensors[name] = torch.from_numpy(reader.get_tensor(name)).to(torch.bfloat16)
+                    # bf16 so the round trip is lossless there). Integer
+                    # tensors must NOT go through that cast: Qwen3.8's PLE hash
+                    # constants are exact int64 (45-bit multipliers, prime
+                    # vocab sizes) and bf16 rounding silently corrupts them.
+                    arr = reader.get_tensor(name)
+                    t = torch.from_numpy(arr)
+                    if np.issubdtype(arr.dtype, np.floating):
+                        t = t.to(torch.bfloat16)
+                    tensors[name] = t
                     weight_map[name] = shard
-            # NOTE: no source.release_shard(shard) -- the expert stages still
-            # read routed experts from these shards.
             if tensors:
                 save_file(tensors, str(peel_dir / shard))
+            # release: keeping every dense-bearing shard would pin ~100 GB of
+            # cache on Qwen3.8 (49 of the 52 also hold experts). The expert
+            # stages re-fetch what they need; network is cheaper than disk here.
+            self.source.release_shard(shard)
         (peel_dir / "config.json").write_text(
             (self.source.cache_dir / "config.json").read_text()
         )
+        # tokenizer / template / preprocessor files: the converter reads them
+        # from the model dir, and the vision mmproj pass needs the preprocessor
+        aux = getattr(self.source, "aux_files", None)
+        if aux is not None:
+            for path in aux():
+                shutil.copy(path, peel_dir / path.name)
         total = sum(p.stat().st_size for p in peel_dir.glob("*.safetensors"))
         (peel_dir / "model.safetensors.index.json").write_text(
             json.dumps({"metadata": {"total_size": total},

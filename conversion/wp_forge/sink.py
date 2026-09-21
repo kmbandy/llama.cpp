@@ -33,6 +33,7 @@ class Sink(Protocol):
     def sha256(self, relpath: str) -> str: ...
     def put_file(self, local: Path, relpath: str) -> tuple[int, str]: ...
     def put_text(self, text: str, relpath: str) -> None: ...
+    def get_text(self, relpath: str) -> str | None: ...
     def mkdir(self) -> None: ...
 
 
@@ -166,6 +167,13 @@ class LocalSink:
             w.close()
 
 
+    def get_text(self, relpath: str) -> str | None:
+        try:
+            return self._p(relpath).read_text()
+        except OSError:
+            return None
+
+
 class SSHSink:
     def __init__(self, host: str, root: str):
         self.host, self.root = host, root
@@ -205,6 +213,12 @@ class SSHSink:
         with self.open(relpath) as w:
             w.write(text.encode())
             w.close()
+
+
+    def get_text(self, relpath: str) -> str | None:
+        if not self.exists(relpath):
+            return None
+        return _ssh(self.host, f"cat {shlex.quote(self._p(relpath))}")
 
 
 def sink_for(m: Machine, root: str) -> Sink:

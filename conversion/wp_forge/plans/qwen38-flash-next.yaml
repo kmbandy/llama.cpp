@@ -1,0 +1,24 @@
+# Qwen3.8-Flash-Next on the DS4.1 layout: Q8_0 dense spine + mmproj on
+# mad-lab-main, MXFP4 routed experts split by layer band (0-30 main,
+# 31-47 + MTP on mad-lab-2026 NVMe). The PLE n-gram table is NOT built here:
+# conversion/qwen38_ple_from_hf.py produces the single concatenated
+# per_layer_token_embd.weight sidecar the qwen4exp loader expects (the
+# SidecarStage would emit 128 HF-named shard tensors). Vision tower ->
+# stock converter --mmproj, outside the forge.
+name: qwen38-flash-next
+source: hf:Qwen/Qwen3.8-Flash-Next
+quant:
+  experts: mxfp4
+  dense: q8_0
+spine: mad-lab-main
+sidecars: mad-lab-main
+experts:
+  - layers: "0-30"
+    machine: mad-lab-main
+  - layers: "31-47"
+    machine: mad-lab-2026
+    path: /mnt/nvme
+spec_head:
+  layers: "48-48"
+  machine: mad-lab-2026
+  path: /mnt/nvme

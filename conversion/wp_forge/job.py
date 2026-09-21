@@ -26,8 +26,8 @@ smallest set's single-layer footprint, which bounds the local hot path
 Resume: a stage whose stage_done is already logged in forge.jsonl is skipped
 and its result recovered from the sink (spine/sidecar: size + sha of the
 gguf; expert: manifest re-read, descriptor only if the file is present, blob
-shas from the manifest). Expert recovery is LocalSink-only in v1 (SSH sinks
-raise NotImplementedError). If recovery finds nothing durable (e.g. the crash
+shas from the manifest). Expert recovery reads the manifest back through the sink (local or ssh
+sha256sum over ssh for remote blobs). If recovery finds nothing durable (e.g. the crash
 happened before the manifest was written) the stage simply re-runs -- its own
 per-layer resume then skips the resided layers.
 
@@ -196,15 +196,19 @@ class Job:
         if s.role == "experts":
             out: set[str] = set()
             for L in s.layers.layers():
-                out.update(self.source.layer_shards(L))
+                out.update(self.source.layer_shards(L, self.rplan.arch.experts.prefix))
             return out
-        # spec head: the shards holding mtp.{stage}.* names
+        # spec head: the shards holding the stage's tensors. The prefix is the
+        # arch's spec-head expert naming (deepseek41: mtp.{stage}., qwen4exp:
+        # mtp.layers.{stage}.), not a hard-coded mtp.{stage}.
         idx = self.source.tensor_index()
         n_layer = self.rplan.arch.n_layer(self.rplan.hparams)
+        naming = self.rplan.arch.spec_head_experts
+        prefix = naming.prefix if naming is not None else "mtp"
         return {
             shard for L in s.layers.layers()
             for name, shard in idx.items()
-            if name.startswith(f"mtp.{L - n_layer}.")
+            if name.startswith(f"{prefix}.{L - n_layer}.")
         }
 
     # -- resume recovery ---------------------------------------------------------------
@@ -222,22 +226,23 @@ class Job:
             if g[0].id.rsplit("-w", 1)[0] != stage:
                 continue
             sinks = {s.id: sink_mod.sink_for(self.rplan.machines[s.machine], s.dir) for s in g}
-            for sink in sinks.values():
-                if not isinstance(sink, LocalSink):
-                    raise NotImplementedError("resume of remote sets not supported in v1")
             res: dict[str, StageResult] = {}
             for s in g:
                 sink = sinks[s.id]
                 manifest_rel = f"{s.output_base}-experts-manifest.json"
-                try:
-                    manifest = json.loads(Path(sink.root, manifest_rel).read_text())
-                except (OSError, json.JSONDecodeError):
+                text = sink.get_text(manifest_rel)
+                if text is None:
                     return None  # nothing durable: let the stage re-run
-                descriptor_rel = f"{manifest_rel}.expert-descriptor.json"
-                if not Path(sink.root, descriptor_rel).is_file():
+                try:
+                    manifest = json.loads(text)
+                except json.JSONDecodeError:
+                    return None
+                # the descriptor tool's default name: MANIFEST minus .json + .expert-descriptor.json
+                descriptor_rel = f"{s.output_base}-experts-manifest.expert-descriptor.json"
+                if not sink.exists(descriptor_rel):
                     descriptor_rel = None
                 # content_hash is an aggregate identity, not the blob sha:
-                # re-hash the blob from the (local) sink.
+                # re-hash the blob from the sink (local read or remote sha256sum).
                 blobs = [
                     (s["blob_file"], int(s["blob_bytes"]), sink.sha256(s["blob_file"]))
                     for s in manifest.get("shards", [])

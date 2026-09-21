@@ -43,6 +43,30 @@ class ExpertNaming:
 
 
 @dataclass(frozen=True)
+class FusedExpertNaming:
+    """Routed experts shipped as ONE tensor per layer per projection, the way
+    the Qwen3.8 checkpoints do: {prefix}.{layer}.{infix}.gate_up_proj
+    [n_expert, 2*n_ff, n_embd] (gate rows first, then up -- the split the
+    stock converter makes) and {prefix}.{layer}.{infix}.down_proj
+    [n_expert, n_embd, n_ff]. No ".weight" suffix, no per-expert index."""
+
+    prefix: str
+    infix: str = "mlp.experts"
+    gate_up: str = "gate_up_proj"
+    down: str = "down_proj"
+
+    def names(self, layer: int) -> tuple[str, str]:
+        base = f"{self.prefix}.{layer}.{self.infix}"
+        return f"{base}.{self.gate_up}", f"{base}.{self.down}"
+
+    def _re(self) -> re.Pattern[str]:
+        return re.compile(
+            rf"^{re.escape(self.prefix)}\.(\d+)\.{re.escape(self.infix)}\."
+            rf"({re.escape(self.gate_up)}|{re.escape(self.down)})(\.weight)?$"
+        )
+
+
+@dataclass(frozen=True)
 class ArchSpec:
     name: str  # gguf arch string: "deepseek41"
     hf_architectures: tuple[str, ...]
@@ -60,6 +84,10 @@ class ArchSpec:
     # spec-head experts prefix; overridden when non-expert MTP tensors live under
     # a broader prefix (qwen4exp: experts under "mtp.layers", dense under "mtp").
     spec_head_prefix: str | None = None
+    # fused per-layer expert tensors (see FusedExpertNaming); when set, the
+    # per-expert ``experts`` / ``spec_head_experts`` naming is not looked for
+    fused_experts: FusedExpertNaming | None = None
+    fused_spec_head_experts: FusedExpertNaming | None = None
 
     @property
     def classes(self) -> tuple[str, ...]:
@@ -104,12 +132,19 @@ _DSV4 = ArchSpec(
 _QWEN4EXP = ArchSpec(
     name="qwen4exp",
     hf_architectures=("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"),
-    experts=ExpertNaming(prefix="model.layers", infix="mlp.experts",
+    # Qwen/Qwen3.8-Flash-Next ships FUSED expert tensors (verified against the
+    # repo's safetensors headers 2026-09-21):
+    #   model.language_model.layers.{L}.mlp.experts.gate_up_proj [512, 1280, 2560]
+    #   model.language_model.layers.{L}.mlp.experts.down_proj    [512, 2560, 640]
+    #   mtp.layers.{s}.mlp.experts.{gate_up_proj,down_proj}      (MTP block)
+    # The per-expert naming below is the shape the converter EMITS after
+    # splitting, kept for name formatting; reads go through fused_experts.
+    experts=ExpertNaming(prefix="model.language_model.layers", infix="mlp.experts",
                          proj={"gate": "gate_proj", "down": "down_proj", "up": "up_proj"}),
-    # mtp.layers.{i}.* remap to model.layers.{num_hidden+i}.* in the qwen converter;
-    # the MTP block carries its own MoE (qwen4exp.py: "mtp.layers.0.mlp.experts").
     spec_head_experts=ExpertNaming(prefix="mtp.layers", infix="mlp.experts",
                                    proj={"gate": "gate_proj", "down": "down_proj", "up": "up_proj"}),
+    fused_experts=FusedExpertNaming(prefix="model.language_model.layers"),
+    fused_spec_head_experts=FusedExpertNaming(prefix="mtp.layers"),
     n_expert_key="num_experts",
     nextn_key="mtp_num_hidden_layers",
     sidecars={"ple": r"\.ngram_embedding\.shard_\d+\."},
@@ -141,10 +176,14 @@ def classify(a: ArchSpec, tensor_name: str) -> str:
             return cls
     if a.spec_head_experts is not None and a.spec_head_experts._re().match(tensor_name):
         return "spec_head.experts"
+    if a.fused_spec_head_experts is not None and a.fused_spec_head_experts._re().match(tensor_name):
+        return "spec_head.experts"
     sh_prefix = a.spec_head_prefix or (a.spec_head_experts.prefix if a.spec_head_experts else None)
     if sh_prefix is not None and tensor_name.startswith(sh_prefix + "."):
         return "spec_head.dense"
     if a.experts._re().match(tensor_name):
+        return "experts"
+    if a.fused_experts is not None and a.fused_experts._re().match(tensor_name):
         return "experts"
     return "dense"
 

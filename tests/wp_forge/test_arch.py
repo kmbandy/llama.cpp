@@ -81,13 +81,23 @@ def test_other_arches() -> None:
     assert A.classify(d4, "layers.3.ffn.gate.weight") == "dense"
 
     q = A.arch_for_hparams({"architectures": ["Qwen4ExpForCausalLM"]})
-    assert A.classify(q, "model.layers.2.mlp.experts.9.gate_proj.weight") == "experts"
-    assert A.classify(q, "model.layers.2.mlp.experts.9.down_proj.weight") == "experts"
-    assert A.classify(q, "model.layers.2.mlp.experts.9.up_proj.weight") == "experts"
-    # MTP block's own MoE (qwen4exp.py: mtp.layers.0.mlp.experts)
-    assert A.classify(q, "mtp.layers.0.mlp.experts.5.gate_up_proj.weight") == "spec_head.experts"
+    # Qwen/Qwen3.8-Flash-Next ships FUSED per-layer expert tensors (real names
+    # from the repo's safetensors headers, 2026-09-21)
+    assert A.classify(q, "model.language_model.layers.2.mlp.experts.gate_up_proj") == "experts"
+    assert A.classify(q, "model.language_model.layers.2.mlp.experts.down_proj") == "experts"
+    assert q.fused_experts is not None
+    assert q.fused_experts.names(2) == (
+        "model.language_model.layers.2.mlp.experts.gate_up_proj",
+        "model.language_model.layers.2.mlp.experts.down_proj")
+    # MTP block's own MoE, fused the same way
+    assert A.classify(q, "mtp.layers.0.mlp.experts.gate_up_proj") == "spec_head.experts"
+    assert A.classify(q, "mtp.layers.0.mlp.experts.down_proj") == "spec_head.experts"
     assert A.classify(q, "mtp.fc_hidden.weight") == "spec_head.dense"
-    # PLE n-gram shard sidecar wins over dense
-    assert A.classify(q, "model.layers.0.ngram_embedding.shard_1.weight") == "ple"
+    assert A.classify(q, "mtp.layers.0.mlp.gate.weight") == "spec_head.dense"
+    assert A.classify(q, "model.language_model.layers.2.mlp.gate.weight") == "dense"
+    assert A.classify(q, "model.language_model.layers.2.mlp.shared_expert.up_proj.weight") == "dense"
+    # PLE n-gram shard sidecar wins over dense; its hash constants are dense
+    assert A.classify(q, "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight") == "ple"
+    assert A.classify(q, "model.language_model.layers.1.ple.ple_embedding.layer_multipliers") == "dense"
     assert A.spec_head_layers(q, {"num_hidden_layers": 48, "mtp_num_hidden_layers": 1}) == [48]
     assert q.converter_tolerates_missing_experts

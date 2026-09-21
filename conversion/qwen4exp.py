@@ -154,8 +154,13 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         _img = self._image_token_id()
         if _img is not None:
             self.gguf_writer.add_ple_image_token_id(int(_img))
-        if self._ple_row_dim is not None:
-            self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
+        # the row width is normally read off the shards; a spine converted with
+        # the table peeled out (wp-forge: the PLE ships as a sidecar) has none,
+        # so derive it: ple_embed_dim is the concatenation of all n-gram heads
+        if self._ple_row_dim is None:
+            n_heads = (int(hp["ngram_size"]) - 1) * int(hp["heads_per_ngram"])
+            self._ple_row_dim = int(hp["ple_embed_dim"]) // n_heads
+        self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
 
         self.gguf_writer.add_ple_layer_multipliers(
             self._read_hash_constants("ple_embedding.layer_multipliers"))

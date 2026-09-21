@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 
 from .arch import ArchSpec, arch_for_hparams, expert_layers, spec_head_layers
-from .machines import Machine
+from .machines import expand_remote_home, Machine
 
 # ggml types gguf-py can produce AND llama-wp-repack can slice; the value is
 # the block size (elements per quant block) used to align expert widths.
@@ -198,7 +198,10 @@ def _check_tiling(stages: list[StageSpec], required: list[int], allow_partial: b
 
 
 def _dest_dir(m: Machine, override: str | None, name: str, set_id: str | None) -> str:
-    root = (override or m.models_dir).rstrip("/")
+    # absolute on the target machine: these paths end up in manifests and
+    # per-blob indexes as model_files, which the descriptor tool and the worker
+    # canonicalize verbatim (a literal "~" fails there)
+    root = expand_remote_home(m, (override or m.models_dir).rstrip("/"))
     return f"{root}/{name}/{set_id}" if set_id else f"{root}/{name}"
 
 
