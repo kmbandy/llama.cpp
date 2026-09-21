@@ -871,10 +871,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     ggml_tensor * kv = build_lora_mm(layer.engram_wkv, rows);
     cb(kv, "engram_wkv", il);
 
-    ggml_tensor * key   = ggml_view_2d(ctx0, kv, n_embd * hc, nt, kv->nb[1], 0);
-    ggml_tensor * value = ggml_view_2d(ctx0, kv, n_embd,      nt, kv->nb[1], n_embd * hc * kv->nb[0]);
-    key   = ggml_reshape_3d(ctx0, key, n_embd, hc, nt);
-    value = ggml_reshape_3d(ctx0, value, n_embd, 1, nt);
+    // kv rows are [n_embd*hc | n_embd] per token: view the key and value halves
+    // as strided 3-D tensors (a 2-D view + reshape is only contiguous at nt == 1);
+    // the casts below materialise them contiguously.
+    ggml_tensor * key   = ggml_view_3d(ctx0, kv, n_embd, hc, nt, n_embd * kv->nb[0], kv->nb[1], 0);
+    ggml_tensor * value = ggml_view_3d(ctx0, kv, n_embd, 1,  nt, n_embd * kv->nb[0], kv->nb[1], n_embd * hc * kv->nb[0]);
 
     ggml_tensor * h = ggml_cast(ctx0, x,   GGML_TYPE_F32);
     ggml_tensor * k = ggml_cast(ctx0, key, GGML_TYPE_F32);
@@ -890,19 +891,21 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     const float eps = hparams.f_norm_rms_eps;
     ggml_tensor * h_ms = ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, h)), 1.0f / (float) n_embd);
     ggml_tensor * k_ms = ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, k)), 1.0f / (float) n_embd);
-    ggml_tensor * rstd = ggml_div(ctx0, ggml_new_f32(ctx0, 1.0f),
-            ggml_sqrt(ctx0, ggml_mul(ctx0,
-                    ggml_add(ctx0, h_ms, ggml_new_f32(ctx0, eps)),
-                    ggml_add(ctx0, k_ms, ggml_new_f32(ctx0, eps)))));
+    // sqrt((h_ms + eps) * (k_ms + eps)) without scalar constant tensors: the
+    // graph context is no_alloc, so ggml_new_f32 cannot be used here.
+    ggml_tensor * denom = ggml_sqrt(ctx0, ggml_mul(ctx0,
+            ggml_scale_bias(ctx0, h_ms, 1.0f, eps),
+            ggml_scale_bias(ctx0, k_ms, 1.0f, eps)));
 
     ggml_tensor * dot = ggml_sum_rows(ctx0, prod);
-    dot = ggml_mul(ctx0, dot, rstd);
+    dot = ggml_div(ctx0, dot, denom);
     dot = ggml_scale(ctx0, dot, 1.0f / sqrtf((float) n_embd));
     ggml_tensor * mag  = ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY);
     ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, dot), ggml_sqrt(ctx0, mag)));
     gate = ggml_reshape_3d(ctx0, gate, 1, hc, nt);
 
-    ggml_tensor * delta = ggml_mul(ctx0, v, gate);
+    // delta[n_embd, hc, nt] = value (shared across the hc streams) * per-stream gate
+    ggml_tensor * delta = ggml_mul(ctx0, ggml_repeat(ctx0, v, h), gate);
     ggml_tensor * out = ggml_add(ctx0, h, delta);
     return ggml_cast(ctx0, out, x->type);
 }
@@ -1097,6 +1100,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_csa2(
             ggml_tensor * ik = inp_dsv4->mctx->get_lid()->get_k(ctx0, src_il);
             ik = ggml_view_4d(ctx0, ik, ik->ne[0], ik->ne[1], n_csa, ik->ne[3],
                     ik->nb[1], ik->nb[2], ik->nb[3], 0);
+            // split the token axis of q / weights per KV stream so the mul_mat
+            // broadcasts over ik's stream dimension (same as deepseek4)
+            const int64_t n_stream = ik->ne[3];
+            iq = ggml_view_4d(ctx0, iq,
+                    iq->ne[0], iq->ne[1], iq->ne[2] / n_stream, n_stream,
+                    iq->nb[1], iq->nb[2], iq->nb[3] / n_stream, 0);
+            iw = ggml_view_4d(ctx0, iw,
+                    iw->ne[0], iw->ne[1] / n_stream, iw->ne[2], n_stream,
+                    iw->nb[1], iw->nb[2] / n_stream, iw->nb[3] / n_stream, 0);
             iq = ggml_permute(ctx0, iq, 0, 2, 1, 3);
             ik = ggml_permute(ctx0, ik, 0, 2, 1, 3);
             ggml_tensor * kq = ggml_mul_mat(ctx0, ik, iq);
