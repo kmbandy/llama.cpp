@@ -220,6 +220,18 @@ std::vector<SliceRange> slice_ranges(const std::vector<int64_t> & widths) {
     return ranges;
 }
 
+uint64_t padded_page_bytes(uint64_t payload_bytes) {
+    const uint64_t remainder = payload_bytes % DIRECT_ALIGNMENT;
+    if (remainder == 0) {
+        return payload_bytes;
+    }
+    const uint64_t padding = DIRECT_ALIGNMENT - remainder;
+    if (payload_bytes > std::numeric_limits<uint64_t>::max() - padding) {
+        throw std::overflow_error("page padding overflows");
+    }
+    return payload_bytes + padding;
+}
+
 std::vector<ExpertGroup> build_expert_groups(const wp::PageCatalog & catalog) {
     std::map<std::pair<int, int>, ExpertGroup> grouped;
 
@@ -263,6 +275,13 @@ std::vector<ExpertGroup> build_expert_groups(const wp::PageCatalog & catalog) {
     result.reserve(grouped.size());
     for (auto & item : grouped) {
         ExpertGroup & group = item.second;
+        // A v1 page is one whole group, and the worker reads every page with
+        // one O_DIRECT read, so the page must be DIRECT_ALIGNMENT-sized. The
+        // DeepSeek stores happened to be (13,369,344 / 18,800,640 B); Qwen3.8
+        // MXFP4 experts are 2,611,200 B. Pad the group like a v2 slice page:
+        // members stay byte-tight, zero fill follows the last member.
+        group.payload_size = group.size;
+        group.size         = padded_page_bytes(group.size);
         std::sort(group.members.begin(), group.members.end(), [](const ExpertMember & a, const ExpertMember & b) {
             if (a.role_mask != b.role_mask) {
                 return a.role_mask < b.role_mask;

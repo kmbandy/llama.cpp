@@ -51,7 +51,8 @@ static void test_grouping() {
         EXPECT_EQ(group.block_idx, 1, "consolidated group block");
         EXPECT_EQ(group.expert_idx, static_cast<int>(expert), "consolidated group expert");
         EXPECT_EQ(group.members.size(), 3u, "consolidated group has three roles");
-        EXPECT_EQ(group.size, 360u, "different role sizes sum without padding");
+        EXPECT_EQ(group.payload_size, 360u, "different role sizes sum into the payload");
+        EXPECT_EQ(group.size, 4096u, "a v1 page is the payload padded to DIRECT_ALIGNMENT");
         if (group.members.size() == 3) {
             EXPECT_EQ(group.members[0].role_mask, wp::ROLE_UP, "canonical up role first");
             EXPECT_EQ(group.members[1].role_mask, wp::ROLE_GATE, "canonical gate role second");
@@ -72,7 +73,8 @@ static void test_grouping() {
         EXPECT_EQ(two_role.block_idx, 2, "native group block");
         EXPECT_EQ(two_role.expert_idx, 7, "native group expert");
         EXPECT_EQ(two_role.members.size(), 2u, "two-role group is not padded");
-        EXPECT_EQ(two_role.size, 228u, "two-role sizes sum exactly");
+        EXPECT_EQ(two_role.payload_size, 228u, "two-role sizes sum exactly");
+        EXPECT_EQ(two_role.size, 4096u, "two-role page padded to DIRECT_ALIGNMENT");
         if (two_role.members.size() == 2) {
             EXPECT_EQ(two_role.members[0].role_mask, wp::ROLE_UP, "two-role up first");
             EXPECT_EQ(two_role.members[1].role_mask, wp::ROLE_DOWN, "two-role down second");
@@ -109,21 +111,22 @@ static void test_sharding() {
         EXPECT_EQ(by_layer[0].layer_first, 0, "first shard starts at layer zero");
         EXPECT_EQ(by_layer[0].layer_last, 0, "first shard ends at layer zero");
         EXPECT_EQ(by_layer[0].group_indices.size(), 2u, "whole layer keeps both groups");
-        EXPECT_EQ(by_layer[0].size, 100u, "whole layer byte size");
+        EXPECT_EQ(by_layer[0].size, 2 * 4096u, "whole layer byte size: two padded pages");
         EXPECT_EQ(by_layer[1].group_indices.size(), 1u, "layer one group remains whole");
         EXPECT_EQ(by_layer[2].group_indices.size(), 1u, "layer two group remains whole");
     }
 
-    const std::vector<wp_repack::ShardPlan> coalesced = wp_repack::plan_shards_max_bytes(groups, 220);
+    // limits are in padded-page bytes: three 4096-byte pages fit under 3*4096
+    const std::vector<wp_repack::ShardPlan> coalesced = wp_repack::plan_shards_max_bytes(groups, 3 * 4096);
     EXPECT_EQ(coalesced.size(), 2u, "adjacent layers coalesce up to limit");
     if (coalesced.size() == 2) {
         EXPECT_EQ(coalesced[0].layer_first, 0, "coalesced shard first layer");
         EXPECT_EQ(coalesced[0].layer_last, 1, "coalesced shard last layer");
         EXPECT_EQ(coalesced[0].group_indices.size(), 3u, "coalescing keeps whole groups");
-        EXPECT_EQ(coalesced[0].size, 210u, "coalesced bytes");
+        EXPECT_EQ(coalesced[0].size, 3 * 4096u, "coalesced bytes");
         EXPECT_EQ(coalesced[1].layer_first, 2, "second shard starts on layer boundary");
         EXPECT_EQ(coalesced[1].layer_last, 2, "second shard ends on layer boundary");
-        EXPECT_EQ(coalesced[1].size, 150u, "second shard bytes");
+        EXPECT_EQ(coalesced[1].size, 4096u, "second shard bytes: one padded page");
     }
 
     const std::vector<wp_repack::ShardPlan> undersized_limit = wp_repack::plan_shards_max_bytes(groups, 90);

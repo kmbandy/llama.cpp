@@ -226,7 +226,7 @@ void print_usage(const char * argv0) {
               << "  BASE-experts-manifest.json             set manifest\n"
               << "  A .wpb is a concatenation of expert groups. A group is one (block_idx,\n"
               << "  expert_idx) and holds its three role members (up, gate, down) whole, in\n"
-              << "  role_mask order, byte-tight with no padding.\n"
+              << "  role_mask order, byte-tight; zero fill pads the group to 4096 bytes.\n"
               << "\n"
               << "FORMAT v2 (--expert-slices)\n"
               << "  BASE" << SLICED_BASE_SUFFIX << "-experts-NNNNN-of-MMMMM.wpb        sliced expert-major blob\n"
@@ -692,10 +692,13 @@ json build_shard_index(const fs::path &                            output_base,
     for (size_t group_index : shard.group_indices) {
         const wp_repack::ExpertGroup & group      = groups.at(group_index);
         json                           group_json = {
-            { "block_idx",    group.block_idx      },
-            { "expert_idx",   group.expert_idx     },
-            { "member_count", group.members.size() },
-            { "members",      json::array()        },
+            { "block_idx",     group.block_idx                  },
+            { "expert_idx",    group.expert_idx                 },
+            { "member_count",  group.members.size()             },
+            // zero fill after the last member that pads the page to
+            // DIRECT_ALIGNMENT; the descriptor and worker read this key
+            { "padding_bytes", group.size - group.payload_size  },
+            { "members",       json::array()                    },
         };
 
         for (const wp_repack::ExpertMember & member : group.members) {
@@ -713,6 +716,8 @@ json build_shard_index(const fs::path &                            output_base,
             });
             blob_offset += member.size;
         }
+        // v1 pages are DIRECT_ALIGNMENT-padded after the last member
+        blob_offset += group.size - group.payload_size;
         index["groups"].push_back(std::move(group_json));
     }
 
@@ -763,6 +768,12 @@ json write_shard(const fs::path &                            output_base,
                 }
                 copy_member(sources[member.file_idx], member.file_offset, member.size, blob, buffer);
                 blob_offset += member.size;
+            }
+            const uint64_t padding = group.size - group.payload_size;
+            if (padding != 0) {
+                const std::string zeros(static_cast<size_t>(padding), '\0');
+                blob.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+                blob_offset += padding;
             }
         }
 
@@ -1283,10 +1294,15 @@ json build_sliced_index(const fs::path &                            output_base,
         index["groups"].push_back(std::move(group_json));
     }
 
-    // Slicing reorders payload bytes but page padding increases the blob size.
-    if (payload_bytes != shard.size) {
+    // Slicing reorders payload bytes but page padding increases the blob size;
+    // compare against the members' bytes, not the (v1-padded) group pages.
+    uint64_t unsliced_bytes = 0;
+    for (size_t group_index : shard.group_indices) {
+        unsliced_bytes += groups.at(group_index).payload_size;
+    }
+    if (payload_bytes != unsliced_bytes) {
         throw std::runtime_error("sliced payload byte count " + std::to_string(payload_bytes) +
-                                 " does not match the unsliced expert bytes " + std::to_string(shard.size));
+                                 " does not match the unsliced expert bytes " + std::to_string(unsliced_bytes));
     }
     index["blob_bytes"] = blob_offset;
     return index;
@@ -2412,6 +2428,18 @@ VerifyCounts verify_index(const fs::path &                            index_path
             next_offset += expected_member.size;
             ++counts.members;
             counts.bytes += expected_member.size;
+        }
+        {
+            const uint64_t padding = expected.size - expected.payload_size;
+            if (actual.value("padding_bytes", (uint64_t) 0) != padding) {
+                throw std::runtime_error("group padding_bytes disagrees with the page geometry");
+            }
+            if (padding != 0) {
+                std::vector<char> padding_buffer(static_cast<size_t>(padding));
+                verify_zero_padding(blob, next_offset, padding, padding_buffer);
+                next_offset += padding;
+                counts.bytes += padding;
+            }
         }
         ++counts.groups;
     }

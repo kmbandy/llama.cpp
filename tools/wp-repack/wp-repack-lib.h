@@ -18,11 +18,17 @@ struct ExpertMember {
 };
 
 struct ExpertGroup {
-    int                       block_idx  = -1;
-    int                       expert_idx = -1;
-    uint64_t                  size       = 0;
+    int                       block_idx    = -1;
+    int                       expert_idx   = -1;
+    uint64_t                  size         = 0;   // page bytes in the blob (payload padded to DIRECT_ALIGNMENT)
+    uint64_t                  payload_size = 0;   // sum of member bytes
     std::vector<ExpertMember> members;
 };
+
+constexpr uint64_t DIRECT_ALIGNMENT = 4096;
+
+// payload rounded up to the next DIRECT_ALIGNMENT multiple (identity when aligned)
+uint64_t padded_page_bytes(uint64_t payload_bytes);
 
 struct LayerRange {
     int first = -1;
