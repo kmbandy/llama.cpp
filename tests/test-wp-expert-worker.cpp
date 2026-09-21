@@ -1354,6 +1354,117 @@ struct ScopedEnv {
     ~ScopedEnv() { unsetenv(name); }
 };
 
+// Task 3: WP_EXPERT_PIN_FILE preloads and PINS its hot set in the host
+// arena at construction, independently of the VRAM pin (disabled here with
+// WP_EXPERT_PIN_MAX_SLOTS=0). The pinned pages must survive every other
+// page of the fixture cycling through a 2-page retention cap, so demanding
+// one afterwards is a RAM hit -- its only blob read is the preload's.
+void test_pin_file_preloads_and_pins() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    const fs::path pin_path = temp.path / "pins.txt";
+    {
+        std::ofstream pin_file(pin_path);
+        pin_file << "# hot set\n" << LAYER << " 0  # 9\n" << LAYER << " 1  # 8\n";
+    }
+    require(setenv("WP_EXPERT_PIN_FILE", pin_path.c_str(), 1) == 0, "failed to set pin file");
+    require(setenv("WP_EXPERT_PIN_MAX_SLOTS", "0", 1) == 0, "failed to disable the VRAM pin");
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest  = fixture.manifest;
+    options.descriptor      = fixture.descriptor;
+    options.device          = "CPU";
+    options.listen_host     = "127.0.0.1";
+    options.listen_port     = port;
+    options.slots           = 4;
+    options.host_tier_bytes = 2 * PAGE_BYTES;   // pins do not count against this
+    options.once            = true;
+    options.test_hooks      = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    const auto cleanup = [&]() {
+        unsetenv("WP_EXPERT_PIN_FILE");
+        unsetenv("WP_EXPERT_PIN_MAX_SLOTS");
+    };
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        // The preload read exactly the two pinned pages, before listening.
+        require(reads.total() == 2 && reads.count_of(LAYER, 0) == 1 &&
+                    reads.count_of(LAYER, 1) == 1,
+                "WP_EXPERT_PIN_FILE preload did not read exactly its two pages");
+
+        const auto dispatch_one = [&](int32_t layer, int32_t expert, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer       = layer;
+            request.n_tokens    = N_TOKENS;
+            request.activations.resize((size_t) N_TOKENS * N_EMBD);
+            request.assignments = { { expert, std::vector<float>(N_TOKENS, 0.5f) } };
+            std::vector<uint8_t> buf = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq, buf.data(), buf.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, buf) && type == PIPE_EXPERT_PARTIAL,
+                    "dispatch did not complete");
+        };
+
+        // Every OTHER page of the fixture: six misses through a 2-page
+        // retention cap (4 arena entries, 2 of them pinned).
+        dispatch_one(LAYER, 2, 100);
+        dispatch_one(LAYER, 3, 101);
+        for (int32_t e = 0; e < 4; ++e) {
+            dispatch_one(OTHER_LAYER, e, 102 + e);
+        }
+        require(reads.total() == 8, "the six unpinned pages did not read exactly once each");
+
+        // The pinned pages are still in RAM: demanding them is a RAM hit.
+        dispatch_one(LAYER, 0, 110);
+        dispatch_one(LAYER, 1, 111);
+        require(reads.count_of(LAYER, 0) == 1 && reads.count_of(LAYER, 1) == 1,
+                "a page pinned by WP_EXPERT_PIN_FILE was re-read from disk");
+        socket.reset();
+    } catch (...) {
+        server.join();
+        cleanup();
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    cleanup();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "worker returned failure");
+}
+
 // A PREDICTED hint must land in HOST RAM and take no VRAM slot at all.
 //
 // The lease can only make a guess give a slot up AFTER taking it; landing in the
@@ -5718,6 +5829,7 @@ int main() {
         test_fixture_arena_stride_alignment();
         run_test();
         test_ram_hit_skips_blob_read();
+        test_pin_file_preloads_and_pins();
         test_ram_hit_skips_blob_read();
         test_default_off_multi_expert_request();
         test_prefetch_hint_without_spec_reads_nothing();

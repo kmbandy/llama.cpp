@@ -2080,6 +2080,13 @@ public:
         n_pinned_demand_hits_ = demand_hits;
     }
 
+    // Host arena: predicted hints landed as speculative entries, and bytes
+    // pinned in RAM by WP_EXPERT_PIN_FILE (Worker::preload_pinned).
+    void set_ram_stats(uint64_t spec_landed, uint64_t pinned_bytes) {
+        ram_spec_landed_  = spec_landed;
+        ram_pinned_bytes_ = pinned_bytes;
+    }
+
     void note_distinct_page(int layer, int expert) {
         if (!enabled_) {
             return;
@@ -2314,6 +2321,8 @@ private:
                   << " n_layerahead_hits=" << n_layerahead_hits_
                   << " n_pinned=" << n_pinned_
                   << " n_pinned_demand_hits=" << n_pinned_demand_hits_
+                  << " ram_spec_landed=" << ram_spec_landed_
+                  << " ram_pinned_bytes=" << ram_pinned_bytes_
                   << " n_host_hit=" << n_host_hit_
                   << " n_host_demote=" << n_host_demote_
                   << " bytes_read=" << bytes_read_
@@ -2532,6 +2541,8 @@ private:
     uint64_t          n_layerahead_hits_    = 0;
     size_t             n_pinned_ = 0;
     uint64_t           n_pinned_demand_hits_ = 0;
+    uint64_t           ram_spec_landed_  = 0;
+    uint64_t           ram_pinned_bytes_ = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          n_host_demote_ = 0;
     uint64_t          bytes_read_ = 0;
@@ -6629,6 +6640,8 @@ public:
     }
 
     uint64_t host_landed() const { return host_landed_.load(std::memory_order_relaxed); }
+    wp::HostArena & arena() { return arena_; }
+    const wp::HostArena & arena() const { return arena_; }
     uint64_t host_spec_bytes() const { return host_bytes_.load(std::memory_order_relaxed); }
     uint64_t host_spec_errors() const { return host_errors_.load(std::memory_order_relaxed); }
     uint64_t host_spec_promotions() const { return arena_.spec_promotions(); }
@@ -11696,6 +11709,7 @@ public:
     void record_stats(const RequestStats & request, size_t n_experts) {
         stats_.set_shield_stats(pool_.n_shield_hits(), pool_.n_shield_exhausted());
         stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
+        stats_.set_ram_stats(pool_.host_landed(), (uint64_t) pool_.arena().pinned_bytes());
         stats_.set_layerahead_stats(
             n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits());
         stats_.record(request, n_experts);
@@ -17654,6 +17668,83 @@ public:
         if (!single_device) {
             load_pin_file();
         }
+        preload_pinned(test_hooks);
+    }
+
+    // WP_EXPERT_PIN_FILE hot set -> host arena, pinned. Independent of the
+    // VRAM pin (load_pin_file) and of WP_EXPERT_OWNER_POLICY=hot: this only
+    // decides which pages are guaranteed a RAM copy. Rank order from
+    // ranked_pages_from_pin_file(); each page is read synchronously on this
+    // thread into a fresh arena entry (begin_read -> pread -> finish_read)
+    // and pin()ned, until pin() refuses (pinned cap) or the arena has no
+    // room. Runs once, after the arena bootstrap. A page already Resident
+    // (nothing is, at construction) would be pinned in place.
+    void preload_pinned(TestHooks * test_hooks) {
+        const char * const pin_path = std::getenv("WP_EXPERT_PIN_FILE");
+        if (pin_path == nullptr || pin_path[0] == '\0' || !arena_.is_initialized() ||
+                arena_.tier_bytes() == 0) {
+            return;
+        }
+        std::unordered_map<int, const ExpertPage *> by_cache_id;
+        for (const auto & item : catalog_.pages) {
+            if (item.second.cache_id >= 0) {
+                by_cache_id[item.second.cache_id] = &item.second;
+            }
+        }
+        size_t   n_pinned = 0;
+        uint64_t bytes    = 0;
+        for (const size_t cache_id : ranked_pages_from_pin_file()) {
+            const auto it = by_cache_id.find((int) cache_id);
+            if (it == by_cache_id.end() || it->second->is_resident) {
+                continue;
+            }
+            const ExpertPage & page = *it->second;
+            if (!arena_.is_resident(page.cache_id)) {
+                void * data = nullptr;
+                wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
+                if (!arena_.begin_read(page.cache_id, /*speculative=*/false, &data, &handle)) {
+                    break;   // nothing evictable: the arena is full of pins
+                }
+                bool ok = false;
+                const int fd = ::open(page.blob.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd >= 0) {
+                    if (test_hooks != nullptr && test_hooks->read_started) {
+                        test_hooks->read_started(page.layer, page.expert);
+                    }
+                    size_t done = 0;
+                    while (done < (size_t) page.size) {
+                        const ssize_t n = ::pread(fd, (char *) data + done,
+                                                  (size_t) page.size - done,
+                                                  (off_t) (page.offset + done));
+                        if (n < 0 && errno == EINTR) {
+                            continue;
+                        }
+                        if (n <= 0) {
+                            break;
+                        }
+                        done += (size_t) n;
+                    }
+                    ::close(fd);
+                    ok = done == (size_t) page.size;
+                    if (ok && test_hooks != nullptr && test_hooks->read_finished) {
+                        test_hooks->read_finished(page.layer, page.expert);
+                    }
+                }
+                arena_.finish_read(page.cache_id, handle, ok);
+                if (!ok) {
+                    std::cerr << "WARN wp expert worker: WP_EXPERT_PIN_FILE preload read failed for "
+                              << page.layer << " " << page.expert << std::endl;
+                    continue;
+                }
+            }
+            if (!arena_.pin(page.cache_id)) {
+                break;   // pinned cap reached
+            }
+            ++n_pinned;
+            bytes += page.size;
+        }
+        std::cerr << "wp::HostArena: pinned " << n_pinned << " pages ("
+                  << (bytes >> 20) << " MiB) from WP_EXPERT_PIN_FILE" << std::endl;
     }
 
     // (size_t) -1 when the layer has no --layer-device entry. Called once per
