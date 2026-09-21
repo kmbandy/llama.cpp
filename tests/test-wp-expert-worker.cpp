@@ -1414,7 +1414,10 @@ void test_pin_file_preloads_and_pins() {
     options.listen_host     = "127.0.0.1";
     options.listen_port     = port;
     options.slots           = 4;
-    options.host_tier_bytes = 2 * PAGE_BYTES;   // pins do not count against this
+    // 3 tier entries: the pinned cap is 90% of the TIER entries only
+    // (floor(3 * 0.9) = 2, exactly the two pins; in-flight entries are never
+    // pinnable), and the unpinned retention cap is 3 pages.
+    options.host_tier_bytes = 3 * PAGE_BYTES;
     options.once            = true;
     options.test_hooks      = &reads.hooks;
 
@@ -1468,8 +1471,8 @@ void test_pin_file_preloads_and_pins() {
                     "dispatch did not complete");
         };
 
-        // Every OTHER page of the fixture: six misses through a 2-page
-        // retention cap (4 arena entries, 2 of them pinned).
+        // Every OTHER page of the fixture: six misses through a 3-page
+        // retention cap (5 arena entries, 2 of them pinned).
         dispatch_one(LAYER, 2, 100);
         dispatch_one(LAYER, 3, 101);
         for (int32_t e = 0; e < 4; ++e) {

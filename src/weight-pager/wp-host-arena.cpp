@@ -108,7 +108,10 @@ size_t HostArena::spec_cap_entries_() const {
 }
 
 size_t HostArena::pinned_cap_entries_() const {
-    return entries_.size() * (size_t) cfg_.pinned_cap_pct / 100;
+    // Tier entries only: the read_inflight_max in-flight entries are never
+    // pinnable (see pin() in the header).
+    const size_t tier_entries = cfg_.entry_bytes == 0 ? 0 : cfg_.tier_bytes / cfg_.entry_bytes;
+    return std::min(tier_entries, entries_.size()) * (size_t) cfg_.pinned_cap_pct / 100;
 }
 
 // Evict a single entry, preferring a speculative victim (a misprediction
@@ -195,6 +198,40 @@ bool HostArena::begin_read_wait(int page_idx, bool speculative, void ** data_out
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             return false;
+        }
+    }
+}
+
+HostArena::Reserve HostArena::reserve_wait(int page_idx, bool speculative, void ** data_out,
+                                           Handle * handle_out, uint64_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(mu_);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        auto it = by_page_.find(page_idx);
+        if (it != by_page_.end()) {
+            if (entries_[it->second].state == State::Resident) {
+                touch_locked_(it->second);
+                return Reserve::Present;
+            }
+            // Reading by someone else: wait for its finish_read (either
+            // outcome notifies cv_), then re-classify.
+        } else if (begin_read_locked_(page_idx, speculative, data_out, handle_out)) {
+            return Reserve::Reserved;
+        }
+        if (std::chrono::steady_clock::now() >= deadline ||
+                cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            // One last look right at the deadline.
+            it = by_page_.find(page_idx);
+            if (it != by_page_.end() && entries_[it->second].state == State::Resident) {
+                touch_locked_(it->second);
+                return Reserve::Present;
+            }
+            if (it == by_page_.end() &&
+                    begin_read_locked_(page_idx, speculative, data_out, handle_out)) {
+                return Reserve::Reserved;
+            }
+            return Reserve::Timeout;
         }
     }
 }
@@ -414,6 +451,9 @@ void HostArena::unpin(int page_idx) {
     if (e.state == State::Resident) {
         insert_mru_locked_(idx, e.speculative);
     }
+    // The entry just became evictable: a reserve_wait()/begin_read_wait()
+    // parked on "nothing evictable" must re-check.
+    cv_.notify_all();
 }
 
 // --- introspection --------------------------------------------------------

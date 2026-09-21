@@ -90,6 +90,20 @@ public:
     // elapses with the request still refused.
     bool begin_read_wait(int page_idx, bool speculative, void ** data_out,
                          Handle * handle_out, uint64_t timeout_ms);
+    // Tri-state variant for a DEMAND caller that will borrow() on a hit:
+    //   Reserved -- the entry is Reading, owned by the caller (as begin_read).
+    //   Present  -- the page is Resident (already, or after waiting for a
+    //               concurrent Reading of it -- another connection's demand
+    //               read or a speculative landing -- to finish_read()): the
+    //               caller must borrow() it. NEVER read the page again.
+    //   Timeout  -- capacity refusal persisted for the whole timeout_ms, or
+    //               the concurrent read never landed in time. timeout_ms is an
+    //               absolute deadline from the call, not per retry.
+    // A concurrent read that fails (finish_read ok=false) frees the entry, and
+    // this call then reserves it for the caller (Reserved) instead.
+    enum class Reserve : uint8_t { Reserved, Present, Timeout };
+    Reserve reserve_wait(int page_idx, bool speculative, void ** data_out,
+                         Handle * handle_out, uint64_t timeout_ms);
     // ok=true: Reading -> Resident. ok=false: Reading -> Free (bytes discarded),
     // regardless of keep_borrowed. keep_borrowed=true (ok=true only) hands the
     // caller ONE outstanding borrow atomically with the landing -- `handle` is
@@ -112,7 +126,9 @@ public:
 
     // --- pinning (coding hot set) ---
     // Marks a Resident entry pinned (LRU skips it). Fails if not Resident or
-    // pinned cap reached.
+    // pinned cap reached. The cap is pinned_cap_pct of the TIER entries
+    // (tier_bytes / entry_bytes) only -- the read_inflight_max in-flight
+    // entries are never pinnable, so a pin set cannot starve readers.
     bool pin(int page_idx);
     void unpin(int page_idx);
 

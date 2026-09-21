@@ -388,6 +388,80 @@ static void test_batch_larger_than_inflight_cap_completes() {
             "a page count twice the inflight cap must still fully complete");
 }
 
+
+// C1: a demand caller that finds its page being READ by someone else (a
+// speculative landing, another connection) must wait for that read to land
+// and then BORROW it -- never time out, never read the page itself.
+static void test_reserve_wait_present_after_concurrent_read() {
+    CountingAlloc a;
+    HostArena arena;
+    require(arena.init(cfg(4), a.alloc(), a.dealloc()), "init");
+    void * data_a; HostArena::Handle h_a;
+    require(arena.begin_read(7, false, &data_a, &h_a), "A reserves 7");
+    std::atomic<bool> b_done{false};
+    HostArena::Reserve b_result = HostArena::Reserve::Timeout;
+    bool b_borrowed = false;
+    std::thread b([&]() {
+        void * data_b = nullptr; HostArena::Handle h_b = HostArena::kInvalidHandle;
+        b_result = arena.reserve_wait(7, false, &data_b, &h_b, 2000);
+        if (b_result == HostArena::Reserve::Present) {
+            const void * src = nullptr;
+            b_borrowed = arena.borrow(7, &src, &h_b);
+            if (b_borrowed) arena.release(7, h_b);
+        }
+        b_done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(!b_done.load(), "B must block while A is still Reading 7");
+    arena.finish_read(7, h_a, true);
+    b.join();
+    require(b_result == HostArena::Reserve::Present, "B sees 7 Present once A lands it");
+    require(b_borrowed, "B borrows the page A read");
+    require(arena.resident_count() == 1, "7 was read exactly once");
+
+    // Already Resident: Present immediately, no wait.
+    void * d; HostArena::Handle h;
+    require(arena.reserve_wait(7, false, &d, &h, 0) == HostArena::Reserve::Present,
+            "Resident page is Present with a zero timeout");
+    // Not present at all: Reserved, as begin_read.
+    require(arena.reserve_wait(8, false, &d, &h, 0) == HostArena::Reserve::Reserved,
+            "unknown page is Reserved");
+    arena.finish_read(8, h, true);
+
+    // A concurrent read that FAILS frees the entry and the waiter gets it
+    // Reserved instead of Present.
+    require(arena.begin_read(9, false, &data_a, &h_a), "A reserves 9");
+    std::thread c([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        arena.finish_read(9, h_a, false);
+    });
+    const HostArena::Reserve r9 = arena.reserve_wait(9, false, &d, &h, 2000);
+    c.join();
+    require(r9 == HostArena::Reserve::Reserved, "failed concurrent read hands the waiter the reservation");
+    arena.finish_read(9, h, true);
+}
+
+// I3: the pinned cap counts TIER entries only; in-flight entries are never
+// pinnable, so a pin set cannot take the entries readers need.
+static void test_pinned_cap_excludes_inflight_entries() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(6);        // budget = 6 entries
+    c.tier_bytes        = 2 * ENTRY;     // 2 tier + 4 in-flight
+    c.read_inflight_max = 4;
+    c.pinned_cap_pct    = 100;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+    void * d; HostArena::Handle h[3];
+    for (int i = 0; i < 3; ++i) {
+        require(arena.begin_read(i, false, &d, &h[i]), "read i");
+        arena.finish_read(i, h[i], true, /*keep_borrowed=*/true);   // held: no trim
+    }
+    require(arena.pin(0) && arena.pin(1), "two tier entries pinnable");
+    require(!arena.pin(2), "third pin refused: only tier_bytes/entry_bytes entries are pinnable");
+    require(arena.pinned_bytes() == 2 * ENTRY, "pinned bytes at the tier cap");
+    for (int i = 0; i < 3; ++i) arena.release(i, h[i]);
+}
+
 int main() {
     try {
         test_init_chunked_and_shrink_on_failure();
@@ -401,6 +475,8 @@ int main() {
         test_tier_cap_trims_lru_on_release();
         test_begin_read_wait_unblocks_on_release();
         test_batch_larger_than_inflight_cap_completes();
+        test_reserve_wait_present_after_concurrent_read();
+        test_pinned_cap_excludes_inflight_entries();
         std::cout << "test-wp-host-arena: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {
