@@ -133,7 +133,10 @@ std::vector<std::string> fuse_gate_up_layout_names(
 struct TestHooks {
     std::function<void(int, int)>      read_started;
     std::function<void(int, int)>      read_finished;
-    std::function<void()>              staging_borrowed;
+    std::function<void()>              arena_reserved;
+    // Host arena bootstrapped: (entry_count, entry_bytes, read_inflight_max).
+    // Fires once per Worker construction (run() and inspect_resources()).
+    std::function<void(size_t, size_t, size_t)> arena_ready;
     std::function<void(int, int, int)> slot_reserved;
     // Fires once per ExpertSlotPool::stripe_plan() call with
     // (page_size, n_pageins, n_stripes_chosen). read_started/read_finished

@@ -311,7 +311,7 @@ public:
             --current;
             cv.notify_all();
         };
-        hooks.staging_borrowed = [this]() {
+        hooks.arena_reserved = [this]() {
             std::lock_guard<std::mutex> lock(mutex);
             ++borrows;
         };
@@ -341,7 +341,7 @@ public:
         return peak;
     }
 
-    int staging_borrows() {
+    int arena_reserves() {
         std::lock_guard<std::mutex> lock(mutex);
         return borrows;
     }
@@ -500,6 +500,40 @@ void test_glm_size_class_plan() {
                 "size-class pin floor missed the worst-case layer");
         require(slot_class->slots >= slot_class->pin_floor,
                 "size-class allocation fell below its pin floor");
+    }
+}
+
+// Task 4: with no retention cap (host_tier_bytes == 0) the host arena is
+// exactly the in-flight read floor -- read_inflight_max entries of the
+// largest page -- so "tier off" costs nothing beyond what StagingPool used
+// to allocate. host_budget_bytes sets that in-flight count; 0 means 16.
+void test_options_host_tier_minimum_is_inflight_floor() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+
+    for (const uint64_t budget : { (uint64_t) 0, 2 * PAGE_BYTES }) {
+        wp_expert_worker::Options options;
+        options.shard_manifest    = fixture.manifest;
+        options.descriptor        = fixture.descriptor;
+        options.device            = "CPU";
+        options.slots             = 4;
+        options.host_budget_bytes = budget;
+        options.host_tier_bytes   = 0;
+        wp_expert_worker::TestHooks hooks;
+        size_t entries = 0, entry_bytes = 0, inflight = 0;
+        hooks.arena_ready = [&](size_t n, size_t bytes, size_t max_inflight) {
+            entries = n; entry_bytes = bytes; inflight = max_inflight;
+        };
+        options.test_hooks = &hooks;
+        const wp_expert_worker::ResourcePlan resources =
+            wp_expert_worker::inspect_resources(options);
+        require(inflight != 0, "arena_ready hook did not fire");
+        require(inflight == (budget == 0 ? 16u : 2u),
+                "read_inflight_max is not host_budget_bytes / entry_bytes (0 => 16)");
+        require(entries == inflight,
+                "host_tier_bytes=0 must size the arena to exactly the in-flight floor");
+        require(entry_bytes == PAGE_BYTES && entry_bytes == resources.staging_buffer_bytes,
+                "arena entry stride is not the largest page");
     }
 }
 
@@ -724,7 +758,7 @@ void run_test() {
                 "cold request did not issue one read per miss");
         require(tracker.peak_reads() == 2,
                 "cold request did not saturate two staging buffers");
-        require(tracker.staging_borrows() == 4,
+        require(tracker.arena_reserves() == 4,
                 "staging buffers did not recycle for excess misses");
 
         pipe_expert_dispatch_req seed = request;
@@ -754,7 +788,7 @@ void run_test() {
         dispatch_and_check(43, request);
         require(tracker.read_count() == 0,
                 "all-hit request issued an expert read");
-        require(tracker.staging_borrows() == 0,
+        require(tracker.arena_reserves() == 0,
                 "all-hit request borrowed staging");
         require(tracker.reservations().empty(),
                 "all-hit request reserved a miss slot");
@@ -763,7 +797,7 @@ void run_test() {
         dispatch_and_check(44, other);
         require(tracker.read_count() == 0,
                 "host victim hit issued an expert read");
-        require(tracker.staging_borrows() == 0,
+        require(tracker.arena_reserves() == 0,
                 "host victim hit borrowed staging");
 
         pipe_expert_dispatch_req rejected = request;
@@ -5827,6 +5861,7 @@ int main() {
         test_fuse_gate_up_layout_matches_split();
         test_glm_size_class_plan();
         test_fixture_arena_stride_alignment();
+        test_options_host_tier_minimum_is_inflight_floor();
         run_test();
         test_ram_hit_skips_blob_read();
         test_pin_file_preloads_and_pins();

@@ -29,7 +29,7 @@ void print_usage(const char * argv0) {
         << "       --host-budget-bytes bounds in-flight reads (default 16 largest-page entries)\n"
         << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional in-flight budget\n"
         << "       --host-tier-bytes / WP_EXPERT_HOST_TIER_BYTES: host RAM retained for evicted\n"
-        << "       and predicted pages (0 = retain nothing)\n"
+        << "       and predicted pages (0 = retain nothing); both accept K/M/G suffixes (e.g. 32G)\n"
         << "       WP_EXPERT_RESIDENT_EXPERTS supplies resident block ranges\n"
         << "       WP_EXPERT_RESERVE_BLOCKS and WP_EXPERT_RESERVE_BYTES supply the reserved partition\n"
         << "       --layer-device 43-45=CPU forces those layers onto a named --device entry\n"
@@ -65,7 +65,9 @@ uint64_t parse_size(const std::string & text, const char * option) {
     uint64_t multiplier = 1;
     if (suffix == "kib" || suffix == "kb") multiplier = 1ull << 10;
     else if (suffix == "mib" || suffix == "mb") multiplier = 1ull << 20;
-    else if (suffix == "gib" || suffix == "gb") multiplier = 1ull << 30;
+    else if (suffix == "gib" || suffix == "gb" || suffix == "g") multiplier = 1ull << 30;
+    else if (suffix == "m") multiplier = 1ull << 20;
+    else if (suffix == "k") multiplier = 1ull << 10;
     else if (!suffix.empty()) throw std::invalid_argument(std::string(option) + " has an invalid suffix");
     if (value == 0 || value > UINT64_MAX / multiplier) throw std::invalid_argument(std::string(option) + " is out of range");
     return (uint64_t) value * multiplier;
@@ -195,10 +197,10 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
                 ? options.device_slots.front() : 0;
         } else if (arg == "--host-budget-bytes") {
             options.host_budget_bytes =
-                parse_positive_u64(take(), "--host-budget-bytes");
+                parse_size(take(), "--host-budget-bytes");
         } else if (arg == "--host-tier-bytes") {
             options.host_tier_bytes =
-                parse_positive_u64(take(), "--host-tier-bytes");
+                parse_size(take(), "--host-tier-bytes");
         } else if (arg == "--weight-paging-resident-experts") {
             const wp::ResidentExpertRequest request =
                 wp::parse_resident_expert_request(take().c_str());
@@ -230,14 +232,14 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
         const char * value = std::getenv("WP_EXPERT_HOST_BUDGET_BYTES");
         if (value != nullptr && value[0] != '\0') {
             options.host_budget_bytes =
-                parse_positive_u64(value, "WP_EXPERT_HOST_BUDGET_BYTES");
+                parse_size(value, "WP_EXPERT_HOST_BUDGET_BYTES");
         }
     }
     if (options.host_tier_bytes == 0) {
         const char * value = std::getenv("WP_EXPERT_HOST_TIER_BYTES");
         if (value != nullptr && value[0] != '\0') {
             options.host_tier_bytes =
-                parse_positive_u64(value, "WP_EXPERT_HOST_TIER_BYTES");
+                parse_size(value, "WP_EXPERT_HOST_TIER_BYTES");
         }
     }
     if (!options.resident_expert_blocks_set && options.resident_expert_blocks.empty()) {
