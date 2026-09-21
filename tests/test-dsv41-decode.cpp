@@ -67,17 +67,17 @@ constexpr uint32_t n_ctx       = 512;
 constexpr uint32_t n_swa       = 128;
 constexpr uint32_t hc_mult     = 4;
 
-// compress_ratios: 0 = full, 1 = reindex, 2 = reuse (CSA2 enum, not a literal
-// downsample factor). Layer 2 is ratio-1, layer 3 is ratio-2; the rest are
-// ratio-0 (dense/full).
-const std::vector<uint32_t> compress_ratios = { 0, 0, 1, 2, 0, 0 };
+// compress_ratios mirror the real V4.1-Flash file: 0 = raw window attention,
+// then a ratio-2 compressed block whose FIRST layer is the stream's KV/index
+// source, then ratio-1 layers that share a later source. Real file:
+// [0,0,2,...,2,1,...] with kv/index sources at the block starts (2, 8, 14, 20).
+const std::vector<uint32_t> compress_ratios = { 0, 0, 2, 2, 1, 1 };
 
-// The ratio-2 layer (3) is the KV/index/candidate source; layers 4 and 5
-// follow it (kv_source_for(il) picks the largest source id <= il), so both
-// are readers that come after their source.
-constexpr uint32_t kv_source_layer   = 3;
-constexpr uint32_t index_source_layer = 3;
-constexpr uint32_t candidate_source_layer = 3;
+// Sources: layer 2 (ratio-2 block: readers 2,3) and layer 4 (ratio-1 block:
+// readers 4,5). Layer 3 and 5 alias their source's storage.
+const std::vector<uint32_t> kv_source_layers    = { 2, 4 };
+const std::vector<uint32_t> index_source_layers = { 2, 4 };
+constexpr uint32_t candidate_source_layer = 2;
 
 // Engram lives on layer 4 (a reader layer, well past prefill start) with a
 // tiny table so the ~200-token history it needs to look back through stays
@@ -183,8 +183,8 @@ static gguf_context_ptr make_gguf() {
     ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                  true);
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,                      "no_vocab");
 
-    ms.add_kv(LLM_KV_ATTENTION_KV_SOURCE_LAYER_IDS,    std::vector<uint32_t>({ kv_source_layer }));
-    ms.add_kv(LLM_KV_ATTENTION_INDEX_SOURCE_LAYER_IDS, std::vector<uint32_t>({ index_source_layer }));
+    ms.add_kv(LLM_KV_ATTENTION_KV_SOURCE_LAYER_IDS,    kv_source_layers);
+    ms.add_kv(LLM_KV_ATTENTION_INDEX_SOURCE_LAYER_IDS, index_source_layers);
     ms.add_kv(LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER_ID, candidate_source_layer);
     ms.add_kv(LLM_KV_ATTENTION_CANDIDATE_TOPK_BLOCKS,     uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,      uint32_t(8));
@@ -548,13 +548,11 @@ int main() {
         fprintf(stderr, "failed to load synthetic DeepSeek-V4.1 GGUF\n");
         return 1;
     }
-    printf("DeepSeek-V4.1 decode fixture loaded: n_embd=%d n_vocab=%u n_layer=%u compress_ratios=[0,0,1,2,0,0] "
-            "kv_source=%u index_source=%u engram_layer=%u n_swa=%u\n",
+    printf("DeepSeek-V4.1 decode fixture loaded: n_embd=%d n_vocab=%u n_layer=%u compress_ratios=[0,0,2,2,1,1] "
+            "kv_sources=[2,4] index_sources=[2,4] engram_layer=%u n_swa=%u\n",
             llama_model_n_embd(model.get()),
             dsv41_decode_fixture::n_vocab,
             dsv41_decode_fixture::n_layer,
-            dsv41_decode_fixture::kv_source_layer,
-            dsv41_decode_fixture::index_source_layer,
             dsv41_decode_fixture::engram_layer,
             dsv41_decode_fixture::n_swa);
 
