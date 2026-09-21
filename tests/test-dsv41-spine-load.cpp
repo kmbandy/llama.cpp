@@ -105,10 +105,18 @@ int main() {
             hist[i] = hasher.compress(tok);
         }
         std::vector<int32_t> row(n_cols);
+        std::vector<int32_t> ctx_ids(hasher.max_ngram);
         size_t mismatches = 0;
         for (int pos = 0; pos < n_tok; ++pos) {
+            // hash_position now takes the already-resolved n-gram context (index 0 = current
+            // token, index s = s positions back, pad substituted for out-of-range lookback)
+            // instead of a hist+pos pair; build it the same way the old signature did.
+            for (uint32_t s = 0; s < hasher.max_ngram; ++s) {
+                const int32_t src_pos = pos - (int32_t) s;
+                ctx_ids[s] = (src_pos >= 0 && src_pos < n_tok) ? hist[src_pos] : hasher.pad_id;
+            }
             for (int layer = 0; layer < n_layers; ++layer) {
-                hasher.hash_position(hist, pos, (uint32_t) layer, row.data());
+                hasher.hash_position(ctx_ids.data(), (uint32_t) layer, row.data());
                 for (int c = 0; c < n_cols; ++c) {
                     long long want = 0;
                     in >> want;

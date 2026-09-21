@@ -1385,8 +1385,8 @@ struct llama_model_deepseek4 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
-struct llama_model_deepseek41 : public llama_model_base {
-    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_base(params) {}
+struct llama_model_deepseek41 : public llama_model_deepseek4 {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -1394,7 +1394,9 @@ struct llama_model_deepseek41 : public llama_model_base {
     // token_map + multipliers come from the GGUF (convert emits them; the
     // tokenizers normalizer chain and numpy's rng are not reproducible here);
     // primes and bucket offsets are derived from engram.vocab_size at load and
-    // checked against each table's row count.
+    // checked against each table's row count. This bit-exact host-side hash
+    // math is unchanged from the from-scratch implementation; only its data
+    // source changed (see llm_graph_input_engram in deepseek41.cpp).
     struct engram_hasher {
         uint32_t max_ngram = 4;
         uint32_t n_heads   = 8;
@@ -1411,44 +1413,56 @@ struct llama_model_deepseek41 : public llama_model_base {
             return (tok >= 0 && (size_t) tok < token_map.size()) ? token_map[(size_t) tok] : tok;
         }
         // NgramHashState.forward for one position of one engram layer:
-        // hist holds COMPRESSED ids by position; writes n_cols() ids to row.
-        void hash_position(const std::vector<int32_t> & hist, int32_t pos, uint32_t layer, int32_t * row) const;
+        // ctx_ids[0..max_ngram) holds COMPRESSED ids, index 0 = current token,
+        // index s = s positions back (pad already substituted for missing
+        // lookback by the caller); writes n_cols() ids to row.
+        void hash_position(const int32_t * ctx_ids, uint32_t ordinal, int32_t * row) const;
     } engram;
+
+    // position of layer il in the engram constants, or -1 if that layer has no engram
+    int engram_index(int il) const;
 
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
         ggml_tensor * identity_pre_mix() const;
+
+        // gather the n-gram rows of layer il: [engram_key_length * n_hash_cols, n_tokens]
+        ggml_tensor * build_inp_engram(
+                const llama_model & model,
+                int il);
+
         ggml_tensor * build_engram(
                 const llama_model & model,
                 ggml_tensor * x,
-                ggml_tensor * hash_ids,
+                ggml_tensor * emb,
                 int il) const;
-        ggml_tensor * build_attention_csa2(
+
+        struct dsv41_rope_cfg rope_cfg(int il) const;
+
+        ggml_tensor * build_attention_tail(
+                const llama_model & model,
+                ggml_tensor * out,
+                ggml_tensor * inp_pos,
+                int64_t nt,
+                int il) const;
+
+        // which compressed positions this layer's queries attend to
+        ggml_tensor * build_indexer_top_k(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                const llm_graph_input_dsv4::comp_input & inp_comp,
+                ggml_tensor * qr,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        ggml_tensor * build_attention_v41(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 int il) const;
-        int32_t kv_source_for(int il) const;
-        bool is_kv_source(int il) const;
-        bool is_index_source(int il) const;
-
-        struct csa2_src_io {
-            int il = -1;
-            uint32_t ratio = 1;
-            ggml_tensor * ring_write_idxs = nullptr;
-            ggml_tensor * ring_read_idxs  = nullptr;
-            ggml_tensor * write_idxs = nullptr;
-            ggml_tensor * group_pos  = nullptr; // I32 [n_latents] = write_idx * ratio
-            ggml_tensor * pool_idxs = nullptr; // I64 [n_tokens]
-            ggml_tensor * pool_mask = nullptr; // F32 [1, ratio*n_latents]
-            ggml_tensor * kq_mask    = nullptr;
-            ggml_tensor * candidate_pin = nullptr; // F32 [n_blocks, n_tokens]
-        };
-        std::vector<csa2_src_io> csa2_sources;
-        mutable ggml_tensor * csa2_shared_topk   = nullptr;
-        mutable ggml_tensor * csa2_candidates    = nullptr;
 
     private:
         void build_dspark_encoder(const llama_model & model);
