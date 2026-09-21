@@ -664,7 +664,10 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         }
     }
 
-    if (ratio == DSV4_CSA_RATIO && !plan.state_pos.empty() &&
+    // The overlap compressor reads a fixed window per block, so every sequence has to write the
+    // same number of blocks or the graph shape moves between ubatches. For DeepSeek-V4 this is
+    // exactly the CSA and indexer streams (both called with overlap=true below).
+    if (overlap && !plan.state_pos.empty() &&
             (!dsv4_csa_lazy_state_enabled() || !plan.state_write_idxs.empty())) {
         assert(kv_size > 0);
 
@@ -720,7 +723,9 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         }
     }
 
-    if (ratio == DSV4_HCA_RATIO && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
+    // A non-overlap stream completes a block only every `ratio` tokens, so a decode step often
+    // completes none. For DeepSeek-V4 this is the HCA stream (called with overlap=false below).
+    if (!overlap && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
         assert(kv_size > 0);
         // the last slot must not be live, or the dummy write would corrupt it;
         // a full stream implies a completed block, which implies real writes
@@ -1031,12 +1036,14 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
                 bool        unified,
             uint32_t        n_seq_max,
             uint32_t        ratio,
+                bool        overlap,
             uint32_t        state_size,
             uint32_t        n_embd_state,
             uint32_t        n_rs_seq,
         const char    * name,
         const llama_memory_i::layer_filter_cb & filter) :
     ratio(ratio),
+    overlap(overlap),
     state_size(state_size),
     n_embd_state(n_embd_state),
     n_stream(unified ? 1 : n_seq_max),
@@ -1185,6 +1192,10 @@ void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info) const
 
 uint32_t llama_dsv4_comp_state::get_ratio() const {
     return ratio;
+}
+
+bool llama_dsv4_comp_state::get_overlap() const {
+    return overlap;
 }
 
 uint32_t llama_dsv4_comp_state::get_state_size() const {
@@ -1485,25 +1496,25 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         }
         GGML_ASSERT(max_ratio <= DSV41_CSA2_STATE_RING);
         csa_state = std::make_unique<llama_dsv4_comp_state>(
-                model, offload, unified_compressed, n_seq_max, max_ratio, DSV41_CSA2_STATE_RING,
+                model, offload, unified_compressed, n_seq_max, max_ratio, /*overlap*/ true, DSV41_CSA2_STATE_RING,
                 model.hparams.n_embd_head_k(), /*n_rs_seq*/ 0, "csa2", filter_csa);
         csa_state->fill_score(-INFINITY);
     } else {
         csa_state = std::make_unique<llama_dsv4_comp_state>(
-                model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+                model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, /*overlap*/ true, 2*DSV4_CSA_RATIO,
                 2*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_csa);
     }
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
     hca_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
+            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, /*overlap*/ false, DSV4_HCA_RATIO,
             model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_hca);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
     lid_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, /*overlap*/ true, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
     // DSV4 attention reads compressed-K / compressor-state rows that the current
@@ -2130,6 +2141,10 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
     kv_swa->set_input_k_rot(dst);
 }
 
+void llama_kv_cache_dsv4_raw_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    kv_swa->get_prev_tokens(ubatch, n, res);
+}
+
 //
 // llama_kv_cache_dsv4_comp_context
 //
@@ -2246,13 +2261,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
     ubatches(std::move(ubatches)),
-    plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
+    plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->get_overlap(),
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_hca(dsv4_build_comp_plans(this->ubatches, DSV4_HCA_RATIO, false,
+    plans_hca(dsv4_build_comp_plans(this->ubatches, kv->get_hca_state()->get_ratio(), kv->get_hca_state()->get_overlap(),
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_lid(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
+    plans_lid(dsv4_build_comp_plans(this->ubatches, kv->get_lid_state()->get_ratio(), kv->get_lid_state()->get_overlap(),
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
@@ -2416,7 +2431,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_csa = dsv4_build_reserve_comp_plan(
-            ubatch, DSV4_CSA_RATIO, true,
+            ubatch, csa_state->get_ratio(), csa_state->get_overlap(),
             csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream(), csa_state->get_n_rs_seq());
 
     return reserve_plan_csa;
@@ -2430,7 +2445,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_hca = dsv4_build_reserve_comp_plan(
-            ubatch, DSV4_HCA_RATIO, false,
+            ubatch, hca_state->get_ratio(), hca_state->get_overlap(),
             hca_state->get_state_size(), get_hca()->get_n_kv(), hca_state->get_n_stream(), hca_state->get_n_rs_seq());
 
     return reserve_plan_hca;
@@ -2444,7 +2459,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_lid = dsv4_build_reserve_comp_plan(
-            ubatch, DSV4_CSA_RATIO, true,
+            ubatch, lid_state->get_ratio(), lid_state->get_overlap(),
             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;

@@ -248,6 +248,16 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // This loop decides which layers own storage. Two gates, applied in order:
+    //   1. has_kv(il) -- the arch-generic "does this layer have KV at all" check. Skipped when
+    //      filter_authoritative is set, meaning the caller's filter is the sole authority on
+    //      which layers own storage here (e.g. DSV4's per-stream caches, where every layer
+    //      passes has_kv() but only some belong to this particular stream).
+    //   2. filter(il) -- the caller-supplied selector (e.g. DSV4.1's filter_csa/filter_lid,
+    //      which select only the layers that own compressed rows). A layer that fails this gate
+    //      allocates nothing of its own, but may still *read* another layer's storage through
+    //      the `reuse` callback below -- that loop uses has_kv() only, not this `filter`, so a
+    //      non-owning reader is never blocked from aliasing its source.
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!filter_authoritative && !hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -478,8 +488,16 @@ llama_kv_cache::llama_kv_cache(
                 continue;
             }
 
-            if (filter && !filter(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
+            // A layer the filter rejected has no storage of its own, which is exactly the case
+            // that most needs to borrow another layer's (e.g. DeepSeek-V4.1's non-source layers,
+            // which filter_csa/filter_lid correctly reject so they don't allocate their own rows,
+            // but which still need to alias their source layer's storage via `reuse`). Owning
+            // storage and reading storage are separate questions, so `filter` -- which only ever
+            // gates the *first* loop above (itself already softened by filter_authoritative) --
+            // must not also gate aliasing here. Only a layer with no KV at all (per the arch's
+            // generic has_kv(), independent of any caller-supplied filter) is skipped.
+            if (!hparams.has_kv(il)) {
+                LLAMA_LOG_DEBUG("%s: - layer %3d: does not have KV cache\n", __func__, il);
                 continue;
             }
 
@@ -566,6 +584,7 @@ llama_kv_cache::llama_kv_cache(
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+                model.arch == LLM_ARCH_DEEPSEEK41 ||
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
                 n_embd_head_k_all > 0 &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
@@ -2277,8 +2296,8 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 bool llama_kv_cache::has_cell_ext() const {
-    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+    // M-RoPE needs the 2D position, the PLE/Engram n-gram hash needs the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.dsv41_n_engram_layers > 0;
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

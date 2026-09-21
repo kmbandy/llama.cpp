@@ -290,6 +290,33 @@ bool llama_hparams::is_engram(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
+void llama_hparams::dsv41_derive_stream_roles() {
+    dsv41_kv_source.fill(-1);
+    dsv41_index_key_source.fill(-1);
+    dsv41_topk_source.fill(-1);
+
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        int32_t kv_src = -1;
+        for (uint32_t i = 0; i < dsv41_n_kv_sources; ++i) {
+            const int32_t s = (int32_t) dsv41_kv_source_layer_ids[i];
+            if (s <= (int32_t) il) {
+                kv_src = s;
+            }
+        }
+        dsv41_kv_source[il] = kv_src;
+
+        int32_t idx_src = -1;
+        for (uint32_t i = 0; i < dsv41_n_index_sources; ++i) {
+            const int32_t s = (int32_t) dsv41_index_source_layer_ids[i];
+            if (s <= (int32_t) il) {
+                idx_src = s;
+            }
+        }
+        dsv41_index_key_source[il] = idx_src;
+        dsv41_topk_source[il]      = idx_src;
+    }
+}
+
 uint32_t llama_hparams::n_pos_per_embd() const {
     return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
 }

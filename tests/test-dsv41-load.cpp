@@ -62,7 +62,13 @@ static gguf_context_ptr make_dsv41_gguf(uint32_t index_top_k = 8, bool dspark = 
     llama_model_saver ms(LLM_ARCH_DEEPSEEK41, ret.get());
 
     const uint32_t n_vocab = 128;
-    const uint32_t n_embd  = 256;
+    // n_embd=512 (not 256) so n_embd_head is 64 at n_head=8: the DeepSeek lightning-indexer
+    // Hadamard rotation (forced on for this arch, deepseek41-port task 1) only precomputes
+    // rotation matrices for sizes >= 64 (llama_kv_cache::llama_kv_cache's
+    // `for (n = 64; n <= ...; n *= 2)` loop), so a smaller head dim would abort in
+    // llama_kv_cache::set_input_k_rot. n_head stays 8 so it still divides the output group
+    // count (8) below.
+    const uint32_t n_embd  = 512;
     const uint32_t n_head  = 8;
     const uint32_t n_ff    = 256;
     const uint32_t n_layer = 2;
@@ -86,7 +92,8 @@ static gguf_context_ptr make_dsv41_gguf(uint32_t index_top_k = 8, bool dspark = 
     ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,     uint32_t(64));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,  n_ctx / 8);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, n_head);
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(32));
+    // matches n_embd_head so n_embd_head_k_full == indexer_head_size (see n_head comment above)
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, n_embd_head);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      index_top_k);
     ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,   uint32_t(32));
@@ -419,7 +426,7 @@ static bool test_dsv41_chunking_consistency() {
 
 static bool test_dsv41_dspark_cycle() {
     constexpr uint32_t n_vocab = 128;
-    constexpr uint32_t n_embd  = 256;
+    constexpr uint32_t n_embd  = 512; // must match make_dsv41_gguf()'s n_embd
     constexpr uint32_t n_prompt = 12;
 
     gguf_context_ptr gguf_ctx = make_dsv41_gguf(8, true);
@@ -704,7 +711,7 @@ int main() {
         fprintf(stderr, "arch mismatch: got %s\n", llm_arch_name(model->arch));
         return 1;
     }
-    if (llama_model_n_embd(model.get()) != 256) {
+    if (llama_model_n_embd(model.get()) != 512) {
         fprintf(stderr, "n_embd mismatch: %d\n", llama_model_n_embd(model.get()));
         return 1;
     }

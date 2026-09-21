@@ -315,6 +315,35 @@ struct llama_hparams {
     uint32_t dsv41_candidate_topk_blocks  = 0;
     uint32_t dsv41_candidate_block_size   = 0;
 
+    // DeepSeek-V4.1 compresses KV (and its lightning-indexer key/topk streams) on a few source
+    // layers and shares each stream with the layers that follow, so for every layer these hold
+    // the layer that published what it reads, or -1 when it reads nothing. A layer whose entry
+    // is itself is a source. The KV cache needs these to alias a reader's storage onto its
+    // source's, so they live here (per-layer, O(1) lookup) rather than being rescanned from the
+    // explicit dsv41_*_source_layer_ids lists on every graph build.
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source{};
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source{};
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source{};
+
+    bool dsv41_is_kv_source   (uint32_t il) const { return dsv41_kv_source[il]        == (int32_t) il; }
+    bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
+    bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
+
+    // Fills dsv41_kv_source/dsv41_index_key_source/dsv41_topk_source from our explicit
+    // dsv41_kv_source_layer_ids / dsv41_index_source_layer_ids lists (already read from the
+    // `deepseek41.attention.kv_source_layer_ids` / `...index_source_layer_ids` GGUF keys).
+    //
+    // Rule (matches our existing graph::kv_source_for, and mirrors upstream's tensor-presence
+    // walk in load_arch_tensors, which -- for our GGUF layout -- resolves to the same thing since
+    // indexer_attn_k and indexer_attn_q_b are always created together on index-source layers):
+    // for layer il, the source is the largest id in the relevant list that is <= il, or -1 if the
+    // list is empty or every id in it is > il. dsv41_index_key_source and dsv41_topk_source both
+    // derive from dsv41_index_source_layer_ids because our format uses one explicit list for
+    // "this layer owns the indexer key projection and the index query/topk computation" -- unlike
+    // upstream, which infers the two roles independently from which of indexer_attn_k /
+    // indexer_attn_q_b happens to be present.
+    void dsv41_derive_stream_roles();
+
     bool is_engram(uint32_t il) const;
 
     // 0 = full rank (DeepSeek-V4)
