@@ -5868,7 +5868,6 @@ int main() {
         run_test();
         test_ram_hit_skips_blob_read();
         test_pin_file_preloads_and_pins();
-        test_ram_hit_skips_blob_read();
         test_default_off_multi_expert_request();
         test_prefetch_hint_without_spec_reads_nothing();
         test_spec_pagein_logs_s_not_d();

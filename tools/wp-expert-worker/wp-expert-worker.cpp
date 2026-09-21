@@ -7092,11 +7092,12 @@ private:
                 pagein.hold_released = false;
                 return true;
             }
-            if (r == wp::HostArena::Reserve::Timeout || now >= deadline) {
+            if (r == wp::HostArena::Reserve::Timeout) {
                 release_drain_quota(pagein, conn_index);
                 return false;
             }
-            // Present: loop back to borrow().
+            // Present: loop back to borrow(); the deadline check at the top
+            // of the loop bounds the retry.
         }
     }
 
@@ -7450,6 +7451,9 @@ private:
                             }
                         }
                         dst = (char *) pagein.arena_data + result->offset;
+                        // the result was built before the lazy reservation:
+                        // point it at the entry the drain will copy from.
+                        result->src = pagein.arena_data;
                     }
                     if (!pagein.ram_hit) {
                         read_page_range(
