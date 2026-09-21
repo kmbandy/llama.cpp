@@ -2821,14 +2821,22 @@ static void test_decode_prefill_compute_profile() {
     require(wp_expert_worker::use_expert_gather(64, false, 2, false) == false,
             "WP_EXPERT_GATHER=0 must disable gather");
 
-    // WP_EXPERT_MM_PIN is three-way: off / on / "decode".
+    // WP_EXPERT_MM_PIN: all (default) / off / on / "decode".
     using wp_expert_worker::mm_pin_mode;
-    require(wp_expert_worker::parse_mm_pin_mode(nullptr) == mm_pin_mode::off,
-            "unset WP_EXPERT_MM_PIN must default off");
-    require(wp_expert_worker::parse_mm_pin_mode("") == mm_pin_mode::off,
-            "empty WP_EXPERT_MM_PIN must be off");
+    require(wp_expert_worker::parse_mm_pin_mode(nullptr) == mm_pin_mode::all,
+            "unset WP_EXPERT_MM_PIN must default to all (width-invariant expert math)");
+    require(wp_expert_worker::parse_mm_pin_mode("") == mm_pin_mode::all,
+            "empty WP_EXPERT_MM_PIN must be all");
     require(wp_expert_worker::parse_mm_pin_mode("0") == mm_pin_mode::off,
             "WP_EXPERT_MM_PIN=0 must be off");
+    require(wp_expert_worker::parse_mm_pin_mode("off") == mm_pin_mode::off,
+            "WP_EXPERT_MM_PIN=off must be off");
+    require(wp_expert_worker::parse_mm_pin_mode("all") == mm_pin_mode::all,
+            "WP_EXPERT_MM_PIN=all must be all");
+    require(wp_expert_worker::use_mm_pin(1, false, mm_pin_mode::all, 9, 8) &&
+            wp_expert_worker::use_mm_pin(4, false, mm_pin_mode::all, 9, 8) &&
+            wp_expert_worker::use_mm_pin(198, true, mm_pin_mode::all, 9, 8),
+            "all must pin every width, gather or dense");
     require(wp_expert_worker::parse_mm_pin_mode("1") == mm_pin_mode::on,
             "WP_EXPERT_MM_PIN=1 must be the legacy wide-request pin");
     require(wp_expert_worker::parse_mm_pin_mode("decode") == mm_pin_mode::decode,

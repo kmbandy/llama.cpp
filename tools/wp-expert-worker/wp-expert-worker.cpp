@@ -400,11 +400,14 @@ mm_pin_mode parse_mm_pin_mode(const char * env) {
 
 mm_pin_mode parse_mm_pin_mode(const char * env, const std::string & device_name) {
     if (env == nullptr) {
-        return mm_pin_mode::off;
+        return mm_pin_mode::all;
     }
     std::string value(env);
     wp_trim_ascii_whitespace(value);
-    if (value.empty() || value == "0") {
+    if (value.empty()) {
+        return mm_pin_mode::all;
+    }
+    if (value == "0" || value == "off") {
         return mm_pin_mode::off;
     }
     if (value == "decode") {

@@ -310,8 +310,11 @@ bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool
 // needs: the GGML_HINT_MUL_MAT_PIN hint forces MMQ on CUDA/HIP (and the
 // mat-vec path on Vulkan) regardless of shape, which MEASURED 2026-09-02 costs
 // ~16% of per-128-token-chunk kernel wall in PREFILL but buys ~3-4 tok/s in
-// DECODE. So the value is a three-way policy, not a boolean:
-//   unset / "" / "0"  -> off
+// DECODE. So the value is a policy, not a boolean:
+//   unset / ""        -> all (DEFAULT since 2026-09-21: correctness first --
+//                        see the "all" note below; the ~16% prefill cost is
+//                        the price of width-invariant expert math)
+//   "0" / "off"       -> off
 //   "decode"          -> pin ONLY requests with n_tokens <= max_tokens
 //                        (WP_EXPERT_MM_PIN_MAX_TOKENS, default 8: decode is
 //                        n_tokens==1, spec-verify blocks are <= 8, and stream4
