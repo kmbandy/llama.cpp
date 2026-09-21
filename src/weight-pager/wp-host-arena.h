@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <condition_variable>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +48,13 @@ public:
         int    spec_frac_pct   = 25;   // max % of entries that may be speculative
         int    pinned_cap_pct  = 90;   // max % of entries that may be pinned
         int    read_inflight_max = 16; // max entries in Reading at once
+        // Retention cap, separate from budget_bytes: a release()/finish_read()
+        // that leaves a Resident, unborrowed, unpinned entry pool over this
+        // many bytes trims LRU (speculative first) down to it, in the same
+        // locked call. 0 (default) frees an entry the instant nothing holds
+        // it -- the pre-arena StagingPool behaviour, byte-for-byte. Pinned
+        // bytes never count against this cap.
+        size_t tier_bytes      = 0;
     };
     // alloc(bytes) returns 4096-aligned memory or nullptr; free(ptr, bytes).
     using Allocator   = std::function<void *(size_t)>;
@@ -71,9 +79,29 @@ public:
     // borrow()), read_inflight_max reached, speculative && spec cap full and
     // no speculative victim, or nothing evictable.
     bool begin_read(int page_idx, bool speculative, void ** data_out, Handle * handle_out);
-    // ok=true: Reading -> Resident. ok=false: Reading -> Free (bytes discarded).
-    // Stale handle: no-op.
-    void finish_read(int page_idx, Handle handle, bool ok);
+    // Blocking variant: waits (up to timeout_ms total) instead of failing
+    // immediately when begin_read() would refuse for capacity reasons
+    // (inflight cap, or nothing evictable right now). Every release() and
+    // finish_read() call wakes waiters, so this succeeds as soon as ANY
+    // reader thread -- of this batch or another -- frees an entry, which is
+    // what lets one batch's page count exceed read_inflight_max: readers
+    // claim, read, and release concurrently rather than every page of a
+    // batch being reserved up front. Returns false only after timeout_ms
+    // elapses with the request still refused.
+    bool begin_read_wait(int page_idx, bool speculative, void ** data_out,
+                         Handle * handle_out, uint64_t timeout_ms);
+    // ok=true: Reading -> Resident. ok=false: Reading -> Free (bytes discarded),
+    // regardless of keep_borrowed. keep_borrowed=true (ok=true only) hands the
+    // caller ONE outstanding borrow atomically with the landing -- `handle` is
+    // still the borrow token, ever_borrowed is set, and the entry cannot be
+    // evicted until a matching release(page_idx, handle) drops it back to
+    // zero. This is what lets a reader thread land a page and an in-flight
+    // async H2D read from it survive a concurrent eviction elsewhere in the
+    // arena: the caller holds the entry for the copy's whole lifetime instead
+    // of racing a lazily-fenced buffer-reuse check. Applies the tier_bytes
+    // trim afterward either way (an entry landing over the cap while NOT
+    // held still trims other entries down to it). Stale handle: no-op.
+    void finish_read(int page_idx, Handle handle, bool ok, bool keep_borrowed = false);
 
     // --- hit path ---
     // Resident only. Increments borrow count, touches LRU, clears
@@ -92,6 +120,7 @@ public:
     State  state_of(int page_idx) const;   // Free if unknown
     bool   is_resident(int page_idx) const;
     size_t entry_bytes()     const;
+    size_t tier_bytes()      const;   // Config::tier_bytes (retention cap)
     size_t entry_count()     const;
     size_t resident_count()  const;
     size_t resident_bytes()  const;
@@ -146,6 +175,9 @@ private:
     enum class EvictScope { Any, SpecOnly };
 
     bool     evict_one_locked_(EvictScope scope);
+    void     trim_to_tier_cap_locked_();
+    // Caller holds mu_. Shared body of begin_read()/begin_read_wait().
+    bool     begin_read_locked_(int page_idx, bool speculative, void ** data_out, Handle * handle_out);
     void     remove_from_list_locked_(size_t idx);
     void     insert_mru_locked_(size_t idx, bool speculative);
     void     touch_locked_(size_t idx);
@@ -153,6 +185,10 @@ private:
     size_t   pinned_cap_entries_() const;
 
     mutable std::mutex mu_;
+    // Notified by every release() and finish_read() (both outcomes) -- the
+    // only two calls that can turn a not-evictable entry into an evictable
+    // or free one. Backs begin_read_wait().
+    std::condition_variable cv_;
 
     Config   cfg_;
     Allocator   alloc_;

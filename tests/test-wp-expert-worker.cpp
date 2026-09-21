@@ -583,7 +583,7 @@ void run_test() {
     options.listen_port    = port;
     options.slots             = 4;
     options.host_budget_bytes = 2 * PAGE_BYTES;
-    options.host_victim_bytes = 8 * PAGE_BYTES;
+    options.host_tier_bytes  = 8 * PAGE_BYTES;
     options.once           = true;
     IoTracker tracker;
     options.test_hooks = &tracker.hooks;
@@ -838,6 +838,105 @@ void run_test() {
     if (server_result == 0) {
         throw std::runtime_error("worker accepted a mismatched HELLO");
     }
+}
+
+// HostArena migration (Task 2): a page read once and evicted from VRAM must
+// be served from RAM on its next request WITHOUT a second blob read -- "a
+// RAM hit is a miss without the pread". 4 VRAM slots (the floor: one per
+// expert of the largest layer) filled by LAYER's four experts, then one
+// OTHER_LAYER page forces the LRU eviction; host_tier_bytes is generous
+// enough that the arena retains every page across it so the later
+// re-request hits RAM instead of the arena having trimmed it back.
+void test_ram_hit_skips_blob_read() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    wp_expert_worker::Options options;
+    options.shard_manifest  = fixture.manifest;
+    options.descriptor      = fixture.descriptor;
+    options.device          = "CPU";
+    options.listen_host     = "127.0.0.1";
+    options.listen_port     = port;
+    options.slots           = 4;
+    options.host_tier_bytes = 8 * PAGE_BYTES;
+    options.once            = true;
+    IoTracker tracker;
+    options.test_hooks = &tracker.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive HELLO");
+        require(type == PIPE_HELLO && seq_id == 0, "worker did not send HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(
+                    *socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive HELLO ack");
+        require(type == PIPE_EXPERT_HELLO_ACK && seq_id == 0 &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "worker rejected matching HELLO");
+
+        const auto dispatch_expert = [&](int layer, int expert_id, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer    = layer;
+            request.n_tokens = N_TOKENS;
+            request.activations.resize((size_t) N_TOKENS * N_EMBD);
+            request.assignments = { { expert_id, { 1.0f, 1.0f } } };
+            payload = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq,
+                                    payload.data(), payload.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                        type == PIPE_EXPERT_PARTIAL && seq_id == seq,
+                    "dispatch did not complete");
+        };
+
+        // Four genuine misses, one per VRAM slot.
+        for (int e = 0; e < 4; ++e) {
+            dispatch_expert(LAYER, e, 60 + (uint64_t) e);
+        }
+        require(tracker.read_count() == 4, "LAYER's four experts should all be real reads");
+        // OTHER_LAYER/0: no free slot left, evicts the LRU one (LAYER/0) --
+        // a fifth genuine miss.
+        dispatch_expert(OTHER_LAYER, 0, 64);
+        require(tracker.read_count() == 5, "OTHER_LAYER/0 should be a real read");
+        // LAYER/0 again: evicted from VRAM, but still resident in the host
+        // arena (host_tier_bytes retains it) -- a RAM hit, so the reader
+        // thread skips read_page_range entirely.
+        dispatch_expert(LAYER, 0, 65);
+        require(tracker.read_count() == 5,
+                "revisiting LAYER/0 must be a RAM hit: no additional blob read");
+    } catch (...) {
+        server.join();
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "worker returned failure");
 }
 
 void test_default_off_multi_expert_request() {
@@ -1278,7 +1377,7 @@ void test_predicted_hint_lands_in_host_ram() {
     options.listen_port       = port;
     options.slots             = 4;
     options.host_budget_bytes = 2 * PAGE_BYTES;
-    options.host_victim_bytes = 8 * PAGE_BYTES;   // room for the guesses
+    options.host_tier_bytes  = 8 * PAGE_BYTES;   // room for the guesses
     options.once              = true;
     options.test_hooks        = &reads.hooks;
 
@@ -1340,13 +1439,18 @@ void test_predicted_hint_lands_in_host_ram() {
         }
         require(reads.total() == 4, "the four demand pages did not read exactly once each");
 
-        hint_p(OTHER_LAYER, { 0, 1, 2, 3 }, PIPE_HINT_PREDICTED);
-        require(reads.wait_for_total(8), "the predicted hints never read");
+        // Two guesses, not four: the arena caps speculative entries at
+        // spec_frac_pct (25%) of its entry count -- 10 entries here (8-page
+        // tier + 2 in-flight), so a third guess would evict the first
+        // (spec-only victim scan) and the promotion check below would see a
+        // re-read that is policy, not a bug.
+        hint_p(OTHER_LAYER, { 0, 1 }, PIPE_HINT_PREDICTED);
+        require(reads.wait_for_total(6), "the predicted hints never read");
 
         for (int32_t e = 0; e < 4; ++e) {
             dispatch_one(LAYER, e, 200 + e);
         }
-        require(reads.total() == 8,
+        require(reads.total() == 6,
                 "a PREDICTED page displaced a demand page from VRAM -- it should have "
                 "landed in host RAM and taken no slot");
 
@@ -5613,6 +5717,8 @@ int main() {
         test_glm_size_class_plan();
         test_fixture_arena_stride_alignment();
         run_test();
+        test_ram_hit_skips_blob_read();
+        test_ram_hit_skips_blob_read();
         test_default_off_multi_expert_request();
         test_prefetch_hint_without_spec_reads_nothing();
         test_spec_pagein_logs_s_not_d();

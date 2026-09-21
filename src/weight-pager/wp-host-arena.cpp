@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 
 namespace wp {
 
@@ -172,6 +173,33 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
 
 bool HostArena::begin_read(int page_idx, bool speculative, void ** data_out, Handle * handle_out) {
     std::lock_guard<std::mutex> lock(mu_);
+    return begin_read_locked_(page_idx, speculative, data_out, handle_out);
+}
+
+bool HostArena::begin_read_wait(int page_idx, bool speculative, void ** data_out,
+                                Handle * handle_out, uint64_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (begin_read_locked_(page_idx, speculative, data_out, handle_out)) {
+        return true;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            // One last try right at the deadline -- a release() that fired
+            // just before the wait timed out must not be wasted.
+            return begin_read_locked_(page_idx, speculative, data_out, handle_out);
+        }
+        if (begin_read_locked_(page_idx, speculative, data_out, handle_out)) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+    }
+}
+
+bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_out, Handle * handle_out) {
     if (!initialized_) return false;
 
     auto it = by_page_.find(page_idx);
@@ -245,7 +273,7 @@ bool HostArena::begin_read(int page_idx, bool speculative, void ** data_out, Han
     return true;
 }
 
-void HostArena::finish_read(int page_idx, Handle handle, bool ok) {
+void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borrowed) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = by_page_.find(page_idx);
     if (it == by_page_.end()) return;
@@ -262,6 +290,15 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok) {
         resident_bytes_ += cfg_.entry_bytes;
         if (e.speculative) spec_bytes_ += cfg_.entry_bytes;
         insert_mru_locked_(idx, e.speculative);
+        if (keep_borrowed) {
+            e.borrows       = 1;
+            e.ever_borrowed = true;
+        }
+        // Trim regardless of keep_borrowed: a held entry cannot itself be
+        // evicted (evict_one_locked_ skips borrowed entries), but landing it
+        // may have pushed the OTHER unborrowed/unpinned resident bytes over
+        // the cap, and those must still come down in this same locked call.
+        trim_to_tier_cap_locked_();
     } else {
         // Reading -> Free: discard the bytes, the page never landed.
         by_page_.erase(it);
@@ -270,6 +307,9 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok) {
         e.gen      = kInvalidHandle;
         free_.push_back(idx);
     }
+    // Either branch can free capacity (a new Free entry, or trim_to_tier_cap_
+    // above evicting something else) that begin_read_wait() is blocked on.
+    cv_.notify_all();
 }
 
 // --- hit path ---------------------------------------------------------
@@ -313,6 +353,22 @@ void HostArena::release(int page_idx, Handle handle) {
     Entry & e = entries_[it->second];
     if (e.gen != handle) return;        // stale: a different generation now owns this page_idx
     if (e.borrows > 0) --e.borrows;
+    trim_to_tier_cap_locked_();
+    cv_.notify_all();
+}
+
+// --- retention cap -------------------------------------------------------
+
+// Caller holds mu_. Evicts LRU (speculative side first, via evict_one_locked_'s
+// own scan order) until Resident-unpinned bytes are at or under tier_bytes, or
+// nothing more can be evicted (everything left is borrowed or pinned). A
+// borrowed entry that is itself over the cap is left alone -- it comes down
+// on its own next release()/finish_read() call, once it is actually
+// evictable.
+void HostArena::trim_to_tier_cap_locked_() {
+    while (resident_bytes_ - pinned_bytes_ > cfg_.tier_bytes) {
+        if (!evict_one_locked_(EvictScope::Any)) break;
+    }
 }
 
 // --- pinning ------------------------------------------------------------
@@ -376,6 +432,7 @@ bool HostArena::is_resident(int page_idx) const {
 }
 
 size_t HostArena::entry_bytes()    const { std::lock_guard<std::mutex> lock(mu_); return cfg_.entry_bytes; }
+size_t HostArena::tier_bytes()     const { std::lock_guard<std::mutex> lock(mu_); return cfg_.tier_bytes; }
 size_t HostArena::entry_count()    const { std::lock_guard<std::mutex> lock(mu_); return entries_.size(); }
 size_t HostArena::resident_count() const { std::lock_guard<std::mutex> lock(mu_); return resident_count_; }
 size_t HostArena::resident_bytes() const { std::lock_guard<std::mutex> lock(mu_); return resident_bytes_; }

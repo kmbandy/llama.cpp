@@ -20,16 +20,16 @@ void print_usage(const char * argv0) {
         << "usage: " << argv0
         << " --shard-manifest PATH --descriptor PATH --device DEVICE"
         << " --listen HOST:PORT --slots N [--host-budget-bytes N]"
-        << " [--host-victim-bytes N]"
+        << " [--host-tier-bytes N]"
         << " [--weight-paging-resident-experts BLOCKS]"
         << " [--expert-reserve-blocks BLOCKS --expert-reserve-bytes SIZE]"
         << " [--layer-device RANGE=DEVICE[,RANGE=DEVICE]]\n"
         << "       --slots is the device budget in largest-page equivalents\n"
         << "       --device NAME1,NAME2 with --slots N1,N2 selects multiple devices\n"
-        << "       staging defaults to up to 16 largest-page buffers\n"
-        << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional staging budget\n"
-        << "       WP_EXPERT_HOST_VICTIM_BYTES supplies the optional VRAM victim tier\n"
-        << "       WP_EXPERT_HOST_SPEC_BYTES reserves additional host RAM for prefetch landings\n"
+        << "       --host-budget-bytes bounds in-flight reads (default 16 largest-page entries)\n"
+        << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional in-flight budget\n"
+        << "       --host-tier-bytes / WP_EXPERT_HOST_TIER_BYTES: host RAM retained for evicted\n"
+        << "       and predicted pages (0 = retain nothing)\n"
         << "       WP_EXPERT_RESIDENT_EXPERTS supplies resident block ranges\n"
         << "       WP_EXPERT_RESERVE_BLOCKS and WP_EXPERT_RESERVE_BYTES supply the reserved partition\n"
         << "       --layer-device 43-45=CPU forces those layers onto a named --device entry\n"
@@ -196,9 +196,9 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
         } else if (arg == "--host-budget-bytes") {
             options.host_budget_bytes =
                 parse_positive_u64(take(), "--host-budget-bytes");
-        } else if (arg == "--host-victim-bytes") {
-            options.host_victim_bytes =
-                parse_positive_u64(take(), "--host-victim-bytes");
+        } else if (arg == "--host-tier-bytes") {
+            options.host_tier_bytes =
+                parse_positive_u64(take(), "--host-tier-bytes");
         } else if (arg == "--weight-paging-resident-experts") {
             const wp::ResidentExpertRequest request =
                 wp::parse_resident_expert_request(take().c_str());
@@ -233,11 +233,11 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
                 parse_positive_u64(value, "WP_EXPERT_HOST_BUDGET_BYTES");
         }
     }
-    if (options.host_victim_bytes == 0) {
-        const char * value = std::getenv("WP_EXPERT_HOST_VICTIM_BYTES");
+    if (options.host_tier_bytes == 0) {
+        const char * value = std::getenv("WP_EXPERT_HOST_TIER_BYTES");
         if (value != nullptr && value[0] != '\0') {
-            options.host_victim_bytes =
-                parse_positive_u64(value, "WP_EXPERT_HOST_VICTIM_BYTES");
+            options.host_tier_bytes =
+                parse_positive_u64(value, "WP_EXPERT_HOST_TIER_BYTES");
         }
     }
     if (!options.resident_expert_blocks_set && options.resident_expert_blocks.empty()) {

@@ -8,7 +8,7 @@
 #include "pipe-expert-dispatcher.h"
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
-#include "weight-pager/wp-host-tier.h"
+#include "weight-pager/wp-host-arena.h"
 
 extern "C" {
 #include "sha256/sha256.h"
@@ -4603,437 +4603,6 @@ static bool wp_hip_is_cuda_backend() {
     return enabled;
 }
 
-class StagingPool {
-public:
-    StagingPool(const ResourcePlan & resources, ggml_backend_t backend) :
-        buffer_bytes_(resources.staging_buffer_bytes),
-        buffer_count_(resources.staging_buffers) {
-        buffers_.reserve((size_t) resources.staging_buffers);
-        host_buffers_.reserve((size_t) resources.staging_buffers);
-        available_.reserve((size_t) resources.staging_buffers);
-
-        backend_ = backend;
-        device_  = backend_ != nullptr ? ggml_backend_get_device(backend_) : nullptr;
-        const char * backend_name = backend_ != nullptr ? ggml_backend_name(backend_) : nullptr;
-        const bool vulkan = backend_name != nullptr &&
-            std::strstr(backend_name, "Vulkan") != nullptr;
-        const bool cuda_family = backend_name != nullptr &&
-            (std::strstr(backend_name, "CUDA") != nullptr ||
-             std::strstr(backend_name, "ROCm") != nullptr);
-
-        ggml_backend_buffer_type_t host_buft = nullptr;
-        bool try_pinned = staging_pinned_env_enabled() && (cuda_family || vulkan);
-        if (try_pinned && !vulkan && backend_ != nullptr) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
-            if (dev != nullptr) {
-                // Portable entry point (ggml-backend.h:187). Never call a
-                // backend-specific host-alloc symbol here: this worker binary
-                // serves ROCm, CUDA and Vulkan, and #if GGML_USE_* branching
-                // in this path is the exact bug class that has recurred six
-                // times in this codebase.
-                host_buft = ggml_backend_dev_host_buffer_type(dev);
-            }
-        }
-
-        // Some backends provide no host buffer type; the allocation can also
-        // fail or come back misaligned. The O_DIRECT reads need 4096-byte
-        // alignment, so verify it now rather than discovering EINVAL at
-        // read() time. Any of these cases falls back to posix_memalign for
-        // the whole pool.
-        //
-        // Also verify the returned buffer's actual type matches host_buft.
-        // ggml_backend_cuda_host_buffer_type_alloc_buffer silently falls back
-        // to a plain CPU buffer (ggml_backend_cpu_buffer_from_ptr) when
-        // cudaHostAlloc fails (e.g. GGML_CUDA_NO_PINNED, or the allocator is
-        // just out of pinned memory) -- and only stamps buffer->buft with the
-        // host type on the success path, so the fallback buffer keeps
-        // ggml_backend_cpu_buffer_type(). That buffer is non-null, has a
-        // valid base pointer, and is 4096-aligned, so the checks above all
-        // pass on it even though the memory is pageable. Without this check
-        // we would report staging_kind=pinned while actually running
-        // pageable, and derive gb_s_h2d against a mechanism that never ran.
-        bool pinned = try_pinned && host_buft != nullptr;
-        // Vulkan host registration needs the DEVICE POOL buffer
-        // (ggml_backend_vk_wp_host_register(pool_buffer, ...)), which this
-        // staging pool does not own at construction. Vulkan tiers keep the
-        // unpinned staging path; CUDA/ROCm use the host buffer type above.
-        if (false && try_pinned && vulkan && ggml_backend_vk_wp_host_register != nullptr) {
-            pinned = true;
-            for (int i = 0; i < resources.staging_buffers; ++i) {
-                void * raw = nullptr;
-                if (posix_memalign(&raw, DIRECT_ALIGNMENT, (size_t) buffer_bytes_) != 0 ||
-                        !ggml_backend_vk_wp_host_register((ggml_backend_buffer_t) nullptr, raw,
-                                                          (size_t) buffer_bytes_)) {
-                    if (raw != nullptr) {
-                        std::free(raw);
-                    }
-                    pinned = false;
-                    break;
-                }
-                buffers_.emplace_back(raw);
-                registered_host_buffers_.push_back(raw);
-            }
-            if (!pinned) {
-                for (void * raw : registered_host_buffers_) {
-                    ggml_backend_vk_wp_host_unregister((ggml_backend_buffer_t) nullptr, raw);
-                }
-                registered_host_buffers_.clear();
-                buffers_.clear();
-            }
-        } else if (pinned) {
-            for (int i = 0; i < resources.staging_buffers; ++i) {
-                buffer_ptr buf(ggml_backend_buft_alloc_buffer(
-                    host_buft, (size_t) buffer_bytes_));
-                void * raw = buf ? ggml_backend_buffer_get_base(buf.get()) : nullptr;
-                if (!buf || raw == nullptr ||
-                        (reinterpret_cast<uintptr_t>(raw) % DIRECT_ALIGNMENT) != 0 ||
-                        ggml_backend_buffer_get_type(buf.get()) != host_buft) {
-                    pinned = false;
-                    break;
-                }
-                host_buffers_.push_back(std::move(buf));
-            }
-            if (!pinned) {
-                host_buffers_.clear();
-            }
-        }
-
-        if (pinned) {
-            for (const buffer_ptr & buf : host_buffers_) {
-                available_.push_back(ggml_backend_buffer_get_base(buf.get()));
-            }
-        } else {
-            for (int i = 0; i < resources.staging_buffers; ++i) {
-                void * raw = nullptr;
-                if (posix_memalign(
-                        &raw, DIRECT_ALIGNMENT, (size_t) buffer_bytes_) != 0) {
-                    throw std::runtime_error(
-                        "failed to allocate aligned O_DIRECT staging buffer");
-                }
-                buffers_.emplace_back(raw);
-                available_.push_back(raw);
-            }
-        }
-
-        pinned_ = pinned;
-        copy_stream_h2d_ = backend_ != nullptr && device_ != nullptr &&
-            ggml_backend_cuda_wp_copy_stream_enabled != nullptr &&
-            ggml_backend_cuda_wp_copy_stream_enabled(backend_);
-        // WP_EXPERT_ASYNC_H2D=1 -- opt IN. Default OFF: 2026-08-07 it lost
-        // decode (3.82/3.67 vs 3.94) because a copy on the COMPUTE stream
-        // cannot overlap the graph. The dedicated-stream path is
-        // WP_EXPERT_COPY_STREAM=1. Vulkan stays OFF even when =1: it killed
-        // :8804 mid-prefill. Drain uses tensor_set_async on the compute
-        // stream; mark_in_flight / borrow() fence staging reuse.
-        const char * async_env = std::getenv("WP_EXPERT_ASYNC_H2D");
-        if (async_env != nullptr && async_env[0] != '\0' && async_env[0] != '0' &&
-                backend != nullptr) {
-            // RUNTIME name check, not a GGML_USE_* macro (that bug class has
-            // recurred six times here). Vulkan ADVERTISES events, so the probe
-            // below passes -- but arming this path on the RX 480 killed the
-            // worker mid-prefill on 2026-08-07 (spine: "worker :8804 died
-            // while computing", llama_decode ret=-3). Until the vk async-set +
-            // event-fence semantics are understood, Vulkan stays on the sync
-            // path by name.
-            const char * bname = ggml_backend_name(backend);
-            const bool vulkan =
-                bname != nullptr && std::strstr(bname, "Vulkan") != nullptr;
-            if (!vulkan) {
-                ggml_backend_event_t probe =
-                    device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
-                if (probe != nullptr) {
-                    ggml_backend_event_free(probe);
-                    async_h2d_ = true;
-                }
-            }
-        }
-        // Logged once: one StagingPool is constructed per worker process.
-        std::cerr << "wp expert worker: staging_kind="
-                  << (pinned_ ? "pinned" : "pageable")
-                  << " async_h2d=" << (async_h2d_ ? "on" : "off")
-                  << " copy_stream=" << (copy_stream_h2d_ ? "on" : "off")
-                  << " copy_stream_events="
-                  << (wp_copy_stream_events_enabled() ? "on" : "off") << std::endl;
-    }
-
-    ~StagingPool() {
-        for (auto & kv : events_) {
-            ggml_backend_event_free(kv.second);
-        }
-        if (ggml_backend_vk_wp_host_unregister != nullptr) {
-            for (void * raw : registered_host_buffers_) {
-                ggml_backend_vk_wp_host_unregister((ggml_backend_buffer_t) nullptr, raw);
-            }
-        }
-    }
-
-    // True when drain paths should use tensor_set_async + mark_in_flight.
-    bool async_h2d() const { return async_h2d_; }
-
-    bool copy_stream_h2d() const { return copy_stream_h2d_; }
-
-    ggml_backend_event_t new_copy_event() const {
-        return copy_stream_h2d_ && device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
-    }
-
-    bool record_copy_event(ggml_backend_event_t event) const {
-        return event != nullptr && ggml_backend_cuda_wp_copy_stream_record_event != nullptr &&
-               ggml_backend_cuda_wp_copy_stream_record_event(backend_, event);
-    }
-
-    // Record "an async copy out of this staging buffer is in flight" on the
-    // backend stream. Dispatch-thread only (same thread as the async issue).
-    void mark_in_flight(void * data) {
-        if (!async_h2d_ && !copy_stream_h2d_) {
-            return;
-        }
-        if (backend_ == nullptr || device_ == nullptr) {
-            async_h2d_ = false;
-            copy_stream_h2d_ = false;
-            return;
-        }
-        ggml_backend_event_t ev = nullptr;
-        {
-            // The map is shared with borrow(); the record itself is not.
-            std::lock_guard<std::mutex> lock(mutex_);
-            ggml_backend_event_t & slot = events_[data];
-            if (slot == nullptr) {
-                slot = ggml_backend_event_new(device_);
-            }
-            ev = slot;
-        }
-        if (ev == nullptr) {
-            // Device refused an event at runtime -- the copy already issued,
-            // so the only safe fallback is a full backend sync now, and the
-            // feature disarms for the rest of the process.
-            async_h2d_ = false;
-            ggml_backend_synchronize(backend_);
-            return;
-        }
-        if (copy_stream_h2d_ && ggml_backend_cuda_wp_copy_stream_record_event != nullptr) {
-            if (!ggml_backend_cuda_wp_copy_stream_record_event(backend_, ev)) {
-                copy_stream_h2d_ = false;
-                ggml_backend_synchronize(backend_);
-            }
-        } else {
-            ggml_backend_event_record(ev, backend_);
-        }
-    }
-
-    // *** PER-CONNECTION STAGING QUOTA -- THE 2026-08-25 MULTI-CONN DEADLOCK
-    // FIX. ***
-    //
-    // Live stacks that day (WP_WORKER_MULTI_CONN=2, WP_EXPERT_STAGING_BUFFERS=32)
-    // showed:
-    //   - connection thread X: holding g_worker_gpu_mutex inside
-    //     finish_split_dispatch -> Worker::dispatch -> drain_one_read, parked
-    //     in batch.state_->cv.wait() for a ReadResult.
-    //   - connection thread Y: parked in pthread_mutex_lock at the top of
-    //     serve_connection's loop, waiting for the SAME g_worker_gpu_mutex.
-    //   - every reader thread (ensure_batch's read_worker/stripe_read_worker
-    //     pool): parked in borrow() below, because available_ was EMPTY.
-    // Mechanism: a Lease travels inside ReadResult::staging and is only
-    // released once drain_one_read performs its H2D upload, which runs under
-    // g_worker_gpu_mutex. Connection Y's earlier BEGIN had already spawned
-    // readers that finished their reads and queued them on Y's batch, each
-    // holding a lease -- but Y cannot drain them (and free those leases)
-    // until it gets the mutex, which X holds while X's OWN readers are stuck
-    // in borrow() because Y's undrained results have pinned every buffer.
-    // Hold-and-wait across two independent transactions sharing one bounded
-    // pool -- classic deadlock, and impossible in single-connection mode
-    // (there is only ever one transaction).
-    //
-    // THE INVARIANT: in multi-conn mode (quota_ < buffer_count_), each
-    // connection may hold at most `quota_` leases at once --
-    // floor(buffer_count_ / N) for N connections. That bounds how many
-    // buffers ANY one connection's undrained results can pin, so the other
-    // connection's readers can never be starved down to zero -- there is
-    // always at least one buffer outside every other connection's quota for
-    // this connection's own readers to make progress with, which lets this
-    // connection's own drain (the only thing that can free ITS leases) always
-    // run to completion and release them. Single-connection mode
-    // (conn_index == -1, or quota_ == buffer_count_) is untouched: quota_
-    // defaults to buffer_count_, so the wait predicate is exactly
-    // `!available_.empty()`, byte-identical to before this fix.
-    class Lease {
-    public:
-        Lease(Lease && other) noexcept :
-            owner_(other.owner_), data_(other.data_), conn_index_(other.conn_index_) {
-            other.owner_ = nullptr;
-            other.data_  = nullptr;
-        }
-
-        ~Lease() {
-            if (owner_ != nullptr) {
-                owner_->release(data_, conn_index_);
-            }
-        }
-
-        Lease(const Lease &) = delete;
-        Lease & operator=(const Lease &) = delete;
-        Lease & operator=(Lease &&) = delete;
-
-        void * get() const {
-            return data_;
-        }
-
-    private:
-        friend class StagingPool;
-
-        Lease(StagingPool * owner, void * data, int conn_index) :
-            owner_(owner), data_(data), conn_index_(conn_index) {
-        }
-
-        StagingPool * owner_ = nullptr;
-        void *        data_  = nullptr;
-        int           conn_index_ = -1;
-    };
-
-    // conn_index: -1 ("none") is the reserved value for a borrow issued
-    // outside any connection's transaction (single-connection default path,
-    // and the idle-pump host-landing/prefetch paths -- see the call sites at
-    // spec_host_submit and spec_pagein_submit). It always draws from the
-    // global pool with no quota, same as every borrow() before this fix.
-    Lease borrow(int conn_index = -1) {
-        void * result = nullptr;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            available_cv_.wait(lock, [&]() {
-                if (available_.empty()) {
-                    return false;
-                }
-                if (conn_index < 0 || quota_ >= buffer_count_) {
-                    return true;
-                }
-                return held_by_conn_[conn_index] < quota_;
-            });
-            result = available_.back();
-            available_.pop_back();
-            if (conn_index >= 0 && quota_ < buffer_count_) {
-                ++held_by_conn_[conn_index];
-                if ((size_t) conn_index < g_worker_staging_held.size()) {
-                    g_worker_staging_held[(size_t) conn_index].fetch_add(
-                        1, std::memory_order_relaxed);
-                }
-            }
-        }
-        // Async H2D: wait for any in-flight copy OUT of this buffer before a
-        // reader thread refills it. Outside the pool lock -- the wait is on
-        // the GPU, and holding the lock would serialize every other borrower
-        // behind it.
-        if (async_h2d_ || copy_stream_h2d_) {
-            ggml_backend_event_t ev = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto it = events_.find(result);
-                if (it != events_.end()) {
-                    ev = it->second;
-                }
-            }
-            if (ev != nullptr) {
-                ggml_backend_event_synchronize(ev);
-            }
-        }
-        return Lease(this, result, conn_index);
-    }
-
-    int buffer_count() const {
-        return buffer_count_;
-    }
-
-    size_t cpu_lease_cap() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return quota_ > 0 ? (size_t) quota_ - 1 : 0;
-    }
-
-    uint64_t buffer_bytes() const {
-        return buffer_bytes_;
-    }
-
-    // Which allocation path actually ran, not what was requested.
-    bool pinned() const {
-        return pinned_;
-    }
-
-    // Called once from run(), after WP_WORKER_MULTI_CONN=N is parsed and
-    // BEFORE any connection thread starts (so no borrow() can race the quota
-    // change). n<=1 (including the untouched default single-connection path)
-    // restores quota_ == buffer_count_, i.e. no cap -- byte-identical to
-    // before this fix. n>buffer_count_ cannot give every connection even one
-    // guaranteed buffer, so rather than assert (and kill a worker over a
-    // config typo) this falls back to the same uncapped N=1 semantics, loudly:
-    // multi-conn is still safe (single connection ever ran that starting
-    // config, whatever it was), the flag just does not get its double-
-    // buffering behaviour until reconfigured.
-    void set_multi_conn(int n) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (n <= 1) {
-            quota_ = buffer_count_;
-            return;
-        }
-        if (n > buffer_count_) {
-            std::cerr << "wp expert worker: WARNING WP_WORKER_MULTI_CONN=" << n
-                      << " exceeds staging buffer_count=" << buffer_count_
-                      << "; per-connection staging quota disabled (falling back to "
-                         "N=1 semantics -- see the 2026-08-25 deadlock comment on "
-                         "StagingPool)" << std::endl;
-            quota_ = buffer_count_;
-            return;
-        }
-        quota_ = buffer_count_ / n;
-    }
-
-private:
-    void release(void * data, int conn_index) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            available_.push_back(data);
-            if (conn_index >= 0 && quota_ < buffer_count_) {
-                auto it = held_by_conn_.find(conn_index);
-                if (it != held_by_conn_.end() && it->second > 0) {
-                    --it->second;
-                }
-                if ((size_t) conn_index < g_worker_staging_held.size()) {
-                    g_worker_staging_held[(size_t) conn_index].fetch_sub(
-                        1, std::memory_order_relaxed);
-                }
-            }
-        }
-        // notify_all, not notify_one: with a per-connection quota, waiters
-        // block on DIFFERENT predicates (different conn_index's `held_by_conn_
-        // < quota_`). A released buffer that satisfies waiter B's predicate
-        // but not waiter A's must not be swallowed by waking only A, which
-        // would then just go back to sleep while B stays parked forever.
-        available_cv_.notify_all();
-    }
-
-    uint64_t                                        buffer_bytes_ = 0;
-    int                                              buffer_count_ = 0;
-    bool                                             pinned_ = false;
-    std::vector<std::unique_ptr<void, free_deleter>> buffers_;
-    std::vector<buffer_ptr>                         host_buffers_;
-    std::vector<void *>                             registered_host_buffers_;
-    std::vector<void *>                             available_;
-    std::mutex                                      mutex_;
-    std::condition_variable                         available_cv_;
-    // Per-connection outstanding-lease counts backing the quota above.
-    // Guarded by mutex_; quota_ defaults to buffer_count_ (no cap) until
-    // set_multi_conn() runs. int, not size_t: it is compared directly
-    // against quota_ (also int) in the wait predicate.
-    std::unordered_map<int, int>                    held_by_conn_;
-    int                                              quota_ = buffer_count_;
-    // Async H2D (WP_EXPERT_ASYNC_H2D). events_ maps a staging buffer's base
-    // pointer to the event that fences its last in-flight copy; guarded by
-    // mutex_. async_h2d_ is atomic only because the runtime-disarm path in
-    // mark_in_flight (dispatch thread) races borrow()'s read (reader threads)
-    // -- either value is safe to observe there.
-    std::atomic<bool>                               async_h2d_{false};
-    std::atomic<bool>                               copy_stream_h2d_{false};
-    ggml_backend_t                                  backend_ = nullptr;
-    ggml_backend_dev_t                              device_  = nullptr;
-    std::unordered_map<void *, ggml_backend_event_t> events_;
-};
-
 class ResidentExpertPool {
 public:
     ResidentExpertPool(ggml_backend_t backend, Catalog & catalog,
@@ -5163,7 +4732,6 @@ private:
 };
 
 class ExpertSlotPool;
-thread_local ExpertSlotPool * g_host_reader_pool = nullptr;
 
 struct WorkerLogFiles {
     WorkerLogFiles() {
@@ -5214,7 +4782,7 @@ private:
         // ensure_batch() call (see the "reader_h2d_this_batch" local right
         // before batch.state_->pageins.push_back below) and copied onto
         // every PageIn of that batch. Deciding it once, at plan time, rather
-        // than re-reading staging_.async_h2d()/copy_stream_h2d() from each
+        // than re-reading async_h2d()/copy_stream_h2d() from each
         // reader thread as it processes each stripe, guarantees every
         // stripe of one page agrees on whether the reader or drain_one_read
         // performs its H2D -- a stripe-by-stripe re-check could disagree
@@ -5225,6 +4793,17 @@ private:
         // WP_CPU_DIRECT_PAGEIN: this page-in's dest/offset/size are 4096-aligned
         // so the reader preads O_DIRECT into slot.raw and drain skips memcpy.
         bool               cpu_direct  = false;
+        // Arena entry backing this page-in, resolved at plan time in
+        // ensure_batch (RAM hit: borrow(); miss: begin_read()). Invalid for a
+        // cpu_direct page-in, which reads straight into slot.raw and never
+        // touches the arena at all.
+        wp::HostArena::Handle arena_handle = wp::HostArena::kInvalidHandle;
+        void *             arena_data = nullptr;
+        // True: this PageIn is a RAM hit -- the arena already has the page
+        // Resident, so the read threads skip read_page_range entirely and go
+        // straight to the same reader-thread/drain H2D a miss would use. A
+        // RAM hit is a miss without the pread; both are the SAME work item.
+        bool               ram_hit    = false;
     };
 
     // One STRIPE of one page-in. A page is read in WP_EXPERT_READ_STRIPES
@@ -5237,7 +4816,11 @@ private:
     // stripe's upload, not the first.
     struct ReadResult {
         size_t                              pagein_indexb = 0;
-        std::shared_ptr<StagingPool::Lease> staging;
+        // Points at PageIn::arena_data (RAM hit) or the arena entry a miss's
+        // begin_read() reserved. Never owned here -- the Batch-level arena
+        // hold (see Batch::arena_holds_) is what keeps it alive, not this
+        // pointer's lifetime.
+        const void *                        src = nullptr;
         size_t                              offset = 0;   // byte offset within the page
         size_t                              len    = 0;   // bytes in this stripe
         bool                                last   = true; // last stripe of this page
@@ -5277,8 +4860,20 @@ private:
         size_t len           = 0;
     };
     struct PageShared {
-        std::shared_ptr<StagingPool::Lease> lease;
-        std::mutex                          lease_mutex;
+        // Coordinates ONE reservation (reserve_arena_for_pagein) across
+        // however many stripe-parallel threads pull a stripe of this same
+        // page: 0 pending, 1 claimed (one thread is inside
+        // reserve_arena_for_pagein right now), 2 done. Whichever thread
+        // wins the 0->1 compare_exchange does the reservation; everyone
+        // else waits on reserve_cv for it to reach 2, then reads
+        // reserve_ok. Needed because PageIn::arena_data/ram_hit/
+        // arena_handle must be resolved exactly once, but ANY stripe of
+        // this page -- not just "the first" -- may be the one a thread
+        // pulls first.
+        std::atomic<int>                    reserve_state{0};
+        bool                                 reserve_ok = false;   // valid once reserve_state==2
+        std::mutex                          reserve_mu;
+        std::condition_variable             reserve_cv;
         std::atomic<size_t>                 remaining{0};
         // Any stripe failed. The LAST completer inherits it so the page's
         // final ReadResult carries an error and drain never publishes a
@@ -5287,15 +4882,37 @@ private:
         std::atomic<bool>                   failed{false};
     };
 
+    // Stripe-parallel counterpart to reserve_arena_for_pagein: several
+    // threads may pull different stripes of the SAME page concurrently, but
+    // the reservation must happen exactly once. See PageShared::reserve_state.
+    bool ensure_arena_reserved(PageShared & shared, PageIn & pagein) {
+        int expected = 0;
+        if (shared.reserve_state.compare_exchange_strong(expected, 1)) {
+            const bool ok = reserve_arena_for_pagein(pagein);
+            {
+                std::lock_guard<std::mutex> lock(shared.reserve_mu);
+                shared.reserve_ok = ok;
+                shared.reserve_state.store(2, std::memory_order_release);
+            }
+            shared.reserve_cv.notify_all();
+            return ok;
+        }
+        std::unique_lock<std::mutex> lock(shared.reserve_mu);
+        shared.reserve_cv.wait(lock, [&]() {
+            return shared.reserve_state.load(std::memory_order_acquire) == 2;
+        });
+        return shared.reserve_ok;
+    }
+
     struct BatchState {
         std::vector<PageIn>                       pageins;
         std::atomic<size_t>                     next{0};
         // Which connection's transaction this batch belongs to (-1 = none:
         // single-connection default path, or a speculative/prefetch batch
-        // with no connection context). Threaded into every staging_.borrow()
-        // call the reader threads make (read_worker/stripe_read_worker) so
-        // the per-connection staging quota (StagingPool's 2026-08-25 deadlock
-        // fix) can be enforced. Set once in ensure_batch, read-only after.
+        // with no connection context). No per-connection quota to enforce
+        // any more (the arena has no bounded buffer pool a second connection
+        // could starve -- see the HostArena migration note), so this is now
+        // read only for logging/diagnostics. Set once in ensure_batch.
         int                                      conn_index = -1;
         // Stripe-parallel mode only; empty otherwise. Built once in
         // ensure_batch before the workers start, read-only afterwards.
@@ -5319,35 +4936,66 @@ private:
         // rewrite look like it had made the used-rate worse (686 -> 431).
         // Only the dispatch thread reads/writes it, and always after submit.
         bool                                    speculative = false;
-        // Decode/verify demand reads land a host-tier copy from staging so
-        // eviction does not need a sync D2H. Prefill (n_tokens>8) stays out
-        // so a 108-pagein ubatch cannot wipe the 3 GiB decode working set.
-        bool                                    admit_host_on_read = false;
     };
 
 public:
     ExpertSlotPool(
             ggml_backend_t backend, ResourcePlan resources,
-            uint64_t host_victim_bytes, TestHooks * test_hooks,
+            wp::HostArena & arena, TestHooks * test_hooks,
             const std::vector<int> & reserve_blocks, size_t page_count = 0,
-            wp::HostTier * shared_host_tier = nullptr,
             WorkerLogFiles * logs = nullptr,
-            const std::string & device_name = {}) :
+            const std::string & device_name = {},
+            const std::string & arena_kind = {}) :
         backend_(backend),
         resources_(std::move(resources)),
-        staging_(resources_, backend),
-        test_hooks_(test_hooks),
         cpu_on_arrival_enabled_(cpu_on_arrival_enabled_from_env()),
         cpu_on_arrival_cap_(cpu_on_arrival_cap_from_env()),
-        owned_host_tier_(shared_host_tier == nullptr
-            ? std::make_unique<wp::HostTier>() : nullptr),
-        host_tier_(shared_host_tier != nullptr ? shared_host_tier : owned_host_tier_.get()) {
+        test_hooks_(test_hooks),
+        arena_(arena),
+        arena_kind_(arena_kind) {
         reserve_blocks_ = reserve_blocks;
         logs_ = logs;
         pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
         device_name_ = device_name.empty()
             ? (ggml_backend_name(backend_) ? ggml_backend_name(backend_) : "")
             : device_name;
+        device_ = backend_ != nullptr ? ggml_backend_get_device(backend_) : nullptr;
+        // *** COPY-STREAM / ASYNC H2D PROBES, FORMERLY STAGINGPOOL'S. ***
+        // Moved verbatim onto the pool: these gate drain_one_read's H2D shape
+        // for backends that cannot use the reader-thread copy (Vulkan/CPU),
+        // and are otherwise independent of where the source bytes live.
+        copy_stream_h2d_ = backend_ != nullptr && device_ != nullptr &&
+            ggml_backend_cuda_wp_copy_stream_enabled != nullptr &&
+            ggml_backend_cuda_wp_copy_stream_enabled(backend_);
+        // WP_EXPERT_ASYNC_H2D=1 -- opt IN. Default OFF: 2026-08-07 it lost
+        // decode (3.82/3.67 vs 3.94) because a copy on the COMPUTE stream
+        // cannot overlap the graph. The dedicated-stream path is
+        // WP_EXPERT_COPY_STREAM=1. Vulkan stays OFF even when =1: it killed
+        // :8804 mid-prefill. Drain uses tensor_set_async on the compute
+        // stream; mark_in_flight / the arena hold fence buffer reuse.
+        {
+            const char * async_env = std::getenv("WP_EXPERT_ASYNC_H2D");
+            if (async_env != nullptr && async_env[0] != '\0' && async_env[0] != '0' &&
+                    backend_ != nullptr) {
+                const char * bname = ggml_backend_name(backend_);
+                const bool vulkan =
+                    bname != nullptr && std::strstr(bname, "Vulkan") != nullptr;
+                if (!vulkan) {
+                    ggml_backend_event_t probe =
+                        device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
+                    if (probe != nullptr) {
+                        ggml_backend_event_free(probe);
+                        async_h2d_ = true;
+                    }
+                }
+            }
+        }
+        std::cerr << "wp expert worker: device=" << device_name_
+                  << " arena_kind=" << arena_kind_
+                  << " async_h2d=" << (async_h2d_ ? "on" : "off")
+                  << " copy_stream=" << (copy_stream_h2d_ ? "on" : "off")
+                  << " copy_stream_events="
+                  << (wp_copy_stream_events_enabled() ? "on" : "off") << std::endl;
         cpu_direct_pagein_ = cpu_direct_pagein_from_env() && backend_is_cpu(backend_);
         if (backend_is_cpu(backend_)) {
             const size_t cpu_inflight = read_inflight_cpu_from_env();
@@ -5397,12 +5045,9 @@ public:
                 (uint64_t) std::numeric_limits<size_t>::max()) {
             throw std::runtime_error("invalid expert slot pool dimensions");
         }
-        // WP_SELF_BENCH=3 benchmarks HERE: staging_ is already built (member
-        // init list) but NO slot buffers exist yet. With =2 (before everything)
-        // measuring 183 us and =1 (after everything) measuring 1341 us, this
-        // splits the constructor: fast here => the SLOT buffers do it; slow here
-        // => the STAGING pool does it. Staging is a fixed 16 buffers regardless
-        // of --slots, which matches the observed flatness across 100..400 slots.
+        // WP_SELF_BENCH=3 benchmarks HERE, before any slot buffer exists, so a
+        // fast-here-vs-slow-at-1 split still isolates the SLOT buffer setup
+        // below from everything that ran ahead of it in the constructor.
         {
             const char * mode = std::getenv("WP_SELF_BENCH");
             if (mode != nullptr && mode[0] == '3') {
@@ -5544,69 +5189,10 @@ public:
         // Compute it here, once, instead of rescanning ~6700 slots two to three
         // times per decode request from arena_id_eligible().
         arena_layout_ = compute_arena_layout();
-        resources_.staging_buffers      = staging_.buffer_count();
-        resources_.staging_buffer_bytes = staging_.buffer_bytes();
-        resources_.staging_bytes =
-            resources_.staging_buffer_bytes *
-            (uint64_t) resources_.staging_buffers;
-
-        // *** WP_EXPERT_HOST_SPEC_BYTES: RAM RESERVED FOR PREFETCH LANDINGS. ***
-        //
-        // Added ON TOP of the victim budget, so the two knobs mean exactly what
-        // they say: WP_EXPERT_HOST_VICTIM_BYTES is what evicted VRAM pages may
-        // hold, this is what speculative landings may hold, and the arena is
-        // their sum. Unset (0) keeps one shared pool and the historic behaviour.
-        //
-        // WHY A HARD RESERVATION AND NOT JUST EVICTION ORDER: set_speculative_tier
-        // below already drains guesses before victims, but ORDER cannot help when
-        // the arena is already full of victims -- a landing then has to evict a
-        // page the GPU actually used, or fail. On the sliced rig it failed, every
-        // time: host_landed sat at 0 against a 3 GiB tier saturated by demand
-        // experts, so the whole prefetch path was measuring a tier it could never
-        // get into. Reserved bytes cannot be taken by the demand path at all.
-        static const uint64_t host_spec_bytes = [] {
-            const char * e = std::getenv("WP_EXPERT_HOST_SPEC_BYTES");
-            if (e == nullptr || e[0] == '\0') {
-                return (uint64_t) 0;
-            }
-            const long long v = atoll(e);
-            return v > 0 ? (uint64_t) v : (uint64_t) 0;
-        }();
-
-        if (host_victim_bytes != 0) {
-            const uint64_t arena_bytes = host_victim_bytes + host_spec_bytes;
-            if (arena_bytes >
-                (uint64_t) std::numeric_limits<size_t>::max() ||
-                arena_bytes < host_victim_bytes ||   // overflow
-                (!host_tier_->is_initialized() &&
-                 !host_tier_->init((size_t) arena_bytes, 0))) {
-                throw std::runtime_error("failed to initialize host victim tier");
-            }
-            if (host_spec_bytes != 0) {
-                host_tier_->set_spec_budget((size_t) host_spec_bytes);
-            }
-            host_tier_->set_device_reader(
-                [](void * dst_host, const void * src_device, size_t n, int page_idx) {
-                    return g_host_reader_pool != nullptr &&
-                        g_host_reader_pool->read_device_page(
-                            dst_host, src_device, n, page_idx);
-                });
-            host_victim_enabled_ = true;
-            // Arm HostTier's Pass 0 so an unconfirmed prediction is drained
-            // before anything VRAM actually touched. Without it spec_tier_ is
-            // false and a guess competes with a known-good victim -- the tier's
-            // own comment calls that "prefetch actively degrading the tier it is
-            // meant to fill". This line silently failed to apply once already:
-            // a str.replace with the wrong indentation is a no-op, not an error.
-            host_tier_->set_speculative_tier(true);
-            fprintf(stderr,
-                    "wp::HostTier: victim=%llu MiB spec_reserved=%llu MiB arena=%llu MiB "
-                    "fill_on_read=%d (decode n_tokens<=8) demote_d2h=%d\n",
-                    (unsigned long long) (host_victim_bytes >> 20),
-                    (unsigned long long) (host_spec_bytes   >> 20),
-                    (unsigned long long) ((host_victim_bytes + host_spec_bytes) >> 20),
-                    (int) fill_host_on_read_, (int) demote_d2h_);
-        }
+        // resources_.staging_buffers/staging_buffer_bytes/staging_bytes were
+        // already set by plan_resources_impl() -- derived reporting values
+        // (read_inflight_max and entry_bytes, in effect) now that there is no
+        // StagingPool to size them from here.
     }
 
     ~ExpertSlotPool() {
@@ -5641,6 +5227,64 @@ public:
             close(item.second);
         }
 #endif
+        for (auto & kv : copy_flight_events_) {
+            ggml_backend_event_free(kv.second);
+        }
+    }
+
+    // *** COPY-STREAM / ASYNC H2D HELPERS, FORMERLY STAGINGPOOL'S. ***
+    // Moved verbatim (see the ctor's probe comment); the only change is that
+    // mark_in_flight()'s fence map is keyed by an arena entry's address
+    // instead of a staging buffer's.
+    bool copy_stream_h2d() const { return copy_stream_h2d_; }
+    bool async_h2d() const { return async_h2d_; }
+
+    ggml_backend_event_t new_copy_event() const {
+        return copy_stream_h2d_ && device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
+    }
+
+    bool record_copy_event(ggml_backend_event_t event) const {
+        return event != nullptr && ggml_backend_cuda_wp_copy_stream_record_event != nullptr &&
+               ggml_backend_cuda_wp_copy_stream_record_event(backend_, event);
+    }
+
+    // Record "an async copy out of this arena entry is in flight" on the
+    // backend stream. Dispatch-thread only (same thread as the async
+    // issue) -- see drain_one_read's mark_in_flight() call sites.
+    void mark_in_flight(void * data) {
+        if (!async_h2d_ && !copy_stream_h2d_) {
+            return;
+        }
+        if (backend_ == nullptr || device_ == nullptr) {
+            async_h2d_ = false;
+            copy_stream_h2d_ = false;
+            return;
+        }
+        ggml_backend_event_t ev = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(copy_event_mutex_);
+            ggml_backend_event_t & slot = copy_flight_events_[data];
+            if (slot == nullptr) {
+                slot = ggml_backend_event_new(device_);
+            }
+            ev = slot;
+        }
+        if (ev == nullptr) {
+            // Device refused an event at runtime -- the copy already issued,
+            // so the only safe fallback is a full backend sync now, and the
+            // feature disarms for the rest of the process.
+            async_h2d_ = false;
+            ggml_backend_synchronize(backend_);
+            return;
+        }
+        if (copy_stream_h2d_ && ggml_backend_cuda_wp_copy_stream_record_event != nullptr) {
+            if (!ggml_backend_cuda_wp_copy_stream_record_event(backend_, ev)) {
+                copy_stream_h2d_ = false;
+                ggml_backend_synchronize(backend_);
+            }
+        } else {
+            ggml_backend_event_record(ev, backend_);
+        }
     }
 
     size_t pin_pages(const std::vector<const ExpertPage *> & pages);
@@ -5711,14 +5355,26 @@ public:
 
         const void * cpu_staging(size_t index) const {
             const Entry & entry = entries_.at(index);
-            if (!entry.ready || !entry.cpu_staging) {
+            if (!entry.ready || entry.cpu_staging_data == nullptr) {
                 throw std::logic_error("CPU-on-arrival page is not ready");
             }
-            return entry.cpu_staging->get();
+            return entry.cpu_staging_data;
         }
 
+        // Releases the arena hold this cpu_on_arrival page-in has held since
+        // it landed in drain_one_read -- deliberately NOT part of
+        // flush_arena_holds()/the generic batch-wide release, because a
+        // cpu_on_arrival page-in's compute (compute_cpu_on_arrival) reads
+        // this pointer AFTER batch.complete() returns, so its hold must
+        // outlive the generic release point.
         void release_cpu_staging(size_t index) {
-            entries_.at(index).cpu_staging.reset();
+            Entry & entry = entries_.at(index);
+            if (entry.cpu_staging_handle != wp::HostArena::kInvalidHandle && owner_ != nullptr) {
+                owner_->arena_.release(entry.cpu_staging_cache_id, entry.cpu_staging_handle);
+            }
+            entry.cpu_staging_data     = nullptr;
+            entry.cpu_staging_cache_id = -1;
+            entry.cpu_staging_handle   = wp::HostArena::kInvalidHandle;
         }
 
         // Slot this entry landed in, or SIZE_MAX for a pinned-resident page that
@@ -5758,6 +5414,17 @@ public:
                 ggml_backend_event_wait(backend, copy_event_);
             }
         }
+
+        // One deferred arena hold: a page-in whose H2D was issued
+        // ASYNCHRONOUSLY out of `data` (copy-stream or tensor_set_async) and
+        // so cannot be released in drain_one_read. Released by
+        // ExpertSlotPool::flush_arena_holds(), which host-synchronizes the
+        // mark_in_flight() event recorded for `data` first.
+        struct ArenaHold {
+            int                   cache_id = -1;
+            wp::HostArena::Handle handle   = wp::HostArena::kInvalidHandle;
+            void *                data     = nullptr;
+        };
 
         // Drain reads until every entry with index < entry_end that needs a
         // page-in has landed, leaving the rest in flight. Lets the caller
@@ -5857,18 +5524,6 @@ public:
             return n_host_hit_;
         }
 
-        uint64_t n_host_demote() const {
-            return n_host_demote_;
-        }
-
-        uint64_t ns_host_get() const {
-            return ns_host_get_;
-        }
-
-        uint64_t ns_demote() const {
-            return ns_demote_;
-        }
-
         uint64_t ns_ensure_post() const {
             return ns_ensure_post_;
         }
@@ -5887,7 +5542,13 @@ public:
             bool   ready      = false;
             bool   copy_pending = false;
             bool   cpu_on_arrival = false;
-            std::shared_ptr<StagingPool::Lease> cpu_staging;
+            // cpu_on_arrival only: the arena entry backing this page-in.
+            // Not released by ExpertSlotPool::flush_arena_holds() -- see
+            // release_cpu_staging()'s comment for why its lifetime is tied
+            // to compute_cpu_on_arrival's actual use of the pointer instead.
+            void * cpu_staging_data = nullptr;
+            int    cpu_staging_cache_id = -1;
+            wp::HostArena::Handle cpu_staging_handle = wp::HostArena::kInvalidHandle;
             uint64_t upload_hash = 0;
             bool upload_hash_valid = false;
         };
@@ -5919,9 +5580,6 @@ public:
         uint64_t                   n_pagein_general_ = 0;
         uint64_t                   bytes_read_ = 0;
         uint64_t                   n_host_hit_ = 0;
-        uint64_t                   n_host_demote_ = 0;
-        uint64_t                   ns_host_get_ = 0;
-        uint64_t                   ns_demote_ = 0;
         uint64_t                   ns_ensure_post_ = 0;
         uint64_t                   host_bytes_ = 0;
         uint64_t                   ns_h2d_    = 0;
@@ -5942,6 +5600,12 @@ public:
         ggml_backend_event_t       copy_event_ = nullptr;
         std::vector<PendingCopy>   pending_copies_;
         std::vector<ggml_backend_event_t> copy_wait_events_;
+        // Deferred (async-copy) arena holds only -- see ArenaHold. Every
+        // synchronous copy releases its hold inline in drain_one_read or on
+        // the reader thread; this list never holds more than
+        // arena_hold_flush_threshold() entries between flushes, so a batch
+        // larger than read_inflight_max can still make progress.
+        std::vector<ArenaHold>     arena_holds_;
         // Drain state. Lives on the Batch rather than in complete_batch's frame
         // so a drain can stop part-way (complete_upto) and be resumed. A read
         // that FAILED never sets entry.ready, so every drain loop is bounded by
@@ -6181,8 +5845,8 @@ public:
                         ++batch.n_resident_;
                         continue;
                     }
-                    const bool host_hit = cpu_on_arrival_enabled_ && host_victim_enabled_ &&
-                        host_tier_->contains(page.cache_id);
+                    const bool host_hit = cpu_on_arrival_enabled_ &&
+                        arena_.is_resident(page.cache_id);
                     const size_t free_slot = cpu_on_arrival_enabled_
                         ? free_slot_for(page, free_slot_claimed) : slots_.size();
                     if (free_slot != slots_.size()) {
@@ -6268,34 +5932,6 @@ public:
                 }
             };
 
-            struct HostHit {
-                const void *                   src = nullptr;
-                wp::HostTier::BorrowHandle borrow =
-                    wp::HostTier::kInvalidBorrowHandle;
-            };
-            std::vector<HostHit> host_hits(pages.size());
-            if (host_victim_enabled_) {
-                for (size_t entry_index : pageins) {
-                    const ExpertPage & page = *pages[entry_index];
-                    if (host_tier_->borrow(
-                            page.cache_id, &host_hits[entry_index].src,
-                            (size_t) page.size, &host_hits[entry_index].borrow)) {
-                        continue;
-                    }
-                }
-            }
-
-            auto release_host_hits = [&]() {
-                for (size_t entry_index : pageins) {
-                    HostHit & host_hit = host_hits[entry_index];
-                    if (host_hit.borrow != wp::HostTier::kInvalidBorrowHandle) {
-                        host_tier_->release(
-                            pages[entry_index]->cache_id, host_hit.borrow);
-                        host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
-                    }
-                }
-            };
-
             // WP_PAGEIN_SORT=offset -- issue this request's misses in file
             // offset order. Same bytes, same slots, only reader issue order.
             // WP_EXPERT_OFFSET_SORT=1 is the older alias. Default off.
@@ -6311,10 +5947,7 @@ public:
             }
             batch.state_ = std::make_shared<BatchState>();
             batch.state_->conn_index = conn_index;
-            batch.state_->admit_host_on_read =
-                host_victim_enabled_ && fill_host_on_read_ && !demote_d2h_ &&
-                n_tokens > 0 && n_tokens <= 8;
-            batch.copy_event_ = staging_.new_copy_event();
+            batch.copy_event_ = new_copy_event();
             batch.state_->pageins.reserve(pageins.size());
             // WP_READER_H2D: decide once, here, under the lock, for every
             // page-in this ensure_batch() call is about to plan -- see the
@@ -6333,20 +5966,47 @@ public:
             // always issues tensor_set_page_range_reader -- a SYNCHRONOUS
             // copy (by the time it returns) on its own dedicated
             // non-blocking reader stream (ggml_backend_cuda_wp_reader_copy
-            // in ggml-cuda.cu), never StagingPool's copy_stream_h2d_ stream
+            // in ggml-cuda.cu), never the pool's own copy_stream_h2d_ stream
             // -- so it never needs the copy-stream event bookkeeping
-            // (StagingPool::mark_in_flight / events_) that copy_stream_h2d()
-            // exists to gate in drain_one_read.
+            // (mark_in_flight / events_) that copy_stream_h2d() exists to
+            // gate in drain_one_read.
             const bool reader_h2d_this_batch =
-                reader_h2d_enabled_ && !staging_.async_h2d();
-            try {
-                for (size_t entry_index : pageins) {
+                reader_h2d_enabled_ && !async_h2d();
+            // *** ARENA RESERVATION HAPPENS ON THE READER THREAD, NOT HERE. ***
+            //
+            // A first cut reserved every page-in's arena entry in THIS loop,
+            // up front, before any reader thread started -- exactly what a
+            // StagingPool::borrow() call used to do, except staging's borrow
+            // ran on the READER thread, concurrently with other readers of
+            // the same batch releasing their own buffers as they finished.
+            // Reserving everything up front instead means a batch bigger
+            // than read_inflight_max can NEVER finish planning: page
+            // read_inflight_max+1 refuses because entries 1..read_inflight_max
+            // are all still sitting in Reading state, and nothing can ever
+            // finish them because their reader threads have not even been
+            // spawned yet (that only happens after this whole loop returns).
+            // A hundreds-of-pages prefill against a 16-entry cap deadlocks
+            // outright -- this is the 2026-09-20 test-wp-expert-worker hang.
+            //
+            // The fix restores the StagingPool shape: read_worker/
+            // stripe_read_worker reserve (borrow() or begin_read_wait())
+            // for THEIR OWN page-in only once they actually start processing
+            // it, so read_inflight_max concurrent readers can cycle through
+            // an arbitrarily large page-in list, each freeing its entry
+            // before or as it moves to the next. PageIn::arena_handle/
+            // arena_data/ram_hit are filled in there instead of here.
+            for (size_t entry_index : pageins) {
                     const ExpertPage & page = *pages[entry_index];
+                    PageIn pi;
+                    pi.entry_index = entry_index;
+                    pi.page        = &page;
                     if (batch.entries_[entry_index].cpu_on_arrival) {
-                        batch.state_->pageins.push_back({
-                            entry_index, std::numeric_limits<size_t>::max(), &page,
-                            fd_for(page.blob), nullptr, false, true
-                        });
+                        pi.slot_index = std::numeric_limits<size_t>::max();
+                        pi.fd         = fd_for(page.blob);
+                        pi.raw        = nullptr;
+                        pi.reader_h2d = false;
+                        pi.cpu_on_arrival = true;
+                        pi.cpu_direct = false;
                         ++batch.n_cpu_on_arrival_;
                         ++batch.n_pagein_;
                         if (std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer)) {
@@ -6355,27 +6015,16 @@ public:
                             ++batch.n_pagein_general_;
                         }
                         batch.bytes_read_ += page.size;
+                        batch.state_->pageins.push_back(pi);
                         continue;
                     }
                     const size_t slot_index =
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
                     if (slot.valid) {
-                        const auto demote_t0 = measure ? std::chrono::steady_clock::now()
-                                                       : std::chrono::steady_clock::time_point{};
-                        if (demote_slot(slot)) {
-                            ++batch.n_host_demote_;
-                        }
-                        if (measure) {
-                            batch.ns_demote_ +=
-                                (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - demote_t0).count();
-                        }
-                        // The slot is about to hold a different page; drop the
-                        // OLD key from the index now, or find_slot(old key) would
-                        // keep returning this slot until something overwrites the
-                        // map entry (the defensive check in find_slot catches a
-                        // stale hit, but there is no reason to rely on it here).
+                        // Simply overwritten: every NVMe read lands in the
+                        // arena and stays there, so there is no D2H demotion
+                        // to run before this slot's old page is discarded.
                         slot_index_.erase(slot_key(slot.key.first, slot.key.second));
                         // Evicted before a demand hit ever confirmed it: the
                         // unconfirmed-speculative occupancy this slot held ends
@@ -6389,124 +6038,36 @@ public:
                     }
                     slot.valid = false;
 
-                    HostHit & host_hit = host_hits[entry_index];
-                    if (host_hit.borrow != wp::HostTier::kInvalidBorrowHandle) {
-                        // WP_EXPERT_TIER_VERIFY=1 -- re-read every tier-restored
-                        // page from its blob and memcmp against what the tier
-                        // returned. Diagnostic for the 2026-08-06 finding that
-                        // tier-on runs produce divergent text: discriminates
-                        // "restore path corrupts pages" from "timing-induced
-                        // reassociation". Costs an extra buffered read per host
-                        // hit; never enable in a measured arm.
-                        static const bool tier_verify = [] {
-                            const char * e = std::getenv("WP_EXPERT_TIER_VERIFY");
-                            return e != nullptr && e[0] == '1';
-                        }();
-                        if (tier_verify) {
-                            static uint64_t n_verified = 0, n_mismatch = 0, n_readfail = 0;
-                            std::vector<uint8_t> disk((size_t) page.size);
-                            bool read_ok = false;
-                            const int vfd = ::open(page.blob.c_str(), O_RDONLY);
-                            if (vfd >= 0) {
-                                read_ok = ::pread(vfd, disk.data(), (size_t) page.size,
-                                                  (off_t) page.offset) == (ssize_t) page.size;
-                                ::close(vfd);
-                            }
-                            ++n_verified;
-                            if (!read_ok) {
-                                ++n_readfail;
-                                fprintf(stderr,
-                                        "W tier-verify REREAD-FAIL layer=%d expert=%d\n",
-                                        page.layer, page.expert);
-                            } else if (memcmp(disk.data(), host_hit.src,
-                                              (size_t) page.size) != 0) {
-                                size_t first = 0;
-                                const uint8_t * t = (const uint8_t *) host_hit.src;
-                                while (first < (size_t) page.size && disk[first] == t[first]) {
-                                    ++first;
-                                }
-                                ++n_mismatch;
-                                fprintf(stderr,
-                                        "W tier-verify MISMATCH layer=%d expert=%d size=%llu "
-                                        "first_diff_byte=%zu disk=%02x tier=%02x\n",
-                                        page.layer, page.expert,
-                                        (unsigned long long) page.size, first,
-                                        disk[first], t[first]);
-                            }
-                            fprintf(stderr,
-                                    "W tier-verify totals verified=%llu mismatch=%llu readfail=%llu\n",
-                                    (unsigned long long) n_verified,
-                                    (unsigned long long) n_mismatch,
-                                    (unsigned long long) n_readfail);
-                        }
-                        const std::chrono::steady_clock::time_point host_get_started =
-                            measure ? std::chrono::steady_clock::now() :
-                                      std::chrono::steady_clock::time_point();
-                        tensor_set_page_range(
-                            slot.raw, page, host_hit.src, 0, (size_t) page.size);
-                        if (wp_worker_cuda_async_hash_trace_enabled(backend_)) {
-                            slot.upload_hash = hash_page_upload(page, host_hit.src);
-                            slot.upload_hash_valid = true;
-                        }
-                        host_tier_->release(page.cache_id, host_hit.borrow);
-                        host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
-                        if (!fill_host_on_read_ || demote_d2h_) {
-                            host_tier_->erase(page.cache_id);
-                        }
-                        slot.valid    = true;
-                        slot.key      = { page.layer, page.expert };
-                        slot_index_[slot_key(page.layer, page.expert)] = slot_index;
-                        slot.cache_id = page.cache_id;
-                        slot.page     = &page;
-                        slot.size     = page.size;
-                        slot.tick     = ++tick_;
-                        // Admit at the age of the last page we evicted, not at
-                        // 1. Otherwise a genuinely hot expert is thrown out
-                        // before it can ever prove itself, and stale pages that
-                        // were hot early squat forever. Those two are the only
-                        // reasons plain use-counting loses to LRU.
-                        slot.uses     = lfu_history_enabled_ ? history_uses(page) :
-                                         evict_age_ + 1;
-                        batch.entries_[entry_index].loaded = {
-                            slot.buffer, slot.raw->data
-                        };
-                        batch.entries_[entry_index].upload_hash = slot.upload_hash;
-                        batch.entries_[entry_index].upload_hash_valid = slot.upload_hash_valid;
-                        batch.entries_[entry_index].hit   = true;
-                        batch.entries_[entry_index].ready = true;
-                        ++batch.n_host_hit_;
-                        if (measure) {
-                            batch.ns_host_get_ +=
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - host_get_started).count();
-                        }
+                    pi.slot_index = slot_index;
+                    pi.raw        = slot.raw;
+                    pi.reader_h2d = reader_h2d_this_batch;
+                    pi.cpu_on_arrival = false;
+                    pi.cpu_direct = cpu_direct_ok(slot.raw, page);
+                    pi.fd         = fd_for(page.blob);
+                    // cpu_direct reads straight into slot.raw and never
+                    // touches the arena; everything else's arena_handle/
+                    // arena_data/ram_hit are filled in by whichever reader
+                    // thread claims this page-in.
+                    ++batch.n_pagein_;
+                    if (std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer)) {
+                        ++batch.n_pagein_reserved_;
                     } else {
-                        batch.state_->pageins.push_back({
-                            entry_index, slot_index, &page, fd_for(page.blob),
-                            slot.raw, reader_h2d_this_batch, false,
-                            cpu_direct_ok(slot.raw, page)
-                        });
-                        ++batch.n_pagein_;
-                        if (std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer)) {
-                            ++batch.n_pagein_reserved_;
-                        } else {
-                            ++batch.n_pagein_general_;
-                        }
-                        batch.bytes_read_ += page.size;
-                        if (test_hooks_ != nullptr &&
-                            test_hooks_->slot_reserved) {
-                            test_hooks_->slot_reserved(
-                                page.layer, page.expert, (int) slot_index);
-                        }
+                        ++batch.n_pagein_general_;
                     }
-                }
-            } catch (...) {
-                release_host_hits();
-                throw;
+                    batch.bytes_read_ += page.size;
+                    if (test_hooks_ != nullptr &&
+                        test_hooks_->slot_reserved) {
+                        test_hooks_->slot_reserved(
+                            page.layer, page.expert, (int) slot_index);
+                    }
+                    batch.state_->pageins.push_back(pi);
             }
             g_read_path_stats.record_cpu_on_arrival_fallback(
                 batch.n_cpu_on_arrival_fallback_);
-            batch.host_bytes_ = host_victim_enabled_ ? host_tier_->used_bytes() : 0;
+            // Reported bytes resident in the shared host arena right now --
+            // no separate "host tier used" accounting exists once every read
+            // lands here (not just victims/predictions).
+            batch.host_bytes_ = (uint64_t) arena_.resident_bytes();
 
             if (batch.state_->pageins.empty()) {
                 batch.completed_ = true;
@@ -6604,8 +6165,13 @@ public:
                 auto & st = *batch.state_;
                 st.page_shared.reserve(st.pageins.size());
                 for (size_t pi = 0; pi < st.pageins.size(); ++pi) {
-                    const auto plan =
-                        stripe_plan(st.pageins[pi].page->size, st.pageins.size());
+                    // A RAM hit has no bytes to stripe -- it is a miss without
+                    // the pread, so it is exactly ONE work item regardless of
+                    // how the blob would have been split.
+                    const auto plan = st.pageins[pi].ram_hit
+                        ? std::vector<std::pair<size_t, size_t>>{
+                              { (size_t) 0, (size_t) st.pageins[pi].page->size } }
+                        : stripe_plan(st.pageins[pi].page->size, st.pageins.size());
                     auto ps = std::make_unique<PageShared>();
                     ps->remaining.store(plan.size(), std::memory_order_relaxed);
                     st.page_shared.push_back(std::move(ps));
@@ -6624,14 +6190,14 @@ public:
             const size_t requested_workers = read_inflight_ != 0
                 ? read_inflight_
                 : (stripe_parallel_ || read_chunk_bytes_ != 0 ? read_workers_from_env()
-                                                               : staging_.buffer_count());
+                                                               : (size_t) resources_.staging_buffers);
             const size_t worker_count = !batch.state_->stripe_jobs.empty()
                 ? std::min<size_t>(batch.state_->stripe_jobs.size(),
                                    std::min<size_t>(requested_workers,
-                                                    (size_t) staging_.buffer_count()))
+                                                    (size_t) resources_.staging_buffers))
                 : std::min<size_t>(
                       batch.state_->pageins.size(),
-                      std::min<size_t>(requested_workers, (size_t) staging_.buffer_count()));
+                      std::min<size_t>(requested_workers, (size_t) resources_.staging_buffers));
             batch.workers_.reserve(worker_count);
             for (size_t i = 0; i < worker_count; ++i) {
                 batch.workers_.emplace_back(
@@ -6824,9 +6390,41 @@ public:
         return demand_reads_pending_.load(std::memory_order_relaxed) > 0;
     }
 
-    // Is there anywhere for a predicted page to land? Without the host tier the
-    // answer is no and the caller must keep it on the VRAM path.
-    bool host_landing_available() const { return host_victim_enabled_; }
+    // Deferred async-copy holds (Batch::ArenaHold): host-synchronize the
+    // mark_in_flight() event recorded for each entry's data pointer (the
+    // copy issued from it has then fully read the entry), then release the
+    // arena borrow. This is the StagingPool::borrow() reuse fence moved from
+    // "next borrower of the same buffer" to "release of this hold". Dispatch
+    // thread only, like mark_in_flight().
+    void flush_arena_holds(Batch & batch) {
+        for (const Batch::ArenaHold & hold : batch.arena_holds_) {
+            ggml_backend_event_t ev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(copy_event_mutex_);
+                auto it = copy_flight_events_.find(hold.data);
+                if (it != copy_flight_events_.end()) {
+                    ev = it->second;
+                }
+            }
+            if (ev != nullptr) {
+                ggml_backend_event_synchronize(ev);
+            }
+            arena_.release(hold.cache_id, hold.handle);
+        }
+        batch.arena_holds_.clear();
+    }
+
+    // Deferred holds may pin at most half the in-flight read entries
+    // before drain_one_read flushes them -- the other half stays available
+    // to this batch's own reader threads.
+    size_t arena_hold_flush_threshold() const {
+        return std::max<size_t>(1, (size_t) resources_.staging_buffers / 2);
+    }
+
+    // Is there anywhere for a predicted page to land? With no retention cap
+    // (host_tier_bytes == 0) a speculative landing would be trimmed the
+    // instant it finished, so the caller must keep it on the VRAM path.
+    bool host_landing_available() const { return arena_.tier_bytes() > 0; }
 
     // Demand-serving gate for preemptible landings. Cheap enough to set
     // unconditionally; only consulted when WP_EXPERT_SPEC_PREEMPT=1.
@@ -6843,12 +6441,11 @@ public:
     //
     // Runs on a reader thread, not the dispatch thread: there is no GPU work
     // here, so the Vulkan command-pool affinity that constrains every other read
-    // path does not apply. HostTier is mutex-guarded throughout.
+    // path does not apply. HostArena is mutex-guarded throughout.
     //
-    // Returns pages queued. Requires the host tier -- without it there is
-    // nowhere to land and the caller falls back to the VRAM path.
+    // Returns pages queued.
     size_t spec_host_submit(const std::vector<const ExpertPage *> & pages) {
-        if (!host_victim_enabled_ || pages.empty()) {
+        if (pages.empty()) {
             return 0;
         }
         // Free any landing threads that finished since the last check. Capacity
@@ -6869,7 +6466,7 @@ public:
             if (page == nullptr || page->cache_id < 0) { ++host_skip_bad_;  continue; }
             if (page->is_resident)                     { ++host_skip_pin_;  continue; }
             if (find_slot(*page) != slots_.size())     { ++host_skip_vram_; continue; }
-            if (host_tier_->contains(page->cache_id))   { ++host_skip_tier_; continue; }
+            if (arena_.is_resident(page->cache_id))      { ++host_skip_tier_; continue; }
             try {
                 cold.emplace_back(page, fd_for(page->blob));
             } catch (const std::exception &) {
@@ -6890,17 +6487,24 @@ public:
         auto finished = std::make_shared<std::atomic<bool>>(false);
         std::thread landing_thread([this, cold, finished]() {
             for (const auto & [page, fd] : cold) {
+                // Reserve a speculative arena entry for this landing. A
+                // refusal (inflight cap, or nothing evictable) just skips
+                // this page -- the same "advisory, never fails the worker"
+                // contract as every other failure on this path. Declared
+                // outside the try below so the catch can finish_read(false)
+                // on a read failure and free the Reading entry back to Free.
+                void * data = nullptr;
+                wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
+                if (!arena_.begin_read(page->cache_id, /*speculative=*/true, &data, &handle)) {
+                    host_pending_.fetch_sub(1, std::memory_order_release);
+                    continue;
+                }
                 try {
                     if (spec_preempt_before_borrow_) {
                         while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
                             std::this_thread::sleep_for(std::chrono::microseconds(200));
                         }
                     }
-                    // conn_index -1 ("none"): a host-landing thread runs off
-                    // the idle pump, with no connection transaction of its
-                    // own -- see the idle-pump note on the StagingPool quota
-                    // comment. Draws from the global pool, uncapped.
-                    StagingPool::Lease lease = staging_.borrow(-1);
                     // Fire the same hooks as every other read path. A host
                     // landing IS a read -- instrumentation that cannot see it
                     // would under-report exactly the bytes this feature spends.
@@ -6958,25 +6562,24 @@ public:
                             }
                             const size_t n =
                                 std::min(spec_subread_, (size_t) page->size - off);
-                            read_page_range(*page, fd, (char *) lease.get() + off, off, n);
+                            read_page_range(*page, fd, (char *) data + off, off, n);
                             off += n;
                         }
                     } else {
-                        read_page_range(*page, fd, (char *) lease.get(),
+                        read_page_range(*page, fd, (char *) data,
                                         0, (size_t) page->size);
                     }
                     if (test_hooks_ != nullptr && test_hooks_->read_finished) {
                         test_hooks_->read_finished(page->layer, page->expert);
                     }
-                    if (host_tier_->store(page->cache_id, lease.get(),
-                                         (size_t) page->size, /*speculative=*/true)) {
-                        host_landed_.fetch_add(1, std::memory_order_relaxed);
-                        host_bytes_.fetch_add(page->size, std::memory_order_relaxed);
-                    }
+                    arena_.finish_read(page->cache_id, handle, /*ok=*/true);
+                    host_landed_.fetch_add(1, std::memory_order_relaxed);
+                    host_bytes_.fetch_add(page->size, std::memory_order_relaxed);
                 } catch (const std::exception &) {
                     // Advisory, exactly like the VRAM speculative path: a failed
                     // guess must not fail the worker. The same error surfaces on
                     // the demand path, which is where it belongs.
+                    arena_.finish_read(page->cache_id, handle, /*ok=*/false);
                     host_errors_.fetch_add(1, std::memory_order_relaxed);
                 }
                 // Per-page, not per-batch: with multiple concurrent landing
@@ -7028,8 +6631,8 @@ public:
     uint64_t host_landed() const { return host_landed_.load(std::memory_order_relaxed); }
     uint64_t host_spec_bytes() const { return host_bytes_.load(std::memory_order_relaxed); }
     uint64_t host_spec_errors() const { return host_errors_.load(std::memory_order_relaxed); }
-    uint64_t host_spec_promotions() const { return host_tier_->speculative_promotions(); }
-    uint64_t host_spec_wasted() const { return host_tier_->speculative_evicted_unused(); }
+    uint64_t host_spec_promotions() const { return arena_.spec_promotions(); }
+    uint64_t host_spec_wasted() const { return arena_.spec_evicted_unused(); }
     uint64_t host_skip_bad()   const { return host_skip_bad_; }
     uint64_t host_skip_pin()   const { return host_skip_pin_; }
     uint64_t host_skip_vram()  const { return host_skip_vram_; }
@@ -7153,6 +6756,11 @@ private:
         } catch (const std::exception &) {
             ++spec_errors_;
         }
+        // Speculative batches never take the async/copy-stream path
+        // (drain_one_read gates both on !batch.state_->speculative), so this
+        // is normally a no-op; kept so a retired spec batch can never carry
+        // a deferred hold into spec_batches_ erasure.
+        flush_arena_holds(batch);
         spec_pageins_ += n_read;
         release_pins(batch);
         spec_batches_.erase(spec_batches_.begin() + (ptrdiff_t) i);
@@ -7248,18 +6856,27 @@ public:
         return resources_;
     }
 
-    // "pinned" or "pageable" -- whichever path the staging pool actually
-    // used, not whichever was requested.
+    // Which allocator backed the shared host arena -- "pinned" (CUDA/ROCm
+    // host buffer type, or Vulkan wp_host_alloc) or "pageable"
+    // (posix_memalign fallback). Set once, from the Worker banner.
     const char * staging_kind() const {
-        return staging_.pinned() ? "pinned" : "pageable";
+        return arena_kind_.c_str();
+    }
+
+    // The arena is bootstrapped by Worker AFTER every DeviceWorker (and
+    // therefore every pool_) is constructed -- see the Worker ctor's arena
+    // bootstrap block -- so this pool cannot know its kind at construction
+    // time. Worker calls this once, right after, for every device.
+    void set_arena_kind(const std::string & kind) {
+        arena_kind_ = kind;
     }
 
     size_t read_inflight() const {
         const size_t requested = read_inflight_ != 0
             ? read_inflight_
             : (stripe_parallel_ || read_chunk_bytes_ != 0
-                   ? read_workers_from_env() : staging_.buffer_count());
-        return std::min<size_t>(requested, (size_t) staging_.buffer_count());
+                   ? read_workers_from_env() : (size_t) resources_.staging_buffers);
+        return std::min<size_t>(requested, (size_t) resources_.staging_buffers);
     }
     size_t read_chunk_bytes() const { return read_chunk_bytes_; }
     bool read_direct() const { return read_direct_; }
@@ -7267,24 +6884,11 @@ public:
         return g_read_direct_fallback.load(std::memory_order_relaxed);
     }
 
-    // Delegates to StagingPool::set_multi_conn -- see that method and the
-    // StagingPool class comment (2026-08-25 deadlock fix) for the quota
-    // formula and why this must run before any connection thread starts.
-    void set_staging_multi_conn(int n) {
-        staging_.set_multi_conn(n);
-    }
-
-    bool read_device_page(void * dst_host, const void * src_device, size_t n,
-                          int page_idx) const {
-        (void) src_device;
-        for (const Slot & slot : slots_) {
-            if (slot.valid && slot.raw != nullptr && slot.page != nullptr &&
-                    slot.cache_id == page_idx && n == slot.page->size) {
-                tensor_get_page(slot.raw, *slot.page, dst_host);
-                return true;
-            }
-        }
-        return false;
+    // No-op: the arena has no bounded buffer pool a second connection could
+    // starve (see the HostArena migration note on BatchState::conn_index),
+    // so there is no per-connection quota left to configure. Kept as a
+    // no-op so callers (Worker::set_staging_multi_conn) need no changes.
+    void set_staging_multi_conn(int) {
     }
 
 private:
@@ -7405,23 +7009,10 @@ private:
     }
 
     size_t cpu_on_arrival_limit() {
-        return std::min(cpu_on_arrival_cap_, staging_.cpu_lease_cap());
-    }
-
-    bool demote_slot(const Slot & slot) {
-        if (slot.pinned || !host_victim_enabled_ || !slot.valid ||
-            slot.cache_id < 0 || slot.size == 0) {
-            return false;
-        }
-        if (fill_host_on_read_ && !demote_d2h_ && host_tier_->contains(slot.cache_id)) {
-            return true;
-        }
-        const auto previous = g_host_reader_pool;
-        g_host_reader_pool = this;
-        const bool stored = slot.page != nullptr && host_tier_->store_from_device(
-            slot.cache_id, slot.raw->data, (size_t) slot.size);
-        g_host_reader_pool = previous;
-        return stored;
+        // No staging-buffer cross-check any more: the arena has no small
+        // bounded pool a batch of cpu_on_arrival holds could exhaust out
+        // from under everyone else. WP_CPU_ON_ARRIVAL_MAX is the only cap.
+        return cpu_on_arrival_cap_;
     }
 
     bool hint_shielded(const Slot & slot) const {
@@ -7558,6 +7149,39 @@ private:
         return enabled;
     }
 
+    // Reserve this page-in's arena entry. Called by the ONE reader thread
+    // that owns it (read_worker), or by whichever stripe-parallel thread
+    // reaches this page's PageShared reservation gate first
+    // (stripe_read_worker) -- never from ensure_batch/the dispatch thread.
+    // See the ensure_batch comment this replaces: reserving on the reader
+    // thread, not up front, is what lets one batch hold more pages than
+    // read_inflight_max without deadlocking, because begin_read_wait() below
+    // is woken by ANY release()/finish_read() in the process, including
+    // this same batch's OTHER reader threads finishing and releasing their
+    // own page-ins as this one waits. Mutates `pagein` in place; safe
+    // without synchronization because exactly one thread ever reserves for
+    // a given page-in (stripe-parallel coordinates that via PageShared).
+    // Returns false only if the arena still refuses after a bounded wait.
+    bool reserve_arena_for_pagein(PageIn & pagein) {
+        if (pagein.cpu_direct) {
+            return true;   // never touches the arena
+        }
+        const void * src = nullptr;
+        if (arena_.borrow(pagein.page->cache_id, &src, &pagein.arena_handle)) {
+            pagein.ram_hit    = true;
+            pagein.arena_data = const_cast<void *>(src);
+            return true;
+        }
+        pagein.ram_hit = false;
+        void * data = nullptr;
+        if (!arena_.begin_read_wait(pagein.page->cache_id, /*speculative=*/false,
+                                    &data, &pagein.arena_handle, /*timeout_ms=*/60000)) {
+            return false;
+        }
+        pagein.arena_data = data;
+        return true;
+    }
+
     void reader_h2d_upload(const PageIn & pagein, bool measure, ReadResult & result) {
         const std::chrono::steady_clock::time_point t0 =
             measure ? std::chrono::steady_clock::now()
@@ -7576,7 +7200,7 @@ private:
             // guarantee than the same-stream kernel ordering MAD-114 is
             // actually about).
             tensor_set_page_range_reader(
-                backend_, pagein.raw, *pagein.page, result.staging->get(),
+                backend_, pagein.raw, *pagein.page, pagein.arena_data,
                 0, (size_t) pagein.page->size);
         } catch (...) {
             result.error = std::current_exception();
@@ -7593,10 +7217,10 @@ private:
             const size_t sample    = std::min<size_t>(4096, page_size);
             uint64_t mismatches = 0;
             tensor_verify_page_range(
-                pagein.raw, *pagein.page, result.staging->get(), 0, sample, mismatches);
+                pagein.raw, *pagein.page, pagein.arena_data, 0, sample, mismatches);
             if (page_size > sample) {
                 tensor_verify_page_range(
-                    pagein.raw, *pagein.page, result.staging->get(),
+                    pagein.raw, *pagein.page, pagein.arena_data,
                     page_size - sample, sample, mismatches);
             }
             if (mismatches > 0) {
@@ -7613,7 +7237,7 @@ private:
                 return;
             }
             const StripeJob & job    = state->stripe_jobs[j];
-            const PageIn &    pagein = state->pageins[job.pagein_indexb];
+            PageIn &          pagein = state->pageins[job.pagein_indexb];
             PageShared &      shared = *state->page_shared[job.pagein_indexb];
             auto result = std::make_unique<ReadResult>();
             result->pagein_indexb = job.pagein_indexb;
@@ -7627,6 +7251,9 @@ private:
                 demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
             }
             try {
+                if (!ensure_arena_reserved(shared, pagein)) {
+                    throw std::runtime_error("host arena exhausted");
+                }
                 const bool page_direct = pagein.cpu_direct &&
                     pagein.raw != nullptr && pagein.raw->data != nullptr;
                 void * dst = nullptr;
@@ -7640,30 +7267,21 @@ private:
                     }
                 }
                 if (dst == nullptr) {
-                    // The lease pointer must be COPIED UNDER THE MUTEX: another
-                    // thread may be assigning shared.lease inside its own critical
-                    // section, and a concurrent unguarded read of a shared_ptr is a
-                    // data race (this exact line, read outside the lock, hung the
-                    // 1070 worker on its first stripe-parallel page-in batch,
-                    // 2026-08-07 sp1).
-                    std::shared_ptr<StagingPool::Lease> lease_local;
-                    {
-                        std::lock_guard<std::mutex> lock(shared.lease_mutex);
-                        if (!shared.lease) {
-                            shared.lease = std::make_shared<StagingPool::Lease>(
-                                staging_.borrow(state->conn_index));
-                            if (test_hooks_ != nullptr && test_hooks_->staging_borrowed) {
-                                test_hooks_->staging_borrowed();
-                            }
-                            if (test_hooks_ != nullptr && test_hooks_->read_started) {
-                                test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
-                            }
-                        }
-                        lease_local = shared.lease;
+                    // No lease/lock needed: PageIn::arena_data was resolved
+                    // once, at plan time, in ensure_batch -- every stripe of
+                    // this page already knows its destination.
+                    dst = (char *) pagein.arena_data + job.offset;
+                    if (job.offset == 0 && !pagein.ram_hit &&
+                            test_hooks_ != nullptr && test_hooks_->staging_borrowed) {
+                        test_hooks_->staging_borrowed();
                     }
-                    result->staging = std::move(lease_local);
-                    dst = (char *) result->staging->get() + job.offset;
-                } else if (job.offset == 0 && test_hooks_ != nullptr &&
+                }
+                // Not for a RAM hit: no blob read is about to happen, so
+                // read_started/read_finished (below) must not fire -- a test
+                // counting reads via these hooks must see a RAM hit as
+                // exactly zero reads, matching the pre-arena host-hit path
+                // (which never touched read_worker/stripe_read_worker at all).
+                if (job.offset == 0 && !pagein.ram_hit && test_hooks_ != nullptr &&
                         test_hooks_->read_started) {
                     test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
                 }
@@ -7671,10 +7289,15 @@ private:
                     result->read_started = std::chrono::steady_clock::now();
                     result->read_timed   = true;
                 }
-                read_page_range(*pagein.page, pagein.fd,
-                                dst,
-                                job.offset, job.len,
-                                state->measure ? state.get() : nullptr);
+                // A RAM hit is a miss without the pread: the arena already
+                // has this page's bytes (ensure_batch's borrow()), so there
+                // is nothing to read -- only the upload below still runs.
+                if (!pagein.ram_hit) {
+                    read_page_range(*pagein.page, pagein.fd,
+                                    dst,
+                                    job.offset, job.len,
+                                    state->measure ? state.get() : nullptr);
+                }
                 if (state->measure && result->read_timed) {
                     result->read_finished = std::chrono::steady_clock::now();
                 }
@@ -7688,19 +7311,21 @@ private:
             const bool is_last =
                 shared.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
             result->last = is_last;
+            result->src  = pagein.arena_data;
             if (is_last) {
-                // *** RELEASE THE PAGE'S LEASE PIN. THIS IS THE sp1/sp1r DEADLOCK
-                // FIX. *** PageShared holds a shared_ptr copy of the lease; left
-                // in place it pins the staging buffer until the BATCH is
-                // destroyed, and a prefill batch (~31 page-ins) pins more pages
-                // than the pool has buffers (16) -- the readers exhaust the pool
-                // and block in borrow() forever while the dispatch thread waits
-                // for results that can never be read. Resetting here leaves only
-                // the in-flight ReadResults holding the buffer, which is exactly
-                // the serial path's lifetime: the buffer recycles as soon as the
-                // page's stripes drain.
-                std::lock_guard<std::mutex> lock(shared.lease_mutex);
-                shared.lease.reset();
+                // Land (or discard) the arena entry exactly once, for the
+                // whole page, right here: a RAM hit's borrow() (in
+                // ensure_arena_reserved above) needs no finish_read; a miss
+                // keeps its entry BORROWED (not merely Resident) so nothing
+                // can evict it out from under an in-flight H2D -- released
+                // below (reader_h2d) or by drain_one_read/
+                // ExpertSlotPool::flush_arena_holds() (RULING 1, amended).
+                if (!pagein.ram_hit) {
+                    const bool ok = result->error == nullptr &&
+                        !shared.failed.load(std::memory_order_acquire);
+                    arena_.finish_read(pagein.page->cache_id, pagein.arena_handle,
+                                       ok, /*keep_borrowed=*/true);
+                }
             }
             if (is_last) {
                 if (result->error == nullptr &&
@@ -7713,7 +7338,7 @@ private:
                         result->error = std::current_exception();
                     }
                 }
-                if (result->error == nullptr && test_hooks_ != nullptr &&
+                if (!pagein.ram_hit && result->error == nullptr && test_hooks_ != nullptr &&
                     test_hooks_->read_finished) {
                     try {
                         test_hooks_->read_finished(pagein.page->layer, pagein.page->expert);
@@ -7722,7 +7347,7 @@ private:
                     }
                 }
                 // WP_READER_H2D: every stripe of this page landed in
-                // result->staging (the acq_rel fetch_sub above is the
+                // pagein.arena_data (the acq_rel fetch_sub above is the
                 // synchronizes-with edge that makes every sibling thread's
                 // writes visible here -- see PageShared's remaining/failed
                 // comment), so the whole page can be uploaded now, off the
@@ -7732,6 +7357,20 @@ private:
                 // no-op branch below instead of drain_one_read's copy.
                 if (result->error == nullptr && pagein.reader_h2d) {
                     reader_h2d_upload(pagein, state->measure, *result);
+                }
+                // RULING 1 (AMENDED): tensor_set_page_range_reader is
+                // host-synchronized, so by the time reader_h2d_upload
+                // returns (success or failure -- the NVMe bytes are good
+                // either way, only the upload may have failed) this entry's
+                // hold has done its job. Release it HERE, on the reader
+                // thread, rather than waiting for the whole batch to
+                // complete: a batch bigger than read_inflight_max (a
+                // hundreds-of-pages prefill against a 16-entry cap) would
+                // otherwise deadlock, since begin_read() for page N+1 can
+                // never succeed while every earlier page in this same batch
+                // still holds its entry.
+                if (pagein.reader_h2d) {
+                    arena_.release(pagein.page->cache_id, pagein.arena_handle);
                 }
             } else if (result->error == nullptr && pagein.reader_h2d) {
                 // Not the last stripe: this stripe's bytes are not yet a
@@ -7775,7 +7414,7 @@ private:
             if (pagein_indexb >= state->pageins.size()) {
                 return;
             }
-            const PageIn & pagein = state->pageins[pagein_indexb];
+            PageIn & pagein = state->pageins[pagein_indexb];
             // Captured per page: the speculative flag is set on the batch just
             // after submit, so the first page of a spec batch may briefly count
             // as demand. Sub-millisecond and harmless; the flag never flips the
@@ -7784,33 +7423,50 @@ private:
             if (count_demand) {
                 demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
             }
-            bool read_started = false;
-            std::shared_ptr<StagingPool::Lease> staging;
-            std::exception_ptr fatal;
+            if (!reserve_arena_for_pagein(pagein)) {
+                // Bounded wait exhausted: the arena is genuinely starved
+                // (every entry Reading/borrowed/pinned for a full 60s with
+                // no progress anywhere in the process). Fail this page-in
+                // the same way a fatal read error does -- one result,
+                // last=true, error set -- so complete_batch's rethrow
+                // surfaces it instead of hanging.
+                auto result = std::make_unique<ReadResult>();
+                result->pagein_indexb = pagein_indexb;
+                result->last = true;
+                try {
+                    throw std::runtime_error("host arena exhausted");
+                } catch (...) {
+                    result->error = std::current_exception();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->ready.push_back(std::move(result));
+                }
+                state->cv.notify_one();
+                if (count_demand) {
+                    demand_reads_pending_.fetch_sub(1, std::memory_order_relaxed);
+                }
+                continue;
+            }
             const bool page_direct = pagein.cpu_direct &&
                 pagein.raw != nullptr && pagein.raw->data != nullptr;
-            try {
-                if (!page_direct) {
-                    staging = std::make_shared<StagingPool::Lease>(
-                        staging_.borrow(state->conn_index));
-                    if (test_hooks_ != nullptr &&
-                        test_hooks_->staging_borrowed) {
-                        test_hooks_->staging_borrowed();
-                    }
-                }
-                read_started = true;
-                if (test_hooks_ != nullptr &&
-                    test_hooks_->read_started) {
-                    test_hooks_->read_started(
-                        pagein.page->layer, pagein.page->expert);
-                }
-            } catch (...) {
-                fatal = std::current_exception();
+            // Not for a RAM hit -- see the matching comment in
+            // stripe_read_worker: no blob read is about to happen.
+            if (!pagein.ram_hit && test_hooks_ != nullptr && test_hooks_->staging_borrowed && !page_direct) {
+                test_hooks_->staging_borrowed();
+            }
+            if (!pagein.ram_hit && test_hooks_ != nullptr && test_hooks_->read_started) {
+                test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
             }
 
-            const auto plan = fatal ? std::vector<std::pair<size_t, size_t>>{{0, 0}}
-                                    : stripe_plan(pagein.page->size,
-                                                  state->pageins.size());
+            // A RAM hit is a miss without the pread: the arena already has
+            // this page (ensure_batch's borrow()), so it is exactly ONE
+            // work item regardless of how the blob would have been striped.
+            // PageIn::arena_data is resolved once, at plan time, so there is
+            // no lease to acquire here at all.
+            const auto plan = pagein.ram_hit
+                ? std::vector<std::pair<size_t, size_t>>{ { (size_t) 0, (size_t) pagein.page->size } }
+                : stripe_plan(pagein.page->size, state->pageins.size());
             // Publish each stripe as soon as it lands so the dispatch thread can
             // upload it while the next one is still being read. The LAST stripe
             // is what flips entry.ready and advances received_, so a page is
@@ -7818,48 +7474,42 @@ private:
             for (size_t s = 0; s < plan.size(); ++s) {
                 auto result = std::make_unique<ReadResult>();
                 result->pagein_indexb = pagein_indexb;
-                result->staging       = staging;
+                result->src           = pagein.arena_data;
                 result->offset        = plan[s].first;
                 result->len           = plan[s].second;
                 result->last          = (s + 1 == plan.size());
-                result->error         = fatal;
-                if (!fatal) {
-                    try {
-                        if (state->measure) {
-                            result->read_started = std::chrono::steady_clock::now();
-                            result->read_timed = true;
+                try {
+                    if (state->measure) {
+                        result->read_started = std::chrono::steady_clock::now();
+                        result->read_timed = true;
+                    }
+                    void * dst = nullptr;
+                    if (page_direct) {
+                        dst = (char *) pagein.raw->data + result->offset;
+                        if (cpu_direct_range_ok(
+                                dst,
+                                pagein.page->offset + (uint64_t) result->offset,
+                                result->len)) {
+                            result->cpu_direct = true;
+                        } else {
+                            dst = nullptr;
                         }
-                        void * dst = nullptr;
-                        if (page_direct) {
-                            dst = (char *) pagein.raw->data + result->offset;
-                            if (cpu_direct_range_ok(
-                                    dst,
-                                    pagein.page->offset + (uint64_t) result->offset,
-                                    result->len)) {
-                                result->cpu_direct = true;
-                            } else {
-                                dst = nullptr;
-                            }
-                        }
-                        if (dst == nullptr) {
-                            if (!staging) {
-                                staging = std::make_shared<StagingPool::Lease>(
-                                    staging_.borrow(state->conn_index));
-                                result->staging = staging;
-                            }
-                            dst = (char *) staging->get() + result->offset;
-                        }
+                    }
+                    if (dst == nullptr) {
+                        dst = (char *) pagein.arena_data + result->offset;
+                    }
+                    if (!pagein.ram_hit) {
                         read_page_range(
                             *pagein.page, pagein.fd,
                             dst,
                             result->offset, result->len,
                             state->measure ? state.get() : nullptr);
-                    } catch (...) {
-                        result->error = std::current_exception();
                     }
-                    if (state->measure && result->read_timed) {
-                        result->read_finished = std::chrono::steady_clock::now();
-                    }
+                } catch (...) {
+                    result->error = std::current_exception();
+                }
+                if (state->measure && result->read_timed) {
+                    result->read_finished = std::chrono::steady_clock::now();
                 }
                 // A failed stripe ends the page: mark it last so the drain still
                 // accounts for it, and stop reading the rest.
@@ -7867,7 +7517,7 @@ private:
                 if (failed) {
                     result->last = true;
                 }
-                if (result->last && read_started && test_hooks_ != nullptr &&
+                if (result->last && !pagein.ram_hit && test_hooks_ != nullptr &&
                     test_hooks_->read_finished) {
                     try {
                         test_hooks_->read_finished(
@@ -7878,12 +7528,20 @@ private:
                         }
                     }
                 }
+                // Land (or discard) the arena entry exactly once, for the
+                // whole page, on the LAST stripe -- see RULING 1 and the
+                // matching comment in stripe_read_worker. A RAM hit's
+                // borrow() already ran in ensure_batch; nothing to finish.
+                if (result->last && !pagein.ram_hit) {
+                    arena_.finish_read(pagein.page->cache_id, pagein.arena_handle,
+                                       result->error == nullptr, /*keep_borrowed=*/true);
+                }
                 // WP_READER_H2D: the serial reader reads every stripe of a
                 // page in program order on this one thread, so by the time
                 // the LAST stripe (or a failed stripe, which forces
                 // result->last above) is reached, every earlier stripe's
-                // bytes are already in `staging` -- same-thread program
-                // order needs no extra synchronization, unlike the
+                // bytes are already in the arena entry -- same-thread
+                // program order needs no extra synchronization, unlike the
                 // cross-thread stripe_parallel_ case. pagein.reader_h2d was
                 // decided once for the whole batch at plan time (see
                 // PageIn::reader_h2d).
@@ -7896,6 +7554,14 @@ private:
                     // treats this as a pure no-op instead of copying a
                     // partial stripe.
                     result->uploaded = true;
+                }
+                // RULING 1 (AMENDED): release right after this page's H2D is
+                // known complete (or definitively abandoned), on the reader
+                // thread -- see the matching comment in stripe_read_worker
+                // for why batch-end release deadlocks any batch larger than
+                // read_inflight_max.
+                if (result->last && pagein.reader_h2d) {
+                    arena_.release(pagein.page->cache_id, pagein.arena_handle);
                 }
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
@@ -8021,18 +7687,32 @@ private:
                         fprintf(spec_log_, "D %d %d\n", pagein.page->layer, pagein.page->expert);
                         fflush(spec_log_);
                     }
-                    if (batch.state_->admit_host_on_read &&
-                            result->staging && pagein.page->cache_id >= 0) {
-                        host_tier_->store(pagein.page->cache_id, result->staging->get(),
-                                          (size_t) pagein.page->size);
-                    }
                     Batch::Entry & entry = batch.entries_[pagein.entry_index];
-                    entry.cpu_staging = std::move(result->staging);
+                    // cpu_on_arrival reads straight out of the arena entry --
+                    // no VRAM slot, no upload. Its hold (reserved by
+                    // reserve_arena_for_pagein on the reader thread) outlives
+                    // this batch's own release point: released by
+                    // release_cpu_staging(), once compute_cpu_on_arrival is
+                    // actually done with the pointer, never by the generic
+                    // ExpertSlotPool::flush_arena_holds().
+                    entry.cpu_staging_data     = pagein.arena_data;
+                    entry.cpu_staging_cache_id = pagein.page->cache_id;
+                    entry.cpu_staging_handle   = pagein.arena_handle;
                     entry.ready = true;
+                    if (pagein.ram_hit) {
+                        ++batch.n_host_hit_;
+                    }
                 }
             } else {
                 Slot & slot = slots_[pagein.slot_index];
                 bool copy_stream_async = false;
+                // Set true wherever the H2D below is issued asynchronously
+                // (copy-stream or tensor_set_async -- anywhere mark_in_flight
+                // is called): the arena hold must then be deferred to
+                // ExpertSlotPool::flush_arena_holds() (RULING 1, amended) instead of
+                // released immediately, because the copy may still be
+                // reading from it after this function returns.
+                bool result_async = false;
                 if (result->uploaded) {
                     // WP_READER_H2D already performed this page's H2D on the
                     // reader thread (the last-stripe branch in
@@ -8064,7 +7744,7 @@ private:
                 // immediately after the API returns. WP_EXPERT_COPY_STREAM_EVENTS
                 // delays slot.valid until E_page completes (see harvest).
                 const bool wanted_copy_stream =
-                    !batch.state_->speculative && staging_.copy_stream_h2d();
+                    !batch.state_->speculative && copy_stream_h2d();
                 bool used_copy_stream = false;
                 bool used_fallback = false;
                 if (page_needs_chunked_h2d(*pagein.page)) {
@@ -8077,14 +7757,14 @@ private:
                         *pagein.page, result->offset, result->len,
                         [&](size_t source_offset, size_t device_offset, size_t n) {
                         const char * source =
-                            (const char *) result->staging->get() + result->offset + source_offset;
+                            (const char *) result->src + result->offset + source_offset;
                         if (wanted_copy_stream &&
                             ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
                             ggml_backend_cuda_wp_copy_tensor_async(
                                 backend_, slot.raw, source, device_offset, n)) {
                             used_copy_stream = true;
                             async_copy = true;
-                        } else if (!batch.state_->speculative && staging_.async_h2d()) {
+                        } else if (!batch.state_->speculative && async_h2d()) {
                             used_fallback = wanted_copy_stream;
                             ggml_backend_tensor_set_async(
                                 backend_, slot.raw, source, device_offset, n);
@@ -8095,26 +7775,29 @@ private:
                         }
                     });
                     if (async_copy) {
-                        staging_.mark_in_flight(result->staging->get());
+                        mark_in_flight(const_cast<void *>(result->src));
                     }
+                    result_async = async_copy;
                 } else if (wanted_copy_stream &&
                            ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
                            ggml_backend_cuda_wp_copy_tensor_async(
-                               backend_, slot.raw, (const char *) result->staging->get() + result->offset,
+                               backend_, slot.raw, (const char *) result->src + result->offset,
                                result->offset, result->len)) {
                     used_copy_stream = true;
-                    staging_.mark_in_flight(result->staging->get());
-                } else if (!batch.state_->speculative && staging_.async_h2d()) {
+                    mark_in_flight(const_cast<void *>(result->src));
+                    result_async = true;
+                } else if (!batch.state_->speculative && async_h2d()) {
                     used_fallback = wanted_copy_stream;
                     ggml_backend_tensor_set_async(
                         backend_,
-                        slot.raw, (const char *) result->staging->get() + result->offset,
+                        slot.raw, (const char *) result->src + result->offset,
                         result->offset, result->len);
-                    staging_.mark_in_flight(result->staging->get());
+                    mark_in_flight(const_cast<void *>(result->src));
+                    result_async = true;
                 } else {
                     used_fallback = wanted_copy_stream;
                     ggml_backend_tensor_set(
-                        slot.raw, (const char *) result->staging->get() + result->offset,
+                        slot.raw, (const char *) result->src + result->offset,
                         result->offset, result->len);
                 }
                 const uint64_t h2d_issue_ns = measure_h2d
@@ -8135,6 +7818,37 @@ private:
                     }
                 }
                 }
+                // RULING 1 (AMENDED), drain-copy path: a synchronous
+                // ggml_backend_tensor_set has already fully read result->src
+                // by the time it returns, so release the hold right here.
+                // An asynchronous copy (copy-stream or tensor_set_async) may
+                // still be reading it after this function returns -- defer
+                // to ExpertSlotPool::flush_arena_holds(), called once the batch's
+                // own wait_copy_event() has host-synced that copy (see
+                // complete_batch()). Neither applies to result->uploaded
+                // (already released on the reader thread) or cpu_direct
+                // (never touched the arena).
+                if (result->last && !result->uploaded && !result->cpu_direct) {
+                    if (result_async) {
+                        // Bounded: never let deferred holds pin more than
+                        // half the in-flight entries, or the reader threads
+                        // of THIS batch starve in begin_read_wait() exactly
+                        // like the up-front-reservation deadlock. The flush
+                        // host-syncs the in-flight copies first (the old
+                        // StagingPool::borrow() fence, moved to release time).
+                        if (batch.arena_holds_.size() >= arena_hold_flush_threshold()) {
+                            flush_arena_holds(batch);
+                        }
+                        batch.arena_holds_.push_back(
+                            { pagein.page->cache_id, pagein.arena_handle,
+                              const_cast<void *>(result->src) });
+                    } else {
+                        arena_.release(pagein.page->cache_id, pagein.arena_handle);
+                    }
+                }
+                if (result->last && pagein.ram_hit) {
+                    ++batch.n_host_hit_;
+                }
                 // Everything below publishes the page to the compute path and so
                 // must happen EXACTLY ONCE, on the final stripe -- otherwise a
                 // half-uploaded slot becomes visible, and the page-in log and LRU
@@ -8149,9 +7863,9 @@ private:
                         }
                     }
                     if (wp_worker_cuda_async_hash_trace_enabled(backend_) &&
-                            result->staging) {
+                            result->src != nullptr) {
                         slot.upload_hash = hash_page_upload(
-                            *pagein.page, result->staging->get());
+                            *pagein.page, result->src);
                         slot.upload_hash_valid = true;
                     }
                     // WP_PAGEIN_LOG=path: append "<layer> <expert>" for every page
@@ -8181,20 +7895,15 @@ private:
                         fprintf(spec_log_, "D %d %d\n", pagein.page->layer, pagein.page->expert);
                         fflush(spec_log_);
                     }
-                    // Land the full page (all stripes share one staging lease)
-                    // in the host tier so the next evict skips D2H. CPU memcpy
-                    // of 12.75 MiB; not a GPU sync.
-                    if (batch.state_->admit_host_on_read &&
-                        result->staging && pagein.page->cache_id >= 0) {
-                        host_tier_->store(pagein.page->cache_id,
-                                         result->staging->get(),
-                                         (size_t) pagein.page->size);
-                    }
+                    // No separate host-tier landing here: the page's bytes
+                    // are already sitting in the arena entry this page-in
+                    // read from (or hit), and they STAY there -- the arena
+                    // is the RAM copy, not a side effect of uploading it.
                     const bool delay_valid =
                         wp_copy_stream_events_enabled() && copy_stream_async;
                     if (delay_valid) {
-                        ggml_backend_event_t ev = staging_.new_copy_event();
-                        if (ev != nullptr && staging_.record_copy_event(ev)) {
+                        ggml_backend_event_t ev = new_copy_event();
+                        if (ev != nullptr && record_copy_event(ev)) {
                             Batch::PendingCopy pending;
                             pending.entry_index = pagein.entry_index;
                             pending.slot_index = pagein.slot_index;
@@ -8213,7 +7922,7 @@ private:
                                 batch, pagein.entry_index, pagein.slot_index,
                                 *pagein.page, slot.upload_hash, slot.upload_hash_valid);
                             if (batch.copy_event_ != nullptr) {
-                                staging_.record_copy_event(batch.copy_event_);
+                                record_copy_event(batch.copy_event_);
                             }
                         }
                     } else {
@@ -8266,7 +7975,7 @@ private:
         // copy_wait_events_ are the fence; skip a covering record that would
         // also wait later pages issued during this drain.
         if (!wp_copy_stream_events_enabled() && batch.copy_event_ != nullptr &&
-                !staging_.record_copy_event(batch.copy_event_)) {
+                !record_copy_event(batch.copy_event_)) {
             ggml_backend_event_free(batch.copy_event_);
             batch.copy_event_ = nullptr;
         }
@@ -8299,7 +8008,7 @@ private:
         batch.workers_.clear();
         batch.completed_ = true;
         if (!wp_copy_stream_events_enabled() &&
-                batch.copy_event_ != nullptr && !staging_.record_copy_event(batch.copy_event_)) {
+                batch.copy_event_ != nullptr && !record_copy_event(batch.copy_event_)) {
             ggml_backend_event_free(batch.copy_event_);
             batch.copy_event_ = nullptr;
         }
@@ -8329,6 +8038,18 @@ private:
                 worker.join();
             }
             batch.workers_.clear();
+            // A cancelled-before-it-ran reader thread never calls
+            // finish_read() for the miss page-ins it would have processed,
+            // which would otherwise leave those arena entries stuck in
+            // Reading forever (nothing ever evicts a Reading entry). Free
+            // them back explicitly. Safe no-op for anything a thread DID
+            // finish before cancellation landed: finish_read() only acts on
+            // an entry still in state Reading, by the exact same handle.
+            for (const PageIn & pagein : batch.state_->pageins) {
+                if (!pagein.ram_hit && pagein.arena_handle != wp::HostArena::kInvalidHandle) {
+                    arena_.finish_read(pagein.page->cache_id, pagein.arena_handle, false);
+                }
+            }
         }
     }
 
@@ -8352,6 +8073,11 @@ private:
             } catch (...) {
             }
         }
+        // Deferred async-copy holds (see Batch::ArenaHold): every batch
+        // ends here (Batch::~Batch), so this is the one release site that
+        // cannot be skipped by an error path. The flush host-syncs the copy
+        // events first, so it is safe whether or not compute ever ran.
+        flush_arena_holds(batch);
         release_pins(batch);
     }
 
@@ -9047,7 +8773,6 @@ private:
 
     ggml_backend_t             backend_ = nullptr;
     ResourcePlan               resources_;
-    StagingPool                staging_;
     const bool                 cpu_on_arrival_enabled_ = cpu_on_arrival_enabled_from_env();
     const size_t                cpu_on_arrival_cap_ = cpu_on_arrival_cap_from_env();
     size_t                     read_stripes_ = read_stripes_from_env();
@@ -9117,21 +8842,32 @@ private:
                 std::strstr(name, "ROCm") != nullptr);
     }();
     TestHooks *                test_hooks_ = nullptr;
-    std::unique_ptr<wp::HostTier> owned_host_tier_;
-    wp::HostTier *              host_tier_ = nullptr;
-    bool                       host_victim_enabled_ = false;
-    // WP_EXPERT_FILL_HOST_ON_READ=1 keeps decode reads in the host tier so a
-    // later eviction can skip the synchronous D2H. Default off for A/B.
-    const bool                 fill_host_on_read_ = [] {
-        const char * e = std::getenv("WP_EXPERT_FILL_HOST_ON_READ");
-        return e != nullptr && e[0] == '1';
-    }();
-    // WP_EXPERT_DEMOTE_D2H=1 forces the old synchronous D2H path, including
-    // when fill-on-read is enabled.
-    const bool                 demote_d2h_ = [] {
-        const char * e = std::getenv("WP_EXPERT_DEMOTE_D2H");
-        return e != nullptr && e[0] == '1';
-    }();
+    // Shared with every other pool/device on this Worker -- one HostArena
+    // process-wide, sized once from Options at Worker construction. Never
+    // null: single-device mode owns one exactly the same way multi-device
+    // does now (see the Worker ctor).
+    wp::HostArena &            arena_;
+    // Set once in the ctor body (needs backend_, which the init list has
+    // already run by then).
+    ggml_backend_dev_t         device_ = nullptr;
+    // Which allocator actually backed the arena ("pinned"/"pageable") --
+    // reported by staging_kind() for the HELLO banner. Set once, from
+    // Worker's arena banner.
+    std::string                arena_kind_;
+    // *** COPY-STREAM / ASYNC H2D STATE, FORMERLY STAGINGPOOL'S. ***
+    // Set once in the ctor body from backend probes; async_h2d_ can still
+    // self-disarm at runtime (see mark_in_flight()) exactly as StagingPool's
+    // did, so it stays non-const.
+    bool                       copy_stream_h2d_ = false;
+    bool                       async_h2d_ = false;
+    // Fences an async copy OUT of an arena entry so the entry cannot be
+    // reused (evicted, or re-begin_read()'d after a full release) while that
+    // copy is still in flight on the GPU. Keyed by the entry's data pointer,
+    // exactly like StagingPool's events_ was keyed by staging buffer
+    // pointer -- an arena entry's address is just as stable for as long as
+    // it stays Resident.
+    std::mutex                                       copy_event_mutex_;
+    std::unordered_map<void *, ggml_backend_event_t>  copy_flight_events_;
     // *** TWO LRU BANDS, NOT ONE COUNTER. ***
     // Demand ticks start at kDemandTickBase and prefetch ticks at 0, so EVERY
     // prefetched page is strictly older than EVERY demand-touched page and is
@@ -9287,7 +9023,7 @@ private:
         if (requested < 1) {
             requested = 1;
         }
-        const size_t buffers    = (size_t) staging_.buffer_count();
+        const size_t buffers    = (size_t) resources_.staging_buffers;
         const size_t max_allowed = std::max<size_t>(1, buffers / 2);
         return std::min<size_t>((size_t) requested, max_allowed);
     }();
@@ -9624,9 +9360,6 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     n_pagein_general_(other.n_pagein_general_),
     bytes_read_(other.bytes_read_),
     n_host_hit_(other.n_host_hit_),
-    n_host_demote_(other.n_host_demote_),
-    ns_host_get_(other.ns_host_get_),
-    ns_demote_(other.ns_demote_),
     ns_ensure_post_(other.ns_ensure_post_),
     host_bytes_(other.host_bytes_),
     ns_h2d_(other.ns_h2d_),
@@ -9647,6 +9380,7 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     copy_event_(other.copy_event_),
     pending_copies_(std::move(other.pending_copies_)),
     copy_wait_events_(std::move(other.copy_wait_events_)),
+    arena_holds_(std::move(other.arena_holds_)),
     // Drain state travels with the batch. It was omitted here originally --
     // harmless while every move ran before the first drain (NRVO covered the
     // return paths), but spec_pagein_submit now moves a live batch into a
@@ -9669,6 +9403,18 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
 ExpertSlotPool::Batch::~Batch() {
     if (owner_ != nullptr) {
         owner_->abandon_batch(*this);
+        // Leak-prevention net for cpu_on_arrival: its arena hold is
+        // deliberately NOT in arena_holds_ (see release_cpu_staging()), so
+        // abandon_batch's flush_arena_holds() never touches it. Anything
+        // still outstanding here means release_cpu_staging() was never
+        // called (an error path that skipped compute_cpu_on_arrival) --
+        // release it now rather than leak the entry forever.
+        for (Entry & entry : entries_) {
+            if (entry.cpu_staging_handle != wp::HostArena::kInvalidHandle) {
+                owner_->arena_.release(entry.cpu_staging_cache_id, entry.cpu_staging_handle);
+                entry.cpu_staging_handle = wp::HostArena::kInvalidHandle;
+            }
+        }
         owner_ = nullptr;
     }
     for (Batch::PendingCopy & pending : pending_copies_) {
@@ -9773,17 +9519,35 @@ public:
         return plan;
     }
 
+    // Worker-level shared-arena bootstrap: the Worker constructs every
+    // DeviceWorker with the arena reference still uninitialized (nothing in
+    // construction touches it -- only real dispatch, long afterward, does),
+    // then uses whichever already-constructed DeviceWorker backend is
+    // CUDA/ROCm to size and allocate the arena exactly once. Using a REAL,
+    // long-lived backend here (rather than a throwaway probe backend built
+    // and torn down just for this) avoids creating and destroying a second
+    // device context on hardware where that is not proven safe.
+    ggml_backend_t backend() const { return backend_.get(); }
+    const std::string & device_name() const { return device_name_; }
+
+    // Called exactly once, by Worker's ctor, right after the arena bootstrap
+    // above finishes -- see this method's use site for why pool_/stats_
+    // could not learn their kind any earlier.
+    void finish_arena_bootstrap(const std::string & kind) {
+        pool_.set_arena_kind(kind);
+        stats_.set_staging_kind(pool_.staging_kind());
+    }
+
     DeviceWorker(
             Catalog catalog,
             const std::string & device,
             int slots,
             uint64_t host_budget_bytes,
-            uint64_t host_victim_bytes,
             TestHooks * test_hooks,
             const std::vector<int> & resident_expert_blocks,
             const std::vector<int> & expert_reserve_blocks,
             uint64_t expert_reserve_bytes,
-            wp::HostTier * shared_host_tier = nullptr,
+            wp::HostArena & arena,
             bool load_pin_file = true,
             std::function<bool(int, int)> page_owner = {},
             WorkerLogFiles * logs = nullptr) :
@@ -9804,9 +9568,9 @@ public:
                     resident_.pinned_bytes(), expert_reserve_blocks,
                     expert_reserve_bytes, backend_.get()),
                 catalog_.descriptor.hparams.n_expert_used, device),
-            host_victim_bytes,
+            arena,
             test_hooks, expert_reserve_blocks, catalog_.pages.size(),
-            shared_host_tier, logs, device),
+            logs, device),
         compute_galloc_(ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend_.get()))),
         slots_(pool_.resources().slot_count) {
@@ -9818,7 +9582,10 @@ public:
         // handle because all device workers write to the same log.
         pool_.set_spec_log(logs_ != nullptr ? logs_->hint : nullptr,
                            logs_ != nullptr ? &logs_->mutex : nullptr);
-        stats_.set_staging_kind(pool_.staging_kind());
+        // NOT stats_.set_staging_kind(pool_.staging_kind()) here: the arena
+        // (shared across every DeviceWorker) is bootstrapped by Worker AFTER
+        // every DeviceWorker exists -- see finish_arena_bootstrap(), which
+        // Worker's ctor calls once that's done.
         stats_.set_device(device);
         device_name_ = device;
         {
@@ -11143,10 +10910,13 @@ public:
             request_stats.n_pagein_reserved = batch.n_pagein_reserved();
             request_stats.n_pagein_general = batch.n_pagein_general();
             request_stats.n_host_hit = batch.n_host_hit();
-            request_stats.n_host_demote = batch.n_host_demote();
+            // n_host_demote/ns_host_get/ns_demote: no longer produced.
+            // Every NVMe read lands in the arena and stays there -- there is
+            // no D2H demotion and no separate host-tier restore step to time
+            // -- so these RequestStats/WorkerStats fields (and the stats-log
+            // columns that print them) stay at their zero default rather
+            // than touching every consumer of that log format.
             request_stats.bytes_read = batch.bytes_read();
-            request_stats.ns_host_get = batch.ns_host_get();
-            request_stats.ns_demote = batch.ns_demote();
             request_stats.ns_ensure_post = batch.ns_ensure_post();
             request_stats.host_bytes = batch.host_bytes();
             request_stats.n_pagein_sorted = batch.n_pagein_sorted();
@@ -17635,13 +17405,13 @@ public:
             const std::string & device,
             int slots,
             uint64_t host_budget_bytes,
-            uint64_t host_victim_bytes,
+            uint64_t host_tier_bytes,
             TestHooks * test_hooks,
             const std::vector<int> & resident_expert_blocks,
             const std::vector<int> & expert_reserve_blocks,
             uint64_t expert_reserve_bytes) :
         Worker(std::move(catalog), std::vector<std::string>{device},
-               std::vector<int>{slots}, host_budget_bytes, host_victim_bytes,
+               std::vector<int>{slots}, host_budget_bytes, host_tier_bytes,
                test_hooks, resident_expert_blocks, expert_reserve_blocks,
                expert_reserve_bytes) {
     }
@@ -17651,7 +17421,7 @@ public:
             const std::vector<std::string> & devices,
             const std::vector<int> & device_slots,
             uint64_t host_budget_bytes,
-            uint64_t host_victim_bytes,
+            uint64_t host_tier_bytes,
             TestHooks * test_hooks,
             const std::vector<int> & resident_expert_blocks,
             const std::vector<int> & expert_reserve_blocks,
@@ -17697,12 +17467,162 @@ public:
                 : [this, i](int layer, int expert) {
                     return owning_device_for_page(layer, expert) == i;
                 };
+            // arena_ is still uninitialized here -- see the arena bootstrap
+            // block right after this loop -- but nothing in construction
+            // touches it, only real dispatch does, long afterward.
             devices_.emplace_back(std::make_unique<DeviceWorker>(
                 catalog_, device_names_[i], device_slots_[i], host_budget_bytes,
-                host_victim_bytes, test_hooks, resident_expert_blocks,
+                test_hooks, resident_expert_blocks,
                 expert_reserve_blocks, expert_reserve_bytes,
-                single_device ? nullptr : &host_tier_, single_device,
+                arena_, single_device,
                 page_owner, &logs_));
+        }
+        // *** BOOTSTRAP THE SHARED HOST ARENA, NOW THAT REAL BACKENDS EXIST. ***
+        //
+        // One HostArena for the whole Worker (single- or multi-device: no
+        // nullptr case any more, see Task 2's migration note) sized from
+        // Options and the catalog, allocated through whichever device's
+        // backend can give it pinned host memory. Deferred to here, after
+        // devices_ is built, so the allocator can use a REAL, long-lived
+        // backend instead of standing up and tearing down a throwaway probe
+        // device context (unverifiable as safe without touching a GPU).
+        {
+            uint64_t entry_bytes = 0;
+            for (const auto & item : catalog_.pages) {
+                entry_bytes = std::max(entry_bytes, item.second.size);
+            }
+            if (entry_bytes == 0) {
+                throw std::runtime_error("host arena: empty catalog has no page size");
+            }
+            const uint64_t read_inflight_max = host_budget_bytes == 0
+                ? 16
+                : std::max<uint64_t>(1, host_budget_bytes / entry_bytes);
+            wp::HostArena::Config cfg;
+            cfg.entry_bytes       = entry_bytes;
+            cfg.read_inflight_max = (int) std::min<uint64_t>(
+                read_inflight_max, (uint64_t) std::numeric_limits<int>::max());
+            cfg.tier_bytes  = host_tier_bytes;
+            cfg.budget_bytes = host_tier_bytes +
+                entry_bytes * (uint64_t) cfg.read_inflight_max;
+
+            // Prefer a CUDA/ROCm device's host buffer type (pinned); a
+            // pageable-fallback buffer (see the 2026-08-xx StagingPool
+            // comment this replaces) is treated as a failure so the whole
+            // pool falls back to posix_memalign instead of silently running
+            // pageable while reporting "pinned". Vulkan-only workers use
+            // ggml_backend_vk_wp_host_alloc. Anything else (or any failure)
+            // falls back to posix_memalign(4096).
+            wp::HostArena::Allocator alloc;
+            ggml_backend_dev_t pinned_dev = nullptr;
+            ggml_backend_t     pinned_backend = nullptr;
+            ggml_backend_t     vulkan_backend = nullptr;
+            for (auto & dw : devices_) {
+                const char * bname = ggml_backend_name(dw->backend());
+                if (bname == nullptr) {
+                    continue;
+                }
+                const bool cuda_family =
+                    std::strstr(bname, "CUDA") != nullptr || std::strstr(bname, "ROCm") != nullptr;
+                if (cuda_family && pinned_backend == nullptr) {
+                    pinned_backend = dw->backend();
+                    pinned_dev     = ggml_backend_get_device(pinned_backend);
+                } else if (std::strstr(bname, "Vulkan") != nullptr && vulkan_backend == nullptr) {
+                    vulkan_backend = dw->backend();
+                }
+            }
+            auto host_buffers = std::make_shared<std::vector<buffer_ptr>>();
+            auto vk_registered = std::make_shared<std::vector<void *>>();
+            std::string kind = "pageable";
+            if (pinned_dev != nullptr) {
+                ggml_backend_buffer_type_t host_buft =
+                    ggml_backend_dev_host_buffer_type(pinned_dev);
+                if (host_buft != nullptr) {
+                    kind = "pinned";
+                    alloc = [host_buft, host_buffers](size_t bytes) -> void * {
+                        buffer_ptr buf(ggml_backend_buft_alloc_buffer(host_buft, bytes));
+                        void * raw = buf ? ggml_backend_buffer_get_base(buf.get()) : nullptr;
+                        // Same pageable-fallback check StagingPool used to
+                        // make: a buffer that silently fell back to a plain
+                        // CPU buffer is not actually pinned, and O_DIRECT
+                        // needs 4096 alignment either way.
+                        if (!buf || raw == nullptr ||
+                                (reinterpret_cast<uintptr_t>(raw) % DIRECT_ALIGNMENT) != 0 ||
+                                ggml_backend_buffer_get_type(buf.get()) != host_buft) {
+                            return nullptr;
+                        }
+                        host_buffers->push_back(std::move(buf));
+                        return raw;
+                    };
+                }
+            } else if (vulkan_backend != nullptr &&
+                       ggml_backend_vk_wp_host_register != nullptr) {
+                kind = "pinned";
+                alloc = [vk_registered](size_t bytes) -> void * {
+                    void * raw = nullptr;
+                    if (posix_memalign(&raw, DIRECT_ALIGNMENT, bytes) != 0) {
+                        return nullptr;
+                    }
+                    if (!ggml_backend_vk_wp_host_register((ggml_backend_buffer_t) nullptr, raw, bytes)) {
+                        std::free(raw);
+                        return nullptr;
+                    }
+                    vk_registered->push_back(raw);
+                    return raw;
+                };
+            }
+            if (!alloc) {
+                kind = "pageable";
+                alloc = [](size_t bytes) -> void * {
+                    void * raw = nullptr;
+                    return posix_memalign(&raw, DIRECT_ALIGNMENT, bytes) == 0 ? raw : nullptr;
+                };
+            }
+            const auto pageable_alloc = [](size_t bytes) -> void * {
+                void * raw = nullptr;
+                return posix_memalign(&raw, DIRECT_ALIGNMENT, bytes) == 0 ? raw : nullptr;
+            };
+            const auto pageable_free = [](void * ptr, size_t) { std::free(ptr); };
+            arena_kind_ = kind;
+            const bool is_vk_registered = vulkan_backend != nullptr && pinned_dev == nullptr;
+            bool ok = arena_.init(cfg,
+                alloc,
+                // host_buft path: host_buffers (captured, RAII buffer_ptr)
+                // owns the real free -- it happens when this Deallocator
+                // std::function itself is destroyed (with arena_, i.e. at
+                // Worker teardown), so there is nothing to do with `ptr`
+                // here for that path. The other two paths allocated the raw
+                // pointer directly (posix_memalign, optionally vk-registered
+                // on top) and must free exactly that pointer per chunk.
+                [host_buffers, is_vk_registered](void * ptr, size_t) {
+                    if (!host_buffers->empty()) {
+                        return;
+                    }
+                    if (is_vk_registered && ggml_backend_vk_wp_host_unregister != nullptr) {
+                        ggml_backend_vk_wp_host_unregister((ggml_backend_buffer_t) nullptr, ptr);
+                    }
+                    std::free(ptr);
+                });
+            if (!ok && kind != "pageable") {
+                // The pinned allocator could not seat even one chunk (no
+                // pinned memory left, or the backend silently handed back a
+                // pageable buffer): fall back to plain 4096-aligned RAM for
+                // the whole arena, exactly as StagingPool did.
+                arena_.shutdown();
+                arena_kind_ = kind = "pageable";
+                ok = arena_.init(cfg, pageable_alloc, pageable_free);
+            }
+            if (!ok) {
+                throw std::runtime_error("failed to initialize shared host arena");
+            }
+            std::cerr << "wp::HostArena: requested=" << (cfg.budget_bytes >> 20)
+                      << " MiB got=" << ((arena_.entry_count() * arena_.entry_bytes()) >> 20)
+                      << " MiB entries=" << arena_.entry_count()
+                      << " entry=" << (arena_.entry_bytes() >> 10)
+                      << " KiB chunks=" << arena_.chunk_count()
+                      << " kind=" << arena_kind_ << std::endl;
+        }
+        for (auto & dw : devices_) {
+            dw->finish_arena_bootstrap(arena_kind_);
         }
         initialize_placement_policy();
         // WP_EXPERT_OWNER_POLICY=hot rewrites the owner map here: AFTER
@@ -19598,7 +19518,17 @@ private:
     std::vector<std::string> device_names_;
     std::vector<int> device_slots_;
     WorkerLogFiles logs_;
-    wp::HostTier host_tier_;
+    // Shared by every DeviceWorker (single- or multi-device -- see the ctor's
+    // arena bootstrap block). Declared before device_names_/devices_ so it
+    // is still alive when a DeviceWorker's own teardown drains any live
+    // batch (same destruction-order discipline as ExpertSlotPool's
+    // spec_batches_ comment).
+    wp::HostArena arena_;
+    std::string   arena_kind_;
+public:
+    wp::HostArena &       arena()       { return arena_; }
+    const wp::HostArena & arena() const { return arena_; }
+private:
     const owner_policy owner_policy_ = owner_policy_from_env();
     // WP_EXPERT_OWNER_POLICY=hot force-disables LFU placement: hot's whole
     // contract is that the owner map never changes after startup, and the LFU
@@ -21810,7 +21740,7 @@ ResourcePlan inspect_resources(const Options & options) {
         devices,
         device_slots,
         options.host_budget_bytes,
-        options.host_victim_bytes,
+        options.host_tier_bytes,
         options.test_hooks,
         options.resident_expert_blocks, options.expert_reserve_blocks,
         options.expert_reserve_bytes, options.layer_device);
@@ -21852,7 +21782,7 @@ int run(const Options & options) {
         devices,
         device_slots,
         options.host_budget_bytes,
-        options.host_victim_bytes,
+        options.host_tier_bytes,
         options.test_hooks,
         options.resident_expert_blocks, options.expert_reserve_blocks,
         options.expert_reserve_bytes, options.layer_device);
@@ -22019,7 +21949,7 @@ int run(const Options & options) {
               << " read_direct_fallback=" << (worker.read_direct_fallback() ? 1 : 0)
               << " read_alignment=" << DIRECT_ALIGNMENT
               << " host_budget=" << resources.host_budget_bytes
-              << " host_victim_budget=" << options.host_victim_bytes
+              << " host_tier_budget=" << options.host_tier_bytes
               << " partial_dtype=f32"
               << '\n';
     for (const SlotClass & slot_class : resources.slot_classes) {
@@ -22155,11 +22085,11 @@ struct trunk_shard_spec {
     int                   slots = 0;
     std::filesystem::path manifest;
     std::filesystem::path descriptor;
-    uint64_t              host_victim_bytes = 0;
+    uint64_t              host_tier_bytes = 0;
 };
 
 // WP_TRUNK_INPROC_SHARDS=
-//   port,device,slots,manifest,descriptor[,host_victim_bytes][;port,...]
+//   port,device,slots,manifest,descriptor[,host_tier_bytes][;port,...]
 std::vector<trunk_shard_spec> parse_trunk_shards() {
     const char * e = std::getenv("WP_TRUNK_INPROC_SHARDS");
     if (e == nullptr || e[0] == '\0') {
@@ -22187,7 +22117,7 @@ std::vector<trunk_shard_spec> parse_trunk_shards() {
             if (fields.size() < 5 || fields.size() > 6) {
                 throw std::runtime_error(
                     "WP_TRUNK_INPROC_SHARDS entry must be "
-                    "port,device,slots,manifest,descriptor[,host_victim_bytes]");
+                    "port,device,slots,manifest,descriptor[,host_tier_bytes]");
             }
             trunk_shard_spec spec;
             spec.port = std::atoi(fields[0].c_str());
@@ -22196,7 +22126,7 @@ std::vector<trunk_shard_spec> parse_trunk_shards() {
             spec.manifest = fields[3];
             spec.descriptor = fields[4];
             if (fields.size() == 6) {
-                spec.host_victim_bytes = (uint64_t) std::strtoull(fields[5].c_str(), nullptr, 10);
+                spec.host_tier_bytes = (uint64_t) std::strtoull(fields[5].c_str(), nullptr, 10);
             }
             if (spec.port <= 0 || spec.port > 65535 || spec.slots <= 0 ||
                     spec.device.empty() || spec.manifest.empty() || spec.descriptor.empty()) {
@@ -22225,7 +22155,7 @@ class InProcessEngine final : public pipe_expert_dispatcher::inproc_backend {
             spec.device,
             spec.slots,
             /*host_budget_bytes=*/0,
-            spec.host_victim_bytes,
+            spec.host_tier_bytes,
             /*test_hooks=*/nullptr,
             /*resident_expert_blocks=*/{},
             /*expert_reserve_blocks=*/{},

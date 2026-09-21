@@ -154,8 +154,15 @@ struct Options {
     int                   listen_port = 0;
     int                   slots       = 0;
     std::vector<int>      device_slots;
+    // In-flight read budget: read_inflight_max = host_budget_bytes / entry_bytes
+    // (0 => 16 entries, today's default). NOT a retention cap -- see
+    // host_tier_bytes for that.
     uint64_t              host_budget_bytes = 0;
-    uint64_t              host_victim_bytes = 0;
+    // Retention cap for the host arena: bytes a Resident, unborrowed, unpinned
+    // entry pool may hold before LRU trims it back down. 0 (default) frees a
+    // page's RAM copy the instant nothing holds it -- the pre-arena
+    // behaviour. Replaces the old host_victim_bytes.
+    uint64_t              host_tier_bytes = 0;
     std::vector<int>      resident_expert_blocks;
     bool                  resident_expert_blocks_set = false;
     std::vector<int>      expert_reserve_blocks;
