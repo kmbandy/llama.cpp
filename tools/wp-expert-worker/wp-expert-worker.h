@@ -329,7 +329,13 @@ bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool
 // NOT require gather: gather is bypassed at n_tokens==1 (see
 // WP_EXPERT_GATHER_MIN_TOKENS above), and the dense path shares the same
 // mul_mat lambda, so requiring it would make the decode pin a no-op.
-enum class mm_pin_mode { off, on, decode };
+// "all" pins EVERY expert mul_mat, any width, gather or dense: the only mode
+// under which a token's expert output is independent of how many other tokens
+// shared its request (MMQ's per-column arithmetic does not depend on ne11;
+// MMVQ at n<=8 and the dequant GEMM above it round differently), so the same
+// token computed in a 4-row cached-prefix batch and in a 198-row prefill gets
+// identical bytes. WP_SELFCHECK=1 is the proof: gather vs dense agree exactly.
+enum class mm_pin_mode { off, on, decode, all };
 mm_pin_mode parse_mm_pin_mode(const char * env);
 mm_pin_mode parse_mm_pin_mode(const char * env, const std::string & device_name);
 int  parse_mm_pin_min_tokens(const char * env);   // default 9

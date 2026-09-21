@@ -388,6 +388,9 @@ static mm_pin_mode parse_mm_pin_mode_token(const std::string & token) {
     if (token == "decode") {
         return mm_pin_mode::decode;
     }
+    if (token == "all") {
+        return mm_pin_mode::all;
+    }
     return mm_pin_mode::on;
 }
 
@@ -407,17 +410,22 @@ mm_pin_mode parse_mm_pin_mode(const char * env, const std::string & device_name)
     if (value == "decode") {
         return mm_pin_mode::decode;
     }
+    if (value == "all") {
+        return mm_pin_mode::all;
+    }
     if (value == "1") {
         return mm_pin_mode::on;
     }
-    // "decode:ROCm0,CUDA0" / "1:ROCm0" / "on:!Vulkan0"
+    // "decode:ROCm0,CUDA0" / "all:ROCm0" / "1:ROCm0" / "on:!Vulkan0"
     const size_t mode_colon = value.find(':');
     if (mode_colon != std::string::npos &&
             (value.compare(0, 7, "decode:") == 0 ||
+             value.compare(0, 4, "all:") == 0 ||
              value.compare(0, 2, "1:") == 0 ||
              value.compare(0, 3, "on:") == 0)) {
         const mm_pin_mode mode = value.compare(0, 7, "decode:") == 0 ?
-            mm_pin_mode::decode : mm_pin_mode::on;
+            mm_pin_mode::decode :
+            value.compare(0, 4, "all:") == 0 ? mm_pin_mode::all : mm_pin_mode::on;
         const std::string list = value.substr(mode_colon + 1);
         return parse_arena_prefill_enabled(list.c_str(), device_name) ?
             mode : mm_pin_mode::off;
@@ -541,6 +549,9 @@ bool use_mm_pin(uint32_t n_tokens, bool use_gather, mm_pin_mode mode,
         case mm_pin_mode::on:
             return use_gather && n_tokens > 8 &&
                    n_tokens >= (uint32_t) min_tokens;
+        case mm_pin_mode::all:
+            // Width-invariant numerics: every request, every width.
+            return n_tokens >= 1;
     }
     return false;
 }
@@ -9851,7 +9862,8 @@ public:
             const char * bname = ggml_backend_name(backend_.get());
             const mm_pin_mode pin_mode = parse_mm_pin_mode(std::getenv("WP_EXPERT_MM_PIN"));
             const char * pin_mode_s = pin_mode == mm_pin_mode::off ? "off" :
-                (pin_mode == mm_pin_mode::decode ? "decode" : "on");
+                (pin_mode == mm_pin_mode::decode ? "decode" :
+                 pin_mode == mm_pin_mode::all ? "all" : "on");
             const char * pin_kernel = std::getenv("GGML_MUL_MAT_PIN_KERNEL");
             const char * fold_e = std::getenv("WP_EXPERT_FOLD_LAST");
             const char * fuse_e = std::getenv("WP_EXPERT_FUSE_GATE_UP");
@@ -9939,6 +9951,7 @@ public:
                          "kernel=%s pad=%d\n",
                          device_name_.c_str(),
                          mm_pin_mode_ == mm_pin_mode::decode ? "decode" :
+                         mm_pin_mode_ == mm_pin_mode::all ? "all" :
                          mm_pin_mode_ == mm_pin_mode::on ? "on" : "off",
                          mm_pin_kernel_mmvq_ ? "mmvq" : "mmq",
                          (int) mm_pin_pad_mmvq_);
