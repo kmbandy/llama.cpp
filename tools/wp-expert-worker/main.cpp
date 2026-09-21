@@ -54,7 +54,9 @@ uint64_t parse_positive_u64(const std::string & text, const char * option) {
     return value;
 }
 
-uint64_t parse_size(const std::string & text, const char * option) {
+// allow_zero: --host-tier-bytes 0 is a legitimate value (retain nothing =
+// the pre-HostArena staging semantics); every other size must be positive.
+uint64_t parse_size(const std::string & text, const char * option, bool allow_zero = false) {
     if (text.empty()) throw std::invalid_argument(std::string(option) + " requires a size");
     char * end = nullptr;
     errno = 0;
@@ -69,7 +71,7 @@ uint64_t parse_size(const std::string & text, const char * option) {
     else if (suffix == "m") multiplier = 1ull << 20;
     else if (suffix == "k") multiplier = 1ull << 10;
     else if (!suffix.empty()) throw std::invalid_argument(std::string(option) + " has an invalid suffix");
-    if (value == 0 || value > UINT64_MAX / multiplier) throw std::invalid_argument(std::string(option) + " is out of range");
+    if ((value == 0 && !allow_zero) || value > UINT64_MAX / multiplier) throw std::invalid_argument(std::string(option) + " is out of range");
     return (uint64_t) value * multiplier;
 }
 
@@ -200,7 +202,7 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
                 parse_size(take(), "--host-budget-bytes");
         } else if (arg == "--host-tier-bytes") {
             options.host_tier_bytes =
-                parse_size(take(), "--host-tier-bytes");
+                parse_size(take(), "--host-tier-bytes", /*allow_zero=*/true);
         } else if (arg == "--weight-paging-resident-experts") {
             const wp::ResidentExpertRequest request =
                 wp::parse_resident_expert_request(take().c_str());
@@ -239,7 +241,7 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
         const char * value = std::getenv("WP_EXPERT_HOST_TIER_BYTES");
         if (value != nullptr && value[0] != '\0') {
             options.host_tier_bytes =
-                parse_size(value, "WP_EXPERT_HOST_TIER_BYTES");
+                parse_size(value, "WP_EXPERT_HOST_TIER_BYTES", /*allow_zero=*/true);
         }
     }
     if (!options.resident_expert_blocks_set && options.resident_expert_blocks.empty()) {
