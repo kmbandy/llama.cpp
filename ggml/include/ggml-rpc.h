@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    6
+#define RPC_PROTO_MAJOR_VERSION    7
 #define RPC_PROTO_MINOR_VERSION    0
 // fork patch version 4: 109 + FP8_B128 phase 2's 2 new ops (FP8_QUANT_ROT, FP8_MUL_MAT) = 111
 // fork patch version 5: 111 + WP_DSV41_SPARSE_ATTN's GGML_OP_SPARSE_ATTN_DSV4 = 112
