@@ -156,3 +156,12 @@ The merge commit was pushed before the compile check finished. Building with cla
 
 ### Pre-existing on origin/master (not caused by this merge; not changed)
 - `ggml/include/ggml-ml8.h` (from `55bc7c6ea`) declares a C++ overload of `ggml_fp8_quant_rot` inside `extern "C"`. Clang accepts it, **GCC rejects it** ("conflicting declaration of C function"). Every build here used clang, which is what the ROCm toolchain uses anyway.
+
+## Verification
+
+- Build: clang, `-DGGML_VULKAN=ON -DLLAMA_BUILD_TESTS=ON`, Release. All 1014 targets build (libllama including the unity-built `models/*.cpp`, llama-server, the wp-expert-worker/dispatcher tools, all tests). No CUDA/HIP toolchain was available in the sync environment, so **the `.cu` changes (FA instance selection, mmq tile sizing, BF16 cuBLAS fallback, allreduce) are only checked by reading, not compiled.** Build `-DGGML_HIP=ON` before merging to master.
+- `ctest -LE model` on CPU (no GPU in the sync environment): 90/106 pass. All 16 failures were checked against a clean build of pre-merge `origin/master` (`26e5f58`) in a separate worktree:
+  - 11 fail identically on origin/master, so they are **pre-existing**: test-arg-parser (asserts upstream's `n_outputs_max_per_seq == 1`, which the fork deliberately does not use; see speculative.cpp), test-dsv41-load/-decode, test-recurrent-state-rollback/-dsv4, test-save-load-state, test-paged-decode-oracle, test-wp-expert-worker, test-routed-experts-external, test-quantize-fns, test-ml8-registry.
+  - 4 need model downloads (no network in the sync environment): test-download-model, test-eval-callback(-download-model), test-thread-safety.
+  - test-barrier timed out only under `-j4` load. It passes when run alone on both trees.
+- Not verified here (needs your hardware): a GPU run of test-backend-ops on ROCm/Vulkan, a router run with `--gpus` placement plus `models_max` eviction (to exercise the deadlock fix), and a DSpark/DFlash draft on a Meta-split target.
