@@ -364,7 +364,7 @@ void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t si
     }
 }
 
-static bool ggml_vk_ensure_host_read_staging_buffer(vk_device& device, size_t size) {
+bool ggml_vk_ensure_host_read_staging_buffer(vk_device& device, size_t size) {
     if (device->host_read_staging != nullptr) {
         return device->host_read_staging->size >= size &&
             (device->host_read_staging->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
@@ -386,7 +386,7 @@ static bool ggml_vk_ensure_host_read_staging_buffer(vk_device& device, size_t si
 // scratch buffer for the fused-expert batch fast path. Returns false (leaving
 // the fast path unusable for this call) only on an actual allocation failure;
 // callers must fall back to the per-expert dispatch loop in that case.
-static bool ggml_vk_ensure_wp_fused_batch_scratch_buffer(vk_device& device, size_t size) {
+bool ggml_vk_ensure_wp_fused_batch_scratch_buffer(vk_device& device, size_t size) {
     if (device->wp_fused_batch_scratch != nullptr && device->wp_fused_batch_scratch->size >= size) {
         return true;
     }

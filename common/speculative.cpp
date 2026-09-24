@@ -2137,7 +2137,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // conditioned on. If call N+1's proposals repeat call N's at the same
                 // absolute positions while THIS line changes, the anchor is being ignored.
                 SPC_INF("DBG anchor seq=%d call=%d n_past=%d id_last=%d '%s'\n",
-                        seq_id, dbg_n_draft, (int) dp.n_past, dp.id_last,
+                        seq_id, dbg_n_draft, (int) dp.pos0, dp.id_last,
                         common_token_to_piece(ctx_dft, dp.id_last).c_str());
 
                 const float * conf_dbg = services_mode
@@ -2182,7 +2182,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     SPC_INF("DBG slot seq=%d call=%d i=%d pos=%d conf=%.3e gap=%.3f | "
                             "top1=%6d (%8.3f) '%s' | top2=%6d (%8.3f) '%s' | top3=%6d (%8.3f) '%s'%s\n",
-                            seq_id, dbg_n_draft, i, (int) dp.n_past + i, c, v[0] - v[1],
+                            seq_id, dbg_n_draft, i, (int) dp.pos0 + i, c, v[0] - v[1],
                             t[0], v[0], common_token_to_piece(ctx_dft, t[0]).c_str(),
                             t[1], v[1], common_token_to_piece(ctx_dft, t[1]).c_str(),
                             t[2], v[2], common_token_to_piece(ctx_dft, t[2]).c_str(),

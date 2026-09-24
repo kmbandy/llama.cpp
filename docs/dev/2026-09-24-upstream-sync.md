@@ -141,3 +141,18 @@ Hand-port decisions worth knowing about:
 ### Vulkan shader type ids - `GGML_TYPE_Q2_0`
 Upstream added `vulkan-shaders/ggml_type_ids.glsl` with `#define GGML_TYPE_Q2_0 42u` and moved the FA shaders from `FA_TYPE_*` to `GGML_TYPE_*`. In this fork 42 is `TURBO3_0`, and Q2_0 was renumbered to 56 in the 2026-08 sync (see the NOTE(fork) in `ggml.h`). **Changed the shader define to 56u** and added the fork's `TURBO2/3/4_0` ids there. The fork's `FA_TYPE_Q1_0` / `FA_TYPE_TURBO4_0` cases in `fa_types.glsl` / `flash_attn_dequant.glsl` were renamed to the new `GGML_TYPE_*` names. Without this, a Q2_0 matmul on Vulkan would have used the TURBO3_0 branch.
 
+## Found by the post-merge build (fixed in the follow-up commit)
+
+The merge commit was pushed before the compile check finished. Building with clang (CPU + Vulkan + all tests) found these. They are fixed in the commit after the merge.
+
+- **Router deadlock (important; corrects the `unload_lru()` decision above).** Upstream #28555 removed the router's stopper thread and its `cv_stop`. Stops now go through `request_stop()`, which **returns early when the model is already in `stopping_models`**. The fork's code still used "insert into `stopping_models`, then wake the stopper thread", in `unload_lru()` and in both GPU-placement eviction paths. As merged, a victim would be marked stopping, `unload()` -> `request_stop()` would then no-op, and the router would wait forever for a model that was never told to exit. All three sites now call `request_stop(victim, !loading)` under the same lock that picked the victim. The fork's guarantee (a concurrent `unload_lru()` cannot choose a second victim) still holds, because `request_stop()` marks the victim stopping under that same lock.
+- `src/models/models.h`: both sides had picked up upstream #28068 (`build_gdn_l2_norm`) at different spots, so git kept two definitions. Removed one.
+- `common/speculative.cpp`: upstream renamed `common_speculative_draft_params::n_past` to `pos0` (#28715, "it is a position, not a count"). Updated the fork's `WP_DSPARK_DEBUG` log lines.
+- Vulkan: the fork's `ggml_vk_ensure_host_read_staging_buffer` / `ggml_vk_ensure_wp_fused_batch_scratch_buffer` landed in `ggml-vulkan-buffers.cpp` (next to `ensure_sync_staging_buffer`, where upstream moved it) but are called from `ggml-vulkan.cpp`. Made them shared and declared them in `common.h`.
+- Vulkan, **two misplaced replay hunks** (identical context text in two places):
+  - The fork's `d_X_buf` / `d_Y_buf` dynamic-subbuffer block and the `d_Qy_copy` quantize source belong to `ggml_vk_mul_mat_q_f16` but had landed in `ggml_vk_mul_mat_id_q_f16`. Moved back.
+  - `case GGML_TYPE_TURBO4_0:` in `supports_op` belongs in the F32->TURBO4_0 (quantize) CPY case but had landed in TURBO4_0->F32. As merged, the backend would have claimed an op it does not implement. Moved back.
+  To catch any others, every fork-modified function was checked with a per-function 3-way merge (base / fork / upstream) against the ported body. After the fixes, the only differences left are the hand-merged functions described above.
+
+### Pre-existing on origin/master (not caused by this merge; not changed)
+- `ggml/include/ggml-ml8.h` (from `55bc7c6ea`) declares a C++ overload of `ggml_fp8_quant_rot` inside `extern "C"`. Clang accepts it, **GCC rejects it** ("conflicting declaration of C function"). Every build here used clang, which is what the ROCm toolchain uses anyway.

@@ -7541,6 +7541,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(qy_sz == y_sz);
     }
 
+    vk_subbuffer d_X_buf = { d_X, x_buf_offset, x_sz };
+    vk_subbuffer d_Y_buf = { d_Y, y_buf_offset, y_sz };
+    if (!qx_needs_dequant) {
+        d_X_buf = ggml_vk_mark_dynamic_subbuffer(ctx, d_X_buf, src0);
+    }
+    if (!qy_needs_dequant && !quantize_y) {
+        d_Y_buf = ggml_vk_mark_dynamic_subbuffer(ctx, d_Y_buf, src1);
+    }
+
     if (x_non_contig || qx_needs_dequant) {
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
@@ -7576,7 +7585,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, d_Qy_copy, ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -8868,15 +8877,6 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         GGML_ASSERT(qy_sz == y_sz);
     }
 
-    vk_subbuffer d_X_buf = { d_X, x_buf_offset, x_sz };
-    vk_subbuffer d_Y_buf = { d_Y, y_buf_offset, y_sz };
-    if (!qx_needs_dequant) {
-        d_X_buf = ggml_vk_mark_dynamic_subbuffer(ctx, d_X_buf, src0);
-    }
-    if (!qy_needs_dequant && !quantize_y) {
-        d_Y_buf = ggml_vk_mark_dynamic_subbuffer(ctx, d_Y_buf, src1);
-    }
-
     if (x_non_contig || qx_needs_dequant) {
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
@@ -8945,8 +8945,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, d_Qy_copy,
-                                  ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -18015,6 +18014,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         break;
@@ -18032,7 +18032,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
-                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         break;

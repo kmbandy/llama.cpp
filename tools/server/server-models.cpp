@@ -1427,14 +1427,15 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         reserve_gpu_placement_locked(name, meta.placement);
         for (const auto & victim : evict) {
             SRV_INF("router placement: evicting %s to make room for %s (exclusive: one model per GPU)\n", victim.c_str(), name.c_str());
-            stopping_models.insert(victim);
             auto it = mapping.find(victim);
-            if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
+            const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
+            if (loading) {
                 it->second.subproc->terminate();
             }
+            // marks the victim stopping and hands the stop to the monitor (upstream #28555)
+            request_stop(victim, !loading);
         }
         if (!evict.empty()) {
-            cv_stop.notify_all();
             cv.wait(lk, [&]() {
                 for (const auto & victim : evict) {
                     auto it = mapping.find(victim);
@@ -1538,14 +1539,15 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
 
     for (const auto & victim : evict) {
         SRV_INF("router placement evicting name=%s for model %s\n", victim.c_str(), name.c_str());
-        stopping_models.insert(victim);
         auto it = mapping.find(victim);
-        if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
+        const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
+        if (loading) {
             it->second.subproc->terminate();
         }
+        // marks the victim stopping and hands the stop to the monitor (upstream #28555)
+        request_stop(victim, !loading);
     }
     if (!evict.empty()) {
-        cv_stop.notify_all();
         cv.wait(lk, [&]() {
             for (const auto & victim : evict) {
                 auto it = mapping.find(victim);
@@ -2031,13 +2033,13 @@ void server_models::unload_lru() {
         if (lru_model_name.empty()) {
             return;
         }
-        // Mark the victim as stopping under the SAME lock that selected it, so a
-        // concurrent unload_lru() excludes it in pick_victim and cannot evict a
-        // second model. unload() below re-inserts idempotently and triggers the stop.
-        stopping_models.insert(lru_model_name);
+        // Stop the victim under the SAME lock that selected it: request_stop() marks it
+        // stopping, so a concurrent unload_lru() excludes it in pick_victim and cannot
+        // evict a second model. pick_victim only returns ready/sleeping models, so a
+        // graceful exit request is always right here.
+        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+        request_stop(lru_model_name, true);
     }
-    SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
-    unload(lru_model_name);
     // wait for unload to complete (find-based: safe if the entry was erased mid-wait,
     // unlike the previous mapping[name] which default-constructed a stray entry)
     wait(lru_model_name, [](const server_model_meta & meta) {
@@ -2119,7 +2121,6 @@ void server_models::load(const std::string & name, const load_options & opts) {
         stopping_models.erase(name);
         marked_loading = false;
         cv.notify_all();
-        cv_stop.notify_all();
     };
     auto rollback_load_attempt = [&](void *) {
         if (!lk.owns_lock()) {
