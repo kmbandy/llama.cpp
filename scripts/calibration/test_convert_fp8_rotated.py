@@ -21,8 +21,9 @@ from convert_fp8_rotated import (  # noqa: E402
     _quantize_fp8_b128_gpu, _rotate_and_fp8_b128, role_group_key, _group_seed, _parse_layer,
     _FP8B128_TILE, _FP8B128_BLOCK_BYTES, _FP8B128_MAX,
     _fit_ml8_centroids, _assign_ml8_indices, _process_rotate_ml8_4_chunked,
-    _ML8_FIT_ROWS_DEFAULT,
+    _ML8_FIT_ROWS_DEFAULT, _copy_field,
 )
+from centroid_quantizer import _lloyd_max_signed, _lloyd_max_signed_batched  # noqa: E402
 from ml8_to_gguf import QK_ML8, ML8_BLOCK_BYTES, N_CENTROIDS  # noqa: E402
 from gguf.quants import quantize as gguf_quantize  # noqa: E402
 from kronecker_rotation import (  # noqa: E402
@@ -558,6 +559,194 @@ def test_parse_layer():
     print("  PASS test_parse_layer")
 
 
+# ─── DS4.1 (deepseek41 arch) role classification, added for the data-free
+# ml8_4 attention conversion (2026-09-22). Tensor names/shapes verified
+# against /home/kmbandy/models/dsv41-spine.gguf's own header.
+def test_dsv41_roles_classify_ml8_4():
+    cases = [
+        ("blk.0.attn_q_a.weight", (5120, 1280), "rotate_kronecker"),
+        ("blk.0.attn_q_b.weight", (1280, 32768), "rotate_kronecker"),
+        ("blk.0.attn_kv.weight", (5120, 512), "rotate_kronecker"),
+        ("blk.0.attn_output_b.weight", (8192, 5120), "rotate_hadamard"),
+        ("blk.2.indexer.proj.weight", (5120, 32), "rotate_kronecker"),
+        ("blk.2.indexer.attn_q_b.weight", (1280, 4096), "rotate_kronecker"),
+        ("blk.2.indexer.attn_k.weight", (512, 128), "rotate_kronecker"),
+        ("blk.2.attn_compressor_kv.weight", (5120, 512), "rotate_kronecker"),
+        ("blk.2.attn_compressor_gate.weight", (5120, 512), "rotate_kronecker"),
+        # attn_output_a itself (unsplit, block-diagonal over 8 groups) must
+        # NOT be rotated here -- rotating the flat concatenation would mix
+        # groups. Non-GEMM tensors stay copied verbatim regardless of format.
+        ("blk.0.attn_output_a.weight", (4096, 8192), "copy"),
+        ("blk.0.attn_norm.weight", (5120,), "copy"),
+        ("blk.0.attn_sinks.weight", (64,), "copy"),
+        # post-split wo_a groups (produced by the wo_a-split conversion step)
+        ("blk.0.attn_output_a.g0.weight", (4096, 1024), "rotate_hadamard"),
+        ("blk.0.attn_output_a.g7.weight", (4096, 1024), "rotate_hadamard"),
+    ]
+    for name, shape, expect in cases:
+        action, role = classify_tensor(name, shape, format="ml8_4")
+        assert action == expect, f"{name}: expected {expect}, got {action} (role={role})"
+    print("  PASS test_dsv41_roles_classify_ml8_4")
+
+
+def test_dsv41_role_group_sharing():
+    # wq_a(cur), wkv(cur), indexer.proj(cur) all consume the SAME activation
+    # (deepseek41.cpp:1499/1511/975) -> must share a rotation group.
+    assert role_group_key("attn_q_a") == role_group_key("attn_kv") == role_group_key("indexer.proj")
+    # wq_b(qr), indexer.attn_q_b(qr) consume qr (deepseek41.cpp:1503/959).
+    assert role_group_key("attn_q_b") == role_group_key("indexer.attn_q_b")
+    # attn_compressor_kv(cur_kv), attn_compressor_gate(cur_kv) (:1551/1558).
+    assert role_group_key("attn_compressor_kv") == role_group_key("attn_compressor_gate")
+    # these three groups, plus the ungrouped indexer.attn_k singleton, must
+    # all be distinct from each other and from the qwen3x groups.
+    keys = {
+        role_group_key("attn_q_a"), role_group_key("attn_q_b"),
+        role_group_key("attn_compressor_kv"), role_group_key("indexer.attn_k"),
+        role_group_key("attn_qkv"), role_group_key("ffn_gate"),
+    }
+    assert len(keys) == 6
+    print("  PASS test_dsv41_role_group_sharing")
+
+
+def _make_dsv41_wo_a_gguf(path: Path, o_group_dim: int, o_lora_rank: int, o_groups: int):
+    """Tiny synthetic deepseek41-arch GGUF with just one attn_output_a
+    (wo_a) tensor [o_group_dim, o_lora_rank*o_groups] and the
+    output_group_count KV field the wo_a split (Task 2) reads. Returns the
+    torch weight [N, K] (N=o_lora_rank*o_groups, K=o_group_dim) used to
+    build it, group-sliced the same way create_tensor's TENSOR_ALLOW_RESHAPE
+    reinterprets the flat tensor in deepseek41.cpp:312 (group g = rows
+    [g*o_lora_rank, (g+1)*o_lora_rank))."""
+    w = gguf.GGUFWriter(str(path), arch="deepseek41")
+    w.add_uint32("deepseek41.embedding_length", o_group_dim)
+    w.add_uint32("deepseek41.block_count", 1)
+    w.add_uint32("deepseek41.attention.output_group_count", o_groups)
+    N = o_lora_rank * o_groups
+    torch.manual_seed(7)
+    weight = torch.randn(N, o_group_dim, dtype=torch.float32) * 0.5
+    _add_bf16(w, "blk.0.attn_output_a.weight", weight)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    return weight
+
+
+def test_dsv41_wo_a_split_produces_group_tensors(tmp_path):
+    """wo_a split (Task 2): with format=ml8_4 and output_group_count present,
+    the flat attn_output_a.weight must NOT appear in the output -- only the
+    8 (here 4, for test speed) per-group tensors, each independently
+    rotate_hadamard/ml8_4-classified."""
+    o_group_dim, o_lora_rank, o_groups = 256, 64, 4  # K=256 (%128 local_b, %64 QK_ML8), per-group N=64
+    src = tmp_path / "wo_a_src.gguf"
+    weight = _make_dsv41_wo_a_gguf(src, o_group_dim, o_lora_rank, o_groups)
+
+    reader = gguf.GGUFReader(src)
+    plan = build_plan(reader, rotation_seed=0, local_b=128, max_b=1024, format="ml8_4")
+    names = [e["name"] for e in plan]
+    assert "blk.0.attn_output_a.weight" not in names
+    for g in range(o_groups):
+        gname = f"blk.0.attn_output_a.g{g}.weight"
+        assert gname in names, f"missing {gname}"
+        e = next(x for x in plan if x["name"] == gname)
+        assert e["action"] == "rotate_hadamard"
+        assert e["shape"] == (o_group_dim, o_lora_rank)
+        assert e["src_name"] == "blk.0.attn_output_a.weight"
+        assert e["row_offset"] == g * o_lora_rank
+
+    out = tmp_path / "wo_a_out.gguf"
+    convert(src, out, rotation_seed=1234, device_str="cpu", local_b=128, max_b=1024, format="ml8_4")
+    out_reader = gguf.GGUFReader(out)
+    out_names = {t.name: t for t in out_reader.tensors}
+    assert "blk.0.attn_output_a.weight" not in out_names
+    for g in range(o_groups):
+        gname = f"blk.0.attn_output_a.g{g}.weight"
+        assert out_names[gname].tensor_type == GGMLQuantizationType.ML8_4
+
+    # ── group-concat equivalence check: dequantize each of the o_groups
+    # ml8_4 group tensors and un-rotate (block_hadamard is self-inverse),
+    # then verify concatenating them along rows reproduces the ORIGINAL
+    # flat weight's block structure (same row range per group as
+    # TENSOR_ALLOW_RESHAPE's 2D->3D reinterpretation at load time).
+    from kronecker_rotation import BlockHadamardRotation
+    recon = np.empty((o_lora_rank * o_groups, o_group_dim), dtype=np.float32)
+    for g in range(o_groups):
+        gname = f"blk.0.attn_output_a.g{g}.weight"
+        decoded_rot = _decode_ml8_4_numpy(out_reader, gname)  # still in rotated basis
+        rot = BlockHadamardRotation(in_features=o_group_dim, b_dim=128)
+        decoded = rot.inverse(torch.from_numpy(decoded_rot)).numpy()
+        recon[g * o_lora_rank:(g + 1) * o_lora_rank] = decoded
+
+    err = _nmse(recon, weight.numpy())
+    assert err < 0.15, f"wo_a group-concat NMSE {err:.3e} too high"
+    print("  PASS test_dsv41_wo_a_split_produces_group_tensors")
+
+
+def test_dsv41_token_embd_output_stay_copy():
+    """DS4.1 (deepseek41 arch) is explicitly out of scope for token_embd/
+    output (task instructions: keep them at whatever type the production
+    spine already has, BF16) -- unlike qwen35, where token_embd (Q8_0) and
+    output (rotate_kronecker, untied lm head) rotating/quantizing is the
+    correct, existing, must-stay-byte-identical behavior. This was a real
+    bug caught during the ml8_4 dry-run against the real DS4.1 BF16 spine:
+    without the arch guard, classify_tensor used the generic qwen role
+    tables for these two names regardless of architecture."""
+    shape = (5120, 129280)
+    assert classify_tensor("token_embd.weight", shape, format="ml8_4")[0] == "q8_0"          # qwen: unaffected
+    assert classify_tensor("output.weight", shape, format="ml8_4")[0] == "rotate_kronecker"  # qwen: unaffected
+    assert classify_tensor("token_embd.weight", shape, format="ml8_4", arch="deepseek41")[0] == "copy"
+    assert classify_tensor("output.weight", shape, format="ml8_4", arch="deepseek41")[0] == "copy"
+    assert classify_tensor("token_embd.weight", shape, format="ml8_4", arch="qwen35")[0] == "q8_0"
+    print("  PASS test_dsv41_token_embd_output_stay_copy")
+
+
+def test_dsv41_wo_a_split_respects_nextn_fallback(tmp_path):
+    """wo_a split (Task 2) must not bypass the existing MTP/nextn safety
+    fallback (classify_tensor's first_nextn_layer rule, ml8 sidecars aren't
+    registered for nextn layers on the C++ side): a wo_a tensor AT OR PAST
+    first_nextn_layer must stay a single flat Q8_0 tensor, not 8 rotated
+    split groups. Caught as a real bug: build_plan's wo_a-split branch
+    originally ran before the first_nextn_layer check entirely."""
+    o_group_dim, o_lora_rank, o_groups = 256, 64, 4
+    src = tmp_path / "wo_a_nextn.gguf"
+    w = gguf.GGUFWriter(str(src), arch="deepseek41")
+    w.add_uint32("deepseek41.embedding_length", o_group_dim)
+    w.add_uint32("deepseek41.block_count", 2)
+    w.add_uint32("deepseek41.nextn_predict_layers", 1)  # -> first_nextn_layer = 2 - 1 = 1
+    w.add_uint32("deepseek41.attention.output_group_count", o_groups)
+    N = o_lora_rank * o_groups
+    torch.manual_seed(3)
+    for layer in (0, 1):
+        weight = torch.randn(N, o_group_dim, dtype=torch.float32) * 0.5
+        _add_bf16(w, f"blk.{layer}.attn_output_a.weight", weight)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    reader = gguf.GGUFReader(src)
+    plan = build_plan(reader, rotation_seed=0, local_b=128, max_b=1024, format="ml8_4")
+    names = {e["name"]: e for e in plan}
+    # layer 0 (< first_nextn=1): split into o_groups rotated tensors.
+    for g in range(o_groups):
+        assert f"blk.0.attn_output_a.g{g}.weight" in names
+    assert "blk.0.attn_output_a.weight" not in names
+    # layer 1 (>= first_nextn=1): stays flat, plain q8_0, NOT split/rotated.
+    assert "blk.1.attn_output_a.weight" in names
+    assert names["blk.1.attn_output_a.weight"]["action"] == "q8_0"
+    for g in range(o_groups):
+        assert f"blk.1.attn_output_a.g{g}.weight" not in names
+    print("  PASS test_dsv41_wo_a_split_respects_nextn_fallback")
+
+
+def test_dsv41_k_not_multiple_of_64_falls_back_to_q8_0():
+    # Defensive: if a future DS4.1 config ever produced a K not divisible by
+    # QK_ML8=64 for one of these roles, ml8_4 classification must fall back
+    # to unrotated Q8_0 rather than silently mis-round K into groups.
+    action, role = classify_tensor("blk.0.attn_q_a.weight", (5121, 1280), format="ml8_4")
+    assert action == "q8_0" and role == "attn_q_a"
+    print("  PASS test_dsv41_k_not_multiple_of_64_falls_back_to_q8_0")
+
+
 def test_dry_run_classification_fp8_b128(synthetic_gguf_b128):
     """--dry-run classification: aligned roles rotate, the unaligned attn_v
     and the standing q8_0/copy exclusions behave as documented."""
@@ -755,6 +944,42 @@ def test_classify_tensor_ml8_4_fallback():
     print("  PASS test_classify_tensor_ml8_4_fallback")
 
 
+def test_classify_tensor_nextn_fallback_scoped_to_targeted_roles():
+    """first_nextn_layer's MTP-safety fallback must only force Q8_0 for roles
+    that would otherwise be rotated/ml8'd (K_SPLIT_HADAMARD_ROLES /
+    N_SPLIT_KRONECKER_ROLES) -- NOT every 2D weight in the nextn block.
+    2026-09-22 regression: the fallback used to catch-all every 2D weight at
+    or past first_nextn_layer, which forced DS4.1 MTP-block tensors like
+    ffn_gate_inp.weight (BF16) and hc_attn_fn.weight/hc_ffn_fn.weight (F32)
+    down to Q8_0, diverging from production's full-precision types for those
+    tensors. See classify_tensor's docstring and ml84-fast-report.md."""
+    # Targeted attention roles (hadamard/kronecker) at/past first_nextn_layer:
+    # still forced to plain q8_0 -- ml8 sidecars aren't registered there.
+    assert classify_tensor("blk.5.attn_output.weight", (4864, 5120),
+                            first_nextn_layer=5)[0] == "q8_0"
+    assert classify_tensor("blk.5.attn_q_a.weight", (2048, 96),
+                            first_nextn_layer=5, format="ml8_4")[0] == "q8_0"
+    # Same roles below first_nextn_layer: rotate normally (unaffected).
+    assert classify_tensor("blk.4.attn_output.weight", (4864, 5120),
+                            first_nextn_layer=5)[0] == "rotate_hadamard"
+    # Non-targeted 2D weights at/past first_nextn_layer: NOT forced to q8_0 --
+    # fall through to normal classification (copy, since none of these are in
+    # any role table), preserving the source GGUF's type (BF16/F32/whatever
+    # production has), matching production's full-precision MTP tensors.
+    assert classify_tensor("blk.5.ffn_gate_inp.weight", (2048, 8),
+                            first_nextn_layer=5)[0] == "copy"
+    assert classify_tensor("blk.5.hc_attn_fn.weight", (2048, 2048),
+                            first_nextn_layer=5)[0] == "copy"
+    assert classify_tensor("blk.5.hc_ffn_fn.weight", (2048, 2048),
+                            first_nextn_layer=5)[0] == "copy"
+    # A Q8_0_ROLES member at/past first_nextn_layer still lands on q8_0 (both
+    # the explicit-role path and the old catch-all agree here, so this isn't
+    # a behavior change, just confirming it still holds under the new scoping).
+    assert classify_tensor("blk.5.ssm_alpha.weight", (2048, 48),
+                            first_nextn_layer=5)[0] == "q8_0"
+    print("  PASS test_classify_tensor_nextn_fallback_scoped_to_targeted_roles")
+
+
 def test_dry_run_classification_ml8_4(synthetic_gguf):
     src, _ = synthetic_gguf
     reader = gguf.GGUFReader(src)
@@ -827,6 +1052,78 @@ def test_fit_and_assign_ml8_centroids_roundtrip():
     err = _nmse(dequant.numpy(), w.numpy())
     assert err < 0.15, f"ml8_4 fit/assign NMSE {err:.3e} too high"
     print("  PASS test_fit_and_assign_ml8_centroids_roundtrip")
+
+
+def test_lloyd_max_signed_batched_matches_per_group():
+    """_lloyd_max_signed_batched (2026-09-22 perf fix: vectorizes the
+    per-group `for g in range(n_groups): _lloyd_max_signed(...)` loop in
+    _fit_ml8_centroids across all groups at once) must reproduce
+    `_lloyd_max_signed` called once per group, on a small synthetic case,
+    bit-exactly (both use n_iter fixed iterations with no early-stop
+    dependence, so there's no floating summation-order slop to allow for at
+    this size -- unlike the real-weight equivalence check, which tolerates
+    rare ULP-level boundary flips)."""
+    torch.manual_seed(7)
+    n_groups, n_samples, n_levels, n_iter = 5, 4096, 16, 25
+
+    samples2d = torch.randn(n_groups, n_samples, dtype=torch.float32)
+    # Make groups have different scales/shapes so a bug that only shows up
+    # for non-uniform data (e.g. an off-by-one group index) isn't masked.
+    samples2d = samples2d * (1.0 + 0.5 * torch.arange(n_groups).view(-1, 1))
+
+    batched = _lloyd_max_signed_batched(
+        samples2d, n_levels=n_levels, n_iter=n_iter, fit_loss="mse")
+    per_group = torch.stack([
+        _lloyd_max_signed(
+            samples2d[g], sample_col_idx=None, col_weights=None,
+            n_levels=n_levels, n_iter=n_iter, fit_loss="mse", mag_weight_p=5.0,
+        )
+        for g in range(n_groups)
+    ])
+
+    assert batched.shape == per_group.shape == (n_groups, n_levels)
+    # Tiny (~1e-6) floating differences are expected and acceptable here: the
+    # batched path's `.sum(dim=1)` reduction over a bin's members can use a
+    # different addition order than the per-group path's `.sum()` over the
+    # same values (see _lloyd_max_signed_batched's docstring) -- this is the
+    # documented summation-order slop, not a correctness bug. A real mismatch
+    # (wrong group indexing, wrong bin assignment, etc.) would show up as
+    # differences far larger than float32 summation noise.
+    torch.testing.assert_close(batched, per_group, atol=1e-5, rtol=1e-5)
+    print("  PASS test_lloyd_max_signed_batched_matches_per_group")
+
+
+def test_fit_ml8_centroids_batched_matches_per_group():
+    """End-to-end (through _fit_ml8_centroids, not just the Lloyd-Max
+    kernel): batched_fit=True vs batched_fit=False must produce the same
+    e4m3-snapped centroids on a small synthetic weight."""
+    from kronecker_rotation import BlockHadamardRotation
+
+    class _Identity:
+        def forward(self, x):
+            return x
+
+    torch.manual_seed(31)
+    N, K = 96, 192  # K = 3 groups of QK_ML8=64
+    w = torch.randn(N, K, dtype=torch.float32) * 0.9
+
+    class _Tensor:
+        tensor_type = GGMLQuantizationType.BF16
+        name = "synthetic"
+
+        def __init__(self, data):
+            self.data = data
+
+    t16 = w.to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
+    tensor = _Tensor(t16)
+
+    rot = _Identity()
+    c_batched = _fit_ml8_centroids(tensor, K, N, torch.device("cpu"), rot,
+                                   fit_rows=N, batched_fit=True, fit_group_chunk=2)
+    c_per_group = _fit_ml8_centroids(tensor, K, N, torch.device("cpu"), rot,
+                                     fit_rows=N, batched_fit=False)
+    torch.testing.assert_close(c_batched, c_per_group, atol=0.0, rtol=0.0)
+    print("  PASS test_fit_ml8_centroids_batched_matches_per_group")
 
 
 def test_convert_ml8_4_end_to_end(synthetic_gguf, tmp_path):
@@ -1109,6 +1406,89 @@ def test_seed_determinism_ml8_4(synthetic_gguf, tmp_path):
         b2 = np.ascontiguousarray(names2[name].data)
         np.testing.assert_array_equal(b1, b2, err_msg=f"{name}: bytes differ across runs")
     print("  PASS test_seed_determinism_ml8_4")
+
+
+def _make_reference_gguf_with_weight_pager_kv(path: Path) -> None:
+    """Small reference GGUF carrying weight_pager.* KV fields, standing in
+    for a production spine (e.g. dsv41-spine.gguf) that has metadata a
+    BF16-from-convert_hf intermediate lacks. Also carries a
+    `weight_pager.already_present` key with a DIFFERENT value than the
+    source will have, to verify --kv-from never overwrites a key the source
+    already defines -- only backfills ones it's missing."""
+    w = gguf.GGUFWriter(str(path), arch="qwen35")
+    w.add_uint32("qwen35.embedding_length", D_MODEL)
+    w.add_uint32("qwen35.block_count", 1)
+    w.add_bool("weight_pager.routed_experts_external", True)
+    w.add_uint32("weight_pager.expert_count", 128)
+    w.add_uint32("weight_pager.already_present", 999)  # source defines its own value (1) for this
+    w.add_string("general.name", "reference-spine-not-copied")  # non-weight_pager.* -- must NOT copy
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_ti_data_to_file()
+    w.close()
+
+
+def test_kv_from_backfills_missing_weight_pager_keys(synthetic_gguf, tmp_path):
+    """--kv-from copies weight_pager.* keys present in the reference GGUF
+    but absent from --src, leaves keys --src already has untouched, and
+    copies nothing outside the weight_pager.* prefix (e.g. general.name is
+    NOT clobbered by the reference's). Regression: an ml8-4-converted DS4.1
+    spine built from a BF16 intermediate straight off convert_hf_to_gguf.py
+    (no weight-pager forge stage) failed to load
+    ("check_tensor_dims: tensor 'blk.0.ffn_gate_exps.weight' not found")
+    because it lacked `weight_pager.routed_experts_external` (BOOL, True in
+    production) -- the C++ loader gates expert-tensor creation on that key."""
+    src, _ = synthetic_gguf
+    ref = tmp_path / "reference_with_wp_kv.gguf"
+    _make_reference_gguf_with_weight_pager_kv(ref)
+
+    # Source already defines this one key -- must survive --kv-from untouched.
+    reader_src = gguf.GGUFReader(src)
+    assert "weight_pager.already_present" not in reader_src.fields  # sanity: not in the fixture
+
+    # Add it to a modified copy of src with its OWN value (1), to prove
+    # --kv-from doesn't clobber it with the reference's (999).
+    src_with_own_key = tmp_path / "src_with_own_key.gguf"
+    w = gguf.GGUFWriter(str(src_with_own_key), arch="qwen35")
+    for name, field in reader_src.fields.items():
+        if name in ("GGUF.version", "GGUF.tensor_count", "GGUF.kv_count", "general.architecture"):
+            continue  # meta fields GGUFWriter already sets via arch=/write_header_to_file
+        _copy_field(w, name, field)
+    w.add_uint32("weight_pager.already_present", 1)
+    for t in reader_src.tensors:
+        w.add_tensor(t.name, np.ascontiguousarray(t.data), raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    out_no_kv_from = tmp_path / "out_no_kv_from.gguf"
+    out_kv_from = tmp_path / "out_kv_from.gguf"
+    convert(src_with_own_key, out_no_kv_from, rotation_seed=0, device_str="cpu",
+            local_b=128, max_b=1024, format="ml8_4")  # kv_from=None (default)
+    convert(src_with_own_key, out_kv_from, rotation_seed=0, device_str="cpu",
+            local_b=128, max_b=1024, format="ml8_4", kv_from=ref)
+
+    r_no_kv = gguf.GGUFReader(out_no_kv_from)
+    r_kv = gguf.GGUFReader(out_kv_from)
+
+    # Unset --kv-from: byte-identical to prior behavior -- no weight_pager.*
+    # keys beyond what --src already had (Qwen conversions never pass
+    # --kv-from, so this is exactly their code path).
+    assert "weight_pager.routed_experts_external" not in r_no_kv.fields
+    assert "weight_pager.expert_count" not in r_no_kv.fields
+    assert r_no_kv.fields["weight_pager.already_present"].contents() == 1
+
+    # --kv-from set: missing keys backfilled from the reference...
+    assert r_kv.fields["weight_pager.routed_experts_external"].contents() == True
+    assert r_kv.fields["weight_pager.expert_count"].contents() == 128
+    # ...but the key --src already had is NOT overwritten by the reference's.
+    assert r_kv.fields["weight_pager.already_present"].contents() == 1
+    # ...and non-weight_pager.* fields from the reference are never copied
+    # (the source has no general.name of its own, so if --kv-from leaked
+    # non-weight_pager.* keys it would show up here).
+    assert "general.name" not in r_kv.fields
+    print("  PASS test_kv_from_backfills_missing_weight_pager_keys")
 
 
 if __name__ == "__main__":

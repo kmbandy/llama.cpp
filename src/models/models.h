@@ -1349,6 +1349,15 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * comb,
                 int il) const;
 
+        // WP_DS4_CONST_SHAPE: pins graph topology (indexer/CSA top-k padding,
+        // n_stream canonicalization) so a compiled graph can be captured/reused
+        // across ubatches with different content. Exposed here (the underlying
+        // check is a file-static in deepseek4.cpp) so deepseek41's CED prefill
+        // trim -- a *conditional* topology change keyed on per-ubatch content --
+        // can refuse to combine with it; the two are incompatible by construction
+        // (see llama_model_deepseek41::graph::graph()).
+        static bool ds4_const_shape_enabled();
+
     protected:
         struct constant_cache_entry {
             ggml_type type;
@@ -1447,6 +1456,13 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 int64_t nt,
                 int il) const;
 
+        // WP_DSV41_TOPK_REUSE: the most recent index source's top-k picks, which
+        // the compressed layers after it reuse (reference model.py:
+        // shared_attn.topk_idxs). Set while building the source layer, read by
+        // the layers whose dsv41_topk_source names it.
+        mutable ggml_tensor * dsv41_shared_top_k     = nullptr;
+        mutable int           dsv41_shared_top_k_src = -1;
+
         // which compressed positions this layer's queries attend to
         ggml_tensor * build_indexer_top_k(
                 const llama_model & model,
@@ -1457,12 +1473,33 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * inp_pos,
                 int il) const;
 
+        // cur_state (CED prefill trim, WP_DSV41_CED_PREFILL): defaults to `cur`.
+        // Pass a WIDER, full-token `cur_state` only for the seam layer under the
+        // trim, where `cur` itself has been narrowed to the trailing W-token
+        // query window but the kv-source/indexer-publish block (the compressed
+        // global KV every decoder layer reads, and the shared index keys) still
+        // needs every token -- see the encoder/decoder split comment at the top
+        // of this file and the trim gate in graph::graph().
+        // ced_log_shapes (CED prefill trim observability, WP_DSV41_CED_PREFILL):
+        // when true, logs q/k_all/kq_mask/n_kv_max shapes for this call via
+        // dsv41_ced_log_if_changed's channel 2. The caller (graph::graph(),
+        // which knows ced_seam) decides which layers this applies to; false
+        // (default) costs nothing beyond the boolean check.
+        // publish_only (CED prefill trim, WP_DSV41_CED_SKIP_NONFINAL): the
+        // caller only needs the kv-source/indexer publish below (a non-final
+        // ubatch's seam layer, see graph::graph()'s ced_skip_layer) -- skip
+        // this layer's own query/RoPE/raw-window-write/attention entirely and
+        // return nullptr. Requires cur_state != nullptr and a compressed
+        // (ratio != 0) layer; both already guaranteed by the caller.
         ggml_tensor * build_attention_v41(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                ggml_tensor * cur_state = nullptr,
+                bool ced_log_shapes = false,
+                bool publish_only = false) const;
 
     private:
         void build_dspark_encoder(const llama_model & model);

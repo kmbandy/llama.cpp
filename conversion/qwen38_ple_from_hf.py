@@ -101,7 +101,7 @@ def read_consts(session, base: str, consts: dict[str, str], remote) -> dict[str,
     return out
 
 
-def convert_table(session, base: str, shards, remote, staging_dir: Path, chunk_rows: int, workers: int) -> tuple[Path, int, int]:
+def convert_table(session, base: str, shards, remote, staging_dir: Path, chunk_rows: int, workers: int, qtype_name: str = "MXFP4") -> tuple[Path, int, int]:
     # geometry from the shards themselves
     n_rows = 0
     n_cols = None
@@ -120,13 +120,13 @@ def convert_table(session, base: str, shards, remote, staging_dir: Path, chunk_r
     if n_cols % 32:
         raise ValueError(f"row width {n_cols} not multiple of MXFP4 block 32")
 
-    qtype = gguf.GGMLQuantizationType.MXFP4
+    qtype = gguf.GGMLQuantizationType[qtype_name]
     row_bytes = int(gguf.quantize(np.zeros((1, n_cols), dtype=np.float32), qtype).nbytes)
     row_in = n_cols * ELEM_BYTES["BF16"]
-    staging = staging_dir / "ple_MXFP4.bin"
-    progress_path = staging_dir / "ple_MXFP4.progress.json"
-    logger.info("PLE table: %d shards -> MXFP4 %d x %d (%.1f GB) at %s",
-                len(shards), n_rows, n_cols, n_rows * row_bytes / 1e9, staging)
+    staging = staging_dir / f"ple_{qtype_name}.bin"
+    progress_path = staging_dir / f"ple_{qtype_name}.progress.json"
+    logger.info("PLE table: %d shards -> %s %d x %d (%.1f GB) at %s",
+                len(shards), qtype_name, n_rows, n_cols, n_rows * row_bytes / 1e9, staging)
 
     start_row = 0
     if staging.is_file() and progress_path.is_file():
@@ -197,7 +197,7 @@ def convert_table(session, base: str, shards, remote, staging_dir: Path, chunk_r
     n_workers = max(1, int(workers))
     pool: ProcessPoolExecutor | None = None
     raw_in = raw_out = None
-    if n_workers > 1:
+    if n_workers > 1 and qtype == gguf.GGMLQuantizationType.MXFP4:
         ctx = get_context("fork")
         raw_in = ctx.RawArray("f", chunk_rows * n_cols)
         raw_out = ctx.RawArray("B", chunk_rows * row_bytes)
@@ -208,12 +208,20 @@ def convert_table(session, base: str, shards, remote, staging_dir: Path, chunk_r
 
     t_all = time.time()
     n_chunks = (n_rows + chunk_rows - 1) // chunk_rows
+    # pipeline: the next chunk downloads while this one packs
+    prefetch = ThreadPoolExecutor(max_workers=1)
+    pending = None
     try:
         for start in range(start_row, n_rows, chunk_rows):
             stop = min(start + chunk_rows, n_rows)
             nrows = stop - start
             t0 = time.time()
-            f32 = fetch_rows(start, stop)
+            if pending is None:
+                pending = prefetch.submit(fetch_rows, start, stop)
+            f32 = pending.result()
+            pending = None
+            if stop < n_rows:
+                pending = prefetch.submit(fetch_rows, stop, min(stop + chunk_rows, n_rows))
             t_dl = time.time()
             if pool is not None and nrows >= 8192:
                 packed = _mxfp4_quantize_with_pool(f32, raw_in, raw_out, pool, n_workers, row_bytes)
@@ -233,6 +241,7 @@ def convert_table(session, base: str, shards, remote, staging_dir: Path, chunk_r
                             stop, n_rows, 100.0 * stop / n_rows, t_dl - t0, time.time() - t_dl, dt,
                             remain * dt / 3600.0)
     finally:
+        prefetch.shutdown(wait=False, cancel_futures=True)
         if pool is not None:
             pool.shutdown(wait=True)
 
@@ -243,7 +252,7 @@ def convert_table(session, base: str, shards, remote, staging_dir: Path, chunk_r
     return staging, n_rows, n_cols
 
 
-def write_gguf(outfile: Path, hparams: dict, consts: dict[str, list[int]], staging: Path, n_rows: int, n_cols: int) -> None:
+def write_gguf(outfile: Path, hparams: dict, consts: dict[str, list[int]], staging: Path, n_rows: int, n_cols: int, qtype_name: str = "MXFP4") -> None:
     writer = gguf.GGUFWriter(str(outfile), arch="qwen4exp", use_temp_file=False)
     # informational: the main GGUF carries the authoritative PLE keys; these let the
     # sidecar describe itself and be checked against the main file
@@ -255,7 +264,7 @@ def write_gguf(outfile: Path, hparams: dict, consts: dict[str, list[int]], stagi
     writer.add_ple_head_offsets(consts["ngram_heads_offsets"])
     writer.add_ple_head_vocab_sizes(consts["ngram_heads_vocab_sizes"])
 
-    qtype = gguf.GGMLQuantizationType.MXFP4
+    qtype = gguf.GGMLQuantizationType[qtype_name]
     row_bytes = int(gguf.quantize(np.zeros((1, n_cols), dtype=np.float32), qtype).nbytes)
     mm = np.memmap(staging, dtype=np.uint8, mode="r")
     if mm.size != n_rows * row_bytes:
@@ -282,6 +291,7 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     ap.add_argument("--probe", action="store_true", help="print shard map and exit")
     ap.add_argument("--keep-staging", action="store_true")
+    ap.add_argument("--qtype", default="MXFP4", help="ggml type for the table (MXFP4, Q8_0, Q4_0, ...)")
     args = ap.parse_args()
 
     session = make_session()
@@ -299,10 +309,10 @@ def main() -> int:
     consts = read_consts(session, base, consts_files, remote)
     (cache_dir / "ple_consts.json").write_text(json.dumps(consts), encoding="utf-8")
 
-    staging, n_rows, n_cols = convert_table(session, base, shards, remote, cache_dir, args.chunk_rows, args.workers)
+    staging, n_rows, n_cols = convert_table(session, base, shards, remote, cache_dir, args.chunk_rows, args.workers, args.qtype)
     outfile = Path(args.outfile)
     require_free(outfile.parent, staging.stat().st_size + 1024 ** 3)
-    write_gguf(outfile, hparams, consts, staging, n_rows, n_cols)
+    write_gguf(outfile, hparams, consts, staging, n_rows, n_cols, args.qtype)
     if not args.keep_staging:
         staging.unlink()
         logger.info("removed staging %s", staging)

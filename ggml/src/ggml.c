@@ -1229,6 +1229,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_BACK",
     "PAGED_ATTN_MT",
     "PAGED_KV_UPDATE_MT",
+    "SPARSE_ATTN_DSV4",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1272,7 +1273,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SINKHORN_NORM",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1357,6 +1358,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_back(x)",
     "paged_attn_mt(q,k,v,bt,cl,ql)",
     "paged_kv_update_mt(k_cur,v_cur,k_cache,v_cache,slot_map)",
+    "sparse_attn_dsv4(q,k_all,kv_indices,attn_sink)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1400,7 +1402,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sinkhorn_norm(x)",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5802,6 +5804,44 @@ struct ggml_tensor * ggml_paged_attn_mt(
 
 // (Legacy ggml_paged_kv_update_mt removed — scatter is fused into
 // ggml_paged_attn_mt above. See MAD-114.)
+
+struct ggml_tensor * ggml_sparse_attn_dsv4(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_all,
+        struct ggml_tensor  * kv_indices,
+        struct ggml_tensor  * kv_indptr,
+        struct ggml_tensor  * attn_sink,
+        float                  scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F16);
+    GGML_ASSERT(kv_indptr->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv_indptr->ne[0] == q->ne[2] + 1 && "sparse_attn_dsv4: kv_indptr must have n_tokens+1 entries");
+    GGML_ASSERT(k_all->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_all->ne[1] == 1 && "sparse_attn_dsv4: k_all must be the K==V latent MQA pool (1 kv head)");
+    GGML_ASSERT(kv_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv_indices->ne[1] == q->ne[2] && "sparse_attn_dsv4: kv_indices must carry one index row per query token");
+    GGML_ASSERT(attn_sink->type == GGML_TYPE_F32);
+    GGML_ASSERT(attn_sink->ne[0] == q->ne[1] && "sparse_attn_dsv4: attn_sink must have one entry per head");
+
+    // Output shape mirrors q: [head_dim, n_heads, n_tokens, 1]
+    int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, ne);
+
+    // op_params: [0] float scale, [1] int32_t n_idx (= kv_indices->ne[0])
+    int32_t params_i32[2];
+    memcpy(&params_i32[0], &scale, sizeof(scale));
+    params_i32[1] = (int32_t) kv_indices->ne[0];
+    ggml_set_op_params(result, params_i32, sizeof(params_i32));
+
+    result->op     = GGML_OP_SPARSE_ATTN_DSV4;
+    result->src[0] = q;
+    result->src[1] = k_all;
+    result->src[2] = kv_indices;
+    result->src[3] = attn_sink;
+    result->src[4] = kv_indptr;
+
+    return result;
+}
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,

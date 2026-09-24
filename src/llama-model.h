@@ -297,6 +297,15 @@ struct llama_layer {
     struct ggml_tensor * wv_b      = nullptr;
     struct ggml_tensor * wqkv_b    = nullptr;
     struct ggml_tensor * wo_a      = nullptr;
+    // ml8-4 data-free conversion (Task 2, 2026-09-22): wo_a split into
+    // o_groups separate 2D tensors (see LLM_TENSOR_ATTN_OUT_A_SPLIT).
+    // wo_a_g[g] is nullptr unless the GGUF carries the split tensors (a
+    // Q8_0 spine has plain `wo_a` only); deepseek41.cpp's
+    // build_attention_tail checks wo_a_g[0] to pick which path to build.
+    // Fixed at 8 (DS4.1's o_group_count today) rather than hparams-sized to
+    // avoid a heap allocation per layer for a field that's null on every
+    // non-deepseek41 arch and every unsplit DS4.1 GGUF.
+    struct ggml_tensor * wo_a_g[8] = { nullptr };
     struct ggml_tensor * wo_b      = nullptr;
     struct ggml_tensor * wq_cross  = nullptr;
     struct ggml_tensor * wk_cross  = nullptr;

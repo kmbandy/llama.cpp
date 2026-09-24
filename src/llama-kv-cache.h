@@ -273,7 +273,15 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // ced_replay_floor (CED prefill trim, WP_DSV41_CED_PREFILL, src/models/deepseek41.cpp):
+    // when >= 0, a cell whose stored position is earlier than this gets
+    // masked out (-inf) regardless of what causal/SWA distance would
+    // otherwise allow -- SWA Bounded Replay: a decoder-layer query may only
+    // attend to positions actually replayed through that layer. -1 (the
+    // default, and the only value every caller other than DSV4's raw/SWA
+    // cache ever passes) is a no-op -- byte-identical to before this param
+    // existed.
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, llama_pos ced_replay_floor = -1) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

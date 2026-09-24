@@ -77,7 +77,7 @@ from ml8_to_gguf import (  # noqa: E402
     pack_scaled_fp8_blocks, _FP8_GROUP_SIZE, _FP8_BLOCK_BYTES,
     pack_ml8_blocks, cast_centroids_to_fp8, QK_ML8, ML8_BLOCK_BYTES, N_CENTROIDS,
 )
-from centroid_quantizer import snap_to_e4m3, _lloyd_max_signed  # noqa: E402
+from centroid_quantizer import snap_to_e4m3, _lloyd_max_signed, _lloyd_max_signed_batched  # noqa: E402
 
 
 # ─── FP8_B128 (block-128 tile-scaled fp8) constants ────────────────────────
@@ -123,6 +123,14 @@ _ML8_FIT_EPS = 1e-8
 # stable per-K-group LUT, and every row is still individually assigned+scaled
 # in the (memory-bounded, chunked) second pass.
 _ML8_FIT_ROWS_DEFAULT = 65536
+# Default number of K-groups fit together in one _lloyd_max_signed_batched
+# call (see --ml8-fit-group-chunk). Bounds peak GPU memory for the batched
+# fit to O(group_chunk * fit_rows * QK_ML8) regardless of how many K-groups
+# a tensor has (up to 128 for the largest DS4.1 K=8192 weight) -- at the
+# default fit_rows=65536, one chunk of 32 groups is ~4.3 GB peak (samples +
+# int64 bins + weights), comfortably inside a 16 GB card even with the
+# tensor's own pooled/x_norm buffers (~2.1 GB each) still resident.
+_ML8_FIT_GROUP_CHUNK_DEFAULT = 32
 
 
 def _rotate_dtype_params(fmt: str):
@@ -140,10 +148,32 @@ def _rotate_dtype_params(fmt: str):
 # Roles are the tensor name with the leading "blk.{L}." (if any) stripped and
 # the trailing ".weight" stripped, e.g. "blk.3.attn_output.weight" -> "attn_output",
 # "output.weight" -> "output", "token_embd.weight" -> "token_embd".
-K_SPLIT_HADAMARD_ROLES = {"attn_output", "ffn_down", "ssm_out"}
+#
+# DS4.1 (deepseek41 arch) roles, added for the data-free ml8_4 attention
+# conversion (2026-09-22). Real tensor names/shapes verified against
+# /home/kmbandy/models/dsv41-spine.gguf's own header (NOT the scoping report's
+# guessed names — attn_comp_wkv/attn_comp_wgate/indexer_proj/indexer_attn_*
+# in the report are attn_compressor_kv/attn_compressor_gate/indexer.proj/
+# indexer.attn_* on disk; see src/models/deepseek41.cpp load_arch_tensors).
+#   attn_output_a (wo_a) is intentionally NOT listed here: it is a single
+#   flat [o_group_dim, o_lora_rank*o_groups] GGUF tensor that create_tensor
+#   reshapes to 3D [o_group_dim, o_lora_rank, o_groups] (TENSOR_ALLOW_RESHAPE)
+#   and consumes via a batched ggml_mul_mat, block-diagonal over 8 groups —
+#   rotating it as one 2D GEMM here would be wrong (see deepseek41.cpp:926 and
+#   the wo_a-split conversion step, which classifies the split
+#   "attn_output_a.gN" role instead, once the split tensors exist).
+K_SPLIT_HADAMARD_ROLES = {
+    "attn_output", "ffn_down", "ssm_out",
+    "attn_output_b",                                    # DS4.1 wo_b (blk.N.attn_output_b.weight)
+    *(f"attn_output_a.g{g}" for g in range(8)),          # DS4.1 wo_a, post-split (see wo_a-split step)
+}
 N_SPLIT_KRONECKER_ROLES = {
     "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate",
     "ffn_gate", "ffn_up", "output",
+    # DS4.1 (deepseek41):
+    "attn_q_a", "attn_q_b", "attn_kv",
+    "indexer.proj", "indexer.attn_q_b", "indexer.attn_k",
+    "attn_compressor_kv", "attn_compressor_gate",
 }
 Q8_0_ROLES = {"token_embd", "ssm_alpha", "ssm_beta"}
 
@@ -154,10 +184,25 @@ Q8_0_ROLES = {"token_embd", "ssm_alpha", "ssm_beta"}
 # here is its own singleton group (attn_output/ssm_out/ffn_down/output — the
 # first two kinds are block_hadamard and don't have an h_a/seed at all, but
 # they still get a stable per-(layer,role) group identity for uniformity).
+#
+# DS4.1 additions (verified against src/models/deepseek41.cpp call sites):
+#   wq_a(cur), wkv(cur), indexer_proj(cur)        -> all three build_lora_mm
+#     calls take the SAME post-attn_norm `cur` tensor (deepseek41.cpp:1499,
+#     1511, 975) -> group "dsv4_cur".
+#   wq_b(qr), indexer_attn_q_b(qr)                -> both take the q_a output
+#     `qr` (deepseek41.cpp:1503, 959) -> group "dsv4_qr".
+#   attn_comp_wkv(cur_kv), attn_comp_wgate(cur_kv) -> both take `cur_kv`
+#     (deepseek41.cpp:1551, 1558) -> group "dsv4_cur_kv".
+#   indexer_attn_k(latent_pre) has no other consumer of latent_pre -> left as
+#   its own singleton (not listed below, role_group_key falls back to the
+#   role name itself).
 _GROUPED_ROLES = {
     "attn_qkv": "attn_qkv_gate", "attn_gate": "attn_qkv_gate",
     "attn_q": "attn_qkv_split", "attn_k": "attn_qkv_split", "attn_v": "attn_qkv_split",
     "ffn_gate": "ffn_gate_up", "ffn_up": "ffn_gate_up",
+    "attn_q_a": "dsv4_cur", "attn_kv": "dsv4_cur", "indexer.proj": "dsv4_cur",
+    "attn_q_b": "dsv4_qr", "indexer.attn_q_b": "dsv4_qr",
+    "attn_compressor_kv": "dsv4_cur_kv", "attn_compressor_gate": "dsv4_cur_kv",
 }
 
 _SKIP_FIELDS = {
@@ -209,8 +254,18 @@ def tensor_role(name: str) -> tuple[str | None, bool]:
     return rest[: -len(".weight")], True
 
 
+# Architectures where token_embd/output are explicitly OUT OF SCOPE for this
+# converter (2026-09-22 DS4.1 attention-only conversion task) and must be
+# copied verbatim at whatever type the source GGUF already has them in --
+# unlike qwen35/qwen36, where "token_embd" (Q8_0_ROLES) and "output"
+# (N_SPLIT_KRONECKER_ROLES) rotating/quantizing IS the wanted, existing,
+# byte-identical-must-stay-that-way behavior (the qwen38-27b-ml8-4 recipe
+# explicitly rotates the lm_head). Keyed by GGUF `general.architecture`.
+_PROTECT_EMBED_OUTPUT_ARCHES = {"deepseek41"}
+
+
 def classify_tensor(name: str, shape: tuple, first_nextn_layer: int | None = None,
-                    format: str = "ml8_fp8") -> tuple[str, str | None]:
+                    format: str = "ml8_fp8", arch: str | None = None) -> tuple[str, str | None]:
     """Return (action, role). action in {"rotate_hadamard", "rotate_kronecker",
     "q8_0", "copy"}. Falls back to "copy" for anything not 2D even if the role
     would otherwise match (defensive — every allowlisted role in this model is
@@ -219,8 +274,19 @@ def classify_tensor(name: str, shape: tuple, first_nextn_layer: int | None = Non
     Layers at or past `first_nextn_layer` (the MTP / nextn draft block, e.g.
     blk.64 when block_count=65 and nextn_predict_layers=1) are loaded by the
     C++ side without the ml8 sidecar registration, so a rotated weight there
-    would leave its sidecars unconsumed ("wrong number of tensors"). Their 2D
-    GEMM weights become plain Q8_0 instead.
+    would leave its sidecars unconsumed ("wrong number of tensors"). Only the
+    2D GEMM weights whose role would otherwise be rotated/ml8'd (role in
+    K_SPLIT_HADAMARD_ROLES or N_SPLIT_KRONECKER_ROLES) become plain Q8_0
+    instead. Everything else at those layers (e.g. blk.N.ffn_gate_inp,
+    blk.N.hc_attn_fn, blk.N.hc_ffn_fn) is NOT in either role table, so it
+    falls through to the normal role-based classification below (Q8_0_ROLES
+    or, for anything else, "copy" — preserving whatever type the source GGUF
+    already has, matching production's behavior of keeping those tensors at
+    full precision. 2026-09-22: previously this fallback forced EVERY 2D
+    weight at/past first_nextn_layer to Q8_0 regardless of role, which
+    downgraded 9 non-attention MTP-block tensors (ffn_gate_inp.weight x3,
+    hc_attn_fn.weight x3, hc_ffn_fn.weight x3) from BF16/F32 to Q8_0 relative
+    to production — see ml84-fast-report.md / ml84-gate-report.md).
 
     format="fp8_b128" adds one more fallback: FP8_B128 tiles are 128x128, so
     any would-be-rotated tensor whose row count (N) or column count (K) isn't
@@ -236,9 +302,24 @@ def classify_tensor(name: str, shape: tuple, first_nextn_layer: int | None = Non
     role, is_weight = tensor_role(name)
     if not is_weight or len(shape) != 2:
         return "copy", role
+    if arch in _PROTECT_EMBED_OUTPUT_ARCHES and role in ("token_embd", "output"):
+        return "copy", role
     if first_nextn_layer is not None and name.startswith("blk."):
         if int(name.split(".", 2)[1]) >= first_nextn_layer:
-            return "q8_0", role
+            # "attn_output_a" (no suffix) is the pre-split role name: at a
+            # nextn layer build_plan skips the wo_a split (is_nextn_layer),
+            # so classify_tensor sees the flat role here rather than
+            # "attn_output_a.g{0..7}" (the split, post-split role that IS in
+            # K_SPLIT_HADAMARD_ROLES) -- it's still a targeted attention
+            # role that would otherwise be rotated, just under its
+            # pre-split name.
+            if (role in K_SPLIT_HADAMARD_ROLES or role in N_SPLIT_KRONECKER_ROLES
+                    or role == "attn_output_a"):
+                return "q8_0", role
+            # else: fall through to normal role-based classification below
+            # (Q8_0_ROLES or "copy" -- preserves production's full-precision
+            # type for out-of-scope MTP-block tensors like ffn_gate_inp,
+            # hc_attn_fn, hc_ffn_fn).
     if role in K_SPLIT_HADAMARD_ROLES:
         action = "rotate_hadamard"
     elif role in N_SPLIT_KRONECKER_ROLES:
@@ -302,6 +383,26 @@ def _bf16_rows_to_fp32_gpu(tensor, device: torch.device, row_start: int, row_end
     return t32.view(torch.float32).contiguous()
 
 
+def _rows_to_fp32_gpu(tensor, device: torch.device, row_start: int, row_end: int) -> torch.Tensor:
+    """Like `_bf16_rows_to_fp32_gpu` but also accepts F32 source tensors
+    (widened to fp32 is a no-op reshape/copy). Needed for the DS4.1
+    nextn/MTP block (blk.{L>=first_nextn}): `convert_hf_to_gguf.py --outtype
+    bf16` keeps a handful of that block's 2D weights (blk.N.hc_attn_fn,
+    blk.N.hc_ffn_fn) in F32 rather than converting them to BF16 -- those
+    still classify as the "q8_0" fallback action (every nextn-layer 2D
+    weight does, regardless of source dtype, see classify_tensor), so
+    _process_q8_0_chunked needs a source-dtype-aware loader. (The
+    rotate_hadamard/rotate_kronecker paths never see this: every such
+    tensor in this model's plan is BF16 -- verified against the real GGUF --
+    so `_bf16_rows_to_fp32_gpu`'s strict BF16-only check there is
+    intentionally left alone.)"""
+    if tensor.tensor_type == GGMLQuantizationType.F32:
+        f32_all = tensor.data.view(np.float32)          # [N, K] zero-copy view of the mmap
+        chunk = np.array(f32_all[row_start:row_end], copy=True)
+        return torch.from_numpy(chunk).to(device=device).contiguous()
+    return _bf16_rows_to_fp32_gpu(tensor, device, row_start, row_end)
+
+
 def _row_chunk_bounds(N: int, chunk_rows: int) -> list[tuple[int, int]]:
     """(start, end) row ranges covering [0, N), each of size chunk_rows except
     possibly the last — merged into the previous chunk if it would otherwise
@@ -332,7 +433,7 @@ def _row_chunk_bounds(N: int, chunk_rows: int) -> list[tuple[int, int]]:
 
 def _process_rotate_chunked(tensor, e: dict, device: torch.device, rotation,
                             chunk_rows: int = _CHUNK_ROWS, fmt: str = "ml8_fp8",
-                            scale_mode: str = "tile") -> np.ndarray:
+                            scale_mode: str = "tile", row_offset: int = 0) -> np.ndarray:
     """Rotate + quantize (ML8_FP8 scaled-fp8 or FP8_B128 tile/channel-scaled
     fp8, per `fmt`/`scale_mode`) one GEMM weight, one row-chunk of the GPU at
     a time. Returns the fully assembled packed bytes (CPU numpy). `scale_mode`
@@ -357,7 +458,7 @@ def _process_rotate_chunked(tensor, e: dict, device: torch.device, rotation,
     n_blocks = K // group_size
     out = np.empty((N, n_blocks * block_bytes), dtype=np.uint8)
     for start, end in _row_chunk_bounds(N, chunk_rows):
-        w = _bf16_rows_to_fp32_gpu(tensor, device, start, end)
+        w = _bf16_rows_to_fp32_gpu(tensor, device, row_offset + start, row_offset + end)
         if fmt == "fp8_b128":
             out[start:end] = _rotate_and_fp8_b128(w, rotation, scale_mode=scale_mode)
         else:
@@ -369,13 +470,13 @@ def _process_rotate_chunked(tensor, e: dict, device: torch.device, rotation,
 
 
 def _process_q8_0_chunked(tensor, e: dict, device: torch.device,
-                          chunk_rows: int = _CHUNK_ROWS) -> np.ndarray:
+                          chunk_rows: int = _CHUNK_ROWS, row_offset: int = 0) -> np.ndarray:
     """Q8_0-quantize one weight, one row-chunk of the GPU at a time."""
     K, N = e["shape"]
     n_blocks = K // _FP8_GROUP_SIZE
     out = np.empty((N, n_blocks * _FP8_BLOCK_BYTES), dtype=np.uint8)
     for start, end in _row_chunk_bounds(N, chunk_rows):
-        w = _bf16_rows_to_fp32_gpu(tensor, device, start, end)
+        w = _rows_to_fp32_gpu(tensor, device, row_offset + start, row_offset + end)
         out[start:end] = _quantize_q8_0_gpu(w)
         del w
         if device.type == "cuda":
@@ -403,7 +504,9 @@ def _fit_ml8_centroids(tensor, K: int, N: int, device: torch.device, rotation,
                        fit_rows: int, group_size: int = QK_ML8,
                        n_centroids: int = N_CENTROIDS, n_iter: int = 25,
                        fit_loss: str = "mse", mag_weight_p: float = 5.0,
-                       chunk_rows: int = _CHUNK_ROWS) -> torch.Tensor:
+                       chunk_rows: int = _CHUNK_ROWS, row_offset: int = 0,
+                       batched_fit: bool = True,
+                       fit_group_chunk: int = _ML8_FIT_GROUP_CHUNK_DEFAULT) -> torch.Tensor:
     """Fit one shared 16-centroid LUT per K-group (64 columns), pooling the
     scale-normalised ROTATED values of a uniformly-subsampled set of rows (up
     to `fit_rows`, see --ml8-fit-rows) across ALL N rows of the weight.
@@ -428,6 +531,18 @@ def _fit_ml8_centroids(tensor, K: int, N: int, device: torch.device, rotation,
     uniform subsample is enough to fit a stable per-group LUT (every row is
     still individually scaled+assigned in the chunked second pass).
 
+    `batched_fit` (default True, see 2026-09-22 perf fix): fit all n_groups
+    groups of this tensor together via `_lloyd_max_signed_batched` (chunked
+    `fit_group_chunk` groups at a time to bound GPU memory) instead of
+    calling `_lloyd_max_signed` in a Python `for g in range(n_groups)` loop.
+    Measured (blk.0.attn_output_a.g0, 64 groups, cuda:1): the per-group loop
+    is ~13.3s/tensor and is >99.8% of this weight's total conversion time
+    (rotate+assign+pack together are ~0.02s) -- thousands of tiny sequential
+    GPU launches (quantile + 25x(bucketize + 16-way masked-sum) per group)
+    dominate wall time, not the actual rotation/quantization math. Set False
+    to use the original per-group path (kept for comparison/equivalence
+    testing, see test_convert_fp8_rotated.py's batched==per_group test).
+
     Returns centroids [n_groups, n_centroids] float32 on `device`, already
     snapped to the e4m3 lattice (matches cast_centroids_to_fp8's input
     contract)."""
@@ -439,7 +554,7 @@ def _fit_ml8_centroids(tensor, K: int, N: int, device: torch.device, rotation,
 
     pooled = torch.empty((len(sample_idx), K), dtype=torch.float32, device=device)
     for start, end in _row_chunk_bounds(len(sample_idx), chunk_rows):
-        idx_chunk = sample_idx[start:end]
+        idx_chunk = sample_idx[start:end] + row_offset
         w = _bf16_rows_to_fp32_gpu_indices(tensor, device, idx_chunk)
         pooled[start:end] = rotation.forward(w)
         del w
@@ -450,15 +565,31 @@ def _fit_ml8_centroids(tensor, K: int, N: int, device: torch.device, rotation,
     scale = pooled.abs().amax(dim=-1, keepdim=True).clamp_min(_ML8_FIT_EPS)  # [rows, n_groups, 1]
     x_norm = pooled / scale
 
-    centroids = torch.empty((n_groups, n_centroids), dtype=torch.float32, device=device)
-    for g in range(n_groups):
-        samples = x_norm[:, g, :].reshape(-1)
-        c = _lloyd_max_signed(
-            samples, sample_col_idx=None, col_weights=None,
-            n_levels=n_centroids, n_iter=n_iter,
-            fit_loss=fit_loss, mag_weight_p=mag_weight_p,
-        )
-        centroids[g] = c.to(device=device, dtype=torch.float32)
+    if batched_fit:
+        centroids = torch.empty((n_groups, n_centroids), dtype=torch.float32, device=device)
+        chunk = max(1, fit_group_chunk)
+        for gs in range(0, n_groups, chunk):
+            ge = min(gs + chunk, n_groups)
+            # [rows, ge-gs, group_size] -> [ge-gs, rows*group_size]: per-chunk
+            # copy only (not the full n_groups at once) to bound peak memory.
+            samples = x_norm[:, gs:ge, :].permute(1, 0, 2).reshape(ge - gs, -1).contiguous()
+            centroids[gs:ge] = _lloyd_max_signed_batched(
+                samples, n_levels=n_centroids, n_iter=n_iter,
+                fit_loss=fit_loss, mag_weight_p=mag_weight_p,
+            )
+            del samples
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    else:
+        centroids = torch.empty((n_groups, n_centroids), dtype=torch.float32, device=device)
+        for g in range(n_groups):
+            samples = x_norm[:, g, :].reshape(-1)
+            c = _lloyd_max_signed(
+                samples, sample_col_idx=None, col_weights=None,
+                n_levels=n_centroids, n_iter=n_iter,
+                fit_loss=fit_loss, mag_weight_p=mag_weight_p,
+            )
+            centroids[g] = c.to(device=device, dtype=torch.float32)
     return snap_to_e4m3(centroids)
 
 
@@ -496,7 +627,10 @@ def _assign_ml8_indices(w_rot: torch.Tensor, centroids: torch.Tensor,
 
 def _process_rotate_ml8_4_chunked(tensor, e: dict, device: torch.device, rotation,
                                   chunk_rows: int = _CHUNK_ROWS,
-                                  fit_rows: int = _ML8_FIT_ROWS_DEFAULT
+                                  fit_rows: int = _ML8_FIT_ROWS_DEFAULT,
+                                  row_offset: int = 0,
+                                  batched_fit: bool = True,
+                                  fit_group_chunk: int = _ML8_FIT_GROUP_CHUNK_DEFAULT,
                                   ) -> tuple[np.ndarray, np.ndarray]:
     """Full data-free ml8_4 pipeline for one GEMM weight [N, K]: fit a
     per-K-group 16-centroid e4m3 LUT (pooled across a uniformly-subsampled
@@ -513,11 +647,12 @@ def _process_rotate_ml8_4_chunked(tensor, e: dict, device: torch.device, rotatio
     n_groups = K // QK_ML8
 
     centroids = _fit_ml8_centroids(tensor, K, N, device, rotation, fit_rows,
-                                   chunk_rows=chunk_rows)
+                                   chunk_rows=chunk_rows, row_offset=row_offset,
+                                   batched_fit=batched_fit, fit_group_chunk=fit_group_chunk)
 
     out = np.empty((N, n_groups * ML8_BLOCK_BYTES), dtype=np.uint8)
     for start, end in _row_chunk_bounds(N, chunk_rows):
-        w = _bf16_rows_to_fp32_gpu(tensor, device, start, end)
+        w = _bf16_rows_to_fp32_gpu(tensor, device, row_offset + start, row_offset + end)
         w_rot = rotation.forward(w)
         indices, scale = _assign_ml8_indices(w_rot, centroids)
         out[start:end] = pack_ml8_blocks(indices, scale)
@@ -658,7 +793,7 @@ def _emission_specs(tensor, e: dict) -> list[dict]:
         group_size, block_bytes, raw_dtype = _rotate_dtype_params(fmt)
         n_blocks = K // group_size
         specs = [{
-            "name": tensor.name,
+            "name": e["name"],
             "byte_shape": (N, n_blocks * block_bytes),
             "dtype": np.uint8,
             "nbytes": N * n_blocks * block_bytes,
@@ -669,7 +804,7 @@ def _emission_specs(tensor, e: dict) -> list[dict]:
             # exactly as ml8_to_gguf.cast_centroids_to_fp8 writes it — GGUF
             # ne-order shape [16, n_blocks] == numpy/byte_shape (n_blocks, 16).
             specs.append({
-                "name": _sidecar_base(tensor.name) + ".centroids",
+                "name": _sidecar_base(e["name"]) + ".centroids",
                 "byte_shape": (n_blocks, N_CENTROIDS),
                 "dtype": np.uint8,
                 "nbytes": n_blocks * N_CENTROIDS,
@@ -678,12 +813,12 @@ def _emission_specs(tensor, e: dict) -> list[dict]:
         if action == "rotate_kronecker":
             a = e["a"]
             specs.append({
-                "name": _sidecar_base(tensor.name) + ".rotation_h_a",
+                "name": _sidecar_base(e["name"]) + ".rotation_h_a",
                 "byte_shape": (a, a), "dtype": np.float32,
                 "nbytes": a * a * 4, "raw_dtype": None,
             })
         specs.append({
-            "name": _sidecar_base(tensor.name) + ".rotation_meta",
+            "name": _sidecar_base(e["name"]) + ".rotation_meta",
             "byte_shape": (4,), "dtype": np.int32,
             "nbytes": 16, "raw_dtype": None,
         })
@@ -692,7 +827,7 @@ def _emission_specs(tensor, e: dict) -> list[dict]:
         K, N = e["shape"]
         n_blocks = K // _FP8_GROUP_SIZE
         return [{
-            "name": tensor.name,
+            "name": e["name"],
             "byte_shape": (N, n_blocks * _FP8_BLOCK_BYTES),
             "dtype": np.uint8,
             "nbytes": N * n_blocks * _FP8_BLOCK_BYTES,
@@ -700,12 +835,70 @@ def _emission_specs(tensor, e: dict) -> list[dict]:
         }]
     # copy: byte-identical to the source tensor's own on-disk layout.
     return [{
-        "name": tensor.name,
+        "name": e["name"],
         "byte_shape": tensor.data.shape,
         "dtype": tensor.data.dtype,
         "nbytes": tensor.n_bytes,
         "raw_dtype": tensor.tensor_type,
     }]
+
+
+# ─── DS4.1 wo_a split (Task 2, 2026-09-22) ──────────────────────────────────
+# attn_output_a (wo_a) is a single flat GGUF tensor [o_group_dim,
+# o_lora_rank*o_groups] that the C++ loader reshapes to 3D and consumes via a
+# batched (block-diagonal-over-groups) mul_mat (deepseek41.cpp:312/926) — see
+# the module-level comment above K_SPLIT_HADAMARD_ROLES. Rotating the flat
+# 2D tensor as one GEMM would mix groups, so for format="ml8_4" we instead
+# split it here into `o_groups` independent 2D tensors
+# "blk.N.attn_output_a.g{0..o_groups-1}.weight", each [o_group_dim,
+# o_lora_rank] — group g occupies output rows [g*o_lora_rank,
+# (g+1)*o_lora_rank) of the flat N dimension (row-major storage: this is
+# exactly the range TENSOR_ALLOW_RESHAPE's 2D->3D reinterpretation groups
+# together, verified against src/models/deepseek41.cpp:312's
+# `create_tensor(..., {o_group_dim, o_lora_rank, o_groups}, ...)`). Each
+# split tensor gets its own K_SPLIT_HADAMARD_ROLES entry
+# ("attn_output_a.g0".."attn_output_a.g7") and rotation_meta sidecar;
+# BlockHadamardRotation has no h_a to share, so there is nothing to
+# cross-group-share here (stateless given local_b).
+def _get_kv_int(reader: "gguf.GGUFReader", suffix: str) -> int | None:
+    """Look up a KV field ending in `suffix` (e.g. "attention.output_group_count"),
+    any arch prefix. Returns None if absent."""
+    for key, field in reader.fields.items():
+        if key.endswith(suffix):
+            return int(field.parts[field.data[0]][0])
+    return None
+
+
+def _wo_a_split_entries(t, shape: tuple, o_groups: int, local_b: int,
+                        format: str) -> list[dict]:
+    """Plan entries for one wo_a source tensor, split into `o_groups` 2D
+    block_hadamard rotate targets. Raises if the shapes don't divide evenly
+    (defensive -- DS4.1's actual dims are 4096/8192 over 8 groups, both
+    divisible by local_b=128 and QK_ML8=64)."""
+    K, N = shape
+    if N % o_groups != 0:
+        raise ValueError(f"{t.name}: N={N} not divisible by o_groups={o_groups}")
+    per_group_n = N // o_groups
+    if K % local_b != 0:
+        raise ValueError(
+            f"{t.name}: K={K} not divisible by --local-b={local_b} "
+            f"(block_hadamard requires this, wo_a split)")
+    if format == "ml8_4" and K % QK_ML8 != 0:
+        raise ValueError(f"{t.name}: K={K} not divisible by QK_ML8={QK_ML8} (wo_a split)")
+    base = _sidecar_base(t.name)
+    entries = []
+    for g in range(o_groups):
+        entries.append({
+            "name": f"{base}.g{g}.weight",
+            "shape": (K, per_group_n),
+            "action": "rotate_hadamard",
+            "role": f"attn_output_a.g{g}",
+            "format": format,
+            "src_name": t.name,
+            "row_offset": g * per_group_n,
+            "kind": "block_hadamard", "a": K // local_b, "b": local_b,
+        })
+    return entries
 
 
 def _first_nextn_layer(reader: "gguf.GGUFReader") -> int | None:
@@ -737,18 +930,30 @@ def build_plan(reader: "gguf.GGUFReader", rotation_seed: int, local_b: int, max_
     group) via _group_seed — weights that consume the same activation
     (role_group_key) get the identical seed, hence the identical h_a, per the
     one-rotation-per-input-group requirement."""
+    arch = reader.fields["general.architecture"].contents()
     first_nextn = _first_nextn_layer(reader)
     kron_names = sorted(
         t.name for t in reader.tensors
-        if classify_tensor(t.name, tuple(int(s) for s in t.shape), first_nextn, format)[0] == "rotate_kronecker"
+        if classify_tensor(t.name, tuple(int(s) for s in t.shape), first_nextn, format, arch)[0] == "rotate_kronecker"
     )
     kron_index = {name: i for i, name in enumerate(kron_names)}
+
+    o_groups = _get_kv_int(reader, "attention.output_group_count")
 
     plan = []
     for t in reader.tensors:
         shape = tuple(int(s) for s in t.shape)  # ne order: shape[0] == K for 2D
-        action, role = classify_tensor(t.name, shape, first_nextn, format)
-        entry = {"name": t.name, "shape": shape, "action": action, "role": role, "format": format}
+        role_only, is_weight = tensor_role(t.name)
+        layer_of_t = _parse_layer(t.name)
+        is_nextn_layer = (first_nextn is not None and layer_of_t is not None
+                          and layer_of_t >= first_nextn)
+        if (format == "ml8_4" and is_weight and role_only == "attn_output_a"
+                and len(shape) == 2 and o_groups and not is_nextn_layer):
+            plan.extend(_wo_a_split_entries(t, shape, o_groups, local_b, format))
+            continue
+        action, role = classify_tensor(t.name, shape, first_nextn, format, arch)
+        entry = {"name": t.name, "shape": shape, "action": action, "role": role,
+                 "format": format, "src_name": t.name}
         if action == "rotate_kronecker":
             K = shape[0]
             a, b = factor_for_dim(K, max_b=max_b)
@@ -789,16 +994,59 @@ def print_plan(plan: list[dict]) -> None:
             print(f"  {e['name']:45s} shape={e['shape']} action={e['action']}")
 
 
+def _kv_from_fields(kv_from: Path, prefix: str, exclude_names: set[str]) -> dict:
+    """Read every KV field from `kv_from` whose name starts with `prefix` and
+    is not already in `exclude_names`. Used by --kv-from to backfill
+    weight-pager metadata (e.g. `weight_pager.routed_experts_external`) that
+    a source GGUF lacks -- see convert()'s kv_from handling. Returns
+    {name: field} (gguf.ReaderField objects, same shape as
+    GGUFReader.fields, so callers can reuse `_copy_field` unchanged)."""
+    ref_reader = gguf.GGUFReader(kv_from)
+    return {
+        name: field for name, field in ref_reader.fields.items()
+        if name.startswith(prefix) and name not in exclude_names
+    }
+
+
 def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
            local_b: int, max_b: int, chunk_rows: int = _CHUNK_ROWS,
            format: str = "ml8_fp8", ml8_fit_rows: int = _ML8_FIT_ROWS_DEFAULT,
-           scale_mode: str = "tile") -> dict:
+           scale_mode: str = "tile", ml8_batched_fit: bool = True,
+           ml8_fit_group_chunk: int = _ML8_FIT_GROUP_CHUNK_DEFAULT,
+           progress_log=None, kv_from: Path | None = None) -> dict:
     reader = gguf.GGUFReader(src)
     arch = reader.fields["general.architecture"].contents()
     print(f"[base] {src}  arch={arch!r}  fields={len(reader.fields)}  tensors={len(reader.tensors)}")
 
+    # --kv-from: some weight-pager metadata (e.g.
+    # `weight_pager.routed_experts_external`) is stamped onto a spine by a
+    # LATER stage of the conversion forge (conversion/wp_forge/stages.py),
+    # not by plain `convert_hf_to_gguf.py --outtype bf16` -- so a BF16
+    # intermediate built directly from HF (as this converter's --src always
+    # is) never has those keys, and this converter (which only copies KV
+    # fields that already exist in --src, see the loop below) had no way to
+    # produce them. Backfill every `weight_pager.*` key present in a
+    # reference GGUF (the production spine, which DOES have them) but absent
+    # from --src. Unset (None, the default): behavior is byte-identical to
+    # before this option existed -- Qwen conversions never pass --kv-from and
+    # are unaffected.
+    kv_from_fields: dict = {}
+    if kv_from is not None:
+        kv_from_fields = _kv_from_fields(kv_from, "weight_pager.", set(reader.fields))
+        print(f"[kv-from] {kv_from}: backfilling {len(kv_from_fields)} "
+              f"weight_pager.* key(s) absent from --src: "
+              f"{sorted(kv_from_fields)}")
+
     plan = build_plan(reader, rotation_seed, local_b, max_b, format=format)
-    plan_by_name = {e["name"]: e for e in plan}
+    # Most entries have src_name == name (1 source tensor -> 1 emitted
+    # tensor); the wo_a split (Task 2) is the one case where several plan
+    # entries share a src_name (8 groups read from one source tensor via
+    # `row_offset`) -- so pass1/pass2 below iterate `reader.tensors` and look
+    # up ALL of that source's entries, not just one.
+    tensor_by_name = {t.name: t for t in reader.tensors}
+    entries_by_src: dict[str, list[dict]] = {}
+    for e in plan:
+        entries_by_src.setdefault(e.get("src_name", e["name"]), []).append(e)
 
     device = torch.device(device_str)
 
@@ -834,6 +1082,8 @@ def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
         if name in _SKIP_FIELDS:
             continue
         _copy_field(writer, name, field)
+    for name, field in kv_from_fields.items():
+        _copy_field(writer, name, field)
     _format_version = {"fp8_b128": 2, "ml8_4": 3}.get(format, 1)
     writer.add_key_value("fp8rot.format_version", _format_version, gguf.GGUFValueType.UINT32)
     writer.add_key_value("fp8rot.rotation_seed", int(rotation_seed), gguf.GGUFValueType.INT32)
@@ -844,18 +1094,19 @@ def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
     # walk of the plan. add_tensor_info requires this to happen before the
     # output file is opened (write_header_to_file), and write_tensor_data
     # (pass 2) consumes these registrations strictly in insertion order.
-    n_fields = sum(1 for name in reader.fields if name not in _SKIP_FIELDS) + 3
+    n_fields = sum(1 for name in reader.fields if name not in _SKIP_FIELDS) + len(kv_from_fields) + 3
     emission_order: list[dict] = []
     for tensor in reader.tensors:
-        e = plan_by_name[tensor.name]
-        for spec in _emission_specs(tensor, e):
-            writer.add_tensor_info(
-                spec["name"], spec["byte_shape"], np.dtype(spec["dtype"]),
-                spec["nbytes"], raw_dtype=spec["raw_dtype"])
-            emission_order.append(spec)
-    print(f"[fields] copied {n_fields - 3} + 3 fp8rot markers; "
+        for e in entries_by_src.get(tensor.name, []):
+            for spec in _emission_specs(tensor, e):
+                writer.add_tensor_info(
+                    spec["name"], spec["byte_shape"], np.dtype(spec["dtype"]),
+                    spec["nbytes"], raw_dtype=spec["raw_dtype"])
+                emission_order.append(spec)
+    print(f"[fields] copied {n_fields - len(kv_from_fields) - 3} + "
+          f"{len(kv_from_fields)} kv-from + 3 fp8rot markers; "
           f"[pass1] registered {len(emission_order)} tensor blobs "
-          f"({len(reader.tensors)} source tensors)")
+          f"({len(reader.tensors)} source tensors, {len(plan)} plan entries)")
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -865,8 +1116,12 @@ def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
     # time, straight into the file via write_tensor_data (no spooling).
     counts = {"rotate_hadamard": 0, "rotate_kronecker": 0, "q8_0": 0, "copy": 0}
     t_start = time.time()
-    for i, tensor in enumerate(reader.tensors):
-        e = plan_by_name[tensor.name]
+    advised_src: set[str] = set()
+    for i, e in enumerate(plan):
+        t_entry_start = time.time()
+        src_name = e.get("src_name", e["name"])
+        tensor = tensor_by_name[src_name]
+        row_offset = e.get("row_offset", 0)
         action = e["action"]
         if action == "rotate_kronecker":
             K, N = e["shape"]
@@ -874,12 +1129,15 @@ def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
             rot = KroneckerRotation(h_a=h_a, b_dim=e["b"])
             if format == "ml8_4":
                 packed, centroids_bytes = _process_rotate_ml8_4_chunked(
-                    tensor, e, device, rot, chunk_rows=chunk_rows, fit_rows=ml8_fit_rows)
+                    tensor, e, device, rot, chunk_rows=chunk_rows, fit_rows=ml8_fit_rows,
+                    row_offset=row_offset, batched_fit=ml8_batched_fit,
+                    fit_group_chunk=ml8_fit_group_chunk)
                 writer.write_tensor_data(packed)
                 writer.write_tensor_data(centroids_bytes)
             else:
                 packed = _process_rotate_chunked(tensor, e, device, rot, chunk_rows=chunk_rows,
-                                                 fmt=format, scale_mode=scale_mode)
+                                                 fmt=format, scale_mode=scale_mode,
+                                                 row_offset=row_offset)
                 writer.write_tensor_data(packed)
             meta = np.array([e["a"], e["b"], K, KRONECKER_ORTH_SYLVESTER_KIND_ID], dtype=np.int32)
             writer.write_tensor_data(h_a.detach().cpu().contiguous().numpy())
@@ -893,33 +1151,58 @@ def convert(src: Path, out: Path, rotation_seed: int, device_str: str,
             rot = BlockHadamardRotation(in_features=K, b_dim=e["b"])
             if format == "ml8_4":
                 packed, centroids_bytes = _process_rotate_ml8_4_chunked(
-                    tensor, e, device, rot, chunk_rows=chunk_rows, fit_rows=ml8_fit_rows)
+                    tensor, e, device, rot, chunk_rows=chunk_rows, fit_rows=ml8_fit_rows,
+                    row_offset=row_offset, batched_fit=ml8_batched_fit,
+                    fit_group_chunk=ml8_fit_group_chunk)
                 writer.write_tensor_data(packed)
                 writer.write_tensor_data(centroids_bytes)
             else:
                 packed = _process_rotate_chunked(tensor, e, device, rot, chunk_rows=chunk_rows,
-                                                 fmt=format, scale_mode=scale_mode)
+                                                 fmt=format, scale_mode=scale_mode,
+                                                 row_offset=row_offset)
                 writer.write_tensor_data(packed)
             meta = np.array([e["a"], e["b"], K, BLOCK_HADAMARD_KIND_ID], dtype=np.int32)
             writer.write_tensor_data(meta)
             counts["rotate_hadamard"] += 1
         elif action == "q8_0":
-            packed = _process_q8_0_chunked(tensor, e, device, chunk_rows=chunk_rows)
+            if tensor.tensor_type == GGMLQuantizationType.Q8_0:
+                # Source is already Q8_0 (some nextn/MTP-block weights keep
+                # their original quantized type through the --outtype bf16
+                # conversion rather than becoming BF16 -- see
+                # _rows_to_fp32_gpu's docstring). block_q8_0's on-disk layout
+                # is exactly what _emission_specs's "q8_0" spec expects, so
+                # this is a byte-identical passthrough, same as the "copy"
+                # action below -- there's no BF16/F32 form to requantize
+                # from, and none is needed.
+                packed = np.ascontiguousarray(tensor.data)
+            else:
+                packed = _process_q8_0_chunked(tensor, e, device, chunk_rows=chunk_rows,
+                                               row_offset=row_offset)
             writer.write_tensor_data(packed)
             counts["q8_0"] += 1
         else:
+            # copy actions never split (src_name == name always), so this is
+            # always the whole source tensor's own bytes.
             cloned = np.ascontiguousarray(tensor.data)
             writer.write_tensor_data(cloned)
             del cloned
             counts["copy"] += 1
 
-        if base_fd >= 0:
+        if base_fd >= 0 and src_name not in advised_src:
             _advise_dontneed(base_fd, tensor.data_offset, tensor.n_bytes)
+            advised_src.add(src_name)
 
-        if (i + 1) % 25 == 0 or (i + 1) == len(reader.tensors):
+        entry_elapsed = time.time() - t_entry_start
+        if progress_log is not None:
+            progress_log.write(
+                f"[{i+1}/{len(plan)}] {e['name']} action={action} time={entry_elapsed:.3f}s\n")
+            progress_log.flush()
+
+        if (i + 1) % 25 == 0 or (i + 1) == len(plan):
             elapsed = time.time() - t_start
-            print(f"[progress] {i+1}/{len(reader.tensors)} tensors "
-                  f"({elapsed:.1f}s elapsed) — {tensor.name} -> {action}")
+            print(f"[progress] {i+1}/{len(plan)} plan entries "
+                  f"({elapsed:.1f}s elapsed) — {e['name']} -> {action} "
+                  f"(last entry {entry_elapsed:.3f}s)")
 
     writer.close()
 
@@ -986,6 +1269,34 @@ def main() -> None:
                         "cost for huge weights (e.g. 248320-row output.weight); "
                         "every row is still individually scaled+assigned in "
                         "the full (chunked) second pass regardless of this.")
+    p.add_argument("--ml8-fit-mode", type=str, default="batched",
+                   choices=["batched", "per_group"],
+                   help="--format ml8_4 only: 'batched' (default, 2026-09-22 "
+                        "perf fix) fits all of a tensor's K-groups' Lloyd-Max "
+                        "centroids together via vectorized ops "
+                        "(_lloyd_max_signed_batched); 'per_group' calls "
+                        "_lloyd_max_signed once per group in a Python loop "
+                        "(the original, much slower path — kept for "
+                        "comparison/equivalence checks).")
+    p.add_argument("--ml8-fit-group-chunk", type=int, default=_ML8_FIT_GROUP_CHUNK_DEFAULT,
+                   help="--ml8-fit-mode batched only: number of K-groups fit "
+                        f"together per batched call (default "
+                        f"{_ML8_FIT_GROUP_CHUNK_DEFAULT}) — bounds peak GPU "
+                        "memory for the batched fit.")
+    p.add_argument("--progress-log", type=Path, default=None,
+                   help="Optional path to write one line per plan entry "
+                        "(name, action, time) as conversion proceeds.")
+    p.add_argument("--kv-from", type=Path, default=None,
+                   help="Optional reference GGUF to backfill weight_pager.* "
+                        "KV metadata that --src lacks (e.g. "
+                        "weight_pager.routed_experts_external -- stamped by "
+                        "a later conversion-forge stage, not present on a "
+                        "BF16 intermediate built straight from convert_hf). "
+                        "Every weight_pager.* key present in this file but "
+                        "absent from --src is copied verbatim; keys already "
+                        "in --src are left alone. Unset (default): no "
+                        "change from prior behavior -- Qwen conversions are "
+                        "unaffected.")
     args = p.parse_args()
 
     reader = gguf.GGUFReader(args.src)
@@ -994,9 +1305,16 @@ def main() -> None:
     if args.dry_run:
         return
 
-    convert(args.src, args.out, args.rotation_seed, args.device, args.local_b, args.max_b,
-           chunk_rows=args.chunk_rows, format=args.format, ml8_fit_rows=args.ml8_fit_rows,
-           scale_mode=args.scale_mode)
+    progress_log = open(args.progress_log, "w") if args.progress_log else None
+    try:
+        convert(args.src, args.out, args.rotation_seed, args.device, args.local_b, args.max_b,
+               chunk_rows=args.chunk_rows, format=args.format, ml8_fit_rows=args.ml8_fit_rows,
+               scale_mode=args.scale_mode, ml8_batched_fit=(args.ml8_fit_mode == "batched"),
+               ml8_fit_group_chunk=args.ml8_fit_group_chunk, progress_log=progress_log,
+               kv_from=args.kv_from)
+    finally:
+        if progress_log is not None:
+            progress_log.close()
 
 
 if __name__ == "__main__":

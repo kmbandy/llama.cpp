@@ -1,0 +1,18 @@
+# Experts only. Every layer, whole experts: 256 on main, 128 on 2026.
+# Spine and engram stay the files already on disk. Spec head is not rebuilt.
+# Repack writes gate/up/down as one group, then llama-wp-expert-shard keeps
+# each expert whole and sends its id range to one machine.
+name: dsv41-w21
+source: hf:deepseek-ai/DeepSeek-V4.1-Flash
+experts_only: true
+spine_file: /home/kmbandy/models/dsv41-spine-ml84.gguf
+quant:
+  experts: mxfp4
+spine: mad-lab-main
+sidecars: mad-lab-main
+spec_head: none
+experts:
+  - layers: "0-39"
+    machine: mad-lab-main
+    expert_ranges: ["0-255", "256-383"]
+    slice_machines: [mad-lab-main, mad-lab-2026]

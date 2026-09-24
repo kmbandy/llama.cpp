@@ -278,6 +278,11 @@ llama_context_ptr make_context(llama_model * model, uint32_t n_batch, uint32_t n
     cparams.n_seq_max = 1;
     cparams.n_threads       = 8;
     cparams.n_threads_batch = 8;
+    // The CPU flash-attn op picks a tiled or a per-row kernel by query-row
+    // count, so its rounding depends on how a prompt was split into ubatches.
+    // That is a property of our CPU fork's kernels, not of this model: run the
+    // non-fused attention path so the checks below are bit-exact on the graph.
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     return llama_context_ptr(llama_init_from_model(model, cparams));
 }
 

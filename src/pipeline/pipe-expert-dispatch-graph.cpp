@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -1504,6 +1505,66 @@ size_t graph_dispatcher::prefetch_ngram_for_tokens(const int32_t * tokens, size_
     return sent;
 }
 
+// WP_ML8_PROBE=path: one record per listed layer of the expert input, the
+// selected expert ids, and the routing weights. Read-only. Unset does nothing.
+// WP_ML8_PROBE_LAYERS=0,19,39 (default) and WP_ML8_PROBE_TOKENS=32 (default)
+// keep the file to the rows the offline ml8-3 check actually scores.
+static void ml8_probe_maybe_dump(int32_t layer, const std::vector<float> & activations,
+                                  const ggml_tensor * selected_experts, const ggml_tensor * weights,
+                                  int64_t n_tokens, int64_t n_embd, int64_t n_expert_used) {
+    static const char * const path = [] {
+        const char * p = std::getenv("WP_ML8_PROBE");
+        return (p != nullptr && p[0] != '\0') ? p : nullptr;
+    }();
+    if (path == nullptr || selected_experts == nullptr || weights == nullptr || n_tokens <= 0) {
+        return;
+    }
+    static const int max_tokens = [] {
+        const char * p = std::getenv("WP_ML8_PROBE_TOKENS");
+        const int n = (p != nullptr && p[0] != '\0') ? std::atoi(p) : 32;
+        return n > 0 ? n : 32;
+    }();
+    static const std::set<int32_t> layers = [] {
+        std::set<int32_t> out;
+        const char * p = std::getenv("WP_ML8_PROBE_LAYERS");
+        const std::string spec = (p != nullptr && p[0] != '\0') ? p : "0,19,39";
+        std::stringstream ss(spec);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty()) {
+                out.insert(std::atoi(item.c_str()));
+            }
+        }
+        return out;
+    }();
+    if (!layers.empty() && !layers.count(layer)) {
+        return;
+    }
+    static FILE * fp = nullptr;
+    if (fp == nullptr) {
+        fp = std::fopen(path, "wb");
+        if (fp == nullptr) {
+            return;
+        }
+    }
+    const int32_t rows = (int32_t) std::min<int64_t>(n_tokens, max_tokens);
+    const uint32_t magic = 0x33384c4d; // 'ML83'
+    const int32_t header[4] = { layer, rows, (int32_t) n_embd, (int32_t) n_expert_used };
+    std::fwrite(&magic, sizeof(magic), 1, fp);
+    std::fwrite(header, sizeof(header), 1, fp);
+    std::fwrite(activations.data(), sizeof(float), (size_t) rows * (size_t) n_embd, fp);
+    for (int32_t t = 0; t < rows; ++t) {
+        for (int32_t s = 0; s < (int32_t) n_expert_used; ++s) {
+            const int index = t * (int) n_expert_used + s;
+            const int32_t expert = ggml_get_i32_1d(selected_experts, index);
+            const float weight = ggml_get_f32_1d(weights, index);
+            std::fwrite(&expert, sizeof(expert), 1, fp);
+            std::fwrite(&weight, sizeof(weight), 1, fp);
+        }
+    }
+    std::fflush(fp);
+}
+
 void graph_dispatcher::capture_routing(const char * prefix, int32_t layer,
                                        const std::vector<float> & activations,
                                        const ggml_tensor * selected_experts,
@@ -1946,6 +2007,8 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
         }
         owner->note_dispatched_experts(context->layer, assignments, (uint32_t) n_tokens);
+        ml8_probe_maybe_dump(context->layer, wire_activations, selected_experts, weights,
+                             n_tokens, n_embd, n_expert_used);
         if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
             capture_prefix != nullptr && capture_prefix[0] != '\0') {
             owner->capture_routing(capture_prefix, context->layer, wire_activations,
@@ -2158,6 +2221,8 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                 owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
             }
             owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
+            ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
+                                 full_tokens, n_embd, n_expert_used);
             if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
                 capture_prefix != nullptr && capture_prefix[0] != '\0') {
                 owner->capture_routing(capture_prefix, context->layer, full_wire_activations,

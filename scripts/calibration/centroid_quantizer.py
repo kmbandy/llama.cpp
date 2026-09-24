@@ -299,4 +299,90 @@ def _lloyd_max_signed(
     return torch.sort(centroids).values
 
 
+def _lloyd_max_signed_batched(
+    samples: torch.Tensor,
+    *,
+    n_levels: int,
+    n_iter: int,
+    fit_loss: str = "mse",
+    mag_weight_p: float = 5.0,
+) -> torch.Tensor:
+    """Batched equivalent of `_lloyd_max_signed`, fitting one set of
+    `n_levels` signed centroids PER ROW of `samples` [G, M] all at once,
+    instead of calling `_lloyd_max_signed` in a Python loop over G groups.
+
+    Same algorithm (quantile init, nearest-centroid assignment via bin
+    edges, per-bin weighted mean update, run for exactly `n_iter`
+    iterations with no early stop — a converged group's centroids are a
+    fixed point of the update, so extra iterations past convergence are a
+    no-op for it), vectorized across G:
+      * init: torch.quantile(samples, q, dim=1) instead of per-row quantile.
+      * assignment: torch.searchsorted with a [G, n_levels-1] batched
+        boundary tensor instead of torch.bucketize per row.
+      * update: keeps the original's `for k in range(n_levels)` masked-sum
+        loop (only 16 iterations, cheap), but each iteration now reduces
+        over ALL G rows at once (`.sum(dim=1)`) instead of over one row at
+        a time -- this is what gives the ~G-fold speedup while staying on
+        well-optimized tree-reduction kernels. A `scatter_add_` into a
+        [G, n_levels] accumulator computes the same thing in principle and
+        was tried first, but measured 5-20x SLOWER than this loop on this
+        GPU/ROCm+torch combo for the group/sample-count shapes this
+        pipeline actually has (e.g. G=20, M=2.1M for attn_q_b: 27s
+        scatter_add vs 1.1s k-loop) -- scatter-adding millions of elements
+        per row into only 16 output slots serializes on atomic writes to
+        those few destinations, while `.sum(dim=1)` is a parallel
+        tree-reduction with no such contention.
+
+    Numerically equivalent to calling `_lloyd_max_signed` once per row up to
+    floating-point summation-order differences (a batched `.sum(dim=1)`
+    reduction's order for a bin's members need not match the per-row
+    `.sum()`'s) -- this can only flip which of two centroids a sample near a
+    bin edge is nearest to on a later assignment pass, not change the fixed
+    point itself.
+
+    Only fit_loss in {"mse", "mag_weighted"} supported (matches
+    `_lloyd_max_signed`); "mse" is the common case (uniform weights) and is
+    given a lighter-weight path (no full-size weight tensor materialized).
+
+    Returns centroids [G, n_levels] float, sorted ascending per row.
+    """
+    assert samples.dim() == 2, f"expected [G, M], got shape {tuple(samples.shape)}"
+    G, M = samples.shape
+    device = samples.device
+    dtype = samples.dtype
+
+    q = torch.linspace(0.0, 1.0, n_levels, device=device, dtype=dtype)
+    # torch.quantile(x, q, dim=1) -> [n_levels, G]; transpose to [G, n_levels].
+    centroids = torch.quantile(samples, q, dim=1).transpose(0, 1).contiguous()
+
+    if fit_loss == "mag_weighted":
+        weights: torch.Tensor | None = samples.abs().pow(mag_weight_p)
+    elif fit_loss == "mse":
+        weights = None
+    else:
+        raise ValueError(f"fit_loss must be 'mse' or 'mag_weighted', got {fit_loss!r}")
+
+    for _ in range(n_iter):
+        edges = (centroids[:, :-1] + centroids[:, 1:]) / 2.0  # [G, n_levels-1]
+        bins = torch.searchsorted(edges.contiguous(), samples)  # [G, M] int64, in [0, n_levels-1]
+
+        new = centroids.clone()
+        for k in range(n_levels):
+            mask = (bins == k).to(dtype)  # [G, M]
+            if weights is None:
+                wk = mask
+            else:
+                wk = weights * mask
+            count = wk.sum(dim=1)                # [G]
+            wsum = (samples * wk).sum(dim=1)      # [G]
+            nonzero = count > 0
+            # Empty bins (for a given group) keep their previous centroid
+            # (matches _lloyd_max_signed's `new = centroids.clone()` +
+            # "if not mask.any(): continue", per-group here via `torch.where`).
+            new[:, k] = torch.where(nonzero, wsum / count.clamp_min(1e-30), centroids[:, k])
+        centroids = new
+
+    return torch.sort(centroids, dim=1).values
+
+
 __all__ = ["CentroidQuantizer"]

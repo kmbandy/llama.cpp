@@ -96,7 +96,24 @@ class KroneckerRotation:
         # H_b leg via fast Walsh-Hadamard (O(b log b), == X @ sylvester(b) to float
         # precision; mirrors the deployed ml8 fused FWHT prologue). H_a leg stays a
         # small a×a matmul. Same fp32 math as the dense `h_a.T @ X @ h_b`.
-        Y = h_a.T @ (fwht_raw(X) * self._inv_sqrt_b)
+        Xw = fwht_raw(X) * self._inv_sqrt_b
+        if self.a_dim == 1:
+            # a_dim=1 degenerates the "a×a matmul" to a scalar multiply by
+            # h_a[0,0] (h_a is 1x1). Special-cased to avoid an actual
+            # torch.matmul/bmm call here: on this GPU (ROCm, RX 9070 XT),
+            # a batched matmul with contraction dim 1 reproducibly crashes
+            # the composable-kernel `_bmm_outer_product_kernel` with an
+            # HSA_STATUS_ERROR_MEMORY_FAULT (confirmed 2026-09-22, reproduces
+            # on plain random 128x512 input with a_dim=1/b_dim=512 -- the
+            # exact shape of blk.N.indexer.attn_k.weight [512,128], which is
+            # in the ml8_4 rotate_kronecker role list -- while the identical
+            # op on CPU is fine, so this is a device-specific kernel bug, not
+            # a numerical issue). Elementwise multiply computes the exact
+            # same math (h_a.T @ X == h_a[0,0] * X when a_dim==1) without
+            # ever invoking the buggy matmul kernel.
+            Y = h_a.reshape(()).to(Xw.dtype) * Xw
+        else:
+            Y = h_a.T @ Xw
         return Y.reshape(x.shape)
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
@@ -110,7 +127,14 @@ class KroneckerRotation:
         X = x.reshape(*x.shape[:-1], self.a_dim, self.b_dim)
         # Sylvester H_b is symmetric (H_b.T == H_b), so the inverse b-leg is the
         # same FWHT/sqrt(b); the a-leg uses h_a (not transposed).
-        Y = h_a @ (fwht_raw(X) * self._inv_sqrt_b)
+        Xw = fwht_raw(X) * self._inv_sqrt_b
+        if self.a_dim == 1:
+            # See forward()'s a_dim==1 special case: same GPU matmul-kernel
+            # crash avoidance, h_a @ X == h_a[0,0] * X here (h_a is 1x1, and
+            # h_a == h_a.T trivially at that size).
+            Y = h_a.reshape(()).to(Xw.dtype) * Xw
+        else:
+            Y = h_a @ Xw
         return Y.reshape(x.shape)
 
     def to_dict(self) -> dict:

@@ -173,6 +173,7 @@ add_library(aiter_triton_aot STATIC
     wrappers/mt_ml8_gemm.cpp                  # MAD-223 Phase C.2 — ml8 dense GEMM wrapper
     wrappers/mt_ml8_moe_gemm.cpp              # MAD-223 Phase C.3 — ml8 MoE GEMM wrapper (MAD-244)
     wrappers/mt_fp8_b128_gemm.cpp             # FP8_B128 phase 2 — AITER preshuffle GEMM wrapper
+    wrappers/mt_sparse_attn_dsv4.cpp          # WP_DSV41_SPARSE_ATTN — AITER native sparse DSv4 attention wrapper
     # Generated sources added at build time via the AOT_C_FILES vars:
     ${vector_add_AOT_C_FILES}
     ${uattn_3d_AOT_C_FILES}
@@ -194,6 +195,9 @@ target_compile_definitions(aiter_triton_aot PUBLIC
     MT_ML8_KERNEL_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemm_ml8.py\"
     # MAD-223 Phase C.3 — ml8 MoE GEMM kernel source path (consumed by mt_ml8_moe_gemm.cpp)
     MT_ML8_MOE_KERNEL_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe_op_gemm_ml8.py\"
+    # WP_DSV41_SPARSE_ATTN — sparse DSv4 attention kernel source paths (consumed by mt_sparse_attn_dsv4.cpp)
+    MT_SPARSE_ATTN_DSV4_PREFILL_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/kernels/sparse_attention_dsv4.py\"
+    MT_SPARSE_ATTN_DSV4_DECODE_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/kernels/pa_decode_sparse.py\"
 )
 
 # Ensure the AOT custom_targets run before the library/wrapper compiles —

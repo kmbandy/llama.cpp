@@ -37,9 +37,12 @@ the sink.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Protocol
@@ -132,6 +135,7 @@ class ExpertStage:
         self.quant_dtype = gguf.GGMLQuantizationType[self.quant.upper()]
         # raw repack bases to clean up after the final stitch.
         self._raw_bases: list[int] = []
+        self._lock = threading.Lock()
 
     # -- naming -----------------------------------------------------------
 
@@ -163,7 +167,10 @@ class ExpertStage:
         # every page (v1 whole expert or v2 slice) is zero-padded to 4096
         page = gate + up + down
         page += (-page) % 4096
-        return self.n_expert * page
+        n_exp = self.n_expert
+        if set_spec.expert_first is not None and set_spec.expert_last is not None:
+            n_exp = set_spec.expert_last - set_spec.expert_first + 1
+        return n_exp * page
 
     def _needs(self, set_spec: SetSpec, pos: int) -> bool:
         dst = self._dst_name(set_spec, pos)
@@ -331,6 +338,9 @@ class ExpertStage:
         self._write_gguf(L, stacks, gguf_path)
 
         widths = self.stage_sets[0].widths
+        by_expert = any(s.expert_first is not None for s in self.stage_sets)
+        if by_expert and widths:
+            raise QuantError(f"stage {self.stage_id} mixes expert ranges and FFN widths")
         raw_base = self.workdir / f"raw-L{L:03d}"
         self.tools.repack(
             gguf_path,
@@ -340,10 +350,21 @@ class ExpertStage:
             expert_slices=widths or None,
             slice_output_split=bool(widths),
         )
-        self._raw_bases.append(L)
+        with self._lock:
+            self._raw_bases.append(L)
+
+        sharded: dict[str, LayerOutput] = {}
+        if by_expert:
+            manifest = Path(str(raw_base) + "-experts-manifest.json")
+            for s in self.stage_sets:
+                out_base = self.workdir / f"raw-L{L:03d}-e{s.expert_first}"
+                index, blob = self.tools.expert_shard(
+                    manifest, out_base, s.expert_first, s.expert_last, L
+                )
+                sharded[s.id] = LayerOutput(L, index, blob)
 
         for s in self.stage_sets:
-            lo = layer_outputs_from_repack(raw_base, L, s.slice_index)
+            lo = sharded[s.id] if by_expert else layer_outputs_from_repack(raw_base, L, s.slice_index)
             dst = self._dst_name(s, pos)
             if need[s.id]:
                 nbytes, sha = self.sinks[s.id].put_file(lo.blob, dst)
@@ -355,7 +376,16 @@ class ExpertStage:
         # Delete the one-layer GGUF now; raw outputs are kept for the final
         # stitch and cleaned up at the end of run().
         gguf_path.unlink(missing_ok=True)
-        self.events(
+        # The blob is already on the sink. Drop the local copies (full layer
+        # plus both ranges) or 40 layers of them fill the disk. Keep the small
+        # index JSON; the final stitch reads it.
+        for extra in (
+            self.workdir / f"raw-L{L:03d}-experts-00001-of-00001.wpb",
+            *(lo.blob for lo in sharded.values()),
+        ):
+            extra.unlink(missing_ok=True)
+        with self._lock:
+            self.events(
             {"kind": "layer_done", "stage": self.stage_id, "layer": L,
              "bytes": sum(per_layer[s.id][L][2] for s in self.stage_sets),
              "secs": round(time.time() - t0, 3)}
@@ -369,8 +399,15 @@ class ExpertStage:
         for s in self.stage_sets:
             sink = self.sinks[s.id]
             dst = self._dst_name(s, pos)
-            blob = Path(sink.root) / dst
-            index = Path(sink.root) / (dst[: -len(".wpb")] + ".wpi.json")
+            blob = Path(getattr(sink, "root", self.workdir)) / dst
+            local = None
+            if s.expert_first is not None:
+                local = self.workdir / (
+                    f"raw-L{L:03d}-e{s.expert_first}-experts-00001-of-00001.wpi.json"
+                )
+            index = local if local is not None and local.is_file() else (
+                Path(getattr(sink, "root", self.workdir)) / (dst[: -len(".wpb")] + ".wpi.json")
+            )
             per_layer[s.id][L] = (
                 LayerOutput(L, index, blob), dst, sink.size(dst), sink.sha256(dst)
             )
@@ -438,12 +475,45 @@ class ExpertStage:
         per_layer: Dict[str, dict[int, tuple[LayerOutput, str, int, str]]] = {
             s.id: {} for s in self.stage_sets
         }
+        pending: list[tuple[int, int, dict[str, bool]]] = []
         for pos, L in enumerate(self.layers, start=1):
             need = {s.id: self._needs(s, pos) for s in self.stage_sets}
             if any(need.values()):
-                self._run_layer(per_layer, pos, L, need)
+                pending.append((pos, L, need))
             else:
                 self._recover(per_layer, pos, L)
+
+        def ahead(start: int) -> None:
+            if not hasattr(self.source, "prefetch"):
+                return
+            names: list[str] = []
+            horizon = int(os.environ.get("WP_FORGE_DOWNLOADS", "8"))
+            for L in self.layers[start:start + horizon]:
+                names.extend(self._shards_for(L))
+            self.source.prefetch(names)
+
+        width = max(1, int(os.environ.get("WP_FORGE_LAYERS", "3")))
+        if width == 1 or len(pending) <= 1:
+            for pos, L, need in pending:
+                ahead(self.layers.index(L))
+                self._run_layer(per_layer, pos, L, need)
+        else:
+            inflight: dict = {}
+            nxt = 0
+            pool = ThreadPoolExecutor(max_workers=width, thread_name_prefix="forge-layer")
+            try:
+                while nxt < len(pending) or inflight:
+                    while nxt < len(pending) and len(inflight) < width:
+                        pos, L, need = pending[nxt]
+                        ahead(self.layers.index(L))
+                        inflight[pool.submit(self._run_layer, per_layer, pos, L, need)] = L
+                        nxt += 1
+                    done, _ = wait(set(inflight), return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        inflight.pop(fut)
+                        fut.result()
+            finally:
+                pool.shutdown(wait=True)
 
         results: dict[str, StageResult] = {
             s.id: self._finish_set(s, per_layer[s.id]) for s in self.stage_sets
@@ -466,6 +536,61 @@ class ExpertStage:
 
 
 # ---------------------------------------------------------------------------
+def stamp_kv(gguf_path: Path, kvs: dict, name: str | None = None) -> None:
+    """Rewrite gguf_path in place with extra/replaced KVs (tensor bytes copied
+    verbatim). general.name is set when given: the descriptor tool requires it
+    and the stock converter names a peeled dir after the directory."""
+    from gguf import GGUFReader, GGUFWriter, GGUFValueType
+
+    r = GGUFReader(str(gguf_path))
+    arch = r.fields["general.architecture"].contents()
+    tmp = gguf_path.parent / (gguf_path.name + ".kv.tmp")
+    w = GGUFWriter(str(tmp), arch, use_temp_file=False)
+    skip = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count", "general.architecture"}
+    for k, f in r.fields.items():
+        if k in skip or k in kvs or (name is not None and k == "general.name"):
+            continue
+        vt = f.types[0]
+        vals = f.contents()
+        if vt == GGUFValueType.ARRAY:
+            sub = f.types[1]
+            if sub == GGUFValueType.STRING:
+                w.add_key_value(k, list(vals), vt, sub)
+            elif sub in (GGUFValueType.FLOAT32, GGUFValueType.FLOAT64):
+                w.add_key_value(k, [float(x) for x in vals], vt, sub)
+            elif sub == GGUFValueType.BOOL:
+                w.add_key_value(k, [bool(x) for x in vals], vt, sub)
+            else:
+                w.add_key_value(k, [int(x) for x in vals], vt, sub)
+        elif vt in (GGUFValueType.FLOAT32, GGUFValueType.FLOAT64):
+            w.add_key_value(k, float(vals), vt)
+        elif vt == GGUFValueType.BOOL:
+            w.add_key_value(k, bool(vals), vt)
+        elif vt == GGUFValueType.STRING:
+            w.add_key_value(k, vals, vt)
+        else:
+            w.add_key_value(k, int(vals), vt)
+    if name is not None:
+        w.add_string("general.name", name)
+    for k, v in kvs.items():
+        if isinstance(v, bool):
+            w.add_bool(k, v)
+        elif isinstance(v, int):
+            w.add_uint32(k, v)
+        elif isinstance(v, float):
+            w.add_float32(k, v)
+        else:
+            w.add_string(k, str(v))
+    for t in r.tensors:
+        w.add_tensor(t.name, t.data, raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    del r
+    tmp.replace(gguf_path)
+
+
 # Spine + sidecar stages (Task 11)
 # ---------------------------------------------------------------------------
 
@@ -483,9 +608,10 @@ class ConverterSpineBuilder:
     only the plan's ``dense`` class (defaulted to q8_0) is applied.
     """
 
-    def __init__(self, tools: Tools, arch: ArchSpec) -> None:
+    def __init__(self, tools: Tools, arch: ArchSpec, plan_name: str | None = None) -> None:
         self.tools = tools
         self.arch = arch
+        self.plan_name = plan_name
 
     def build(self, peel_dir: Path, out_gguf: Path, quant: dict[str, str]) -> Path:
         if not self.arch.converter_tolerates_missing_experts:
@@ -503,6 +629,11 @@ class ConverterSpineBuilder:
             )
         finally:
             tmp_bf16.unlink(missing_ok=True)
+        # the loader only skips the routed experts when the spine says they are
+        # external (weight_pager.routed_experts_external, the KV wp-dense-extract
+        # writes on the GGUF-source path); the stock converter knows nothing of it
+        stamp_kv(result, {"weight_pager.routed_experts_external": True},
+                 name=self.plan_name)
         return result
 
 

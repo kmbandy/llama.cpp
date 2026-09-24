@@ -243,7 +243,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     if (n_outputs == n_tokens) {
         for (int i = 0; i < n_tokens; ++i) {
-            data[i] = i;
+            data[i] = (int32_t) (i - row_offset);
         }
 
         return;
@@ -255,7 +255,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     for (int i = 0; i < n_tokens; ++i) {
         if (ubatch->output[i]) {
-            data[n_outputs++] = i;
+            data[n_outputs++] = (int32_t) (i - row_offset);
         }
     }
 }
@@ -1010,6 +1010,45 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+// CED prefill trim NaN fix (2026-09-22): host-to-host tail copy from a
+// graph-wide kq_mask leaf (already correctly filled by the ordinary,
+// unmodified fill path -- dsv4_set_kq_mask or llama_kv_cache::
+// set_input_kq_mask, called just before this) into its dedicated
+// trailing-width counterpart (ced_kq_mask_trailing). Both tensors are
+// ordinary host-resident ggml graph inputs at this point in set_input()
+// (a CPU-side preparation step that runs before any GPU compute), so this
+// is a plain memcpy per stream row-block -- no ggml_view, no ggml_cont, no
+// GPU kernel reading a view of an input leaf. That is deliberate: see
+// llm_graph_input_dsv4_raw::ced_kq_mask_trailing's doc comment for why the
+// GPU-side view+cont this replaces produced wrong data for some rows.
+// No-op (returns immediately) whenever `trailing` wasn't built, i.e.
+// whenever the CED trim is inactive for this graph -- matching every other
+// CED helper's "no separate active flag" discipline.
+static void dsv4_copy_kq_mask_trailing(ggml_tensor * full, ggml_tensor * trailing, uint32_t offset) {
+    if (full == nullptr || trailing == nullptr || !full->buffer || !trailing->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(full->buffer) &&
+            "CED prefill trim: kq_mask trailing-copy source must be a host-resident input leaf");
+    GGML_ASSERT(ggml_backend_buffer_is_host(trailing->buffer) &&
+            "CED prefill trim: kq_mask trailing-copy destination must be a host-resident input leaf");
+    GGML_ASSERT(full->type == trailing->type);
+    GGML_ASSERT(full->ne[0] == trailing->ne[0]);
+    GGML_ASSERT(full->ne[2] == trailing->ne[2] && full->ne[3] == trailing->ne[3]);
+
+    const uint32_t width = (uint32_t) trailing->ne[1];
+    GGML_ASSERT((uint64_t) offset + width <= (uint64_t) full->ne[1] &&
+            "CED prefill trim: trailing kq_mask window falls outside the full mask's own token range");
+
+    const size_t row_bytes = ggml_row_size(full->type, full->ne[0]);
+    for (int64_t s = 0; s < full->ne[3]; ++s) {
+        const char * src = (const char *) full->data     + (size_t) s * full->nb[3]     + (size_t) offset * row_bytes;
+        char       * dst = (char       *) trailing->data + (size_t) s * trailing->nb[3];
+        memcpy(dst, src, (size_t) width * row_bytes);
+    }
+}
+
 static void dsv4_set_i64(ggml_tensor * dst, const std::vector<int64_t> & src) {
     if (!dst || !dst->buffer) {
         return;
@@ -1256,8 +1295,31 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_k_idxs(self_k_idxs);
     }
 
+    if (ced_k_idxs_trailing && ced_k_idxs_trailing->buffer) {
+        mctx->set_input_k_idxs_trailing(ced_k_idxs_trailing, ced_k_idxs_trailing_offset);
+    }
+
     if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, ced_replay_floor);
+        dsv4_copy_kq_mask_trailing(self_kq_mask, ced_kq_mask_trailing, ced_k_idxs_trailing_offset);
+    }
+
+    // CED prefill trim fix (round 2): fill the dedicated trailing-positions
+    // leaf straight from ubatch->pos -- see ced_pos_trailing's doc comment
+    // above for why this sources from the ubatch directly rather than from
+    // the already-built inp_pos tensor.
+    if (ced_pos_trailing && ced_pos_trailing->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(ced_pos_trailing->buffer) &&
+                "CED prefill trim: pos trailing-copy destination must be a host-resident input leaf");
+        GGML_ASSERT(ubatch->pos != nullptr &&
+                "CED prefill trim: ubatch has no positions to source the trailing pos leaf from");
+
+        const uint32_t width = (uint32_t) ced_pos_trailing->ne[0];
+        GGML_ASSERT((uint64_t) ced_pos_trailing_offset + width <= (uint64_t) ubatch->n_tokens &&
+                "CED prefill trim: trailing pos window falls outside this ubatch's own token range");
+
+        ggml_backend_tensor_set(ced_pos_trailing, ubatch->pos + ced_pos_trailing_offset, 0,
+                (size_t) width * ggml_element_size(ced_pos_trailing));
     }
 
     if (self_k_rot) {
@@ -1277,6 +1339,10 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
     dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
     dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
     dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+
+    dsv4_copy_kq_mask_trailing(inp_csa.kq_mask, inp_csa.ced_kq_mask_trailing, ced_mask_trailing_offset);
+    dsv4_copy_kq_mask_trailing(inp_hca.kq_mask, inp_hca.ced_kq_mask_trailing, ced_mask_trailing_offset);
+    dsv4_copy_kq_mask_trailing(inp_lid.kq_mask, inp_lid.ced_kq_mask_trailing, ced_mask_trailing_offset);
 
     if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
         mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
@@ -3060,7 +3126,7 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     return cur;
 }
 
-ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+ggml_tensor * llm_graph_context::build_inp_out_ids(int64_t row_offset) const {
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interfere with
     //       features that require constant topology such as pipeline parallelism
@@ -3069,7 +3135,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     //    return nullptr;
     //}
 
-    auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs);
+    auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs, row_offset);
 
     auto & cur = inp->out_ids;
 

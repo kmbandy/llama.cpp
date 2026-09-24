@@ -670,7 +670,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_trunk_layer(
         int il) {
     res->t_layer_inp[il] = res_hc;
 
-    if (hparams.is_ple(il)) {
+    if (std::getenv("WP_PLE_TRACE") && il <= 2) {
+        fprintf(stderr, "ple trace: build_trunk_layer il=%d is_ple=%d ple_n_heads=%u n_tokens=%lld\n",
+            il, (int) hparams.is_ple(il), hparams.ple_n_heads, (long long) n_tokens);
+    }
+    // WP_PLE_SKIP=1: diagnostic -- leave the PLE block out of the graph entirely
+    // (the sidecar table is still loaded). Distinguishes the block's serving
+    // machinery (mmap'd CPU table, get_rows split, conv-history rs row) from
+    // its arithmetic, which an all-zero table already showed to be a no-op.
+    static const bool s_ple_skip = std::getenv("WP_PLE_SKIP") != nullptr;
+    if (hparams.is_ple(il) && !s_ple_skip) {
         res_hc = build_ple(inp->get_recr(), mctx_hyb, res_hc, il);
     }
 
@@ -1518,6 +1527,10 @@ public:
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
+    static const bool trace_entry = std::getenv("WP_PLE_TRACE") != nullptr;
+    if (trace_entry) {
+        LLAMA_LOG_WARN("ple trace: set_input n_tokens=%lld rows=%p\n", (long long) ubatch->n_tokens, (void *) rows);
+    }
 
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
@@ -1560,6 +1573,14 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
             cut = cut || t < 0 || t == eos;
             ctx[s] = cut ? eos : t;
+        }
+
+        // WP_PLE_TRACE=1: print the n-gram window the hash sees for the first tokens of a ubatch
+        static const bool trace = std::getenv("WP_PLE_TRACE") != nullptr;
+        if (trace && i < 8) {
+            LLAMA_LOG_WARN("ple trace: ubatch n_tokens=%lld i=%lld tok=%lld prev1=%lld prev2=%lld cut=%d\n",
+                (long long) n_tokens, (long long) i, (long long) ctx[0], (long long) ctx[1],
+                (long long) (n_gram > 2 ? ctx[2] : -1), (int) cut);
         }
 
         for (int64_t n = 2; n <= n_gram; ++n) {
@@ -1644,6 +1665,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t hc_dim  = hc * n_embd;
     const int64_t n_heads = hparams.ple_n_heads;
 
+    static const bool trace_build = std::getenv("WP_PLE_TRACE") != nullptr;
+    if (trace_build) {
+        LLAMA_LOG_WARN("ple trace: build_ple il=%d n_tokens=%lld\n", il, (long long) n_tokens);
+    }
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());

@@ -598,6 +598,10 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_KV,
     LLM_TENSOR_ATTN_KV_NORM,
     LLM_TENSOR_ATTN_OUT_A,
+    LLM_TENSOR_ATTN_OUT_A_SPLIT, // ml8-4 data-free conversion: wo_a split into o_groups separate
+                                 // 2D tensors ("blk.%d.attn_output_a.g%d"), xid = group index.
+                                 // See scripts/calibration/convert_fp8_rotated.py's wo_a split
+                                 // and llama_model_deepseek41::load_arch_tensors/build_attention_tail.
     LLM_TENSOR_ATTN_OUT_B,
     LLM_TENSOR_ATTN_K_B,
     LLM_TENSOR_ATTN_V_B,

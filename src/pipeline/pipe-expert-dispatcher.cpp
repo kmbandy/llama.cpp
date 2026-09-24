@@ -3016,6 +3016,23 @@ struct dispatcher::impl {
                 if (chunk_index != 0) {
                     type = await_response(request, wanted_seq_id, payload, state);
                     response_received_at = dispatch_clock::now();
+                    // Mirror chunk 0's handling (above, before this stream_wire
+                    // branch): a worker-side protocol rejection sent mid-stream
+                    // is a PIPE_ERROR with a real code and message -- decode and
+                    // surface it exactly as chunk 0 does, instead of collapsing
+                    // it into the generic "interleaved a non-chunk frame"
+                    // message below. That message is for the one case it can
+                    // actually mean (an unrecognised/wrong frame type arrived),
+                    // not for a worker that explained itself.
+                    if (type == PIPE_ERROR) {
+                        note_in_flight_delta(state, -1);
+                        const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+                        throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                                 " rejected expert(s) " + assignment_experts(request.assignments) +
+                                                 " on layer " + std::to_string(layer) + " chunk " +
+                                                 std::to_string(chunk_index) + " with code " +
+                                                 std::to_string(error.code) + ": " + error.msg);
+                    }
                     if (type != PIPE_EXPERT_PARTIAL_CHUNK) {
                         note_in_flight_delta(state, -1);
                         throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +

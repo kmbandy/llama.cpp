@@ -493,6 +493,12 @@ static bool ds4_const_shape_enabled() {
     return enabled;
 }
 
+// Public wrapper so deepseek41.cpp (a different translation unit) can gate its
+// CED prefill trim on the same flag without duplicating the getenv/parse.
+bool llama_model_deepseek4::graph::ds4_const_shape_enabled() {
+    return ::ds4_const_shape_enabled();
+}
+
 dsv4_state_tensors dsv4_build_state_restore(
         ggml_context * ctx,
         const llm_graph_input_dsv4::comp_input & inp,

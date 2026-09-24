@@ -215,6 +215,8 @@ class ModelBase:
                 data_gen = lambda r=remote_tensor: LazyTorchTensor.from_remote_tensor(r)  # noqa: E731
                 if titem := self.filter_tensors((name, data_gen)):
                     tname, tgen = titem
+                    if tname in tensors:
+                        raise ValueError(f"duplicate tensor key {tname!r} (from remote {name!r}); a later tensor would silently overwrite an earlier one")
                     tensors[tname] = tgen
 
             return tensors
@@ -276,6 +278,8 @@ class ModelBase:
                             data_gen = lambda data=data_torch: data  # noqa: E731
                     if titem := self.filter_tensors((name, data_gen)):
                         tname, tgen = titem
+                        if tname in tensors:
+                            raise ValueError(f"duplicate tensor key {tname!r} (from {name!r} in {part_name!r}); a later shard would silently overwrite an earlier one")
                         tensors[tname] = tgen
 
         # verify tensor name presence and identify potentially missing files

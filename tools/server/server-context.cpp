@@ -6013,8 +6013,51 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // WP_PREFILL_TAIL_MIN (env, default 0 = off, every other
+                    // model's batching unchanged): when set, and filling this
+                    // slot's batch all the way to n_batch would leave a
+                    // nonzero remainder no bigger than WP_PREFILL_TAIL_MIN for
+                    // the slot's next (final) batch, shrink THIS batch so
+                    // that final one has > WP_PREFILL_TAIL_MIN tokens
+                    // instead. Exists for architectures whose decoder-range
+                    // work can be skipped entirely on non-final batches (see
+                    // src/models/deepseek41.cpp, WP_DSV41_CED_SKIP_NONFINAL):
+                    // that trim's replay window must land entirely inside the
+                    // final batch, with no dependency on a preceding
+                    // (skipped) batch's decoder state -- see the CED prefill
+                    // trim report for the hazard this closes. Strictly
+                    // greater, not >=: graph::graph()'s own trim gate requires
+                    // n_tokens > W (a final batch of EXACTLY W tokens still
+                    // refuses the trim and falls back to the untrimmed path,
+                    // which is the hazard this exists to avoid -- caught live
+                    // during A/B testing with WP_PREFILL_TAIL_MIN==W). Setting
+                    // this to W therefore closes the gap with one token to
+                    // spare; setting it lower reopens exactly that edge case.
+                    // Bounds only this server-side batch-fill loop; if
+                    // n_batch > n_ubatch, llama_decode()'s own internal ubatch
+                    // split is a separate boundary this does not cover.
+                    static const int32_t wp_prefill_tail_min = []() {
+                        const char * e = std::getenv("WP_PREFILL_TAIL_MIN");
+                        return (e == nullptr || e[0] == '\0') ? 0 : std::max(0, std::atoi(e));
+                    }();
+
+                    int32_t n_batch_slot_cap = n_batch;
+                    if (wp_prefill_tail_min > 0) {
+                        const int64_t budget    = (int64_t) n_batch - (int64_t) n_tokens_prev;
+                        const int64_t remaining = (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens();
+                        if (budget > 0 && remaining > budget) {
+                            const int64_t tail_after = remaining - budget;
+                            if (tail_after > 0 && tail_after <= wp_prefill_tail_min) {
+                                const int64_t shrunk_budget = remaining - (wp_prefill_tail_min + 1);
+                                if (shrunk_budget > 0 && shrunk_budget < budget) {
+                                    n_batch_slot_cap = (int32_t) (n_tokens_prev + shrunk_budget);
+                                }
+                            }
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot_cap) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

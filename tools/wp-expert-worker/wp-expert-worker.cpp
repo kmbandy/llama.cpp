@@ -20087,10 +20087,36 @@ void note_frame_residency(int type, uint64_t ns) {
 constexpr size_t WP_WORKER_PIPELINE_QUEUE_DEPTH      = 2;
 constexpr size_t WP_WORKER_PIPELINE_MAX_QUEUED_BYTES = 256ull * 1024 * 1024;
 
+// DEFAULT ON as of 2026-09-22 -- this is no longer a pure perf knob. Root
+// cause of the untrimmed-898-token DSv4.1 prefill wedge on 192.168.1.33:8803
+// (repro: 4/4, both a pre-existing and a freshly rebuilt worker binary):
+// serve_connection()'s DIRECT path (pipeline_on == false) does recv, compute,
+// send, recv, ... on ONE thread. The spine's stream_wire request path
+// (WP_DISPATCH_STREAM>=2, pipe-expert-dispatcher.cpp issue_requests()) writes
+// every PIPE_EXPERT_DISPATCH_CHUNK frame of a split request back-to-back and
+// only reads the matching PIPE_EXPERT_PARTIAL_CHUNK responses afterward
+// (receive_partial()) -- but this worker sends a PARTIAL_CHUNK response after
+// EVERY chunk, before it can recv() the next one (see the PIPE_EXPERT_
+// DISPATCH_CHUNK branch below). Once the untrimmed chunk payloads are big
+// enough (898 tokens vs. the trimmed 128 that happens to fit), both that
+// response send and the spine's next chunk send block on a full socket
+// buffer at the same instant: a bidirectional TCP write/write deadlock,
+// neither side ever back in recv(). This was previously gated behind
+// wp_worker_dispatch_stream_enabled(), which reads THIS PROCESS's own
+// WP_DISPATCH_STREAM -- a spine-only env var workers-la.sh's WENV never
+// propagates, so that guard silently never fired in the real deployment. The
+// reader/writer split below removes the hazard structurally (the reader
+// thread keeps draining incoming chunks off the socket regardless of whether
+// the writer thread is currently blocked sending a response), independent of
+// any spine-side flag, and was already proven behavior-neutral when WP_
+// WORKER_PIPELINE=1 was opt-in (see the design comment above this function):
+// same FIFO per-connection order, same frames, no wire-format change. Kept
+// as an explicit escape hatch (WP_WORKER_PIPELINE=0) for A/B and diagnosis,
+// not a supported steady-state configuration.
 bool wp_worker_pipeline_enabled() {
     static const bool on = [] {
         const char * e = std::getenv("WP_WORKER_PIPELINE");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0';
     }();
     return on;
 }

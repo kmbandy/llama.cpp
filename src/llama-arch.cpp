@@ -539,6 +539,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ATTN_KV,                                "blk.%d.attn_kv" },
     { LLM_TENSOR_ATTN_KV_NORM,                           "blk.%d.attn_kv_a_norm" },
     { LLM_TENSOR_ATTN_OUT_A,                             "blk.%d.attn_output_a" },
+    { LLM_TENSOR_ATTN_OUT_A_SPLIT,                       "blk.%d.attn_output_a.g%d" },
     { LLM_TENSOR_ATTN_OUT_B,                             "blk.%d.attn_output_b" },
     { LLM_TENSOR_HC_HEAD_FN,                             "output_hc_fn" },
     { LLM_TENSOR_HC_HEAD_BASE,                           "output_hc_base" },
@@ -775,6 +776,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ATTN_KV,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_KV_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_ATTN_OUT_A,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_OUT_A_SPLIT,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_OUT_B,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_HC_HEAD_FN,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_HC_HEAD_BASE,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
@@ -1158,8 +1160,17 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
 
 bool llm_arch_caps_lm_head_rows(const llm_arch & arch) {
     switch (arch) {
-        // the only two archs that call cap_lm_head_rows() in their graphs
+        // the archs that call cap_lm_head_rows() in their graphs. DEEPSEEK41's
+        // two call sites (src/models/deepseek41.cpp, the DSpark-drafter path
+        // and the main decode path) are structurally identical to
+        // DEEPSEEK4's three (main, per-layer nextn, MTP nextn): `cur` is
+        // already narrowed to n_outputs rows via inp_out_ids before
+        // cap_lm_head_rows() is called, and t_embd is captured beforehand,
+        // so only the final vocab mul_mat shrinks -- embeddings and any
+        // upstream layer-input/embeddings_layer_inp taps (DSpark's own) read
+        // from earlier in the graph and are untouched by this cap.
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_DFLASH:
             return true;
         default:

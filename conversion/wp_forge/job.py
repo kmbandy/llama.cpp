@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +88,7 @@ class Job:
         self.tools = tools
         self.workdir = Path(workdir)
         self.resume = resume
+        self._emit_lock = threading.Lock()
         self.builder = builder
         self.workers = int(workers)
         self.verify_load = verify_load
@@ -101,10 +103,12 @@ class Job:
         out = dict(ev)
         out["ts"] = _now()
         out["job_id"] = self.job_id
-        with self._log_path.open("a") as f:
-            f.write(json.dumps(out) + "\n")
-        if self._event_sink is not None:
-            self._event_sink(out)
+        line = json.dumps(out) + "\n"
+        with self._emit_lock:
+            with self._log_path.open("a") as f:
+                f.write(line)
+            if self._event_sink is not None:
+                self._event_sink(out)
 
     def _events(self, stage_name: str) -> Callable[[dict], None]:
         """events callable handed to a stage: stamp, log, forward."""
@@ -286,12 +290,18 @@ class Job:
         try:
             self._preflight(log)
 
-            # 1. spine
-            if "spine" in done:
+            # 1. spine. experts_only reuses the spine already on disk.
+            if self.rplan.plan.experts_only:
+                sp = Path(self.rplan.spine_path)
+                if not sp.is_file():
+                    raise PreflightError(f"experts_only: spine file missing: {sp}")
+                spine = (sp.stat().st_size, "existing")
+                self._emit({"kind": "stage_done", "stage": "spine", "skipped": "experts_only"})
+            elif "spine" in done:
                 spine = self._recovered("spine", groups)
                 self._emit({"kind": "stage_done", "stage": "spine", "resumed": True})
             else:
-                builder = self.builder or ConverterSpineBuilder(self.tools, self.rplan.arch)
+                builder = self.builder or ConverterSpineBuilder(self.tools, self.rplan.arch, self.rplan.plan.name)
                 spine = SpineStage(
                     self.rplan, self.source, self.tools, self._spine_sink(),
                     self._events("spine"), self.workdir, builder,
@@ -304,7 +314,9 @@ class Job:
 
             # 2. sidecars (HF sources only; only classes the plan quantizes)
             sidecars: dict[str, tuple[int, str]] = {}
-            for cls in self.rplan.arch.sidecars:
+            if self.rplan.plan.experts_only:
+                self._emit({"kind": "stage_done", "stage": "sidecars", "skipped": "experts_only"})
+            for cls in ([] if self.rplan.plan.experts_only else self.rplan.arch.sidecars):
                 if self.source.is_gguf or cls not in self.rplan.plan.quant:
                     continue
                 if cls in done:

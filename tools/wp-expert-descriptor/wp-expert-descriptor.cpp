@@ -354,7 +354,8 @@ int run(const Options & options) {
     if (activation_id >= 0) {
         activation = required_string(first_loaded.first.get(), architecture + ".hidden_activation");
     } else if (architecture == "glm-dsa" || architecture == "deepseek4" ||
-               architecture == "deepseek41" || architecture == "qwen4exp") {
+               architecture == "deepseek41" || architecture == "qwen4exp" ||
+               architecture == "qwen35moe") {
         // NOTE 2026-07-31: this was a one-entry allowlist ("glm-dsa"), so every
         // other SwiGLU model failed here with a message implying the MODEL was
         // deficient rather than this list. deepseek4 added on evidence, not
@@ -487,7 +488,22 @@ int run(const Options & options) {
                 role.type = layered_type;
                 role.ne0  = role_name == "down" ? (int64_t) n_ff_exp : (int64_t) n_embd;
                 role.ne1  = role_name == "down" ? (int64_t) n_embd   : (int64_t) n_ff_exp;
+                // A GGUF-sourced repack (wp-repack on the full model) can mix
+                // expert types per role (e.g. MXFP4_MOE quants keep down in
+                // q5_K). When the model actually carries the tensor, its real
+                // type/shape wins over the manifest's single expert_ggml_type;
+                // the forge path (per-layer synthetic model files) keeps using
+                // the manifest type.
+                if (const ggml_tensor * t = ggml_get_tensor(first_loaded.second.get(), role.source_tensor_name.c_str())) {
+                    if (t->ne[2] != (int64_t) n_expert || t->ne[3] != 1) {
+                        throw std::runtime_error(role.source_tensor_name + ": expert dimension does not match model expert count");
+                    }
+                    role.type = t->type;
+                    role.ne0  = t->ne[0];
+                    role.ne1  = t->ne[1];
+                }
                 role.bytes = ggml_row_size(role.type, role.ne0) * (uint64_t) role.ne1;
+                validate_role_shape(role, n_embd, n_ff_exp);
                 roles.emplace(role_name, std::move(role));
             }
             layers.emplace(layer_first, std::move(roles));

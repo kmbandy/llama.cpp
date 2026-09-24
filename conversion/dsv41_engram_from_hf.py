@@ -164,7 +164,7 @@ def make_session() -> requests.Session:
         allowed_methods=frozenset(["GET", "HEAD"]),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=16)
     sess.mount("https://", adapter)
     sess.mount("http://", adapter)
     return sess

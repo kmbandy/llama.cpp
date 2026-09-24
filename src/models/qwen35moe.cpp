@@ -130,10 +130,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
         }
 
-        // Routed experts
+        // Routed experts. expert_flags is OURS: with cross-machine dispatch the
+        // routed experts live on the workers, so the spine must not load them.
+        const int expert_flags = routed_experts_external ? TENSOR_SKIP | TENSOR_NOT_REQUIRED : 0;
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, expert_flags | flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, expert_flags | flags);
 
         // ml8-4 sidecars for the three routed-expert weight tensors. No-op if
         // the expert tensors aren't ml8-typed.
@@ -169,10 +171,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
 
-        // Routed experts
+        // Routed experts (same external-expert skip as the trunk; the MTP
+        // block's experts are stripped by wp-dense-extract along with the rest)
+        const int mtp_expert_flags = mtp_flags | (routed_experts_external ? TENSOR_SKIP | TENSOR_NOT_REQUIRED : 0);
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_expert_flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_expert_flags);
 
         // ml8-4 sidecars for the MTP block's routed experts. No-op if not ml8-typed.
         load_ml8_moe_sidecars(layer.ffn_gate_exps, LLM_TENSOR_FFN_GATE_EXPS, il, n_embd, n_expert,

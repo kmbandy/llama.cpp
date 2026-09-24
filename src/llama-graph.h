@@ -244,7 +244,9 @@ public:
     llm_graph_input_out_ids(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
+            uint32_t n_outputs,
+            int64_t  row_offset = 0) :
+        hparams(hparams), cparams(cparams), n_outputs(n_outputs), row_offset(row_offset) {}
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -257,6 +259,15 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+
+    // Subtracted from each absolute token index before it is written into out_ids.
+    // 0 (default) for every caller except a graph whose builder computed fewer
+    // token rows than n_tokens for the tensor out_ids will ggml_get_rows() from
+    // (e.g. deepseek41's CED prefill trim, which only ever computes the trailing
+    // W = n_swa rows of its decoder layers -- see build_inp_out_ids(row_offset)
+    // and llama_model_deepseek41::graph::graph()). Harmless for row_offset == 0:
+    // set_input() then writes exactly the absolute indices it always has.
+    const int64_t row_offset;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -701,6 +712,70 @@ public:
 
     ggml_tensor * self_k_rot = nullptr;
 
+    // CED prefill trim (WP_DSV41_CED_PREFILL, src/models/deepseek41.cpp): set
+    // by graph::graph() right after build_inp_dsv4() returns, before
+    // set_input() runs, whenever the trim is active for this ubatch -- the
+    // absolute position of the first replayed token. Forwarded to
+    // llama_kv_cache::set_input_kq_mask's ced_replay_floor param. -1
+    // (default, and the value for every ubatch the trim doesn't apply to)
+    // means no restriction -- set_input() then behaves exactly as before
+    // this field existed.
+    llama_pos ced_replay_floor = -1;
+
+    // CED prefill trim (WP_DSV41_CED_PREFILL, src/models/deepseek41.cpp):
+    // when non-null, a SEPARATE, directly-filled I64 input tensor holding
+    // the trailing (this tensor's own ne[0]-many) raw-window write indices,
+    // built and set by graph::graph() right after build_inp_dsv4() returns,
+    // alongside ced_replay_floor. Deliberately NOT a ggml_view_1d of
+    // self_k_idxs: that view -- of an INPUT LEAF specifically, as opposed to
+    // a view of a computed tensor -- is what turned out to corrupt the raw-
+    // window cpy_k write at the seam layer (see the report). Null (default)
+    // when the trim is inactive for this ubatch; set_input() then never
+    // touches it.
+    ggml_tensor * ced_k_idxs_trailing        = nullptr;
+    uint32_t      ced_k_idxs_trailing_offset = 0;
+
+    // CED prefill trim NaN fix (2026-09-22): like ced_k_idxs_trailing just
+    // above, but for the mask. Was previously produced by
+    // dsv41_ced_mask_for_nt's ggml_view_4d + ggml_cont of self_kq_mask_cnv
+    // (a host-resident graph-wide input LEAF) -- the exact same
+    // "fresh-per-layer-view-of-a-host-leaf-feeding-a-GPU-op" shape already
+    // diagnosed and fixed for k_idxs above (see that field's doc comment
+    // and the crash-fix report), just never applied to the mask until this
+    // fix: that view+cont was found to produce wrong data (way more
+    // "finite" entries than the n_kv_max bound allows, including some
+    // actual NaN bit patterns) for specific rows of the narrowed copy,
+    // which poisoned the seam layer's attention softmax for those rows.
+    // ced_kq_mask_trailing sidesteps it exactly like ced_k_idxs_trailing
+    // does: set_input() fills it with a plain host-to-host memcpy of the
+    // trailing rows of the already-correctly-filled self_kq_mask, not a
+    // GPU op reading a view of it. Null (default) when the trim is
+    // inactive; set_input() then never touches it, and
+    // dsv41_ced_mask_for_nt() falls back to its old (safe when nt ==
+    // ne[1], i.e. a no-op) behavior.
+    ggml_tensor * ced_kq_mask_trailing = nullptr;
+
+    // CED prefill trim fix (round 2, code-review sweep): like
+    // ced_k_idxs_trailing/ced_kq_mask_trailing above, but for RoPE
+    // positions. graph::graph() previously built the decoder-range layers'
+    // narrowed `inp_pos` as a plain `ggml_view_1d` of the graph-wide
+    // `inp_pos` input LEAF (built by build_inp_pos(), a host-filled
+    // ggml_set_input tensor) and fed that view straight into
+    // ggml_rope_ext/ggml_rope_ext_back at every decoder-range layer -- the
+    // exact same "GPU op reads a view of a host-resident input leaf" shape
+    // already diagnosed and fixed above for k_idxs and the mask, just never
+    // applied here. ced_pos_trailing sidesteps it exactly like its two
+    // siblings: it is its own ordinary graph input (I32, `ced_w` elements),
+    // filled directly from `ubatch->pos` in set_input() below (not derived
+    // from the already-built `inp_pos` tensor at all, since that one is not
+    // guaranteed to be host-resident the way self_kq_mask/self_k_idxs are --
+    // sourcing straight from `ubatch->pos`, the same host array
+    // llm_graph_input_pos::set_input() itself copies from, sidesteps the
+    // question entirely). Null (default) when the trim is inactive for this
+    // ubatch; set_input() then never touches it.
+    ggml_tensor * ced_pos_trailing        = nullptr;
+    uint32_t      ced_pos_trailing_offset = 0;
+
     const llama_cparams cparams;
 
     const llama_kv_cache_dsv4_raw_context * mctx;
@@ -721,6 +796,12 @@ public:
         ggml_tensor * state_write_pos  = nullptr; // I32 [n_state_write]
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+
+        // CED prefill trim NaN fix: see
+        // llm_graph_input_dsv4_raw::ced_kq_mask_trailing's doc comment --
+        // same fix, applied to the compressed (csa/hca) mask. Offset shared
+        // across csa/hca: llm_graph_input_dsv4::ced_mask_trailing_offset.
+        ggml_tensor * ced_kq_mask_trailing = nullptr;
 
         ggml_tensor * k_rot      = nullptr;
     };
@@ -749,6 +830,14 @@ public:
     comp_input inp_csa;
     comp_input inp_hca;
     comp_input inp_lid;
+
+    // CED prefill trim NaN fix: row offset for inp_csa/inp_hca's (and, if
+    // ever built, inp_lid's) ced_kq_mask_trailing -- same value as
+    // llm_graph_input_dsv4_raw::ced_k_idxs_trailing_offset (both are
+    // ced_offset from graph::graph()), kept as a separate field since this
+    // one lives on the other input object. 0 (default) is inert: set_input()
+    // only reads it when a ced_kq_mask_trailing tensor was actually built.
+    uint32_t ced_mask_trailing_offset = 0;
 
     const llama_cparams cparams;
 
@@ -973,6 +1062,32 @@ struct llm_graph_params {
 
         if (n_outputs != other.n_outputs) {
             return false;
+        }
+
+        // Same COUNT of output rows does not mean same output rows: two ubatches
+        // can both want, say, one row out of n_tokens, but not the same row (one
+        // wants only the final prompt token, another -- same count -- an interior
+        // one for a different purpose). Reusing a graph built for one row set to
+        // serve a request for a different one returns someone else's logits, with
+        // no error to catch it. This used to be checked only when samplers were
+        // attached (below); it must hold unconditionally, because a graph builder
+        // is now free to make topology itself depend on which rows are requested
+        // (see the deepseek41 CED prefill trim: it only computes a trailing window
+        // of decoder layers, so a request for a row outside that window can only
+        // be served by a *different* graph, not a relabeled reuse of this one).
+        // When every token is an output (n_outputs == n_tokens, "logits_all")
+        // there is only one possible row set for a given n_tokens -- already
+        // covered by the count check above -- and ubatch.output is not populated
+        // in that case, so skip the per-row scan rather than dereference null.
+        if ((int64_t) n_outputs != (int64_t) ubatch.n_tokens || (int64_t) n_outputs != (int64_t) other.ubatch.n_tokens) {
+            if (!ubatch.output || !other.ubatch.output || !ubatch.data || !other.ubatch.data) {
+                return false;
+            }
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.output[i] != other.ubatch.output[i]) {
+                    return false;
+                }
+            }
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
@@ -1446,7 +1561,9 @@ struct llm_graph_context {
     ggml_tensor * build_inp_hidden() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
-    ggml_tensor * build_inp_out_ids() const;
+    // row_offset: see llm_graph_input_out_ids::row_offset. 0 (default) is
+    // byte-identical to every existing caller.
+    ggml_tensor * build_inp_out_ids(int64_t row_offset = 0) const;
     // Slice `cur` [n_embd, n_rows] to the last llm_graph_logit_row_cap rows
     // before the vocab mul_mat. Embeddings/nextn stay on the unsliced tensor.
     ggml_tensor * cap_lm_head_rows(ggml_tensor * cur) const;

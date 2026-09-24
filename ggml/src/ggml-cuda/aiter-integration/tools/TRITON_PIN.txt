@@ -1,1 +1,1 @@
-007ef1530aa1c9d1a78d206417fb7721fbd53211  # pinned 2026-06-14; contains #10458 bb5acbe59 (OCP e4m3 fix)
+ae932beb20881ba055af124e6055de7ee9602e54  # pinned 2026-09-23: upstream main b7fdaf802 + madlab RDNA2 swizzle (64f12ea20 cherry-picked; LOCAL-ONLY commit, branch madlab/rdna2-on-main-0923). Previous: 007ef1530 (2026-06-14)

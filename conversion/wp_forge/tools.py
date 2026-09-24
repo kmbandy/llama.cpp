@@ -136,6 +136,23 @@ class Tools:
             for i in indices
         ]
 
+    def expert_shard(self, src_manifest: Path, out_base: Path, first: int, last: int, layer: int) -> tuple[Path, Path]:
+        """Keep whole experts first..last of one layer. Returns (index, blob)."""
+        binary = self.repack_bin.parent / "llama-wp-expert-shard"
+        argv = [
+            str(binary),
+            "--src-manifest", str(src_manifest),
+            "--out-base", str(out_base),
+            "--experts", f"{first}-{last}",
+            "--layers", f"{layer}-{layer}",
+        ]
+        self._run("llama-wp-expert-shard", argv)
+        blob = Path(f"{out_base}-experts-00001-of-00001.wpb")
+        index = Path(f"{out_base}-experts-00001-of-00001.wpi.json")
+        if not blob.is_file() or not index.is_file():
+            raise ToolError("llama-wp-expert-shard", argv, 0, f"missing {blob} or {index}")
+        return index, blob
+
     def descriptor(self, spine_gguf: Path, manifest: Path) -> Path:
         """Run llama-wp-expert-descriptor. Returns the descriptor path
         (default: <manifest stem>.expert-descriptor.json in the manifest's dir)."""

@@ -2177,6 +2177,10 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     return ubatches_write[i_next].n_tokens;
 }
 
+uint32_t llama_kv_cache_dsv4_raw_context::get_write_capacity() const {
+    return kv_swa->get_size() * kv_swa->get_n_stream();
+}
+
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv_swa->get_k(ctx, il, n_kv, sinfos_read[i_next]);
 }
@@ -2227,8 +2231,43 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
     kv_swa->set_input_k_idxs(dst, &ubatches_write[i_next], sinfos_write[i_next]);
 }
 
-void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_idxs_trailing(ggml_context * ctx, uint32_t width) const {
+    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, width);
+    ggml_set_input(k_idxs);
+
+    return k_idxs;
+}
+
+void llama_kv_cache_dsv4_raw_context::set_input_k_idxs_trailing(ggml_tensor * dst, uint32_t offset) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    // Same computation as llama_kv_cache::set_input_k_idxs (llama-kv-cache.cpp)
+    // -- offs + sinfo.idxs[s][i] -- restricted to the trailing `width` ubatch
+    // positions starting at `offset`, written into `dst` starting at row 0
+    // instead of row `offset`. Deliberately duplicated here rather than
+    // adding an offset/width parameter to the shared method: `slot_info` and
+    // llama_kv_cache::get_size() are both public, this context already reads
+    // sinfos_write directly for the full-width fill above, and keeping this
+    // entirely local to the DSV4-specific file means the shared, arch-
+    // neutral fill code every other architecture's KV cache calls is not
+    // touched at all this round.
+    const auto & sinfo = sinfos_write[i_next];
+    const uint32_t width = (uint32_t) dst->ne[0];
+
+    GGML_ASSERT((uint64_t) offset + width <= sinfo.size() &&
+            "CED prefill trim: trailing k_idxs window falls outside this ubatch's own write-index plan");
+
+    int64_t * data = (int64_t *) dst->data;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const int64_t offs = (int64_t) sinfo.strm[s] * kv_swa->get_size();
+        for (uint32_t i = 0; i < width; ++i) {
+            data[s*width + i] = offs + sinfo.idxs[s][offset + i];
+        }
+    }
+}
+
+void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, llama_pos ced_replay_floor) const {
+    kv_swa->set_input_kq_mask(dst, ubatch, causal_attn, ced_replay_floor);
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
@@ -2280,6 +2319,10 @@ bool llama_kv_cache_dsv4_comp_context::next() {
 
 uint32_t llama_kv_cache_dsv4_comp_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_dsv4_comp_context::get_write_capacity() const {
+    return kv->get_size() * kv->get_n_stream();
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_t il) const {

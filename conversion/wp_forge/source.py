@@ -10,6 +10,8 @@ import json
 import os
 import re
 import sys
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
@@ -62,11 +64,21 @@ class _SafetensorsReader:
     def keys(self) -> list[str]:
         return list(self._f.keys())
 
-    def get_tensor(self, name: str) -> np.ndarray:
+    def get_tensor(self, name: str):
         import torch
         t = self._f.get_tensor(name)
         if t.dtype == torch.bfloat16:
             return t.float().numpy()
+        # MXFP4 scales are float8_e8m0, which has no numpy dtype. The lossless
+        # repack views them as the raw E8M0 byte. Packed nibble weights are
+        # already uint8; keep both as torch so repack_mxfp4_blocks can view them.
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0 is not None and t.dtype == e8m0:
+            return t.view(torch.uint8)
+        # Packed MXFP4 nibbles arrive as int8. Keep the tensor so the repack
+        # can view the same bytes as uint8; numpy would be the wrong type.
+        if t.dtype in (torch.uint8, torch.int8):
+            return t
         return t.numpy()
 
 
@@ -79,8 +91,38 @@ class HFSource:
         self.fetch = fetch or _hf_fetch
         self._hparams: dict | None = None
         self._index: dict[str, str] | None = None
+        # Several shard files at once. One file per layer, so this is what
+        # overlaps the next layers' downloads with the layer being packed.
+        n = int(os.environ.get("WP_FORGE_DOWNLOADS", "8"))
+        self._dl_pool = ThreadPoolExecutor(max_workers=max(1, n), thread_name_prefix="hf-shard")
+        self._dl_lock = threading.Lock()
+        self._dl_futs: dict[str, Future] = {}
+
+    def _download(self, filename: str, min_bytes: int) -> Path:
+        path = self.cache_dir / filename
+        if path.is_file() and path.stat().st_size >= min_bytes:
+            return path
+        return self.fetch(self.repo, filename, self.cache_dir)
+
+    def _start(self, filename: str, min_bytes: int) -> Future:
+        with self._dl_lock:
+            fut = self._dl_futs.get(filename)
+            if fut is None:
+                fut = self._dl_pool.submit(self._download, filename, min_bytes)
+                self._dl_futs[filename] = fut
+            return fut
+
+    def prefetch(self, filenames: list[str]) -> None:
+        """Start downloads for shards the next layers will need. No waiting."""
+        for name in filenames:
+            path = self.cache_dir / name
+            if path.is_file() and path.stat().st_size >= MIN_SHARD_BYTES:
+                continue
+            self._start(name, MIN_SHARD_BYTES)
 
     def _ensure(self, filename: str, min_bytes: int = 1) -> Path:
+        if min_bytes >= MIN_SHARD_BYTES:
+            return self._start(filename, min_bytes).result()
         path = self.cache_dir / filename
         if not path.is_file() or path.stat().st_size < min_bytes:
             path = self.fetch(self.repo, filename, self.cache_dir)

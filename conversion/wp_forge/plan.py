@@ -61,6 +61,10 @@ class StageSpec:
     machine: str
     path: str | None
     widths: list[int] | str | None  # explicit element widths, or "a:b" ratios
+    # one machine per width slice; None keeps every slice on `machine`
+    slice_machines: list[str] | None = None
+    # whole-expert id ranges, "first-last", one per output set. Not an FFN cut.
+    expert_ranges: list[tuple[int, int]] | None = None
 
 
 @dataclass
@@ -74,6 +78,9 @@ class Plan:
     experts: list[StageSpec]
     spec_head: StageSpec | str | None  # StageSpec, "none", or None (unspecified)
     allow_partial: bool = False
+    experts_only: bool = False
+    # existing spine gguf to point the bundle at when experts_only skips the rebuild
+    spine_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,8 @@ class SetSpec:
     output_base: str  # blob prefix: "<name>-<id>"
     quant: str  # ggml type name for the experts of this set ("src" = verbatim)
     est_bytes: int
+    expert_first: int | None = None
+    expert_last: int | None = None
 
 
 @dataclass
@@ -122,7 +131,23 @@ def _placement(v: object, default: Placement | None, what: str) -> Placement:
 def _stage(v: dict, what: str) -> StageSpec:
     if not isinstance(v, dict) or "layers" not in v or "machine" not in v:
         raise PlanError(f"{what}: stage needs 'layers' and 'machine'")
-    return StageSpec(LayerRange.parse(v["layers"]), v["machine"], v.get("path"), v.get("widths"))
+    raw_slices = v.get("slice_machines")
+    if raw_slices is not None and (not isinstance(raw_slices, list) or not all(isinstance(x, str) for x in raw_slices)):
+        raise PlanError(f"{what}: slice_machines must be a list of machine names")
+    raw_ranges = v.get("expert_ranges")
+    ranges = None
+    if raw_ranges is not None:
+        if not isinstance(raw_ranges, list):
+            raise PlanError(f"{what}: expert_ranges must be a list of 'first-last'")
+        ranges = []
+        for item in raw_ranges:
+            m = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", str(item))
+            if not m or int(m[1]) > int(m[2]):
+                raise PlanError(f"{what}: bad expert range {item!r}")
+            ranges.append((int(m[1]), int(m[2])))
+    return StageSpec(
+        LayerRange.parse(v["layers"]), v["machine"], v.get("path"), v.get("widths"), raw_slices, ranges
+    )
 
 
 def load_plan(path: Path) -> Plan:
@@ -146,6 +171,8 @@ def load_plan(path: Path) -> Plan:
         experts=[_stage(s, f"experts[{i}]") for i, s in enumerate(raw.get("experts") or [])],
         spec_head="none" if sh == "none" else (_stage(sh, "spec_head") if sh else None),
         allow_partial=bool(raw.get("allow_partial", False)),
+        experts_only=bool(raw.get("experts_only", False)),
+        spine_file=str(raw["spine_file"]) if raw.get("spine_file") else None,
     )
 
 
@@ -230,9 +257,12 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
             raise PlanError(f"quant: type '{t}' for {cls} is not producible+sliceable (allowed: {', '.join(sorted(QUANT_BLOCK))})")
 
     machine_names = {plan.spine.machine, plan.sidecars.machine}
-    machine_names.update(st.machine for st in plan.experts)
+    for st in plan.experts:
+        machine_names.add(st.machine)
+        machine_names.update(st.slice_machines or [])
     if isinstance(plan.spec_head, StageSpec):
         machine_names.add(plan.spec_head.machine)
+        machine_names.update(plan.spec_head.slice_machines or [])
     for name in machine_names:
         if name not in machines:
             raise PlanError(f"machine '{name}' not in machines.json (have: {', '.join(sorted(machines))})")
@@ -256,16 +286,51 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
     sets: list[SetSpec] = []
 
     def emit(st: StageSpec, role: str, quant: str, n_expert: int) -> None:
-        m = machines[st.machine]
         n_layers = len(st.layers.layers())
         block = max(SLICE_ALIGNMENT, QUANT_BLOCK.get(quant, SLICE_ALIGNMENT))
+        if st.expert_ranges and st.widths:
+            raise PlanError("expert_ranges and widths cannot both be set")
+        if st.expert_ranges:
+            covered = [False] * n_expert
+            for first, last in st.expert_ranges:
+                if first < 0 or last >= n_expert:
+                    raise PlanError(f"expert range {first}-{last} outside 0-{n_expert - 1}")
+                for eid in range(first, last + 1):
+                    if covered[eid]:
+                        raise PlanError(f"expert {eid} is in more than one expert_range")
+                    covered[eid] = True
+            if not all(covered):
+                raise PlanError("expert_ranges do not cover every expert")
+            if st.slice_machines is not None and len(st.slice_machines) != len(st.expert_ranges):
+                raise PlanError(
+                    f"slice_machines has {len(st.slice_machines)} entries, want {len(st.expert_ranges)}"
+                )
+            full = 0 if quant == "src" else _expert_bytes(quant, n_expert, n_ff, n_embd, n_layers)
+            for i, (first, last) in enumerate(st.expert_ranges):
+                machine_name = st.slice_machines[i] if st.slice_machines else st.machine
+                m = machines[machine_name]
+                sid = f"L{st.layers}-e{i}"
+                count = last - first + 1
+                est = 0 if quant == "src" else full * count // n_expert
+                sets.append(SetSpec(
+                    sid, role, st.layers, None, None,
+                    machine_name, _dest_dir(m, st.path, plan.name, sid),
+                    f"{plan.name}-{sid}", quant, est, first, last))
+            return
         widths = parse_widths(st.widths, n_ff, block) if st.widths else None
+        n_slices = len(widths) if widths else 1
+        if st.slice_machines is not None and len(st.slice_machines) != n_slices:
+            raise PlanError(
+                f"slice_machines {st.slice_machines} has {len(st.slice_machines)} entries, want {n_slices}"
+            )
         for i, w in enumerate(widths or [n_ff]):
+            machine_name = st.slice_machines[i] if st.slice_machines else st.machine
+            m = machines[machine_name]
             sid = f"L{st.layers}-w{i}" if widths else f"L{st.layers}"
             est = 0 if quant == "src" else _expert_bytes(quant, n_expert, w, n_embd, n_layers)
             sets.append(SetSpec(
                 sid, role, st.layers, i if widths else None, widths,
-                st.machine, _dest_dir(m, st.path, plan.name, sid),
+                machine_name, _dest_dir(m, st.path, plan.name, sid),
                 f"{plan.name}-{sid}", quant, est))
 
     for st in plan.experts:
@@ -276,7 +341,7 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
 
     sm = machines[plan.spine.machine]
     bundle_dir = _dest_dir(sm, plan.spine.path, plan.name, None)
-    spine_path = f"{bundle_dir}/{plan.name}-spine.gguf"
+    spine_path = plan.spine_file or f"{bundle_dir}/{plan.name}-spine.gguf"
     scm = machines[plan.sidecars.machine]
     sc_dir = _dest_dir(scm, plan.sidecars.path, plan.name, None)
     sidecar_paths = {cls: f"{sc_dir}/{plan.name}-{cls}.gguf" for cls in arch.sidecars}

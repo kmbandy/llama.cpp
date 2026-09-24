@@ -97,12 +97,22 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name = item[0]
 
-        # The MTP block brings its OWN hyper-connection mixer, which takes the
-        # model-level slot in an MTP-only file (this arch has no output_norm -- the
-        # final mixer carries it). Rename before _QwenMtpMixin drops it as a
+        # The MTP block brings its OWN hyper-connection mixer. In an MTP-only file
+        # it takes the model-level slot (this arch has no output_norm -- the final
+        # mixer carries it), so rename it before _QwenMtpMixin drops it as a
         # non-MTP tensor. ref: ggml-org#27739
+        #
+        # In a FULL conversion it must be dropped: the trunk's own
+        # model.language_model.hyper_connection_mixer.* lands on the same
+        # model.hyper_connection_mixer.* key, and renaming the MTP copy too made
+        # the later shard overwrite the trunk's -- the LM head was then read out
+        # through the t+2 draft mixer (function words dropped; found 2026-09-21).
+        # The MTP graph currently reuses hc_head_* for its draft, so the draft
+        # runs on the trunk mixer; a separate blk.N.nextn slot is future work.
         if name.startswith("mtp.hyper_connection_mixer."):
-            return None if cls.no_mtp else (name.replace("mtp.", "model.", 1), item[1])
+            if cls.mtp_only:
+                return name.replace("mtp.", "model.", 1), item[1]
+            return None
 
         return super().filter_tensors(item)
 

@@ -27,6 +27,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/mt_pagedattn.cuh"
+#include "ggml-cuda/mt_sparse_attn_dsv4.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -4236,6 +4237,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_PAGED_ATTN_MT:
             mt::ggml_cuda_op_paged_attn_mt(ctx, dst);
+            break;
+        case GGML_OP_SPARSE_ATTN_DSV4:
+            mt::ggml_cuda_op_sparse_attn_dsv4(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -9694,6 +9698,60 @@ static void ggml_cuda_graph_enforce_vram_budget(ggml_backend_cuda_context * cuda
 }
 #endif // USE_CUDA_GRAPH
 
+// WP_NODE_TRACE_LIVE=1: print one line per graph node to stderr, flushed
+// immediately, BEFORE that node's kernel(s) launch. Diagnostic for
+// synchronous crashes -- run with AMD_SERIALIZE_KERNEL=3 (or
+// HIP_LAUNCH_BLOCKING=1) so the fault is synchronous, and the last line
+// printed names the faulting node.
+//
+// Deliberately a DIFFERENT env var from the pre-existing WP_NODE_TRACE
+// (wp-node-trace.cu/.cuh): that one only records each node into an
+// in-memory ring buffer -- it never writes to stderr at launch time -- and
+// is dumped only by the all-reduce watchdog thread (allreduce.cu) on a
+// stall it detects, which a single-GPU (or non-allreduce-stalled) fault
+// like this one would never trigger before the process dies. Its one
+// "before execution" call site in this same loop (ggml_cuda_is_view_or_noop
+// branch, a few lines below) only fires for skipped view/no-op nodes, never
+// for a node that actually launches a kernel -- so it could not have named
+// this node either way. This is a separate, always-immediate,
+// always-flushed print, positioned before ggml_cuda_try_fuse (which may
+// itself execute a fused kernel sequence without ever reaching the normal
+// ggml_cuda_compute_forward call below), so every node that launches
+// anything gets its line printed first, whichever path ends up running it.
+//
+// Default off; a single memoized getenv check is the only cost when unset.
+static bool wp_node_trace_live_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("WP_NODE_TRACE_LIVE");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
+// One compact line: node index, op, name, type, and ne[] for the node and
+// every non-null src. fprintf+fflush, not a GGML_LOG macro -- the log
+// macros are not confirmed to flush unconditionally, and flushing is the
+// entire point here (buffered output would lose exactly the line the crash
+// needs).
+static void wp_node_trace_live_print(int i, const ggml_tensor * node) {
+    if (node == nullptr) {
+        return;
+    }
+    fprintf(stderr, "wp node-trace-live i=%d op=%s name=%s type=%s ne=[%lld,%lld,%lld,%lld]",
+            i, ggml_op_name(node->op), node->name, ggml_type_name(node->type),
+            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = node->src[j];
+        if (src == nullptr) {
+            continue;
+        }
+        fprintf(stderr, " src%d=%s:%s:ne=[%lld,%lld,%lld,%lld]", j, src->name, ggml_type_name(src->type),
+                (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -9932,6 +9990,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 const bool wp_prof_capture = use_cuda_graph && cuda_graph_update_required;
                 wp_op_profile_begin_node(cuda_ctx->device, cuda_ctx->stream(), wp_prof_capture);
+
+                if (wp_node_trace_live_enabled()) {
+                    // Before ggml_cuda_try_fuse, not after: a fused chain can
+                    // execute entirely inside that call and never reach the
+                    // ggml_cuda_compute_forward call below at all, so this is
+                    // the one place upstream of every possible kernel launch
+                    // for this node.
+                    wp_node_trace_live_print(i, node);
+                }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -11932,6 +11999,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 && op->src[7]->type == GGML_TYPE_F16
                 && op->src[8]                          // slot_mapping (fused scatter)
                 && op->src[8]->type == GGML_TYPE_I32;
+        case GGML_OP_SPARSE_ATTN_DSV4:
+            // HIP + kernel-present only (mt::ggml_cuda_sparse_attn_dsv4_supported
+            // compiles to `return false` entirely when GGML_HIP_AITER is off),
+            // gated by the WP_DSV41_SPARSE_ATTN knob and the fixed baked
+            // shape (head_dim=512, n_heads=64) -- see mt_sparse_attn_dsv4.cuh.
+            // The CPU backend never reaches this op: this function only runs
+            // for the CUDA/HIP backend's own device-support query.
+            return mt::ggml_cuda_sparse_attn_dsv4_supported(op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

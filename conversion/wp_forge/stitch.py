@@ -132,7 +132,10 @@ def stitch(
         "allow_partial": True,
         "input_model": input_model,
         "model_files": model_files,
-        "retained_expert_range": {"first": 0, "last": n_expert - 1},
+        "retained_expert_range": {
+            "first": 0 if set_spec.expert_first is None else set_spec.expert_first,
+            "last": n_expert - 1 if set_spec.expert_last is None else set_spec.expert_last,
+        },
         "expert_ggml_type": expert_type,
         "content_hash": aggregate_identity(shards),
         "total_group_count": sum(s["group_count"] for s in shards),

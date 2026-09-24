@@ -1,12 +1,14 @@
 #include "models.h"
 
 #include "ggml-backend.h"
+#include "ggml-ml8.h"
 #include "llama-batch.h"
 #include "llama-impl.h"
 #include "llama-kv-cache-dsv4.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -297,6 +299,105 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
     // V4.1 Single-Pass mHC does not ship output_hc_*. Leave hc_head_* null.
 
+    // ml8-4 / ml8-fp8 / fp8_b128 sidecar registration (2026-09-22), mirroring
+    // llama_model_qwen35::load_arch_tensors's identical lambda block
+    // (src/models/qwen35.cpp ~line 64-191) verbatim except for one addition:
+    // an optional `xid_` parameter threaded through every tn() call, needed
+    // for LLM_TENSOR_ATTN_OUT_A_SPLIT's group index (wo_a's split tensors,
+    // "blk.%d.attn_output_a.g%d") -- every other DS4.1 target tensor passes
+    // xid_=-1 (tn()'s default, meaning "no second index", same as qwen35's
+    // calls). build_ml8_or_mul_mat (src/llama-ml8-registry.h) itself is
+    // arch-agnostic; this registration is the piece that was NOT automatic
+    // (scoping note: earlier assumed "likely automatic", which turned out
+    // to be wrong -- register_weight() is only ever called from model-arch
+    // code, once per weight, at load time).
+    auto is_ml8_sidecar_weight = [](const struct ggml_tensor * w) {
+        return w && (w->type == GGML_TYPE_ML8_4 || w->type == GGML_TYPE_ML8_FP8 || w->type == GGML_TYPE_FP8_B128);
+    };
+
+    auto load_ml8_sidecars = [&](
+            struct ggml_tensor * weight,
+            llm_tensor tensor_id,
+            int il_,
+            int64_t k_dim,
+            struct ggml_tensor ** out_centroids,
+            struct ggml_tensor ** out_rotation_h_a,
+            struct ggml_tensor ** out_rotation_meta,
+            struct ggml_tensor ** out_awq_scale,
+            int xid_ = -1) {
+        if (!is_ml8_sidecar_weight(weight)) {
+            return;
+        }
+        if (weight->type == GGML_TYPE_ML8_4) {
+            *out_centroids = create_tensor(tn(tensor_id, "centroids", il_, xid_),
+                                           { 16, k_dim / 64 }, TENSOR_NOT_REQUIRED);
+            *out_awq_scale = create_tensor(tn(tensor_id, "awq_scale", il_, xid_),
+                                           { k_dim }, TENSOR_NOT_REQUIRED);
+        }
+        const auto * h_a_meta = ml.get_tensor_meta(tn(tensor_id, "rotation_h_a", il_, xid_).str().c_str());
+        if (h_a_meta != nullptr) {
+            const int64_t a = h_a_meta->ne[0];
+            *out_rotation_h_a  = create_tensor(tn(tensor_id, "rotation_h_a",  il_, xid_),
+                                               { a, a }, TENSOR_NOT_REQUIRED);
+        }
+        // block_hadamard weights carry rotation_meta with NO rotation_h_a, so
+        // this is checked independently rather than nested under h_a_meta.
+        const auto * meta_meta = ml.get_tensor_meta(tn(tensor_id, "rotation_meta", il_, xid_).str().c_str());
+        if (meta_meta != nullptr) {
+            *out_rotation_meta = create_tensor(tn(tensor_id, "rotation_meta", il_, xid_),
+                                               { 4 }, TENSOR_NOT_REQUIRED);
+        }
+    };
+
+    auto read_rotation_meta = [&](llm_tensor tensor_id, int il_, int32_t (&out)[4], int xid_ = -1) -> bool {
+        const std::string name = tn(tensor_id, "rotation_meta", il_, xid_).str();
+        const auto * w = ml.get_weight(name.c_str());
+        if (w == nullptr) {
+            return false;
+        }
+        GGML_ASSERT(w->idx < ml.files.size());
+        ml.files.at(w->idx)->seek(w->offs, SEEK_SET);
+        ml.files.at(w->idx)->read_raw(out, sizeof(out));
+        return true;
+    };
+
+    auto fill_rotation_meta = [&](ml8_sidecars & sc, struct ggml_tensor * rotation_meta,
+                                  llm_tensor tensor_id, int il_, int xid_ = -1) {
+        if (rotation_meta == nullptr) {
+            return;
+        }
+        int32_t meta[4];
+        if (!read_rotation_meta(tensor_id, il_, meta, xid_)) {
+            return;
+        }
+        const int32_t kind_id = meta[3];
+        GGML_ASSERT((kind_id == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER ||
+                     kind_id == GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD) &&
+                    "rotation_meta: unrecognized kind_id");
+        GGML_ASSERT((kind_id == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) == (sc.rotation_h_a != nullptr) &&
+                    "rotation_meta kind_id / rotation_h_a presence mismatch");
+        sc.rotation_b_dim          = meta[1];
+        sc.rotation_block_hadamard = (kind_id == GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD);
+    };
+
+    // k_dim is the weight's input feature count (ne[0] / K) — the same value
+    // the weight's create_tensor used for its leading dim.
+    auto register_ml8_weight = [&](struct ggml_tensor * weight,
+                                   llm_tensor tensor_id, int il_, int64_t k_dim, int xid_ = -1) {
+        if (!is_ml8_sidecar_weight(weight)) {
+            return;
+        }
+        struct ggml_tensor * centroids    = nullptr;
+        struct ggml_tensor * rotation_h_a = nullptr;
+        struct ggml_tensor * rotation_meta = nullptr;
+        struct ggml_tensor * awq_scale    = nullptr;
+        load_ml8_sidecars(weight, tensor_id, il_, k_dim,
+                          &centroids, &rotation_h_a, &rotation_meta, &awq_scale, xid_);
+        ml8_sidecars sc{ centroids, rotation_h_a, awq_scale };
+        fill_rotation_meta(sc, rotation_meta, tensor_id, il_, xid_);
+        ml8_reg.register_weight(weight, sc);
+    };
+
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
         const int flags = i < n_layer ? trunk_flags : mtp_flags;
@@ -308,7 +409,33 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * n_embd_head}, flags);
         layer.wkv           = create_tensor(tn(LLM_TENSOR_ATTN_KV,       "weight", i), {n_embd, n_embd_head}, flags);
         layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,  "weight", i), {n_embd_head}, flags);
-        layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank, o_groups}, flags | TENSOR_ALLOW_RESHAPE);
+        // Not required: an ml8-4 spine ships only the split wo_a_g below. The
+        // assert after the split loop requires exactly one of the two forms.
+        layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank, o_groups}, flags | TENSOR_ALLOW_RESHAPE | TENSOR_NOT_REQUIRED);
+        // ml8-4 data-free conversion (Task 2, 2026-09-22): optional split wo_a,
+        // o_groups separate 2D tensors instead of the flat block-diagonal-over-
+        // groups layout above (rotating that flat tensor as one GEMM would mix
+        // groups -- see scripts/calibration/convert_fp8_rotated.py's wo_a
+        // split). Present only in a converted ml8-4 spine; a Q8_0 spine has
+        // none of these (TENSOR_NOT_REQUIRED), wo_a_g[0] stays nullptr, and
+        // build_attention_tail below keeps using the batched-mul_mat path on
+        // layer.wo_a unchanged.
+        GGML_ASSERT(o_groups <= (int64_t) (sizeof(layer.wo_a_g) / sizeof(layer.wo_a_g[0])) &&
+                "wo_a_g is fixed-size; dsv4_o_group_count grew past what the loader supports");
+        for (int64_t g = 0; g < o_groups; ++g) {
+            layer.wo_a_g[g] = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A_SPLIT, "weight", i, (int) g),
+                    {n_head * n_embd_head / o_groups, o_lora_rank}, flags | TENSOR_NOT_REQUIRED);
+        }
+        if (!(flags & TENSOR_SKIP)) { // MTP layers skipped at load have neither form, by design
+            int64_t n_split = 0;
+            for (int64_t g = 0; g < o_groups; ++g) {
+                n_split += layer.wo_a_g[g] != nullptr;
+            }
+            if ((layer.wo_a == nullptr) == (n_split == 0) || (n_split != 0 && n_split != o_groups)) {
+                throw std::runtime_error(format("layer %d: need either attn_output_a.weight or all %d attn_output_a.g* splits (have flat=%d, splits=%d)",
+                                                i, (int) o_groups, layer.wo_a != nullptr, (int) n_split));
+            }
+        }
         layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,    "weight", i), {o_groups * o_lora_rank, n_embd}, flags);
 
         layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, flags);
@@ -332,6 +459,27 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, flags | TENSOR_NOT_REQUIRED);
         layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {n_embd_indexer}, flags | TENSOR_NOT_REQUIRED);
         layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd_head, n_embd_indexer}, flags | TENSOR_NOT_REQUIRED);
+
+        // ml8-4 / ml8-fp8 / fp8_b128 registry registration for the 9 (+8 wo_a
+        // split groups) DS4.1 attention/indexer/compressor GEMM roles
+        // convert_fp8_rotated.py's ml8_4 format targets (2026-09-22). Every
+        // call is a no-op unless the weight's actual GGUF type is one of the
+        // three ml8-family types (is_ml8_sidecar_weight), so this is safe on
+        // an unconverted Q8_0 spine -- registry stays empty, build_lora_mm
+        // falls back to plain mul_mat exactly as before this change.
+        register_ml8_weight(layer.wq_a,          LLM_TENSOR_ATTN_Q_A,          i, n_embd);
+        register_ml8_weight(layer.wq_b,          LLM_TENSOR_ATTN_Q_B,          i, q_lora_rank);
+        register_ml8_weight(layer.wkv,           LLM_TENSOR_ATTN_KV,           i, n_embd);
+        register_ml8_weight(layer.wo_b,          LLM_TENSOR_ATTN_OUT_B,        i, o_groups * o_lora_rank);
+        for (int64_t g = 0; g < o_groups; ++g) {
+            register_ml8_weight(layer.wo_a_g[g], LLM_TENSOR_ATTN_OUT_A_SPLIT, i,
+                                n_head * n_embd_head / o_groups, (int) g);
+        }
+        register_ml8_weight(layer.attn_comp_wkv,   LLM_TENSOR_ATTN_COMPRESSOR_WKV,   i, n_embd);
+        register_ml8_weight(layer.attn_comp_wgate, LLM_TENSOR_ATTN_COMPRESSOR_WGATE, i, n_embd);
+        register_ml8_weight(layer.indexer_proj,     LLM_TENSOR_INDEXER_PROJ,     i, n_embd);
+        register_ml8_weight(layer.indexer_attn_q_b, LLM_TENSOR_INDEXER_ATTN_Q_B, i, q_lora_rank);
+        register_ml8_weight(layer.indexer_attn_k,   LLM_TENSOR_INDEXER_ATTN_K,   i, n_embd_head);
 
         if (hparams.is_engram((uint32_t) i)) {
             const int64_t engram_dim = hparams.dsv41_engram_head_dim ? hparams.dsv41_engram_head_dim : 256;
@@ -811,6 +959,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
         ggml_tensor * x,
         ggml_tensor * emb,
         int il) const {
+    // WP_DSV41_ENGRAM=0: diagnostic ablation -- the engram layers become a
+    // pass-through so the n-gram lookup can be isolated from the rest of the
+    // graph on a live serve. Default on.
+    static const bool engram_enabled = [] {
+        const char * e = std::getenv("WP_DSV41_ENGRAM");
+        return e == nullptr || e[0] != '0';
+    }();
+    if (!engram_enabled) {
+        return x;
+    }
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc*n_embd;
     const int64_t nt     = x->ne[2];
@@ -910,12 +1068,33 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
     cb(out, "attn_derope", il);
 
     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
-    out = ggml_permute(ctx0, out, 0, 2, 1, 3);
 
-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
-    cb(oa, "attn_wo_a", il);
-
-    oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+    ggml_tensor * oa;
+    if (layer.wo_a_g[0] != nullptr) {
+        // ml8-4 data-free conversion (Task 2): wo_a was split at conversion
+        // time into `n_groups` separate 2D tensors (see load_arch_tensors and
+        // scripts/calibration/convert_fp8_rotated.py's wo_a split), each
+        // projecting only its own group's heads -- o_groups build_lora_mm
+        // calls (so ml8-4 dispatch via the registry applies per group) whose
+        // [o_lora_rank, 1, nt] outputs are concatenated along the group axis
+        // to reproduce the batched path's [o_lora_rank, n_groups, nt] shape
+        // below, bit-for-bit the same layout the non-split path's permute +
+        // cont_2d produces.
+        oa = nullptr;
+        for (int64_t g = 0; g < n_groups; ++g) {
+            ggml_tensor * out_g = ggml_view_2d(ctx0, out, o_group_dim, nt, out->nb[2], g*out->nb[1]);
+            out_g = ggml_cont(ctx0, out_g);
+            ggml_tensor * oa_g = build_lora_mm(layer.wo_a_g[g], out_g);
+            oa_g = ggml_reshape_3d(ctx0, oa_g, o_lora_rank, 1, nt);
+            oa = oa == nullptr ? oa_g : ggml_concat(ctx0, oa, oa_g, 1);
+        }
+        cb(oa, "attn_wo_a_split", il);
+    } else {
+        out = ggml_permute(ctx0, out, 0, 2, 1, 3);
+        oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+        cb(oa, "attn_wo_a", il);
+        oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+    }
     oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, nt);
 
     out = build_lora_mm(layer.wo_b, oa);
@@ -984,26 +1163,42 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
             idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
             idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
 
-    idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
-    idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
+    ggml_tensor * score = nullptr;
+    if (cparams.fused_lid) {
+        // ggml_lightning_indexer wants q/k/weights in their pre-permute layout
+        // (see the shape doc on the op) and the mask as F16; the compressed
+        // mask is only F16 when flash attention is on (dsv4_build_comp_inputs),
+        // so cast it up front, the same widening the unfused path below does
+        // to F32 (the mask only ever holds 0 or -inf, so either cast is exact).
+        ggml_tensor * mask = inp_comp.kq_mask;
+        if (mask->type != GGML_TYPE_F16) {
+            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        }
+        score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask);
+        cb(score, "idx_score", il);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
+        idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
 
-    ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+        score = ggml_mul_mat(ctx0, idx_k, idx_q);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
 
-    score = ggml_relu(ctx0, score);
-    score = ggml_mul(ctx0, score, idx_w);
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+        score = ggml_relu(ctx0, score);
+        score = ggml_mul(ctx0, score, idx_w);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
 
-    // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
-    // ever holds 0 or -inf, so widening it is exact.
-    ggml_tensor * mask = inp_comp.kq_mask;
-    if (mask->type != score->type) {
-        mask = ggml_cast(ctx0, mask, score->type);
+        // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
+        // ever holds 0 or -inf, so widening it is exact.
+        ggml_tensor * mask = inp_comp.kq_mask;
+        if (mask->type != score->type) {
+            mask = ggml_cast(ctx0, mask, score->type);
+        }
+
+        score = ggml_add(ctx0, score, mask);
+        cb(score, "idx_score", il);
     }
-
-    score = ggml_add(ctx0, score, mask);
-    cb(score, "idx_score", il);
 
     const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
 
@@ -1011,6 +1206,668 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     cb(top_k, "idx_top_k", il);
 
     return top_k;
+}
+
+// CED prefill trim (WP_DSV41_CED_PREFILL), gate + trunk-loop helpers. See the
+// long comment in graph::graph() (where the gate is evaluated) for the
+// architecture rationale; these are just the small pieces it and
+// build_attention_v41 share.
+
+static bool dsv41_ced_prefill_env_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("WP_DSV41_CED_PREFILL");
+        return e != nullptr && e[0] == '1'; // default OFF; require exact "1"
+    }();
+    return enabled;
+}
+
+// WP_DSV41_SPARSE_ATTN: route DS4.1's attention through AITER's native
+// sparse kernels (ggml_sparse_attn_dsv4 / GGML_OP_SPARSE_ATTN_DSV4, HIP-only)
+// instead of the dense build_attn_mha scan. Default OFF; the dense path is
+// always the fallback (env off, op unsupported, or the "no top_k" case
+// below where n_comp is unbounded).
+static bool dsv41_sparse_attn_env_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("WP_DSV41_SPARSE_ATTN");
+        return e != nullptr && e[0] == '1'; // default OFF; require exact "1"
+    }();
+    return enabled;
+}
+
+// WP_DSV41_TOPK_REUSE=1: non-source compressed layers reuse their index
+// source's top-k (as the reference does) instead of attending to every
+// compressed position. Default off until A/B'd.
+static bool dsv41_topk_reuse_env_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_DSV41_TOPK_REUSE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool dsv41_sparse_attn_check_env_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("WP_DSV41_SPARSE_ATTN_CHECK");
+        return e != nullptr && e[0] == '1'; // default OFF; require exact "1"
+    }();
+    return enabled;
+}
+
+// WP_DSV41_CED_W: bisection knob, active only when WP_DSV41_CED_PREFILL=1.
+// Overrides the replay width W (default hparams.n_swa) with any value the
+// caller asks for; the only clamp applied is the structural one every other
+// eligibility condition already enforces (w >= 1, and the gate's own
+// `n_tokens > w` check refuses anything that isn't strictly narrower than
+// the prompt). Deliberately does NOT require w == n_swa: that equality was
+// a correctness assumption for the *shipped* semantics (SWA Bounded
+// Replay), not a structural necessity of the narrowing mechanism itself --
+// this knob exists precisely to let W vary so the two can be told apart.
+// Memoized like the other env parsers; -1 means "not set, use the default".
+static int64_t dsv41_ced_w_override() {
+    static const int64_t w = []() -> int64_t {
+        const char * e = std::getenv("WP_DSV41_CED_W");
+        if (e == nullptr || e[0] == '\0') {
+            return -1;
+        }
+        char * end = nullptr;
+        const long long v = std::strtoll(e, &end, 10);
+        if (end == e || v < 1) {
+            return -1; // unparseable or structurally invalid -- fall back to the default
+        }
+        return (int64_t) v;
+    }();
+    return w;
+}
+
+enum class dsv41_ced_scope {
+    ALL,  // default: today's behaviour -- attention AND the FFN/MoE both narrow at the seam
+    FFN,  // narrow only the FFN/MoE path; the seam layer's own attention runs full width
+    ATTN, // narrow only attention; see the scope-coupling note in graph::graph()
+};
+
+// WP_DSV41_CED_SCOPE: bisection knob, active only when WP_DSV41_CED_PREFILL=1.
+// "all" (default), "ffn", or "attn" (case-sensitive, exact match); anything
+// else falls back to "all". See graph::graph() for how each is implemented
+// and the one place ATTN and ALL are provably the same code path (a
+// structural coupling, not an oversight -- documented there, not hidden
+// here).
+static dsv41_ced_scope dsv41_ced_scope_override() {
+    static const dsv41_ced_scope scope = []() {
+        const char * e = std::getenv("WP_DSV41_CED_SCOPE");
+        if (e != nullptr && std::strcmp(e, "ffn") == 0) {
+            return dsv41_ced_scope::FFN;
+        }
+        if (e != nullptr && std::strcmp(e, "attn") == 0) {
+            return dsv41_ced_scope::ATTN;
+        }
+        return dsv41_ced_scope::ALL;
+    }();
+    return scope;
+}
+
+static const char * dsv41_ced_scope_name(dsv41_ced_scope scope) {
+    switch (scope) {
+        case dsv41_ced_scope::FFN:  return "ffn";
+        case dsv41_ced_scope::ATTN: return "attn";
+        default:                    return "all";
+    }
+}
+
+// WP_DSV41_CED_SKIP_NONFINAL: bisection knob, active only when
+// WP_DSV41_CED_PREFILL=1. A non-final ubatch (n_outputs==0) has no row any
+// caller will ever read: the trim above already narrows its decoder-range
+// compute to the trailing W rows of THAT ubatch, but even that is wasted
+// work when nothing downstream looks at it. Default ON (any value other than
+// exact "0") once the trim itself is on, so enabling the trim gets this too
+// unless the caller opts out to restore today's per-ubatch trailing-W
+// behaviour -- see graph::graph()'s ced_skip_layer for what it changes.
+static bool dsv41_ced_skip_nonfinal_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("WP_DSV41_CED_SKIP_NONFINAL");
+        return e == nullptr || e[0] != '0';
+    }();
+    return enabled;
+}
+
+// Observability for the gate above: with the env var on, we still build a
+// graph per ubatch (many per prefill, one per decode token) and log at WARN
+// -- same facility/threshold as "expert dispatch gate"/"expert dispatch
+// deferral" in llama-graph.cpp / pipe-expert-dispatch-graph.cpp -- but a line
+// per ubatch would be hundreds of lines for one prompt. Only emit when the
+// outcome (applied vs. refused, and if refused, which condition) actually
+// differs from the last line logged, so a request produces a handful of
+// lines: one at the first decision, and one each time it changes. Only ever
+// called from code gated on dsv41_ced_prefill_env_enabled(), which the
+// env-var-off path never enters, so this is silent (and these statics are
+// never touched) when the feature is off.
+//
+// `channel` keeps independent dedup state per kind of line -- the gate
+// decision (0), k_idxs bounds-check trips (1), shape logging (2), and the
+// skip-nonfinal short-final-ubatch hazard (3) -- so e.g. a bounds-check line
+// firing doesn't reset the gate-decision line's "already logged this" state
+// and cause it to reprint on the next ubatch.
+static void dsv41_ced_log_if_changed(const std::string & msg, int channel = 0) {
+    static std::string last[4];
+    GGML_ASSERT(channel >= 0 && channel < 4);
+    if (msg != last[channel]) {
+        last[channel] = msg;
+        LLAMA_LOG_WARN("%s\n", msg.c_str());
+    }
+}
+
+// Every requested output row must resolve inside the trailing `w` tokens the
+// trim actually computes; a row outside that window was never produced by
+// the trimmed graph and reading it would be a stale/uninitialized-buffer
+// read, not merely a wrong answer. O(n_tokens - w), not O(n_tokens): this
+// only has to find one disqualifying row outside the kept window.
+//
+// n_outputs==0 (no row of THIS ubatch requested) USED TO be refused
+// unconditionally (round-1 fix, see scratchpad/ced-multiubatch-fix-report.md):
+// llama-server requests outputs only on the ubatch that actually contains
+// the token(s) the caller wants (normally just the last ubatch of a
+// multi-ubatch prefill), so every earlier ubatch had n_outputs==0. Trimming
+// decoder layers on THAT ubatch narrows their query/KV-write compute (see
+// graph::graph() below) to its own local trailing w rows; find_slot()/
+// apply_ubatch() -- CED-unaware -- still mark cells used for the ubatch's
+// FULL n_tokens, so the untrimmed rows' decoder-range raw-KV cells are
+// marked valid/in-range but never written by anything. The confirmed root
+// cause (WP_CED_NAN_TRACE=1 on a reliably-crashing 7010-token, ubatch-2048
+// prompt): a non-seam decoder layer's raw attention passed n_kv_max=0 ("no
+// explicit cap", the plain dense-mask fallback every non-index-source V4/
+// V4.1 layer already used before CED existed), so the flash-attention
+// kernel scanned every physical raw-KV column regardless of the mask;
+// ced_replay_floor's masking (llama_kv_cache::set_input_kq_mask) correctly
+// marks the never-written cells -inf, but IEEE-754 -inf + NaN = NaN, so a
+// masked cell that happens to hold a NaN bit pattern still poisons the
+// whole row's softmax -- the mask value alone doesn't suppress it when the
+// kernel isn't told to skip the entry.
+//
+// round-3 fix: rather than refuse n_outputs==0 outright, `n_kv_max` (see its
+// own doc comment where it's computed in build_attention_v41) now bounds
+// EVERY decoder-range layer's scan to the true finite-entry count (SWA-
+// visible raw span + every comp entry, the comp side always being fully
+// written regardless of trim -- see cur_kv), not the dense "scan everything"
+// fallback. That directly closes the mechanism above: a masked, possibly-
+// NaN raw cell from a skipped (non-final-ubatch) row is simply never
+// touched by the kernel once n_kv_max excludes it, independent of whether
+// the mask value alone would have suppressed it. With that fix in place,
+// n_outputs==0 is exactly as safe to trim as n_outputs>0 -- every eligible
+// ubatch (final or not) narrows its own decoder-range compute to its own
+// trailing w rows, writing real raw KV only for those rows (still finite,
+// still correctly masked for whichever LATER query, if any, needs them --
+// see the "final ubatch shorter than w" note below for the one case this
+// doesn't cover, which the w > 0 && n_tokens > w gate already refuses).
+static bool dsv41_ced_outputs_in_window(const llama_ubatch & ubatch, uint32_t n_outputs, int64_t n_tokens, int64_t w) {
+    if ((int64_t) n_outputs == n_tokens) {
+        // logits_all: every row is requested. A trimmed graph only ever
+        // computes the last `w` of them, so this can never be satisfied.
+        return false;
+    }
+    if (n_outputs == 0) {
+        // No row of THIS ubatch is requested -- fine to trim now (see the
+        // function comment above): every eligible ubatch narrows to its own
+        // trailing w rows regardless, and n_kv_max keeps that safe. Skip
+        // straight to "trim it" rather than falling into the loop below,
+        // which is scanning ubatch.output for rows OUTSIDE the window --
+        // moot when nothing is requested at all, and ubatch.output may not
+        // even be populated in that case.
+        return true;
+    }
+    if (!ubatch.output) {
+        return false; // can't verify which rows are wanted; refuse rather than guess
+    }
+    for (int64_t i = 0; i < n_tokens - w; ++i) {
+        if (ubatch.output[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// WP_DSV41_CED_CONT: bisection/diagnostic knob, active only when
+// WP_DSV41_CED_PREFILL=1. When set, every dsv41_ced_trailing_2d/3d call
+// below materializes its trailing view into a genuine contiguous copy
+// (ggml_cont) before returning it, instead of handing callers a strided view
+// that aliases the pre-narrowing tensor's own buffer. Costs one small memcpy
+// per narrowed tensor per seam-layer call (a handful of times per prefill,
+// not per token) -- negligible against the dispatch cost this trim is
+// chasing.
+//
+// Purpose: isolate whether the view itself -- offset arithmetic, stride
+// preservation, aliasing with the parent's buffer -- is implicated, as
+// opposed to something downstream of it. If turning this on makes an
+// otherwise-reproducing fault disappear, the view/aliasing mechanism is
+// proven at fault (a real GGML op reading through a narrowed inpL view is
+// doing something a genuinely materialized, ordinarily-allocated tensor of
+// the same shape would not); if the fault persists identically with this on,
+// the view construction itself is exonerated and whatever narrow inpL feeds
+// downstream (build_hc_mixes/build_hc_pre/build_moe_ffn/expert dispatch) is
+// implicated instead, independent of whether its input happens to be a view.
+static bool dsv41_ced_cont_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("WP_DSV41_CED_CONT");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+// Trailing-token views of tensors the trunk loop just built itself (inpL/
+// residual, and build_hc_mixes' attn_pre/post/comb outputs) at the seam layer.
+// All of these are freshly allocated, contiguous tensors going into the seam
+// (see the seam-layer comment in graph::graph()), and hc_pre/hc_post/hc_mixes
+// are strictly per-token/row-local (no cross-token mixing), so slicing their
+// OUTPUT to the last `w` tokens here is exactly the tensor those ops would
+// have produced had they been fed an already-trimmed input -- not an
+// approximation, just done after the (cheap) full-width compute instead of
+// before it, matching build_hc_mixes' own existing "compute full, slice at
+// point of use" pattern for its outputs.
+static ggml_tensor * dsv41_ced_trailing_2d(ggml_context * ctx0, ggml_tensor * x, int64_t w, int64_t offset) {
+    ggml_tensor * v = ggml_view_2d(ctx0, x, x->ne[0], w, x->nb[1], offset * x->nb[1]);
+    return dsv41_ced_cont_enabled() ? ggml_cont(ctx0, v) : v;
+}
+
+static ggml_tensor * dsv41_ced_trailing_3d(ggml_context * ctx0, ggml_tensor * x, int64_t w, int64_t offset) {
+    ggml_tensor * v = ggml_view_3d(ctx0, x, x->ne[0], x->ne[1], w, x->nb[1], x->nb[2], offset * x->nb[2]);
+    return dsv41_ced_cont_enabled() ? ggml_cont(ctx0, v) : v;
+}
+
+// CED prefill trim (WP_DSV41_CED_PREFILL): every DSV4 raw/compressed kq_mask
+// is [n_kv, n_query_tokens/n_stream, 1, n_stream] and every k_idxs is
+// [n_query_tokens] (see llm_graph_input_dsv4_raw / comp_input in
+// llama-graph.h) -- the query-token axis, not the graph's n_tokens. A trimmed
+// decoder-layer `cur` (see graph::graph()) carries fewer query tokens than
+// these graph-wide inputs were built for, so a trailing view of that axis is
+// needed wherever they are read. These helpers are no-ops (return the input
+// unchanged) whenever the axis already matches, so every call site below
+// behaves exactly as before when the trim is off -- there is no separate
+// "trim active" flag threaded through this file's attention path at all.
+// mask is a graph-wide INPUT LEAF (built once by build_inp_dsv4(), filled by
+// llama_kv_cache::set_input_kq_mask), not a computed tensor -- unlike inpL/
+// cur/attn_pre/post/comb, which are freshly computed by this file's own hc_*
+// helpers every layer. ggml_cont here materializes the narrowed view into an
+// ordinary computed tensor before any GPU consumer (build_attn_mha) reads it,
+// so the same input-leaf-view hazard the raw k_idxs view turned out to have
+// (see dsv41_ced_raw_k_idxs_for_nt below, and the report) cannot apply here
+// too: the attention kernel that reads this mask sees a normal intermediate
+// tensor, not a view whose data pointer is offset into a host-resident leaf's
+// own buffer. Costs one small copy per narrowed layer, same trade discussed
+// for WP_DSV41_CED_CONT.
+static ggml_tensor * dsv41_ced_mask_for_nt(ggml_context * ctx0, ggml_tensor * mask, ggml_tensor * trailing, int64_t nt) {
+    if (mask == nullptr || mask->ne[1] == nt) {
+        return mask;
+    }
+    // NaN fix (2026-09-22): prefer the dedicated, directly host-filled
+    // ced_kq_mask_trailing tensor graph::graph() builds whenever the trim is
+    // active (see llm_graph_input_dsv4_raw::ced_kq_mask_trailing's doc
+    // comment) -- it is filled by a host-to-host memcpy in set_input(), not
+    // a GPU op reading a view of the graph-wide leaf, which is what this
+    // function used to do below and what turned out to corrupt some rows of
+    // the narrowed copy (see the nan-fix report).
+    if (trailing != nullptr) {
+        GGML_ASSERT(trailing->ne[1] == nt &&
+                "CED prefill trim: dedicated trailing mask tensor was built at the wrong width");
+        return trailing;
+    }
+    // Fallback only: every call site below passes a non-null `trailing`
+    // whenever mask->ne[1] != nt can happen (i.e. whenever the trim is
+    // active), so this GGML_ASSERT should never actually fire in practice --
+    // kept as a loud failure instead of silently falling back to the known-
+    // bad view+cont path if some future call site forgets to build one.
+    GGML_ASSERT(false && "CED prefill trim: mask needs narrowing but no dedicated trailing tensor was built");
+    return nullptr;
+}
+
+// Selects which k_idxs tensor a raw-window cpy_k call should use: the full,
+// unmodified graph-wide leaf when this layer isn't narrowed (nt == the
+// leaf's own width -- every encoder-range layer, and the whole graph when
+// the trim is off), or the SEPARATE, dedicated, already-correctly-sized
+// ced_k_idxs_trailing tensor (built by graph::graph(), see
+// llm_graph_input_dsv4_raw's doc comment) when it is. No ggml_view_1d of
+// the leaf anywhere -- that view is exactly what corrupted this write (see
+// the report): self_k_idxs is host-resident (set_input_k_idxs requires
+// ggml_backend_buffer_is_host), and a per-layer, freshly-built view of it
+// feeding a GPU-side ggml_set_rows gave the backend scheduler a new,
+// uncached cross-backend materialization to get right on every narrowed
+// layer, which it did not. ced_k_idxs_trailing sidesteps the question
+// entirely: it is its own ordinary graph input, filled directly at its own
+// correct width, never a view of anything.
+static ggml_tensor * dsv41_ced_raw_k_idxs_for_nt(llm_graph_input_dsv4_raw * inp_attn, int64_t nt) {
+    ggml_tensor * full = inp_attn->get_k_idxs();
+    if (full == nullptr || full->ne[0] == nt) {
+        return full;
+    }
+    GGML_ASSERT(inp_attn->ced_k_idxs_trailing != nullptr && inp_attn->ced_k_idxs_trailing->ne[0] == nt &&
+            "CED prefill trim: narrowed raw-window write requested but ced_k_idxs_trailing wasn't built at this width");
+    return inp_attn->ced_k_idxs_trailing;
+}
+
+// CED prefill trim observability: a runtime bounds check on the actual index
+// *values* handed to a cpy_k WRITE, or a set_rows/get_rows-style GATHER,
+// gated behind WP_DSV41_CED_PREFILL the same way as the trim itself.
+//
+// Covers two distinct hazards this file's own bounds no longer guarantee once
+// the trim is active:
+//  - write indices (k_idxs into a cpy_k call): checks that skipping the
+//    writes for the tokens a decoder layer doesn't process under the trim
+//    never leaves a k_idxs value pointing outside the cache's actual
+//    scatter-destination extent. `limit` here is get_write_capacity() --
+//    the destination's own row count (physical size times stream count),
+//    NOT get_n_kv() -- an earlier version of this check used get_n_kv() and
+//    it is the wrong bound: get_n_kv() is a separately-computed masking/
+//    attention-read-window size that is not guaranteed to be >= every valid
+//    physical write-slot index (see the crash-report investigation, which
+//    also found the CSA compressed-state write was calling cpy_k completely
+//    unguarded by any check at all).
+//  - gather indices (the indexer's top-k output, used by build_top_k_mask,
+//    deepseek4.cpp, to select which compressed positions a query is allowed
+//    to see): `limit` is n_comp (inp_comp.kq_mask->ne[0]), the exact size
+//    build_top_k_mask's own scatter destination is built to -- a graph-local
+//    temporary, not a persistent cache, so no get_n_kv()-vs-capacity
+//    distinction applies here. If anything upstream of the indexer score
+//    produces NaNs, ggml_top_k's comparison-based selection over NaN is not
+//    guaranteed to stay in range, and a garbage index handed to a
+//    set_rows-style scatter is exactly the shape of an async out-of-bounds
+//    memory fault.
+//
+// Runs on every call site while the env var is on, not just the ones the
+// trim actually narrows -- mirrors dsv41_ced_mask_for_nt/_k_idxs_for_nt's own
+// no-separate-"trim active"-flag design above -- and is cheap (an O(n) scan
+// of at most a few hundred indices) and silent unless a value actually trips
+// it, using the same change-only logging discipline as the gate decision
+// (dsv41_ced_log_if_changed, channel 1) so a whole prefill costs at most a
+// handful of extra log lines even if something is wrong on every ubatch.
+struct dsv41_ced_idx_check_ctx {
+    int64_t      limit;
+    int32_t      il;
+    const char * label; // always a string literal (e.g. "raw"/"lid"/"top_k") -- static storage, no lifetime concern
+};
+
+static void dsv41_ced_check_idxs_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return; // n_tasks == 1 below, but guard regardless of how a backend schedules it
+    }
+
+    const auto * cx = (const dsv41_ced_idx_check_ctx *) userdata;
+    const int64_t n = ggml_nelements(a);
+
+    // Both k_idxs (I64, cpy_k) and ggml_top_k's output (I32, the indexer
+    // gather) reach here -- ggml_set_rows itself accepts either, so this
+    // mirrors that rather than assuming one width.
+    for (int64_t i = 0; i < n; ++i) {
+        int64_t v;
+        if (a->type == GGML_TYPE_I64) {
+            v = ((const int64_t *) a->data)[i];
+        } else {
+            GGML_ASSERT(a->type == GGML_TYPE_I32 && "CED prefill trim: index bounds check expects an I32 or I64 index tensor");
+            v = ((const int32_t *) a->data)[i];
+        }
+
+        if (v < 0 || v >= cx->limit) {
+            char msg[224];
+            std::snprintf(msg, sizeof(msg),
+                    "CED prefill trim: index OOB cache=%s il=%d row=%lld value=%lld limit=%lld over_by=%lld",
+                    cx->label, cx->il, (long long) i, (long long) v, (long long) cx->limit,
+                    (long long) (v >= cx->limit ? (v - cx->limit + 1) : -(v + 1)));
+            dsv41_ced_log_if_changed(msg, 1);
+            break; // one report per triggering call is enough to localise it
+        }
+    }
+}
+
+// Checks `idxs` as a wholly SEPARATE, forward-expanded side node -- idxs
+// itself is returned to callers unmodified and untouched, never spliced into
+// its own consumer's data path. This is deliberately NOT what an earlier
+// version of this function did: that version used ggml_map_custom1_INPLACE
+// and returned the wrapped view for the caller to hand to cpy_k in idxs'
+// place. That turned out to be a real bug, found via WP_NODE_TRACE_LIVE, not
+// a theory -- see the report. GGML_OP_MAP_CUSTOM1 is not a CUDA-supported op
+// (ggml-cuda.cu's device-support switch has no case for it, confirmed by
+// reading it directly), so the scheduler must run that node on the CPU
+// backend. Every layer's raw-window cpy_k reads the SAME shared host input
+// leaf (self_k_idxs) directly in the unmodified codebase, which lets the
+// backend scheduler's cross-backend-copy machinery materialize ONE GPU-side
+// copy of it and reuse that copy for every layer's cpy_k. Splicing in a
+// freshly-built, per-layer INPLACE custom-op node ahead of each layer's
+// cpy_k instead handed each one a DIFFERENT tensor object aliasing the same
+// buffer -- defeating that reuse and forcing ~40 new CPU/GPU transition
+// points where there used to be effectively one, each one a fresh
+// opportunity for the copy the scheduler generates to be stale, wrong-sized,
+// or simply never populated correctly for that specific split. The node
+// WP_NODE_TRACE_LIVE caught faulting (an ordinary layer-2 raw-window cpy_k,
+// nowhere near anything CED narrows) is consistent with exactly that: a
+// scheduler-generated cross-backend copy feeding the real consumer with
+// garbage, while this check's own callback -- reading the original,
+// correctly-filled host buffer via the same alias -- saw valid data and
+// never had anything to report. Keeping the check itself (it is not useless:
+// it still verifies the CPU-side values are correct) but no longer letting
+// it sit on the path to the actual scatter.
+static void dsv41_ced_check_indices(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * idxs, int64_t limit, int il, const char * label) {
+    if (!dsv41_ced_prefill_env_enabled() || idxs == nullptr) {
+        return;
+    }
+
+    // Small, deliberately leaked per call: ggml_map_custom1's own op_params
+    // slot is already spoken for internally (ggml_map_custom1_impl stores the
+    // {fun, n_tasks, userdata} triple there itself to dispatch the callback --
+    // writing into it ourselves would corrupt that), so `userdata` is the
+    // only channel this API gives a callback to receive per-call context
+    // through, and it must outlive graph build (this call returning) until
+    // graph execution (when the callback actually runs). At most a few dozen
+    // of these are allocated per graph build, only while
+    // WP_DSV41_CED_PREFILL=1, so the leak is bounded -- this is the same
+    // userdata-ownership shape already used for CPU-side custom ops in
+    // pipe-expert-dispatch-graph.cpp (there the context is long-lived and
+    // reused instead of leaked; for a value that is never freed, the effect
+    // is the same).
+    auto * cx = new dsv41_ced_idx_check_ctx{ limit, il, label };
+
+    // Non-inplace: a fresh, independent tensor, not a view of idxs. Nothing
+    // else in the graph reads it -- it exists purely so the scheduler has a
+    // reason to execute the callback -- so it must be forward-expanded
+    // explicitly, unlike the old inplace version, which got pulled in
+    // automatically as cpy_k's own input dependency.
+    ggml_tensor * checked = ggml_map_custom1(ctx0, idxs, dsv41_ced_check_idxs_cb, 1, cx);
+    ggml_build_forward_expand(gf, checked);
+}
+
+// CED prefill trim observability: log a tensor's ne[]/nb[]/type, using the
+// same change-only discipline as the rest of this feature's logging
+// (dsv41_ced_log_if_changed, channel 2, independent of the gate-decision and
+// bounds-check channels). The caller decides which layers/tensors this is
+// worth calling for (graph::graph() only asks build_attention_v41 to do this
+// for the seam layer and the first decoder layer past it); a null tensor is
+// silently skipped.
+static void dsv41_ced_log_shape(int il, const char * label, const ggml_tensor * t) {
+    if (t == nullptr) {
+        return;
+    }
+    char msg[224];
+    std::snprintf(msg, sizeof(msg),
+            "CED prefill trim: shape il=%d %s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%d",
+            il, label,
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3], (int) t->type);
+    dsv41_ced_log_if_changed(msg, 2);
+}
+
+// WP_DSV41_SPARSE_ATTN index construction. Builds the fixed-width per-query
+// kv_indices [n_idx, nt] I32 (-1 = pad/skip) that ggml_sparse_attn_dsv4 needs,
+// from the SAME (dedicated, non-view) raw_mask tensor the dense path already
+// uses for this call -- not a re-derivation of the causal/SWA/replay-floor
+// logic, so it automatically honours the CED trim's trailing-row narrowing
+// and replay floor exactly as the dense path sees them.
+//
+// Window part: ggml_top_k(raw_mask, k_win) picks, per query row, the k_win
+// highest-valued raw_mask entries (admitted cells are 0.0, others -INFINITY,
+// so top_k always prefers every admitted cell first). When a row's true
+// window is shorter than k_win (only possible for the first few rows of a
+// sequence), the extra picks land on -inf cells; gathering raw_mask's own
+// value back at each picked index (via ggml_get_rows on a n_embd=1 reshape)
+// and folding "is this pick's mask value -inf?" into the index itself turns
+// those extra picks into -1, which both AITER kernels vendored under
+// aiter-integration/kernels/{sparse_attention_dsv4,pa_decode_sparse}.py skip
+// (kv_indices_ptr entries are compared `slot >= 0`, `other=-1` on the
+// index-tile load) -- verified against the vendored kernel bodies, not
+// assumed.
+//
+// Comp part: top_k (the indexer's own picks, when this layer is an index
+// source) is already an explicit, fixed-width index list into the n_comp
+// compressed positions -- appended verbatim, offset by raw_k_len (k_all's
+// layout is raw-then-comp, ggml_concat(raw_k, comp_k, 2)). No layer here has
+// a "no top_k but small n_comp" case in DS4.1's actual hparams (every
+// ratio!=0 layer is either an index source or a decoder-range reader with an
+// unbounded-by-top-k n_comp), so returns nullptr (dense fallback) whenever
+// top_k is null -- the conservative half of the coordinator-approved
+// "append top_k ... or fall back to dense" instruction, not implemented via
+// a size-threshold heuristic.
+// Turn candidate indices into kernel indices: gather `mask_f32` (0 = admitted,
+// -inf = masked, [n_cells, nt]) at each pick and replace masked picks with -1
+// (both AITER kernels skip slot < 0), then add `offset` to the kept ones.
+static ggml_tensor * dsv41_sparse_attn_mask_picks(
+        ggml_context * ctx0,
+        ggml_tensor * mask_f32,
+        ggml_tensor * picks,
+        int64_t offset) {
+    const int64_t nt = mask_f32->ne[1];
+    const int64_t k  = picks->ne[0];
+    ggml_tensor * mask_1 = ggml_reshape_4d(ctx0, mask_f32, 1, mask_f32->ne[0], nt, 1);
+    ggml_tensor * gathered = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mask_1, picks), k, nt);
+    ggml_tensor * valid = ggml_scale_bias(ctx0, ggml_clamp(ctx0, gathered, -1.0f, 0.0f), 1.0f, 1.0f); // 1 kept, 0 masked
+    ggml_tensor * picks_f = ggml_scale_bias(ctx0, ggml_cast(ctx0, picks, GGML_TYPE_F32), 1.0f, (float) offset + 1.0f);
+    ggml_tensor * out_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, picks_f, valid), 1.0f, -1.0f); // pick+offset or -1
+    return ggml_cast(ctx0, out_f, GGML_TYPE_I32);
+}
+
+static ggml_tensor * dsv41_sparse_attn_build_indices(
+        ggml_context * ctx0,
+        ggml_tensor * raw_mask,
+        ggml_tensor * comp_mask,
+        ggml_tensor * top_k,
+        int64_t n_swa,
+        int64_t raw_k_len) {
+    if (!top_k) {
+        return nullptr; // dense fallback: no bounded index list to build
+    }
+    GGML_ASSERT(raw_mask->ne[2] == 1 && raw_mask->ne[3] == 1 &&
+            "sparse_attn index build assumes a plain 2D [n_raw, nt] mask");
+
+    const int64_t nt    = raw_mask->ne[1];
+    const int64_t k_win = std::min<int64_t>(raw_mask->ne[0], n_swa);
+    GGML_ASSERT(k_win > 0);
+
+    // ggml_cuda_op_top_k only accepts F32 (ggml-cuda/top-k.cu:220); kq_mask
+    // is F16 under flash_attn (matches build_top_k_mask's own
+    // `cparams.flash_attn ? F16 : F32` convention elsewhere in this file) --
+    // cast defensively rather than assume. get_rows tolerates the source
+    // dtype fine on its own, but top_k does not, so this must happen before
+    // the top_k call, not just before the later float arithmetic.
+    ggml_tensor * raw_mask_f32 = raw_mask->type == GGML_TYPE_F32
+        ? raw_mask : ggml_cast(ctx0, raw_mask, GGML_TYPE_F32);
+
+    ggml_tensor * win_idx = ggml_top_k(ctx0, raw_mask_f32, (int) k_win); // I32 [k_win, nt]
+
+    ggml_tensor * mask_1 = ggml_reshape_4d(ctx0, raw_mask_f32, 1, raw_mask_f32->ne[0], nt, 1);
+    ggml_tensor * gathered = ggml_get_rows(ctx0, mask_1, win_idx); // [1, k_win, nt, 1]
+    gathered = ggml_reshape_2d(ctx0, gathered, k_win, nt);
+
+    // valid_f: 0.0 where the picked cell was admitted (mask==0), -1.0 where
+    // it was a padding pick (mask==-inf) -- clamp maps -inf to the floor -1
+    // and leaves 0 alone.
+    ggml_tensor * valid_f = ggml_clamp(ctx0, gathered, -1.0f, 0.0f);
+
+    ggml_tensor * win_idx_f = ggml_cast(ctx0, win_idx, GGML_TYPE_F32);
+    ggml_tensor * a1 = ggml_scale_bias(ctx0, win_idx_f, 1.0f, 1.0f); // win_idx + 1
+    ggml_tensor * b1 = ggml_scale_bias(ctx0, valid_f,   1.0f, 1.0f); // 1 (valid) or 0 (invalid)
+    ggml_tensor * prod = ggml_mul(ctx0, a1, b1);                    // (win_idx+1) or 0
+    ggml_tensor * win_idx_masked_f = ggml_scale_bias(ctx0, prod, 1.0f, -1.0f); // win_idx or -1
+    ggml_tensor * win_idx_masked = ggml_cast(ctx0, win_idx_masked_f, GGML_TYPE_I32);
+
+    // Compressed half: the dense path admits a top-k pick only where the causal
+    // compressed mask is also 0 (build_top_k_mask adds kq_mask), so a pick of a
+    // not-yet-visible position -- top_k over fewer than indexer_top_k visible
+    // entries -- must be dropped here too, not attended.
+    GGML_ASSERT(comp_mask->ne[1] == nt && comp_mask->ne[2] == 1 && comp_mask->ne[3] == 1);
+    ggml_tensor * comp_mask_f32 = comp_mask->type == GGML_TYPE_F32
+        ? comp_mask : ggml_cast(ctx0, comp_mask, GGML_TYPE_F32);
+    ggml_tensor * comp_idx = dsv41_sparse_attn_mask_picks(ctx0, comp_mask_f32, top_k, raw_k_len); // offset into k_all
+
+    return ggml_concat(ctx0, win_idx_masked, comp_idx, 0); // [k_win + top_k->ne[0], nt] I32
+}
+
+// WP_DSV41_SPARSE_ATTN_CHECK: index-equivalence proof. Reads back
+// kv_indices (the sparse op's constructed index set) and raw_mask (the SAME
+// dense mask the non-sparse path admits columns from) on the CPU and checks,
+// for a small sample of rows, that the window half of kv_indices names
+// exactly the raw_mask-admitted cells for that row -- no more (every -1 in
+// [0,k_win) really is a padding slot, verified by checking raw_mask at that
+// same row/column is -inf) and no fewer (the count of non-(-1) entries in
+// [0,k_win) equals the count of admitted (0-valued) raw_mask entries in that
+// row). Logged via the same change-only discipline as the CED checks above.
+struct dsv41_sparse_attn_check_ctx {
+    int32_t il;
+    int64_t k_win;
+    int64_t n_raw;
+};
+
+static void dsv41_sparse_attn_check_cb(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b,
+        int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    const auto * cx = (const dsv41_sparse_attn_check_ctx *) userdata;
+    const ggml_tensor * kv_indices = a; // I32 [n_idx, nt]
+    const ggml_tensor * raw_mask   = b; // F16/F32 [n_raw, nt]
+    const int64_t nt = kv_indices->ne[1];
+
+    auto mask_admits = [&](int64_t kv, int64_t t) -> bool {
+        const char * row = (const char *) raw_mask->data + t * raw_mask->nb[1];
+        if (raw_mask->type == GGML_TYPE_F16) {
+            return ggml_fp16_to_fp32(((const ggml_fp16_t *) row)[kv]) == 0.0f;
+        }
+        GGML_ASSERT(raw_mask->type == GGML_TYPE_F32);
+        return ((const float *) row)[kv] == 0.0f;
+    };
+
+    // Sample the first and last query row of this ubatch -- enough to catch
+    // a systematic construction bug without an O(n_idx * nt) scan every call.
+    const int64_t rows[2] = { 0, nt - 1 };
+    for (int64_t ri = 0; ri < (nt > 1 ? 2 : 1); ++ri) {
+        const int64_t t = rows[ri];
+        const int32_t * idx_row = (const int32_t *) ((const char *) kv_indices->data + t * kv_indices->nb[1]);
+
+        int64_t admitted_in_mask = 0;
+        for (int64_t kv = 0; kv < cx->n_raw; ++kv) {
+            if (mask_admits(kv, t)) admitted_in_mask++;
+        }
+
+        int64_t admitted_in_idx = 0;
+        int64_t bad_picks = 0;
+        for (int64_t i = 0; i < cx->k_win; ++i) {
+            const int32_t v = idx_row[i];
+            if (v < 0) continue;
+            admitted_in_idx++;
+            if (v >= cx->n_raw || !mask_admits(v, t)) {
+                bad_picks++;
+            }
+        }
+
+        char msg[256];
+        if (admitted_in_idx != admitted_in_mask || bad_picks != 0) {
+            std::snprintf(msg, sizeof(msg),
+                    "SPARSE_ATTN_CHECK MISMATCH il=%d row=%lld admitted_mask=%lld admitted_idx=%lld bad_picks=%lld",
+                    cx->il, (long long) t, (long long) admitted_in_mask, (long long) admitted_in_idx, (long long) bad_picks);
+            dsv41_ced_log_if_changed(msg, 3);
+        } else {
+            std::snprintf(msg, sizeof(msg),
+                    "SPARSE_ATTN_CHECK ok il=%d row=%lld admitted=%lld/%lld",
+                    cx->il, (long long) t, (long long) admitted_in_idx, (long long) cx->k_win);
+            dsv41_ced_log_if_changed(msg, 3);
+        }
+    }
 }
 
 // DeepSeek-V4.1 attention: a sliding window of raw KV, plus, where the layer uses one, the
@@ -1024,9 +1881,18 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
+        int il,
+        ggml_tensor * cur_state,
+        bool ced_log_shapes,
+        bool publish_only) const {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+
+    // CED prefill trim: `cur` may be narrowed to the trailing W tokens (see
+    // graph::graph()); the kv-source/indexer-publish block below always reads
+    // `cur_kv` instead, which defaults to `cur` itself (every layer except the
+    // trim's seam layer) so nothing changes when the trim is inactive.
+    ggml_tensor * cur_kv = cur_state ? cur_state : cur;
 
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
@@ -1035,39 +1901,52 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     GGML_ASSERT(n_embd_head == n_embd_head_v);
     GGML_ASSERT(n_head % hparams.dsv4_o_group_count == 0);
+    // graph::graph()'s gate already refuses the whole trim for a ratio==0
+    // decoder-range layer, so publish_only (skip-nonfinal) never reaches here
+    // with no compressed stream to publish.
+    GGML_ASSERT((!publish_only || ratio != 0) &&
+            "CED prefill trim: publish_only requires a compressed-stream (ratio != 0) layer");
 
     const dsv41_rope_cfg rc = rope_cfg(il);
-
-    // Query. V4 normalizes again after wq_b; V4.1 normalizes only the low rank part.
-    ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
-    qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-    cb(qr, "qr", il);
-
-    ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
-    q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
-            rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
-    q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
-    cb(q, "q", il);
-
-    // the sliding window KV, which every layer keeps for itself
-    ggml_tensor * kv = build_lora_mm(layer.wkv, cur);
-    kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
-    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
-    kv = ggml_rope_ext(ctx0, kv, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
-            rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
-    kv = ggml_rope_set_offset(kv, n_embd_head - n_embd_head_rope);
-    cb(kv, "kv", il);
-
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
-    ggml_tensor * out = nullptr;
+    // CED prefill trim (WP_DSV41_CED_SKIP_NONFINAL): publish_only means this
+    // ubatch is non-final (n_outputs==0) and only the kv-source/indexer
+    // publish block below is needed -- nothing reads this layer's own query
+    // output on this ubatch. Skip the RoPE'd q/kv projections, the raw-window
+    // write and the attention/top-k below entirely; qr stays null and is
+    // never read (build_indexer_top_k, which uses it, is also skipped).
+    ggml_tensor * qr = nullptr;
+    ggml_tensor * q  = nullptr;
+    ggml_tensor * kv = nullptr;
+    if (!publish_only) {
+        // Query. V4 normalizes again after wq_b; V4.1 normalizes only the low rank part.
+        qr = build_lora_mm(layer.wq_a, cur);
+        qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        cb(qr, "qr", il);
 
-    if (ratio == 0) {
-        // no compressed stream, so this layer sees only its own window
-        out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks, kq_scale, il);
+        q = build_lora_mm(layer.wq_b, qr);
+        q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
+        q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
+                rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+        q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
+        cb(q, "q", il);
 
-        return build_attention_tail(model, out, inp_pos, nt, il);
+        // the sliding window KV, which every layer keeps for itself
+        kv = build_lora_mm(layer.wkv, cur);
+        kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+        kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
+        kv = ggml_rope_ext(ctx0, kv, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
+                rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+        kv = ggml_rope_set_offset(kv, n_embd_head - n_embd_head_rope);
+        cb(kv, "kv", il);
+
+        if (ratio == 0) {
+            // no compressed stream, so this layer sees only its own window
+            ggml_tensor * out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks, kq_scale, il);
+
+            return build_attention_tail(model, out, inp_pos, nt, il);
+        }
     }
 
     // The plan slot follows the ratio, since a plan encodes how many tokens make a row. The rows
@@ -1083,15 +1962,25 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     GGML_ASSERT(inp_comp.kq_mask && "a compressed layer needs a plan for its ratio");
 
+    // CED prefill trim: everything below this point that reads inp_comp.kq_mask
+    // is query-side (this layer's own candidate selection / attention), so it
+    // uses the trailing-window view when `cur` was narrowed; the kv-source
+    // block above already read cur_kv/inp_comp directly and is unaffected.
+    // Skipped under publish_only: no query side to build a mask for.
+    llm_graph_input_dsv4::comp_input inp_comp_q = inp_comp;
+    if (!publish_only) {
+        inp_comp_q.kq_mask = dsv41_ced_mask_for_nt(ctx0, inp_comp.kq_mask, inp_comp.ced_kq_mask_trailing, nt);
+    }
+
     if (hparams.dsv41_is_kv_source(il) && inp_comp.state_pos) {
-        ggml_tensor * state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
+        ggml_tensor * state_kv = build_lora_mm(layer.attn_comp_wkv, cur_kv);
         cb(state_kv, "comp_state_kv", il);
 
         // At ratio 1 there is nothing to pool and the file carries no gate. The softmax below
         // then runs over a single element and returns 1.0 whatever the score holds, so the
         // values reach the cache unweighted, which is what a plain projection means.
         ggml_tensor * state_score = layer.attn_comp_wgate
-            ? build_lora_mm(layer.attn_comp_wgate, cur)
+            ? build_lora_mm(layer.attn_comp_wgate, cur_kv)
             : state_kv;
         cb(state_score, "comp_state_score", il);
 
@@ -1136,6 +2025,23 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 idx_k = llama_mul_mat_hadamard(ctx0, idx_k, inp_dsv4->get_lid().k_rot);
             }
 
+            // idxs are the ORIGINAL state_write_idxs tensor, unwrapped and
+            // unmodified -- see dsv41_ced_check_indices's comment for why this
+            // must not splice a graph node into cpy_k's own index argument.
+            dsv41_ced_check_indices(ctx0, gf, inp_comp.state_write_idxs,
+                    (int64_t) inp_dsv4->mctx->get_lid()->get_write_capacity(), il, "lid");
+            // Build-time width check (see the crash-report investigation): if
+            // the seam split ever left idx_k narrowed while state_write_idxs
+            // stayed full-width, or vice versa, llama_kv_cache::cpy_k reads
+            // idx_k->ne[2] as its row count -- assert that against the index
+            // count directly, at graph-build time, rather than waiting on a
+            // runtime value check. Gated on the env var like every other CED
+            // check; a real mismatch would GGML_ABORT here, immediately, with
+            // a stack that names this exact line.
+            if (dsv41_ced_prefill_env_enabled()) {
+                GGML_ASSERT(idx_k->ne[2] == inp_comp.state_write_idxs->ne[0] &&
+                        "CED prefill trim: LID cpy_k source row count (idx_k->ne[2]) != index count (state_write_idxs->ne[0])");
+            }
             ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(
                         ctx0, idx_k, inp_comp.state_write_idxs, il));
         }
@@ -1145,6 +2051,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             cb(latent, "comp_kv_rot", il);
         }
 
+        dsv41_ced_check_indices(ctx0, gf, inp_comp.state_write_idxs,
+                (int64_t) inp_dsv4->mctx->get_csa()->get_write_capacity(), il, "csa");
+        if (dsv41_ced_prefill_env_enabled()) {
+            GGML_ASSERT(latent->ne[2] == inp_comp.state_write_idxs->ne[0] &&
+                    "CED prefill trim: CSA cpy_k source row count (latent->ne[2]) != index count (state_write_idxs->ne[0])");
+        }
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(
                     ctx0, latent, inp_comp.state_write_idxs, il));
 
@@ -1170,10 +2082,31 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                     ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
     }
 
+    if (publish_only) {
+        // CED prefill trim (WP_DSV41_CED_SKIP_NONFINAL): the publish above is
+        // all this non-final ubatch needs from this layer -- no query, no
+        // raw-window write, no attention/top-k/MoE. The caller (graph::graph()'s
+        // ced_skip_layer) discards the return value.
+        return nullptr;
+    }
+
     // an index source picks the positions; the layers in between reuse what it picked
     ggml_tensor * top_k = nullptr;
     if (hparams.dsv41_is_index_source(il)) {
-        top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        top_k = build_indexer_top_k(model, inp_dsv4, inp_comp_q, qr, cur, inp_pos, il);
+        dsv41_shared_top_k     = top_k;
+        dsv41_shared_top_k_src = il;
+    } else if (dsv41_topk_reuse_env_enabled() &&
+               hparams.dsv41_topk_source[il] >= 0 &&
+               hparams.dsv41_topk_source[il] == dsv41_shared_top_k_src &&
+               dsv41_shared_top_k != nullptr &&
+               dsv41_shared_top_k->ne[1] == nt) {
+        // Reference model.py: a compressed layer that is not an index source
+        // attends to the positions its source picked (shared_attn.topk_idxs),
+        // not to every compressed position. The source's comp rows are the
+        // same ones this layer reads (kv-cache reuse aliasing), so the indices
+        // are valid here unchanged.
+        top_k = dsv41_shared_top_k;
     }
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
@@ -1187,7 +2120,18 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
 
-    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+    // The value cpy_k actually receives -- the full graph-wide leaf, or the
+    // dedicated ced_k_idxs_trailing tensor, never a view of the leaf (see
+    // dsv41_ced_raw_k_idxs_for_nt's comment). The bounds check below reads
+    // this SAME tensor as a separate side node -- it must not wrap or
+    // replace it (see dsv41_ced_check_indices's comment).
+    ggml_tensor * raw_write_idxs = dsv41_ced_raw_k_idxs_for_nt(inp_attn, nt);
+    dsv41_ced_check_indices(ctx0, gf, raw_write_idxs, (int64_t) mctx_raw->get_write_capacity(), il, "raw");
+    if (dsv41_ced_prefill_env_enabled()) {
+        GGML_ASSERT(kv->ne[2] == raw_write_idxs->ne[0] &&
+                "CED prefill trim: raw-window cpy_k source row count (kv->ne[2]) != index count (k_idxs->ne[0])");
+    }
+    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, raw_write_idxs, il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "raw_k", il);
@@ -1206,20 +2150,137 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
     cb(k_all, "k_all", il);
 
-    ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
+    ggml_tensor * raw_mask = dsv41_ced_mask_for_nt(ctx0, inp_attn->get_kq_mask(), inp_attn->ced_kq_mask_trailing, nt);
+
+    // Gather-bounds check on the indexer's top-k output: these values select
+    // which of the n_comp compressed positions build_top_k_mask (deepseek4.cpp)
+    // scatters into the comp mask below. See dsv41_ced_check_indices's
+    // comment -- this is the coordinator's leading hypothesis for the
+    // original crash, not just hardening: if anything upstream of the
+    // indexer score is NaN-contaminated (e.g. by the raw-window replay gap
+    // closed at the source in llama_kv_cache::set_input_kq_mask's
+    // ced_replay_floor -- see graph::graph() below), ggml_top_k's selection
+    // over NaN is not guaranteed to stay in range, and a garbage index
+    // feeding a set_rows-style scatter is exactly the shape of an async OOB
+    // memory fault.
+    dsv41_ced_check_indices(ctx0, gf, top_k, n_comp, il, "top_k");
+
     ggml_tensor * comp_mask = top_k
-        ? build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il)
-        : inp_comp.kq_mask;
+        ? build_top_k_mask(inp_comp_q.kq_mask, top_k, "comp_top_k_mask", il)
+        : inp_comp_q.kq_mask;
 
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
     cb(kq_mask, "kq_mask", il);
 
-    const int64_t n_kv_max = top_k
-        ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0]
-        : 0;
+    // CED prefill trim, multi-ubatch fix (round 3): a non-index-source
+    // decoder layer has no top_k cap, so it used to pass n_kv_max=0 ("no
+    // explicit cap", the ordinary dense-mask fallback every non-index-source
+    // V4/V4.1 layer already used before CED existed) -- safe normally
+    // because every physical raw-KV cell the dense kernel scans is finite
+    // (the untrimmed path writes all of them). Under the trim, a non-final
+    // ubatch's decoder-range layers only write raw KV for their own
+    // trailing W rows (see dsv41_ced_outputs_in_window below); cells outside
+    // that range are never written for THAT ubatch, and per IEEE-754
+    // -inf + NaN = NaN, a masked-but-NaN cell the dense (n_kv_max=0) kernel
+    // still touches poisons the whole row's softmax even though the mask
+    // marks it invisible (this was the confirmed root cause of the original
+    // multi-ubatch crash, src/models/deepseek41.cpp's dsv41_ced_outputs_in_window
+    // doc comment / scratchpad/ced-multiubatch-fix-report.md). The compressed
+    // side has no such gap -- the seam layer's kv-source/indexer-publish
+    // block always runs full-width regardless of trim (see cur_kv above), so
+    // every one of the n_comp compressed positions any row could see is
+    // always finite. So: give every layer a real n_kv_max bound instead of
+    // falling back to the dense scan -- min(raw_mask->ne[0], n_swa) raw
+    // entries (the true SWA-visible count, always <= what's actually
+    // written, trim or not) plus either top_k's exact count or, when there
+    // is no top-k cap, n_comp itself (every comp entry, which is always
+    // finite). This is the SAME true finite-entry count the dense fallback
+    // was already relying on implicitly; the only change is telling the
+    // kernel the bound explicitly, so it uses the sparse path (which looks
+    // up finite entries directly, per ggml.h's contract) instead of touching
+    // every column unconditionally. Gated on the CED env var, matching every
+    // other change in this file's discipline: zero behavior change with the
+    // trim off, and even with the trim on this is a strict tightening (a
+    // real bound instead of "no bound"), never a relaxation.
+    const int64_t n_kv_max = dsv41_ced_prefill_env_enabled()
+        ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + (top_k ? top_k->ne[0] : n_comp)
+        : (top_k ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0] : 0);
 
-    out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
-            nullptr, n_kv_max, kq_scale, il);
+    if (ced_log_shapes) {
+        dsv41_ced_log_shape(il, "q", q);
+        dsv41_ced_log_shape(il, "k_all", k_all);
+        dsv41_ced_log_shape(il, "kq_mask", kq_mask);
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "CED prefill trim: shape il=%d n_kv_max=%lld", il, (long long) n_kv_max);
+        dsv41_ced_log_if_changed(msg, 2);
+    }
+
+    // WP_DSV41_SPARSE_ATTN: route through AITER's native sparse kernels
+    // (ggml_sparse_attn_dsv4, HIP-only -- see ggml-cuda/mt_sparse_attn_dsv4.{cuh,cu}
+    // and aiter-integration/wrappers/mt_sparse_attn_dsv4.{h,cpp}) instead of
+    // the dense build_attn_mha scan below. Gated on: the knob being on, the
+    // baked AOT shape assumptions matching DS4.1's own fixed hparams
+    // (n_embd_head==512, n_head==64 -- true for every DS4.1 layer today;
+    // this is a "should never fail" defensive check, not a per-call runtime
+    // fallback), and top_k being non-null (see dsv41_sparse_attn_build_indices's
+    // doc comment for why the no-top_k case always falls back to dense).
+    // ggml_backend_cuda_supports_op independently re-checks tensor dtype/
+    // contiguity at schedule time and would refuse the op if this graph ever
+    // built one it can't actually run -- this is belt-and-suspenders, not the
+    // only gate.
+    // 512/64 mirror MT_SPARSE_ATTN_DSV4_HEAD_DIM/MT_SPARSE_ATTN_DSV4_NUM_HEADS
+    // in aiter-integration/wrappers/mt_sparse_attn_dsv4.h (not included here --
+    // that header pulls in hip_runtime_api.h, only available in the HIP-only
+    // ggml-cuda/aiter-integration translation units, not this host-side file).
+    ggml_tensor * out = nullptr;
+    if (dsv41_sparse_attn_env_enabled() &&
+            n_embd_head == 512 &&
+            n_head       == 64) {
+        ggml_tensor * kv_indices = dsv41_sparse_attn_build_indices(
+                ctx0, raw_mask, inp_comp_q.kq_mask, top_k, hparams.n_swa, raw_k->ne[2]);
+        if (kv_indices) {
+            ggml_tensor * q_f16 = q->type == GGML_TYPE_F16 ? q : ggml_cast(ctx0, q, GGML_TYPE_F16);
+            ggml_tensor * k_all_f16 = k_all->type == GGML_TYPE_F16 ? k_all : ggml_cast(ctx0, k_all, GGML_TYPE_F16);
+
+            if (dsv41_sparse_attn_check_env_enabled()) {
+                // Small, deliberately leaked per call -- same userdata-ownership
+                // shape as dsv41_ced_check_indices above (must outlive graph
+                // build until graph execution runs the callback).
+                auto * cx = new dsv41_sparse_attn_check_ctx{
+                    il, std::min<int64_t>(raw_mask->ne[0], hparams.n_swa), raw_mask->ne[0] };
+                ggml_tensor * checked = ggml_map_custom2(ctx0, kv_indices, raw_mask,
+                        dsv41_sparse_attn_check_cb, 1, cx);
+                ggml_build_forward_expand(gf, checked);
+            }
+
+            // Uniform row offsets [0, n_idx, ..., nt*n_idx] built in-graph (exact in
+            // F32 for nt*n_idx < 2^24), so the op needs no host copy or stream sync
+            // and stays safe under HIP graph capture.
+            const int64_t nt_q = q->ne[2];
+            ggml_tensor * kv_indptr = ggml_arange(ctx0, 0.0f, (float) (nt_q + 1), 1.0f);
+            kv_indptr = ggml_scale(ctx0, kv_indptr, (float) kv_indices->ne[0]);
+            kv_indptr = ggml_cast(ctx0, kv_indptr, GGML_TYPE_I32);
+            out = ggml_sparse_attn_dsv4(ctx0, q_f16, k_all_f16, kv_indices, kv_indptr, layer.attn_sinks, kq_scale);
+            // ggml_flash_attn_ext (the dense path below) always returns
+            // GGML_TYPE_F32 (ggml.c:5723) -- downstream consumers of `out`
+            // (build_attention_tail, then whatever FFN-side op reads it next,
+            // e.g. the ml8-4 fp8_quant_rot path) are built against that
+            // contract. The AITER kernel itself genuinely writes F16 bytes
+            // (matches its real output buffer, verified in Stage 2), so the
+            // op's tensor stays F16 -- this cast is a real, separate
+            // conversion node, not a type-tag mismatch. Its absence was the
+            // root cause of a `ggml-ml8.c:425 GGML_ASSERT(x->type == F32 ||
+            // x->type == BF16)` abort hit during this turn's first load
+            // attempt (isolated by reloading with the knob off, which loaded
+            // clean -- confirming this path, not something pre-existing).
+            out = ggml_cast(ctx0, out, GGML_TYPE_F32);
+            cb(out, "attn_out_sparse", il);
+        }
+    }
+    if (!out) {
+        out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
+                nullptr, n_kv_max, kq_scale, il);
+    }
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -1245,11 +2306,330 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         moe_dispatch_split_shexp = (expert_dispatch != nullptr) && split_on;
     }
 
+    // CED prefill trim (WP_DSV41_CED_PREFILL, default OFF -- with it unset the
+    // graph built below is identical to before this feature existed). DeepSeek-
+    // V4.1 is a Causal Encoder-Decoder: layers [0, ced_seam) are the encoder,
+    // [ced_seam, n_layer) the decoder, where ced_seam is the LAST kv-source
+    // layer (dsv41_kv_source_layer_ids -- derived per-model, not hardcoded to
+    // "20"). Per the model's own card, most prompt tokens are only ever
+    // processed by the encoder: the decoder's compressed/global KV is
+    // projected once from the encoder's final hidden state (the seam layer's
+    // kv-source/indexer-publish block, which always runs over every token --
+    // see cur_kv in build_attention_v41), and the decoder layers' own sliding-
+    // window KV is exactly what decode itself would rebuild by replaying only
+    // the last n_swa tokens ("SWA Bounded Replay"). Prefill currently pays the
+    // full decoder cost over the whole prompt; this trims the decoder layers'
+    // QUERY-side compute -- their own attention/MoE, NOT the kv-source/index-
+    // key publish -- down to that same trailing window, matching what a
+    // subsequent decode step would already have rebuilt.
+    //
+    // Every condition below is a REFUSAL, decided fresh per ubatch: any doubt
+    // and this silently falls back to the untrimmed path, which is what makes
+    // WP_DSV41_CED_PREFILL=1 safe to leave on in production while A/B testing.
+    int     ced_seam   = -1;   // first decoder layer, i.e. last kv-source layer id
+    bool    ced_trim   = false;
+    int64_t ced_w      = 0;    // trim window width; hparams.n_swa unless WP_DSV41_CED_W overrides it
+    int64_t ced_offset = 0;    // n_tokens - ced_w
+    // WP_DSV41_CED_SKIP_NONFINAL: true when this ubatch is non-final
+    // (n_outputs==0, nothing reads its decoder-range output) and the trim is
+    // applied -- see dsv41_ced_skip_nonfinal_enabled() and the ced_skip_layer
+    // use below. false whenever ced_trim is false, so it is always safe to
+    // read regardless of the env var.
+    bool    ced_skip_nonfinal = false;
+
+    // ced_reason names the single condition that refused the trim for this
+    // ubatch (or "applied"), for the log line below -- see
+    // dsv41_ced_log_if_changed(). Never read/written when the env var is off.
+    char ced_reason[160] = "";
+
+    if (dsv41_ced_prefill_env_enabled()) {
+        const bool gtype_ok        = params.gtype != LLM_GRAPH_TYPE_ENCODER && params.gtype != LLM_GRAPH_TYPE_DECODER_DSPARK;
+        const bool const_shape_off = !ds4_const_shape_enabled();             // mutually exclusive with topology pinning
+        const bool tokens_only     = ubatch.embd == nullptr;                 // tokens only, no VL/embd input
+        // ubatch.n_seqs_unq is the count of DISTINCT sequence ids actually present
+        // in the ubatch (llama_batch_allocr::ubatch_add derives it from seq_id_unq,
+        // regardless of split mode) -- this is what the KV cache/graph code
+        // elsewhere treats as the stream count (dsv4_comp_graph_n_stream,
+        // llama-graph.cpp's n_stream, deepseek4.cpp's n_blocks). ubatch.n_seqs is
+        // NOT a stream count: it is "sequence SETS in the ubatch", and for the
+        // split_simple() ubatches DS4.1 always builds (llama-kv-cache-dsv4.cpp,
+        // b_equal_seqs=false), each token is its own set, so n_seqs == n_tokens for
+        // any multi-token single-sequence prefill -- requiring n_seqs == 1 as well
+        // made this refuse every real prefill. Dropped.
+        const bool single_stream   = ubatch.n_seqs_unq == 1;
+        const bool pos_flat        = hparams.n_pos_per_embd() == 1;          // a flat trailing view of inp_pos must be valid
+        const bool has_kv_sources  = hparams.dsv41_n_kv_sources > 0;
+        const bool multi_token     = n_tokens > 1;
+
+        // NOTE: whether the DSpark HEAD WEIGHTS are loaded (model.fc != nullptr) is
+        // deliberately NOT checked here. The DeepSeek-V4.1 spine GGUF ships those
+        // tensors unconditionally, so model.fc != nullptr for every DS4.1 model this
+        // trim will ever run against, loaded or not, speculative decoding on or off --
+        // gating on it made the trim permanently dead. The actual hazard (DSpark's
+        // drafter reading a decoder-range hidden-state tap computed only over the
+        // trimmed trailing window) is already caught below, correctly, by the
+        // embeddings_layer_inp scan over [ced_seam, n_layer]: common_speculative's
+        // DFlash/EAGLE3/DSpark implementations (common/speculative.cpp) all arm
+        // cparams.embeddings_layer_inp[il] on ctx_tgt -- this same context -- via
+        // llama_set_embeddings_layer_inp() at spec-init time, for exactly the
+        // target_layer_ids they tap, and ONLY when a drafter is actually configured
+        // (i.e. only when --spec-* wiring runs common_speculative_init(); the array
+        // stays all-false for the lifetime of a context that never gets one). That is
+        // the genuine "DSpark is live for this graph" signal; model.fc is not.
+        if (!gtype_ok) {
+            std::snprintf(ced_reason, sizeof(ced_reason), "side-graph (gtype=%d, not a plain prefill/decode build)", (int) params.gtype);
+        } else if (!const_shape_off) {
+            std::snprintf(ced_reason, sizeof(ced_reason), "WP_DS4_CONST_SHAPE-active (mutually exclusive with topology pinning)");
+        } else if (!tokens_only) {
+            std::snprintf(ced_reason, sizeof(ced_reason), "embd-input (VL/embd ubatch, not plain tokens)");
+        } else if (!single_stream) {
+            std::snprintf(ced_reason, sizeof(ced_reason), "multi-stream ubatch (n_seqs_unq=%u n_seqs=%u)", ubatch.n_seqs_unq, ubatch.n_seqs);
+        } else if (!pos_flat) {
+            std::snprintf(ced_reason, sizeof(ced_reason), "n_pos_per_embd=%d (multi-axis positions, trailing view unsafe)", hparams.n_pos_per_embd());
+        } else if (!has_kv_sources) {
+            std::snprintf(ced_reason, sizeof(ced_reason), "no-kv-source-layers (hparams.dsv41_n_kv_sources=0)");
+        } else if (!multi_token) {
+            std::snprintf(ced_reason, sizeof(ced_reason), "single-token ubatch (n_tokens=%lld, nothing to trim)", (long long) n_tokens);
+        } else {
+            for (uint32_t i = 0; i < hparams.dsv41_n_kv_sources; ++i) {
+                ced_seam = std::max(ced_seam, (int) hparams.dsv41_kv_source_layer_ids[i]);
+            }
+
+            bool layers_ok = ced_seam >= 0 && ced_seam < (int) n_layer;
+            if (!layers_ok) {
+                std::snprintf(ced_reason, sizeof(ced_reason), "no-decoder-layers (ced_seam=%d n_layer=%d)", ced_seam, (int) n_layer);
+            }
+
+            for (int il = ced_seam; layers_ok && il < (int) n_layer; ++il) {
+                // The ratio==0 "pure SWA, no compressed stream" path
+                // (build_raw_attention, deepseek4.cpp) reads the raw mask/k_idxs
+                // directly off inp_attn without going through any of the trailing-
+                // view helpers above, and that function is shared with plain V4 --
+                // rather than teach shared code about a V4.1-only trim, refuse it
+                // here. No layer in the decoder range is expected to be ratio==0
+                // in a trained config (every one of them reads ced_seam's
+                // compressed stream), so this should never actually fire, but it
+                // is cheap to check and load-bearing if that assumption is wrong.
+                if (hparams.dsv4_compress_ratios[il] == 0) {
+                    layers_ok = false;
+                    std::snprintf(ced_reason, sizeof(ced_reason), "ratio==0 decoder layer (il=%d has no compressed stream)", il);
+                }
+                // build_inp_engram() sizes its graph input off the FULL n_tokens
+                // (see build_inp_engram/build_engram below), not the trimmed
+                // window; an engram layer inside the decoder range would silently
+                // mismatch a trimmed inpL. Not observed in the current config
+                // (engram layers are encoder-side), but checked directly rather
+                // than assumed.
+                if (static_cast<const llama_model_deepseek41 &>(model).engram_index(il) >= 0) {
+                    layers_ok = false;
+                    std::snprintf(ced_reason, sizeof(ced_reason), "engram layer in decoder range (il=%d)", il);
+                }
+            }
+
+            // No decoder-range layer-input/embedding tap (distillation probes,
+            // DSpark's tap-population path -- see build_dspark_stages and the
+            // file-header comment) may be requested: a tap at or past the seam
+            // would publish a W-row tensor where the caller expects n_tokens rows.
+            // Checked through the post-loop tap too (il == n_layer).
+            for (int il = ced_seam; layers_ok && il <= (int) n_layer; ++il) {
+                if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+                    layers_ok = false;
+                    std::snprintf(ced_reason, sizeof(ced_reason), "embeddings_layer_inp tap in decoder range (il=%d)", il);
+                }
+            }
+
+            // WP_DSV41_CED_W (bisection knob): overrides W away from n_swa.
+            // Safe to do unconditionally now that llama_kv_cache::
+            // set_input_kq_mask's ced_replay_floor (see graph::graph() below)
+            // masks out every cell earlier than the first replayed token
+            // directly, regardless of W vs n_swa -- the old
+            // "W must equal n_swa or decode-boundary rows read unwritten
+            // cells" hazard this used to guard against is exactly the gap
+            // that fix closed at the source, so a caller-chosen W no longer
+            // depends on it for correctness.
+            const int64_t w_override = dsv41_ced_w_override();
+            const int64_t w = w_override >= 0 ? w_override : (int64_t) hparams.n_swa;
+
+            if (layers_ok && !(w > 0 && n_tokens > w)) {
+                std::snprintf(ced_reason, sizeof(ced_reason), "window-not-smaller-than-prompt (n_tokens=%lld <= W=%lld)", (long long) n_tokens, (long long) w);
+
+                // Graph-side guard (WP_DSV41_CED_SKIP_NONFINAL hazard): this
+                // ubatch falls back to the untrimmed decoder path below,
+                // which assumes every raw-KV cell its attention window can
+                // reach was already written by a prior ubatch. That is true
+                // under today's (non-skip) trim -- every eligible ubatch,
+                // final or not, writes its own trailing W raw-KV rows -- but
+                // NOT if a preceding, non-final ubatch of this same prompt
+                // had its decoder-range work skipped entirely (skip_nonfinal
+                // on) and this one is shorter than W: part of its replay
+                // window then falls on cells nothing ever wrote. n_outputs>0
+                // (this is a final ubatch, otherwise nothing reads it) and
+                // ubatch.pos[0]>0 (a prior ubatch of this sequence exists) are
+                // the two facts observable from right here; there is no way
+                // to recover the missing KV at this point (that would mean
+                // redoing the previous ubatch), so this can only log loudly
+                // and fall through to the same untrimmed path it would have
+                // taken anyway -- the actual fix is at the source: the
+                // server's prompt batching (WP_PREFILL_TAIL_MIN) must never
+                // hand this graph a final ubatch shorter than W when
+                // skip_nonfinal is in play. See the report for how the two
+                // halves of this fix compose.
+                if (dsv41_ced_skip_nonfinal_enabled() && n_outputs > 0 && ubatch.pos[0] > 0) {
+                    char haz[256];
+                    std::snprintf(haz, sizeof(haz),
+                            "CED prefill trim: HAZARD final ubatch shorter than window (n_tokens=%lld < W=%lld, "
+                            "pos0=%lld) with WP_DSV41_CED_SKIP_NONFINAL enabled -- a preceding ubatch may be "
+                            "missing decoder KV; ensure WP_PREFILL_TAIL_MIN>=W at the server",
+                            (long long) n_tokens, (long long) w, (long long) ubatch.pos[0]);
+                    dsv41_ced_log_if_changed(haz, 3);
+                }
+            } else if (layers_ok && w > 0 && n_tokens > w && !dsv41_ced_outputs_in_window(ubatch, n_outputs, n_tokens, w)) {
+                if ((int64_t) n_outputs == n_tokens) {
+                    std::snprintf(ced_reason, sizeof(ced_reason),
+                            "logits_all (all %lld rows requested; trim only computes the trailing W=%lld)",
+                            (long long) n_tokens, (long long) w);
+                } else {
+                    // n_outputs==0 no longer refuses (round-3 multi-ubatch
+                    // fix -- see dsv41_ced_outputs_in_window's comment), so
+                    // reaching here with n_outputs==0 can't happen; this is
+                    // the "some requested row is outside the trailing
+                    // window" case (ubatch.output null, or a wanted row <
+                    // n_tokens-W).
+                    std::snprintf(ced_reason, sizeof(ced_reason),
+                            "output row outside trailing window (a requested row is < n_tokens-W=%lld, or ubatch.output is unavailable)",
+                            (long long) (n_tokens - w));
+                }
+            }
+
+            ced_trim = layers_ok && w > 0 && n_tokens > w &&
+                dsv41_ced_outputs_in_window(ubatch, n_outputs, n_tokens, w);
+
+            if (ced_trim) {
+                // Structural requirement only (see dsv41_ced_w_override's
+                // comment): w >= 1 is already implied by `w > 0` above, and
+                // `n_tokens > w` was just checked too -- restated here as a
+                // belt-and-braces assert on the value actually committed,
+                // since WP_DSV41_CED_W can set w to anything a caller likes.
+                GGML_ASSERT(w >= 1 && n_tokens > w &&
+                        "CED prefill trim: committed window width must be structurally valid (1 <= w < n_tokens)");
+                ced_w      = w;
+                ced_offset = n_tokens - w;
+                std::snprintf(ced_reason, sizeof(ced_reason), "applied");
+
+                // WP_DSV41_CED_SKIP_NONFINAL: n_outputs==0 means no row of
+                // this ubatch is ever read (see dsv41_ced_outputs_in_window),
+                // so a non-final ubatch can skip the decoder-range compute
+                // entirely rather than just narrowing it to W rows -- see
+                // graph::graph()'s ced_skip_layer below.
+                ced_skip_nonfinal = dsv41_ced_skip_nonfinal_enabled() && n_outputs == 0;
+            }
+        }
+
+        char ced_log[256];
+        if (ced_trim) {
+            std::snprintf(ced_log, sizeof(ced_log),
+                    "CED prefill trim: applied seam_il=%d W=%lld scope=%s ubatch_n_tokens=%lld decoder_n_tokens=%lld skip_decoder=%s",
+                    ced_seam, (long long) ced_w, dsv41_ced_scope_name(dsv41_ced_scope_override()),
+                    (long long) n_tokens, (long long) ced_w, ced_skip_nonfinal ? "nonfinal" : "none");
+        } else {
+            std::snprintf(ced_log, sizeof(ced_log),
+                    "CED prefill trim: refused reason=%s ubatch_n_tokens=%lld",
+                    ced_reason, (long long) n_tokens);
+        }
+        dsv41_ced_log_if_changed(ced_log);
+    }
+
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = build_inp_out_ids(ced_trim ? ced_offset : 0);
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
+
+    // CED prefill trim: the raw-window mask restriction, applied at the
+    // source in llama_kv_cache::set_input_kq_mask (llama-kv-cache.cpp) --
+    // see llm_graph_input_dsv4_raw::ced_replay_floor's doc comment. SWA
+    // Bounded Replay ("truncat[es] attention to that segment", per the DS4.1
+    // paper) means every decoder-range query under the trim may attend only
+    // to positions actually replayed through that layer; the mask builder
+    // now enforces that directly from cell positions, in the one place they
+    // are known, rather than via a graph-space reconstruction (which turned
+    // out to be the actual crash: raw_write_idxs carries physical cache-slot
+    // addresses, not mask-column indices, and the two spaces are not
+    // interchangeable -- see the report). ced_offset indexes into THIS
+    // ubatch, so ubatch.pos[ced_offset] is always the first replayed
+    // token's own absolute position, never a cell from a prior ubatch.
+    // -1 (unset, the default) when the trim is inactive for this ubatch --
+    // set_input_kq_mask then behaves exactly as it did before this existed.
+    if (ced_trim) {
+        inp_dsv4->get_raw()->ced_replay_floor = ubatch.pos[ced_offset];
+
+        // CED prefill trim: a dedicated, directly-filled I64 input tensor
+        // for the raw-window write's trailing ced_w indices -- see
+        // llm_graph_input_dsv4_raw::ced_k_idxs_trailing's doc comment. Built
+        // once, graph-wide, exactly like the self_k_idxs leaf it replaces
+        // for the decoder-range layers, since every decoder-range layer's
+        // raw-window write targets the same ced_w physical cells.
+        inp_dsv4->get_raw()->ced_k_idxs_trailing =
+            inp_dsv4->get_raw()->mctx->build_input_k_idxs_trailing(ctx0, (uint32_t) ced_w);
+        inp_dsv4->get_raw()->ced_k_idxs_trailing_offset = (uint32_t) ced_offset;
+
+        // NaN fix (2026-09-22): dedicated, directly host-filled trailing-
+        // width copies of the raw-window and compressed kq_mask inputs --
+        // see llm_graph_input_dsv4_raw::ced_kq_mask_trailing's doc comment.
+        // Shapes are derived from each already-built full-width leaf's own
+        // ne[]/type (self_kq_mask / inp_csa.kq_mask / inp_hca.kq_mask were
+        // all built earlier by build_inp_dsv4(), before this gate runs), not
+        // re-derived from the comp plan -- ne[0] (n_kv) and ne[2]/ne[3]
+        // (stream shape) are unaffected by the CED narrowing, only ne[1]
+        // (the query-token axis) changes.
+        {
+            ggml_tensor * full = inp_dsv4->get_raw()->self_kq_mask;
+            GGML_ASSERT(full != nullptr && "CED prefill trim: raw self_kq_mask must exist once the gate is eligible");
+            ggml_tensor * trailing = ggml_new_tensor_4d(ctx0, full->type, full->ne[0], ced_w, full->ne[2], full->ne[3]);
+            ggml_set_input(trailing);
+            ggml_set_name(trailing, "attn_inp_kq_mask_ced_trailing");
+            inp_dsv4->get_raw()->ced_kq_mask_trailing = trailing;
+        }
+
+        inp_dsv4->ced_mask_trailing_offset = (uint32_t) ced_offset;
+        for (llm_graph_input_dsv4::comp_input * comp : { &inp_dsv4->inp_csa, &inp_dsv4->inp_hca }) {
+            if (comp->kq_mask == nullptr) {
+                continue;
+            }
+            ggml_tensor * full = comp->kq_mask;
+            ggml_tensor * trailing = ggml_new_tensor_4d(ctx0, full->type, full->ne[0], ced_w, full->ne[2], full->ne[3]);
+            ggml_set_input(trailing);
+            ggml_set_name(trailing, "attn_inp_comp_kq_mask_ced_trailing");
+            comp->ced_kq_mask_trailing = trailing;
+        }
+    }
+
+    // CED prefill trim fix (round 2): a dedicated, directly host-filled I32
+    // input tensor for the decoder-range layers' RoPE positions -- see
+    // llm_graph_input_dsv4_raw::ced_pos_trailing's doc comment. Was
+    // previously `ggml_view_1d(ctx0, inp_pos, ced_w, ced_offset * ...)`, a
+    // GPU-side view of the graph-wide `inp_pos` input LEAF fed straight into
+    // ggml_rope_ext/ggml_rope_ext_back at every decoder-range layer -- the
+    // same "view of a host-resident input leaf feeding a GPU op" shape
+    // already found (and fixed, for k_idxs and the mask) to produce wrong
+    // data; this was the one instance of that shape the prior fix round
+    // missed. hparams.n_pos_per_embd() == 1 is required by the gate above,
+    // so a flat I32 leaf is the right shape (matches inp_pos's own layout in
+    // that case).
+    ggml_tensor * inp_pos_trim = nullptr;
+    if (ced_trim) {
+        inp_pos_trim = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ced_w);
+        ggml_set_input(inp_pos_trim);
+        ggml_set_name(inp_pos_trim, "attn_inp_pos_ced_trailing");
+        inp_dsv4->get_raw()->ced_pos_trailing        = inp_pos_trim;
+        inp_dsv4->get_raw()->ced_pos_trailing_offset = (uint32_t) ced_offset;
+    }
+
+    // WP_DSV41_CED_SCOPE (bisection knob): read once per graph build. Only
+    // ever consulted below when ced_trim is true; dsv41_ced_scope_override()
+    // itself is inert (never called) when the env var is off, matching every
+    // other CED knob's discipline.
+    const dsv41_ced_scope ced_scope = ced_trim ? dsv41_ced_scope_override() : dsv41_ced_scope::ALL;
 
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
@@ -1262,6 +2642,38 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     cb(pre_mix, "hc_pre_mix_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
+        // CED prefill trim (WP_DSV41_CED_SKIP_NONFINAL): on a non-final
+        // ubatch (nothing reads this graph's output), every decoder-range
+        // layer past the seam contributes nothing at all -- whatever it
+        // would compute was already skipped at il==ced_seam below, so there
+        // is nothing left to inherit. Layer-input/embedding taps and engram
+        // layers cannot occur in the decoder range while ced_trim is active
+        // (the gate above refuses the trim otherwise), so skipping them here
+        // too is a no-op, not a behavior change.
+        if (ced_skip_nonfinal && il > ced_seam) {
+            continue;
+        }
+
+        if (ced_skip_nonfinal && il == ced_seam) {
+            // Build only what the seam's kv-source/indexer publish needs --
+            // the attn_norm'd, full-width hidden state -- and stop there.
+            // No hc_mixes/hc_post/FFN/MoE for this layer, and (per the skip
+            // above) none at all for the decoder layers after it. inpL/
+            // pre_mix are left exactly as the encoder produced them; the
+            // trunk loop's post-loop code and hc_collapse below run on that
+            // stale-but-shape-valid stream, which is fine since n_outputs==0
+            // is exactly the condition that guarantees nothing reads it.
+            ggml_tensor * cur = build_hc_pre(inpL, pre_mix, il);
+            cb(cur, "hc_attn_pre", il);
+
+            cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
+
+            build_attention_v41(model, inp_dsv4, cur, inp_pos, il,
+                    /* cur_state = */ cur, /* ced_log_shapes = */ true, /* publish_only = */ true);
+            continue;
+        }
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -1292,10 +2704,110 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, il);
+        ggml_tensor * cur_state    = nullptr;
+        ggml_tensor * attn_inp_pos = inp_pos;
+
+        // WP_DSV41_CED_SCOPE (bisection knob): which half of the seam layer's
+        // work gets narrowed before it runs. Only meaningful at il==ced_seam --
+        // by il==ced_seam+1, inpL is already whatever width the seam layer's
+        // own FFN-side hc_post left it at (see ced_narrow_after_attn below),
+        // and every later decoder-range layer just inherits that, regardless
+        // of scope; there is no width left to choose independently for them.
+        // This is a real structural coupling, not an oversight -- see the
+        // report.
+        const bool ced_narrow_before_attn = ced_trim && il == ced_seam && ced_scope != dsv41_ced_scope::FFN;
+        const bool ced_narrow_after_attn  = ced_trim && il == ced_seam && ced_scope == dsv41_ced_scope::FFN;
+
+        if (ced_narrow_before_attn) {
+            // scope=all (default) or scope=attn: today's behaviour. cur_state
+            // carries the full-width `cur` into build_attention_v41's
+            // kv-source/indexer-publish block (every token, per the
+            // architecture comment above); everything else -- this layer's
+            // own query/window-KV/attention/MoE, and the whole of the decoder
+            // layers after it -- only ever needs the trailing ced_w rows from
+            // here on, so cur/residual/attn_pre/post/comb are all narrowed to
+            // that window now (see dsv41_ced_trailing_2d/3d).
+            //
+            // scope=attn and scope=all are the SAME code path here: nothing
+            // in this file independently narrows the FFN/MoE half at all --
+            // its width has only ever been an inherited CONSEQUENCE of
+            // attention's own narrowing (inpL flows straight from attention's
+            // hc_post into the FFN's build_hc_mixes/build_hc_pre with no
+            // separate narrowing step of its own). "Leave the FFN full width"
+            // while attention narrows first is not achievable without
+            // recomputing the dropped rows' hidden state some other way, so
+            // scope=attn documents this coupling rather than papering over it
+            // with a second, cosmetic narrowing call that would do nothing
+            // different from scope=all.
+            cur_state = cur;
+            cur       = dsv41_ced_trailing_2d(ctx0, cur,      ced_w, ced_offset);
+            residual  = dsv41_ced_trailing_3d(ctx0, residual, ced_w, ced_offset);
+            attn_pre  = dsv41_ced_trailing_2d(ctx0, attn_pre, ced_w, ced_offset);
+            post      = dsv41_ced_trailing_2d(ctx0, post,     ced_w, ced_offset);
+            comb      = dsv41_ced_trailing_3d(ctx0, comb,     ced_w, ced_offset);
+            attn_inp_pos = inp_pos_trim;
+        } else if (ced_trim && il > ced_seam) {
+            // inpL (hence residual/attn_pre/post/comb, all derived from it by
+            // build_hc_mixes/build_hc_post above) is already ced_w rows here --
+            // it became that width when layer ced_seam's hc_post ran (scope=all/
+            // attn) or its FFN-side hc_post ran (scope=ffn, see
+            // ced_narrow_after_attn below) -- either way, every layer past the
+            // seam inherits a narrow stream regardless of scope. Only inp_pos
+            // is a single graph-wide input untouched by that, so it is the one
+            // thing still needing the trailing view every layer.
+            attn_inp_pos = inp_pos_trim;
+        }
+        // scope=ffn at il==ced_seam: neither branch above runs. cur_state stays
+        // null and attn_inp_pos stays the full inp_pos, so build_attention_v41
+        // sees exactly what an encoder layer would -- nt == n_tokens, every
+        // trailing-view helper it calls is a no-op, every scatter (raw-window
+        // cpy_k, mask, k_idxs) runs at full width, identical to the off path
+        // for this one layer.
+
+        // CED prefill trim observability: log q/k_all/kq_mask/n_kv_max shapes
+        // for the seam layer (where cur/etc. just got narrowed, or -- scope=ffn
+        // -- is about to run at full width) and the first decoder layer past
+        // it (where the narrowing has already propagated through inpL with no
+        // explicit view left in this loop to point at) -- enough to see the
+        // shapes at both ends of the seam without a line per layer for the
+        // whole decoder range.
+        const bool ced_log_shapes = ced_trim && (il == ced_seam || il == ced_seam + 1);
+
+        cur = build_attention_v41(model, inp_dsv4, cur, attn_inp_pos, il, cur_state, ced_log_shapes);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
+
+        if (ced_narrow_after_attn) {
+            // scope=ffn: attention just ran at full width (898 rows in, 898
+            // rows out); narrow the stream HERE instead, right before the
+            // FFN/MoE portion of this same layer. Everything computed FROM
+            // this point on -- the FFN-side build_hc_mixes/build_hc_pre
+            // below, residual, build_moe_ffn, build_ffn, this layer's own
+            // second hc_post, and every subsequent decoder layer, which
+            // inherits inpL as its own input -- derives its row count from
+            // inpL's own shape, so one narrow of inpL here covers all of
+            // that with no separate call needed.
+            //
+            // attn_pre is the one exception: it was computed at the TOP of
+            // this same loop iteration (build_hc_mixes(inpL, hc_attn_fn, ...,
+            // &attn_pre, ...), before either narrow point exists), at
+            // whatever width inpL entered this layer with -- full 898 here,
+            // since scope=ffn never narrows anything before attention. It is
+            // then read by `cur = build_hc_pre(inpL, attn_pre, il)` below,
+            // AFTER this narrow, against the now-narrow inpL. Left
+            // unnarrowed, build_hc_pre's manual (non-fused) path would view
+            // attn_pre's LEADING ced_w rows (dsv4_view_2d's extent comes from
+            // x's nt, offset 0) instead of the TRAILING ones inpL's own view
+            // actually represents -- wrong data, not an out-of-bounds read
+            // (the view still fits inside attn_pre's real 898-row buffer),
+            // but wrong regardless, and the fused path
+            // (cparams.fused_dsv4_hc_pre) would instead hit a GGML_ASSERT
+            // shape mismatch at graph-build time. Narrow it the same way here.
+            inpL     = dsv41_ced_trailing_3d(ctx0, inpL,     ced_w, ced_offset);
+            attn_pre = dsv41_ced_trailing_2d(ctx0, attn_pre, ced_w, ced_offset);
+            cb(inpL, "hc_attn_post_ffn_scope_narrow", il);
+        }
 
         residual = inpL;
 
@@ -1359,7 +2871,15 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     }
 
     if (inp_out_ids) {
-        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+        // Row count comes from inpL itself, not the graph-level n_tokens: under
+        // the CED prefill trim inpL only ever has ced_w rows by this point (see
+        // the trunk loop above), and inp_out_ids' values were already rebased
+        // by build_inp_out_ids(row_offset) to address that narrower stream --
+        // using n_tokens here would reshape into the wrong row count and then
+        // read out of bounds. Using inpL->ne[2] is exactly correct (and a
+        // no-op change) whether or not the trim is active.
+        const int64_t nt_cur = inpL->ne[2];
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, nt_cur);
         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
         pre_mix = ggml_get_rows(ctx0, pre_mix, inp_out_ids);
     }

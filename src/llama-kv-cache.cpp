@@ -2016,6 +2016,10 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // CED prefill trim (WP_DSV41_CED_PREFILL, src/models/deepseek41.cpp): see
+    // llama_kv_cache::set_input_kq_mask's doc comment. -1 = no restriction.
+    llama_pos ced_replay_floor;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -2155,6 +2159,35 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
+                // CED prefill trim (WP_DSV41_CED_PREFILL, src/models/deepseek41.cpp):
+                // an additional restriction on top of everything above, never a
+                // relaxation of it -- SWA Bounded Replay means a decoder-layer
+                // query may attend only to positions actually replayed through
+                // that layer, i.e. never to a cell whose own stored position
+                // predates the first replayed token, regardless of what the
+                // ordinary causal/SWA checks above would otherwise allow.
+                //
+                // Gated on `p1 >= args.ced_replay_floor` (the QUERY row's own
+                // position), not just `args.ced_replay_floor >= 0`: this mask
+                // buffer is shared graph-wide -- every layer's raw-window
+                // attention, encoder-range (il < ced_seam) included, reads the
+                // same filled data, only narrowed by a row VIEW for the
+                // decoder-range layers that actually trim. Encoder-range query
+                // rows have p1 < ced_replay_floor by construction (they are
+                // never part of the replayed window), and without this guard
+                // every one of their own in-SWA-window cells -- which also
+                // have p0 < ced_replay_floor, since an encoder row's whole SWA
+                // window sits below the floor -- would be excluded too,
+                // leaving those rows fully masked (all -inf, softmax NaN) for
+                // no reason: the floor is only ever supposed to apply to
+                // decoder-range queries, i.e. rows with p1 >= ced_replay_floor.
+                // -1 (the default, every non-DSV4 caller, and the CED off
+                // path) skips this branch entirely regardless of p1 --
+                // byte-identical to before this existed.
+                if (args.ced_replay_floor >= 0 && p1 >= args.ced_replay_floor && p0 < args.ced_replay_floor) {
+                    goto skip;
+                }
+
                 if (alibi) {
                     data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
                 } else {
@@ -2208,7 +2241,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, llama_pos ced_replay_floor) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -2239,6 +2272,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.ced_replay_floor =*/ ced_replay_floor,
     };
 
     if (dst->type == GGML_TYPE_F16) {

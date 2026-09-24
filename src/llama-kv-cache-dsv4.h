@@ -209,14 +209,37 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_write() const;
 
+    // The valid range for a cpy_k/set_rows DESTINATION index into this cache
+    // -- kv_swa's own physical row count times its stream count, i.e. exactly
+    // what llama_kv_cache::cpy_k's internal reshape-to-kv_size*n_stream (when
+    // n_stream > 1) scatters into. NOT get_n_kv(): that is a separately-
+    // computed, masking/attention-read-window bound (see its own comment)
+    // that is not guaranteed to be >= every valid physical write-slot index
+    // (see the CED prefill trim crash-report investigation).
+    uint32_t get_write_capacity() const;
+
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
 
+    // CED prefill trim (WP_DSV41_CED_PREFILL, src/models/deepseek41.cpp): a
+    // dedicated, directly-filled I64 tensor of exactly `width` write indices,
+    // for the trailing tokens of this ubatch starting at ubatch index
+    // `offset` when filled -- built and sized to `width` from the start, no
+    // ggml_view_1d of the full-width self_k_idxs leaf involved anywhere.
+    // Deliberately separate from build_input_k_idxs/set_input_k_idxs (which
+    // remain untouched, still building the full-width, graph-wide leaf every
+    // other layer and every non-DSV4 caller uses) rather than adding an
+    // offset/width parameter to those shared entry points.
+    ggml_tensor * build_input_k_idxs_trailing(ggml_context * ctx, uint32_t width) const;
+    void set_input_k_idxs_trailing(ggml_tensor * dst, uint32_t offset) const;
+
     void set_input_k_idxs(ggml_tensor * dst) const;
-    void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // ced_replay_floor: forwarded verbatim to llama_kv_cache::set_input_kq_mask
+    // (see its doc comment) -- -1 (default) is a no-op.
+    void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, llama_pos ced_replay_floor = -1) const;
     void set_input_k_rot(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens(); the engram n-gram hash needs the preceding tokens
@@ -262,6 +285,11 @@ public:
     bool next();
 
     uint32_t get_n_kv() const;
+
+    // see llama_kv_cache_dsv4_raw_context::get_write_capacity()'s comment --
+    // the same distinction applies here (kv's physical row count times its
+    // stream count, not get_n_kv()).
+    uint32_t get_write_capacity() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;

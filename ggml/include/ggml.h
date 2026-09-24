@@ -582,6 +582,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_PAGED_ATTN_MT,    // mt:: paged attention (block-table indirected K/V)
         GGML_OP_PAGED_KV_UPDATE_MT, // mt:: paged K/V scatter (writes K_cur/V_cur into block-indexed cache)
+        GGML_OP_SPARSE_ATTN_DSV4, // AITER native sparse DSv4 attention (window + indexer top-k gather), HIP-only
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2670,6 +2671,31 @@ extern "C" {
             int                   block_size,
             int                   n_kv_heads,
             float                 scale);
+
+    // AITER native sparse DSv4 attention (HIP-only; ggml_cuda_supports_op
+    // gates it to HIP builds with the AOT kernel present -- CPU/Vulkan never
+    // reach this op). Gathers a fixed-width per-query index set (the SWA
+    // window + the indexer's top-k picks) out of a unified [D, 1, NKV] K==V
+    // pool instead of scanning every column, matching DS4.1's real attention
+    // pattern. Baked (AOT-compile-time) shape assumptions: head_dim==512,
+    // n_heads==64 -- the graph builder (build_attention_v41) checks these
+    // against DS4.1's own hparams before ever emitting this op and falls
+    // back to the dense ggml_flash_attn_ext path otherwise, so a mismatch
+    // here is a "should never happen" defensive GGML_ASSERT, not a runtime
+    // fallback path.
+    //   q            [head_dim, n_heads, n_tokens, 1]         f16
+    //   k_all        [head_dim, 1,       n_kv,     1]         f16  (K==V, latent MQA; raw window rows first, then compressed rows -- ggml_concat(raw_k, comp_k, 2)'s own layout)
+    //   kv_indices   [n_idx, n_tokens]                        i32  (per-query flat index list into k_all's dim-2 axis; -1 = skip/pad)
+    //   attn_sink    [n_heads]                                f32  (per-head softmax-denom bias)
+    // returns q's shape (head_dim, n_heads, n_tokens, 1), f16.
+    GGML_API struct ggml_tensor * ggml_sparse_attn_dsv4(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_all,
+            struct ggml_tensor  * kv_indices,
+            struct ggml_tensor  * kv_indptr,   // I32 [n_tokens+1], row offsets into kv_indices (built in-graph: no host sync, graph-capture safe)
+            struct ggml_tensor  * attn_sink,
+            float                  scale);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

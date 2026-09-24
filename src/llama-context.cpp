@@ -59,6 +59,367 @@ extern "C" bool ggml_backend_cuda_wp_graph_counts(
 // llama_context
 //
 
+// WP_CED_NAN_TRACE=1 (2026-09-22, CED prefill trim NaN investigation):
+// env-gated, post-compute, read-only finite check on a fixed watch-list of
+// CED-relevant named tensors (src/models/deepseek41.cpp's `cb(...)` calls
+// format node names as "<label>-<il>"). Installed as a
+// ggml_backend_sched eval-callback -- the same mechanism
+// examples/eval-callback and wp::weight_pager_eval_cb already use -- which
+// only ever reads tensor data back to the host AFTER the scheduler has
+// computed and synchronized it (ggml-backend.cpp's
+// ggml_backend_sched_graph_compute_async: `ggml_backend_graph_compute_async`
+// then `synchronize_backend` then the ask=false callback). It inserts no
+// new ggml op into the graph and does not alter graph topology, so it
+// cannot reproduce the earlier ggml_map_custom1_inplace interference (that
+// bug came from adding a graph NODE that itself forced a CPU<->GPU split
+// and corrupted k_idxs -- this is not a node, it is a scheduler-level hook
+// that fires after nodes already have their real, final values). Default
+// off; a single memoized getenv check is the only cost when unset.
+//
+// Caveat, stated rather than hidden: `model.wp_pager` (the weight pager)
+// ALREADY installs its own eval-callback unconditionally whenever paging is
+// enabled (see the two `ggml_backend_sched_set_eval_callback` call sites
+// below), completely replacing `cparams.cb_eval` rather than composing with
+// it. Since this deployment routes MoE work through the weight pager, this
+// trace chains onto that existing callback (calls it first, unchanged, on
+// both ask=true and ask=false) rather than assuming cparams.cb_eval is
+// live. On ask=true this trace ORs its own "I want this tensor" decision
+// onto the pager's -- it can only ever ADD sync points for nodes the pager
+// wasn't already going to stop at, never remove one the pager needed -- so
+// the pager's own patching behavior is unperturbed. The scheduler already
+// runs every node through this same ask/ask=false round trip whenever the
+// pager is active (that is the pager's normal mode of operation, not
+// something this trace introduces), so the "does the instrument disable
+// CUDA/HIP graph capture or op fusion" concern that would otherwise apply
+// to a plain cb_eval install does not add a NEW mode here -- it is already
+// the deployment's normal mode when the pager is active. The one thing this
+// trace changes beyond the pager's existing behavior is: a few additional
+// nodes (the watch-list) now also get individually synced+read back, which
+// can only ever split what would otherwise be a fused multi-node
+// sub-dispatch into more, smaller ones for those specific nodes -- it
+// cannot change which kernel runs or what values it produces.
+static bool wp_ced_nan_trace_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("WP_CED_NAN_TRACE");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool wp_ced_nan_trace_watch(const char * name) {
+    static const char * const stems[] = {
+        "qr-", "q-", "kv-", "comp_state_kv-", "comp_state_score-",
+        "idx_k_new-", "comp_kv_rot-", "raw_k-", "comp_k-", "k_all-",
+        "kq_mask-", "comp_top_k_mask-", "attn_out_raw-", "hc_attn_pre-",
+        "hc_attn_post-", "hc_attn_post_ffn_scope_narrow-", "attn_norm-",
+        "ffn_norm-", "hc_ffn_pre-", "ffn_moe_out-", "ffn_shexp-",
+        "ffn_shexp_in-", "ffn_out-", "l_last-", "layer_inp-",
+    };
+    for (const char * s : stems) {
+        if (strncmp(name, s, strlen(s)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::atomic<int> wp_ced_nan_trace_hits{0};
+static std::atomic<int> wp_ced_nan_trace_row_hits{0};
+
+// -inf is a LEGITIMATE value in a kq_mask / comp_top_k_mask tensor (that is
+// literally what "masked out" means, see llama-kv-cache.cpp's `mask_drop =
+// llama_cast<T>(-INFINITY)`), so the generic non-finite scan below is noisy
+// (expected) for these two tensor kinds. The actual bug signature for a
+// mask is a query ROW (fixed i1, varying i0/kv-position) that is masked out
+// in EVERY column -- that is what turns into an all-(-inf) softmax input
+// and a NaN attention output for that row. Scan row-by-row for exactly
+// that, independent of and in addition to the generic element scan.
+static bool wp_ced_nan_trace_is_mask_name(const char * name) {
+    return strncmp(name, "kq_mask-", 8) == 0 || strncmp(name, "comp_top_k_mask-", 16) == 0 ||
+           strncmp(name, "raw_mask-", 9) == 0;
+}
+
+static std::atomic<bool> wp_ced_nan_trace_row_dump_done{false};
+
+// One-shot (first matching tensor only): dump the per-row count of valid
+// (finite, i.e. non-masked) columns for a kq_mask tensor narrowed to the
+// CED window (ne[1] == 128), for every row -- to see whether the row that
+// later shows up NaN in attn_out_raw has a conspicuously different valid
+// count than its neighbors (e.g. suspiciously low, or an off-by-one at a
+// window edge), independent of and more detailed than the fully-masked-row
+// check above (which only catches the extreme case of exactly zero).
+static void wp_ced_nan_trace_dump_row_counts(const struct ggml_tensor * t, const uint8_t * data) {
+    bool expected = false;
+    // Fires for kq_mask-20 (the CED seam layer) at WHATEVER width it has --
+    // 128 under the trim, or the full ubatch width (e.g. 898) with the trim
+    // off -- so the same absolute-position window can be compared trimmed
+    // vs. untrimmed. Only the last 20 rows (tail of the tensor) are dumped;
+    // under the trim that is local rows [108,128), which is absolute
+    // [ced_offset+108, ced_offset+128); untrimmed it is the same absolute
+    // rows directly (the last 20 of the full ubatch).
+    // Restrict to the real request's widths (898 untrimmed, 128 trimmed) so
+    // a graph_reserve() warmup/sizing pass (e.g. a 2048-token synthetic
+    // reservation ubatch) can't consume the one-shot dump before the actual
+    // prompt is served.
+    if (strncmp(t->name, "kq_mask-20", 10) != 0 || (t->ne[1] != 898 && t->ne[1] != 128) ||
+        !wp_ced_nan_trace_row_dump_done.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    fprintf(stderr, "WP_CED_NAN_TRACE: row valid-counts for %s ne=[%lld,%lld,%lld,%lld]:\n",
+            t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+    const int64_t i1_start = t->ne[1] > 20 ? t->ne[1] - 20 : 0;
+    for (int64_t i1 = i1_start; i1 < t->ne[1]; ++i1) {
+        int64_t valid = 0;
+        int64_t first_valid = -1, last_valid = -1;
+        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+            const size_t off = (size_t) i1*t->nb[1] + (size_t) i0*t->nb[0];
+            float v = (t->type == GGML_TYPE_F16)
+                ? ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[off])
+                : *(const float *) &data[off];
+            if (std::isfinite(v)) {
+                if (first_valid < 0) first_valid = i0;
+                last_valid = i0;
+                ++valid;
+            }
+        }
+        fprintf(stderr, "  i1=%lld valid=%lld first=%lld last=%lld\n",
+                (long long) i1, (long long) valid, (long long) first_valid, (long long) last_valid);
+    }
+    fflush(stderr);
+}
+
+static void wp_ced_nan_trace_check_fully_masked_rows(const struct ggml_tensor * t, const uint8_t * data) {
+    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+        bool any_finite = false;
+        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+            const size_t off = (size_t) i1*t->nb[1] + (size_t) i0*t->nb[0];
+            float v = (t->type == GGML_TYPE_F16)
+                ? ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[off])
+                : *(const float *) &data[off];
+            if (std::isfinite(v)) {
+                any_finite = true;
+                break;
+            }
+        }
+        if (!any_finite && t->ne[0] > 0) {
+            if (wp_ced_nan_trace_row_hits.fetch_add(1, std::memory_order_relaxed) < 200) {
+                fprintf(stderr,
+                    "WP_CED_NAN_TRACE: FULLY MASKED ROW in %s ne=[%lld,%lld,%lld,%lld] row i1=%lld "
+                    "(every one of %lld columns is -inf -- softmax over this row is NaN)\n",
+                    t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                    (long long) i1, (long long) t->ne[0]);
+                fflush(stderr);
+            }
+        }
+    }
+}
+
+// Reads `t` back to host (if not already host-resident) and scans for the
+// first non-finite element, reporting the (i0,i1,i2,i3) index and value.
+// Called only with ask=false, i.e. only after the scheduler has actually
+// computed and synchronized this node -- see the doc comment above.
+static void wp_ced_nan_trace_check(const struct ggml_tensor * t) {
+    if (ggml_is_quantized(t->type)) {
+        return;
+    }
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
+        return;
+    }
+    const size_t n_bytes = ggml_nbytes(t);
+    if (n_bytes == 0) {
+        return;
+    }
+    std::vector<uint8_t> buf;
+    const uint8_t * data;
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        data = (const uint8_t *) t->data;
+    } else {
+        buf.resize(n_bytes);
+        ggml_backend_tensor_get(t, buf.data(), 0, n_bytes);
+        data = buf.data();
+    }
+
+    const bool is_mask = wp_ced_nan_trace_is_mask_name(t->name);
+    if (is_mask && t->type != GGML_TYPE_BF16) {
+        wp_ced_nan_trace_check_fully_masked_rows(t, data);
+        if (strncmp(t->name, "kq_mask-", 8) == 0) {
+            wp_ced_nan_trace_dump_row_counts(t, data);
+        }
+        return; // element-level -inf in a mask is expected; don't spam it
+    }
+
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                    const size_t off = (size_t) i3*t->nb[3] + (size_t) i2*t->nb[2] +
+                                        (size_t) i1*t->nb[1] + (size_t) i0*t->nb[0];
+                    float v;
+                    if (t->type == GGML_TYPE_F32) {
+                        v = *(const float *) &data[off];
+                    } else if (t->type == GGML_TYPE_F16) {
+                        v = ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[off]);
+                    } else {
+                        v = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &data[off]);
+                    }
+                    if (!std::isfinite(v)) {
+                        if (wp_ced_nan_trace_hits.fetch_add(1, std::memory_order_relaxed) < 200) {
+                            fprintf(stderr,
+                                "WP_CED_NAN_TRACE: non-finite in %s type=%s ne=[%lld,%lld,%lld,%lld] "
+                                "at i0=%lld i1=%lld i2=%lld i3=%lld value=%g\n",
+                                t->name, ggml_type_name(t->type),
+                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                                (long long) i0, (long long) i1, (long long) i2, (long long) i3, (double) v);
+                            fflush(stderr);
+                        }
+                        return; // first bad element in this tensor is enough
+                    }
+                }
+            }
+        }
+    }
+}
+
+// WP_CED_VALUE_DUMP=<path> (2026-09-22, CED correctness investigation): like
+// WP_CED_NAN_TRACE, but instead of scanning for non-finite values, appends a
+// small numeric summary of the LAST ROW (highest i1, i.e. the last query
+// token this tensor's graph node computed for -- under the CED trim that is
+// always the prompt's actual last token, since the trim only ever keeps the
+// trailing window) of every watched tensor to a plain-text file: the tensor
+// name, its shape, and the first 8 elements plus the L2 norm of that row.
+// This is exactly the "dump specific named tensors for the final token's
+// row" comparison the correctness task asked for: run once with
+// WP_DSV41_CED_PREFILL=0 (untrimmed) and once with =1 (trimmed), same
+// prompt, and diff the two dump files -- the first tensor/layer where the
+// last row's values diverge beyond float noise is where the trim actually
+// breaks from the reference. Default off (no file path => disabled); a
+// single memoized getenv is the only cost otherwise. Independent of
+// WP_CED_NAN_TRACE (both can be on at once; they chain the same way).
+static const char * wp_ced_value_dump_path() {
+    static const char * const path = std::getenv("WP_CED_VALUE_DUMP");
+    return path;
+}
+
+// Only these stems: all are plain 2D [dim, n_tokens] tensors (token axis is
+// ne[1]) in this file's own graph, so "last row" is unambiguous, and this is
+// a small enough set to keep the per-tensor host readback cheap. Deliberately
+// narrower than wp_ced_nan_trace_watch's list (which also matches 3D/4D
+// tensors like q/kv/hc_attn_post where ne[1] is NOT the token axis -- fine
+// for a NaN scan of the whole tensor, wrong for a single "last row" read).
+static bool wp_ced_value_dump_watch(const char * name) {
+    static const char * const stems[] = {
+        "attn_norm-", "ffn_norm-", "comp_state_kv-", "comp_state_score-",
+        "idx_k_new-", "attn_out_raw-", "ffn_out-", "result_norm",
+    };
+    for (const char * s : stems) {
+        if (strncmp(name, s, strlen(s)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void wp_ced_value_dump_check(const struct ggml_tensor * t) {
+    const char * path = wp_ced_value_dump_path();
+    if (!path || !wp_ced_value_dump_watch(t->name)) {
+        return;
+    }
+    if (ggml_is_quantized(t->type)) {
+        return;
+    }
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
+        return;
+    }
+    if (t->ne[1] <= 0 || t->ne[2] != 1 || t->ne[3] != 1) {
+        return; // not a plain 2D [dim, n_tokens] tensor -- see the watch list's doc comment
+    }
+    const int64_t i1 = t->ne[1] - 1; // last row on the token axis
+    const int64_t i2 = 0;
+    const int64_t i3 = 0;
+
+    // Read back ONLY this one row, not the whole tensor -- ggml_backend_tensor_get
+    // over a full multi-thousand-row tensor just to look at the last row is what
+    // made an earlier version of this dump take minutes per layer under HIP.
+    const size_t row_off   = (size_t) i1 * t->nb[1];
+    const size_t row_bytes = (size_t) t->nb[1] > 0 ? (size_t) t->nb[1] : ggml_row_size(t->type, t->ne[0]);
+    std::vector<uint8_t> buf;
+    const uint8_t * data;
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        data = (const uint8_t *) t->data;
+    } else {
+        buf.resize(row_bytes);
+        ggml_backend_tensor_get(t, buf.data(), row_off, row_bytes);
+        data = buf.data() - row_off; // so the same off-based indexing below still works
+    }
+
+    auto read_f = [&](int64_t i0) -> float {
+        const size_t off = (size_t) i3*t->nb[3] + (size_t) i2*t->nb[2] +
+                            (size_t) i1*t->nb[1] + (size_t) i0*t->nb[0];
+        if (t->type == GGML_TYPE_F32) {
+            return *(const float *) &data[off];
+        } else if (t->type == GGML_TYPE_F16) {
+            return ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[off]);
+        } else {
+            return ggml_bf16_to_fp32(*(const ggml_bf16_t *) &data[off]);
+        }
+    };
+
+    double sumsq = 0.0;
+    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+        const float v = read_f(i0);
+        if (std::isfinite(v)) {
+            sumsq += (double) v * (double) v;
+        }
+    }
+
+    FILE * f = std::fopen(path, "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "%s ne=[%lld,%lld,%lld,%lld] row=%lld l2=%.6g first8=[",
+            t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            (long long) i1, std::sqrt(sumsq));
+    for (int64_t i0 = 0; i0 < t->ne[0] && i0 < 8; ++i0) {
+        fprintf(f, "%s%.6g", i0 ? "," : "", (double) read_f(i0));
+    }
+    fprintf(f, "]\n");
+    std::fclose(f);
+}
+
+static ggml_backend_sched_eval_callback wp_ced_nan_trace_inner_cb = nullptr;
+static void *                           wp_ced_nan_trace_inner_ud = nullptr;
+
+static bool wp_ced_nan_trace_chain_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    bool inner_need = true;
+    if (wp_ced_nan_trace_inner_cb) {
+        inner_need = wp_ced_nan_trace_inner_cb(t, ask, user_data);
+    }
+    const bool mine_want = t != nullptr && (wp_ced_nan_trace_watch(t->name) || wp_ced_value_dump_path() != nullptr);
+    if (ask) {
+        return inner_need || mine_want;
+    }
+    if (t != nullptr && wp_ced_nan_trace_watch(t->name)) {
+        wp_ced_nan_trace_check(t);
+        wp_ced_value_dump_check(t);
+    }
+    return true; // never abort the graph -- this is observation only
+}
+
+// Call at each `ggml_backend_sched_set_eval_callback` site, after `eval_cb`/
+// `eval_cb_user_data` have been resolved to whatever they would otherwise be
+// (cparams.cb_eval, or the weight pager's callback when paging is active).
+// Chains the trace onto whichever of those is already selected rather than
+// replacing it.
+static void wp_ced_nan_trace_install(ggml_backend_sched_eval_callback & eval_cb, void * & eval_cb_user_data) {
+    if (!wp_ced_nan_trace_enabled() && !wp_ced_value_dump_path()) {
+        return;
+    }
+    wp_ced_nan_trace_inner_cb = eval_cb;
+    wp_ced_nan_trace_inner_ud = eval_cb_user_data;
+    eval_cb           = wp_ced_nan_trace_chain_cb;
+    eval_cb_user_data = wp_ced_nan_trace_inner_ud;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -487,7 +848,13 @@ static void register_router_oracle(const llama_model &                        mo
             }
             const ggml_tensor * w = model.layers[il].ffn_gate_inp;
             const ggml_tensor * b = model.layers[il].ffn_exp_probs_b;
-            if (w == nullptr || b == nullptr) {
+            // A tensor that was created but never loaded (e.g. an MTP layer's
+            // router on a spine that does not load its MTP stages) has no data
+            // to read: treat it as absent rather than asserting in tensor_get.
+            const auto unloaded = [](const ggml_tensor * t) {
+                return t == nullptr || t->data == nullptr;
+            };
+            if (unloaded(w) || unloaded(b)) {
                 skipped.push_back(il);
                 continue;
             }
@@ -639,10 +1006,14 @@ llama_context::llama_context(
         // build_moe_ffn, and it satisfies that function's dispatch preconditions:
         // LLM_FFN_SILU, no expert biases, no per-expert scales, and a shared expert
         // that is computed on the spine and added after the dispatch returns.
+        // QWEN35MOE (Qwen3.5-A3B / Qwen3.6-35B-A3B) added 2026-09-21 on the same
+        // standard: build_layer_ffn -> build_moe_ffn(LLM_FFN_SILU, norm_w, SOFTMAX),
+        // no expert biases, no per-expert scales for non-ml8 experts, sigmoid-gated
+        // shared expert computed on the spine after the routed sum.
         if (model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_GLM_DSA &&
             model.arch != LLM_ARCH_DEEPSEEK4 && model.arch != LLM_ARCH_QWEN4EXP &&
-            model.arch != LLM_ARCH_DEEPSEEK41) {
-            throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2, GLM-DSA, DeepSeek4, DeepSeek41 or Qwen4Exp graph");
+            model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_QWEN35MOE) {
+            throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2, GLM-DSA, DeepSeek4, DeepSeek41, Qwen4Exp or Qwen35MoE graph");
         }
         // last_no_defer_layer = last main-graph MoE index (excludes NextN/MTP).
         // Worker HELLO lists can include the MTP block (e.g. layer 78) which the
@@ -3104,6 +3475,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             eval_cb = wp::weight_pager_eval_cb;
             eval_cb_user_data = model.wp_pager.get();
         }
+        wp_ced_nan_trace_install(eval_cb, eval_cb_user_data);
         ggml_backend_sched_set_eval_callback(sched_active, eval_cb, eval_cb_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -3514,6 +3886,7 @@ llm_graph_result * llama_context::process_ubatch_staged(
             eval_cb = wp::weight_pager_eval_cb;
             eval_cb_user_data = model.wp_pager.get();
         }
+        wp_ced_nan_trace_install(eval_cb, eval_cb_user_data);
         ggml_backend_sched_set_eval_callback(sched.get(), eval_cb, eval_cb_user_data);
 
         ggml_cgraph * gf = model.build_graph(gparams);
