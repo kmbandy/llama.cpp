@@ -70,6 +70,7 @@ struct layer_trace_stats {
     uint64_t send_ns   = 0;
     uint64_t recv_ns   = 0;
     uint64_t decode_ns = 0;
+    uint64_t plan_ns   = 0; // plan_requests(): routing plus building and encoding every worker's frames
 };
 
 // Cumulative prefetch-hint counters. MECHANISM counters, not outcome ones:

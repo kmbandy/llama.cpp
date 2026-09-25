@@ -2373,6 +2373,8 @@ struct dispatcher::impl {
                 const uint32_t chunk_count = std::min(dispatch_stream_chunks_, total_tokens);
                 const uint32_t chunk_rows = total_tokens / chunk_count;
                 request.stream_payloads.reserve(chunk_count);
+                const dispatch_clock::time_point stream_encode_started =
+                    layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
                 for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
                     const uint32_t token_start = chunk_index * chunk_rows;
                     const uint32_t token_end = chunk_index + 1 == chunk_count
@@ -2401,6 +2403,10 @@ struct dispatcher::impl {
                         wire_request.activations.begin() + (size_t) token_end * (size_t) n_embd,
                         chunk.request.activations.begin());
                     request.stream_payloads.push_back(pipe_encode_expert_dispatch_chunk(chunk));
+                }
+                if (layer_trace_enabled()) {
+                    add_layer_trace(layer, &layer_trace_stats::encode_ns,
+                                    elapsed_ns(stream_encode_started, dispatch_clock::now()));
                 }
                 request.stream_wire = true;
                 requests.push_back(std::move(request));
@@ -3812,9 +3818,14 @@ struct dispatcher::impl {
             // correctness property; this only shifts when deferred experts
             // refresh the LRU relative to the prior order.
             std::vector<size_t> assigned_counts(workers.size(), 0);
+            const dispatch_clock::time_point plan_started =
+                layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
             std::vector<planned_request> imm_requests =
                 plan_requests(layer, n_tokens, activations, immediate, route_it->second, assigned_counts,
                               swiglu_clamp);
+            if (layer_trace_enabled()) {
+                add_layer_trace(layer, &layer_trace_stats::plan_ns, elapsed_ns(plan_started, dispatch_clock::now()));
+            }
             std::vector<planned_request> def_requests =
                 deferred.empty()
                     ? std::vector<planned_request>{}

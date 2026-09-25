@@ -615,7 +615,7 @@ void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
         labels += " (" + std::to_string(layer) + ",1," +
                   std::to_string(second->second->seq_id) + ")";
     }
-    std::fprintf(layer_trace_, "DS4 layer=%d chunks=%d labels=%s dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu\n",
+    std::fprintf(layer_trace_, "DS4 layer=%d chunks=%d labels=%s dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu plan_ns=%llu\n",
                  layer,
                  chunked ? 2 : 1,
                  labels.c_str(),
@@ -624,7 +624,8 @@ void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
                  (unsigned long long) transport.send_ns,
                  (unsigned long long) transport.recv_ns,
                  (unsigned long long) transport.decode_ns,
-                 0ull);
+                 0ull,
+                 (unsigned long long) transport.plan_ns);
     std::fflush(layer_trace_);
 }
 
