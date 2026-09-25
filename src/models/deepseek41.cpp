@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-kv-cache-dsv4.h"
 
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1870,6 +1871,118 @@ static void dsv41_sparse_attn_check_cb(ggml_tensor * dst, const ggml_tensor * a,
     }
 }
 
+// WP_DSV41_SPARSE_ATTN_DIFF=1 (debug, needs WP_DSV41_SPARSE_ATTN=1): per layer,
+// log the sparse output's error against the dense output for the first few
+// prefill and decode calls. a = sparse, b = dense, both F32 [512*64, nt].
+static bool dsv41_sparse_attn_diff_env_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_DSV41_SPARSE_ATTN_DIFF");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+struct dsv41_sparse_attn_diff_ctx {
+    int     il;
+    int     kind;  // 0 = prefill kernel call (nt >= 32), 1 = decode kernel
+    int64_t nt;    // full call width
+    int64_t keep;  // trailing rows handed to the callback
+    float   scale;
+};
+
+// src: [0] sparse tail F32 [512*64, keep], [1] dense tail (same), [2] q tail [512, 64, keep],
+// [3] k_all F16 [512, 1, n_kv], [4] kv_indices tail I32 [n_idx, keep], [5] sinks F32 [64].
+// Logs each path's error against a float64 attention over the same indices.
+static void dsv41_sparse_attn_diff_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    const auto * cx = (const dsv41_sparse_attn_diff_ctx *) userdata;
+    static std::atomic<int> n_logged[LLAMA_MAX_LAYERS][2];
+    if (n_logged[cx->il][cx->kind].fetch_add(1) >= 3) {
+        return;
+    }
+    const ggml_tensor * sp  = dst->src[0];
+    const ggml_tensor * dn  = dst->src[1];
+    const ggml_tensor * q   = dst->src[2];
+    const ggml_tensor * k   = dst->src[3];
+    const ggml_tensor * idx = dst->src[4];
+    const ggml_tensor * snk = dst->src[5];
+    GGML_ASSERT(sp->type == GGML_TYPE_F32 && dn->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && snk->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16);
+
+    const int64_t D = 512, H = 64, row = D * H;
+    const int64_t n_idx = idx->ne[0];
+    auto qv = [&](int64_t t, int64_t h, int64_t d) -> double {
+        const char * p = (const char *) q->data + t * q->nb[2] + h * q->nb[1] + d * q->nb[0];
+        return q->type == GGML_TYPE_F32 ? *(const float *) p : ggml_fp16_to_fp32(*(const ggml_fp16_t *) p);
+    };
+    auto kv = [&](int64_t n, int64_t d) -> double {
+        return ggml_fp16_to_fp32(*(const ggml_fp16_t *) ((const char *) k->data + n * k->nb[2] + d * k->nb[0]));
+    };
+
+    // sparse vs dense over every handed row, and both vs float64 on the last few
+    double sd2 = 0.0, dd2 = 0.0, se2 = 0.0, de2 = 0.0, r2 = 0.0;
+    const int64_t n_ref = std::min<int64_t>(cx->keep, 4);
+    std::vector<double> ref(D), sc;
+    std::vector<int32_t> picks;
+    for (int64_t r = 0; r < cx->keep; ++r) {
+        const float * xs = (const float *) sp->data + r * row;
+        const float * xd = (const float *) dn->data + r * row;
+        for (int64_t i = 0; i < row; ++i) {
+            const double d = (double) xs[i] - (double) xd[i];
+            sd2 += d * d;
+            dd2 += (double) xd[i] * xd[i];
+        }
+        if (r < cx->keep - n_ref) {
+            continue;
+        }
+        const int64_t t = r; // q and kv_indices arrive as the same trailing rows
+        const int32_t * ir = (const int32_t *) ((const char *) idx->data + t * idx->nb[1]);
+        picks.clear();
+        for (int64_t j = 0; j < n_idx; ++j) {
+            if (ir[j] >= 0) {
+                picks.push_back(ir[j]);
+            }
+        }
+        sc.resize(picks.size());
+        for (int64_t h = 0; h < H; ++h) {
+            double m = ((const float *) snk->data)[h];
+            for (size_t j = 0; j < picks.size(); ++j) {
+                double s = 0.0;
+                for (int64_t d = 0; d < D; ++d) {
+                    s += qv(t, h, d) * kv(picks[j], d);
+                }
+                sc[j] = s * cx->scale;
+                m = std::max(m, sc[j]);
+            }
+            double den = std::exp(((const float *) snk->data)[h] - m);
+            std::fill(ref.begin(), ref.end(), 0.0);
+            for (size_t j = 0; j < picks.size(); ++j) {
+                const double w = std::exp(sc[j] - m);
+                den += w;
+                for (int64_t d = 0; d < D; ++d) {
+                    ref[d] += w * kv(picks[j], d);
+                }
+            }
+            for (int64_t d = 0; d < D; ++d) {
+                const double y = ref[d] / den;
+                const double es = xs[h * D + d] - y;
+                const double ed = xd[h * D + d] - y;
+                se2 += es * es;
+                de2 += ed * ed;
+                r2  += y * y;
+            }
+        }
+    }
+    LLAMA_LOG_WARN("SPARSE_ATTN_DIFF il=%d %s nt=%lld sparse_vs_dense=%.3e | vs_f64 (last %lld rows): sparse=%.3e dense=%.3e\n",
+            cx->il, cx->kind == 0 ? "prefill" : "decode", (long long) cx->nt,
+            dd2 > 0.0 ? std::sqrt(sd2 / dd2) : 0.0, (long long) n_ref,
+            r2 > 0.0 ? std::sqrt(se2 / r2) : 0.0, r2 > 0.0 ? std::sqrt(de2 / r2) : 0.0);
+}
+
 // DeepSeek-V4.1 attention: a sliding window of raw KV, plus, where the layer uses one, the
 // compressed positions the indexer picked, concatenated into a single masked attention.
 //
@@ -2233,6 +2346,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     // that header pulls in hip_runtime_api.h, only available in the HIP-only
     // ggml-cuda/aiter-integration translation units, not this host-side file).
     ggml_tensor * out = nullptr;
+    ggml_tensor * sparse_idx = nullptr; // kept for WP_DSV41_SPARSE_ATTN_DIFF's reference
+    ggml_tensor * sparse_k   = nullptr;
     if (dsv41_sparse_attn_env_enabled() &&
             n_embd_head == 512 &&
             n_head       == 64) {
@@ -2261,6 +2376,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             kv_indptr = ggml_scale(ctx0, kv_indptr, (float) kv_indices->ne[0]);
             kv_indptr = ggml_cast(ctx0, kv_indptr, GGML_TYPE_I32);
             out = ggml_sparse_attn_dsv4(ctx0, q_f16, k_all_f16, kv_indices, kv_indptr, layer.attn_sinks, kq_scale);
+            sparse_idx = kv_indices;
+            sparse_k   = k_all_f16;
             // ggml_flash_attn_ext (the dense path below) always returns
             // GGML_TYPE_F32 (ggml.c:5723) -- downstream consumers of `out`
             // (build_attention_tail, then whatever FFN-side op reads it next,
@@ -2276,6 +2393,33 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             out = ggml_cast(ctx0, out, GGML_TYPE_F32);
             cb(out, "attn_out_sparse", il);
         }
+    }
+    if (out && dsv41_sparse_attn_diff_env_enabled()) {
+        // Debug: build the dense path too, log how far the sparse output is from
+        // it (last 64 token rows only, so prefill stays cheap), and carry the
+        // dense output forward so every layer compares on the same inputs.
+        ggml_tensor * dense = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
+                nullptr, n_kv_max, kq_scale, il);
+        GGML_ASSERT(ggml_nelements(dense) == ggml_nelements(out));
+        const int64_t row  = n_embd_head * n_head;
+        const int64_t keep = std::min<int64_t>(nt, 64);
+        ggml_tensor * out_2d   = ggml_reshape_2d(ctx0, out, row, nt);
+        ggml_tensor * dense_2d = ggml_reshape_2d(ctx0, dense, row, nt);
+        ggml_tensor * out_tail   = ggml_view_2d(ctx0, out_2d, row, keep, out_2d->nb[1], (nt - keep) * out_2d->nb[1]);
+        ggml_tensor * dense_tail = ggml_view_2d(ctx0, dense_2d, row, keep, dense_2d->nb[1], (nt - keep) * dense_2d->nb[1]);
+        // the kind (prefill vs decode) is judged on the full call, so pass nt along
+        ggml_tensor * args[] = {
+            ggml_cont(ctx0, out_tail), ggml_cont(ctx0, dense_tail),
+            ggml_cont(ctx0, ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], keep, q->nb[1], q->nb[2], (nt - keep) * q->nb[2])),
+            sparse_k,
+            ggml_cont(ctx0, ggml_view_2d(ctx0, sparse_idx, sparse_idx->ne[0], keep, sparse_idx->nb[1], (nt - keep) * sparse_idx->nb[1])),
+            layer.attn_sinks,
+        };
+        auto * dcx = new dsv41_sparse_attn_diff_ctx{ il, nt >= 32 ? 0 : 1, nt, keep, kq_scale };
+        ggml_tensor * diffed = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, 1, 1, 1, args, 6,
+                dsv41_sparse_attn_diff_cb, 1, dcx);
+        ggml_build_forward_expand(gf, diffed);
+        out = dense;
     }
     if (!out) {
         out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
