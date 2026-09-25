@@ -206,8 +206,214 @@ def freq_admit_phase(refs_nt, cap):
     return hits
 
 
+def freq_admit_phase_reject(refs_nt, cap):
+    """WP_HOST_TIER_POLICY=freq_admit as of the 2026-09-25 reject_lru_
+    revision (HostArena::admit_landed_locked_ / begin_read_locked_ /
+    evict_one_locked_ in src/weight-pager/wp-host-arena.cpp). Supersedes
+    freq_admit_phase() above, which modeled the ORIGINAL (commit 2ccf93034)
+    version of the policy -- kept for comparison, not because it is still
+    what the code does.
+
+    Two things changed, both found by tracing what a live run actually did
+    (not by assumption -- see the design note this function's diff summary
+    cites):
+
+    1. THE RESERVATION-TIME EVICTION BUG. admit_landed_locked_ only ever
+       decided WHERE a page that had ALREADY been read through NVMe landed
+       (finish_read time). It said nothing about begin_read_locked_'s OWN
+       eviction, which runs BEFORE that decision, to physically free a slot
+       for the read to land in. Under sustained load the tier sits at its
+       byte cap essentially always, so begin_read_locked_'s eviction fires on
+       almost every miss regardless of what admission will later decide --
+       i.e. every "rejected" candidate still evicted a REAL resident to get
+       read at all, which is exactly what a live run (2026-09-25) measured:
+       ram_evictions ~= ram_lookups, near-0 hit rate even with the tier sized
+       to hold >10% of the working set. This function models that: a miss
+       ALWAYS evicts something (from `reject`, the disposable list, if it
+       has anything, else from `main`, the real resident set) the moment it
+       needs a slot, not only when admission accepts it.
+    2. reject_lru_ (this function's `reject` dict): a losing prefill landing
+       goes into ITS OWN small disposable resident list instead of the front
+       of `main`. Eviction always drains `reject` before ever touching
+       `main`. Combined with (1), this is what actually fixes the bug: once
+       ANY page has been rejected, every subsequent miss's unavoidable
+       eviction takes its victim from `reject` (cheap, by construction) and
+       `main`'s real residents stop being touched at all -- the
+       evictions-that-hit-`main` count (the thing to watch live as
+       ram_evictions_lru) should fall to ~0 once the first rejection has
+       landed, while total evictions (ram_evictions) stays high because
+       `reject` keeps legitimately churning to serve every requested-but-
+       not-worth-caching page.
+    3. RECORD ON EVERY ACCESS, HIT OR MISS (both prefill and decode): the
+       original policy recorded frequency only on a hit, reasoning that a
+       fresh miss is as uninformative as the victim it displaces. With
+       reservation eviction no longer clobbering `main` on every miss, a
+       losing prefill candidate still needs SOME way to grow its own
+       estimate (once per sweep pass, from its own misses) so it can be told
+       apart from a real incumbent -- otherwise every comparison after the
+       first pass would need the OLD 0-vs-0 tie-break to be doing literally
+       all the work, which is fragile. Recording on every access is also
+       what lets a decode page's real repeat-borrow frequency keep beating a
+       same-once-per-pass prefill sweep page after eviction and re-read.
+
+    No physically separate "staging" scratch region is modeled (or built in
+    the C++): reject_lru_ produces the same practical effect for the metric
+    that matters (`main`/lru_ evictions -> 0) without a second bounded pool,
+    duplicate-read races for concurrently-requested pages, or touching every
+    call site that finalizes a page-in's arena hold in wp-expert-worker.cpp
+    (see the diff summary for the full reservation-vs-staging tradeoff
+    analysis) -- the existing budget_bytes = tier_bytes + margin headroom
+    (read_inflight_max entries) already absorbs concurrent in-flight reads
+    exactly as it did before this change.
+    """
+    main = OrderedDict()
+    reject = OrderedDict()
+    freq = {}
+    hits = 0
+    evictions_main = 0
+    evictions_reject = 0
+    for p, nt in refs_nt:
+        if p in main:
+            main.move_to_end(p)
+            freq[p] = freq.get(p, 0) + 1
+            hits += 1
+            continue
+        if p in reject:
+            # A demand hit on a previously-rejected page promotes it, same
+            # shape as HostArena::borrow()'s new reject_lru_ promotion path.
+            del reject[p]
+            main[p] = True
+            freq[p] = freq.get(p, 0) + 1
+            hits += 1
+            continue
+
+        # Miss: record on EVERY access, admitted or not (point 3 above).
+        freq[p] = freq.get(p, 0) + 1
+
+        total = len(main) + len(reject)
+        if total < cap:
+            main[p] = True
+            continue
+
+        # Need to evict to land: reject first (cheap, disposable), main only
+        # if reject has nothing to give up (point 1/2 above).
+        if nt <= 1:
+            # Decode: never gated -- plain LRU straight into main.
+            if reject:
+                victim = next(iter(reject)); del reject[victim]
+                evictions_reject += 1
+            else:
+                victim = next(iter(main)); del main[victim]
+                evictions_main += 1
+            main[p] = True
+            continue
+
+        # Prefill: always compare against the WEAKEST currently resident
+        # page -- reject's own front if it has anything, else main's front.
+        # BUG FOUND VIA THIS SIMULATOR (2026-09-25): an earlier version of
+        # this function (and, it turned out, the C++ it mirrors) skipped the
+        # comparison entirely whenever `reject` was non-empty, reasoning
+        # that disposable capacity already existing meant nothing needed
+        # gating. That is wrong: one-in-one-out churn keeps `reject`
+        # non-empty almost permanently once the first rejection has
+        # happened, so the gate stopped firing after landing #1 and every
+        # later candidate was admitted unconditionally -- measured as EXACT
+        # 0% hit rate on the pure prefill trace below (a plain sliding
+        # window, no incumbent protection at all), not the
+        # tier_size/sweep_size convergence the design intends. Comparing
+        # against reject's own front (not skipping the comparison) is what
+        # fixes it: reject entries are no stronger than any main entry, so
+        # testing a candidate against one is still a real admission test.
+        if reject:
+            victim = next(iter(reject))
+        else:
+            victim = next(iter(main))
+        if freq.get(p, 0) <= freq.get(victim, 0):
+            # Candidate loses/ties: it lands in reject, and the unavoidable
+            # eviction (to physically free a slot) takes exactly the page it
+            # just lost to.
+            if victim in reject:
+                del reject[victim]; evictions_reject += 1
+            else:
+                del main[victim]; evictions_main += 1
+            reject[p] = True
+        else:
+            # Candidate wins: it lands hot in main, displacing the page it
+            # just beat (from reject if that's where the victim was, else
+            # from main itself).
+            if victim in reject:
+                del reject[victim]; evictions_reject += 1
+            else:
+                del main[victim]; evictions_main += 1
+            main[p] = True
+    return hits, evictions_main, evictions_reject
+
+
 POLICIES = {"LRU": lru, "FREQ_ADMIT": freq_admit, "FREQ_ADMIT_W": freq_admit_windowed}
-PHASE_POLICIES = {"FREQ_ADMIT_PHASE": freq_admit_phase}
+PHASE_POLICIES = {
+    "FREQ_ADMIT_PHASE (old, 2ccf93034)": freq_admit_phase,
+    "FREQ_ADMIT_PHASE_REJECT (new, reject_lru_)": freq_admit_phase_reject,
+}
+
+
+# --- spec-land-then-promote (the 2026-09-25 live-traffic finding) ----------
+#
+# The traces and policies above all model page-ins as a single event: a
+# demand read either hits or misses. Live traffic under
+# WP_PREFILL_LAYER_AHEAD is NOT shaped like that: a coordinator-run live test
+# (three back-to-back 24.5k-token prefills, freq_admit engaged) measured
+# n_pagein(demand)=2462 against ~60k layer-ahead SPECULATIVE page-ins on the
+# same worker -- ~96% of traffic. Every one of those speculative pages lands
+# Resident-but-speculative through begin_read/finish_read (which never gates
+# a speculative landing -- admit_landed_locked_'s condition is
+# `!e.speculative`), and only becomes a genuine demand (admitted) resident
+# through HostArena::borrow()'s spec->demand promotion on its first real
+# (prefill) reference. The FREQ_ADMIT_PHASE_REJECT policy above only ever
+# models a FRESH DEMAND MISS being gated -- it has nothing to say about a
+# page that was already resident (as a speculative landing) before its first
+# demand reference, which is what the live traffic actually mostly is. That
+# gap is exactly why the live counters showed the gate provably working on
+# the minority path it covered (ram_admission_cold_landed=754, nonzero) while
+# hit rate stayed ~0 (ram_lookup_hits=34 of 61641) and ram_evictions_lru
+# tracked ram_lookups almost 1:1: the promotion path -- where nearly all
+# traffic actually entered demand standing -- was completely unguarded.
+def spec_promote_old(refs, cap):
+    """Before the 2026-09-25 promotion-gate fix: borrow()'s spec->demand
+    promotion NEVER consulted admission at all -- every promoted page landed
+    hot in lru_ unconditionally, regardless of frequency. For a trace where
+    every page lands speculatively and is promoted on its very next
+    reference (one land-then-promote event per page per pass, exactly what a
+    single-pass-per-prompt prefill layer-ahead sweep looks like), an
+    unconditional-always-hot promotion is BYTE FOR BYTE plain LRU -- there is
+    no frequency-gated code left in the loop at all. This is the function
+    that reproduces the live ~0% hit rate."""
+    return lru(refs, cap)
+
+
+def spec_promote_new(refs, cap):
+    """After the fix: the promotion is gated with the SAME comparison a
+    fresh demand landing uses (HostArena::loses_admission_locked_, shared by
+    admit_landed_locked_ and borrow()'s promotion path). For this trace
+    shape (land speculatively, promote on the very next -- i.e. essentially
+    simultaneous -- reference), landing-then-immediate-promotion collapses
+    to exactly one gated admission decision per page reference, so this
+    reuses freq_admit_phase_reject()'s mechanics directly rather than
+    duplicating them: the RESULT is what matters here, not a byte-identical
+    reproduction of the two separate HostArena calls (begin_read/finish_read
+    for the speculative landing, then borrow() for the promotion) --
+    reject_lru_'s eviction preference (spec_lru_ -> reject_lru_ -> lru_,
+    unconditional on the source of the landing) already means the
+    speculative landing itself never has to touch lru_ either, so the two
+    HostArena calls and this one combined step reach the same steady state.
+    """
+    hits, _, _ = freq_admit_phase_reject([(p, 8) for p in refs], cap)
+    return hits
+
+
+SPEC_PROMOTE_POLICIES = {
+    "SPEC_PROMOTE (old, promotion ungated)": spec_promote_old,
+    "SPEC_PROMOTE (new, promotion gated)":   spec_promote_new,
+}
 
 
 # --- synthetic traces --------------------------------------------------------
@@ -315,8 +521,33 @@ def run(name, refs, tier_gb_list, refs_nt=None):
             print("     %-16s hit_rate=%.4f (%d/%d)" % (pname, hits / n if n else 0.0, hits, n))
         if refs_nt is not None:
             for pname, fn in PHASE_POLICIES.items():
-                hits = fn(refs_nt, cap)
-                print("     %-16s hit_rate=%.4f (%d/%d)" % (pname, hits / n if n else 0.0, hits, n))
+                result = fn(refs_nt, cap)
+                if isinstance(result, tuple):
+                    hits, ev_main, ev_reject = result
+                    print("     %-42s hit_rate=%.4f (%d/%d)  evictions_main=%d evictions_reject=%d"
+                          % (pname, hits / n if n else 0.0, hits, n, ev_main, ev_reject))
+                else:
+                    hits = result
+                    print("     %-42s hit_rate=%.4f (%d/%d)"
+                          % (pname, hits / n if n else 0.0, hits, n))
+
+
+def run_spec_promote(name, refs, tier_gb_list):
+    """Report for SPEC_PROMOTE_POLICIES (spec-land-then-promote traffic --
+    see the block comment above spec_promote_old/spec_promote_new). Separate
+    from run() because this shape doesn't need the LRU/FREQ_ADMIT/etc.
+    comparison policies at all -- the point here is specifically old vs new
+    promotion-gate behaviour on traffic shaped like the live finding."""
+    n = len(refs)
+    distinct = len(set(refs))
+    print("\n===== %s" % name)
+    print("  %d references, %d distinct pages (%.1f GB distinct footprint)" %
+          (n, distinct, distinct * PAGE_MB / 1024))
+    for gb, cap in caps_for(tier_gb_list):
+        print("  tier %2d GB (%5d pages, tier/sweep=%.4f):" % (gb, cap, cap / distinct if distinct else 0.0))
+        for pname, fn in SPEC_PROMOTE_POLICIES.items():
+            hits = fn(refs, cap)
+            print("     %-38s hit_rate=%.4f (%d/%d)" % (pname, hits / n if n else 0.0, hits, n))
 
 
 def main():
@@ -327,7 +558,7 @@ def main():
     ap.add_argument("--k", type=int, default=6, help="experts/token/layer selected by the router")
     ap.add_argument("--prefill-ubatches", type=int, default=3)
     ap.add_argument("--decode-tokens", type=int, default=20000)
-    ap.add_argument("--tier-gb", type=int, nargs="+", default=[8, 16, 32, 40])
+    ap.add_argument("--tier-gb", type=int, nargs="+", default=[8, 16, 24, 32])
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--pagein-log", type=str, default=None,
                      help="replay a captured WP_PAGEIN_LOG file instead of synthetic traces")
@@ -359,6 +590,18 @@ def main():
                                                 drift_every=64)]
     run("mixed (2 prefills then long decode)",
         [p for p, _ in mixed_nt], args.tier_gb, refs_nt=mixed_nt)
+
+    # Reuses prefill_refs (already the same cyclic-sweep shape
+    # WP_PREFILL_LAYER_AHEAD produces): the live finding this section
+    # reproduces is specifically about layer-ahead SPECULATIVE prefill
+    # traffic, and old/new only differ on whether the spec->demand promotion
+    # is gated -- see the block comment above spec_promote_old/_new.
+    run_spec_promote(
+        "prefill, spec-land-then-promote (%d ubatches x %d layers x %d experts -- "
+        "matches the live finding: WP_PREFILL_LAYER_AHEAD makes ~96%% of page-ins "
+        "speculative landings promoted via borrow(), not fresh demand misses)" %
+        (args.prefill_ubatches, args.layers, args.experts_per_layer),
+        prefill_refs, args.tier_gb)
 
 
 if __name__ == "__main__":

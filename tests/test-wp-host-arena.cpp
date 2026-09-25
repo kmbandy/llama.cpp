@@ -710,6 +710,174 @@ static void test_freq_admission_off_speculative_can_still_evict_demand() {
             "plain LRU (policy off): page 1 gets evicted to seat it -- the pre-existing behaviour, unchanged");
 }
 
+// Larger-scale version of test_freq_admission_locks_a_stable_subset_on_
+// cyclic_sweep, shaped like the live production symptom this whole change
+// exists to fix: a sweep much bigger than the tier, run for MANY passes (not
+// just 2-3), with a realistic margin (budget = tier + margin, same as the
+// worker's own cfg.budget_bytes = host_tier_bytes + entry_bytes *
+// read_inflight_max) so reservation-time eviction has real slack to work
+// with instead of the tiny 4-page test's edge-of-capacity behaviour.
+//
+// This specifically guards against a regression class the tiny test above
+// cannot catch: admit_landed_locked_'s gate comparing against the wrong
+// victim (or not firing at all) once reject_lru_ has been populated by an
+// earlier landing -- on a small trace, trim_to_tier_cap_locked_ tends to
+// evict a freshly-cold-landed page in the SAME call that landed it (reject_
+// lru_ empty before, so the new entry is its own front), so reject_lru_
+// rarely stays populated across separate page-in events and a gate bug tied
+// to "reject_lru_ non-empty" would not show up. At this larger scale it can
+// (and, during development of this change, briefly did in the standalone
+// Python simulator, scripts/sim-host-tier.py -- FREQ_ADMIT_PHASE_REJECT on
+// the pure-prefill trace measured an exact 0% hit rate with a first, buggy
+// version of this gate condition, instead of converging to tier_size /
+// sweep_size like every other prefill trial): if the gate stops firing once
+// reject_lru_ has anything in it, every later prefill sweep page gets
+// admitted hot unconditionally, evicting main's real residents on a rolling
+// basis, and the second-pass-onward hit rate degrades toward 0 as the
+// window slides instead of stabilising.
+static void test_freq_admission_large_sweep_stays_stable_many_passes() {
+    CountingAlloc a;
+    const size_t tier_pages   = 20;
+    const size_t margin_pages = 20;   // production shape: budget = tier + margin
+    const size_t sweep_pages  = 100;
+    HostArena::Config c = cfg(tier_pages + margin_pages);
+    c.tier_bytes      = tier_pages * ENTRY;
+    c.freq_admission  = true;
+    c.sketch_width    = 256;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    const int n_passes = 20;
+    double last_hit_rate = -1.0;
+    for (int pass = 0; pass < n_passes; ++pass) {
+        int hits = 0;
+        for (size_t page = 0; page < sweep_pages; ++page) {
+            if (hit_page(arena, (int) page)) ++hits; else read_page(arena, (int) page);
+        }
+        const double hit_rate = (double) hits / (double) sweep_pages;
+        if (pass >= 2) {
+            // Converged by pass 2 (pass 0 is cold, pass 1 may still be
+            // settling); from here the resident subset must be STABLE, not
+            // degrade pass over pass -- a wide tolerance (not an exact
+            // tier/sweep check, which is a stronger property already
+            // covered by the smaller test above) because this test's job is
+            // catching regression to near-0, not verifying the exact number.
+            require(hit_rate > 0.10,
+                    "hit rate degraded well below tier_pages/sweep_pages on a "
+                    "large many-pass sweep -- the admission gate likely "
+                    "stopped firing once reject_lru_ was populated");
+            if (last_hit_rate >= 0.0) {
+                require(hit_rate >= last_hit_rate - 0.02,
+                        "hit rate is still trending down pass over pass instead "
+                        "of having stabilised -- the resident set is not locking in");
+            }
+        }
+        last_hit_rate = hit_rate;
+    }
+    // The metric this whole change exists to move: once stable, evictions
+    // that actually displaced an admitted (lru_) resident should be a small
+    // fraction of total evictions -- most churn should have landed on
+    // reject_lru_ instead.
+    require(arena.evictions_lru() < arena.evictions() / 4,
+            "too many evictions are landing on real (lru_) residents instead "
+            "of being absorbed by reject_lru_");
+    require(arena.admission_cold_landed() > 0, "the gate never actually rejected anything");
+}
+
+// Reproduces the 2026-09-25 LIVE finding (three back-to-back 24.5k-token
+// prefills, freq_admit engaged, main: ram_lookups=61641 ram_lookup_hits=34
+// ram_evictions_lru=59483 ram_admission_cold_landed=754
+// ram_reject_promotions=0): live traffic is ~96% layer-ahead SPECULATIVE
+// reads (WP_PREFILL_LAYER_AHEAD), which land Resident-but-speculative via
+// begin_read/finish_read and only ever become genuine demand (lru_)
+// residents through borrow()'s spec->demand promotion on their first real
+// reference -- a transition admit_landed_locked_ (finish_read's landing
+// gate) never sees, because the page was already Resident by the time any
+// demand access happens. Before this test's fix, that promotion was
+// unconditional: every promoted page landed hot in lru_ regardless of
+// frequency, so ram_evictions_lru tracked ram_lookups almost 1:1 and
+// ram_reject_promotions stayed 0 even with admission_cold_landed proving the
+// OTHER gate (fresh demand misses) was, in isolation, working -- exactly
+// the live numbers above (cold_landed=754 nonzero, reject_promotions=0).
+//
+// This test builds a real (frequency-bearing) demand incumbent, fills the
+// tier to its cap with it plus a speculative page, then demand-borrows the
+// speculative page with prefill_hint=true: the promotion must be gated the
+// same way a fresh landing is, and a losing promotion must land in
+// reject_lru_ without disturbing the incumbent.
+static void test_freq_admission_gates_spec_to_demand_promotion() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(4);      // 2 tier + 2 margin
+    c.tier_bytes      = 2 * ENTRY;
+    c.freq_admission  = true;
+    c.spec_frac_pct   = 100;
+    c.sketch_width    = 64;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    // page 1: real demand incumbent with genuine (nonzero, repeat-earned)
+    // frequency -- the same shape as a decode expert's own resident set that
+    // a prefill sweep must not casually displace.
+    read_page(arena, /*page=*/1, /*prefill=*/true);
+    require(hit_page(arena, 1), "build page 1's real frequency (hit 1/2)");
+    require(hit_page(arena, 1), "build page 1's real frequency (hit 2/2)");
+
+    // page 2: a layer-ahead speculative landing -- Resident, speculative,
+    // never yet demand-referenced. Together with page 1 this exactly fills
+    // the 2-page tier (tier_full via >=, not >: see the tier_full comment in
+    // HostArena::borrow()), with no trim needed (not OVER cap), so the
+    // scenario is stable across separate calls instead of self-correcting.
+    void * data; HostArena::Handle h2;
+    require(arena.begin_read(2, /*speculative=*/true, &data, &h2), "spec read 2");
+    arena.finish_read(2, h2, /*ok=*/true);
+    require(arena.resident_count() == 2, "tier exactly full: page 1 (demand) + page 2 (spec)");
+    require(arena.spec_promotions() == 0 && arena.spec_promotions_rejected() == 0,
+            "nothing promoted yet");
+
+    // The promotion under test: a prefill-hinted demand reference to page 2.
+    // Its own estimate (freshly recorded by this very call, per "record on
+    // every access") cannot beat page 1's real, multiply-earned estimate --
+    // it must lose and land in reject_lru_, not lru_, and page 1 must be
+    // completely undisturbed.
+    const void * src; HostArena::Handle b2;
+    require(arena.borrow(2, &src, &b2, /*demand=*/true, /*prefill_hint=*/true),
+            "demand borrow of the speculative page");
+    arena.release(2, b2);
+
+    require(arena.spec_promotions() == 1, "page 2 was confirmed out of spec_lru_");
+    require(arena.spec_promotions_rejected() == 1,
+            "the promotion lost the admission comparison -- THE counter a live run "
+            "measuring 0 here (despite admission_cold_landed > 0 elsewhere) is the "
+            "signature of this exact bug");
+    require(arena.state_of(1) == HostArena::State::Resident,
+            "page 1 (the real incumbent) must survive an ungated-would-have-evicted promotion");
+    require(arena.is_resident(2), "page 2 is still resident (in reject_lru_), just not admitted");
+
+    // A demand hit on page 2 now (it is resident, just in reject_lru_) must
+    // still promote it the rest of the way on real re-reference -- losing
+    // once is not permanent exile, same guarantee reject_lru_ gives a
+    // rejected fresh landing.
+    const void * src2; HostArena::Handle b2b;
+    require(arena.borrow(2, &src2, &b2b), "page 2 is still borrowable after losing admission");
+    arena.release(2, b2b);
+    require(arena.reject_promotions() == 1, "a real re-reference promotes it out of reject_lru_");
+
+    // Sanity: the SAME scenario with prefill_hint=false (a decode access)
+    // must never gate -- decode promotions stay unconditional, same phase
+    // split as admit_landed_locked_'s prefill_hint.
+    void * data3; HostArena::Handle h3;
+    require(arena.begin_read(3, /*speculative=*/true, &data3, &h3), "spec read 3");
+    arena.finish_read(3, h3, /*ok=*/true, /*keep_borrowed=*/true);   // hold it so trim can't evict it below
+    arena.release(3, h3);
+    const void * src3; HostArena::Handle b3;
+    require(arena.borrow(3, &src3, &b3, /*demand=*/true, /*prefill_hint=*/false),
+            "decode-hinted promotion");
+    arena.release(3, b3);
+    require(arena.spec_promotions_rejected() == 1,
+            "a decode-hinted (prefill_hint=false) promotion must never be gated -- "
+            "the rejected count must not have grown");
+}
+
 int main() {
     try {
         test_init_chunked_and_shrink_on_failure();
@@ -727,6 +895,8 @@ int main() {
         test_pinned_cap_excludes_inflight_entries();
         test_plain_lru_gets_zero_hits_on_oversized_cyclic_sweep();
         test_freq_admission_locks_a_stable_subset_on_cyclic_sweep();
+        test_freq_admission_large_sweep_stays_stable_many_passes();
+        test_freq_admission_gates_spec_to_demand_promotion();
         test_freq_admission_hot_page_resists_a_cold_scan();
         test_freq_admission_decode_hint_never_gates();
         test_freq_admission_speculative_never_evicts_demand();

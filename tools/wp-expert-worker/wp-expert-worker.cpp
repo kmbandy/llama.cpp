@@ -2050,7 +2050,10 @@ public:
     void set_ram_stats(uint64_t spec_landed, uint64_t resident_bytes,
                        uint64_t pinned_bytes, uint64_t evictions,
                        uint64_t admission_cold_landed,
-                       uint64_t lookups, uint64_t lookup_hits) {
+                       uint64_t lookups, uint64_t lookup_hits,
+                       uint64_t evictions_spec, uint64_t evictions_reject,
+                       uint64_t evictions_lru, uint64_t reject_promotions,
+                       uint64_t spec_promotions_rejected) {
         ram_spec_landed_    = spec_landed;
         ram_resident_bytes_ = resident_bytes;
         ram_pinned_bytes_   = pinned_bytes;
@@ -2058,6 +2061,24 @@ public:
         ram_admission_cold_landed_ = admission_cold_landed;
         ram_lookups_        = lookups;
         ram_lookup_hits_    = lookup_hits;
+        // freq_admit (reject_lru_) breakdown -- see HostArena::evictions_lru().
+        // With the policy off reject_lru_ stays empty and evictions_lru_ is
+        // plain LRU's count; under the policy, evictions_lru_ falling toward
+        // 0 is the resident-set stabilisation signal.
+        ram_evictions_spec_    = evictions_spec;
+        ram_evictions_reject_  = evictions_reject;
+        ram_evictions_lru_     = evictions_lru;
+        ram_reject_promotions_ = reject_promotions;
+        // 2026-09-25: of borrow()'s spec->demand promotions (the path a live
+        // run found was the one the admission gate actually needed to see --
+        // most live traffic is layer-ahead speculative reads that only ever
+        // enter demand standing THROUGH this promotion, not through a fresh
+        // finish_read landing), how many lost the comparison and were routed
+        // to reject_lru_ instead of lru_. Nonzero here is the proof the gate
+        // is engaging on the traffic that matters, not just on the small
+        // minority of pages that miss the arena entirely on first prefill
+        // reference.
+        ram_spec_promotions_rejected_ = spec_promotions_rejected;
     }
 
     void note_distinct_page(int layer, int expert) {
@@ -2304,7 +2325,20 @@ private:
                   << " ram_resident_mb=" << (ram_resident_bytes_ >> 20)
                   << " ram_pinned_mb=" << (ram_pinned_bytes_ >> 20)
                   << " ram_evictions=" << ram_evictions_
+                  << " ram_evictions_spec=" << ram_evictions_spec_
+                  << " ram_evictions_reject=" << ram_evictions_reject_
+                  // ram_evictions_lru: evictions that actually displaced a
+                  // page admission had accepted, not a disposable reject_lru_
+                  // entry or a speculative guess. This is the number to watch
+                  // for stabilisation under WP_HOST_TIER_POLICY=freq_admit --
+                  // it should fall to near 0 once the resident set locks in,
+                  // unlike ram_evictions (total) which stays high because
+                  // reject_lru_ keeps churning by design (see
+                  // HostArena::admit_landed_locked_'s 2026-09-25 revision).
+                  << " ram_evictions_lru=" << ram_evictions_lru_
                   << " ram_admission_cold_landed=" << ram_admission_cold_landed_
+                  << " ram_reject_promotions=" << ram_reject_promotions_
+                  << " ram_spec_promotions_rejected=" << ram_spec_promotions_rejected_
                   // ram_lookups: every arena_.borrow() call (the only
                   // lookup path today -- see HostArena::lookups()'s
                   // comment). If this stays 0 while n_pagein climbs, the
@@ -2530,6 +2564,11 @@ private:
     uint64_t           ram_admission_cold_landed_ = 0;
     uint64_t           ram_lookups_        = 0;
     uint64_t           ram_lookup_hits_    = 0;
+    uint64_t           ram_evictions_spec_    = 0;
+    uint64_t           ram_evictions_reject_  = 0;
+    uint64_t           ram_evictions_lru_     = 0;
+    uint64_t           ram_reject_promotions_ = 0;
+    uint64_t           ram_spec_promotions_rejected_ = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          bytes_read_ = 0;
     uint64_t          host_bytes_ = 0;
@@ -5809,7 +5848,12 @@ public:
                 if (slot.spec_pending) {
                     if (slot.layer_ahead) {
                         ++n_layerahead_hits_;
+                        if (slot.layer_ahead_depth >= 1 &&
+                            slot.layer_ahead_depth <= kMaxLayerAheadDepthTracked) {
+                            ++n_layerahead_hits_by_depth_[slot.layer_ahead_depth - 1];
+                        }
                         slot.layer_ahead = false;
+                        slot.layer_ahead_depth = 0;
                     }
                     slot.spec_pending = false;
                     --n_spec_pending_;
@@ -5963,7 +6007,11 @@ public:
                     PageIn pi;
                     pi.entry_index = entry_index;
                     pi.page        = &page;
-                    pi.prefill     = n_tokens > 32; // speculative verify (2-8 tokens) is decode traffic
+                    // speculative verify (2-8 tokens) is decode traffic. Prefill
+                    // layer-ahead batches arrive with n_tokens=0 (spec_pagein_submit)
+                    // but are prefill by construction; without this ~96% of prefill
+                    // page-ins skipped the WP_HOST_TIER_POLICY admission gate.
+                    pi.prefill     = n_tokens > 32 || spec_call_is_layer_ahead;
                     const size_t slot_index =
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
@@ -6016,6 +6064,7 @@ public:
                             }
                             slot.spec_pending = false;
                             slot.layer_ahead = false;
+                            slot.layer_ahead_depth = 0;
                             --n_spec_pending_;
                         }
                     }
@@ -6247,13 +6296,27 @@ public:
     // layer_ahead: one extra in-flight batch beyond WP_EXPERT_SPEC_MAX_INFLIGHT
     // so the prefill whole-next-layer path is not serialized behind the decode
     // spec pump's default cap of 1. Decode spec_pagein_step still passes false.
+    // WP_PREFILL_LAYER_AHEAD_DEPTH>1 needs more than one extra slot here -- N
+    // depth targets can each have a batch in flight at once (nearest-first
+    // submission order means an earlier depth's batch is typically still
+    // draining when a deeper depth's gets submitted) -- so the extra headroom
+    // scales with prefill_layer_ahead_depth_ instead of a hardcoded 1. At
+    // depth<=1 (the default) prefill_layer_ahead_depth_==1 and this is exactly
+    // the original "+1" cap.
+    // layer_ahead_depth: which WP_PREFILL_LAYER_AHEAD_DEPTH target (1..N) this
+    // submission came from, purely for the by-depth stats (n_layerahead_hits_
+    // by_depth_/n_layerahead_pageins_by_depth_ on the Worker side) -- 0 (the
+    // default) means "not tracked by depth", used by every non-layer-ahead
+    // caller (layer_ahead=false) and is otherwise harmless to leave unset.
     size_t spec_pagein_submit(const std::vector<const ExpertPage *> & pages,
                               const std::vector<uint64_t> & leases,
-                              bool layer_ahead = false) {
+                              bool layer_ahead = false,
+                              uint32_t layer_ahead_depth = 0) {
         // WP_EXPERT_SPEC_MAX_INFLIGHT: refuse once spec_batches_ is already at
         // capacity, same shape as the old "one speculative batch in flight at a
         // time" refusal but against a configurable cap instead of a hardcoded 1.
-        const size_t cap = (size_t) spec_max_inflight_ + (layer_ahead ? 1 : 0);
+        const size_t cap = (size_t) spec_max_inflight_ +
+            (layer_ahead ? prefill_layer_ahead_depth_ : 0);
         if (pages.empty() || spec_batches_.size() >= cap) {
             return 0;
         }
@@ -6347,6 +6410,7 @@ public:
         entry.inflight    = std::move(landed);
         entry.leases      = std::move(landed_leases);
         entry.layer_ahead = layer_ahead;
+        entry.layer_ahead_depth = layer_ahead ? (uint8_t) std::min<uint32_t>(layer_ahead_depth, 255) : 0;
         // LOG AT SUBMIT, NOT AT HARVEST. The read is issued here, so this is when
         // the cost is paid and when the position in the stream is meaningful.
         // Logging at harvest inverts the order against R: an async batch can be
@@ -6815,6 +6879,7 @@ private:
                     if (!slot.spec_pending) {
                         slot.spec_pending = true;
                         slot.layer_ahead  = entry.layer_ahead;
+                        slot.layer_ahead_depth = entry.layer_ahead_depth;
                         ++n_spec_pending_;
                     }
                 }
@@ -6879,6 +6944,21 @@ public:
     // submission was blocked or shrunk by it.
     size_t   n_spec_pending()     const { return n_spec_pending_; }
     uint64_t spec_blocked_budget() const { return spec_blocked_budget_; }
+    // WP_EXPERT_SPEC_MAX_SLOTS's raw value (0 = uncapped) and the pool's total
+    // slot count -- both surfaced for the WP_PREFILL_LAYER_AHEAD_DEPTH engaged
+    // banner (depth * largest-layer-page-count vs this cap).
+    long     spec_max_slots()    const { return spec_max_slots_; }
+    size_t   total_slots()       const { return slots_.size(); }
+    // Hits attributed to a specific WP_PREFILL_LAYER_AHEAD_DEPTH target depth
+    // (1-based; see Slot::layer_ahead_depth). Out-of-range (including 0 and
+    // anything past kMaxLayerAheadDepthTracked) returns 0, never throws --
+    // this is a stats accessor, not a bounds-checked index.
+    uint64_t n_layerahead_hits_by_depth(size_t depth_1based) const {
+        if (depth_1based < 1 || depth_1based > kMaxLayerAheadDepthTracked) {
+            return 0;
+        }
+        return n_layerahead_hits_by_depth_[depth_1based - 1];
+    }
     // Live in-flight speculative BATCH count and the WP_EXPERT_SPEC_MAX_INFLIGHT
     // cap it is checked against -- surfaced on the WP_HINT_LOG counter line
     // (spec_inflight[live/cap]) so a run proves its own configuration rather
@@ -7066,6 +7146,12 @@ private:
         // Set with spec_pending when the landing came from WP_PREFILL_LAYER_AHEAD.
         // Demand hit counts n_layerahead_hits_ and clears both.
         bool                layer_ahead  = false;
+        // Which depth slot (1..N) of WP_PREFILL_LAYER_AHEAD_DEPTH submitted this
+        // read-ahead page -- meaningful only while layer_ahead is true, 0
+        // otherwise. Always 1 at depth<=1 (today's single-target path), so the
+        // by-depth hit counters below degenerate to n_layerahead_hits_ itself
+        // and depth<=1 behaviour is unaffected by this field's existence.
+        uint8_t             layer_ahead_depth = 0;
         bool                pinned      = false;
     };
 
@@ -7301,7 +7387,13 @@ private:
             // reports Present; borrow() then succeeds unless the page was
             // evicted in between, in which case we simply go round again.
             const void * src = nullptr;
-            if (arena_.borrow(pagein.page->cache_id, &src, &pagein.arena_handle)) {
+            // prefill_hint forwarded so freq_admit's promotion gate (a live
+            // run found the plain spec->demand promotion path was where
+            // nearly all traffic entered demand standing ungated -- see
+            // HostArena::borrow()'s prefill_hint comment) sees this access
+            // the same way finish_read()'s prefill_hint already does.
+            if (arena_.borrow(pagein.page->cache_id, &src, &pagein.arena_handle,
+                              /*demand=*/true, pagein.prefill)) {
                 pagein.ram_hit    = true;
                 pagein.arena_data = const_cast<void *>(src);
                 pagein.hold_released = false;
@@ -9161,6 +9253,27 @@ private:
     // because WP_EXPERT_SPEC_MAX_SLOTS was already spent. Surfaced on the
     // WP_HINT_LOG counter line so the cap binding is visible.
     uint64_t                    spec_blocked_budget_ = 0;
+    // WP_PREFILL_LAYER_AHEAD_DEPTH mirror -- read independently of Worker's own
+    // copy (same parsing, same env var), same pattern as
+    // spec_protect_layerahead_evict_ above: the pool needs its own value only
+    // to size the layer-ahead in-flight cap headroom in spec_pagein_submit
+    // (N concurrent depth-target batches instead of a hardcoded +1). Default/
+    // "<=1" parsing must match Worker's copy exactly or the two disagree about
+    // what "depth>1" means for the cap.
+    const size_t                prefill_layer_ahead_depth_ = [] {
+        const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD_DEPTH");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 1;
+        return v > 1 ? (size_t) v : (size_t) 1;
+    }();
+    // Hits by WP_PREFILL_LAYER_AHEAD_DEPTH target depth (index 0 = depth 1,
+    // the nearest target), for the "prefill layer-ahead depth:" log line.
+    // Capped at kMaxLayerAheadDepthTracked entries -- a depth beyond that
+    // still reads/submits/lands correctly, it just stops being attributed to
+    // a per-depth bucket here (still counted in the aggregate n_layerahead_
+    // hits_ above). No practical config gets near this cap: depths beyond a
+    // handful stop paying for themselves long before 8.
+    static constexpr size_t     kMaxLayerAheadDepthTracked = 8;
+    uint64_t                    n_layerahead_hits_by_depth_[kMaxLayerAheadDepthTracked] = {};
     // WP_EXPERT_SPEC_MAX_INFLIGHT -- how many speculative page-in BATCHES may be
     // in flight at once, i.e. the size of spec_batches_ the pump gate allows.
     // MEASURED 2026-08-19: with the old hard cap of one, the pump logged
@@ -9191,6 +9304,8 @@ private:
         std::vector<const ExpertPage *> inflight;
         std::vector<uint64_t>           leases;
         bool                            layer_ahead = false;
+        // Depth this batch was submitted at (1..N); see Slot::layer_ahead_depth.
+        uint8_t                         layer_ahead_depth = 0;
     };
     std::vector<SpecBatch>          spec_batches_;
     // WP_EXPERT_SPEC_HOST_THREADS -- concurrent host-landing reader threads.
@@ -10002,6 +10117,36 @@ public:
                       << " width>" << prefill_layer_ahead_width_
                       << " reserve=" << prefill_layer_ahead_reserve_
                       << std::endl;
+            // Once-per-process banner for WP_PREFILL_LAYER_AHEAD_DEPTH>1, plus a
+            // one-time warning if the configured depth cannot possibly fit
+            // inside WP_EXPERT_SPEC_MAX_SLOTS: at depth N, up to N whole
+            // layers' worth of pages can be unconfirmed-speculative at once
+            // (one per depth target), so N * (the largest layer's page count)
+            // is the worst case against that cap. Advisory only -- truncation/
+            // re-offer already keeps this safe, just slower than the operator
+            // may expect.
+            if (prefill_layer_ahead_depth_ > 1) {
+                size_t largest_layer_pages = 0;
+                for (const auto & kv : layer_pages_sorted_) {
+                    largest_layer_pages = std::max(largest_layer_pages, kv.second.size());
+                }
+                const long spec_max_slots = pool_.spec_max_slots();
+                std::cerr << "wp-expert-worker: WP_PREFILL_LAYER_AHEAD_DEPTH="
+                          << prefill_layer_ahead_depth_ << " engaged (spec_max_slots="
+                          << spec_max_slots << ", reserve=" << prefill_layer_ahead_reserve_
+                          << ", slots=" << pool_.total_slots() << ")" << std::endl;
+                if (spec_max_slots > 0 &&
+                    (long) prefill_layer_ahead_depth_ * (long) largest_layer_pages > spec_max_slots) {
+                    std::cerr << "WARN wp-expert-worker: WP_PREFILL_LAYER_AHEAD_DEPTH="
+                              << prefill_layer_ahead_depth_ << " * largest layer page count="
+                              << largest_layer_pages << " = "
+                              << (uint64_t) prefill_layer_ahead_depth_ * (uint64_t) largest_layer_pages
+                              << " exceeds WP_EXPERT_SPEC_MAX_SLOTS=" << spec_max_slots
+                              << " -- deeper depth targets may be truncated/re-offered "
+                                 "rather than submitted whole"
+                              << std::endl;
+                }
+            }
         }
         std::cerr << "WARN wp expert worker: WP_EXPERT_SPEC_DEMAND_FIRST="
                   << (spec_demand_first_ ? 1 : 0)
@@ -10494,7 +10639,12 @@ public:
     // here would not. Revisit an explicit cap only if live data with the
     // knob on still shows meaningful n_layerahead_spec_deferred_ pressure
     // (i.e. protection is frequently leaving L+2 with nothing to fetch into).
-    void submit_prefill_layer_ahead(int32_t layer, uint32_t n_tokens) {
+    // THE ORIGINAL SINGLE-TARGET IMPLEMENTATION, UNCHANGED. Only reachable at
+    // WP_PREFILL_LAYER_AHEAD_DEPTH<=1 (the default) -- see
+    // submit_prefill_layer_ahead()'s dispatch below. Kept verbatim, including
+    // ahead_target_'s "a truncated submit still latches the target as done"
+    // behaviour, so depth<=1 is byte-identical to before this knob existed.
+    void submit_prefill_layer_ahead_d1(int32_t layer, uint32_t n_tokens) {
         if (!prefill_layer_ahead_ || n_tokens <= prefill_layer_ahead_width_) {
             return;
         }
@@ -10551,10 +10701,15 @@ public:
             ahead_offered_layer_ = nxt;
         }
         std::vector<uint64_t> leases(pages.size(), pool_.spec_lease());
-        const size_t n = pool_.spec_pagein_submit(pages, leases, /*layer_ahead=*/ true);
+        // layer_ahead_depth=1: stats-only (see spec_pagein_submit's comment) --
+        // does not change the +1 in-flight cap headroom, which is still
+        // computed from prefill_layer_ahead_depth_==1 at this depth.
+        const size_t n = pool_.spec_pagein_submit(pages, leases, /*layer_ahead=*/ true,
+                                                  /*layer_ahead_depth=*/ 1);
         if (n > 0) {
             ahead_target_ = nxt;
             n_layerahead_pageins_ += n;
+            n_layerahead_pageins_by_depth_[0] += n;
             ++ahead_submits_;
             ahead_pages_ += n;
         } else if (pool_.spec_inflight_live() < pool_.spec_inflight_cap() + 1) {
@@ -10562,6 +10717,166 @@ public:
             // fetch for this target. Still at-cap returns 0 without this mark
             // so a later retry can submit.
             ahead_target_ = nxt;
+        }
+    }
+
+    // WP_PREFILL_LAYER_AHEAD_DEPTH>1: the same whole-layer-as-one-spec-batch
+    // mechanism as submit_prefill_layer_ahead_d1(), fanned out to N targets
+    // (next_served_layer chained from `layer`), nearest first, each tracked
+    // independently in ahead_targets_ instead of the single ahead_target_
+    // latch.
+    //
+    // BUDGET IS SHARED ACROSS TARGETS AND SPENT NEAREST-FIRST. Each loop
+    // iteration re-reads pool_.unpinned_slots() fresh rather than decrementing
+    // a running total: a landed layer-ahead page is PINNED for the duration of
+    // its async read (released only when the batch retires, see ensure_batch's
+    // pin/release_pins), so unpinned_slots() already reflects exactly what the
+    // nearer depth(s) just claimed this same call -- no separate bookkeeping
+    // needed to get nearest-first priority right.
+    //
+    // TRUNCATED TARGETS ARE RE-OFFERED, NOT LATCHED. Unlike ahead_target_
+    // above, ahead_targets_[d].settled is only set once a target's FULL
+    // current page list was handed to spec_pagein_submit with no budget cut
+    // (see `truncated` below) -- a truncated target keeps settled=false so the
+    // very next call (from time_layer_ahead's per-chunk retries, or the next
+    // request) offers it again. Passing the SAME full page list again is
+    // safe and cheap: spec_pagein_submit's own resident/in-flight filter
+    // (cold, in spec_pagein_submit) drops everything that already landed or
+    // is already reading, so only the genuinely-still-missing remainder ever
+    // reaches a reader thread.
+    void submit_prefill_layer_ahead_multi(int32_t layer, uint32_t n_tokens) {
+        if (!prefill_layer_ahead_ || n_tokens <= prefill_layer_ahead_width_) {
+            return;
+        }
+        if (pool_.demand_reads_outstanding()) {
+            ++pump_vram_demand_defer_;
+            ++n_layerahead_defers_;
+            return;
+        }
+        (void) pool_.spec_pagein_poll(false);
+
+        if (ahead_targets_.size() != prefill_layer_ahead_depth_) {
+            ahead_targets_.assign(prefill_layer_ahead_depth_, AheadTarget{});
+        }
+
+        int32_t chain_layer = layer;
+        for (size_t d = 0; d < ahead_targets_.size(); ++d) {
+            const int32_t nxt = next_served_layer(chain_layer);
+            if (nxt < 0) {
+                break;   // chain ran out of served layers before reaching depth d+1
+            }
+            chain_layer = nxt;
+            AheadTarget & tgt = ahead_targets_[d];
+            bool is_retry = false;
+
+            if (tgt.target_layer != nxt) {
+                // Dispatch advanced (or this depth slot never had a target
+                // yet): start fresh against the new target. Whatever was left
+                // of the OLD target is simply abandoned here, same as
+                // ahead_target_'s own "moving the gate drops the remainder".
+                tgt.target_layer = nxt;
+                tgt.settled      = false;
+                tgt.hinted       = false;
+            } else if (tgt.settled) {
+                // Already fully offered, untruncated -- nothing left to do
+                // for this depth this round, but keep walking the chain so
+                // deeper targets still get evaluated (and their own budget
+                // still reflects this target's earlier claim on the pool).
+                continue;
+            } else {
+                // Retrying a truncated (or previously deferred) target.
+                is_retry = true;
+                ++n_layerahead_reoffers_;
+            }
+
+            const auto it = layer_pages_sorted_.find(nxt);
+            if (it == layer_pages_sorted_.end() || it->second.empty()) {
+                tgt.settled = true;   // nothing to offer, nothing to retry
+                continue;
+            }
+
+            const size_t unpinned = pool_.unpinned_slots();
+            const size_t budget = unpinned > prefill_layer_ahead_reserve_
+                ? unpinned - prefill_layer_ahead_reserve_ : 0;
+            if (budget == 0) {
+                break;   // no room for this or any deeper target this call
+            }
+
+            std::vector<const ExpertPage *> pages = it->second;
+            bool truncated = false;
+            if (pages.size() > budget) {
+                truncated = true;
+                // Counted every time a truncated offer is retried, same as
+                // the d1 path counts it every time it truncates -- this is a
+                // "how much got cut this attempt" counter, not "how many
+                // pages are permanently lost" (a retried page that lands next
+                // time was still counted here on the attempt that cut it).
+                n_layerahead_truncated_ += pages.size() - budget;
+                std::nth_element(
+                    pages.begin(), pages.begin() + (ptrdiff_t) budget, pages.end(),
+                    [this](const ExpertPage * a, const ExpertPage * b) {
+                        const uint64_t ra = expert_recency_of(a->expert);
+                        const uint64_t rb = expert_recency_of(b->expert);
+                        if (ra != rb) {
+                            return ra > rb;
+                        }
+                        if (a->blob != b->blob) {
+                            return a->blob < b->blob;
+                        }
+                        return a->offset < b->offset;
+                    });
+                pages.resize(budget);
+                std::sort(pages.begin(), pages.end(),
+                          [](const ExpertPage * a, const ExpertPage * b) {
+                              if (a->blob != b->blob) {
+                                  return a->blob < b->blob;
+                              }
+                              return a->offset < b->offset;
+                          });
+            }
+
+            if (!tgt.hinted) {
+                n_layerahead_hints_ += it->second.size();
+                tgt.hinted = true;
+            }
+
+            std::vector<uint64_t> leases(pages.size(), pool_.spec_lease());
+            const size_t n = pool_.spec_pagein_submit(
+                pages, leases, /*layer_ahead=*/ true,
+                /*layer_ahead_depth=*/ (uint32_t) (d + 1));
+            if (n > 0) {
+                n_layerahead_pageins_ += n;
+                if (d < kMaxLayerAheadDepthTracked) {
+                    n_layerahead_pageins_by_depth_[d] += n;
+                }
+                ++ahead_submits_;
+                ahead_pages_ += n;
+                if (is_retry) {
+                    ++n_layerahead_retries_;   // a reoffer that actually landed something
+                }
+            }
+            if (!truncated &&
+                (n > 0 ||
+                 pool_.spec_inflight_live() < pool_.spec_inflight_cap() + prefill_layer_ahead_depth_)) {
+                // Either the full list submitted cleanly, or nothing was left
+                // to fetch (all resident/in-flight) and the pool was not at
+                // its layer-ahead in-flight cap -- either way this target is
+                // done until the chain moves it. If we ARE at that cap, leave
+                // settled=false so a later retry, once a batch drains, tries
+                // again instead of being mistaken for "nothing to fetch".
+                tgt.settled = true;
+            }
+        }
+    }
+
+    // Dispatches to the byte-identical single-target path at depth<=1 (the
+    // default), or the multi-target path above when WP_PREFILL_LAYER_AHEAD_
+    // DEPTH>1 is armed.
+    void submit_prefill_layer_ahead(int32_t layer, uint32_t n_tokens) {
+        if (prefill_layer_ahead_depth_ <= 1) {
+            submit_prefill_layer_ahead_d1(layer, n_tokens);
+        } else {
+            submit_prefill_layer_ahead_multi(layer, n_tokens);
         }
     }
 
@@ -10865,6 +11180,33 @@ public:
                          (unsigned long long) pool_.n_layerahead_evicted_spec_other_ahead(),
                          (unsigned long long) pool_.n_layerahead_evicted_spec_other_behind(),
                          (unsigned long long) pool_.n_layerahead_spec_deferred());
+            // WP_PREFILL_LAYER_AHEAD_DEPTH>1 only -- pageins/hits broken out by
+            // which depth target (d1 = nearest) submitted the page, plus the
+            // re-offer/defer/retry counters the multi-target path adds. Kept
+            // as a second line, gated on depth>1, so the line above (and its
+            // exact field layout) is byte-identical at the default depth==1.
+            if (prefill_layer_ahead_depth_ > 1) {
+                std::string pageins_by_depth;
+                std::string hits_by_depth;
+                for (size_t d = 0; d < prefill_layer_ahead_depth_ &&
+                                    d < kMaxLayerAheadDepthTracked; ++d) {
+                    if (d != 0) {
+                        pageins_by_depth += '/';
+                        hits_by_depth    += '/';
+                    }
+                    pageins_by_depth += std::to_string(n_layerahead_pageins_by_depth_[d]);
+                    hits_by_depth    += std::to_string(pool_.n_layerahead_hits_by_depth(d + 1));
+                }
+                std::fprintf(stderr,
+                             "wp-expert-worker prefill layer-ahead depth: depth=%u "
+                             "pageins[d1..dN]=%s hits[d1..dN]=%s "
+                             "reoffers=%llu defers=%llu retries=%llu\n",
+                             prefill_layer_ahead_depth_,
+                             pageins_by_depth.c_str(), hits_by_depth.c_str(),
+                             (unsigned long long) n_layerahead_reoffers_,
+                             (unsigned long long) n_layerahead_defers_,
+                             (unsigned long long) n_layerahead_retries_);
+            }
         }
     }
 
@@ -11959,7 +12301,10 @@ public:
             stats_.set_ram_stats(pool_.host_landed(), (uint64_t) arena.resident_bytes(),
                                  (uint64_t) arena.pinned_bytes(), arena.evictions(),
                                  arena.admission_cold_landed(),
-                                 arena.lookups(), arena.lookup_hits());
+                                 arena.lookups(), arena.lookup_hits(),
+                                 arena.evictions_spec(), arena.evictions_reject(),
+                                 arena.evictions_lru(), arena.reject_promotions(),
+                                 arena.spec_promotions_rejected());
         }
         stats_.set_layerahead_stats(
             n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits(),
@@ -12434,6 +12779,24 @@ private:
         const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
         return v > 0 ? (size_t) v : (size_t) 0;
     }();
+    // WP_PREFILL_LAYER_AHEAD_DEPTH -- how many served layers ahead of the one
+    // being dispatched to keep prefetching, chained via next_served_layer(),
+    // nearest first. Default 1 = today's behaviour EXACTLY: submit_prefill_
+    // layer_ahead() below still calls submit_prefill_layer_ahead_d1(), the
+    // original single-target function body, untouched, whenever this is <=1.
+    // >1 fans the SAME "one whole layer as one spec-VRAM batch" mechanism out
+    // to N independently-tracked targets (submit_prefill_layer_ahead_multi(),
+    // see ahead_targets_ below) instead of the single ahead_target_/
+    // ahead_offered_layer_ latch, so a deeper target's budget truncation never
+    // blocks a nearer one, and (unlike the d1 path, which never revisits a
+    // target once ANY page of it has been offered -- see ahead_target_'s
+    // comment) a truncated target is re-offered on the next call instead of
+    // being treated as permanently done.
+    const uint32_t     prefill_layer_ahead_depth_ = [] {
+        const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD_DEPTH");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 1;
+        return v > 1 ? (uint32_t) v : (uint32_t) 1;
+    }();
     uint64_t           ahead_submits_ = 0;
     uint64_t           ahead_pages_   = 0;
     uint64_t           n_layerahead_hints_   = 0;
@@ -12444,8 +12807,46 @@ private:
     // distinguishable from an eviction after landing (pool_.n_layerahead_
     // evicted_demand()/n_layerahead_evicted_spec(), see ExpertSlotPool).
     uint64_t           n_layerahead_truncated_       = 0;
+    // ahead_target_/ahead_offered_layer_: the ORIGINAL single-target latch,
+    // read/written ONLY by submit_prefill_layer_ahead_d1() -- kept exactly as
+    // it always was so that function's behaviour (including the "a truncated
+    // submit still latches the target as done" bug noted above) is byte-
+    // identical at WP_PREFILL_LAYER_AHEAD_DEPTH<=1.
     int32_t            ahead_target_         = -1;
     int32_t            ahead_offered_layer_  = -1;
+    // Per-depth-slot target state for WP_PREFILL_LAYER_AHEAD_DEPTH>1, used
+    // only by submit_prefill_layer_ahead_multi(). Index d holds depth d+1
+    // (index 0 = the nearest target, next_served_layer(layer)).
+    struct AheadTarget {
+        int32_t target_layer = -1;  // layer this depth slot is currently after
+        bool    hinted       = false; // n_layerahead_hints_ already counted it
+        bool    settled      = false; // offered its FULL page list, untruncated
+    };
+    std::vector<AheadTarget> ahead_targets_;
+    // Pages submitted per depth (index 0 = depth 1), for the "prefill layer-
+    // ahead depth:" log line. Mirrors ExpertSlotPool::kMaxLayerAheadDepthTracked
+    // (private to the pool, so duplicated here rather than exposed) -- must
+    // match it or the pageins-by-depth and hits-by-depth arrays printed on the
+    // same line silently disagree about where the cap is.
+    static constexpr size_t kMaxLayerAheadDepthTracked = 8;
+    uint64_t           n_layerahead_pageins_by_depth_[kMaxLayerAheadDepthTracked] = {};
+    // A depth target whose page list was truncated by budget last time and is
+    // being offered again (its remaining pages -- spec_pagein_submit's own
+    // resident/in-flight filter keeps this from re-reading anything that
+    // already landed).
+    uint64_t           n_layerahead_reoffers_ = 0;
+    // submit_prefill_layer_ahead_multi() found demand reads still outstanding
+    // for the current layer and deferred the whole call (see spec_demand_
+    // first_'s comment elsewhere -- same demand-first policy as d1, counted
+    // separately here so depth>1's own defer rate is visible without wading
+    // through pump_vram_demand_defer_, which also counts the unrelated
+    // decode-time spec_pagein_step pump's defers).
+    uint64_t           n_layerahead_defers_   = 0;
+    // A call that actually re-submitted a previously-truncated target's
+    // remaining pages (subset of n_layerahead_reoffers_ that found the budget
+    // to submit at least one page rather than being reoffered-but-starved
+    // again).
+    uint64_t           n_layerahead_retries_  = 0;
     std::vector<uint64_t> expert_recency_;
     uint64_t           recency_tick_ = 0;
     // WP_EXPERT_SPEC_CHUNK -- pages read per idle step. 1 by default: this is
@@ -17849,6 +18250,16 @@ public:
                                 "registration needs a pool buffer and is not used)"
                               : "")
                       << std::endl;
+            // Once-per-process line proving the policy actually took effect
+            // (not just that the env var parsed): a live run comparing
+            // ram_evictions_lru before/after this change needs to know for
+            // certain which binary/config produced the numbers.
+            if (cfg.freq_admission) {
+                std::cerr << "wp::HostArena: WP_HOST_TIER_POLICY=freq_admit engaged"
+                          << " tier_mb=" << (cfg.tier_bytes >> 20)
+                          << " entries=" << arena_.entry_count()
+                          << " sketch_width=" << cfg.sketch_width << std::endl;
+            }
             arena_inflight_max_ = (size_t) cfg.read_inflight_max;
             if (test_hooks != nullptr && test_hooks->arena_ready) {
                 test_hooks->arena_ready(arena_.entry_count(), arena_.entry_bytes(),

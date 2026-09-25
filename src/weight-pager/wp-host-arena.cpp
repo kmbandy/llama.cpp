@@ -66,6 +66,7 @@ void HostArena::shutdown() {
     by_page_.clear();
     lru_.clear();
     spec_lru_.clear();
+    reject_lru_.clear();
 
     resident_count_       = 0;
     resident_bytes_       = 0;
@@ -73,8 +74,13 @@ void HostArena::shutdown() {
     spec_bytes_           = 0;
     reading_count_        = 0;
     evictions_            = 0;
+    evictions_spec_       = 0;
+    evictions_reject_     = 0;
+    evictions_lru_        = 0;
     spec_evicted_unused_  = 0;
     spec_promotions_      = 0;
+    reject_promotions_    = 0;
+    spec_promotions_rejected_ = 0;
     begin_read_refusals_  = 0;
     admission_cold_landed_ = 0;
     lookups_       = 0;
@@ -95,30 +101,28 @@ bool HostArena::is_initialized() const {
 
 void HostArena::remove_from_list_locked_(size_t idx) {
     Entry & e = entries_[idx];
-    if (e.loc == ListLoc::Lru)      lru_.erase(e.lru_pos);
-    else if (e.loc == ListLoc::SpecLru) spec_lru_.erase(e.lru_pos);
+    if (e.loc == ListLoc::Lru)           lru_.erase(e.lru_pos);
+    else if (e.loc == ListLoc::SpecLru)  spec_lru_.erase(e.lru_pos);
+    else if (e.loc == ListLoc::RejectLru) reject_lru_.erase(e.lru_pos);
     e.loc = ListLoc::None;
 }
 
-void HostArena::insert_mru_locked_(size_t idx, bool speculative) {
+void HostArena::insert_mru_locked_(size_t idx, ListLoc loc) {
     Entry & e = entries_[idx];
-    if (speculative) {
-        spec_lru_.push_back(idx);
-        e.lru_pos = std::prev(spec_lru_.end());
-        e.loc     = ListLoc::SpecLru;
-    } else {
-        lru_.push_back(idx);
-        e.lru_pos = std::prev(lru_.end());
-        e.loc     = ListLoc::Lru;
-    }
+    std::list<size_t> * list = loc == ListLoc::SpecLru   ? &spec_lru_
+                              : loc == ListLoc::RejectLru ? &reject_lru_
+                                                           : &lru_;
+    list->push_back(idx);
+    e.lru_pos = std::prev(list->end());
+    e.loc     = loc;
 }
 
 void HostArena::touch_locked_(size_t idx) {
     Entry & e = entries_[idx];
     if (e.loc == ListLoc::None) return;   // pinned (or not resident) -- nothing to touch
-    const bool speculative = e.loc == ListLoc::SpecLru;
+    const ListLoc loc = e.loc;   // stays in the same list -- touch is a recency bump, not a promotion
     remove_from_list_locked_(idx);
-    insert_mru_locked_(idx, speculative);
+    insert_mru_locked_(idx, loc);
 }
 
 size_t HostArena::spec_cap_entries_() const {
@@ -204,93 +208,127 @@ uint32_t HostArena::sketch_estimate_locked_(int page_idx) const {
 //
 // admit_landed_locked_ is the one place that memory gets used: a freshly
 // landed DEMAND page (never a speculative one -- those keep the pre-existing
-// prefetch-protection ordering untouched) is placed at the cold (LRU-front,
-// next-to-evict) end instead of the usual MRU end when (a) landing it will
-// require a trim, (b) that trim's victim would come from the demand list
-// (spec_lru_ has nothing left to give up -- if it does, the incoming page
-// isn't really competing with anything, so let it land hot as before), and
-// (c) the incoming page's sketch estimate is NOT STRICTLY GREATER than the
-// victim's -- a tie goes to the INCUMBENT.
+// prefetch-protection ordering untouched) is placed in reject_lru_ instead
+// of lru_ when (a) landing it will require a trim, (b) spec_lru_ has
+// nothing left to give up (if it does, the incoming page isn't really
+// competing with anything that matters, so let it land in lru_ as normal;
+// spec_lru_ absorbs the trim instead), and (c) the incoming page's sketch
+// estimate is NOT STRICTLY GREATER than the WEAKEST currently resident
+// page's -- reject_lru_'s own front if it has anything, else lru_'s front
+// -- a tie goes to the INCUMBENT.
 //
-// Deliberately NOT recorded here: landing a page does not, by itself, bump
-// its own sketch count (only borrow() -- an actual repeat reference -- does,
-// see below). A fresh miss is exactly as uninformative about future demand
-// as the LRU victim it is displacing; recording on landing would let a page
-// win purely for having been read a SECOND calendar time (once per sweep
-// pass, same as literally every other swept page), which defeats the
-// tie-break below and degenerates back to plain LRU. With landing
-// unrecorded, a page's estimate is 0 until it earns a real hit, so on a
-// pure cyclic sweep (every page touched exactly once per pass, nothing ever
-// resident long enough to be hit twice) every comparison is a 0-vs-0 tie
-// forever -- and tie-favors-incumbent is what makes that converge: whichever
-// ~tier_size pages happen to be resident when the tier first fills keep
-// winning every subsequent tie (a challenger can only unseat them by
-// scoring STRICTLY higher, which requires a real hit, which a page that
-// self-evicts before anyone can reference it again can never get). Hit rate
-// settles at tier_size / sweep_size once locked in, instead of the 0% plain
-// LRU gets on the same trace, and it locks in even without genuine
-// popularity differences.
+// *** 2026-09-25 REVISION: record on EVERY demand access, hit or miss. ***
+// The original version of this policy (commit 2ccf93034) deliberately did
+// NOT bump a page's sketch count on landing -- only borrow() (an actual
+// repeat reference) did. That was analyzed to converge to tier_size /
+// sweep_size hit rate on a cyclic sweep via tie-favors-incumbent. A live run
+// (2026-09-25, two back-to-back 24.5k-token prefills, main tier 24G/~1300
+// pages of a ~10k-page sweep) instead measured ram_evictions almost exactly
+// equal to ram_lookups -- i.e. a real cache-resident page was being evicted
+// on nearly every single page-in, not just during the cyclic churn among
+// losing candidates. The cause was NOT the sketch's recording rule: it was
+// that begin_read_locked_'s reservation (the call that actually vacates a
+// slot for the incoming read) had no visibility into admission at all --
+// admit_landed_locked_ only ever decided WHERE a page that had ALREADY been
+// read landed, after evict_one_locked_(Any) had already evicted whatever sat
+// at lru_.front() to make room for it. A losing candidate landing "cold" at
+// lru_.front() (the old design) was consequently always the very next
+// eviction victim, so the front of lru_ was, in steady state, permanently
+// occupied by the MOST RECENTLY rejected page -- meaning every subsequent
+// miss's reservation evicted a page that had ITSELF just displaced a real
+// resident one page-in ago, not a stable incumbent. reject_lru_ (this
+// revision) fixes the mechanism, not just the bookkeeping: a rejected
+// landing now goes to its OWN list, which evict_one_locked_ drains ahead of
+// lru_ (see the EvictScope::Any ordering in the .h), so the reservation for
+// the NEXT page-in takes its victim from reject_lru_ instead of lru_ as long
+// as reject_lru_ has anything in it -- and it always will, in steady state,
+// because one rejection happens on almost every non-admitted landing. Real
+// lru_ residents stop being touched by this churn entirely once the first
+// rejection has landed.
 //
-// The starvation this implies -- a challenger that loses its first tie
-// self-evicts before it can ever earn the hit that would let it win next
-// time, so a locked-in resident set can in principle hold forever even past
-// its actual popularity -- is now confined to PREFILL-vs-PREFILL contention
-// only (decode never lands through the gate at all, see below), which is
-// the scan-resistance behavior this exists to provide, not a bug: a prefill
-// sweep page losing forever to whatever else earned real hits (from decode,
-// or from surviving an earlier prefill pass) is the intended outcome. A
-// full W-TinyLFU windowed admit (the W segment gives every newcomer a
-// bounded number of real chances before facing the gate) would still be a
-// strictly more general fix and is a reasonable next step; not built here
-// because the phase split above already closes the one case
-// (docs/dev/sim-host-tier.py's freq_admit vs freq_admit_phase measurements)
-// where the simpler gate actually regressed something.
+// Recording on every access (not just hits) is what makes the comparison
+// meaningful under that fix: with reservation-time eviction no longer
+// clobbering lru_, a losing candidate's estimate must still be able to grow
+// via its own repeated MISSES (once per sweep pass) so that it can be
+// distinguished from a page that is winning purely by sweep order rather
+// than genuine reuse. On a pure cyclic sweep with no decode traffic, a
+// resident incumbent's estimate grows once per pass from decode/demand HITS
+// and a challenger's grows once per pass from its own MISSES -- the same
+// rate -- so ties still persist and tie-favors-incumbent still converges to
+// tier_size / sweep_size, exactly as before, but now with lru_evictions()
+// approaching 0 instead of tracking ram_lookups 1:1. Where this recording
+// change actually matters is decode: a page borrow()'d many times across a
+// session accrues a real, strictly-greater estimate than a same-pass-once
+// prefill sweep page, so it keeps winning admission ties even after being
+// evicted and re-read -- see HostArena::sketch_record_locked_'s doc comment.
+// Compare against the WEAKEST currently resident page: reject_lru_'s own
+// front if it has anything (reject_lru_ entries are, by construction, no
+// stronger than any lru_ entry -- comparing against them is still a real
+// admission test, not a free pass), else lru_'s front; false (never loses)
+// if both are empty -- nothing to compare against, so nothing to lose to.
+// Earlier revision of this bug (admit_landed_locked_ only): requiring
+// reject_lru_ to be EMPTY before comparing at all meant the gate stopped
+// firing the moment the first page was ever rejected (which happens almost
+// immediately and then stays true forever in one-in-one-out steady state --
+// see evict_one_locked_'s reject-first preference), so every later
+// candidate landed hot unconditionally: a simulated cyclic sweep measured
+// 0% hit rate with that bug, not the tier_size/sweep_size convergence the
+// design intends. Comparing against reject_lru_'s own front instead of
+// skipping the comparison keeps the gate live regardless of reject_lru_'s
+// occupancy.
+bool HostArena::loses_admission_locked_(int page_idx) const {
+    if (reject_lru_.empty() && lru_.empty()) return false;
+    const size_t victim_idx = !reject_lru_.empty() ? reject_lru_.front() : lru_.front();
+    const uint32_t cand_f  = sketch_estimate_locked_(page_idx);
+    const uint32_t vict_f  = sketch_estimate_locked_(entries_[victim_idx].page_idx);
+    return cand_f <= vict_f;
+}
+
 void HostArena::admit_landed_locked_(size_t idx, bool prefill_hint) {
     Entry & e = entries_[idx];
     bool land_cold = false;
     if (cfg_.freq_admission && !e.speculative && prefill_hint) {
         const bool would_trim = resident_bytes_ - pinned_bytes_ > cfg_.tier_bytes;
-        if (would_trim && spec_lru_.empty() && !lru_.empty()) {
-            const size_t victim_idx = lru_.front();
-            const uint32_t cand_f  = sketch_estimate_locked_(e.page_idx);
-            const uint32_t vict_f  = sketch_estimate_locked_(entries_[victim_idx].page_idx);
-            land_cold = cand_f <= vict_f;
+        if (would_trim && spec_lru_.empty()) {
+            land_cold = loses_admission_locked_(e.page_idx);
         }
     }
-    insert_mru_locked_(idx, e.speculative);
     if (land_cold) {
-        remove_from_list_locked_(idx);
-        lru_.push_front(idx);
-        entries_[idx].lru_pos = lru_.begin();
-        entries_[idx].loc     = ListLoc::Lru;
+        insert_mru_locked_(idx, ListLoc::RejectLru);
         ++admission_cold_landed_;
+    } else {
+        insert_mru_locked_(idx, e.speculative ? ListLoc::SpecLru : ListLoc::Lru);
     }
 }
 
-// Evict a single entry, preferring a speculative victim (a misprediction
-// must never displace a page the caller actually demanded). Scans the
-// applicable list from the front, skipping a borrowed entry IN PLACE
+// Evict a single entry, preferring the cheapest victim first: spec_lru_
+// (a misprediction must never displace a page the caller actually
+// demanded), then reject_lru_ (a page admission already judged disposable
+// -- see admit_landed_locked_ -- is a strictly better victim than a page
+// that won admission), and lru_ only as the last resort. Scans the
+// applicable list(s) from the front, skipping a borrowed entry IN PLACE
 // (neither removed nor reordered -- a later attempt sees it in the same
-// spot), and evicts the first unborrowed entry found. SpecOnly refuses
-// outright if spec_lru_ has no unborrowed entry rather than falling back to
-// a demand victim, because a full spec budget must be relieved from the
-// spec side, never the demand side.
+// spot), and evicts the first unborrowed entry found in the
+// highest-priority list that has one. SpecOnly/SpecOrReject refuse outright
+// rather than falling back to lru_, because a speculative read must never
+// steal room from a confirmed demand page just to seat a guess (see the
+// .h EvictScope comment).
 bool HostArena::evict_one_locked_(EvictScope scope) {
-    size_t idx    = 0;
-    bool   found  = false;
-    bool   from_spec = false;
+    size_t idx   = 0;
+    bool   found = false;
+    ListLoc from = ListLoc::None;
 
     for (size_t cand : spec_lru_) {
-        if (entries_[cand].borrows == 0) {
-            idx = cand; found = true; from_spec = true; break;
+        if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::SpecLru; break; }
+    }
+    if (!found && scope != EvictScope::SpecOnly) {
+        for (size_t cand : reject_lru_) {
+            if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::RejectLru; break; }
         }
     }
-    if (!found) {
-        if (scope == EvictScope::SpecOnly) return false;
+    if (!found && scope == EvictScope::Any) {
         for (size_t cand : lru_) {
-            if (entries_[cand].borrows == 0) {
-                idx = cand; found = true; from_spec = false; break;
-            }
+            if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::Lru; break; }
         }
     }
     if (!found) return false;
@@ -298,14 +336,19 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
     Entry & e = entries_[idx];
     const int page_idx = e.page_idx;
 
-    if (from_spec) {
+    if (from == ListLoc::SpecLru) {
         spec_lru_.erase(e.lru_pos);
         spec_bytes_ -= cfg_.entry_bytes;
         // Still speculative when evicted: only "unused" if a demand or
         // peek borrow() never touched it (see ever_borrowed).
         if (!e.ever_borrowed) ++spec_evicted_unused_;
+        ++evictions_spec_;
+    } else if (from == ListLoc::RejectLru) {
+        reject_lru_.erase(e.lru_pos);
+        ++evictions_reject_;
     } else {
         lru_.erase(e.lru_pos);
+        ++evictions_lru_;
     }
     e.loc = ListLoc::None;
 
@@ -426,7 +469,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             idx = free_.back();
             free_.pop_back();
         } else if (evict_one_locked_(
-                       cfg_.freq_admission ? EvictScope::SpecOnly : EvictScope::Any)) {
+                       cfg_.freq_admission ? EvictScope::SpecOrReject : EvictScope::Any)) {
             // *** THE BUG THE LIVE 2026-09-25 RUN FOUND: n_host_hit=0 EVEN
             // WITH A TIER SIZED TO HOLD THE WHOLE WORKING SET. ***
             // admit_landed_locked_ only gates WHERE a demand page LANDS
@@ -449,13 +492,17 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             // distinct page count (speculative churn, not genuine demand
             // turnover) and n_host_hit staying at 0 regardless of tier size.
             // Fix: under freq_admission, a speculative reservation must
-            // relieve ONLY the speculative side (SpecOnly) -- if spec has
-            // nothing evictable either, refuse (the existing
-            // begin_read_refusals_ / "advisory, never fails the worker"
-            // contract every other speculative-path failure already uses)
-            // rather than stealing a demand page to seat a guess. Gated on
-            // cfg_.freq_admission so default (policy unset) behaviour is
-            // byte-for-byte unchanged.
+            // relieve ONLY the speculative or reject side (SpecOrReject,
+            // widened from the original SpecOnly once reject_lru_ existed --
+            // a disposable reject_lru_ entry is no worse a victim for a
+            // guess than another speculative one, and letting spec draw on
+            // it instead of refusing outright means fewer begin_read_refusals_
+            // under heavy layer-ahead prefetch) -- if BOTH have nothing
+            // evictable, refuse (the existing begin_read_refusals_ /
+            // "advisory, never fails the worker" contract every other
+            // speculative-path failure already uses) rather than stealing a
+            // demand page to seat a guess. Gated on cfg_.freq_admission so
+            // default (policy unset) behaviour is byte-for-byte unchanged.
             idx = free_.back();
             free_.pop_back();
         } else {
@@ -473,6 +520,21 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             ++begin_read_refusals_;
             return false;
         }
+    }
+
+    // Record this demand access into the frequency sketch NOW, on the one
+    // definitive success path (not per retry attempt -- reserve_wait/
+    // begin_read_wait may call begin_read_locked_ several times for the
+    // SAME logical page-in while capacity is refused, and recording on
+    // every attempt would inflate a congested page's estimate for reasons
+    // unrelated to genuine popularity). Paired with borrow()'s own
+    // recording on every demand HIT, this is what makes "every demand
+    // access, hit or miss" (see the 2026-09-25 revision comment above
+    // admit_landed_locked_) actually every access exactly once: a page
+    // either hits (borrow() records) or misses and reserves here (this
+    // records) -- never both for the same access.
+    if (cfg_.freq_admission && !speculative) {
+        sketch_record_locked_(page_idx);
     }
 
     Entry & e     = entries_[idx];
@@ -535,7 +597,8 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borr
 
 // --- hit path ---------------------------------------------------------
 
-bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand) {
+bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand,
+                       bool prefill_hint) {
     std::lock_guard<std::mutex> lock(mu_);
     ++lookups_;   // unconditional: proves the lookup path is even reached (see .h comment)
     auto it = by_page_.find(page_idx);
@@ -562,12 +625,56 @@ bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out,
     if (!e.pinned) {
         if (demand && e.speculative) {
             // A demand hit confirms a prediction: promote out of the
-            // speculative side into the demand side.
+            // speculative side into the demand side. 2026-09-25: THIS is the
+            // promotion path a live run found unguarded -- under
+            // freq_admission, a prefill-hinted promotion is gated exactly
+            // like a fresh demand landing (admit_landed_locked_), using the
+            // SAME loses_admission_locked_ comparison, because on live
+            // traffic dominated by layer-ahead speculative reads this path
+            // (not admit_landed_locked_'s finish_read call, which a
+            // speculative landing never even passes prefill_hint=true to)
+            // is where nearly every page actually enters demand standing.
+            // Leaving it ungated made the whole policy a no-op: every
+            // promoted page landed hot regardless of frequency, degenerating
+            // to plain LRU. No would_trim precondition here (unlike
+            // admit_landed_locked_): promoting doesn't add resident bytes
+            // (the page is already Resident, just relabeled), so there is no
+            // "would this landing need a trim" question -- only "does this
+            // page deserve genuine lru_ standing", which is always worth
+            // asking once the tier is at its cap. Deliberately >= here, NOT
+            // > like admit_landed_locked_'s would_trim: that check runs
+            // AFTER resident_bytes_ already counts the new landing, so ==
+            // there means "fit with room to spare, nothing to gate". Here
+            // resident_bytes_ does NOT change (the page is already
+            // Resident), and trim_to_tier_cap_locked_ keeps the tier at
+            // EXACTLY tier_bytes in steady state between separate calls (it
+            // always restores <=, never leaves capacity transiently unspent)
+            // -- so a strict > would almost never be true when borrow() is
+            // later called on live traffic, silently reproducing the same
+            // "gate looks right but never fires" failure this whole promotion
+            // path exists to fix. >= is what actually engages at the
+            // steady-state cap.
+            const bool tier_full = resident_bytes_ - pinned_bytes_ >= cfg_.tier_bytes;
+            const bool reject_promotion =
+                cfg_.freq_admission && prefill_hint && tier_full &&
+                loses_admission_locked_(page_idx);
             remove_from_list_locked_(idx);
             e.speculative = false;
             spec_bytes_ -= cfg_.entry_bytes;
             ++spec_promotions_;
-            insert_mru_locked_(idx, false);
+            if (reject_promotion) {
+                insert_mru_locked_(idx, ListLoc::RejectLru);
+                ++spec_promotions_rejected_;
+            } else {
+                insert_mru_locked_(idx, ListLoc::Lru);
+            }
+        } else if (demand && e.loc == ListLoc::RejectLru) {
+            // A demand hit on a page admission had judged disposable: it
+            // just proved itself worth keeping after all, same promotion
+            // shape as the speculative case above.
+            remove_from_list_locked_(idx);
+            ++reject_promotions_;
+            insert_mru_locked_(idx, ListLoc::Lru);
         } else {
             touch_locked_(idx);
         }
@@ -645,7 +752,9 @@ void HostArena::unpin(int page_idx) {
     e.pinned = false;
     pinned_bytes_ -= cfg_.entry_bytes;
     if (e.state == State::Resident) {
-        insert_mru_locked_(idx, e.speculative);
+        // Never back to reject_lru_: unpinning is an explicit decision that
+        // this page still matters, the same standing a promoted page gets.
+        insert_mru_locked_(idx, e.speculative ? ListLoc::SpecLru : ListLoc::Lru);
     }
     // The entry just became evictable: a reserve_wait()/begin_read_wait()
     // parked on "nothing evictable" must re-check.
@@ -682,6 +791,11 @@ uint64_t HostArena::spec_evicted_unused() const { std::lock_guard<std::mutex> lo
 uint64_t HostArena::spec_promotions()     const { std::lock_guard<std::mutex> lock(mu_); return spec_promotions_; }
 uint64_t HostArena::begin_read_refusals() const { std::lock_guard<std::mutex> lock(mu_); return begin_read_refusals_; }
 uint64_t HostArena::admission_cold_landed() const { std::lock_guard<std::mutex> lock(mu_); return admission_cold_landed_; }
+uint64_t HostArena::evictions_spec()   const { std::lock_guard<std::mutex> lock(mu_); return evictions_spec_; }
+uint64_t HostArena::evictions_reject() const { std::lock_guard<std::mutex> lock(mu_); return evictions_reject_; }
+uint64_t HostArena::evictions_lru()    const { std::lock_guard<std::mutex> lock(mu_); return evictions_lru_; }
+uint64_t HostArena::reject_promotions() const { std::lock_guard<std::mutex> lock(mu_); return reject_promotions_; }
+uint64_t HostArena::spec_promotions_rejected() const { std::lock_guard<std::mutex> lock(mu_); return spec_promotions_rejected_; }
 uint64_t HostArena::lookups()     const { std::lock_guard<std::mutex> lock(mu_); return lookups_; }
 uint64_t HostArena::lookup_hits() const { std::lock_guard<std::mutex> lock(mu_); return lookup_hits_; }
 

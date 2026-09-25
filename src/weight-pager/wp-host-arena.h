@@ -23,6 +23,16 @@
 // a page the caller actually demanded. Pinned entries live in neither list
 // (pin() removes the entry from its LRU) so LRU eviction never considers
 // them. Reading entries are also in neither list.
+//
+// freq_admission only: a third list, `reject_lru_`, holds demand landings
+// that lost the admission comparison in admit_landed_locked_ (2026-09-25
+// revision -- see the block comment above that function in the .cpp). These
+// pages are genuinely resident (a caller can still borrow() one; a hit
+// promotes it into lru_ exactly like a confirmed speculative page promotes
+// out of spec_lru_) but disposable: eviction drains reject_lru_ ahead of
+// lru_ (after spec_lru_), so a rejected landing's own eventual replacement
+// almost never has to touch a page that actually won admission. Empty and
+// unused whenever freq_admission is false.
 
 #include <cstddef>
 #include <cstdint>
@@ -143,7 +153,21 @@ public:
     // Resident only. Increments borrow count, touches LRU, clears
     // `speculative` (a demand hit confirms a prediction) unless
     // demand=false. Returns false on miss or if the entry is Reading.
-    bool borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand = true);
+    // prefill_hint: same meaning as finish_read()'s -- true iff this access
+    // belongs to a prefill request. 2026-09-25: live traffic is
+    // overwhelmingly layer-ahead SPECULATIVE reads (WP_PREFILL_LAYER_AHEAD),
+    // which land Resident-but-speculative and only become genuine lru_
+    // residents THROUGH THIS FUNCTION's spec->demand promotion on their
+    // first real reference -- a landing that finish_read()/
+    // admit_landed_locked_() never sees at all (it already happened,
+    // silently, as a speculative landing). Under freq_admission, that
+    // promotion is admission-gated here exactly like a fresh demand landing
+    // is gated in admit_landed_locked_ -- see the .cpp for why, and why an
+    // un-gated promotion path made the whole policy a no-op in production
+    // (ram_evictions_lru tracked ram_lookups almost 1:1, ~0 hit rate) even
+    // though the demand-landing gate alone looked correct in isolation.
+    bool borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand = true,
+               bool prefill_hint = false);
     void release(int page_idx, Handle handle);
 
     // --- pinning (coding hot set) ---
@@ -166,15 +190,36 @@ public:
     size_t spec_bytes()      const;
     size_t reading_count()   const;
     size_t chunk_count()     const;
-    uint64_t evictions()             const;
+    uint64_t evictions()             const;   // total, all three lists combined
     uint64_t spec_evicted_unused()   const;
     uint64_t spec_promotions()       const;
     uint64_t begin_read_refusals()   const;  // inflight cap / nothing evictable
-    // freq_admission only: demand landings placed at the cold (immediately
-    // evictable) end instead of MRU because the incoming page's sketch
-    // estimate lost to the current LRU victim's. Always 0 when the policy
-    // is off.
+    // freq_admission only: demand landings placed in reject_lru_ instead of
+    // lru_ because the incoming page's sketch estimate lost to the current
+    // lru_ victim's. Always 0 when the policy is off. This is the
+    // "admission rejects" counter -- how many landings were judged not
+    // worth displacing a real resident for.
     uint64_t admission_cold_landed() const;
+    // Eviction breakdown by source list, so a live run can show WHERE the
+    // churn is landing: evictions_spec() + evictions_reject() +
+    // evictions_lru() == evictions(). Under freq_admission, once the
+    // resident set stabilises, evictions_lru() should approach 0 -- the
+    // whole point of reject_lru_ is that repeat rejected/disposable
+    // landings absorb the eviction traffic instead of real residents.
+    uint64_t evictions_spec()   const;
+    uint64_t evictions_reject() const;
+    uint64_t evictions_lru()    const;
+    // freq_admission only: a demand hit promoted an entry out of
+    // reject_lru_ into lru_ (parallel to spec_promotions()).
+    uint64_t reject_promotions() const;
+    // freq_admission only: of spec_promotions() (borrow()'s spec->demand
+    // promotions), how many LOST the admission comparison and were routed
+    // into reject_lru_ instead of lru_ -- the counter proving the
+    // promotion-path gate (added 2026-09-25, see borrow()'s prefill_hint
+    // comment) is actually engaging on the traffic that matters. Always 0
+    // when the policy is off, and always 0 for a decode-hinted (prefill_hint
+    // =false) promotion, same phase split as admission_cold_landed().
+    uint64_t spec_promotions_rejected() const;
     // Proof-of-lookup counters, unconditional (not freq_admission-gated):
     // every borrow() call is one cache lookup attempt (the only lookup path
     // -- the demand pagein path is currently the only caller). Added
@@ -192,7 +237,7 @@ private:
     // Which LRU list (if any) currently holds this entry. Pinned and Reading
     // entries are in neither (None); a Resident entry is in exactly one of
     // spec_lru_ (speculative) or lru_ (demand) unless it is pinned.
-    enum class ListLoc : uint8_t { None, Lru, SpecLru };
+    enum class ListLoc : uint8_t { None, Lru, SpecLru, RejectLru };
 
     struct Entry {
         int      page_idx     = -1;
@@ -216,25 +261,29 @@ private:
     };
 
     // Which side of the partition an eviction may take from. Any scans
-    // spec_lru_ first, falling back to lru_; SpecOnly restricts the victim to
-    // spec_lru_ (used when a new speculative read needs a victim and the
-    // spec cap is already full -- it must not steal room from a demand page
-    // just to seat a guess).
+    // spec_lru_, then reject_lru_, then falls back to lru_ last; SpecOnly
+    // restricts the victim to spec_lru_; SpecOrReject scans spec_lru_ then
+    // reject_lru_ but never falls back to lru_. SpecOnly/SpecOrReject exist
+    // for a speculative begin_read that needs a victim under freq_admission
+    // -- it must not steal room from a demand page (lru_) just to seat a
+    // guess, but it MAY take a reject_lru_ entry (already judged disposable
+    // by admission, so no worse a victim than another speculative one).
     //
-    // Eviction is a scan: walk the applicable list from the front, skipping
-    // a borrowed entry IN PLACE (it is neither removed nor reordered, so a
-    // later attempt sees it in the same spot), and evict the first unborrowed
-    // entry found. Refuse only when the scan reaches the end of both lists
-    // without finding one. This keeps eviction order exactly LRU order among
-    // the entries that are actually evictable at the moment.
-    enum class EvictScope { Any, SpecOnly };
+    // Eviction is a scan: walk the applicable list(s) from the front,
+    // skipping a borrowed entry IN PLACE (it is neither removed nor
+    // reordered, so a later attempt sees it in the same spot), and evict the
+    // first unborrowed entry found in the highest-priority list that has
+    // one. Refuse only when every list in scope is exhausted without
+    // finding one. This keeps eviction order exactly LRU order within each
+    // list, and reject_lru_/spec_lru_ ahead of lru_ across lists.
+    enum class EvictScope { Any, SpecOnly, SpecOrReject };
 
     bool     evict_one_locked_(EvictScope scope);
     void     trim_to_tier_cap_locked_();
     // Caller holds mu_. Shared body of begin_read()/begin_read_wait().
     bool     begin_read_locked_(int page_idx, bool speculative, void ** data_out, Handle * handle_out);
     void     remove_from_list_locked_(size_t idx);
-    void     insert_mru_locked_(size_t idx, bool speculative);
+    void     insert_mru_locked_(size_t idx, ListLoc loc);
     void     touch_locked_(size_t idx);
     size_t   spec_cap_entries_() const;
     size_t   pinned_cap_entries_() const;
@@ -253,6 +302,18 @@ private:
     // Called from finish_read()'s ok==true branch instead of a bare
     // insert_mru_locked_ call when cfg_.freq_admission is set.
     void     admit_landed_locked_(size_t idx, bool prefill_hint);
+    // Caller holds mu_. Shared admission test: does `page_idx` fail to beat
+    // the weakest currently resident page (reject_lru_'s own front if it
+    // has anything, else lru_'s front; false -- never loses -- if both are
+    // empty, nothing to compare against)? Tie goes to the incumbent (loses).
+    // Used by admit_landed_locked_ (a freshly read demand page) AND by
+    // borrow()'s spec->demand promotion (an already-resident speculative
+    // page's first real reference) -- both are "should this page hold
+    // genuine lru_ standing" decisions under freq_admission, and must use
+    // the identical comparison or one path becomes a backdoor around the
+    // other (see borrow()'s prefill_hint comment for why this was missed
+    // the first time: it looked like only admit_landed_locked_ needed it).
+    bool     loses_admission_locked_(int page_idx) const;
 
     mutable std::mutex mu_;
     // Notified by every release() and finish_read() (both outcomes) -- the
@@ -273,6 +334,7 @@ private:
     // LRU order: front = least recently used, back = most recently used.
     std::list<size_t> lru_;
     std::list<size_t> spec_lru_;
+    std::list<size_t> reject_lru_;   // freq_admission only; see the .h banner comment
 
     Handle next_gen_ = kInvalidHandle + 1;
 
@@ -283,8 +345,13 @@ private:
     size_t   reading_count_  = 0;
 
     uint64_t evictions_           = 0;
+    uint64_t evictions_spec_      = 0;
+    uint64_t evictions_reject_    = 0;
+    uint64_t evictions_lru_       = 0;
     uint64_t spec_evicted_unused_ = 0;
     uint64_t spec_promotions_     = 0;
+    uint64_t reject_promotions_   = 0;
+    uint64_t spec_promotions_rejected_ = 0;
     uint64_t begin_read_refusals_ = 0;
     uint64_t admission_cold_landed_ = 0;
     uint64_t lookups_     = 0;

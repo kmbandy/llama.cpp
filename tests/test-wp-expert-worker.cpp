@@ -2944,6 +2944,315 @@ void test_prefill_layer_ahead_two_rounds_evict_spec(bool protect) {
             "worker returned failure during the cross-round layer-ahead reproduction");
 }
 
+// WP_PREFILL_LAYER_AHEAD_DEPTH=2: ONE prefill-shaped dispatch on LAYER must
+// fan out to BOTH OTHER_LAYER (depth 1, nearest) and THIRD_LAYER (depth 2),
+// nearest first -- and a truncated deeper target must be RE-OFFERED (unlike
+// the depth<=1 path's ahead_target_, which latches a target "done" the
+// moment anything of it is submitted, truncated or not -- see
+// submit_prefill_layer_ahead_d1's comment).
+//
+// Budget shape: 1 slot for LAYER/0's own demand page, 4 for OTHER_LAYER's
+// full catalog (exactly fits, depth 1 never truncates), 1 left over for
+// THIRD_LAYER (depth 2) -- so THIRD_LAYER is truncated to ITS single
+// cheapest expert (index 0, ties broken by offset -- see
+// submit_prefill_layer_ahead_multi's nth_element comment) on round 1, and
+// n_layerahead_truncated_ must record the other 3 as cut.
+//
+// OTHER_LAYER's read-ahead batch deliberately stalls (DelayedReadLog on
+// OTHER_LAYER/3) so its 4 pins are still held throughout round 1's own
+// dispatch (including its own in-request retries via time_layer_ahead) --
+// without that, a fast CPU-backend read could harvest and unpin OTHER_LAYER's
+// batch before round 1 returns, non-deterministically letting THIRD_LAYER's
+// retry succeed within round 1 instead of staying truncated. Round 2 sleeps
+// past the stall, letting OTHER_LAYER's batch retire and free its pins, then
+// re-dispatches LAYER/0 -- depth 1 is already settled (skipped), depth 2
+// retries with the FULL THIRD_LAYER page list again; spec_pagein_submit's own
+// resident-page filter drops THIRD_LAYER/0 (already landed) and only the
+// remaining three actually read.
+void test_prefill_layer_ahead_depth2_nearest_first_and_reoffer() {
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_PREFILL_LAYER_AHEAD", "1", 1) == 0, "failed to arm WP_PREFILL_LAYER_AHEAD");
+    require(setenv("WP_PREFILL_LAYER_AHEAD_WIDTH", "1", 1) == 0,
+            "failed to lower the prefill-ahead width so this test's requests qualify");
+    require(setenv("WP_PREFILL_LAYER_AHEAD_DEPTH", "2", 1) == 0,
+            "failed to arm WP_PREFILL_LAYER_AHEAD_DEPTH=2");
+    require(setenv("WP_EXPERT_SPEC_LEASE", "0", 1) == 0, "failed to disable the speculative lease");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_RESERVE");
+    unsetenv("WP_EXPERT_SPEC_PROTECT_LAYERAHEAD");
+    unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+
+    TempDir temp;
+    const Fixture fixture = make_fixture3(temp.path);
+    const int port = reserve_port();
+
+    DelayedReadLog reads;
+    reads.delay_layer  = OTHER_LAYER;
+    reads.delay_expert = 3;
+    reads.delay        = std::chrono::milliseconds(600);
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    // 1 for LAYER/0's own demand page + 4 for OTHER_LAYER's full catalog
+    // (depth 1, fits exactly) + 1 for THIRD_LAYER's truncated depth-2 offer.
+    options.slots             = 6;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        const auto dispatch = [&](int32_t layer, int32_t expert, uint32_t n_tokens, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer    = layer;
+            request.n_tokens = n_tokens;
+            request.activations.resize((size_t) n_tokens * N_EMBD);
+            request.assignments.push_back({ expert, std::vector<float>(n_tokens, 0.5f) });
+            payload = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq,
+                                    payload.data(), payload.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload),
+                    "worker closed the connection instead of answering");
+            if (type == PIPE_ERROR) {
+                const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+                throw std::runtime_error("dispatch failed: " + error.msg);
+            }
+            require(type == PIPE_EXPERT_PARTIAL && seq_id == seq, "dispatch did not complete");
+        };
+
+        // ROUND 1. LAYER/0 (n_tokens=2 > WIDTH=1) pins its own page, then
+        // submit_prefill_layer_ahead_multi(LAYER, 2) fires depth 1 (OTHER_LAYER,
+        // all 4 experts fit) then depth 2 (THIRD_LAYER, truncated to 1 by the
+        // single leftover slot). OTHER_LAYER/3's read stalls for 600 ms, so
+        // OTHER_LAYER's 4 pins are still held for every in-request retry this
+        // same dispatch makes -- THIRD_LAYER's retry(ies) within round 1 must
+        // therefore stay budget-starved too.
+        dispatch(LAYER, 0, /*n_tokens=*/ 2, 100);
+        require(reads.wait_for_start(std::chrono::milliseconds(2000)),
+                "OTHER_LAYER/3's stalled read never started -- depth 1 did not "
+                "submit its full page list");
+        // Expect 1 (LAYER/0) + 4 (OTHER_LAYER, depth 1) + 1 (THIRD_LAYER,
+        // depth 2, truncated) reads total by the time the settle window below
+        // elapses -- checked page-by-page rather than as a running total
+        // since DelayedReadLog (unlike ReadLog) has no wait_for_total/total().
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(reads.count_of(LAYER, 0) == 1, "LAYER/0's own demand read did not run exactly once");
+        require(reads.count_of(OTHER_LAYER, 0) == 1 && reads.count_of(OTHER_LAYER, 1) == 1 &&
+                    reads.count_of(OTHER_LAYER, 2) == 1 && reads.count_of(OTHER_LAYER, 3) == 1,
+                "depth 1 (OTHER_LAYER) did not submit its full page list nearest-first");
+        require(reads.count_of(THIRD_LAYER, 0) == 1,
+                "depth 2 (THIRD_LAYER) did not land its one budget-sized page");
+        require(reads.count_of(THIRD_LAYER, 1) == 0 && reads.count_of(THIRD_LAYER, 2) == 0 &&
+                    reads.count_of(THIRD_LAYER, 3) == 0,
+                "depth 2 (THIRD_LAYER) read more than its truncated budget in round 1 -- "
+                "either the budget/truncation math changed, or OTHER_LAYER's stall did not "
+                "hold its pins through round 1's own in-request retries");
+
+        // ROUND 2. Let OTHER_LAYER/3's stalled read (and the batch holding all
+        // 4 of OTHER_LAYER's pages) actually finish and retire, freeing its
+        // pins. Re-dispatch LAYER/0: depth 1 (OTHER_LAYER) is already settled
+        // (its full list was offered untruncated in round 1) and is skipped;
+        // depth 2 (THIRD_LAYER) is NOT settled (round 1 truncated it) and is
+        // RE-OFFERED its full page list -- spec_pagein_submit's own resident
+        // filter drops THIRD_LAYER/0 (already landed), leaving experts 1..3
+        // to actually read.
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        dispatch(LAYER, 0, /*n_tokens=*/ 2, 101);
+        // No stall armed on any of round 2's reads (only OTHER_LAYER/3 ever
+        // stalls, and it already ran in round 1) -- give the reader threads a
+        // moment to log their read_started calls before checking, same as
+        // round 1's own settle window above.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        require(reads.count_of(LAYER, 0) == 1,
+                "LAYER/0's second dispatch re-read its own page -- it should already be "
+                "resident (a plain demand hit) and need no read at all");
+        require(reads.count_of(THIRD_LAYER, 0) == 1,
+                "THIRD_LAYER/0 was re-read on the depth-2 retry -- spec_pagein_submit's own "
+                "resident-page filter should have dropped it, since it already landed in "
+                "round 1");
+        require(reads.count_of(THIRD_LAYER, 1) == 1 && reads.count_of(THIRD_LAYER, 2) == 1 &&
+                    reads.count_of(THIRD_LAYER, 3) == 1,
+                "depth 2's re-offer of THIRD_LAYER did not land its remaining (previously "
+                "truncated) pages once OTHER_LAYER's batch freed the budget");
+
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_PREFILL_LAYER_AHEAD");
+        unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+        unsetenv("WP_PREFILL_LAYER_AHEAD_DEPTH");
+        unsetenv("WP_EXPERT_SPEC_LEASE");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    unsetenv("WP_EXPERT_SPEC_PAGEIN");
+    unsetenv("WP_PREFILL_LAYER_AHEAD");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_DEPTH");
+    unsetenv("WP_EXPERT_SPEC_LEASE");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0,
+            "worker returned failure during the depth=2 nearest-first/reoffer reproduction");
+}
+
+// WP_PREFILL_LAYER_AHEAD_DEPTH left UNSET (default 1): a depth-2-shaped
+// fixture (make_fixture3, three served layers) must behave EXACTLY like the
+// original single-target test above -- submit_prefill_layer_ahead() must
+// dispatch to submit_prefill_layer_ahead_d1() and never touch THIRD_LAYER at
+// all from LAYER's own read-ahead (only OTHER_LAYER's first dispatch would
+// ever reach it, and this test never issues one), proving the depth<=1 code
+// path is untouched by WP_PREFILL_LAYER_AHEAD_DEPTH's existence.
+void test_prefill_layer_ahead_depth_default_is_single_target() {
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_PREFILL_LAYER_AHEAD", "1", 1) == 0, "failed to arm WP_PREFILL_LAYER_AHEAD");
+    require(setenv("WP_PREFILL_LAYER_AHEAD_WIDTH", "1", 1) == 0,
+            "failed to lower the prefill-ahead width so this test's requests qualify");
+    require(setenv("WP_EXPERT_SPEC_LEASE", "0", 1) == 0, "failed to disable the speculative lease");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_DEPTH");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_RESERVE");
+    unsetenv("WP_EXPERT_SPEC_PROTECT_LAYERAHEAD");
+    unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+
+    TempDir temp;
+    const Fixture fixture = make_fixture3(temp.path);
+    const int port = reserve_port();
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    // Same shape as test_prefill_layer_ahead_evicted_by_own_layer_demand:
+    // 1 slot for LAYER/0's own demand page + 4 for OTHER_LAYER's full catalog
+    // -- plenty left over (THIRD_LAYER's 4) to prove nothing beyond OTHER_LAYER
+    // is ever touched at depth<=1.
+    options.slots             = 10;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        const auto dispatch = [&](int32_t layer, int32_t expert, uint32_t n_tokens, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer    = layer;
+            request.n_tokens = n_tokens;
+            request.activations.resize((size_t) n_tokens * N_EMBD);
+            request.assignments.push_back({ expert, std::vector<float>(n_tokens, 0.5f) });
+            payload = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq,
+                                    payload.data(), payload.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload),
+                    "worker closed the connection instead of answering");
+            if (type == PIPE_ERROR) {
+                const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+                throw std::runtime_error("dispatch failed: " + error.msg);
+            }
+            require(type == PIPE_EXPERT_PARTIAL && seq_id == seq, "dispatch did not complete");
+        };
+
+        dispatch(LAYER, 0, /*n_tokens=*/ 2, 100);
+        const size_t expected_ahead = 4;
+        require(reads.wait_for_total(1 + expected_ahead),
+                "the single-target read-ahead did not land its expected pages");
+        require(reads.count_of(LAYER, 0) == 1, "LAYER/0's own demand read did not run exactly once");
+        require(reads.count_of(OTHER_LAYER, 0) == 1 && reads.count_of(OTHER_LAYER, 1) == 1 &&
+                    reads.count_of(OTHER_LAYER, 2) == 1 && reads.count_of(OTHER_LAYER, 3) == 1,
+                "depth<=1 skipped a page of its single target it should have offered");
+        require(reads.total() == 1 + expected_ahead,
+                "depth<=1 touched THIRD_LAYER (or something else) -- WP_PREFILL_LAYER_AHEAD_DEPTH "
+                "being unset must never reach past the single next_served_layer() target");
+
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_PREFILL_LAYER_AHEAD");
+        unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+        unsetenv("WP_EXPERT_SPEC_LEASE");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    unsetenv("WP_EXPERT_SPEC_PAGEIN");
+    unsetenv("WP_PREFILL_LAYER_AHEAD");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+    unsetenv("WP_EXPERT_SPEC_LEASE");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0,
+            "worker returned failure with WP_PREFILL_LAYER_AHEAD_DEPTH unset against a "
+            "3-layer fixture");
+}
+
 } // namespace
 
 static void test_scatter_compact_rows_matches_get_rows_back() {
@@ -6409,6 +6718,8 @@ int main() {
         test_prefill_layer_ahead_evicted_by_own_layer_demand(/*reserve_slots=*/ 1);
         test_prefill_layer_ahead_two_rounds_evict_spec(/*protect=*/ false);
         test_prefill_layer_ahead_two_rounds_evict_spec(/*protect=*/ true);
+        test_prefill_layer_ahead_depth2_nearest_first_and_reoffer();
+        test_prefill_layer_ahead_depth_default_is_single_target();
         test_stripe_min_part_restores_overlap_byte_identical();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
