@@ -6046,9 +6046,11 @@ private:
                         const int64_t budget    = (int64_t) n_batch - (int64_t) n_tokens_prev;
                         const int64_t remaining = (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens();
                         if (budget > 0 && remaining > budget) {
+                            // +4: the checkpoint break splits the last 4 prompt tokens off the
+                            // final batch, so leave enough that what precedes them is still > W.
                             const int64_t tail_after = remaining - budget;
-                            if (tail_after > 0 && tail_after <= wp_prefill_tail_min) {
-                                const int64_t shrunk_budget = remaining - (wp_prefill_tail_min + 1);
+                            if (tail_after > 0 && tail_after <= wp_prefill_tail_min + 4) {
+                                const int64_t shrunk_budget = remaining - (wp_prefill_tail_min + 1 + 4);
                                 if (shrunk_budget > 0 && shrunk_budget < budget) {
                                     n_batch_slot_cap = (int32_t) (n_tokens_prev + shrunk_budget);
                                 }
@@ -6171,6 +6173,19 @@ private:
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.size());
                     } else {
+                        // WP_PREFILL_TAIL_MIN: the checkpoint break above can still leave a
+                        // final batch of only 4 tokens. Ask for an output on this batch's last
+                        // token so it counts as final: the decoder then runs here (trimmed to
+                        // its trailing window, or at full depth if the batch is that short)
+                        // instead of being skipped (WP_DSV41_CED_SKIP_NONFINAL), and the short
+                        // batch after it attends to real decoder state.
+                        // The +4 is the checkpoint break's tail offset: the next batch is then
+                        // n_left - 4 tokens, which is still too short to trim on its own.
+                        const int64_t n_left = (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens();
+                        if (wp_prefill_tail_min > 0 && n_left <= wp_prefill_tail_min + 4) {
+                            batch.set_output(batch.size() - 1, true);
+                        }
+
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
                         if (!is_user_start && !near_prompt_end) {

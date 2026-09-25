@@ -1214,6 +1214,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 // architecture rationale; these are just the small pieces it and
 // build_attention_v41 share.
 
+// see the HAZARD check in graph::graph(); one sequence per server here
+static llama_pos dsv41_ced_skipped_decoder_end = -1;
+
 static bool dsv41_ced_prefill_env_enabled() {
     static const bool enabled = []() {
         const char * e = std::getenv("WP_DSV41_CED_PREFILL");
@@ -2618,7 +2621,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 // hand this graph a final ubatch shorter than W when
                 // skip_nonfinal is in play. See the report for how the two
                 // halves of this fix compose.
-                if (dsv41_ced_skip_nonfinal_enabled() && n_outputs > 0 && ubatch.pos[0] > 0) {
+                if (dsv41_ced_skip_nonfinal_enabled() && n_outputs > 0 && ubatch.pos[0] > 0 &&
+                        dsv41_ced_skipped_decoder_end == ubatch.pos[0]) {
                     char haz[256];
                     std::snprintf(haz, sizeof(haz),
                             "CED prefill trim: HAZARD final ubatch shorter than window (n_tokens=%lld < W=%lld, "
@@ -2668,6 +2672,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 ced_skip_nonfinal = dsv41_ced_skip_nonfinal_enabled() && n_outputs == 0;
             }
         }
+
+        // Where the last ubatch that skipped its decoder ended, so the HAZARD
+        // above fires only when this ubatch directly follows one (the server's
+        // WP_PREFILL_TAIL_MIN marks the batch before a short tail as final).
+        dsv41_ced_skipped_decoder_end = ced_skip_nonfinal ? (llama_pos) (ubatch.pos[0] + n_tokens) : -1;
 
         char ced_log[256];
         if (ced_trim) {
