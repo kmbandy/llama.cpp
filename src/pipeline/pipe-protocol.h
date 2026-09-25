@@ -269,8 +269,15 @@ enum pipe_role : uint32_t {
 };
 
 enum pipe_hidden_type : int32_t {
-    PIPE_HIDDEN_F32 = 0,
-    PIPE_HIDDEN_F16 = 1,
+    PIPE_HIDDEN_F32  = 0,
+    PIPE_HIDDEN_F16  = 1,
+    // Expert dispatch only (WP_EXPERT_WIRE). Not a segment hidden type.
+    // BF16 is 2 bytes/value. Q8_0 is the standard 32-wide block (34 bytes).
+    // ML8_4 is the AllReduce wire block: fp16 absmax + 16x 4-bit E4M3 indices
+    // per 32 values (18 bytes). Same codebook as allreduce-ml8-centroids.cuh.
+    PIPE_HIDDEN_BF16  = 2,
+    PIPE_HIDDEN_Q8_0  = 3,
+    PIPE_HIDDEN_ML8_4 = 4,
 };
 
 enum pipe_segment_wire_precision : uint32_t {
@@ -615,7 +622,12 @@ struct pipe_expert_partial {
     // erroring on a frame a stale peer legitimately sent.
     int32_t             dtype = PIPE_HIDDEN_F32;
     std::vector<float> partial;
+    // Already-packed ML8-4 payload for `partial`. Encode writes these bytes
+    // and does not pack again. Empty unless the worker packed on device.
+    std::vector<uint8_t> wire_bytes;
 };
+
+void pipe_expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n);
 
 // Payload: u32 part_index, u32 part_count, then a pipe_expert_partial payload.
 struct pipe_expert_partial_stream {

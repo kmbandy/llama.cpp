@@ -29,6 +29,13 @@ GGML_BACKEND_API bool ggml_backend_cuda_wp_graph_counts(
 // in ggml-cuda.cu, thin wrapper over allreduce.cu's ggml_cuda_ar_dump_state.
 GGML_BACKEND_API void ggml_backend_cuda_ar_dump_state(const char * reason);
 
+// Pack host f32 into the ml8-4 AllReduce wire layout on the current device.
+// ne must be a multiple of 32. False if the device pack cannot run.
+GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne);
+// Same pack, but src is already on the current device. Downloads only the
+// 18-byte blocks. False if the pointer is not device memory.
+GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int64_t ne);
+
 #ifdef GGML_USE_HIP
 #define GGML_CUDA_NAME "ROCm"
 #define GGML_CUBLAS_NAME "hipBLAS"

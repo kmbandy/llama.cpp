@@ -12,6 +12,7 @@
 
 extern "C" {
 #include "sha256/sha256.h"
+bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int64_t ne);
 }
 
 #include <nlohmann/json.hpp>
@@ -11253,7 +11254,7 @@ public:
         }
         if (!request.assignments.empty()) {
             read_result(sum, request_stats, std::numeric_limits<size_t>::max(),
-                        (int) request.layer, last_compute_path_);
+                        (int) request.layer, last_compute_path_, true);
             last_compute_path_ = "none";
         }
         request_stats.ns_result = lap();
@@ -11330,6 +11331,10 @@ public:
             response.partial.assign(sum.begin(), sum.end());
         } else {
             response.partial = std::move(sum);
+        }
+        if (!ml8_wire_partial_.empty()) {
+            response.wire_bytes = std::move(ml8_wire_partial_);
+            response.dtype = PIPE_HIDDEN_ML8_4;
         }
         request_stats.ns_encode = lap();
         return response;
@@ -16714,7 +16719,8 @@ private:
 
     void read_result(std::vector<float> & result, RequestStats & request_stats,
                      size_t result_offset = std::numeric_limits<size_t>::max(),
-                     int finite_check_layer = -1, const char * finite_check_path = nullptr) {
+                     int finite_check_layer = -1, const char * finite_check_path = nullptr,
+                     bool capture_wire = false) {
         synchronize_async(&request_stats);
         const uint32_t n_tokens = (uint32_t) (
             result.size() / (size_t) catalog_.descriptor.hparams.n_embd);
@@ -16743,6 +16749,27 @@ private:
         void * result_dst = result.data();
         if (io_src_base_ != nullptr && result_bytes <= io_src_size_) {
             result_dst = io_src_base_;
+        }
+        if (capture_wire) {
+            ml8_wire_partial_.clear();
+            static const bool ml8_wire = [] {
+                const char * v = std::getenv("WP_EXPERT_WIRE");
+                return v != nullptr && (std::strcmp(v, "ml8_4") == 0 || std::strcmp(v, "ml8-4") == 0);
+            }();
+            if (ml8_wire && result.size() % 32 == 0) {
+                void * base = ggml_backend_buffer_get_base(buf);
+                const float * d_src = reinterpret_cast<const float *>(
+                    static_cast<char *>(base) + effective_result_offset);
+                ml8_wire_partial_.resize((result.size() / 32) * 18);
+                if (ggml_cuda_expert_wire_pack_ml8_4_device(
+                        d_src, ml8_wire_partial_.data(), (int64_t) result.size())) {
+                    pipe_expert_wire_unpack_ml8_4(
+                        result.data(), ml8_wire_partial_.data(), result.size());
+                    scan_finite(result, request_stats, finite_check_layer, n_tokens, finite_check_path);
+                    return;
+                }
+                ml8_wire_partial_.clear();
+            }
         }
         const auto readback_started = std::chrono::steady_clock::now();
         ggml_backend_tensor_get(
@@ -17073,6 +17100,7 @@ private:
         ggml_tensor * tensor = nullptr;
     };
     std::unordered_map<uint32_t, ResultIoMeta> io_result_meta_;
+    std::vector<uint8_t> ml8_wire_partial_;
     std::string    device_name_;
     // Which compute path answered the request being read back (WP_WORKER_CHECK_FINITE label).
     const char *   last_compute_path_ = "none";

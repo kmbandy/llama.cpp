@@ -1144,6 +1144,121 @@ GGML_CUDA_AR_ML8_DEF(5)
 GGML_CUDA_AR_ML8_DEF(6)
 GGML_CUDA_AR_ML8_DEF(8)
 
+// Host-side entry for the expert wire. The activation is already on the CPU
+// when the dispatch op runs, so this uploads a chunk, packs with the same
+// kernel the AllReduce uses, and downloads the 18-byte blocks. Chunked so a
+// full worker GPU does not have to hold a 160 MB staging buffer.
+extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne) {
+    if (src == nullptr || dst == nullptr || ne <= 0 || (ne % QK_ML8_WIRE) != 0) {
+        return false;
+    }
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        return false;
+    }
+    // 1 Mi elements: 4 MB up, about 0.6 MB down. Multiple of the 32-wide block.
+    constexpr int64_t k_chunk = 1 << 20;
+    struct scratch {
+        int            dev    = -1;
+        cudaStream_t   stream = nullptr;
+        float *        d_src  = nullptr;
+        block_ml8_4_wire * d_dst = nullptr;
+    };
+    static std::mutex mu;
+    static scratch s;
+    std::lock_guard<std::mutex> lock(mu);
+    if (s.stream == nullptr || s.dev != dev) {
+        if (s.d_src != nullptr) { cudaFree(s.d_src); s.d_src = nullptr; }
+        if (s.d_dst != nullptr) { cudaFree(s.d_dst); s.d_dst = nullptr; }
+        if (s.stream != nullptr) { cudaStreamDestroy(s.stream); s.stream = nullptr; }
+        ggml_cuda_set_device(dev);
+        if (cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) != cudaSuccess) {
+            return false;
+        }
+        const int64_t nb_cap = k_chunk / QK_ML8_WIRE;
+        if (cudaMalloc(&s.d_src, k_chunk * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(reinterpret_cast<void **>(&s.d_dst), nb_cap * sizeof(block_ml8_4_wire)) != cudaSuccess) {
+            if (s.d_src != nullptr) { cudaFree(s.d_src); s.d_src = nullptr; }
+            if (s.d_dst != nullptr) { cudaFree(s.d_dst); s.d_dst = nullptr; }
+            cudaStreamDestroy(s.stream);
+            s.stream = nullptr;
+            return false;
+        }
+        s.dev = dev;
+        std::fprintf(stderr, "pipe: ml8_4 wire pack on GPU device %d\n", dev);
+    }
+    auto * out = static_cast<block_ml8_4_wire *>(dst);
+    for (int64_t off = 0; off < ne; off += k_chunk) {
+        const int64_t n = std::min(k_chunk, ne - off);
+        const int64_t nb = n / QK_ML8_WIRE;
+        if (cudaMemcpyAsync(s.d_src, src + off, n * sizeof(float), cudaMemcpyHostToDevice, s.stream) != cudaSuccess) {
+            return false;
+        }
+        ggml_cuda_ar_codec_pack_ml8_4<float>(s.d_src, s.d_dst, n, s.stream);
+        if (cudaMemcpyAsync(out + (off / QK_ML8_WIRE), s.d_dst, nb * sizeof(block_ml8_4_wire),
+                            cudaMemcpyDeviceToHost, s.stream) != cudaSuccess) {
+            return false;
+        }
+    }
+    return cudaStreamSynchronize(s.stream) == cudaSuccess;
+}
+
+// src is already a device pointer (the worker's result tensor). One kernel,
+// then a download of the packed blocks. No upload of the float partial.
+extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int64_t ne) {
+    if (src == nullptr || dst == nullptr || ne <= 0 || (ne % QK_ML8_WIRE) != 0) {
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    hipPointerAttribute_t attr;
+    if (hipPointerGetAttributes(&attr, src) != hipSuccess || attr.type != hipMemoryTypeDevice) {
+        return false;
+    }
+#else
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, src) != cudaSuccess || attr.type != cudaMemoryTypeDevice) {
+        return false;
+    }
+#endif
+    const int dev = attr.device;
+    constexpr int64_t k_chunk = 1 << 20;
+    struct scratch {
+        int                dev    = -1;
+        cudaStream_t       stream = nullptr;
+        block_ml8_4_wire * d_dst  = nullptr;
+    };
+    static std::mutex mu;
+    static scratch s;
+    std::lock_guard<std::mutex> lock(mu);
+    if (s.stream == nullptr || s.dev != dev) {
+        if (s.d_dst != nullptr) { cudaFree(s.d_dst); s.d_dst = nullptr; }
+        if (s.stream != nullptr) { cudaStreamDestroy(s.stream); s.stream = nullptr; }
+        ggml_cuda_set_device(dev);
+        if (cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) != cudaSuccess) {
+            return false;
+        }
+        const int64_t nb_cap = k_chunk / QK_ML8_WIRE;
+        if (cudaMalloc(reinterpret_cast<void **>(&s.d_dst), nb_cap * sizeof(block_ml8_4_wire)) != cudaSuccess) {
+            cudaStreamDestroy(s.stream);
+            s.stream = nullptr;
+            return false;
+        }
+        s.dev = dev;
+        std::fprintf(stderr, "pipe: ml8_4 partial pack from GPU device %d\n", dev);
+    }
+    auto * out = static_cast<block_ml8_4_wire *>(dst);
+    for (int64_t off = 0; off < ne; off += k_chunk) {
+        const int64_t n = std::min(k_chunk, ne - off);
+        const int64_t nb = n / QK_ML8_WIRE;
+        ggml_cuda_ar_codec_pack_ml8_4<float>(src + off, s.d_dst, n, s.stream);
+        if (cudaMemcpyAsync(out + (off / QK_ML8_WIRE), s.d_dst, nb * sizeof(block_ml8_4_wire),
+                            cudaMemcpyDeviceToHost, s.stream) != cudaSuccess) {
+            return false;
+        }
+    }
+    return cudaStreamSynchronize(s.stream) == cudaSuccess;
+}
+
 
 // ml8-8r: scale-free E4M3. Elementwise, so it needs no block machinery -- and
 // rank symmetry still holds because both partials are rounded identically.

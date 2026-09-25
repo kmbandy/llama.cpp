@@ -983,6 +983,199 @@ pipe_expert_hello_ack pipe_decode_expert_hello_ack(const uint8_t * buf, size_t l
 }
 
 // ---------------------------------------------------------------------------
+// WP_EXPERT_WIRE=f32|bf16|q8_0|ml8_4. Expert activations (spine -> worker) and
+// the partial summed back (worker -> spine). Default f32, byte-identical to
+// the historical frame. Both processes must agree: the activation tail has no
+// dtype tag, so a mismatch fails the size check. Partials do carry dtype.
+// This is not the removed f16 partial knob.
+// ml8_4 is the tensor-parallel AllReduce wire codec (18 bytes / 32 values),
+// not the weight-sidecar ML8_4 GGUF type.
+
+enum class expert_wire_kind { f32, bf16, q8_0, ml8_4 };
+
+// Baked codebook from ggml/src/ggml-cuda/allreduce-ml8-centroids.cuh.
+// That table is __device__ __constant__, so the values are copied here.
+static const float k_ml8_4_centroids[16] = {
+    -0.93750000f, -0.75000000f, -0.56250000f, -0.43750000f, -0.31250000f, -0.21875000f, -0.12500000f, -0.03906250f,
+    +0.04296875f, +0.12500000f, +0.21875000f, +0.31250000f, +0.43750000f, +0.56250000f, +0.75000000f, +0.93750000f,
+};
+
+static int ml8_4_nearest(float v) {
+    int   best = 0;
+    float bd   = std::fabs(v - k_ml8_4_centroids[0]);
+    for (int i = 1; i < 16; ++i) {
+        const float d = std::fabs(v - k_ml8_4_centroids[i]);
+        if (d < bd) {
+            bd   = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+extern "C" {
+__attribute__((weak)) bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne);
+}
+
+static void expert_wire_pack_ml8_4(uint8_t * dst, const float * src, size_t n) {
+    if (ggml_cuda_expert_wire_pack_ml8_4 != nullptr &&
+        ggml_cuda_expert_wire_pack_ml8_4(src, dst, (int64_t) n)) {
+        return;
+    }
+    static bool warned = false;
+    if (!warned) {
+        std::fprintf(stderr, "pipe: ml8_4 wire pack fell back to CPU\n");
+        warned = true;
+    }
+    const size_t nb = n / 32ull;
+    for (size_t b = 0; b < nb; ++b) {
+        const float * v = src + b * 32ull;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            amax = std::max(amax, std::fabs(v[j]));
+        }
+        const ggml_fp16_t h = ggml_fp32_to_fp16(amax);
+        const float d = ggml_fp16_to_fp32(h);
+        const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+        uint8_t * blk = dst + b * 18ull;
+        std::memcpy(blk, &h, sizeof(h));
+        uint8_t * qs = blk + sizeof(h);
+        for (int j = 0; j < 32; j += 2) {
+            const int i0 = ml8_4_nearest(v[j + 0] * inv);
+            const int i1 = ml8_4_nearest(v[j + 1] * inv);
+            qs[j / 2] = (uint8_t) (i0 | (i1 << 4));
+        }
+    }
+}
+
+static void expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n) {
+    const size_t nb = n / 32ull;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t * blk = src + b * 18ull;
+        ggml_fp16_t h;
+        std::memcpy(&h, blk, sizeof(h));
+        const float d = ggml_fp16_to_fp32(h);
+        const uint8_t * qs = blk + sizeof(h);
+        float * y = dst + b * 32ull;
+        for (int j = 0; j < 32; j += 2) {
+            const uint8_t p = qs[j / 2];
+            y[j + 0] = k_ml8_4_centroids[p & 0xF] * d;
+            y[j + 1] = k_ml8_4_centroids[p >>  4] * d;
+        }
+    }
+}
+
+static expert_wire_kind expert_wire_mode() {
+    static const expert_wire_kind mode = [] {
+        const char * v = std::getenv("WP_EXPERT_WIRE");
+        expert_wire_kind kind = expert_wire_kind::f32;
+        const char * name = "f32";
+        if (v != nullptr && v[0] != '\0' && std::strcmp(v, "f32") != 0) {
+            if (std::strcmp(v, "bf16") == 0) {
+                kind = expert_wire_kind::bf16;
+                name = "bf16";
+            } else if (std::strcmp(v, "q8_0") == 0 || std::strcmp(v, "q8") == 0) {
+                kind = expert_wire_kind::q8_0;
+                name = "q8_0";
+            } else if (std::strcmp(v, "ml8_4") == 0 || std::strcmp(v, "ml8-4") == 0) {
+                kind = expert_wire_kind::ml8_4;
+                name = "ml8_4";
+            } else {
+                fail(PIPE_ERR_BAD_FRAME, "pipe: WP_EXPERT_WIRE=%s (expected f32, bf16, q8_0, ml8_4)", v);
+            }
+        }
+        std::fprintf(stderr, "pipe: WP_EXPERT_WIRE=%s\n", name);
+        return kind;
+    }();
+    return mode;
+}
+
+static int32_t expert_wire_dtype() {
+    switch (expert_wire_mode()) {
+        case expert_wire_kind::bf16:  return PIPE_HIDDEN_BF16;
+        case expert_wire_kind::q8_0:  return PIPE_HIDDEN_Q8_0;
+        case expert_wire_kind::ml8_4: return PIPE_HIDDEN_ML8_4;
+        case expert_wire_kind::f32:   return PIPE_HIDDEN_F32;
+    }
+    return PIPE_HIDDEN_F32;
+}
+
+static uint64_t expert_wire_bytes(size_t n, int32_t dtype) {
+    if (n == 0) {
+        return 0;
+    }
+    switch (dtype) {
+        case PIPE_HIDDEN_F32:  return (uint64_t) n * 4ull;
+        case PIPE_HIDDEN_BF16: return (uint64_t) n * 2ull;
+        case PIPE_HIDDEN_Q8_0:
+            if (n % 32ull != 0) {
+                fail(PIPE_ERR_BAD_FRAME, "pipe: q8_0 wire length %zu is not a multiple of 32", n);
+            }
+            return (uint64_t) (n / 32ull) * 34ull;
+        case PIPE_HIDDEN_ML8_4:
+            if (n % 32ull != 0) {
+                fail(PIPE_ERR_BAD_FRAME, "pipe: ml8_4 wire length %zu is not a multiple of 32", n);
+            }
+            return (uint64_t) (n / 32ull) * 18ull;
+        default:
+            fail(PIPE_ERR_BAD_FRAME, "pipe: unknown expert wire dtype %d", dtype);
+    }
+}
+
+static void expert_wire_pack(uint8_t * dst, const float * src, size_t n, int32_t dtype) {
+    if (n == 0) {
+        return;
+    }
+    if (dtype == PIPE_HIDDEN_F32) {
+        wr_f32_bulk(dst, src, n);
+        return;
+    }
+    if (dtype == PIPE_HIDDEN_BF16) {
+        ggml_fp32_to_bf16_row(src, reinterpret_cast<ggml_bf16_t *>(dst), (int64_t) n);
+        return;
+    }
+    if (dtype == PIPE_HIDDEN_ML8_4) {
+        expert_wire_pack_ml8_4(dst, src, n);
+        return;
+    }
+    const size_t wrote = ggml_quantize_chunk(GGML_TYPE_Q8_0, src, dst, 0, 1, (int64_t) n, nullptr);
+    if (wrote != (size_t) expert_wire_bytes(n, PIPE_HIDDEN_Q8_0)) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: q8_0 pack wrote %zu bytes, want %llu",
+             wrote, (unsigned long long) expert_wire_bytes(n, PIPE_HIDDEN_Q8_0));
+    }
+}
+
+static void expert_wire_unpack(float * dst, const uint8_t * src, size_t n, int32_t dtype) {
+    if (n == 0) {
+        return;
+    }
+    if (dtype == PIPE_HIDDEN_F32) {
+        std::memcpy(dst, src, n * sizeof(float));
+        return;
+    }
+    if (dtype == PIPE_HIDDEN_BF16) {
+        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(src), dst, (int64_t) n);
+        return;
+    }
+    if (dtype == PIPE_HIDDEN_ML8_4) {
+        expert_wire_unpack_ml8_4(dst, src, n);
+        return;
+    }
+    const size_t nb = n / 32ull;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t * blk = src + b * 34ull;
+        ggml_fp16_t h;
+        std::memcpy(&h, blk, sizeof(h));
+        const float d = ggml_fp16_to_fp32(h);
+        const int8_t * qs = reinterpret_cast<const int8_t *>(blk + sizeof(h));
+        float * y = dst + b * 32ull;
+        for (int i = 0; i < 32; ++i) {
+            y[i] = d * (float) qs[i];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // expert dispatch request
 
 std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p) {
@@ -1000,8 +1193,9 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
         }
         total += 4ull + (uint64_t) assignment.weights.size() * 4ull;
     }
-    // 4 bytes per value: request activations are f32 as of PIPE_VERSION 4.
-    total += (uint64_t) p.activation_size() * 4ull;
+    // f32 unless WP_EXPERT_WIRE says otherwise. n_embd is implicit: the
+    // activation vector length is n_tokens * n_embd.
+    total += expert_wire_bytes(p.activation_size(), expert_wire_dtype());
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch encode size %llu exceeds max payload",
              (unsigned long long) total);
@@ -1019,7 +1213,7 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
             wr_f32(w, weight);
         }
     }
-    wr_f32_bulk(w, p.activation_data(), p.activation_size());
+    expert_wire_pack(w, p.activation_data(), p.activation_size(), expert_wire_dtype());
     return out;
 }
 
@@ -1070,8 +1264,9 @@ static pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_impl(
 
     const uint64_t assignment_bytes =
         (uint64_t) n_assignments * (4ull + (uint64_t) r.n_tokens * 4ull);
-    const uint64_t activation_bytes =
-        (uint64_t) r.n_tokens * (uint64_t) n_embd * 4ull;
+    const size_t n_activations_expect = (size_t) r.n_tokens * (size_t) n_embd;
+    const int32_t wire_dtype = expert_wire_dtype();
+    const uint64_t activation_bytes = expert_wire_bytes(n_activations_expect, wire_dtype);
     if ((uint64_t) (end - p) != assignment_bytes + activation_bytes) {
         fail(PIPE_ERR_BAD_FRAME,
              "pipe: expert dispatch payload bytes %lld do not match dimensions",
@@ -1097,9 +1292,9 @@ static pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_impl(
         r.assignments.push_back(std::move(assignment));
     }
 
-    const size_t n_activations = (size_t) r.n_tokens * (size_t) n_embd;
+    const size_t n_activations = n_activations_expect;
 #if PIPE_F32_WIRE_IS_HOST
-    if (borrow_activations) {
+    if (borrow_activations && wire_dtype == PIPE_HIDDEN_F32) {
         r.activations_view = reinterpret_cast<const float *>(p);
         r.activations_view_size = n_activations;
         for (size_t i = 0; i < n_activations; ++i) {
@@ -1112,9 +1307,8 @@ static pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_impl(
 #else
     (void) borrow_activations;
 #endif
-    r.activations.reserve(n_activations);
     r.activations.resize(n_activations);
-    rd_f32_bulk(p, r.activations.data(), n_activations);
+    expert_wire_unpack(r.activations.data(), p, n_activations, wire_dtype);
     return r;
 }
 
@@ -1183,26 +1377,26 @@ pipe_expert_dispatch_begin pipe_decode_expert_dispatch_begin(
 
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts(
         const pipe_expert_dispatch_acts & p) {
-    const uint64_t total = (uint64_t) p.activations.size() * 4ull;
+    const int32_t dtype = expert_wire_dtype();
+    const uint64_t total = expert_wire_bytes(p.activations.size(), dtype);
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS exceeds max payload");
     }
     std::vector<uint8_t> out((size_t) total);
-    uint8_t * w = out.data();
-    wr_f32_bulk(w, p.activations.data(), p.activations.size());
+    expert_wire_pack(out.data(), p.activations.data(), p.activations.size(), dtype);
     return out;
 }
 
 pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
         const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd) {
-    if (n_embd <= 0 || n_tokens == 0 ||
-        (uint64_t) n_tokens * (uint64_t) n_embd * 4ull != len) {
+    const size_t n_act = (size_t) n_tokens * (size_t) n_embd;
+    const int32_t dtype = expert_wire_dtype();
+    if (n_embd <= 0 || n_tokens == 0 || expert_wire_bytes(n_act, dtype) != len) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS dimensions do not match BEGIN");
     }
     pipe_expert_dispatch_acts r;
-    r.activations.resize((size_t) n_tokens * (size_t) n_embd);
-    const uint8_t * p = buf;
-    rd_f32_bulk(p, r.activations.data(), r.activations.size());
+    r.activations.resize(n_act);
+    expert_wire_unpack(r.activations.data(), buf, n_act, dtype);
     for (float value : r.activations) {
         if (!std::isfinite(value)) {
             fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS has a non-finite activation");
@@ -1262,28 +1456,31 @@ pipe_expert_dispatch_chunk pipe_decode_expert_dispatch_chunk(
 
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_publish(
         const pipe_expert_dispatch_acts_publish & p) {
-    const uint64_t total = 4ull + (uint64_t) p.activations.size() * 4ull;
+    const int32_t dtype = expert_wire_dtype();
+    const uint64_t total = 4ull + expert_wire_bytes(p.activations.size(), dtype);
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_PUBLISH exceeds max payload");
     }
     std::vector<uint8_t> out((size_t) total);
     uint8_t * w = out.data();
     wr_u32(w, p.n_subscribers);
-    wr_f32_bulk(w, p.activations.data(), p.activations.size());
+    expert_wire_pack(w, p.activations.data(), p.activations.size(), dtype);
     return out;
 }
 
 pipe_expert_dispatch_acts_publish pipe_decode_expert_dispatch_acts_publish(
         const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd) {
+    const size_t n_act = (size_t) n_tokens * (size_t) n_embd;
+    const int32_t dtype = expert_wire_dtype();
     if (n_embd <= 0 || n_tokens == 0 || len < 4 ||
-        (uint64_t) n_tokens * (uint64_t) n_embd * 4ull != (uint64_t) len - 4ull) {
+        expert_wire_bytes(n_act, dtype) != (uint64_t) len - 4ull) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_PUBLISH dimensions do not match BEGIN");
     }
     pipe_expert_dispatch_acts_publish r;
     const uint8_t * p = buf;
     r.n_subscribers = rd_u32(p);
-    r.activations.resize((size_t) n_tokens * (size_t) n_embd);
-    rd_f32_bulk(p, r.activations.data(), r.activations.size());
+    r.activations.resize(n_act);
+    expert_wire_unpack(r.activations.data(), p, n_act, dtype);
     for (float value : r.activations) {
         if (!std::isfinite(value)) {
             fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_PUBLISH has a non-finite activation");
@@ -1413,26 +1610,35 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
 // ---------------------------------------------------------------------------
 // expert partial response
 
+void pipe_expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n) {
+    expert_wire_unpack_ml8_4(dst, src, n);
+}
+
 void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expert_partial & p) {
-    // `dtype` is still self-describing on the wire as of PIPE_VERSION 13 (see the
-    // version history and the struct comment in pipe-protocol.h), and
-    // pipe_decode_expert_partial() below still accepts PIPE_HIDDEN_F16 from a
-    // stale worker during a rolling restart. But as of 2026-08-19 this process
-    // will not PRODUCE one: WP_EXPERT_PARTIAL_DTYPE=f16 rounded a per-worker
-    // partial subtotal at the expert-partition boundary, which made generated
-    // text at temperature 0 depend on which worker an expert happened to land
-    // on -- a correctness risk the ~16 KB/layer/worker bandwidth saving (and a
-    // measured -10% decode throughput) did not justify. The knob is gone; only
-    // f32 is ever written here. Do not resurrect an f16 branch in this
-    // function -- if a future change legitimately needs to send f16 partials,
-    // that needs a new correctness case, not simply restoring this code.
+    if (!p.wire_bytes.empty()) {
+        const uint64_t expect = expert_wire_bytes(p.partial.size(), PIPE_HIDDEN_ML8_4);
+        if (p.wire_bytes.size() != (size_t) expect || p.n_tokens == 0 || 12ull + expect > PIPE_MAX_PAYLOAD) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: prepacked ml8_4 partial has the wrong size");
+        }
+        out.resize((size_t) (12ull + expect));
+        uint8_t * w = out.data();
+        wr_i32(w, p.layer);
+        wr_u32(w, p.n_tokens);
+        wr_i32(w, PIPE_HIDDEN_ML8_4);
+        std::memcpy(w, p.wire_bytes.data(), p.wire_bytes.size());
+        return;
+    }
+    // f16 production stays removed (2026-08-19): rounding a per-worker subtotal
+    // to f16 made temperature-0 text depend on which worker held the expert.
+    // WP_EXPERT_WIRE may still send bf16 or q8_0. Those are a separate trial,
+    // tagged in the dtype field, and the spine dequantizes back to f32 before
+    // the sum. Default f32 is the historical encoding.
     if (p.dtype != PIPE_HIDDEN_F32) {
         fail(PIPE_ERR_BAD_FRAME,
-             "pipe: expert partial encode only supports PIPE_HIDDEN_F32 (got dtype %d) -- "
-             "f16 partial production was removed, see pipe-protocol.h", p.dtype);
+             "pipe: expert partial encode only accepts an f32 source (got dtype %d)", p.dtype);
     }
-    const uint32_t elt = pipe_hidden_elt_size(p.dtype);
-    const uint64_t total = 12ull + (uint64_t) p.partial.size() * (uint64_t) elt;
+    const int32_t dtype = expert_wire_dtype();
+    const uint64_t total = 12ull + expert_wire_bytes(p.partial.size(), dtype);
     if (p.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial response");
     }
@@ -1440,10 +1646,8 @@ void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expe
     uint8_t * w = out.data();
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
-    wr_i32(w, p.dtype);
-    // Bit-for-bit the same f32 encoding this frame has always used -- only the
-    // 4-byte dtype tag ahead of it (added in PIPE_VERSION 13) is new.
-    wr_f32_bulk(w, p.partial.data(), p.partial.size());
+    wr_i32(w, dtype);
+    expert_wire_pack(w, p.partial.data(), p.partial.size(), dtype);
 }
 
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
@@ -1460,11 +1664,29 @@ void pipe_encode_expert_partial_stream_into(
     if (part_count == 0 || part_index >= part_count) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid streamed expert partial index");
     }
+    if (!partial.wire_bytes.empty()) {
+        const uint64_t expect = expert_wire_bytes(partial.partial.size(), PIPE_HIDDEN_ML8_4);
+        const uint64_t total = 24ull + expect;
+        if (partial.wire_bytes.size() != (size_t) expect || partial.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: prepacked streamed ml8_4 partial has the wrong size");
+        }
+        out.resize((size_t) total);
+        uint8_t * w = out.data();
+        wr_u32(w, PIPE_EXPERT_PARTIAL_STREAM_TAG);
+        wr_u32(w, part_index);
+        wr_u32(w, part_count);
+        wr_i32(w, partial.layer);
+        wr_u32(w, partial.n_tokens);
+        wr_i32(w, PIPE_HIDDEN_ML8_4);
+        std::memcpy(w, partial.wire_bytes.data(), partial.wire_bytes.size());
+        return;
+    }
     if (partial.dtype != PIPE_HIDDEN_F32) {
         fail(PIPE_ERR_BAD_FRAME,
-             "pipe: streamed expert partial encode only supports PIPE_HIDDEN_F32");
+             "pipe: streamed expert partial encode only accepts an f32 source");
     }
-    const uint64_t total = 24ull + (uint64_t) partial.partial.size() * sizeof(float);
+    const int32_t dtype = expert_wire_dtype();
+    const uint64_t total = 24ull + expert_wire_bytes(partial.partial.size(), dtype);
     if (partial.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid streamed expert partial response");
     }
@@ -1475,8 +1697,8 @@ void pipe_encode_expert_partial_stream_into(
     wr_u32(w, part_count);
     wr_i32(w, partial.layer);
     wr_u32(w, partial.n_tokens);
-    wr_i32(w, partial.dtype);
-    wr_f32_bulk(w, partial.partial.data(), partial.partial.size());
+    wr_i32(w, dtype);
+    expert_wire_pack(w, partial.partial.data(), partial.partial.size(), dtype);
 }
 
 std::vector<uint8_t> pipe_encode_expert_partial_stream(
@@ -1497,15 +1719,25 @@ pipe_expert_partial pipe_decode_expert_partial(
     r.layer    = rd_i32(p);
     r.n_tokens = rd_u32(p);
     r.dtype    = rd_i32(p);
-    if (r.dtype != PIPE_HIDDEN_F32 && r.dtype != PIPE_HIDDEN_F16) {
+    if (r.dtype != PIPE_HIDDEN_F32 && r.dtype != PIPE_HIDDEN_F16 &&
+        r.dtype != PIPE_HIDDEN_BF16 && r.dtype != PIPE_HIDDEN_Q8_0 &&
+        r.dtype != PIPE_HIDDEN_ML8_4) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial has unknown dtype %d", r.dtype);
     }
-    const uint32_t elt = pipe_hidden_elt_size(r.dtype);
     const uint64_t n_values = (uint64_t) r.n_tokens * (uint64_t) n_embd;
-    if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != n_values * (uint64_t) elt) {
+    const uint64_t payload_bytes = (r.dtype == PIPE_HIDDEN_BF16 || r.dtype == PIPE_HIDDEN_Q8_0 ||
+                                    r.dtype == PIPE_HIDDEN_ML8_4)
+        ? expert_wire_bytes((size_t) n_values, r.dtype)
+        : n_values * (uint64_t) pipe_hidden_elt_size(r.dtype);
+    if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != payload_bytes) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial dimensions do not match payload");
     }
     r.partial.resize((size_t) n_values);
+    if (r.dtype == PIPE_HIDDEN_BF16 || r.dtype == PIPE_HIDDEN_Q8_0 || r.dtype == PIPE_HIDDEN_ML8_4) {
+        expert_wire_unpack(r.partial.data(), p, (size_t) n_values, r.dtype);
+        r.dtype = PIPE_HIDDEN_F32;
+        return r;
+    }
     if (r.dtype == PIPE_HIDDEN_F16) {
         std::vector<ggml_fp16_t> half((size_t) n_values);
         rd_u16_bulk(p, half.data(), half.size());
@@ -1558,6 +1790,25 @@ std::vector<uint8_t> pipe_encode_expert_partial_chunk(
         p.total_tokens == 0 || p.token_start >= p.token_end ||
         p.token_end > p.total_tokens || p.partial.n_tokens != p.token_end - p.token_start) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial chunk range");
+    }
+    if (!p.partial.wire_bytes.empty()) {
+        const uint64_t expect = expert_wire_bytes(p.partial.partial.size(), PIPE_HIDDEN_ML8_4);
+        if (p.partial.wire_bytes.size() != (size_t) expect) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: prepacked ml8_4 partial chunk has the wrong size");
+        }
+        const size_t partial_size = 12ull + (size_t) expect;
+        std::vector<uint8_t> out(20ull + partial_size);
+        uint8_t * w = out.data();
+        wr_u32(w, p.chunk_index);
+        wr_u32(w, p.chunk_count);
+        wr_u32(w, p.total_tokens);
+        wr_u32(w, p.token_start);
+        wr_u32(w, p.token_end);
+        wr_i32(w, p.partial.layer);
+        wr_u32(w, p.partial.n_tokens);
+        wr_i32(w, PIPE_HIDDEN_ML8_4);
+        std::memcpy(w, p.partial.wire_bytes.data(), p.partial.wire_bytes.size());
+        return out;
     }
     if (p.partial.dtype != PIPE_HIDDEN_F32) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk encode only supports PIPE_HIDDEN_F32");
