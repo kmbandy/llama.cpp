@@ -680,7 +680,26 @@ void llama_model_deepseek4::graph::build_hc_mixes(
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     cb(flat_norm, "hc_flat_norm", il);
     dsv4_pin_to_weight(sched, flat_norm, hc_fn);
-    ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+    ggml_tensor * mixes = nullptr;
+    // WP_DSV4_HC_SPLITK=S: the mixes GEMM is [hc_mix_dim=24] x [hc_dim=20480] x nt, too
+    // few output tiles for BLAS to fill the GPU while each walks all of K. Split K into S
+    // chunks as a batched GEMM ([24, nt, S]) and sum the chunks.
+    static const int64_t hc_splitk = [] {
+        const char * e = std::getenv("WP_DSV4_HC_SPLITK");
+        return e != nullptr ? (int64_t) std::max(0, std::atoi(e)) : (int64_t) 0;
+    }();
+    if (hc_splitk > 1 && hc_dim % hc_splitk == 0 && nt > 1) {
+        const int64_t kc = hc_dim / hc_splitk;
+        ggml_tensor * w = ggml_cont(ctx0, ggml_permute(ctx0,
+                ggml_reshape_3d(ctx0, hc_fn, kc, hc_splitk, hc_mix_dim), 0, 2, 1, 3));  // [kc, 24, S]
+        ggml_tensor * a = ggml_cont(ctx0, ggml_permute(ctx0,
+                ggml_reshape_3d(ctx0, flat_norm, kc, hc_splitk, nt), 0, 2, 1, 3));      // [kc, nt, S]
+        ggml_tensor * part = ggml_mul_mat(ctx0, w, a);                                  // [24, nt, S]
+        part = ggml_cont(ctx0, ggml_permute(ctx0, part, 1, 2, 0, 3));                   // [S, 24, nt]
+        mixes = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, part), hc_mix_dim, nt);
+    } else {
+        mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+    }
     cb(mixes, "hc_mixes", il);
 
     ggml_tensor * scale_pre  = get_weight_view_1d(hc_scale, 1, 0);

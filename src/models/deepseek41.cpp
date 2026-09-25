@@ -1744,20 +1744,15 @@ static ggml_tensor * dsv41_sparse_attn_mask_picks(
     return ggml_cast(ctx0, out_f, GGML_TYPE_I32);
 }
 
-static ggml_tensor * dsv41_sparse_attn_build_indices(
+// Window half of a sparse index list: the k_win = min(n_raw, n_swa) raw cells
+// raw_mask admits per row, padding picks (-inf cells) turned into -1.
+static ggml_tensor * dsv41_sparse_attn_window_indices(
         ggml_context * ctx0,
         ggml_tensor * raw_mask,
-        ggml_tensor * comp_mask,
-        ggml_tensor * top_k,
-        int64_t n_swa,
-        int64_t raw_k_len) {
-    if (!top_k) {
-        return nullptr; // dense fallback: no bounded index list to build
-    }
+        int64_t n_swa) {
     GGML_ASSERT(raw_mask->ne[2] == 1 && raw_mask->ne[3] == 1 &&
             "sparse_attn index build assumes a plain 2D [n_raw, nt] mask");
 
-    const int64_t nt    = raw_mask->ne[1];
     const int64_t k_win = std::min<int64_t>(raw_mask->ne[0], n_swa);
     GGML_ASSERT(k_win > 0);
 
@@ -1771,22 +1766,21 @@ static ggml_tensor * dsv41_sparse_attn_build_indices(
         ? raw_mask : ggml_cast(ctx0, raw_mask, GGML_TYPE_F32);
 
     ggml_tensor * win_idx = ggml_top_k(ctx0, raw_mask_f32, (int) k_win); // I32 [k_win, nt]
+    return dsv41_sparse_attn_mask_picks(ctx0, raw_mask_f32, win_idx, 0);
+}
 
-    ggml_tensor * mask_1 = ggml_reshape_4d(ctx0, raw_mask_f32, 1, raw_mask_f32->ne[0], nt, 1);
-    ggml_tensor * gathered = ggml_get_rows(ctx0, mask_1, win_idx); // [1, k_win, nt, 1]
-    gathered = ggml_reshape_2d(ctx0, gathered, k_win, nt);
-
-    // valid_f: 0.0 where the picked cell was admitted (mask==0), -1.0 where
-    // it was a padding pick (mask==-inf) -- clamp maps -inf to the floor -1
-    // and leaves 0 alone.
-    ggml_tensor * valid_f = ggml_clamp(ctx0, gathered, -1.0f, 0.0f);
-
-    ggml_tensor * win_idx_f = ggml_cast(ctx0, win_idx, GGML_TYPE_F32);
-    ggml_tensor * a1 = ggml_scale_bias(ctx0, win_idx_f, 1.0f, 1.0f); // win_idx + 1
-    ggml_tensor * b1 = ggml_scale_bias(ctx0, valid_f,   1.0f, 1.0f); // 1 (valid) or 0 (invalid)
-    ggml_tensor * prod = ggml_mul(ctx0, a1, b1);                    // (win_idx+1) or 0
-    ggml_tensor * win_idx_masked_f = ggml_scale_bias(ctx0, prod, 1.0f, -1.0f); // win_idx or -1
-    ggml_tensor * win_idx_masked = ggml_cast(ctx0, win_idx_masked_f, GGML_TYPE_I32);
+static ggml_tensor * dsv41_sparse_attn_build_indices(
+        ggml_context * ctx0,
+        ggml_tensor * raw_mask,
+        ggml_tensor * comp_mask,
+        ggml_tensor * top_k,
+        int64_t n_swa,
+        int64_t raw_k_len) {
+    if (!top_k) {
+        return nullptr; // dense fallback: no bounded index list to build
+    }
+    const int64_t nt = raw_mask->ne[1];
+    ggml_tensor * win_idx_masked = dsv41_sparse_attn_window_indices(ctx0, raw_mask, n_swa);
 
     // Compressed half: the dense path admits a top-k pick only where the causal
     // compressed mask is also 0 (build_top_k_mask adds kq_mask), so a pick of a
@@ -2059,7 +2053,33 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
         if (ratio == 0) {
             // no compressed stream, so this layer sees only its own window
-            ggml_tensor * out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks, kq_scale, il);
+            ggml_tensor * out = nullptr;
+            // WP_DSV41_SPARSE_ATTN: the dense path scans the whole raw cache to use n_swa cells;
+            // hand the sparse kernel just the window instead.
+            const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+            if (dsv41_sparse_attn_env_enabled() && n_embd_head == 512 && n_head == 64 &&
+                    inp_attn->self_k_rot == nullptr && mctx_raw->get_k(ctx0, il)->type == GGML_TYPE_F16) {
+                ggml_build_forward_expand(gf, q);
+                ggml_build_forward_expand(gf, kv);
+                ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+
+                ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
+                if (!ggml_is_contiguous(raw_k)) {
+                    raw_k = ggml_cont(ctx0, raw_k);
+                }
+                ggml_tensor * kv_indices = dsv41_sparse_attn_window_indices(ctx0, inp_attn->get_kq_mask(), hparams.n_swa);
+                ggml_tensor * q_f16 = q->type == GGML_TYPE_F16 ? q : ggml_cast(ctx0, q, GGML_TYPE_F16);
+
+                ggml_tensor * kv_indptr = ggml_arange(ctx0, 0.0f, (float) (nt + 1), 1.0f);
+                kv_indptr = ggml_scale(ctx0, kv_indptr, (float) kv_indices->ne[0]);
+                kv_indptr = ggml_cast(ctx0, kv_indptr, GGML_TYPE_I32);
+                out = ggml_sparse_attn_dsv4(ctx0, q_f16, raw_k, kv_indices, kv_indptr, layer.attn_sinks, kq_scale);
+                out = ggml_cast(ctx0, out, GGML_TYPE_F32);
+                cb(out, "attn_raw_sparse", il);
+            }
+            if (!out) {
+                out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks, kq_scale, il);
+            }
 
             return build_attention_tail(model, out, inp_pos, nt, il);
         }
