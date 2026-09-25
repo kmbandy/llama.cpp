@@ -2253,6 +2253,45 @@ struct dispatcher::impl {
         std::vector<uint8_t>  shared_payload, shared_begin_payload, shared_acts_payload;
         std::vector<uint32_t> shared_token_ids;
         bool have_shared = false;
+
+        // PACK-ONCE (2026-09-25). Every worker on this layer is sent the SAME
+        // activation values -- only expert assignments differ -- so the wire
+        // dtype conversion (f32/bf16/q8_0/ml8_4) is redundant work when done
+        // per worker, and doubly so per CHUNK under WP_DISPATCH_STREAM
+        // (dispatch_stream_chunks_ workers, each re-packing the identical
+        // bytes). Pack the whole [n_tokens x n_embd] matrix once here and hand
+        // out byte slices of it below instead. Row-separable only when n_embd
+        // is a multiple of 32 for a block dtype (q8_0/ml8_4); f32/bf16 are
+        // always row-separable. See pipe_expert_wire_pack_matrix()'s header
+        // comment in pipe-protocol.h for why slicing is valid at all.
+        //
+        // Lazy: only actually packs if some worker below takes a wire path
+        // that can use it (skips inproc/shm workers and the non-separable
+        // fallback, which still pack their own bytes exactly as before).
+        const int32_t  wire_dtype_now = pipe_expert_wire_dtype();
+        const bool     wire_pack_row_separable =
+            wire_dtype_now == PIPE_HIDDEN_F32 || wire_dtype_now == PIPE_HIDDEN_BF16 ||
+            (n_embd % 32) == 0;
+        const uint64_t packed_row_bytes = wire_pack_row_separable ? pipe_expert_wire_row_bytes(n_embd) : 0;
+        std::vector<uint8_t> packed_all;
+        bool                 packed_all_ready = false;
+        const auto ensure_packed_all = [&]() {
+            if (packed_all_ready) {
+                return;
+            }
+            const dispatch_clock::time_point pack_started =
+                layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+            packed_all.resize((size_t) n_tokens * (size_t) packed_row_bytes);
+            pipe_expert_wire_pack_matrix(packed_all.data(), activations.data(), n_tokens, n_embd);
+            packed_all_ready = true;
+            // Counts against encode_ns, same bucket the per-request pack this
+            // replaces used to add to -- see the WP_DS4_LAYER_TRACE note at
+            // each call site below.
+            if (layer_trace_enabled()) {
+                add_layer_trace(layer, &layer_trace_stats::encode_ns,
+                                elapsed_ns(pack_started, dispatch_clock::now()));
+            }
+        };
         for (planned_request & request : by_worker) {
             if (request.assignments.empty()) {
                 continue;
@@ -2317,6 +2356,21 @@ struct dispatcher::impl {
             pipe_expert_dispatch_req wire_request;
             wire_request.layer        = layer;
             wire_request.swiglu_clamp = swiglu_clamp;
+            // Everything downstream of this request that stays on the CPU as
+            // real floats (inproc: dispatched locally, no wire at all; shm:
+            // untouched by this change, see the note at its branch below) must
+            // still get wire_request.activations populated with real f32, so
+            // the gather/full-copy below is skipped ONLY when the frame will
+            // actually go out packed. Decided up front, before the gather
+            // branch, because both branches need it.
+            const bool use_packed_activations =
+                !workers[request.worker_index].inproc &&
+                workers[request.worker_index].shm == nullptr &&
+                wire_pack_row_separable;
+            const uint8_t *      packed_ptr = nullptr;
+            size_t                packed_len = 0;
+            std::vector<uint8_t> gathered_packed; // only used by the gather branch below
+
             // *** SPINE-SIDE GATHER: send only the rows this worker needs. ***
             // Skipped when it needs every row, so the loopback worker (99.8%) and
             // every decode step take the identity path and stay bit-identical.
@@ -2350,19 +2404,43 @@ struct dispatcher::impl {
                     }
                     wire_request.assignments.push_back(std::move(compact));
                 }
-                wire_request.activations.resize(rows * (size_t) n_embd);
-                for (size_t r = 0; r < rows; ++r) {
-                    const float * src = activations.data() + (size_t) needed[r] * (size_t) n_embd;
-                    std::copy(src, src + n_embd,
-                              wire_request.activations.begin() + (ptrdiff_t) (r * (size_t) n_embd));
+                if (use_packed_activations) {
+                    // Gather PACKED row_bytes-sized slices instead of f32 rows
+                    // then packing: same bytes (row-separable, see the
+                    // pack-once comment above), no re-pack per worker.
+                    ensure_packed_all();
+                    gathered_packed.resize(rows * (size_t) packed_row_bytes);
+                    for (size_t r = 0; r < rows; ++r) {
+                        std::memcpy(gathered_packed.data() + r * (size_t) packed_row_bytes,
+                                    packed_all.data() + (size_t) needed[r] * (size_t) packed_row_bytes,
+                                    (size_t) packed_row_bytes);
+                    }
+                    packed_ptr = gathered_packed.data();
+                    packed_len = gathered_packed.size();
+                } else {
+                    wire_request.activations.resize(rows * (size_t) n_embd);
+                    for (size_t r = 0; r < rows; ++r) {
+                        const float * src = activations.data() + (size_t) needed[r] * (size_t) n_embd;
+                        std::copy(src, src + n_embd,
+                                  wire_request.activations.begin() + (ptrdiff_t) (r * (size_t) n_embd));
+                    }
                 }
                 request.token_ids = std::move(needed);
             } else {
                 wire_request.n_tokens    = n_tokens;
                 wire_request.assignments = request.assignments;
-                wire_request.activations = activations;
+                if (use_packed_activations) {
+                    ensure_packed_all();
+                    packed_ptr = packed_all.data();
+                    packed_len = packed_all.size();
+                } else {
+                    wire_request.activations = activations;
+                }
             }
             if (workers[request.worker_index].inproc) {
+                // use_packed_activations is false whenever inproc is true, so
+                // wire_request.activations already holds the real f32 rows
+                // this dispatch needs -- unchanged from before this change.
                 request.inproc_wire = std::move(wire_request);
                 requests.push_back(std::move(request));
                 continue;
@@ -2379,30 +2457,48 @@ struct dispatcher::impl {
                     const uint32_t token_start = chunk_index * chunk_rows;
                     const uint32_t token_end = chunk_index + 1 == chunk_count
                         ? total_tokens : token_start + chunk_rows;
-                    pipe_expert_dispatch_chunk chunk;
-                    chunk.chunk_index  = chunk_index;
-                    chunk.chunk_count  = chunk_count;
-                    chunk.total_tokens = total_tokens;
-                    chunk.token_start  = token_start;
-                    chunk.token_end    = token_end;
-                    chunk.request.layer = wire_request.layer;
-                    chunk.request.n_tokens = token_end - token_start;
-                    chunk.request.swiglu_clamp = wire_request.swiglu_clamp;
-                    chunk.request.assignments.reserve(wire_request.assignments.size());
+                    std::vector<pipe_expert_assignment> chunk_assignments;
+                    chunk_assignments.reserve(wire_request.assignments.size());
                     for (const pipe_expert_assignment & assignment : wire_request.assignments) {
                         pipe_expert_assignment sliced;
                         sliced.expert_id = assignment.expert_id;
                         sliced.weights.assign(assignment.weights.begin() + token_start,
                                               assignment.weights.begin() + token_end);
-                        chunk.request.assignments.push_back(std::move(sliced));
+                        chunk_assignments.push_back(std::move(sliced));
                     }
-                    chunk.request.activations.resize(
-                        (size_t) (token_end - token_start) * (size_t) n_embd);
-                    std::copy(
-                        wire_request.activations.begin() + (size_t) token_start * (size_t) n_embd,
-                        wire_request.activations.begin() + (size_t) token_end * (size_t) n_embd,
-                        chunk.request.activations.begin());
-                    request.stream_payloads.push_back(pipe_encode_expert_dispatch_chunk(chunk));
+                    std::vector<uint8_t> chunk_payload;
+                    if (use_packed_activations) {
+                        // No per-chunk copy of f32 activations: slice the
+                        // ALREADY-PACKED bytes for this worker (whole-layer or
+                        // gathered, from above) by row range and write the
+                        // chunk directly -- this is the 2 workers x 4 chunks
+                        // redundant re-pack this change targets.
+                        pipe_encode_expert_dispatch_chunk_prepacked(
+                            chunk_payload, chunk_index, chunk_count, total_tokens,
+                            token_start, token_end, wire_request.layer, n_embd,
+                            chunk_assignments, wire_request.swiglu_clamp,
+                            packed_ptr + (size_t) token_start * (size_t) packed_row_bytes,
+                            (size_t) (token_end - token_start) * (size_t) packed_row_bytes);
+                    } else {
+                        pipe_expert_dispatch_chunk chunk;
+                        chunk.chunk_index  = chunk_index;
+                        chunk.chunk_count  = chunk_count;
+                        chunk.total_tokens = total_tokens;
+                        chunk.token_start  = token_start;
+                        chunk.token_end    = token_end;
+                        chunk.request.layer = wire_request.layer;
+                        chunk.request.n_tokens = token_end - token_start;
+                        chunk.request.swiglu_clamp = wire_request.swiglu_clamp;
+                        chunk.request.assignments = std::move(chunk_assignments);
+                        chunk.request.activations.resize(
+                            (size_t) (token_end - token_start) * (size_t) n_embd);
+                        std::copy(
+                            wire_request.activations.begin() + (size_t) token_start * (size_t) n_embd,
+                            wire_request.activations.begin() + (size_t) token_end * (size_t) n_embd,
+                            chunk.request.activations.begin());
+                        chunk_payload = pipe_encode_expert_dispatch_chunk(chunk);
+                    }
+                    request.stream_payloads.push_back(std::move(chunk_payload));
                 }
                 if (layer_trace_enabled()) {
                     add_layer_trace(layer, &layer_trace_stats::encode_ns,
@@ -2422,10 +2518,19 @@ struct dispatcher::impl {
                 begin.n_tokens = wire_request.n_tokens;
                 begin.assignments = wire_request.assignments;
                 begin.swiglu_clamp = wire_request.swiglu_clamp;
-                pipe_expert_dispatch_acts acts;
-                acts.activations = wire_request.activations;
                 request.begin_payload = pipe_encode_expert_dispatch_begin(begin);
-                request.acts_payload = pipe_encode_expert_dispatch_acts(acts);
+                if (use_packed_activations) {
+                    request.acts_payload = pipe_encode_expert_dispatch_acts_prepacked(
+                        wire_request.n_tokens, n_embd, packed_ptr, packed_len);
+                } else {
+                    pipe_expert_dispatch_acts acts;
+                    acts.activations = wire_request.activations;
+                    request.acts_payload = pipe_encode_expert_dispatch_acts(acts);
+                }
+            } else if (use_packed_activations) {
+                request.payload = pipe_encode_expert_dispatch_req_prepacked(
+                    wire_request.layer, wire_request.n_tokens, n_embd, wire_request.assignments,
+                    wire_request.swiglu_clamp, packed_ptr, packed_len);
             } else {
                 request.payload = pipe_encode_expert_dispatch_req(wire_request);
             }

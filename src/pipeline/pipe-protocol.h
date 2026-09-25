@@ -847,6 +847,70 @@ std::vector<uint8_t> pipe_encode_expert_shm_ref(const pipe_expert_shm_ref & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_begin(const pipe_expert_dispatch_begin & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts(const pipe_expert_dispatch_acts & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_chunk(const pipe_expert_dispatch_chunk & p);
+
+// ---------------------------------------------------------------------------
+// prepacked expert-dispatch encoding (WP_DISPATCH_STREAM / plan_requests()
+// pack-once path).
+//
+// Every worker on a layer is sent the SAME activation values -- only the
+// expert assignments differ -- so packing the wire dtype once per
+// plan_requests() call and slicing it per worker/chunk saves the redundant
+// re-pack pipe_encode_expert_dispatch_req() would otherwise do per frame.
+// These entry points take activations that are ALREADY packed in the current
+// WP_EXPERT_WIRE dtype and produce frames byte-identical to what the
+// f32-in encoders above would produce for the same logical request.
+//
+// Row-separability (why slicing a whole-matrix pack is valid): f32 and bf16
+// pack one value at a time, so any row range packs independently of any
+// other. q8_0 and ml8_4 pack independent 32-value blocks; with n_embd a
+// multiple of 32, a token row is an integer number of blocks, so a block
+// never straddles a row boundary and packing the whole matrix agrees byte-
+// for-byte with packing any contiguous row range (or any row subset, applied
+// one row at a time) of it. This does NOT hold when n_embd % 32 != 0 for a
+// block dtype -- callers must fall back to the f32-in path in that case.
+
+// The current WP_EXPERT_WIRE dtype (PIPE_HIDDEN_*) and the packed byte count
+// for one row of `n_embd` values in it. Exposed so callers can size and
+// validate a prepacked buffer without duplicating expert_wire_bytes().
+int32_t  pipe_expert_wire_dtype();
+uint64_t pipe_expert_wire_row_bytes(int32_t n_embd);
+
+// Packs `n_tokens` rows of `n_embd` f32 values (row-major, [n_tokens, n_embd])
+// into `dst` in the current WP_EXPERT_WIRE dtype. `dst` must hold at least
+// n_tokens * pipe_expert_wire_row_bytes(n_embd) bytes. Row-separable per the
+// note above.
+void pipe_expert_wire_pack_matrix(uint8_t * dst, const float * src, uint32_t n_tokens, int32_t n_embd);
+
+// pipe_encode_expert_dispatch_req(), but the activation tail is supplied
+// already packed rather than packed from f32 here. `packed_len` must equal
+// expert_wire_bytes(n_tokens * n_embd, expert_wire_dtype()) or this fails
+// exactly like the existing encoders do on a size mismatch.
+std::vector<uint8_t> pipe_encode_expert_dispatch_req_prepacked(
+    int32_t layer, uint32_t n_tokens, int32_t n_embd,
+    const std::vector<pipe_expert_assignment> & assignments, float swiglu_clamp,
+    const uint8_t * packed_activations, size_t packed_len);
+
+// pipe_encode_expert_dispatch_chunk(), but writes the 20-byte chunk header and
+// the request directly into `out` (resized to fit) instead of building an
+// intermediate request buffer and memcpy'ing it in. `chunk_assignments` must
+// already be sliced to the chunk's [token_start, token_end) width (weights of
+// length token_end - token_start). `packed_activations`/`packed_len` are this
+// chunk's row range only, already packed -- typically a byte slice of a
+// whole-layer pack via pipe_expert_wire_row_bytes().
+void pipe_encode_expert_dispatch_chunk_prepacked(
+    std::vector<uint8_t> & out,
+    uint32_t chunk_index, uint32_t chunk_count, uint32_t total_tokens,
+    uint32_t token_start, uint32_t token_end,
+    int32_t layer, int32_t n_embd,
+    const std::vector<pipe_expert_assignment> & chunk_assignments, float swiglu_clamp,
+    const uint8_t * packed_activations, size_t packed_len);
+
+// pipe_encode_expert_dispatch_acts(), but the activations are already packed.
+// The ACTS payload has no header -- it is exactly the packed bytes -- so this
+// only validates `packed_len` and hands them back as the payload vector.
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts_prepacked(
+    uint32_t n_tokens, int32_t n_embd, const uint8_t * packed_activations, size_t packed_len);
+
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_publish(const pipe_expert_dispatch_acts_publish & p);
 std::vector<uint8_t> pipe_encode_expert_acts_publish_ack(const pipe_expert_acts_publish_ack & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts_ref(const pipe_expert_dispatch_acts_ref & p);

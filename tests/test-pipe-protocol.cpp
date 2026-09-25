@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -882,6 +883,237 @@ static void test_expert_dispatch_non_finite_rejected() {
         PIPE_ERR_BAD_FRAME);
 }
 
+// ---------------------------------------------------------------------------
+// prepacked expert-dispatch parity (plan_requests() pack-once path)
+//
+// pipe_encode_expert_dispatch_req/chunk/acts_prepacked() must produce frames
+// byte-identical to the original f32-in encoders for the SAME logical
+// request, since plan_requests() now packs a layer's activations once and
+// slices/gathers the packed bytes instead of re-packing per worker/chunk.
+//
+// DTYPE SEAM: expert_wire_mode() in pipe-protocol.cpp caches WP_EXPERT_WIRE
+// in a function-local `static const`, resolved once on the first call and
+// never reset for the life of the process. This function itself is dtype-
+// agnostic -- it just calls pipe_expert_wire_dtype()/row_bytes()/pack_matrix()
+// and compares old vs. new encoder output for whatever dtype THIS PROCESS
+// resolved to. main() runs it directly once (covers the default, f32) and
+// then re-execs this binary with WP_EXPERT_WIRE=bf16/q8_0/ml8_4 and
+// --prepacked-subtest, one fresh process per dtype, so each actually
+// exercises a different wire format instead of re-checking the cached one.
+static void test_expert_dispatch_prepacked_parity() {
+    std::mt19937 rng(20260925u);
+    std::uniform_real_distribution<float> weight_dist(-2.0f, 2.0f);
+    std::uniform_real_distribution<float> act_dist(-8.0f, 8.0f);
+
+    // Multiple of 32: valid row width for every WP_EXPERT_WIRE dtype,
+    // including the block ones (q8_0, ml8_4), which is what makes whole-
+    // matrix packing + row slicing agree with per-row packing at all.
+    const int32_t n_embd = 64;
+    const uint32_t token_counts[] = { 1, 7, 64, 300 };
+
+    for (uint32_t n_tokens : token_counts) {
+        std::vector<float> activations((size_t) n_tokens * (size_t) n_embd);
+        for (size_t i = 0; i < activations.size(); ++i) {
+            const unsigned roll = rng() % 8;
+            if (roll == 0) {
+                activations[i] = 0.0f;               // exact zero
+            } else if (roll == 1) {
+                activations[i] = act_dist(rng) * 1e4f; // large magnitude
+            } else {
+                activations[i] = act_dist(rng);
+            }
+        }
+
+        const int n_assignments = 1 + (int) (rng() % 5); // 1-5 assignments
+        std::vector<pipe_expert_assignment> assignments((size_t) n_assignments);
+        for (int a = 0; a < n_assignments; ++a) {
+            assignments[(size_t) a].expert_id = a;
+            assignments[(size_t) a].weights.resize(n_tokens);
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                assignments[(size_t) a].weights[t] = weight_dist(rng);
+            }
+        }
+        const float   swiglu_clamp = 3.5f;
+        const int32_t layer        = 11;
+
+        const uint64_t row_bytes = pipe_expert_wire_row_bytes(n_embd);
+        std::vector<uint8_t> packed_all((size_t) n_tokens * (size_t) row_bytes);
+        pipe_expert_wire_pack_matrix(packed_all.data(), activations.data(), n_tokens, n_embd);
+
+        // (a) whole-matrix prepacked request == old f32-in request.
+        {
+            pipe_expert_dispatch_req full;
+            full.layer        = layer;
+            full.n_tokens      = n_tokens;
+            full.assignments   = assignments;
+            full.swiglu_clamp  = swiglu_clamp;
+            full.activations   = activations;
+            const std::vector<uint8_t> old_bytes = pipe_encode_expert_dispatch_req(full);
+            const std::vector<uint8_t> new_bytes = pipe_encode_expert_dispatch_req_prepacked(
+                layer, n_tokens, n_embd, assignments, swiglu_clamp,
+                packed_all.data(), packed_all.size());
+            CHECK(old_bytes == new_bytes);
+        }
+
+        // (b) a chunk built from a row slice of the whole-matrix pack == the
+        // old chunk encoder run on the copied rows, for several chunk widths.
+        for (uint32_t chunk_count : { 1u, 2u, 3u, 4u }) {
+            if (chunk_count > n_tokens) {
+                continue;
+            }
+            const uint32_t chunk_rows = n_tokens / chunk_count;
+            for (uint32_t ci = 0; ci < chunk_count; ++ci) {
+                const uint32_t start = ci * chunk_rows;
+                const uint32_t end   = ci + 1 == chunk_count ? n_tokens : start + chunk_rows;
+
+                std::vector<pipe_expert_assignment> sliced;
+                sliced.reserve(assignments.size());
+                for (const pipe_expert_assignment & a : assignments) {
+                    pipe_expert_assignment s;
+                    s.expert_id = a.expert_id;
+                    s.weights.assign(a.weights.begin() + start, a.weights.begin() + end);
+                    sliced.push_back(s);
+                }
+
+                pipe_expert_dispatch_chunk old_chunk;
+                old_chunk.chunk_index         = ci;
+                old_chunk.chunk_count         = chunk_count;
+                old_chunk.total_tokens        = n_tokens;
+                old_chunk.token_start         = start;
+                old_chunk.token_end           = end;
+                old_chunk.request.layer       = layer;
+                old_chunk.request.n_tokens    = end - start;
+                old_chunk.request.swiglu_clamp = swiglu_clamp;
+                old_chunk.request.assignments = sliced;
+                old_chunk.request.activations.assign(
+                    activations.begin() + (size_t) start * n_embd,
+                    activations.begin() + (size_t) end * n_embd);
+                const std::vector<uint8_t> old_bytes = pipe_encode_expert_dispatch_chunk(old_chunk);
+
+                std::vector<uint8_t> new_bytes;
+                pipe_encode_expert_dispatch_chunk_prepacked(
+                    new_bytes, ci, chunk_count, n_tokens, start, end, layer, n_embd,
+                    sliced, swiglu_clamp,
+                    packed_all.data() + (size_t) start * row_bytes,
+                    (size_t) (end - start) * row_bytes);
+
+                CHECK(old_bytes == new_bytes);
+
+                // decode also agrees, i.e. the new frame is not just the same
+                // length by coincidence.
+                const pipe_expert_dispatch_chunk decoded =
+                    pipe_decode_expert_dispatch_chunk(new_bytes.data(), new_bytes.size(), n_embd);
+                CHECK(decoded.token_start == start && decoded.token_end == end);
+                CHECK(decoded.request.activations.size() == (size_t) (end - start) * n_embd);
+            }
+        }
+
+        // (c) a gathered-rows frame == the old path run on gathered f32 rows.
+        if (n_tokens >= 3) {
+            std::vector<uint32_t> needed;
+            for (uint32_t t = 0; t < n_tokens; t += 2) { // deterministic subset
+                needed.push_back(t);
+            }
+            const size_t rows = needed.size();
+
+            std::vector<pipe_expert_assignment> compact;
+            compact.reserve(assignments.size());
+            for (const pipe_expert_assignment & a : assignments) {
+                pipe_expert_assignment c;
+                c.expert_id = a.expert_id;
+                c.weights.resize(rows);
+                for (size_t r = 0; r < rows; ++r) {
+                    c.weights[r] = a.weights[needed[r]];
+                }
+                compact.push_back(c);
+            }
+
+            pipe_expert_dispatch_req gathered_old;
+            gathered_old.layer        = layer;
+            gathered_old.n_tokens      = (uint32_t) rows;
+            gathered_old.swiglu_clamp  = swiglu_clamp;
+            gathered_old.assignments   = compact;
+            gathered_old.activations.resize(rows * (size_t) n_embd);
+            for (size_t r = 0; r < rows; ++r) {
+                std::copy(activations.begin() + (size_t) needed[r] * n_embd,
+                          activations.begin() + (size_t) (needed[r] + 1) * n_embd,
+                          gathered_old.activations.begin() + (ptrdiff_t) (r * (size_t) n_embd));
+            }
+            const std::vector<uint8_t> old_bytes = pipe_encode_expert_dispatch_req(gathered_old);
+
+            std::vector<uint8_t> gathered_packed(rows * (size_t) row_bytes);
+            for (size_t r = 0; r < rows; ++r) {
+                std::memcpy(gathered_packed.data() + r * row_bytes,
+                            packed_all.data() + (size_t) needed[r] * row_bytes,
+                            (size_t) row_bytes);
+            }
+            const std::vector<uint8_t> new_bytes = pipe_encode_expert_dispatch_req_prepacked(
+                layer, (uint32_t) rows, n_embd, compact, swiglu_clamp,
+                gathered_packed.data(), gathered_packed.size());
+            CHECK(old_bytes == new_bytes);
+        }
+
+        // (d) ACTS-prepacked (split_wire path) parity.
+        {
+            pipe_expert_dispatch_acts acts_old;
+            acts_old.activations = activations;
+            const std::vector<uint8_t> old_bytes = pipe_encode_expert_dispatch_acts(acts_old);
+            const std::vector<uint8_t> new_bytes = pipe_encode_expert_dispatch_acts_prepacked(
+                n_tokens, n_embd, packed_all.data(), packed_all.size());
+            CHECK(old_bytes == new_bytes);
+        }
+
+        // A packed-length mismatch is rejected exactly like the other
+        // encoders reject a malformed size, not silently truncated/padded.
+        CHECK_THROWS_PROTO(
+            pipe_encode_expert_dispatch_req_prepacked(
+                layer, n_tokens, n_embd, assignments, swiglu_clamp,
+                packed_all.data(), packed_all.size() - 1),
+            PIPE_ERR_BAD_FRAME);
+    }
+}
+
+#ifndef _WIN32
+// Runs test_expert_dispatch_prepacked_parity() in a FRESH process with
+// WP_EXPERT_WIRE=<dtype>. fork() alone is not enough -- it copies whatever
+// pipe-protocol.cpp's cached expert_wire_mode() static already resolved to
+// in the parent, so only a re-exec (a genuinely new process image, static
+// storage reinitialised) makes the child actually pick up a different dtype.
+static void run_prepacked_parity_subprocess(const char * dtype) {
+    const pid_t pid = fork();
+    if (pid < 0) {
+        std::fprintf(stderr, "FAIL: fork() failed for WP_EXPERT_WIRE=%s prepacked subtest\n", dtype);
+        ++g_failed;
+        return;
+    }
+    if (pid == 0) {
+        setenv("WP_EXPERT_WIRE", dtype, 1);
+        // HARD NO-GPU CONSTRAINT for this test binary: ml8_4 packing prefers
+        // ggml_cuda_expert_wire_pack_ml8_4() (allreduce.cu) when a HIP/CUDA
+        // device is visible, and this binary links ggml, which pulls the HIP
+        // backend in on a HIP build. Hiding every device makes
+        // cudaGetDevice() fail up front (allreduce.cu:1156), so the weak
+        // symbol's real implementation returns false before touching any
+        // device -- no context, no allocation, no kernel -- and
+        // expert_wire_pack_ml8_4() falls back to the CPU path in
+        // pipe-protocol.cpp, which is what this test is required to exercise
+        // and compare byte-for-byte anyway.
+        setenv("HIP_VISIBLE_DEVICES", "", 1);
+        setenv("CUDA_VISIBLE_DEVICES", "", 1);
+        setenv("ROCR_VISIBLE_DEVICES", "", 1);
+        execl("/proc/self/exe", "test-pipe-protocol", "--prepacked-subtest", (char *) nullptr);
+        _exit(127); // exec failed
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::fprintf(stderr,
+            "FAIL: prepacked parity subtest failed for WP_EXPERT_WIRE=%s (waitpid status=%d)\n",
+            dtype, status);
+        ++g_failed;
+    }
+}
+#endif
+
 static void test_token_roundtrip() {
     // empty
     {
@@ -1471,7 +1703,19 @@ static void test_segment_roundtrip() {
 
 // ---------------------------------------------------------------------------
 
-int main() {
+int main(int argc, char ** argv) {
+#ifndef _WIN32
+    // Re-exec entry point: see run_prepacked_parity_subprocess() above for
+    // why this needs to be a fresh process rather than a second in-process
+    // call.
+    if (argc > 1 && std::strcmp(argv[1], "--prepacked-subtest") == 0) {
+        test_expert_dispatch_prepacked_parity();
+        return g_failed == 0 ? 0 : 1;
+    }
+#else
+    (void) argc;
+    (void) argv;
+#endif
     test_header_roundtrip();
     test_header_rejects();
     test_wire_compression_roundtrips();
@@ -1489,6 +1733,12 @@ int main() {
     test_expert_partial_dtype_rejects();
     test_expert_dispatch_chunk_roundtrip();
     test_expert_dispatch_non_finite_rejected();
+    test_expert_dispatch_prepacked_parity(); // covers the default dtype, f32
+#ifndef _WIN32
+    run_prepacked_parity_subprocess("bf16");
+    run_prepacked_parity_subprocess("q8_0");
+    run_prepacked_parity_subprocess("ml8_4");
+#endif
     test_token_roundtrip();
     test_error_roundtrip();
     test_endianness_explicit();

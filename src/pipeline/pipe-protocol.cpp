@@ -1178,42 +1178,101 @@ static void expert_wire_unpack(float * dst, const uint8_t * src, size_t n, int32
 // ---------------------------------------------------------------------------
 // expert dispatch request
 
-std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p) {
-    if (p.n_tokens == 0 || p.assignments.empty()) {
+// Shared by pipe_encode_expert_dispatch_req() and the *_prepacked() encoders
+// below: validates dimensions/weights/clamp exactly like the original single
+// function did, sizes `out` for header + assignments + `activation_bytes`,
+// and writes everything except the activation region. Returns a pointer at
+// the start of that (still unwritten) region so the caller can either pack
+// f32 into it or memcpy already-packed bytes -- either way the header and
+// assignment bytes are produced by this ONE code path, so the two encoders
+// can never drift apart on the non-activation part of the frame.
+static uint8_t * write_expert_dispatch_req_header(
+        std::vector<uint8_t> & out, int32_t layer, uint32_t n_tokens,
+        const std::vector<pipe_expert_assignment> & assignments, float swiglu_clamp,
+        uint64_t activation_bytes) {
+    if (n_tokens == 0 || assignments.empty()) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch requires tokens and assignments");
     }
-    if (!std::isfinite(p.swiglu_clamp) || p.swiglu_clamp < 0.0f) {
+    if (!std::isfinite(swiglu_clamp) || swiglu_clamp < 0.0f) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has an invalid swiglu clamp");
     }
     // 16, not 12: + f32 swiglu_clamp as of PIPE_VERSION 3.
     uint64_t total = 16;
-    for (const pipe_expert_assignment & assignment : p.assignments) {
-        if (assignment.weights.size() != p.n_tokens) {
+    for (const pipe_expert_assignment & assignment : assignments) {
+        if (assignment.weights.size() != n_tokens) {
             fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch weight count does not match n_tokens");
         }
         total += 4ull + (uint64_t) assignment.weights.size() * 4ull;
     }
-    // f32 unless WP_EXPERT_WIRE says otherwise. n_embd is implicit: the
-    // activation vector length is n_tokens * n_embd.
-    total += expert_wire_bytes(p.activation_size(), expert_wire_dtype());
+    total += activation_bytes;
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch encode size %llu exceeds max payload",
              (unsigned long long) total);
     }
 
-    std::vector<uint8_t> out((size_t) total);
+    out.resize((size_t) total);
     uint8_t * w = out.data();
-    wr_i32(w, p.layer);
-    wr_u32(w, p.n_tokens);
-    wr_u32(w, (uint32_t) p.assignments.size());
-    wr_f32(w, p.swiglu_clamp);
-    for (const pipe_expert_assignment & assignment : p.assignments) {
+    wr_i32(w, layer);
+    wr_u32(w, n_tokens);
+    wr_u32(w, (uint32_t) assignments.size());
+    wr_f32(w, swiglu_clamp);
+    for (const pipe_expert_assignment & assignment : assignments) {
         wr_i32(w, assignment.expert_id);
         for (float weight : assignment.weights) {
             wr_f32(w, weight);
         }
     }
+    return w;
+}
+
+std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p) {
+    // f32 unless WP_EXPERT_WIRE says otherwise. n_embd is implicit: the
+    // activation vector length is n_tokens * n_embd.
+    const uint64_t activation_bytes = expert_wire_bytes(p.activation_size(), expert_wire_dtype());
+    std::vector<uint8_t> out;
+    uint8_t * w = write_expert_dispatch_req_header(out, p.layer, p.n_tokens, p.assignments,
+                                                    p.swiglu_clamp, activation_bytes);
     expert_wire_pack(w, p.activation_data(), p.activation_size(), expert_wire_dtype());
+    return out;
+}
+
+int32_t pipe_expert_wire_dtype() {
+    return expert_wire_dtype();
+}
+
+uint64_t pipe_expert_wire_row_bytes(int32_t n_embd) {
+    if (n_embd <= 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert wire row bytes requires positive n_embd");
+    }
+    return expert_wire_bytes((size_t) n_embd, expert_wire_dtype());
+}
+
+void pipe_expert_wire_pack_matrix(uint8_t * dst, const float * src, uint32_t n_tokens, int32_t n_embd) {
+    if (n_embd <= 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert wire pack requires positive n_embd");
+    }
+    expert_wire_pack(dst, src, (size_t) n_tokens * (size_t) n_embd, expert_wire_dtype());
+}
+
+std::vector<uint8_t> pipe_encode_expert_dispatch_req_prepacked(
+        int32_t layer, uint32_t n_tokens, int32_t n_embd,
+        const std::vector<pipe_expert_assignment> & assignments, float swiglu_clamp,
+        const uint8_t * packed_activations, size_t packed_len) {
+    if (n_embd <= 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch prepacked requires positive n_embd");
+    }
+    const size_t   n_values     = (size_t) n_tokens * (size_t) n_embd;
+    const uint64_t expect_bytes = expert_wire_bytes(n_values, expert_wire_dtype());
+    if ((uint64_t) packed_len != expect_bytes) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch prepacked activation bytes %zu, want %llu",
+             packed_len, (unsigned long long) expect_bytes);
+    }
+    std::vector<uint8_t> out;
+    uint8_t * w = write_expert_dispatch_req_header(out, layer, n_tokens, assignments, swiglu_clamp,
+                                                    expect_bytes);
+    if (expect_bytes > 0) {
+        std::memcpy(w, packed_activations, (size_t) expect_bytes);
+    }
     return out;
 }
 
@@ -1425,6 +1484,90 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_chunk(
     wr_u32(w, p.token_end);
     std::memcpy(w, request.data(), request.size());
     return out;
+}
+
+void pipe_encode_expert_dispatch_chunk_prepacked(
+        std::vector<uint8_t> & out,
+        uint32_t chunk_index, uint32_t chunk_count, uint32_t total_tokens,
+        uint32_t token_start, uint32_t token_end,
+        int32_t layer, int32_t n_embd,
+        const std::vector<pipe_expert_assignment> & chunk_assignments, float swiglu_clamp,
+        const uint8_t * packed_activations, size_t packed_len) {
+    if (chunk_count == 0 || chunk_count > 64 || chunk_index >= chunk_count ||
+        total_tokens == 0 || token_start >= token_end || token_end > total_tokens) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert dispatch chunk range");
+    }
+    if (n_embd <= 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk prepacked requires positive n_embd");
+    }
+    const uint32_t chunk_n_tokens = token_end - token_start;
+    // Same validation pipe_encode_expert_dispatch_req() (via
+    // write_expert_dispatch_req_header) applies to a request with n_tokens ==
+    // chunk_n_tokens, done here up front so a bad frame is rejected before
+    // anything is written -- matching the old chunk encoder, which validated
+    // through that same call before touching its output buffer.
+    if (chunk_assignments.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch requires tokens and assignments");
+    }
+    if (!std::isfinite(swiglu_clamp) || swiglu_clamp < 0.0f) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has an invalid swiglu clamp");
+    }
+    uint64_t assignment_bytes = 0;
+    for (const pipe_expert_assignment & assignment : chunk_assignments) {
+        if (assignment.weights.size() != chunk_n_tokens) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch weight count does not match n_tokens");
+        }
+        assignment_bytes += 4ull + (uint64_t) assignment.weights.size() * 4ull;
+    }
+    const size_t   n_values     = (size_t) chunk_n_tokens * (size_t) n_embd;
+    const uint64_t expect_bytes = expert_wire_bytes(n_values, expert_wire_dtype());
+    if ((uint64_t) packed_len != expect_bytes) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk prepacked activation bytes %zu, want %llu",
+             packed_len, (unsigned long long) expect_bytes);
+    }
+    const uint64_t request_bytes = 16ull + assignment_bytes + expect_bytes;
+    if (request_bytes > PIPE_MAX_PAYLOAD - 20ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk exceeds max payload");
+    }
+
+    // Everything above only validates/computes sizes; `out` (the caller's one
+    // output buffer) is written from here on, directly -- no intermediate
+    // request vector and no whole-request memcpy, unlike
+    // pipe_encode_expert_dispatch_chunk().
+    out.resize((size_t) (20ull + request_bytes));
+    uint8_t * w = out.data();
+    wr_u32(w, chunk_index);
+    wr_u32(w, chunk_count);
+    wr_u32(w, total_tokens);
+    wr_u32(w, token_start);
+    wr_u32(w, token_end);
+    wr_i32(w, layer);
+    wr_u32(w, chunk_n_tokens);
+    wr_u32(w, (uint32_t) chunk_assignments.size());
+    wr_f32(w, swiglu_clamp);
+    for (const pipe_expert_assignment & assignment : chunk_assignments) {
+        wr_i32(w, assignment.expert_id);
+        for (float weight : assignment.weights) {
+            wr_f32(w, weight);
+        }
+    }
+    if (expect_bytes > 0) {
+        std::memcpy(w, packed_activations, (size_t) expect_bytes);
+    }
+}
+
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts_prepacked(
+        uint32_t n_tokens, int32_t n_embd, const uint8_t * packed_activations, size_t packed_len) {
+    if (n_embd <= 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS prepacked requires positive n_embd");
+    }
+    const size_t   n_values     = (size_t) n_tokens * (size_t) n_embd;
+    const uint64_t expect_bytes = expert_wire_bytes(n_values, expert_wire_dtype());
+    if ((uint64_t) packed_len != expect_bytes) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS prepacked bytes %zu, want %llu",
+             packed_len, (unsigned long long) expect_bytes);
+    }
+    return std::vector<uint8_t>(packed_activations, packed_activations + packed_len);
 }
 
 pipe_expert_dispatch_chunk pipe_decode_expert_dispatch_chunk(
