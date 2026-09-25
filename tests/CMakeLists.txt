@@ -586,6 +586,36 @@ target_link_libraries(test-pipe-protocol PRIVATE ggml)
 target_compile_features(test-pipe-protocol PRIVATE cxx_std_17)
 llama_test(test-pipe-protocol)
 
+# Standalone CPU benchmark + byte-identity check for the spine-side MoE
+# "plan + encode" hot path (2026-09-25 profiling task): WP_EXPERT_PLAN_THREADS
+# / WP_EXPERT_ENCODE_THREADS parallelize routing classification and wire
+# encoding via the persistent pool in pipe-thread-pool.h. Re-execs itself
+# (fork+exec) per thread count since both knobs latch once per process -- see
+# the file header. Links pipe-channel/pipe-protocol/pipe-transport/
+# pipe-reduce-simd/llama-pipeline the same way test-pipe-protocol does, plus
+# the vendored sha256 for the byte-identity hashes.
+add_executable(
+    test-wp-expert-plan-encode-bench
+    test-wp-expert-plan-encode-bench.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-channel.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-protocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-reduce-simd.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/vendor/hash/sha256/sha256.c
+)
+target_include_directories(test-wp-expert-plan-encode-bench PRIVATE
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/vendor/hash/sha256
+    ${CMAKE_SOURCE_DIR}/vendor
+    ${CMAKE_SOURCE_DIR}/vendor/hash
+)
+target_link_libraries(test-wp-expert-plan-encode-bench PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-wp-expert-plan-encode-bench PRIVATE cxx_std_17)
+llama_test(test-wp-expert-plan-encode-bench)
+
 # Correctness + microbench for the vectorized unpack helpers
 # (pipe_simd_accumulate_f32 / pipe_simd_convert_f16_to_f32 /
 # pipe_simd_decode_f16_accumulate) used by pipe-protocol.cpp's decode path

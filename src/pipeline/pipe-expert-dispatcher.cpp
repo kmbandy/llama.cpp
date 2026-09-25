@@ -5,6 +5,7 @@
 #include "pipe-transport.h"
 #include "pipe-reduce-simd.h"
 #include "pipe-expert-shm.h"
+#include "pipe-thread-pool.h"
 
 #include <algorithm>
 #include <numeric>
@@ -470,6 +471,14 @@ int parse_wp_defer_k() {
     return (int) parsed;
 }
 
+// WP_STREAM_SEND_OVERLAP=1 (default off, current behaviour unchanged). Only
+// meaningful together with WP_DISPATCH_STREAM (dispatch_stream_chunks_ > 1);
+// see the stream_wire encode/issue branches below.
+bool stream_send_overlap_enabled() {
+    const char * value = std::getenv("WP_STREAM_SEND_OVERLAP");
+    return value != nullptr && value[0] == '1';
+}
+
 int dispatch_chunks_enabled() {
     const char * value = std::getenv("WP_DISPATCH_CHUNKS");
     if (value == nullptr || value[0] == '\0') {
@@ -513,6 +522,43 @@ uint32_t dispatch_stream_min_tokens() {
         return (uint32_t) parsed;
     }();
     return cached;
+}
+
+// WP_EXPERT_PLAN_THREADS=N (default 1, current single-threaded behaviour
+// byte-for-byte). Threads the assignment->worker classification loop in
+// plan_requests() (choose_worker() plus a push_back that deep-copies each
+// assignment's full n_tokens-length weight vector -- up to ~n_expert
+// assignments of n_tokens floats each, real bytes moved, not a cheap loop).
+// Only takes effect when WP_DISPATCH_STATIC_ASSIGN is on (the 2026-08-04
+// default and the DS4.1 config of record): choose_worker() is then a PURE
+// function of (layer, expert) and does not read assigned_counts, so which
+// thread classifies which assignment cannot change the result -- see
+// choose_worker's own comment. Off (or forced off with WP_DISPATCH_STATIC_ASSIGN=0)
+// falls back to nt=1 with a one-time warning, because the non-static-assign
+// path's residency/assigned_counts balancing is order-dependent by design and
+// parallelizing it would silently change worker choice, not just wall time.
+int dispatch_plan_threads_enabled(bool static_assign) {
+    const char * value = std::getenv("WP_EXPERT_PLAN_THREADS");
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+    const int parsed = std::atoi(value);
+    if (parsed <= 1) {
+        return 1;
+    }
+    if (!static_assign) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN(
+                "expert dispatch: WP_EXPERT_PLAN_THREADS=%d ignored -- requires "
+                "WP_DISPATCH_STATIC_ASSIGN=1 (choose_worker must be a pure "
+                "function of layer,expert for parallel classification to stay "
+                "order-independent)\n",
+                parsed);
+        }
+        return 1;
+    }
+    return parsed;
 }
 
 // WP_DEFER_MAX_WIDTH = upper bound on n_tokens for a dispatch to be eligible
@@ -731,9 +777,20 @@ struct dispatcher::impl {
         bool               failed  = false;
         std::string        error_msg;
         // Backpressure cap. One layer of requests is <= ~3 frames per worker
-        // (<= ~60 MB worst-case prefill), so a full queue means a wedged worker;
-        // fail loudly rather than grow without bound.
-        static constexpr size_t MAX_QUEUE = 8;
+        // (<= ~60 MB worst-case prefill) on the plain async_issue path, so a
+        // full queue there means a wedged worker; fail loudly rather than grow
+        // without bound. WP_STREAM_SEND_OVERLAP can legitimately enqueue up to
+        // WP_DISPATCH_STREAM chunks for ONE request, so start_writers() raises
+        // this per-writer when that knob is on instead of using one constant
+        // for both mechanisms.
+        size_t             max_queue = 8;
+        // Bumped by enqueue_frame, matched by completed once writer_loop's
+        // pipe_send_frame call for that frame returns. flush_writer() (see
+        // below) waits for completed == enqueued rather than queue.empty(),
+        // because queue.empty() alone is true the instant the writer thread
+        // pops the last frame -- before it has actually sent it.
+        uint64_t           enqueued  = 0;
+        uint64_t           completed = 0;
     };
 
     // WP_CONCURRENT_ISSUE: one persistent sender thread per socket, but unlike
@@ -796,6 +853,12 @@ struct dispatcher::impl {
         // this request's socket. The vector is empty on the legacy path.
         std::vector<std::vector<uint8_t>>  stream_payloads;
         bool                                stream_wire = false;
+        // WP_STREAM_SEND_OVERLAP: true once plan_requests() has already
+        // enqueued every entry of stream_payloads onto this worker's writer
+        // FIFO (in order). issue_requests() must not resend them -- it only
+        // flush_writer()s to enforce the same "not sent yet" error contract
+        // before returning.
+        bool                                stream_sent_via_writer = false;
         // PER-REQUEST split-frame decision (2026-08-27). WP_SPLIT_FRAME used to
         // be a connection-lifetime latch, so EVERY request paid two frames --
         // but split-frame exists only to carry WP_DISPATCH_DEDUP_ACTIVATIONS,
@@ -980,6 +1043,14 @@ struct dispatcher::impl {
     // choose_worker and send_prefetch_hints -- one field so a hint can never be
     // routed by a different rule than the request that follows it.
     bool                                                static_assign = true;
+    // WP_EXPERT_PLAN_THREADS latch; see dispatch_plan_threads_enabled(). Depends
+    // on static_assign, so it is declared (and constructed) after it.
+    int                                                 plan_threads_ = 1;
+    // WP_STREAM_SEND_OVERLAP latch (2026-09-25). See start_writers()/
+    // stream_wire handling below: reuses the WP_ASYNC_ISSUE socket_writer FIFO
+    // to enqueue a WP_DISPATCH_STREAM chunk the moment it is encoded, instead
+    // of collecting every worker's every chunk before any send begins.
+    bool                                                stream_send_overlap_ = false;
     bool                                                hint_inflight = false;
     bool                                                stats_logging = false;
     // WP_ASYNC_ISSUE latch (D1). True => issue/hint frames go through per-socket
@@ -1050,6 +1121,8 @@ struct dispatcher::impl {
     explicit impl(const std::vector<endpoint> & endpoints) :
                 speed_split(speed_split_enabled()),
                 static_assign(static_assign_enabled()),
+                plan_threads_(dispatch_plan_threads_enabled(static_assign)),
+                stream_send_overlap_(stream_send_overlap_enabled()),
                 hint_inflight(hint_inflight_enabled()),
                 async_issue(async_issue_enabled()),
                 unpack_overlap(unpack_overlap_enabled()),
@@ -1358,7 +1431,11 @@ struct dispatcher::impl {
     }
 
     void start_writers() {
-        if (!async_issue) {
+        // WP_STREAM_SEND_OVERLAP also needs a socket_writer per worker (it
+        // enqueues stream chunks to the same FIFO async_issue uses) even when
+        // async_issue itself is off -- see the stream_wire encode branch in
+        // plan_requests() and its issue_requests() counterpart below.
+        if (!async_issue && !stream_send_overlap_) {
             return;
         }
         try {
@@ -1369,6 +1446,15 @@ struct dispatcher::impl {
                 value.writer.reset(new socket_writer{});
                 value.writer->socket = value.socket;   // own ref for the thread
                 value.writer->endpoint = value.info.endpoint;
+                if (stream_send_overlap_ && dispatch_stream_chunks_ > 1) {
+                    // One request can enqueue up to dispatch_stream_chunks_
+                    // chunks before issue_requests's flush_writer() drains
+                    // them; async_issue's 8-frame cap (sized for <=2
+                    // frames/request on the split_wire path) is too small for
+                    // that. +8 keeps headroom for a following request's BEGIN/
+                    // ACTS or plain frame landing before the flush runs.
+                    value.writer->max_queue = std::max<size_t>(8, (size_t) dispatch_stream_chunks_ + 8);
+                }
                 socket_writer * w = value.writer.get();
                 w->thread = std::thread([this, w]() { writer_loop(w); });
             }
@@ -1477,6 +1563,11 @@ struct dispatcher::impl {
                 }
                 break;
             }
+            {
+                std::lock_guard<std::mutex> lock(w->mutex);
+                ++w->completed;
+            }
+            w->cv.notify_all();
         }
         {
             std::lock_guard<std::mutex> lock(w->mutex);
@@ -1499,14 +1590,35 @@ struct dispatcher::impl {
                 throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                          " writer failed: " + w->error_msg);
             }
-            if (w->queue.size() >= socket_writer::MAX_QUEUE) {
+            if (w->queue.size() >= w->max_queue) {
                 throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                          " writer queue overflow (worker wedged?)");
             }
             frame.enqueued_at = dispatch_clock::now();
             w->queue.push_back(std::move(frame));
+            ++w->enqueued;
         }
         w->cv.notify_one();
+    }
+
+    // WP_STREAM_SEND_OVERLAP: block until every frame enqueued to this
+    // worker's writer so far has actually been sent (not merely popped off
+    // the queue -- see socket_writer::enqueued/completed's comment). Throws
+    // the writer's recorded error the same way join_concurrent_job's callers
+    // do, so issue_requests's error contract for a failed send is unchanged
+    // whether the frame went out via the plain send_frame lambda or here.
+    void flush_writer(worker & value) {
+        socket_writer * w = value.writer.get();
+        if (!w) {
+            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                     " has no writer (stream send overlap requires WP_ASYNC_ISSUE-style writers)");
+        }
+        std::unique_lock<std::mutex> lock(w->mutex);
+        w->cv.wait(lock, [w]() { return w->failed || w->completed >= w->enqueued; });
+        if (w->failed) {
+            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                     " writer failed: " + w->error_msg);
+        }
     }
 
     void start_concurrent_senders() {
@@ -2248,25 +2360,72 @@ struct dispatcher::impl {
                                                const std::vector<pipe_expert_assignment> & assignments,
                                                const std::vector<std::vector<size_t>> &   layer_routes,
                                                std::vector<size_t> &                       assigned_counts,
-                                               float                                       swiglu_clamp) {
+                                               float                                       swiglu_clamp,
+                                               uint64_t                                    seq_id = 0) {
         std::vector<planned_request> by_worker(workers.size());
         for (size_t i = 0; i < workers.size(); ++i) {
             by_worker[i].worker_index = i;
             by_worker[i].layer = layer;
         }
         const bool layer_is_slice = layer_slice_mode.at(layer);
-        for (const pipe_expert_assignment & assignment : assignments) {
-            const std::vector<size_t> & candidates = layer_routes[(size_t) assignment.expert_id];
-            if (layer_is_slice) {
-                for (size_t worker_index : candidates) {
-                    by_worker[worker_index].assignments.push_back(assignment);
-                    ++assigned_counts[worker_index];
-                }
-                continue;
+        // WP_EXPERT_PLAN_THREADS: classify assignments to workers in parallel
+        // chunks, then merge in original chunk order so each worker's
+        // assignments vector ends up byte-identical to the serial loop's
+        // (order matters: it becomes the wire's assignment order). Only
+        // engaged when plan_threads_ > 1, which dispatch_plan_threads_enabled()
+        // already gates on WP_DISPATCH_STATIC_ASSIGN=1 -- see that function's
+        // comment for why choose_worker() is then order-independent. Below a
+        // small assignment count the serial loop is cheaper than a pool hop.
+        if (plan_threads_ > 1 && assignments.size() >= 64) {
+            const size_t per_chunk = (assignments.size() + (size_t) plan_threads_ - 1) / (size_t) plan_threads_;
+            const size_t n_chunks  = (assignments.size() + per_chunk - 1) / per_chunk;
+            std::vector<std::vector<std::vector<pipe_expert_assignment>>> chunk_by_worker(n_chunks);
+            std::vector<std::vector<size_t>> chunk_counts(n_chunks, std::vector<size_t>(workers.size(), 0));
+            for (auto & cw : chunk_by_worker) {
+                cw.resize(workers.size());
             }
-            const size_t chosen = choose_worker(layer, assignment.expert_id, candidates, assigned_counts, n_tokens);
-            by_worker[chosen].assignments.push_back(assignment);
-            ++assigned_counts[chosen];
+            pipe_parallel_for(assignments.size(), (size_t) plan_threads_, [&](size_t a0, size_t a1) {
+                const size_t chunk_idx = a0 / per_chunk;
+                auto & cw = chunk_by_worker[chunk_idx];
+                auto & cc = chunk_counts[chunk_idx];
+                for (size_t i = a0; i < a1; ++i) {
+                    const pipe_expert_assignment & assignment = assignments[i];
+                    const std::vector<size_t> & candidates = layer_routes[(size_t) assignment.expert_id];
+                    if (layer_is_slice) {
+                        for (size_t worker_index : candidates) {
+                            cw[worker_index].push_back(assignment);
+                            ++cc[worker_index];
+                        }
+                        continue;
+                    }
+                    const size_t chosen =
+                        choose_worker(layer, assignment.expert_id, candidates, assigned_counts, n_tokens);
+                    cw[chosen].push_back(assignment);
+                    ++cc[chosen];
+                }
+            });
+            for (size_t c = 0; c < n_chunks; ++c) {
+                for (size_t w = 0; w < workers.size(); ++w) {
+                    for (pipe_expert_assignment & a : chunk_by_worker[c][w]) {
+                        by_worker[w].assignments.push_back(std::move(a));
+                    }
+                    assigned_counts[w] += chunk_counts[c][w];
+                }
+            }
+        } else {
+            for (const pipe_expert_assignment & assignment : assignments) {
+                const std::vector<size_t> & candidates = layer_routes[(size_t) assignment.expert_id];
+                if (layer_is_slice) {
+                    for (size_t worker_index : candidates) {
+                        by_worker[worker_index].assignments.push_back(assignment);
+                        ++assigned_counts[worker_index];
+                    }
+                    continue;
+                }
+                const size_t chosen = choose_worker(layer, assignment.expert_id, candidates, assigned_counts, n_tokens);
+                by_worker[chosen].assignments.push_back(assignment);
+                ++assigned_counts[chosen];
+            }
         }
 
         std::vector<planned_request> requests;
@@ -2488,10 +2647,15 @@ struct dispatcher::impl {
                 const uint32_t total_tokens = wire_request.n_tokens;
                 const uint32_t chunk_count = std::min(dispatch_stream_chunks_, total_tokens);
                 const uint32_t chunk_rows = total_tokens / chunk_count;
-                request.stream_payloads.reserve(chunk_count);
+                // Sized up front (not reserve()+push_back) so WP_EXPERT_ENCODE_THREADS
+                // can write chunk_index's slot from whichever thread encodes
+                // it, in any completion order -- the vector's CONTENT ends up
+                // identical to the serial push_back loop either way, since
+                // each chunk lands at its own fixed index.
+                request.stream_payloads.assign(chunk_count, {});
                 const dispatch_clock::time_point stream_encode_started =
                     layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
-                for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+                const auto encode_one_chunk = [&](uint32_t chunk_index) {
                     const uint32_t token_start = chunk_index * chunk_rows;
                     const uint32_t token_end = chunk_index + 1 == chunk_count
                         ? total_tokens : token_start + chunk_rows;
@@ -2536,13 +2700,49 @@ struct dispatcher::impl {
                             chunk.request.activations.begin());
                         chunk_payload = pipe_encode_expert_dispatch_chunk(chunk);
                     }
-                    request.stream_payloads.push_back(std::move(chunk_payload));
+                    request.stream_payloads[chunk_index] = std::move(chunk_payload);
+                };
+                const int encode_nt = pipe_expert_encode_threads();
+                if (encode_nt > 1 && chunk_count >= 2) {
+                    pipe_parallel_for((size_t) chunk_count, (size_t) encode_nt,
+                                      [&](size_t c0, size_t c1) {
+                                          for (size_t c = c0; c < c1; ++c) {
+                                              encode_one_chunk((uint32_t) c);
+                                          }
+                                      });
+                } else {
+                    for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+                        encode_one_chunk(chunk_index);
+                    }
                 }
                 if (layer_trace_enabled()) {
                     add_layer_trace(layer, &layer_trace_stats::encode_ns,
                                     elapsed_ns(stream_encode_started, dispatch_clock::now()));
                 }
                 request.stream_wire = true;
+                // WP_STREAM_SEND_OVERLAP: hand every chunk to this worker's
+                // writer FIFO right now, in chunk order, rather than waiting
+                // for issue_requests() to do it after EVERY worker in this
+                // dispatch has finished encoding. The chunks above may have
+                // been encoded out of order (parallel), but they are only
+                // ever pushed to the wire in this strict 0..chunk_count-1
+                // loop, so the bytes on the socket are identical to today's
+                // sequential send -- only the WALL-CLOCK moment sending
+                // starts moves earlier (as soon as THIS worker's chunks are
+                // ready, not after every worker's). Requires a writer thread,
+                // which start_writers() only creates for non-inproc/non-shm
+                // sockets, matching this branch's own preconditions.
+                if (stream_send_overlap_ && workers[request.worker_index].socket) {
+                    for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+                        wire_frame frame;
+                        frame.type    = PIPE_EXPERT_DISPATCH_CHUNK;
+                        frame.seq_id  = seq_id;
+                        frame.layer   = layer;
+                        frame.payload = std::move(request.stream_payloads[chunk_index]);
+                        enqueue_frame(workers[request.worker_index], std::move(frame));
+                    }
+                    request.stream_sent_via_writer = true;
+                }
                 requests.push_back(std::move(request));
                 continue;
             }
@@ -2926,6 +3126,13 @@ struct dispatcher::impl {
                     throw std::runtime_error("expert dispatcher failed to signal local shm request to worker " +
                                              value.info.endpoint);
                 }
+            } else if (request.stream_wire && request.stream_sent_via_writer) {
+                // WP_STREAM_SEND_OVERLAP already enqueued every chunk (in
+                // order) back in plan_requests(); just confirm the writer has
+                // actually finished sending all of them before this call
+                // returns, with the same error contract a failed send always
+                // had (throw naming this worker).
+                flush_writer(value);
             } else if (request.stream_wire) {
                 for (const std::vector<uint8_t> & payload : request.stream_payloads) {
                     if (!send_frame(PIPE_EXPERT_DISPATCH_CHUNK, payload)) {
@@ -4143,7 +4350,7 @@ struct dispatcher::impl {
                 layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
             std::vector<planned_request> imm_requests =
                 plan_requests(layer, n_tokens, activations, immediate, route_it->second, assigned_counts,
-                              swiglu_clamp);
+                              swiglu_clamp, seq_id);
             if (layer_trace_enabled()) {
                 add_layer_trace(layer, &layer_trace_stats::plan_ns, elapsed_ns(plan_started, dispatch_clock::now()));
             }
@@ -4151,7 +4358,7 @@ struct dispatcher::impl {
                 deferred.empty()
                     ? std::vector<planned_request>{}
                     : plan_requests(layer, n_tokens, activations, deferred, route_it->second, assigned_counts,
-                                    swiglu_clamp);
+                                    swiglu_clamp, seq_id);
 
             state.stats              = {};
             state.stats.workers_used = imm_requests.size() + def_requests.size();

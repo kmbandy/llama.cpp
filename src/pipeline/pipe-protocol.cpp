@@ -1,6 +1,7 @@
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
 #include "pipe-reduce-simd.h"
+#include "pipe-thread-pool.h"
 
 #include "ggml.h"
 
@@ -1268,11 +1269,41 @@ static uint8_t * write_expert_dispatch_req_header(
     wr_u32(w, n_tokens);
     wr_u32(w, (uint32_t) assignments.size());
     wr_f32(w, swiglu_clamp);
-    for (const pipe_expert_assignment & assignment : assignments) {
-        wr_i32(w, assignment.expert_id);
-        for (float weight : assignment.weights) {
-            wr_f32(w, weight);
+    // Per-assignment byte offset from `w` is 16 (header, already written above)
+    // does not apply here -- w has already been advanced past the 16-byte
+    // header by the four wr_*() calls above, so assignment i starts at
+    // i * (4 + n_tokens*4) from HERE. That is a pure function of i, so any
+    // subset of assignments can be written by any thread without touching
+    // another thread's bytes -- see WP_EXPERT_ENCODE_THREADS above.
+    const uint64_t per_assignment_bytes = 4ull + (uint64_t) n_tokens * 4ull;
+    const int      nt = pipe_expert_encode_threads();
+    // Below ~64 assignments the per-thread slice is not worth a pool hop.
+    if (nt <= 1 || assignments.size() < 64) {
+        for (const pipe_expert_assignment & assignment : assignments) {
+            wr_i32(w, assignment.expert_id);
+            for (float weight : assignment.weights) {
+                wr_f32(w, weight);
+            }
         }
+    } else {
+        pipe_parallel_for(assignments.size(), (size_t) nt, [&](size_t a0, size_t a1) {
+            uint8_t * aw = w + a0 * per_assignment_bytes;
+            for (size_t i = a0; i < a1; ++i) {
+                const pipe_expert_assignment & assignment = assignments[i];
+                wr_i32(aw, assignment.expert_id);
+                for (float weight : assignment.weights) {
+                    wr_f32(aw, weight);
+                }
+            }
+        });
+        // The threaded branch above writes through per-thread-local `aw`
+        // copies, not through `w` itself (each thread's slice is a pure
+        // function of its own a0/a1, deliberately -- see the offset comment),
+        // so `w` never advanced past the header the way the serial loop's
+        // in-place wr_*() calls do. Advance it here by the exact byte count
+        // just written, or the caller's activation memcpy below lands at the
+        // wrong offset and overwrites the assignments it just wrote.
+        w += assignments.size() * per_assignment_bytes;
     }
     return w;
 }
@@ -1299,11 +1330,47 @@ uint64_t pipe_expert_wire_row_bytes(int32_t n_embd) {
     return expert_wire_bytes((size_t) n_embd, expert_wire_dtype());
 }
 
+// WP_EXPERT_ENCODE_THREADS=N (default 1, current single-threaded behaviour
+// byte-for-byte). Shared by the two spine-side hot loops profiled 2026-09-25
+// as the bulk of plan_ns/encode_ns on an 8192-token ubatch: packing the whole
+// activation matrix to the wire dtype once per layer (pipe_expert_wire_pack_matrix,
+// row-separable so any row range is independent), and writing each assignment's
+// per-token weight array into its fixed byte offset in the request header
+// (write_expert_dispatch_req_header below, offsets are a pure function of
+// assignment index so any subset of assignments can be written by any thread).
+// Uses the persistent pool in pipe-thread-pool.h, not per-call std::thread --
+// a layer's issue phase runs every ~200 ms across 40 layers x up to 3 ubatches
+// per prefill, so spawn/join overhead is not noise at that cadence.
+int pipe_expert_encode_threads() {
+    static const int n = [] {
+        const char * v = std::getenv("WP_EXPERT_ENCODE_THREADS");
+        if (v == nullptr || v[0] == '\0') {
+            return 1;
+        }
+        const int parsed = std::atoi(v);
+        return parsed > 1 ? parsed : 1;
+    }();
+    return n;
+}
+
 void pipe_expert_wire_pack_matrix(uint8_t * dst, const float * src, uint32_t n_tokens, int32_t n_embd) {
     if (n_embd <= 0) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert wire pack requires positive n_embd");
     }
-    expert_wire_pack(dst, src, (size_t) n_tokens * (size_t) n_embd, expert_wire_dtype());
+    const int32_t  dtype     = expert_wire_dtype();
+    const size_t   row_bytes = (size_t) expert_wire_bytes((size_t) n_embd, dtype);
+    const int      nt        = pipe_expert_encode_threads();
+    // Below ~256 rows the per-thread slice is too small to be worth a pool
+    // hop (matches the >=4096-block threshold expert_wire_unpack_ml8_4 uses
+    // for the same reason, scaled by row width instead of block count).
+    if (nt <= 1 || n_tokens < 256) {
+        expert_wire_pack(dst, src, (size_t) n_tokens * (size_t) n_embd, dtype);
+        return;
+    }
+    pipe_parallel_for((size_t) n_tokens, (size_t) nt, [&](size_t t0, size_t t1) {
+        expert_wire_pack(dst + t0 * row_bytes, src + t0 * (size_t) n_embd,
+                         (t1 - t0) * (size_t) n_embd, dtype);
+    });
 }
 
 std::vector<uint8_t> pipe_encode_expert_dispatch_req_prepacked(

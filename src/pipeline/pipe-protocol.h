@@ -881,6 +881,13 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_chunk(const pipe_expert_dispatc
 int32_t  pipe_expert_wire_dtype();
 uint64_t pipe_expert_wire_row_bytes(int32_t n_embd);
 
+// WP_EXPERT_ENCODE_THREADS=N (default 1, current single-threaded behaviour
+// byte-for-byte): thread count used by pipe_expert_wire_pack_matrix's row-block
+// packing and write_expert_dispatch_req_header's per-assignment weight writes,
+// both in pipe-protocol.cpp. Exposed so callers (e.g. the dispatcher's own
+// stream-chunk encode loop) can share the same knob and pool sizing.
+int pipe_expert_encode_threads();
+
 // Packs `n_tokens` rows of `n_embd` f32 values (row-major, [n_tokens, n_embd])
 // into `dst` in the current WP_EXPERT_WIRE dtype. `dst` must hold at least
 // n_tokens * pipe_expert_wire_row_bytes(n_embd) bytes. Row-separable per the
