@@ -333,15 +333,11 @@ struct llama_hparams {
     // dsv41_kv_source_layer_ids / dsv41_index_source_layer_ids lists (already read from the
     // `deepseek41.attention.kv_source_layer_ids` / `...index_source_layer_ids` GGUF keys).
     //
-    // Rule (matches our existing graph::kv_source_for, and mirrors upstream's tensor-presence
-    // walk in load_arch_tensors, which -- for our GGUF layout -- resolves to the same thing since
-    // indexer_attn_k and indexer_attn_q_b are always created together on index-source layers):
-    // for layer il, the source is the largest id in the relevant list that is <= il, or -1 if the
-    // list is empty or every id in it is > il. dsv41_index_key_source and dsv41_topk_source both
-    // derive from dsv41_index_source_layer_ids because our format uses one explicit list for
-    // "this layer owns the indexer key projection and the index query/topk computation" -- unlike
-    // upstream, which infers the two roles independently from which of indexer_attn_k /
-    // indexer_attn_q_b happens to be present.
+    // Rule: for layer il, the source is the largest id in the relevant list that is <= il, or -1
+    // if the list is empty or every id in it is > il. dsv41_topk_source follows
+    // dsv41_index_source_layer_ids; dsv41_index_key_source follows dsv41_kv_source_layer_ids,
+    // because index keys are projected from a kv source's compressed latent (only those layers
+    // carry indexer_attn_k) and later index sources score against that source's keys.
     void dsv41_derive_stream_roles();
 
     bool is_engram(uint32_t il) const;

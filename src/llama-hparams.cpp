@@ -312,7 +312,9 @@ void llama_hparams::dsv41_derive_stream_roles() {
                 idx_src = s;
             }
         }
-        dsv41_index_key_source[il] = idx_src;
+        // Index keys come from the compressor's latent, so only a kv source makes them
+        // (reference Indexer.owns_k); index sources past the last kv source read its keys.
+        dsv41_index_key_source[il] = kv_src;
         dsv41_topk_source[il]      = idx_src;
     }
 }
