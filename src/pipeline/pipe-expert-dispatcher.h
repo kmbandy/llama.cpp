@@ -69,7 +69,21 @@ struct layer_trace_stats {
     uint64_t encode_ns = 0;
     uint64_t send_ns   = 0;
     uint64_t recv_ns   = 0;
+    // decode_ns: wire dtype -> f32 (CPU expert_wire_unpack, or -- when
+    // WP_EXPERT_WIRE_GPU_UNPACK=1 and eligible -- the upload+kernel+download
+    // round trip in receive_partial). fold_ns: scatter_add() only, i.e. the
+    // per-worker-partial add into the layer result (see WHAT TO DO item 1's
+    // "keep decode_ns meaning 'unpack+fold'" ask -- both are kept separate
+    // here since GPU unpack changes decode_ns's cost independently of fold's;
+    // add them for the combined "unpack+fold" figure).
     uint64_t decode_ns = 0;
+    uint64_t fold_ns   = 0;
+    // copy_ns: the streamed-chunk and streamed-partial paths' combined
+    // non-finite-scan + copy-into-`out` pass (receive_partial's stream_wire
+    // and PIPE_EXPERT_PARTIAL_STREAM branches) -- previously untimed and not
+    // inside decode_ns, this is what a 2026-09-25 live trace (decode_ns=168ms,
+    // recv_ns=~600ms) needed to account for the ~430ms gap between them.
+    uint64_t copy_ns   = 0;
     uint64_t plan_ns   = 0; // plan_requests(): routing plus building and encoding every worker's frames
 };
 

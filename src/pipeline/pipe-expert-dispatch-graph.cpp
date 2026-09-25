@@ -615,7 +615,12 @@ void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
         labels += " (" + std::to_string(layer) + ",1," +
                   std::to_string(second->second->seq_id) + ")";
     }
-    std::fprintf(layer_trace_, "DS4 layer=%d chunks=%d labels=%s dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu plan_ns=%llu\n",
+    // scatter_ns was a placeholder (always printed 0) until now: it is
+    // transport.fold_ns, the scatter_add()-only time (the "+fold" half of
+    // "decode_ns meaning unpack+fold" -- decode_ns is the wire-dtype -> f32
+    // step alone, still separate so a WP_EXPERT_WIRE_GPU_UNPACK A/B can see
+    // which half moved).
+    std::fprintf(layer_trace_, "DS4 layer=%d chunks=%d labels=%s dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu plan_ns=%llu copy_ns=%llu\n",
                  layer,
                  chunked ? 2 : 1,
                  labels.c_str(),
@@ -624,8 +629,9 @@ void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
                  (unsigned long long) transport.send_ns,
                  (unsigned long long) transport.recv_ns,
                  (unsigned long long) transport.decode_ns,
-                 0ull,
-                 (unsigned long long) transport.plan_ns);
+                 (unsigned long long) transport.fold_ns,
+                 (unsigned long long) transport.plan_ns,
+                 (unsigned long long) transport.copy_ns);
     std::fflush(layer_trace_);
 }
 

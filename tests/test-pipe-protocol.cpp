@@ -24,6 +24,7 @@
 #include <limits>
 #include <random>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -759,6 +760,275 @@ static void test_expert_partial_dtype_rejects() {
                            PIPE_ERR_BAD_FRAME);
     }
 }
+
+// Hand-packs `n_values` floats into ml8_4 wire bytes -- same algorithm as
+// expert_wire_pack_ml8_4() (pipe-protocol.cpp, CPU fallback), duplicated here
+// so these tests need no WP_EXPERT_WIRE env / subprocess machinery to get
+// packed bytes to decode.
+static std::vector<uint8_t> pack_ml8_4_for_test(const std::vector<float> & v) {
+    static const float centroids[16] = {
+        -0.93750000f, -0.75000000f, -0.56250000f, -0.43750000f, -0.31250000f, -0.21875000f, -0.12500000f, -0.03906250f,
+        +0.04296875f, +0.12500000f, +0.21875000f, +0.31250000f, +0.43750000f, +0.56250000f, +0.75000000f, +0.93750000f,
+    };
+    auto nearest = [&](float x) {
+        int best = 0; float bd = std::fabs(x - centroids[0]);
+        for (int i = 1; i < 16; ++i) {
+            const float dd = std::fabs(x - centroids[i]);
+            if (dd < bd) { bd = dd; best = i; }
+        }
+        return best;
+    };
+    const size_t n_blocks = v.size() / 32ull;
+    std::vector<uint8_t> packed(n_blocks * 18ull);
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const float * blk_v = v.data() + b * 32ull;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            amax = std::max(amax, std::fabs(blk_v[j]));
+        }
+        const ggml_fp16_t h = ggml_fp32_to_fp16(amax);
+        const float d = ggml_fp16_to_fp32(h);
+        const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+        uint8_t * blk = packed.data() + b * 18ull;
+        std::memcpy(blk, &h, sizeof(h));
+        for (int j = 0; j < 32; j += 2) {
+            const int i0 = nearest(blk_v[j + 0] * inv);
+            const int i1 = nearest(blk_v[j + 1] * inv);
+            blk[2 + j / 2] = (uint8_t) (i0 | (i1 << 4));
+        }
+    }
+    return packed;
+}
+
+// WP_DISPATCH_STREAM's chunk path: pipe_decode_expert_partial_chunk() needs
+// its OWN keep_ml8_4_packed wiring -- it used to hard-reject anything but
+// PIPE_HIDDEN_F32 (see pipe-protocol.cpp), so passing keep_ml8_4_packed=true
+// there without also relaxing that check would just throw. Live trace showed
+// WP_EXPERT_WIRE_GPU_UNPACK never engaging under WP_DISPATCH_STREAM=4
+// precisely because this decoder never got the flag at all before this test
+// existed. Same three checks as the plain-partial version above, through the
+// chunk wrapper instead.
+static void test_expert_partial_chunk_ml8_4_keep_packed_roundtrip() {
+    std::mt19937 rng(20260925u ^ 0x63686e6bu); // "chnk"
+    std::uniform_real_distribution<float> act_dist(-8.0f, 8.0f);
+    const int32_t  n_embd  = 64; // multiple of 32
+    const uint32_t n_tokens = 5;
+    std::vector<float> v((size_t) n_tokens * (size_t) n_embd);
+    for (float & f : v) {
+        f = act_dist(rng);
+    }
+    const std::vector<uint8_t> packed = pack_ml8_4_for_test(v);
+
+    auto build_chunk_frame = [&](int32_t dtype, const std::vector<uint8_t> & payload) {
+        std::vector<uint8_t> frame;
+        put_u32(frame, 2); // chunk_index
+        put_u32(frame, 3); // chunk_count
+        put_u32(frame, 9); // total_tokens
+        put_u32(frame, 4); // token_start
+        put_u32(frame, 4 + n_tokens); // token_end
+        put_i32(frame, 8); // layer
+        put_u32(frame, n_tokens);
+        put_i32(frame, dtype);
+        frame.insert(frame.end(), payload.begin(), payload.end());
+        return frame;
+    };
+
+    const std::vector<uint8_t> ml8_frame = build_chunk_frame(PIPE_HIDDEN_ML8_4, packed);
+    const pipe_expert_partial_chunk kept = pipe_decode_expert_partial_chunk(
+        ml8_frame.data(), ml8_frame.size(), n_embd, /*keep_ml8_4_packed=*/true);
+    CHECK(kept.chunk_index == 2 && kept.token_start == 4 && kept.token_end == 4 + n_tokens);
+    CHECK(kept.partial.dtype == PIPE_HIDDEN_ML8_4);
+    CHECK(kept.partial.partial.empty());
+    CHECK(kept.partial.wire_bytes.size() == packed.size());
+    CHECK(std::memcmp(kept.partial.wire_bytes.data(), packed.data(), packed.size()) == 0);
+
+    std::vector<float> from_kept(v.size());
+    pipe_expert_wire_unpack_ml8_4(from_kept.data(), kept.partial.wire_bytes.data(), v.size());
+
+    const pipe_expert_partial_chunk plain = pipe_decode_expert_partial_chunk(
+        ml8_frame.data(), ml8_frame.size(), n_embd, /*keep_ml8_4_packed=*/false);
+    CHECK(plain.partial.dtype == PIPE_HIDDEN_F32);
+    CHECK(plain.partial.partial.size() == v.size());
+    CHECK(std::memcmp(from_kept.data(), plain.partial.partial.data(), v.size() * sizeof(float)) == 0);
+
+    // no-op on a non-ML8_4 chunk
+    std::vector<uint8_t> f32_payload;
+    for (float f : v) {
+        uint32_t bits;
+        std::memcpy(&bits, &f, 4);
+        put_u32(f32_payload, bits);
+    }
+    const std::vector<uint8_t> f32_frame = build_chunk_frame(PIPE_HIDDEN_F32, f32_payload);
+    const pipe_expert_partial_chunk f32_kept = pipe_decode_expert_partial_chunk(
+        f32_frame.data(), f32_frame.size(), n_embd, /*keep_ml8_4_packed=*/true);
+    CHECK(f32_kept.partial.dtype == PIPE_HIDDEN_F32);
+    CHECK(f32_kept.partial.wire_bytes.empty());
+    CHECK(std::memcmp(f32_kept.partial.partial.data(), v.data(), v.size() * sizeof(float)) == 0);
+}
+
+// WP_EXPERT_WIRE_GPU_UNPACK's decode-side knob: keep_ml8_4_packed=true. Hand-
+// builds an ML8_4 frame (no WP_EXPERT_WIRE env dependency -- decode reads the
+// dtype off the frame, not the global cache) and checks:
+//  (a) with the flag, decode leaves dtype==PIPE_HIDDEN_ML8_4, `partial` empty,
+//      and `wire_bytes` an exact copy of the payload bytes (not re-quantized,
+//      not touched at all);
+//  (b) dequantizing those wire_bytes with pipe_expert_wire_unpack_ml8_4() --
+//      the same function the GPU-unavailable fallback in
+//      pipe-expert-dispatcher.cpp calls, and mathematically the same table
+//      the new GPU kernel uses (allreduce-ml8.cuh's ML8_4_CENTROIDS, copied
+//      into k_ml8_4_centroids per the comment above that table) -- is
+//      bit-for-bit equal to decoding the SAME frame without the flag, i.e.
+//      the ordinary CPU path pipe_decode_expert_partial always used before
+//      this task;
+//  (c) the flag is a no-op for any other dtype (only ML8_4 frames change
+//      shape).
+static void test_expert_partial_ml8_4_keep_packed_roundtrip() {
+    std::mt19937 rng(20260925u ^ 0x6d6c3834u); // "ml84"
+    std::uniform_real_distribution<float> act_dist(-8.0f, 8.0f);
+    const int32_t n_embd = 64; // multiple of 32
+    for (uint32_t n_tokens : { 1u, 3u, 17u }) {
+        const size_t n_values = (size_t) n_tokens * (size_t) n_embd;
+        std::vector<float> v(n_values);
+        for (float & f : v) {
+            f = act_dist(rng);
+        }
+        const std::vector<uint8_t> packed = pack_ml8_4_for_test(v);
+        std::vector<uint8_t> frame;
+        put_i32(frame, 5);              // layer
+        put_u32(frame, n_tokens);       // n_tokens
+        put_i32(frame, PIPE_HIDDEN_ML8_4);
+        frame.insert(frame.end(), packed.begin(), packed.end());
+
+        const pipe_expert_partial kept =
+            pipe_decode_expert_partial(frame.data(), frame.size(), n_embd, /*keep_ml8_4_packed=*/true);
+        CHECK(kept.dtype == PIPE_HIDDEN_ML8_4);
+        CHECK(kept.partial.empty());
+        CHECK(kept.wire_bytes.size() == packed.size());
+        CHECK(std::memcmp(kept.wire_bytes.data(), packed.data(), packed.size()) == 0);
+
+        std::vector<float> from_kept(n_values);
+        pipe_expert_wire_unpack_ml8_4(from_kept.data(), kept.wire_bytes.data(), n_values);
+
+        const pipe_expert_partial plain =
+            pipe_decode_expert_partial(frame.data(), frame.size(), n_embd, /*keep_ml8_4_packed=*/false);
+        CHECK(plain.dtype == PIPE_HIDDEN_F32);
+        CHECK(plain.partial.size() == n_values);
+        CHECK(std::memcmp(from_kept.data(), plain.partial.data(), n_values * sizeof(float)) == 0);
+
+        // (c) no-op on a non-ML8_4 frame.
+        std::vector<uint8_t> f32_frame;
+        put_i32(f32_frame, 5);
+        put_u32(f32_frame, n_tokens);
+        put_i32(f32_frame, PIPE_HIDDEN_F32);
+        std::vector<float> f32_vals(n_values);
+        for (size_t i = 0; i < n_values; ++i) {
+            f32_vals[i] = act_dist(rng);
+        }
+        for (float f : f32_vals) {
+            uint32_t bits;
+            std::memcpy(&bits, &f, 4);
+            put_u32(f32_frame, bits);
+        }
+        const pipe_expert_partial f32_kept =
+            pipe_decode_expert_partial(f32_frame.data(), f32_frame.size(), n_embd, /*keep_ml8_4_packed=*/true);
+        CHECK(f32_kept.dtype == PIPE_HIDDEN_F32);
+        CHECK(f32_kept.wire_bytes.empty());
+        CHECK(f32_kept.partial.size() == n_values);
+        CHECK(std::memcmp(f32_kept.partial.data(), f32_vals.data(), n_values * sizeof(float)) == 0);
+    }
+}
+
+#ifndef _WIN32
+// WP_EXPERT_WIRE_UNPACK_THREADS=N: threading only changes which thread does
+// which block/row range, never the arithmetic (see the comments on
+// expert_wire_unpack_ml8_4_blocks() and scatter_add()'s identity branch in
+// pipe-expert-dispatcher.cpp), so N=1 and N=8 must decode to bit-identical
+// output. pipe_expert_wire_unpack_threads() caches WP_EXPERT_WIRE_UNPACK_THREADS
+// in a function-local static on first read (same pattern as expert_wire_mode()
+// for WP_EXPERT_WIRE above), so comparing two thread counts needs two fresh
+// processes, not two in-process calls.
+static void run_unpack_threads_subtest(const char * outfile) {
+    setenv("HIP_VISIBLE_DEVICES", "", 1);
+    setenv("CUDA_VISIBLE_DEVICES", "", 1);
+    setenv("ROCR_VISIBLE_DEVICES", "", 1);
+    setenv("WP_EXPERT_WIRE", "ml8_4", 1);
+    std::mt19937 rng(20260925u ^ 0x74687264u); // "thrd" -- fixed seed, both
+                                                // children build the identical
+                                                // input so only decode threading differs
+    std::uniform_real_distribution<float> act_dist(-8.0f, 8.0f);
+    const int32_t  n_embd    = 256;
+    const uint32_t n_tokens  = 600;              // 600*256/32 = 4800 blocks: over
+                                                  // the 4096-block threading floor
+    pipe_expert_partial r;
+    r.dtype    = PIPE_HIDDEN_F32;
+    r.layer    = 3;
+    r.n_tokens = n_tokens;
+    r.partial.resize((size_t) n_tokens * (size_t) n_embd);
+    for (float & v : r.partial) {
+        v = act_dist(rng);
+    }
+    const std::vector<uint8_t> enc = pipe_encode_expert_partial(r); // packs via WP_EXPERT_WIRE=ml8_4, CPU (no GPU visible)
+    const pipe_expert_partial  dec = pipe_decode_expert_partial(enc.data(), enc.size(), n_embd);
+    CHECK(dec.dtype == PIPE_HIDDEN_F32);
+    FILE * f = std::fopen(outfile, "wb");
+    if (f == nullptr) {
+        std::fprintf(stderr, "FAIL: could not open %s for the unpack-threads subtest\n", outfile);
+        ++g_failed;
+        return;
+    }
+    std::fwrite(dec.partial.data(), sizeof(float), dec.partial.size(), f);
+    std::fclose(f);
+}
+
+static void test_expert_wire_unpack_threads_bit_identical() {
+    const char * out1 = "/tmp/pipe_unpack_threads_1.bin";
+    const char * out8 = "/tmp/pipe_unpack_threads_8.bin";
+    std::remove(out1);
+    std::remove(out8);
+
+    for (const auto & spec : { std::make_pair(out1, (const char *) nullptr),
+                               std::make_pair(out8, "8") }) {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            std::fprintf(stderr, "FAIL: fork() failed for unpack-threads subtest\n");
+            ++g_failed;
+            continue;
+        }
+        if (pid == 0) {
+            if (spec.second != nullptr) {
+                setenv("WP_EXPERT_WIRE_UNPACK_THREADS", spec.second, 1);
+            } else {
+                unsetenv("WP_EXPERT_WIRE_UNPACK_THREADS");
+            }
+            execl("/proc/self/exe", "test-pipe-protocol", "--unpack-threads-subtest", spec.first, (char *) nullptr);
+            _exit(127);
+        }
+        int status = 0;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            std::fprintf(stderr, "FAIL: unpack-threads subtest process failed (status=%d)\n", status);
+            ++g_failed;
+        }
+    }
+
+    FILE * f1 = std::fopen(out1, "rb");
+    FILE * f8 = std::fopen(out8, "rb");
+    CHECK(f1 != nullptr && f8 != nullptr);
+    if (f1 != nullptr && f8 != nullptr) {
+        std::vector<uint8_t> b1, b8;
+        uint8_t buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f1)) > 0) b1.insert(b1.end(), buf, buf + n);
+        while ((n = std::fread(buf, 1, sizeof(buf), f8)) > 0) b8.insert(b8.end(), buf, buf + n);
+        CHECK(!b1.empty());
+        CHECK(b1.size() == b8.size());
+        CHECK(b1 == b8); // N=1 vs N=8: bit-for-bit
+    }
+    if (f1 != nullptr) std::fclose(f1);
+    if (f8 != nullptr) std::fclose(f8);
+    std::remove(out1);
+    std::remove(out8);
+}
+#endif // _WIN32
 
 static void test_expert_dispatch_chunk_roundtrip() {
     constexpr int32_t n_embd = 3;
@@ -1712,6 +1982,10 @@ int main(int argc, char ** argv) {
         test_expert_dispatch_prepacked_parity();
         return g_failed == 0 ? 0 : 1;
     }
+    if (argc > 2 && std::strcmp(argv[1], "--unpack-threads-subtest") == 0) {
+        run_unpack_threads_subtest(argv[2]);
+        return g_failed == 0 ? 0 : 1;
+    }
 #else
     (void) argc;
     (void) argv;
@@ -1731,6 +2005,11 @@ int main(int argc, char ** argv) {
     test_expert_partial_f32_default_bit_identical();
     test_expert_partial_f16_roundtrip_tolerance();
     test_expert_partial_dtype_rejects();
+    test_expert_partial_ml8_4_keep_packed_roundtrip();
+    test_expert_partial_chunk_ml8_4_keep_packed_roundtrip();
+#ifndef _WIN32
+    test_expert_wire_unpack_threads_bit_identical();
+#endif
     test_expert_dispatch_chunk_roundtrip();
     test_expert_dispatch_non_finite_rejected();
     test_expert_dispatch_prepacked_parity(); // covers the default dtype, f32

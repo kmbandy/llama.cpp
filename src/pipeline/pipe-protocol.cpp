@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
@@ -1048,9 +1050,13 @@ static void expert_wire_pack_ml8_4(uint8_t * dst, const float * src, size_t n) {
     }
 }
 
-static void expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n) {
-    const size_t nb = n / 32ull;
-    for (size_t b = 0; b < nb; ++b) {
+// Unpacks blocks [b0, b1) only -- the row-range slice a worker thread in
+// expert_wire_unpack_ml8_4() below operates on. Split out so the threaded and
+// single-threaded callers run the exact same per-block arithmetic; threading
+// only changes which thread executes which block, never the math, so the
+// result is bit-identical regardless of thread count.
+static void expert_wire_unpack_ml8_4_blocks(float * dst, const uint8_t * src, size_t b0, size_t b1) {
+    for (size_t b = b0; b < b1; ++b) {
         const uint8_t * blk = src + b * 18ull;
         ggml_fp16_t h;
         std::memcpy(&h, blk, sizeof(h));
@@ -1062,6 +1068,52 @@ static void expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n)
             y[j + 0] = k_ml8_4_centroids[p & 0xF] * d;
             y[j + 1] = k_ml8_4_centroids[p >>  4] * d;
         }
+    }
+}
+
+// WP_EXPERT_WIRE_UNPACK_THREADS=N (default 1 = current single-threaded
+// behaviour, byte-for-byte). Each block is independent (its own 2-byte scale
+// + 16-byte codes -> 32 floats), so splitting the block range across threads
+// changes nothing about the arithmetic, only which thread does which blocks --
+// the output is identical to the N=1 loop for every element. N<=1 or too few
+// blocks to bother (<4096, ~0.5 ms of work at single-thread scalar rates)
+// takes the plain loop with no thread-pool overhead.
+int pipe_expert_wire_unpack_threads() {
+    static const int n = [] {
+        const char * v = std::getenv("WP_EXPERT_WIRE_UNPACK_THREADS");
+        if (v == nullptr || v[0] == '\0') {
+            return 1;
+        }
+        const int parsed = std::atoi(v);
+        return parsed > 1 ? parsed : 1;
+    }();
+    return n;
+}
+
+static void expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n) {
+    const size_t nb = n / 32ull;
+    const int    nt = pipe_expert_wire_unpack_threads();
+    if (nt <= 1 || nb < 4096ull) {
+        expert_wire_unpack_ml8_4_blocks(dst, src, 0, nb);
+        return;
+    }
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        std::fprintf(stderr, "pipe: WP_EXPERT_WIRE_UNPACK_THREADS=%d engaged (CPU ml8_4 unpack)\n", nt);
+    }
+    const size_t per = (nb + (size_t) nt - 1) / (size_t) nt;
+    std::vector<std::thread> pool;
+    pool.reserve((size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        const size_t b0 = (size_t) t * per;
+        if (b0 >= nb) {
+            break;
+        }
+        const size_t b1 = std::min(nb, b0 + per);
+        pool.emplace_back(expert_wire_unpack_ml8_4_blocks, dst, src, b0, b1);
+    }
+    for (std::thread & th : pool) {
+        th.join();
     }
 }
 
@@ -1852,7 +1904,7 @@ std::vector<uint8_t> pipe_encode_expert_partial_stream(
 }
 
 pipe_expert_partial pipe_decode_expert_partial(
-        const uint8_t * buf, size_t len, int32_t n_embd) {
+        const uint8_t * buf, size_t len, int32_t n_embd, bool keep_ml8_4_packed) {
     if (n_embd <= 0 || len < 12) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial payload is too small");
     }
@@ -1874,6 +1926,14 @@ pipe_expert_partial pipe_decode_expert_partial(
         : n_values * (uint64_t) pipe_hidden_elt_size(r.dtype);
     if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != payload_bytes) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial dimensions do not match payload");
+    }
+    if (keep_ml8_4_packed && r.dtype == PIPE_HIDDEN_ML8_4) {
+        // Leave dtype == PIPE_HIDDEN_ML8_4 and `partial` empty: the caller
+        // (pipe-expert-dispatcher.cpp) dequantizes -- on GPU, or by calling
+        // pipe_expert_wire_unpack_ml8_4() on CPU -- once it decides whether
+        // this request qualifies for the GPU fold path.
+        r.wire_bytes.assign(p, p + (size_t) payload_bytes);
+        return r;
     }
     r.partial.resize((size_t) n_values);
     if (r.dtype == PIPE_HIDDEN_BF16 || r.dtype == PIPE_HIDDEN_Q8_0 || r.dtype == PIPE_HIDDEN_ML8_4) {
@@ -1976,7 +2036,7 @@ std::vector<uint8_t> pipe_encode_expert_partial_chunk(
 }
 
 pipe_expert_partial_chunk pipe_decode_expert_partial_chunk(
-        const uint8_t * buf, size_t len, int32_t n_embd) {
+        const uint8_t * buf, size_t len, int32_t n_embd, bool keep_ml8_4_packed) {
     if (len < 20) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial chunk is too small");
     }
@@ -1992,8 +2052,12 @@ pipe_expert_partial_chunk pipe_decode_expert_partial_chunk(
         r.token_end > r.total_tokens) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial chunk range");
     }
-    r.partial = pipe_decode_expert_partial(p, len - 20, n_embd);
-    if (r.partial.dtype != PIPE_HIDDEN_F32) {
+    r.partial = pipe_decode_expert_partial(p, len - 20, n_embd, keep_ml8_4_packed);
+    // Kept packed (dtype still PIPE_HIDDEN_ML8_4, `partial.partial` empty) is
+    // the expected shape when keep_ml8_4_packed was requested AND honoured --
+    // only reject the ORIGINAL invariant this function always enforced: every
+    // chunk is either that, or plain f32.
+    if (r.partial.dtype != PIPE_HIDDEN_F32 && r.partial.dtype != PIPE_HIDDEN_ML8_4) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: streamed expert partial chunk is not f32");
     }
     if (r.partial.n_tokens != r.token_end - r.token_start) {

@@ -1259,6 +1259,139 @@ extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4_device(const f
     return cudaStreamSynchronize(s.stream) == cudaSuccess;
 }
 
+// ---------------------------------------------------------------------------
+// Plain ml8-4 dequant for the expert dispatch spine (WP_EXPERT_WIRE_GPU_UNPACK).
+//
+// This is NOT ggml_cuda_ar_codec_unpack_ml8_4_dispatch above: that one is
+// typed ggml_cuda_ar_unpack_accumulate_fn and implements the AllReduce
+// ring-reduce contract `dst = dequant(quantize(dst)) + dequant(src)` -- it
+// RE-QUANTIZES whatever is already in dst before adding, which is correct
+// there because dst is a running value both ranks re-round identically every
+// step, but is NOT a plain dequant: re-quantizing an arbitrary float (e.g. a
+// worker's already-dequantized partial) is not guaranteed to round-trip, so
+// reusing it here would silently corrupt every fold after the first one. The
+// spine has no "local" value to fold against symmetrically -- it just needs
+// dst = dequant(worker_A) [+= dequant(worker_B) ...], so this kernel calls the
+// SAME ml8_4_dequantize() device function (allreduce-ml8.cuh) used inside
+// that macro, with no requantize step, no other new device math.
+static __global__ void ggml_cuda_expert_wire_unpack_ml8_4_kernel(
+        const block_ml8_4_wire * src, float * dst, int n_blocks, bool accumulate) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nt  = gridDim.x * blockDim.x;
+    for (int ib = tid; ib < n_blocks; ib += nt) {
+        float v[QK_ML8_WIRE];
+        ml8_4_dequantize(&src[ib], v);
+        float * out = &dst[ib * QK_ML8_WIRE];
+        if (accumulate) {
+            for (int j = 0; j < QK_ML8_WIRE; ++j) {
+                out[j] += v[j];
+            }
+        } else {
+            for (int j = 0; j < QK_ML8_WIRE; ++j) {
+                out[j] = v[j];
+            }
+        }
+    }
+}
+
+// Host side: fold one worker's packed ml8_4 partial (host bytes) into a
+// persistent device f32 accumulator, growing it (never shrinking) to fit the
+// largest `ne` seen so far, on a dedicated stream separate from the graph's
+// compute stream. accumulate=false (re)starts the accumulator at this
+// partial's dequant; accumulate=true adds into whatever is already there.
+// Async: no host sync here on purpose (the caller may fold several workers
+// back to back); call ggml_cuda_expert_wire_unpack_ml8_4_download() once, at
+// the end, to sync and pull the f32 result back to the host.
+//
+// The custom op this feeds (pipe-expert-dispatch-graph.cpp) runs on the CPU
+// backend BETWEEN graph splits, i.e. never inside a captured HIP-graph replay
+// region, so an eventual host sync in the download call below is safe here --
+// it would not be inside GGML_HIP_GRAPHS=1 capture.
+namespace {
+struct expert_unpack_scratch {
+    int                dev      = -1;
+    cudaStream_t       stream   = nullptr;
+    block_ml8_4_wire * d_src    = nullptr;
+    float *            d_acc    = nullptr;
+    int64_t            cap      = 0; // elements the buffers are sized for
+};
+std::mutex             g_expert_unpack_mu;
+expert_unpack_scratch  g_expert_unpack_scratch;
+} // namespace
+
+extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_unpack_ml8_4_fold(
+        const uint8_t * packed, int64_t ne, bool accumulate) {
+    if (packed == nullptr || ne <= 0 || (ne % QK_ML8_WIRE) != 0) {
+        return false;
+    }
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_unpack_mu);
+    expert_unpack_scratch & s = g_expert_unpack_scratch;
+    if (s.stream == nullptr || s.dev != dev) {
+        if (s.d_src != nullptr) { cudaFree(s.d_src); s.d_src = nullptr; }
+        if (s.d_acc != nullptr) { cudaFree(s.d_acc); s.d_acc = nullptr; }
+        if (s.stream != nullptr) { cudaStreamDestroy(s.stream); s.stream = nullptr; }
+        s.cap = 0;
+        ggml_cuda_set_device(dev);
+        if (cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) != cudaSuccess) {
+            return false;
+        }
+        s.dev = dev;
+    }
+    if (ne > s.cap) {
+        // Grow-only, bucketed: round up so a run that oscillates near a
+        // boundary (e.g. ragged last chunk) does not reallocate every call.
+        const int64_t bucket = 1 << 20; // 1 Mi elements, same bucket as the pack path
+        const int64_t new_cap = ((ne + bucket - 1) / bucket) * bucket;
+        block_ml8_4_wire * new_src = nullptr;
+        float *            new_acc = nullptr;
+        if (cudaMalloc(reinterpret_cast<void **>(&new_src),
+                       (new_cap / QK_ML8_WIRE) * sizeof(block_ml8_4_wire)) != cudaSuccess ||
+            cudaMalloc(reinterpret_cast<void **>(&new_acc), new_cap * sizeof(float)) != cudaSuccess) {
+            if (new_src != nullptr) { cudaFree(new_src); }
+            if (new_acc != nullptr) { cudaFree(new_acc); }
+            return false;
+        }
+        if (s.d_src != nullptr) { cudaFree(s.d_src); }
+        if (s.d_acc != nullptr) { cudaFree(s.d_acc); }
+        s.d_src = new_src;
+        s.d_acc = new_acc;
+        s.cap   = new_cap;
+        std::fprintf(stderr, "pipe: ml8_4 spine unpack scratch grown to %lld elements on device %d\n",
+                     (long long) new_cap, dev);
+    }
+    const int64_t nb = ne / QK_ML8_WIRE;
+    if (cudaMemcpyAsync(s.d_src, packed, (size_t) nb * sizeof(block_ml8_4_wire),
+                        cudaMemcpyHostToDevice, s.stream) != cudaSuccess) {
+        return false;
+    }
+    ggml_cuda_expert_wire_unpack_ml8_4_kernel<<<ggml_cuda_ar_codec_grid((int) nb), 256, 0, s.stream>>>(
+        s.d_src, s.d_acc, (int) nb, accumulate);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// Sync the dedicated stream and D2H the first `ne` elements of the
+// accumulator into `dst` (host). Must follow one or more _fold() calls with
+// the same `ne`.
+extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_unpack_ml8_4_download(float * dst, int64_t ne) {
+    if (dst == nullptr || ne <= 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_unpack_mu);
+    expert_unpack_scratch & s = g_expert_unpack_scratch;
+    if (s.stream == nullptr || ne > s.cap) {
+        return false;
+    }
+    if (cudaMemcpyAsync(dst, s.d_acc, (size_t) ne * sizeof(float),
+                        cudaMemcpyDeviceToHost, s.stream) != cudaSuccess) {
+        return false;
+    }
+    return cudaStreamSynchronize(s.stream) == cudaSuccess;
+}
+
 
 // ml8-8r: scale-free E4M3. Elementwise, so it needs no block machinery -- and
 // rank symmetry still holds because both partials are rounded identically.

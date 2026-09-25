@@ -629,6 +629,12 @@ struct pipe_expert_partial {
 
 void pipe_expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n);
 
+// WP_EXPERT_WIRE_UNPACK_THREADS=N (default 1). Shared knob: the ml8_4 CPU
+// unpack (pipe-protocol.cpp) and the spine's row-range fold (scatter_add,
+// pipe-expert-dispatcher.cpp) both read it, so one setting controls both
+// halves of "unpack+fold" for the kernel-free CPU-threaded A/B path.
+int pipe_expert_wire_unpack_threads();
+
 // Payload: u32 part_index, u32 part_count, then a pipe_expert_partial payload.
 struct pipe_expert_partial_stream {
     uint32_t             part_index = 0;
@@ -976,12 +982,25 @@ pipe_expert_dispatch_acts_ref pipe_decode_expert_dispatch_acts_ref(
     const uint8_t * buf, size_t len);
 pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     const uint8_t * buf, size_t len);
+// keep_ml8_4_packed=true (WP_EXPERT_WIRE_GPU_UNPACK's decode side): when the
+// frame's dtype is PIPE_HIDDEN_ML8_4, skip the CPU dequant and return the raw
+// 18-byte-per-32-value blocks in `wire_bytes` instead, with `dtype` left at
+// PIPE_HIDDEN_ML8_4 (not forced to F32) and `partial` empty -- the caller
+// (pipe-expert-dispatcher.cpp) is responsible for dequantizing, on GPU or by
+// falling back to expert_wire_unpack_ml8_4 on CPU. Any other dtype decodes
+// exactly as before (this flag only ever changes ML8_4 handling), so a caller
+// that always passes false gets byte-for-byte the old behaviour.
 pipe_expert_partial pipe_decode_expert_partial(
-    const uint8_t * buf, size_t len, int32_t n_embd);
+    const uint8_t * buf, size_t len, int32_t n_embd, bool keep_ml8_4_packed = false);
 pipe_expert_partial_stream pipe_decode_expert_partial_stream(
     const uint8_t * buf, size_t len, int32_t n_embd);
+// keep_ml8_4_packed: same meaning as on pipe_decode_expert_partial() above,
+// forwarded to the embedded pipe_expert_partial. WP_DISPATCH_STREAM's chunk
+// frames (PIPE_EXPERT_PARTIAL_CHUNK) are the actual wire shape for a streamed
+// request -- WP_EXPERT_WIRE_GPU_UNPACK has to reach this decoder, not just
+// pipe_decode_expert_partial(), or it never engages for a chunked response.
 pipe_expert_partial_chunk pipe_decode_expert_partial_chunk(
-    const uint8_t * buf, size_t len, int32_t n_embd);
+    const uint8_t * buf, size_t len, int32_t n_embd, bool keep_ml8_4_packed = false);
 pipe_segment_hello pipe_decode_segment_hello(const uint8_t * buf, size_t len);
 pipe_segment_hello_ack pipe_decode_segment_hello_ack(const uint8_t * buf, size_t len);
 pipe_segment_fwd_req pipe_decode_segment_fwd_req(const uint8_t * buf, size_t len, int32_t n_embd);

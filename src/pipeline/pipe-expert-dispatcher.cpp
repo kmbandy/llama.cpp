@@ -262,6 +262,44 @@ bool layer_trace_enabled() {
     return enabled;
 }
 
+// WP_EXPERT_WIRE_GPU_UNPACK=1 -- DEFAULT OFF. Only affects ML8_4 wire
+// partials (WP_EXPERT_WIRE=ml8_4): instead of the CPU dequant
+// (expert_wire_unpack_ml8_4, pipe-protocol.cpp), keep the received bytes
+// packed and dequantize them on the spine GPU (ggml_cuda_expert_wire_unpack_
+// ml8_4_fold/_download, ggml/src/ggml-cuda/allreduce.cu -- a plain dequant
+// kernel, NOT the AllReduce unpack_accumulate kernel; see the comment there
+// for why that one is unsafe to reuse). scatter_add() still does the actual
+// worker-to-worker fold and gather/scatter (token_ids) on the host, unchanged
+// -- this flag only moves the ml8_4 -> f32 dequant of ONE worker's partial
+// off the CPU, it does not change fold order or shape checking.
+bool gpu_unpack_enabled() {
+    const char * value = std::getenv("WP_EXPERT_WIRE_GPU_UNPACK");
+    return value != nullptr && value[0] == '1';
+}
+
+// WP_EXPERT_WIRE_GPU_UNPACK_MIN_TOKENS (default 64): below this row count for
+// a given request's partial, the upload/kernel-launch/download round trip
+// costs more than the CPU scalar unpack does, so stay on CPU. Matches the
+// "decode ~160 ms at 8192 tokens" regime this knob targets; single-token
+// decode steps are unaffected by default.
+size_t gpu_unpack_min_tokens() {
+    static const size_t n = [] {
+        const char * value = std::getenv("WP_EXPERT_WIRE_GPU_UNPACK_MIN_TOKENS");
+        if (value == nullptr || value[0] == '\0') {
+            return (size_t) 64;
+        }
+        const long parsed = std::atol(value);
+        return parsed > 0 ? (size_t) parsed : (size_t) 64;
+    }();
+    return n;
+}
+
+extern "C" {
+__attribute__((weak)) bool ggml_cuda_expert_wire_unpack_ml8_4_fold(
+    const uint8_t * packed, int64_t ne, bool accumulate);
+__attribute__((weak)) bool ggml_cuda_expert_wire_unpack_ml8_4_download(float * dst, int64_t ne);
+}
+
 // WP_DISPATCH_UNION=1 -- measurement only, no behaviour change. Logs how many
 // token rows a worker's assignments actually need versus how many it is sent.
 // Read once at startup; a per-request getenv on the dispatch path would itself
@@ -3150,44 +3188,118 @@ struct dispatcher::impl {
                                                  " interleaved a non-chunk frame while sending partials");
                     }
                 }
-                pipe_expert_partial_chunk response;
-                const dispatch_clock::time_point decode_started =
-                    layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
-                try {
-                    response = pipe_decode_expert_partial_chunk(payload.data(), payload.size(), n_embd);
-                } catch (const std::exception & error) {
-                    note_in_flight_delta(state, -1);
-                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
-                                             " returned an invalid streamed partial: " + error.what());
-                }
-                if (layer_trace_enabled()) {
-                    add_layer_trace(layer, &layer_trace_stats::decode_ns,
-                                    elapsed_ns(decode_started, dispatch_clock::now()));
-                }
                 const uint32_t base = total_rows / chunk_count;
                 const uint32_t want_start = chunk_index * base;
                 const uint32_t want_end = chunk_index + 1 == chunk_count
                     ? total_rows : want_start + base;
                 const size_t chunk_values = (size_t) (want_end - want_start) * (size_t) n_embd;
+                // Same WP_EXPERT_WIRE_GPU_UNPACK gate as receive_partial()'s
+                // plain-partial branch, sized to THIS CHUNK's rows (a stream
+                // chunk is n_tokens/chunk_count rows, still comfortably over
+                // the threshold at the 8k-token/4-chunk config this was
+                // measured on -- 2048 rows here vs. the default 64-row floor).
+                const bool want_gpu_unpack =
+                    gpu_unpack_enabled() && chunk_values >= gpu_unpack_min_tokens() * (size_t) n_embd;
+                pipe_expert_partial_chunk response;
+                const dispatch_clock::time_point decode_started =
+                    layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+                try {
+                    response = pipe_decode_expert_partial_chunk(payload.data(), payload.size(), n_embd,
+                                                                want_gpu_unpack);
+                } catch (const std::exception & error) {
+                    note_in_flight_delta(state, -1);
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " returned an invalid streamed partial: " + error.what());
+                }
                 if (response.chunk_index != chunk_index || response.chunk_count != chunk_count ||
                     response.total_tokens != total_rows || response.token_start != want_start ||
                     response.token_end != want_end || response.partial.layer != layer ||
-                    response.partial.n_tokens != want_end - want_start ||
-                    response.partial.partial.size() != chunk_values) {
+                    response.partial.n_tokens != want_end - want_start) {
                     note_in_flight_delta(state, -1);
                     throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                              " returned the wrong streamed partial range");
                 }
-                for (size_t i = 0; i < response.partial.partial.size(); ++i) {
-                    if (std::isfinite(response.partial.partial[i])) {
-                        continue;
+                float * dst_row = out.data() + (size_t) want_start * (size_t) n_embd;
+                if (response.partial.dtype == PIPE_HIDDEN_ML8_4) {
+                    // Kept packed: dequantize straight into `out` at this
+                    // chunk's offset -- GPU dequant (or its CPU fallback, same
+                    // packed bytes either way) writes directly where the plain
+                    // f32 branch below would otherwise std::copy into, so
+                    // there is no separate unpack-then-copy step for this path.
+                    const size_t expect_bytes = (chunk_values / 32ull) * 18ull;
+                    if (chunk_values % 32ull != 0 || response.partial.wire_bytes.size() != expect_bytes) {
+                        note_in_flight_delta(state, -1);
+                        throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                                 " returned the wrong packed ml8_4 streamed chunk size");
                     }
-                    note_in_flight_delta(state, -1);
-                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
-                                             " returned a NON-FINITE streamed partial");
+                    bool gpu_ok = ggml_cuda_expert_wire_unpack_ml8_4_fold != nullptr &&
+                                 ggml_cuda_expert_wire_unpack_ml8_4_download != nullptr &&
+                                 ggml_cuda_expert_wire_unpack_ml8_4_fold(
+                                     response.partial.wire_bytes.data(), (int64_t) chunk_values,
+                                     /*accumulate=*/false) &&
+                                 ggml_cuda_expert_wire_unpack_ml8_4_download(dst_row, (int64_t) chunk_values);
+                    if (gpu_ok) {
+                        static std::atomic<bool> logged{false};
+                        if (!logged.exchange(true)) {
+                            std::fprintf(stderr, "pipe: WP_EXPERT_WIRE_GPU_UNPACK engaged (device ml8_4 dequant, streamed chunk path)\n");
+                        }
+                    } else {
+                        pipe_expert_wire_unpack_ml8_4(dst_row, response.partial.wire_bytes.data(), chunk_values);
+                    }
+                    if (layer_trace_enabled()) {
+                        add_layer_trace(layer, &layer_trace_stats::decode_ns,
+                                        elapsed_ns(decode_started, dispatch_clock::now()));
+                    }
+                    // Non-finite check on the dequantized f32 result, same
+                    // message/semantics as the f32 branch below (folded into
+                    // ITS single pass too -- see copy_ns's comment on
+                    // layer_trace_stats for why this used to be a second,
+                    // untimed full-array pass).
+                    const dispatch_clock::time_point copy_started =
+                        layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+                    for (size_t i = 0; i < chunk_values; ++i) {
+                        if (std::isfinite(dst_row[i])) {
+                            continue;
+                        }
+                        note_in_flight_delta(state, -1);
+                        throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                                 " returned a NON-FINITE streamed partial");
+                    }
+                    if (layer_trace_enabled()) {
+                        add_layer_trace(layer, &layer_trace_stats::copy_ns,
+                                        elapsed_ns(copy_started, dispatch_clock::now()));
+                    }
+                } else {
+                    if (response.partial.partial.size() != chunk_values) {
+                        note_in_flight_delta(state, -1);
+                        throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                                 " returned the wrong streamed partial range");
+                    }
+                    if (layer_trace_enabled()) {
+                        add_layer_trace(layer, &layer_trace_stats::decode_ns,
+                                        elapsed_ns(decode_started, dispatch_clock::now()));
+                    }
+                    // ONE pass instead of the previous isfinite-scan-then-
+                    // std::copy: same total element count, half the memory
+                    // traffic over this buffer. copy_ns times it separately
+                    // from decode_ns so a live trace can see this step's cost
+                    // even though it is not part of "unpack".
+                    const dispatch_clock::time_point copy_started =
+                        layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+                    for (size_t i = 0; i < chunk_values; ++i) {
+                        const float v = response.partial.partial[i];
+                        if (!std::isfinite(v)) {
+                            note_in_flight_delta(state, -1);
+                            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                                     " returned a NON-FINITE streamed partial");
+                        }
+                        dst_row[i] = v;
+                    }
+                    if (layer_trace_enabled()) {
+                        add_layer_trace(layer, &layer_trace_stats::copy_ns,
+                                        elapsed_ns(copy_started, dispatch_clock::now()));
+                    }
                 }
-                std::copy(response.partial.partial.begin(), response.partial.partial.end(),
-                          out.begin() + (size_t) want_start * (size_t) n_embd);
                 request.response_bytes = payload.size();
                 request.await_finished_at = req_log_ != nullptr ? response_received_at
                                                                  : dispatch_clock::time_point();
@@ -3346,20 +3458,6 @@ struct dispatcher::impl {
             add_layer_trace(layer, &layer_trace_stats::recv_ns,
                             elapsed_ns(recv_started, dispatch_clock::now()));
         }
-        pipe_expert_partial partial;
-        try {
-            const dispatch_clock::time_point decode_started =
-                layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
-            partial = pipe_decode_expert_partial(payload.data(), payload.size(), n_embd);
-            if (layer_trace_enabled()) {
-                add_layer_trace(layer, &layer_trace_stats::decode_ns,
-                                elapsed_ns(decode_started, dispatch_clock::now()));
-            }
-        } catch (const std::exception & error) {
-            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
-                                     " returned an invalid partial for expert(s) " +
-                                     assignment_experts(request.assignments) + ": " + error.what());
-        }
         // Partial carries (layer, n_tokens); token identity is the layout of
         // partial[token * n_embd + dim]. Do not rely on arrival ordering across
         // workers — each partial is a full [n_tokens * n_embd] block.
@@ -3370,7 +3468,29 @@ struct dispatcher::impl {
         const uint32_t want_rows = request.token_ids.empty()
             ? n_tokens : (uint32_t) request.token_ids.size();
         const size_t   want_vals = (size_t) want_rows * (size_t) n_embd;
-        if (partial.layer != layer || partial.n_tokens != want_rows || partial.partial.size() != want_vals) {
+        // WP_EXPERT_WIRE_GPU_UNPACK=1: ask the decoder to leave an ML8_4
+        // frame packed (wire_bytes) instead of dequantizing it on the CPU.
+        // Gated on size so a single-token decode step (n_tokens==1) never
+        // pays an upload/download round trip for one row.
+        const bool want_gpu_unpack = gpu_unpack_enabled() && want_vals >= gpu_unpack_min_tokens() * (size_t) n_embd;
+        pipe_expert_partial partial;
+        try {
+            const dispatch_clock::time_point decode_started =
+                layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+            partial = pipe_decode_expert_partial(payload.data(), payload.size(), n_embd, want_gpu_unpack);
+            if (layer_trace_enabled() && partial.dtype != PIPE_HIDDEN_ML8_4) {
+                // GPU-unpack path (below) times itself separately, including
+                // the CPU fallback branch inside it -- this bucket is only
+                // for the ordinary CPU decode-to-f32 case.
+                add_layer_trace(layer, &layer_trace_stats::decode_ns,
+                                elapsed_ns(decode_started, dispatch_clock::now()));
+            }
+        } catch (const std::exception & error) {
+            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                     " returned an invalid partial for expert(s) " +
+                                     assignment_experts(request.assignments) + ": " + error.what());
+        }
+        if (partial.layer != layer || partial.n_tokens != want_rows) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " returned the wrong partial shape for expert(s) " +
                                      assignment_experts(request.assignments) +
@@ -3379,9 +3499,54 @@ struct dispatcher::impl {
                                      " n_tokens=" + std::to_string(partial.n_tokens) +
                                      " want_n_tokens=" + std::to_string(want_rows) + ")");
         }
+        if (partial.dtype == PIPE_HIDDEN_ML8_4) {
+            // Kept packed by the decoder above (want_gpu_unpack was true and
+            // this frame really was ML8_4 -- a stale worker's f32 fallback
+            // decodes to the ordinary f32 branch below instead, dtype forced
+            // to PIPE_HIDDEN_F32 by pipe_decode_expert_partial()).
+            // 18 bytes per 32 values (PIPE_HIDDEN_ML8_4 wire layout).
+            const size_t expect_bytes = (want_vals / 32ull) * 18ull;
+            if (want_vals % 32ull != 0 || partial.wire_bytes.size() != expect_bytes) {
+                throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                         " returned the wrong packed ml8_4 partial size for expert(s) " +
+                                         assignment_experts(request.assignments));
+            }
+            const dispatch_clock::time_point decode_started =
+                layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+            out.resize(want_vals);
+            bool gpu_ok = ggml_cuda_expert_wire_unpack_ml8_4_fold != nullptr &&
+                         ggml_cuda_expert_wire_unpack_ml8_4_download != nullptr &&
+                         ggml_cuda_expert_wire_unpack_ml8_4_fold(
+                             partial.wire_bytes.data(), (int64_t) want_vals, /*accumulate=*/false) &&
+                         ggml_cuda_expert_wire_unpack_ml8_4_download(out.data(), (int64_t) want_vals);
+            if (gpu_ok) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true)) {
+                    std::fprintf(stderr, "pipe: WP_EXPERT_WIRE_GPU_UNPACK engaged (device ml8_4 dequant, plain partial path)\n");
+                }
+            } else {
+                // GPU wrapper missing/failed (weak symbol null in a CPU-only
+                // build, or a device error): dequantize the SAME packed bytes
+                // on CPU instead of dropping the worker's answer. Same
+                // centroid table and fp16 widening as the GPU kernel (see the
+                // comment on ggml_cuda_expert_wire_unpack_ml8_4_fold), so this
+                // is not a different result, only a slower path this once.
+                pipe_expert_wire_unpack_ml8_4(out.data(), partial.wire_bytes.data(), want_vals);
+            }
+            if (layer_trace_enabled()) {
+                add_layer_trace(layer, &layer_trace_stats::decode_ns,
+                                elapsed_ns(decode_started, dispatch_clock::now()));
+            }
+        } else {
+            if (partial.partial.size() != want_vals) {
+                throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                         " returned the wrong partial shape for expert(s) " +
+                                         assignment_experts(request.assignments));
+            }
+            out.assign(partial.partial.begin(), partial.partial.end());
+        }
         if (dispatch_hash_trace_enabled()) {
-            const uint64_t hash = dispatch_hash_fnv1a(
-                partial.partial.data(), partial.partial.size() * sizeof(float));
+            const uint64_t hash = dispatch_hash_fnv1a(out.data(), out.size() * sizeof(float));
             if (value.inproc) {
                 std::fprintf(stderr,
                              "DISPPART seq=%llu layer=%d worker=inproc h=%llu\n",
@@ -3394,25 +3559,24 @@ struct dispatcher::impl {
                              request.worker_index, (unsigned long long) hash);
             }
         }
-        // `partial.partial` is ALWAYS f32 here regardless of what dtype the worker
-        // put on the wire (PIPE_VERSION 13's self-describing dtype tag): the tag
-        // lives on the frame and pipe_decode_expert_partial() does the fp16->fp32
-        // widening internally before this function ever sees the vector. The spine
-        // does not need to know or configure anything about a worker's dtype choice
-        // -- it only ever operates on f32, and scatter_add below sums in f32 either
-        // way. Current workers only ever send f32 (WP_EXPERT_PARTIAL_DTYPE=f16 was
-        // removed 2026-08-19, see pipe-protocol.h), but the decode path still
-        // accepts f16 from a stale worker mid-rolling-restart, so this comment and
-        // the code below make no assumption about which one arrives.
+        // `out` is ALWAYS f32 here regardless of what dtype the worker put on
+        // the wire (PIPE_VERSION 13's self-describing dtype tag): the tag
+        // lives on the frame, and either pipe_decode_expert_partial() (CPU
+        // path) or the GPU-unpack branch above does the widening/dequant
+        // before this function returns. The spine does not need to know or
+        // configure anything about a worker's dtype choice -- it only ever
+        // operates on f32, and scatter_add below sums in f32 either way.
         // MAD-LAB DIAGNOSTIC: the spine validates every weight it SENDS (see
         // pipe-protocol.cpp, "expert dispatch has a non-finite weight") but never
         // validated a partial it RECEIVES. That asymmetry let a worker return
         // NaN rows that landed silently in ffn_moe_out via scatter_add, and only
         // surfaced one layer later as a bogus "non-finite weight" rejection --
         // blaming the spine's routing for the previous layer's corrupted output.
-        // Name the worker and the row instead.
-        for (size_t i = 0; i < partial.partial.size(); ++i) {
-            if (std::isfinite(partial.partial[i])) {
+        // Name the worker and the row instead. Runs on the FINAL f32 result
+        // regardless of which path produced it (CPU decode or GPU dequant),
+        // same message/semantics either way.
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (std::isfinite(out[i])) {
                 continue;
             }
             const size_t row = i / (size_t) n_embd;
@@ -3425,7 +3589,6 @@ struct dispatcher::impl {
                                      std::to_string(i % (size_t) n_embd) +
                                      " for expert(s) " + assignment_experts(request.assignments));
         }
-        out.assign(partial.partial.begin(), partial.partial.end());
         GGML_ASSERT(out.size() == want_vals);
         GGML_UNUSED(n_values);
     }
@@ -3442,7 +3605,13 @@ struct dispatcher::impl {
         receive_partial(one, result.size(), request, seq_id, layer, n_tokens, last_response, state);
         const auto unpack_t0 = req_log_ != nullptr ? dispatch_clock::now()
                                                    : dispatch_clock::time_point();
+        const dispatch_clock::time_point fold_started =
+            layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
         scatter_add(result, one, request);
+        if (layer_trace_enabled()) {
+            add_layer_trace(layer, &layer_trace_stats::fold_ns,
+                            elapsed_ns(fold_started, dispatch_clock::now()));
+        }
         if (req_log_ != nullptr) {
             request.unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
             write_request_log(request, layer, n_tokens, state);
@@ -3463,6 +3632,47 @@ struct dispatcher::impl {
         const bool simd = pipe_simd_unpack_enabled() != 0;
         if (request.token_ids.empty()) {
             GGML_ASSERT(one.size() == result.size());
+            // WP_EXPERT_WIRE_UNPACK_THREADS=N: split the elementwise add over
+            // row blocks. Each thread owns a disjoint index range, so this is
+            // bit-identical to the single-threaded loop for every element --
+            // only which thread does the add changes, never the order any one
+            // result[i] is summed in (unlike a tree/pairwise reduction, this
+            // never combines two partial sums together).
+            const int nt = pipe_expert_wire_unpack_threads();
+            const size_t width = (size_t) n_embd;
+            const size_t min_rows_per_thread = 64; // don't thread a tiny partial
+            if (nt > 1 && result.size() >= (size_t) nt * width * min_rows_per_thread) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true)) {
+                    std::fprintf(stderr, "pipe: WP_EXPERT_WIRE_UNPACK_THREADS=%d engaged (scatter_add fold)\n", nt);
+                }
+                const size_t n_rows = result.size() / width;
+                const size_t rows_per = (n_rows + (size_t) nt - 1) / (size_t) nt;
+                std::vector<std::thread> pool;
+                pool.reserve((size_t) nt);
+                for (int t = 0; t < nt; ++t) {
+                    const size_t r0 = (size_t) t * rows_per;
+                    if (r0 >= n_rows) {
+                        break;
+                    }
+                    const size_t r1 = std::min(n_rows, r0 + rows_per);
+                    pool.emplace_back([&result, &one, simd, width, r0, r1] {
+                        if (simd) {
+                            pipe_simd_accumulate_f32(result.data() + r0 * width,
+                                                     one.data() + r0 * width,
+                                                     (r1 - r0) * width);
+                        } else {
+                            for (size_t i = r0 * width; i < r1 * width; ++i) {
+                                result[i] += one[i];
+                            }
+                        }
+                    });
+                }
+                for (std::thread & th : pool) {
+                    th.join();
+                }
+                return;
+            }
             if (simd) {
                 pipe_simd_accumulate_f32(result.data(), one.data(), result.size());
             } else {
@@ -3614,7 +3824,13 @@ struct dispatcher::impl {
         for (size_t i = 0; i < n; ++i) {
             const auto unpack_t0 = req_log_ != nullptr ? dispatch_clock::now()
                                                        : dispatch_clock::time_point();
+            const dispatch_clock::time_point fold_started =
+                layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
             scatter_add(result, partials[i], requests[i]);
+            if (layer_trace_enabled()) {
+                add_layer_trace(layer, &layer_trace_stats::fold_ns,
+                                elapsed_ns(fold_started, dispatch_clock::now()));
+            }
             if (req_log_ != nullptr && !requests[i].stream_wire) {
                 requests[i].unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
                 write_request_log(requests[i], layer, n_tokens, state);
