@@ -181,21 +181,17 @@ class ExpertStage:
     # -- source reading ---------------------------------------------------
 
     def _shards_for(self, L: int) -> list[str]:
-        if self.role == "experts":
-            return self.source.layer_shards(L, self.arch.experts.prefix)
-        # Spec-head tensors are named {prefix}.{stage}.* (deepseek41: mtp.,
-        # qwen4exp: mtp.layers.); layer_shards only keys off the main stack,
-        # so pick the shards that actually hold them.
-        idx = self.source.tensor_index()
-        stage = L - self.n_layer
-        assert self.arch.spec_head_experts is not None
-        prefix = f"{self.arch.spec_head_experts.prefix}.{stage}."
+        # Only the expert tensors. layer_shards() also matches engram and other
+        # per-layer weights, and for DS4.1 those live in a ~100 GB file.
+        spec = self.arch.experts if self.role == "experts" else self.arch.spec_head_experts
+        if spec is None:
+            return []
+        index = L if self.role == "experts" else L - self.n_layer
+        prefix = f"{spec.prefix}.{index}.{spec.infix}."
         seen: list[str] = []
-        for name, shard in idx.items():
+        for name, shard in self.source.tensor_index().items():
             if name.startswith(prefix) and shard not in seen:
                 seen.append(shard)
-        if not seen:
-            raise KeyError(f"no shards hold spec-head tensors for layer {L} ({prefix}*)")
         return seen
 
     def _release_after(self, L: int, shards: list[str]) -> None:
@@ -342,6 +338,9 @@ class ExpertStage:
         if by_expert and widths:
             raise QuantError(f"stage {self.stage_id} mixes expert ranges and FFN widths")
         raw_base = self.workdir / f"raw-L{L:03d}"
+        # A killed run leaves these behind, and llama-wp-repack will not overwrite them.
+        for stale in self.workdir.glob(f"raw-L{L:03d}*"):
+            stale.unlink(missing_ok=True)
         self.tools.repack(
             gguf_path,
             raw_base,
