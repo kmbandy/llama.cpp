@@ -2021,10 +2021,23 @@ public:
         n_shield_exhausted_ = exhausted;
     }
 
-    void set_layerahead_stats(uint64_t hints, uint64_t pageins, uint64_t hits) {
-        n_layerahead_hints_   = hints;
-        n_layerahead_pageins_ = pageins;
-        n_layerahead_hits_    = hits;
+    void set_layerahead_stats(uint64_t hints, uint64_t pageins, uint64_t hits,
+                              uint64_t truncated, uint64_t evicted_demand,
+                              uint64_t evicted_spec,
+                              uint64_t evicted_spec_la_ahead, uint64_t evicted_spec_la_behind,
+                              uint64_t evicted_spec_other_ahead, uint64_t evicted_spec_other_behind,
+                              uint64_t spec_deferred) {
+        n_layerahead_hints_          = hints;
+        n_layerahead_pageins_        = pageins;
+        n_layerahead_hits_           = hits;
+        n_layerahead_truncated_      = truncated;
+        n_layerahead_evicted_demand_ = evicted_demand;
+        n_layerahead_evicted_spec_   = evicted_spec;
+        n_layerahead_evicted_spec_la_ahead_     = evicted_spec_la_ahead;
+        n_layerahead_evicted_spec_la_behind_    = evicted_spec_la_behind;
+        n_layerahead_evicted_spec_other_ahead_  = evicted_spec_other_ahead;
+        n_layerahead_evicted_spec_other_behind_ = evicted_spec_other_behind;
+        n_layerahead_spec_deferred_             = spec_deferred;
     }
 
     void set_pin_stats(size_t n_pinned, uint64_t demand_hits) {
@@ -2035,11 +2048,16 @@ public:
     // Host arena snapshot, taken at record time: predicted hints landed as
     // speculative entries, resident/pinned bytes, and LRU evictions.
     void set_ram_stats(uint64_t spec_landed, uint64_t resident_bytes,
-                       uint64_t pinned_bytes, uint64_t evictions) {
+                       uint64_t pinned_bytes, uint64_t evictions,
+                       uint64_t admission_cold_landed,
+                       uint64_t lookups, uint64_t lookup_hits) {
         ram_spec_landed_    = spec_landed;
         ram_resident_bytes_ = resident_bytes;
         ram_pinned_bytes_   = pinned_bytes;
         ram_evictions_      = evictions;
+        ram_admission_cold_landed_ = admission_cold_landed;
+        ram_lookups_        = lookups;
+        ram_lookup_hits_    = lookup_hits;
     }
 
     void note_distinct_page(int layer, int expert) {
@@ -2268,6 +2286,14 @@ private:
                   << " n_layerahead_hints=" << n_layerahead_hints_
                   << " n_layerahead_pageins=" << n_layerahead_pageins_
                   << " n_layerahead_hits=" << n_layerahead_hits_
+                  << " n_layerahead_truncated=" << n_layerahead_truncated_
+                  << " n_layerahead_evicted_demand=" << n_layerahead_evicted_demand_
+                  << " n_layerahead_evicted_spec=" << n_layerahead_evicted_spec_
+                  << " n_layerahead_evicted_spec_la_ahead=" << n_layerahead_evicted_spec_la_ahead_
+                  << " n_layerahead_evicted_spec_la_behind=" << n_layerahead_evicted_spec_la_behind_
+                  << " n_layerahead_evicted_spec_other_ahead=" << n_layerahead_evicted_spec_other_ahead_
+                  << " n_layerahead_evicted_spec_other_behind=" << n_layerahead_evicted_spec_other_behind_
+                  << " n_layerahead_spec_deferred=" << n_layerahead_spec_deferred_
                   << " n_pinned=" << n_pinned_
                   << " n_pinned_demand_hits=" << n_pinned_demand_hits_
                   << " n_host_hit=" << n_host_hit_
@@ -2278,6 +2304,16 @@ private:
                   << " ram_resident_mb=" << (ram_resident_bytes_ >> 20)
                   << " ram_pinned_mb=" << (ram_pinned_bytes_ >> 20)
                   << " ram_evictions=" << ram_evictions_
+                  << " ram_admission_cold_landed=" << ram_admission_cold_landed_
+                  // ram_lookups: every arena_.borrow() call (the only
+                  // lookup path today -- see HostArena::lookups()'s
+                  // comment). If this stays 0 while n_pagein climbs, the
+                  // demand path is not reaching the arena at all; if
+                  // lookups climb but ram_lookup_hits stays ~0 while pages
+                  // are known resident, the bug is in admission/eviction,
+                  // not in whether the lookup happens.
+                  << " ram_lookups=" << ram_lookups_
+                  << " ram_lookup_hits=" << ram_lookup_hits_
                   << " ram_spec_landed=" << ram_spec_landed_
                   << " h2d_gbps=" << h2d_gbps_
                   << " bytes_read=" << bytes_read_
@@ -2477,12 +2513,23 @@ private:
     uint64_t          n_layerahead_hints_   = 0;
     uint64_t          n_layerahead_pageins_ = 0;
     uint64_t          n_layerahead_hits_    = 0;
+    uint64_t          n_layerahead_truncated_      = 0;
+    uint64_t          n_layerahead_evicted_demand_ = 0;
+    uint64_t          n_layerahead_evicted_spec_   = 0;
+    uint64_t          n_layerahead_evicted_spec_la_ahead_     = 0;
+    uint64_t          n_layerahead_evicted_spec_la_behind_    = 0;
+    uint64_t          n_layerahead_evicted_spec_other_ahead_  = 0;
+    uint64_t          n_layerahead_evicted_spec_other_behind_ = 0;
+    uint64_t          n_layerahead_spec_deferred_             = 0;
     size_t             n_pinned_ = 0;
     uint64_t           n_pinned_demand_hits_ = 0;
     uint64_t           ram_spec_landed_    = 0;
     uint64_t           ram_resident_bytes_ = 0;
     uint64_t           ram_pinned_bytes_   = 0;
     uint64_t           ram_evictions_      = 0;
+    uint64_t           ram_admission_cold_landed_ = 0;
+    uint64_t           ram_lookups_        = 0;
+    uint64_t           ram_lookup_hits_    = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          bytes_read_ = 0;
     uint64_t          host_bytes_ = 0;
@@ -4742,6 +4789,13 @@ private:
         // straight to the same reader-thread/drain H2D a miss would use. A
         // RAM hit is a miss without the pread; both are the SAME work item.
         bool               ram_hit    = false;
+        // This page-in's request had n_tokens > 1 (a prefill ubatch, not a
+        // single-token decode step) -- set once, at plan time in
+        // ensure_batch, from that call's own n_tokens argument. Forwarded to
+        // HostArena::finish_read()'s prefill_hint so WP_HOST_TIER_POLICY=
+        // freq_admit only ever gates prefill landings; see the block comment
+        // above HostArena::admit_landed_locked_ for why decode is exempt.
+        bool               prefill    = false;
         // Hold bookkeeping (reader thread until the last result is pushed,
         // dispatch thread afterwards -- never both at once):
         //   hold_released -- the arena borrow/reservation this page-in took
@@ -5619,6 +5673,15 @@ public:
     // leaves it null, so for them this function's shared-state footprint is
     // unchanged: still one lock, held start to finish. See the "READ-ISSUE
     // UNLOCKED" block below for what the parameter actually does.
+    // spec_call/spec_call_is_layer_ahead: set ONLY by spec_pagein_submit's own
+    // call (count_demand is already false there too). spec_call marks "this
+    // batch is a speculative submission, not pin_pages/seed" -- it gates both
+    // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD's drop-instead-of-throw behaviour and
+    // the evict_spec source classification below; pin_pages/seed keep their
+    // existing hard-throw-on-failure contract unchanged either way.
+    // spec_call_is_layer_ahead further says whether THIS submission came from
+    // submit_prefill_layer_ahead (true) or somewhere else -- decode-time
+    // WP_EXPERT_SPEC_PAGEIN via spec_pagein_step's plain submit (false).
     Batch ensure_batch(
             const std::vector<const ExpertPage *> & pages,
             bool measure,
@@ -5626,7 +5689,10 @@ public:
             uint32_t n_tokens = 0,
             int conn_index = -1,
             std::unique_lock<std::mutex> * gpu_lock = nullptr,
-            bool count_demand = true) {
+            bool count_demand = true,
+            bool spec_call = false,
+            bool spec_call_is_layer_ahead = false) {
+        const bool protect_this_call = spec_call && spec_protect_layerahead_evict_;
         // Take anything the reader threads already landed -- free residency for
         // this request, and it frees the pins. Non-blocking. spec_any_in_flight
         // ("is anything live"), not spec_in_flight ("at the WP_EXPERT_SPEC_MAX_
@@ -5763,10 +5829,26 @@ public:
 
             // Reserve and pin all pagein slots before starting any read. Later
             // allocations in this request cannot select an earlier pagein.
+            std::vector<size_t> dropped_pageins;
             for (size_t entry_index : pageins) {
                 const ExpertPage & page = *pages[entry_index];
-                const size_t slot_index = select_victim(page);
+                const size_t slot_index = select_victim(page, protect_this_call);
                 if (slot_index == slots_.size()) {
+                    if (protect_this_call) {
+                        // Every remaining candidate is a not-yet-consumed
+                        // layer-ahead page for a layer still ahead of us --
+                        // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD says don't evict
+                        // it. Drop this ONE page-in (leave its batch entry at
+                        // its default "unresolved" state, SIZE_MAX slot_index)
+                        // instead of throwing; spec_pagein_submit filters it
+                        // back out of `entry.inflight` below. A speculative
+                        // submission losing part of its chunk is normal --
+                        // resident/in-flight pages are already dropped the
+                        // same way before ensure_batch is ever called.
+                        ++n_layerahead_spec_deferred_;
+                        dropped_pageins.push_back(entry_index);
+                        continue;
+                    }
                     throw std::runtime_error(
                         "no expert slot can hold requested page");
                 }
@@ -5781,6 +5863,24 @@ public:
                 slots_[slot_index].lease_until = 0;
                 ++slots_[slot_index].pin_count;
                 batch.entries_[entry_index].slot_index = slot_index;
+            }
+            if (!dropped_pageins.empty()) {
+                // Remove the dropped entries from `pageins` before the read-
+                // planning loop below builds PageIn jobs -- a dropped entry
+                // must never get a reader thread. Its batch.entries_[] stays
+                // at the Entry default (slot_index=SIZE_MAX, hit=false, ready=
+                // false); retire_spec_batch's own `slot_index >= slots_.size()`
+                // guard already treats that as "nothing to stamp", and
+                // complete_batch only ever waits on batch.state_->pageins,
+                // which this filtering keeps from ever containing it.
+                pageins.erase(
+                    std::remove_if(pageins.begin(), pageins.end(),
+                                   [&dropped_pageins](size_t idx) {
+                                       return std::find(dropped_pageins.begin(),
+                                                        dropped_pageins.end(), idx) !=
+                                              dropped_pageins.end();
+                                   }),
+                    pageins.end());
             }
 
             if (measure) {
@@ -5863,6 +5963,7 @@ public:
                     PageIn pi;
                     pi.entry_index = entry_index;
                     pi.page        = &page;
+                    pi.prefill     = n_tokens > 32; // speculative verify (2-8 tokens) is decode traffic
                     const size_t slot_index =
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
@@ -5876,6 +5977,43 @@ public:
                         // here, whether it is being evicted to serve a demand
                         // page-in or another speculative one (WP_EXPERT_SPEC_MAX_SLOTS).
                         if (slot.spec_pending) {
+                            if (slot.layer_ahead) {
+                                // count_demand distinguishes the two callers of
+                                // ensure_batch that can land here: real dispatch
+                                // (true, the default) versus another speculative
+                                // submission -- spec_pagein_submit's own batch,
+                                // pin_pages, WP_EXPERT_PIN_MODE=seed -- all of
+                                // which pass false. See the counters' comment.
+                                if (count_demand) {
+                                    ++n_layerahead_evicted_demand_;
+                                } else {
+                                    ++n_layerahead_evicted_spec_;
+                                    // Further split: which kind of speculative
+                                    // call evicted it, and was the victim's own
+                                    // layer still at-or-ahead of where we are
+                                    // (current_layer_ itself included: while L
+                                    // is the layer being dispatched, an
+                                    // unconfirmed layer-ahead page FOR L is
+                                    // exactly as not-yet-used as one for L+1 --
+                                    // a later micro-batch of L may still demand
+                                    // it -- so >= current_layer_, not >, or the
+                                    // real waste case, L+2's read-ahead evicting
+                                    // L+1's still-pending pages while L+1 is
+                                    // itself current, would misclassify as
+                                    // "behind") or already BEHIND it (dispatch
+                                    // moved past that layer without ever
+                                    // demanding this expert -- stale, evicting
+                                    // it costs nothing).
+                                    const bool ahead = slot.key.first >= current_layer_;
+                                    if (spec_call_is_layer_ahead) {
+                                        if (ahead) { ++n_layerahead_evicted_spec_layerahead_ahead_; }
+                                        else       { ++n_layerahead_evicted_spec_layerahead_behind_; }
+                                    } else {
+                                        if (ahead) { ++n_layerahead_evicted_spec_other_ahead_; }
+                                        else       { ++n_layerahead_evicted_spec_other_behind_; }
+                                    }
+                                }
+                            }
                             slot.spec_pending = false;
                             slot.layer_ahead = false;
                             --n_spec_pending_;
@@ -6168,7 +6306,8 @@ public:
             // pump, not inside any connection's transaction -- see the
             // StagingPool quota comment. Uncapped, same as before this fix.
             entry.batch = std::make_unique<Batch>(
-                ensure_batch(cold, false, {}, 0, -1, nullptr, false));
+                ensure_batch(cold, false, {}, 0, -1, nullptr, false,
+                            /*spec_call=*/true, /*spec_call_is_layer_ahead=*/layer_ahead));
             // Safe to set after the fact: reads land on reader threads, but the
             // flag is only consulted by drain_one_read, which runs exclusively
             // on THIS thread and cannot run before submit returns.
@@ -6183,8 +6322,30 @@ public:
             ++spec_errors_;
             return 0;
         }
-        entry.inflight    = std::move(cold);
-        entry.leases      = std::move(cold_leases);
+        // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD may have left some of `cold`
+        // unresolved (ensure_batch's protect_this_call dropped it rather than
+        // evicting a still-ahead layer-ahead page -- see n_layerahead_spec_
+        // deferred_). Filter down to what actually landed a slot BEFORE
+        // recording entry.inflight/leases or logging "S": every consumer of
+        // those (retire_spec_batch's landing stamp, the spec log, and this
+        // function's own return value) must describe only pages this batch
+        // is really reading, matching cold[j] 1:1 against the batch's own
+        // resolution of that same index.
+        std::vector<const ExpertPage *> landed;
+        std::vector<uint64_t>           landed_leases;
+        landed.reserve(cold.size());
+        landed_leases.reserve(cold.size());
+        for (size_t j = 0; j < cold.size(); ++j) {
+            if (entry.batch->slot_index(j) < slots_.size()) {
+                landed.push_back(cold[j]);
+                landed_leases.push_back(cold_leases[j]);
+            }
+        }
+        if (landed.empty()) {
+            return 0;   // everything in this chunk was protection-dropped
+        }
+        entry.inflight    = std::move(landed);
+        entry.leases      = std::move(landed_leases);
         entry.layer_ahead = layer_ahead;
         // LOG AT SUBMIT, NOT AT HARVEST. The read is issued here, so this is when
         // the cost is paid and when the position in the stream is meaningful.
@@ -6725,6 +6886,23 @@ public:
     size_t   spec_inflight_live() const { return spec_batches_.size(); }
     size_t   spec_inflight_cap()  const { return (size_t) spec_max_inflight_; }
     uint64_t n_layerahead_hits()  const { return n_layerahead_hits_; }
+    uint64_t n_layerahead_evicted_demand() const { return n_layerahead_evicted_demand_; }
+    uint64_t n_layerahead_evicted_spec()   const { return n_layerahead_evicted_spec_; }
+    uint64_t n_layerahead_evicted_spec_layerahead_ahead()  const { return n_layerahead_evicted_spec_layerahead_ahead_; }
+    uint64_t n_layerahead_evicted_spec_layerahead_behind() const { return n_layerahead_evicted_spec_layerahead_behind_; }
+    uint64_t n_layerahead_evicted_spec_other_ahead()       const { return n_layerahead_evicted_spec_other_ahead_; }
+    uint64_t n_layerahead_evicted_spec_other_behind()      const { return n_layerahead_evicted_spec_other_behind_; }
+    uint64_t n_layerahead_spec_deferred() const { return n_layerahead_spec_deferred_; }
+
+    // Worker calls this at the top of dispatch()/begin_split_dispatch(),
+    // before any ensure_batch call for that request -- the only input
+    // layerahead_ahead_protected() needs to tell "still ahead of where we are"
+    // from "already behind us". Model layer indices increase with depth in
+    // this catalog (next_served_layer's std::upper_bound over a sorted
+    // catalog_.layers relies on the same fact), so a plain integer compare
+    // against the evicted slot's own key.first is enough -- the pool does not
+    // need the catalog itself for this.
+    void set_current_layer(int32_t layer) { current_layer_ = layer; }
 
     // Unpinned slots are the ones select_victim can take without stealing a
     // live demand or in-flight spec pin. Layer-ahead uses this as the silent
@@ -6929,8 +7107,25 @@ private:
             hint_shield_counts_.count(slot_key(slot.key.first, slot.key.second)) != 0;
     }
 
+    // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD's exclusion predicate: true for a slot
+    // still holding an UNCONFIRMED layer-ahead read for a layer at or ahead of
+    // current_layer_. >=, not > -- current_layer_ IS included: while L is the
+    // layer being dispatched, an unconfirmed layer-ahead page FOR L is exactly
+    // as not-yet-used as one for L+1 (a later micro-batch of L may still
+    // demand it), so treating "==current_layer_" as already-behind would strip
+    // protection from the one case this knob exists for -- L+2's read-ahead
+    // (fired on L+1's first dispatch, current_layer_ now L+1) evicting L+1's
+    // own still-unconsumed pages. Only ever consulted from a speculative
+    // (count_demand=false) victim search -- see select_victim's protect
+    // parameter and ensure_batch's protect_this_call.
+    bool layerahead_ahead_protected(const Slot & slot) const {
+        return spec_protect_layerahead_evict_ && slot.valid && slot.spec_pending &&
+               slot.layer_ahead && slot.key.first >= current_layer_;
+    }
+
     size_t select_victim_impl(
-            const ExpertPage & page, bool skip_shielded, bool * shielded_seen) const {
+            const ExpertPage & page, bool skip_shielded, bool * shielded_seen,
+            bool protect_layerahead = false) const {
         const uint64_t page_size = page.size;
         const bool wants_reserved = std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer);
         size_t victim = slots_.size();
@@ -6987,6 +7182,16 @@ private:
                 }
                 continue;
             }
+            // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD: unlike hint-shield above, this
+            // exclusion has NO ignore-and-fall-back-to-it pass -- see
+            // select_victim's comment. A protected slot is simply never a
+            // candidate for a speculative caller; if that leaves nothing,
+            // select_victim_impl returns slots_.size() and the caller (only
+            // ensure_batch's protect_this_call branch) drops the page-in
+            // instead of evicting.
+            if (protect_layerahead && layerahead_ahead_protected(slot)) {
+                continue;
+            }
             if (victim == slots_.size() ||
                 slot.capacity < slots_[victim].capacity ||
                 (slot.capacity == slots_[victim].capacity &&
@@ -7005,6 +7210,9 @@ private:
                     }
                     continue;
                 }
+                if (protect_layerahead && layerahead_ahead_protected(slot)) {
+                    continue;
+                }
                 if (victim == slots_.size() || slot.capacity < slots_[victim].capacity ||
                     (slot.capacity == slots_[victim].capacity &&
                      rank_less(slot, slots_[victim]))) victim = i;
@@ -7013,19 +7221,23 @@ private:
         return victim;
     }
 
-    size_t select_victim(const ExpertPage & page) {
+    // protect_layerahead: see layerahead_ahead_protected(). Only ensure_batch's
+    // protect_this_call branch ever passes true (a speculative page-in, knob
+    // on); the demand path always passes the default false, so demand
+    // behaviour is byte-identical regardless of the knob.
+    size_t select_victim(const ExpertPage & page, bool protect_layerahead = false) {
         if (hint_shield_depth_ == 0) {
-            return select_victim_impl(page, false, nullptr);
+            return select_victim_impl(page, false, nullptr, protect_layerahead);
         }
         bool shielded_seen = false;
-        const size_t victim = select_victim_impl(page, true, &shielded_seen);
+        const size_t victim = select_victim_impl(page, true, &shielded_seen, protect_layerahead);
         if (victim != slots_.size()) {
             if (shielded_seen) {
                 ++n_shield_hits_;
             }
             return victim;
         }
-        const size_t fallback = select_victim_impl(page, false, nullptr);
+        const size_t fallback = select_victim_impl(page, false, nullptr, protect_layerahead);
         if (fallback != slots_.size() && shielded_seen) {
             ++n_shield_exhausted_;
         }
@@ -7278,7 +7490,7 @@ private:
                     const bool ok = result->error == nullptr &&
                         !shared.failed.load(std::memory_order_acquire);
                     arena_.finish_read(pagein.page->cache_id, pagein.arena_handle,
-                                       ok, /*keep_borrowed=*/true);
+                                       ok, /*keep_borrowed=*/true, pagein.prefill);
                     if (!ok) {
                         // ok=false freed the entry: there is no borrow to give back.
                         pagein.hold_released = true;
@@ -7506,7 +7718,8 @@ private:
                 // borrow() already ran in ensure_batch; nothing to finish.
                 if (result->last && !pagein.ram_hit) {
                     arena_.finish_read(pagein.page->cache_id, pagein.arena_handle,
-                                       result->error == nullptr, /*keep_borrowed=*/true);
+                                       result->error == nullptr, /*keep_borrowed=*/true,
+                                       pagein.prefill);
                     if (result->error != nullptr) {
                         pagein.hold_released = true;   // ok=false freed the entry
                         release_drain_quota(pagein, state->conn_index);
@@ -8891,6 +9104,59 @@ private:
     // against the budget until the slot is either hit or evicted.
     size_t                      n_spec_pending_ = 0;
     uint64_t                    n_layerahead_hits_ = 0;
+    // A slot still marked layer_ahead+spec_pending (i.e. landed by read-ahead,
+    // never confirmed by a demand hit) evicted by the pagein-reservation loop in
+    // ensure_batch, split by what evicted it: a REAL demand batch
+    // (count_demand==true, the issuing layer's own trailing page-ins) versus a
+    // later SPECULATIVE batch (count_demand==false: another layer-ahead round,
+    // WP_EXPERT_SPEC_PAGEIN's decode-time speculation, or pin_pages/seed). Read
+    // together with n_layerahead_hits_: hints - hits - truncated (Worker-side)
+    // should equal evicted_demand_ + evicted_spec_ + whatever spec_pagein_submit
+    // filtered as already-resident/in-flight at submit time.
+    uint64_t                    n_layerahead_evicted_demand_ = 0;
+    uint64_t                    n_layerahead_evicted_spec_   = 0;
+    // evict_spec split further, live-data-driven (2026-09-25: a 24k-token
+    // prefill measured evict_demand=484/184 (main/other) against evict_spec=
+    // 3745/1990 -- ~88% of the loss is a LATER speculative submission, not the
+    // issuing layer's own demand traffic). Two orthogonal axes:
+    //   source   -- was the EVICTING call itself another layer-ahead round
+    //               (spec_call_is_layer_ahead==true, passed into ensure_batch
+    //               from spec_pagein_submit) or something else (decode-time
+    //               WP_EXPERT_SPEC_PAGEIN via spec_pagein_step's plain
+    //               spec_pagein_submit call, or pin_pages/WP_EXPERT_PIN_MODE=
+    //               seed, which also run count_demand=false)?
+    //   position -- was the EVICTED page's own layer (slot.key.first) still
+    //               AHEAD of current_layer_ (the layer this worker is
+    //               currently dispatching, set by Worker::set_current_layer
+    //               at the top of dispatch()/begin_split_dispatch()) -- i.e.
+    //               about to be used -- or BEHIND it (already served, or the
+    //               request stream moved past it without ever demanding this
+    //               particular expert; evicting that one is not wasted work).
+    // The four cells sum to n_layerahead_evicted_spec_.
+    uint64_t                    n_layerahead_evicted_spec_layerahead_ahead_  = 0;
+    uint64_t                    n_layerahead_evicted_spec_layerahead_behind_ = 0;
+    uint64_t                    n_layerahead_evicted_spec_other_ahead_       = 0;
+    uint64_t                    n_layerahead_evicted_spec_other_behind_      = 0;
+    // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD=1 -- a speculative (count_demand=
+    // false) page-in from spec_pagein_submit must never evict a slot that is
+    // still spec_pending+layer_ahead for a layer AHEAD of current_layer_ (see
+    // layerahead_ahead_protected()). When protection leaves no other
+    // candidate, that ONE page-in is dropped instead of evicting -- counted
+    // here, not thrown, exactly like a page spec_pagein_submit's own pre-
+    // filter (resident/in-flight) already drops silently. Default OFF: today's
+    // behaviour (evict whatever rank_less picks, including a still-ahead
+    // layer-ahead page) is unchanged unless this is set.
+    const bool                 spec_protect_layerahead_evict_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_PROTECT_LAYERAHEAD");
+        return e != nullptr && e[0] == '1';
+    }();
+    // current_layer_: the layer Worker is currently dispatching (or last
+    // dispatched, between requests), fed by set_current_layer(). -1 until the
+    // first request; layerahead_ahead_protected() only ever fires once a real
+    // dispatch has set it, since protection is only consulted from a spec
+    // submission triggered by that same dispatch stream.
+    int32_t                     current_layer_ = -1;
+    uint64_t                    n_layerahead_spec_deferred_ = 0;
     // Times spec_pagein_submit refused to submit (or had to shrink a chunk)
     // because WP_EXPERT_SPEC_MAX_SLOTS was already spent. Surfaced on the
     // WP_HINT_LOG counter line so the cap binding is visible.
@@ -9734,6 +10000,7 @@ public:
             std::cerr << "WARN wp expert worker: WP_PREFILL_LAYER_AHEAD=1 layers="
                       << catalog_.layers.size()
                       << " width>" << prefill_layer_ahead_width_
+                      << " reserve=" << prefill_layer_ahead_reserve_
                       << std::endl;
         }
         std::cerr << "WARN wp expert worker: WP_EXPERT_SPEC_DEMAND_FIRST="
@@ -10208,6 +10475,25 @@ public:
     // filters residents; PREFILL_GATE / SPEC_CHUNK / SPEC_QUEUE_MAX are not
     // consulted -- this is not a guess. Demand-first: skip while demand reads
     // are still outstanding and retry from later call sites in dispatch().
+    //
+    // WHY THIS DOES NOT ALSO WAIT FOR L+1's READ-AHEAD TO DRAIN BEFORE FIRING
+    // L+2's (2026-09-25, live data: evict_spec >> evict_demand -- L+2's own
+    // read-ahead, fired on L+1's FIRST dispatch, was evicting most of L+1's
+    // still-unconsumed pages). An explicit "don't submit L+2 until L+1 is
+    // mostly confirmed" gate was considered instead of/alongside
+    // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD, and rejected for this pass: it needs
+    // its own state (a per-target consumed/pending ratio, since ahead_target_
+    // only remembers WHICH layer was last targeted, not how much of it has
+    // been confirmed) and a threshold to decide "mostly", and a slow L+1
+    // dispatch stream could starve L+2's read-ahead outright with no eviction
+    // pressure at all to fall back on. The protect+drop mechanism at the slot
+    // level is finer-grained -- it still lets L+2 use any slot that is not a
+    // pending L+1 page (an ordinary stale valid slot, a free one, even a
+    // pending page for a layer already behind us) -- and it also covers
+    // eviction by decode-time WP_EXPERT_SPEC_PAGEIN, which a layer-count gate
+    // here would not. Revisit an explicit cap only if live data with the
+    // knob on still shows meaningful n_layerahead_spec_deferred_ pressure
+    // (i.e. protection is frequently leaving L+2 with nothing to fetch into).
     void submit_prefill_layer_ahead(int32_t layer, uint32_t n_tokens) {
         if (!prefill_layer_ahead_ || n_tokens <= prefill_layer_ahead_width_) {
             return;
@@ -10227,11 +10513,17 @@ public:
         (void) pool_.spec_pagein_poll(false);
 
         std::vector<const ExpertPage *> pages = it->second;
-        const size_t budget = pool_.unpinned_slots();
+        const size_t unpinned = pool_.unpinned_slots();
+        const size_t budget = unpinned > prefill_layer_ahead_reserve_
+            ? unpinned - prefill_layer_ahead_reserve_ : 0;
         if (budget == 0) {
             return;
         }
         if (pages.size() > budget) {
+            // Some of this layer's experts will never be offered to
+            // spec_pagein_submit at all -- counted here, against the layer's
+            // full size, so it is distinguishable from an eviction after landing.
+            n_layerahead_truncated_ += pages.size() - budget;
             std::nth_element(
                 pages.begin(), pages.begin() + (ptrdiff_t) budget, pages.end(),
                 [this](const ExpertPage * a, const ExpertPage * b) {
@@ -10456,7 +10748,7 @@ public:
     // n_pagein and bytes_read because spend and saving are only interpretable
     // together.
     std::string prefetch_hint_line() const {
-        char buf[1280];
+        char buf[1600];
         std::snprintf(buf, sizeof(buf),
                       "frames=%llu experts=%llu "
                       "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
@@ -10471,7 +10763,10 @@ public:
                       "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit/vdemand_defer]="
                       "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
                       "spec_inflight[live/cap]=%zu/%zu "
-                      "n_layerahead[hints/pageins/hits]=%llu/%llu/%llu",
+                      "n_layerahead[hints/pageins/hits]=%llu/%llu/%llu "
+                      "n_layerahead_lost[trunc/evict_demand/evict_spec]=%llu/%llu/%llu "
+                      "n_layerahead_evict_spec[la_ahead/la_behind/other_ahead/other_behind]="
+                      "%llu/%llu/%llu/%llu n_layerahead_spec_deferred=%llu",
                       (unsigned long long) hint_frames_,
                       (unsigned long long) hint_experts_,
                       (unsigned long long) hint_foreign_layer_,
@@ -10512,7 +10807,15 @@ public:
                       pool_.spec_inflight_cap(),
                       (unsigned long long) n_layerahead_hints_,
                       (unsigned long long) n_layerahead_pageins_,
-                      (unsigned long long) pool_.n_layerahead_hits());
+                      (unsigned long long) pool_.n_layerahead_hits(),
+                      (unsigned long long) n_layerahead_truncated_,
+                      (unsigned long long) pool_.n_layerahead_evicted_demand(),
+                      (unsigned long long) pool_.n_layerahead_evicted_spec(),
+                      (unsigned long long) pool_.n_layerahead_evicted_spec_layerahead_ahead(),
+                      (unsigned long long) pool_.n_layerahead_evicted_spec_layerahead_behind(),
+                      (unsigned long long) pool_.n_layerahead_evicted_spec_other_ahead(),
+                      (unsigned long long) pool_.n_layerahead_evicted_spec_other_behind(),
+                      (unsigned long long) pool_.n_layerahead_spec_deferred());
         return buf;
     }
 
@@ -10545,12 +10848,23 @@ public:
         if (ahead_submits_ > 0 || n_layerahead_hints_ > 0) {
             std::fprintf(stderr,
                          "wp-expert-worker prefill layer-ahead: submits=%llu pages=%llu "
-                         "n_layerahead_hints=%llu n_layerahead_pageins=%llu n_layerahead_hits=%llu\n",
+                         "n_layerahead_hints=%llu n_layerahead_pageins=%llu n_layerahead_hits=%llu "
+                         "n_layerahead_lost[trunc/evict_demand/evict_spec]=%llu/%llu/%llu "
+                         "n_layerahead_evict_spec[la_ahead/la_behind/other_ahead/other_behind]="
+                         "%llu/%llu/%llu/%llu n_layerahead_spec_deferred=%llu\n",
                          (unsigned long long) ahead_submits_,
                          (unsigned long long) ahead_pages_,
                          (unsigned long long) n_layerahead_hints_,
                          (unsigned long long) n_layerahead_pageins_,
-                         (unsigned long long) pool_.n_layerahead_hits());
+                         (unsigned long long) pool_.n_layerahead_hits(),
+                         (unsigned long long) n_layerahead_truncated_,
+                         (unsigned long long) pool_.n_layerahead_evicted_demand(),
+                         (unsigned long long) pool_.n_layerahead_evicted_spec(),
+                         (unsigned long long) pool_.n_layerahead_evicted_spec_layerahead_ahead(),
+                         (unsigned long long) pool_.n_layerahead_evicted_spec_layerahead_behind(),
+                         (unsigned long long) pool_.n_layerahead_evicted_spec_other_ahead(),
+                         (unsigned long long) pool_.n_layerahead_evicted_spec_other_behind(),
+                         (unsigned long long) pool_.n_layerahead_spec_deferred());
         }
     }
 
@@ -10843,6 +11157,11 @@ public:
             ~DemandGate() { if (active) pool.demand_serving(false); }
         } demand_gate{ pool_, owns_gate };
         validate_dispatch(request);
+        // WP_EXPERT_SPEC_PROTECT_LAYERAHEAD's "still ahead of us" test needs
+        // this set before any ensure_batch call this request makes (both the
+        // demand batch below and the submit_prefill_layer_ahead() call that
+        // follows it).
+        pool_.set_current_layer(request.layer);
 
         // WP_WORKER_NULL=1 -- TIMING PROBE ONLY (hop-theory probe B/C,
         // 2026-08-22): decode-path requests answered with zeros, no reads,
@@ -11381,6 +11700,7 @@ public:
         request.assignments = begin.assignments;
         request.swiglu_clamp = begin.swiglu_clamp;
         validate_dispatch(request);
+        pool_.set_current_layer(request.layer);
         std::vector<const ExpertPage *> pages;
         pages.reserve(request.assignments.size());
         for (const pipe_expert_assignment & assignment : request.assignments) {
@@ -11637,10 +11957,19 @@ public:
         {
             const wp::HostArena & arena = pool_.arena();
             stats_.set_ram_stats(pool_.host_landed(), (uint64_t) arena.resident_bytes(),
-                                 (uint64_t) arena.pinned_bytes(), arena.evictions());
+                                 (uint64_t) arena.pinned_bytes(), arena.evictions(),
+                                 arena.admission_cold_landed(),
+                                 arena.lookups(), arena.lookup_hits());
         }
         stats_.set_layerahead_stats(
-            n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits());
+            n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits(),
+            n_layerahead_truncated_, pool_.n_layerahead_evicted_demand(),
+            pool_.n_layerahead_evicted_spec(),
+            pool_.n_layerahead_evicted_spec_layerahead_ahead(),
+            pool_.n_layerahead_evicted_spec_layerahead_behind(),
+            pool_.n_layerahead_evicted_spec_other_ahead(),
+            pool_.n_layerahead_evicted_spec_other_behind(),
+            pool_.n_layerahead_spec_deferred());
         stats_.record(request, n_experts);
     }
 
@@ -12085,10 +12414,36 @@ private:
         const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 8;
         return v > 0 ? (uint32_t) v : (uint32_t) 8;
     }();
+    // WP_PREFILL_LAYER_AHEAD_RESERVE -- hold back this many unpinned slots from
+    // the read-ahead budget computed in submit_prefill_layer_ahead(). That budget
+    // is unpinned_slots() -- EVERY unpinned slot in the pool, not just the free
+    // ones -- and the read-ahead for layer L+1 is submitted on the FIRST dispatch
+    // of layer L, before most of L's own demand page-ins have even happened (see
+    // submit_prefill_layer_ahead's ahead_target_ gate: it fires once per target
+    // layer, immediately). A large read-ahead chunk can therefore claim nearly
+    // the whole pool right as L's remaining demand traffic still needs slots --
+    // and since every speculative page sits in the low tick_ band (always a
+    // preferred eviction victim over any demand-band slot, see kDemandTickBase),
+    // L's own trailing demand page-ins evict L+1's freshly-landed, not-yet-used
+    // read-ahead pages before layer L+1 ever runs to consume them. Reserving a
+    // slice of the pool for that trailing demand traffic leaves the read-ahead
+    // pages room to survive to their own layer. Default 0 = unpinned_slots() is
+    // used whole, i.e. today's behaviour exactly.
+    const size_t       prefill_layer_ahead_reserve_ = [] {
+        const char * e = std::getenv("WP_PREFILL_LAYER_AHEAD_RESERVE");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
+        return v > 0 ? (size_t) v : (size_t) 0;
+    }();
     uint64_t           ahead_submits_ = 0;
     uint64_t           ahead_pages_   = 0;
     uint64_t           n_layerahead_hints_   = 0;
     uint64_t           n_layerahead_pageins_ = 0;
+    // Never even offered to spec_pagein_submit because the unpinned_slots()
+    // budget (minus the reserve, if any) was smaller than the next layer's
+    // expert count -- counted here, against the full layer size, so it is
+    // distinguishable from an eviction after landing (pool_.n_layerahead_
+    // evicted_demand()/n_layerahead_evicted_spec(), see ExpertSlotPool).
+    uint64_t           n_layerahead_truncated_       = 0;
     int32_t            ahead_target_         = -1;
     int32_t            ahead_offered_layer_  = -1;
     std::vector<uint64_t> expert_recency_;
@@ -17363,6 +17718,21 @@ public:
             cfg.tier_bytes  = host_tier_bytes;
             cfg.budget_bytes = host_tier_bytes +
                 entry_bytes * (uint64_t) cfg.read_inflight_max;
+            // WP_HOST_TIER_POLICY=freq_admit: gate demand-page RAM-tier
+            // admission on a persistent (survives eviction) frequency
+            // sketch instead of plain LRU. Unset/anything else keeps the
+            // default LRU-only behaviour, byte-for-byte. Plain LRU (and any
+            // "admit everyone" policy) measures ~0 host_hit_rate under
+            // prefill: each ubatch sweeps nearly every expert of every layer
+            // in the same order, a cycle far bigger than the tier, so every
+            // page is evicted long before its next use. freq_admit fixes
+            // that by refusing to let a page with no admission history evict
+            // a page the sketch remembers as popular -- see
+            // HostArena::admit_landed_locked_ for the policy itself and why
+            // it converges instead of thrashing.
+            if (const char * e = std::getenv("WP_HOST_TIER_POLICY")) {
+                cfg.freq_admission = std::strcmp(e, "freq_admit") == 0;
+            }
             // WP_HOST_ARENA_SPEC_FRAC: percent of entries that may hold
             // speculative (predicted, unconfirmed) pages; default 25.
             // WP_HOST_ARENA_CHUNK_BYTES: allocation granularity; default 1 GiB.

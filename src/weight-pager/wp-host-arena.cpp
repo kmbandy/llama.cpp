@@ -37,6 +37,18 @@ bool HostArena::init(const Config & cfg, Allocator alloc, Deallocator dealloc) {
     }
 
     initialized_ = !entries_.empty();
+
+    if (cfg_.freq_admission && initialized_) {
+        sketch_.assign((size_t) kSketchRows * std::max<size_t>(cfg_.sketch_width, 1), 0);
+        // Aging period: halve every counter after this many record() calls,
+        // same shape as the WP_EXPERT_LFU_HALFLIFE / doorkeeper_lru sim
+        // knob -- scaled off entries_.size() (the tier's own turnover rate)
+        // rather than sketch width, so a bigger sketch doesn't make aging
+        // slower. Floor of 4096 keeps a tiny test arena from aging on
+        // nearly every record.
+        sketch_period_ = std::max<uint64_t>(8 * entries_.size(), 4096);
+    }
+
     return initialized_;
 }
 
@@ -64,6 +76,12 @@ void HostArena::shutdown() {
     spec_evicted_unused_  = 0;
     spec_promotions_      = 0;
     begin_read_refusals_  = 0;
+    admission_cold_landed_ = 0;
+    lookups_       = 0;
+    lookup_hits_   = 0;
+    sketch_.clear();
+    sketch_ops_    = 0;
+    sketch_period_ = 0;
     next_gen_             = kInvalidHandle + 1;
     initialized_          = false;
 }
@@ -112,6 +130,141 @@ size_t HostArena::pinned_cap_entries_() const {
     // pinnable (see pin() in the header).
     const size_t tier_entries = cfg_.entry_bytes == 0 ? 0 : cfg_.tier_bytes / cfg_.entry_bytes;
     return std::min(tier_entries, entries_.size()) * (size_t) cfg_.pinned_cap_pct / 100;
+}
+
+// --- frequency sketch (freq_admission only) -------------------------------
+
+namespace {
+// splitmix64 finalizer -- deterministic, no per-process seed (unlike
+// std::hash<std::string>), so a captured trace replays identically run to
+// run. page_idx is small (a catalog page index) so it is folded into the
+// state rather than used as a seed on its own.
+inline uint64_t mix64_(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+}  // namespace
+
+size_t HostArena::sketch_lane_locked_(int page_idx, int row) const {
+    const uint64_t h = mix64_((uint64_t) (uint32_t) page_idx * 0x9E3779B97F4A7C15ULL +
+                               (uint64_t) row * 0xBF58476D1CE4E5B9ULL);
+    return (size_t) row * cfg_.sketch_width + (h % cfg_.sketch_width);
+}
+
+void HostArena::sketch_record_locked_(int page_idx) {
+    if (sketch_.empty()) return;   // freq_admission off, or init() never sized it
+    if (++sketch_ops_ % sketch_period_ == 0) {
+        // Aging: halve every counter so a page popular many sweeps ago
+        // cannot out-bid current traffic forever. O(kSketchRows *
+        // sketch_width) but amortized over sketch_period_ real records, so
+        // this stays a small constant per record on average.
+        for (uint8_t & c : sketch_) c >>= 1;
+    }
+    for (int r = 0; r < kSketchRows; ++r) {
+        uint8_t & c = sketch_[sketch_lane_locked_(page_idx, r)];
+        if (c < 255) ++c;
+    }
+}
+
+uint32_t HostArena::sketch_estimate_locked_(int page_idx) const {
+    if (sketch_.empty()) return 0;
+    uint32_t est = 255;
+    for (int r = 0; r < kSketchRows; ++r) {
+        est = std::min<uint32_t>(est, sketch_[sketch_lane_locked_(page_idx, r)]);
+    }
+    return est;
+}
+
+// *** WHY PLAIN LRU GETS ~0 HITS HERE, AND WHAT THIS BUYS. ***
+// A cyclic prefill sweep touches every non-resident page exactly once per
+// pass, in the same order every pass. When the sweep is bigger than the
+// tier, LRU (and FIFO, and any "admit everyone, evict oldest" policy) evicts
+// every page before its next reference: hit rate 0, byte for byte the
+// symptom this exists to fix. The fix needs memory that OUTLIVES eviction --
+// an evicted Entry forgets everything (state resets to Free) -- which is
+// exactly what the sketch above is: counts keyed by page_idx, independent of
+// whether the page currently holds an arena slot.
+//
+// *** WHY THE GATE ONLY APPLIES TO PREFILL LANDINGS (prefill_hint). ***
+// An earlier version of this gated every demand landing, prefill or decode.
+// docs/dev/sim-host-tier.py's freq_admit() vs freq_admit_phase() trials
+// measured that ungating decode regressed decode's OWN hit rate 40-55%
+// relative to plain LRU at realistic tier sizes -- decode's per-token
+// traffic already has real, LRU-friendly short-term reuse, and a frequency
+// gate can only ever slow down how fast the cache admits and tracks that
+// (a decode page starts at estimate 0 same as any other newcomer, so gating
+// it costs real hits for no scan-resistance benefit: decode was never the
+// phase producing one-shot scans). Prefill is: every prefill page-in is, by
+// construction, part of a sweep that touches each page exactly once, so
+// there is nothing to lose by gating it, and gating it is what stops it
+// from trashing whatever decode -- or an earlier prefill pass -- already
+// proved is worth keeping.
+//
+// admit_landed_locked_ is the one place that memory gets used: a freshly
+// landed DEMAND page (never a speculative one -- those keep the pre-existing
+// prefetch-protection ordering untouched) is placed at the cold (LRU-front,
+// next-to-evict) end instead of the usual MRU end when (a) landing it will
+// require a trim, (b) that trim's victim would come from the demand list
+// (spec_lru_ has nothing left to give up -- if it does, the incoming page
+// isn't really competing with anything, so let it land hot as before), and
+// (c) the incoming page's sketch estimate is NOT STRICTLY GREATER than the
+// victim's -- a tie goes to the INCUMBENT.
+//
+// Deliberately NOT recorded here: landing a page does not, by itself, bump
+// its own sketch count (only borrow() -- an actual repeat reference -- does,
+// see below). A fresh miss is exactly as uninformative about future demand
+// as the LRU victim it is displacing; recording on landing would let a page
+// win purely for having been read a SECOND calendar time (once per sweep
+// pass, same as literally every other swept page), which defeats the
+// tie-break below and degenerates back to plain LRU. With landing
+// unrecorded, a page's estimate is 0 until it earns a real hit, so on a
+// pure cyclic sweep (every page touched exactly once per pass, nothing ever
+// resident long enough to be hit twice) every comparison is a 0-vs-0 tie
+// forever -- and tie-favors-incumbent is what makes that converge: whichever
+// ~tier_size pages happen to be resident when the tier first fills keep
+// winning every subsequent tie (a challenger can only unseat them by
+// scoring STRICTLY higher, which requires a real hit, which a page that
+// self-evicts before anyone can reference it again can never get). Hit rate
+// settles at tier_size / sweep_size once locked in, instead of the 0% plain
+// LRU gets on the same trace, and it locks in even without genuine
+// popularity differences.
+//
+// The starvation this implies -- a challenger that loses its first tie
+// self-evicts before it can ever earn the hit that would let it win next
+// time, so a locked-in resident set can in principle hold forever even past
+// its actual popularity -- is now confined to PREFILL-vs-PREFILL contention
+// only (decode never lands through the gate at all, see below), which is
+// the scan-resistance behavior this exists to provide, not a bug: a prefill
+// sweep page losing forever to whatever else earned real hits (from decode,
+// or from surviving an earlier prefill pass) is the intended outcome. A
+// full W-TinyLFU windowed admit (the W segment gives every newcomer a
+// bounded number of real chances before facing the gate) would still be a
+// strictly more general fix and is a reasonable next step; not built here
+// because the phase split above already closes the one case
+// (docs/dev/sim-host-tier.py's freq_admit vs freq_admit_phase measurements)
+// where the simpler gate actually regressed something.
+void HostArena::admit_landed_locked_(size_t idx, bool prefill_hint) {
+    Entry & e = entries_[idx];
+    bool land_cold = false;
+    if (cfg_.freq_admission && !e.speculative && prefill_hint) {
+        const bool would_trim = resident_bytes_ - pinned_bytes_ > cfg_.tier_bytes;
+        if (would_trim && spec_lru_.empty() && !lru_.empty()) {
+            const size_t victim_idx = lru_.front();
+            const uint32_t cand_f  = sketch_estimate_locked_(e.page_idx);
+            const uint32_t vict_f  = sketch_estimate_locked_(entries_[victim_idx].page_idx);
+            land_cold = cand_f <= vict_f;
+        }
+    }
+    insert_mru_locked_(idx, e.speculative);
+    if (land_cold) {
+        remove_from_list_locked_(idx);
+        lru_.push_front(idx);
+        entries_[idx].lru_pos = lru_.begin();
+        entries_[idx].loc     = ListLoc::Lru;
+        ++admission_cold_landed_;
+    }
 }
 
 // Evict a single entry, preferring a speculative victim (a misprediction
@@ -272,7 +425,37 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
         } else if (!free_.empty()) {
             idx = free_.back();
             free_.pop_back();
-        } else if (evict_one_locked_(EvictScope::Any)) {
+        } else if (evict_one_locked_(
+                       cfg_.freq_admission ? EvictScope::SpecOnly : EvictScope::Any)) {
+            // *** THE BUG THE LIVE 2026-09-25 RUN FOUND: n_host_hit=0 EVEN
+            // WITH A TIER SIZED TO HOLD THE WHOLE WORKING SET. ***
+            // admit_landed_locked_ only gates WHERE a demand page LANDS
+            // (finish_read). It says nothing about THIS call -- a
+            // SPECULATIVE (layer-ahead/WP_EXPERT_SPEC_PAGEIN) begin_read
+            // reserving a fresh entry. Before this fix, when spec_lru_ was
+            // under its cap but free_ was empty (arena at its budget, which
+            // it reaches fast once demand fills the tier), this fell back to
+            // EvictScope::Any -- and Any evicts from lru_ (the DEMAND list)
+            // whenever spec_lru_ happens to have nothing evictable at that
+            // exact instant. Under continuous prefetch
+            // (WP_PREFILL_LAYER_AHEAD=1 + WP_EXPERT_SPEC_PAGEIN=1, the live
+            // production config, NOT exercised by any test in this file
+            // before this one) spec_lru_ churns constantly and routinely
+            // empties for a moment, so an UNCONFIRMED guess kept evicting a
+            // CONFIRMED, possibly-about-to-be-reused demand page --
+            // completely bypassing the frequency gate, which only ever sees
+            // finish_read's landing decision. That is exactly consistent
+            // with the live symptom: ram_evictions far exceeding the
+            // distinct page count (speculative churn, not genuine demand
+            // turnover) and n_host_hit staying at 0 regardless of tier size.
+            // Fix: under freq_admission, a speculative reservation must
+            // relieve ONLY the speculative side (SpecOnly) -- if spec has
+            // nothing evictable either, refuse (the existing
+            // begin_read_refusals_ / "advisory, never fails the worker"
+            // contract every other speculative-path failure already uses)
+            // rather than stealing a demand page to seat a guess. Gated on
+            // cfg_.freq_admission so default (policy unset) behaviour is
+            // byte-for-byte unchanged.
             idx = free_.back();
             free_.pop_back();
         } else {
@@ -310,7 +493,8 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
     return true;
 }
 
-void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borrowed) {
+void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borrowed,
+                            bool prefill_hint) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = by_page_.find(page_idx);
     if (it == by_page_.end()) return;
@@ -326,7 +510,7 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borr
         ++resident_count_;
         resident_bytes_ += cfg_.entry_bytes;
         if (e.speculative) spec_bytes_ += cfg_.entry_bytes;
-        insert_mru_locked_(idx, e.speculative);
+        admit_landed_locked_(idx, prefill_hint);
         if (keep_borrowed) {
             e.borrows       = 1;
             e.ever_borrowed = true;
@@ -353,15 +537,27 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borr
 
 bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand) {
     std::lock_guard<std::mutex> lock(mu_);
+    ++lookups_;   // unconditional: proves the lookup path is even reached (see .h comment)
     auto it = by_page_.find(page_idx);
     if (it == by_page_.end()) return false;
 
     size_t idx = it->second;
     Entry & e  = entries_[idx];
     if (e.state != State::Resident) return false;   // miss or Reading
+    ++lookup_hits_;
 
     ++e.borrows;
     e.ever_borrowed = true;   // any borrow, demand or peek, counts as "used"
+
+    if (cfg_.freq_admission && demand) {
+        // Every real demand hit grows the page's persistent frequency --
+        // this (not the per-Entry LRU touch, which is forgotten on
+        // eviction) is what lets a hot decode expert keep winning admission
+        // ties after being evicted and re-read. Speculative peeks
+        // (demand=false) do not count: an unconfirmed prefetch guess is not
+        // yet real popularity.
+        sketch_record_locked_(page_idx);
+    }
 
     if (!e.pinned) {
         if (demand && e.speculative) {
@@ -485,5 +681,8 @@ uint64_t HostArena::evictions()           const { std::lock_guard<std::mutex> lo
 uint64_t HostArena::spec_evicted_unused() const { std::lock_guard<std::mutex> lock(mu_); return spec_evicted_unused_; }
 uint64_t HostArena::spec_promotions()     const { std::lock_guard<std::mutex> lock(mu_); return spec_promotions_; }
 uint64_t HostArena::begin_read_refusals() const { std::lock_guard<std::mutex> lock(mu_); return begin_read_refusals_; }
+uint64_t HostArena::admission_cold_landed() const { std::lock_guard<std::mutex> lock(mu_); return admission_cold_landed_; }
+uint64_t HostArena::lookups()     const { std::lock_guard<std::mutex> lock(mu_); return lookups_; }
+uint64_t HostArena::lookup_hits() const { std::lock_guard<std::mutex> lock(mu_); return lookup_hits_; }
 
 }  // namespace wp

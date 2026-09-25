@@ -55,6 +55,17 @@ public:
         // it -- the pre-arena StagingPool behaviour, byte-for-byte. Pinned
         // bytes never count against this cap.
         size_t tier_bytes      = 0;
+        // Frequency-gated admission (WP_HOST_TIER_POLICY=freq_admit in the
+        // worker). Default false: byte-for-byte the plain-LRU behaviour
+        // above. See the block comment above admit_landed_locked_() in the
+        // .cpp for the policy itself and why plain LRU gets ~0 hit rate on
+        // a cyclic sweep bigger than the tier.
+        bool   freq_admission  = false;
+        // Count-min sketch shape backing freq_admission. sketch_width_ is
+        // per-row counters (rows fixed at kSketchRows); ~0 memory either way
+        // (4 * 65536 bytes at the default) but exposed for the unit tests
+        // to exercise aging on a small sketch without a slow test.
+        size_t sketch_width    = 65536;
     };
     // alloc(bytes) returns 4096-aligned memory or nullptr; free(ptr, bytes).
     using Allocator   = std::function<void *(size_t)>;
@@ -115,7 +126,18 @@ public:
     // of racing a lazily-fenced buffer-reuse check. Applies the tier_bytes
     // trim afterward either way (an entry landing over the cap while NOT
     // held still trims other entries down to it). Stale handle: no-op.
-    void finish_read(int page_idx, Handle handle, bool ok, bool keep_borrowed = false);
+    // prefill_hint: true iff this page-in belongs to a prefill request
+    // (n_tokens > 1 at the worker -- see PageIn::prefill in
+    // wp-expert-worker.cpp). Only consulted when cfg_.freq_admission is set
+    // and the entry is a non-speculative demand landing; see
+    // admit_landed_locked_() in the .cpp for why decode (prefill_hint=false)
+    // is deliberately never gated -- gating it regressed decode's own hit
+    // rate relative to plain LRU in the docs/dev/sim-host-tier.py trials
+    // (freq_admit vs freq_admit_phase), because decode's legitimate,
+    // already-LRU-friendly reuse doesn't need or benefit from an admission
+    // filter, and gating it only slows how fast the cache tracks it.
+    void finish_read(int page_idx, Handle handle, bool ok, bool keep_borrowed = false,
+                     bool prefill_hint = false);
 
     // --- hit path ---
     // Resident only. Increments borrow count, touches LRU, clears
@@ -148,6 +170,23 @@ public:
     uint64_t spec_evicted_unused()   const;
     uint64_t spec_promotions()       const;
     uint64_t begin_read_refusals()   const;  // inflight cap / nothing evictable
+    // freq_admission only: demand landings placed at the cold (immediately
+    // evictable) end instead of MRU because the incoming page's sketch
+    // estimate lost to the current LRU victim's. Always 0 when the policy
+    // is off.
+    uint64_t admission_cold_landed() const;
+    // Proof-of-lookup counters, unconditional (not freq_admission-gated):
+    // every borrow() call is one cache lookup attempt (the only lookup path
+    // -- the demand pagein path is currently the only caller). Added
+    // 2026-09-25 after a live run measured n_host_hit=0 with no way to tell
+    // whether the lookup was ever reached at all; see the block comment
+    // above begin_read_locked_'s speculative-eviction branch in the .cpp for
+    // what was actually wrong (a separate bug, not this counter's fault, but
+    // this pair is what would have made it visible immediately instead of
+    // needing a live-vs-simulator diff).
+    uint64_t lookups()      const;   // every borrow() call, hit or miss
+    uint64_t lookup_hits()  const;   // borrow() calls that found the page Resident
+
 
 private:
     // Which LRU list (if any) currently holds this entry. Pinned and Reading
@@ -200,6 +239,21 @@ private:
     size_t   spec_cap_entries_() const;
     size_t   pinned_cap_entries_() const;
 
+    // --- frequency sketch (freq_admission only) -----------------------------
+    // Count-min sketch, kSketchRows independent hashes over sketch_width_
+    // counters each. Persists across eviction (unlike Entry::borrows, which
+    // resets to 0 the instant an entry frees) -- that persistence is the
+    // whole point: it is what lets a page that was evicted many sweeps ago
+    // still outbid a first-time page at the next admission decision. See
+    // admit_landed_locked_() in the .cpp for how it is used.
+    static constexpr int kSketchRows = 4;
+    void     sketch_record_locked_(int page_idx);
+    uint32_t sketch_estimate_locked_(int page_idx) const;
+    size_t   sketch_lane_locked_(int page_idx, int row) const;
+    // Called from finish_read()'s ok==true branch instead of a bare
+    // insert_mru_locked_ call when cfg_.freq_admission is set.
+    void     admit_landed_locked_(size_t idx, bool prefill_hint);
+
     mutable std::mutex mu_;
     // Notified by every release() and finish_read() (both outcomes) -- the
     // only two calls that can turn a not-evictable entry into an evictable
@@ -232,6 +286,16 @@ private:
     uint64_t spec_evicted_unused_ = 0;
     uint64_t spec_promotions_     = 0;
     uint64_t begin_read_refusals_ = 0;
+    uint64_t admission_cold_landed_ = 0;
+    uint64_t lookups_     = 0;
+    uint64_t lookup_hits_ = 0;
+
+    // Sketch storage: kSketchRows * cfg_.sketch_width counters, row r's
+    // lane at r * cfg_.sketch_width + (hash % cfg_.sketch_width). Empty
+    // (never allocated) when cfg_.freq_admission is false.
+    std::vector<uint8_t> sketch_;
+    uint64_t             sketch_ops_    = 0;
+    uint64_t             sketch_period_ = 0;   // halve all counters every this many records
 };
 
 }  // namespace wp

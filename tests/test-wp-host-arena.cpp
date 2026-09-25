@@ -462,6 +462,254 @@ static void test_pinned_cap_excludes_inflight_entries() {
     for (int i = 0; i < 3; ++i) arena.release(i, h[i]);
 }
 
+// --- freq_admission (WP_HOST_TIER_POLICY=freq_admit) -----------------------
+
+static void read_page(HostArena & arena, int page, bool prefill = true) {
+    void * data; HostArena::Handle h;
+    require(arena.begin_read(page, false, &data, &h), "begin_read (miss)");
+    arena.finish_read(page, h, true, /*keep_borrowed=*/false, prefill);
+}
+
+// true (and releases) iff the page was resident -- a "hit" in the cache
+// sense, mirroring reserve_arena_for_pagein's own borrow()-first sequence.
+static bool hit_page(HostArena & arena, int page) {
+    const void * src; HostArena::Handle h;
+    if (!arena.borrow(page, &src, &h)) return false;
+    arena.release(page, h);
+    return true;
+}
+
+// The motivating bug: prefill sweeps every expert of every layer in the same
+// cyclic order, a cycle far bigger than the tier. Plain LRU (cfg()'s default,
+// freq_admission left false) evicts every page before its next reference:
+// hit rate 0 forever, exactly the ram_hit_rate=0 the worker was measuring.
+static void test_plain_lru_gets_zero_hits_on_oversized_cyclic_sweep() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(4);
+    c.tier_bytes = 2 * ENTRY;               // tier holds 2, sweep touches 4
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+    int hits = 0;
+    for (int pass = 0; pass < 4; ++pass) {
+        for (int page = 0; page < 4; ++page) {
+            if (hit_page(arena, page)) ++hits; else read_page(arena, page);
+        }
+    }
+    require(hits == 0, "plain LRU: a 4-page cyclic sweep through a 2-page tier never hits");
+}
+
+// freq_admission=true on the SAME trace: it must settle on a STABLE 2-page
+// subset instead of thrashing, and hit rate must converge to tier_size /
+// sweep_size (2/4 = 50%) from the second pass on -- see the block comment
+// above HostArena::admit_landed_locked_ for why tie-favors-incumbent with an
+// unrecorded landing is what produces exactly this convergence.
+static void test_freq_admission_locks_a_stable_subset_on_cyclic_sweep() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(4);
+    c.tier_bytes      = 2 * ENTRY;
+    c.freq_admission  = true;
+    c.sketch_width    = 64;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    // Pass 1: cold cache, nothing to compare against yet (every landing is
+    // either under the cap or ties 0-vs-0 and self-evicts) -- 0 hits, same
+    // as plain LRU has to be on a cold start.
+    int hits_pass1 = 0;
+    for (int page = 0; page < 4; ++page) {
+        if (hit_page(arena, page)) ++hits_pass1; else read_page(arena, page);
+    }
+    require(hits_pass1 == 0, "pass 1 is necessarily cold");
+    require(arena.resident_count() == 2, "tier holds exactly 2 after pass 1");
+
+    bool resident_after_pass1[4];
+    for (int page = 0; page < 4; ++page) resident_after_pass1[page] = arena.is_resident(page);
+
+    // Pass 2 and 3: the resident pair from pass 1 must now be HIT (they
+    // never left), and the other pair must keep losing admission and
+    // self-evict without disturbing the resident pair.
+    for (int pass = 2; pass <= 3; ++pass) {
+        int hits = 0;
+        for (int page = 0; page < 4; ++page) {
+            if (hit_page(arena, page)) ++hits; else read_page(arena, page);
+        }
+        require(hits == 2, "hit rate settles at tier_size/sweep_size (2/4) once locked in");
+        for (int page = 0; page < 4; ++page) {
+            require(arena.is_resident(page) == resident_after_pass1[page],
+                    "the resident subset is STABLE across passes, not re-shuffled");
+        }
+    }
+    require(arena.admission_cold_landed() > 0,
+            "the losing pair actually went through the cold-landing/self-evict path");
+}
+
+// Decode-shaped scan resistance: a single hot page is borrow()'d repeatedly
+// (building real sketch frequency) while a long stream of one-shot cold
+// pages -- each never referenced again, exactly like the low-popularity
+// tail of a Zipf routing distribution -- tries to take its slot. None of
+// them may succeed: every one of them starts at estimate 0, which can never
+// beat the hot page's real (>0) estimate under the <= tie-break.
+static void test_freq_admission_hot_page_resists_a_cold_scan() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(8);
+    c.tier_bytes      = 1 * ENTRY;          // one slot: everything contends for it
+    c.freq_admission  = true;
+    c.sketch_width    = 64;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    read_page(arena, /*hot=*/0);
+    for (int i = 0; i < 3; ++i) {
+        require(hit_page(arena, 0), "hot page re-referenced (builds real sketch frequency)");
+    }
+    for (int cold = 100; cold < 164; ++cold) {
+        read_page(arena, cold);   // miss: never resident before, admission-gated
+        require(arena.state_of(0) == HostArena::State::Resident,
+                "a first-time cold page must never evict the proven-hot incumbent");
+        require(arena.state_of(cold) == HostArena::State::Free,
+                "the losing cold page self-evicts on this same call instead of squatting");
+    }
+    require(arena.admission_cold_landed() >= 64, "every cold-scan page went through the loss path");
+}
+
+// freq_admission=false (the default, unset in cfg()) must be exactly the
+// pre-existing behaviour: admission_cold_landed() stays 0 even under the
+// same pressure that exercises it above.
+static void test_freq_admission_off_never_touches_admission_counters() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(8);
+    c.tier_bytes = 1 * ENTRY;
+    HostArena arena;   // freq_admission left at its default: false
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+    read_page(arena, 0);
+    for (int i = 0; i < 3; ++i) require(hit_page(arena, 0), "hit");
+    for (int cold = 100; cold < 110; ++cold) read_page(arena, cold);
+    require(arena.admission_cold_landed() == 0,
+            "policy off: the counter never increments, byte-for-byte legacy behaviour");
+    require(arena.state_of(0) == HostArena::State::Free,
+            "policy off: plain LRU still evicts the old page like every pre-existing test expects");
+}
+
+// prefill_hint=false (decode) must NEVER be gated, even under exactly the
+// scan pressure that gates prefill above -- this is what keeps
+// freq_admit's phase split from regressing decode below plain LRU (see the
+// docs/dev/sim-host-tier.py freq_admit vs freq_admit_phase measurements the
+// block comment above HostArena::admit_landed_locked_ cites).
+static void test_freq_admission_decode_hint_never_gates() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(8);
+    c.tier_bytes      = 1 * ENTRY;
+    c.freq_admission  = true;
+    c.sketch_width    = 64;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    read_page(arena, 0, /*prefill=*/false);
+    for (int i = 0; i < 3; ++i) require(hit_page(arena, 0), "hit");
+    // A stream of decode (prefill=false) one-shot pages: plain LRU DOES
+    // evict the incumbent here (unlike the prefill-hint scan-resistance
+    // test above) because decode landings are never gated.
+    bool ever_evicted = false;
+    for (int cold = 100; cold < 110; ++cold) {
+        read_page(arena, cold, /*prefill=*/false);
+        if (arena.state_of(0) != HostArena::State::Resident) ever_evicted = true;
+    }
+    require(ever_evicted, "decode-hinted landings are ungated: they behave like plain LRU, "
+                          "not like the prefill scan-resistance path");
+    require(arena.admission_cold_landed() == 0,
+            "the gate never even evaluates a decode-hinted landing");
+}
+
+// Reproduces the live 2026-09-25 finding: WP_HOST_TIER_POLICY=freq_admit
+// measured n_host_hit=0 in production even with the tier sized to hold the
+// whole working set. admit_landed_locked_ (tested above) only gates WHERE a
+// DEMAND page lands; it says nothing about a SPECULATIVE begin_read's own
+// eviction choice inside begin_read_locked_. Before the fix, when spec was
+// under its cap but the arena had no free entries AND spec_lru_ happened to
+// be empty at that instant, begin_read_locked_'s speculative branch fell
+// back to EvictScope::Any, which evicts from lru_ (the DEMAND list) same as
+// plain LRU -- completely bypassing the frequency gate, since that gate is
+// never even consulted on this path. Under continuous production prefetch
+// (WP_PREFILL_LAYER_AHEAD=1 + WP_EXPERT_SPEC_PAGEIN=1, not exercised by any
+// test in this file before this one) spec_lru_ churns constantly and
+// routinely empties for a moment, so an unconfirmed guess kept evicting
+// confirmed demand pages -- matching the live symptom of near-0 hits and
+// ram_evictions far exceeding the distinct page count.
+static void test_freq_admission_speculative_never_evicts_demand() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(3);       // exactly demand(1) + spec(2): no free slack
+    c.tier_bytes     = 3 * ENTRY;       // no retention pressure: isolates begin_read's own bug
+    c.spec_frac_pct  = 100;             // spec cap == the whole arena: never the limiting factor
+    c.freq_admission = true;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    // 1. One demand (prefill) page lands and is never touched again.
+    read_page(arena, /*page=*/1, /*prefill=*/true);
+
+    // 2. Two speculative reads fill the rest of the arena.
+    void * data; HostArena::Handle h2, h3;
+    require(arena.begin_read(2, /*speculative=*/true, &data, &h2), "spec read 2");
+    arena.finish_read(2, h2, true);
+    require(arena.begin_read(3, /*speculative=*/true, &data, &h3), "spec read 3");
+    arena.finish_read(3, h3, true);
+    require(arena.entry_count() == 3 && arena.resident_count() == 3, "arena is completely full");
+
+    // 3. Demand hits on 2 and 3 promote them out of spec_lru_ into the
+    //    demand list, emptying spec_lru_ while the arena is still full.
+    const void * src; HostArena::Handle b2, b3;
+    require(arena.borrow(2, &src, &b2), "promote 2 to demand");
+    arena.release(2, b2);
+    require(arena.borrow(3, &src, &b3), "promote 3 to demand");
+    arena.release(3, b3);
+    require(arena.spec_bytes() == 0, "spec_lru_ is now empty -- everything is confirmed demand");
+
+    // 4. A NEW speculative guess: free_ is empty, spec_lru_ has nothing to
+    //    give up, and page 1 (confirmed demand, untouched since landing)
+    //    sits at the front of lru_ looking like the cheapest LRU victim.
+    //    It must refuse rather than evict page 1.
+    void * data4; HostArena::Handle h4;
+    const uint64_t refusals_before = arena.begin_read_refusals();
+    require(!arena.begin_read(4, /*speculative=*/true, &data4, &h4),
+            "a speculative guess must not be able to evict a confirmed demand page");
+    require(arena.begin_read_refusals() == refusals_before + 1,
+            "refused and counted, not silently starved");
+    require(arena.state_of(1) == HostArena::State::Resident,
+            "page 1 (demand, never re-touched) must have survived");
+}
+
+// Same exact scenario with freq_admission left at its default (false): the
+// fix must be opt-in only. This documents (does not newly introduce) that a
+// speculative guess CAN evict a confirmed demand page under plain LRU --
+// proving the fix above is additive behind the knob, not a default change.
+static void test_freq_admission_off_speculative_can_still_evict_demand() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(3);
+    c.tier_bytes     = 3 * ENTRY;
+    c.spec_frac_pct  = 100;
+    // freq_admission left false (default).
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    read_page(arena, /*page=*/1);
+    void * data; HostArena::Handle h2, h3;
+    require(arena.begin_read(2, true, &data, &h2), "spec read 2");
+    arena.finish_read(2, h2, true);
+    require(arena.begin_read(3, true, &data, &h3), "spec read 3");
+    arena.finish_read(3, h3, true);
+    const void * src; HostArena::Handle b2, b3;
+    require(arena.borrow(2, &src, &b2), "promote 2");
+    arena.release(2, b2);
+    require(arena.borrow(3, &src, &b3), "promote 3");
+    arena.release(3, b3);
+
+    void * data4; HostArena::Handle h4;
+    require(arena.begin_read(4, true, &data4, &h4),
+            "plain LRU (policy off): the speculative guess DOES get admitted");
+    require(arena.state_of(1) == HostArena::State::Free,
+            "plain LRU (policy off): page 1 gets evicted to seat it -- the pre-existing behaviour, unchanged");
+}
+
 int main() {
     try {
         test_init_chunked_and_shrink_on_failure();
@@ -477,6 +725,13 @@ int main() {
         test_batch_larger_than_inflight_cap_completes();
         test_reserve_wait_present_after_concurrent_read();
         test_pinned_cap_excludes_inflight_entries();
+        test_plain_lru_gets_zero_hits_on_oversized_cyclic_sweep();
+        test_freq_admission_locks_a_stable_subset_on_cyclic_sweep();
+        test_freq_admission_hot_page_resists_a_cold_scan();
+        test_freq_admission_decode_hint_never_gates();
+        test_freq_admission_speculative_never_evicts_demand();
+        test_freq_admission_off_speculative_can_still_evict_demand();
+        test_freq_admission_off_never_touches_admission_counters();
         std::cout << "test-wp-host-arena: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

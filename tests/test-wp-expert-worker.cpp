@@ -42,6 +42,12 @@ static constexpr int N_EMBD   = 32;
 static constexpr int N_FF_EXP = 32;
 static constexpr int LAYER    = 3;
 static constexpr int OTHER_LAYER = 4;
+// THIRD_LAYER: only make_fixture3() below wires this in (a 3-layer catalog),
+// for the two-consecutive-read-ahead-rounds reproduction -- LAYER's read-
+// ahead lands OTHER_LAYER, then OTHER_LAYER's own first dispatch fires a
+// SECOND round targeting THIRD_LAYER while OTHER_LAYER's pages are still
+// unconfirmed.
+static constexpr int THIRD_LAYER = 5;
 static constexpr int N_TOKENS = 2;
 static constexpr uint64_t ROLE_BYTES =
     (uint64_t) N_EMBD * N_FF_EXP * sizeof(float);
@@ -249,6 +255,167 @@ Fixture make_fixture(const fs::path & dir) {
         { "total_group_count", 8 },
         { "total_blob_bytes", total_blob_bytes },
         { "shard_count", 2 },
+        { "content_hash", identity },
+        { "shards", std::move(shards) },
+    });
+    return fixture;
+}
+
+// Same synthetic catalog as make_fixture(), but with a THIRD layer
+// (THIRD_LAYER) so a test can exercise TWO CONSECUTIVE layer-ahead rounds:
+// LAYER's read-ahead lands OTHER_LAYER, then OTHER_LAYER's own first dispatch
+// fires a second round targeting THIRD_LAYER while OTHER_LAYER's pages may
+// still be unconfirmed. make_fixture() only ever has one "next" layer, which
+// cannot reach that shape at all.
+Fixture make_fixture3(const fs::path & dir) {
+    Fixture fixture;
+    fixture.descriptor = dir / "synthetic3.expert-descriptor.json";
+    fixture.manifest   = dir / "synthetic3-experts-manifest.json";
+
+    const json identity = {
+        { "algorithm", "sha256" },
+        { "value", "synthetic-expert-worker-test-3layer" },
+    };
+    const json role_shape = { N_EMBD, N_FF_EXP };
+    const auto role_desc = [&](const char * role) {
+        return json{
+            { "ggml_type", (int) GGML_TYPE_F32 },
+            { "ggml_type_name", ggml_type_name(GGML_TYPE_F32) },
+            { "shape", role_shape },
+            { "bytes_per_expert", ROLE_BYTES },
+            { "source_tensor_name", std::string("synthetic.") + role },
+        };
+    };
+    const auto layer_desc = [&](int layer) {
+        return json{
+            { "layer", layer },
+            { "roles",
+              {
+                  { "gate", role_desc("gate") },
+                  { "up", role_desc("up") },
+                  { "down", role_desc("down") },
+              } },
+        };
+    };
+    const std::vector<int> layers = { LAYER, OTHER_LAYER, THIRD_LAYER };
+    json layer_json = json::array();
+    for (int layer : layers) {
+        layer_json.push_back(layer_desc(layer));
+    }
+    write_json(fixture.descriptor, {
+        { "format", "llama.cpp.weight-pager.expert-descriptor" },
+        { "version", 1 },
+        { "source_model",
+          {
+              { "input_model", "synthetic.gguf" },
+              { "model_files", { "synthetic.gguf" } },
+              { "architecture", "synthetic" },
+              { "name", "synthetic" },
+          } },
+        { "shard_manifest_identity", identity },
+        { "retained_expert_range", { { "first", 0 }, { "last", 3 } } },
+        { "hparams",
+          {
+              { "n_layer", THIRD_LAYER + 1 },
+              { "n_embd", N_EMBD },
+              { "n_ff_exp", N_FF_EXP },
+              { "n_expert", 4 },
+              { "n_expert_used", 2 },
+              { "activation", "silu" },
+          } },
+        { "layers", std::move(layer_json) },
+    });
+
+    json shards = json::array();
+    uint64_t total_blob_bytes = 0;
+    int shard_index = 0;
+    for (int layer : layers) {
+        const std::string stem =
+            "synthetic3-0000" + std::to_string(shard_index + 1) +
+            "-of-0000" + std::to_string(layers.size());
+        const fs::path sidecar = dir / (stem + ".wpi.json");
+        const fs::path blob    = dir / (stem + ".wpb");
+        json groups = json::array();
+        std::ofstream blob_output(blob, std::ios::binary);
+        if (!blob_output) {
+            throw std::runtime_error("failed to create synthetic blob");
+        }
+        uint64_t offset = 0;
+        for (int expert = 0; expert < 4; ++expert) {
+            json members = json::array();
+            for (const auto & role : {
+                     std::make_pair(std::string("up"), 1),
+                     std::make_pair(std::string("gate"), 2),
+                     std::make_pair(std::string("down"), 4) }) {
+                const int role_index =
+                    role.first == "up" ? 0 : (role.first == "gate" ? 1 : 2);
+                std::vector<float> matrix = make_matrix(expert, role_index);
+                fixture.weights.emplace(
+                    std::make_pair(expert, role.first), matrix);
+                blob_output.write(
+                    reinterpret_cast<const char *>(matrix.data()),
+                    (std::streamsize) (matrix.size() * sizeof(float)));
+                members.push_back({
+                    { "role_mask", role.second },
+                    { "size", ROLE_BYTES },
+                    { "offset", offset },
+                    { "catalog_name",
+                      "blk." + std::to_string(layer) + ".ffn_" +
+                      role.first + "." + std::to_string(expert) + ".weight" },
+                    { "source_tensor_name", "synthetic." + role.first },
+                    { "source_file_idx", 0 },
+                    { "source_file_offset", offset },
+                });
+                offset += ROLE_BYTES;
+            }
+            groups.push_back({
+                { "block_idx", layer },
+                { "expert_idx", expert },
+                { "member_count", 3 },
+                { "members", std::move(members) },
+            });
+        }
+        blob_output.close();
+        require(offset == PAGE_BYTES * 4,
+                "synthetic3 shard size mismatch");
+        write_json(sidecar, {
+            { "format", "llama.cpp.weight-pager.expert-shard-index" },
+            { "version", 1 },
+            { "blob_file", blob.filename().string() },
+            { "shard_index", shard_index },
+            { "shard_count", (int) layers.size() },
+            { "layer_first", layer },
+            { "layer_last", layer },
+            { "group_count", 4 },
+            { "blob_bytes", offset },
+            { "content_hash", identity },
+            { "model_files", { "synthetic.gguf" } },
+            { "groups", std::move(groups) },
+        });
+        shards.push_back({
+            { "blob_file", blob.filename().string() },
+            { "index_file", sidecar.filename().string() },
+            { "shard_index", shard_index },
+            { "layer_first", layer },
+            { "layer_last", layer },
+            { "group_count", 4 },
+            { "blob_bytes", offset },
+            { "content_hash", identity },
+        });
+        total_blob_bytes += offset;
+        ++shard_index;
+    }
+
+    write_json(fixture.manifest, {
+        { "format", "llama.cpp.weight-pager.expert-shard-manifest" },
+        { "version", 1 },
+        { "input_model", "synthetic.gguf" },
+        { "model_files", { "synthetic.gguf" } },
+        { "sharding_mode", "expert-index-range" },
+        { "retained_expert_range", { { "first", 0 }, { "last", 3 } } },
+        { "total_group_count", 4 * (int) layers.size() },
+        { "total_blob_bytes", total_blob_bytes },
+        { "shard_count", (int) layers.size() },
         { "content_hash", identity },
         { "shards", std::move(shards) },
     });
@@ -2431,6 +2598,350 @@ void test_demand_dispatch_waits_for_inflight_prefill_ahead_batch() {
     require(server_result == 0,
             "worker returned failure after a demand dispatch overlapped an "
             "in-flight prefill-ahead speculative batch");
+}
+
+// THE WASTED-READ-AHEAD REGRESSION. submit_prefill_layer_ahead() fires on the
+// FIRST dispatch of layer L (see its ahead_target_ gate) and sizes its budget
+// from pool_.unpinned_slots() -- every unpinned slot, with no headroom held
+// back for L's OWN remaining demand traffic, which keeps arriving across the
+// rest of L's micro-batches. With the pool full, that trailing demand has
+// nowhere to land but an eviction, and a landed-but-unconfirmed layer-ahead
+// page (spec_tick_ band, always older than the kDemandTickBase-anchored
+// demand band -- see rank_less) is the eviction victim. The freshly-fetched
+// page for L+1 is gone before L+1 ever dispatches and has to be re-read from
+// disk -- exactly the ~46% wasted layer-ahead read-ahead this test pins.
+//
+// Lease OFF (WP_EXPERT_SPEC_LEASE=0): the two-band LRU invariant applies with
+// no lease complication, so which page gets evicted is deterministic (the
+// lowest spec_tick_, i.e. the first-landed page of the ahead batch) and the
+// mechanism under test -- eviction by the ISSUING layer's own demand, not by
+// L+1's read-ahead or L+2's -- is isolated from lease tuning.
+//
+// reserve_slots: WP_PREFILL_LAYER_AHEAD_RESERVE. 0 reproduces today's
+// behaviour (the bug); a positive value holds back that many unpinned slots
+// from the read-ahead budget, so L's trailing demand page-in lands in a slot
+// that was never claimed instead of evicting a not-yet-used layer-ahead page.
+void test_prefill_layer_ahead_evicted_by_own_layer_demand(int reserve_slots) {
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_PREFILL_LAYER_AHEAD", "1", 1) == 0, "failed to arm WP_PREFILL_LAYER_AHEAD");
+    require(setenv("WP_PREFILL_LAYER_AHEAD_WIDTH", "1", 1) == 0,
+            "failed to lower the prefill-ahead width so this test's requests qualify");
+    require(setenv("WP_EXPERT_SPEC_LEASE", "0", 1) == 0, "failed to disable the speculative lease");
+    if (reserve_slots > 0) {
+        require(setenv("WP_PREFILL_LAYER_AHEAD_RESERVE", std::to_string(reserve_slots).c_str(), 1) == 0,
+                "failed to set WP_PREFILL_LAYER_AHEAD_RESERVE");
+    } else {
+        unsetenv("WP_PREFILL_LAYER_AHEAD_RESERVE");
+    }
+    unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    // 1 slot for LAYER/0's own demand page + 4 for OTHER_LAYER's full catalog:
+    // exactly the pool a real worker offers submit_prefill_layer_ahead (every
+    // unpinned slot), so with reserve_slots=0 the read-ahead claims the whole
+    // pool and LAYER's own trailing demand for expert 1 has nothing to land in
+    // but an eviction.
+    options.slots             = 5;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        const auto dispatch = [&](int32_t layer, int32_t expert, uint32_t n_tokens, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer    = layer;
+            request.n_tokens = n_tokens;
+            request.activations.resize((size_t) n_tokens * N_EMBD);
+            request.assignments.push_back({ expert, std::vector<float>(n_tokens, 0.5f) });
+            payload = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq,
+                                    payload.data(), payload.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload),
+                    "worker closed the connection instead of answering");
+            if (type == PIPE_ERROR) {
+                const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+                throw std::runtime_error("dispatch failed: " + error.msg);
+            }
+            require(type == PIPE_EXPERT_PARTIAL && seq_id == seq, "dispatch did not complete");
+        };
+
+        // 1. Prefill-shaped dispatch on LAYER/0 (n_tokens=2 > WIDTH=1). Its own
+        //    demand pagein pins first; submit_prefill_layer_ahead(LAYER, 2)
+        //    then fires once for OTHER_LAYER, offering its whole catalog
+        //    (experts 0..3) against a budget of unpinned_slots() (4, or 3 with
+        //    reserve_slots=1).
+        dispatch(LAYER, 0, /*n_tokens=*/ 2, 100);
+        const size_t expected_ahead = reserve_slots > 0 ? 3 : 4;
+        require(reads.wait_for_total(1 + expected_ahead),
+                "the layer-ahead read-ahead did not land its expected pages");
+        require(reads.count_of(LAYER, 0) == 1, "LAYER/0's own demand read did not run exactly once");
+        require(reads.count_of(OTHER_LAYER, 0) == 1 && reads.count_of(OTHER_LAYER, 1) == 1 &&
+                    reads.count_of(OTHER_LAYER, 2) == 1,
+                "the layer-ahead read-ahead skipped a page it should have offered");
+
+        // 2. LAYER's OWN trailing demand traffic: a different expert of the
+        //    layer that is STILL COMPUTING, arriving after the read-ahead
+        //    already claimed the pool. This is the exact shape
+        //    submit_prefill_layer_ahead's comment describes -- "demand batch
+        //    for L is already issued (and pinned)" is only true for the FIRST
+        //    micro-batch, not the rest of L's dispatch stream.
+        dispatch(LAYER, 1, /*n_tokens=*/ 1, 101);
+        require(reads.count_of(LAYER, 1) == 1, "LAYER/1's own demand read did not run exactly once");
+
+        // 3. THE ASSERTION. Layer L+1 (OTHER_LAYER) finally dispatches and
+        //    demands the page the read-ahead already fetched for it.
+        //    reserve_slots=0: LAYER/1 had nowhere to land but an eviction, and
+        //    the two-band LRU rule made OTHER_LAYER/0 (lowest spec_tick_, the
+        //    first-landed read-ahead page) the victim -- so this demand MUST
+        //    re-read it from disk, count_of == 2. reserve_slots>0: the reserve
+        //    left LAYER/1 a slot that needed no eviction, so OTHER_LAYER/0 is
+        //    still resident and this must NOT re-read, count_of == 1.
+        dispatch(OTHER_LAYER, 0, /*n_tokens=*/ 1, 102);
+        const size_t expected_rereads = reserve_slots > 0 ? 1 : 2;
+        require(reads.count_of(OTHER_LAYER, 0) == expected_rereads,
+                reserve_slots > 0
+                    ? "WP_PREFILL_LAYER_AHEAD_RESERVE did not protect the read-ahead page "
+                      "from the issuing layer's own trailing demand page-in"
+                    : "the issuing layer's own trailing demand page-in did not evict the "
+                      "read-ahead page -- the reproduction no longer holds, check select_victim/"
+                      "rank_less/kDemandTickBase for an unrelated behaviour change");
+        // Pages NOT touched by the forcing eviction stay resident either way.
+        require(reads.count_of(OTHER_LAYER, 1) == 1 && reads.count_of(OTHER_LAYER, 2) == 1,
+                "an untouched layer-ahead page was re-read; the eviction pinned the wrong victim");
+
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_PREFILL_LAYER_AHEAD");
+        unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+        unsetenv("WP_EXPERT_SPEC_LEASE");
+        unsetenv("WP_PREFILL_LAYER_AHEAD_RESERVE");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    unsetenv("WP_EXPERT_SPEC_PAGEIN");
+    unsetenv("WP_PREFILL_LAYER_AHEAD");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+    unsetenv("WP_EXPERT_SPEC_LEASE");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_RESERVE");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0,
+            "worker returned failure during the layer-ahead eviction reproduction");
+}
+
+// THE CROSS-ROUND POLLUTION REGRESSION (2026-09-25 live data: a 24k-token
+// prefill measured n_layerahead_lost[evict_demand/evict_spec]=484/3745 (main)
+// and 184/1990 (other) -- ~88% of lost read-ahead is evict_spec, not
+// evict_demand). Reproduces it with TWO layer-ahead rounds back to back:
+// LAYER's dispatch fires round 1 (targets OTHER_LAYER, lands all 4 experts).
+// OTHER_LAYER's own FIRST dispatch (a) confirms OTHER_LAYER/0 as a real hit
+// (promoting it out of the spec band) and (b) immediately fires round 2
+// (targets THIRD_LAYER) -- while OTHER_LAYER/{1,2,3} are STILL unconfirmed
+// layer-ahead pages for a layer (OTHER_LAYER) that is, at that exact moment,
+// current_layer_ itself (still very much about to be used by OTHER_LAYER's
+// own later micro-batches). Pool is sized so round 2 has zero free slots and
+// must evict to fetch THIRD_LAYER's 4 experts.
+//
+// Without WP_EXPERT_SPEC_PROTECT_LAYERAHEAD: round 2's own ensure_batch call
+// is itself a speculative (count_demand=false) submission, so the two-band
+// LRU rule (spec always loses to demand, lowest spec_tick_ first within the
+// spec band) picks OTHER_LAYER/1, then /2, then /3 -- in that order, the
+// three lowest surviving spec ticks -- before finally taking LAYER/0 (the
+// only demand-band slot left) for THIRD_LAYER's fourth page. All three of
+// OTHER_LAYER's still-pending pages die to make room for THIRD_LAYER's
+// read-ahead before OTHER_LAYER's own dispatch stream ever asks for them.
+//
+// With the knob on: layerahead_ahead_protected() excludes OTHER_LAYER/{1,2,3}
+// from round 2's victim search entirely (OTHER_LAYER >= current_layer_==
+// OTHER_LAYER). Only LAYER/0 is left as an eligible victim, so THIRD_LAYER/0
+// lands there and THIRD_LAYER/{1,2,3} are DROPPED (counted, not thrown --
+// n_layerahead_spec_deferred_) instead of cannibalizing OTHER_LAYER's pages.
+void test_prefill_layer_ahead_two_rounds_evict_spec(bool protect) {
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_PREFILL_LAYER_AHEAD", "1", 1) == 0, "failed to arm WP_PREFILL_LAYER_AHEAD");
+    require(setenv("WP_PREFILL_LAYER_AHEAD_WIDTH", "1", 1) == 0,
+            "failed to lower the prefill-ahead width so this test's requests qualify");
+    require(setenv("WP_EXPERT_SPEC_LEASE", "0", 1) == 0, "failed to disable the speculative lease");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_RESERVE");
+    if (protect) {
+        require(setenv("WP_EXPERT_SPEC_PROTECT_LAYERAHEAD", "1", 1) == 0,
+                "failed to arm WP_EXPERT_SPEC_PROTECT_LAYERAHEAD");
+    } else {
+        unsetenv("WP_EXPERT_SPEC_PROTECT_LAYERAHEAD");
+    }
+    unsetenv("WP_EXPERT_SPEC_MAX_INFLIGHT");
+
+    TempDir temp;
+    const Fixture fixture = make_fixture3(temp.path);
+    const int port = reserve_port();
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    // 1 slot for LAYER/0's own demand page + 4 for OTHER_LAYER's full
+    // catalog: round 1 claims the whole pool (as in the single-round test
+    // above), so round 2 has zero free slots and must evict.
+    options.slots             = 5;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        const auto dispatch = [&](int32_t layer, int32_t expert, uint32_t n_tokens, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer    = layer;
+            request.n_tokens = n_tokens;
+            request.activations.resize((size_t) n_tokens * N_EMBD);
+            request.assignments.push_back({ expert, std::vector<float>(n_tokens, 0.5f) });
+            payload = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq,
+                                    payload.data(), payload.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, payload),
+                    "worker closed the connection instead of answering");
+            if (type == PIPE_ERROR) {
+                const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+                throw std::runtime_error("dispatch failed: " + error.msg);
+            }
+            require(type == PIPE_EXPERT_PARTIAL && seq_id == seq, "dispatch did not complete");
+        };
+
+        // ROUND 1. LAYER/0 (n_tokens=2 > WIDTH=1) pins its own page, then
+        // submit_prefill_layer_ahead(LAYER, 2) lands all 4 of OTHER_LAYER's
+        // experts. Pool is now completely full (5/5 valid slots).
+        dispatch(LAYER, 0, /*n_tokens=*/ 2, 100);
+        require(reads.wait_for_total(5), "round 1's layer-ahead read-ahead did not land");
+        require(reads.count_of(OTHER_LAYER, 1) == 1 && reads.count_of(OTHER_LAYER, 2) == 1,
+                "round 1 skipped a page it should have offered");
+
+        // ROUND 2. OTHER_LAYER/0's demand hit promotes that one slot out of
+        // the spec band; submit_prefill_layer_ahead(OTHER_LAYER, 2) then
+        // fires for THIRD_LAYER, forced to evict (or, with the knob, drop)
+        // against a completely full pool.
+        dispatch(OTHER_LAYER, 0, /*n_tokens=*/ 2, 101);
+        require(reads.count_of(OTHER_LAYER, 0) == 1,
+                "OTHER_LAYER/0's demand dispatch re-read a page round 1 already landed");
+        require(reads.wait_for_total(protect ? 6 : 9),
+                "round 2's layer-ahead read-ahead did not land the expected pages");
+
+        // THE ASSERTION. OTHER_LAYER's own stream keeps demanding the pages
+        // round 1 already fetched for it.
+        dispatch(OTHER_LAYER, 1, /*n_tokens=*/ 1, 102);
+        dispatch(OTHER_LAYER, 2, /*n_tokens=*/ 1, 103);
+        const size_t expected = protect ? 1 : 2;
+        require(reads.count_of(OTHER_LAYER, 1) == expected,
+                protect
+                    ? "WP_EXPERT_SPEC_PROTECT_LAYERAHEAD did not protect OTHER_LAYER/1 from "
+                      "round 2's own read-ahead"
+                    : "round 2's read-ahead did not evict OTHER_LAYER/1 -- the cross-round "
+                      "reproduction no longer holds, check rank_less/kDemandTickBase/select_victim "
+                      "for an unrelated behaviour change");
+        require(reads.count_of(OTHER_LAYER, 2) == expected,
+                protect
+                    ? "WP_EXPERT_SPEC_PROTECT_LAYERAHEAD did not protect OTHER_LAYER/2 from "
+                      "round 2's own read-ahead"
+                    : "round 2's read-ahead did not evict OTHER_LAYER/2 -- the cross-round "
+                      "reproduction no longer holds");
+
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_PREFILL_LAYER_AHEAD");
+        unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+        unsetenv("WP_EXPERT_SPEC_LEASE");
+        unsetenv("WP_EXPERT_SPEC_PROTECT_LAYERAHEAD");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    unsetenv("WP_EXPERT_SPEC_PAGEIN");
+    unsetenv("WP_PREFILL_LAYER_AHEAD");
+    unsetenv("WP_PREFILL_LAYER_AHEAD_WIDTH");
+    unsetenv("WP_EXPERT_SPEC_LEASE");
+    unsetenv("WP_EXPERT_SPEC_PROTECT_LAYERAHEAD");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0,
+            "worker returned failure during the cross-round layer-ahead reproduction");
 }
 
 } // namespace
@@ -5894,6 +6405,10 @@ int main() {
             "batches to read concurrently");
         test_demand_dispatch_waits_for_inflight_spec_batch();
         test_demand_dispatch_waits_for_inflight_prefill_ahead_batch();
+        test_prefill_layer_ahead_evicted_by_own_layer_demand(/*reserve_slots=*/ 0);
+        test_prefill_layer_ahead_evicted_by_own_layer_demand(/*reserve_slots=*/ 1);
+        test_prefill_layer_ahead_two_rounds_evict_spec(/*protect=*/ false);
+        test_prefill_layer_ahead_two_rounds_evict_spec(/*protect=*/ true);
         test_stripe_min_part_restores_overlap_byte_identical();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
