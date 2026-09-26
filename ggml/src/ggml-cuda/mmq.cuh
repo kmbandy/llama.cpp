@@ -223,6 +223,7 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-ampere.cuh"
 #include "mmq-config-blackwell.cuh"
 
+#include "mmq-config-gcn.cuh"
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
 #include "mmq-config-rdna3.cuh"
@@ -233,6 +234,9 @@ struct ggml_cuda_mmq_config {
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
+        if (GGML_CUDA_CC_IS_GCN(cc)) {
+            return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+        }
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
             return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
         }
@@ -261,7 +265,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback) {
 #ifdef GGML_USE_HIP
-#ifdef CDNA
+#ifdef GCN
+    return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+#elif defined(CDNA)
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
 #elif defined(RDNA4)
     return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
@@ -1419,6 +1425,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
     bool force_mm_id = false;
     // Optional per-expert weight pointer array for routing-aware weight
     // paging on consolidated MoE (MAD-88). When non-null, the kernel reads
@@ -1542,7 +1549,9 @@ static void mul_mat_q_switch_J_impl(ggml_backend_cuda_context & ctx, const mmq_a
         const long value = std::strtol(env, nullptr, 10);
         return value < 0 ? (int64_t) MMQ_FORCE_MM_REFERENCE_TOKENS : (int64_t) value;
     }();
-    const int64_t ncols_max = args.force_mm_id && pin_ref_tokens > 0 ? pin_ref_tokens : args.ncols_max;
+    // fork: a pinned expert mul_mat keeps its fixed reference width (width-invariant tiling);
+    // everything else sizes tiles against upstream's ncols_opt
+    const int64_t ncols_tile = args.force_mm_id && pin_ref_tokens > 0 ? pin_ref_tokens : args.ncols_opt;
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
@@ -1554,7 +1563,7 @@ static void mul_mat_q_switch_J_impl(ggml_backend_cuda_context & ctx, const mmq_a
             continue;
         }
 
-        const int ntiles_x = (ncols_max + config.J - 1) / config.J;
+        const int ntiles_x = (ncols_tile + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;

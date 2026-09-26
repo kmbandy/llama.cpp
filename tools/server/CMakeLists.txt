@@ -30,8 +30,8 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if(GGML_HIP)
     target_include_directories(${TARGET} PRIVATE /opt/rocm/include)
     target_compile_definitions(${TARGET} PRIVATE __HIP_PLATFORM_AMD__)
@@ -42,7 +42,7 @@ target_link_libraries(${TARGET} PUBLIC llama-common llama-expert-dispatch mtmd $
 # No GPU, no model load -- see tools/server/tests-cpp/test-prefix-cache-match.cpp.
 if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
     add_executable(test-prefix-cache-match tests-cpp/test-prefix-cache-match.cpp)
-    target_include_directories(test-prefix-cache-match PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src ../mtmd)
+    target_include_directories(test-prefix-cache-match PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src ../mtmd)
     target_link_libraries(test-prefix-cache-match PRIVATE server-context)
     add_test(NAME test-prefix-cache-match COMMAND test-prefix-cache-match)
 endif()
@@ -61,8 +61,10 @@ add_library(${TARGET}
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR} ../wp-expert-worker)
+target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR} ../wp-expert-worker)
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib llama-wp-expert-worker-lib ${CMAKE_THREAD_LIBS_INIT})
+
+add_dependencies(${TARGET} llama-ui-assets)
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)

@@ -15,7 +15,7 @@ void ggml_cuda_ar_wait_logged(cudaStream_t stream, cudaEvent_t event, const char
 struct ggml_cuda_ar_pipeline;
 
 // Allocate a pipeline for n_devices GPUs.
-// devices[] holds the CUDA device IDs in rank order.
+// devices[] holds the GPU device IDs in rank order.
 // Returns nullptr on allocation failure.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(
     const int * devices, size_t n_devices);

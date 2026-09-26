@@ -12,6 +12,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <filesystem>
+#include <thread>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -149,17 +150,17 @@ struct server_model_meta {
 };
 
 struct server_models_routes;
-struct server_subproc;   // defined in server-models.cpp
 struct server_lru_sched; // defined in server-models.cpp
+struct server_monitor;   // defined in server-models.cpp
 
 struct server_models {
     friend struct server_models_routes;
     friend struct server_lru_sched;
+    friend struct server_monitor;
 
 private:
     struct instance_t {
-        std::shared_ptr<server_subproc> subproc; // shared between main thread and monitoring thread
-        std::thread th;
+        std::shared_ptr<server_subproc> subproc; // shared with the monitor thread
         server_model_meta meta;
         // Requests currently being proxied to this model. The idle sweeper refuses to
         // unload a model with any in flight -- `meta.last_used` is stamped when a request
@@ -169,6 +170,9 @@ private:
         // same counter as `req_count` and its scheduler reads that name, so the two are
         // unified here rather than kept side by side.
         int req_count = 0; // number of active proxy requests
+
+        // ask the child to exit (it handles the command on its stdin, see server_child::setup)
+        void request_exit() const;
     };
 
     std::mutex mutex;
@@ -192,8 +196,7 @@ private:
     std::atomic<bool> idle_stop{false};
     void idle_sweeper_loop();
 
-    // for stopping models
-    std::condition_variable cv_stop;
+    // models asked to stop, still counted as running until the monitor records their exit
     std::set<std::string> stopping_models;
 
     // set to true while load_models() is executing a reload; load() will wait until clear
@@ -310,6 +313,13 @@ private:
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
+    // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
+    // not thread-safe, caller must hold mutex
+    void request_stop(const std::string & name, bool send_exit = true);
+
+    // called by the monitor once a child exited and was reaped
+    void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code);
+
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
 
@@ -387,12 +397,16 @@ public:
 
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
-    // this function is not thread-safe, must be called from instance's monitoring thread
+    // called from the monitor thread
     // payload per state:
     //     state = loading     -> payload = {} (TODO: add progress info)
     //     state = ready       -> payload = model_info (json), or {} if wakeup from sleeping
     //     state = sleeping    -> payload = {}
     void handle_child_state(const std::string & name, const std::string & raw_input);
+
+private:
+    // one thread watching every child; keep last, the destructor joins the thread
+    std::unique_ptr<server_monitor> monitor;
 };
 
 struct server_child {

@@ -4,6 +4,7 @@
 !stress/
 !perf-baseline/
 !perf-baseline/**
+!fusion/
 *.o
 ggml-common.h
 **/*.swp

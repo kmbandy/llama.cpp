@@ -809,10 +809,10 @@ struct common_params {
     std::string kv_tier_instance_id;        // MAD-131: per-instance ID for cold-tier subdir + lockfile (default: pid)
     int   kv_tier_cold_budget_mb  = 0;      // MAD-131: cap cold-pool size to N MiB (0 = no limit beyond percent-derived)
 
-    std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
+    std::vector<std::string> hostnames = {"127.0.0.1"};
     bool use_jinja = true;                                                                                  // NOLINT
 
     // server CORS params
