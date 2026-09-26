@@ -3130,10 +3130,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
         compute_type = GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc)) {
-        if (GGML_CUDA_CC_IS_AMD(cc) && src1->ne[1] > 32) {
-            compute_type = GGML_TYPE_F32;
-        }
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && src1->ne[1] > (cc >= GGML_CUDA_CC_VOLTA ? 8 : 128)) {
+        // fork: F32 at every batch size on AMD without BF16 hardware (RDNA2/GCN) and on
+        // pre-Volta NVIDIA. Upstream's batch thresholds (> 32 / > 128) put the small
+        // speculative verify batches that fall off MMVF (n = 9..16, measured on the
+        // GTX 1070 2026-08-16) back on emulated BF16 compute. F32 keeps the BF16
+        // conversion exact. Volta/Turing keep upstream's > 8 threshold.
+        if (GGML_CUDA_CC_IS_AMD(cc) ||
+            (GGML_CUDA_CC_IS_NVIDIA(cc) && (cc < GGML_CUDA_CC_VOLTA || src1->ne[1] > 8))) {
             compute_type = GGML_TYPE_F32;
         }
     }
