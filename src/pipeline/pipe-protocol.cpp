@@ -1421,7 +1421,8 @@ pipe_expert_shm_ref pipe_decode_expert_shm_ref(const uint8_t * buf, size_t len) 
 }
 
 static pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_impl(
-        const uint8_t * buf, size_t len, int32_t n_embd, bool borrow_activations) {
+        const uint8_t * buf, size_t len, int32_t n_embd, bool borrow_activations,
+        std::vector<float> * reuse_activations) {
     if (n_embd <= 0 || len < 16) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch payload is too small");
     }
@@ -1485,19 +1486,29 @@ static pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_impl(
 #else
     (void) borrow_activations;
 #endif
+    // WP_WORKER_ACT_POOL=1: move the caller's pooled buffer in before sizing
+    // it for this frame, so a buffer whose capacity already fits n_activations
+    // (the common case -- chunk shape is constant across a run) resizes in
+    // place instead of the vector freeing an old block and mmap'ing a new
+    // one. nullptr (every caller before this knob existed) takes the exact
+    // same resize()+unpack() path as before, byte-identical.
+    if (reuse_activations != nullptr) {
+        r.activations = std::move(*reuse_activations);
+    }
     r.activations.resize(n_activations);
     expert_wire_unpack(r.activations.data(), p, n_activations, wire_dtype);
     return r;
 }
 
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
-        const uint8_t * buf, size_t len, int32_t n_embd) {
-    return pipe_decode_expert_dispatch_req_impl(buf, len, n_embd, false);
+        const uint8_t * buf, size_t len, int32_t n_embd,
+        std::vector<float> * reuse_activations) {
+    return pipe_decode_expert_dispatch_req_impl(buf, len, n_embd, false, reuse_activations);
 }
 
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_view(
         const uint8_t * buf, size_t len, int32_t n_embd) {
-    return pipe_decode_expert_dispatch_req_impl(buf, len, n_embd, true);
+    return pipe_decode_expert_dispatch_req_impl(buf, len, n_embd, true, nullptr);
 }
 
 std::vector<uint8_t> pipe_encode_expert_dispatch_begin(
@@ -1690,7 +1701,8 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_acts_prepacked(
 }
 
 pipe_expert_dispatch_chunk pipe_decode_expert_dispatch_chunk(
-        const uint8_t * buf, size_t len, int32_t n_embd) {
+        const uint8_t * buf, size_t len, int32_t n_embd,
+        std::vector<float> * reuse_activations) {
     if (len < 20) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk is too small");
     }
@@ -1706,7 +1718,7 @@ pipe_expert_dispatch_chunk pipe_decode_expert_dispatch_chunk(
         r.token_end > r.total_tokens) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert dispatch chunk range");
     }
-    r.request = pipe_decode_expert_dispatch_req(p, len - 20, n_embd);
+    r.request = pipe_decode_expert_dispatch_req(p, len - 20, n_embd, reuse_activations);
     if (r.request.n_tokens != r.token_end - r.token_start) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch chunk token count does not match range");
     }

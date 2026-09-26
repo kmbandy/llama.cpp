@@ -242,6 +242,11 @@ class graph_dispatcher {
     void spine_layer_profile_wait(int32_t layer, uint64_t ns_wait) noexcept;
     void spine_layer_profile_issue_begin(int32_t layer,
                                          std::chrono::steady_clock::time_point time) noexcept;
+    // Marks the instant remote.finish_dispatch() returns in compute_wait(),
+    // for spine_layer_profile_post_begin() to diff against -- see
+    // spine_layer_profile_record::ns_gap.
+    void spine_layer_profile_finish_return(int32_t layer,
+                                           std::chrono::steady_clock::time_point time) noexcept;
     void spine_layer_profile_post_begin(int32_t layer,
                                         std::chrono::steady_clock::time_point time) noexcept;
     void spine_layer_profile_end(std::chrono::steady_clock::time_point end) noexcept;
@@ -523,16 +528,32 @@ class graph_dispatcher {
         uint64_t ns_issue = 0;
         uint64_t ns_wait = 0;
         uint64_t ns_post = 0;
+        // ns_gap: wall time between finish_dispatch() returning (ns_wait's
+        // stopping point is INSIDE that call, at the reader-recorded
+        // last_response -- see layer_trace_stats::fold_block_ns/
+        // tail_after_last_byte_ns for what fills that inner part) and
+        // spine_layer_profile_post_begin() being called for this layer's
+        // last chunk -- i.e. graph-thread time (zero_phantom_rows() plus the
+        // chunk_count>1 stats-merge bookkeeping in compute_wait(), see
+        // pipe-expert-dispatch-graph.cpp) counted in neither ms_wait nor
+        // ms_post. Zero unless WP_SPINE_LAYER_PROFILE is set.
+        uint64_t ns_gap = 0;
         std::chrono::steady_clock::time_point start{};
         std::chrono::steady_clock::time_point issue_begin{};
         std::chrono::steady_clock::time_point post_begin{};
         std::chrono::steady_clock::time_point end{};
+        // finish_return: dispatch_clock::now() taken right after
+        // remote.finish_dispatch() returns in compute_wait(), i.e. right
+        // after ns_wait's window closes on the graph thread. Used only to
+        // compute ns_gap once post_begin is known.
+        std::chrono::steady_clock::time_point finish_return{};
         std::vector<std::string> split_backends;
         int last_split_id = -1;
         bool have_start = false;
         bool have_issue = false;
         bool have_post = false;
         bool have_end = false;
+        bool have_finish_return = false;
     };
     struct spine_layer_profile_state {
         uint64_t ubatch_index = 0;

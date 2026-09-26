@@ -120,8 +120,9 @@ FILE * spine_layer_profile_log() {
         }
         opened = true;
         if (file != nullptr) {
-            std::fprintf(file, "# WP_SPINE_LAYER_PROFILE ubatch_index\tn_tokens\tlayer\tms_pre\tms_issue\tms_wait\tms_post\tms_total\n");
+            std::fprintf(file, "# WP_SPINE_LAYER_PROFILE ubatch_index\tn_tokens\tlayer\tms_pre\tms_issue\tms_wait\tms_post\tms_total\tms_gap\n");
             std::fprintf(file, "# split timestamps are host-side submission boundaries; no extra backend synchronization is added\n");
+            std::fprintf(file, "# ms_gap (2026-09-26): graph-thread time between finish_dispatch() returning and post timing starting -- currently outside both ms_wait and ms_post; see spine_layer_profile_record::ns_gap\n");
         }
     }
     return file;
@@ -496,11 +497,26 @@ void graph_dispatcher::spine_layer_profile_wait(int32_t layer, uint64_t ns_wait)
     }
 }
 
+void graph_dispatcher::spine_layer_profile_finish_return(int32_t layer, dispatch_clock::time_point time) noexcept {
+    if (!spine_layer_profile_.active) {
+        return;
+    }
+    spine_layer_profile_record & record = spine_layer_profile_.layers[layer];
+    record.finish_return = time;
+    record.have_finish_return = true;
+}
+
 void graph_dispatcher::spine_layer_profile_post_begin(int32_t layer, dispatch_clock::time_point time) noexcept {
     if (!spine_layer_profile_.active) {
         return;
     }
     spine_layer_profile_record & record = spine_layer_profile_.layers[layer];
+    // ns_gap: the graph-thread interval between finish_dispatch() returning
+    // (ns_wait's window already closed, INSIDE that call) and post timing
+    // starting here -- see spine_layer_profile_record::ns_gap's comment.
+    if (record.have_finish_return && time > record.finish_return) {
+        record.ns_gap = elapsed_ns(record.finish_return, time);
+    }
     record.post_begin = time;
     record.have_post = true;
 }
@@ -515,17 +531,23 @@ void graph_dispatcher::write_spine_layer_profile() noexcept {
     uint64_t sum_issue = 0;
     uint64_t sum_wait = 0;
     uint64_t sum_post = 0;
+    uint64_t sum_gap = 0;
     for (const auto & entry : spine_layer_profile_.layers) {
         const int32_t layer = entry.first;
         const spine_layer_profile_record & record = entry.second;
         const uint64_t total = record.ns_pre + record.ns_issue + record.ns_wait + record.ns_post;
-        std::fprintf(file, "%llu\t%u\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+        // ms_gap is appended AFTER ms_total (existing column order/semantics
+        // unchanged) -- see spine_layer_profile_record::ns_gap's comment for
+        // what it measures: graph-thread time between finish_dispatch()
+        // returning and post timing starting, currently outside both
+        // ms_wait and ms_post.
+        std::fprintf(file, "%llu\t%u\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
                      (unsigned long long) spine_layer_profile_.ubatch_index,
                      spine_layer_profile_.n_tokens,
                      layer,
                      profile_ms(record.ns_pre), profile_ms(record.ns_issue),
                      profile_ms(record.ns_wait), profile_ms(record.ns_post),
-                     profile_ms(total));
+                     profile_ms(total), profile_ms(record.ns_gap));
         std::fprintf(file, "SPLITS\t%llu\t%u\t%d\t%zu\t",
                      (unsigned long long) spine_layer_profile_.ubatch_index,
                      spine_layer_profile_.n_tokens, layer, record.split_backends.size());
@@ -540,12 +562,14 @@ void graph_dispatcher::write_spine_layer_profile() noexcept {
         sum_issue += record.ns_issue;
         sum_wait += record.ns_wait;
         sum_post += record.ns_post;
+        sum_gap += record.ns_gap;
     }
-    std::fprintf(file, "%llu\t%u\tSUMMARY\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+    std::fprintf(file, "%llu\t%u\tSUMMARY\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
                  (unsigned long long) spine_layer_profile_.ubatch_index,
                  spine_layer_profile_.n_tokens,
                  profile_ms(sum_pre), profile_ms(sum_issue), profile_ms(sum_wait),
-                 profile_ms(sum_post), profile_ms(sum_pre + sum_issue + sum_wait + sum_post));
+                 profile_ms(sum_post), profile_ms(sum_pre + sum_issue + sum_wait + sum_post),
+                 profile_ms(sum_gap));
     std::fflush(file);
 }
 
@@ -620,7 +644,12 @@ void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
     // "decode_ns meaning unpack+fold" -- decode_ns is the wire-dtype -> f32
     // step alone, still separate so a WP_EXPERT_WIRE_GPU_UNPACK A/B can see
     // which half moved).
-    std::fprintf(layer_trace_, "DS4 layer=%d chunks=%d labels=%s dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu plan_ns=%llu copy_ns=%llu\n",
+    // fold_block_ns/tail_after_last_byte_ns/recv_frame_ns/assign_zero_ns are
+    // the WP_DISPATCH_RECV_AHEAD foldtail fields (2026-09-26, see their
+    // comments on layer_trace_stats) -- appended at the end so existing
+    // parsers of this line (which key on "field=" tokens, not position)
+    // keep working unchanged.
+    std::fprintf(layer_trace_, "DS4 layer=%d chunks=%d labels=%s dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu plan_ns=%llu copy_ns=%llu fold_block_ns=%llu tail_after_last_byte_ns=%llu recv_frame_ns=%llu assign_zero_ns=%llu\n",
                  layer,
                  chunked ? 2 : 1,
                  labels.c_str(),
@@ -631,7 +660,11 @@ void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
                  (unsigned long long) transport.decode_ns,
                  (unsigned long long) transport.fold_ns,
                  (unsigned long long) transport.plan_ns,
-                 (unsigned long long) transport.copy_ns);
+                 (unsigned long long) transport.copy_ns,
+                 (unsigned long long) transport.fold_block_ns,
+                 (unsigned long long) transport.tail_after_last_byte_ns,
+                 (unsigned long long) transport.recv_frame_ns,
+                 (unsigned long long) transport.assign_zero_ns);
     std::fflush(layer_trace_);
 }
 
@@ -2366,6 +2399,9 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         // before the result unpack so that memcpy is outside dispatch wait.
         dispatch_stats layer_stats;
         std::vector<float> result = owner->remote.finish_dispatch(context->handle, &layer_stats);
+        if (layer_profile) {
+            owner->spine_layer_profile_finish_return(context->layer, dispatch_clock::now());
+        }
         if (wait_trace && context->layer < 4) {
             std::fprintf(stderr,
                          "expert dispatch chunks trace: compute_wait DONE layer=%d chunk=%d/%d handle=%llu still_open=%d any_open=%d\n",

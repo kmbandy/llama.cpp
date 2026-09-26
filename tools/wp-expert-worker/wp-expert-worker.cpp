@@ -20989,6 +20989,78 @@ bool wp_worker_decode_ahead_enabled() {
     return on;
 }
 
+// WP_WORKER_ACT_POOL=1 -- DEFAULT OFF. The real fix the comment above
+// wp_worker_decode_ahead_enabled() called out of scope: reuse the ~40 MB
+// `activations` buffer pipe_decode_expert_dispatch_req_impl() resizes on
+// every PIPE_EXPERT_DISPATCH_CHUNK frame (4 per layer for a 2048-token
+// prefill at n_embd 5120), instead of letting each chunk's request die at
+// the end of its branch and forcing the next chunk to alloc+page-fault a
+// fresh block -- ~19 ms of that ~20-25 ms per-chunk decode cost, per the
+// same measurement, is exactly the alloc/page-fault/munmap this avoids
+// (MALLOC_TRIM_THRESHOLD_=131072 in this worker's runtime env means a freed
+// block this large is always returned to the OS, so the next chunk's
+// resize() always faults in fresh pages rather than reusing a still-resident
+// one). See WpActivationPool below for the pool itself, and its use at both
+// decode call sites (the reader thread's decode-ahead path and the compute
+// thread's direct-decode path) for why a single static buffer is not safe
+// with WP_WORKER_DECODE_AHEAD=1 in play.
+bool wp_worker_act_pool_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_WORKER_ACT_POOL");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// Free-list cap for WpActivationPool. WP_WORKER_PIPELINE_QUEUE_DEPTH (2)
+// bounds how many decoded-ahead frames can be queued, plus one the reader
+// may be decoding into and one the compute thread is currently holding --
+// 4 gives that headroom without letting a burst pin more buffers than any
+// realistic in-flight count could use.
+constexpr size_t WP_WORKER_ACT_POOL_MAX = 4;
+
+// Per-connection reuse pool for PIPE_EXPERT_DISPATCH_CHUNK activation
+// buffers -- see wp_worker_act_pool_enabled() above for why this exists.
+// One instance per connection (own mutex, own free list); shared between
+// that connection's reader thread (WP_WORKER_DECODE_AHEAD=1: decodes ahead
+// of the compute thread, so more than one buffer can be checked out at
+// once) and its compute thread (always the one to release, after dispatch()
+// and the response send that reads dispatch()'s result -- never before,
+// since nothing here can tell whether the send path still needs the
+// request). acquire() only ever hands out a buffer it owns outright -- an
+// empty one if the free list has nothing to give -- so two concurrent
+// checkouts can never alias the same storage.
+class WpActivationPool {
+public:
+    // Empty vector if the free list is empty (equivalent to today's fresh
+    // allocation); otherwise a buffer whose capacity is, in steady state,
+    // already exactly right, so the resize() inside
+    // pipe_decode_expert_dispatch_req_impl() that follows does no work.
+    std::vector<float> acquire() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (free_.empty()) {
+            return {};
+        }
+        std::vector<float> buf = std::move(free_.back());
+        free_.pop_back();
+        return buf;
+    }
+    // `buf` must be a request's activations, and the caller must be done
+    // reading them -- see the class comment. Capped at WP_WORKER_ACT_POOL_MAX
+    // so a pathological burst of in-flight chunks cannot pin unbounded
+    // memory in the free list; buffers over the cap are simply freed.
+    void release(std::vector<float> && buf) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (free_.size() < WP_WORKER_ACT_POOL_MAX) {
+            free_.push_back(std::move(buf));
+        }
+    }
+
+private:
+    std::mutex                      mu_;
+    std::vector<std::vector<float>> free_;
+};
+
 // One frame handed from the reader to the compute loop, or (ok == false) the
 // EOF/error sentinel standing in for what pipe_recv_frame returning false
 // means on the direct path -- the compute loop's while-condition treats the
@@ -21150,9 +21222,19 @@ private:
 // n_embd) with no access to Worker/pool state, so running it on this thread
 // does not touch anything the "reader is transport only" rule above is
 // protecting.
+//
+// act_pool/act_pool_enabled: WP_WORKER_ACT_POOL=1 only (act_pool_enabled is
+// false and act_pool unused otherwise). `*act_pool` is shared with this
+// connection's compute thread -- see WpActivationPool's class comment for
+// why concurrent acquire()/release() from the two threads is safe. A buffer
+// checked out here either ends up owned by f.decoded_chunk (decode
+// succeeded -- the compute thread releases it once it is done with the
+// request, per that same comment) or is handed straight back below (decode
+// failed, so nothing downstream will ever see it).
 void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bool timeline,
                                       bool decode_ahead, int32_t n_embd,
-                                      WpPipelineQueue<WpPipelineFrame> & frames) {
+                                      WpPipelineQueue<WpPipelineFrame> & frames,
+                                      bool act_pool_enabled, WpActivationPool * act_pool) {
     for (;;) {
         WpPipelineFrame f;
         uint64_t hdr_done_ns = 0;
@@ -21173,9 +21255,12 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
             const auto t_decode_start = time_recv
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
+            std::vector<float> reuse_activations = act_pool_enabled ? act_pool->acquire()
+                                                                     : std::vector<float>();
             try {
                 f.decoded_chunk = pipe_decode_expert_dispatch_chunk(
-                    f.payload.data(), f.payload.size(), n_embd);
+                    f.payload.data(), f.payload.size(), n_embd,
+                    act_pool_enabled ? &reuse_activations : nullptr);
             } catch (const pipe_protocol_error & error) {
                 f.decode_failed = true;
                 f.decode_error_code = error.code;
@@ -21184,6 +21269,13 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
                 f.decode_failed = true;
                 f.decode_error_code = PIPE_ERR_BAD_FRAME;
                 f.decode_error_msg = error.what();
+            }
+            // Decode threw before (or without) consuming the checked-out
+            // buffer -- give it back so it is not simply dropped on the
+            // floor. (On success reuse_activations was already moved into
+            // f.decoded_chunk->request.activations, so this is a no-op.)
+            if (act_pool_enabled && f.decode_failed) {
+                act_pool->release(std::move(reuse_activations));
             }
             if (time_recv) {
                 f.ns_req_decode_ahead = (uint64_t) std::chrono::duration_cast<
@@ -21665,6 +21757,14 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // starting the threads is gated.
     const bool pipeline_on = wp_worker_pipeline_enabled() ||
                              wp_worker_dispatch_stream_enabled();
+    // WP_WORKER_ACT_POOL=1: see WpActivationPool's class comment. One pool
+    // per connection, used on BOTH the direct path (pipeline_on == false --
+    // the compute thread decodes every DISPATCH_CHUNK itself, below) and the
+    // pipelined path (with or without WP_WORKER_DECODE_AHEAD=1), so it is
+    // constructed unconditionally right alongside the pipeline queues rather
+    // than only under `if (pipeline_on)`.
+    const bool act_pool_enabled = wp_worker_act_pool_enabled();
+    WpActivationPool activation_pool;
     WpPipelineQueue<WpPipelineFrame>    pipeline_frames(WP_WORKER_PIPELINE_QUEUE_DEPTH);
     WpPipelineQueue<WpPipelineResponse> pipeline_responses(WP_WORKER_PIPELINE_QUEUE_DEPTH);
     pipeline_frames.set_byte_cap(WP_WORKER_PIPELINE_MAX_QUEUED_BYTES);
@@ -21715,7 +21815,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         (void) pipeline_announced;
         pipeline_threads.reader = std::thread(wp_worker_pipeline_reader_thread,
             std::ref(socket), time_recv, wp_req_log_timeline_enabled(),
-            wp_worker_decode_ahead_enabled(), mine.n_embd, std::ref(pipeline_frames));
+            wp_worker_decode_ahead_enabled(), mine.n_embd, std::ref(pipeline_frames),
+            act_pool_enabled, &activation_pool);
         pipeline_threads.writer = std::thread(wp_worker_pipeline_writer_thread,
             std::ref(socket), std::ref(pipeline_responses), std::ref(pipeline_write_failed));
         pipeline_threads.started = true;
@@ -22407,8 +22508,16 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     throw pipe_protocol_error(pipeline_decode_error_code,
                                               pipeline_decode_error_msg);
                 } else {
+                    // act_pool_enabled: this thread's own decode (pipeline
+                    // off, or on without WP_WORKER_DECODE_AHEAD=1) checks a
+                    // buffer out of the same per-connection pool the reader
+                    // thread uses; released back below once this request is
+                    // fully done with it, alongside the decode-ahead case.
+                    std::vector<float> reuse_activations = act_pool_enabled
+                        ? activation_pool.acquire() : std::vector<float>();
                     chunk = pipe_decode_expert_dispatch_chunk(
-                        payload.data(), payload.size(), mine.n_embd);
+                        payload.data(), payload.size(), mine.n_embd,
+                        act_pool_enabled ? &reuse_activations : nullptr);
                     ns_req_decode_frame = time_recv
                         ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now() - t_chunk_decode_start).count()
@@ -22529,6 +22638,19 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 stream_dispatch.next_start = chunk.token_end;
                 if (stream_dispatch.next_index == stream_dispatch.chunk_count) {
                     stream_dispatch = {};
+                }
+                // act_pool_enabled: this request is fully done -- dispatch()
+                // above already produced `partial`/`response`/`encoded` (all
+                // independent copies) and the response send just above this
+                // has completed, so nothing downstream still reads
+                // chunk.request.activations. Hand it back to the pool so the
+                // NEXT chunk on this connection (decoded here or ahead, by
+                // the reader thread) reuses its capacity instead of
+                // allocating. Skipped on any exception path below (the
+                // buffer is simply freed instead) -- rare, and every such
+                // path already returns 1 and ends the connection.
+                if (act_pool_enabled) {
+                    activation_pool.release(std::move(chunk.request.activations));
                 }
             } catch (const pipe_protocol_error & error) {
                 std::fprintf(stderr, "wp expert worker: protocol error (code %d): %s\n",

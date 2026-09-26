@@ -85,6 +85,40 @@ struct layer_trace_stats {
     // recv_ns=~600ms) needed to account for the ~430ms gap between them.
     uint64_t copy_ns   = 0;
     uint64_t plan_ns   = 0; // plan_requests(): routing plus building and encoding every worker's frames
+
+    // WP_DISPATCH_RECV_AHEAD foldtail instrumentation (2026-09-26): all four
+    // below are summed across requests folded for the layer and are zero
+    // unless WP_DISPATCH_RECV_AHEAD=1 AND WP_DS4_LAYER_TRACE is set (gated
+    // the same way as the fields above -- see fold_recv_ahead_result() /
+    // run_recv_ahead_job() in pipe-expert-dispatcher.cpp).
+    //
+    // fold_block_ns: wall time the GRAPH thread spends blocked inside
+    // fold_recv_ahead_result()'s `job->cv.wait(...)`, measured on the graph
+    // thread's OWN clock. This is distinct from (and always >=) ns_wait,
+    // which stops at the reader thread's recorded timestamp for the last
+    // chunk (chunk_capture::await_finished_at) rather than at the moment the
+    // graph thread actually wakes up -- see the note on tail_after_last_byte_ns
+    // for where the rest of the gap between them lives.
+    uint64_t fold_block_ns = 0;
+    // tail_after_last_byte_ns: reader-thread time from the LAST chunk's frame
+    // finishing arrival (pipe_recv_frame() returning, i.e. right before that
+    // chunk's decode starts) to the reader thread actually publishing
+    // job->done under job->mutex -- i.e. that chunk's decode_ns + copy_ns
+    // (already counted separately above) PLUS the reader_loop() bookkeeping
+    // (has_job reset, job mutex acquisition) that runs after
+    // run_recv_ahead_job() returns and before the graph thread can observe
+    // `done`. Together with fold_block_ns this accounts for the time between
+    // ns_wait's stopping point and the graph thread actually resuming.
+    uint64_t tail_after_last_byte_ns = 0;
+    // recv_frame_ns: reader-thread time from starting to await one chunk's
+    // frame (before pipe_recv_frame()) to that frame being fully parsed and
+    // ready to decode -- summed across every chunk of every recv-ahead
+    // request folded for this layer.
+    uint64_t recv_frame_ns = 0;
+    // assign_zero_ns: reader-thread time in run_recv_ahead_job()'s
+    // `job.out.assign(total_values, 0.0f)` zero-fill -- once per recv-ahead
+    // REQUEST (not per chunk), summed across requests folded for the layer.
+    uint64_t assign_zero_ns = 0;
 };
 
 // Cumulative prefetch-hint counters. MECHANISM counters, not outcome ones:

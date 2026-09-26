@@ -970,8 +970,16 @@ pipe_token     pipe_decode_token     (const uint8_t * buf, size_t len);
 pipe_error     pipe_decode_error     (const uint8_t * buf, size_t len);
 pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len);
 pipe_expert_hello_ack pipe_decode_expert_hello_ack(const uint8_t * buf, size_t len);
+// reuse_activations (WP_WORKER_ACT_POOL=1 callers only): when non-null, its
+// contents are moved into the returned request's `activations` BEFORE the
+// resize() that sizes it for this frame, so a buffer with enough existing
+// capacity (e.g. from a pool of same-shape chunks) is resized in place
+// instead of the vector allocating a fresh block. `*reuse_activations` is
+// left moved-from (empty) either way. Every existing caller passes nullptr
+// and gets byte-identical behaviour to before this parameter existed.
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
-    const uint8_t * buf, size_t len, int32_t n_embd);
+    const uint8_t * buf, size_t len, int32_t n_embd,
+    std::vector<float> * reuse_activations = nullptr);
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req_view(
     const uint8_t * buf, size_t len, int32_t n_embd);
 pipe_expert_shm_ref pipe_decode_expert_shm_ref(const uint8_t * buf, size_t len);
@@ -979,8 +987,12 @@ pipe_expert_dispatch_begin pipe_decode_expert_dispatch_begin(
     const uint8_t * buf, size_t len);
 pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
     const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd);
+// reuse_activations: forwarded as-is to the pipe_decode_expert_dispatch_req()
+// call this makes internally -- see that function's doc comment. nullptr
+// (every existing caller) is byte-identical to before this parameter existed.
 pipe_expert_dispatch_chunk pipe_decode_expert_dispatch_chunk(
-    const uint8_t * buf, size_t len, int32_t n_embd);
+    const uint8_t * buf, size_t len, int32_t n_embd,
+    std::vector<float> * reuse_activations = nullptr);
 pipe_expert_dispatch_acts_publish pipe_decode_expert_dispatch_acts_publish(
     const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd);
 pipe_expert_acts_publish_ack pipe_decode_expert_acts_publish_ack(

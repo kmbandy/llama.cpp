@@ -306,6 +306,104 @@ bool recv_ahead_enabled() {
     return value != nullptr && value[0] == '1';
 }
 
+// WP_RECV_AHEAD_NO_ZERO=1 -- DEFAULT OFF, foldtail (2026-09-26). Only takes
+// effect when WP_DISPATCH_RECV_AHEAD=1. run_recv_ahead_job() spends
+// assign_zero_ns zero-filling job.out (job.out.assign(total_values, 0.0f))
+// on every recv-ahead request, plus a fresh ~total_values*4-byte allocation.
+// The zero-fill is unnecessary here specifically: a stream_wire request's
+// chunk boundaries (want_start/want_end below) are computed the SAME way
+// every time -- chunk_index*base .. (last ? total_rows : want_start+base) --
+// so chunks 0..chunk_count-1 always tile [0, total_rows) contiguously with
+// no gaps and no overlap, REGARDLESS of runtime values, as long as every
+// chunk decodes successfully. When it does, every row of job.out gets
+// written by some chunk's `dst_row` copy before fold_recv_ahead_result()
+// ever reads it, so the zero-fill was only ever defending against a job
+// that returns with has_error set -- and fold_recv_ahead_result() already
+// throws BEFORE `out = std::move(job->out)` on that path (see its
+// `if (job->has_error) { throw ...; }`), so a half-written buffer is never
+// folded into scatter_add() whether or not it was pre-zeroed. See
+// acquire_recv_ahead_buffer()/release_recv_ahead_buffer() for the paired
+// buffer-reuse pool this flag also enables.
+// Deliberately NOT cached in a function-local static (unlike
+// layer_trace_enabled()): this is checked once per recv-ahead request/chunk,
+// the same call frequency as recv_ahead_enabled() above (which is also
+// uncached), and staying uncached lets a test flip this env var and see the
+// new behavior within the SAME process -- no fork+exec dance required, as
+// opposed to WP_DS4_LAYER_TRACE's cached knob (see run_self_submode()'s
+// comment in tests/test-wp-expert-dispatcher.cpp for that hazard).
+bool recv_ahead_no_zero_enabled() {
+    const char * value = std::getenv("WP_RECV_AHEAD_NO_ZERO");
+    return value != nullptr && value[0] == '1';
+}
+
+// WP_RECV_AHEAD_DIRECT_DECODE=1 -- NOT IMPLEMENTED. Investigated 2026-09-26:
+// pipe_decode_expert_partial_chunk() (pipe-protocol.cpp) always allocates
+// its OWN pipe_expert_partial::partial vector internally (via
+// pipe_decode_expert_partial()'s `r.partial.resize(n_values)` and the
+// dtype-specific unpack that writes into r.partial.data()) and returns it
+// by value -- there is no overload that takes a caller-owned destination
+// pointer/stride, so decoding straight into job.out's `dst_row` rows is not
+// reachable from pipe-expert-dispatcher.cpp without changing that function's
+// signature in pipe-protocol.h/.cpp. This process does not modify
+// pipe-protocol.cpp (owned by a different in-flight change), so this knob is
+// a documented no-op: set it and you get exactly the WP_RECV_AHEAD_NO_ZERO/
+// WP_RECV_AHEAD_DECODE_THREADS behavior with no additional effect, plus one
+// stderr warning. THE CHANGE THIS WOULD NEED: add an overload such as
+//   pipe_expert_partial_chunk pipe_decode_expert_partial_chunk_into(
+//       const uint8_t * buf, size_t len, int32_t n_embd,
+//       float * dst, size_t dst_stride_values, bool keep_ml8_4_packed);
+// (or a `float * out_partial` param on the existing pipe_decode_expert_-
+// partial() that, when non-null, is used in place of `r.partial.resize()` +
+// writes) so pipe_decode_expert_partial's per-dtype unpack branches
+// (memcpy/bf16/ml8_4/q8_0/f16) write directly to `dst` instead of a fresh
+// vector -- same shape checks and same non-finite check semantics, just no
+// intermediate response.partial buffer or its copy into job.out. Report this
+// to whoever owns pipe-protocol.cpp rather than making the change here.
+void recv_ahead_direct_decode_warn_if_set() {
+    const char * value = std::getenv("WP_RECV_AHEAD_DIRECT_DECODE");
+    if (value == nullptr || value[0] != '1') {
+        return;
+    }
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+        std::fprintf(stderr,
+            "pipe: WP_RECV_AHEAD_DIRECT_DECODE=1 requested but NOT IMPLEMENTED -- "
+            "pipe_decode_expert_partial_chunk() has no destination-buffer overload; "
+            "adding one is a pipe-protocol.cpp change this process declines to make "
+            "(see recv_ahead_direct_decode_warn_if_set()'s comment for the exact "
+            "signature it would need). Behavior is unchanged from this knob being 0.\n");
+    }
+}
+
+// WP_RECV_AHEAD_DECODE_THREADS=N (default 1, off) -- foldtail (2026-09-26).
+// Only takes effect when WP_DISPATCH_RECV_AHEAD=1. Parallelizes ONE chunk's
+// copy-into-job.out + non-finite-check pass (run_recv_ahead_job()'s
+// `dst_row[i] = v` loop below decode) across N threads, split by
+// contiguous row range. Deliberately NOT pipe_thread_pool (pipe-thread-
+// pool.h): that pool has a single outstanding-job slot and is documented as
+// unsafe for two concurrent callers, but with WP_DISPATCH_RECV_AHEAD=1 there
+// is one reader thread PER WORKER and two workers can each be decoding a
+// chunk at the same moment -- a shared pool object would need its own
+// job-queueing/synchronization to be safe for that, which is exactly the
+// hazard being avoided here. Instead this spawns EPHEMERAL std::thread
+// objects for the one row-range split and joins before returning, so there
+// is no object shared between reader threads at all -- trivially safe under
+// concurrent callers by construction. This mirrors the existing
+// WP_EXPERT_WIRE_UNPACK_THREADS pattern in pipe-protocol.cpp's
+// expert_wire_unpack_ml8_4() (same file family, same "ephemeral spawn, no
+// shared pool state" answer to the same "called from more than one thread"
+// constraint). Below k_min_rows_for_threads falls back to the plain serial
+// loop so a small chunk never pays thread-spawn overhead.
+// Uncached for the same reason as recv_ahead_no_zero_enabled() above.
+int recv_ahead_decode_threads() {
+    const char * value = std::getenv("WP_RECV_AHEAD_DECODE_THREADS");
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+    const int parsed = std::atoi(value);
+    return parsed > 1 ? parsed : 1;
+}
+
 bool layer_trace_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_DS4_LAYER_TRACE");
@@ -926,6 +1024,11 @@ struct dispatcher::impl {
         uint64_t                   copy_ns        = 0;
         uint32_t                   want_start     = 0;
         uint32_t                   want_end       = 0;
+        // Foldtail instrumentation: time from await_started_at (before
+        // pipe_recv_frame()) to the point decode starts on this chunk, i.e.
+        // the frame-receive-and-parse cost alone, separate from decode_ns/
+        // copy_ns. See layer_trace_stats::recv_frame_ns.
+        uint64_t                   recv_ns        = 0;
     };
 
     // One read-ahead job: everything a socket_reader thread (below) needs to
@@ -958,6 +1061,21 @@ struct dispatcher::impl {
         std::vector<uint32_t>    token_ids;   // copy; empty means identity rows
         std::string              endpoint;
         std::string              assignment_desc;
+
+        // Foldtail instrumentation (WP_DS4_LAYER_TRACE), written by the
+        // reader thread ONLY before `done` is published, read by the graph
+        // thread ONLY after -- same fence as `out`/`chunks` above.
+        //
+        // assign_ns: time in job.out.assign()'s zero-fill.
+        uint64_t                 assign_ns              = 0;
+        // last_frame_received_at: decode_started timestamp of the LAST
+        // chunk (i.e. right after that chunk's pipe_recv_frame() returns).
+        // Set only when the job completes without error before that chunk.
+        dispatch_clock::time_point last_frame_received_at{};
+        // tail_after_last_byte_ns: elapsed(last_frame_received_at, the
+        // instant reader_loop() is about to publish `done`) -- see
+        // layer_trace_stats::tail_after_last_byte_ns's comment.
+        uint64_t                 tail_after_last_byte_ns = 0;
     };
 
     // WP_DISPATCH_RECV_AHEAD: one persistent reader thread per worker socket,
@@ -1252,6 +1370,52 @@ struct dispatcher::impl {
     // WP_DISPATCH_RECV_AHEAD latch; see recv_ahead_enabled() for the full
     // design note. Latched once, like the other flags above.
     bool                                                recv_ahead_ = false;
+
+    // WP_RECV_AHEAD_NO_ZERO buffer pool (see recv_ahead_no_zero_enabled()).
+    // Generic std::vector<float> recycler: acquire_recv_ahead_buffer() pops
+    // (or allocates) on a reader thread when it starts a new recv-ahead
+    // job's job.out; release_recv_ahead_buffer() pushes back on the GRAPH
+    // thread once scatter_add() has read a folded partial and it is provably
+    // no longer referenced (see harvest_partials()/collect_pending_deferred()/
+    // accumulate_partial()'s release calls right after their scatter_add()).
+    // Popping happens on N reader threads concurrently (one per worker);
+    // pushing happens on the one graph thread; the mutex is the only thing
+    // that needs to be safe for that, and the critical section is a single
+    // vector pop_back/push_back -- never a resize or touch of the buffer's
+    // contents while the lock is held.
+    std::mutex                                          recv_ahead_pool_mutex_;
+    std::vector<std::vector<float>>                      recv_ahead_pool_;
+    static constexpr size_t                              k_recv_ahead_pool_max = 8;
+
+    std::vector<float> acquire_recv_ahead_buffer(size_t n) {
+        std::vector<float> buf;
+        {
+            std::lock_guard<std::mutex> lock(recv_ahead_pool_mutex_);
+            if (!recv_ahead_pool_.empty()) {
+                buf = std::move(recv_ahead_pool_.back());
+                recv_ahead_pool_.pop_back();
+            }
+        }
+        // resize(), not assign(n, 0.0f): when the pooled buffer's capacity
+        // already covers `n`, this only changes size -- no zero-fill, no
+        // reallocation. If `n` exceeds the pooled buffer's old size, the
+        // newly appended tail elements ARE zero-value-initialized by
+        // std::vector, but that is a bounded, shrinking cost as the pool
+        // warms up to the run's steady-state chunk size, not a per-request
+        // full zero-fill. A cold `buf` (pool empty) default-constructs and
+        // resize() then value-initializes the whole thing once -- the same
+        // one-time cost assign() would have paid, just not repeated.
+        buf.resize(n);
+        return buf;
+    }
+
+    void release_recv_ahead_buffer(std::vector<float> && buf) {
+        std::lock_guard<std::mutex> lock(recv_ahead_pool_mutex_);
+        if (recv_ahead_pool_.size() < k_recv_ahead_pool_max) {
+            recv_ahead_pool_.push_back(std::move(buf));
+        }
+    }
+
     bool                                                split_frame = false;
     // WP_DISPATCH_DEDUP_ACTIVATIONS latch. Requires split_frame (the mechanism
     // extends the BEGIN/ACTS split with two more per-machine-role ACTS
@@ -1886,6 +2050,16 @@ struct dispatcher::impl {
             }
             {
                 std::lock_guard<std::mutex> lock(job->mutex);
+                // Foldtail instrumentation: measured as late as possible,
+                // right before `done` becomes visible, so it captures every
+                // bit of reader_loop() bookkeeping after the last chunk's
+                // bytes actually arrived (see layer_trace_stats::
+                // tail_after_last_byte_ns). Zero cost when layer_trace_
+                // enabled() is false (one branch, no clock read).
+                if (layer_trace_enabled() && !job->has_error && !job->chunks.empty()) {
+                    job->tail_after_last_byte_ns =
+                        elapsed_ns(job->last_frame_received_at, dispatch_clock::now());
+                }
                 job->done = true;
             }
             job->cv.notify_all();
@@ -1934,7 +2108,23 @@ struct dispatcher::impl {
         const uint32_t chunk_count = job.chunk_count;
         const uint32_t total_rows  = job.total_rows;
         const size_t   total_values = (size_t) total_rows * (size_t) n_embd;
-        job.out.assign(total_values, 0.0f);
+        // Foldtail instrumentation: layer_trace_stats::assign_zero_ns. Cheap
+        // enough (one clock read either side of an assign() we do anyway)
+        // to leave ungated -- add_layer_trace() at fold time is where the
+        // WP_DS4_LAYER_TRACE gate actually lives, matching decode_ns/copy_ns
+        // below.
+        const dispatch_clock::time_point assign_started = dispatch_clock::now();
+        if (recv_ahead_no_zero_enabled()) {
+            // See recv_ahead_no_zero_enabled()'s comment: chunk geometry
+            // always tiles [0, total_rows) with no gaps when every chunk
+            // decodes successfully, so a stale/pooled buffer is fully
+            // overwritten before fold_recv_ahead_result() (which never
+            // folds on job.has_error) can observe it. No zero-fill needed.
+            job.out = acquire_recv_ahead_buffer(total_values);
+        } else {
+            job.out.assign(total_values, 0.0f);
+        }
+        job.assign_ns = elapsed_ns(assign_started, dispatch_clock::now());
         job.chunks.reserve(chunk_count);
         std::vector<uint8_t> payload;
         for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
@@ -1984,6 +2174,16 @@ struct dispatcher::impl {
             cap.want_end   = want_end;
 
             const dispatch_clock::time_point decode_started = dispatch_clock::now();
+            // Foldtail instrumentation: layer_trace_stats::recv_frame_ns
+            // (frame-receive-and-parse cost, separate from decode/copy) and
+            // recv_ahead_job::last_frame_received_at (used by reader_loop()
+            // to compute tail_after_last_byte_ns once this is the last
+            // chunk). Ungated for the same reason as assign_ns above.
+            cap.recv_ns = elapsed_ns(cap.await_started_at, decode_started);
+            if (chunk_index + 1 == chunk_count) {
+                job.last_frame_received_at = decode_started;
+            }
+            recv_ahead_direct_decode_warn_if_set();
             pipe_expert_partial_chunk response;
             try {
                 response = pipe_decode_expert_partial_chunk(payload.data(), payload.size(), n_embd,
@@ -2007,15 +2207,55 @@ struct dispatcher::impl {
             }
             float * dst_row = job.out.data() + (size_t) want_start * (size_t) n_embd;
             const dispatch_clock::time_point copy_started = dispatch_clock::now();
-            for (size_t i = 0; i < chunk_values; ++i) {
-                const float v = response.partial.partial[i];
-                if (!std::isfinite(v)) {
-                    job.has_error = true;
-                    job.error_msg = "expert dispatcher worker " + job.endpoint +
-                                     " returned a NON-FINITE streamed partial";
-                    return;
+            // WP_RECV_AHEAD_DECODE_THREADS=N: split the copy+non-finite-check
+            // pass across N ephemeral threads by contiguous element range --
+            // see recv_ahead_decode_threads()'s comment for why this spawns
+            // rather than uses a shared pool. k_min_values_for_threads mirrors
+            // pipe-protocol.cpp's expert_wire_unpack_ml8_4() nb<4096 guard:
+            // below it, thread-spawn overhead would exceed the serial loop's
+            // own cost.
+            static constexpr size_t k_min_values_for_threads = 4096;
+            const int    decode_threads = recv_ahead_decode_threads();
+            std::atomic<bool> non_finite{false};
+            if (decode_threads > 1 && chunk_values >= k_min_values_for_threads) {
+                const size_t per = (chunk_values + (size_t) decode_threads - 1) / (size_t) decode_threads;
+                std::vector<std::thread> pool;
+                pool.reserve((size_t) decode_threads);
+                for (int t = 0; t < decode_threads; ++t) {
+                    const size_t i0 = (size_t) t * per;
+                    if (i0 >= chunk_values) {
+                        break;
+                    }
+                    const size_t i1 = std::min(chunk_values, i0 + per);
+                    pool.emplace_back([&response, dst_row, i0, i1, &non_finite]() {
+                        for (size_t i = i0; i < i1; ++i) {
+                            const float v = response.partial.partial[i];
+                            if (!std::isfinite(v)) {
+                                non_finite.store(true, std::memory_order_relaxed);
+                                return;
+                            }
+                            dst_row[i] = v;
+                        }
+                    });
                 }
-                dst_row[i] = v;
+                for (std::thread & th : pool) {
+                    th.join();
+                }
+            } else {
+                for (size_t i = 0; i < chunk_values; ++i) {
+                    const float v = response.partial.partial[i];
+                    if (!std::isfinite(v)) {
+                        non_finite.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                    dst_row[i] = v;
+                }
+            }
+            if (non_finite.load(std::memory_order_relaxed)) {
+                job.has_error = true;
+                job.error_msg = "expert dispatcher worker " + job.endpoint +
+                                 " returned a NON-FINITE streamed partial";
+                return;
             }
             cap.copy_ns         = elapsed_ns(copy_started, dispatch_clock::now());
             cap.response_bytes  = payload.size();
@@ -2078,9 +2318,25 @@ struct dispatcher::impl {
                                 dispatch_state &              state) {
         std::shared_ptr<recv_ahead_job> job = std::move(request.recv_ahead_job_);
         request.recv_ahead_job_.reset();
+        // Foldtail instrumentation: layer_trace_stats::fold_block_ns is the
+        // GRAPH thread's own wall-clock measurement of this wait -- distinct
+        // from ns_wait (stops at the reader's recorded chunk timestamp) and
+        // from tail_after_last_byte_ns (the reader-side remainder); together
+        // they should roughly bound the gap between ns_wait and when the
+        // graph thread resumes. Gated the same as add_layer_trace() below so
+        // the two now() calls cost nothing when WP_DS4_LAYER_TRACE is unset.
+        const dispatch_clock::time_point block_started =
+            layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
         {
             std::unique_lock<std::mutex> lock(job->mutex);
             job->cv.wait(lock, [&job]() { return job->done; });
+        }
+        if (layer_trace_enabled()) {
+            add_layer_trace(layer, &layer_trace_stats::fold_block_ns,
+                             elapsed_ns(block_started, dispatch_clock::now()));
+            add_layer_trace(layer, &layer_trace_stats::tail_after_last_byte_ns,
+                             job->tail_after_last_byte_ns);
+            add_layer_trace(layer, &layer_trace_stats::assign_zero_ns, job->assign_ns);
         }
         note_in_flight_delta(state, -1);
         if (job->has_error) {
@@ -2099,6 +2355,7 @@ struct dispatcher::impl {
             if (layer_trace_enabled()) {
                 add_layer_trace(layer, &layer_trace_stats::decode_ns, cap.decode_ns);
                 add_layer_trace(layer, &layer_trace_stats::copy_ns, cap.copy_ns);
+                add_layer_trace(layer, &layer_trace_stats::recv_frame_ns, cap.recv_ns);
             }
             if (collect_stats && last_response != nullptr) {
                 *last_response = cap.await_finished_at;
@@ -4405,6 +4662,12 @@ struct dispatcher::impl {
             request.unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
             write_request_log(request, layer, n_tokens, state);
         }
+        // WP_RECV_AHEAD_NO_ZERO: `one` is provably done being read (scatter_add
+        // above already summed it into `result`) and nothing else touches it
+        // below this point, so it is safe to hand back to the pool here.
+        if (recv_ahead_no_zero_enabled()) {
+            release_recv_ahead_buffer(std::move(one));
+        }
     }
 
     // Add a worker's partial into the layer result. Identity (token_ids empty) is
@@ -4624,6 +4887,15 @@ struct dispatcher::impl {
                 requests[i].unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
                 write_request_log(requests[i], layer, n_tokens, state);
             }
+            // WP_RECV_AHEAD_NO_ZERO: same "provably done being read" point as
+            // accumulate_partial()'s release above -- covers WP_DISPATCH_HARVEST/
+            // WP_UNPACK_OVERLAP combined with WP_DISPATCH_RECV_AHEAD, where a
+            // recv-ahead request's job.out can arrive here via poll_harvest_receive
+            // -> receive_partial -> fold_recv_ahead_result instead of
+            // accumulate_partial.
+            if (recv_ahead_no_zero_enabled()) {
+                release_recv_ahead_buffer(std::move(partials[i]));
+            }
         }
     }
 
@@ -4664,6 +4936,9 @@ struct dispatcher::impl {
                 scatter_add(fold, partials[i], request);
                 update_speed_estimate(request);
                 update_residency(request.worker_index, layer, request.assignments);
+                if (recv_ahead_no_zero_enabled()) {
+                    release_recv_ahead_buffer(std::move(partials[i]));
+                }
             }
         } else {
             for (planned_request & request : requests) {
