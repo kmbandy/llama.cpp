@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -749,6 +751,132 @@ struct fault_server {
     }
 
     ~fault_server() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    void finish() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+};
+
+// A minimal synthetic WP_DISPATCH_STREAM peer: HELLO handshake identical to
+// fault_server's, then answers exactly `chunk_count` PIPE_EXPERT_DISPATCH_
+// CHUNK requests with a deterministic PIPE_EXPERT_PARTIAL_CHUNK each (pure
+// function of chunk_index/row/dim, no real compute) -- so two runs against
+// fresh instances of this server, same construction args, produce identical
+// wire bytes and therefore an identical dispatcher result regardless of
+// WP_DISPATCH_RECV_AHEAD. delay_ms_per_chunk[i] sleeps AFTER receiving chunk
+// i's request and BEFORE replying, to simulate one worker being the slow
+// one; error_at_chunk sends a PIPE_ERROR instead of that chunk's partial
+// (matching receive_partial()'s own mid-stream PIPE_ERROR handling) and
+// stops -- used to check WP_DISPATCH_RECV_AHEAD surfaces the identical
+// error text as the non-recv-ahead path.
+struct stream_fault_server {
+    int                  port;
+    int32_t              layer;
+    uint32_t             total_rows;
+    uint32_t             chunk_count;
+    float                base_value;
+    std::vector<int>     delay_ms_per_chunk;
+    int                  error_at_chunk = -1;
+    pipe_error_code      error_code     = PIPE_ERR_EXPERT_RANGE;
+    std::string          error_text     = "synthetic mid-stream failure";
+    std::thread          thread;
+    std::exception_ptr   error;
+    std::promise<void>   ready;
+
+    stream_fault_server(int32_t layer_, uint32_t total_rows_, uint32_t chunk_count_, float base_value_) :
+        port(reserve_port()), layer(layer_), total_rows(total_rows_), chunk_count(chunk_count_),
+        base_value(base_value_), delay_ms_per_chunk(chunk_count_, 0) {
+        std::future<void> listening = ready.get_future();
+        thread                      = std::thread([this]() {
+            try {
+                pipe_socket_ptr server = pipe_socket_t::create_server("127.0.0.1", port);
+                if (!server) {
+                    throw std::runtime_error("stream fault server failed to listen");
+                }
+                ready.set_value();
+                pipe_socket_ptr client = server->accept();
+                if (!client) {
+                    throw std::runtime_error("stream fault server failed to accept");
+                }
+
+                // shard_identity's "slice:" prefix is what tells build_routes()
+                // this worker retains EVERY expert (like the live DS4.1
+                // main/2026 pair) rather than a disjoint classic shard --
+                // without it, two workers both declaring expert_first=0/
+                // expert_last=n_expert-1 collide as "advertised by more than
+                // one machine". Port-qualified so two stream_fault_servers in
+                // the same test never collide with each other either.
+                pipe_expert_hello hello = fault_hello();
+                hello.shard_identity    = "slice:synthetic-recv-ahead-" + std::to_string(port);
+                std::vector<uint8_t> payload = pipe_encode_expert_hello(hello);
+                require(pipe_send_frame(*client, PIPE_HELLO, 0, payload.data(), payload.size()),
+                        "stream fault server failed to send HELLO");
+                pipe_frame_type type;
+                uint64_t        seq_id = 0;
+                require(pipe_recv_frame(*client, type, seq_id, payload),
+                        "stream fault server failed to receive client HELLO");
+                require(type == PIPE_HELLO, "stream fault server expected client HELLO");
+                const std::vector<uint8_t> ack_payload = pipe_encode_expert_hello_ack({ true, "" });
+                require(pipe_send_frame(*client, PIPE_EXPERT_HELLO_ACK, 0, ack_payload.data(), ack_payload.size()),
+                        "stream fault server failed to ack HELLO");
+
+                const uint32_t base = total_rows / chunk_count;
+                for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+                    require(pipe_recv_frame(*client, type, seq_id, payload),
+                            "stream fault server (port " + std::to_string(port) +
+                            ") failed to receive chunk request " + std::to_string(chunk_index));
+                    require(type == PIPE_EXPERT_DISPATCH_CHUNK, "stream fault server expected a chunk dispatch");
+                    if (delay_ms_per_chunk[chunk_index] > 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_per_chunk[chunk_index]));
+                    }
+                    if (error_at_chunk == (int) chunk_index) {
+                        require(pipe_send_error(*client, seq_id, error_code, error_text),
+                                "stream fault server failed to send injected error");
+                        return;
+                    }
+                    const uint32_t want_start = chunk_index * base;
+                    const uint32_t want_end   = chunk_index + 1 == chunk_count ? total_rows : want_start + base;
+                    pipe_expert_partial_chunk resp;
+                    resp.chunk_index     = chunk_index;
+                    resp.chunk_count     = chunk_count;
+                    resp.total_tokens    = total_rows;
+                    resp.token_start     = want_start;
+                    resp.token_end       = want_end;
+                    resp.partial.layer   = layer;
+                    resp.partial.n_tokens = want_end - want_start;
+                    resp.partial.dtype   = PIPE_HIDDEN_F32;
+                    resp.partial.partial.resize((size_t) (want_end - want_start) * (size_t) N_EMBD);
+                    for (uint32_t r = want_start; r < want_end; ++r) {
+                        for (int d = 0; d < N_EMBD; ++d) {
+                            resp.partial.partial[(size_t) (r - want_start) * N_EMBD + d] =
+                                base_value + (float) chunk_index * 0.01f + (float) r * 0.001f + (float) d * 0.0001f;
+                        }
+                    }
+                    const std::vector<uint8_t> enc = pipe_encode_expert_partial_chunk(resp);
+                    require(pipe_send_frame(*client, PIPE_EXPERT_PARTIAL_CHUNK, seq_id, enc.data(), enc.size()),
+                            "stream fault server failed to send partial chunk");
+                }
+            } catch (...) {
+                error = std::current_exception();
+                try {
+                    ready.set_exception(error);
+                } catch (...) {
+                }
+            }
+        });
+        listening.get();
+    }
+
+    ~stream_fault_server() {
         if (thread.joinable()) {
             thread.join();
         }
@@ -1790,6 +1918,468 @@ void test_classic_layer_coverage_gap_throws() {
     low.finish();
 }
 
+// Drives a small streamed dispatch (WP_DISPATCH_STREAM chunks, WP_STREAM_
+// SEND_OVERLAP=1) against two real CPU-backend worker subprocesses over real
+// sockets -- the same loopback+remote-worker shape the live spine dispatches
+// to, just both on 127.0.0.1 -- with both the spine's WP_DISPATCH_REQ_LOG_
+// TIMELINE=1 and each worker's WP_REQ_LOG_TIMELINE=1 enabled, then runs
+// scripts/wp-req-timeline.py on the three logs and checks it parses, joins
+// every request, and reports non-negative, sane-summing intervals.
+void test_req_log_timeline(weight_map & weights, const fs::path & temp_dir) {
+    const fixture shard_x = make_fixture(temp_dir, "shard-timeline-x", 0, 1, weights);
+    const fixture shard_y = make_fixture(temp_dir, "shard-timeline-y", 2, 3, weights);
+    const int     port_x  = reserve_port();
+    const int     port_y  = reserve_port();
+
+    // Env vars set here are inherited by the worker subprocesses this
+    // constructs below (fork() copies the parent's environment, execl()
+    // does not replace it) -- this is how the worker side of the sub-knobs
+    // gets turned on for this one test without a separate launch mechanism.
+    require(setenv("WP_DISPATCH_STREAM", "4", 1) == 0, "failed to enable dispatch stream chunks");
+    require(setenv("WP_DISPATCH_STREAM_MIN_TOKENS", "8", 1) == 0, "failed to lower stream min tokens");
+    require(setenv("WP_STREAM_SEND_OVERLAP", "1", 1) == 0, "failed to enable stream send overlap");
+    require(setenv("WP_WORKER_PIPELINE", "1", 1) == 0, "failed to enable worker pipeline");
+    // WP_REQ_LOG (like WP_DISPATCH_REQ_LOG.writer above) only ever writes a
+    // row when the worker's own per-request stats are turned on -- see
+    // Worker::stats_enabled()/WorkerStats::enabled_ -- so this is required,
+    // not just WP_REQ_LOG_TIMELINE.
+    require(setenv("WP_WORKER_STATS", "1", 1) == 0, "failed to enable worker stats");
+    require(setenv("WP_REQ_LOG_TIMELINE", "1", 1) == 0, "failed to enable worker req-log timeline");
+
+    const fs::path spine_log    = temp_dir / "timeline-spine.reqlog";
+    const fs::path worker_log_x = temp_dir / "timeline-worker-x.reqlog";
+    const fs::path worker_log_y = temp_dir / "timeline-worker-y.reqlog";
+    require(setenv("WP_DISPATCH_REQ_LOG", spine_log.c_str(), 1) == 0, "failed to set spine req log path");
+    require(setenv("WP_DISPATCH_REQ_LOG_TIMELINE", "1", 1) == 0, "failed to enable spine req-log timeline");
+
+    require(setenv("WP_REQ_LOG", worker_log_x.c_str(), 1) == 0, "failed to set worker x req log path");
+    worker_process proc_x(shard_x, port_x, temp_dir / "worker-timeline-x.log");
+    require(setenv("WP_REQ_LOG", worker_log_y.c_str(), 1) == 0, "failed to set worker y req log path");
+    worker_process proc_y(shard_y, port_y, temp_dir / "worker-timeline-y.log");
+
+    auto wait_or_dump = [&](int port, pid_t pid, const fs::path & log_path) {
+        try {
+            wait_for_listener(port, pid);
+        } catch (const std::exception & error) {
+            std::ifstream log_in(log_path);
+            std::cerr << "test_req_log_timeline: worker log " << log_path << ":\n" << log_in.rdbuf() << std::endl;
+            throw;
+        }
+    };
+    wait_or_dump(port_x, proc_x.pid, temp_dir / "worker-timeline-x.log");
+    wait_or_dump(port_y, proc_y.pid, temp_dir / "worker-timeline-y.log");
+
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", port_x, "machine-timeline-x" },
+            { "127.0.0.1", port_y, "machine-timeline-y" },
+        });
+        const uint32_t            n_tokens = 32;   // >= WP_DISPATCH_STREAM_MIN_TOKENS, divisible by 4 chunks.
+        std::vector<float>        activation((size_t) n_tokens * N_EMBD);
+        for (size_t i = 0; i < activation.size(); ++i) {
+            activation[i] = ((int) (i % 11) - 5) * 0.05f;
+        }
+        const std::vector<pipe_expert_assignment> assignments = {
+            { 0, std::vector<float>(n_tokens, 0.6f)  },
+            { 1, std::vector<float>(n_tokens, -0.3f) },
+            { 2, std::vector<float>(n_tokens, 0.2f)  },
+            { 3, std::vector<float>(n_tokens, -0.1f) },
+        };
+        for (uint64_t seq = 100; seq < 103; ++seq) {
+            const std::vector<float> out =
+                dispatcher.dispatch(LAYER, seq, n_tokens, activation, assignments, TEST_SWIGLU_CLAMP);
+            require(out.size() == (size_t) n_tokens * N_EMBD, "streamed dispatch output shape mismatch");
+        }
+        // dispatcher's destructor (end of this scope) closes req_log_/
+        // writer_log_ -- every write up to here was already fflush()ed, but
+        // wait for the file handles to close before a script reads them.
+    }
+    require(unsetenv("WP_DISPATCH_REQ_LOG") == 0, "failed to clear spine req log path");
+    require(unsetenv("WP_DISPATCH_REQ_LOG_TIMELINE") == 0, "failed to clear spine req-log timeline");
+    require(unsetenv("WP_REQ_LOG") == 0, "failed to clear worker req log path");
+    require(unsetenv("WP_REQ_LOG_TIMELINE") == 0, "failed to clear worker req-log timeline");
+    require(unsetenv("WP_WORKER_STATS") == 0, "failed to disable worker stats");
+    require(unsetenv("WP_DISPATCH_STREAM") == 0, "failed to disable dispatch stream chunks");
+    require(unsetenv("WP_DISPATCH_STREAM_MIN_TOKENS") == 0, "failed to clear stream min tokens");
+    require(unsetenv("WP_STREAM_SEND_OVERLAP") == 0, "failed to disable stream send overlap");
+
+    require(fs::exists(spine_log), "spine req log was not written");
+    require(fs::exists(spine_log.string() + ".writer"), "spine writer log was not written");
+    require(fs::exists(worker_log_x), "worker x req log was not written");
+    require(fs::exists(worker_log_y), "worker y req log was not written");
+
+    const std::string cmd = std::string("python3 ") + WP_REQ_LOG_TIMELINE_SCRIPT +
+        " --spine " + spine_log.string() +
+        " --writer " + spine_log.string() + ".writer" +
+        " --worker 0:" + worker_log_x.string() +
+        " --worker 1:" + worker_log_y.string();
+    const int rc = std::system(cmd.c_str());
+    require(rc == 0, "scripts/wp-req-timeline.py failed to parse/join the test's own logs (exit " +
+                     std::to_string(rc) + "): " + cmd);
+    std::cout << "req-log timeline: streamed dispatch logged and joined by scripts/wp-req-timeline.py\n";
+}
+
+// Shared setup for the WP_DISPATCH_RECV_AHEAD tests below: two stream_fault_
+// servers (deterministic synthetic partials, no real compute) standing in
+// for the loopback-main / remote-2026 pair from the live timeline, one
+// dispatcher, one streamed dispatch call. `configure` gets a chance to set
+// each server's delay_ms_per_chunk / error_at_chunk before the dispatch
+// runs. Returns the dispatch result (throws whatever the dispatch throws).
+std::vector<float> run_recv_ahead_dispatch(
+        uint32_t n_tokens, uint32_t chunk_count,
+        const std::function<void(stream_fault_server &, stream_fault_server &)> & configure) {
+    stream_fault_server server0(LAYER, n_tokens, chunk_count, /*base_value=*/1.0f);
+    stream_fault_server server1(LAYER, n_tokens, chunk_count, /*base_value=*/2.0f);
+    configure(server0, server1);
+
+    pipe_expert_dispatcher::dispatcher dispatcher({
+        { "127.0.0.1", server0.port, "machine-recv-ahead-0" },
+        { "127.0.0.1", server1.port, "machine-recv-ahead-1" },
+    });
+    std::vector<float> activation((size_t) n_tokens * N_EMBD);
+    for (size_t i = 0; i < activation.size(); ++i) {
+        activation[i] = ((int) (i % 11) - 5) * 0.05f;
+    }
+    const std::vector<pipe_expert_assignment> assignments = {
+        { 0, std::vector<float>(n_tokens, 0.6f)  },
+        { 1, std::vector<float>(n_tokens, -0.3f) },
+        { 2, std::vector<float>(n_tokens, 0.2f)  },
+        { 3, std::vector<float>(n_tokens, -0.1f) },
+    };
+    std::vector<float> result;
+    std::exception_ptr dispatch_error;
+    try {
+        result = dispatcher.dispatch(LAYER, /*seq=*/500, n_tokens, activation, assignments, TEST_SWIGLU_CLAMP);
+    } catch (...) {
+        dispatch_error = std::current_exception();
+    }
+    server0.finish();
+    server1.finish();
+    if (dispatch_error) {
+        std::rethrow_exception(dispatch_error);
+    }
+    return result;
+}
+
+// WP_DISPATCH_RECV_AHEAD=1 must not change the folded result: same fixed
+// request order, same scatter_add -- only WHEN each worker's chunks are
+// drained/decoded moves. Runs the identical synthetic dispatch with the
+// knob off and on (fresh servers each time, same deterministic partials)
+// and requires the two result vectors to be byte-identical.
+void test_recv_ahead_byte_identical() {
+    require(setenv("WP_DISPATCH_STREAM", "4", 1) == 0, "failed to enable dispatch stream chunks");
+    require(setenv("WP_DISPATCH_STREAM_MIN_TOKENS", "8", 1) == 0, "failed to lower stream min tokens");
+    const uint32_t n_tokens    = 32;
+    const uint32_t chunk_count = 4;
+    auto no_fault = [](stream_fault_server &, stream_fault_server &) {};
+
+    require(unsetenv("WP_DISPATCH_RECV_AHEAD") == 0, "failed to clear recv-ahead (baseline run)");
+    const std::vector<float> off = run_recv_ahead_dispatch(n_tokens, chunk_count, no_fault);
+
+    require(setenv("WP_DISPATCH_RECV_AHEAD", "1", 1) == 0, "failed to enable recv-ahead");
+    const std::vector<float> on = run_recv_ahead_dispatch(n_tokens, chunk_count, no_fault);
+    require(unsetenv("WP_DISPATCH_RECV_AHEAD") == 0, "failed to clear recv-ahead");
+
+    require(off.size() == on.size(), "WP_DISPATCH_RECV_AHEAD changed the result shape");
+    require(std::memcmp(off.data(), on.data(), off.size() * sizeof(float)) == 0,
+            "WP_DISPATCH_RECV_AHEAD changed the folded result bytes (summation order regression)");
+
+    require(unsetenv("WP_DISPATCH_STREAM") == 0, "failed to disable dispatch stream chunks");
+    require(unsetenv("WP_DISPATCH_STREAM_MIN_TOKENS") == 0, "failed to clear stream min tokens");
+    std::cout << "WP_DISPATCH_RECV_AHEAD: byte-identical result on vs off\n";
+}
+
+// A worker that sends a PIPE_ERROR mid-stream (chunk 2 of 4) must fail the
+// dispatch with the identical error text whether WP_DISPATCH_RECV_AHEAD is
+// off (receive_partial()'s own stream_wire loop) or on (run_recv_ahead_job()
+// mirrors that same message format -- see recv_ahead_enabled()'s note).
+void test_recv_ahead_error_mid_stream() {
+    require(setenv("WP_DISPATCH_STREAM", "4", 1) == 0, "failed to enable dispatch stream chunks");
+    require(setenv("WP_DISPATCH_STREAM_MIN_TOKENS", "8", 1) == 0, "failed to lower stream min tokens");
+    const uint32_t n_tokens    = 32;
+    const uint32_t chunk_count = 4;
+    auto inject_error = [](stream_fault_server & s0, stream_fault_server &) {
+        s0.error_at_chunk = 2;
+        s0.error_code     = PIPE_ERR_EXPERT_RANGE;
+        s0.error_text     = "synthetic mid-stream failure";
+    };
+
+    require(unsetenv("WP_DISPATCH_RECV_AHEAD") == 0, "failed to clear recv-ahead (baseline run)");
+    std::string message_off;
+    try {
+        run_recv_ahead_dispatch(n_tokens, chunk_count, inject_error);
+        require(false, "expected the baseline (recv-ahead off) dispatch to throw");
+    } catch (const std::exception & error) {
+        message_off = error.what();
+    }
+
+    require(setenv("WP_DISPATCH_RECV_AHEAD", "1", 1) == 0, "failed to enable recv-ahead");
+    std::string message_on;
+    try {
+        run_recv_ahead_dispatch(n_tokens, chunk_count, inject_error);
+        require(false, "expected the recv-ahead dispatch to throw");
+    } catch (const std::exception & error) {
+        message_on = error.what();
+    }
+    require(unsetenv("WP_DISPATCH_RECV_AHEAD") == 0, "failed to clear recv-ahead");
+
+    require(message_off.find("synthetic mid-stream failure") != std::string::npos,
+            "baseline error message lost the injected text: " + message_off);
+    require(message_off.find(" chunk 2 ") != std::string::npos,
+            "baseline error message lost the chunk index: " + message_off);
+    // Each run's stream_fault_server binds a fresh ephemeral port (reserve_
+    // port() cannot be pinned to the same number twice), so the endpoint
+    // substring legitimately differs between the two runs -- strip
+    // "127.0.0.1:<port>" before comparing the rest of the message
+    // byte-for-byte.
+    auto strip_endpoint = [](const std::string & msg) {
+        const std::string prefix = "127.0.0.1:";
+        const size_t       pos    = msg.find(prefix);
+        if (pos == std::string::npos) {
+            return msg;
+        }
+        size_t end = pos + prefix.size();
+        while (end < msg.size() && std::isdigit((unsigned char) msg[end])) {
+            ++end;
+        }
+        return msg.substr(0, pos) + "127.0.0.1:<port>" + msg.substr(end);
+    };
+    const std::string message_off_norm = strip_endpoint(message_off);
+    const std::string message_on_norm  = strip_endpoint(message_on);
+    require(message_off_norm == message_on_norm,
+            "WP_DISPATCH_RECV_AHEAD produced a different error message (endpoint-normalized): off=[" +
+            message_off_norm + "] on=[" + message_on_norm + "]");
+
+    require(unsetenv("WP_DISPATCH_STREAM") == 0, "failed to disable dispatch stream chunks");
+    require(unsetenv("WP_DISPATCH_STREAM_MIN_TOKENS") == 0, "failed to clear stream min tokens");
+    std::cout << "WP_DISPATCH_RECV_AHEAD: mid-stream PIPE_ERROR surfaces identically on vs off\n";
+}
+
+// Parses one column out of every row of a WP_DISPATCH_REQ_LOG file matching
+// a given worker_index and chunk_index (columns 3 and 14 respectively; see
+// write_request_log()'s comment for the full layout). Returns the LAST
+// matching row's requested column (0-based), or -1 if none matched.
+long long read_req_log_column(const fs::path & path, int worker_index, int chunk_index, int column) {
+    std::ifstream in(path);
+    require((bool) in, "failed to open req log " + path.string());
+    std::string line;
+    long long   result = -1;
+    while (std::getline(in, line)) {
+        std::istringstream    iss(line);
+        std::vector<long long> fields;
+        long long              value;
+        while (iss >> value) {
+            fields.push_back(value);
+        }
+        if (fields.size() <= (size_t) std::max(2, column) || fields.size() < 14) {
+            continue;
+        }
+        if (fields[2] == worker_index && fields[13] == chunk_index) {
+            result = fields[(size_t) column];
+        }
+    }
+    return result;
+}
+
+// Proves genuine read-ahead: with one worker (index 0) delayed on its FIRST
+// chunk send and WP_DISPATCH_RECV_AHEAD=1, the OTHER worker's (index 1)
+// chunks -- which arrive with no delay -- must be drained/decoded (recorded
+// await_end_ns, req log column 12) BEFORE the slow worker's last chunk is.
+// With the knob off, fixed-order receive means the opposite: worker 1's
+// chunks cannot be read until worker 0's entire stream (delayed) has been
+// drained, so its await_end_ns must land AFTER worker 0's.
+void test_recv_ahead_decodes_before_slow_completes() {
+    require(setenv("WP_DISPATCH_STREAM", "4", 1) == 0, "failed to enable dispatch stream chunks");
+    require(setenv("WP_DISPATCH_STREAM_MIN_TOKENS", "8", 1) == 0, "failed to lower stream min tokens");
+    const uint32_t n_tokens    = 32;
+    const uint32_t chunk_count = 4;
+    const int      delay_ms    = 250;
+    auto slow_worker0 = [&](stream_fault_server & s0, stream_fault_server &) {
+        s0.delay_ms_per_chunk[0] = delay_ms;
+    };
+
+    temp_dir  temp;
+    auto run_and_get_await_end = [&](bool recv_ahead, long long & worker0_end, long long & worker1_end) {
+        const fs::path log_path = temp.path / (std::string("recv-ahead-order-") +
+                                               (recv_ahead ? "on" : "off") + ".reqlog");
+        require(setenv("WP_DISPATCH_REQ_LOG", log_path.c_str(), 1) == 0, "failed to set req log path");
+        require(setenv("WP_DISPATCH_RECV_AHEAD", recv_ahead ? "1" : "0", 1) == 0,
+                "failed to set recv-ahead");
+        run_recv_ahead_dispatch(n_tokens, chunk_count, slow_worker0);
+        require(unsetenv("WP_DISPATCH_REQ_LOG") == 0, "failed to clear req log path");
+        require(unsetenv("WP_DISPATCH_RECV_AHEAD") == 0, "failed to clear recv-ahead");
+        require(fs::exists(log_path), "req log was not written: " + log_path.string());
+        // Column 11 (0-based) is await_end_ns; chunk 3 is the last of 4.
+        worker0_end = read_req_log_column(log_path, /*worker_index=*/0, /*chunk_index=*/3, /*column=*/11);
+        worker1_end = read_req_log_column(log_path, /*worker_index=*/1, /*chunk_index=*/3, /*column=*/11);
+        require(worker0_end >= 0, "no logged row for worker 0's last chunk");
+        require(worker1_end >= 0, "no logged row for worker 1's last chunk");
+    };
+
+    long long off_worker0_end = 0, off_worker1_end = 0;
+    run_and_get_await_end(/*recv_ahead=*/false, off_worker0_end, off_worker1_end);
+    require(off_worker1_end > off_worker0_end,
+            "sanity check failed: with the knob off, fixed-order receive should read worker 1 "
+            "strictly after worker 0's delayed stream finishes");
+
+    long long on_worker0_end = 0, on_worker1_end = 0;
+    run_and_get_await_end(/*recv_ahead=*/true, on_worker0_end, on_worker1_end);
+    require(on_worker1_end < on_worker0_end,
+            "WP_DISPATCH_RECV_AHEAD did not decode the fast worker's chunks before the slow "
+            "worker's delayed stream finished (worker1_end=" + std::to_string(on_worker1_end) +
+            " worker0_end=" + std::to_string(on_worker0_end) + ")");
+
+    require(unsetenv("WP_DISPATCH_STREAM") == 0, "failed to disable dispatch stream chunks");
+    require(unsetenv("WP_DISPATCH_STREAM_MIN_TOKENS") == 0, "failed to clear stream min tokens");
+    std::cout << "WP_DISPATCH_RECV_AHEAD: fast worker decoded before slow worker's delayed stream "
+                 "completes (off=" << off_worker0_end << "/" << off_worker1_end <<
+                 " on=" << on_worker0_end << "/" << on_worker1_end << ")\n";
+// WP_WORKER_DECODE_AHEAD=1 (kbandy 2026-09-26): moves the PIPE_EXPERT_
+// DISPATCH_CHUNK request decode (wire unpack of the activation matrix plus
+// assignment-weight parsing/validation -- pipe_decode_expert_dispatch_chunk)
+// off the worker's compute thread, where it has always run synchronously
+// right after the frame is popped from the per-connection queue, onto the
+// reader thread, right after recv() and before the frame is queued (see
+// WpPipelineFrame::decoded_chunk in wp-expert-worker.cpp). The point is to
+// let decode of chunk N+1 overlap the GPU-bound dispatch() of chunk N instead
+// of running serially after it -- see wp_worker_decode_ahead_enabled()'s own
+// comment for the CPU microbenchmark (alloc+zero-touch+free of the ~40 MB
+// activations buffer a real 2048x5120 chunk allocates fresh every time
+// measured ~19 ms on that box, vs ~2 ms for the same write loop against a
+// reused buffer) that motivated it.
+//
+// This drives a real streamed dispatch (WP_DISPATCH_STREAM chunks) against a
+// real CPU-backend worker SUBPROCESS (not a thread -- wp_worker_decode_ahead_
+// enabled() and its sibling knobs latch their env read in a function-local
+// static on first call, so toggling the knob between two runs only works
+// across separate PROCESSES, which is exactly what worker_process gives us;
+// two std::thread-hosted wp_expert_worker::run() calls in one process, as
+// test-wp-expert-worker.cpp's helpers do, would silently keep whichever
+// setting was read first) with the knob off, then on, and requires the
+// dispatcher's assembled per-token output to be byte-identical either way --
+// decode is a pure function of the same wire bytes regardless of which
+// thread runs it, so this is a real regression bar, not a tolerance check.
+// n_tokens is deliberately large (not WP_DISPATCH_STREAM_MIN_TOKENS-sized
+// like test_req_log_timeline's) so each chunk's activation buffer is big
+// enough for the allocation cost above to be a real, if modest, fraction of
+// this fixture's very cheap CPU-backend dispatch() -- see the printed
+// off/on wall-clock split, which is diagnostic evidence only (this box is
+// shared and noisy; see the report for the controlled, repeatable
+// standalone microbenchmark). The byte-identity check above is the pass/
+// fail bar.
+void test_decode_ahead_byte_identical(weight_map & weights, const fs::path & temp_dir) {
+    // Two shards covering experts 0..3 between them, same shape as
+    // test_req_log_timeline's shard_x/shard_y -- the dispatcher's coverage-
+    // gap check (pipe-expert-dispatcher.cpp) requires every expert in
+    // [0, n_expert) to be routable, and n_expert comes from the fixture's
+    // descriptor (N_EXPERT == 4) regardless of any one worker's own
+    // expert_first/expert_last range. worker_process hardcodes --slots 2,
+    // so one worker cannot host all 4 experts either.
+    const fixture shard_x = make_fixture(temp_dir, "shard-decode-ahead-x", 0, 1, weights);
+    const fixture shard_y = make_fixture(temp_dir, "shard-decode-ahead-y", 2, 3, weights);
+    const int     port_x  = reserve_port();
+    const int     port_y  = reserve_port();
+
+    require(setenv("WP_DISPATCH_STREAM", "4", 1) == 0, "failed to enable dispatch stream chunks");
+    require(setenv("WP_DISPATCH_STREAM_MIN_TOKENS", "8", 1) == 0, "failed to lower stream min tokens");
+    require(setenv("WP_WORKER_STATS", "1", 1) == 0, "failed to enable worker stats");
+    // NOT WP_EXPERT_WIRE=ml8_4: expert_wire_mode() (pipe-protocol.cpp) latches
+    // its env read in a function-local static on first call, same hazard as
+    // wp_worker_decode_ahead_enabled() below -- but that static lives in THIS
+    // process (the dispatcher/spine side runs in-process here, unlike the
+    // worker), and an earlier test in this binary's run_test() (test_req_log_
+    // timeline) already called dispatch() with the default wire (f32) before
+    // this test runs, so setenv here would be silently ignored on the SPINE
+    // side while the freshly-exec'd WORKER subprocess (which has no such
+    // stale cache) picked up ml8_4 -- an encode/decode wire mismatch, not a
+    // decode-ahead bug (caught while developing this test: "pipe: expert
+    // dispatch payload bytes ... do not match dimensions"). f32 exercises the
+    // same allocation this task's fix targets regardless: pipe_decode_expert_
+    // dispatch_chunk() always calls the non-view pipe_decode_expert_dispatch_
+    // req() overload, which resize()s a fresh activations vector and unpacks
+    // into it for EVERY wire dtype -- the zero-copy activations_view path
+    // exists only for the shm view decoder, a different call site.
+
+    // Divisible by 4 (WP_DISPATCH_STREAM) and big enough that each chunk's
+    // activation buffer (n_tokens/4 * N_EMBD * 4 bytes) is several MB.
+    static constexpr uint32_t DECODE_AHEAD_TOKENS = 65536;
+    std::vector<float> activation((size_t) DECODE_AHEAD_TOKENS * N_EMBD);
+    for (size_t i = 0; i < activation.size(); ++i) {
+        activation[i] = ((int) ((i * 13 + i / N_EMBD) % 23) - 11) * 0.017f;
+    }
+    const std::vector<pipe_expert_assignment> assignments = {
+        { 0, std::vector<float>(DECODE_AHEAD_TOKENS, 0.4f)   },
+        { 1, std::vector<float>(DECODE_AHEAD_TOKENS, -0.25f) },
+        { 2, std::vector<float>(DECODE_AHEAD_TOKENS, 0.15f)  },
+        { 3, std::vector<float>(DECODE_AHEAD_TOKENS, -0.1f)  },
+    };
+
+    const auto run_once = [&](bool decode_ahead, uint64_t seq, double & elapsed_ms) {
+        require(setenv("WP_WORKER_DECODE_AHEAD", decode_ahead ? "1" : "0", 1) == 0,
+                "failed to set WP_WORKER_DECODE_AHEAD");
+        const std::string tag = decode_ahead ? "on" : "off";
+        const fs::path log_x = temp_dir / ("worker-decode-ahead-x-" + tag + ".log");
+        const fs::path log_y = temp_dir / ("worker-decode-ahead-y-" + tag + ".log");
+        worker_process proc_x(shard_x, port_x, log_x);
+        worker_process proc_y(shard_y, port_y, log_y);
+        const auto wait_or_dump = [&](int port, pid_t pid, const fs::path & log_path) {
+            try {
+                wait_for_listener(port, pid);
+            } catch (const std::exception & error) {
+                std::ifstream log_in(log_path);
+                std::cerr << "test_decode_ahead_byte_identical: worker log " << log_path << ":\n"
+                          << log_in.rdbuf() << std::endl;
+                throw;
+            }
+        };
+        wait_or_dump(port_x, proc_x.pid, log_x);
+        wait_or_dump(port_y, proc_y.pid, log_y);
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", port_x, "machine-decode-ahead-x" },
+            { "127.0.0.1", port_y, "machine-decode-ahead-y" },
+        });
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<float> out;
+        try {
+            out = dispatcher.dispatch(
+                LAYER, seq, DECODE_AHEAD_TOKENS, activation, assignments, TEST_SWIGLU_CLAMP);
+        } catch (const std::exception & error) {
+            std::ifstream lx(log_x);
+            std::ifstream ly(log_y);
+            std::cerr << "test_decode_ahead_byte_identical: worker log " << log_x << ":\n" << lx.rdbuf()
+                      << "\ntest_decode_ahead_byte_identical: worker log " << log_y << ":\n" << ly.rdbuf()
+                      << std::endl;
+            throw;
+        }
+        elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        require(out.size() == activation.size(), "decode-ahead output shape mismatch");
+        return out;
+    };
+
+    double elapsed_off = 0.0;
+    double elapsed_on  = 0.0;
+    const std::vector<float> out_off = run_once(false, 910, elapsed_off);
+    const std::vector<float> out_on  = run_once(true,  911, elapsed_on);
+
+    for (size_t i = 0; i < out_off.size(); ++i) {
+        if (std::memcmp(&out_off[i], &out_on[i], sizeof(float)) != 0) {
+            throw std::runtime_error(
+                "WP_WORKER_DECODE_AHEAD changed the streamed dispatch answer at element " +
+                std::to_string(i) + ": off=" + std::to_string(out_off[i]) +
+                " on=" + std::to_string(out_on[i]));
+        }
+    }
+
+    require(unsetenv("WP_WORKER_DECODE_AHEAD") == 0, "failed to clear WP_WORKER_DECODE_AHEAD");
+    require(unsetenv("WP_WORKER_STATS") == 0, "failed to disable worker stats");
+    require(unsetenv("WP_DISPATCH_STREAM") == 0, "failed to disable dispatch stream chunks");
+    require(unsetenv("WP_DISPATCH_STREAM_MIN_TOKENS") == 0, "failed to clear stream min tokens");
+
+    std::cout << "decode-ahead: " << DECODE_AHEAD_TOKENS << "-token streamed dispatch byte-identical, "
+                 "off=" << elapsed_off << " ms on=" << elapsed_on << " ms (diagnostic only)\n";
+}
+
 void run_test() {
     test_slice_partial_sum_equivalence();
     test_all_slice_fleet_routing();
@@ -2006,6 +2596,13 @@ void run_test() {
 
     test_graph_failure_isolation();
     test_graph_local_failure_short_circuit();
+
+    test_req_log_timeline(weights, temp.path);
+
+    test_recv_ahead_byte_identical();
+    test_recv_ahead_error_mid_stream();
+    test_recv_ahead_decodes_before_slow_completes();
+    test_decode_ahead_byte_identical(weights, temp.path);
 }
 
 }  // namespace

@@ -23,6 +23,7 @@
 #include <iterator>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -255,12 +256,84 @@ bool unpack_overlap_enabled() {
     return value != nullptr && value[0] == '1';
 }
 
+// WP_DISPATCH_RECV_AHEAD=1 -- DEFAULT OFF. Answers a narrower question than
+// either flag above: poll_harvest_receive() (WP_DISPATCH_HARVEST /
+// WP_UNPACK_OVERLAP) polls per REQUEST, but a WP_DISPATCH_STREAM request is a
+// WHOLE multi-chunk exchange -- once its socket is seen readable,
+// receive_partial()'s stream_wire loop drains every remaining chunk with a
+// blocking await_response() call each, back to back, before poll_harvest_-
+// receive() (or the plain fixed-order loop) ever looks at the OTHER worker's
+// socket again. A remote worker that finished streaming all of its chunks
+// milliseconds ago still sits unread while a slower worker earlier in fixed
+// order is drained one blocking recv at a time. See the note directly above
+// poll_harvest_receive()'s definition and its `for (k ...)` loop for exactly
+// where that happens.
+//
+// This flag adds a persistent per-worker reader thread (mirrors socket_writer's
+// start/stop/failure-latch lifecycle -- see start_readers()/stop_readers()/
+// reader_loop() below) that recv()s and ml8_4-decodes a stream_wire request's
+// chunks the moment they land on the wire, independent of which request the
+// graph thread happens to be waiting on. The graph thread still only waits
+// for "request i complete" (fold_recv_ahead_result()) and still folds every
+// request via scatter_add() in the SAME fixed request order as always --
+// only WHEN the network read + wire decode happens moves, never the order
+// partials are summed in, so the result is bit-identical.
+//
+// SCOPE, deliberately narrow: only WP_DISPATCH_STREAM's immediate-request
+// PIPE_EXPERT_PARTIAL_CHUNK path (finish_dispatch's non-harvest fixed-order
+// loop) is covered. Left on today's code path even when this is 1:
+//   - the plain (non-streamed) PIPE_EXPERT_PARTIAL path and the older
+//     part-indexed PIPE_EXPERT_PARTIAL_STREAM path (different mechanism,
+//     folds itself incrementally already via `partials`/`received`);
+//   - WP_DEFER_K's deferred fold (collect_pending_deferred) -- a deferred
+//     request can share a socket with the SAME worker's next-layer immediate
+//     request, and TCP FIFO order is the only thing that keeps those two
+//     requests' frames from interleaving; teaching the reader thread that
+//     ordering is a separate design this pass does not take on;
+//   - the WP_DISPATCH_DEDUP_ACTIVATIONS retry (rare, secondary-worker-only,
+//     not a stream_wire request);
+//   - WP_EXPERT_WIRE_GPU_UNPACK's device dequant path
+//     (ggml_cuda_expert_wire_unpack_ml8_4_fold/_download): that is process-
+//     global device state, not safe to call from more than one reader thread
+//     concurrently. The reader thread always calls
+//     pipe_decode_expert_partial_chunk(..., keep_ml8_4_packed=false), which
+//     already CPU-unpacks ml8_4 internally (see pipe_decode_expert_partial()
+//     in pipe-protocol.cpp) -- the exact same arithmetic
+//     WP_EXPERT_WIRE_GPU_UNPACK's own CPU fallback uses, so the floats match;
+//     only the device path is skipped.
+bool recv_ahead_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_RECV_AHEAD");
+    return value != nullptr && value[0] == '1';
+}
+
 bool layer_trace_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_DS4_LAYER_TRACE");
         return value != nullptr && value[0] != '\0';
     }();
     return enabled;
+}
+
+// WP_DISPATCH_REQ_LOG_TIMELINE=1 -- DEFAULT OFF. Sub-knob of WP_DISPATCH_REQ_LOG
+// (has no effect unless that is also set): adds the extra per-frame/per-chunk
+// timestamps needed to build a cross-host request timeline -- hdr_done_ns
+// wired through await_response's pipe_recv_frame call, a CLOCK_REALTIME stamp
+// alongside every req_log_/writer_log_ row (for offline clock-offset
+// estimation against the worker's own WP_REQ_LOG_TIMELINE=1 rows), and the
+// chunk_index carried on wire_frame so writer_log_ rows are joinable per
+// stream chunk, not just per request. A branch on this latched bool is the
+// only cost paid when it (or WP_DISPATCH_REQ_LOG itself) is off.
+bool dispatch_req_log_timeline_enabled() {
+    // Deliberately NOT cached in a static (unlike layer_trace_enabled()
+    // above): req_log_ and writer_log_ themselves are read fresh from
+    // getenv() on every dispatcher::impl construction (see their member
+    // initializers below), and this is their sub-knob -- a test process that
+    // builds several dispatchers against different WP_DISPATCH_REQ_LOG_
+    // TIMELINE values in one run (e.g. test-wp-expert-dispatcher.cpp) needs
+    // this to track the CURRENT environment at each construction, not
+    // whatever it was the first time any dispatcher in the process was built.
+    const char * value = std::getenv("WP_DISPATCH_REQ_LOG_TIMELINE");
+    return value != nullptr && value[0] == '1';
 }
 
 // WP_EXPERT_WIRE_GPU_UNPACK=1 -- DEFAULT OFF. Only affects ML8_4 wire
@@ -586,6 +659,17 @@ uint64_t elapsed_ns(dispatch_clock::time_point begin, dispatch_clock::time_point
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
 }
 
+// CLOCK_REALTIME, nanoseconds since epoch. Only ever read when
+// dispatch_req_log_timeline_enabled() -- see its comment -- so it costs a
+// syscall per request/frame only in that opt-in mode, never in a normal run.
+// Two machines' CLOCK_REALTIME differ (NTP skew); scripts/wp-req-timeline.py
+// estimates the offset offline via the min-latency method rather than
+// trusting these to already agree.
+uint64_t realtime_ns_now() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 std::string endpoint_label(const endpoint & value) {
     return value.host + ":" + std::to_string(value.port);
 }
@@ -747,6 +831,12 @@ struct wire_frame {
     int32_t              layer = -1;
     std::vector<uint8_t> payload;
     dispatch_clock::time_point enqueued_at{};
+    // WP_DISPATCH_STREAM chunk index for a PIPE_EXPERT_DISPATCH_CHUNK frame;
+    // UINT32_MAX (the default) for every other frame type. Only set at the
+    // one enqueue site that knows it (the stream_send_overlap_ chunk loop);
+    // exists so writer_log_ rows are joinable per chunk, not just per
+    // request, when WP_DISPATCH_REQ_LOG_TIMELINE=1.
+    uint32_t              chunk_index = UINT32_MAX;
 };
 
 }  // namespace
@@ -819,6 +909,77 @@ struct dispatcher::impl {
         size_t              len2  = 0;
     };
 
+    // WP_DISPATCH_RECV_AHEAD: per-chunk bookkeeping the reader thread records
+    // while decoding, so the graph thread can replay write_request_log() /
+    // layer_trace / in-flight accounting itself once the job is done -- see
+    // recv_ahead_job below. The reader thread never touches req_log_,
+    // dispatch_state, or layer_traces_ directly; only the graph thread does,
+    // exactly as without this flag, just later (at fold time) instead of at
+    // decode time.
+    struct chunk_capture {
+        dispatch_clock::time_point await_started_at{};
+        dispatch_clock::time_point await_finished_at{};
+        uint64_t                   hdr_done_ns    = 0;
+        uint64_t                   response_bytes = 0;
+        uint64_t                   unpack_ns      = 0;
+        uint64_t                   decode_ns      = 0;
+        uint64_t                   copy_ns        = 0;
+        uint32_t                   want_start     = 0;
+        uint32_t                   want_end       = 0;
+    };
+
+    // One read-ahead job: everything a socket_reader thread (below) needs to
+    // drain and ml8_4-decode ONE stream_wire request's chunks, entirely on
+    // its own thread, without touching the planned_request the graph thread
+    // owns or any dispatcher-wide mutable state (dispatch_state, req_log_,
+    // layer_traces_, in_flight). Every field below is either read-only after
+    // the graph thread posts the job (layer/total_rows/chunk_count/token_ids/
+    // endpoint/assignment_desc -- plain copies, so the reader never has to
+    // read a planned_request field the graph thread might concurrently
+    // touch) or written ONLY by the reader thread before it sets `done`
+    // (out/chunks/has_error/error_msg) and read ONLY by the graph thread
+    // after it observes `done` under `mutex` -- the mutex/condition_variable
+    // pair is the full memory fence between those two phases; no atomics are
+    // needed beyond it. `out` is sized once, before the reader is handed the
+    // job, and never resized afterward, so there is no resize-while-writing
+    // hazard.
+    struct recv_ahead_job {
+        std::mutex               mutex;
+        std::condition_variable  cv;
+        bool                     done      = false;
+        bool                     has_error = false;
+        std::string              error_msg;
+        std::vector<float>       out;
+        std::vector<chunk_capture> chunks;
+
+        int32_t                  layer       = -1;
+        uint32_t                 total_rows  = 0;
+        uint32_t                 chunk_count = 0;
+        std::vector<uint32_t>    token_ids;   // copy; empty means identity rows
+        std::string              endpoint;
+        std::string              assignment_desc;
+    };
+
+    // WP_DISPATCH_RECV_AHEAD: one persistent reader thread per worker socket,
+    // mirroring socket_writer's lifecycle exactly (start/stop, failure latch,
+    // shutdown-on-destruction) but for the RECEIVE side. Unlike socket_writer
+    // there is no FIFO queue -- like concurrent_sender, one job slot posted
+    // then waited-on by the graph thread (via the job's own mutex/cv, not
+    // this one) -- because a worker never has two stream_wire requests
+    // outstanding on its socket at once (see start_recv_ahead()).
+    struct socket_reader {
+        pipe_socket_ptr                 socket;
+        std::string                     endpoint;
+        std::thread                     thread;
+        std::mutex                      mutex;
+        std::condition_variable         cv;
+        bool                            stop    = false;
+        bool                            failed  = false;
+        std::string                     error_msg;
+        bool                            has_job = false;
+        std::shared_ptr<recv_ahead_job> job;
+    };
+
     struct worker {
         endpoint                                 target;
         worker_info                              info;
@@ -827,6 +988,7 @@ struct dispatcher::impl {
         pipe_socket_ptr                          socket;
         std::unique_ptr<pipe_expert_shm_ring>    shm;
         std::unique_ptr<socket_writer>           writer;
+        std::unique_ptr<socket_reader>           reader;   // WP_DISPATCH_RECV_AHEAD
         std::unique_ptr<concurrent_sender>       sender;
         // D9: residency LRU as std::list + unordered_map (key = layer<<32|expert)
         // instead of an O(n_slots) vector memmove per assignment. Dispatch-thread
@@ -891,6 +1053,18 @@ struct dispatcher::impl {
         uint64_t                            response_bytes = 0;
         uint64_t                            unpack_ns = 0;
         uint64_t                            wait_ns = 0;
+        // WP_DISPATCH_REQ_LOG_TIMELINE=1 only (0 otherwise -- see
+        // dispatch_req_log_timeline_enabled()). hdr_done_ns is the response
+        // frame's header-recv-return steady_clock reading (pipe_recv_frame's
+        // out-param), so
+        //   ns_hdr_wait = elapsed_ns(await_started_at, hdr_done_ns-as-time_point)
+        // is "request wire + worker queue + worker service" up to the moment
+        // the response header lands, and the remainder up to
+        // await_finished_at is response body transfer. await_started_realtime_ns
+        // is CLOCK_REALTIME at await_started_at, for the offline clock-offset
+        // estimate in scripts/wp-req-timeline.py.
+        uint64_t                            hdr_done_ns = 0;
+        uint64_t                            await_started_realtime_ns = 0;
         // SPINE-SIDE GATHER (2026-08-05). When non-empty, this request carries
         // only these token rows -- token_ids[r] is the ORIGINAL token index of
         // compacted row r -- and the returned partial is [token_ids.size() x
@@ -926,6 +1100,15 @@ struct dispatcher::impl {
         // In-process trunk workers: skip encode/TCP. Dispatch runs in
         // await/finish, not issue — HIP graph capture is still open then.
         pipe_expert_dispatch_req            inproc_wire;
+
+        // WP_DISPATCH_RECV_AHEAD: set by start_recv_ahead() right after this
+        // request is issued; non-null means a reader thread is (or will be)
+        // draining/decoding this request's stream chunks concurrently.
+        // receive_partial() checks this FIRST and, when set, takes the
+        // fold_recv_ahead_result() path instead of touching the socket
+        // itself. Touched only by the graph thread -- see recv_ahead_job's
+        // comment for why the reader thread never needs to see this pointer.
+        std::shared_ptr<recv_ahead_job>     recv_ahead_job_;
     };
 
     using dispatch_handle = dispatcher::dispatch_handle;
@@ -1066,6 +1249,9 @@ struct dispatcher::impl {
     // design note. Latched once, like the other flags above, so a per-layer
     // getenv never appears on the dispatch path.
     bool                                                unpack_overlap = false;
+    // WP_DISPATCH_RECV_AHEAD latch; see recv_ahead_enabled() for the full
+    // design note. Latched once, like the other flags above.
+    bool                                                recv_ahead_ = false;
     bool                                                split_frame = false;
     // WP_DISPATCH_DEDUP_ACTIVATIONS latch. Requires split_frame (the mechanism
     // extends the BEGIN/ACTS split with two more per-machine-role ACTS
@@ -1109,6 +1295,9 @@ struct dispatcher::impl {
         return (p != nullptr && p[0] != '\0') ? fopen((std::string(p) + ".writer").c_str(), "w") : (FILE *) nullptr;
     }();
     std::mutex                                          writer_log_mutex_;
+    // See dispatch_req_log_timeline_enabled(); latched once so every log call
+    // site pays only a bool read to decide whether to take the extra columns.
+    const bool                                          req_log_timeline_ = dispatch_req_log_timeline_enabled();
 
     // Gap accounting: time spent with in_flight == 0.
     bool                       gap_at_zero = false;
@@ -1126,6 +1315,7 @@ struct dispatcher::impl {
                 hint_inflight(hint_inflight_enabled()),
                 async_issue(async_issue_enabled()),
                 unpack_overlap(unpack_overlap_enabled()),
+                recv_ahead_(recv_ahead_enabled()),
                 dispatch_stream_chunks_(dispatch_stream_chunks_enabled()),
                 dispatch_chunks_(dispatch_chunks_enabled()) {
         if (dispatch_chunks_ > 1) {
@@ -1159,6 +1349,13 @@ struct dispatcher::impl {
                          "expert dispatch: WP_UNPACK_OVERLAP=1 -- decoding worker partials as they "
                          "arrive (poll order), folding in fixed worker order (bit-exact); forward-"
                          "budget ns_wait may now include decode cost that used to show as ns_unpack\n");
+        }
+        if (recv_ahead_) {
+            std::fprintf(stderr,
+                         "expert dispatch: WP_DISPATCH_RECV_AHEAD=1 -- a per-worker reader thread "
+                         "drains+decodes WP_DISPATCH_STREAM chunks as they arrive; graph thread still "
+                         "folds in fixed request order (bit-exact); does NOT cover WP_DEFER_K, "
+                         "dedup-retry, or WP_EXPERT_WIRE_GPU_UNPACK (see recv_ahead_enabled())\n");
         }
         concurrent_issue = concurrent_issue_enabled() && !async_issue;
         if (concurrent_issue_enabled() && !concurrent_issue) {
@@ -1372,12 +1569,14 @@ struct dispatcher::impl {
                          (unsigned) decode_max_tokens_, decode_prefer_port_);
         }
         start_writers();
+        start_readers();
         start_concurrent_senders();
     }
 
     // Normal destruction lets queued frames drain before joining writers.
     ~impl() {
         stop_writers(false);
+        stop_readers(false);
         stop_concurrent_senders();
         if (req_log_ != nullptr) fclose(req_log_);
         if (writer_log_ != nullptr) fclose(writer_log_);
@@ -1540,6 +1739,7 @@ struct dispatcher::impl {
                 continue;
             }
             const dispatch_clock::time_point send_started = dispatch_clock::now();
+            const uint64_t send_started_realtime_ns = req_log_timeline_ ? realtime_ns_now() : 0;
             const bool send_ok = pipe_send_frame(*w->socket, frame.type, frame.seq_id,
                                                  frame.payload.data(), frame.payload.size());
             if (layer_trace_enabled() && frame.layer >= 0) {
@@ -1548,11 +1748,24 @@ struct dispatcher::impl {
             }
             if (writer_log_ != nullptr) {
                 std::lock_guard<std::mutex> log_lock(writer_log_mutex_);
-                fprintf(writer_log_, "%llu %llu %u %llu %zu %s\n",
+                // Columns 1-6 (always): ns_queued (enqueue -> send start),
+                // ns_send (send start -> send returns), frame type, seq_id,
+                // payload bytes, endpoint. WP_DISPATCH_REQ_LOG_TIMELINE=1
+                // appends two more: chunk_index (UINT32_MAX for non-chunk
+                // frames) and CLOCK_REALTIME ns at send_started, so
+                // scripts/wp-req-timeline.py can join a chunk's send against
+                // the worker's own WP_REQ_LOG_TIMELINE=1 row and estimate the
+                // cross-host clock offset.
+                fprintf(writer_log_, "%llu %llu %u %llu %zu %s",
                         (unsigned long long) elapsed_ns(frame.enqueued_at, send_started),
                         (unsigned long long) elapsed_ns(send_started, dispatch_clock::now()),
                         (unsigned) frame.type, (unsigned long long) frame.seq_id,
                         frame.payload.size(), w->endpoint.c_str());
+                if (req_log_timeline_) {
+                    fprintf(writer_log_, " %u %llu", frame.chunk_index,
+                            (unsigned long long) send_started_realtime_ns);
+                }
+                fprintf(writer_log_, "\n");
                 fflush(writer_log_);
             }
             if (!send_ok) {
@@ -1574,6 +1787,323 @@ struct dispatcher::impl {
             w->done = true;
         }
         w->cv.notify_all();
+    }
+
+    // WP_DISPATCH_RECV_AHEAD: start one persistent reader thread per worker
+    // socket. Mirrors start_writers()'s shape exactly (see stop_readers()/
+    // reader_loop() below for the rest of the lifecycle).
+    void start_readers() {
+        if (!recv_ahead_) {
+            return;
+        }
+        try {
+            for (worker & value : workers) {
+                if (!value.socket || value.inproc) {
+                    continue;
+                }
+                value.reader.reset(new socket_reader{});
+                value.reader->socket   = value.socket;
+                value.reader->endpoint = value.info.endpoint;
+                socket_reader * r = value.reader.get();
+                r->thread = std::thread([this, r]() { reader_loop(r); });
+            }
+        } catch (...) {
+            stop_readers(true);
+            throw;
+        }
+    }
+
+    // Mirrors stop_writers(): signal stop, optionally wait for any in-flight
+    // job to finish on its own, then shutdown() any socket still mid-job so a
+    // reader blocked in pipe_recv_frame wakes up, then join every thread.
+    void stop_readers(bool immediate) {
+        for (worker & value : workers) {
+            socket_reader * r = value.reader.get();
+            if (!r) {
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(r->mutex);
+                r->stop = true;
+            }
+            r->cv.notify_all();
+        }
+        const auto deadline = dispatch_clock::now() + std::chrono::seconds(3);
+        if (!immediate) {
+            for (worker & value : workers) {
+                socket_reader * r = value.reader.get();
+                if (!r) {
+                    continue;
+                }
+                std::unique_lock<std::mutex> lock(r->mutex);
+                r->cv.wait_until(lock, deadline, [r]() { return !r->has_job; });
+            }
+        }
+        for (worker & value : workers) {
+            socket_reader * r = value.reader.get();
+            if (!r) {
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(r->mutex);
+            if (r->has_job && r->socket) {
+                r->socket->shutdown();
+            }
+        }
+        for (worker & value : workers) {
+            socket_reader * r = value.reader.get();
+            if (!r) {
+                continue;
+            }
+            if (r->thread.joinable()) {
+                r->thread.join();
+            }
+            r->socket.reset();
+        }
+    }
+
+    // Reader thread body: wait for one job, run it to completion (success or
+    // error -- run_recv_ahead_job() never throws), publish `done` under the
+    // JOB's own mutex (not `r->mutex` -- the graph thread waits on the job
+    // directly and must never have to touch a worker's reader lock), then go
+    // back to waiting. Never throws.
+    void reader_loop(socket_reader * r) {
+        for (;;) {
+            std::shared_ptr<recv_ahead_job> job;
+            {
+                std::unique_lock<std::mutex> lock(r->mutex);
+                r->cv.wait(lock, [r]() { return r->stop || r->has_job; });
+                if (r->has_job) {
+                    job = r->job;
+                } else {
+                    break;
+                }
+            }
+            run_recv_ahead_job(*r, *job);
+            {
+                std::lock_guard<std::mutex> lock(r->mutex);
+                r->has_job = false;
+                r->job.reset();
+            }
+            {
+                std::lock_guard<std::mutex> lock(job->mutex);
+                job->done = true;
+            }
+            job->cv.notify_all();
+            r->cv.notify_all();   // wake stop_readers()'s wait_until on !has_job
+        }
+    }
+
+    // Post one job to a worker's reader thread. At most one job is ever
+    // outstanding per socket: a worker never has two stream_wire requests
+    // in flight on the same connection at once (start_recv_ahead() only
+    // calls this right after issue_requests() sent this layer's immediate
+    // requests, one per worker).
+    void post_recv_ahead_job(worker & value, std::shared_ptr<recv_ahead_job> job) {
+        socket_reader * r = value.reader.get();
+        if (!r) {
+            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                     " has no reader thread (WP_DISPATCH_RECV_AHEAD requires a live socket)");
+        }
+        {
+            std::lock_guard<std::mutex> lock(r->mutex);
+            if (r->failed) {
+                throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                         " reader failed: " + r->error_msg);
+            }
+            if (r->has_job) {
+                throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                         " reader already has an outstanding job");
+            }
+            r->job     = std::move(job);
+            r->has_job = true;
+        }
+        r->cv.notify_one();
+    }
+
+    // Drain and ml8_4-decode ONE stream_wire request's chunks. Runs entirely
+    // on the reader thread, touching only `job` (private to this call until
+    // `done` is published) and `r->socket` (this worker's socket, owned for
+    // the duration of the job -- see post_recv_ahead_job()'s at-most-one-job
+    // invariant). Mirrors receive_partial()'s stream_wire loop exactly for
+    // the CPU (non-GPU-unpack) path -- same shape checks, same non-finite
+    // check, same error text -- because pipe_decode_expert_partial_chunk()
+    // is called with keep_ml8_4_packed=false here unconditionally (see
+    // recv_ahead_enabled()'s note on why the GPU device-dequant path is
+    // skipped rather than shared across reader threads).
+    void run_recv_ahead_job(socket_reader & r, recv_ahead_job & job) {
+        const uint32_t chunk_count = job.chunk_count;
+        const uint32_t total_rows  = job.total_rows;
+        const size_t   total_values = (size_t) total_rows * (size_t) n_embd;
+        job.out.assign(total_values, 0.0f);
+        job.chunks.reserve(chunk_count);
+        std::vector<uint8_t> payload;
+        for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+            chunk_capture cap;
+            cap.await_started_at = dispatch_clock::now();
+            pipe_frame_type type;
+            uint64_t        seq_id_recv = 0;
+            uint64_t        hdr_done_ns = 0;
+            if (!pipe_recv_frame(*r.socket, type, seq_id_recv, payload, &hdr_done_ns)) {
+                job.has_error = true;
+                job.error_msg = "expert dispatcher worker " + job.endpoint +
+                                 " died while computing expert(s) " + job.assignment_desc;
+                return;
+            }
+            cap.hdr_done_ns = hdr_done_ns;
+            if (type == PIPE_ERROR) {
+                const pipe_error error = pipe_decode_error(payload.data(), payload.size());
+                job.has_error = true;
+                if (chunk_index == 0) {
+                    job.error_msg = "expert dispatcher worker " + job.endpoint +
+                                     " rejected expert(s) " + job.assignment_desc +
+                                     " on layer " + std::to_string(job.layer) + " with code " +
+                                     std::to_string(error.code) + ": " + error.msg;
+                } else {
+                    job.error_msg = "expert dispatcher worker " + job.endpoint +
+                                     " rejected expert(s) " + job.assignment_desc +
+                                     " on layer " + std::to_string(job.layer) + " chunk " +
+                                     std::to_string(chunk_index) + " with code " +
+                                     std::to_string(error.code) + ": " + error.msg;
+                }
+                return;
+            }
+            if (type != PIPE_EXPERT_PARTIAL_CHUNK) {
+                job.has_error = true;
+                job.error_msg = chunk_index == 0
+                    ? ("expert dispatcher worker " + job.endpoint +
+                       " returned a non-chunk partial for a streamed request")
+                    : ("expert dispatcher worker " + job.endpoint +
+                       " interleaved a non-chunk frame while sending partials");
+                return;
+            }
+            const uint32_t base       = total_rows / chunk_count;
+            const uint32_t want_start = chunk_index * base;
+            const uint32_t want_end   = chunk_index + 1 == chunk_count ? total_rows : want_start + base;
+            const size_t   chunk_values = (size_t) (want_end - want_start) * (size_t) n_embd;
+            cap.want_start = want_start;
+            cap.want_end   = want_end;
+
+            const dispatch_clock::time_point decode_started = dispatch_clock::now();
+            pipe_expert_partial_chunk response;
+            try {
+                response = pipe_decode_expert_partial_chunk(payload.data(), payload.size(), n_embd,
+                                                             /*keep_ml8_4_packed=*/false);
+            } catch (const std::exception & error) {
+                job.has_error = true;
+                job.error_msg = "expert dispatcher worker " + job.endpoint +
+                                 " returned an invalid streamed partial: " + std::string(error.what());
+                return;
+            }
+            cap.decode_ns = elapsed_ns(decode_started, dispatch_clock::now());
+            if (response.chunk_index != chunk_index || response.chunk_count != chunk_count ||
+                response.total_tokens != total_rows || response.token_start != want_start ||
+                response.token_end != want_end || response.partial.layer != job.layer ||
+                response.partial.n_tokens != want_end - want_start ||
+                response.partial.partial.size() != chunk_values) {
+                job.has_error = true;
+                job.error_msg = "expert dispatcher worker " + job.endpoint +
+                                 " returned the wrong streamed partial range";
+                return;
+            }
+            float * dst_row = job.out.data() + (size_t) want_start * (size_t) n_embd;
+            const dispatch_clock::time_point copy_started = dispatch_clock::now();
+            for (size_t i = 0; i < chunk_values; ++i) {
+                const float v = response.partial.partial[i];
+                if (!std::isfinite(v)) {
+                    job.has_error = true;
+                    job.error_msg = "expert dispatcher worker " + job.endpoint +
+                                     " returned a NON-FINITE streamed partial";
+                    return;
+                }
+                dst_row[i] = v;
+            }
+            cap.copy_ns         = elapsed_ns(copy_started, dispatch_clock::now());
+            cap.response_bytes  = payload.size();
+            cap.await_finished_at = dispatch_clock::now();
+            cap.unpack_ns       = elapsed_ns(decode_started, dispatch_clock::now());
+            job.chunks.push_back(cap);
+        }
+    }
+
+    // WP_DISPATCH_RECV_AHEAD: called right after issue_requests() sends this
+    // layer's immediate requests. Hands off every stream_wire request to its
+    // worker's reader thread. See recv_ahead_enabled() for full scope.
+    void start_recv_ahead(std::vector<planned_request> & requests, dispatch_state & state) {
+        if (!recv_ahead_) {
+            return;
+        }
+        for (planned_request & request : requests) {
+            if (!request.stream_wire || request.stream_payloads.empty()) {
+                continue;
+            }
+            worker & value = workers[request.worker_index];
+            if (value.inproc || !value.reader) {
+                continue;
+            }
+            const uint32_t total_rows = request.token_ids.empty()
+                ? state.n_tokens : (uint32_t) request.token_ids.size();
+            auto job = std::make_shared<recv_ahead_job>();
+            job->layer           = request.layer;
+            job->total_rows      = total_rows;
+            job->chunk_count     = (uint32_t) request.stream_payloads.size();
+            job->token_ids       = request.token_ids;
+            job->endpoint        = value.info.endpoint;
+            job->assignment_desc = assignment_experts(request.assignments);
+            request.recv_ahead_job_   = job;
+            request.await_started_at = dispatch_clock::now();
+            if (req_log_timeline_) {
+                request.await_started_realtime_ns = realtime_ns_now();
+            }
+            post_recv_ahead_job(value, std::move(job));
+        }
+    }
+
+    // WP_DISPATCH_RECV_AHEAD: the graph-thread side of receive_partial() for
+    // a request whose chunks a reader thread already drained/decoded (or is
+    // still draining). Waits for the job, then replays -- ON THE GRAPH
+    // THREAD, in the SAME order the reader recorded chunks in -- every side
+    // effect receive_partial()'s stream_wire branch would have produced
+    // itself: write_request_log() per chunk, layer_trace decode_ns/copy_ns,
+    // and the single note_in_flight_delta(-1) the success path always does
+    // exactly once (see the stream_wire branch's note_in_flight_delta calls:
+    // every one but the final is on an ERROR path, replayed as the single
+    // decrement below on the has_error branch). This is the only place that
+    // touches dispatch_state/req_log_/layer_traces_ for this request, so
+    // there is no new race versus the non-recv-ahead path -- it is just
+    // deferred from decode time to fold time.
+    void fold_recv_ahead_result(std::vector<float> &         out,
+                                planned_request &            request,
+                                int32_t                      layer,
+                                dispatch_clock::time_point * last_response,
+                                dispatch_state &              state) {
+        std::shared_ptr<recv_ahead_job> job = std::move(request.recv_ahead_job_);
+        request.recv_ahead_job_.reset();
+        {
+            std::unique_lock<std::mutex> lock(job->mutex);
+            job->cv.wait(lock, [&job]() { return job->done; });
+        }
+        note_in_flight_delta(state, -1);
+        if (job->has_error) {
+            throw std::runtime_error(job->error_msg);
+        }
+        out = std::move(job->out);
+        for (size_t i = 0; i < job->chunks.size(); ++i) {
+            const chunk_capture & cap = job->chunks[i];
+            request.response_bytes    = cap.response_bytes;
+            request.await_finished_at = cap.await_finished_at;
+            request.unpack_ns         = cap.unpack_ns;
+            request.hdr_done_ns       = cap.hdr_done_ns;
+            if (req_log_ != nullptr) {
+                write_request_log(request, layer, cap.want_end - cap.want_start, state, (uint32_t) i);
+            }
+            if (layer_trace_enabled()) {
+                add_layer_trace(layer, &layer_trace_stats::decode_ns, cap.decode_ns);
+                add_layer_trace(layer, &layer_trace_stats::copy_ns, cap.copy_ns);
+            }
+            if (collect_stats && last_response != nullptr) {
+                *last_response = cap.await_finished_at;
+            }
+        }
     }
 
     // Enqueue one frame onto a worker's writer FIFO. Throws if the writer has
@@ -2252,6 +2782,7 @@ struct dispatcher::impl {
         // time the object is destroyed. Same reasoning for the concurrent-issue
         // senders.
         stop_writers(true);
+        stop_readers(true);
         stop_concurrent_senders();
         for (worker & value : workers) {
             value.socket.reset();
@@ -2285,7 +2816,8 @@ struct dispatcher::impl {
     }
 
     pipe_frame_type await_response(planned_request & request, uint64_t wanted_seq_id,
-                                   std::vector<uint8_t> & payload, dispatch_state & state) {
+                                   std::vector<uint8_t> & payload, dispatch_state & state,
+                                   uint64_t * hdr_done_ns_out = nullptr) {
         if (!state.stats.first_await_recorded) {
             state.stats.first_await_recorded  = true;
             state.stats.first_await_in_flight = in_flight;
@@ -2316,7 +2848,7 @@ struct dispatcher::impl {
         // timeout, on error, or when disabled we fall into the identical
         // blocking pipe_recv_frame below.
         spin_for_readable(*value.socket);
-        if (!pipe_recv_frame(*value.socket, type, seq_id, payload)) {
+        if (!pipe_recv_frame(*value.socket, type, seq_id, payload, hdr_done_ns_out)) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " died while computing expert(s) " + assignment_experts(request.assignments));
         }
@@ -2735,10 +3267,11 @@ struct dispatcher::impl {
                 if (stream_send_overlap_ && workers[request.worker_index].socket) {
                     for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
                         wire_frame frame;
-                        frame.type    = PIPE_EXPERT_DISPATCH_CHUNK;
-                        frame.seq_id  = seq_id;
-                        frame.layer   = layer;
-                        frame.payload = std::move(request.stream_payloads[chunk_index]);
+                        frame.type        = PIPE_EXPERT_DISPATCH_CHUNK;
+                        frame.seq_id      = seq_id;
+                        frame.layer       = layer;
+                        frame.chunk_index = chunk_index;
+                        frame.payload     = std::move(request.stream_payloads[chunk_index]);
                         enqueue_frame(workers[request.worker_index], std::move(frame));
                     }
                     request.stream_sent_via_writer = true;
@@ -3225,7 +3758,20 @@ struct dispatcher::impl {
         // Column order: layer n_tokens worker_index n_experts ns_before_await
         // ns_blocked ns_issue_done ns_await_recv resp_bytes ns_unpack
         // await_start_ns await_end_ns seq_id chunk_index.
-        fprintf(req_log_, "%d %u %zu %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %u\n",
+        // WP_DISPATCH_REQ_LOG_TIMELINE=1 appends four more (0 when
+        // hdr_done_ns was never stamped, e.g. this row is a retry/chunk that
+        // didn't call await_response with the out-param this time):
+        //   ns_hdr_wait   await_started_at -> response HEADER landing
+        //                 (request wire + worker queue + worker service, up
+        //                 to but not including this frame's body transfer).
+        //   ns_body_wait  header landing -> await_finished_at (body transfer,
+        //                 the counterpart of the worker's own ns_recv_body
+        //                 but measured on THIS frame in THIS direction).
+        //   epoch_await_start_ns / epoch_await_end_ns: CLOCK_REALTIME at
+        //                 await_started_at / await_finished_at, for
+        //                 scripts/wp-req-timeline.py's offline clock-offset
+        //                 estimate against the worker's own epoch stamps.
+        fprintf(req_log_, "%d %u %zu %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %u",
                 layer, n_tokens, request.worker_index, request.assignments.size(),
                 (unsigned long long) elapsed_ns(request.issued_at, request.await_started_at),
                 (unsigned long long) elapsed_ns(request.await_started_at, request.await_finished_at),
@@ -3237,6 +3783,23 @@ struct dispatcher::impl {
                 (unsigned long long) elapsed_ns(state.req_dispatch_start_, request.await_finished_at),
                 (unsigned long long) state.seq_id,
                 transport_chunk == UINT32_MAX ? state.chunk_index : transport_chunk);
+        if (req_log_timeline_) {
+            const uint64_t await_started_ns = (uint64_t) std::chrono::duration_cast<
+                std::chrono::nanoseconds>(request.await_started_at.time_since_epoch()).count();
+            const uint64_t ns_hdr_wait = request.hdr_done_ns > await_started_ns
+                ? request.hdr_done_ns - await_started_ns : 0;
+            const uint64_t ns_total_wait =
+                elapsed_ns(request.await_started_at, request.await_finished_at);
+            const uint64_t ns_body_wait = ns_total_wait > ns_hdr_wait
+                ? ns_total_wait - ns_hdr_wait : 0;
+            const uint64_t epoch_await_end_ns = request.await_started_realtime_ns != 0
+                ? request.await_started_realtime_ns + ns_total_wait : 0;
+            fprintf(req_log_, " %llu %llu %llu %llu",
+                    (unsigned long long) ns_hdr_wait, (unsigned long long) ns_body_wait,
+                    (unsigned long long) request.await_started_realtime_ns,
+                    (unsigned long long) epoch_await_end_ns);
+        }
+        fprintf(req_log_, "\n");
         fflush(req_log_);
     }
 
@@ -3248,6 +3811,18 @@ struct dispatcher::impl {
                          uint32_t                         n_tokens,
                          dispatch_clock::time_point *     last_response,
                          dispatch_state &                 state) {
+        // WP_DISPATCH_RECV_AHEAD: this request's chunks are being (or already
+        // were) drained/decoded on its worker's reader thread -- fold the
+        // result instead of touching the socket ourselves. See
+        // fold_recv_ahead_result()'s comment for exactly which side effects
+        // get replayed and in what order.
+        if (request.recv_ahead_job_) {
+            fold_recv_ahead_result(out, request, layer, last_response, state);
+            GGML_UNUSED(seq_id);
+            GGML_UNUSED(n_values);
+            GGML_UNUSED(n_tokens);
+            return;
+        }
         std::vector<uint8_t>  payload;
         // WP_DISPATCH_REQ_LOG=path: one line per request. The complete column
         // order is documented at write_request_log below.
@@ -3271,10 +3846,14 @@ struct dispatcher::impl {
         const auto wp_await_t0 = req_log_ != nullptr ? dispatch_clock::now()
                                                      : dispatch_clock::time_point();
         request.await_started_at = wp_await_t0;
+        if (req_log_timeline_) {
+            request.await_started_realtime_ns = realtime_ns_now();
+        }
         const dispatch_clock::time_point recv_started =
             layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
         uint64_t         wanted_seq_id = seq_id;
-        pipe_frame_type  type          = await_response(request, wanted_seq_id, payload, state);
+        pipe_frame_type  type          = await_response(request, wanted_seq_id, payload, state,
+                                                         req_log_timeline_ ? &request.hdr_done_ns : nullptr);
         const bool       streamed      = type == PIPE_EXPERT_PARTIAL_STREAM ||
                                          type == PIPE_EXPERT_PARTIAL_CHUNK;
         if (!streamed) {
@@ -3322,7 +3901,8 @@ struct dispatcher::impl {
                                              assignment_experts(request.assignments));
                 }
                 wanted_seq_id = retry_seq;
-                type = await_response(request, wanted_seq_id, payload, state);
+                type = await_response(request, wanted_seq_id, payload, state,
+                                      req_log_timeline_ ? &request.hdr_done_ns : nullptr);
                 if (type != PIPE_EXPERT_PARTIAL_STREAM) {
                     note_in_flight_delta(state, -1);
                 }
@@ -3370,7 +3950,8 @@ struct dispatcher::impl {
             out.assign(total_values, 0.0f);
             for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
                 if (chunk_index != 0) {
-                    type = await_response(request, wanted_seq_id, payload, state);
+                    type = await_response(request, wanted_seq_id, payload, state,
+                                          req_log_timeline_ ? &request.hdr_done_ns : nullptr);
                     response_received_at = dispatch_clock::now();
                     // Mirror chunk 0's handling (above, before this stream_wire
                     // branch): a worker-side protocol rejection sent mid-stream
@@ -3630,7 +4211,8 @@ struct dispatcher::impl {
                     }
                     break;
                 }
-                type = await_response(request, wanted_seq_id, payload, state);
+                type = await_response(request, wanted_seq_id, payload, state,
+                                      req_log_timeline_ ? &request.hdr_done_ns : nullptr);
                 response_received_at = dispatch_clock::now();
             }
             request.await_finished_at = req_log_ != nullptr ? response_received_at
@@ -4395,6 +4977,18 @@ struct dispatcher::impl {
             // is not a safe thing to do without its own dedicated design.
             dedup_publish_and_ref(imm_requests, seq_id, layer, n_tokens, activations, state);
             issue_requests(imm_requests, seq_id, state);
+            // WP_DISPATCH_RECV_AHEAD: hand this layer's stream_wire immediate
+            // requests to their workers' reader threads NOW, right after the
+            // bytes went out, so draining/decoding overlaps everything this
+            // function still has to do (issuing deferred requests below,
+            // collecting the previous layer's deferred fold, and whatever the
+            // caller does before it next calls finish_dispatch). Deliberately
+            // AFTER issue_requests(imm_requests, ...) (so the requests are
+            // actually on the wire) and BEFORE def_requests is issued (so a
+            // deferred request sharing a worker's socket cannot be posted to
+            // that worker's reader thread by mistake -- start_recv_ahead()
+            // only ever sees imm_requests).
+            start_recv_ahead(imm_requests, state);
             if (!def_requests.empty()) {
                 issue_requests(def_requests, seq_id, state);
             }

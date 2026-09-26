@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #ifdef _WIN32
@@ -319,6 +320,27 @@ pipe_socket_ptr pipe_socket_t::connect(const char * host, int port, bool * retry
         PIPE_LOG_ERROR("pipe: failed to suppress SIGPIPE\n");
         close_socket_fd(sockfd);
         return nullptr;
+    }
+    // WP_PIPE_RCVBUF=<bytes> (default unset: kernel autotuning, unchanged).
+    // Autotuning only grows a receive buffer while the application keeps
+    // reading it; the expert dispatcher reads worker responses in fixed
+    // order, so a socket it is not currently reading stays ~2 MB and the
+    // remote worker blocks in send() -- stalling its next chunk's compute --
+    // until the dispatcher gets to it. Must be set before connect() so the
+    // window scale is negotiated for it; capped by net.core.rmem_max.
+    static const int rcvbuf = [] {
+        const char * v = std::getenv("WP_PIPE_RCVBUF");
+        return v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
+    }();
+    if (rcvbuf > 0) {
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *) &rcvbuf, sizeof(rcvbuf));
+        static std::once_flag logged;
+        std::call_once(logged, [sockfd] {
+            int got = 0;
+            pipe_socklen_t len = sizeof(got);
+            getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *) &got, &len);
+            fprintf(stderr, "pipe: WP_PIPE_RCVBUF=%d requested, kernel granted %d\n", rcvbuf, got);
+        });
     }
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;

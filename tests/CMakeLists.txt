@@ -445,6 +445,7 @@ target_link_libraries(test-wp-expert-dispatcher PRIVATE
 )
 target_compile_definitions(test-wp-expert-dispatcher PRIVATE
     WP_EXPERT_WORKER_BIN="$<TARGET_FILE:llama-wp-expert-worker>"
+    WP_REQ_LOG_TIMELINE_SCRIPT="${CMAKE_SOURCE_DIR}/scripts/wp-req-timeline.py"
 )
 target_compile_features(test-wp-expert-dispatcher PRIVATE cxx_std_17)
 llama_test(test-wp-expert-dispatcher)

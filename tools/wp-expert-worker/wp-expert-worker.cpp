@@ -1711,6 +1711,12 @@ struct RequestStats {
     uint64_t ns_recv_body  = 0;
     uint64_t ns_req_decode = 0;
     uint64_t ns_resp_send  = 0;
+    // WP_REQ_LOG_TIMELINE=1 only (0 otherwise). ns_queue_wait: reader-queue
+    // wait (WpPipelineFrame::queued_at_ns -> compute-loop pop), the worker-
+    // side head-of-line term. epoch_recv_ns: CLOCK_REALTIME at frame arrival,
+    // for the offline clock-offset estimate in scripts/wp-req-timeline.py.
+    uint64_t ns_queue_wait  = 0;
+    uint64_t epoch_recv_ns  = 0;
     // WP_WORKER_PIPELINE=1: the reader/writer frame queue's high-water item
     // count for THIS connection, as of this request. 0 (and meaningless) with
     // the knob off -- see WorkerStats::n_frames_queued_max_'s max-merge,
@@ -20930,6 +20936,59 @@ bool wp_worker_pipeline_enabled() {
     return on;
 }
 
+// WP_REQ_LOG_TIMELINE=1 -- DEFAULT OFF. Sub-knob of WP_REQ_LOG: appends the
+// extra per-request columns needed to join this worker's own timeline against
+// the spine's WP_DISPATCH_REQ_LOG_TIMELINE=1 rows (scripts/wp-req-timeline.py)
+// -- seq_id, the reader-queue wait (frame pushed by the reader thread ->
+// popped by the compute loop, WP_WORKER_PIPELINE=1 only), and a CLOCK_REALTIME
+// stamp at frame arrival (for the offline clock-offset estimate; the two
+// hosts' CLOCK_REALTIME are NTP-skewed, monotonic clocks are unrelated
+// across hosts). A branch on this latched bool is the only cost when it (or
+// WP_REQ_LOG itself) is off.
+bool wp_req_log_timeline_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_REQ_LOG_TIMELINE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// WP_WORKER_DECODE_AHEAD=1 -- DEFAULT OFF. Moves PIPE_EXPERT_DISPATCH_CHUNK
+// request decode (pipe_decode_expert_dispatch_chunk: wire unpack of the
+// activation matrix plus assignment-weight parsing/validation) from the
+// compute thread, where it has always run synchronously right after pop(),
+// onto the reader thread, right after recv() and before push() -- see
+// WpPipelineFrame::decoded_chunk for why this is safe (decode touches no
+// shared Worker/pool state) and the measurement that motivated it.
+//
+// MEASURED 2026-09-26 (CPU microbench, single-threaded, this box):
+// expert_wire_unpack_ml8_4_blocks() on one 2048x5120 ml8_4 chunk is ~5.9 ms
+// of arithmetic, but pipe_decode_expert_dispatch_req_impl() also
+// std::vector<float>::resize()s a FRESH ~40 MB activations buffer every
+// single chunk (no reuse -- the whole pipe_expert_dispatch_chunk, activations
+// included, is a local that dies at the end of the DISPATCH_CHUNK branch).
+// Repeatedly alloc+zero-touch+free a 40 MB buffer measured ~19 ms on this
+// box (vs ~2.2 ms for the same write loop against an already-touched, reused
+// buffer of the same size) -- glibc's malloc puts a block this large through
+// mmap/munmap, and munmap on a live multi-threaded process pays for a TLB
+// shootdown IPI to every core in the process's affinity mask. So the real
+// per-chunk decode cost is closer to allocation-dominated ~20-25 ms than the
+// ~6 ms the unpack arithmetic alone suggests -- and with WP_DISPATCH_STREAM=4
+// chunks arriving back-to-back within ~25 ms of a layer's start (per the
+// reader thread's own queue-depth/queue_wait counters), that is comfortably
+// long enough to sit entirely inside the GPU-bound dispatch() of the
+// PREVIOUS chunk instead of serially after it -- which is exactly what this
+// knob does. It does not by itself fix the allocation (a real fix would
+// reuse the activations buffer across chunks; out of scope here -- see the
+// no-behaviour-change constraint above), it only relocates who pays for it.
+bool wp_worker_decode_ahead_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_WORKER_DECODE_AHEAD");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 // One frame handed from the reader to the compute loop, or (ok == false) the
 // EOF/error sentinel standing in for what pipe_recv_frame returning false
 // means on the direct path -- the compute loop's while-condition treats the
@@ -20948,6 +21007,51 @@ struct WpPipelineFrame {
     // latter is what RequestStats::ns_recv_body has ever meant. 0 when
     // time_recv is false, same as the direct path.
     uint64_t              ns_recv_body = 0;
+    // WP_REQ_LOG_TIMELINE=1 only (0 otherwise): steady_clock ns (since
+    // epoch) at the instant this frame was pushed onto the queue -- i.e.
+    // right after the reader's own recv completed, same instant as
+    // ns_recv_body's end. The compute loop diffs its own pop-time reading
+    // against this to get "worker queue-before-dispatch": time a fully-
+    // received frame sat waiting for the compute thread, which is 0 whenever
+    // the queue was empty at push (the common case) and nonzero exactly when
+    // the compute thread is still busy on an earlier frame -- the worker-side
+    // head-of-line effect.
+    uint64_t              queued_at_ns = 0;
+    // WP_REQ_LOG_TIMELINE=1 only (0 otherwise): CLOCK_REALTIME ns at the same
+    // instant as queued_at_ns, for the offline clock-offset estimate.
+    uint64_t              epoch_recv_ns = 0;
+    // *** WP_WORKER_DECODE_AHEAD=1 -- DEFAULT OFF. ***
+    // pipe_decode_expert_dispatch_chunk() (wire unpack of the activation
+    // matrix -- ml8_4/etc -- plus assignment-weight parsing and the
+    // non-finite checks) run on THIS thread, right after recv and before
+    // push(), instead of on the compute thread after pop(). It is a pure
+    // function of (payload bytes, n_embd): no access to ensure_batch, pool_,
+    // or any residency structure, so pulling it forward here does not break
+    // the "reader is transport only" invariant documented above this struct
+    // -- that invariant is about not touching mutable Worker/pool state
+    // without the GPU lock, and decode touches none of it. Only set when the
+    // knob is on AND type == PIPE_EXPERT_DISPATCH_CHUNK; std::nullopt
+    // otherwise (knob off, wrong frame type, or -- see decode_failed below --
+    // decode threw). The point: by the time the compute thread finishes
+    // dispatch() on chunk N and pops chunk N+1, chunk N+1's activations are
+    // already plain f32 sitting in this struct, because the reader decoded
+    // them while dispatch() was still running -- decode moves from strictly
+    // AFTER the previous chunk's response to fully OVERLAPPED with it.
+    std::optional<pipe_expert_dispatch_chunk> decoded_chunk;
+    // Set instead of decoded_chunk when pipe_decode_expert_dispatch_chunk()
+    // threw on the reader thread. The compute thread rethrows a
+    // pipe_protocol_error built from these two fields, from the exact same
+    // try/catch that would have caught the throw had decode run there --
+    // same code, same message, same PIPE_ERROR reply to the peer.
+    bool                   decode_failed = false;
+    pipe_error_code        decode_error_code = PIPE_ERR_BAD_FRAME;
+    std::string            decode_error_msg;
+    // Reader-thread wall time for the decode above, WP_WORKER_STATS-gated
+    // exactly like ns_recv_body -- substituted for RequestStats::ns_req_decode
+    // so the WP_REQ_LOG column keeps meaning "this frame's request decode"
+    // regardless of which thread paid for it. 0 when decode_chunk decode
+    // never ran here (knob off, wrong type, or time_recv false).
+    uint64_t               ns_req_decode_ahead = 0;
 };
 
 // One response frame handed from the compute loop to the writer.
@@ -21038,7 +21142,16 @@ private:
 // Exclusively calls pipe_recv_frame and pushes the result (frame or EOF/error
 // sentinel) onto `frames`. Stops after the first sentinel -- nothing more can
 // ever arrive once pipe_recv_frame has returned false once.
-void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv,
+//
+// decode_ahead/n_embd: WP_WORKER_DECODE_AHEAD=1 only (decode_ahead is false
+// otherwise, and n_embd is unused). See wp_worker_decode_ahead_enabled() and
+// WpPipelineFrame::decoded_chunk for what this does and why it is safe here:
+// pipe_decode_expert_dispatch_chunk() is a pure function of (payload bytes,
+// n_embd) with no access to Worker/pool state, so running it on this thread
+// does not touch anything the "reader is transport only" rule above is
+// protecting.
+void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bool timeline,
+                                      bool decode_ahead, int32_t n_embd,
                                       WpPipelineQueue<WpPipelineFrame> & frames) {
     for (;;) {
         WpPipelineFrame f;
@@ -21050,6 +21163,33 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv,
             const uint64_t now_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             f.ns_recv_body = now_ns - hdr_done_ns;
+            if (timeline) {
+                f.queued_at_ns = now_ns;
+                f.epoch_recv_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            }
+        }
+        if (decode_ahead && f.ok && f.type == PIPE_EXPERT_DISPATCH_CHUNK) {
+            const auto t_decode_start = time_recv
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            try {
+                f.decoded_chunk = pipe_decode_expert_dispatch_chunk(
+                    f.payload.data(), f.payload.size(), n_embd);
+            } catch (const pipe_protocol_error & error) {
+                f.decode_failed = true;
+                f.decode_error_code = error.code;
+                f.decode_error_msg = error.what();
+            } catch (const std::exception & error) {
+                f.decode_failed = true;
+                f.decode_error_code = PIPE_ERR_BAD_FRAME;
+                f.decode_error_msg = error.what();
+            }
+            if (time_recv) {
+                f.ns_req_decode_ahead = (uint64_t) std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t_decode_start).count();
+            }
         }
         const bool eof = !f.ok;
         const size_t bytes = f.payload.size();
@@ -21197,6 +21337,25 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     //   prologue + prep + wait + pagein_compute + result (cols 32,33,34,35,38).
     // Columns 1-40 keep their positions. The aggregate file is unchanged.
     // WP_REQ_LOG_HEADER=1 writes a commented header row as the first line of each file.
+    // WP_REQ_LOG_TIMELINE=1 (see wp_req_log_timeline_enabled()) appends SEVEN
+    // more columns after everything above (after the per-device "extra" block
+    // too, on per-device files), replacing the old bare "chunk_index" suffix
+    // (which was only ever present on stream rows) with an always-present,
+    // positionally-fixed block so the columns can be parsed without knowing
+    // whether a row came from a streamed dispatch:
+    //   chunk_index (UINT32_MAX when this row is not a stream chunk)
+    //   seq_id                the spine's request seq_id -- the correlation
+    //                         key against pipe-expert-dispatcher.cpp's
+    //                         WP_DISPATCH_REQ_LOG/.writer rows.
+    //   ns_recv_body          header-recv-return -> body-complete for this
+    //                         frame (WP_WORKER_PIPELINE=1: measured by the
+    //                         reader thread; see RequestStats::ns_recv_body).
+    //   ns_req_decode         this frame's request decode.
+    //   ns_resp_send          encode + unlock + send + relock for the response.
+    //   ns_queue_wait         reader-queue wait (WP_WORKER_PIPELINE=1 only):
+    //                         frame pushed by the reader -> popped by compute.
+    //   epoch_recv_ns         CLOCK_REALTIME ns at frame arrival, for
+    //                         scripts/wp-req-timeline.py's clock-offset estimate.
     static const char * const k_req_log_header =
         "layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep "
         "ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit "
@@ -21241,10 +21400,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         req_log_dev_files.emplace(name, f);
         return f;
     };
-    auto write_req_log_row = [](FILE * out, int32_t layer, uint32_t n_tokens,
+    const bool req_log_timeline_row = wp_req_log_timeline_enabled();
+    auto write_req_log_row = [req_log_timeline_row](FILE * out, int32_t layer, uint32_t n_tokens,
                                 size_t n_assignments, const RequestStats & s,
                                 uint64_t ns_wall, double epoch_end,
-                                const char * chunk_suffix, bool extra) {
+                                const char * chunk_suffix, bool extra,
+                                uint64_t seq_id, uint32_t chunk_index) {
         if (out == nullptr) {
             return;
         }
@@ -21292,13 +21453,24 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     (unsigned long long) s.ns_readback,
                     ns_leg_unique);
         }
-        fprintf(out, "%s\n", chunk_suffix);
+        if (req_log_timeline_row) {
+            fprintf(out, " %u %llu %llu %llu %llu %llu %llu",
+                    chunk_index, (unsigned long long) seq_id,
+                    (unsigned long long) s.ns_recv_body,
+                    (unsigned long long) s.ns_req_decode,
+                    (unsigned long long) s.ns_resp_send,
+                    (unsigned long long) s.ns_queue_wait,
+                    (unsigned long long) s.epoch_recv_ns);
+        } else {
+            fprintf(out, "%s", chunk_suffix);
+        }
+        fprintf(out, "\n");
         fflush(out);
     };
     auto write_req_log = [&](int32_t layer, uint32_t n_tokens, size_t n_assignments,
                              const RequestStats & s,
                              std::chrono::steady_clock::time_point started,
-                             uint32_t chunk_index) {
+                             uint32_t chunk_index, uint64_t seq_id_for_log = 0) {
         if (started == std::chrono::steady_clock::time_point{}) {
             return;
         }
@@ -21314,14 +21486,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             std::snprintf(chunk_suffix, sizeof(chunk_suffix), " %u", chunk_index);
         }
         write_req_log_row(req_log, layer, n_tokens, n_assignments, s,
-                          ns_wall, epoch_end, chunk_suffix, false);
+                          ns_wall, epoch_end, chunk_suffix, false, seq_id_for_log, chunk_index);
         if (!req_log_per_device) {
             return;
         }
         for (const DeviceReqLog & row : worker.last_device_reqlog()) {
             FILE * f = req_log_dev_file(row.name);
             write_req_log_row(f, layer, n_tokens, row.n_experts, row.stats,
-                              row.stats.ns_dispatch_total, epoch_end, chunk_suffix, true);
+                              row.stats.ns_dispatch_total, epoch_end, chunk_suffix, true,
+                              seq_id_for_log, chunk_index);
         }
     };
     pipe_expert_dispatch_begin split_log_begin;
@@ -21448,6 +21621,26 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // by the reader thread (see WpPipelineFrame::ns_recv_body) -- unused on
     // the direct path.
     uint64_t       pipeline_ns_recv_body = 0;
+    // WP_REQ_LOG_TIMELINE=1 (and WP_WORKER_PIPELINE=1): the reader-queue wait
+    // for the current frame -- now() at pop time minus WpPipelineFrame::
+    // queued_at_ns (the reader's push-time reading). 0 on the direct path
+    // (no queue) and 0 whenever the queue was empty at push.
+    uint64_t       pipeline_ns_queue_wait = 0;
+    // CLOCK_REALTIME ns at frame arrival, for the offline clock-offset
+    // estimate; 0 unless WP_REQ_LOG_TIMELINE=1.
+    uint64_t       pipeline_epoch_recv    = 0;
+    const bool     req_log_timeline = wp_req_log_timeline_enabled();
+    // WP_WORKER_DECODE_AHEAD=1: the current frame's already-decoded request
+    // (WpPipelineFrame::decoded_chunk), and the reader-thread decode-error/
+    // decode-time fields alongside it -- see the DISPATCH_CHUNK branch below,
+    // which is the only consumer. std::nullopt/false/0 whenever the knob is
+    // off, this frame was not a DISPATCH_CHUNK, or the direct (non-pipeline)
+    // path is in use, matching WpPipelineFrame's own defaults.
+    std::optional<pipe_expert_dispatch_chunk> pipeline_decoded_chunk;
+    bool           pipeline_decode_failed     = false;
+    pipe_error_code pipeline_decode_error_code = PIPE_ERR_BAD_FRAME;
+    std::string    pipeline_decode_error_msg;
+    uint64_t       pipeline_ns_req_decode_ahead = 0;
     // Reused response-encode buffer. One per serve_connection call, so one per
     // connection thread -- no sharing, no thread_local, and nothing to
     // synchronise. It removes a heap allocation AND a full zero-fill of the
@@ -21521,7 +21714,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         }();
         (void) pipeline_announced;
         pipeline_threads.reader = std::thread(wp_worker_pipeline_reader_thread,
-            std::ref(socket), time_recv, std::ref(pipeline_frames));
+            std::ref(socket), time_recv, wp_req_log_timeline_enabled(),
+            wp_worker_decode_ahead_enabled(), mine.n_embd, std::ref(pipeline_frames));
         pipeline_threads.writer = std::thread(wp_worker_pipeline_writer_thread,
             std::ref(socket), std::ref(pipeline_responses), std::ref(pipeline_write_failed));
         pipeline_threads.started = true;
@@ -21593,6 +21787,19 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                      payload     = std::move(f.payload);
                      hdr_done_ns = f.hdr_done_ns;
                      pipeline_ns_recv_body = f.ns_recv_body;
+                     if (req_log_timeline && f.queued_at_ns != 0) {
+                         const uint64_t now_ns = (uint64_t) std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+                         pipeline_ns_queue_wait = now_ns > f.queued_at_ns
+                             ? now_ns - f.queued_at_ns : 0;
+                     }
+                     pipeline_epoch_recv = f.epoch_recv_ns;
+                     pipeline_decoded_chunk       = std::move(f.decoded_chunk);
+                     pipeline_decode_failed       = f.decode_failed;
+                     pipeline_decode_error_code   = f.decode_error_code;
+                     pipeline_decode_error_msg    = std::move(f.decode_error_msg);
+                     pipeline_ns_req_decode_ahead = f.ns_req_decode_ahead;
                      return true;
                  }()
                : (await_request(),
@@ -21929,6 +22136,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     // never clobber them.
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.ns_queue_wait  = pipeline_ns_queue_wait;
+                    split_log_stats.epoch_recv_ns  = pipeline_epoch_recv;
                     split_log_stats.n_frames_queued_max =
                         pipeline_on ? pipeline_frames.high_water() : 0;
                     if (stream_sent_count == 0) {
@@ -21939,7 +22148,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
-                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX);
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX,
+                              seq_id);
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
@@ -22037,6 +22247,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     }
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.ns_queue_wait  = pipeline_ns_queue_wait;
+                    split_log_stats.epoch_recv_ns  = pipeline_epoch_recv;
                     split_log_stats.n_frames_queued_max =
                         pipeline_on ? pipeline_frames.high_water() : 0;
                     if (stream_sent_count == 0) {
@@ -22047,7 +22259,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
-                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX);
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX,
+                              seq_id);
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
@@ -22143,6 +22356,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     }
                     split_log_stats.ns_recv_body  = ns_recv_body_frame;
                     split_log_stats.ns_req_decode = ns_req_decode_frame;
+                    split_log_stats.ns_queue_wait  = pipeline_ns_queue_wait;
+                    split_log_stats.epoch_recv_ns  = pipeline_epoch_recv;
                     split_log_stats.n_frames_queued_max =
                         pipeline_on ? pipeline_frames.high_water() : 0;
                     if (stream_sent_count == 0) {
@@ -22153,7 +22368,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     worker.record_stats(split_log_stats, split_log_begin.assignments.size());
                 }
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
-                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX);
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started, UINT32_MAX,
+                              seq_id);
                 split_log_started = std::chrono::steady_clock::time_point{};
                 worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
@@ -22168,15 +22384,36 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
 #endif // __linux__
         if (type == PIPE_EXPERT_DISPATCH_CHUNK) {
             try {
-                const auto t_chunk_decode_start = time_recv
+                // WP_WORKER_DECODE_AHEAD=1: the reader thread already decoded
+                // this frame (or already hit the exact error decoding it
+                // would have thrown here) while this thread was still inside
+                // dispatch() on the PREVIOUS chunk -- see WpPipelineFrame::
+                // decoded_chunk. Reuse that result instead of re-decoding
+                // `payload`: pipe_decode_expert_dispatch_chunk() is a pure
+                // function of the same bytes either way, so the value and any
+                // thrown error are identical, only which thread paid for it
+                // differs. t_chunk_decode_start is left at "now" in that case
+                // so nothing downstream double-counts decode time that did
+                // not happen on this thread.
+                auto t_chunk_decode_start = time_recv
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
-                const pipe_expert_dispatch_chunk chunk =
-                    pipe_decode_expert_dispatch_chunk(payload.data(), payload.size(), mine.n_embd);
-                const uint64_t ns_req_decode_frame = time_recv
-                    ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now() - t_chunk_decode_start).count()
-                    : 0;
+                uint64_t ns_req_decode_frame;
+                pipe_expert_dispatch_chunk chunk;
+                if (pipeline_decoded_chunk.has_value()) {
+                    chunk = std::move(*pipeline_decoded_chunk);
+                    ns_req_decode_frame = pipeline_ns_req_decode_ahead;
+                } else if (pipeline_decode_failed) {
+                    throw pipe_protocol_error(pipeline_decode_error_code,
+                                              pipeline_decode_error_msg);
+                } else {
+                    chunk = pipe_decode_expert_dispatch_chunk(
+                        payload.data(), payload.size(), mine.n_embd);
+                    ns_req_decode_frame = time_recv
+                        ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - t_chunk_decode_start).count()
+                        : 0;
+                }
                 if (!stream_dispatch.active) {
                     if (chunk.chunk_index != 0 || chunk.token_start != 0) {
                         throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
@@ -22273,6 +22510,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 if (worker.stats_enabled()) {
                     request_stats.ns_recv_body = ns_recv_body_frame;
                     request_stats.ns_req_decode = ns_req_decode_frame;
+                    request_stats.ns_queue_wait = pipeline_ns_queue_wait;
+                    request_stats.epoch_recv_ns = pipeline_epoch_recv;
                     request_stats.ns_send = (uint64_t) std::chrono::duration_cast<
                         std::chrono::nanoseconds>(t_sent - send_started).count();
                     request_stats.ns_resp_send = request_stats.ns_send;
@@ -22283,7 +22522,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 if (worker.stats_enabled() && req_log != nullptr) {
                     write_req_log(chunk.request.layer, chunk.request.n_tokens,
                                   chunk.request.assignments.size(), request_stats,
-                                  req_started, chunk.chunk_index);
+                                  req_started, chunk.chunk_index, seq_id);
                 }
                 worker.spec_pagein_after_dispatch();
                 ++stream_dispatch.next_index;
@@ -22418,6 +22657,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 }
                 request_stats.ns_recv_body  = ns_recv_body_frame;
                 request_stats.ns_req_decode = ns_req_decode_frame;
+                request_stats.ns_queue_wait  = pipeline_ns_queue_wait;
+                request_stats.epoch_recv_ns  = pipeline_epoch_recv;
                 request_stats.n_frames_queued_max =
                     pipeline_on ? pipeline_frames.high_water() : 0;
                 // Same window as ns_send on this branch (t_sent is taken after
@@ -22456,7 +22697,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             // unflushed stdio buffer produced 0-byte files the first time.
             if (measure && req_log != nullptr) {
                 write_req_log(request.layer, request.n_tokens, request.assignments.size(),
-                              request_stats, req_started, UINT32_MAX);
+                              request_stats, req_started, UINT32_MAX, seq_id);
             }
             worker.spec_pagein_after_dispatch();
         } catch (const pipe_protocol_error & error) {
