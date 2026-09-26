@@ -205,6 +205,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv41-spine-load.cpp)
     target_include_directories(test-dsv41-spine-load PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(test-sidecar-mmap.cpp)
+    target_include_directories(test-sidecar-mmap PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 

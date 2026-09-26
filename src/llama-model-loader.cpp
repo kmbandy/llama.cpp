@@ -568,6 +568,11 @@ llama_model_loader::llama_model_loader(
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
+    // MAD-LAB: see the comment on `sidecar_mmap_only` in llama-model-loader.h.
+    if (const char * env = getenv("LLAMA_MMAP_SIDECAR_ONLY")) {
+        this->sidecar_mmap_only = env[0] != '\0' && env[0] != '0';
+    }
+
     if (!fname.empty()) {
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
@@ -687,6 +692,7 @@ llama_model_loader::llama_model_loader(
         // their own GGUF) that carry no split.* metadata. Loaded after any
         // numbered splits, in the given order; each gets the next file_idx,
         // which is what the weight pager keys page sources on.
+        n_main_files = (uint32_t) files.size();
         for (const std::string & fname_side : sidecars) {
             struct ggml_context * ctx_side = NULL;
             struct gguf_init_params side_params = {
@@ -779,6 +785,13 @@ llama_model_loader::llama_model_loader(
                 weights_map.emplace(tensor_name, llama_tensor_weight(cur));
             }
         }
+    }
+
+    // MAD-LAB: only the `!fname.empty()` branch above can append sidecars
+    // (and sets n_main_files itself, before doing so); every other branch
+    // has no sidecars, so all of `files` counts as "main".
+    if (n_main_files == 0) {
+        n_main_files = (uint32_t) files.size();
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -1541,6 +1554,19 @@ void llama_model_loader::done_getting_tensors(bool partial, bool pipeline_band) 
     }
 }
 
+bool llama_model_loader::mmap_enabled_for_file(uint32_t idx) const {
+    if (!use_mmap) {
+        return false;
+    }
+    if (sidecar_mmap_only && idx < n_main_files && files.size() > n_main_files) {
+        // main/split file, sidecar-mmap-only mode: no OS mmap for this file
+        // unless it has lazy-read ranges of its own (main files never do in
+        // practice, but honor the contract exactly).
+        return !lazy.for_file(idx).empty();
+    }
+    return true;
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
@@ -1548,6 +1574,21 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
             const auto & file = files[idx];
+
+            if (!mmap_enabled_for_file(idx)) {
+                // MAD-LAB: sidecar-mmap-only mode. This file is read directly
+                // (seek + read into upload buffers) in load_all_data()
+                // instead of being mapped, so its page cache never stays
+                // resident after its tensors are copied out. Keep `mappings`
+                // / `mmaps_used` / `mlock_mmaps` aligned with `files` by
+                // pushing an empty placeholder.
+                mappings.emplace_back(nullptr);
+                mmaps_used.emplace_back(0, 0);
+                if (mlock_mmaps) {
+                    mlock_mmaps->emplace_back(nullptr);
+                }
+                continue;
+            }
 
             bool is_numa = false;
 
@@ -1598,7 +1639,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 }
 
 void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
-    if (!use_mmap) { return; }
+    if (!mmap_enabled_for_file(w.idx)) { return; }
     mappings.at(w.idx)->unmap_fragment(w.offs, w.offs + ggml_nbytes(w.tensor));
 }
 
@@ -1607,7 +1648,7 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
 
     const void * data = buf;
 
-    if (use_mmap) {
+    if (mmap_enabled_for_file(w.idx)) {
         data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;
     } else {
         GGML_ASSERT(buf != nullptr);
@@ -1663,8 +1704,22 @@ bool llama_model_loader::load_all_data(
         return env != nullptr && env[0] == '1' && env[1] == '\0';
     }();
 
+    // MAD-LAB: with sidecar_mmap_only, some files (the main/split GGUFs) are
+    // read directly instead of mmapped even though `use_mmap` is globally
+    // true (the sidecar needs it). Any such file's tensors take the
+    // non-mapping branch below and can use the async pinned-upload path, so
+    // don't skip setting it up just because use_mmap is set. When
+    // sidecar_mmap_only is off this is identical to `!use_mmap`.
+    bool any_direct_io_file = false;
+    for (uint32_t idx = 0; idx < files.size(); idx++) {
+        if (!mmap_enabled_for_file(idx)) {
+            any_direct_io_file = true;
+            break;
+        }
+    }
+
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors || sync_load) {
+        if (!any_direct_io_file || check_tensors || sync_load) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1760,7 +1815,7 @@ bool llama_model_loader::load_all_data(
 
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
-    if (!use_mmap) {
+    if (any_direct_io_file) {
         std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
             const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
             const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
@@ -1813,7 +1868,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        const bool from_mapping = mmap_enabled_for_file(weight->idx) || lazy.has(cur);
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1980,8 +2035,13 @@ bool llama_model_loader::load_all_data(
             const int64_t t_unmap_us = ggml_time_us();
             size_t n_unmapped = 0;
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
-                const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
+                if (!mapping) {
+                    // MAD-LAB: sidecar-mmap-only mode -- this file was never
+                    // mapped in the first place (see init_mappings()).
+                    continue;
+                }
+                const auto & mmap_used = mmaps_used.at(idx);
                 n_unmapped += mmap_used.first;
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {

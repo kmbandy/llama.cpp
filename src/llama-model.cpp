@@ -3015,6 +3015,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                // MAD-LAB: sidecar-mmap-only mode -- this file has no mapping
+                // (ml.mappings.at(idx) is null, see init_mappings()), so it
+                // can't supply a host_ptr view here. Its tensors are picked
+                // up by the direct-io fallback allocation below instead.
+                if (!ml.mmap_enabled_for_file(idx)) {
+                    continue;
+                }
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
                 //     then we could just use metal for all layers
@@ -3032,6 +3039,60 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+            }
+
+            // MAD-LAB: direct-io fallback. Any tensor in this ctx that belongs
+            // to a file sidecar_mmap_only decided NOT to mmap (skipped just
+            // above) is still unallocated at this point -- the host_ptr views
+            // above only cover mmap-enabled files. Give those tensors a real
+            // buffer here, sized to just themselves, so load_all_data() (which
+            // will read them via plain file I/O, since mmap_enabled_for_file()
+            // is false for their file) has somewhere to write. Tensors already
+            // covered above keep data == nullptr here -- load_all_data() binds
+            // them lazily via ggml_backend_tensor_alloc(), which this must not
+            // race ahead of.
+            {
+                const size_t alignment = ggml_backend_buft_get_alignment(buft);
+                auto align_up = [&](size_t s) { return (s + alignment - 1) & ~(alignment - 1); };
+                size_t total = 0;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->data != nullptr) {
+                        continue;
+                    }
+                    const auto * w = ml.get_weight(ggml_get_name(t));
+                    if (w == nullptr || ml.mmap_enabled_for_file(w->idx)) {
+                        continue;
+                    }
+                    total += align_up(ggml_backend_buft_get_alloc_size(buft, t));
+                }
+                if (total > 0) {
+                    ggml_backend_buffer_t direct_buf = ggml_backend_buft_alloc_buffer(buft, total);
+                    if (direct_buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer for non-mmapped tensors", ggml_backend_buft_name(buft)));
+                    }
+                    char * base = (char *) ggml_backend_buffer_get_base(direct_buf);
+                    size_t offset = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        if (t->data != nullptr) {
+                            continue;
+                        }
+                        const auto * w = ml.get_weight(ggml_get_name(t));
+                        if (w == nullptr || ml.mmap_enabled_for_file(w->idx)) {
+                            continue;
+                        }
+                        if (ggml_backend_tensor_alloc(direct_buf, t, base + offset) != GGML_STATUS_SUCCESS) {
+                            throw std::runtime_error(format("unable to allocate tensor '%s' in non-mmapped buffer", ggml_get_name(t)));
+                        }
+                        offset += align_up(ggml_backend_buft_get_alloc_size(buft, t));
+                    }
+                    if (use_mlock && ggml_backend_buffer_is_host(direct_buf)) {
+                        pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                        auto & mlock_buf = pimpl->mlock_bufs.back();
+                        mlock_buf->init   (ggml_backend_buffer_get_base(direct_buf));
+                        mlock_buf->grow_to(ggml_backend_buffer_get_size(direct_buf));
+                    }
+                    bufs.emplace_back(direct_buf);
+                }
             }
         } else {
             ggml_backend_buffer_t buf;

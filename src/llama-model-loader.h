@@ -106,6 +106,31 @@ struct llama_model_loader {
     bool load_mtp;
     bool is_pipeline_band = false;
 
+    // MAD-LAB: LLAMA_MMAP_SIDECAR_ONLY=1 keeps use_mmap semantics for sidecar
+    // GGUFs (needed by TENSOR_READ_LAZY engram gathers, which alias tensor
+    // data directly into the mapping) while forcing the main/split files to
+    // load via plain file I/O + upload buffers instead of mmap. This exists
+    // because the existing unmap_fragment cleanup in load_all_data() only
+    // trims the mapping *outside* the envelope of host-aliased tensors: if a
+    // model keeps even one tensor host-resident near the start of the file
+    // and one near the end (e.g. tied token_embd / output kept on CPU while
+    // everything else uploads to the GPU), the whole file stays mapped and
+    // resident for the model's lifetime even though the GPU tensors in
+    // between were only ever read once, to copy them out. Per-file mmap
+    // sidesteps that: a file that is never mapped can never leak resident
+    // pages. Default off; when unset, mmap_enabled_for_file() is identical
+    // to `use_mmap` for every file, i.e. this is a no-op unless requested.
+    bool sidecar_mmap_only = false;
+
+    // number of files loaded before any `sidecars` (main file + any
+    // split.* shards); files at idx >= n_main_files are sidecar GGUFs.
+    uint32_t n_main_files = 0;
+
+    // per-file mmap decision. See `sidecar_mmap_only` above. Always equal to
+    // `use_mmap` unless sidecar_mmap_only disables it for a main/split file
+    // that has no lazy-read ranges of its own.
+    bool mmap_enabled_for_file(uint32_t idx) const;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {
