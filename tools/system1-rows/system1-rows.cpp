@@ -798,11 +798,16 @@ int main(int argc, char ** argv) {
             }
             confirmed_upto = i + 1;
         }
-        // fclose flushes buffered writes; if it fails we cannot trust that anything
-        // buffered since the last successful flush actually reached disk, so nothing
-        // is "confirmed" beyond this point either.
+        // fclose flushes buffered writes; if it fails we cannot trust that ANY of the
+        // buffered data actually reached disk, including bytes from entries whose
+        // fwrite() calls all reported success earlier in this loop (stdio buffers
+        // across calls, so a flush failure here can lose all of it, not just the most
+        // recent write). Reset confirmed_upto to 0 so the downgrade loop below covers
+        // every entry, not just the ones written after the last (nonexistent) partial
+        // flush.
         if (fclose(out) != 0) {
             write_ok = false;
+            confirmed_upto = 0;
         }
     }
     if (!write_ok) {
