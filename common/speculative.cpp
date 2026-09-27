@@ -4414,6 +4414,12 @@ common_speculative_init_result::common_speculative_init_result(
             return (uint32_t) 256;
         }();
         cparams.n_ubatch = std::min(cparams.n_ubatch, wp_mtp_draft_ubatch);
+        // Block drafters (DFlash/DSpark) cap n_outputs_max at n_parallel*(n_max+1)
+        // for the decode step, but the prompt catch-up encodes up to n_ubatch rows
+        // per call (see the chunk loop in process()), and output_reserve asserts
+        // against n_outputs_max -- a 256-row chunk vs an 8-row budget aborted DS4.1
+        // on its first prompt. Cover the chunk; the host rows cost n_vocab*n_ubatch*4.
+        cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_ubatch);
     }
 
     // MAD-LAB: select the graph for an in-model DSpark context.
