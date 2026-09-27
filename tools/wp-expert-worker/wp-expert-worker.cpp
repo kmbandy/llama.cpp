@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-ml8.h"
 #include "ggml-vulkan.h"
 #include "pipe-expert-dispatcher.h"
 #include "pipe-protocol.h"
@@ -12,7 +13,9 @@
 
 extern "C" {
 #include "sha256/sha256.h"
+#ifdef GGML_USE_CUDA
 bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int64_t ne);
+#endif
 }
 
 #include <nlohmann/json.hpp>
@@ -3110,12 +3113,34 @@ static constexpr const char * INDEX_FORMAT =
     "llama.cpp.weight-pager.expert-shard-index";
 static constexpr const char * DESCRIPTOR_FORMAT =
     "llama.cpp.weight-pager.expert-descriptor";
+// Rotation applied to a role's input dim K before the matmul: mirrors the
+// descriptor's optional "rotation" object (see wp-expert-descriptor.cpp's
+// RotationDesc / role_to_json). kind 1 = kronecker_orth_sylvester (carries
+// h_a, a*a floats); kind 2 = block_hadamard (no h_a).
+struct RotationSpec {
+    int                kind = 0;
+    int64_t            a = 0;
+    int64_t            b = 0;
+    int64_t            k = 0;
+    std::vector<float> h_a;
+};
+
 struct RoleSpec {
     enum ggml_type type = GGML_TYPE_COUNT;
     int64_t        ne0 = 0;
     int64_t        ne1 = 0;
     uint64_t       bytes = 0;
     std::string    source_tensor_name;
+
+    // lut_bytes: ML8_4 centroid LUT bytes appended after the weight bytes in
+    // this role's page member (0 when the role carries no LUT). Descriptor
+    // key "lut_bytes_per_expert"; defaults to 0 when absent (back-compat).
+    uint64_t lut_bytes = 0;
+
+    // Optional per-role rotation; absent (has_rotation == false) unless the
+    // descriptor carries a "rotation" object for this role.
+    bool          has_rotation = false;
+    RotationSpec  rotation;
 };
 
 struct HParams {
@@ -3315,6 +3340,46 @@ RoleSpec parse_role(const json & value, const fs::path & path) {
         ggml_row_size(role.type, role.ne0) * (uint64_t) role.ne1 != role.bytes) {
         throw std::runtime_error(path.string() + ": expert role shape/type byte count is invalid");
     }
+
+    role.lut_bytes = value.value("lut_bytes_per_expert", (uint64_t) 0);
+    if (role.type == GGML_TYPE_ML8_4) {
+        if (role.ne0 % 64 != 0 || role.lut_bytes != 16 * (uint64_t) (role.ne0 / 64)) {
+            throw std::runtime_error(path.string() + ": ML8_4 role has an invalid lut_bytes_per_expert");
+        }
+    } else if (role.lut_bytes != 0) {
+        throw std::runtime_error(path.string() + ": non-ML8_4 role has a non-zero lut_bytes_per_expert");
+    }
+
+    if (value.contains("rotation")) {
+        const json & rot = value.at("rotation");
+        RotationSpec rs;
+        rs.kind = get_value<int>(rot, "kind", path);
+        rs.a    = get_value<int64_t>(rot, "a", path);
+        rs.b    = get_value<int64_t>(rot, "b", path);
+        rs.k    = get_value<int64_t>(rot, "k", path);
+        if (rs.kind != GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER &&
+            rs.kind != GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD) {
+            throw std::runtime_error(path.string() + ": rotation has unknown kind");
+        }
+        if (rs.a <= 0 || rs.b <= 0 || rs.a * rs.b != rs.k || rs.k != role.ne0 ||
+            (rs.b & (rs.b - 1)) != 0) {
+            throw std::runtime_error(path.string() + ": rotation a/b/k is inconsistent or does not match role ne0");
+        }
+        if (rs.kind == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+            const json & h_a = get_array(rot, "h_a", path);
+            if ((int64_t) h_a.size() != rs.a * rs.a) {
+                throw std::runtime_error(path.string() + ": rotation h_a size does not match a*a");
+            }
+            rs.h_a.reserve(h_a.size());
+            for (const json & v : h_a) {
+                rs.h_a.push_back(v.get<float>());
+            }
+        } else if (rot.contains("h_a")) {
+            throw std::runtime_error(path.string() + ": block_hadamard rotation must not carry h_a");
+        }
+        role.has_rotation = true;
+        role.rotation     = std::move(rs);
+    }
     return role;
 }
 
@@ -3410,6 +3475,19 @@ Descriptor load_descriptor(const fs::path & path) {
         std::map<std::string, RoleSpec> parsed;
         for (const std::string name : { "gate", "up", "down" }) {
             parsed.emplace(name, parse_role(roles.at(name), path));
+        }
+        {
+            const RoleSpec & gate = parsed.at("gate");
+            const RoleSpec & up   = parsed.at("up");
+            if (gate.has_rotation != up.has_rotation ||
+                (gate.has_rotation &&
+                 (gate.rotation.kind != up.rotation.kind || gate.rotation.a != up.rotation.a ||
+                  gate.rotation.b != up.rotation.b || gate.rotation.k != up.rotation.k ||
+                  gate.rotation.h_a != up.rotation.h_a))) {
+                throw std::runtime_error(
+                    path.string() + ": layer " + std::to_string(layer) +
+                    " gate and up rotations must be identical (they share the input)");
+            }
         }
         const int64_t n_ff = result.sliced ? result.slice_last - result.slice_first : result.hparams.n_ff_exp;
         if (parsed.at("gate").ne0 != result.hparams.n_embd ||
@@ -3575,7 +3653,8 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
                 const uint64_t size   = get_value<uint64_t>(member, "size", index_path);
                 const std::string source_tensor_name =
                     get_value<std::string>(member, "source_tensor_name", index_path);
-                if (offset != next_offset || size != role_specs.at(role).bytes ||
+                if (offset != next_offset ||
+                    size != role_specs.at(role).bytes + role_specs.at(role).lut_bytes ||
                     source_tensor_name != role_specs.at(role).source_tensor_name ||
                     page.roles.count(role) != 0) {
                     throw std::runtime_error(
@@ -9952,6 +10031,7 @@ public:
         if (!compute_galloc_) {
             throw std::runtime_error("failed to create expert graph allocator");
         }
+        init_rotation_tensors();
         // The pool logs demand and speculative page-ins into the Worker's handle
         // so every event lands in one ordered stream. The coordinator owns the
         // handle because all device workers write to the same log.
@@ -13574,6 +13654,7 @@ private:
             bool add_previous,
             size_t result_offset,
             RequestStats & request_stats) {
+        reject_if_ml8_special(pages, "compute_batch_fused");
         if (ggml_backend_vk_wp_fused_expert == nullptr) {
             request_stats.n_vk_fused_skip_dispatch_fail++;
             return false;
@@ -13930,6 +14011,7 @@ private:
             CpuSerialSmallGuard(const CpuSerialSmallGuard &) = delete;
             CpuSerialSmallGuard & operator=(const CpuSerialSmallGuard &) = delete;
         };
+        reject_if_ml8_special(pages, "compute_batch");
         const CpuSerialSmallGuard cpu_serial_small(this, request.n_tokens, &request_stats);
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::chrono::steady_clock::time_point vk_compute_started =
@@ -15213,6 +15295,7 @@ private:
             bool add_previous,
             bool use_gather,
             RequestStats & request_stats) {
+        reject_if_ml8_special(pages, "compute_batch_mmid");
         std::vector<size_t> sel;
         sel.reserve(n_selected);
         for (size_t i = 0; i < request.assignments.size(); ++i) {
@@ -15673,6 +15756,7 @@ private:
             RequestStats & request_stats,
             bool collapse_copies,
             bool warn_grouped_gemv) {
+        reject_if_ml8_special(pages, "compute_batch_grouped");
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const auto build_started = std::chrono::steady_clock::now();
 
@@ -16204,6 +16288,7 @@ private:
             const std::vector<const ExpertPage *> & pages,
             const ExpertSlotPool::Batch & batch,
             RequestStats & request_stats) {
+        reject_if_ml8_special(pages, "compute_batch_arena_prefill");
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::optional<ExpertSlotPool::ArenaLayout> & layout_opt = pool_.arena_layout();
         if (!layout_opt.has_value()) {
@@ -16763,6 +16848,7 @@ private:
             const ExpertSlotPool::ArenaLayout & layout,
             const std::array<ArenaRoleKey, 3> & roles,
             const std::vector<ArenaGroup> & groups) {
+        reject_if_ml8_special(pages, "compute_batch_arena_multi");
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const size_t n = request.assignments.size();
         const size_t params_align = ggml_backend_buft_get_alignment(
@@ -17037,6 +17123,7 @@ private:
             const std::vector<const ExpertPage *> & pages,
             const ExpertSlotPool::Batch & batch,
             RequestStats & request_stats) {
+        reject_if_ml8_special(pages, "compute_batch_arena");
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::optional<ExpertSlotPool::ArenaLayout> & layout_opt = pool_.arena_layout();
         if (!layout_opt.has_value()) {
@@ -17519,6 +17606,7 @@ private:
                 return v != nullptr && (std::strcmp(v, "ml8_4") == 0 || std::strcmp(v, "ml8-4") == 0);
             }();
             if (ml8_wire && result.size() % 32 == 0) {
+#ifdef GGML_USE_CUDA
                 void * base = ggml_backend_buffer_get_base(buf);
                 const float * d_src = reinterpret_cast<const float *>(
                     static_cast<char *>(base) + effective_result_offset);
@@ -17531,6 +17619,11 @@ private:
                     return;
                 }
                 ml8_wire_partial_.clear();
+#else
+                throw std::runtime_error(
+                    "WP_EXPERT_WIRE=ml8_4 requires a CUDA/HIP build (ggml_cuda_expert_wire_pack_ml8_4_device "
+                    "is not available in this CPU-only build)");
+#endif
             }
         }
         const auto readback_started = std::chrono::steady_clock::now();
@@ -17840,6 +17933,109 @@ private:
     ResidentExpertPool resident_;
     ExpertSlotPool pool_;
     galloc_ptr     compute_galloc_;
+    // ml8 rotation: resident F32 [a,a] h_a tensors for every (layer, role)
+    // whose rotation is kronecker_orth_sylvester (kind 1). One shared context
+    // + device buffer for the whole catalog -- these are tiny (a is small,
+    // e.g. 8x8 = 256 floats) and never change after load, unlike the
+    // per-request graph tensors above. block_hadamard (kind 2) needs no
+    // resident tensor (no h_a), so it has no entry here. Built by
+    // init_rotation_tensors(), called once from the constructor after
+    // backend_/compute_galloc_ exist. NOT yet wired into any compute path
+    // (see gating in compute_batch* -- ml8-special layers fail loudly instead
+    // of computing); a later step consumes these.
+    context_ptr    rotation_ctx_;
+    buffer_ptr     rotation_buf_;
+    std::map<std::pair<int, std::string>, ggml_tensor *> rotation_h_a_;
+
+    void init_rotation_tensors() {
+        size_t n_kronecker = 0;
+        for (const auto & layer_kv : catalog_.descriptor.layers) {
+            for (const auto & role_kv : layer_kv.second) {
+                const RoleSpec & role = role_kv.second;
+                if (role.has_rotation && role.rotation.kind == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+                    ++n_kronecker;
+                }
+            }
+        }
+        if (n_kronecker == 0) {
+            return;
+        }
+        const size_t ctx_size = n_kronecker * ggml_tensor_overhead() + ggml_graph_overhead();
+        const ggml_init_params params = {
+            /* .mem_size   = */ ctx_size,
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        rotation_ctx_.reset(ggml_init(params));
+        if (!rotation_ctx_) {
+            throw std::runtime_error("failed to allocate ml8 rotation tensor context");
+        }
+        for (const auto & layer_kv : catalog_.descriptor.layers) {
+            for (const auto & role_kv : layer_kv.second) {
+                const RoleSpec & role = role_kv.second;
+                if (!role.has_rotation ||
+                    role.rotation.kind != GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+                    continue;
+                }
+                ggml_tensor * t = ggml_new_tensor_2d(
+                    rotation_ctx_.get(), GGML_TYPE_F32, role.rotation.a, role.rotation.a);
+                ggml_set_name(t, ("ml8_rotation_h_a." + std::to_string(layer_kv.first) + "." + role_kv.first).c_str());
+                rotation_h_a_.emplace(std::make_pair(layer_kv.first, role_kv.first), t);
+            }
+        }
+        rotation_buf_.reset(ggml_backend_alloc_ctx_tensors(rotation_ctx_.get(), backend_.get()));
+        if (!rotation_buf_) {
+            throw std::runtime_error("failed to allocate ml8 rotation tensor buffer");
+        }
+        for (const auto & layer_kv : catalog_.descriptor.layers) {
+            for (const auto & role_kv : layer_kv.second) {
+                const RoleSpec & role = role_kv.second;
+                if (!role.has_rotation ||
+                    role.rotation.kind != GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+                    continue;
+                }
+                ggml_tensor * t = rotation_h_a_.at({ layer_kv.first, role_kv.first });
+                ggml_backend_tensor_set(
+                    t, role.rotation.h_a.data(), 0, role.rotation.h_a.size() * sizeof(float));
+            }
+        }
+    }
+
+    // ml8-special: true when this layer has any role carrying a rotation or
+    // stored as ML8_4 -- every compute path currently REFUSES such layers
+    // (see the "ml8 rotation/ML8_4 experts not yet supported" checks); a
+    // later step wires the actual computation up.
+    bool layer_is_ml8_special(int layer) const {
+        const auto it = catalog_.descriptor.layers.find(layer);
+        if (it == catalog_.descriptor.layers.end()) {
+            return false;
+        }
+        for (const auto & role_kv : it->second) {
+            if (role_kv.second.has_rotation || role_kv.second.type == GGML_TYPE_ML8_4) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Gate for every compute path below: none of them yet know how to apply
+    // an ml8 rotation or route through GGML_OP_ML8_MUL_MAT[_ID] with a
+    // non-contiguous slot-arena view, so fail loudly instead of silently
+    // computing wrong numbers. ML8_FP8 WITHOUT rotation is a plain ggml type
+    // and is NOT gated here (it already flows through these paths fine).
+    // Called at the top of compute_batch() (the single real dispatcher --
+    // every other compute_batch_* below is only ever reached through it) AND
+    // redundantly at the top of each compute_batch_* for defense in depth,
+    // in case a future caller reaches one directly.
+    void reject_if_ml8_special(const std::vector<const ExpertPage *> & pages, const char * path_name) const {
+        for (const ExpertPage * page : pages) {
+            if (page != nullptr && layer_is_ml8_special(page->layer)) {
+                throw std::runtime_error(
+                    std::string("ml8 rotation/ML8_4 experts not yet supported by ") + path_name);
+            }
+        }
+    }
+
     buffer_ptr     io_buffer_;
     size_t         io_buffer_size_ = 0;
     // WP_IO_SMALL_TOKENS: a SECOND, small, host-visible io buffer used only for

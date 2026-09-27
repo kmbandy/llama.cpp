@@ -1,6 +1,7 @@
 #include "wp-expert-descriptor.h"
 
 #include "ggml.h"
+#include "ggml-ml8.h"
 #include "gguf.h"
 
 #include <nlohmann/json.hpp>
@@ -50,6 +51,18 @@ using ggml_ptr = std::unique_ptr<ggml_context, ggml_deleter>;
 
 // Options is defined in wp-expert-descriptor.h (shared with the test target).
 
+// ml8 rotation for a (layer, role): mirrors the top-level "ml8_rotation"
+// index entry (see tools/wp-repack/wp-repack.cpp's ml8_rotation_json_for_layer).
+// kind 1 = kronecker_orth_sylvester (carries h_a, size a*a floats),
+// kind 2 = block_hadamard (no h_a).
+struct RotationDesc {
+    int                kind = 0;
+    int64_t            a = 0;
+    int64_t            b = 0;
+    int64_t            k = 0;
+    std::vector<float> h_a;
+};
+
 struct RoleDesc {
     std::string    role;
     std::string    source_tensor_name;
@@ -57,6 +70,21 @@ struct RoleDesc {
     int64_t        ne0 = 0;
     int64_t        ne1 = 0;
     uint64_t       bytes = 0;
+
+    // lut_bytes_per_expert: the ML8_4 centroid LUT size appended after the
+    // weight bytes in this role's shard-index member, in bytes; 0 when the
+    // role carries no LUT (non-ML8_4, or ML8_4 with a global/no LUT). Set the
+    // first time a group's member for this (layer, role) is seen and then
+    // required to match on every subsequent expert -- back-compat manifests
+    // (no "lut_bytes" member key) leave this 0, matching today's output.
+    uint64_t lut_bytes_per_expert = 0;
+    bool     lut_bytes_seen = false;
+
+    // Optional per-(layer, role) rotation, from the shard index's top-level
+    // "ml8_rotation" key. has_rotation stays false (today's output, exactly)
+    // when the index carries no such key for this layer/role.
+    bool          has_rotation = false;
+    RotationDesc  rotation;
 };
 
 using LayerRoles = std::map<std::string, RoleDesc>;
@@ -201,13 +229,27 @@ std::string role_from_mask(uint64_t mask) {
 }
 
 json role_to_json(const RoleDesc & role) {
-    return {
+    json out = {
         { "ggml_type",         (int) role.type       },
         { "ggml_type_name",    ggml_type_name(role.type) },
         { "shape",             { role.ne0, role.ne1 } },
         { "bytes_per_expert",  role.bytes           },
         { "source_tensor_name", role.source_tensor_name },
+        { "lut_bytes_per_expert", role.lut_bytes_per_expert },
     };
+    if (role.has_rotation) {
+        json rotation = {
+            { "kind", role.rotation.kind },
+            { "a",    role.rotation.a    },
+            { "b",    role.rotation.b    },
+            { "k",    role.rotation.k    },
+        };
+        if (role.rotation.kind == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+            rotation["h_a"] = role.rotation.h_a;
+        }
+        out["rotation"] = std::move(rotation);
+    }
+    return out;
 }
 
 void validate_role_shape(
@@ -525,6 +567,88 @@ int run(const Options & options) {
             throw std::runtime_error(index_path.string() + ": group count does not match retained range");
         }
         layer_n_expert[layer_first] = (int) groups.size();
+
+        // ml8_rotation: optional top-level index key, per (layer, role).
+        // Missing entirely (or missing this layer) leaves every role's
+        // has_rotation false -- today's output, exactly.
+        if (index.contains("ml8_rotation")) {
+            const json & rotation_top = index.at("ml8_rotation");
+            if (!rotation_top.is_object()) {
+                throw std::runtime_error(index_path.string() + ": ml8_rotation is not an object");
+            }
+            const std::string layer_key = std::to_string(layer_first);
+            if (rotation_top.contains(layer_key)) {
+                const json & layer_rotation = rotation_top.at(layer_key);
+                if (!layer_rotation.is_object()) {
+                    throw std::runtime_error(index_path.string() + ": ml8_rotation." + layer_key + " is not an object");
+                }
+                for (const auto & rk : layer_rotation.items()) {
+                    const std::string & role_name = rk.key();
+                    if (role_name != "gate" && role_name != "up" && role_name != "down") {
+                        throw std::runtime_error(index_path.string() + ": ml8_rotation has unknown role " + role_name);
+                    }
+                    const json & entry = rk.value();
+                    RotationDesc rd;
+                    rd.kind = get_value<int>(entry, "kind", index_path);
+                    rd.a    = get_value<int64_t>(entry, "a", index_path);
+                    rd.b    = get_value<int64_t>(entry, "b", index_path);
+                    rd.k    = get_value<int64_t>(entry, "k", index_path);
+                    if (rd.kind != GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER &&
+                        rd.kind != GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD) {
+                        throw std::runtime_error(
+                            index_path.string() + ": ml8_rotation role " + role_name +
+                            " has unknown kind " + std::to_string(rd.kind));
+                    }
+                    if (rd.a <= 0 || rd.b <= 0 || rd.a * rd.b != rd.k) {
+                        throw std::runtime_error(
+                            index_path.string() + ": ml8_rotation role " + role_name + " has inconsistent a*b != k");
+                    }
+                    if ((rd.b & (rd.b - 1)) != 0) {
+                        throw std::runtime_error(
+                            index_path.string() + ": ml8_rotation role " + role_name + " has non-power-of-2 b");
+                    }
+                    const int64_t want_k = sliced ? (role_name == "down" ? slice_width : (int64_t) n_embd)
+                                                   : layer_it->second.at(role_name).ne0;
+                    if (rd.k != want_k) {
+                        throw std::runtime_error(
+                            index_path.string() + ": ml8_rotation role " + role_name + " k=" +
+                            std::to_string(rd.k) + " does not match role ne0=" + std::to_string(want_k));
+                    }
+                    if (rd.kind == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+                        const json & h_a = get_array(entry, "h_a", index_path);
+                        if ((int64_t) h_a.size() != rd.a * rd.a) {
+                            throw std::runtime_error(
+                                index_path.string() + ": ml8_rotation role " + role_name +
+                                " h_a size does not match a*a");
+                        }
+                        rd.h_a.reserve(h_a.size());
+                        for (const json & v : h_a) {
+                            rd.h_a.push_back(v.get<float>());
+                        }
+                    } else if (entry.contains("h_a")) {
+                        throw std::runtime_error(
+                            index_path.string() + ": ml8_rotation role " + role_name +
+                            " is block_hadamard but carries h_a");
+                    }
+                    RoleDesc & role = layer_it->second.at(role_name);
+                    role.has_rotation = true;
+                    role.rotation     = std::move(rd);
+                }
+            }
+        }
+        {
+            const RoleDesc & gate = layer_it->second.at("gate");
+            const RoleDesc & up   = layer_it->second.at("up");
+            if (gate.has_rotation != up.has_rotation ||
+                (gate.has_rotation &&
+                 (gate.rotation.kind != up.rotation.kind || gate.rotation.a != up.rotation.a ||
+                  gate.rotation.b != up.rotation.b || gate.rotation.k != up.rotation.k ||
+                  gate.rotation.h_a != up.rotation.h_a))) {
+                throw std::runtime_error(
+                    index_path.string() + ": gate and up rotations must be identical (they share the input)");
+            }
+        }
+
         uint64_t next_offset = 0;
         int expected_expert = expert_first;
         for (const json & group : groups) {
@@ -545,7 +669,7 @@ int run(const Options & options) {
                 if (!roles_seen.insert(role_name).second) {
                     throw std::runtime_error(index_path.string() + ": expert group repeats role " + role_name);
                 }
-                const RoleDesc & role = layer_it->second.at(role_name);
+                RoleDesc & role = layer_it->second.at(role_name);
                 const uint64_t offset = get_value<uint64_t>(member, "offset", index_path);
                 const uint64_t size   = get_value<uint64_t>(member, "size", index_path);
                 const std::string source_name =
@@ -553,6 +677,42 @@ int run(const Options & options) {
                 const int64_t want0 = sliced ? (role_name == "down" ? slice_width : (int64_t) n_embd) : role.ne0;
                 const int64_t want1 = sliced ? (role_name == "down" ? (int64_t) n_embd : slice_width) : role.ne1;
                 const uint64_t want_bytes = ggml_row_size(role.type, want0) * (uint64_t) want1;
+
+                // lut_bytes: omitted (0) unless this member carries an ML8_4
+                // centroid LUT appended after its weight bytes. Must be
+                // identical across every expert of this (layer, role).
+                const uint64_t member_lut_bytes = member.value("lut_bytes", (uint64_t) 0);
+                if (!role.lut_bytes_seen) {
+                    role.lut_bytes_per_expert = member_lut_bytes;
+                    role.lut_bytes_seen       = true;
+                } else if (role.lut_bytes_per_expert != member_lut_bytes) {
+                    throw std::runtime_error(
+                        index_path.string() + ": layer " + std::to_string(layer_first) +
+                        " expert " + std::to_string(expert) + " role " + role_name +
+                        " lut_bytes differs from other experts of this role");
+                }
+                if (role.type == GGML_TYPE_ML8_4) {
+                    if (want0 % 64 != 0) {
+                        throw std::runtime_error(
+                            index_path.string() + ": layer " + std::to_string(layer_first) +
+                            " role " + role_name + " ML8_4 ne0 is not a multiple of 64");
+                    }
+                    const uint64_t want_lut_bytes = 16 * (uint64_t) (want0 / 64);
+                    if (member_lut_bytes != want_lut_bytes) {
+                        throw std::runtime_error(
+                            index_path.string() + ": layer " + std::to_string(layer_first) +
+                            " expert " + std::to_string(expert) + " role " + role_name +
+                            " ML8_4 lut_bytes=" + std::to_string(member_lut_bytes) +
+                            " does not match expected 16*K/64=" + std::to_string(want_lut_bytes));
+                    }
+                } else if (member_lut_bytes != 0) {
+                    throw std::runtime_error(
+                        index_path.string() + ": layer " + std::to_string(layer_first) +
+                        " expert " + std::to_string(expert) + " role " + role_name +
+                        " has a non-zero lut_bytes but is not ML8_4");
+                }
+                const uint64_t want_total_bytes = want_bytes + member_lut_bytes;
+
                 if (sliced && (get_array(member, "slice_shape", index_path) != json({ want0, want1 }) ||
                                get_value<int>(group, "slice_idx", index_path) !=
                                    get_value<int>(manifest.at("expert_slicing"), "selected_slice", options.manifest) ||
@@ -560,7 +720,7 @@ int run(const Options & options) {
                                get_value<int64_t>(group, "ff_last", index_path) != slice_last)) {
                     throw std::runtime_error(index_path.string() + ": expert slice metadata disagrees with manifest");
                 }
-                if (offset != next_offset || size != want_bytes ||
+                if (offset != next_offset || size != want_total_bytes ||
                     source_name != role.source_tensor_name) {
                     throw std::runtime_error(
                         index_path.string() + ": layer " + std::to_string(layer_first) +
