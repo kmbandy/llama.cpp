@@ -710,6 +710,100 @@ static void test_freq_admission_off_speculative_can_still_evict_demand() {
             "plain LRU (policy off): page 1 gets evicted to seat it -- the pre-existing behaviour, unchanged");
 }
 
+// Config::protect_demand_from_spec: the SAME scenario as
+// test_freq_admission_speculative_never_evicts_demand, but with
+// freq_admission left OFF and only protect_demand_from_spec turned on --
+// proving the eviction-scope fix works standalone (WP_HOST_TIER_PROTECT_
+// DEMAND=1 without WP_HOST_TIER_POLICY=freq_admit), which is the shape the
+// live decode config (plain LRU, no admission policy) actually needs.
+static void test_protect_demand_from_spec_speculative_never_evicts_demand() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(3);
+    c.tier_bytes     = 3 * ENTRY;
+    c.spec_frac_pct  = 100;
+    // freq_admission left false; only this knob is set.
+    c.protect_demand_from_spec = true;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    read_page(arena, /*page=*/1);
+    void * data; HostArena::Handle h2, h3;
+    require(arena.begin_read(2, /*speculative=*/true, &data, &h2), "spec read 2");
+    arena.finish_read(2, h2, true);
+    require(arena.begin_read(3, /*speculative=*/true, &data, &h3), "spec read 3");
+    arena.finish_read(3, h3, true);
+    const void * src; HostArena::Handle b2, b3;
+    require(arena.borrow(2, &src, &b2), "promote 2 to demand");
+    arena.release(2, b2);
+    require(arena.borrow(3, &src, &b3), "promote 3 to demand");
+    arena.release(3, b3);
+    require(arena.spec_bytes() == 0, "spec_lru_ is now empty -- everything is confirmed demand");
+
+    void * data4; HostArena::Handle h4;
+    const uint64_t refusals_before = arena.begin_read_refusals();
+    require(!arena.begin_read(4, /*speculative=*/true, &data4, &h4),
+            "protect_demand_from_spec alone (no freq_admission) must still stop a "
+            "speculative guess from evicting a confirmed demand page");
+    require(arena.begin_read_refusals() == refusals_before + 1,
+            "refused and counted, not silently starved");
+    require(arena.state_of(1) == HostArena::State::Resident,
+            "page 1 (demand, never re-touched) must have survived");
+    require(arena.admission_cold_landed() == 0,
+            "protect_demand_from_spec must not engage the freq_admission landing gate -- "
+            "it only narrows reservation-time eviction scope");
+}
+
+// Concurrency: a speculative begin_read_wait() must keep retrying (never
+// evict the demand page to force progress) until the demand side itself
+// frees an entry, proving the scope narrowing holds under the same
+// wait/notify path production traffic uses (begin_read_wait/cv_), not just
+// the single-threaded begin_read() refusal above.
+static void test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(2);        // demand(1) + spec(1): no free slack
+    c.tier_bytes     = 2 * ENTRY;
+    c.spec_frac_pct  = 100;
+    c.protect_demand_from_spec = true;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+
+    // Page 1: demand-resident, never re-touched -- the page a buggy fallback
+    // would evict.
+    read_page(arena, /*page=*/1);
+    // Page 2: held Reading (never finished) so the arena is fully occupied
+    // (1 resident + 1 reading) with nothing free and nothing in spec_lru_/
+    // reject_lru_ to give up.
+    void * data2; HostArena::Handle h2;
+    require(arena.begin_read(2, /*speculative=*/false, &data2, &h2), "reserve 2 (stays Reading)");
+
+    std::atomic<bool> waiter_done{false};
+    std::atomic<bool> waiter_result{false};
+    void * data3; HostArena::Handle h3;
+    std::thread waiter([&]() {
+        // speculative=true: must NOT be satisfied by evicting page 1. It can
+        // only succeed once page 2's Reading entry frees up.
+        waiter_result = arena.begin_read_wait(3, /*speculative=*/true, &data3, &h3,
+                                              /*timeout_ms=*/5000);
+        waiter_done = true;
+    });
+
+    // Give the waiter time to actually block on cv_ rather than racing it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    require(!waiter_done.load(), "the waiter must not have found a way to proceed yet -- "
+            "if it did, something (page 1) got evicted to seat the guess");
+    require(arena.state_of(1) == HostArena::State::Resident,
+            "page 1 must still be intact while the speculative waiter is blocked");
+
+    // Free page 2's Reading entry (as if its read failed): this is what the
+    // waiter should actually be woken by.
+    arena.finish_read(2, h2, /*ok=*/false);
+
+    waiter.join();
+    require(waiter_result.load(), "the waiter must succeed once a real Free entry appears");
+    require(arena.state_of(1) == HostArena::State::Resident,
+            "page 1 must have survived the whole sequence");
+}
+
 // Larger-scale version of test_freq_admission_locks_a_stable_subset_on_
 // cyclic_sweep, shaped like the live production symptom this whole change
 // exists to fix: a sweep much bigger than the tier, run for MANY passes (not
@@ -902,6 +996,8 @@ int main() {
         test_freq_admission_speculative_never_evicts_demand();
         test_freq_admission_off_speculative_can_still_evict_demand();
         test_freq_admission_off_never_touches_admission_counters();
+        test_protect_demand_from_spec_speculative_never_evicts_demand();
+        test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand();
         std::cout << "test-wp-host-arena: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

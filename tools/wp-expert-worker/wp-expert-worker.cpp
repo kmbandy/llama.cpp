@@ -18140,6 +18140,22 @@ public:
             if (const char * e = std::getenv("WP_HOST_TIER_POLICY")) {
                 cfg.freq_admission = std::strcmp(e, "freq_admit") == 0;
             }
+            // WP_HOST_TIER_PROTECT_DEMAND=1: default off. Narrows a
+            // speculative begin_read's reservation-time eviction fallback
+            // to spec_lru_/reject_lru_ only (never lru_, the demand list)
+            // independent of WP_HOST_TIER_POLICY -- see
+            // wp::HostArena::Config::protect_demand_from_spec for why this
+            // is a separate knob from freq_admission: under continuous
+            // prefetch (WP_PREFILL_LAYER_AHEAD=1 / WP_EXPERT_SPEC_PAGEIN=1)
+            // spec_lru_ routinely empties for a moment, and with
+            // freq_admission off (the default) that fallback is
+            // EvictScope::Any today, which lets an unconfirmed speculative
+            // guess evict a confirmed demand-resident page -- the measured
+            // cause of n_host_hit staying at 0 under plain LRU regardless of
+            // --host-tier-bytes.
+            if (const char * e = std::getenv("WP_HOST_TIER_PROTECT_DEMAND")) {
+                cfg.protect_demand_from_spec = std::strcmp(e, "1") == 0;
+            }
             // WP_HOST_ARENA_SPEC_FRAC: percent of entries that may hold
             // speculative (predicted, unconfirmed) pages; default 25.
             // WP_HOST_ARENA_CHUNK_BYTES: allocation granularity; default 1 GiB.

@@ -469,7 +469,8 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             idx = free_.back();
             free_.pop_back();
         } else if (evict_one_locked_(
-                       cfg_.freq_admission ? EvictScope::SpecOrReject : EvictScope::Any)) {
+                       (cfg_.freq_admission || cfg_.protect_demand_from_spec)
+                           ? EvictScope::SpecOrReject : EvictScope::Any)) {
             // *** THE BUG THE LIVE 2026-09-25 RUN FOUND: n_host_hit=0 EVEN
             // WITH A TIER SIZED TO HOLD THE WHOLE WORKING SET. ***
             // admit_landed_locked_ only gates WHERE a demand page LANDS
@@ -501,8 +502,11 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             // evictable, refuse (the existing begin_read_refusals_ /
             // "advisory, never fails the worker" contract every other
             // speculative-path failure already uses) rather than stealing a
-            // demand page to seat a guess. Gated on cfg_.freq_admission so
-            // default (policy unset) behaviour is byte-for-byte unchanged.
+            // demand page to seat a guess. Gated on cfg_.freq_admission OR
+            // cfg_.protect_demand_from_spec (2026-09-26: the freq_admission
+            // coupling left this fix inert for plain-LRU/decode -- see
+            // Config::protect_demand_from_spec's .h comment) so with BOTH
+            // off, default behaviour is byte-for-byte unchanged.
             idx = free_.back();
             free_.pop_back();
         } else {
