@@ -1068,7 +1068,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
 
     const dsv41_rope_cfg rc = rope_cfg(il);
 
-    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
+    // Skip the reshape when the shape already matches: gallocr never reuses a view parent in
+    // place, and an extra [n_embd_head, n_head, nt] f32 copy is 1 GiB at ubatch 8192.
+    if (out->ne[0] != n_embd_head || out->ne[1] != n_head || out->ne[2] != nt || !ggml_is_contiguous(out)) {
+        out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
+    }
     out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
             rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
     out = ggml_rope_set_offset(out, n_embd_head_nope);
@@ -2192,7 +2196,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
         q = build_lora_mm(layer.wq_b, qr);
         q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-        q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
+        // in place: nothing else reads the wq_b output, and a second f32 q is 1 GiB at ubatch 8192
+        q = ggml_rope_ext_inplace(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
                 rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
         q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
         cb(q, "q", il);
