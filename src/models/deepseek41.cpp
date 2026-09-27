@@ -1257,6 +1257,22 @@ static bool dsv41_sparse_attn_check_env_enabled() {
     return enabled;
 }
 
+// WP_DSV41_SPARSE_NO_CONCAT: on the sparse path (WP_DSV41_SPARSE_ATTN=1),
+// gather only the K rows kv_indices actually names (window + top-k
+// compressed picks, ~640 rows) instead of materializing the full
+// ggml_concat(raw_k, comp_k) every call (context-linear: O(n_raw+n_comp)
+// rows written per call regardless of how many are read). See
+// dsv41_sparse_attn_gather_k's doc comment for the construction. Default
+// OFF; with it unset, build_attention_v41 builds and reads k_all exactly as
+// before this knob existed -- byte-identical.
+static bool dsv41_sparse_no_concat_env_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("WP_DSV41_SPARSE_NO_CONCAT");
+        return e != nullptr && e[0] == '1'; // default OFF; require exact "1"
+    }();
+    return enabled;
+}
+
 // WP_DSV41_CED_W: bisection knob, active only when WP_DSV41_CED_PREFILL=1.
 // Overrides the replay width W (default hparams.n_swa) with any value the
 // caller asks for; the only clamp applied is the structural one every other
@@ -1794,6 +1810,139 @@ static ggml_tensor * dsv41_sparse_attn_build_indices(
     return ggml_concat(ctx0, win_idx_masked, comp_idx, 0); // [k_win + top_k->ne[0], nt] I32
 }
 
+// WP_DSV41_SPARSE_NO_CONCAT (candidate (a) from the concat-elimination task:
+// gather only the rows kv_indices names). kv_indices (as built by
+// dsv41_sparse_attn_build_indices just above) is laid out [k_win + k_top, nt]:
+// slots [0, k_win) are raw-window picks with values in [0, raw_k_len) or -1
+// (padding), slots [k_win, k_win+k_top) are compressed picks with values in
+// [raw_k_len, raw_k_len + n_comp) or -1 -- i.e. absolute row offsets into the
+// k_all = ggml_concat(raw_k, comp_k, 2) that dense/diff still build, but
+// which the sparse op never needs in full: it only ever reads the <=~640
+// rows kv_indices names per token.
+//
+// Splits kv_indices back into its two known-width, known-offset-space
+// halves (plain views, no copy), gathers each half's rows directly from
+// raw_k/comp_k via ggml_get_rows (one gather per source, not per source
+// per token -- get_rows here is the plain non-batched form: reshape each
+// source to 2D [d, src_len] and flatten the (width, nt) index block to
+// [width*nt] so every token's picks come out of the SAME shared source in
+// one call), and remaps every valid slot from "row in k_all" to "row in the
+// freshly gathered k_sel". k_sel lays the two gathered blocks back to back
+// (window rows for every token, then comp rows for every token) rather than
+// k_all's raw-then-comp-per-row convention, so the remap is a fresh
+// position (not a copy of the original index): window slot j at token t
+// lands at flat row t*k_win + j; comp slot j at token t lands at flat row
+// k_win*nt + t*k_top + j. Invalid (-1) slots stay -1 either way -- validity
+// is read off the ORIGINAL kv_indices (mask_picks already turned "not
+// admitted" into exactly -1), not the clamped gather index (which is
+// clamped to a safe in-range row -- garbage content, but that row's slot is
+// marked -1 in the remap and the op skips index<0, so the garbage is never
+// read).
+//
+// Only valid when every pick in a query row draws from the SAME k_win/k_top
+// widths (true here: kv_indices is always [k_win + top_k->ne[0], nt], fixed
+// per call) -- if DS4.1 ever grew per-head or per-token-ragged pick counts
+// (kv_indptr genuinely non-uniform), this flat remap would need revisiting;
+// today kv_indptr is always the uniform t*n_idx stride build_attention_v41
+// already builds, unchanged by this function.
+// Declared (non-static) in models.h purely so the CPU unit test
+// (tests/test-dsv41-sparse-no-concat.cpp) can call the real production
+// function directly; build_attention_v41 below is still its only caller in
+// the graph builder itself.
+ggml_tensor * dsv41_sparse_attn_gather_k(
+        ggml_context * ctx0,
+        ggml_tensor  * raw_k,      // [d, n_head_kv, raw_k_len, ns]
+        ggml_tensor  * comp_k,     // [d, n_head_kv, n_comp,    ns]
+        ggml_tensor  * kv_indices, // I32 [k_win + k_top, nt], see above
+        int64_t        k_win,
+        int64_t        raw_k_len,
+        int64_t        n_comp,
+        ggml_tensor ** out_kv_indices) {
+    const int64_t n_idx = kv_indices->ne[0];
+    const int64_t nt    = kv_indices->ne[1];
+    const int64_t k_top = n_idx - k_win;
+    GGML_ASSERT(k_win >= 0 && k_top >= 0 && (k_win + k_top) == n_idx);
+
+    ggml_tensor * win_idx  = k_win > 0
+        ? ggml_view_2d(ctx0, kv_indices, k_win, nt, kv_indices->nb[1], 0)
+        : nullptr;
+    ggml_tensor * comp_idx = k_top > 0
+        ? ggml_view_2d(ctx0, kv_indices, k_top, nt, kv_indices->nb[1], k_win * kv_indices->nb[0])
+        : nullptr;
+
+    // Gather `width*nt` rows of `src` (reshaped to a plain 2D [d, src_len])
+    // at the (offset-adjusted, then clamped-to-valid) positions named by
+    // `idx` -- one flat, non-batched ggml_get_rows call, not one per token.
+    // `idx_offset` un-biases idx back to src's own [0, src_len) row space:
+    // 0 for the window half (already in [0, raw_k_len)), raw_k_len for the
+    // compressed half (mask_picks biased those picks by +raw_k_len so they
+    // land in the right half of the would-be k_all).
+    auto gather_rows = [&](ggml_tensor * src, ggml_tensor * idx, int64_t idx_offset, int64_t src_len, int64_t width) -> ggml_tensor * {
+        ggml_tensor * src_c = ggml_is_contiguous(src) ? src : ggml_cont(ctx0, src);
+        ggml_tensor * src_2d = ggml_reshape_2d(ctx0, src_c, src_c->ne[0] * src_c->ne[1], src_len);
+
+        ggml_tensor * idx_f = ggml_cast(ctx0, idx, GGML_TYPE_F32);
+        if (idx_offset != 0) {
+            // A padding slot is exactly -1 before this subtraction; shifting
+            // it by -idx_offset just moves which negative number it is --
+            // still < 0, so the clamp below still catches it.
+            idx_f = ggml_scale_bias(ctx0, idx_f, 1.0f, (float) -idx_offset);
+        }
+        ggml_tensor * safe_idx_f  = ggml_clamp(ctx0, idx_f, 0.0f, (float) (src_len - 1)); // pad (<0) -> 0
+        ggml_tensor * safe_idx    = ggml_cast(ctx0, safe_idx_f, GGML_TYPE_I32);
+        ggml_tensor * safe_idx_1d = ggml_reshape_1d(ctx0, safe_idx, width * nt);
+
+        return ggml_get_rows(ctx0, src_2d, safe_idx_1d); // [d*n_head_kv, width*nt, 1, 1]
+    };
+
+    ggml_tensor * win_rows  = win_idx  ? gather_rows(raw_k,  win_idx,  0,         raw_k_len, k_win) : nullptr;
+    ggml_tensor * comp_rows = comp_idx ? gather_rows(comp_k, comp_idx, raw_k_len, n_comp,    k_top) : nullptr;
+
+    ggml_tensor * k_sel;
+    if (win_rows && comp_rows) {
+        k_sel = ggml_concat(ctx0, win_rows, comp_rows, 1); // small: (k_win+k_top)*nt rows, not n_raw+n_comp
+    } else {
+        k_sel = win_rows ? win_rows : comp_rows;
+    }
+
+    // Remap slot j (of `width`, at token t) in a block starting at flat row
+    // `row_base` to `row_base + t*width + j` when the ORIGINAL idx[j,t] was
+    // valid (>=0), else -1. Same clamp(-1,0)+1 validity trick
+    // dsv41_sparse_attn_mask_picks uses, applied to the index itself instead
+    // of a mask value: idx>=0 clamps to 0 (valid=1), idx==-1 stays -1
+    // (valid=0).
+    auto remap_block = [&](ggml_tensor * idx, int64_t width, int64_t row_base) -> ggml_tensor * {
+        ggml_tensor * idx_f  = ggml_cast(ctx0, idx, GGML_TYPE_F32);
+        ggml_tensor * valid  = ggml_scale_bias(ctx0, ggml_clamp(ctx0, idx_f, -1.0f, 0.0f), 1.0f, 1.0f); // 1 valid, 0 pad
+
+        ggml_tensor * flat_iota = ggml_arange(ctx0, 0.0f, (float) (width * nt), 1.0f); // 0..width*nt-1
+        ggml_tensor * pos       = ggml_reshape_2d(ctx0, flat_iota, width, nt); // pos[j,t] = t*width + j
+        pos = ggml_scale_bias(ctx0, pos, 1.0f, (float) row_base); // + row_base
+
+        ggml_tensor * pos1  = ggml_scale_bias(ctx0, pos, 1.0f, 1.0f);
+        ggml_tensor * out_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, pos1, valid), 1.0f, -1.0f); // pos or -1
+        return ggml_cast(ctx0, out_f, GGML_TYPE_I32);
+    };
+
+    ggml_tensor * win_idx_new  = win_idx  ? remap_block(win_idx,  k_win, 0)          : nullptr;
+    ggml_tensor * comp_idx_new = comp_idx ? remap_block(comp_idx, k_top, k_win * nt) : nullptr;
+
+    ggml_tensor * kv_indices_new;
+    if (win_idx_new && comp_idx_new) {
+        kv_indices_new = ggml_concat(ctx0, win_idx_new, comp_idx_new, 0); // [k_win + k_top, nt], same shape as before
+    } else {
+        kv_indices_new = win_idx_new ? win_idx_new : comp_idx_new;
+    }
+    *out_kv_indices = kv_indices_new;
+
+    // k_sel is [d*n_head_kv, N, 1, 1] out of get_rows/concat; reshape to
+    // k_all's own 4D convention ([d, n_head_kv, N, 1]) so the caller's f16
+    // cast / contiguity checks see the same tensor shape family as before.
+    // Pure metadata reshape: N is contiguous immediately after the
+    // (already-flattened) d*n_head_kv block either way.
+    return ggml_reshape_4d(ctx0, k_sel, raw_k->ne[0], raw_k->ne[1], k_sel->ne[1], 1);
+}
+
 // WP_DSV41_SPARSE_ATTN_CHECK: index-equivalence proof. Reads back
 // kv_indices (the sparse op's constructed index set) and raw_mask (the SAME
 // dense mask the non-sparse path admits columns from) on the CPU and checks,
@@ -2283,8 +2432,22 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
     cb(comp_k, "comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
-    cb(k_all, "k_all", il);
+    // WP_DSV41_SPARSE_NO_CONCAT: k_all is only ever needed by the dense
+    // fallback and the WP_DSV41_SPARSE_ATTN_DIFF debug path below -- the
+    // sparse path itself, when the knob is on, gathers straight from raw_k/
+    // comp_k instead (dsv41_sparse_attn_gather_k). Build it lazily so a
+    // decode step that takes the sparse+gather path never pays for the
+    // concat at all; every existing caller of k_all still gets the exact
+    // same tensor it always did (built the same way, same cb() name/il),
+    // just built on first use instead of unconditionally up front.
+    ggml_tensor * k_all_lazy = nullptr;
+    auto get_k_all = [&]() -> ggml_tensor * {
+        if (!k_all_lazy) {
+            k_all_lazy = ggml_concat(ctx0, raw_k, comp_k, 2);
+            cb(k_all_lazy, "k_all", il);
+        }
+        return k_all_lazy;
+    };
 
     ggml_tensor * raw_mask = dsv41_ced_mask_for_nt(ctx0, inp_attn->get_kq_mask(), inp_attn->ced_kq_mask_trailing, nt);
 
@@ -2344,7 +2507,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     if (ced_log_shapes) {
         dsv41_ced_log_shape(il, "q", q);
-        dsv41_ced_log_shape(il, "k_all", k_all);
+        dsv41_ced_log_shape(il, "k_all", get_k_all());
         dsv41_ced_log_shape(il, "kq_mask", kq_mask);
         char msg[96];
         std::snprintf(msg, sizeof(msg), "CED prefill trim: shape il=%d n_kv_max=%lld", il, (long long) n_kv_max);
@@ -2378,9 +2541,19 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 ctx0, raw_mask, inp_comp_q.kq_mask, top_k, hparams.n_swa, raw_k->ne[2]);
         if (kv_indices) {
             ggml_tensor * q_f16 = q->type == GGML_TYPE_F16 ? q : ggml_cast(ctx0, q, GGML_TYPE_F16);
-            ggml_tensor * k_all_f16 = k_all->type == GGML_TYPE_F16 ? k_all : ggml_cast(ctx0, k_all, GGML_TYPE_F16);
 
             if (dsv41_sparse_attn_check_env_enabled()) {
+                // Runs against the ORIGINAL (pre-gather-remap) kv_indices,
+                // whose window half still indexes into raw_mask's own row
+                // space -- exactly what dsv41_sparse_attn_check_cb expects.
+                // This validates dsv41_sparse_attn_build_indices's
+                // construction regardless of WP_DSV41_SPARSE_NO_CONCAT; the
+                // gather/remap step below is a separate, purely mechanical
+                // transform (verified instead by the CPU test comparing its
+                // output against get_rows on the full k_all), not something
+                // this mask-admission check could see through the remap
+                // anyway (k_sel has no mask of its own).
+                //
                 // Small, deliberately leaked per call -- same userdata-ownership
                 // shape as dsv41_ced_check_indices above (must outlive graph
                 // build until graph execution runs the callback).
@@ -2391,16 +2564,53 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 ggml_build_forward_expand(gf, checked);
             }
 
+            // WP_DSV41_SPARSE_NO_CONCAT: gather ~640 rows straight from
+            // raw_k/comp_k instead of building/reading the full k_all
+            // concat -- see dsv41_sparse_attn_gather_k. Forced off whenever
+            // WP_DSV41_SPARSE_ATTN_DIFF needs a full dense reference below
+            // (that path builds k_all regardless, so gathering buys
+            // nothing there and would just add its own cost on top).
+            // Restricted to decode-shaped calls (nt below the same
+            // MT_SPARSE_ATTN_DSV4_PREFILL_MIN_T=32 boundary the AITER
+            // wrapper itself uses to pick its decode vs prefill kernel --
+            // mirrored here for the same reason the 512/64 shape check
+            // above is mirrored, not included): the gather's cost is
+            // O(n_idx*nt) vs the concat's O(n_raw+n_comp); at decode's
+            // nt==1 (this task's measured hot path) that is a huge win and
+            // strictly smaller, but at large prefill nt it can cross over
+            // and exceed the concat's cost, so prefill keeps building
+            // k_all as before -- this is a performance choice, not a
+            // correctness one; either path is exact.
+            constexpr int64_t k_no_concat_max_nt = 32;
+            const bool use_gather = dsv41_sparse_no_concat_env_enabled() &&
+                    !dsv41_sparse_attn_diff_env_enabled() &&
+                    nt < k_no_concat_max_nt;
+
+            ggml_tensor * k_src_f16;
+            if (use_gather) {
+                ggml_tensor * kv_indices_sel = nullptr;
+                const int64_t k_win = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa);
+                ggml_tensor * k_sel = dsv41_sparse_attn_gather_k(
+                        ctx0, raw_k, comp_k, kv_indices, k_win, raw_k->ne[2], n_comp, &kv_indices_sel);
+                GGML_ASSERT(kv_indices_sel != nullptr);
+                kv_indices = kv_indices_sel;
+                k_src_f16 = k_sel->type == GGML_TYPE_F16 ? k_sel : ggml_cast(ctx0, k_sel, GGML_TYPE_F16);
+            } else {
+                ggml_tensor * k_all = get_k_all();
+                k_src_f16 = k_all->type == GGML_TYPE_F16 ? k_all : ggml_cast(ctx0, k_all, GGML_TYPE_F16);
+            }
+
             // Uniform row offsets [0, n_idx, ..., nt*n_idx] built in-graph (exact in
             // F32 for nt*n_idx < 2^24), so the op needs no host copy or stream sync
-            // and stays safe under HIP graph capture.
+            // and stays safe under HIP graph capture. n_idx (kv_indices->ne[0]) is
+            // unchanged by the gather/remap above, so this is identical either way.
             const int64_t nt_q = q->ne[2];
             ggml_tensor * kv_indptr = ggml_arange(ctx0, 0.0f, (float) (nt_q + 1), 1.0f);
             kv_indptr = ggml_scale(ctx0, kv_indptr, (float) kv_indices->ne[0]);
             kv_indptr = ggml_cast(ctx0, kv_indptr, GGML_TYPE_I32);
-            out = ggml_sparse_attn_dsv4(ctx0, q_f16, k_all_f16, kv_indices, kv_indptr, layer.attn_sinks, kq_scale);
+            out = ggml_sparse_attn_dsv4(ctx0, q_f16, k_src_f16, kv_indices, kv_indptr, layer.attn_sinks, kq_scale);
             sparse_idx = kv_indices;
-            sparse_k   = k_all_f16;
+            sparse_k   = k_src_f16;
             // ggml_flash_attn_ext (the dense path below) always returns
             // GGML_TYPE_F32 (ggml.c:5723) -- downstream consumers of `out`
             // (build_attention_tail, then whatever FFN-side op reads it next,
@@ -2421,7 +2631,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         // Debug: build the dense path too, log how far the sparse output is from
         // it (last 64 token rows only, so prefill stays cheap), and carry the
         // dense output forward so every layer compares on the same inputs.
-        ggml_tensor * dense = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
+        ggml_tensor * dense = build_attn_mha(q, get_k_all(), get_k_all(), nullptr, kq_mask, layer.attn_sinks,
                 nullptr, n_kv_max, kq_scale, il);
         GGML_ASSERT(ggml_nelements(dense) == ggml_nelements(out));
         const int64_t row  = n_embd_head * n_head;
@@ -2445,7 +2655,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         out = dense;
     }
     if (!out) {
-        out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
+        out = build_attn_mha(q, get_k_all(), get_k_all(), nullptr, kq_mask, layer.attn_sinks,
                 nullptr, n_kv_max, kq_scale, il);
     }
     if (k_rot) {

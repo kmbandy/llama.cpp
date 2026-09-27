@@ -41,6 +41,21 @@ dsv4_state_tensors dsv4_build_state_snapshot(
         ggml_tensor * source_score,
         int32_t il);
 
+// WP_DSV41_SPARSE_NO_CONCAT's gather/remap step (src/models/deepseek41.cpp).
+// Exposed (non-static) only so tests/test-dsv41-sparse-no-concat.cpp can
+// exercise the real production function on synthetic CPU tensors -- every
+// other DS4.1 sparse-attn helper stays file-local static since only
+// build_attention_v41 calls them.
+ggml_tensor * dsv41_sparse_attn_gather_k(
+        ggml_context * ctx0,
+        ggml_tensor  * raw_k,
+        ggml_tensor  * comp_k,
+        ggml_tensor  * kv_indices,
+        int64_t        k_win,
+        int64_t        raw_k_len,
+        int64_t        n_comp,
+        ggml_tensor ** out_kv_indices);
+
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
     const float n = x->ne[0];

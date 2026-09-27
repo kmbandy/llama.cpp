@@ -76,6 +76,29 @@ public:
         // (4 * 65536 bytes at the default) but exposed for the unit tests
         // to exercise aging on a small sketch without a slow test.
         size_t sketch_width    = 65536;
+        // WP_HOST_TIER_PROTECT_DEMAND in the worker. Default false: byte-
+        // for-byte unchanged (see test_freq_admission_off_speculative_can_
+        // still_evict_demand). When true, narrows a SPECULATIVE begin_read's
+        // reservation-time eviction fallback to EvictScope::SpecOrReject
+        // (never Any) EVEN WHEN freq_admission IS OFF -- i.e. it is the same
+        // fix begin_read_locked_'s "THE BUG THE LIVE 2026-09-25 RUN FOUND"
+        // comment already applies, just no longer coupled to freq_admission.
+        // Motivation: under continuous prefetch (WP_PREFILL_LAYER_AHEAD=1 +
+        // WP_EXPERT_SPEC_PAGEIN=1, the live production config -- see
+        // ~/ds4-runs/dsv41/workers-la.sh), spec_lru_ churns constantly and
+        // routinely empties for a moment; with freq_admission off (its
+        // default) that fallback is EvictScope::Any, which evicts from lru_
+        // (the DEMAND list) -- an unconfirmed speculative guess evicting a
+        // CONFIRMED, possibly-about-to-be-reused demand page. That silently
+        // caps n_host_hit near 0 regardless of tier size or admission
+        // policy, independent of the freq_admission-specific thrashing
+        // admit_landed_locked_ addresses. This knob fixes ONLY the
+        // reservation-time eviction scope; it does not gate WHERE a landed
+        // page goes (admit_landed_locked_ / insert_mru_locked_ are
+        // untouched), so a demand page still lands and evicts plain-LRU as
+        // before -- this only stops a *speculative* reservation from being
+        // the one to evict it.
+        bool   protect_demand_from_spec = false;
     };
     // alloc(bytes) returns 4096-aligned memory or nullptr; free(ptr, bytes).
     using Allocator   = std::function<void *(size_t)>;
