@@ -1315,6 +1315,14 @@ struct dispatcher::impl {
     int32_t                                             n_embd        = 0;
     int32_t                                             n_ff_exp      = 0;
     int32_t                                             n_expert      = 0;
+    // Layers whose router is narrower than n_expert (DeepSeek-V4.1's MTP
+    // stages route over 128 of the main stack's 384). Coverage and assignment
+    // checks for such a layer stop at its own count.
+    std::map<int32_t, int32_t>                          layer_n_expert_;
+    int32_t layer_expert_count(int32_t layer) const {
+        const auto it = layer_n_expert_.find(layer);
+        return it != layer_n_expert_.end() ? it->second : n_expert;
+    }
     int32_t                                             n_expert_used = 0;
     int32_t                                             last_routed_layer = -1;
     // Host-provided last main-graph MoE layer that must not defer (no successor).
@@ -1471,7 +1479,7 @@ struct dispatcher::impl {
     dispatch_clock::time_point window_wall_begin{};
     bool                       window_sample_ok = false;
 
-    explicit impl(const std::vector<endpoint> & endpoints) :
+    explicit impl(const std::vector<endpoint> & endpoints, const std::map<int32_t, int32_t> & layer_n_expert) :
                 speed_split(speed_split_enabled()),
                 static_assign(static_assign_enabled()),
                 plan_threads_(dispatch_plan_threads_enabled(static_assign)),
@@ -1482,6 +1490,7 @@ struct dispatcher::impl {
                 recv_ahead_(recv_ahead_enabled()),
                 dispatch_stream_chunks_(dispatch_stream_chunks_enabled()),
                 dispatch_chunks_(dispatch_chunks_enabled()) {
+        layer_n_expert_ = layer_n_expert;
         if (dispatch_chunks_ > 1) {
             if (!static_assign) {
                 static_assign = true;
@@ -2575,7 +2584,8 @@ struct dispatcher::impl {
             const bool layer_is_slice = all_slice;
             layer_slice_mode.emplace(layer, layer_is_slice);
 
-            for (int32_t expert = 0; expert < n_expert; ++expert) {
+            const int32_t layer_n_expert = layer_expert_count(layer);
+            for (int32_t expert = 0; expert < layer_n_expert; ++expert) {
                 std::set<std::string> machines;
                 for (size_t i = 0; i < workers.size(); ++i) {
                     const worker & value = workers[i];
@@ -5128,7 +5138,7 @@ struct dispatcher::impl {
 
         std::set<int32_t> seen_experts;
         for (const pipe_expert_assignment & assignment : assignments) {
-            if (assignment.expert_id < 0 || assignment.expert_id >= n_expert ||
+            if (assignment.expert_id < 0 || assignment.expert_id >= layer_expert_count(layer) ||
                 !seen_experts.insert(assignment.expert_id).second || assignment.weights.size() != n_tokens) {
                 throw std::invalid_argument("expert dispatcher has an invalid or repeated expert assignment");
             }
@@ -5505,7 +5515,8 @@ void set_inproc_backend_factory(inproc_backend_factory factory) {
     g_inproc_factory = factory;
 }
 
-dispatcher::dispatcher(const std::vector<endpoint> & endpoints) : pimpl(new impl(endpoints)) {}
+dispatcher::dispatcher(const std::vector<endpoint> & endpoints, const std::map<int32_t, int32_t> & layer_n_expert) :
+    pimpl(new impl(endpoints, layer_n_expert)) {}
 
 dispatcher::~dispatcher() = default;
 

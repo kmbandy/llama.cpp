@@ -1028,6 +1028,22 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("%s: borrowing expert dispatcher from parent context (%zu workers)\n",
                            __func__, expert_dispatch->n_workers());
         } else {
+            // Layers whose router is narrower than hparams.n_expert (V4.1's MTP
+            // stages route over 128 of 384): pass their own width so the
+            // dispatcher does not demand coverage of experts that do not exist.
+            // A NextN/MTP layer this model did not load (spec decode off) gets 0:
+            // workers may still advertise it, but nothing will ever dispatch to it.
+            std::map<int32_t, int32_t> layer_n_expert;
+            for (uint32_t il = 0; il < hparams.n_layer_all && il < model.layers.size(); ++il) {
+                const ggml_tensor * gate_inp = model.layers[il].ffn_gate_inp;
+                if (gate_inp == nullptr) {
+                    if (il >= hparams.n_layer()) {
+                        layer_n_expert[(int32_t) il] = 0;
+                    }
+                } else if (gate_inp->ne[1] != (int64_t) hparams.n_expert) {
+                    layer_n_expert[(int32_t) il] = (int32_t) gate_inp->ne[1];
+                }
+            }
             expert_dispatch_owned.reset(new pipe_expert_dispatcher::graph_dispatcher(
                 params.expert_dispatch,
                 (int32_t) hparams.n_embd,
@@ -1035,7 +1051,8 @@ llama_context::llama_context(
                 (int32_t) hparams.n_expert,
                 (int32_t) hparams.n_expert_used(),
                 last_no_defer,
-                (int32_t) model.vocab.token_mask()));
+                (int32_t) model.vocab.token_mask(),
+                layer_n_expert));
             expert_dispatch = expert_dispatch_owned.get();
             LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
             register_hash_oracle(model, *expert_dispatch_owned);

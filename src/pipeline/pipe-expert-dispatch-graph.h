@@ -36,7 +36,8 @@ class graph_dispatcher {
                      int32_t             n_expert,
                      int32_t             n_expert_used,
                      int32_t             last_no_defer_layer = -1,
-                     int32_t             phantom_token = -1);
+                     int32_t             phantom_token = -1,
+                     const std::map<int32_t, int32_t> & layer_n_expert = {});
     ~graph_dispatcher();
 
     graph_dispatcher(const graph_dispatcher &)             = delete;

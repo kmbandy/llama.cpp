@@ -223,8 +223,9 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
                                    int32_t             n_expert,
                                    int32_t             n_expert_used,
                                    int32_t             last_no_defer_layer,
-                                   int32_t             phantom_token) :
-    remote(parse_endpoints(endpoints)),
+                                   int32_t             phantom_token,
+                                   const std::map<int32_t, int32_t> & layer_n_expert) :
+    remote(parse_endpoints(endpoints), layer_n_expert),
     phantom_token_(phantom_token),
     collect_stats_(dispatch_stats_enabled()) {
     static std::once_flag chunks_log_once;

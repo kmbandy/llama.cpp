@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -184,7 +185,10 @@ class dispatcher {
   public:
     using dispatch_handle = uint64_t;
 
-    explicit dispatcher(const std::vector<endpoint> & endpoints);
+    // layer_n_expert: per-layer expert count for layers narrower than the
+    // model-wide n_expert (e.g. DeepSeek-V4.1 MTP stages); absent = n_expert.
+    explicit dispatcher(const std::vector<endpoint> & endpoints,
+                        const std::map<int32_t, int32_t> & layer_n_expert = {});
     ~dispatcher();
 
     dispatcher(const dispatcher &)             = delete;
