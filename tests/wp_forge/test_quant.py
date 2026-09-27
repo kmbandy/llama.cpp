@@ -13,7 +13,16 @@ import torch
 import gguf
 from gguf.constants import GGML_QUANT_SIZES
 
-from conversion.wp_forge.quant import QuantError, dequant, lossless_repack, quantize_expert
+from conversion.wp_forge.quant import (
+    QuantError, dequant, forge_quant_types, lossless_repack, quantize_expert,
+)
+
+
+def test_forge_quant_types_includes_ml8_and_standard_types() -> None:
+    types = forge_quant_types()
+    assert "ml8_fp8" in types and "ml8_4" in types
+    assert "mxfp4" in types and "q8_0" in types
+    assert types == sorted(types)
 
 ROWS, COLS = 8, 512
 SEED = 20260915

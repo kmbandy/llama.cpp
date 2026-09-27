@@ -7,7 +7,7 @@ import pytest
 
 from conversion.wp_forge.machines import Machine
 from conversion.wp_forge.plan import (
-    LayerRange, Plan, PlanError, Placement, StageSpec,
+    LayerRange, Ml8Settings, Plan, PlanError, Placement, StageSpec,
     load_plan, parse_widths, resolve,
 )
 
@@ -183,6 +183,99 @@ def test_spec_head_expert_quant_override() -> None:
     r = resolve(plan(quant={"experts": "mxfp4", "spec_head.experts": "q8_0", "engram": "q4_0"}),
                 HP, MS, source_is_gguf=False)
     assert r.sets[3].quant == "q8_0"
+
+
+# --- resolve: ml8 (ml8_fp8/ml8_4 quant + `ml8:` block) ---
+
+def _unsliced_experts() -> list[StageSpec]:
+    # the plan() fixture's default experts stages width-slice L0-25; ml8 with
+    # a real rotation can't use those (see test_ml8_width_slice_rejects_rotation)
+    return [StageSpec(LayerRange(0, 25), "main", None, None),
+            StageSpec(LayerRange(26, 39), "b2026", None, None)]
+
+
+def test_ml8_quant_allowed_only_for_experts_classes() -> None:
+    # experts/spec_head.experts may use ml8_fp8/ml8_4 ...
+    r = resolve(plan(quant={"experts": "ml8_fp8", "dense": "q8_0", "engram": "q4_0"},
+                     experts=_unsliced_experts()), HP, MS, source_is_gguf=False)
+    assert all(s.quant == "ml8_fp8" for s in r.sets if s.role == "experts")
+    r2 = resolve(plan(quant={"experts": "ml8_4", "dense": "q8_0", "engram": "q4_0"},
+                      experts=_unsliced_experts()), HP, MS, source_is_gguf=False)
+    assert all(s.quant == "ml8_4" for s in r2.sets if s.role == "experts")
+    # ... but dense/sidecar classes keep today's whitelist
+    with pytest.raises(PlanError, match="not producible"):
+        resolve(plan(quant={"experts": "mxfp4", "dense": "ml8_fp8", "engram": "q4_0"}), HP, MS,
+                source_is_gguf=False)
+    with pytest.raises(PlanError, match="not producible"):
+        resolve(plan(quant={"experts": "mxfp4", "dense": "q8_0", "engram": "ml8_4"}), HP, MS,
+                source_is_gguf=False)
+
+
+def test_ml8_settings_defaults() -> None:
+    r = resolve(plan(quant={"experts": "ml8_fp8", "dense": "q8_0", "engram": "q4_0"},
+                     experts=_unsliced_experts()), HP, MS, source_is_gguf=False)
+    ml8 = [s for s in r.sets if s.role == "experts"][0].ml8
+    assert ml8 == Ml8Settings("kronecker", 0, 1024, 65536)
+    # non-ml8 quants carry no ml8 settings
+    r2 = resolve(plan(), HP, MS, source_is_gguf=False)
+    assert all(s.ml8 is None for s in r2.sets)
+
+
+def test_ml8_settings_overridden() -> None:
+    base = plan(quant={"experts": "ml8_4", "dense": "q8_0", "engram": "q4_0"}, experts=_unsliced_experts())
+    base.ml8 = {"rotation": "block_hadamard", "rotation_seed": 7, "max_b": 256, "fit_rows": 4096}
+    r = resolve(base, HP, MS, source_is_gguf=False)
+    ml8 = [s for s in r.sets if s.role == "experts"][0].ml8
+    assert ml8 == Ml8Settings("block_hadamard", 7, 256, 4096)
+
+
+def test_ml8_block_without_ml8_quant_is_error() -> None:
+    base = plan(quant={"experts": "mxfp4", "dense": "q8_0", "engram": "q4_0"})
+    base.ml8 = {"rotation": "none"}
+    with pytest.raises(PlanError, match="ml8"):
+        resolve(base, HP, MS, source_is_gguf=False)
+
+
+def test_ml8_bad_rotation() -> None:
+    base = plan(quant={"experts": "ml8_fp8", "dense": "q8_0", "engram": "q4_0"})
+    base.ml8 = {"rotation": "bogus"}
+    with pytest.raises(PlanError, match="rotation"):
+        resolve(base, HP, MS, source_is_gguf=False)
+
+
+def test_ml8_bad_max_b_not_power_of_two() -> None:
+    base = plan(quant={"experts": "ml8_fp8", "dense": "q8_0", "engram": "q4_0"})
+    base.ml8 = {"max_b": 700}
+    with pytest.raises(PlanError, match="max_b"):
+        resolve(base, HP, MS, source_is_gguf=False)
+
+
+def test_ml8_width_slice_rejects_rotation() -> None:
+    # rotation != none (the default, "kronecker") + widths -> rejected
+    bad = plan(
+        quant={"experts": "ml8_fp8", "dense": "q8_0", "engram": "q4_0"},
+        experts=[StageSpec(LayerRange(0, 25), "main", None, [1408, 896]),
+                 StageSpec(LayerRange(26, 39), "b2026", None, None)],
+    )
+    with pytest.raises(PlanError, match="width-sliced"):
+        resolve(bad, HP, MS, source_is_gguf=False)
+    # rotation: none + widths is fine
+    ok = plan(
+        quant={"experts": "ml8_fp8", "dense": "q8_0", "engram": "q4_0"},
+        experts=[StageSpec(LayerRange(0, 25), "main", None, [1408, 896]),
+                 StageSpec(LayerRange(26, 39), "b2026", None, None)],
+    )
+    ok.ml8 = {"rotation": "none"}
+    r = resolve(ok, HP, MS, source_is_gguf=False)
+    assert all(s.ml8.rotation == "none" for s in r.sets if s.role == "experts")
+    # expert_ranges + rotation != none is fine (not a width slice)
+    ranged = plan(
+        quant={"experts": "ml8_4", "dense": "q8_0", "engram": "q4_0"},
+        experts=[StageSpec(LayerRange(0, 25), "main", None, None, expert_ranges=[(0, 99), (100, 383)]),
+                 StageSpec(LayerRange(26, 39), "b2026", None, None)],
+    )
+    r2 = resolve(ranged, HP, MS, source_is_gguf=False)
+    assert all(s.ml8 is not None for s in r2.sets if s.role == "experts")
 
 
 def test_machine_rule() -> None:

@@ -133,6 +133,12 @@ class ExpertStage:
             else int(self.hp[self.arch.n_expert_key])
         )
         self.quant_dtype = gguf.GGMLQuantizationType[self.quant.upper()]
+        # ml8: data-free ROTATED ML8_FP8/ML8_4. Bypasses quant.quantize_expert
+        # (gguf.quantize has no dispatch entry for either type) -- see ml8.py.
+        self.is_ml8 = self.quant in ("ml8_fp8", "ml8_4")
+        self.ml8_settings = stage_sets[0].ml8 if self.is_ml8 else None
+        if self.is_ml8 and self.ml8_settings is None:
+            raise ValueError(f"stage {self.stage_id}: quant {self.quant!r} needs a resolved ml8: block")
         # raw repack bases to clean up after the final stitch.
         self._raw_bases: list[int] = []
         self._lock = threading.Lock()
@@ -218,11 +224,44 @@ class ExpertStage:
             if by_shard.get(shard, -1) <= L:
                 self.source.release_shard(shard)
 
-    def _gather(self, L: int) -> dict[str, np.ndarray]:
-        """Packed per-role stacks [n_expert, rows, bytes_per_row] uint8."""
+    # -- ml8 (rotated ML8_FP8/ML8_4) helpers -------------------------------
+
+    def _ml8_build_roles(self, L: int) -> dict[str, tuple]:
+        """(rotation, kind_id, a, b) per role at layer L. gate/up share group
+        "gate_up" (identical rotation -- they share the input, n_embd); down
+        uses group "down" (n_ff). Rotation is a function of (layer,
+        role-group) only, so it's the same for every expert of this layer."""
+        from . import ml8 as ml8mod
+
+        s = self.ml8_settings
+        gate_up = ml8mod.build_rotation(self.n_embd, s.rotation, s.rotation_seed, s.max_b, L, "gate_up")
+        down = ml8mod.build_rotation(self.n_ff, s.rotation, s.rotation_seed, s.max_b, L, "down")
+        return {"gate": gate_up, "up": gate_up, "down": down}
+
+    def _ml8_add_rotation_sidecars(self, extra: dict[str, dict], ml8_roles: dict) -> None:
+        from . import ml8 as ml8mod
+
+        for role in ("gate", "up", "down"):
+            rot, kind, a, b = ml8_roles[role]
+            ex = extra.setdefault(role, {})
+            if rot is not None:
+                k = self.n_ff if role == "down" else self.n_embd
+                ex["rotation_meta"] = ml8mod.rotation_meta_bytes(a, b, k, kind)
+                if kind == ml8mod.KRONECKER_KIND_ID:
+                    ex["rotation_h_a"] = ml8mod.rotation_h_a_array(rot)
+
+    def _gather(self, L: int) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
+        """Packed per-role stacks [n_expert, rows, bytes_per_row] uint8, plus
+        (ml8 quants only) a per-role sidecar dict with any of "rotation_meta"
+        (I32[4], absent for rotation="none"), "rotation_h_a" (F32[a,a],
+        kronecker only), "centroids" (F8_E4M3 [n_expert, K/64, 16], ml8_4
+        only)."""
         fused = self.arch.fused_experts if self.role == "experts" else self.arch.fused_spec_head_experts
         if fused is not None:
             return self._gather_fused(L, fused)
+
+        ml8_roles = self._ml8_build_roles(L) if self.is_ml8 else None
+        cent_lists: dict[str, list] = {}
 
         if self.role == "experts":
             names_by_eid = [expert_tensor_names(self.arch, L, eid) for eid in range(self.n_expert)]
@@ -242,10 +281,19 @@ class ExpertStage:
                         if wname not in keys:
                             continue
                         f32 = reader.get_tensor(wname)
-                        scale = reader.get_tensor(sname) if (sname is not None and sname in keys) else None
-                        packed = lossless_repack(f32, scale, "mxfp4", self.quant) if scale is not None else None
-                        if packed is None:
-                            packed = quantize_expert({role: f32}, self.quant, workers=self.workers)[role]
+                        if self.is_ml8:
+                            from . import ml8 as ml8mod
+                            rot, _kind, _a, _b = ml8_roles[role]
+                            if self.quant == "ml8_fp8":
+                                packed = ml8mod.quantize_role_ml8_fp8(f32, rot)
+                            else:
+                                packed, cent = ml8mod.quantize_role_ml8_4(f32, rot, self.ml8_settings.fit_rows)
+                                cent_lists.setdefault(role, [None] * self.n_expert)[eid] = cent
+                        else:
+                            scale = reader.get_tensor(sname) if (sname is not None and sname in keys) else None
+                            packed = lossless_repack(f32, scale, "mxfp4", self.quant) if scale is not None else None
+                            if packed is None:
+                                packed = quantize_expert({role: f32}, self.quant, workers=self.workers)[role]
                         if role not in stacks:
                             stacks[role] = np.empty((self.n_expert, *packed.shape), dtype=np.uint8)
                         stacks[role][eid] = packed
@@ -253,19 +301,39 @@ class ExpertStage:
             if role not in stacks:
                 raise KeyError(f"role {role} has no experts for layer {L}")
         self._release_after(L, self._shards_for(L))
-        return stacks
 
-    def _gather_fused(self, L: int, fused) -> dict[str, np.ndarray]:
+        extra: dict[str, dict] = {}
+        if self.is_ml8:
+            for role, lst in cent_lists.items():
+                if any(c is None for c in lst):
+                    raise QuantError(f"role {role} has no ml8_4 centroids for every expert at layer {L}")
+                extra[role] = {"centroids": np.ascontiguousarray(np.stack(lst, axis=0))}
+            self._ml8_add_rotation_sidecars(extra, ml8_roles)
+        return stacks, extra
+
+    def _gather_fused(self, L: int, fused) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
         """Fused-tensor sources: one [n_expert, 2*n_ff, n_embd] gate_up and one
         [n_expert, n_embd, n_ff] down per layer. Each role is quantized as a
         single 2-D [n_expert*rows, cols] pass (one pool spin per role) and
-        reshaped back to the per-expert stack."""
+        reshaped back to the per-expert stack. For ml8_4 the centroid LUT is
+        still fit PER EXPERT (see ml8.quantize_experts_ml8_4) even though the
+        rotation+gather is one batched pass."""
         stage = L if self.role == "experts" else L - self.n_layer
         gate_up_name, down_name = fused.names(stage)
         stacks: dict[str, np.ndarray] = {}
+        extra: dict[str, dict] = {}
+        ml8_roles = self._ml8_build_roles(L) if self.is_ml8 else None
 
         def pack(role: str, arr: np.ndarray) -> np.ndarray:
             n_e, rows, cols = arr.shape
+            if self.is_ml8:
+                from . import ml8 as ml8mod
+                rot, _kind, _a, _b = ml8_roles[role]
+                if self.quant == "ml8_fp8":
+                    return ml8mod.quantize_experts_ml8_fp8(arr, rot)
+                packed, cent = ml8mod.quantize_experts_ml8_4(arr, rot, self.ml8_settings.fit_rows)
+                extra[role] = {"centroids": cent}
+                return packed
             packed = quantize_expert(
                 {role: np.ascontiguousarray(arr.reshape(n_e * rows, cols))},
                 self.quant, workers=self.workers,
@@ -304,9 +372,14 @@ class ExpertStage:
             if role not in stacks:
                 raise KeyError(f"role {role} has no experts for layer {L}")
         self._release_after(L, shards)
-        return stacks
+        if self.is_ml8:
+            self._ml8_add_rotation_sidecars(extra, ml8_roles)
+        return stacks, extra
 
-    def _write_gguf(self, L: int, stacks: dict[str, np.ndarray], path: Path) -> None:
+    def _write_gguf(
+        self, L: int, stacks: dict[str, np.ndarray], path: Path,
+        ml8_extra: dict[str, dict] | None = None,
+    ) -> None:
         writer = gguf.GGUFWriter(str(path), arch=self.arch.name)
         writer.add_block_count(self.n_layer + self.arch.nextn_count(self.hp))
         writer.add_embedding_length(self.n_embd)
@@ -314,9 +387,21 @@ class ExpertStage:
         writer.add_expert_feed_forward_length(self.n_ff)
         writer.add_expert_used_count(self.n_expert_used)
         for role in ("gate", "up", "down"):
-            writer.add_tensor(
-                f"blk.{L}.ffn_{role}_exps.weight", stacks[role], raw_dtype=self.quant_dtype
-            )
+            base = f"blk.{L}.ffn_{role}_exps"
+            writer.add_tensor(f"{base}.weight", stacks[role], raw_dtype=self.quant_dtype)
+            ex = (ml8_extra or {}).get(role)
+            if not ex:
+                continue
+            # Companion tensors mirror the main path's name, NO ".weight".
+            if "centroids" in ex:
+                writer.add_tensor(
+                    f"{base}.centroids", ex["centroids"],
+                    raw_dtype=gguf.GGMLQuantizationType.F8_E4M3,
+                )
+            if "rotation_meta" in ex:
+                writer.add_tensor(f"{base}.rotation_meta", ex["rotation_meta"])
+            if "rotation_h_a" in ex:
+                writer.add_tensor(f"{base}.rotation_h_a", ex["rotation_h_a"])
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file()
@@ -329,9 +414,9 @@ class ExpertStage:
         need: dict[str, bool],
     ) -> None:
         t0 = time.time()
-        stacks = self._gather(L)
+        stacks, ml8_extra = self._gather(L)
         gguf_path = self.workdir / f"L{L:03d}.gguf"
-        self._write_gguf(L, stacks, gguf_path)
+        self._write_gguf(L, stacks, gguf_path, ml8_extra)
 
         widths = self.stage_sets[0].widths
         by_expert = any(s.expert_first is not None for s in self.stage_sets)

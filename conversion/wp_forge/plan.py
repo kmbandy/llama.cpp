@@ -25,6 +25,25 @@ QUANT_BLOCK = {
 }
 SLICE_ALIGNMENT = 32  # wp-repack's slice_alignment floor
 
+# ml8 quant types: data-free ROTATED ML8_FP8 / ML8_4 (conversion/wp_forge/ml8.py).
+# Allowed ONLY for the "experts" / "spec_head.experts" classes (dense/sidecar
+# classes keep QUANT_BLOCK's whitelist unchanged) -- see resolve()'s per-class
+# allowed-set selection. Block sizes match GGML_QUANT_SIZES: ML8_FP8 (32, 34),
+# ML8_4 (64, 36).
+ML8_QUANT_BLOCK = {"ml8_fp8": 32, "ml8_4": 64}
+EXPERTS_CLASSES = ("experts", "spec_head.experts")
+ML8_ROTATIONS = ("kronecker", "block_hadamard", "none")
+
+
+@dataclass(frozen=True)
+class Ml8Settings:
+    """Resolved conversion/wp_forge/plan.yaml `ml8:` block (defaults match the
+    contract: kronecker rotation, seed 0, max_b 1024, fit_rows 65536)."""
+    rotation: str = "kronecker"
+    rotation_seed: int = 0
+    max_b: int = 1024
+    fit_rows: int = 65536
+
 
 class PlanError(ValueError):
     """One-line plan failure; the reason names the offending field."""
@@ -81,6 +100,8 @@ class Plan:
     experts_only: bool = False
     # existing spine gguf to point the bundle at when experts_only skips the rebuild
     spine_file: str | None = None
+    # raw `ml8:` block from the yaml (validated + defaulted into Ml8Settings in resolve())
+    ml8: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +118,7 @@ class SetSpec:
     est_bytes: int
     expert_first: int | None = None
     expert_last: int | None = None
+    ml8: "Ml8Settings | None" = None  # resolved ml8: block, only when quant is ml8_fp8/ml8_4
 
 
 @dataclass
@@ -161,6 +183,9 @@ def load_plan(path: Path) -> Plan:
         raise PlanError("source: must be hf:<repo> or gguf:<path>")
     spine = _placement(raw.get("spine"), None, "spine")
     sh = raw.get("spec_head")
+    raw_ml8 = raw.get("ml8")
+    if raw_ml8 is not None and not isinstance(raw_ml8, dict):
+        raise PlanError("ml8: must be a mapping")
     return Plan(
         name=raw["name"],
         source=src,
@@ -173,6 +198,7 @@ def load_plan(path: Path) -> Plan:
         allow_partial=bool(raw.get("allow_partial", False)),
         experts_only=bool(raw.get("experts_only", False)),
         spine_file=str(raw["spine_file"]) if raw.get("spine_file") else None,
+        ml8=raw_ml8,
     )
 
 
@@ -253,8 +279,9 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
         if cls not in arch.classes:
             raise PlanError(f"quant: unknown class '{cls}' for {arch.name} (classes: {', '.join(arch.classes)})")
     for cls, t in plan.quant.items():
-        if t not in QUANT_BLOCK:
-            raise PlanError(f"quant: type '{t}' for {cls} is not producible+sliceable (allowed: {', '.join(sorted(QUANT_BLOCK))})")
+        allowed = {**QUANT_BLOCK, **ML8_QUANT_BLOCK} if cls in EXPERTS_CLASSES else QUANT_BLOCK
+        if t not in allowed:
+            raise PlanError(f"quant: type '{t}' for {cls} is not producible+sliceable (allowed: {', '.join(sorted(allowed))})")
 
     machine_names = {plan.spine.machine, plan.sidecars.machine}
     for st in plan.experts:
@@ -283,11 +310,33 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
     q_exp = plan.quant.get("experts", "src")
     q_sh = plan.quant.get("spec_head.experts", q_exp)
 
+    uses_ml8 = q_exp in ML8_QUANT_BLOCK or q_sh in ML8_QUANT_BLOCK
+    if plan.ml8 is not None and not uses_ml8:
+        raise PlanError("ml8: block present but no quant.experts/quant.spec_head.experts uses ml8_fp8/ml8_4")
+    ml8_settings: Ml8Settings | None = None
+    if uses_ml8:
+        rd = plan.ml8 or {}
+        rotation = str(rd.get("rotation", "kronecker")).lower()
+        if rotation not in ML8_ROTATIONS:
+            raise PlanError(f"ml8.rotation: {rotation!r} not one of {ML8_ROTATIONS}")
+        try:
+            rotation_seed = int(rd.get("rotation_seed", 0))
+            max_b = int(rd.get("max_b", 1024))
+            fit_rows = int(rd.get("fit_rows", 65536))
+        except (TypeError, ValueError):
+            raise PlanError("ml8: rotation_seed/max_b/fit_rows must be ints")
+        if max_b < 1 or (max_b & (max_b - 1)) != 0:
+            raise PlanError(f"ml8.max_b: must be a positive power of 2, got {max_b}")
+        if fit_rows < 1:
+            raise PlanError(f"ml8.fit_rows: must be positive, got {fit_rows}")
+        ml8_settings = Ml8Settings(rotation, rotation_seed, max_b, fit_rows)
+
     sets: list[SetSpec] = []
 
     def emit(st: StageSpec, role: str, quant: str, n_expert: int) -> None:
         n_layers = len(st.layers.layers())
-        block = max(SLICE_ALIGNMENT, QUANT_BLOCK.get(quant, SLICE_ALIGNMENT))
+        block = max(SLICE_ALIGNMENT, {**QUANT_BLOCK, **ML8_QUANT_BLOCK}.get(quant, SLICE_ALIGNMENT))
+        set_ml8 = ml8_settings if quant in ML8_QUANT_BLOCK else None
         if st.expert_ranges and st.widths:
             raise PlanError("expert_ranges and widths cannot both be set")
         if st.expert_ranges:
@@ -315,9 +364,14 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
                 sets.append(SetSpec(
                     sid, role, st.layers, None, None,
                     machine_name, _dest_dir(m, st.path, plan.name, sid),
-                    f"{plan.name}-{sid}", quant, est, first, last))
+                    f"{plan.name}-{sid}", quant, est, first, last, set_ml8))
             return
         widths = parse_widths(st.widths, n_ff, block) if st.widths else None
+        if widths is not None and set_ml8 is not None and set_ml8.rotation != "none":
+            raise PlanError(
+                f"quant '{quant}' with ml8.rotation '{set_ml8.rotation}' cannot be used on "
+                f"FFN width-sliced sets (widths {st.widths}) -- the down rotation would span slices"
+            )
         n_slices = len(widths) if widths else 1
         if st.slice_machines is not None and len(st.slice_machines) != n_slices:
             raise PlanError(
@@ -331,7 +385,7 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
             sets.append(SetSpec(
                 sid, role, st.layers, i if widths else None, widths,
                 machine_name, _dest_dir(m, st.path, plan.name, sid),
-                f"{plan.name}-{sid}", quant, est))
+                f"{plan.name}-{sid}", quant, est, None, None, set_ml8))
 
     for st in plan.experts:
         emit(st, "experts", q_exp, n_exp)

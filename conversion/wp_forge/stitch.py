@@ -101,8 +101,22 @@ def stitch(
 
     blobs: list[BlobPlan] = []
     shards: list[dict] = []
+    # ml8_rotation: wp-repack writes this as a top-level object on each
+    # per-layer index, keyed by stringified layer number (tools/wp-repack
+    # commit 61fc24e0c) -- merge every shard's entry into one dict covering
+    # the whole set rather than dropping it (per-group "lut_bytes" needs no
+    # such handling: it lives nested in idx["groups"][*]["members"][*] and
+    # _rewrite_index only ever sets/reads a few top-level keys, so it
+    # round-trips through json.dumps(idx) untouched).
+    ml8_rotation: dict = {}
     for i, lo in enumerate(per_layer):
         idx = json.loads(lo.index_json.read_text())
+        rot = idx.get("ml8_rotation")
+        if rot:
+            for k, v in rot.items():
+                if k in ml8_rotation and ml8_rotation[k] != v:
+                    raise ValueError(f"{lo.index_json}: ml8_rotation[{k}] disagrees with an earlier shard")
+                ml8_rotation[k] = v
         blobs.append(
             BlobPlan(
                 src_blob=lo.blob,
@@ -137,6 +151,7 @@ def stitch(
             "last": n_expert - 1 if set_spec.expert_last is None else set_spec.expert_last,
         },
         "expert_ggml_type": expert_type,
+        **({"ml8_rotation": ml8_rotation} if ml8_rotation else {}),
         "content_hash": aggregate_identity(shards),
         "total_group_count": sum(s["group_count"] for s in shards),
         "total_blob_bytes": total,

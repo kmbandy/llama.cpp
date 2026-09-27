@@ -136,6 +136,17 @@ def quantize_expert(
     return result
 
 
+def forge_quant_types() -> list[str]:
+    """Every experts qtype wp-forge can produce: every gguf-py quantizable
+    (and wp-repack sliceable) ggml type, plus the data-free rotated ml8 types
+    (ml8_fp8, ml8_4) that bypass gguf.quantize entirely (see ml8.py). Console
+    probe contract: kept cheap (no torch import here -- ml8.py imports torch
+    lazily, only inside the functions an ml8 quant path actually calls)."""
+    from .plan import QUANT_BLOCK
+    from .ml8 import ML8_QUANT_TYPES
+    return sorted(set(QUANT_BLOCK) | set(ML8_QUANT_TYPES))
+
+
 def lossless_repack(
     weight, scale, source_format: str, qtype: str,
 ) -> np.ndarray | None:

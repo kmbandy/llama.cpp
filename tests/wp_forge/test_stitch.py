@@ -219,6 +219,85 @@ def test_stitch_sliced(tools, repack_run):
     assert sum(slice_totals) >= unsliced_total
 
 
+# --- ml8: stitch must preserve per-group "lut_bytes" and hoist top-level
+# "ml8_rotation" (both added by tools/wp-repack commit 61fc24e0c) rather than
+# drop them as unknown keys. Synthetic index JSONs (no C++ tools needed --
+# these keys are pure JSON passthrough/merge, nothing stitch computes). ---
+
+def _fake_idx(layer: int, ml8_rotation: dict | None) -> dict:
+    return {
+        "layer_first": layer,
+        "layer_last": layer,
+        "group_count": 1,
+        "blob_bytes": 100,
+        "content_hash": {"algorithm": "sha256", "value": f"deadbeef{layer}"},
+        "groups": [
+            {
+                "members": [
+                    {"role_mask": 1, "size": 68, "offset": 0, "lut_bytes": 36},
+                    {"role_mask": 2, "size": 32, "offset": 68},  # no lut_bytes (not ml8_4)
+                ]
+            }
+        ],
+        **({"ml8_rotation": ml8_rotation} if ml8_rotation is not None else {}),
+    }
+
+
+def _fake_per_layer(tmp_path: Path, rotations: list[dict | None]) -> list[LayerOutput]:
+    out = []
+    for L, rot in enumerate(rotations):
+        idx_path = tmp_path / f"L{L}.wpi.json"
+        idx_path.write_text(json.dumps(_fake_idx(L, rot)))
+        blob_path = tmp_path / f"L{L}.wpb"
+        blob_path.touch()
+        out.append(LayerOutput(L, idx_path, blob_path))
+    return out
+
+
+def test_stitch_preserves_lut_bytes_and_merges_ml8_rotation(tmp_path: Path) -> None:
+    rot0 = {"0": {"gate_up": {"kind": 1, "a": 1, "b": 32}, "down": {"kind": 1, "a": 1, "b": 64}}}
+    rot1 = {"1": {"gate_up": {"kind": 1, "a": 1, "b": 32}, "down": {"kind": 1, "a": 1, "b": 64}}}
+    per_layer = _fake_per_layer(tmp_path, [rot0, rot1])
+    out = stitch(
+        per_layer, _set_spec(id="L0-1", layers=LayerRange(0, 1)), "spine.gguf",
+        input_model="fake/repo", expert_type="ml8_4", n_expert=N_EXPERT,
+    )
+    # top-level ml8_rotation merged across both layers' shards
+    assert out.manifest["ml8_rotation"] == {**rot0, **rot1}
+    assert out.manifest["expert_ggml_type"] == "ml8_4"
+    # per-group member lut_bytes survives the index rewrite untouched
+    for plan in out.blobs:
+        rewritten = json.loads(plan.index_text)
+        members = rewritten["groups"][0]["members"]
+        assert members[0]["lut_bytes"] == 36
+        assert "lut_bytes" not in members[1]
+        assert "ml8_rotation" in rewritten  # the per-layer key also survives
+
+
+def test_stitch_without_ml8_keys_unaffected(tmp_path: Path) -> None:
+    per_layer = _fake_per_layer(tmp_path, [None, None])
+    out = stitch(
+        per_layer, _set_spec(id="L0-1", layers=LayerRange(0, 1)), "spine.gguf",
+        input_model="fake/repo", expert_type="Q8_0", n_expert=N_EXPERT,
+    )
+    assert "ml8_rotation" not in out.manifest
+    for plan in out.blobs:
+        assert "ml8_rotation" not in json.loads(plan.index_text)
+
+
+def test_stitch_ml8_rotation_disagreement_raises(tmp_path: Path) -> None:
+    rot0 = {"0": {"gate_up": {"kind": 1, "a": 1, "b": 32}}}
+    # same key "0" (wrong -- would only happen with a malformed shard set) with
+    # a different value -> must raise rather than silently pick one
+    rot_conflict = {"0": {"gate_up": {"kind": 2, "a": 4, "b": 8}}}
+    per_layer = _fake_per_layer(tmp_path, [rot0, rot_conflict])
+    with pytest.raises(ValueError, match="disagrees"):
+        stitch(
+            per_layer, _set_spec(id="L0-1", layers=LayerRange(0, 1)), "spine.gguf",
+            input_model="fake/repo", expert_type="ml8_4", n_expert=N_EXPERT,
+        )
+
+
 def _fake_slice_outputs(repack_run: Path, d: Path, disagree: str | None) -> list[LayerOutput]:
     """Copy each layer's real per-slice repack output (a BASE prefix, not a
     dir) into its own subdir of d; optionally corrupt the geometry in
