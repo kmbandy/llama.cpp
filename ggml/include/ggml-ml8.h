@@ -257,20 +257,6 @@ GGML_API struct ggml_tensor * ggml_fp8_quant_rot_gated(
         int32_t kind,
         int32_t G);
 
-// Back-compat 6-arg overload (C++ only) — existing callers keep compiling
-// unchanged and get G=128 (the historical FP8_B128 behaviour).
-#ifdef __cplusplus
-static inline struct ggml_tensor * ggml_fp8_quant_rot(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * h_a,
-        int64_t a_dim,
-        int64_t b_dim,
-        int32_t kind) {
-    return ggml_fp8_quant_rot(ctx, x, h_a, a_dim, b_dim, kind, 128);
-}
-#endif
-
 // Block-fp8 weight x packed-fp8 activation matmul. `a` must be the output of
 // ggml_fp8_quant_rot (or bit-compatible with it). w may be GGML_TYPE_FP8_B128
 // (G=128, 130-byte blocks) or GGML_TYPE_ML8_FP8 (G=32, 34-byte blocks); G is
@@ -305,4 +291,21 @@ GGML_API struct ggml_tensor * ggml_fp8_mul_mat_bf16(
 
 #ifdef __cplusplus
 }  // extern "C"
+
+// Back-compat 6-arg overload (C++ only) — existing callers keep compiling
+// unchanged and get G=128 (the historical FP8_B128 behaviour). Must live
+// outside the extern "C" block: a static inline C++ overload declared with C
+// linkage cannot coexist with the 7-arg extern "C" declaration above (no
+// overloading in C linkage) -- this was previously mis-nested and broke any
+// C++ translation unit that included this header outside of the specific
+// TUs that happened not to hit it.
+static inline struct ggml_tensor * ggml_fp8_quant_rot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * h_a,
+        int64_t a_dim,
+        int64_t b_dim,
+        int32_t kind) {
+    return ggml_fp8_quant_rot(ctx, x, h_a, a_dim, b_dim, kind, 128);
+}
 #endif

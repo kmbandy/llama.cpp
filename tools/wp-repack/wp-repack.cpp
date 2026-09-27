@@ -17,6 +17,7 @@
  */
 
 #include "ggml.h"
+#include "ggml-ml8.h"
 #include "gguf.h"
 #include "nlohmann/json.hpp"
 #include "wp-repack-lib.h"
@@ -73,6 +74,11 @@ struct TensorGeom {
     int64_t   blck      = 0;  // elements per quant block along ne0
     size_t    type_size = 0;  // bytes per quant block
     uint64_t  row_bytes = 0;  // bytes for one full ne0 row = ne0 / blck * type_size
+    // MAD ML8: needed to reopen the source file and read raw bytes for
+    // rotation_meta / rotation_h_a sidecars, and to locate a centroids
+    // tensor's per-expert LUT slice.
+    uint16_t  file_idx    = 0;
+    uint64_t  file_offset = 0;
 };
 
 struct ModelCatalog {
@@ -495,6 +501,8 @@ ModelCatalog build_catalog(const std::string & input) {
                 if (geom.blck > 0 && geom.ne0 % geom.blck == 0) {
                     geom.row_bytes = static_cast<uint64_t>(geom.ne0 / geom.blck) * geom.type_size;
                 }
+                geom.file_idx    = static_cast<uint16_t>(file_idx);
+                geom.file_offset = file_offset;
                 result.geom.emplace(name, geom);
             }
 
@@ -524,6 +532,206 @@ ModelCatalog build_catalog(const std::string & input) {
         }
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// MAD ML8 -- rotated ML8_FP8 / ML8_4 routed-expert sidecars.
+//
+// wp-forge writes companion tensors alongside each ffn_{gate,up,down}_exps
+// weight: "...centroids" (ML8_4 per-expert LUT, F8_E4M3 [16, K/64, n_exp]),
+// "...rotation_meta" (I32[4] = [a,b,k,kind]) and "...rotation_h_a" (F32
+// [a,a], kronecker kind only). None of these are PageCatalog expert pages
+// (classify_expert requires an exact "weight" suffix) -- they're read here
+// directly by name/geometry and folded into the repack output: centroids as
+// extra bytes appended to the matching weight member, rotation as a
+// top-level "ml8_rotation" block in the shard index.
+// ---------------------------------------------------------------------------
+
+struct Ml8RotationInfo {
+    int32_t             a    = 0;
+    int32_t             b    = 0;
+    int32_t             k    = 0;
+    int32_t             kind = 0;
+    std::vector<float>  h_a;  // only populated for kind == KRONECKER_ORTH_SYLVESTER
+};
+
+struct Ml8LayerInfo {
+    std::map<std::pair<int, uint8_t>, wp_repack::ExpertLutInfo>    lut_by_layer_role;
+    std::map<int, std::map<std::string, Ml8RotationInfo>>          rotation_by_layer_role;
+
+    bool empty() const { return lut_by_layer_role.empty() && rotation_by_layer_role.empty(); }
+};
+
+uint8_t ml8_role_name_to_mask(const std::string & role) {
+    if (role == "gate") return wp::ROLE_GATE;
+    if (role == "up")   return wp::ROLE_UP;
+    if (role == "down") return wp::ROLE_DOWN;
+    throw std::runtime_error("internal: unknown ml8 role name '" + role + "'");
+}
+
+// "blk.<L>.ffn_<role>_exps.<suffix>" -> (block_idx, role, suffix). Returns
+// false for anything else (dense tensors, attention tensors, non-expert FFN,
+// or a name that doesn't parse).
+bool parse_block_and_ffn_exps(const std::string & name, int & block_idx, std::string & role, std::string & suffix) {
+    static const char prefix[] = "blk.";
+    constexpr size_t  prefix_len = sizeof(prefix) - 1;
+    if (name.size() <= prefix_len || name.compare(0, prefix_len, prefix) != 0) {
+        return false;
+    }
+    const size_t dot = name.find('.', prefix_len);
+    if (dot == std::string::npos || dot == prefix_len) {
+        return false;
+    }
+    char *     end_ptr = nullptr;
+    const long v       = std::strtol(name.substr(prefix_len, dot - prefix_len).c_str(), &end_ptr, 10);
+    if (end_ptr == nullptr || *end_ptr != '\0' || v < 0) {
+        return false;
+    }
+
+    const std::string rest = name.substr(dot + 1);
+    static const char * roles[] = { "gate", "up", "down" };
+    for (const char * r : roles) {
+        const std::string prefixed = std::string("ffn_") + r + "_exps.";
+        if (rest.size() > prefixed.size() && rest.compare(0, prefixed.size(), prefixed) == 0) {
+            block_idx = static_cast<int>(v);
+            role      = r;
+            suffix    = rest.substr(prefixed.size());
+            return true;
+        }
+    }
+    return false;
+}
+
+void read_exact(const std::string & path, uint64_t offset, void * dst, size_t bytes, const std::string & what) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("ml8: failed to reopen source file for " + what + ": " + path);
+    }
+    f.seekg(static_cast<std::streamoff>(offset));
+    f.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(bytes));
+    if (!f || static_cast<size_t>(f.gcount()) != bytes) {
+        throw std::runtime_error("ml8: short read of " + what);
+    }
+}
+
+Ml8LayerInfo collect_ml8_layer_info(const ModelCatalog & model) {
+    Ml8LayerInfo out;
+
+    // Pass 1: rotation_meta (must precede rotation_h_a -- h_a's expected
+    // size depends on meta's a_dim).
+    for (const auto & kv : model.geom) {
+        int block_idx = -1;
+        std::string role, suffix;
+        if (!parse_block_and_ffn_exps(kv.first, block_idx, role, suffix) || suffix != "rotation_meta") {
+            continue;
+        }
+        const TensorGeom & g = kv.second;
+        if (g.type != GGML_TYPE_I32 || g.ne0 != 4) {
+            throw std::runtime_error("ml8: " + kv.first + " must be I32[4]");
+        }
+        int32_t meta[4];
+        read_exact(model.files.at(g.file_idx), g.file_offset, meta, sizeof(meta), kv.first);
+
+        Ml8RotationInfo info;
+        info.a    = meta[0];
+        info.b    = meta[1];
+        info.k    = meta[2];
+        info.kind = meta[3];
+        if (info.kind != GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER &&
+            info.kind != GGML_ML8_ROTATION_KIND_BLOCK_HADAMARD) {
+            throw std::runtime_error("ml8: " + kv.first + " has unknown rotation kind " + std::to_string(info.kind));
+        }
+        if (info.a <= 0 || info.b <= 0 || info.k <= 0 || static_cast<int64_t>(info.a) * info.b != info.k) {
+            throw std::runtime_error("ml8: " + kv.first + " has inconsistent a*b != k");
+        }
+        out.rotation_by_layer_role[block_idx][role] = info;
+    }
+
+    // Pass 2: rotation_h_a (kronecker kind only).
+    for (const auto & kv : model.geom) {
+        int block_idx = -1;
+        std::string role, suffix;
+        if (!parse_block_and_ffn_exps(kv.first, block_idx, role, suffix) || suffix != "rotation_h_a") {
+            continue;
+        }
+        auto layer_it = out.rotation_by_layer_role.find(block_idx);
+        if (layer_it == out.rotation_by_layer_role.end() || layer_it->second.find(role) == layer_it->second.end()) {
+            throw std::runtime_error("ml8: " + kv.first + " has no matching rotation_meta");
+        }
+        Ml8RotationInfo & info = layer_it->second.at(role);
+        if (info.kind != GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+            throw std::runtime_error("ml8: " + kv.first + " present but rotation kind is not kronecker_orth_sylvester");
+        }
+        const TensorGeom & g = kv.second;
+        if (g.type != GGML_TYPE_F32 || g.ne0 != info.a || g.ne1 != info.a) {
+            throw std::runtime_error("ml8: " + kv.first + " shape does not match rotation_meta a_dim=" +
+                                     std::to_string(info.a));
+        }
+        const size_t n = static_cast<size_t>(info.a) * static_cast<size_t>(info.a);
+        info.h_a.assign(n, 0.0f);
+        read_exact(model.files.at(g.file_idx), g.file_offset, info.h_a.data(), n * sizeof(float), kv.first);
+    }
+
+    for (const auto & layer_kv : out.rotation_by_layer_role) {
+        for (const auto & role_kv : layer_kv.second) {
+            if (role_kv.second.kind == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER && role_kv.second.h_a.empty()) {
+                throw std::runtime_error("ml8: layer " + std::to_string(layer_kv.first) + " role " + role_kv.first +
+                                         " is kronecker_orth_sylvester but has no rotation_h_a tensor");
+            }
+        }
+    }
+
+    // Pass 3: centroids (ML8_4 per-expert LUT).
+    for (const auto & kv : model.geom) {
+        int block_idx = -1;
+        std::string role, suffix;
+        if (!parse_block_and_ffn_exps(kv.first, block_idx, role, suffix) || suffix != "centroids") {
+            continue;
+        }
+        const TensorGeom & g = kv.second;
+        if (g.type != GGML_TYPE_F8_E4M3 || g.ne0 != 16) {
+            throw std::runtime_error("ml8: " + kv.first + " must be F8_E4M3 with ne0 == 16");
+        }
+        wp_repack::ExpertLutInfo info;
+        info.file_idx         = g.file_idx;
+        info.file_offset      = g.file_offset;
+        info.per_expert_bytes = static_cast<uint64_t>(g.ne1) * 16;  // F8_E4M3 is 1 byte/elem
+        out.lut_by_layer_role[{ block_idx, ml8_role_name_to_mask(role) }] = info;
+    }
+
+    return out;
+}
+
+json ml8_rotation_json_for_layer(const std::map<std::string, Ml8RotationInfo> & roles) {
+    json out = json::object();
+    for (const auto & kv : roles) {
+        json entry = {
+            { "kind", kv.second.kind },
+            { "a",    kv.second.a    },
+            { "b",    kv.second.b    },
+            { "k",    kv.second.k    },
+        };
+        if (kv.second.kind == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+            entry["h_a"] = kv.second.h_a;
+        }
+        out[kv.first] = std::move(entry);
+    }
+    return out;
+}
+
+// Slice of `rotation_by_layer_role` restricted to [layer_first, layer_last],
+// JSON-keyed by stringified layer number as the contract specifies. Returns
+// an empty (not-added) result when no layer in range has any rotation.
+json ml8_rotation_json_for_range(const std::map<int, std::map<std::string, Ml8RotationInfo>> & rotation_by_layer_role,
+                                 int layer_first, int layer_last) {
+    json out = json::object();
+    for (const auto & kv : rotation_by_layer_role) {
+        if (kv.first < layer_first || kv.first > layer_last) {
+            continue;
+        }
+        out[std::to_string(kv.first)] = ml8_rotation_json_for_layer(kv.second);
+    }
+    return out;
 }
 
 void sha_update_u64(sha256_t & hash, uint64_t value) {
@@ -667,7 +875,8 @@ json build_shard_index(const fs::path &                            output_base,
                        size_t                                      shard_count,
                        const wp_repack::ShardPlan &                shard,
                        const std::vector<wp_repack::ExpertGroup> & groups,
-                       const std::vector<std::string> &            model_files) {
+                       const std::vector<std::string> &            model_files,
+                       const Ml8LayerInfo &                        ml8 = Ml8LayerInfo()) {
     const ShardPaths paths = shard_paths(output_base, shard_index, shard_count);
     json index = {
         { "format",       INDEX_FORMAT                   },
@@ -705,7 +914,7 @@ json build_shard_index(const fs::path &                            output_base,
             if (member.file_idx >= model_files.size()) {
                 throw std::runtime_error("catalog source file index is out of range");
             }
-            group_json["members"].push_back({
+            json member_json = {
                 { "role_mask",          member.role_mask          },
                 { "size",               member.size               },
                 { "offset",             blob_offset               },
@@ -713,7 +922,15 @@ json build_shard_index(const fs::path &                            output_base,
                 { "source_tensor_name", member.source_tensor_name },
                 { "source_file_idx",    member.file_idx           },
                 { "source_file_offset", member.file_offset        },
-            });
+            };
+            // lut_bytes is omitted (rather than written as 0) for every
+            // non-ml8_4 member -- this is what keeps the index byte-for-byte
+            // identical to the pre-ml8 format when nothing in the model uses
+            // rotation or ML8_4.
+            if (member.lut_bytes != 0) {
+                member_json["lut_bytes"] = member.lut_bytes;
+            }
+            group_json["members"].push_back(std::move(member_json));
             blob_offset += member.size;
         }
         // v1 pages are DIRECT_ALIGNMENT-padded after the last member
@@ -723,6 +940,11 @@ json build_shard_index(const fs::path &                            output_base,
 
     if (blob_offset != shard.size) {
         throw std::runtime_error("internal shard byte count mismatch");
+    }
+
+    const json rotation = ml8_rotation_json_for_range(ml8.rotation_by_layer_role, shard.layer_first, shard.layer_last);
+    if (!rotation.empty()) {
+        index["ml8_rotation"] = rotation;
     }
     return index;
 }
@@ -747,9 +969,10 @@ json write_shard(const fs::path &                            output_base,
                  const std::vector<wp_repack::ExpertGroup> & groups,
                  const std::vector<std::string> &            model_files,
                  std::vector<std::ifstream> &                sources,
-                 bool                                        manifest_only) {
+                 bool                                        manifest_only,
+                 const Ml8LayerInfo &                        ml8 = Ml8LayerInfo()) {
     const ShardPaths paths = shard_paths(output_base, shard_index, shard_count);
-    const json        index = build_shard_index(output_base, shard_index, shard_count, shard, groups, model_files);
+    const json        index = build_shard_index(output_base, shard_index, shard_count, shard, groups, model_files, ml8);
 
     if (!manifest_only) {
         const fs::path temp_blob(paths.blob.string() + ".tmp");
@@ -766,7 +989,13 @@ json write_shard(const fs::path &                            output_base,
                 if (member.file_idx >= sources.size()) {
                     throw std::runtime_error("catalog source file index is out of range");
                 }
-                copy_member(sources[member.file_idx], member.file_offset, member.size, blob, buffer);
+                copy_member(sources[member.file_idx], member.file_offset, member.weight_bytes(), blob, buffer);
+                if (member.lut_bytes != 0) {
+                    if (member.lut_file_idx >= sources.size()) {
+                        throw std::runtime_error("catalog lut source file index is out of range");
+                    }
+                    copy_member(sources[member.lut_file_idx], member.lut_file_offset, member.lut_bytes, blob, buffer);
+                }
                 blob_offset += member.size;
             }
             const uint64_t padding = group.size - group.payload_size;
@@ -1689,11 +1918,35 @@ void repack_sliced(const CliOptions &                          options,
 }
 
 void repack(const CliOptions & options) {
-    ModelCatalog                              model  = build_catalog(options.model);
-    const std::vector<wp_repack::ExpertGroup> groups = wp_repack::build_expert_groups(model.catalog);
+    ModelCatalog                        model  = build_catalog(options.model);
+    std::vector<wp_repack::ExpertGroup> groups = wp_repack::build_expert_groups(model.catalog);
     if (groups.empty()) {
         throw std::runtime_error("PageCatalog found no slottable expert groups");
     }
+
+    const Ml8LayerInfo ml8 = collect_ml8_layer_info(model);
+    if (!ml8.empty() && options.sliced) {
+        throw std::runtime_error(
+            "wp-repack: rotated / ML8_4 routed experts are not supported by --expert-slices (v2) repack; "
+            "repack without --expert-slices for a model using ml8 rotation or ML8_4 experts");
+    }
+
+    // Every ML8_4-typed weight must have a matching centroids sidecar --
+    // silently repacking one without the other would produce a blob a
+    // worker cannot correctly decode.
+    for (const auto & kv : model.geom) {
+        int block_idx = -1;
+        std::string role, suffix;
+        if (!parse_block_and_ffn_exps(kv.first, block_idx, role, suffix) || suffix != "weight") {
+            continue;
+        }
+        if (kv.second.type == GGML_TYPE_ML8_4 &&
+            ml8.lut_by_layer_role.find({ block_idx, ml8_role_name_to_mask(role) }) == ml8.lut_by_layer_role.end()) {
+            throw std::runtime_error("wp-repack: ML8_4 weight '" + kv.first + "' has no matching centroids sidecar tensor");
+        }
+    }
+
+    wp_repack::attach_ml8_luts(groups, ml8.lut_by_layer_role);
 
     std::vector<wp_repack::ShardPlan> shards;
     std::string                       sharding_mode;
@@ -1776,8 +2029,8 @@ void repack(const CliOptions & options) {
         std::cout << "writing shard " << i + 1 << "/" << shards.size() << " layers " << shards[i].layer_first << "-"
                   << shards[i].layer_last << " groups " << shards[i].group_indices.size() << " bytes " << shards[i].size
                   << '\n';
-        manifest["shards"].push_back(
-            write_shard(output_base, i, shards.size(), shards[i], groups, model.files, sources, options.manifest_only));
+        manifest["shards"].push_back(write_shard(output_base, i, shards.size(), shards[i], groups, model.files, sources,
+                                                 options.manifest_only, ml8));
         total_bytes += shards[i].size;
     }
     manifest["total_blob_bytes"] = total_bytes;
@@ -2413,7 +2666,8 @@ VerifyCounts verify_index(const fs::path &                            index_path
                 actual_member.at("catalog_name").get<std::string>() != expected_member.catalog_name ||
                 actual_member.at("source_tensor_name").get<std::string>() != expected_member.source_tensor_name ||
                 actual_member.at("source_file_idx").get<uint16_t>() != expected_member.file_idx ||
-                actual_member.at("source_file_offset").get<uint64_t>() != expected_member.file_offset) {
+                actual_member.at("source_file_offset").get<uint64_t>() != expected_member.file_offset ||
+                actual_member.value<uint64_t>("lut_bytes", 0) != expected_member.lut_bytes) {
                 throw std::runtime_error("member identity or size mismatch for " + expected_member.catalog_name);
             }
             if (actual_offset != next_offset) {
@@ -2424,7 +2678,14 @@ VerifyCounts verify_index(const fs::path &                            index_path
             }
 
             compare_bytes(blob, actual_offset, sources[expected_member.file_idx], expected_member.file_offset,
-                          expected_member.size, blob_buffer, source_buffer);
+                          expected_member.weight_bytes(), blob_buffer, source_buffer);
+            if (expected_member.lut_bytes != 0) {
+                if (expected_member.lut_file_idx >= sources.size()) {
+                    throw std::runtime_error("fresh catalog lut source file index is out of range");
+                }
+                compare_bytes(blob, actual_offset + expected_member.weight_bytes(), sources[expected_member.lut_file_idx],
+                              expected_member.lut_file_offset, expected_member.lut_bytes, blob_buffer, source_buffer);
+            }
             next_offset += expected_member.size;
             ++counts.members;
             counts.bytes += expected_member.size;
@@ -2509,11 +2770,17 @@ VerifyCounts verify_manifest(const fs::path &                            path,
 }
 
 void verify(const CliOptions & options) {
-    ModelCatalog                              model  = build_catalog(options.model);
-    const std::vector<wp_repack::ExpertGroup> groups = wp_repack::build_expert_groups(model.catalog);
+    ModelCatalog                        model  = build_catalog(options.model);
+    std::vector<wp_repack::ExpertGroup> groups = wp_repack::build_expert_groups(model.catalog);
     if (groups.empty()) {
         throw std::runtime_error("PageCatalog found no slottable expert groups");
     }
+    // v2 (sliced) sets never carry ml8 data (repack() refuses to produce
+    // them) so this is a no-op for that path; for v1 it must match exactly
+    // what write_shard() attached, or every content hash / byte compare
+    // below would fail on an ml8 model.
+    const Ml8LayerInfo ml8 = collect_ml8_layer_info(model);
+    wp_repack::attach_ml8_luts(groups, ml8.lut_by_layer_role);
 
     std::vector<std::ifstream> sources;
     sources.reserve(model.files.size());

@@ -386,6 +386,47 @@ std::vector<int> uncovered_layers(const std::vector<ExpertGroup> & groups,
     return missing;
 }
 
+void attach_ml8_luts(std::vector<ExpertGroup> &                                groups,
+                     const std::map<std::pair<int, uint8_t>, ExpertLutInfo> & lut_by_layer_role) {
+    if (lut_by_layer_role.empty()) {
+        return;
+    }
+    for (ExpertGroup & group : groups) {
+        bool touched = false;
+        for (ExpertMember & member : group.members) {
+            const auto it = lut_by_layer_role.find({ group.block_idx, member.role_mask });
+            if (it == lut_by_layer_role.end()) {
+                continue;
+            }
+            const ExpertLutInfo & info = it->second;
+            if (group.expert_idx < 0) {
+                throw std::runtime_error("ml8 lut attach: group has no valid expert_idx: " + member.catalog_name);
+            }
+            const uint64_t lut_offset = info.file_offset +
+                                        static_cast<uint64_t>(group.expert_idx) * info.per_expert_bytes;
+
+            member.lut_bytes       = info.per_expert_bytes;
+            member.lut_file_idx    = info.file_idx;
+            member.lut_file_offset = lut_offset;
+            member.size += info.per_expert_bytes;
+            touched = true;
+        }
+        if (touched) {
+            // Recompute from scratch rather than incrementally adjusting the
+            // already-padded group.size -- simpler and cannot drift.
+            uint64_t payload = 0;
+            for (const ExpertMember & member : group.members) {
+                if (member.size > std::numeric_limits<uint64_t>::max() - payload) {
+                    throw std::overflow_error("expert bytes overflow group total (ml8 lut attach)");
+                }
+                payload += member.size;
+            }
+            group.payload_size = payload;
+            group.size         = padded_page_bytes(payload);
+        }
+    }
+}
+
 std::vector<ShardPlan> plan_shards_for_ranges(const std::vector<ExpertGroup> & groups,
                                               const std::vector<LayerRange> &  ranges,
                                               bool                             allow_partial) {

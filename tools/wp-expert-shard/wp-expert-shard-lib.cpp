@@ -45,6 +45,11 @@ struct PlannedShard {
     uint64_t          blob_bytes   = 0;
     std::vector<json> groups;
     std::string       content_hash;
+    // MAD ML8: the source index's "ml8_rotation"[<layer>] role map, or null
+    // if this layer has none. Since every source shard here is exactly one
+    // layer (layer_first == layer_last is enforced above), this is at most
+    // one layer's worth of roles.
+    json              ml8_rotation = nullptr;
 };
 
 struct Plan {
@@ -332,6 +337,17 @@ Plan build_plan(const Options & options) {
         planned.layer               = layer_first;
         uint64_t source_next_offset = 0;
 
+        // MAD ML8: carry the source layer's rotation block through verbatim
+        // -- this tool re-shards by expert range, it never touches weight
+        // bytes or rotation math, so there's nothing to recompute.
+        if (index.contains("ml8_rotation")) {
+            const std::string layer_key = std::to_string(layer_first);
+            const json &      rotation  = index.at("ml8_rotation");
+            if (rotation.contains(layer_key)) {
+                planned.ml8_rotation = rotation.at(layer_key);
+            }
+        }
+
         for (const json & group : groups) {
             const int block_idx  = get_value<int>(group, "block_idx", index_path);
             const int expert_idx = get_value<int>(group, "expert_idx", index_path);
@@ -477,6 +493,9 @@ json build_output_index(const Plan & plan, const PlannedShard & shard) {
     };
     if (plan.sliced) {
         index["expert_slicing"] = plan.expert_slicing;
+    }
+    if (!shard.ml8_rotation.is_null()) {
+        index["ml8_rotation"] = { { std::to_string(shard.layer), shard.ml8_rotation } };
     }
 
     uint64_t output_offset = 0;

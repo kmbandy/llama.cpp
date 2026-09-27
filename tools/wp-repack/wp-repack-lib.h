@@ -3,7 +3,9 @@
 #include "weight-pager/wp-page-catalog.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wp_repack {
@@ -12,9 +14,22 @@ struct ExpertMember {
     uint8_t     role_mask   = 0;
     uint16_t    file_idx    = 0;
     uint64_t    file_offset = 0;
-    uint64_t    size        = 0;
+    uint64_t    size        = 0;   // TOTAL member bytes: weight bytes, plus lut_bytes if any
     std::string catalog_name;
     std::string source_tensor_name;
+
+    // MAD ML8: an ML8_4 role carries its per-expert centroid LUT slice
+    // immediately after the weight bytes in the SAME member (see
+    // attach_ml8_luts). lut_bytes == 0 means no LUT (ML8_FP8, unrotated, or
+    // any non-ml8 role). The LUT's own source location is tracked
+    // separately from the weight's (file_idx/file_offset above), since the
+    // centroids tensor is a distinct GGUF tensor from the weight tensor,
+    // though normally in the same file.
+    uint64_t lut_bytes       = 0;
+    uint16_t lut_file_idx    = 0;
+    uint64_t lut_file_offset = 0;
+
+    uint64_t weight_bytes() const { return size - lut_bytes; }
 };
 
 struct ExpertGroup {
@@ -105,6 +120,27 @@ struct SliceRange {
 std::vector<SliceRange> slice_ranges(const std::vector<int64_t> & widths);
 
 std::vector<ExpertGroup> build_expert_groups(const wp::PageCatalog & catalog);
+
+// MAD ML8: per-(layer, role) centroid LUT location, keyed by (block_idx,
+// role_mask). `file_offset` is expert 0's LUT slice; expert e's slice starts
+// at file_offset + e * per_expert_bytes (centroids tensor is [16, K/64,
+// n_expert], row-major, so experts are the outermost/slowest axis).
+struct ExpertLutInfo {
+    uint16_t file_idx         = 0;
+    uint64_t file_offset      = 0;
+    uint64_t per_expert_bytes = 0;
+};
+
+// Attach ML8_4 centroid LUT bytes to the matching members of `groups`, one
+// lookup per (block_idx, role_mask). For a matching member: lut_bytes,
+// lut_file_idx, lut_file_offset are set (lut_file_offset = info.file_offset
+// + expert_idx * info.per_expert_bytes), member.size grows by lut_bytes, and
+// the owning group's size/payload_size are recomputed (re-padded to
+// DIRECT_ALIGNMENT). Members/groups with no matching (block_idx, role_mask)
+// entry are left completely untouched, which is what keeps unrotated /
+// non-ml8 output byte-identical to before this function existed.
+void attach_ml8_luts(std::vector<ExpertGroup> &                                groups,
+                     const std::map<std::pair<int, uint8_t>, ExpertLutInfo> & lut_by_layer_role);
 
 std::vector<LayerRange> parse_layer_ranges(const std::string & text);
 

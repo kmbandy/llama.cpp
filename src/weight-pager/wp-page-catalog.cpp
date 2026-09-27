@@ -60,11 +60,24 @@ void classify_expert(const std::string & rest, PageMeta & m) {
         if (rest.size() <= r.len) continue;
         if (std::memcmp(rest.data(), r.prefix, r.len) != 0) continue;
 
-        // Consolidated form: "ffn_<role>_exps."
-        static const char cons[] = "_exps.";
+        // Consolidated form: "ffn_<role>_exps.weight". MAD ML8: the same
+        // "ffn_<role>_exps." prefix is also used by the weight's companion
+        // sidecars ("centroids", "rotation_meta", "rotation_h_a") -- those
+        // must NOT be classified as additional expert weight pages (they'd
+        // bloat a group past its exactly-3-member invariant), so the suffix
+        // is checked exactly against "weight".
+        static const char cons[]  = "_exps.";
         constexpr size_t  cons_len = sizeof(cons) - 1;
+        static const char weight_suffix[]  = "weight";
+        constexpr size_t  weight_suffix_len = sizeof(weight_suffix) - 1;
         if (rest.size() >= r.len + cons_len &&
             std::memcmp(rest.data() + r.len, cons, cons_len) == 0) {
+            const std::string suffix = rest.substr(r.len + cons_len);
+            if (suffix.size() != weight_suffix_len || std::memcmp(suffix.data(), weight_suffix, weight_suffix_len) != 0) {
+                // A companion sidecar tensor (centroids / rotation_meta /
+                // rotation_h_a, or anything else future) -- not paged.
+                return;
+            }
             m.is_expert        = true;
             m.is_consolidated  = true;
             m.expert_role_mask = r.mask;
@@ -72,7 +85,7 @@ void classify_expert(const std::string & rest, PageMeta & m) {
             return;
         }
 
-        // Per-expert form: "ffn_<role>.<E>."
+        // Per-expert form: "ffn_<role>.<E>.weight"
         if (rest[r.len] == '.') {
             const size_t num_start = r.len + 1;
             const size_t next_dot  = rest.find('.', num_start);
@@ -83,6 +96,10 @@ void classify_expert(const std::string & rest, PageMeta & m) {
             char * end_ptr = nullptr;
             const long e   = std::strtol(num_str.c_str(), &end_ptr, 10);
             if (end_ptr == nullptr || *end_ptr != '\0' || e < 0 || e > INT16_MAX) {
+                return;
+            }
+            const std::string suffix = rest.substr(next_dot + 1);
+            if (suffix != weight_suffix) {
                 return;
             }
             m.is_expert        = true;
