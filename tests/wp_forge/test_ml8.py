@@ -191,3 +191,92 @@ def test_quantize_experts_ml8_4_fits_per_expert_lut() -> None:
 def test_ml8_4_bad_shape_raises() -> None:
     with pytest.raises(ml8.Ml8Error):
         ml8.quantize_role_ml8_4(_f32(4, 100), None, fit_rows=4)  # 100 not %64
+
+
+# --- ML8_4 fast path vs. reference (sorted-prefix-sum Lloyd-Max / -----------
+#     searchsorted index assignment vs. the original O(G*M*16) fit and
+#     O(16)-per-element distance argmin) -------------------------------------
+
+def _weight_variants(rows: int, K: int, seed: int) -> dict:
+    rng = np.random.RandomState(seed)
+    gauss = (rng.randn(rows, K).astype(np.float32) * 0.02)
+    # heavy-tailed: student-t df=3 exercises large-outlier absmax scaling.
+    t = (np.random.default_rng(seed + 1).standard_t(df=3, size=(rows, K)).astype(np.float32) * 0.02)
+    # a group with many exact zeros (sparsity pattern independent per row).
+    zeros = gauss.copy()
+    zero_mask = rng.rand(rows, K) < 0.35
+    zeros[zero_mask] = 0.0
+    return {"gaussian": gauss, "student_t": t, "many_zeros": zeros}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2026])
+@pytest.mark.parametrize("shape", [(64, 256), (37, 128), (256, 128)])
+def test_ml8_4_fast_matches_reference_role(seed: int, shape: tuple[int, int]) -> None:
+    rows, K = shape
+    for name, w in _weight_variants(rows, K, seed).items():
+        p_fast, c_fast = ml8.quantize_role_ml8_4(w, None, fit_rows=rows, fast=True)
+        p_ref, c_ref = ml8.quantize_role_ml8_4(w, None, fit_rows=rows, fast=False)
+        assert np.array_equal(c_fast, c_ref), f"{name} seed={seed} shape={shape}: centroid bytes differ"
+        diff_frac = float((p_fast != p_ref).mean())
+        # e4m3-snapped centroids can leave a normalized sample exactly on a
+        # decision boundary; float32-masked-sum (reference) vs. float64
+        # prefix-sum (fast) summation-order differences can then flip which
+        # of two adjacent centroids a handful of samples land nearest to
+        # during the fit, before any such tie affects the final assignment.
+        # Bound this instead of requiring bit-identical bytes.
+        assert diff_frac < 1e-4, f"{name} seed={seed} shape={shape}: packed byte diff frac={diff_frac}"
+
+
+def test_ml8_4_fast_matches_reference_rotated() -> None:
+    K, rows = 2048, 128
+    rot, _, _, _ = ml8.build_rotation(K, "kronecker", 3, 1024, layer=4, group="down")
+    for name, w in _weight_variants(rows, K, 7).items():
+        p_fast, c_fast = ml8.quantize_role_ml8_4(w, rot, fit_rows=rows, fast=True)
+        p_ref, c_ref = ml8.quantize_role_ml8_4(w, rot, fit_rows=rows, fast=False)
+        assert np.array_equal(c_fast, c_ref), f"{name}: centroid bytes differ"
+        diff_frac = float((p_fast != p_ref).mean())
+        assert diff_frac < 1e-4, f"{name}: packed byte diff frac={diff_frac}"
+
+
+def test_ml8_4_fast_matches_reference_fused_experts() -> None:
+    """quantize_experts_ml8_4's fast (chunked, batched-over-experts) path
+    against its own reference per-expert Python-loop implementation."""
+    K, rows, n_e = 128, 32, 6
+    stack = np.stack(
+        [
+            np.random.RandomState(100 + e).standard_t(df=3, size=(rows, K)).astype(np.float32) * (0.01 * (e + 1))
+            for e in range(n_e)
+        ],
+        axis=0,
+    )
+    rot, _, _, _ = ml8.build_rotation(K, "kronecker", 5, 64, layer=2, group="down")
+
+    p_fast, c_fast = ml8.quantize_experts_ml8_4(stack, rot, fit_rows=rows, fast=True, expert_chunk=2)
+    p_ref, c_ref = ml8._quantize_experts_ml8_4_reference(stack, rot, fit_rows=rows)
+
+    assert p_fast.shape == p_ref.shape and c_fast.shape == c_ref.shape
+    assert np.array_equal(c_fast, c_ref)
+    diff_frac = float((p_fast != p_ref).mean())
+    assert diff_frac < 1e-4, f"packed byte diff frac={diff_frac}"
+
+
+def test_lloyd_max_signed_batched_fast_matches_reference() -> None:
+    """Direct check of the Lloyd-Max kernel swap in isolation (no e4m3
+    snap / packing in the way): fast sorted-prefix-sum fit vs.
+    centroid_quantizer._lloyd_max_signed_batched(fit_loss="mse")."""
+    ml8._ensure_paths()
+    from centroid_quantizer import _lloyd_max_signed_batched  # noqa: E402
+
+    for seed in (0, 1, 2):
+        g = torch.Generator().manual_seed(seed)
+        gauss = torch.randn(20, 5000, generator=g)
+        # StudentT.rsample doesn't take a `generator` kwarg (unlike
+        # torch.randn) -- it draws from torch's global RNG, so seed that
+        # explicitly or this branch is nondeterministic across test order /
+        # process state (was flaky before this fix).
+        torch.manual_seed(seed + 1000)
+        t = torch.distributions.StudentT(df=3).rsample((20, 5000))
+        for samples in (gauss, t):
+            fast = ml8._lloyd_max_signed_batched_fast(samples, n_levels=16, n_iter=25)
+            ref = _lloyd_max_signed_batched(samples, n_levels=16, n_iter=25, fit_loss="mse")
+            assert torch.allclose(fast, ref, atol=1e-6), f"seed={seed}: max diff={ (fast - ref).abs().max()}"
