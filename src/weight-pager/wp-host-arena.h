@@ -193,6 +193,15 @@ public:
                bool prefill_hint = false);
     void release(int page_idx, Handle handle);
 
+    // --- exclusive victim tier (WP_HOST_TIER_VICTIM in the worker) ---
+    // Free `page_idx`'s entry as soon as nothing holds it: now if it is
+    // Resident, unborrowed and unpinned, otherwise at the release() or
+    // finish_read() that leaves it so. The worker marks a page once its VRAM
+    // slot has the bytes, so the arena keeps only pages VRAM has evicted
+    // (demoted by D2H) instead of shadowing what VRAM already holds.
+    void mark_drop(int page_idx);
+    uint64_t drops() const;   // entries freed through mark_drop
+
     // --- pinning (coding hot set) ---
     // Marks a Resident entry pinned (LRU skips it). Fails if not Resident or
     // pinned cap reached. The cap is pinned_cap_pct of the TIER entries
@@ -268,6 +277,7 @@ private:
         int      borrows      = 0;
         bool     speculative  = false;
         bool     pinned       = false;
+        bool     drop_when_idle = false;  // mark_drop(): free on the last release
         bool     ever_borrowed = false;   // set by any borrow() (demand or peek), reset
                                            // when the entry becomes Reading again; an
                                            // eviction while still speculative only counts
@@ -303,6 +313,9 @@ private:
 
     bool     evict_one_locked_(EvictScope scope);
     void     trim_to_tier_cap_locked_();
+    // Caller holds mu_. Frees a Resident, unborrowed, unpinned entry flagged
+    // drop_when_idle; returns whether it did.
+    bool     drop_if_idle_locked_(size_t idx);
     // Caller holds mu_. Shared body of begin_read()/begin_read_wait().
     bool     begin_read_locked_(int page_idx, bool speculative, void ** data_out, Handle * handle_out);
     void     remove_from_list_locked_(size_t idx);
@@ -379,6 +392,7 @@ private:
     uint64_t admission_cold_landed_ = 0;
     uint64_t lookups_     = 0;
     uint64_t lookup_hits_ = 0;
+    uint64_t drops_       = 0;
 
     // Sketch storage: kSketchRows * cfg_.sketch_width counters, row r's
     // lane at r * cfg_.sketch_width + (hash % cfg_.sketch_width). Empty

@@ -972,6 +972,44 @@ static void test_freq_admission_gates_spec_to_demand_promotion() {
             "the rejected count must not have grown");
 }
 
+// mark_drop (WP_HOST_TIER_VICTIM): a page whose VRAM slot now holds it is freed
+// at its last release, never while held, and at once if already idle; a
+// page marked while still Reading frees at its release after landing.
+static void test_mark_drop_frees_when_idle() {
+    CountingAlloc a;
+    HostArena arena;
+    require(arena.init(cfg(4), a.alloc(), a.dealloc()), "init");
+    void * data; HostArena::Handle h;
+
+    require(arena.begin_read(1, false, &data, &h), "read 1");
+    arena.mark_drop(1);   // marked while Reading
+    arena.finish_read(1, h, true, /*keep_borrowed=*/true);
+    require(arena.state_of(1) == HostArena::State::Resident, "held landing stays resident");
+    arena.release(1, h);
+    require(arena.state_of(1) == HostArena::State::Free, "freed at the release after landing");
+
+    require(arena.begin_read(2, false, &data, &h), "read 2");
+    arena.finish_read(2, h, true);
+    require(arena.state_of(2) == HostArena::State::Resident, "2 retained without mark");
+    const void * src; HostArena::Handle hb;
+    require(arena.borrow(2, &src, &hb), "borrow 2");
+    arena.mark_drop(2);
+    require(arena.state_of(2) == HostArena::State::Resident, "not freed while borrowed");
+    arena.release(2, hb);
+    require(arena.state_of(2) == HostArena::State::Free, "freed at the last release");
+
+    require(arena.begin_read(3, false, &data, &h), "read 3");
+    arena.finish_read(3, h, true);
+    arena.mark_drop(3);
+    require(arena.state_of(3) == HostArena::State::Free, "idle entry freed at once");
+
+    require(arena.begin_read(4, false, &data, &h), "read 4 reuses a dropped entry");
+    arena.finish_read(4, h, true);
+    require(arena.state_of(4) == HostArena::State::Resident, "a fresh landing is not marked");
+    require(arena.drops() == 3, "three drops counted");
+    require(arena.resident_count() == 1, "only 4 resident");
+}
+
 int main() {
     try {
         test_init_chunked_and_shrink_on_failure();
@@ -998,6 +1036,7 @@ int main() {
         test_freq_admission_off_never_touches_admission_counters();
         test_protect_demand_from_spec_speculative_never_evicts_demand();
         test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand();
+        test_mark_drop_frees_when_idle();
         std::cout << "test-wp-host-arena: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

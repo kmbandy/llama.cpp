@@ -1282,6 +1282,27 @@ bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t backend, ggml_tensor 
     return true;
 }
 
+bool ggml_backend_cuda_wp_d2h(ggml_backend_t backend, const ggml_tensor * tensor,
+                             void * dst, size_t offset, size_t size) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    // One stream per (thread, device): concurrent reader threads each wait only
+    // on their own copy. Reader threads live for the worker's lifetime.
+    thread_local cudaStream_t streams[GGML_CUDA_MAX_DEVICES] = {};
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t & stream = streams[ctx->device];
+    if (stream == nullptr && ggml_cuda_wp_copy_stream_create(&stream) != cudaSuccess) {
+        stream = nullptr;
+        return false;
+    }
+    if (cudaMemcpyAsync(dst, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return false;
+    }
+    return cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
 bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t backend,
                                                    ggml_backend_event_t event) {
     // Check capability before reading backend->context; backend names are not type checks.

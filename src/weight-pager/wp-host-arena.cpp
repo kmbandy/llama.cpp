@@ -548,6 +548,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
     e.speculative = speculative;
     e.pinned      = false;
     e.ever_borrowed = false;
+    e.drop_when_idle = false;
     e.gen         = next_gen_++;
     e.loc         = ListLoc::None;
 
@@ -581,6 +582,7 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borr
             e.borrows       = 1;
             e.ever_borrowed = true;
         }
+        drop_if_idle_locked_(idx);
         // Trim regardless of keep_borrowed: a held entry cannot itself be
         // evicted (evict_one_locked_ skips borrowed entries), but landing it
         // may have pushed the OTHER unborrowed/unpinned resident bytes over
@@ -697,8 +699,42 @@ void HostArena::release(int page_idx, Handle handle) {
     Entry & e = entries_[it->second];
     if (e.gen != handle) return;        // stale: a different generation now owns this page_idx
     if (e.borrows > 0) --e.borrows;
+    drop_if_idle_locked_(it->second);
     trim_to_tier_cap_locked_();
     cv_.notify_all();
+}
+
+// --- exclusive victim tier ---------------------------------------------------
+
+bool HostArena::drop_if_idle_locked_(size_t idx) {
+    Entry & e = entries_[idx];
+    if (!e.drop_when_idle || e.state != State::Resident || e.borrows != 0 || e.pinned) {
+        return false;
+    }
+    remove_from_list_locked_(idx);
+    if (e.speculative) spec_bytes_ -= cfg_.entry_bytes;
+    resident_count_ -= 1;
+    resident_bytes_ -= cfg_.entry_bytes;
+    by_page_.erase(e.page_idx);
+    e.state          = State::Free;
+    e.page_idx       = -1;
+    e.borrows        = 0;
+    e.speculative    = false;
+    e.drop_when_idle = false;
+    e.gen            = kInvalidHandle;
+    free_.push_back(idx);
+    ++drops_;
+    return true;
+}
+
+void HostArena::mark_drop(int page_idx) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = by_page_.find(page_idx);
+    if (it == by_page_.end()) return;
+    Entry & e = entries_[it->second];
+    if (e.pinned) return;   // a pinned hot-set page stays regardless
+    e.drop_when_idle = true;
+    if (drop_if_idle_locked_(it->second)) cv_.notify_all();
 }
 
 // --- retention cap -------------------------------------------------------
@@ -802,5 +838,6 @@ uint64_t HostArena::reject_promotions() const { std::lock_guard<std::mutex> lock
 uint64_t HostArena::spec_promotions_rejected() const { std::lock_guard<std::mutex> lock(mu_); return spec_promotions_rejected_; }
 uint64_t HostArena::lookups()     const { std::lock_guard<std::mutex> lock(mu_); return lookups_; }
 uint64_t HostArena::lookup_hits() const { std::lock_guard<std::mutex> lock(mu_); return lookup_hits_; }
+uint64_t HostArena::drops()       const { std::lock_guard<std::mutex> lock(mu_); return drops_; }
 
 }  // namespace wp

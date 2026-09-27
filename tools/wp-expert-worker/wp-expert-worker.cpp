@@ -88,6 +88,8 @@ bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t, ggml_tensor *,
 bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t,
                                                                ggml_backend_event_t)
     __attribute__((weak));
+bool ggml_backend_cuda_wp_d2h(ggml_backend_t, const ggml_tensor *, void *, size_t, size_t)
+    __attribute__((weak));
 // Reader-thread H2D: reader-thread H2D on a dedicated non-blocking per-device
 // stream (see the long comment on the definition in ggml-cuda.cu for why
 // this exists instead of calling ggml_backend_tensor_set from a reader
@@ -2049,6 +2051,16 @@ public:
         n_layerahead_spec_deferred_             = spec_deferred;
     }
 
+    // WP_HOST_TIER_VICTIM: pool-lifetime D2H demotions into the arena, the
+    // ones skipped (arena busy/full, page already there), their total time,
+    // and arena entries freed by mark_drop after their upload.
+    void set_victim_stats(uint64_t demoted, uint64_t skipped, uint64_t ns_demote, uint64_t drops) {
+        victim_demoted_   = demoted;
+        victim_skipped_   = skipped;
+        victim_ns_demote_ = ns_demote;
+        victim_drops_     = drops;
+    }
+
     void set_pin_stats(size_t n_pinned, uint64_t demand_hits) {
         n_pinned_ = n_pinned;
         n_pinned_demand_hits_ = demand_hits;
@@ -2355,6 +2367,10 @@ private:
                   // lookups climb but ram_lookup_hits stays ~0 while pages
                   // are known resident, the bug is in admission/eviction,
                   // not in whether the lookup happens.
+                  << " ram_victim_demoted=" << victim_demoted_
+                  << " ram_victim_skipped=" << victim_skipped_
+                  << " ram_victim_demote_ms=" << (victim_ns_demote_ / 1000000)
+                  << " ram_drops=" << victim_drops_
                   << " ram_lookups=" << ram_lookups_
                   << " ram_lookup_hits=" << ram_lookup_hits_
                   << " ram_spec_landed=" << ram_spec_landed_
@@ -2572,6 +2588,10 @@ private:
     uint64_t           ram_evictions_      = 0;
     uint64_t           ram_admission_cold_landed_ = 0;
     uint64_t           ram_lookups_        = 0;
+    uint64_t           victim_demoted_     = 0;
+    uint64_t           victim_skipped_     = 0;
+    uint64_t           victim_ns_demote_   = 0;
+    uint64_t           victim_drops_       = 0;
     uint64_t           ram_lookup_hits_    = 0;
     uint64_t           ram_evictions_spec_    = 0;
     uint64_t           ram_evictions_reject_  = 0;
@@ -4931,6 +4951,11 @@ private:
         // freq_admit only ever gates prefill landings; see the block comment
         // above HostArena::admit_landed_locked_ for why decode is exempt.
         bool               prefill    = false;
+        // WP_HOST_TIER_VICTIM: the page this page-in's slot held until now,
+        // set at plan time for a decode page-in evicting a confirmed page.
+        // reserve_arena_for_pagein D2H-copies it into the arena before
+        // anything overwrites the slot, and clears it.
+        const ExpertPage * demote_page = nullptr;
         // Hold bookkeeping (reader thread until the last result is pushed,
         // dispatch thread afterwards -- never both at once):
         //   hold_released -- the arena borrow/reservation this page-in took
@@ -6112,9 +6137,15 @@ public:
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
                     if (slot.valid) {
-                        // Simply overwritten: every NVMe read lands in the
-                        // arena and stays there, so there is no D2H demotion
-                        // to run before this slot's old page is discarded.
+                        // Without WP_HOST_TIER_VICTIM the old page is simply
+                        // overwritten. With it, a decode page-in hands the
+                        // evicted page (unless it was an unconfirmed guess)
+                        // to reserve_arena_for_pagein for a D2H into the
+                        // arena, so RAM holds what VRAM just let go of.
+                        if (host_tier_victim_enabled() && !pi.prefill &&
+                                !slot.spec_pending && slot.page != nullptr) {
+                            pi.demote_page = slot.page;
+                        }
                         slot_index_.erase(slot_key(slot.key.first, slot.key.second));
                         // Evicted before a demand hit ever confirmed it: the
                         // unconfirmed-speculative occupancy this slot held ends
@@ -6853,6 +6884,9 @@ public:
     }
 
     uint64_t host_landed() const { return host_landed_.load(std::memory_order_relaxed); }
+    uint64_t n_victim_demoted() const { return n_victim_demoted_.load(std::memory_order_relaxed); }
+    uint64_t n_victim_skipped() const { return n_victim_skipped_.load(std::memory_order_relaxed); }
+    uint64_t ns_victim_demote() const { return ns_victim_demote_.load(std::memory_order_relaxed); }
     wp::HostArena & arena() { return arena_; }
     const wp::HostArena & arena() const { return arena_; }
     uint64_t host_spec_bytes() const { return host_bytes_.load(std::memory_order_relaxed); }
@@ -7452,6 +7486,75 @@ private:
         return enabled;
     }
 
+    // WP_HOST_TIER_VICTIM=1: exclusive victim tier. Decode page-ins D2H the
+    // page their slot is evicting into the arena (demote_to_arena), and every
+    // page-in marks its own arena entry for drop once its upload is done, so
+    // the arena holds only pages VRAM has evicted. The default (off) keeps the
+    // fill-on-read arena, which on DS4.1 measured 0 decode hits: with the tier
+    // smaller than the VRAM pool, every page it holds is also in VRAM.
+    static bool host_tier_victim_enabled() {
+        static const bool enabled = [] {
+            const char * e = std::getenv("WP_HOST_TIER_VICTIM");
+            return e != nullptr && e[0] == '1';
+        }();
+        return enabled;
+    }
+
+    // Copy pagein.demote_page out of the slot this page-in is about to
+    // overwrite. Runs on the one thread that reserves for this page-in, before
+    // any read or upload touches the slot (reserve_arena_for_pagein's first
+    // step). Best effort: a full or busy arena, or a page already there, skips
+    // the demotion and the page is simply dropped as before.
+    void demote_to_arena(PageIn & pagein) {
+        const ExpertPage & victim = *pagein.demote_page;
+        pagein.demote_page = nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        void * data = nullptr;
+        wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
+        if (!arena_.begin_read(victim.cache_id, /*speculative=*/false, &data, &handle)) {
+            n_victim_skipped_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        bool ok = true;
+        try {
+            // Non-blocking per-thread stream where the backend has one: the
+            // per-thread-stream tensor_get fallback measured ~12 ms per 18 MiB
+            // page on gfx1201, queued behind the compute graph. It returns
+            // false on the first chunk for a non-CUDA/HIP backend.
+            bool fast = ggml_backend_cuda_wp_d2h != nullptr;
+            bool first = true;
+            if (fast) {
+                for_each_page_chunk(victim, 0, (size_t) victim.size,
+                                    [&](size_t dst_off, size_t dev_off, size_t n) {
+                    if (!fast || !ok) return;
+                    if (!ggml_backend_cuda_wp_d2h(backend_, pagein.raw,
+                                                  (char *) data + dst_off, dev_off, n)) {
+                        if (first) fast = false; else ok = false;
+                    }
+                    first = false;
+                });
+            }
+            if (!fast) {
+                // reader-thread safe (per-thread stream, see tensor_verify_page_range)
+                tensor_get_page(pagein.raw, victim, data);
+            }
+        } catch (...) {
+            ok = false;
+        }
+        arena_.finish_read(victim.cache_id, handle, ok);
+        if (ok) {
+            n_victim_demoted_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            n_victim_skipped_.fetch_add(1, std::memory_order_relaxed);
+        }
+        ns_victim_demote_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    }
+
+    std::atomic<uint64_t> n_victim_demoted_{0};
+    std::atomic<uint64_t> n_victim_skipped_{0};
+    std::atomic<uint64_t> ns_victim_demote_{0};
+
     // Reserve this page-in's arena entry. Called by the ONE reader thread
     // that owns it (read_worker), or by whichever stripe-parallel thread
     // reaches this page's PageShared reservation gate first
@@ -7470,6 +7573,13 @@ private:
     // fails with "host arena exhausted" -- only reachable when every entry
     // stays Reading/borrowed/pinned with zero progress process-wide.
     bool reserve_arena_for_pagein(PageIn & pagein, int conn_index) {
+        // Paths that write the slot before drain_one_read must demote here;
+        // otherwise drain_one_read demotes right before the page's first
+        // upload, off the reader threads (measured ~9-14 ms per D2H with 16
+        // readers doing it concurrently, vs ~1 ms per upload on dispatch).
+        if (pagein.demote_page != nullptr && (pagein.reader_h2d || pagein.cpu_direct)) {
+            demote_to_arena(pagein);
+        }
         if (pagein.cpu_direct) {
             return true;   // never touches the arena (unless a stripe falls back: I2)
         }
@@ -7493,6 +7603,11 @@ private:
                 pagein.ram_hit    = true;
                 pagein.arena_data = const_cast<void *>(src);
                 pagein.hold_released = false;
+                if (host_tier_victim_enabled()) {
+                    // exclusive: the page is going back to VRAM, free its
+                    // entry once this upload's hold is released
+                    arena_.mark_drop(pagein.page->cache_id);
+                }
                 return true;
             }
             const auto now = std::chrono::steady_clock::now();
@@ -7505,6 +7620,10 @@ private:
                 pagein.ram_hit    = false;
                 pagein.arena_data = data;
                 pagein.hold_released = false;
+                if (host_tier_victim_enabled()) {
+                    // staging only: freed at the release after its upload
+                    arena_.mark_drop(pagein.page->cache_id);
+                }
                 return true;
             }
             if (r == wp::HostArena::Reserve::Timeout) {
@@ -8055,6 +8174,10 @@ private:
                 }
             } else {
                 Slot & slot = slots_[pagein.slot_index];
+                if (pagein.demote_page != nullptr) {
+                    // before this page-in's first stripe lands in the slot
+                    demote_to_arena(pagein);
+                }
                 bool copy_stream_async = false;
                 // Set true wherever the H2D below is issued asynchronously
                 // (copy-stream or tensor_set_async -- anywhere mark_in_flight
@@ -12418,6 +12541,8 @@ public:
                                  arena.evictions_spec(), arena.evictions_reject(),
                                  arena.evictions_lru(), arena.reject_promotions(),
                                  arena.spec_promotions_rejected());
+            stats_.set_victim_stats(pool_.n_victim_demoted(), pool_.n_victim_skipped(),
+                                    pool_.ns_victim_demote(), arena.drops());
         }
         stats_.set_layerahead_stats(
             n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits(),
