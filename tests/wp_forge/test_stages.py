@@ -33,7 +33,7 @@ from synth import SyntheticSpineBuilder, make_synthetic_hf_repo
 # Expected on-disk size of one layer of experts at the test's geometry:
 # n_ff=64, n_embd=32, 4 experts, q8_0 -> gate/up 64x34, down 32x68 per expert,
 # 3*2176*4 = 26112 bytes.
-BLOB_1LYR = 26112
+BLOB_1LYR = 32768  # 8 experts x one 4096-aligned page each (wp-repack pads v1 pages since 1c134da00)
 
 
 def _write_spine(path: Path) -> None:

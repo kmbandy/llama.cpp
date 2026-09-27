@@ -4480,6 +4480,17 @@ Catalog & layout_sliced_pages(
             ggml_tensor * tensor =
                 ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
             size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+            // ML8_4 roles carry their per-expert centroid LUT immediately
+            // after the weight bytes, inside the SAME page member / same
+            // device allocation (mirrors load_catalog's
+            // `size != role_specs.at(role).bytes + role_specs.at(role).lut_bytes`
+            // host-layout check) -- reserve room for it here too, or a
+            // nonzero spec.lut_bytes makes member.second->size (weight+LUT)
+            // exceed alloc_size (weight only) and this throws for every
+            // ML8_4 page. The compute path's make_centroids() reads the LUT
+            // at this role's device_offset + spec.bytes, i.e. right where
+            // this reservation places it.
+            alloc_size += spec.lut_bytes;
             if (alloc_size < member.second->size) {
                 throw std::runtime_error("invalid expert slice device allocation size");
             }
@@ -11347,6 +11358,10 @@ public:
     }
 
     bool grouped_gemv_eligible(const pipe_expert_dispatch_req & request) const {
+        if (layer_is_ml8_special(request.layer)) {
+            log_ml8_special_fallback(request.layer, "compute_batch_grouped (grouped_gemv)");
+            return false;
+        }
         static const bool enabled = [] {
             const char * e = std::getenv("WP_EXPERT_GROUPED_GEMV");
             return e != nullptr && std::strtol(e, nullptr, 10) == 1;
@@ -11365,6 +11380,10 @@ public:
     bool batch_mmid_eligible(const pipe_expert_dispatch_req & request) const {
         if (!batch_mmid_enabled_ || request.n_tokens < 1 ||
                 request.assignments.empty()) {
+            return false;
+        }
+        if (layer_is_ml8_special(request.layer)) {
+            log_ml8_special_fallback(request.layer, "compute_batch_mmid");
             return false;
         }
         // CPU was silently dropped: the allow-list parser accepts "CPU" but
@@ -11481,6 +11500,10 @@ public:
         if (!arena_prefill_enabled_ || request.n_tokens <= 8) {
             return false;
         }
+        if (layer_is_ml8_special(request.layer)) {
+            log_ml8_special_fallback(request.layer, "compute_batch_arena_prefill");
+            return false;
+        }
         const std::optional<ExpertSlotPool::ArenaLayout> & layout = pool_.arena_layout();
         const bool ok = layout.has_value() && arena_assignments_eligible(request, batch, *layout);
         static const bool diag = [] {
@@ -11527,6 +11550,10 @@ public:
         if (request.n_tokens < 1 || request.n_tokens > 8 ||
                 request.assignments.empty() ||
                 request.assignments.size() > (size_t) 16 * request.n_tokens) {
+            return false;
+        }
+        if (layer_is_ml8_special(request.layer)) {
+            log_ml8_special_fallback(request.layer, "compute_batch_arena/compute_batch_arena_multi");
             return false;
         }
         const char * const backend_name = ggml_backend_name(backend_.get());
@@ -14011,7 +14038,11 @@ private:
             CpuSerialSmallGuard(const CpuSerialSmallGuard &) = delete;
             CpuSerialSmallGuard & operator=(const CpuSerialSmallGuard &) = delete;
         };
-        reject_if_ml8_special(pages, "compute_batch");
+        // NOTE: compute_batch() itself is now ml8-aware (see the per-expert
+        // loop below) -- no reject_if_ml8_special() here. Every OTHER arm it
+        // may dispatch to (fused / mmid / grouped / arena / arena_prefill)
+        // still gates ml8-special layers out of its own eligibility check
+        // and keeps its own reject_if_ml8_special backstop.
         const CpuSerialSmallGuard cpu_serial_small(this, request.n_tokens, &request_stats);
         const bool measure_vk = stats_.enabled() && is_vulkan_backend();
         const std::chrono::steady_clock::time_point vk_compute_started =
@@ -14241,10 +14272,15 @@ private:
                 }
             }
         }
+        const bool ml8_special_layer = layer_is_ml8_special(request.layer);
         const bool fused_expert_request =
             !force_fallback && is_vulkan_backend() &&
             s_vk_fused_enabled &&
-            request.n_tokens >= 1 && request.n_tokens <= 8;
+            request.n_tokens >= 1 && request.n_tokens <= 8 &&
+            !ml8_special_layer;
+        if (ml8_special_layer && vk_fused_armed) {
+            log_ml8_special_fallback(request.layer, "compute_batch_fused");
+        }
         if (fused_expert_request) {
             record_vk_setup();
             if (compute_batch_fused(
@@ -14317,10 +14353,14 @@ private:
         const bool d3_grouped =
             !mmid_assoc.use_mmid &&
             !persistent_graphs &&
+            !ml8_special_layer &&
             (grouped_gemv || (s_batch_moe && !use_gather) || (s_worker_collapse && !use_gather)) &&
                 sel_begin == 0 &&
                 sel_end >= request.assignments.size() &&
                 result_offset == std::numeric_limits<size_t>::max();
+        if (ml8_special_layer && (s_batch_moe || s_worker_collapse) && !use_gather) {
+            log_ml8_special_fallback(request.layer, "compute_batch_grouped (WP_EXPERT_BATCH_MOE/WP_WORKER_COLLAPSE)");
+        }
         if (s_worker_collapse && !d3_grouped && !request_stats.d3_counted) {
             ++request_stats.n_d3_bounce;
             request_stats.d3_counted = true;
@@ -14423,7 +14463,12 @@ private:
             return e != nullptr && e[0] == '1';
         }();
         FuseGateUpDiag fuse_diag;
-        if (s_fuse_gate_up) {
+        // ml8-special: gate/up may need separate rotations/LUTs (ML8_4's
+        // per-role centroid LUT in particular cannot be fused into one
+        // matmul across two differently-calibrated weights), so this
+        // optimization is not attempted for such a layer -- the per-expert
+        // loop below always takes its separate gate/up branch instead.
+        if (s_fuse_gate_up && !ml8_special_layer) {
             FuseGateUpCheck chk;
             chk.swiglu_clamp = request.swiglu_clamp;
             chk.use_gather = use_gather;
@@ -14554,7 +14599,8 @@ private:
         const bool fuse_gate_up_vk_wide =
             vk_mmv_cap > 0 && max_expert_width > vk_mmv_cap;
         const bool fuse_gate_up =
-            s_fuse_gate_up && fuse_diag.reason == FuseGateUpReason::Ok &&
+            s_fuse_gate_up && !ml8_special_layer &&
+            fuse_diag.reason == FuseGateUpReason::Ok &&
             !fuse_gate_up_vk_wide;
         if (s_fuse_gate_up) {
             if (fuse_gate_up_vk_wide && fuse_diag.reason == FuseGateUpReason::Ok) {
@@ -14576,7 +14622,16 @@ private:
         const std::chrono::steady_clock::time_point vk_cache_started =
             measure_vk ? std::chrono::steady_clock::now() :
                           std::chrono::steady_clock::time_point();
+        // D2 graph cache: skip entirely for ml8-special layers. The cache's
+        // hit path rebinds per-expert leaf tensors by a fixed (gate, up,
+        // down) index scheme (gc->expert_w, k*3+j) and knows nothing about
+        // the extra per-role centroid-LUT tensors or rotation nodes the
+        // per-expert loop below adds for such a layer -- rather than extend
+        // that rebind scheme, always take the "D2 miss" / fresh-context path
+        // for these layers (ctx_local below), which is correct, just not
+        // cached across requests.
         if (s_graph_cache && s_params_coalesce && gather_rank_uniform &&
+                !ml8_special_layer &&
                 result_offset == std::numeric_limits<size_t>::max()) {
             GraphKey key;
             key.n_tokens     = io_cols;
@@ -14839,6 +14894,29 @@ private:
             }
             return result;
         };
+        // ml8-4: y = w @ x.T with w [K,N] GGML_TYPE_ML8_4 and its per-K-group
+        // F8_E4M3 centroid LUT (see ggml-ml8.h) -- same [N,M] output layout as
+        // plain mul_mat above, so it is a drop-in per-role replacement. Not a
+        // ggml_mul_mat_set_hint candidate (that hint is plain-mul_mat-only).
+        const auto ml8_4_mul_mat = [&](ggml_tensor * weight, ggml_tensor * centroids, ggml_tensor * activation) {
+            return ggml_ml8_mul_mat(ctx.get(), weight, centroids, activation);
+        };
+        // Apply role's rotation (if any) to x's leading dim. Gate and up
+        // share one rotation (validated identical at descriptor load, see
+        // load_descriptor); down's rotation, if any, is independent and is
+        // applied to the swiglu/clamp output actually fed into the down
+        // matmul, per the contract in the commit that added RotationSpec.
+        const auto apply_role_rotation = [&](int layer, const std::string & role,
+                                              const RoleSpec & spec, ggml_tensor * x) {
+            if (!spec.has_rotation) {
+                return x;
+            }
+            ggml_tensor * h_a = nullptr;
+            if (spec.rotation.kind == GGML_ML8_ROTATION_KIND_KRONECKER_ORTH_SYLVESTER) {
+                h_a = rotation_h_a_.at({ layer, role });
+            }
+            return ggml_ml8_apply_rotation(ctx.get(), x, h_a, spec.rotation.a, spec.rotation.b);
+        };
 
         for (size_t i = 0; i < request.assignments.size(); ++i) {
             if (!selected(i)) {
@@ -14859,6 +14937,28 @@ private:
                 if (gc != nullptr) {
                     gc->expert_w.push_back(tensor);
                 }
+                return tensor;
+            };
+            // ML8_4 centroid LUT sidecar: [16, K/64] F8_E4M3, packed
+            // immediately after this role's weight bytes inside the SAME
+            // page member (wp-repack's layout; see load_catalog's
+            // `size != role_specs.at(role).bytes + role_specs.at(role).lut_bytes`
+            // check and layout_sliced_pages' matching device reservation for
+            // spec.lut_bytes) -- so its device offset is simply the weight's
+            // device_offset plus the weight's own byte count. Not pushed into
+            // gc->expert_w: only reachable when gc == nullptr (the D2 cache
+            // is skipped for ml8-special layers, see its call site above).
+            const auto make_centroids = [&](const std::string & role) {
+                const RoleSpec & spec = specs.at(role);
+                // QK_ML8 == 64 (ggml-common.h, internal to ggml -- parse_role
+                // already validated ne0 % 64 == 0 and lut_bytes == 16*ne0/64
+                // for every ML8_4 role at descriptor load).
+                const int64_t n_groups = spec.ne0 / 64;
+                ggml_tensor * tensor =
+                    ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F8_E4M3, 16, n_groups);
+                attach_weight(
+                    tensor, loaded.buffer, loaded.base,
+                    page.roles.at(role).device_offset + spec.bytes);
                 return tensor;
             };
 
@@ -14912,8 +15012,22 @@ private:
             ggml_tensor * gate = nullptr;
             ggml_tensor * up   = nullptr;
             if (hidden == nullptr) {
-                gate = mul_mat(make_weight("gate"), ffn_in);
-                up   = mul_mat(make_weight("up"), ffn_in);
+                const RoleSpec & gate_spec = specs.at("gate");
+                const RoleSpec & up_spec   = specs.at("up");
+                // gate and up share exactly one rotation (validated identical
+                // at descriptor load), so rotate the shared input ONCE and
+                // feed both matmuls from it.
+                ggml_tensor * gu_in = gate_spec.has_rotation
+                    ? apply_role_rotation(page.layer, "gate", gate_spec, ffn_in)
+                    : ffn_in;
+                ggml_tensor * gate_w = make_weight("gate");
+                gate = gate_spec.type == GGML_TYPE_ML8_4
+                    ? ml8_4_mul_mat(gate_w, make_centroids("gate"), gu_in)
+                    : mul_mat(gate_w, gu_in);
+                ggml_tensor * up_w = make_weight("up");
+                up = up_spec.type == GGML_TYPE_ML8_4
+                    ? ml8_4_mul_mat(up_w, make_centroids("up"), gu_in)
+                    : mul_mat(up_w, gu_in);
             }
             // *** SwiGLU CLAMP. ADDED 2026-08-05 -- ITS ABSENCE WAS A CORRECTNESS BUG. ***
             // Mirrors the LLM_ARCH_DEEPSEEK4 branch of build_moe_ffn() in
@@ -14936,7 +15050,21 @@ private:
                 }
                 hidden = ggml_swiglu_split(ctx.get(), gate, up);
             }
-            ggml_tensor * output = mul_mat(make_weight("down"), hidden);
+            ggml_tensor * output;
+            {
+                const RoleSpec & down_spec = specs.at("down");
+                // down's rotation (if any) is independent of gate/up's and
+                // applies to exactly the tensor fed into the down matmul --
+                // i.e. AFTER swiglu and any DeepSeek4 clamp above, not to the
+                // pre-swiglu gate/up activations.
+                ggml_tensor * down_in = down_spec.has_rotation
+                    ? apply_role_rotation(page.layer, "down", down_spec, hidden)
+                    : hidden;
+                ggml_tensor * down_w = make_weight("down");
+                output = down_spec.type == GGML_TYPE_ML8_4
+                    ? ml8_4_mul_mat(down_w, make_centroids("down"), down_in)
+                    : mul_mat(down_w, down_in);
+            }
             // SHAPE MATTERS: [1, n_tokens], NOT [n_tokens]. output is
             // [n_embd, n_tokens]; ggml_mul broadcasts src1 into src0 via
             // ggml_can_repeat, which only checks ne[i] % src1->ne[i] == 0. A
@@ -18002,9 +18130,14 @@ private:
     }
 
     // ml8-special: true when this layer has any role carrying a rotation or
-    // stored as ML8_4 -- every compute path currently REFUSES such layers
-    // (see the "ml8 rotation/ML8_4 experts not yet supported" checks); a
-    // later step wires the actual computation up.
+    // stored as ML8_4. Only the DEFAULT per-expert path (compute_batch's
+    // per-expert loop, below) knows how to apply a rotation and route through
+    // ggml_ml8_mul_mat -- every other compute_batch_* arm (fused, mmid,
+    // grouped, arena/arena_multi, arena_prefill) has its eligibility
+    // predicate gated false for such a layer (see log_ml8_special_fallback
+    // and its call sites) so compute_batch() falls through to the per-expert
+    // loop; reject_if_ml8_special stays as a defense-in-depth backstop
+    // inside those arms in case a future caller reaches one directly.
     bool layer_is_ml8_special(int layer) const {
         const auto it = catalog_.descriptor.layers.find(layer);
         if (it == catalog_.descriptor.layers.end()) {
@@ -18018,21 +18151,32 @@ private:
         return false;
     }
 
-    // Gate for every compute path below: none of them yet know how to apply
-    // an ml8 rotation or route through GGML_OP_ML8_MUL_MAT[_ID] with a
-    // non-contiguous slot-arena view, so fail loudly instead of silently
-    // computing wrong numbers. ML8_FP8 WITHOUT rotation is a plain ggml type
-    // and is NOT gated here (it already flows through these paths fine).
-    // Called at the top of compute_batch() (the single real dispatcher --
-    // every other compute_batch_* below is only ever reached through it) AND
-    // redundantly at the top of each compute_batch_* for defense in depth,
-    // in case a future caller reaches one directly.
+    // Backstop for every compute_batch_* arm EXCEPT the default per-expert
+    // path (which is ml8-aware -- see layer_is_ml8_special's comment).
+    // Reachable only if an eligibility predicate above compute_batch() ever
+    // fails to gate an ml8-special layer out; fail loudly rather than
+    // silently computing wrong numbers.
     void reject_if_ml8_special(const std::vector<const ExpertPage *> & pages, const char * path_name) const {
         for (const ExpertPage * page : pages) {
             if (page != nullptr && layer_is_ml8_special(page->layer)) {
                 throw std::runtime_error(
                     std::string("ml8 rotation/ML8_4 experts not yet supported by ") + path_name);
             }
+        }
+    }
+
+    // Logs once per (layer, path) that an ml8-special layer fell back to the
+    // default per-expert path because `path_name`'s eligibility predicate
+    // does not (yet, or ever) handle rotation / ML8_4.
+    mutable std::mutex             ml8_special_log_mu_;
+    mutable std::set<std::pair<int, std::string>> ml8_special_logged_;
+    void log_ml8_special_fallback(int layer, const char * path_name) const {
+        std::lock_guard<std::mutex> lock(ml8_special_log_mu_);
+        if (ml8_special_logged_.emplace(layer, path_name).second) {
+            std::fprintf(stderr,
+                "INFO wp expert worker: layer %d is ml8-special (rotation and/or ML8_4); "
+                "%s does not support it, falling back to the default per-expert path\n",
+                layer, path_name);
         }
     }
 
