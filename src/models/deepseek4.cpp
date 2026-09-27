@@ -356,7 +356,8 @@ std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const
     return std::make_unique<graph>(*this, params);
 }
 
-static void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+// Also used by DeepSeek-V4.1's DSpark stages (deepseek41.cpp): same Markov + confidence head contract.
+void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto & res = g.res;
     const int64_t n_vocab = res->t_logits->ne[0];
@@ -1339,7 +1340,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+    // V4 normalizes each head again after wq_b; V4.1 normalizes only the low-rank qr.
+    // DeepSeek-V4.1's DSpark stages reach this V4 path through the iswa overload, so the
+    // per-head norm must stay V4-only (with it, V4.1 drafts ignore their anchor).
+    if (model.arch != LLM_ARCH_DEEPSEEK41) {
+        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+    }
     cb(q, "q_norm", il);
 
     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,

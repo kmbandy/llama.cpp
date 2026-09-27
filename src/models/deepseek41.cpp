@@ -783,6 +783,12 @@ void llama_model_deepseek41::graph::build_dspark_stages(const llama_model & mode
     cb(cur, "result_output", -1);
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
+    // Markov bias per draft slot + confidence head (reference DSparkBlock.forward_head);
+    // t_embd above is the pre-norm collapsed hidden the confidence head reads.
+    if (model.dspark_markov_w1 != nullptr) {
+        dsv4_build_dspark_head(*this, model, inp_tokens);
+    }
 }
 
 // DSpark layer-input taps collapse the hyper-connection residual

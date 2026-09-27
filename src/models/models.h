@@ -1422,6 +1422,9 @@ struct llama_model_deepseek4 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// deepseek4.cpp: in-graph DSpark Markov bias + confidence head over res->t_logits / res->t_embd.
+void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens);
+
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
