@@ -514,6 +514,14 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        // MAD-LAB system1-rows: when true AND embeddings is on AND pooling_type is
+        // LLAMA_POOLING_TYPE_NONE AND the batch supplies logits flags, only the flagged
+        // tokens are extracted as embeddings (instead of every token in the batch). Any
+        // other combination behaves exactly as if this were false. Lets a ubatch hold
+        // several sequences while the output head only runs on the rows the caller
+        // actually wants (e.g. the "decide" token of each branch).
+        bool embd_sparse_outputs;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

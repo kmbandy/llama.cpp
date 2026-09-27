@@ -1065,6 +1065,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.embd_sparse_outputs     = params.embd_sparse_outputs;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -4490,8 +4491,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                           : mtp_embd        ? hparams.n_embd_out()
                                             : hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    // when computing embeddings, all tokens are output -- unless the caller opted into
+    // sparse outputs (system1-rows) and the batch supplies explicit logits flags, in
+    // which case only the flagged rows are output. Any other combination is unchanged.
+    const bool output_all   = cparams.embeddings &&
+                               !(cparams.embd_sparse_outputs &&
+                                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE &&
+                                 batch_inp.logits);
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -7890,6 +7896,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.embd_sparse_outputs         =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.kv_tier_enabled             =*/ false,
