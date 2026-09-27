@@ -5807,6 +5807,12 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
             GGML_ABORT("output layer input buffer not allocated");
         }
         ggml_tensor * t = res->get_layer_inp((int) il);
+        if (!t && res->layer_inp_skipped) {
+            const size_t row_floats = (size_t) llama_context_layer_inp_size(model);
+            GGML_ASSERT((token_offset + n_tokens) * row_floats <= embd_layer_inp[il].size);
+            std::memset(embd_layer_inp[il].data + token_offset * row_floats, 0, n_tokens * row_floats * sizeof(float));
+            continue;
+        }
         if (!t) {
             GGML_ABORT("layer input tensor not found");
         }
@@ -5814,10 +5820,22 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         const size_t nbytes = ggml_nbytes(t);
         const size_t nfloats = nbytes / sizeof(float);
         GGML_ASSERT(n_tokens > 0);
-        GGML_ASSERT(nfloats % n_tokens == 0);
 
-        const size_t row_floats = nfloats / n_tokens;
-        const size_t dst_offset = token_offset * row_floats;
+        // One row per token, as wide as the host buffer's rows. A tap past DS4.1's CED
+        // seam under the prefill trim carries only the ubatch's trailing rows (DSpark
+        // reads just its n_swa window of them): land those on the LAST rows and zero
+        // the leading ones.
+        const size_t row_floats = (size_t) llama_context_layer_inp_size(model);
+        GGML_ASSERT(row_floats > 0);
+        GGML_ASSERT(nfloats % row_floats == 0);
+        const size_t t_rows = nfloats / row_floats;
+        GGML_ASSERT(t_rows <= n_tokens);
+        if (t_rows < n_tokens) {
+            GGML_ASSERT((token_offset + n_tokens) * row_floats <= embd_layer_inp[il].size);
+            std::memset(embd_layer_inp[il].data + token_offset * row_floats, 0,
+                        (n_tokens - t_rows) * row_floats * sizeof(float));
+        }
+        const size_t dst_offset = (token_offset + n_tokens - t_rows) * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         // Pure views/reshapes used as layer-input taps may not receive a sched

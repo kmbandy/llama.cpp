@@ -1712,6 +1712,7 @@ void llm_graph_result::reset() {
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+    layer_inp_skipped = false;
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1762,6 +1763,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
+                if (t_layer_inp[il] == nullptr && layer_inp_skipped) {
+                    continue;
+                }
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }

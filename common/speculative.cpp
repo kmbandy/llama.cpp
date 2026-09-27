@@ -1321,6 +1321,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             SPC_INF("DFlash prompt tail retention = %d tokens per sequence per process call\n", prefill_tail);
         }
+        // DSpark's stages are sliding-window, so the prompt catch-up only ever needs the
+        // last n_swa rows: nothing earlier stays visible to a draft query. Trimming it
+        // here is also what lets DS4.1 keep its CED prefill trim with the taps live
+        // (the target only computes decoder-range taps for each ubatch's trailing rows).
+        // WP_DSPARK_PREFILL_TAIL=0 restores the full catch-up.
+        if (is_dspark) {
+            const char * dsp_tail_env = std::getenv("WP_DSPARK_PREFILL_TAIL");
+            const auto & hp = model_dft->hparams;
+            bool stages_swa = hp.swa_type == LLAMA_SWA_TYPE_STANDARD && hp.n_swa > 0 && hp.n_layer_all > hp.n_layer();
+            for (uint32_t il = hp.n_layer(); il < hp.n_layer_all; ++il) {
+                stages_swa = stages_swa && hp.is_swa(il);
+            }
+            if (stages_swa && !(dsp_tail_env != nullptr && dsp_tail_env[0] == '0')) {
+                prefill_tail = (int32_t) hp.n_swa;
+            }
+            SPC_INF("DSpark prompt tail retention = %d tokens per sequence per process call\n", prefill_tail);
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         // MAD-LAB: a sidecar GGUF ships no LM head, which is the signal that this draft
@@ -1661,6 +1678,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (contiguous) {
                     // Injection rows are independent; retain the full visible window.
                     i_batch_beg[seq_id] = i_batch_end[seq_id] - prefill_tail + 1;
+                    // A multi-batch prompt skips ahead of what the draft cache holds
+                    // (e.g. 8191 -> 16256), and a batch must continue at seq_pos_max+1.
+                    // Every cached cell is older than this tail, i.e. outside the
+                    // window, so drop them and start the sequence over.
+                    llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+                    const llama_pos p_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+                    if (p_max >= 0 && (llama_pos) batch_in.pos[i_batch_beg[seq_id]] > p_max + 1) {
+                        llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+                    }
                 }
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;

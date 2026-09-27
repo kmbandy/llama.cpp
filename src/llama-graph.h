@@ -1203,6 +1203,10 @@ public:
     std::vector<ggml_tensor *> t_trace_layer_out;
 
     std::vector<ggml_tensor *> t_layer_inp;
+    // Set when the graph deliberately did not compute the requested layer-input taps for
+    // this ubatch (DS4.1 CED skip-nonfinal: no decoder, nothing downstream reads its rows).
+    // The taps stay null and extract_layer_inputs zero-fills their rows.
+    bool layer_inp_skipped = false;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;

@@ -2779,6 +2779,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             }
 
             bool layers_ok = ced_seam >= 0 && ced_seam < (int) n_layer;
+            bool ced_taps_live = false;
             if (!layers_ok) {
                 std::snprintf(ced_reason, sizeof(ced_reason), "no-decoder-layers (ced_seam=%d n_layer=%d)", ced_seam, (int) n_layer);
             }
@@ -2809,15 +2810,21 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 }
             }
 
-            // No decoder-range layer-input/embedding tap (distillation probes,
-            // DSpark's tap-population path -- see build_dspark_stages and the
-            // file-header comment) may be requested: a tap at or past the seam
-            // would publish a W-row tensor where the caller expects n_tokens rows.
+            const int64_t w_override = dsv41_ced_w_override();
+            const int64_t w = w_override >= 0 ? w_override : (int64_t) hparams.n_swa;
+
+            // A decoder-range layer-input tap publishes only the trimmed trailing W rows
+            // (extract_layer_inputs lands them on the ubatch's last W rows and zeroes the
+            // rest). DSpark's taps only ever feed its n_swa-token sliding window, so the
+            // trim stays on for them when W >= n_swa; any other W still refuses.
             // Checked through the post-loop tap too (il == n_layer).
             for (int il = ced_seam; layers_ok && il <= (int) n_layer; ++il) {
                 if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-                    layers_ok = false;
-                    std::snprintf(ced_reason, sizeof(ced_reason), "embeddings_layer_inp tap in decoder range (il=%d)", il);
+                    ced_taps_live = true;
+                    if (w < (int64_t) hparams.n_swa) {
+                        layers_ok = false;
+                        std::snprintf(ced_reason, sizeof(ced_reason), "embeddings_layer_inp tap in decoder range (il=%d) with W=%lld < n_swa", il, (long long) w);
+                    }
                 }
             }
 
@@ -2830,9 +2837,6 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             // cells" hazard this used to guard against is exactly the gap
             // that fix closed at the source, so a caller-chosen W no longer
             // depends on it for correctness.
-            const int64_t w_override = dsv41_ced_w_override();
-            const int64_t w = w_override >= 0 ? w_override : (int64_t) hparams.n_swa;
-
             if (layers_ok && !(w > 0 && n_tokens > w)) {
                 std::snprintf(ced_reason, sizeof(ced_reason), "window-not-smaller-than-prompt (n_tokens=%lld <= W=%lld)", (long long) n_tokens, (long long) w);
 
@@ -2905,7 +2909,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 // so a non-final ubatch can skip the decoder-range compute
                 // entirely rather than just narrowing it to W rows -- see
                 // graph::graph()'s ced_skip_layer below.
+                // Skip-nonfinal builds no decoder at all, so live decoder-range taps get no
+                // tensor on this ubatch; DSpark only reads the final ubatch's trailing rows,
+                // so mark them skipped (zero-filled) rather than refusing the skip.
                 ced_skip_nonfinal = dsv41_ced_skip_nonfinal_enabled() && n_outputs == 0;
+                res->layer_inp_skipped = ced_skip_nonfinal && ced_taps_live;
             }
         }
 
