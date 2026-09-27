@@ -984,8 +984,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     ggml_tensor * kv = build_lora_mm(model.layers[il].engram_wkv, emb);
     cb(kv, "engram_kv", il);
 
-    ggml_tensor * key   = ggml_cont(ctx0, ggml_view_2d(ctx0, kv, hc_dim, nt, kv->nb[1], 0));
+    // Built as [n_embd, hc, nt] tensors straight away, never through a reshape of an
+    // intermediate: gallocr only reuses a parent in place when it is not a view, and every
+    // [n_embd, hc, nt] f32 copy is 640 MiB at ubatch 8192.
+    ggml_tensor * key   = ggml_cont_3d(ctx0, ggml_view_2d(ctx0, kv, hc_dim, nt, kv->nb[1], 0), n_embd, hc, nt);
     ggml_tensor * value = ggml_cont(ctx0, ggml_view_2d(ctx0, kv, n_embd, nt, kv->nb[1], hc_dim*kv->nb[0]));
+    // Pin the order: both copies out of kv first so kv dies before the norms, and the gate
+    // before the value's repeat below, so at most three [n_embd, hc, nt] tensors are live.
+    ggml_build_forward_expand(gf, value);
+    ggml_build_forward_expand(gf, key);
 
     // The gate scales reach ggml_mul, which takes only f32, and a file quantized before
     // llama-quant.cpp learned to skip them carries them quantized. get_rows dequantizes.
@@ -1001,11 +1008,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     // keeps engram_q and engram_k apart but only ever uses their product, so applying one to each
     // side of the dot product gives the same result.
     auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
-        t = ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
+        GGML_ASSERT(t->ne[0] == n_embd && t->ne[1] == hc && t->ne[2] == nt);
         t = ggml_rms_norm(ctx0, t, norm_rms_eps);
-        t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
-        t = ggml_mul(ctx0, t, ggml_reshape_2d(ctx0, w, hc_dim, 1));
-        return ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
+        return ggml_mul(ctx0, t, ggml_reshape_3d(ctx0, w, n_embd, hc, 1));
     };
 
     ggml_tensor * k = grouped_norm(key, as_f32(model.layers[il].engram_k));
@@ -1018,6 +1023,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, s), 1e-6f, INFINITY));
     ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
     cb(gate, "engram_gate", il);
+    ggml_build_forward_expand(gf, gate);
 
     // the value is shared across the copies, only the gate differs
     ggml_tensor * v = ggml_reshape_3d(ctx0, value, n_embd, 1, nt);
