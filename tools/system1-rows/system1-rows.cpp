@@ -22,7 +22,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -251,7 +253,12 @@ std::vector<EntryIn> read_and_validate_input(std::istream & in) {
             if (!tok.is_number_integer()) {
                 fatal_line(line_no, "\"state\" must contain only integers");
             }
-            e.state.push_back(tok.get<llama_token>());
+            const int64_t v = tok.get<int64_t>();
+            if (v < 0 || v > INT32_MAX) {
+                fatal_line(line_no, "state token id " + std::to_string(v) +
+                        " is out of range (must be a non-negative int32)");
+            }
+            e.state.push_back((llama_token) v);
         }
         if (e.state.empty()) {
             fatal_line(line_no, "empty state");
@@ -270,8 +277,14 @@ std::vector<EntryIn> read_and_validate_input(std::istream & in) {
                 if (!tok.is_number_integer()) {
                     fatal_line(line_no, "branch \"ids\" must contain only integers");
                 }
-                b.ids.push_back(tok.get<llama_token>());
+                const int64_t v = tok.get<int64_t>();
+                if (v < 0 || v > INT32_MAX) {
+                    fatal_line(line_no, "branch token id " + std::to_string(v) +
+                            " is out of range (must be a non-negative int32)");
+                }
+                b.ids.push_back((llama_token) v);
             }
+            std::set<int32_t> seen_outs;
             for (const auto & off : jb["outs"]) {
                 if (!off.is_number_integer()) {
                     fatal_line(line_no, "branch \"outs\" must contain only integers");
@@ -280,6 +293,9 @@ std::vector<EntryIn> read_and_validate_input(std::istream & in) {
                 if (o < 0 || o >= (int64_t) b.ids.size()) {
                     fatal_line(line_no, "outs offset " + std::to_string(o) +
                             " is outside its branch (branch has " + std::to_string(b.ids.size()) + " ids)");
+                }
+                if (!seen_outs.insert((int32_t) o).second) {
+                    fatal_line(line_no, "duplicate outs offset " + std::to_string(o) + " in branch");
                 }
                 b.outs.push_back((int32_t) o);
             }
@@ -290,6 +306,42 @@ std::vector<EntryIn> read_and_validate_input(std::istream & in) {
     }
 
     return entries;
+}
+
+// Marks (only) entries that reference a token id outside [0, n_vocab) as failed, naming
+// the offending id. Must run after the model is loaded (n_vocab isn't known before
+// then) and before grouping/decoding, so a single bad id in one entry can't take down
+// an otherwise-valid group (llama_decode would fail the whole batch otherwise).
+void mark_out_of_vocab_entries(const std::vector<EntryIn> & entries, std::vector<EntryOut> & results, int32_t n_vocab) {
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (!results[i].error.empty()) {
+            continue; // already excluded for another reason
+        }
+        llama_token bad = -1;
+        for (llama_token t : entries[i].state) {
+            if (t < 0 || t >= n_vocab) {
+                bad = t;
+                break;
+            }
+        }
+        if (bad == -1) {
+            for (const auto & b : entries[i].branches) {
+                for (llama_token t : b.ids) {
+                    if (t < 0 || t >= n_vocab) {
+                        bad = t;
+                        break;
+                    }
+                }
+                if (bad != -1) {
+                    break;
+                }
+            }
+        }
+        if (bad != -1) {
+            results[i].error = "token id " + std::to_string(bad) + " is outside the model vocab [0, " +
+                    std::to_string(n_vocab) + ")";
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -441,8 +493,13 @@ long run_batched(llama_context * ctx, const std::vector<EntryIn> & entries, std:
 
     // Entries that cannot possibly fit (their state + their own longest branch alone
     // exceeds the context) are marked failed up front and excluded from grouping.
+    // Entries already marked failed (e.g. an out-of-vocab token id) are skipped here too
+    // -- their error is left as-is, and they never enter a group.
     std::vector<size_t> eligible;
     for (size_t i = 0; i < entries.size(); i++) {
+        if (!results[i].error.empty()) {
+            continue;
+        }
         uint32_t longest_branch = 0;
         for (const auto & b : entries[i].branches) {
             longest_branch = std::max<uint32_t>(longest_branch, (uint32_t) b.ids.size());
@@ -568,6 +625,9 @@ long run_no_copy(llama_context * ctx, const std::vector<EntryIn> & entries, std:
     llama_memory_t mem = llama_get_memory(ctx);
 
     for (size_t i = 0; i < entries.size(); i++) {
+        if (!results[i].error.empty()) {
+            continue; // already excluded (e.g. an out-of-vocab token id)
+        }
         const auto & entry = entries[i];
         for (size_t bi = 0; bi < entry.branches.size(); bi++) {
             const auto & branch = entry.branches[bi];
@@ -634,6 +694,12 @@ int main(int argc, char ** argv) {
         fatal_runtime("failed to load model: " + args.model);
     }
 
+    // Reject entries that reference a token id outside the model's vocab now that we
+    // know n_vocab, before any grouping/decoding happens -- one bad id fails only its
+    // own entry, not the group it would otherwise have shared a decode call with.
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    mark_out_of_vocab_entries(entries, results, llama_vocab_n_tokens(vocab));
+
     llama_adapter_lora * lora = nullptr;
     if (!args.lora.empty()) {
         lora = llama_adapter_lora_init(model, args.lora.c_str());
@@ -699,22 +765,56 @@ int main(int argc, char ** argv) {
             total_rows += (long) (row.size() / (size_t) n_embd);
         }
     }
-    // 6) write the binary rows file: successful entries, in input order.
-    FILE * out = fopen(args.out.c_str(), "wb");
-    if (out == nullptr) {
-        fatal_runtime("failed to open --out for writing: " + args.out);
-    }
-    for (const auto & r : results) {
-        if (!r.ok) {
-            continue;
+    // 6) write the binary rows file: successful entries, in input order. fwrite/fclose
+    // are checked -- a short write or a failed close (e.g. disk full) must not leave a
+    // truncated file while stdout still claims ok:true for rows that never made it to
+    // disk, since the downstream consumer slices the file by those counts.
+    bool write_ok = true;
+    size_t confirmed_upto = 0; // prefix [0, confirmed_upto) is durably on disk
+    {
+        FILE * out = fopen(args.out.c_str(), "wb");
+        if (out == nullptr) {
+            fatal_runtime("failed to open --out for writing: " + args.out);
         }
-        for (const auto & row : r.rows) {
-            if (!row.empty()) {
-                fwrite(row.data(), sizeof(float), row.size(), out);
+        for (size_t i = 0; i < results.size(); i++) {
+            if (!results[i].ok) {
+                confirmed_upto = i + 1;
+                continue;
+            }
+            bool entry_ok = true;
+            for (const auto & row : results[i].rows) {
+                if (row.empty()) {
+                    continue;
+                }
+                const size_t wrote = fwrite(row.data(), sizeof(float), row.size(), out);
+                if (wrote != row.size()) {
+                    entry_ok = false;
+                    break;
+                }
+            }
+            if (!entry_ok) {
+                write_ok = false;
+                break;
+            }
+            confirmed_upto = i + 1;
+        }
+        // fclose flushes buffered writes; if it fails we cannot trust that anything
+        // buffered since the last successful flush actually reached disk, so nothing
+        // is "confirmed" beyond this point either.
+        if (fclose(out) != 0) {
+            write_ok = false;
+        }
+    }
+    if (!write_ok) {
+        for (size_t i = confirmed_upto; i < results.size(); i++) {
+            if (results[i].ok) {
+                results[i].ok    = false;
+                results[i].error = "output write failed";
             }
         }
+        fprintf(stderr, "system1-rows: failed writing --out (%s); rows past entry %zu are not on disk\n",
+                args.out.c_str(), confirmed_upto);
     }
-    fclose(out);
 
     // 7) stdout: one JSON line per input entry, input order.
     for (const auto & r : results) {
@@ -745,5 +845,5 @@ int main(int argc, char ** argv) {
     llama_model_free(model);
     llama_backend_free();
 
-    return 0;
+    return write_ok ? 0 : 1;
 }

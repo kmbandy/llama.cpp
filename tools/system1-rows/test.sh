@@ -104,6 +104,36 @@ expect_exit "non-integer state element exits 2" 2 \
 " --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
 echo "$LAST_OUT" | grep -qi "model" && fail "non-integer-state error message mentions 'model' (should be about input)"
 
+expect_exit "negative state token id exits 2" 2 \
+  "{\"id\":\"a\",\"state\":[1,-2,3],\"branches\":[]}
+" --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
+echo "$LAST_OUT" | grep -qi "model" && fail "negative-state-id error message mentions 'model' (should be about input)"
+echo "$LAST_OUT" | grep -qi "out of range" || fail "negative-state-id error message doesn't say out of range"
+
+expect_exit "state token id > INT32_MAX exits 2" 2 \
+  "{\"id\":\"a\",\"state\":[1,9999999999,3],\"branches\":[]}
+" --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
+echo "$LAST_OUT" | grep -qi "model" && fail "too-large-state-id error message mentions 'model' (should be about input)"
+echo "$LAST_OUT" | grep -qi "out of range" || fail "too-large-state-id error message doesn't say out of range"
+
+expect_exit "negative branch id exits 2" 2 \
+  "{\"id\":\"a\",\"state\":$VALID_STATE_TOKS,\"branches\":[{\"ids\":[10,-11],\"outs\":[1]}]}
+" --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
+echo "$LAST_OUT" | grep -qi "model" && fail "negative-branch-id error message mentions 'model' (should be about input)"
+echo "$LAST_OUT" | grep -qi "out of range" || fail "negative-branch-id error message doesn't say out of range"
+
+expect_exit "branch id > INT32_MAX exits 2" 2 \
+  "{\"id\":\"a\",\"state\":$VALID_STATE_TOKS,\"branches\":[{\"ids\":[10,9999999999],\"outs\":[1]}]}
+" --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
+echo "$LAST_OUT" | grep -qi "model" && fail "too-large-branch-id error message mentions 'model' (should be about input)"
+echo "$LAST_OUT" | grep -qi "out of range" || fail "too-large-branch-id error message doesn't say out of range"
+
+expect_exit "duplicate outs offset exits 2" 2 \
+  "{\"id\":\"a\",\"state\":$VALID_STATE_TOKS,\"branches\":[{\"ids\":[10,11],\"outs\":[1,1]}]}
+" --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
+echo "$LAST_OUT" | grep -qi "model" && fail "duplicate-outs error message mentions 'model' (should be about input)"
+echo "$LAST_OUT" | grep -qi "duplicate" || fail "duplicate-outs error message doesn't say duplicate"
+
 # --- missing --model file with VALID input: exit 1 (model load failure) -------------
 VALID_INPUT="{\"id\":\"a\",\"state\":$VALID_STATE_TOKS,\"branches\":[{\"ids\":[10,11],\"outs\":[1]}]}
 "
