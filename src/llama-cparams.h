@@ -46,6 +46,9 @@ struct llama_cparams {
     // *after* setting res->t_embd so llama_get_embeddings() still returns the
     // post-output_norm hidden state.
     bool no_output_head = false;
+    // MAD-LAB system1-rows: opt-in sparse embedding outputs. See llama_context_params
+    // ::embd_sparse_outputs in llama.h for the exact activation condition.
+    bool embd_sparse_outputs = false;
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
