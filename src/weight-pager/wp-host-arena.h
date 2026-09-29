@@ -202,6 +202,16 @@ public:
     void mark_drop(int page_idx);
     uint64_t drops() const;   // entries freed through mark_drop
 
+    // --- speculative outcome tags ---
+    // A caller-defined byte attached to a speculative entry (by page and
+    // handle, so a stale landing cannot tag its successor). When the entry
+    // leaves the speculative side, the matching per-tag counter counts it:
+    // spec_used_tag on a promotion, spec_unused_tag on an unused eviction.
+    // The worker encodes hint distance and a "demand got there first" bit.
+    void set_spec_tag(int page_idx, Handle handle, uint8_t tag);
+    uint64_t spec_used_tag(uint8_t tag) const;
+    uint64_t spec_unused_tag(uint8_t tag) const;
+
     // --- pinning (coding hot set) ---
     // Marks a Resident entry pinned (LRU skips it). Fails if not Resident or
     // pinned cap reached. The cap is pinned_cap_pct of the TIER entries
@@ -278,6 +288,7 @@ private:
         bool     speculative  = false;
         bool     pinned       = false;
         bool     drop_when_idle = false;  // mark_drop(): free on the last release
+        uint8_t  tag          = 0;        // set_spec_tag(); reset by begin_read
         bool     ever_borrowed = false;   // set by any borrow() (demand or peek), reset
                                            // when the entry becomes Reading again; an
                                            // eviction while still speculative only counts
@@ -393,6 +404,8 @@ private:
     uint64_t lookups_     = 0;
     uint64_t lookup_hits_ = 0;
     uint64_t drops_       = 0;
+    uint64_t spec_used_by_tag_[256]   = {};
+    uint64_t spec_unused_by_tag_[256] = {};
 
     // Sketch storage: kSketchRows * cfg_.sketch_width counters, row r's
     // lane at r * cfg_.sketch_width + (hash % cfg_.sketch_width). Empty
