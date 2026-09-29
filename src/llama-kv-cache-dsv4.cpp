@@ -579,8 +579,25 @@ static void dsv4_pad_live_plan_to_reserve_rank(
     // full-ctx mask on the first 2048-token prompt. Decode/verify on this
     // serve is n_tokens <= 32 (parallel=1, spec window). Packed multi-seq
     // decode with n_tokens>32 can recapture; that is cheaper than 2 GiB swap.
+    //
+    // WP_DSV4_DECODE_KV_STEP=N (compressed slots, 0 = off) pads the width up to
+    // the next multiple of N instead of pinning it at kv_size. The lightning
+    // indexer and its top-k scan every column of this width: at ctx 524288
+    // (131072 CSA/LID slots) against a ~2k-slot 7k prompt, that was ~10 ms per
+    // indexer layer, ~85 ms per DSpark verify step on the 9070XT. A step of a
+    // few thousand slots re-captures graphs once per N*ratio tokens.
+    static const uint32_t decode_kv_step = [] {
+        const char * e = getenv("WP_DSV4_DECODE_KV_STEP");
+        const long v = e != nullptr ? atol(e) : 0;
+        return v > 0 ? (uint32_t) v : 0u;
+    }();
     if (ubatch.n_tokens <= 32) {
-        plan.n_kv = kv_size;
+        if (decode_kv_step > 0) {
+            const int64_t padded = GGML_PAD(std::max<int64_t>(plan.n_kv, 1), decode_kv_step);
+            plan.n_kv = std::min<int64_t>(kv_size, padded);
+        } else {
+            plan.n_kv = kv_size;
+        }
     }
 }
 
