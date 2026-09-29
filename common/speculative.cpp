@@ -1869,7 +1869,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             const int32_t const_shape_width = wp_ds4_const_shape_width();
-            const int32_t n_shape_tokens = const_shape_width > 0 ? const_shape_width + 1 : n_block_tokens;
+            // Same +1 rule as n_block_tokens: anchor-first DSpark blocks are exactly
+            // n_draft wide. A blanket width + 1 appended a stray mask token to every
+            // anchor-first block, and the drafter attends non-causally, so that one
+            // token changed every draft (DS4.1 acceptance 3.3 -> 1.4 tok/step).
+            const int32_t n_shape_tokens = const_shape_width > 0
+                ? const_shape_width + (is_dspark && sample_from_anchor ? 0 : 1)
+                : n_block_tokens;
             GGML_ASSERT(n_block_tokens <= n_shape_tokens);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
