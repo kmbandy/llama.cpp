@@ -402,7 +402,21 @@ inline bool ggml_cuda_graph_tensor_topo_equal(const ggml_tensor & a, const ggml_
 // eager-fallback diagnostic in ggml-cuda.cu can name the op/shape that made a
 // graph permanently uncapturable. ggml_cuda_graph_is_prefill_shaped() below
 // keeps the original bool contract for existing call sites.
+//
+// 2026-09-29: the true ubatch width, published by llama-context through
+// ggml_cuda_wp_set_ubatch_width_hint() (ggml-cuda.cu) before each graph
+// compute; 0 = not published (e.g. expert workers), use the shape rules.
+// With it, width alone decides: DS4.1 sparse attention's decode fragments hold
+// nodes like GET_ROWS [512, n_tokens*128] and MUL_MAT [.., n_tokens*32] that
+// the shape rules read as prefill, which kept every layer's attention segment
+// eager on the spine (~110 eager launches/layer, ~4 ms/layer at 6 tokens).
+inline std::atomic<int32_t> g_ggml_cuda_wp_ubatch_width_hint{0};
+
 inline const ggml_tensor * ggml_cuda_graph_prefill_shaped_node(const ggml_cgraph * cgraph) {
+    const int32_t hint = g_ggml_cuda_wp_ubatch_width_hint.load(std::memory_order_relaxed);
+    if (hint > 0) {
+        return hint > 32 && cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr;
+    }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {

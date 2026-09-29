@@ -4895,6 +4895,25 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph,
     return use_cuda_graph;
 }
 
+// Declared weak in src/llama-context.cpp, which calls it with ubatch.n_tokens
+// before every graph compute. The llama side landed in c4b0762e8 without this
+// definition, so the call was a no-op and the shape rules kept misreading DS4.1
+// decode fragments as prefill. Read by ggml_cuda_graph_prefill_shaped_node().
+// WP_HIP_GRAPHS_WIDTH_HINT=1 opts in (default off). On DS4.1 it makes every
+// decode attention segment capturable, ~5200 graphs across verify widths: under
+// the default 512 MB / 2 MB-floor budget that churned (budget_evicted ~6000,
+// ~+60 ms per verify step), and with the budget lifted it replayed fine but did
+// not move spine time (host syncs/copies dominate, not kernel launches).
+extern "C" void ggml_cuda_wp_set_ubatch_width_hint(int32_t n_tokens) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_HIP_GRAPHS_WIDTH_HINT");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (enabled) {
+        g_ggml_cuda_wp_ubatch_width_hint.store(n_tokens, std::memory_order_relaxed);
+    }
+}
+
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     if (cgraph->n_nodes == 0) {
         return cgraph;

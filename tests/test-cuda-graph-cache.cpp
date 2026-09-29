@@ -219,6 +219,28 @@ int main() {
     }
 
     {
+        // DS4.1 sparse-attention decode gather: GET_ROWS [512, n_tokens*128].
+        // The shape rules read ne[1] = 768 as prefill; the published ubatch
+        // width (6) is what decides once llama-context sets it.
+        ggml_tensor gather = make_node("kv_gather", GGML_OP_GET_ROWS, 512, 768);
+        ggml_tensor * nodes[] = { &gather };
+        ggml_cgraph g;
+        std::memset(&g, 0, sizeof(g));
+        g.n_nodes = 1;
+        g.nodes   = nodes;
+        require(ggml_cuda_graph_is_prefill_shaped(&g),
+                "without a width hint the shape rules apply");
+        g_ggml_cuda_wp_ubatch_width_hint.store(6);
+        require(!ggml_cuda_graph_is_prefill_shaped(&g),
+                "a 6-token ubatch hint keeps the decode gather capturable");
+        g_ggml_cuda_wp_ubatch_width_hint.store(64);
+        gather.ne[1] = 4;
+        require(ggml_cuda_graph_is_prefill_shaped(&g),
+                "a 64-token ubatch hint is prefill even for a narrow node");
+        g_ggml_cuda_wp_ubatch_width_hint.store(0);
+    }
+
+    {
         // GATED_DELTA_NET's dst concatenates recurrent state onto the token
         // rows (ggml_gated_delta_net, ggml.c), so dst->ne[1] alone cannot
         // tell prefill from decode -- the true per-call token count is

@@ -1668,6 +1668,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
+            // WP_SPEC_CONST_WIDTH pads the verify batch with trailing mask tokens.
+            // They are not real positions: keep their hidden states out of the
+            // draft cache.
+            if (wp_ds4_const_shape_width() > 0 && has_tokens && mask_token_id != LLAMA_TOKEN_NULL) {
+                while (i_batch_end[seq_id] > i_batch_beg[seq_id] &&
+                       batch_in.token[i_batch_end[seq_id]] == mask_token_id) {
+                    --i_batch_end[seq_id];
+                }
+            }
             const int32_t n_rows_in = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             if (prefill_tail > 0 && has_tokens && n_rows_in > prefill_tail) {
                 bool contiguous = true;
