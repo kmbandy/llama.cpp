@@ -55,6 +55,20 @@ bool rdna4_gemm_ml84_decode_v2(int M, const void* A, const uint8_t* B_nib, const
                                 float* C_f32, const float* a_scale, const float* b_scale_g,
                                 int M_pad, int N, int K, int n_splits, hipStream_t stream);
 
+// Grouped decode GEMM: G (<= 8) independent GEMMs in one launch, each with
+// its own B_nib/lut/b_scale_g. Group g reads A rows at A + g*K with row
+// stride lda bytes, its per-row scale at a_scale[m*sa + g], and writes rows
+// of N floats at C_f32 + g*N with row stride ldc floats. Same M/M_pad/N/K
+// contract and decline rules as rdna4_gemm_ml84_decode_v2, plus G*N must fit
+// the persistent split-K scratch. Rows read for padding (m >= M, up to the
+// 16-row tile) must be readable memory; their values never reach C.
+bool rdna4_gemm_ml84_decode_v2_grouped(int G, int M, const void* A,
+                                       const uint8_t* const* B_nib, const uint8_t* const* lut,
+                                       const float* const* b_scale_g,
+                                       float* C_f32, const float* a_scale,
+                                       int M_pad, int N, int K, int lda, int sa, int ldc,
+                                       hipStream_t stream);
+
 // Compiled ceiling for N that the persistent split-K scratch is sized for
 // (248320 — Qwen3.8-27B's output head). rdna4_gemm_ml84_decode_v2 returns
 // false for any N above this rather than growing scratch mid-launch.

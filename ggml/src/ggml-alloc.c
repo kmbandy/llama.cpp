@@ -1006,7 +1006,36 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+// WP_GALLOCR_TRACE=1: one stderr line per re-plan saying why (a moved plan
+// moves every tensor address, which forces HIP-graph recapture downstream).
+static bool ggml_gallocr_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("WP_GALLOCR_TRACE");
+        enabled = e != NULL && e[0] == '1';
+    }
+    return enabled == 1;
+}
+
+static bool ggml_gallocr_needs_realloc_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    const bool r = ggml_gallocr_needs_realloc_impl(galloc, graph);
+    if (r && ggml_gallocr_trace_enabled()) {
+        const char * why = "tensor does not fit";
+        if (galloc->n_nodes != graph->n_nodes) {
+            why = "n_nodes";
+        } else if (galloc->n_leafs != graph->n_leafs) {
+            why = "n_leafs";
+        }
+        fprintf(stderr, "wp gallocr replan: %s plan(n_nodes=%d n_leafs=%d) graph(n_nodes=%d n_leafs=%d) first=%s\n",
+                why, galloc->n_nodes, galloc->n_leafs, graph->n_nodes, graph->n_leafs,
+                graph->n_nodes > 0 ? graph->nodes[0]->name : "");
+    }
+    return r;
+}
+
+static bool ggml_gallocr_needs_realloc_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);

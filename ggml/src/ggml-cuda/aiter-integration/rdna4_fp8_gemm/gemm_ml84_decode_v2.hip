@@ -153,6 +153,17 @@ static constexpr int V2_MSTRIDE = 32;              // fixed partial-buffer row s
 static constexpr int V2_MAX_N = 248320;            // Qwen3.8-27B output head — the largest production N
 static constexpr int V2_MAX_KS = 4;
 
+// Grouped launch (rdna4_gemm_ml84_decode_v2_grouped): blockIdx.y selects one
+// of up to V2_MAX_GROUPS independent GEMMs that share one A/a_scale buffer
+// (row-strided) and one output (column-offset, row-strided). The plain
+// launcher is the 1-group case.
+#define V2_MAX_GROUPS 8
+struct ml84_v2_grp {
+    const uint8_t * B_nib[V2_MAX_GROUPS];
+    const uint8_t * lut[V2_MAX_GROUPS];
+    const float   * b_scale_g[V2_MAX_GROUPS];
+};
+
 #if defined(__gfx1201__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // One 64-wide K-group's worth of WMMA work (BK_GROUP=64 -> 4 K16-steps),
@@ -242,10 +253,21 @@ __device__ __forceinline__ void ml84_v2_group(
 // ─────────────────────────────────────────────────────────────────────────
 template <int DBK, int DKS, int DTM, bool NT>
 __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
-    const float8_t* __restrict__ A, const uint8_t* __restrict__ B_nib,
-    const uint8_t* __restrict__ lut, const float* __restrict__ a_scale,
-    const float* __restrict__ b_scale_g, float* __restrict__ P, int* __restrict__ cnt,
-    float* __restrict__ C_f32, int M, int N, int K) {
+    const float8_t* __restrict__ A_base, const ml84_v2_grp grp,
+    const float* __restrict__ a_scale_base, float* __restrict__ P_base, int* __restrict__ cnt_base,
+    float* __restrict__ C_base, int M, int N, int K, int lda, int sa, int ldc) {
+    // Group g reads A rows at A_base + g*K with row stride lda, its per-row
+    // scale at a_scale_base[m*sa + g], and writes C at C_base + g*N with row
+    // stride ldc; split-K scratch and counters are private per group.
+    const int grp_i = blockIdx.y;
+    const uint8_t* __restrict__ B_nib    = grp.B_nib[grp_i];
+    const uint8_t* __restrict__ lut      = grp.lut[grp_i];
+    const float* __restrict__ b_scale_g  = grp.b_scale_g[grp_i];
+    const float8_t* __restrict__ A       = A_base + (size_t) grp_i * K;
+    const float* __restrict__ a_scale    = a_scale_base + grp_i;
+    float* __restrict__ P                = P_base + (size_t) grp_i * V2_MAX_KS * V2_MSTRIDE * N;
+    int* __restrict__ cnt                = cnt_base + (size_t) grp_i * gridDim.x;
+    float* __restrict__ C_f32            = C_base + (size_t) grp_i * N;
     constexpr int ASTRIDE = DBK + V2_PAD;
     constexpr int GROUPS_PER_SLAB = DBK / QK_ML8;
     // NOTE (flagged, same spirit as trfeed_ml84_kernels.h's unverified
@@ -293,8 +315,11 @@ __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
             const int idx = tid * 16;
             if (idx < ATOTAL) {
                 const int r = idx / DBK, c = idx % DBK;
-                *reinterpret_cast<int4*>(&sA[r * ASTRIDE + c]) =
-                    *reinterpret_cast<const int4*>(Ab + (size_t) r * K + k0 + c);
+                // Rows >= M are zero-filled, never read: callers may pass an
+                // unpadded M-row A (see ml8.cu's MT_ML8_4_DECODE_V2_NOPAD).
+                *reinterpret_cast<int4*>(&sA[r * ASTRIDE + c]) = r < M
+                    ? *reinterpret_cast<const int4*>(Ab + (size_t) r * lda + k0 + c)
+                    : int4{0, 0, 0, 0};
             }
         }
         __syncthreads();
@@ -323,7 +348,7 @@ __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const int m = mi * 16 + e_rowbase + e;
-                    if (m < M) C_f32[(size_t) m * N + n] = a_scale[m] * acc[mi][e];
+                    if (m < M) C_f32[(size_t) m * ldc + n] = a_scale[(size_t) m * sa] * acc[mi][e];
                 }
             }
         }
@@ -342,7 +367,7 @@ __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
             #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 const int m = mi * 16 + e_rowbase + e;
-                if (m < M) P[((size_t) ks * V2_MSTRIDE + m) * N + n] = a_scale[m] * acc[mi][e];
+                if (m < M) P[((size_t) ks * V2_MSTRIDE + m) * N + n] = a_scale[(size_t) m * sa] * acc[mi][e];
             }
         }
     }
@@ -366,7 +391,7 @@ __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
             float sum = 0.f;
             #pragma unroll
             for (int k = 0; k < DKS; ++k) sum += P[((size_t) k * V2_MSTRIDE + m) * N + nn];
-            C_f32[(size_t) m * N + nn] = sum;
+            C_f32[(size_t) m * ldc + nn] = sum;
         }
     }
 }
@@ -374,10 +399,9 @@ __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
 #else
 template <int DBK, int DKS, int DTM, bool NT>
 __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
-    const float8_t* __restrict__ A, const uint8_t* __restrict__ B_nib,
-    const uint8_t* __restrict__ lut, const float* __restrict__ a_scale,
-    const float* __restrict__ b_scale_g, float* __restrict__ P, int* __restrict__ cnt,
-    float* __restrict__ C_f32, int M, int N, int K);
+    const float8_t* __restrict__ A_base, const ml84_v2_grp grp,
+    const float* __restrict__ a_scale_base, float* __restrict__ P_base, int* __restrict__ cnt_base,
+    float* __restrict__ C_base, int M, int N, int K, int lda, int sa, int ldc);
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -451,12 +475,16 @@ static int ml84_decode_v2_split_k_for(int nblk, int M) {
     return V2_MAX_KS;
 }
 
-extern "C" bool rdna4_gemm_ml84_decode_v2(int M, const void* A, const uint8_t* B_nib, const uint8_t* lut,
-                                          float* C_f32, const float* a_scale, const float* b_scale_g,
-                                          int M_pad, int N, int K, int n_splits, hipStream_t stream) {
+static bool ml84_decode_v2_launch(int G, int M, const void* A, const ml84_v2_grp& grp,
+                                  float* C_f32, const float* a_scale,
+                                  int M_pad, int N, int K, int n_splits, int lda, int sa, int ldc,
+                                  hipStream_t stream) {
+    if (G <= 0 || G > V2_MAX_GROUPS) return false;
     if (M <= 0 || M > 32) return false;
     if (M_pad <= 0 || M_pad < M) return false;
     if (N <= 0 || (N % 16) != 0 || N > V2_MAX_N) return false;
+    // Per-group split-K scratch slices must fit the one persistent buffer.
+    if ((size_t) G * (size_t) N > (size_t) V2_MAX_N) return false;
     if (K <= 0 || (K % QK_ML8) != 0) return false;
 
     // Measured 2026-09-19 (bench/gemm_ml84_decode_v2_bench, R9700 DPM auto):
@@ -480,7 +508,7 @@ extern "C" bool rdna4_gemm_ml84_decode_v2(int M, const void* A, const uint8_t* B
         const char* e = std::getenv("MT_ML8_4_DECODE_V2_NT");
         return !(e && std::atoi(e) != 0);
     }();
-    int ks = env_ks > 0 ? env_ks : (n_splits > 0 ? n_splits : ml84_decode_v2_split_k_for(nblk, M));
+    int ks = env_ks > 0 ? env_ks : (n_splits > 0 ? n_splits : ml84_decode_v2_split_k_for(nblk * G, M));
     ks = (ks >= 4) ? 4 : (ks >= 2) ? 2 : 1;
     const bool use_nt = !env_nt_off;
 
@@ -495,12 +523,12 @@ extern "C" bool rdna4_gemm_ml84_decode_v2(int M, const void* A, const uint8_t* B
         cnt = scr->cnt;
     }
 
-    const dim3 grid(nblk, 1, ks);
+    const dim3 grid(nblk, G, ks);
     const dim3 block(V2_DWN * 32);
 
 #define V2_LAUNCH(DBK_, KS_, DTM_, NT_)                                                       \
     ml84_decode_v2_kernel<DBK_, KS_, DTM_, NT_><<<grid, block, 0, stream>>>(                   \
-        (const float8_t*) A, B_nib, lut, a_scale, b_scale_g, P, cnt, C_f32, M, N, K)
+        (const float8_t*) A, grp, a_scale, P, cnt, C_f32, M, N, K, lda, sa, ldc)
 #define V2_BY_DTM(DBK_, KS_, NT_)                                                             \
     do { if (dtm == 1) { V2_LAUNCH(DBK_, KS_, 1, NT_); } else { V2_LAUNCH(DBK_, KS_, 2, NT_); } } while (0)
 #define V2_BY_KS(DBK_, NT_)                                                                   \
@@ -520,4 +548,32 @@ extern "C" bool rdna4_gemm_ml84_decode_v2(int M, const void* A, const uint8_t* B
 #undef V2_LAUNCH
 
     return true;
+}
+
+extern "C" bool rdna4_gemm_ml84_decode_v2(int M, const void* A, const uint8_t* B_nib, const uint8_t* lut,
+                                          float* C_f32, const float* a_scale, const float* b_scale_g,
+                                          int M_pad, int N, int K, int n_splits, hipStream_t stream) {
+    ml84_v2_grp grp = {};
+    grp.B_nib[0] = B_nib;
+    grp.lut[0] = lut;
+    grp.b_scale_g[0] = b_scale_g;
+    return ml84_decode_v2_launch(1, M, A, grp, C_f32, a_scale, M_pad, N, K, n_splits,
+                                 /*lda=*/K, /*sa=*/1, /*ldc=*/N, stream);
+}
+
+extern "C" bool rdna4_gemm_ml84_decode_v2_grouped(int G, int M, const void* A,
+                                                  const uint8_t* const* B_nib, const uint8_t* const* lut,
+                                                  const float* const* b_scale_g,
+                                                  float* C_f32, const float* a_scale,
+                                                  int M_pad, int N, int K, int lda, int sa, int ldc,
+                                                  hipStream_t stream) {
+    if (G <= 0 || G > V2_MAX_GROUPS) return false;
+    ml84_v2_grp grp = {};
+    for (int g = 0; g < G; ++g) {
+        grp.B_nib[g] = B_nib[g];
+        grp.lut[g] = lut[g];
+        grp.b_scale_g[g] = b_scale_g[g];
+    }
+    return ml84_decode_v2_launch(G, M, A, grp, C_f32, a_scale, M_pad, N, K, /*n_splits=*/0,
+                                 lda, sa, ldc, stream);
 }

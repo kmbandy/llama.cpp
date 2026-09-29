@@ -1873,8 +1873,23 @@ ggml_tensor * dsv41_sparse_attn_gather_k(
         int64_t        k_win,
         int64_t        raw_k_len,
         int64_t        n_comp,
-        ggml_tensor ** out_kv_indices) {
+        ggml_tensor ** out_kv_indices,
+        std::unordered_map<std::string, ggml_tensor *> * memo) {
     const int64_t n_idx = kv_indices->ne[0];
+    // The index tensors below depend only on kv_indices and fixed sizes, so
+    // layers sharing one kv_indices share them too; only the K gathers are
+    // per layer.
+    auto memo_key = [&](const char * role, int64_t a, int64_t b, int64_t c) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "gk|%p|%s|%lld|%lld|%lld", (const void *) kv_indices, role,
+                      (long long) a, (long long) b, (long long) c);
+        return std::string(buf);
+    };
+    auto memo_find = [&](const std::string & k) -> ggml_tensor * {
+        if (memo == nullptr) return nullptr;
+        auto it = memo->find(k);
+        return it == memo->end() ? nullptr : it->second;
+    };
     const int64_t nt    = kv_indices->ne[1];
     const int64_t k_top = n_idx - k_win;
     GGML_ASSERT(k_win >= 0 && k_top >= 0 && (k_win + k_top) == n_idx);
@@ -1897,6 +1912,10 @@ ggml_tensor * dsv41_sparse_attn_gather_k(
         ggml_tensor * src_c = ggml_is_contiguous(src) ? src : ggml_cont(ctx0, src);
         ggml_tensor * src_2d = ggml_reshape_2d(ctx0, src_c, src_c->ne[0] * src_c->ne[1], src_len);
 
+        const std::string key = memo_key("safe", idx_offset, src_len, width);
+        if (ggml_tensor * cached = memo_find(key)) {
+            return ggml_get_rows(ctx0, src_2d, cached);
+        }
         ggml_tensor * idx_f = ggml_cast(ctx0, idx, GGML_TYPE_F32);
         if (idx_offset != 0) {
             // A padding slot is exactly -1 before this subtraction; shifting
@@ -1907,6 +1926,9 @@ ggml_tensor * dsv41_sparse_attn_gather_k(
         ggml_tensor * safe_idx_f  = ggml_clamp(ctx0, idx_f, 0.0f, (float) (src_len - 1)); // pad (<0) -> 0
         ggml_tensor * safe_idx    = ggml_cast(ctx0, safe_idx_f, GGML_TYPE_I32);
         ggml_tensor * safe_idx_1d = ggml_reshape_1d(ctx0, safe_idx, width * nt);
+        if (memo != nullptr) {
+            (*memo)[key] = safe_idx_1d;
+        }
 
         return ggml_get_rows(ctx0, src_2d, safe_idx_1d); // [d*n_head_kv, width*nt, 1, 1]
     };
@@ -1940,14 +1962,19 @@ ggml_tensor * dsv41_sparse_attn_gather_k(
         return ggml_cast(ctx0, out_f, GGML_TYPE_I32);
     };
 
-    ggml_tensor * win_idx_new  = win_idx  ? remap_block(win_idx,  k_win, 0)          : nullptr;
-    ggml_tensor * comp_idx_new = comp_idx ? remap_block(comp_idx, k_top, k_win * nt) : nullptr;
-
-    ggml_tensor * kv_indices_new;
-    if (win_idx_new && comp_idx_new) {
-        kv_indices_new = ggml_concat(ctx0, win_idx_new, comp_idx_new, 0); // [k_win + k_top, nt], same shape as before
-    } else {
-        kv_indices_new = win_idx_new ? win_idx_new : comp_idx_new;
+    const std::string remap_key = memo_key("remap", k_win, k_top, nt);
+    ggml_tensor * kv_indices_new = memo_find(remap_key);
+    if (kv_indices_new == nullptr) {
+        ggml_tensor * win_idx_new  = win_idx  ? remap_block(win_idx,  k_win, 0)          : nullptr;
+        ggml_tensor * comp_idx_new = comp_idx ? remap_block(comp_idx, k_top, k_win * nt) : nullptr;
+        if (win_idx_new && comp_idx_new) {
+            kv_indices_new = ggml_concat(ctx0, win_idx_new, comp_idx_new, 0); // [k_win + k_top, nt], same shape as before
+        } else {
+            kv_indices_new = win_idx_new ? win_idx_new : comp_idx_new;
+        }
+        if (memo != nullptr) {
+            (*memo)[remap_key] = kv_indices_new;
+        }
     }
     *out_kv_indices = kv_indices_new;
 
@@ -2554,8 +2581,36 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     if (dsv41_sparse_attn_env_enabled() &&
             n_embd_head == 512 &&
             n_head       == 64) {
-        ggml_tensor * kv_indices = dsv41_sparse_attn_build_indices(
-                ctx0, raw_mask, inp_comp_q.kq_mask, top_k, hparams.n_swa, raw_k->ne[2]);
+        // WP_DSV41_SPARSE_IDX_MEMO=0 rebuilds the index tensors per layer (A/B).
+        static const bool idx_memo_on = [] {
+            const char * e = std::getenv("WP_DSV41_SPARSE_IDX_MEMO");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (!idx_memo_on) {
+            sparse_idx_memo.clear();
+        }
+        ggml_tensor * kv_indices = nullptr;
+        {
+            char key[160];
+            std::snprintf(key, sizeof(key), "idx|%p|%p|%p|%lld|%lld", (const void *) raw_mask,
+                          (const void *) inp_comp_q.kq_mask, (const void *) top_k,
+                          (long long) hparams.n_swa, (long long) raw_k->ne[2]);
+            auto it = sparse_idx_memo.find(key);
+            static const bool memo_log = std::getenv("WP_DSV41_SPARSE_IDX_MEMO_LOG") != nullptr;
+            if (memo_log && nt <= 16) {
+                LLAMA_LOG_WARN("dsv41 sparse idx memo: layer %d key %s %s\n", il, key,
+                               it != sparse_idx_memo.end() ? "HIT" : "miss");
+            }
+            if (it != sparse_idx_memo.end()) {
+                kv_indices = it->second;
+            } else {
+                kv_indices = dsv41_sparse_attn_build_indices(
+                        ctx0, raw_mask, inp_comp_q.kq_mask, top_k, hparams.n_swa, raw_k->ne[2]);
+                if (idx_memo_on) {
+                    sparse_idx_memo[key] = kv_indices;
+                }
+            }
+        }
         if (kv_indices) {
             ggml_tensor * q_f16 = q->type == GGML_TYPE_F16 ? q : ggml_cast(ctx0, q, GGML_TYPE_F16);
 
@@ -2608,7 +2663,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 ggml_tensor * kv_indices_sel = nullptr;
                 const int64_t k_win = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa);
                 ggml_tensor * k_sel = dsv41_sparse_attn_gather_k(
-                        ctx0, raw_k, comp_k, kv_indices, k_win, raw_k->ne[2], n_comp, &kv_indices_sel);
+                        ctx0, raw_k, comp_k, kv_indices, k_win, raw_k->ne[2], n_comp, &kv_indices_sel,
+                        idx_memo_on ? &sparse_idx_memo : nullptr);
                 GGML_ASSERT(kv_indices_sel != nullptr);
                 kv_indices = kv_indices_sel;
                 k_src_f16 = k_sel->type == GGML_TYPE_F16 ? k_sel : ggml_cast(ctx0, k_sel, GGML_TYPE_F16);
@@ -2622,9 +2678,22 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             // and stays safe under HIP graph capture. n_idx (kv_indices->ne[0]) is
             // unchanged by the gather/remap above, so this is identical either way.
             const int64_t nt_q = q->ne[2];
-            ggml_tensor * kv_indptr = ggml_arange(ctx0, 0.0f, (float) (nt_q + 1), 1.0f);
-            kv_indptr = ggml_scale(ctx0, kv_indptr, (float) kv_indices->ne[0]);
-            kv_indptr = ggml_cast(ctx0, kv_indptr, GGML_TYPE_I32);
+            ggml_tensor * kv_indptr = nullptr;
+            {
+                char key[96];
+                std::snprintf(key, sizeof(key), "indptr|%lld|%lld", (long long) nt_q, (long long) kv_indices->ne[0]);
+                auto it = sparse_idx_memo.find(key);
+                if (it != sparse_idx_memo.end()) {
+                    kv_indptr = it->second;
+                } else {
+                    kv_indptr = ggml_arange(ctx0, 0.0f, (float) (nt_q + 1), 1.0f);
+                    kv_indptr = ggml_scale(ctx0, kv_indptr, (float) kv_indices->ne[0]);
+                    kv_indptr = ggml_cast(ctx0, kv_indptr, GGML_TYPE_I32);
+                    if (idx_memo_on) {
+                        sparse_idx_memo[key] = kv_indptr;
+                    }
+                }
+            }
             out = ggml_sparse_attn_dsv4(ctx0, q_f16, k_src_f16, kv_indices, kv_indptr, layer.attn_sinks, kq_scale);
             sparse_idx = kv_indices;
             sparse_k   = k_src_f16;

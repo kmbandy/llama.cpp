@@ -1,5 +1,8 @@
 #pragma once
 
+#include <string>
+#include <unordered_map>
+
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
@@ -54,7 +57,8 @@ ggml_tensor * dsv41_sparse_attn_gather_k(
         int64_t        k_win,
         int64_t        raw_k_len,
         int64_t        n_comp,
-        ggml_tensor ** out_kv_indices);
+        ggml_tensor ** out_kv_indices,
+        std::unordered_map<std::string, ggml_tensor *> * memo = nullptr);
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
@@ -1464,6 +1468,12 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
 
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
+
+        // Per-graph memo of layer-invariant sparse-attention index tensors:
+        // every layer reads the same raw/compressed masks and top-k-reuse
+        // layers share one top_k, so the ~60 small index ops per layer are
+        // identical across layers (build_attention_v41).
+        mutable std::unordered_map<std::string, ggml_tensor *> sparse_idx_memo;
 
         ggml_tensor * identity_pre_mix() const;
 

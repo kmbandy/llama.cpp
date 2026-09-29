@@ -4895,6 +4895,25 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph,
     return use_cuda_graph;
 }
 
+// Declared weak in src/llama-context.cpp, which calls it with ubatch.n_tokens
+// before every graph compute. The llama side landed in c4b0762e8 without this
+// definition, so the call was a no-op and the shape rules kept misreading DS4.1
+// decode fragments as prefill. Read by ggml_cuda_graph_prefill_shaped_node().
+// WP_HIP_GRAPHS_WIDTH_HINT=1 opts in (default off). On DS4.1 it makes every
+// decode attention segment capturable, ~5200 graphs across verify widths: under
+// the default 512 MB / 2 MB-floor budget that churned (budget_evicted ~6000,
+// ~+60 ms per verify step), and with the budget lifted it replayed fine but did
+// not move spine time (host syncs/copies dominate, not kernel launches).
+extern "C" void ggml_cuda_wp_set_ubatch_width_hint(int32_t n_tokens) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_HIP_GRAPHS_WIDTH_HINT");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (enabled) {
+        g_ggml_cuda_wp_ubatch_width_hint.store(n_tokens, std::memory_order_relaxed);
+    }
+}
+
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     if (cgraph->n_nodes == 0) {
         return cgraph;
@@ -8641,6 +8660,128 @@ static int ggml_cuda_try_ml8_radiance_pattern_b_split(
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// WP_ML8_GROUP_FUSE=1: DS4.1's split wo_a (src/models/deepseek41.cpp
+// build_attention_tail) emits, per group g of G on attn_derope [K, G, M]:
+//   [VIEW (g>0)] CONT FP8_QUANT_ROT ML8_MUL_MAT RESHAPE [CONCAT (g>0)]
+// ending in CONCAT [N, G, M]. Matched at group 0's CONT and replaced by one
+// quantize + one grouped GEMM (ggml_cuda_ml8_4_grouped_decode) writing the
+// final CONCAT directly; every node in between is skipped. The chain's only
+// outside inputs are x3d and the weights, and each intermediate has exactly
+// one use, so skipping them cannot starve another consumer, and nothing live
+// across the chain can share the final CONCAT's memory.
+// WP_ML8_GROUP_FUSE_VERIFY=1 also runs the original nodes afterwards and logs
+// the max difference (the original result is what stays in dst).
+static int ggml_cuda_try_ml8_group_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] { const char * e = getenv("WP_ML8_GROUP_FUSE"); return e != nullptr && e[0] == '1'; }();
+    static const bool verify  = [] { const char * e = getenv("WP_ML8_GROUP_FUSE_VERIFY"); return e != nullptr && e[0] == '1'; }();
+    if (!enabled) {
+        return 0;
+    }
+    ggml_tensor * cont0 = cgraph->nodes[i];
+    if (cont0->op != GGML_OP_CONT || cont0->src[0] == nullptr || cont0->src[0]->op != GGML_OP_VIEW) {
+        return 0;
+    }
+    const ggml_tensor * view0 = cont0->src[0];
+    const ggml_tensor * x3d   = view0->src[0];
+    if (x3d == nullptr || view0->view_offs != 0 || !ggml_is_contiguous(x3d) || x3d->ne[3] != 1) {
+        return 0;
+    }
+    const int G = (int) x3d->ne[1];
+    if (G < 2 || G > 8 || x3d->ne[2] > 16) {
+        return 0;
+    }
+    const ggml_tensor * mm[8];
+    const ggml_tensor * qrot0 = nullptr;
+    const ggml_tensor * acc   = nullptr;
+    int j = i;
+    for (int g = 0; g < G; ++g) {
+        if (g > 0) {
+            if (j >= cgraph->n_nodes) return 0;
+            const ggml_tensor * v = cgraph->nodes[j];
+            if (v->op != GGML_OP_VIEW || v->src[0] != x3d || v->view_offs != (size_t) g * x3d->nb[1]) return 0;
+            ++j;
+        }
+        if (j + 3 >= cgraph->n_nodes) return 0;
+        const ggml_tensor * c  = cgraph->nodes[j];
+        const ggml_tensor * q  = cgraph->nodes[j + 1];
+        const ggml_tensor * m  = cgraph->nodes[j + 2];
+        const ggml_tensor * rs = cgraph->nodes[j + 3];
+        if (c->op != GGML_OP_CONT || (g > 0 && c->src[0] != cgraph->nodes[j - 1])) return 0;
+        if (q->op != GGML_OP_FP8_QUANT_ROT || q->src[0] != c) return 0;
+        if (m->op != GGML_OP_ML8_MUL_MAT || m->src[2] != q) return 0;
+        if (rs->op != GGML_OP_RESHAPE || rs->src[0] != m) return 0;
+        if (!ggml_node_has_n_uses(cgraph, j, 1) || !ggml_node_has_n_uses(cgraph, j + 1, 1) ||
+            !ggml_node_has_n_uses(cgraph, j + 2, 1)) return 0;
+        if (g == 0) {
+            qrot0 = q;
+        } else if (memcmp(q->op_params, qrot0->op_params, 4 * sizeof(int32_t)) != 0 ||
+                   q->src[1] != qrot0->src[1] || q->src[2] != nullptr) {
+            return 0;   // every group must quantize identically for one shared quantize
+        }
+        mm[g] = m;
+        j += 4;
+        if (g == 0) {
+            acc = rs;
+        } else {
+            if (j >= cgraph->n_nodes) return 0;
+            const ggml_tensor * cc = cgraph->nodes[j];
+            if (cc->op != GGML_OP_CONCAT || cc->src[0] != acc || cc->src[1] != rs || ggml_get_op_params_i32(cc, 0) != 1) return 0;
+            if (g < G - 1 && !ggml_node_has_n_uses(cgraph, j, 1)) return 0;
+            acc = cc;
+            ++j;
+        }
+    }
+    const int last = j - 1;
+    ggml_tensor * dst = cgraph->nodes[last];
+
+    if (!verify) {
+        return ggml_cuda_ml8_4_grouped_decode(*ctx, qrot0, x3d, mm, G, dst) ? last - i : 0;
+    }
+    // Verify: the fused path reads its own copy of x3d and writes a scratch
+    // output (the allocator may place dst over x3d, which is dead by then), the
+    // original nodes then compute dst as usual, and the two are compared.
+    hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+    hipStreamIsCapturing(ctx->stream(), &cap);
+    if (cap != hipStreamCaptureStatusNone) {
+        return 0;   // verify syncs; leave captured segments on the original path
+    }
+    ggml_cuda_pool_alloc<uint8_t> x_copy(ctx->pool(), ggml_nbytes(x3d));
+    ggml_cuda_pool_alloc<uint8_t> out_copy(ctx->pool(), ggml_nbytes(dst));
+    CUDA_CHECK(cudaMemcpyAsync(x_copy.get(), x3d->data, ggml_nbytes(x3d), cudaMemcpyDeviceToDevice, ctx->stream()));
+    ggml_tensor x3d_v = *x3d;
+    x3d_v.data = x_copy.get();
+    ggml_tensor dst_v = *dst;
+    dst_v.data = out_copy.get();
+    if (!ggml_cuda_ml8_4_grouped_decode(*ctx, qrot0, &x3d_v, mm, G, &dst_v)) {
+        return 0;
+    }
+    const size_t nbytes = ggml_nbytes(dst);
+    std::vector<float> fused(nbytes / sizeof(float)), ref(nbytes / sizeof(float));
+    CUDA_CHECK(cudaMemcpyAsync(fused.data(), out_copy.get(), nbytes, cudaMemcpyDeviceToHost, ctx->stream()));
+    for (int k = i; k <= last; ++k) {
+        ggml_tensor * n = cgraph->nodes[k];
+        if (!ggml_cuda_is_view_or_noop(n)) {
+            ggml_cuda_compute_forward(*ctx, n);
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ref.data(), dst->data, nbytes, cudaMemcpyDeviceToHost, ctx->stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+    double max_abs = 0.0, max_ref = 0.0;
+    for (size_t e = 0; e < ref.size(); ++e) {
+        max_abs = std::max(max_abs, (double) std::fabs(fused[e] - ref[e]));
+        max_ref = std::max(max_ref, (double) std::fabs(ref[e]));
+    }
+    static std::atomic<int> logged_per_m[17] = {};
+    const double rel = max_ref > 0 ? max_abs / max_ref : 0.0;
+    const int m_idx = (int) std::min<int64_t>(x3d->ne[2], 16);
+    if (rel > 1e-4 || logged_per_m[m_idx].fetch_add(1) < 20) {
+        fprintf(stderr, "wp ml8 group fuse verify: %s G=%d M=%lld N=%lld max_abs=%.6g max_ref=%.6g rel=%.3g\n",
+                dst->name, G, (long long) x3d->ne[2], (long long) dst->ne[0], max_abs, max_ref,
+                max_ref > 0 ? max_abs / max_ref : 0.0);
+    }
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -8654,6 +8795,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         std::atoi(getenv("GGML_CUDA_DISABLE_SCALE_UNARY_FUSION"));
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (const int grp_skip = ggml_cuda_try_ml8_group_fuse(cuda_ctx, cgraph, i)) {
+        return grp_skip;
+    }
 
     // MT_ML8_4_GEMM_LOG=2: one-shot graph-shape dump, independent of whether
     // the fuse itself is enabled (diagnostic only).
