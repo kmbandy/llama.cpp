@@ -10842,6 +10842,16 @@ public:
                         continue;
                     }
                     ++predicted_this_frame;
+                    // WP_EXPERT_SPEC_HOST_DRY=1: take the frame, land nothing
+                    // (separates hint-frame cost from landing cost in an A/B).
+                    static const bool host_dry = [] {
+                        const char * e = std::getenv("WP_EXPERT_SPEC_HOST_DRY");
+                        return e != nullptr && e[0] == '1';
+                    }();
+                    if (host_dry) {
+                        ++spec_dropped_;
+                        continue;
+                    }
                     pool_.note_host_hint(*page);
                     enqueue_newest(host_queue_, page);
                 } else {
