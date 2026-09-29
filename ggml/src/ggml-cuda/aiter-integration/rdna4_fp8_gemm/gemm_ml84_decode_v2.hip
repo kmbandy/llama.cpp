@@ -315,8 +315,11 @@ __global__ __launch_bounds__(V2_DWN * 32) void ml84_decode_v2_kernel(
             const int idx = tid * 16;
             if (idx < ATOTAL) {
                 const int r = idx / DBK, c = idx % DBK;
-                *reinterpret_cast<int4*>(&sA[r * ASTRIDE + c]) =
-                    *reinterpret_cast<const int4*>(Ab + (size_t) r * lda + k0 + c);
+                // Rows >= M are zero-filled, never read: callers may pass an
+                // unpadded M-row A (see ml8.cu's MT_ML8_4_DECODE_V2_NOPAD).
+                *reinterpret_cast<int4*>(&sA[r * ASTRIDE + c]) = r < M
+                    ? *reinterpret_cast<const int4*>(Ab + (size_t) r * lda + k0 + c)
+                    : int4{0, 0, 0, 0};
             }
         }
         __syncthreads();
