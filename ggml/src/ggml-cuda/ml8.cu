@@ -7132,3 +7132,116 @@ void ggml_cuda_op_ml8_mul_mat_id(
     CUDA_CHECK(cudaGetLastError());
 #endif // GGML_HIP_AITER
 }
+
+// WP_ML8_GROUP_FUSE (ggml-cuda.cu): DS4.1's split wo_a runs G per-group
+// CONT -> FP8_QUANT_ROT -> ML8_MUL_MAT -> RESHAPE (-> CONCAT) chains per layer,
+// ~6 runtime launches per group before the GEMM itself. This runs the whole
+// chain as one FP8_QUANT_ROT over all G*M rows of x3d ([K, G, M], rows ordered
+// (token, group)) into a pool scratch plus one grouped decode-v2 GEMM that
+// writes each group straight into its column slice of dst ([N, G, M]). All
+// groups must share qrot0's rotation params (the caller checks the op_params).
+// Returns false with no side effects when a shape/layout is not handled; the
+// caller then runs the original nodes.
+bool ggml_cuda_ml8_4_grouped_decode(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         qrot0,
+    const ggml_tensor *         x3d,
+    const ggml_tensor * const * mm,
+    int                         G,
+    ggml_tensor *               dst) {
+#if !defined(GGML_HIP_AITER) || !ML8_4_DECODE_V2_AVAILABLE
+    GGML_UNUSED(ctx); GGML_UNUSED(qrot0); GGML_UNUSED(x3d); GGML_UNUSED(mm); GGML_UNUSED(G); GGML_UNUSED(dst);
+    return false;
+#else
+    if (G < 2 || G > 8 || qrot0 == nullptr || x3d == nullptr || dst == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w0 = mm[0]->src[0];
+    if (w0 == nullptr || w0->type != GGML_TYPE_ML8_4) {
+        return false;
+    }
+    const int32_t K = (int32_t) w0->ne[0];
+    const int32_t N = (int32_t) w0->ne[1];
+    const int32_t M = (int32_t) x3d->ne[2];
+    if (M < 1 || M > 16 || x3d->type != GGML_TYPE_F32 || !ggml_is_contiguous(x3d) ||
+        x3d->ne[0] != K || x3d->ne[1] != G || x3d->ne[3] != 1) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        dst->ne[0] != N || dst->ne[1] != G || dst->ne[2] != M || dst->ne[3] != 1) {
+        return false;
+    }
+    const int32_t * qp = (const int32_t *) qrot0->op_params;
+    if (qrot0->type != GGML_TYPE_I8 || qp[3] != 0 || qrot0->src[2] != nullptr) {
+        return false;   // per-row, ungated quantize only
+    }
+    cudaStream_t stream = ctx.stream();
+    const uint8_t * B[8];
+    const uint8_t * L[8];
+    const float   * S[8];
+    for (int g = 0; g < G; ++g) {
+        const ggml_tensor * w    = mm[g]->src[0];
+        const ggml_tensor * cent = mm[g]->src[1];
+        if (w == nullptr || cent == nullptr || w->type != GGML_TYPE_ML8_4 || cent->type != GGML_TYPE_F8_E4M3 ||
+            w->ne[0] != K || w->ne[1] != N || !ggml_is_contiguous(w) || !ggml_is_contiguous(cent) ||
+            cent->ne[0] != 16) {
+            return false;
+        }
+        const int32_t lut_group_off = ggml_get_op_params_i32(mm[g], 0);
+        if (lut_group_off < 0 || (int64_t) lut_group_off + K / QK_ML8 > cent->ne[1]) {
+            return false;
+        }
+        const ml8_weight_repack_t * repack = ggml_cuda_ml8_get_or_repack(stream, w);
+        if (repack == nullptr || repack->layout != ML8_4_LAYOUT_RDNA4_TRFEED) {
+            return false;
+        }
+        B[g] = (const uint8_t *) repack->b_packed;
+        L[g] = (const uint8_t *) cent->data + (size_t) lut_group_off * 16;
+        S[g] = (const float *) repack->b_scale;
+    }
+
+    // Scratch: the quantize writes G*M rows of K fp8 then G*M fp32 scales; the
+    // GEMM's 16-row tile reads up to 16*G rows at stride G*K, so size for that.
+    const size_t rows_alloc = (size_t) 16 * (size_t) G;
+    ggml_cuda_pool_alloc<uint8_t> scratch(ctx.pool(), rows_alloc * ((size_t) K + sizeof(float)));
+
+    // Row-major per-row quantize of all G*M rows, same v4 -> v3 -> v2 cascade
+    // as ggml_cuda_op_fp8_quant_rot's block-hadamard branch. Called directly:
+    // the op itself takes a TILED layout for >32 rows (%16) under
+    // MT_ML8_4_PREFILL_RADIANCE, which this GEMM cannot read.
+    const int32_t a_dim = qp[0];
+    const int32_t b_dim = qp[1];
+    const int32_t kind  = qp[2];
+    if (kind != GGML_FP8_QUANT_ROT_KIND_BLOCK_HADAMARD || qrot0->src[1] != nullptr ||
+        a_dim <= 0 || a_dim > ML8_QROT_V2_BLOCKHAD_MAX_A || b_dim < 16 || b_dim > 1024 ||
+        (b_dim & (b_dim - 1)) != 0 || (int64_t) a_dim * b_dim != K) {
+        return false;
+    }
+    const int n_rows = G * M;
+    uint8_t * out_qs    = scratch.get();
+    float   * out_scale = (float *) (scratch.get() + (size_t) n_rows * (size_t) K);
+    const float * xin   = (const float *) x3d->data;
+    if (ggml_cuda_fp8_qrot_v3_disabled() ||
+        !(ml8_launch_qrot_v4(stream, false, xin, nullptr, nullptr, 0.0f, out_qs, out_scale, K, a_dim, b_dim, n_rows) ||
+          ml8_launch_qrot_v3(stream, false, xin, nullptr, out_qs, out_scale, K, a_dim, b_dim, n_rows))) {
+        if (a_dim <= 16) {
+            ml8_launch_qrot_v2<16, false>(stream, xin, nullptr, out_qs, out_scale, K, a_dim, b_dim, n_rows);
+        } else {
+            ml8_launch_qrot_v2<ML8_QROT_V2_BLOCKHAD_MAX_A, false>(stream, xin, nullptr, out_qs, out_scale, K, a_dim, b_dim, n_rows);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const uint8_t * A       = scratch.get();
+    const float   * a_scale = (const float *) (scratch.get() + (size_t) G * (size_t) M * (size_t) K);
+    const bool ok = rdna4_gemm_ml84_decode_v2_grouped(
+        G, M, A, B, L, S, (float *) dst->data, a_scale,
+        /*M_pad=*/16, N, K, /*lda=*/G * K, /*sa=*/G, /*ldc=*/G * N, stream);
+    if (!ok) {
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    ml8_gemm_log_once("decode-v2-grouped", M, N, K, G);
+    return true;
+#endif
+}

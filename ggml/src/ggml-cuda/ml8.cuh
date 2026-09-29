@@ -261,6 +261,16 @@ bool ggml_cuda_ml8_4_mul_mat_prequant(
     int                         M,
     ggml_tensor *               dst);
 
+// Grouped decode for DS4.1's split wo_a (see ml8.cu). Returns false with no
+// side effects when not handled.
+bool ggml_cuda_ml8_4_grouped_decode(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         qrot0,
+    const ggml_tensor *         x3d,
+    const ggml_tensor * const * mm,
+    int                         G,
+    ggml_tensor *               dst);
+
 // GGML_OP_ML8_GET_ROWS dispatch — native 4-bit token-embedding gather.
 // Unlike ggml_cuda_op_ml8_mul_mat this needs NO AITER GEMM: it gathers row
 // ids[i] from the ml8-4 weight and dequantizes via the per-K-group centroid
