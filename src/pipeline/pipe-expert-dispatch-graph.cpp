@@ -1297,7 +1297,17 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
             // unchanged by WP_HINT_QUEUE_DEPTH -- the queue only changes
             // whether an ACCEPTED snapshot can survive the predictor still
             // being busy with a previous one.
-            if (pred_snapshot_taken_) {
+            // WP_HINT_ROUTER2_EVERY_LAYER=1: score every layer's snapshot
+            // instead (layer L -> L+2 at K=1, one layer of lead). Offline on
+            // DS4.1 decode (~/ds4-runs/dsv41/pred/score.py) router_{L+2} on
+            // h_L at top-6 named 43% of the NVMe misses left after the RAM
+            // victim tier, 1.7 reads per miss caught; the one-snapshot
+            // horizon above transfers from much further away.
+            static const bool every_layer = [] {
+                const char * e = std::getenv("WP_HINT_ROUTER2_EVERY_LAYER");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (pred_snapshot_taken_ && !every_layer) {
                 ++pred_dropped_;
                 return;
             }
