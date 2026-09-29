@@ -5124,6 +5124,15 @@ public:
         arena_(arena),
         arena_kind_(arena_kind) {
         reserve_blocks_ = reserve_blocks;
+        track_n_   = page_count;
+        hint_ns_   = std::make_unique<std::atomic<int64_t>[]>(track_n_);
+        demand_ns_ = std::make_unique<std::atomic<int64_t>[]>(track_n_);
+        hint_dist_ = std::make_unique<std::atomic<int8_t>[]>(track_n_);
+        for (size_t i = 0; i < track_n_; ++i) {
+            hint_ns_[i].store(0, std::memory_order_relaxed);
+            demand_ns_[i].store(0, std::memory_order_relaxed);
+            hint_dist_[i].store(0, std::memory_order_relaxed);
+        }
         logs_ = logs;
         pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
         device_name_ = device_name.empty()
@@ -6133,6 +6142,10 @@ public:
                     // but are prefill by construction; without this ~96% of prefill
                     // page-ins skipped the WP_HOST_TIER_POLICY admission gate.
                     pi.prefill     = n_tokens > 32 || spec_call_is_layer_ahead;
+                    if (count_demand && tracked(page.cache_id)) {
+                        demand_ns_[page.cache_id].store(track_now_ns(),
+                                                        std::memory_order_relaxed);
+                    }
                     const size_t slot_index =
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
@@ -6719,7 +6732,11 @@ public:
             // filter ate everything and nothing about WHICH condition did it.
             if (page == nullptr || page->cache_id < 0) { ++host_skip_bad_;  continue; }
             if (page->is_resident)                     { ++host_skip_pin_;  continue; }
-            if (find_slot(*page) != slots_.size())     { ++host_skip_vram_; continue; }
+            if (find_slot(*page) != slots_.size()) {
+                ++host_skip_vram_;
+                if (demand_beat_hint(page->cache_id)) { ++host_skip_vram_late_; }
+                continue;
+            }
             if (arena_.is_resident(page->cache_id))      { ++host_skip_tier_; continue; }
             try {
                 cold.emplace_back(page, fd_for(page->blob));
@@ -6750,6 +6767,7 @@ public:
                 void * data = nullptr;
                 wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
                 if (!arena_.begin_read(page->cache_id, /*speculative=*/true, &data, &handle)) {
+                    host_begin_refused_.fetch_add(1, std::memory_order_relaxed);
                     host_pending_.fetch_sub(1, std::memory_order_release);
                     continue;
                 }
@@ -6826,6 +6844,11 @@ public:
                     if (test_hooks_ != nullptr && test_hooks_->read_finished) {
                         test_hooks_->read_finished(page->layer, page->expert);
                     }
+                    const uint8_t tag = landing_tag(page->cache_id);
+                    if (tag & kTagLate) {
+                        host_landed_late_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    arena_.set_spec_tag(page->cache_id, handle, tag);
                     arena_.finish_read(page->cache_id, handle, /*ok=*/true);
                     host_landed_.fetch_add(1, std::memory_order_relaxed);
                     host_bytes_.fetch_add(page->size, std::memory_order_relaxed);
@@ -6897,6 +6920,29 @@ public:
     uint64_t host_skip_pin()   const { return host_skip_pin_; }
     uint64_t host_skip_vram()  const { return host_skip_vram_; }
     uint64_t host_skip_tier()  const { return host_skip_tier_; }
+    uint64_t host_skip_vram_late() const { return host_skip_vram_late_; }
+    uint64_t host_landed_late() const { return host_landed_late_.load(std::memory_order_relaxed); }
+    uint64_t host_begin_refused() const { return host_begin_refused_.load(std::memory_order_relaxed); }
+    uint64_t host_waited_inflight() const { return host_waited_inflight_.load(std::memory_order_relaxed); }
+    // "d<dist>:used/unused/late_used/late_unused ..." for every distance
+    // that saw a landing outcome.
+    std::string host_outcome_by_dist() const {
+        std::string out;
+        for (int d = 0; d <= kTagDistMax; ++d) {
+            const uint64_t u  = arena_.spec_used_tag((uint8_t) d);
+            const uint64_t w  = arena_.spec_unused_tag((uint8_t) d);
+            const uint64_t lu = arena_.spec_used_tag((uint8_t) (d | kTagLate));
+            const uint64_t lw = arena_.spec_unused_tag((uint8_t) (d | kTagLate));
+            if (u + w + lu + lw == 0) { continue; }
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%sd%d:%llu/%llu/%llu/%llu",
+                          out.empty() ? "" : " ", d,
+                          (unsigned long long) u, (unsigned long long) w,
+                          (unsigned long long) lu, (unsigned long long) lw);
+            out += buf;
+        }
+        return out;
+    }
 
     // Is `page` currently being read speculatively? The demand path has to ask,
     // because an in-flight slot is not yet valid, so find_slot cannot see it and
@@ -7113,6 +7159,33 @@ public:
     // against the evicted slot's own key.first is enough -- the pool does not
     // need the catalog itself for this.
     void set_current_layer(int32_t layer) { current_layer_ = layer; }
+
+    static int64_t track_now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    bool tracked(int cache_id) const {
+        return cache_id >= 0 && (size_t) cache_id < track_n_;
+    }
+    // A predicted page queued for a host landing (frame thread).
+    void note_host_hint(const ExpertPage & page) {
+        if (!tracked(page.cache_id)) { return; }
+        const int d = current_layer_ < 0 ? 0 : page.layer - current_layer_;
+        hint_dist_[page.cache_id].store((int8_t) std::clamp(d, 0, kTagDistMax),
+                                        std::memory_order_relaxed);
+        hint_ns_[page.cache_id].store(track_now_ns(), std::memory_order_relaxed);
+    }
+    // Did a demand page-in plan this page after its latest hint?
+    bool demand_beat_hint(int cache_id) const {
+        return tracked(cache_id) &&
+               demand_ns_[cache_id].load(std::memory_order_relaxed) >
+               hint_ns_[cache_id].load(std::memory_order_relaxed);
+    }
+    uint8_t landing_tag(int cache_id) const {
+        if (!tracked(cache_id)) { return 0; }
+        return (uint8_t) ((demand_beat_hint(cache_id) ? kTagLate : 0) |
+                          (uint8_t) hint_dist_[cache_id].load(std::memory_order_relaxed));
+    }
 
     // Unpinned slots are the ones select_victim can take without stealing a
     // live demand or in-flight spec pin. Layer-ahead uses this as the silent
@@ -7585,6 +7658,7 @@ private:
         }
         acquire_drain_quota(pagein, conn_index);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        bool waited = false;
         while (true) {
             // C1: a page another thread is READING right now (a speculative
             // landing, another connection's or device's demand read) must be
@@ -7603,6 +7677,9 @@ private:
                 pagein.ram_hit    = true;
                 pagein.arena_data = const_cast<void *>(src);
                 pagein.hold_released = false;
+                if (waited) {
+                    host_waited_inflight_.fetch_add(1, std::memory_order_relaxed);
+                }
                 if (host_tier_victim_enabled()) {
                     // exclusive: the page is going back to VRAM, free its
                     // entry once this upload's hold is released
@@ -7632,6 +7709,7 @@ private:
             }
             // Present: loop back to borrow(); the deadline check at the top
             // of the loop bounds the retry.
+            waited = true;
         }
     }
 
@@ -9645,6 +9723,22 @@ private:
     uint64_t                        host_skip_pin_  = 0;
     uint64_t                        host_skip_vram_ = 0;
     uint64_t                        host_skip_tier_ = 0;
+    // Host-landing outcome split. Per cache_id: when the spine last hinted
+    // the page, how many layers ahead of current_layer_ that hint was, and
+    // when a demand page-in last planned it. A demand stamp newer than the
+    // hint stamp means demand got there first -- the hint was LATE, not
+    // wrong. The tag each landing carries into the arena (see kTagLate) lets
+    // promoted/wasted be counted per distance and per late/on-time.
+    static constexpr uint8_t        kTagLate = 0x80;
+    static constexpr int            kTagDistMax = 15;
+    size_t                                  track_n_ = 0;
+    std::unique_ptr<std::atomic<int64_t>[]> hint_ns_;
+    std::unique_ptr<std::atomic<int64_t>[]> demand_ns_;
+    std::unique_ptr<std::atomic<int8_t>[]>  hint_dist_;
+    uint64_t                        host_skip_vram_late_ = 0;   // of host_skip_vram_
+    std::atomic<uint64_t>           host_landed_late_{0};
+    std::atomic<uint64_t>           host_begin_refused_{0};
+    std::atomic<uint64_t>           host_waited_inflight_{0};
     // retire_spec_batch -> complete_batch -> ... never re-enters ensure_batch,
     // but the guard makes that explicit and cheap rather than assumed.
     bool                            spec_recursion_ = false;
@@ -10748,6 +10842,7 @@ public:
                         continue;
                     }
                     ++predicted_this_frame;
+                    pool_.note_host_hint(*page);
                     enqueue_newest(host_queue_, page);
                 } else {
                     // CERTAIN (or host-less) -> VRAM spec_queue_. Newest-wins:
@@ -11351,7 +11446,15 @@ public:
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_ahead(),
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_behind(),
                       (unsigned long long) pool_.n_layerahead_spec_deferred());
-        return buf;
+        char split[256];
+        std::snprintf(split, sizeof(split),
+                      " host_skip_vram_late=%llu host_landed_late=%llu "
+                      "host_begin_refused=%llu host_waited_inflight=%llu host_by_dist=[",
+                      (unsigned long long) pool_.host_skip_vram_late(),
+                      (unsigned long long) pool_.host_landed_late(),
+                      (unsigned long long) pool_.host_begin_refused(),
+                      (unsigned long long) pool_.host_waited_inflight());
+        return std::string(buf) + split + pool_.host_outcome_by_dist() + "]";
     }
 
     // R -- GROUND TRUTH: the experts a dispatch actually asked for. Without this

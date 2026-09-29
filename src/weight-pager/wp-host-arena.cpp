@@ -81,6 +81,8 @@ void HostArena::shutdown() {
     spec_promotions_      = 0;
     reject_promotions_    = 0;
     spec_promotions_rejected_ = 0;
+    std::fill(std::begin(spec_used_by_tag_), std::end(spec_used_by_tag_), 0);
+    std::fill(std::begin(spec_unused_by_tag_), std::end(spec_unused_by_tag_), 0);
     begin_read_refusals_  = 0;
     admission_cold_landed_ = 0;
     lookups_       = 0;
@@ -341,7 +343,10 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
         spec_bytes_ -= cfg_.entry_bytes;
         // Still speculative when evicted: only "unused" if a demand or
         // peek borrow() never touched it (see ever_borrowed).
-        if (!e.ever_borrowed) ++spec_evicted_unused_;
+        if (!e.ever_borrowed) {
+            ++spec_evicted_unused_;
+            ++spec_unused_by_tag_[e.tag];
+        }
         ++evictions_spec_;
     } else if (from == ListLoc::RejectLru) {
         reject_lru_.erase(e.lru_pos);
@@ -549,6 +554,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
     e.pinned      = false;
     e.ever_borrowed = false;
     e.drop_when_idle = false;
+    e.tag         = 0;
     e.gen         = next_gen_++;
     e.loc         = ListLoc::None;
 
@@ -668,6 +674,7 @@ bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out,
             e.speculative = false;
             spec_bytes_ -= cfg_.entry_bytes;
             ++spec_promotions_;
+            ++spec_used_by_tag_[e.tag];
             if (reject_promotion) {
                 insert_mru_locked_(idx, ListLoc::RejectLru);
                 ++spec_promotions_rejected_;
@@ -737,6 +744,25 @@ void HostArena::mark_drop(int page_idx) {
     if (drop_if_idle_locked_(it->second)) cv_.notify_all();
 }
 
+void HostArena::set_spec_tag(int page_idx, Handle handle, uint8_t tag) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = by_page_.find(page_idx);
+    if (it == by_page_.end()) return;
+    Entry & e = entries_[it->second];
+    if (e.gen != handle || !e.speculative) return;
+    e.tag = tag;
+}
+
+uint64_t HostArena::spec_used_tag(uint8_t tag) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return spec_used_by_tag_[tag];
+}
+
+uint64_t HostArena::spec_unused_tag(uint8_t tag) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return spec_unused_by_tag_[tag];
+}
+
 // --- retention cap -------------------------------------------------------
 
 // Caller holds mu_. Evicts LRU (speculative side first, via evict_one_locked_'s
@@ -774,6 +800,7 @@ bool HostArena::pin(int page_idx) {
         e.speculative = false;
         spec_bytes_ -= cfg_.entry_bytes;
         ++spec_promotions_;
+        ++spec_used_by_tag_[e.tag];
     }
     e.pinned = true;
     pinned_bytes_ += cfg_.entry_bytes;

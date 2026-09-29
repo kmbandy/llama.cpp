@@ -1010,6 +1010,31 @@ static void test_mark_drop_frees_when_idle() {
     require(arena.resident_count() == 1, "only 4 resident");
 }
 
+static void test_spec_tags_count_outcomes() {
+    CountingAlloc a;
+    HostArena arena;
+    require(arena.init(cfg(4), a.alloc(), a.dealloc()), "init");
+    void * data; HostArena::Handle h;
+
+    require(arena.begin_read(10, true, &data, &h), "spec 10");
+    arena.set_spec_tag(10, h, 0x83);
+    arena.finish_read(10, h, true);
+    const void * src; HostArena::Handle hb;
+    require(arena.borrow(10, &src, &hb), "demand hit on 10");
+    arena.release(10, hb);
+    require(arena.spec_used_tag(0x83) == 1, "promotion counted under its tag");
+
+    require(arena.begin_read(11, true, &data, &h), "spec 11");
+    arena.set_spec_tag(11, h, 0x05);
+    arena.set_spec_tag(11, h + 1000, 0x7f);   // stale handle: ignored
+    arena.finish_read(11, h, true);
+    require(arena.begin_read(12, true, &data, &h), "spec 12 evicts 11");
+    arena.finish_read(12, h, true);
+    require(arena.spec_unused_tag(0x05) == 1, "unused eviction counted under its tag");
+    require(arena.spec_unused_tag(0x7f) == 0, "stale tag never applied");
+    require(arena.spec_used_tag(0) + arena.spec_unused_tag(0) == 0, "untagged side untouched");
+}
+
 int main() {
     try {
         test_init_chunked_and_shrink_on_failure();
@@ -1037,6 +1062,7 @@ int main() {
         test_protect_demand_from_spec_speculative_never_evicts_demand();
         test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand();
         test_mark_drop_frees_when_idle();
+        test_spec_tags_count_outcomes();
         std::cout << "test-wp-host-arena: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {
