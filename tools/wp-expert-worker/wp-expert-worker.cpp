@@ -2054,7 +2054,9 @@ public:
     // WP_HOST_TIER_VICTIM: pool-lifetime D2H demotions into the arena, the
     // ones skipped (arena busy/full, page already there), their total time,
     // and arena entries freed by mark_drop after their upload.
-    void set_victim_stats(uint64_t demoted, uint64_t skipped, uint64_t ns_demote, uint64_t drops) {
+    void set_victim_stats(uint64_t demoted, uint64_t skipped, uint64_t ns_demote, uint64_t drops,
+                          uint64_t ns_wait = 0) {
+        victim_ns_wait_   = ns_wait;
         victim_demoted_   = demoted;
         victim_skipped_   = skipped;
         victim_ns_demote_ = ns_demote;
@@ -2370,6 +2372,7 @@ private:
                   << " ram_victim_demoted=" << victim_demoted_
                   << " ram_victim_skipped=" << victim_skipped_
                   << " ram_victim_demote_ms=" << (victim_ns_demote_ / 1000000)
+                  << " ram_victim_wait_ms=" << (victim_ns_wait_ / 1000000)
                   << " ram_drops=" << victim_drops_
                   << " ram_lookups=" << ram_lookups_
                   << " ram_lookup_hits=" << ram_lookup_hits_
@@ -2591,6 +2594,7 @@ private:
     uint64_t           victim_demoted_     = 0;
     uint64_t           victim_skipped_     = 0;
     uint64_t           victim_ns_demote_   = 0;
+    uint64_t           victim_ns_wait_     = 0;
     uint64_t           victim_drops_       = 0;
     uint64_t           ram_lookup_hits_    = 0;
     uint64_t           ram_evictions_spec_    = 0;
@@ -4902,6 +4906,12 @@ struct WorkerLogFiles {
     std::mutex mutex;
 };
 
+struct DemoteTicket {
+    std::mutex              m;
+    std::condition_variable cv;
+    bool                    done = false;
+};
+
 class ExpertSlotPool {
 private:
     struct PageIn {
@@ -4956,6 +4966,9 @@ private:
         // reserve_arena_for_pagein D2H-copies it into the arena before
         // anything overwrites the slot, and clears it.
         const ExpertPage * demote_page = nullptr;
+        // WP_HOST_TIER_VICTIM_ASYNC=1: the demote was handed to the demote
+        // thread at plan time; wait on this before anything writes the slot.
+        std::shared_ptr<struct DemoteTicket> demote_ticket;
         // Hold bookkeeping (reader thread until the last result is pushed,
         // dispatch thread afterwards -- never both at once):
         //   hold_released -- the arena borrow/reservation this page-in took
@@ -5353,6 +5366,7 @@ public:
     }
 
     ~ExpertSlotPool() {
+        stop_demote_thread();   // WP_HOST_TIER_VICTIM_ASYNC; no-op if never started
         // DESTRUCTION-ORDER LANDMINE, DEFUSED EXPLICITLY.
         //
         // spec_batches_ is declared ABOVE slots_/slot_index_ in this class, so
@@ -6234,6 +6248,10 @@ public:
                         test_hooks_->slot_reserved(
                             page.layer, page.expert, (int) slot_index);
                     }
+                    if (pi.demote_page != nullptr && host_tier_victim_async()) {
+                        pi.demote_ticket = submit_demote(pi.demote_page, pi.raw);
+                        pi.demote_page   = nullptr;
+                    }
                     batch.state_->pageins.push_back(pi);
             }
             // Reported bytes resident in the shared host arena right now --
@@ -6921,6 +6939,7 @@ public:
     uint64_t n_victim_demoted() const { return n_victim_demoted_.load(std::memory_order_relaxed); }
     uint64_t n_victim_skipped() const { return n_victim_skipped_.load(std::memory_order_relaxed); }
     uint64_t ns_victim_demote() const { return ns_victim_demote_.load(std::memory_order_relaxed); }
+    uint64_t ns_victim_wait() const { return ns_victim_wait_.load(std::memory_order_relaxed); }
     wp::HostArena & arena() { return arena_; }
     const wp::HostArena & arena() const { return arena_; }
     uint64_t host_spec_bytes() const { return host_bytes_.load(std::memory_order_relaxed); }
@@ -7596,6 +7615,94 @@ private:
     void demote_to_arena(PageIn & pagein) {
         const ExpertPage & victim = *pagein.demote_page;
         pagein.demote_page = nullptr;
+        demote_core(victim, pagein.raw);
+    }
+
+    static bool host_tier_victim_async() {
+        static const bool enabled = [] {
+            const char * e = std::getenv("WP_HOST_TIER_VICTIM_ASYNC");
+            return e != nullptr && e[0] == '1';
+        }();
+        return enabled;
+    }
+
+    // WP_HOST_TIER_VICTIM_ASYNC: one demote thread, fed at plan time, so a
+    // page-in that reads from NVMe overlaps its victim's D2H with that read
+    // instead of paying it serially before the upload (~0.8 ms/page on the
+    // R9700, ~1.8 ms on the 6900XT, measured 2026-09-29). One thread, not the
+    // readers: 16 concurrent reader-thread D2Hs measured 9-14 ms each.
+    std::shared_ptr<DemoteTicket> submit_demote(const ExpertPage * victim, ggml_tensor * raw) {
+        auto ticket = std::make_shared<DemoteTicket>();
+        {
+            std::lock_guard<std::mutex> lock(demote_mu_);
+            if (!demote_thread_.joinable()) {
+                demote_thread_ = std::thread([this] { demote_loop(); });
+            }
+            demote_q_.push_back(DemoteJob{victim, raw, ticket});
+        }
+        demote_cv_.notify_one();
+        return ticket;
+    }
+
+    void wait_demote(std::shared_ptr<DemoteTicket> & ticket) {
+        if (!ticket) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            std::unique_lock<std::mutex> lock(ticket->m);
+            ticket->cv.wait(lock, [&] { return ticket->done; });
+        }
+        ns_victim_wait_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+        ticket.reset();
+    }
+
+    void demote_loop() {
+        for (;;) {
+            DemoteJob job;
+            {
+                std::unique_lock<std::mutex> lock(demote_mu_);
+                demote_cv_.wait(lock, [&] { return demote_stop_ || !demote_q_.empty(); });
+                if (demote_q_.empty()) {
+                    return;   // stop requested and nothing left
+                }
+                job = std::move(demote_q_.front());
+                demote_q_.pop_front();
+            }
+            demote_core(*job.victim, job.raw);
+            {
+                std::lock_guard<std::mutex> lock(job.ticket->m);
+                job.ticket->done = true;
+            }
+            job.ticket->cv.notify_all();
+        }
+    }
+
+    void stop_demote_thread() {
+        {
+            std::lock_guard<std::mutex> lock(demote_mu_);
+            demote_stop_ = true;
+        }
+        demote_cv_.notify_all();
+        if (demote_thread_.joinable()) {
+            demote_thread_.join();
+        }
+    }
+
+    struct DemoteJob {
+        const ExpertPage *            victim = nullptr;
+        ggml_tensor *                 raw    = nullptr;
+        std::shared_ptr<DemoteTicket> ticket;
+    };
+    std::mutex                demote_mu_;
+    std::condition_variable   demote_cv_;
+    std::deque<DemoteJob>     demote_q_;
+    std::thread               demote_thread_;
+    bool                      demote_stop_ = false;
+    std::atomic<uint64_t>     ns_victim_wait_{0};
+
+    void demote_core(const ExpertPage & victim, ggml_tensor * raw) {
         const auto t0 = std::chrono::steady_clock::now();
         void * data = nullptr;
         wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
@@ -7615,7 +7722,7 @@ private:
                 for_each_page_chunk(victim, 0, (size_t) victim.size,
                                     [&](size_t dst_off, size_t dev_off, size_t n) {
                     if (!fast || !ok) return;
-                    if (!ggml_backend_cuda_wp_d2h(backend_, pagein.raw,
+                    if (!ggml_backend_cuda_wp_d2h(backend_, raw,
                                                   (char *) data + dst_off, dev_off, n)) {
                         if (first) fast = false; else ok = false;
                     }
@@ -7624,7 +7731,7 @@ private:
             }
             if (!fast) {
                 // reader-thread safe (per-thread stream, see tensor_verify_page_range)
-                tensor_get_page(pagein.raw, victim, data);
+                tensor_get_page(raw, victim, data);
             }
         } catch (...) {
             ok = false;
@@ -7667,6 +7774,9 @@ private:
         // readers doing it concurrently, vs ~1 ms per upload on dispatch).
         if (pagein.demote_page != nullptr && (pagein.reader_h2d || pagein.cpu_direct)) {
             demote_to_arena(pagein);
+        }
+        if (pagein.demote_ticket && (pagein.reader_h2d || pagein.cpu_direct)) {
+            wait_demote(pagein.demote_ticket);
         }
         if (pagein.cpu_direct) {
             return true;   // never touches the arena (unless a stripe falls back: I2)
@@ -8277,6 +8387,7 @@ private:
                     // before this page-in's first stripe lands in the slot
                     demote_to_arena(pagein);
                 }
+                wait_demote(pagein.demote_ticket);
                 bool copy_stream_async = false;
                 // Set true wherever the H2D below is issued asynchronously
                 // (copy-stream or tensor_set_async -- anywhere mark_in_flight
@@ -12683,7 +12794,7 @@ public:
                                  arena.evictions_lru(), arena.reject_promotions(),
                                  arena.spec_promotions_rejected());
             stats_.set_victim_stats(pool_.n_victim_demoted(), pool_.n_victim_skipped(),
-                                    pool_.ns_victim_demote(), arena.drops());
+                                    pool_.ns_victim_demote(), arena.drops(), pool_.ns_victim_wait());
         }
         stats_.set_layerahead_stats(
             n_layerahead_hints_, n_layerahead_pageins_, pool_.n_layerahead_hits(),
