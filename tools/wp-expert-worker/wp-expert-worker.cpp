@@ -5128,10 +5128,12 @@ public:
         hint_ns_   = std::make_unique<std::atomic<int64_t>[]>(track_n_);
         demand_ns_ = std::make_unique<std::atomic<int64_t>[]>(track_n_);
         hint_dist_ = std::make_unique<std::atomic<int8_t>[]>(track_n_);
+        land_boost_ = std::make_unique<std::atomic<uint8_t>[]>(track_n_);
         for (size_t i = 0; i < track_n_; ++i) {
             hint_ns_[i].store(0, std::memory_order_relaxed);
             demand_ns_[i].store(0, std::memory_order_relaxed);
             hint_dist_[i].store(0, std::memory_order_relaxed);
+            land_boost_[i].store(0, std::memory_order_relaxed);
         }
         logs_ = logs;
         pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
@@ -6771,9 +6773,15 @@ public:
                     host_pending_.fetch_sub(1, std::memory_order_release);
                     continue;
                 }
+                // A demand read waiting on this page counts in
+                // demand_reads_pending_ -- yielding to it would starve it.
+                const auto must_yield = [this, page]() {
+                    return demand_reads_pending_.load(std::memory_order_relaxed) > 0 &&
+                           !landing_boosted(page->cache_id);
+                };
                 try {
                     if (spec_preempt_before_borrow_) {
-                        while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
+                        while (must_yield()) {
                             std::this_thread::sleep_for(std::chrono::microseconds(200));
                         }
                     }
@@ -6814,7 +6822,7 @@ public:
                         while (off < (size_t) page->size) {
                             if (spec_preempt_deadline_) {
                                 const auto wait_start = std::chrono::steady_clock::now();
-                                while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
+                                while (must_yield()) {
                                     const auto waited =
                                         std::chrono::duration_cast<std::chrono::microseconds>(
                                             std::chrono::steady_clock::now() - wait_start).count();
@@ -6828,7 +6836,7 @@ public:
                                     std::this_thread::sleep_for(std::chrono::microseconds(200));
                                 }
                             } else {
-                                while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
+                                while (must_yield()) {
                                     std::this_thread::sleep_for(std::chrono::microseconds(200));
                                 }
                             }
@@ -6859,6 +6867,9 @@ public:
                     // so a non-std throw cannot leak a Reading entry.
                     arena_.finish_read(page->cache_id, handle, /*ok=*/false);
                     host_errors_.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (tracked(page->cache_id)) {
+                    land_boost_[page->cache_id].store(0, std::memory_order_relaxed);
                 }
                 // Per-page, not per-batch: with multiple concurrent landing
                 // threads host_pending_ has to be a real count of pages still
@@ -6924,6 +6935,7 @@ public:
     uint64_t host_landed_late() const { return host_landed_late_.load(std::memory_order_relaxed); }
     uint64_t host_begin_refused() const { return host_begin_refused_.load(std::memory_order_relaxed); }
     uint64_t host_waited_inflight() const { return host_waited_inflight_.load(std::memory_order_relaxed); }
+    uint64_t host_boosted() const { return host_boosted_.load(std::memory_order_relaxed); }
     // "d<dist>:used/unused/late_used/late_unused ..." for every distance
     // that saw a landing outcome.
     std::string host_outcome_by_dist() const {
@@ -7180,6 +7192,9 @@ public:
         return tracked(cache_id) &&
                demand_ns_[cache_id].load(std::memory_order_relaxed) >
                hint_ns_[cache_id].load(std::memory_order_relaxed);
+    }
+    bool landing_boosted(int cache_id) const {
+        return tracked(cache_id) && land_boost_[cache_id].load(std::memory_order_relaxed) != 0;
     }
     uint8_t landing_tag(int cache_id) const {
         if (!tracked(cache_id)) { return 0; }
@@ -7691,6 +7706,11 @@ private:
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
             void * data = nullptr;
+            if (tracked(pagein.page->cache_id) &&
+                    arena_.state_of(pagein.page->cache_id) == wp::HostArena::State::Reading) {
+                // If a host landing holds this page, it must not yield to us.
+                land_boost_[pagein.page->cache_id].store(1, std::memory_order_relaxed);
+            }
             const wp::HostArena::Reserve r = arena_.reserve_wait(
                 pagein.page->cache_id, /*speculative=*/false, &data, &pagein.arena_handle, left_ms);
             if (r == wp::HostArena::Reserve::Reserved) {
@@ -7710,6 +7730,7 @@ private:
             // Present: loop back to borrow(); the deadline check at the top
             // of the loop bounds the retry.
             waited = true;
+            host_boosted_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -9735,6 +9756,12 @@ private:
     std::unique_ptr<std::atomic<int64_t>[]> hint_ns_;
     std::unique_ptr<std::atomic<int64_t>[]> demand_ns_;
     std::unique_ptr<std::atomic<int8_t>[]>  hint_dist_;
+    // Set by a demand read about to wait on this page; the host landing
+    // reading it stops yielding to demand. Without it the waiting read itself
+    // counts in demand_reads_pending_, so the landing it waits on crawls at one
+    // slice per spec_preempt_max_wait_us_ (~38 ms for an 18.8 MB page).
+    std::unique_ptr<std::atomic<uint8_t>[]> land_boost_;
+    std::atomic<uint64_t>           host_boosted_{0};
     uint64_t                        host_skip_vram_late_ = 0;   // of host_skip_vram_
     std::atomic<uint64_t>           host_landed_late_{0};
     std::atomic<uint64_t>           host_begin_refused_{0};
@@ -11459,11 +11486,12 @@ public:
         char split[256];
         std::snprintf(split, sizeof(split),
                       " host_skip_vram_late=%llu host_landed_late=%llu "
-                      "host_begin_refused=%llu host_waited_inflight=%llu host_by_dist=[",
+                      "host_begin_refused=%llu host_waited_inflight=%llu host_boosted=%llu host_by_dist=[",
                       (unsigned long long) pool_.host_skip_vram_late(),
                       (unsigned long long) pool_.host_landed_late(),
                       (unsigned long long) pool_.host_begin_refused(),
-                      (unsigned long long) pool_.host_waited_inflight());
+                      (unsigned long long) pool_.host_waited_inflight(),
+                      (unsigned long long) pool_.host_boosted());
         return std::string(buf) + split + pool_.host_outcome_by_dist() + "]";
     }
 
