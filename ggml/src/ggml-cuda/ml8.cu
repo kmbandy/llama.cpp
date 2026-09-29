@@ -3566,8 +3566,19 @@ static void ml8_mul_mat_core(
         } else {
             a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
             a_scale_scratch.alloc((size_t) M_pad);
-            CUDA_CHECK(cudaMemsetAsync(a_fp8_scratch.get(), 0, (size_t) M_pad * (size_t) K, stream));
-            CUDA_CHECK(cudaMemsetAsync(a_scale_scratch.get(), 0, (size_t) M_pad * sizeof(float), stream));
+            // MT_ML8_4_PAD_NO_ZERO=1: leave padding rows unzeroed. GEMM rows are
+            // independent and rows >= M are never stored (decode-v2 writes m < M;
+            // split-K copies out M rows), so the two memsets are dead work: two
+            // of the ~6 runtime launches each decode projection paid (DS4.1 spine
+            // trace: ~450 projections, ~10k launches per verify step).
+            static const bool pad_no_zero = [] {
+                const char * e = std::getenv("MT_ML8_4_PAD_NO_ZERO");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (!pad_no_zero) {
+                CUDA_CHECK(cudaMemsetAsync(a_fp8_scratch.get(), 0, (size_t) M_pad * (size_t) K, stream));
+                CUDA_CHECK(cudaMemsetAsync(a_scale_scratch.get(), 0, (size_t) M_pad * sizeof(float), stream));
+            }
             CUDA_CHECK(cudaMemcpyAsync(a_fp8_scratch.get(), qs_base, (size_t) M * (size_t) K,
                                        cudaMemcpyDeviceToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(a_scale_scratch.get(), scale_base, (size_t) M * sizeof(float),
