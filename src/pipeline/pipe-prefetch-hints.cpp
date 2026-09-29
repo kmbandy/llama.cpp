@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <numeric>
@@ -188,15 +189,29 @@ std::vector<int32_t> router2_top_experts(const float *      weights,
             best_p = std::max(best_p,
                               std::exp(logits[(size_t) expert] - max_logit) / denom);
         }
-        std::partial_sort(order.begin(), order.begin() + top_m, order.end(),
+        // WP_HINT_ROUTER2_MARGIN=x keeps only experts whose score beats this
+        // token's (top_m+1)-th best by at least x. Offline on DS4.1 decode
+        // (~/ds4-runs/dsv41/pred/score3.py, L+2 top-6): no gate reads 26%
+        // useful at 44% miss recall, 0.2 reads 63% useful at 20% recall.
+        static const float margin = [] {
+            const char * e = std::getenv("WP_HINT_ROUTER2_MARGIN");
+            return e != nullptr && e[0] != '\0' ? std::strtof(e, nullptr) : 0.0f;
+        }();
+        const int32_t n_sort = margin > 0.0f ? std::min(top_m + 1, n_expert) : top_m;
+        std::partial_sort(order.begin(), order.begin() + n_sort, order.end(),
                           [&scores](int32_t a, int32_t b) {
                               if (scores[(size_t) a] != scores[(size_t) b]) {
                                   return scores[(size_t) a] > scores[(size_t) b];
                               }
                               return a < b;
                           });
+        const double floor_score = margin > 0.0f && n_sort > top_m
+            ? scores[(size_t) order[(size_t) top_m]] + (double) margin
+            : -std::numeric_limits<double>::infinity();
         for (int32_t i = 0; i < top_m; ++i) {
-            ++hits[(size_t) order[(size_t) i]];
+            if (scores[(size_t) order[(size_t) i]] >= floor_score) {
+                ++hits[(size_t) order[(size_t) i]];
+            }
         }
     }
     if (min_conf > 0.0f && best_p < (double) min_conf) {
