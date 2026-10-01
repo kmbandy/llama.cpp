@@ -12762,6 +12762,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // DS4.1 routed-expert shapes (gate/up 2304x5120, down 5120x2304) at decode /
+    // DSpark-verify widths: ML8_4 vs the MXFP4 the expert pages are today.
+    for (int64_t n : {1, 2, 4, 6, 8, 12, 16, 32, 64}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{2304, 5120}, {5120, 2304}}) {
+            test_cases.emplace_back(new test_ml8_mul_mat(mk.first, n, mk.second));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+    // DS4.1 routed experts as one layer's MUL_MAT_ID (top-6 of 128 resident),
+    // weights well past L3 so the CPU numbers are RAM-streaming numbers.
+    for (int64_t n : {1, 2, 4, 6, 8}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{2304, 5120}, {5120, 2304}}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 128, 6, false, mk.first, n, mk.second));
+        }
+    }
     return test_cases;
 }
 

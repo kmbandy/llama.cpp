@@ -19,6 +19,7 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_ML8_4:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -78,6 +79,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+        case GGML_TYPE_ML8_4:   return VDR_ML8_4_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
@@ -955,6 +957,36 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
+        if constexpr (type == GGML_TYPE_ML8_4) {
+            // ML8_4: the codebook group, the row's table lookups and scales depend on the
+            // weight only, so do them once per (kbx, row) and reuse them for every column.
+            int8_t tbl[16];
+            *(int4 *) tbl = *(const int4 *) (fusion.ml8_lut_q + kbx*16);
+            const float gd = fusion.ml8_lut_d[kbx];
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                if constexpr (rows2) {
+                    if (uint32_t(row0 + i) >= stride_col_dst) {
+                        continue;
+                    }
+                }
+                const block_ml8_4 * blk = (const block_ml8_4 *) vx_for_channel + kbx_offset + i*stride_row_x + kbx;
+                const int * qs = (const int *) blk->qs + kqs;
+                const int2  v0 = get_int_from_table_16(qs[0], tbl);
+                const int2  v1 = get_int_from_table_16(qs[1], tbl);
+                const float ws = blk->scale * gd;
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const block_q8_1 * by = &y[j*stride_col_y + kby] + (kqs >> 2);
+                    const int        * q8 = (const int *) by->qs + (kqs & 3) * 2;
+                    int sumi = ggml_cuda_dp4a(v0.x, q8[0], 0);
+                    sumi     = ggml_cuda_dp4a(v0.y, q8[1], sumi);
+                    sumi     = ggml_cuda_dp4a(v1.x, q8[2], sumi);
+                    sumi     = ggml_cuda_dp4a(v1.y, q8[3], sumi);
+                    tmp[j][i] += ws * __low2float(by->ds) * sumi;
+                }
+            }
+        } else {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -980,6 +1012,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+        }
         }
     }
 
@@ -1883,4 +1916,17 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+void ggml_cuda_ml8_4_mul_mat_vec_q(
+        const void * vx, const int8_t * lut_q, const float * lut_d, const void * vy, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    ggml_cuda_mm_fusion_args_device fusion{};
+    fusion.ml8_lut_q = lut_q;
+    fusion.ml8_lut_d = lut_d;
+    mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ML8_4>
+        (vx, vy, nullptr, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+         /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1, 0, 0, 0,
+         /*nsamples_x=*/1, /*nsamples_dst=*/1, 0, 0, 0, /*ids_stride=*/0, stream, nullptr);
 }

@@ -11,6 +11,9 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "vecdotq.cuh"      // get_int_from_table_16 (generic ML8_4 skinny GEMM)
+#include "mmvq.cuh"         // ggml_cuda_ml8_4_mul_mat_vec_q
+#include "mmq.cuh"          // ggml_cuda_ml8_4_mul_mat_q
 #ifdef GGML_HIP_AITER
 // The ml8 GEMM dispatch goes through the AITER Triton-AOT kernels. Their headers
 // only live on the include path when ggml-hip is configured with -DGGML_HIP_AITER=ON
@@ -434,6 +437,71 @@ std::unordered_map<const void *, inplace_entry_t> g_ml8_inplace;
 
 } // namespace
 
+// MT_ML8_REPACK_EPHEMERAL=1: for weights whose device memory is reused for
+// other weights (the expert worker's page slots), the device-pointer-keyed
+// g_ml8_cache below is wrong twice over -- a slot re-filled with another
+// expert would get the previous expert's packed copy back, and every slot
+// ever touched keeps its own cudaMalloc'd copy. This mode packs into one
+// scratch buffer per stream on every call instead. The returned info is
+// valid until the next call on the same stream, which is stream-ordered
+// after the GEMM that consumes it.
+static bool ml8_repack_ephemeral() {
+    static const bool on = [] {
+        const char * e = getenv("MT_ML8_REPACK_EPHEMERAL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+namespace {
+struct ml8_ephemeral_t {
+    void *              b_packed = nullptr;
+    float *             b_scale  = nullptr;
+    size_t              packed_cap = 0;
+    size_t              scale_cap  = 0;
+    ml8_weight_repack_t info{};
+};
+std::mutex                                     g_ml8_ephemeral_mu;
+std::unordered_map<cudaStream_t, ml8_ephemeral_t> g_ml8_ephemeral;
+} // namespace
+
+static const ml8_weight_repack_t * ml8_repack_ephemeral_get(
+    cudaStream_t stream, const ggml_tensor * w, int32_t K, int32_t N, int32_t n_groups_k, int32_t group_size) {
+    const size_t b_packed_bytes = (size_t) (K / 2) * (size_t) N;
+    const size_t b_scale_bytes  = (size_t) n_groups_k * (size_t) N * sizeof(float);
+    std::lock_guard<std::mutex> lock(g_ml8_ephemeral_mu);
+    ml8_ephemeral_t & e = g_ml8_ephemeral[stream];
+    if (e.packed_cap < b_packed_bytes || e.scale_cap < b_scale_bytes) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            GGML_ABORT("MT_ML8_REPACK_EPHEMERAL grows its scratch with cudaMalloc, which a capturing "
+                       "stream does not allow: run with graphs disabled, or serve pre-packed pages "
+                       "(GGML_TENSOR_FLAG_ML8_PACKED / WP_ML8_PREPACKED=1)");
+        }
+        // growth only: the old buffers may still feed a GEMM queued on this stream
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (e.b_packed) { CUDA_CHECK(cudaFree(e.b_packed)); }
+        if (e.b_scale)  { CUDA_CHECK(cudaFree(e.b_scale)); }
+        CUDA_CHECK(cudaMalloc(&e.b_packed, b_packed_bytes));
+        CUDA_CHECK(cudaMalloc((void **) &e.b_scale, b_scale_bytes));
+        e.packed_cap = b_packed_bytes;
+        e.scale_cap  = b_scale_bytes;
+    }
+    const int32_t layout = ml8_4_layout_for_tensor(N);
+    ml8_4_pack_for_layout(stream, (const uint8_t *) w->data, (uint8_t *) e.b_packed, e.b_scale,
+        N, K, n_groups_k, layout);
+    CUDA_CHECK(cudaGetLastError());
+    e.info.b_packed   = e.b_packed;
+    e.info.b_scale    = e.b_scale;
+    e.info.N          = N;
+    e.info.K          = K;
+    e.info.n_groups_k = n_groups_k;
+    e.info.group_size = group_size;
+    e.info.layout     = layout;
+    return &e.info;
+}
+
 const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     cudaStream_t        stream,
     const ggml_tensor * w) {
@@ -455,6 +523,21 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
 
     const void * key = w->data;
 
+    // Pre-packed weight (e.g. an expert page stored packed on disk): the tensor's
+    // own bytes are the kernel layout, exactly what the in-place repack writes.
+    // Nothing is cached per pointer, so re-filled page slots are always read fresh.
+    if (w->flags & GGML_TENSOR_FLAG_ML8_PACKED) {
+        static thread_local ml8_weight_repack_t info;
+        info.b_packed   = w->data;
+        info.b_scale    = (char *) w->data + (size_t) (K / 2) * (size_t) N;
+        info.N          = N;
+        info.K          = K;
+        info.n_groups_k = n_groups_k;
+        info.group_size = group_size;
+        info.layout     = ml8_4_layout_for_tensor(N);
+        return &info;
+    }
+
     // Load-time in-place repack: the tensor's own allocation is the kernel layout.
     {
         std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
@@ -462,6 +545,10 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
         if (it != g_ml8_inplace.end() && it->second.packed) {
             return &it->second.info;
         }
+    }
+
+    if (ml8_repack_ephemeral()) {
+        return ml8_repack_ephemeral_get(stream, w, K, N, n_groups_k, group_size);
     }
 
     {
@@ -2749,6 +2836,11 @@ static ml8_expand_prefetch_state * ml8_expand_prefetch_get(int device) {
     // measured 2026-09-18 on qwen38-27b-ml84-tp 8k: prefetch on 1182 pp, off 1345 pp.
     // MT_ML8_4_PREFETCH=1/0 forces either way.
     static const bool disabled = [] {
+        // successor learning is keyed by weight pointer: meaningless (and
+        // wrong) when those pointers are reused page slots
+        if (ml8_repack_ephemeral()) {
+            return true;
+        }
         const char * e = std::getenv("MT_ML8_4_PREFETCH");
         if (e != nullptr) {
             return std::strcmp(e, "0") == 0;
@@ -2986,6 +3078,11 @@ struct ml8_expand_cache_state {
 
 static int ml8_expand_cache_size() {
     static const int n = [] {
+        // keyed by weight pointer, so it would hand a re-filled page slot the
+        // previous weight's expansion
+        if (ml8_repack_ephemeral()) {
+            return 0;
+        }
         const char * e = std::getenv("MT_ML8_4_EXPAND_CACHE");
         if (e != nullptr) {
             const int v = std::atoi(e);
@@ -3687,7 +3784,7 @@ static void ml8_mul_mat_core(
             const float   * radiance_colscale = nullptr;
             ggml_cuda_pool_alloc<float>   radiance_colscale_scratch(ctx.pool());
             bool radiance_table_ready = false;
-            if (prefill_radiance_mode == 2) {
+            if (prefill_radiance_mode == 2 && !(w->flags & GGML_TENSOR_FLAG_ML8_PACKED)) {  // per-pointer cache: not for re-filled page slots
                 radiance_table_ready = ml8_4_radiance_cache_get_or_build(
                     w->data, cent_data, (const float *) repack->b_scale,
                     N, K, stream, &radiance_colscale);
@@ -3881,7 +3978,7 @@ static void ml8_mul_mat_core(
             ggml_cuda_pool_alloc<float>   radiance_colscale_scratch(ctx.pool());
             bool radiance_table_ready = false;
 
-            if (prefill_radiance_mode == 2) {
+            if (prefill_radiance_mode == 2 && !(w->flags & GGML_TENSOR_FLAG_ML8_PACKED)) {  // per-pointer cache: not for re-filled page slots
                 radiance_table_ready = ml8_4_radiance_cache_get_or_build(
                     w->data, cent_data, (const float *) repack->b_scale,
                     N, K, stream, &radiance_colscale);
@@ -3952,7 +4049,11 @@ static void ml8_mul_mat_core(
         // first pass we know which weight follows this one and expand it on a
         // side stream while this GEMM runs (double-buffered, event-fenced).
         // MT_ML8_4_PREFETCH=0 disables (synchronous pool-scratch expand).
-        ml8_expand_prefetch_state * pf = ml8_expand_prefetch_get(ctx.device);
+        // Pre-packed weights live in page slots that get re-filled with other
+        // weights: everything below keyed by the weight pointer (successor
+        // prefetch, expand caches) would hand back a previous occupant's expansion.
+        const bool w_paged = (w->flags & GGML_TENSOR_FLAG_ML8_PACKED) != 0;
+        ml8_expand_prefetch_state * pf = w_paged ? nullptr : ml8_expand_prefetch_get(ctx.device);
         const uint8_t * b_shuf_ptr      = nullptr;
         const float   * b_scale_out_ptr = nullptr;
         ggml_cuda_pool_alloc<uint8_t> b_shuf(ctx.pool());
@@ -3967,7 +4068,7 @@ static void ml8_mul_mat_core(
             use_slot = ml8_expand_prefetch_acquire(pf, w, cent_data, repack, N, K, stream);
             b_shuf_ptr      = pf->slot[use_slot].b_shuf;
             b_scale_out_ptr = pf->slot[use_slot].b_scale;
-        } else if (ml8_expand_on_ar_stream_enabled() &&
+        } else if (!w_paged && ml8_expand_on_ar_stream_enabled() &&
                    (ec_ar = ml8_expand_cache_get(ctx.device)) != nullptr) {
             // Multi-GPU TP path, prefetch disabled, AR-stream reuse enabled:
             // hide the cache's remaining misses (see the big comment above
@@ -3975,7 +4076,7 @@ static void ml8_mul_mat_core(
             // per-device stream instead of the compute stream.
             ec_ar_idx = ml8_expand_cache_acquire_ar(ec_ar, w, w->data, cent_data, repack, N, K, stream,
                                                      &b_shuf_ptr, &b_scale_out_ptr);
-        } else if (ml8_expand_cache_state * ec = ml8_expand_cache_get(ctx.device)) {
+        } else if (ml8_expand_cache_state * ec = w_paged ? nullptr : ml8_expand_cache_get(ctx.device)) {
             // Multi-GPU TP path (prefetch disabled): the two interleaved
             // sub-batch "slots" re-expand the same device-resident weight
             // back to back on this same compute stream. Skip the redundant
@@ -4628,6 +4729,12 @@ void ggml_cuda_op_ml8_get_rows(
             if (it != g_ml8_inplace.end() && it->second.packed) {
                 info = it->second.info; packed = true;
             }
+        }
+        if (!packed && (w->flags & GGML_TENSOR_FLAG_ML8_PACKED)) {
+            info.b_packed = w->data;
+            info.b_scale  = (char *) w->data + (size_t) (K / 2) * (size_t) N;
+            info.layout   = ml8_4_layout_for_tensor((int32_t) N);
+            packed = true;
         }
         if (packed && info.layout == ML8_4_LAYOUT_TRITON) {
             ml8_packed_get_rows_kernel<<<grid, dim3(256), 0, stream>>>(
@@ -7271,4 +7378,251 @@ bool ggml_cuda_ml8_4_grouped_decode(
     ml8_gemm_log_once("decode-v2-grouped", M, N, K, G);
     return true;
 #endif
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Generic (non-RDNA4) ML8_4 mul_mat: dequantize the native block_ml8_4 weight
+// to f16, the caller (ggml-cuda.cu) runs the regular f16 mul_mat on it. The
+// gfx1201 kernels in the AITER dispatch are compiled to empty bodies for every
+// other arch and a non-AITER build has no ML8_4 GEMM at all, so this is the
+// only ML8_4 path for e.g. the RX 6900 XT (gfx1030). Same math as
+// ml8_get_rows_kernel (lo-nibble first, LUT row g + lut_group_off).
+// ─────────────────────────────────────────────────────────────────────
+static __global__ void ml8_4_dequant_f16_kernel(
+    const block_ml8_4 * __restrict__ w,    // [N rows][n_groups_k blocks]
+    const uint8_t     * __restrict__ lut,  // [n_groups_lut, 16] fp8 e4m3
+    half              * __restrict__ y,    // [N, K] row-major
+    int n_groups_k, int lut_group_off, int64_t n_bytes) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;  // one qs byte
+    if (t >= n_bytes) {
+        return;
+    }
+    const int64_t b = t / (QK_ML8 / 2);
+    const int     p = (int) (t % (QK_ML8 / 2));
+    const int     g = (int) (b % n_groups_k);
+    const float   scale = w[b].scale;
+    const uint8_t byte  = w[b].qs[p];
+    const uint8_t * lut_g = lut + (int64_t) (g + lut_group_off) * 16;
+    y[b * QK_ML8 + 2 * p]     = __float2half(ml8_fp8_e4m3_to_fp32(lut_g[byte & 0x0F]) * scale);
+    y[b * QK_ML8 + 2 * p + 1] = __float2half(ml8_fp8_e4m3_to_fp32(lut_g[(byte >> 4) & 0x0F]) * scale);
+}
+
+bool ggml_cuda_ml8_4_use_generic(int device) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(device);
+    return true;
+#else
+    static const bool force = [] {
+        const char * e = getenv("MT_ML8_4_GENERIC");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return force || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc);
+#endif
+}
+
+void ggml_cuda_ml8_4_dequant_f16(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         w,
+    const ggml_tensor *         cent,
+    int32_t                     lut_group_off,
+    half *                      y) {
+    GGML_ASSERT(w->type == GGML_TYPE_ML8_4 && cent->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_is_contiguous(cent));
+    cudaStream_t  stream     = ctx.stream();
+    const int32_t K          = (int32_t) w->ne[0];
+    const int32_t N          = (int32_t) (ggml_nelements(w) / K);
+    const int     n_groups_k = (int) (K / QK_ML8);
+    const int64_t n_blocks   = ggml_nelements(w) / QK_ML8;
+    const int64_t n_bytes    = n_blocks * (QK_ML8 / 2);
+
+    // a weight uploaded through set_tensor was packed in place into the
+    // kernel layout (g_ml8_inplace); get the on-disk block layout back first
+    const block_ml8_4 * w_blocks = (const block_ml8_4 *) w->data;
+    ggml_cuda_pool_alloc<uint8_t> unpacked(ctx.pool());
+    {
+        ml8_weight_repack_t info;
+        bool packed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+            auto it = g_ml8_inplace.find(w->data);
+            if (it != g_ml8_inplace.end() && it->second.packed) {
+                info = it->second.info; packed = true;
+            }
+        }
+        if (!packed && (w->flags & GGML_TENSOR_FLAG_ML8_PACKED)) {
+            info.b_packed = w->data;
+            info.b_scale  = (char *) w->data + (size_t) (K / 2) * (size_t) N;
+            info.layout   = ml8_4_layout_for_tensor((int32_t) N);
+            packed = true;
+        }
+        if (packed) {
+            unpacked.alloc((size_t) n_blocks * sizeof(block_ml8_4));
+            ml8_4_unpack_for_layout(stream, (const uint8_t *) info.b_packed, (const float *) info.b_scale,
+                unpacked.get(), N, K, n_groups_k, info.layout);
+            w_blocks = (const block_ml8_4 *) unpacked.get();
+        }
+    }
+
+    const int     threads = 256;
+    const int64_t grid    = (n_bytes + threads - 1) / threads;
+    ml8_4_dequant_f16_kernel<<<(unsigned) grid, threads, 0, stream>>>(
+        w_blocks, (const uint8_t *) cent->data, y, n_groups_k, lut_group_off, n_bytes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ML8_4 on non-RDNA4 devices through MXFP4's own mmvq/mmq kernels: the weight
+// blocks are read in place, the per-K-group e4m3 codebook is turned into int8
+// tables (16 lanes per group) in the same launch that quantizes the activations,
+// and the dot products are the MXFP4 dp4a pipeline.
+// ─────────────────────────────────────────────────────────────────────
+// x [M][K] f32 -> q8_1 blocks [M][K/32] with every 8-chunk even-elements-first
+// (what vec_dot_ml8_4_q8_1 / the ML8_4 mmvq branch expect); grid.y == M carries
+// the centroid LUT conversion so the prologue is one launch, like MXFP4's
+// quantize_q8_1. Same thread shape as quantize_q8_1: 4 floats per thread, 8 lanes
+// per 32-value block; thread pairs swap halves so each writes one even/odd int.
+#define ML8_Q8_1_THREADS 256
+static __global__ void ml8_4_quant_x_q8_1_kernel(const float * __restrict__ x, block_q8_1 * __restrict__ yq,
+        int64_t K, int64_t x_stride, int64_t M,
+        const uint8_t * __restrict__ lut, int8_t * __restrict__ lut_q, float * __restrict__ lut_d,
+        int n_groups_k, int lut_group_off) {
+    if ((int64_t) blockIdx.y == M) {
+        // codebook: 16 lanes per group, one centroid each
+        const int t = blockIdx.x * blockDim.x + threadIdx.x;
+        const int g = t >> 4;
+        const int j = t & 15;
+        const float v = g < n_groups_k ? ml8_fp8_e4m3_to_fp32(lut[(int64_t) (g + lut_group_off) * 16 + j]) : 0.0f;
+        float amx = fabsf(v);
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) {
+            amx = fmaxf(amx, __shfl_xor_sync(0xFFFFFFFF, amx, off, WARP_SIZE));
+        }
+        if (g < n_groups_k) {
+            lut_q[g * 16 + j] = (int8_t) (amx == 0.0f ? 0 : __float2int_rn(v * (127.0f / amx)));
+            if (j == 0) {
+                lut_d[g] = amx / 127.0f;
+            }
+        }
+        return;
+    }
+    const int64_t i0 = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i0 >= K) {
+        return;
+    }
+    const int64_t c  = blockIdx.y;
+    const float4  xi = *(const float4 *) (x + c * x_stride + i0);
+    float amx = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        amx = fmaxf(amx, __shfl_xor_sync(0xFFFFFFFF, amx, off, WARP_SIZE));
+    }
+    const float d  = amx / 127.0f;
+    const float id = amx == 0.0f ? 0.0f : 127.0f / amx;
+    const int q0 = __float2int_rn(xi.x * id), q1 = __float2int_rn(xi.y * id);
+    const int q2 = __float2int_rn(xi.z * id), q3 = __float2int_rn(xi.w * id);
+    // lower thread of a pair holds x0..x3 of an 8-chunk, upper holds x4..x7:
+    // even int = (x0 x2 x4 x6), odd int = (x1 x3 x5 x7)
+    const int evn = (q0 & 0xFF) | ((q2 & 0xFF) << 8);
+    const int odd = (q1 & 0xFF) | ((q3 & 0xFF) << 8);
+    const bool hi = (threadIdx.x & 1) != 0;
+    const int  send  = hi ? evn : odd;                     // what the partner needs
+    const int  recv  = __shfl_xor_sync(0xFFFFFFFF, send, 1, WARP_SIZE);
+    const int  mine  = hi ? odd : evn;
+    const int  word  = hi ? (recv | (mine << 16)) : (mine | (recv << 16));
+    block_q8_1 * b = yq + c * (K / 32) + i0 / 32;
+    ((int *) b->qs)[(i0 % 32) / 4] = word;                 // lo thread -> even int, hi thread -> odd int
+    if (i0 % 32 == 0) {
+        b->ds = make_half2(d, 0.0f);                       // partial sum unused by ML8_4
+    }
+}
+
+bool ggml_cuda_ml8_4_gemv_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w    = dst->src[0];
+    const ggml_tensor * cent = dst->src[1];
+    const ggml_tensor * x    = dst->src[2];
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    const int64_t M = x->ne[1];
+    if (w->type != GGML_TYPE_ML8_4 || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        w->ne[2] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
+        !ggml_is_contiguous(w) || x->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+        K % QK_ML8 != 0 || x->nb[1] % 16 != 0 || ((uintptr_t) x->data) % 16 != 0) {
+        return false;
+    }
+    cudaStream_t  stream        = ctx.stream();
+    const int     n_groups_k    = (int) (K / QK_ML8);
+    const int32_t lut_group_off = ggml_get_op_params_i32(dst, 0);
+
+    // weight packed in place by set_tensor (resident weights / tests): back to block layout
+    const block_ml8_4 * w_blocks = (const block_ml8_4 *) w->data;
+    ggml_cuda_pool_alloc<uint8_t> unpacked(ctx.pool());
+    {
+        ml8_weight_repack_t info;
+        bool packed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_ml8_inplace_mu);
+            auto it = g_ml8_inplace.find(w->data);
+            if (it != g_ml8_inplace.end() && it->second.packed) {
+                info = it->second.info; packed = true;
+            }
+        }
+        if (!packed && (w->flags & GGML_TENSOR_FLAG_ML8_PACKED)) {
+            info.b_packed = w->data;
+            info.b_scale  = (char *) w->data + (size_t) (K / 2) * (size_t) N;
+            info.layout   = ml8_4_layout_for_tensor((int32_t) N);
+            packed = true;
+        }
+        if (packed) {
+            unpacked.alloc((size_t) N * n_groups_k * sizeof(block_ml8_4));
+            ml8_4_unpack_for_layout(stream, (const uint8_t *) info.b_packed, (const float *) info.b_scale,
+                unpacked.get(), (int32_t) N, (int32_t) K, n_groups_k, info.layout);
+            w_blocks = (const block_ml8_4 *) unpacked.get();
+        }
+    }
+
+    const uint8_t * lut      = (const uint8_t *) cent->data;
+    const int64_t   x_stride = x->nb[1] / sizeof(float);
+    const int64_t   y_stride = dst->nb[1] / sizeof(float);
+
+    if (M <= MMVQ_MAX_BATCH_SIZE) {
+        // decode widths: MXFP4's mmvq kernel with the ML8_4 dot product
+        ggml_cuda_pool_alloc<block_q8_1> yq(ctx.pool(), (size_t) (K / 32) * M);
+        ggml_cuda_pool_alloc<int8_t>     lut_q(ctx.pool(), (size_t) n_groups_k * 16);
+        ggml_cuda_pool_alloc<float>      lut_d(ctx.pool(), (size_t) n_groups_k);
+        const int  bx    = (int) std::max<int64_t>((K / 4 + ML8_Q8_1_THREADS - 1) / ML8_Q8_1_THREADS, (n_groups_k * 16 + ML8_Q8_1_THREADS - 1) / ML8_Q8_1_THREADS);
+        const dim3 grid((unsigned) bx, (unsigned) (M + 1), 1);
+        ml8_4_quant_x_q8_1_kernel<<<grid, ML8_Q8_1_THREADS, 0, stream>>>(
+            (const float *) x->data, yq.get(), K, x_stride, M, lut, lut_q.get(), lut_d.get(), n_groups_k, lut_group_off);
+        ggml_cuda_ml8_4_mul_mat_vec_q(w_blocks, lut_q.get(), lut_d.get(), yq.get(), (float *) dst->data,
+            (int) K, (int) N, (int) M, n_groups_k, (int) (K / 32), (int) y_stride, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+
+    // wider batches: MXFP4's mmq kernel with the ML8_4 tile loader (same launch count as MXFP4)
+    ggml_cuda_ml8_4_mul_mat_q(ctx, w_blocks, lut + (int64_t) lut_group_off * 16, (const float *) x->data, x_stride,
+        (float *) dst->data, y_stride, K, N, M);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// Offline pre-packing of ML8_4 weights (e.g. expert pages for an RDNA4 worker):
+// src = native block_ml8_4 [N][K/64] in device memory, dst = the device GEMM
+// layout the in-place load repack would produce (packed nibbles, then fp32
+// scales; same byte count). Returns false when this device's layout for N is not
+// a packed one (then the weight should stay native).
+extern "C" GGML_BACKEND_API bool ggml_cuda_ml8_4_pack_device(const void * src, void * dst, int64_t N, int64_t K, void * stream) {
+    if (N <= 0 || K <= 0 || K % QK_ML8 != 0) {
+        return false;
+    }
+    const int32_t layout = ml8_4_layout_for_tensor((int32_t) N);
+    if (layout != ML8_4_LAYOUT_RDNA4_TRFEED) {
+        return false;
+    }
+    const int32_t n_groups_k = (int32_t) (K / QK_ML8);
+    uint8_t * dst_packed = (uint8_t *) dst;
+    float   * dst_scale  = (float *) (dst_packed + (size_t) (K / 2) * (size_t) N);
+    ml8_4_pack_for_layout((cudaStream_t) stream, (const uint8_t *) src, dst_packed, dst_scale,
+        (int32_t) N, (int32_t) K, n_groups_k, layout);
+    return true;
 }

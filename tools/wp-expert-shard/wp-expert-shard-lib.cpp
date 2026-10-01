@@ -383,6 +383,12 @@ Plan build_plan(const Options & options) {
                 }
                 uint64_t group_bytes = 0;
                 consume_members(members, group_bytes);
+                // wp-repack zero-pads each group to 4096 (v1 pages) and records
+                // it as padding_bytes; ML8_4 pages (weight + LUT) need it, the
+                // MXFP4 pages happened to be 4096-multiples already.
+                const uint64_t padding = group.value("padding_bytes", (uint64_t) 0);
+                source_next_offset = checked_add(source_next_offset, padding, "source blob");
+                group_bytes        = checked_add(group_bytes, padding, "source group");
                 if (expert_idx >= options.expert_first && expert_idx <= options.expert_last) {
                     planned.groups.push_back(group);
                     planned.blob_bytes = checked_add(planned.blob_bytes, group_bytes, "output shard");
@@ -508,6 +514,7 @@ json build_output_index(const Plan & plan, const PlannedShard & shard) {
             output_offset = checked_add(output_offset, source_member.at("size").get<uint64_t>(), "output blob");
             output_group["members"].push_back(std::move(output_member));
         }
+        output_offset = checked_add(output_offset, source_group.value("padding_bytes", (uint64_t) 0), "output blob");
         index["groups"].push_back(std::move(output_group));
     }
     if (output_offset != shard.blob_bytes) {
@@ -627,6 +634,7 @@ RunStats verify_output(const PlannedShard & shard,
             ++stats.members;
             stats.bytes += size;
         }
+        output_offset = checked_add(output_offset, source_group.value("padding_bytes", (uint64_t) 0), "verified output");
         ++stats.groups;
     }
     if (output_offset != actual_size) {
@@ -668,6 +676,11 @@ RunStats write_shard(const Plan & plan, const PlannedShard & shard, bool verify)
             for (const json & member : group.at("members")) {
                 copy_member(source, member.at("offset").get<uint64_t>(), member.at("size").get<uint64_t>(), output,
                             buffer);
+            }
+            const uint64_t padding = group.value("padding_bytes", (uint64_t) 0);
+            if (padding > 0) {
+                const std::vector<char> zeros(padding, 0);
+                output.write(zeros.data(), static_cast<std::streamsize>(padding));
             }
         }
         output.close();

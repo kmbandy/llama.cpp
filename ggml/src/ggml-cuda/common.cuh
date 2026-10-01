@@ -1089,6 +1089,16 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int bs = sizeof(block_mxfp4);
 };
 
+// ML8_4 through mmvq/mmq: 64 weights per block, 4-bit indices into a per-K-group
+// codebook that lives outside the block (see ggml_cuda_mm_fusion_args_device::ml8_lut_q)
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_ML8_4> {
+    static constexpr int qk = QK_ML8;
+    static constexpr int qr = 2;
+    static constexpr int qi = QK_ML8 / (4 * 2);
+    static constexpr int bs = sizeof(block_ml8_4);
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qk = QK_NVFP4;
@@ -1893,6 +1903,9 @@ struct ggml_cuda_mm_fusion_args_host {
     float glu_limit = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
+    // GGML_TYPE_ML8_4 only: per-K-group codebook as int8 [n_groups][16] + fp32 scale [n_groups]
+    const int8_t * ml8_lut_q = nullptr;
+    const float  * ml8_lut_d = nullptr;
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
