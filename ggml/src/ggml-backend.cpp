@@ -1045,6 +1045,19 @@ static bool wp_sched_copy_to_pinned_host_async(
            wp_sched_copy_uses_pinned_host(producer, src, dst);
 }
 
+// WP_SCHED_SINGLE_D2H_SYNC (default ON, 0 disables): queue every pinned D2H
+// input copy of a split asynchronously and do ONE compute-stream sync per
+// producer backend before the CPU consumer split runs, instead of one
+// cudaStreamSynchronize per input (router x/ids/weights each paid a full host
+// round trip, ~3 per MoE layer).
+static bool wp_sched_single_d2h_sync_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SCHED_SINGLE_D2H_SYNC");
+        return (e == nullptr || e[0] == '\0' || strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
+}
+
 // Root parent + absolute byte offset for a (possibly multi-level) view.
 static const struct ggml_tensor * ggml_sched_view_root(const struct ggml_tensor * t, size_t * abs_offs) {
     size_t offs = 0;
@@ -2168,6 +2181,7 @@ struct ggml_backend_sched_compute_runner {
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         bool split_backend_ready_for_input_copies = false;
+        std::vector<ggml_backend_t> pending_d2h_sync;
 
         if constexpr (collect_split_stats) {
             if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -2360,7 +2374,15 @@ struct ggml_backend_sched_compute_runner {
                     }
                     if (wp_sched_copy_to_pinned_host_async(input_backend, input, input_cpy)) {
                         ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
-                        synchronize_compute_stream(input_backend);
+                        if (wp_sched_single_d2h_sync_enabled()) {
+                            // deferred: one sync after the input loop (consumer is a
+                            // CPU split that only runs after prepare returns)
+                            if (std::find(pending_d2h_sync.begin(), pending_d2h_sync.end(), input_backend) == pending_d2h_sync.end()) {
+                                pending_d2h_sync.push_back(input_backend);
+                            }
+                        } else {
+                            synchronize_compute_stream(input_backend);
+                        }
                         copy_pinned_d2h = true;
                         if constexpr (collect_split_stats) {
                             ++split_stats.n_syncs_elided;
@@ -2413,6 +2435,11 @@ struct ggml_backend_sched_compute_runner {
                 }
             }
         }
+
+        for (ggml_backend_t pending : pending_d2h_sync) {
+            synchronize_compute_stream(pending);
+        }
+        pending_d2h_sync.clear();
 
         if (tp_phase_dbg && ggml_time_us() - dbg_t0 > 30000) {
             fprintf(stderr, "TPPHASE prepare split=%d backend=%s total_us=%lld inputs:%s\n", split_id, ggml_backend_name(split_backend),
@@ -2629,6 +2656,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         bool split_backend_ready_for_input_copies = false;
+        std::vector<ggml_backend_t> pending_d2h_sync;
 
         if constexpr (collect_split_stats) {
             if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -2807,7 +2835,15 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     }
                     if (wp_sched_copy_to_pinned_host_async(input_backend, input, input_cpy)) {
                         ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
-                        synchronize_compute_stream(input_backend);
+                        if (wp_sched_single_d2h_sync_enabled()) {
+                            // deferred: one sync after the input loop (consumer is a
+                            // CPU split that only runs after prepare returns)
+                            if (std::find(pending_d2h_sync.begin(), pending_d2h_sync.end(), input_backend) == pending_d2h_sync.end()) {
+                                pending_d2h_sync.push_back(input_backend);
+                            }
+                        } else {
+                            synchronize_compute_stream(input_backend);
+                        }
                         copy_pinned_d2h = true;
                         if constexpr (collect_split_stats) {
                             ++split_stats.n_syncs_elided;
@@ -2854,6 +2890,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 }
             }
         }
+
+        for (ggml_backend_t pending : pending_d2h_sync) {
+            synchronize_compute_stream(pending);
+        }
+        pending_d2h_sync.clear();
 
         // Complete deferred HIP multi-input stages after all split inputs are
         // queued and BEFORE eval_cb / graph_compute (WP ensure must see staged
