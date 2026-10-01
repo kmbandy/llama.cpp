@@ -1271,7 +1271,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // that work out of the column loop; they are bit-exact against vec_dot, not
     // merely within tolerance. Restricted to the plain 2-D contiguous case --
     // no broadcast, no mmla row pairing -- which is what the expert FFN emits.
-    if (wp_gemm_enabled() && num_rows_per_vec_dot == 1 &&
+    if ((wp_gemm_enabled() || (type == GGML_TYPE_MXFP4 && wp_gemm_mxfp4_enabled())) && num_rows_per_vec_dot == 1 &&
             ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             nb0 == sizeof(float) && (src1_cont || src1->type != vec_dot_type)) {
         const char * A = (const char *) src0->data + ir0_start * nb01;
@@ -1280,7 +1280,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         const int    nx = (int) (ir0_end - ir0_start);
         const int    ny = (int) (ir1_end - ir1_start);
         bool done = false;
-        if (type == GGML_TYPE_Q4_K && vec_dot_type == GGML_TYPE_Q8_K) {
+        if (type == GGML_TYPE_MXFP4 && vec_dot_type == GGML_TYPE_Q8_0) {
+            // Bit-identical to ggml_vec_dot_mxfp4_q8_0; default ON, WP_CPU_MXFP4_GEMM=0 disables.
+            // Only from 3 columns: at 1 column vec_dot already streams at the DRAM roofline
+            // (44 GB/s, 3900X, 8 threads, DS4.1 expert shapes) and this kernel measured 5-20%
+            // slower; 2 columns was mixed; 4-8 columns measured 1.4-1.7x faster.
+            done = wp_gemm_mxfp4_enabled() && ny >= 3 &&
+                   wp_gemm_mxfp4_q8_0((int) ne00, nx, ny, A, nb01, B, row_size, C, nb1 / sizeof(float));
+        } else if (!wp_gemm_enabled()) {
+            done = false;
+        } else if (type == GGML_TYPE_Q4_K && vec_dot_type == GGML_TYPE_Q8_K) {
             done = wp_gemm_q4K_q8K((int) ne00, nx, ny, A, nb01, B, row_size, C, nb1 / sizeof(float));
         } else if (type == GGML_TYPE_Q5_1 && vec_dot_type == GGML_TYPE_Q8_1) {
             done = wp_gemm_q5_1_q8_1((int) ne00, nx, ny, A, nb01, B, row_size, C, nb1 / sizeof(float));

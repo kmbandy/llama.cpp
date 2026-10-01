@@ -45,6 +45,16 @@
 
 namespace {
 
+#define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
+// same values as kvalues_fp4 in ggml-common.h (e2m1, doubled)
+alignas(16) static const int8_t wp_kvalues_fp4[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+
+inline __m256i mul_add_epi8_x(const __m256i x, const __m256i y) {
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    return _mm256_maddubs_epi16(ax, sy);
+}
+
 inline float hsum_f32_8(__m256 x) {
     __m128 r = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
     r = _mm_add_ps(r, _mm_movehl_ps(r, r));
@@ -367,6 +377,128 @@ bool wp_gemm_q5_1_q8_1(int n, int nrc_x, int nrc_y,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// MXFP4 x Q8_0 (DS4.1 routed experts).
+//
+// Bit-identical to ggml_vec_dot_mxfp4_q8_0 (AVX2 path). That function keeps TWO
+// float accumulators (even / odd blocks), per block does
+//     p = madd_epi16(mul_add_epi8(lut(nibbles), q8), 1)
+//     acc[ib&1] = fmadd(set1(fp16(y.d) * e8m0_half(x.e)), cvt(p), acc[ib&1])
+// and finishes with hsum_float_8(acc0 + acc1). The integer part is exact; the
+// float sequence (scale product, fmadd order, two accumulators, final hsum) is
+// reproduced here per output element, so every element rounds identically.
+// Only the *scheduling* changes: NR rows x NC columns are processed together so
+// the nibble unpack + LUT shuffle is shared across columns, the q8 block loads
+// are shared across rows, and NR independent weight streams are in flight.
+// nb must be even (vec_dot has a scalar tail for odd nb; we just decline).
+// ---------------------------------------------------------------------------
+template <int NR, int NC>
+static inline void mxfp4_tile(int nb, const block_mxfp4 * const * x, const block_q8_0 * const * y,
+                              float * C, size_t stride_C) {
+    const __m128i values128 = _mm_loadu_si128((const __m128i *) wp_kvalues_fp4);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+
+    __m256 acc0[NR][NC];
+    __m256 acc1[NR][NC];
+    for (int r = 0; r < NR; ++r) {
+        for (int c = 0; c < NC; ++c) {
+            acc0[r][c] = _mm256_setzero_ps();
+            acc1[r][c] = _mm256_setzero_ps();
+        }
+    }
+
+    for (int ib = 0; ib + 1 < nb; ib += 2) {
+        __m256i q4a[NR], q4b[NR];
+        float   ea[NR],  eb[NR];
+        for (int r = 0; r < NR; ++r) {
+            const __m128i b1 = _mm_loadu_si128((const __m128i *) x[r][ib + 0].qs);
+            const __m128i b2 = _mm_loadu_si128((const __m128i *) x[r][ib + 1].qs);
+            q4a[r] = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(b1, 4), m4b)),
+                                     _mm_shuffle_epi8(values128, _mm_and_si128(b1, m4b)));
+            q4b[r] = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(b2, 4), m4b)),
+                                     _mm_shuffle_epi8(values128, _mm_and_si128(b2, m4b)));
+            ea[r] = GGML_CPU_E8M0_TO_FP32_HALF(x[r][ib + 0].e);
+            eb[r] = GGML_CPU_E8M0_TO_FP32_HALF(x[r][ib + 1].e);
+        }
+        for (int c = 0; c < NC; ++c) {
+            const __m256i q8a = _mm256_loadu_si256((const __m256i *) y[c][ib + 0].qs);
+            const __m256i q8b = _mm256_loadu_si256((const __m256i *) y[c][ib + 1].qs);
+            const float   da  = GGML_CPU_FP16_TO_FP32(y[c][ib + 0].d);
+            const float   db  = GGML_CPU_FP16_TO_FP32(y[c][ib + 1].d);
+            for (int r = 0; r < NR; ++r) {
+                const __m256i pa = _mm256_madd_epi16(mul_add_epi8_x(q4a[r], q8a), mone);
+                const __m256i pb = _mm256_madd_epi16(mul_add_epi8_x(q4b[r], q8b), mone);
+                acc0[r][c] = _mm256_fmadd_ps(_mm256_set1_ps(da * ea[r]), _mm256_cvtepi32_ps(pa), acc0[r][c]);
+                acc1[r][c] = _mm256_fmadd_ps(_mm256_set1_ps(db * eb[r]), _mm256_cvtepi32_ps(pb), acc1[r][c]);
+            }
+        }
+    }
+
+    for (int c = 0; c < NC; ++c) {
+        for (int r = 0; r < NR; ++r) {
+            C[(size_t) c * stride_C + r] = hsum_f32_8(_mm256_add_ps(acc0[r][c], acc1[r][c]));
+        }
+    }
+}
+
+template <int NC>
+static inline void mxfp4_cols(int nb, int nrc_x, const char * A, size_t bx,
+                              const block_q8_0 * const * y, float * C, size_t stride_C) {
+    constexpr int NR_MAX = (NC == 1) ? 4 : (NC == 2 || NC == 3) ? 2 : 1;
+    int ix = 0;
+    auto run = [&](auto nr_tag) {
+        constexpr int NR = decltype(nr_tag)::value;
+        const block_mxfp4 * x[NR];
+        while (ix + NR <= nrc_x && NR <= NR_MAX) {
+            for (int r = 0; r < NR; ++r) {
+                x[r] = (const block_mxfp4 *) (A + (size_t) (ix + r) * bx);
+            }
+            // prefetch the next group of rows' streams a little ahead is left to HW
+            mxfp4_tile<NR, NC>(nb, x, y, C + ix, stride_C);
+            ix += NR;
+        }
+    };
+    if (NR_MAX >= 4) run(std::integral_constant<int, 4>{});
+    if (NR_MAX >= 2) run(std::integral_constant<int, 2>{});
+    run(std::integral_constant<int, 1>{});
+}
+
+bool wp_gemm_mxfp4_q8_0(int n, int nrc_x, int nrc_y,
+                        const void * A, size_t bx,
+                        const void * B, size_t by,
+                        float * C, size_t stride_C) {
+    if (n % QK_MXFP4 != 0 || ((n / QK_MXFP4) & 1)) {
+        return false;
+    }
+    const int nb = n / QK_MXFP4;
+    int iy = 0;
+    // Column block outer, rows inner (same cache argument as q4_K).
+    #define WP_MXFP4_BLOCK(W)                                                          \
+        while (iy + (W) <= nrc_y) {                                                    \
+            const block_q8_0 * cols[W];                                                \
+            for (int k = 0; k < (W); ++k) {                                            \
+                cols[k] = (const block_q8_0 *) ((const char *) B + (size_t) (iy + k) * by); \
+            }                                                                          \
+            mxfp4_cols<W>(nb, nrc_x, (const char *) A, bx, cols, C + (size_t) iy * stride_C, stride_C); \
+            iy += (W);                                                                 \
+        }
+    WP_MXFP4_BLOCK(4)
+    WP_MXFP4_BLOCK(2)
+    WP_MXFP4_BLOCK(1)
+    #undef WP_MXFP4_BLOCK
+    return true;
+}
+
+bool wp_gemm_mxfp4_enabled(void) {
+    // Default ON; WP_CPU_MXFP4_GEMM=0 is the kill switch.
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_CPU_MXFP4_GEMM");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return enabled;
+}
+
 #else  // no AVX2
 
 bool wp_gemm_q4K_q8K(int, int, int, const void *, size_t,
@@ -376,6 +508,15 @@ bool wp_gemm_q4K_q8K(int, int, int, const void *, size_t,
 
 bool wp_gemm_q5_1_q8_1(int, int, int, const void *, size_t,
                        const void *, size_t, float *, size_t) {
+    return false;
+}
+
+bool wp_gemm_mxfp4_q8_0(int, int, int, const void *, size_t,
+                        const void *, size_t, float *, size_t) {
+    return false;
+}
+
+bool wp_gemm_mxfp4_enabled(void) {
     return false;
 }
 
