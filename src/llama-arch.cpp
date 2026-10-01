@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -1179,10 +1180,19 @@ bool llm_arch_caps_lm_head_rows(const llm_arch & arch) {
         // so only the final vocab mul_mat shrinks -- embeddings and any
         // upstream layer-input/embeddings_layer_inp taps (DSpark's own) read
         // from earlier in the graph and are untouched by this cap.
+        // LLAMA_LM_HEAD_ALL_ROWS=1 lifts the cap (graph and logits buffer
+        // together, both key on this predicate) for tools that need logits at
+        // every position, e.g. llama-perplexity / --kl-divergence.
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_DFLASH:
-            return true;
+            {
+                static const bool all_rows = [] {
+                    const char * v = getenv("LLAMA_LM_HEAD_ALL_ROWS");
+                    return v != nullptr && atoi(v) != 0;
+                }();
+                return !all_rows;
+            }
         default:
             return false;
     }
