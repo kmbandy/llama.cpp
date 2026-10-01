@@ -1778,15 +1778,64 @@ static ggml_tensor * dsv41_sparse_attn_mask_picks(
 
 // Window half of a sparse index list: the k_win = min(n_raw, n_swa) raw cells
 // raw_mask admits per row, padding picks (-inf cells) turned into -1.
+// WP_DSV41_MASK_CPY_HOIST (default ON, 0 disables; also needs
+// WP_DSV41_SPARSE_IDX_MEMO on): build the F32 casts of the raw/csa/hca kq masks
+// and the raw-window index picks once per graph instead of once per top_k group.
+static bool dsv41_mask_hoist_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_DSV41_MASK_CPY_HOIST");
+        const char * m = std::getenv("WP_DSV41_SPARSE_IDX_MEMO");
+        return (e == nullptr || e[0] != '0') && (m == nullptr || m[0] != '0');
+    }();
+    return on;
+}
+
+// `memo` (the per-graph sparse_idx_memo, nullptr = off): the F32 mask cast and
+// the window picks depend only on the mask tensor and sizes, not on the layer
+// or its top_k, so every layer/group reading the same mask reuses one copy of
+// the cast (a CPY of attn_inp_kq_mask) and the picks instead of rebuilding
+// them per top_k group. Same ops on the same inputs: bit-exact.
+static ggml_tensor * dsv41_mask_as_f32(
+        ggml_context * ctx0,
+        ggml_tensor * mask,
+        std::unordered_map<std::string, ggml_tensor *> * memo) {
+    if (mask->type == GGML_TYPE_F32) {
+        return mask;
+    }
+    char key[96];
+    std::snprintf(key, sizeof(key), "maskf32|%p", (const void *) mask);
+    if (memo != nullptr) {
+        auto it = memo->find(key);
+        if (it != memo->end()) {
+            return it->second;
+        }
+    }
+    ggml_tensor * out = ggml_cast(ctx0, mask, GGML_TYPE_F32);
+    if (memo != nullptr) {
+        (*memo)[key] = out;
+    }
+    return out;
+}
+
 static ggml_tensor * dsv41_sparse_attn_window_indices(
         ggml_context * ctx0,
         ggml_tensor * raw_mask,
-        int64_t n_swa) {
+        int64_t n_swa,
+        std::unordered_map<std::string, ggml_tensor *> * memo = nullptr) {
     GGML_ASSERT(raw_mask->ne[2] == 1 && raw_mask->ne[3] == 1 &&
             "sparse_attn index build assumes a plain 2D [n_raw, nt] mask");
 
     const int64_t k_win = std::min<int64_t>(raw_mask->ne[0], n_swa);
     GGML_ASSERT(k_win > 0);
+
+    char win_key[96];
+    std::snprintf(win_key, sizeof(win_key), "win|%p|%lld", (const void *) raw_mask, (long long) k_win);
+    if (memo != nullptr) {
+        auto it = memo->find(win_key);
+        if (it != memo->end()) {
+            return it->second;
+        }
+    }
 
     // ggml_cuda_op_top_k only accepts F32 (ggml-cuda/top-k.cu:220); kq_mask
     // is F16 under flash_attn (matches build_top_k_mask's own
@@ -1794,11 +1843,14 @@ static ggml_tensor * dsv41_sparse_attn_window_indices(
     // cast defensively rather than assume. get_rows tolerates the source
     // dtype fine on its own, but top_k does not, so this must happen before
     // the top_k call, not just before the later float arithmetic.
-    ggml_tensor * raw_mask_f32 = raw_mask->type == GGML_TYPE_F32
-        ? raw_mask : ggml_cast(ctx0, raw_mask, GGML_TYPE_F32);
+    ggml_tensor * raw_mask_f32 = dsv41_mask_as_f32(ctx0, raw_mask, memo);
 
     ggml_tensor * win_idx = ggml_top_k(ctx0, raw_mask_f32, (int) k_win); // I32 [k_win, nt]
-    return dsv41_sparse_attn_mask_picks(ctx0, raw_mask_f32, win_idx, 0);
+    ggml_tensor * win_masked = dsv41_sparse_attn_mask_picks(ctx0, raw_mask_f32, win_idx, 0);
+    if (memo != nullptr) {
+        (*memo)[win_key] = win_masked;
+    }
+    return win_masked;
 }
 
 static ggml_tensor * dsv41_sparse_attn_build_indices(
@@ -1807,20 +1859,20 @@ static ggml_tensor * dsv41_sparse_attn_build_indices(
         ggml_tensor * comp_mask,
         ggml_tensor * top_k,
         int64_t n_swa,
-        int64_t raw_k_len) {
+        int64_t raw_k_len,
+        std::unordered_map<std::string, ggml_tensor *> * memo = nullptr) {
     if (!top_k) {
         return nullptr; // dense fallback: no bounded index list to build
     }
     const int64_t nt = raw_mask->ne[1];
-    ggml_tensor * win_idx_masked = dsv41_sparse_attn_window_indices(ctx0, raw_mask, n_swa);
+    ggml_tensor * win_idx_masked = dsv41_sparse_attn_window_indices(ctx0, raw_mask, n_swa, memo);
 
     // Compressed half: the dense path admits a top-k pick only where the causal
     // compressed mask is also 0 (build_top_k_mask adds kq_mask), so a pick of a
     // not-yet-visible position -- top_k over fewer than indexer_top_k visible
     // entries -- must be dropped here too, not attended.
     GGML_ASSERT(comp_mask->ne[1] == nt && comp_mask->ne[2] == 1 && comp_mask->ne[3] == 1);
-    ggml_tensor * comp_mask_f32 = comp_mask->type == GGML_TYPE_F32
-        ? comp_mask : ggml_cast(ctx0, comp_mask, GGML_TYPE_F32);
+    ggml_tensor * comp_mask_f32 = dsv41_mask_as_f32(ctx0, comp_mask, memo);
     ggml_tensor * comp_idx = dsv41_sparse_attn_mask_picks(ctx0, comp_mask_f32, top_k, raw_k_len); // offset into k_all
 
     return ggml_concat(ctx0, win_idx_masked, comp_idx, 0); // [k_win + top_k->ne[0], nt] I32
@@ -2260,7 +2312,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 if (!ggml_is_contiguous(raw_k)) {
                     raw_k = ggml_cont(ctx0, raw_k);
                 }
-                ggml_tensor * kv_indices = dsv41_sparse_attn_window_indices(ctx0, inp_attn->get_kq_mask(), hparams.n_swa);
+                ggml_tensor * kv_indices = dsv41_sparse_attn_window_indices(ctx0, inp_attn->get_kq_mask(), hparams.n_swa,
+                        dsv41_mask_hoist_enabled() ? &sparse_idx_memo : nullptr);
                 ggml_tensor * q_f16 = q->type == GGML_TYPE_F16 ? q : ggml_cast(ctx0, q, GGML_TYPE_F16);
 
                 ggml_tensor * kv_indptr = ggml_arange(ctx0, 0.0f, (float) (nt + 1), 1.0f);
@@ -2605,7 +2658,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 kv_indices = it->second;
             } else {
                 kv_indices = dsv41_sparse_attn_build_indices(
-                        ctx0, raw_mask, inp_comp_q.kq_mask, top_k, hparams.n_swa, raw_k->ne[2]);
+                        ctx0, raw_mask, inp_comp_q.kq_mask, top_k, hparams.n_swa, raw_k->ne[2],
+                        (idx_memo_on && dsv41_mask_hoist_enabled()) ? &sparse_idx_memo : nullptr);
                 if (idx_memo_on) {
                     sparse_idx_memo[key] = kv_indices;
                 }
