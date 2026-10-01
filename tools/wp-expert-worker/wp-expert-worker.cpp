@@ -1861,6 +1861,10 @@ struct RequestStats {
     uint64_t n_d3_typed    = 0;
     uint64_t n_d3_bounce   = 0;
     uint64_t n_batch_mmid_hit = 0;
+    uint64_t n_cpu_tier = 0;   // WP_EXPERT_CPU_TIER
+    uint64_t n_cpu_tier_ram_hit = 0;   // WP_EXPERT_CPU_TIER
+    uint64_t ns_cpu_tier_compute = 0;   // WP_EXPERT_CPU_TIER
+    uint64_t ns_cpu_tier_wait = 0;   // WP_EXPERT_CPU_TIER
     uint64_t n_batch_mmid_fallback = 0;
     uint64_t n_batch_mmid_ineligible = 0;
     uint64_t n_batch_mmid_arena_bytes = 0;
@@ -2068,6 +2072,16 @@ public:
         n_pinned_demand_hits_ = demand_hits;
     }
 
+    // WP_EXPERT_CPU_TIER_PREFETCH counters (pool atomics, snapshot at record time).
+    void set_pf_stats(uint64_t issued, uint64_t landed, uint64_t used,
+                      uint64_t stale_dropped, uint64_t yield) {
+        n_pf_issued_ = issued;
+        n_pf_landed_ = landed;
+        n_pf_used_ = used;
+        n_pf_stale_dropped_ = stale_dropped;
+        n_pf_yield_ = yield;
+    }
+
     // Host arena snapshot, taken at record time: predicted hints landed as
     // speculative entries, resident/pinned bytes, and LRU evictions.
     void set_ram_stats(uint64_t spec_landed, uint64_t resident_bytes,
@@ -2195,6 +2209,10 @@ public:
         n_d3_typed_ += request.n_d3_typed;
         n_d3_bounce_ += request.n_d3_bounce;
         n_batch_mmid_hit_ += request.n_batch_mmid_hit;
+        n_cpu_tier_ += request.n_cpu_tier;
+        n_cpu_tier_ram_hit_ += request.n_cpu_tier_ram_hit;
+        ns_cpu_tier_compute_ += request.ns_cpu_tier_compute;
+        ns_cpu_tier_wait_ += request.ns_cpu_tier_wait;
         n_batch_mmid_fallback_ += request.n_batch_mmid_fallback;
         n_batch_mmid_ineligible_ += request.n_batch_mmid_ineligible;
         n_batch_mmid_arena_bytes_ += request.n_batch_mmid_arena_bytes;
@@ -2492,6 +2510,15 @@ private:
                   << " n_d3_typed=" << n_d3_typed_
                   << " n_d3_bounce=" << n_d3_bounce_
                   << " n_batch_mmid_hit=" << n_batch_mmid_hit_
+                  << " n_cpu_tier=" << n_cpu_tier_
+                  << " n_cpu_tier_ram_hit=" << n_cpu_tier_ram_hit_
+                  << " ns_cpu_tier_compute=" << ns_cpu_tier_compute_
+                  << " ns_cpu_tier_wait=" << ns_cpu_tier_wait_
+                  << " n_pf_issued=" << n_pf_issued_
+                  << " n_pf_landed=" << n_pf_landed_
+                  << " n_pf_used=" << n_pf_used_
+                  << " n_pf_stale_dropped=" << n_pf_stale_dropped_
+                  << " n_pf_yield=" << n_pf_yield_
                   << " n_batch_mmid_fallback=" << n_batch_mmid_fallback_
                   << " n_batch_mmid_ineligible=" << n_batch_mmid_ineligible_
                   << " n_batch_mmid_arena_bytes=" << n_batch_mmid_arena_bytes_
@@ -2668,6 +2695,15 @@ private:
     uint64_t          n_d3_typed_ = 0;
     uint64_t          n_d3_bounce_ = 0;
     uint64_t          n_batch_mmid_hit_ = 0;
+    uint64_t          n_cpu_tier_ = 0;
+    uint64_t          n_cpu_tier_ram_hit_ = 0;
+    uint64_t          ns_cpu_tier_compute_ = 0;
+    uint64_t          ns_cpu_tier_wait_ = 0;
+    uint64_t          n_pf_issued_ = 0;
+    uint64_t          n_pf_landed_ = 0;
+    uint64_t          n_pf_used_ = 0;
+    uint64_t          n_pf_stale_dropped_ = 0;
+    uint64_t          n_pf_yield_ = 0;
     uint64_t          n_batch_mmid_fallback_ = 0;
     uint64_t          n_batch_mmid_ineligible_ = 0;
     uint64_t          n_batch_mmid_arena_bytes_ = 0;
@@ -5393,6 +5429,7 @@ public:
                 w.thread.join();
             }
         }
+        stop_cpu_pf();   // reads into the arena through fds_: join before they close
 #if defined(__linux__)
         for (const auto & item : fds_) {
             close(item.second);
@@ -5517,6 +5554,16 @@ public:
 
         bool is_resident(size_t index) const {
             return entries_.at(index).hit;
+        }
+
+        bool is_cpu_tier(size_t index) const {
+            return entries_.at(index).cpu_tier;
+        }
+        int cpu_fd(size_t index) const {
+            return entries_.at(index).cpu_fd;
+        }
+        size_t n_cpu_tier() const {
+            return n_cpu_tier_;
         }
 
         // Slot this entry landed in, or SIZE_MAX for a pinned-resident page that
@@ -5678,6 +5725,11 @@ public:
             bool   copy_pending = false;
             uint64_t upload_hash = 0;
             bool upload_hash_valid = false;
+            // WP_EXPERT_CPU_TIER: computed on the CPU from the arena, never
+            // given a slot. ready=true, hit=false, loaded={} -- every GPU
+            // compute path must skip it (compute_batch's selected()).
+            bool   cpu_tier = false;
+            int    cpu_fd   = -1;
         };
 
         struct PendingCopy {
@@ -5703,6 +5755,7 @@ public:
         uint64_t                   ns_read_   = 0;
         uint64_t                   n_resident_     = 0;
         uint64_t                   n_pagein_    = 0;
+        size_t                     n_cpu_tier_  = 0;
         uint64_t                   n_pagein_reserved_ = 0;
         uint64_t                   n_pagein_general_ = 0;
         uint64_t                   bytes_read_ = 0;
@@ -5952,6 +6005,9 @@ public:
             }
         }
         Batch batch(this, pages.size());
+        // Demand decode/verify only: never a speculative or prefill call.
+        const bool cpu_tier_this_call = cpu_tier_enabled() && count_demand && !spec_call &&
+            n_tokens >= 1 && n_tokens <= cpu_tier_max_tokens();
         try {
             std::vector<size_t> pageins;
             pageins.reserve(pages.size());
@@ -5962,6 +6018,25 @@ public:
                 const ExpertPage & page = *pages[i];
                 if (count_demand) {
                     note_demand_reference(page);
+                }
+                // WP_EXPERT_CPU_TIER: count this page's decode demand
+                // references whether it hits or misses; `cpu_refs` is the count
+                // BEFORE this one.
+                bool     cpu_eligible = false;
+                uint32_t cpu_refs     = 0;
+                if (cpu_tier_this_call && page.cache_id >= 0) {
+                    cpu_eligible = true;
+                    uint32_t & refs = cpu_tier_refs_[page.cache_id];
+                    cpu_refs = refs;
+                    if (refs < std::numeric_limits<uint32_t>::max()) {
+                        ++refs;
+                    }
+                    if (cpu_tier_halflife() != 0 && ++cpu_tier_ref_total_ >= cpu_tier_halflife()) {
+                        cpu_tier_ref_total_ = 0;
+                        for (auto & kv : cpu_tier_refs_) {
+                            kv.second >>= 1;
+                        }
+                    }
                 }
                 const size_t slot_index = find_slot(page);
                 if (slot_index == slots_.size()) {
@@ -5975,6 +6050,14 @@ public:
                         batch.entries_[i].upload_hash = page.upload_hash;
                         batch.entries_[i].upload_hash_valid = page.upload_hash_valid;
                         ++batch.n_resident_;
+                        continue;
+                    }
+                    if (cpu_eligible && (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
+                            batch.n_cpu_tier_ < cpu_tier_max()) {
+                        batch.entries_[i].cpu_tier = true;
+                        batch.entries_[i].ready    = true;
+                        batch.entries_[i].cpu_fd   = fd_for(page.blob);
+                        ++batch.n_cpu_tier_;
                         continue;
                     }
                     pageins.push_back(i);
@@ -6935,6 +7018,124 @@ public:
         }
     }
 
+    // *** WP_EXPERT_CPU_TIER_PREFETCH=1: STRICTLY LOW-PRIORITY RAM PREFETCH (default OFF). ***
+    // The CPU tier's step is bound by NVMe reads of cold pages (~145 of ~178
+    // ms/step at PROMOTE=8 MAX=8), yet the drive idles ~200 ms/step between
+    // demand bursts. Simulation (~/ds4-runs/dsv41/tier/agent-pf, real
+    // predictor hints, ROUTER2 margin >= 0.1-0.2) gives -30..-37 ms/step from
+    // landing predicted pages in the arena 2-3 layers ahead, but ONLY when a
+    // prefetch read never delays a demand read; equal-share prefetch is a net
+    // loss. The existing host landing cannot promise that: with
+    // WP_EXPERT_SPEC_PREEMPT_DEADLINE it proceeds after 2 ms of yielding, the
+    // CPU tier's own reads never counted in demand_reads_pending_, and a hint
+    // for an already-dispatched layer is still read. This path is separate:
+    // ONE reader thread, chunked reads (WP_EXPERT_CPU_TIER_PREFETCH_CHUNK,
+    // default 2 MiB), a chunk is issued only while demand_reads_pending_ == 0
+    // (GPU page-in stripes + CPU-tier reads), a page whose layer has been
+    // dispatched is dropped mid-read, and landings are speculative arena
+    // entries (never evicting borrowed/pinned/demand ones) that the tier's
+    // borrow(demand=true) promotes. WP_EXPERT_CPU_TIER_PREFETCH_MAX bounds the
+    // pages queued per decode step (default 40).
+    static bool cpu_tier_prefetch_enabled() {
+        static const bool v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER");
+            const char * p = std::getenv("WP_EXPERT_CPU_TIER_PREFETCH");
+            return e != nullptr && e[0] == '1' && p != nullptr && p[0] == '1';
+        }();
+        return v;
+    }
+    // Spec-tag bit marking a prefetch landing, so its used/unused outcome is
+    // countable apart from the old host landings (which use only 0x80 | dist).
+    static constexpr uint8_t kTagPf = 0x40;
+
+    // Frame thread (== dispatch thread, so find_slot/fd_for are safe here).
+    void cpu_pf_enqueue(const ExpertPage & page) {
+        if (page.cache_id < 0 || page.is_resident) {
+            return;
+        }
+        if (find_slot(page) != slots_.size()) {
+            return;   // already in VRAM
+        }
+        if (arena_.state_of(page.cache_id) != wp::HostArena::State::Free) {
+            return;   // resident or being read already
+        }
+        if (page.layer <= current_layer_) {
+            n_pf_stale_dropped_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        int fd = -1;
+        try {
+            fd = fd_for(page.blob);
+        } catch (const std::exception &) {
+            return;
+        }
+        static const size_t cap = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_MAX", 40);
+        {
+            std::lock_guard<std::mutex> lock(pf_mu_);
+            if (pf_step_count_ >= cap) {
+                n_pf_capped_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            for (const PfItem & q : pf_q_) {
+                if (q.page == &page) {
+                    return;
+                }
+            }
+            pf_q_.push_back(PfItem{&page, fd});
+            ++pf_step_count_;
+            if (!pf_thread_.joinable()) {
+                pf_thread_ = std::thread([this] { cpu_pf_loop(); });
+            }
+        }
+        pf_cv_.notify_one();
+    }
+
+    // A CPU-tier demand about to wait on a page the prefetcher is reading:
+    // tell the reader not to yield to (or abandon for) this very demand.
+    bool pf_boost_for_demand(const ExpertPage & page) {
+        if (!cpu_tier_prefetch_enabled() || !tracked(page.cache_id) ||
+                arena_.state_of(page.cache_id) != wp::HostArena::State::Reading) {
+            return false;
+        }
+        land_boost_[page.cache_id].store(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // CPU-tier IO reads are demand: the prefetch gate (and the old host
+    // landing's preempt gate) must see them from queueing until settled.
+    void cpu_tier_demand_begin(size_t n) {
+        demand_reads_pending_.fetch_add((int) n, std::memory_order_relaxed);
+    }
+    void cpu_tier_demand_end() {
+        demand_reads_pending_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    uint64_t pf_issued() const        { return n_pf_issued_.load(std::memory_order_relaxed); }
+    uint64_t pf_landed() const        { return n_pf_landed_.load(std::memory_order_relaxed); }
+    uint64_t pf_stale_dropped() const { return n_pf_stale_dropped_.load(std::memory_order_relaxed); }
+    uint64_t pf_yield() const         { return n_pf_yield_.load(std::memory_order_relaxed); }
+    uint64_t pf_capped() const        { return n_pf_capped_.load(std::memory_order_relaxed); }
+    // Landed prefetch entries a demand borrow() later promoted (tag-counted).
+    uint64_t pf_used() const {
+        uint64_t n = 0;
+        for (int d = 0; d <= kTagDistMax; ++d) {
+            n += arena_.spec_used_tag((uint8_t) (kTagPf | d));
+            n += arena_.spec_used_tag((uint8_t) (kTagPf | kTagLate | d));
+        }
+        return n;
+    }
+
+    void stop_cpu_pf() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(pf_mu_);
+            pf_stop_ = true;
+        }
+        pf_cv_.notify_all();
+        if (pf_thread_.joinable()) {
+            pf_thread_.join();
+        }
+    }
+
     uint64_t host_landed() const { return host_landed_.load(std::memory_order_relaxed); }
     uint64_t n_victim_demoted() const { return n_victim_demoted_.load(std::memory_order_relaxed); }
     uint64_t n_victim_skipped() const { return n_victim_skipped_.load(std::memory_order_relaxed); }
@@ -7189,8 +7390,19 @@ public:
     // catalog_.layers relies on the same fact), so a plain integer compare
     // against the evicted slot's own key.first is enough -- the pool does not
     // need the catalog itself for this.
-    void set_current_layer(int32_t layer) { current_layer_ = layer; }
-
+    void set_current_layer(int32_t layer) {
+        if (cpu_tier_prefetch_enabled()) {
+            // A layer below the previous one is a new decode step: the
+            // per-step prefetch budget starts over. pf_layer_ is what the
+            // prefetch reader's staleness test reads (atomic: other thread).
+            if (layer < current_layer_) {
+                std::lock_guard<std::mutex> lock(pf_mu_);
+                pf_step_count_ = 0;
+            }
+            pf_layer_.store(layer, std::memory_order_relaxed);
+        }
+        current_layer_ = layer;
+    }
     static int64_t track_now_ns() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -7625,6 +7837,181 @@ private:
         }();
         return enabled;
     }
+
+  public:
+    // *** WP_EXPERT_CPU_TIER=1: COMPUTE-ON-ARRIVAL CPU EXPERT TIER (default OFF). ***
+    // A decode/verify miss on a page with fewer than WP_EXPERT_CPU_TIER_PROMOTE
+    // demand references (counted here, per page, over the worker's life) is NOT
+    // paged into VRAM: it is computed on the CPU straight from its arena entry
+    // (borrowed on a RAM hit, read from NVMe into the arena otherwise), on a
+    // dedicated thread, while the GPU computes the rest. No VRAM slot, no
+    // eviction, no victim D2H. The Nth reference promotes the page to VRAM on
+    // the normal path. Measured 2026-10-01 (test-backend-ops MUL_MAT_ID mxfp4):
+    // ~0.43 ms/expert on the 3900X and ~0.6 ms on the 6700K, against 1.6/3.8 ms
+    // for a RAM-hit page-in to VRAM. Membership depends on VRAM residency, so
+    // runs are NOT bit-identical with this on (kmbandy, 2026-10-01: accepted).
+    static bool cpu_tier_enabled() {
+        static const bool enabled = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER");
+            return e != nullptr && e[0] == '1';
+        }();
+        return enabled;
+    }
+    static uint64_t cpu_tier_env_u64(const char * name, uint64_t def) {
+        const char * e = std::getenv(name);
+        if (e == nullptr || e[0] == '\0') {
+            return def;
+        }
+        const long long v = std::strtoll(e, nullptr, 10);
+        return v > 0 ? (uint64_t) v : def;
+    }
+    // The page goes to VRAM on its Nth demand reference; references 1..N-1 run
+    // on the CPU. 1 = never CPU.
+    static uint32_t cpu_tier_promote() {
+        static const uint32_t v = (uint32_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PROMOTE", 3);
+        return v;
+    }
+    // Most CPU-tier experts in one request; the rest page in as before.
+    static size_t cpu_tier_max() {
+        static const size_t v = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_MAX", 4);
+        return v;
+    }
+    // Widest request the tier serves (decode/verify only; prefill never).
+    static uint32_t cpu_tier_max_tokens() {
+        static const uint32_t v = (uint32_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_MAX_TOKENS", 8);
+        return v;
+    }
+    // NVMe reads of a CPU-tier page are split into this many concurrent chunks
+    // (O_DIRECT-aligned, one IO task each). One ~18.8 MB pread per page is QD1:
+    // on the 2026 box's SN750 (~2.8-3.1 GB/s ceiling) the tier's wait was
+    // ~97 ms/step vs ~28 ms of compute. 1 = one whole-page pread (old behaviour).
+    static size_t cpu_tier_read_chunks() {
+        static const size_t v = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_READ_CHUNKS", 4);
+        return v;
+    }
+    // WP_EXPERT_CPU_TIER_EARLY_IO=1: start the tier's NVMe reads at the split
+    // dispatch BEGIN frame (batch planned there) instead of when ACTS arrives
+    // and dispatch() runs; the activation is only needed to compute. Default 0.
+    static bool cpu_tier_early_io() {
+        static const bool v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_EARLY_IO");
+            return e != nullptr && e[0] == '1';
+        }();
+        return v;
+    }
+    // Every this many tier demand references, halve every page's count (0 = never).
+    static uint64_t cpu_tier_halflife() {
+        static const uint64_t v = cpu_tier_env_u64("WP_EXPERT_CPU_TIER_HALFLIFE", 0);
+        return v;
+    }
+
+    struct HostPage {
+        const void *          data   = nullptr;
+        wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
+        bool                  ram_hit = false;
+    };
+
+    // CPU tier: hold `page`'s bytes in the arena -- borrow on a RAM hit,
+    // otherwise reserve an entry and read the whole page from NVMe into it.
+    // Either way the entry stays borrowed (unevictable) until
+    // release_host_page. Thread-safe: arena_ is, and read_page_range touches no
+    // pool state. Unlike reserve_arena_for_pagein this never marks the entry
+    // for drop under WP_HOST_TIER_VICTIM: the CPU tier computes FROM RAM, so the
+    // page staying there is the point.
+    HostPage acquire_host_page(const ExpertPage & page, int fd) {
+        HostPage hp;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (true) {
+            const void * src = nullptr;
+            if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
+                              /*prefill_hint=*/false)) {
+                hp.data    = src;
+                hp.ram_hit = true;
+                return hp;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t left_ms = now >= deadline ? 0 :
+                (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            void * data = nullptr;
+            const bool boosted = pf_boost_for_demand(page);
+            const wp::HostArena::Reserve r = arena_.reserve_wait(
+                page.cache_id, /*speculative=*/false, &data, &hp.handle, left_ms);
+            if (boosted) {
+                land_boost_[page.cache_id].store(0, std::memory_order_relaxed);
+            }
+            if (r == wp::HostArena::Reserve::Reserved) {
+                try {
+                    read_page_range(page, fd, data, 0, (size_t) page.size);
+                } catch (...) {
+                    arena_.finish_read(page.cache_id, hp.handle, /*ok=*/false);
+                    throw;
+                }
+                arena_.finish_read(page.cache_id, hp.handle, /*ok=*/true,
+                                   /*keep_borrowed=*/true, /*prefill_hint=*/false);
+                hp.data = data;
+                return hp;
+            }
+            if (r == wp::HostArena::Reserve::Timeout) {
+                throw std::runtime_error("host arena exhausted (cpu tier)");
+            }
+            // Present: another reader landed it meanwhile -- borrow on the next pass.
+        }
+    }
+
+    // Chunked variant of acquire_host_page, step 1: borrow on a RAM hit
+    // (returns true, hp filled) or reserve an arena entry (returns false,
+    // hp.handle + *data filled; the caller MUST read the page with
+    // read_host_chunk and then call finish_host_read exactly once).
+    bool acquire_host_page_begin(const ExpertPage & page, HostPage & hp, void ** data) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (true) {
+            const void * src = nullptr;
+            if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
+                              /*prefill_hint=*/false)) {
+                hp.data    = src;
+                hp.ram_hit = true;
+                return true;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t left_ms = now >= deadline ? 0 :
+                (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            void * d = nullptr;
+            const bool boosted = pf_boost_for_demand(page);
+            const wp::HostArena::Reserve r = arena_.reserve_wait(
+                page.cache_id, /*speculative=*/false, &d, &hp.handle, left_ms);
+            if (boosted) {
+                land_boost_[page.cache_id].store(0, std::memory_order_relaxed);
+            }
+            if (r == wp::HostArena::Reserve::Reserved) {
+                *data = d;
+                hp.data = d;
+                return false;
+            }
+            if (r == wp::HostArena::Reserve::Timeout) {
+                throw std::runtime_error("host arena exhausted (cpu tier)");
+            }
+        }
+    }
+    void read_host_chunk(const ExpertPage & page, int fd, void * data, size_t off, size_t len) {
+        read_page_range(page, fd, (char *) data + off, off, len);
+    }
+    void finish_host_read(const ExpertPage & page, HostPage & hp, bool ok) {
+        if (ok) {
+            arena_.finish_read(page.cache_id, hp.handle, /*ok=*/true,
+                               /*keep_borrowed=*/true, /*prefill_hint=*/false);
+        } else {
+            arena_.finish_read(page.cache_id, hp.handle, /*ok=*/false);
+            hp.handle = wp::HostArena::kInvalidHandle;
+        }
+    }
+
+    void release_host_page(const ExpertPage & page, HostPage & hp) {
+        if (hp.handle != wp::HostArena::kInvalidHandle) {
+            arena_.release(page.cache_id, hp.handle);
+            hp.handle = wp::HostArena::kInvalidHandle;
+        }
+    }
+  private:
 
     // WP_HOST_TIER_VICTIM_ASYNC: one demote thread, fed at plan time, so a
     // page-in that reads from NVMe overlaps its victim's D2H with that read
@@ -9580,6 +9967,10 @@ private:
     // can be A/B'd on the same binary.
     uint64_t                   evict_age_ = 0;
     uint64_t                   evictions_ = 0;
+    // WP_EXPERT_CPU_TIER: per-page decode demand references (cache_id ->
+    // count), touched only under ensure_batch's serialization.
+    std::unordered_map<int, uint32_t> cpu_tier_refs_;
+    uint64_t                   cpu_tier_ref_total_ = 0;
     // WP_EXPERT_SPEC_LEASE -- evictions a speculative page survives before it
     // becomes an ordinary eviction candidate. 0 restores the old first-victim
     // behaviour exactly, so the lease is A/B-able on one binary.
@@ -9847,6 +10238,131 @@ private:
     // ~16 ms/page (2026-08-07 pkm* arms: promotes collapsed because pages
     // landed after their layer had passed). The drive is only contended while
     // demand reads are actually outstanding; pause exactly then.
+    struct PfItem {
+        const ExpertPage * page;
+        int                fd;
+    };
+    std::mutex                      pf_mu_;
+    std::condition_variable         pf_cv_;
+    std::deque<PfItem>              pf_q_;
+    std::thread                     pf_thread_;
+    bool                            pf_stop_ = false;
+    size_t                          pf_step_count_ = 0;
+    std::atomic<int32_t>            pf_layer_{-1};
+    std::atomic<uint64_t>           n_pf_issued_{0};
+    std::atomic<uint64_t>           n_pf_landed_{0};
+    std::atomic<uint64_t>           n_pf_stale_dropped_{0};
+    std::atomic<uint64_t>           n_pf_yield_{0};
+    std::atomic<uint64_t>           n_pf_capped_{0};
+    std::atomic<uint64_t>           n_pf_errors_{0};
+
+    enum class PfGate { Go, Stale, Stop };
+    // Wait until no demand read is pending. A page a demand is already waiting
+    // on (land_boost_) is exempt from both the yield and the staleness test:
+    // abandoning it would make that demand read it a second time.
+    PfGate cpu_pf_gate(const ExpertPage & page) {
+        bool yielded = false;
+        for (;;) {
+            if (landing_boosted(page.cache_id)) {
+                return PfGate::Go;
+            }
+            {
+                std::lock_guard<std::mutex> lock(pf_mu_);
+                if (pf_stop_) {
+                    return PfGate::Stop;
+                }
+            }
+            if (page.layer <= pf_layer_.load(std::memory_order_relaxed)) {
+                return PfGate::Stale;
+            }
+            if (demand_reads_pending_.load(std::memory_order_relaxed) <= 0) {
+                return PfGate::Go;
+            }
+            if (!yielded) {
+                yielded = true;
+                n_pf_yield_.fetch_add(1, std::memory_order_relaxed);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+
+    void cpu_pf_loop() {
+        static const size_t chunk = [] {
+            const size_t v = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_CHUNK", 2u << 20);
+            return std::max<size_t>(64u << 10, (v + 4095) / 4096 * 4096);
+        }();
+        for (;;) {
+            PfItem it;
+            {
+                std::unique_lock<std::mutex> lock(pf_mu_);
+                pf_cv_.wait(lock, [&] { return pf_stop_ || !pf_q_.empty(); });
+                if (pf_stop_) {
+                    return;
+                }
+                it = pf_q_.front();
+                pf_q_.pop_front();
+            }
+            const ExpertPage & page = *it.page;
+            // The page may have landed or started reading since it was queued.
+            if (arena_.state_of(page.cache_id) != wp::HostArena::State::Free) {
+                continue;
+            }
+            PfGate g = cpu_pf_gate(page);
+            if (g == PfGate::Stop) {
+                return;
+            }
+            if (g == PfGate::Stale) {
+                n_pf_stale_dropped_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            void *                data   = nullptr;
+            wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
+            // Speculative reservation: evicts only speculative entries, never
+            // a borrowed/pinned/demand one; a refusal just skips the page.
+            if (!arena_.begin_read(page.cache_id, /*speculative=*/true, &data, &handle)) {
+                host_begin_refused_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            n_pf_issued_.fetch_add(1, std::memory_order_relaxed);
+            bool ok = true;
+            bool stopped = false;
+            try {
+                size_t off = 0;
+                while (off < (size_t) page.size) {
+                    g = cpu_pf_gate(page);
+                    if (g != PfGate::Go) {
+                        ok = false;
+                        stopped = g == PfGate::Stop;
+                        if (g == PfGate::Stale) {
+                            n_pf_stale_dropped_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        break;
+                    }
+                    const size_t n = std::min(chunk, (size_t) page.size - off);
+                    read_page_range(page, it.fd, (char *) data + off, off, n);
+                    off += n;
+                }
+            } catch (...) {
+                ok = false;
+                n_pf_errors_.fetch_add(1, std::memory_order_relaxed);
+            }
+            // Exactly one finish_read per begin_read, whatever happened above.
+            if (ok) {
+                arena_.set_spec_tag(page.cache_id, handle, (uint8_t) (kTagPf | landing_tag(page.cache_id)));
+            }
+            arena_.finish_read(page.cache_id, handle, ok);
+            if (ok) {
+                n_pf_landed_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (tracked(page.cache_id)) {
+                land_boost_[page.cache_id].store(0, std::memory_order_relaxed);
+            }
+            if (stopped) {
+                return;
+            }
+        }
+    }
+
     std::atomic<int>                demand_reads_pending_{0};
     std::atomic<uint64_t>           host_landed_{0};
     std::atomic<uint64_t>           host_bytes_{0};
@@ -10147,6 +10663,7 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     ns_read_(other.ns_read_),
     n_resident_(other.n_resident_),
     n_pagein_(other.n_pagein_),
+    n_cpu_tier_(other.n_cpu_tier_),
     n_pagein_reserved_(other.n_pagein_reserved_),
     n_pagein_general_(other.n_pagein_general_),
     bytes_read_(other.bytes_read_),
@@ -10991,6 +11508,11 @@ public:
                         continue;
                     }
                     pool_.note_host_hint(*page);
+                    if (ExpertSlotPool::cpu_tier_prefetch_enabled()) {
+                        // Strictly low-priority reader instead of host_queue_.
+                        pool_.cpu_pf_enqueue(*page);
+                        continue;
+                    }
                     enqueue_newest(host_queue_, page);
                 } else {
                     // CERTAIN (or host-less) -> VRAM spec_queue_. Newest-wins:
@@ -11594,15 +12116,19 @@ public:
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_ahead(),
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_behind(),
                       (unsigned long long) pool_.n_layerahead_spec_deferred());
-        char split[256];
+        char split[512];
         std::snprintf(split, sizeof(split),
                       " host_skip_vram_late=%llu host_landed_late=%llu "
-                      "host_begin_refused=%llu host_waited_inflight=%llu host_boosted=%llu host_by_dist=[",
+                      "host_begin_refused=%llu host_waited_inflight=%llu host_boosted=%llu "
+                      "n_pf[issued/landed/used/stale/yield/capped]=%llu/%llu/%llu/%llu/%llu/%llu host_by_dist=[",
                       (unsigned long long) pool_.host_skip_vram_late(),
                       (unsigned long long) pool_.host_landed_late(),
                       (unsigned long long) pool_.host_begin_refused(),
                       (unsigned long long) pool_.host_waited_inflight(),
-                      (unsigned long long) pool_.host_boosted());
+                      (unsigned long long) pool_.host_boosted(),
+                      (unsigned long long) pool_.pf_issued(), (unsigned long long) pool_.pf_landed(),
+                      (unsigned long long) pool_.pf_used(), (unsigned long long) pool_.pf_stale_dropped(),
+                      (unsigned long long) pool_.pf_yield(), (unsigned long long) pool_.pf_capped());
         return std::string(buf) + split + pool_.host_outcome_by_dist() + "]";
     }
 
@@ -11970,6 +12496,23 @@ public:
             stats_enabled(), request_stats,
             stats_enabled() ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point() };
+        // WP_EXPERT_CPU_TIER_EARLY_IO: a prepared batch may already have its
+        // CPU-tier reads in flight (started at BEGIN). Taken first so every exit
+        // path below either queues it for compute or cancels it -- its IO holds
+        // arena entries that only the compute thread releases.
+        std::shared_ptr<CpuTierJob> cpu_job;
+        if (prepared.has_value()) {
+            cpu_job = take_early_cpu_job(conn_index);
+        }
+        struct EarlyCpuJobGuard {
+            DeviceWorker & worker;
+            std::shared_ptr<CpuTierJob> & job;
+            ~EarlyCpuJobGuard() {
+                if (job && !job->compute_queued) {
+                    worker.queue_cpu_tier_compute(job, nullptr);
+                }
+            }
+        } early_cpu_job_guard{ *this, cpu_job };
         const bool owns_gate = !prepared.has_value();
         if (owns_gate) {
             spec_prefill_gate_active_ = spec_prefill_gate_enabled_ &&
@@ -12060,6 +12603,26 @@ public:
             request_stats.host_bytes = batch.host_bytes();
             request_stats.n_pagein_sorted = batch.n_pagein_sorted();
         }
+
+        // WP_EXPERT_CPU_TIER: start the CPU experts now -- RAM hits compute
+        // at once, NVMe misses as their reads land -- underneath everything
+        // the GPU does below. The guard waits on every exit path: the job
+        // reads `request` and holds arena entries.
+        if (batch.n_cpu_tier() > 0) {
+            if (!cpu_job) {
+                cpu_job = submit_cpu_tier_io(pages, batch, request);
+            }
+            queue_cpu_tier_compute(cpu_job, &request);
+        }
+        struct CpuTierGuard {
+            DeviceWorker & worker;
+            std::shared_ptr<CpuTierJob> & job;
+            ~CpuTierGuard() {
+                if (job) {
+                    worker.wait_cpu_tier(*job);
+                }
+            }
+        } cpu_tier_guard{ *this, cpu_job };
 
         // WP_PREFILL_LAYER_AHEAD: after THIS layer's demand pins, try the NEXT
         // layer's catalog as one spec-VRAM batch. Demand-first defers while
@@ -12159,7 +12722,7 @@ public:
         }();
         const bool effective_overlap = overlap &&
             !(persistent_graphs && arena_request) && !arena_prefill_request &&
-            !batch_mmid_request;
+            !batch_mmid_request && batch.n_cpu_tier() == 0;
         // WP_EXPERT_COMPUTE_CHUNKS=<n>: split the expert compute into n fixed
         // index chunks so all but the last can run while the tail of the page-in
         // reads is still in flight. 1 = the original strictly-serial path.
@@ -12232,6 +12795,7 @@ public:
         // (no extra per-expert graph submits, no fold pass).
         const bool resident_first_eligible =
             !grouped_gemv_request && !batch_mmid_request &&
+            batch.n_cpu_tier() == 0 &&
             s_resident_first &&
             !request.assignments.empty() &&
             request.n_tokens <= s_resident_first_max_tokens &&
@@ -12322,7 +12886,9 @@ public:
             // 40.8 s of the 74.0 s decode dispatch wait, so this is not a rounding
             // error. n_pagein == 0 means every expert is already resident and the
             // serial path is strictly better.
-            const size_t chunks   = fused_expert_request ? 1 :
+            // CPU-tier entries have no slot, so a chunk can select nothing:
+            // one pass, and the CPU partials join after read_result.
+            const size_t chunks   = (fused_expert_request || batch.n_cpu_tier() > 0) ? 1 :
                 (grouped_gemv_request
                 ? 1
                 : batch_mmid_compute_chunks(
@@ -12401,12 +12967,23 @@ public:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - vk_dispatch_started).count();
         }
-        if (!request.assignments.empty()) {
+        // All-CPU request: no GPU pass ran, so the io result is stale -- leave
+        // `sum` at zero. With CPU partials still to add, the GPU result must
+        // come back unrounded: the wire codec runs once, over the full sum,
+        // in the protocol encoder.
+        if (!request.assignments.empty() &&
+                request.assignments.size() > batch.n_cpu_tier()) {
             read_result(sum, request_stats, std::numeric_limits<size_t>::max(),
-                        (int) request.layer, last_compute_path_, true);
+                        (int) request.layer, last_compute_path_,
+                        /* capture_wire = */ cpu_job == nullptr);
             last_compute_path_ = "none";
         }
         request_stats.ns_result = lap();
+        if (cpu_job) {
+            finish_cpu_tier(cpu_job, sum, request_stats);
+            cpu_job.reset();
+            ml8_wire_partial_.clear();   // the encoder packs the full f32 sum
+        }
 
         // *** WP_SELFCHECK=1: EQUIVALENCE PROBE (default OFF, diagnostic only). ***
         // THE INVARIANT UNDER TEST: an expert's contribution to a token must not
@@ -12428,12 +13005,51 @@ public:
         }();
         if (s_selfcheck &&
                 !request.assignments.empty() && !sum.empty()) {
+            const uint64_t mmid_hit_before = request_stats.n_batch_mmid_hit;
             std::vector<float> dense(sum.size(), 0.0f);
             compute_batch(
                 request, pages, batch, /* hits = */ true,
                 /* add_previous = */ false, request_stats,
                 /* all_experts = */ true, /* force_dense = */ true);
             read_result(dense, request_stats);
+            // WP_SELFCHECK_DUMP=<dir>: write the first WP_SELFCHECK_DUMP_MAX (8)
+            // requests (routing, activation, both results) for an offline
+            // exact reference. Layout: i32 layer, u32 n_tokens, u32 n_assign,
+            // f32 clamp, u32 n_embd, u32 mmid_hit, {i32 id, f32 w[n_tokens]}*,
+            // f32 act[n_tokens*n_embd], f32 sum[..], f32 dense[..].
+            static const char * s_dump_dir = std::getenv("WP_SELFCHECK_DUMP");
+            static std::atomic<int> s_dump_n{0};
+            static const int s_dump_max = [] {
+                const char * e = std::getenv("WP_SELFCHECK_DUMP_MAX");
+                return e != nullptr ? std::atoi(e) : 8;
+            }();
+            if (s_dump_dir != nullptr) {
+                const int k = s_dump_n.fetch_add(1);
+                if (k < s_dump_max) {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/req-L%02d-%03d.bin",
+                                  s_dump_dir, (int) request.layer, k);
+                    if (FILE * f = std::fopen(path, "wb")) {
+                        const uint32_t n_assign = (uint32_t) request.assignments.size();
+                        const uint32_t n_embd = (uint32_t) catalog_.descriptor.hparams.n_embd;
+                        const uint32_t hit = (uint32_t) mmid_hit_before;
+                        std::fwrite(&request.layer, 4, 1, f);
+                        std::fwrite(&request.n_tokens, 4, 1, f);
+                        std::fwrite(&n_assign, 4, 1, f);
+                        std::fwrite(&request.swiglu_clamp, 4, 1, f);
+                        std::fwrite(&n_embd, 4, 1, f);
+                        std::fwrite(&hit, 4, 1, f);
+                        for (const auto & a : request.assignments) {
+                            std::fwrite(&a.expert_id, 4, 1, f);
+                            std::fwrite(a.weights.data(), 4, a.weights.size(), f);
+                        }
+                        std::fwrite(activation, 4, (size_t) request.n_tokens * n_embd, f);
+                        std::fwrite(sum.data(), 4, sum.size(), f);
+                        std::fwrite(dense.data(), 4, dense.size(), f);
+                        std::fclose(f);
+                    }
+                }
+            }
             double max_abs = 0.0, max_rel = 0.0, sum_abs = 0.0;
             size_t worst = 0;
             for (size_t i = 0; i < sum.size(); ++i) {
@@ -12561,9 +13177,19 @@ public:
                                                      pending.request.n_tokens, conn_index,
                                                      gpu_lock));
             pending.arena_eligible = arena_id_eligible(pending.request, *pending.batch);
+            // WP_EXPERT_CPU_TIER_EARLY_IO: the tier's NVMe reads need only the
+            // page list, not the activation, so start them now and overlap the
+            // wait for ACTS. dispatch() adds the compute half.
+            if (ExpertSlotPool::cpu_tier_early_io() && pending.batch->n_cpu_tier() > 0) {
+                early_cpu_job_by_conn_[conn_index] =
+                    submit_cpu_tier_io(pages, *pending.batch, pending.request);
+            }
             submit_prefill_layer_ahead(pending.request.layer, pending.request.n_tokens);
             split_pending_by_conn_.emplace(conn_index, std::move(pending));
         } catch (...) {
+            if (std::shared_ptr<CpuTierJob> job = take_early_cpu_job(conn_index)) {
+                queue_cpu_tier_compute(job, nullptr);
+            }
             pool_.demand_serving(false);
             spec_prefill_gate_active_ = false;
             throw;
@@ -12600,6 +13226,9 @@ public:
     }
 
     void abandon_split_dispatch(int conn_index = -1) noexcept {
+        if (std::shared_ptr<CpuTierJob> job = take_early_cpu_job(conn_index)) {
+            queue_cpu_tier_compute(job, nullptr);   // drains + releases its pages
+        }
         split_pending_by_conn_.erase(conn_index);
         pool_.demand_serving(false);
         spec_prefill_gate_active_ = false;
@@ -12784,6 +13413,8 @@ public:
     void record_stats(const RequestStats & request, size_t n_experts) {
         stats_.set_shield_stats(pool_.n_shield_hits(), pool_.n_shield_exhausted());
         stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
+        stats_.set_pf_stats(pool_.pf_issued(), pool_.pf_landed(), pool_.pf_used(),
+                            pool_.pf_stale_dropped(), pool_.pf_yield());
         {
             const wp::HostArena & arena = pool_.arena();
             stats_.set_ram_stats(pool_.host_landed(), (uint64_t) arena.resident_bytes(),
@@ -14466,8 +15097,9 @@ private:
                         std::chrono::steady_clock::now() - vk_setup_started).count();
             }
         };
+        // WP_EXPERT_CPU_TIER entries have no slot: the CPU tier computes them.
         const auto selected = [&](size_t i) {
-            return i >= sel_begin && i < sel_end &&
+            return i >= sel_begin && i < sel_end && !batch.is_cpu_tier(i) &&
                    (all_experts || (batch.is_resident(i) == hits));
         };
         size_t n_selected = 0;
@@ -14495,7 +15127,7 @@ private:
         const bool mmid_subrange =
             sel_begin != 0 ||
             sel_end < request.assignments.size() ||
-            n_selected != request.assignments.size() ||
+            n_selected + batch.n_cpu_tier() != request.assignments.size() ||
             result_offset != std::numeric_limits<size_t>::max();
         const BatchMmidAssociation mmid_assoc = plan_batch_mmid_association(
             batch_mmid_eligible(request) && !force_fallback,
@@ -15308,6 +15940,16 @@ private:
                     ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
                 attach_weight(
                     tensor, loaded.buffer, loaded.base, page.roles.at(role).device_offset);
+                // WP_ML8_PREPACKED=1: this worker's ML8_4 pages are stored in the device
+                // GEMM layout (packed offline for its GPU), so ggml-cuda reads them in
+                // place instead of repacking per matmul.
+                static const bool ml8_prepacked = [] {
+                    const char * e = std::getenv("WP_ML8_PREPACKED");
+                    return e != nullptr && std::atoi(e) != 0;
+                }();
+                if (ml8_prepacked && spec.type == GGML_TYPE_ML8_4) {
+                    tensor->flags |= GGML_TENSOR_FLAG_ML8_PACKED;
+                }
                 // D2 miss: record for rebinding on later hits. Creation order is
                 // gate, up, down per expert -- the hit path indexes k*3+j on
                 // exactly that order.
@@ -15791,6 +16433,468 @@ private:
     // same graph over that. Fold is a left fold over ids-slot k (assignment
     // order per token). HIP/CUDA gather pads uneven rank with unique ids
     // (dummy expert n once, then unused real experts).
+    // ---- WP_EXPERT_CPU_TIER executor ---------------------------------------
+    struct CpuTierJob {
+        const pipe_expert_dispatch_req *       request = nullptr;
+        std::vector<size_t>                    index;   // assignment indices, ascending
+        std::vector<const ExpertPage *>        pages;
+        std::vector<int>                       fds;
+        std::vector<ExpertSlotPool::HostPage>  holds;
+        std::vector<std::vector<float>>        partials;
+        std::mutex                             m;
+        std::condition_variable                cv;
+        std::deque<size_t>                     landed;      // k, in arrival order
+        size_t                                 n_settled = 0;   // landed or failed
+        size_t                                 n_ram_hit = 0;
+        uint64_t                               ns_compute = 0;
+        std::exception_ptr                     error;
+        bool                                   finished = false;
+        // Chunked NVMe read state of one page (WP_EXPERT_CPU_TIER_READ_CHUNKS > 1).
+        struct PageRead {
+            void *                       data = nullptr;
+            const ExpertPage *           page = nullptr;
+            int                          fd   = -1;
+            ExpertSlotPool::HostPage     hp;
+            std::atomic<size_t>          remaining{0};
+            std::atomic<bool>            failed{false};
+        };
+        std::vector<std::unique_ptr<PageRead>> reads;
+        bool                                   compute_queued = false;   // dispatch thread only
+    };
+
+    // One IO-thread task: chunk < 0 acquires page k (borrow or reserve, then
+    // reads chunk 0 itself); chunk >= 0 reads that chunk of an already
+    // reserved page.
+    struct CpuTierIoTask {
+        std::shared_ptr<CpuTierJob> job;
+        size_t                      k;
+        int                         chunk;
+    };
+
+    static int cpu_tier_compute_threads() {
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const uint64_t def = hw >= 16 ? 8 : 4;
+        return (int) std::min<uint64_t>(
+            ExpertSlotPool::cpu_tier_env_u64("WP_EXPERT_CPU_TIER_THREADS", def), hw);
+    }
+
+    // The job's request pointer is set later (queue_cpu_tier_compute): the IO
+    // half can start before the request object has its final address (early
+    // IO at BEGIN, WP_EXPERT_CPU_TIER_EARLY_IO) -- it needs only pages + fds.
+    std::shared_ptr<CpuTierJob> submit_cpu_tier_io(
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            const pipe_expert_dispatch_req & request) {
+        auto job = std::make_shared<CpuTierJob>();
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (batch.is_cpu_tier(i)) {
+                job->index.push_back(i);
+                job->pages.push_back(pages[i]);
+                job->fds.push_back(batch.cpu_fd(i));
+            }
+        }
+        job->holds.resize(job->index.size());
+        job->partials.resize(job->index.size());
+        job->reads.resize(job->index.size());
+        (void) request;
+        {
+            std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+            if (cpu_tier_threads_.empty()) {
+                const size_t n_io = (size_t) ExpertSlotPool::cpu_tier_env_u64("WP_EXPERT_CPU_TIER_IO", 4);
+                for (size_t t = 0; t < n_io; ++t) {
+                    cpu_tier_threads_.emplace_back([this] { cpu_tier_io_loop(); });
+                }
+                cpu_tier_threads_.emplace_back([this] { cpu_tier_compute_loop(); });
+                std::fprintf(stderr,
+                    "wp: WP_EXPERT_CPU_TIER=1: promote=%u max=%zu max_tokens=%u io=%zu "
+                    "compute_threads=%d halflife=%llu read_chunks=%zu early_io=%d\n",
+                    ExpertSlotPool::cpu_tier_promote(), ExpertSlotPool::cpu_tier_max(),
+                    ExpertSlotPool::cpu_tier_max_tokens(), n_io, cpu_tier_compute_threads(),
+                    (unsigned long long) ExpertSlotPool::cpu_tier_halflife(),
+                    ExpertSlotPool::cpu_tier_read_chunks(),
+                    (int) ExpertSlotPool::cpu_tier_early_io());
+            }
+            // These reads are DEMAND: count them from queueing until settled so
+            // the prefetch reader (and the preempt gate) hold off for them.
+            pool_.cpu_tier_demand_begin(job->index.size());
+            for (size_t k = 0; k < job->index.size(); ++k) {
+                cpu_tier_io_q_.push_back(CpuTierIoTask{job, k, -1});
+            }
+        }
+        cpu_tier_cv_.notify_all();
+        return job;
+    }
+
+    // Hands the job to the compute thread (it consumes pages as they land).
+    // request == nullptr cancels: the compute thread only drains and releases
+    // the pages (abandoned BEGIN, or dispatch() left before it got here).
+    void queue_cpu_tier_compute(const std::shared_ptr<CpuTierJob> & job,
+                                const pipe_expert_dispatch_req * request) noexcept {
+        job->compute_queued = true;
+        if (request != nullptr) {
+            job->request = request;
+        } else {
+            try {
+                std::lock_guard<std::mutex> lock(job->m);
+                if (!job->error) {
+                    job->error = std::make_exception_ptr(
+                        std::runtime_error("cpu tier job cancelled"));
+                }
+            } catch (...) {
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+            cpu_tier_compute_q_.push_back(job);
+        }
+        cpu_tier_cv_.notify_all();
+    }
+
+    // Early IO (BEGIN frame) hand-off: conn_index -> job whose reads are
+    // already queued; dispatch() takes it, abandon_split_dispatch cancels it.
+    std::shared_ptr<CpuTierJob> take_early_cpu_job(int conn_index) {
+        const auto it = early_cpu_job_by_conn_.find(conn_index);
+        if (it == early_cpu_job_by_conn_.end()) {
+            return nullptr;
+        }
+        std::shared_ptr<CpuTierJob> job = std::move(it->second);
+        early_cpu_job_by_conn_.erase(it);
+        return job;
+    }
+
+    void wait_cpu_tier(CpuTierJob & job) noexcept {
+        std::unique_lock<std::mutex> lock(job.m);
+        job.cv.wait(lock, [&] { return job.finished; });
+    }
+
+    // Waits for the job, then adds its partials into `sum` in assignment order.
+    void finish_cpu_tier(const std::shared_ptr<CpuTierJob> & job, std::vector<float> & sum,
+                         RequestStats & request_stats) {
+        const auto t0 = std::chrono::steady_clock::now();
+        wait_cpu_tier(*job);
+        request_stats.ns_cpu_tier_wait += (uint64_t) std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (job->error) {
+            std::rethrow_exception(job->error);
+        }
+        for (const std::vector<float> & partial : job->partials) {
+            if (partial.size() != sum.size()) {
+                throw std::runtime_error("cpu tier partial has the wrong size");
+            }
+            for (size_t j = 0; j < sum.size(); ++j) {
+                sum[j] += partial[j];
+            }
+        }
+        request_stats.n_cpu_tier          += job->index.size();
+        request_stats.n_cpu_tier_ram_hit  += job->n_ram_hit;
+        request_stats.ns_cpu_tier_compute += job->ns_compute;
+    }
+
+    void stop_cpu_tier() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+            cpu_tier_stop_ = true;
+        }
+        cpu_tier_cv_.notify_all();
+        for (std::thread & t : cpu_tier_threads_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        cpu_tier_threads_.clear();
+    }
+
+    // Marks page k of `job` settled (landed ok, or failed with `err`).
+    void cpu_tier_settle(CpuTierJob & job, size_t k, bool landed, bool ram_hit,
+                         std::exception_ptr err) {
+        pool_.cpu_tier_demand_end();   // pairs with cpu_tier_demand_begin at submit
+        {
+            std::lock_guard<std::mutex> lock(job.m);
+            if (landed) {
+                job.n_ram_hit += ram_hit ? 1 : 0;
+                job.landed.push_back(k);
+            } else if (err && !job.error) {
+                job.error = err;
+            }
+            ++job.n_settled;
+        }
+        job.cv.notify_all();
+    }
+
+    // Chunk c of page k. The last chunk to finish (remaining -> 0) closes the
+    // arena read EXACTLY once: finish_read(ok) if every chunk succeeded, else
+    // finish_read(false), and settles the page.
+    void cpu_tier_read_chunk(const std::shared_ptr<CpuTierJob> & job, size_t k, size_t off, size_t len) {
+        CpuTierJob::PageRead & pr = *job->reads[k];
+        std::exception_ptr err;
+        if (!pr.failed.load(std::memory_order_relaxed)) {
+            try {
+                pool_.read_host_chunk(*pr.page, pr.fd, pr.data, off, len);
+            } catch (...) {
+                err = std::current_exception();
+                pr.failed.store(true, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(job->m);
+                if (!job->error) {
+                    job->error = err;
+                }
+            }
+        }
+        if (pr.remaining.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+            return;
+        }
+        const bool ok = !pr.failed.load(std::memory_order_relaxed);
+        pool_.finish_host_read(*pr.page, pr.hp, ok);
+        if (ok) {
+            job->holds[k] = pr.hp;
+        }
+        cpu_tier_settle(*job, k, ok, false, nullptr);
+    }
+
+    // Chunk size for a page of `size` bytes: a multiple of 4096 (O_DIRECT
+    // alignment, like stripe_plan) and not below ~1 MiB; the last chunk
+    // absorbs the remainder. part == size means one whole-page read.
+    static size_t cpu_tier_chunk_part(size_t size) {
+        const size_t want = ExpertSlotPool::cpu_tier_read_chunks();
+        const size_t n    = std::min(want, std::max<size_t>(1, size / (1u << 20)));
+        if (n <= 1) {
+            return size;
+        }
+        return ((size + n - 1) / n + 4095) / 4096 * 4096;
+    }
+    static size_t cpu_tier_chunks_for(size_t size) {
+        const size_t part = cpu_tier_chunk_part(size);
+        return (size + part - 1) / part;
+    }
+    static std::pair<size_t, size_t> cpu_tier_chunk_range(size_t size, size_t c) {
+        const size_t part = cpu_tier_chunk_part(size);
+        const size_t off  = c * part;
+        return { off, std::min(part, size - off) };
+    }
+
+    void cpu_tier_io_loop() {
+        for (;;) {
+            CpuTierIoTask task;
+            {
+                std::unique_lock<std::mutex> lock(cpu_tier_mu_);
+                cpu_tier_cv_.wait(lock, [&] { return cpu_tier_stop_ || !cpu_tier_io_q_.empty(); });
+                if (cpu_tier_io_q_.empty()) {
+                    return;
+                }
+                task = std::move(cpu_tier_io_q_.front());
+                cpu_tier_io_q_.pop_front();
+            }
+            const std::shared_ptr<CpuTierJob> & job = task.job;
+            const size_t k = task.k;
+            if (task.chunk >= 0) {
+                const size_t size = (size_t) job->pages[k]->size;
+                const auto r = cpu_tier_chunk_range(size, (size_t) task.chunk);
+                cpu_tier_read_chunk(job, k, r.first, r.second);
+                continue;
+            }
+            try {
+                const ExpertPage & page = *job->pages[k];
+                const size_t size = (size_t) page.size;
+                const size_t n = cpu_tier_chunks_for(size);
+                if (n <= 1) {
+                    ExpertSlotPool::HostPage hp = pool_.acquire_host_page(page, job->fds[k]);
+                    {
+                        std::lock_guard<std::mutex> lock(job->m);
+                        job->holds[k] = hp;
+                    }
+                    cpu_tier_settle(*job, k, true, hp.ram_hit, nullptr);
+                    continue;
+                }
+                auto pr = std::make_unique<CpuTierJob::PageRead>();
+                pr->page = &page;
+                pr->fd   = job->fds[k];
+                void * data = nullptr;
+                const bool hit = pool_.acquire_host_page_begin(page, pr->hp, &data);
+                if (hit) {
+                    {
+                        std::lock_guard<std::mutex> lock(job->m);
+                        job->holds[k] = pr->hp;
+                    }
+                    cpu_tier_settle(*job, k, true, true, nullptr);
+                    continue;
+                }
+                pr->data = data;
+                pr->remaining.store(n, std::memory_order_relaxed);
+                job->reads[k] = std::move(pr);   // reads[k] is touched only after this point
+                {
+                    // Front of the queue: finish this page before starting
+                    // other pages, so compute can begin on it sooner.
+                    std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+                    for (size_t c = n; c-- > 1;) {
+                        cpu_tier_io_q_.push_front(CpuTierIoTask{job, k, (int) c});
+                    }
+                }
+                cpu_tier_cv_.notify_all();
+                const auto r = cpu_tier_chunk_range(size, 0);
+                cpu_tier_read_chunk(job, k, r.first, r.second);
+            } catch (...) {
+                // Only reached before any chunk was queued (acquire failed):
+                // no entry is reserved, nothing to finish.
+                cpu_tier_settle(*job, k, false, false, std::current_exception());
+            }
+        }
+    }
+
+    void cpu_tier_compute_loop() {
+        // Own backend on this thread: ggml applies the threadpool's settings to
+        // OpenMP thread 0, which is the calling thread -- never a GPU thread here.
+        backend_ptr cpu(ggml_backend_cpu_init());
+        if (cpu) {
+            ggml_backend_cpu_set_n_threads(cpu.get(), cpu_tier_compute_threads());
+        }
+        galloc_ptr galloc(ggml_gallocr_new(ggml_backend_cpu_buffer_type()));
+        for (;;) {
+            std::shared_ptr<CpuTierJob> job;
+            {
+                std::unique_lock<std::mutex> lock(cpu_tier_mu_);
+                cpu_tier_cv_.wait(lock, [&] { return cpu_tier_stop_ || !cpu_tier_compute_q_.empty(); });
+                if (cpu_tier_compute_q_.empty()) {
+                    return;
+                }
+                job = std::move(cpu_tier_compute_q_.front());
+                cpu_tier_compute_q_.pop_front();
+            }
+            const size_t n = job->index.size();
+            for (;;) {
+                size_t k = 0;
+                {
+                    std::unique_lock<std::mutex> lock(job->m);
+                    job->cv.wait(lock, [&] { return !job->landed.empty() || job->n_settled == n; });
+                    if (job->landed.empty()) {
+                        break;   // every page settled and consumed
+                    }
+                    k = job->landed.front();
+                    job->landed.pop_front();
+                }
+                bool failed = false;
+                {
+                    std::lock_guard<std::mutex> lock(job->m);
+                    failed = job->error != nullptr;
+                }
+                if (!failed) {
+                    try {
+                        if (!cpu || !galloc) {
+                            throw std::runtime_error("failed to initialize the CPU tier backend");
+                        }
+                        const auto t0 = std::chrono::steady_clock::now();
+                        cpu_tier_compute_one(*job, k, cpu.get(), galloc.get());
+                        job->ns_compute += (uint64_t) std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(job->m);
+                        if (!job->error) {
+                            job->error = std::current_exception();
+                        }
+                    }
+                }
+                pool_.release_host_page(*job->pages[k], job->holds[k]);
+            }
+            {
+                std::lock_guard<std::mutex> lock(job->m);
+                job->finished = true;
+            }
+            job->cv.notify_all();
+        }
+    }
+
+    // One routed expert's weighted FFN on the CPU, from its arena bytes (file
+    // layout: MemberSpan::offset, not device_offset).
+    void cpu_tier_compute_one(CpuTierJob & job, size_t k, ggml_backend_t cpu, ggml_gallocr_t galloc) {
+        const pipe_expert_dispatch_req & request = *job.request;
+        const ExpertPage & page = *job.pages[k];
+        const pipe_expert_assignment & assignment = request.assignments[job.index[k]];
+        const auto & specs = catalog_.descriptor.layers.at(page.layer);
+        const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
+        if (assignment.weights.size() != (size_t) request.n_tokens) {
+            throw std::runtime_error("cpu tier routing weights do not match n_tokens");
+        }
+        // Compute only the tokens actually routed to this expert (nonzero
+        // weight): at verify width most of the 8 rows are zero-weighted, and
+        // computing them dense measured ~4x the per-expert cost.
+        std::vector<int64_t> rows;
+        for (size_t t = 0; t < assignment.weights.size(); ++t) {
+            if (assignment.weights[t] != 0.0f) {
+                rows.push_back((int64_t) t);
+            }
+        }
+        std::vector<float> & out = job.partials[k];
+        out.assign((size_t) request.n_tokens * (size_t) n_embd, 0.0f);
+        if (rows.empty()) {
+            return;
+        }
+        const int64_t m = (int64_t) rows.size();
+        std::vector<float> x((size_t) m * (size_t) n_embd);
+        std::vector<float> w((size_t) m);
+        for (int64_t r = 0; r < m; ++r) {
+            std::memcpy(x.data() + (size_t) r * n_embd,
+                        request.activation_data() + (size_t) rows[r] * n_embd,
+                        (size_t) n_embd * sizeof(float));
+            w[r] = assignment.weights[rows[r]];
+        }
+        // Only the arena page is wrapped in place (entries are O_DIRECT-aligned);
+        // the activation and routing weights live at arbitrary offsets in the
+        // request, and a CPU buffer must be TENSOR_ALIGNMENT-aligned, so they are
+        // graph inputs copied in after allocation.
+        buffer_ptr weight_buffer(ggml_backend_cpu_buffer_from_ptr(
+            const_cast<void *>(job.holds[k].data), (size_t) page.size));
+        if (!weight_buffer) {
+            throw std::runtime_error("failed to wrap CPU tier expert weights");
+        }
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(16, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate CPU tier graph metadata");
+        }
+        ggml_tensor * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, m);
+        ggml_set_input(input);
+        const auto role = [&](const char * name) {
+            const RoleSpec & spec = specs.at(name);
+            ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
+            attach_weight(t, weight_buffer.get(), ggml_backend_buffer_get_base(weight_buffer.get()),
+                          page.roles.at(name).offset);
+            return t;
+        };
+        ggml_tensor * gate = role("gate");
+        ggml_tensor * up   = role("up");
+        ggml_tensor * down = role("down");
+        ggml_tensor * gate_x = ggml_mul_mat(ctx.get(), gate, input);
+        ggml_tensor * up_x   = ggml_mul_mat(ctx.get(), up, input);
+        if (request.swiglu_clamp > 1e-6f) {
+            up_x   = ggml_clamp(ctx.get(), up_x, -request.swiglu_clamp, request.swiglu_clamp);
+            gate_x = ggml_clamp(ctx.get(), gate_x, -INFINITY, request.swiglu_clamp);
+        }
+        ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate_x, up_x);
+        ggml_tensor * output = ggml_mul_mat(ctx.get(), down, hidden);
+        ggml_tensor * route  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, m);
+        ggml_set_input(route);
+        ggml_tensor * weighted = ggml_mul(ctx.get(), output, route);
+        ggml_set_output(weighted);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 16, false);
+        ggml_build_forward_expand(graph, weighted);
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+            throw std::runtime_error("failed to allocate CPU tier graph");
+        }
+        ggml_backend_tensor_set(input, x.data(), 0, ggml_nbytes(input));
+        ggml_backend_tensor_set(route, w.data(), 0, ggml_nbytes(route));
+        if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("CPU tier graph compute failed");
+        }
+        std::vector<float> y((size_t) m * (size_t) n_embd);
+        ggml_backend_tensor_get(weighted, y.data(), 0, y.size() * sizeof(float));
+        for (int64_t r = 0; r < m; ++r) {
+            std::memcpy(out.data() + (size_t) rows[r] * n_embd, y.data() + (size_t) r * n_embd,
+                        (size_t) n_embd * sizeof(float));
+        }
+    }
+
     bool compute_batch_mmid(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
@@ -18438,6 +19542,16 @@ private:
     ResidentExpertPool resident_;
     ExpertSlotPool pool_;
     galloc_ptr     compute_galloc_;
+    // WP_EXPERT_CPU_TIER executor: I/O threads land pages (borrow or NVMe read
+    // into the arena), ONE compute thread runs each page's FFN as it lands.
+    // Started on first use; stopped first thing in ~DeviceWorker.
+    std::mutex                                               cpu_tier_mu_;
+    std::condition_variable                                  cpu_tier_cv_;
+    std::deque<CpuTierIoTask>                                cpu_tier_io_q_;
+    std::unordered_map<int, std::shared_ptr<CpuTierJob>>     early_cpu_job_by_conn_;
+    std::deque<std::shared_ptr<CpuTierJob>>                  cpu_tier_compute_q_;
+    std::vector<std::thread>                                 cpu_tier_threads_;
+    bool                                                     cpu_tier_stop_ = false;
     // ml8 rotation: resident F32 [a,a] h_a tensors for every (layer, role)
     // whose rotation is kronecker_orth_sylvester (kind 1). One shared context
     // + device buffer for the whole catalog -- these are tiny (a is small,
@@ -18608,6 +19722,7 @@ private:
 };
 
 DeviceWorker::~DeviceWorker() {
+    stop_cpu_tier();   // before pool_ goes: the tier threads hold arena entries
     if (backend_ == nullptr) {
         return;
     }
@@ -18713,6 +19828,10 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_d3_typed += src.n_d3_typed;
     dst.n_d3_bounce += src.n_d3_bounce;
     dst.n_batch_mmid_hit += src.n_batch_mmid_hit;
+    dst.n_cpu_tier += src.n_cpu_tier;
+    dst.n_cpu_tier_ram_hit += src.n_cpu_tier_ram_hit;
+    dst.ns_cpu_tier_compute += src.ns_cpu_tier_compute;
+    dst.ns_cpu_tier_wait += src.ns_cpu_tier_wait;
     dst.n_batch_mmid_fallback += src.n_batch_mmid_fallback;
     dst.n_batch_mmid_ineligible += src.n_batch_mmid_ineligible;
     dst.n_batch_mmid_arena_bytes += src.n_batch_mmid_arena_bytes;
@@ -22119,8 +23238,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     //   10 ns_hits  11 ns_wait  12 ns_pagein_compute  13 ns_result
     //   14 ns_read  15 ns_h2d  16 ns_submit  17 ns_readback
     //   18 ns_encode  19 ns_send  20 n_weight_nonzero  21 n_weight_total
-    //   22 epoch_end  23 ns_params_set  24 n_host_hit  25 n_host_demote
-    //   26 ns_host_get  27 ns_demote  28 ns_ensure_post  29 ns_final_sync
+    //   22 epoch_end  23 ns_params_set  24 n_host_hit  25 n_cpu_tier
+    //   26 ns_cpu_tier_wait  27 ns_cpu_tier_compute  28 ns_ensure_post
+    //   29 ns_final_sync
+    // Columns 25-27 were n_host_demote/ns_host_get/ns_demote (dead zeros since
+    // the HostArena migration) and are repurposed for WP_EXPERT_CPU_TIER so the
+    // column count stays fixed: per-request CPU-tier expert count, time the
+    // dispatch thread blocked in finish_cpu_tier, and CPU time spent computing
+    // the tier's experts (summed over the request; overlaps the GPU). All 0
+    // with the tier off.
     //   30 chunk_index (WP_DISPATCH_STREAM rows only)
     // epoch_end (added 2026-08-06) is the request's wall-clock END in epoch
     // seconds; start = epoch_end - ns_wall/1e9.
@@ -22185,7 +23311,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         "layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep "
         "ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit "
         "ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end "
-        "ns_params_set n_host_hit n_host_demote ns_host_get ns_demote ns_ensure_post "
+        "ns_params_set n_host_hit n_cpu_tier ns_cpu_tier_wait ns_cpu_tier_compute ns_ensure_post "
         "ns_final_sync";
     static const char * const k_req_log_header_dev =
         " n_experts_on_device n_pagein_on_device ns_prologue ns_prep ns_wait "
@@ -22251,10 +23377,13 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 (unsigned long long) s.n_weight_total, epoch_end,
                 (unsigned long long) s.ns_params_set,
                 (unsigned long long) s.n_host_hit,
-                // n_host_demote / ns_host_get / ns_demote: columns 25-27 kept
-                // at 0 so positions 1-40 are unchanged (no D2H demotion or
-                // host-tier restore exists since the HostArena migration).
-                0ULL, 0ULL, 0ULL,
+                // Columns 25-27: n_host_demote/ns_host_get/ns_demote were dead
+                // zeros since the HostArena migration; they now carry the CPU
+                // tier's per-request numbers (RequestStats is per request) so
+                // positions 1-40 stay put.
+                (unsigned long long) s.n_cpu_tier,
+                (unsigned long long) s.ns_cpu_tier_wait,
+                (unsigned long long) s.ns_cpu_tier_compute,
                 (unsigned long long) s.ns_ensure_post,
                 (unsigned long long) s.ns_final_sync);
         if (extra) {
