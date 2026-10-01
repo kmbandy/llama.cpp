@@ -1628,6 +1628,117 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// GGML_TYPE_ML8_4: same tile layout as MXFP4 (256 K-elements = 64 natural-order
+// int8 ints per row + 8 fp32 scales per 32 elements); the per-K-group codebook
+// comes in as int8 tables + fp32 scales (ml8_lut_q/ml8_lut_d), and each qs word's
+// (even, odd) table quads are re-interleaved to natural order with two byte perms.
+// kbx0 already carries the tile's row offset (a multiple of stride), so the
+// in-row block (= codebook group) index is (kbx0 + kbx) % stride.
+static __device__ __forceinline__ int2 ml8_4_even_odd_to_natural(const int2 v) {
+#if defined(GGML_USE_HIP)
+    return make_int2((int) __builtin_amdgcn_perm((uint32_t) v.y, (uint32_t) v.x, 0x05010400u),
+                     (int) __builtin_amdgcn_perm((uint32_t) v.y, (uint32_t) v.x, 0x07030602u));
+#else
+    return make_int2((int) __byte_perm(v.x, v.y, 0x5140), (int) __byte_perm(v.x, v.y, 0x7362));
+#endif
+}
+
+static __device__ __forceinline__ float ml8_4_e4m3_to_f32(const uint8_t b) {
+    const uint32_t s = b >> 7, e = (b >> 3) & 0xF, m = b & 0x7;
+    const float    v = e == 0 ? ldexpf((float) m, -9) : __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+
+// one codebook group (16 e4m3 centroids) -> int8 table against the group absmax; returns absmax/127
+static __device__ __forceinline__ float ml8_4_group_to_q8(const uint8_t * __restrict__ lut_g, int8_t * tbl) {
+    float v[16];
+    float amx = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        v[j] = ml8_4_e4m3_to_f32(lut_g[j]);
+        amx  = fmaxf(amx, fabsf(v[j]));
+    }
+    const float id = amx == 0.0f ? 0.0f : 127.0f / amx;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        tbl[j] = (int8_t) __float2int_rn(v[j] * id);
+    }
+    return amx / 127.0f;
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ml8_4(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+        const int8_t * __restrict__ lut_q, const float * __restrict__ lut_d) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int QI_ML8      = ggml_cuda_type_traits<GGML_TYPE_ML8_4>::qi;   // 8 qs ints per block
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_ML8_4, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * 2);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi  = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_ML8;
+    const int kqsx = txi % QI_ML8;
+
+    int8_t tbl[16];
+    *(int4 *) tbl = *(const int4 *) (lut_q + ((kbx0 + kbx) % stride) * 16);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_ml8_4 * bxi = (const block_ml8_4 *) x + kbx0 + i*stride + kbx;
+
+        const int2 v  = ml8_4_even_odd_to_natural(get_int_from_table_16(((const int *) bxi->qs)[kqsx], tbl));
+        const int  k0 = kbx * (2 * QI_ML8) + kqsx * 2;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*sram_stride + k0 + 0] = v.x;
+        x_qs[i*sram_stride + k0 + 1] = v.y;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 0] = v.x;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 1] = v.y;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)  || defined(AMD_WMMA_AVAILABLE)
+    }
+
+    // one scale per 32 elements, same slots as MXFP4 (QI_MXFP4 ints per 32 elements)
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_MXFP4;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+    const float gd = lut_d[(kbx0 + kbxd/2) % stride];
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_ml8_4 * bxi = (const block_ml8_4 *) x + kbx0 + i*stride + kbxd/2;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                           + kbxd] = bxi->scale * gd;
+#else
+        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = bxi->scale * gd;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_fp4(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

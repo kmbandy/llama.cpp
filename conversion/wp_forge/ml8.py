@@ -380,7 +380,8 @@ def _assign_ml8_indices_multi(w_rot_multi, centroids_multi, group_size: int = 64
 
 
 def quantize_experts_ml8_4(stack: np.ndarray, rotation, fit_rows: int,
-                           fast: bool = True, expert_chunk: int = 16) -> tuple[np.ndarray, np.ndarray]:
+                           fast: bool = True, expert_chunk: int = 16,
+                           n_centroids: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """stack: [n_expert, rows, K] f32, one role of a fused gather. Centroids
     are fit PER EXPERT (required even in the fused path -- two experts with
     very different scales must not share a LUT). Returns
@@ -394,13 +395,20 @@ def quantize_experts_ml8_4(stack: np.ndarray, rotation, fit_rows: int,
     memory to O(expert_chunk * rows * K) rather than O(n_expert * rows * K)
     while still cutting per-expert kernel-launch overhead by expert_chunk.
     `fast=False` falls back to the original per-expert Python loop (kept
-    reachable for equivalence tests)."""
+    reachable for equivalence tests).
+
+    `n_centroids` < 16 fits a smaller codebook (8 = ml8-3) and pads the LUT
+    to ML8_4's 16 slots by repeating the top centroid; indices only ever
+    reach the fitted slots, so the result is an exact ml8-3 stored as ML8_4.
+    Fast path only."""
     _ensure_paths()
     if stack.ndim != 3:
         raise Ml8Error(f"ml8_4: expected 3D (n_expert, rows, cols), got {stack.shape}")
     n_e = stack.shape[0]
 
     if not fast:
+        if n_centroids is not None:
+            raise Ml8Error("ml8_4: n_centroids needs the fast path")
         packed = []
         cents = []
         for e in range(n_e):
@@ -418,14 +426,20 @@ def quantize_experts_ml8_4(stack: np.ndarray, rotation, fit_rows: int,
     w = torch.from_numpy(np.ascontiguousarray(stack.reshape(n_e * rows, k), dtype=np.float32))
     w_rot = (rotation.forward(w) if rotation is not None else w).view(n_e, rows, k)
 
+    n_fit = N_CENTROIDS if n_centroids is None else n_centroids
+    if not 1 <= n_fit <= N_CENTROIDS:
+        raise Ml8Error(f"ml8_4: n_centroids {n_fit} outside [1, {N_CENTROIDS}]")
     packed = []
     cents = []
     for start in range(0, n_e, max(1, expert_chunk)):
         end = min(start + max(1, expert_chunk), n_e)
         chunk = w_rot[start:end].contiguous()
         n_chunk = end - start
-        centroids = _fit_centroids_multi(chunk, QK_ML8, N_CENTROIDS, fit_rows)
+        centroids = _fit_centroids_multi(chunk, QK_ML8, n_fit, fit_rows)
         indices, scale = _assign_ml8_indices_multi(chunk, centroids, group_size=QK_ML8)
+        if n_fit < N_CENTROIDS:
+            pad = centroids[..., -1:].expand(*centroids.shape[:-1], N_CENTROIDS - n_fit)
+            centroids = torch.cat([centroids, pad], dim=-1)
         flat_packed = pack_ml8_blocks(indices.reshape(n_chunk * rows, k),
                                        scale.reshape(n_chunk * rows, k // QK_ML8))
         packed.append(flat_packed.reshape(n_chunk, rows, flat_packed.shape[-1]))

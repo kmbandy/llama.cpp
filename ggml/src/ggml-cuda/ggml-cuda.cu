@@ -3676,6 +3676,49 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// GGML_OP_ML8_MUL_MAT on a device the gfx1201 ML8_4 GEMMs cannot serve (see
+// ggml_cuda_ml8_4_use_generic). Narrow activations go to the fused LUT kernel;
+// wide ones dequantize the weight to f16 in pool scratch and run the regular
+// mul_mat on it, writing straight into dst.
+static void ggml_cuda_ml8_mul_mat_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w    = dst->src[0];
+    const ggml_tensor * cent = dst->src[1];
+    const ggml_tensor * x    = dst->src[2];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        "generic ML8_4 mul_mat takes F32 activations and writes F32");
+
+    // decode / verify widths: fused LUT kernel, weight read once
+    if (ggml_cuda_ml8_4_gemv_generic(ctx, dst)) {
+        return;
+    }
+    // wide (prefill) batches: one dequant pass amortized over the GEMM
+
+    ggml_cuda_pool_alloc<half> w_f16_buf(ctx.pool(), ggml_nelements(w));
+    ggml_cuda_ml8_4_dequant_f16(ctx, w, cent, ggml_get_op_params_i32(dst, 0), w_f16_buf.get());
+
+    ggml_tensor w_f16 = *w;
+    w_f16.type  = GGML_TYPE_F16;
+    w_f16.data  = w_f16_buf.get();
+    w_f16.nb[0] = sizeof(half);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        w_f16.nb[d] = w_f16.nb[d - 1] * w_f16.ne[d - 1];
+    }
+    w_f16.view_src = nullptr;
+    w_f16.extra    = nullptr;
+
+    // plain MUL_MAT view of dst: ML8's op_params[0] is the LUT group offset,
+    // which ggml_cuda_mul_mat would read as a hint.
+    ggml_tensor dst_mm = *dst;
+    dst_mm.op = GGML_OP_MUL_MAT;
+    memset(dst_mm.op_params, 0, sizeof(dst_mm.op_params));
+    dst_mm.src[0] = &w_f16;
+    dst_mm.src[1] = const_cast<ggml_tensor *>(x);
+    for (int k = 2; k < GGML_MAX_SRC; ++k) {
+        dst_mm.src[k] = nullptr;
+    }
+    ggml_cuda_mul_mat(ctx, &w_f16, x, &dst_mm);
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -4137,7 +4180,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
         case GGML_OP_ML8_MUL_MAT:
-            ggml_cuda_op_ml8_mul_mat(ctx, dst);
+            if (ggml_cuda_ml8_4_use_generic(ctx.device)) {
+                ggml_cuda_ml8_mul_mat_generic(ctx, dst);
+            } else {
+                ggml_cuda_op_ml8_mul_mat(ctx, dst);
+            }
             break;
         case GGML_OP_ML8_APPLY_ROTATION:
             ggml_cuda_op_ml8_apply_rotation(ctx, dst);
@@ -8796,7 +8843,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (const int grp_skip = ggml_cuda_try_ml8_group_fuse(cuda_ctx, cgraph, i)) {
+    // the ML8 fusions all end in gfx1201-only kernels
+    const bool ml8_rdna4 = !ggml_cuda_ml8_4_use_generic(cuda_ctx->device);
+
+    if (const int grp_skip = ml8_rdna4 ? ggml_cuda_try_ml8_group_fuse(cuda_ctx, cgraph, i) : 0) {
         return grp_skip;
     }
 
@@ -8833,7 +8883,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // loop's own call to this function, and skips its normal dispatch that
     // way. The deferred kernel itself runs later, at the qrot's own normal
     // turn -- see the GGML_OP_FP8_QUANT_ROT branch below.
-    if (ml8_4_radiance_fuse_enabled() && ml8_4_prefill_radiance_active()) {
+    if (ml8_rdna4 && ml8_4_radiance_fuse_enabled() && ml8_4_prefill_radiance_active()) {
         // Any node's own normal turn where a deferred COPY plan was
         // registered for IT specifically (by pattern A/C's own detection,
         // at the chain's head) -- the qrot's own copy (A_tiled+a_scale,
@@ -11616,6 +11666,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (cent->type != GGML_TYPE_F8_E4M3)  return false;
                 if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_I8) return false;
                 if (x->type == GGML_TYPE_I8 && x->ne[0] != w->ne[0] + 4) return false;
+                // generic (non-RDNA4) path: F32 activations, F32 output only
+                if (ggml_cuda_ml8_4_use_generic(dev_ctx->device) &&
+                    (x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)) return false;
                 // LLAMA_ACT_BF16 (2026-09-18 phase 2): bf16 dst is only wired
                 // for the ML8_4 RDNA4_TRFEED prefill tile (M>32); see
                 // ggml_cuda_ml8_4_mul_mat_supports_bf16_out (ml8.cu) — the

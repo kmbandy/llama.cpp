@@ -19,3 +19,12 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// GGML_TYPE_ML8_4 weights through mmvq (decode widths, ncols_dst <= MMVQ_MAX_BATCH_SIZE).
+// vy: q8_1 blocks with each 8-chunk stored even-elements-first; lut_q/lut_d: the
+// weight's per-K-group codebook as int8 [ncols_x/64][16] + fp32 scale.
+// Strides: row in ML8_4 blocks, y column in q8_1 blocks, dst column in floats.
+void ggml_cuda_ml8_4_mul_mat_vec_q(
+        const void * vx, const int8_t * lut_q, const float * lut_d, const void * vy, float * dst,
+        int ncols_x, int nrows_x, int ncols_dst,
+        int stride_row_x, int stride_col_y, int stride_col_dst, cudaStream_t stream);

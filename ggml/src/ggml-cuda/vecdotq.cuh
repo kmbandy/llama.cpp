@@ -328,6 +328,33 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     return d * sumi;
 }
 
+// ML8_4: y is q8_1 with every 8-chunk stored even-elements-first
+// ([x0 x2 x4 x6 | x1 x3 x5 x7]) to match ML8_4's lo/hi nibble interleave, so
+// get_int_from_table_16's (even, odd) quads dot straight against it.
+#define VDR_ML8_4_Q8_1_MMVQ 2
+
+static __device__ __forceinline__ float vec_dot_ml8_4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const int8_t * __restrict__ table, const float lut_d) {
+
+    const block_ml8_4 * blk = (const block_ml8_4 *) vbq + kbx;
+    const block_q8_1  * by  = bq8_1 + (iqs >> 2);            // 4 qs ints (32 weights) per q8_1 block
+    const int         * q8  = (const int *) by->qs + (iqs & 3) * 2;
+    const int         * qs  = (const int *) blk->qs + iqs;
+
+    int8_t tbl[16];
+    *(int4 *) tbl = *(const int4 *) table;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_ML8_4_Q8_1_MMVQ; ++l) {
+        const int2 v = get_int_from_table_16(qs[l], tbl);
+        sumi = ggml_cuda_dp4a(v.x, q8[2*l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[2*l + 1], sumi);
+    }
+    return blk->scale * lut_d * __low2float(by->ds) * sumi;
+}
+
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 

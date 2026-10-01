@@ -223,6 +223,25 @@ void ggml_cuda_op_ml8_mul_mat(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);
 
+// Generic ML8_4 path for devices the gfx1201 GEMMs cannot serve (any non-RDNA4
+// arch, or a build without GGML_HIP_AITER; MT_ML8_4_GENERIC=1 forces it on
+// RDNA4 for A/B). ggml_cuda_ml8_4_dequant_f16 writes the weight as f16
+// [ne1, ne0] row-major into y (ggml_nelements(w) halfs); ggml-cuda.cu then runs
+// its regular f16 mul_mat on that. Activations must be F32 (the pre-quantized
+// I8 variant only comes from RDNA4 graph fusion).
+bool ggml_cuda_ml8_4_use_generic(int device);
+// ML8_4 on the generic path through MXFP4's mmvq (<= MMVQ_MAX_BATCH_SIZE columns)
+// or mmq (wider). Returns false when the shape is outside that contract (batched
+// ne2, non-F32 activations/output, unaligned activations, ...) and the caller
+// falls back to dequant-to-f16 + regular mul_mat.
+bool ggml_cuda_ml8_4_gemv_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_ml8_4_dequant_f16(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         w,
+    const ggml_tensor *         cent,
+    int32_t                     lut_group_off,
+    half *                      y);
+
 // LLAMA_ACT_BF16 (2026-09-18 phase 2): true iff ggml_cuda_op_ml8_mul_mat can
 // write a GGML_TYPE_BF16 dst directly for a weight with this N (output
 // feature count) and this many valid rows M — i.e. the ML8_4 RDNA4_TRFEED

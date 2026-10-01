@@ -652,3 +652,88 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
+
+// mmq's q8_1 D4 activation layout (same as quantize_mmq_q8_1 for MXFP4), plus one
+// extra grid column (blockIdx.x == ne1) that turns the e4m3 codebook into int8
+// tables, so ML8_4 wide batches take exactly MXFP4's two launches.
+static __global__ void ml8_4_quantize_mmq_q8_1_d4(
+        const float * __restrict__ x, void * __restrict__ vy, const int64_t ne00, const int64_t s01,
+        const int64_t ne0, const int ne1,
+        const uint8_t * __restrict__ lut, int8_t * __restrict__ lut_q, float * __restrict__ lut_d, const int n_groups) {
+    if ((int) blockIdx.x == ne1) {
+        const int g = blockIdx.y*blockDim.x + threadIdx.x;
+        if (g < n_groups) {
+            int8_t t[16];
+            lut_d[g] = ml8_4_group_to_q8(lut + (int64_t) g*16, t);
+            *(int4 *) (lut_q + (int64_t) g*16) = *(const int4 *) t;
+        }
+        return;
+    }
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+    if (i0 >= ne0) {
+        return;
+    }
+    const float4 * x4 = (const float4 *) x;
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+    const int64_t k_block = i0 / QK8_1_MMQ;
+    const int64_t iqs     = i0 % QK8_1_MMQ;
+
+    const float4 xi = i0 < ne00 ? x4[(blockIdx.x*s01 + i0)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = 32/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+
+    const int64_t ib = k_block*ne1 + blockIdx.x;
+    ((char4 *) y[ib].qs)[iqs/4] = q;
+    if (iqs % 32 == 0) {
+        y[ib].d4[iqs/32] = 1.0f / d_inv;
+    }
+}
+
+void ggml_cuda_ml8_4_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const void * vx, const uint8_t * lut,
+        const float * x, const int64_t x_stride, float * dst, const int64_t dst_stride,
+        const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_y) {
+    cudaStream_t stream = ctx.stream();
+    const int    cc     = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool   fallback = nrows_x % 128 != 0;
+    const int    n_groups = (int) (ncols_x / QK_ML8);
+
+    const int64_t ne10_padded = GGML_PAD(ncols_x, MATRIX_ROW_PADDING);
+    const size_t  nbytes_y    = ncols_y*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+        ggml_cuda_mmq_get_J_max(GGML_TYPE_ML8_4, fallback, cc, ncols_y) * sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char>   y_q8_1(ctx.pool(), nbytes_y);
+    ggml_cuda_pool_alloc<int8_t> lut_q(ctx.pool(), (size_t) n_groups * 16);
+    ggml_cuda_pool_alloc<float>  lut_d(ctx.pool(), (size_t) n_groups);
+    {
+        const int64_t block_num_y = (ne10_padded + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+        const dim3 num_blocks((unsigned) (ncols_y + 1), (unsigned) block_num_y, 1);
+        ml8_4_quantize_mmq_q8_1_d4<<<num_blocks, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, stream>>>(
+            x, y_q8_1.get(), ncols_x, x_stride, ne10_padded, (int) ncols_y, lut, lut_q.get(), lut_d.get(), n_groups);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t s12 = ncols_y * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    mmq_args args = {
+        (const char *) vx, GGML_TYPE_ML8_4, (const int *) y_q8_1.ptr, nullptr, nullptr, dst, nullptr,
+        ncols_x, nrows_x, ncols_y, ncols_x / QK_ML8, ncols_y, dst_stride,
+        1, 1, 0, s12, 0,
+        1, 1, 0, s12, 0,
+        ncols_y, ncols_y};
+    args.ml8_lut_q = lut_q.get();
+    args.ml8_lut_d = lut_d.get();
+    mul_mat_q_case<GGML_TYPE_ML8_4>(ctx, args, stream);
+}
