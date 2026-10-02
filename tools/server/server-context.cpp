@@ -6101,7 +6101,17 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // WP_PREFILL_NO_USER_CHECKPOINT=1 (MAD-LAB): skip these breaks. On a
+                        // sweep-bound expert-dispatch model every batch streams nearly all
+                        // experts of its layers, so the break turns the previous assistant
+                        // turn into its own ~10 s pass (DS4.1 agent turns, 2026-10-01). The
+                        // continuation reuse comes from the {4}-before-end checkpoint below;
+                        // only editing/regenerating the last user message loses its restore point.
+                        static const bool wp_no_user_checkpoint = [] {
+                            const char * env = std::getenv("WP_PREFILL_NO_USER_CHECKPOINT");
+                            return env != nullptr && env[0] == '1';
+                        }();
+                        if (do_checkpoint && !wp_no_user_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
