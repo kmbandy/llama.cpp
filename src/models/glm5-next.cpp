@@ -358,14 +358,7 @@ static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t n
     return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
 }
 
-static ggml_tensor * dsv4_view_2d(
-        ggml_context * ctx,
-        ggml_tensor  * t,
-        int64_t        ne0,
-        int64_t        ne1,
-        int64_t        i0) {
-    return ggml_view_2d(ctx, t, ne0, ne1, t->nb[1], dsv4_elem_offset(t, i0));
-}
+// fork: dsv4_view_2d is shared from deepseek4.cpp (declared in models.h)
 
 ggml_tensor * llama_model_glm5_next::graph::build_hc_mean(ggml_tensor * x) const {
     const int64_t hc = x->ne[1];
