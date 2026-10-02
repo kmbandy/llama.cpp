@@ -862,6 +862,17 @@ static bool wp_sched_pinned_d2h_enabled(void) {
     return on != 0;
 }
 
+// WP_SCHED_ASYNC_H2D (default OFF, 1 enables): host-resident split outputs
+// (CPU split -> next GPU split) go H2D with cudaMemcpyAsync on the consumer's
+// stream from a pinned staging arena instead of the blocking set_tensor path.
+static bool wp_sched_async_h2d_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SCHED_ASYNC_H2D");
+        return (e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
+}
+
 static uint64_t wp_sched_split_stats_every(void) {
     static const uint64_t every = []() {
         const char * e = getenv("WP_SPLIT_STATS_EVERY");
@@ -892,6 +903,7 @@ struct wp_sched_split_stats {
     uint64_t n_copy_pageable_d2h;
     uint64_t ns_copy_pageable_d2h;
     uint64_t n_syncs_elided;
+    uint64_t n_copy_async_h2d;
     uint64_t n_graph_entries;
     uint64_t ns_graph_entry_total;
 };
@@ -911,6 +923,7 @@ struct wp_sched_split_stats_totals {
     std::atomic<uint64_t> n_copy_pageable_d2h{0};
     std::atomic<uint64_t> ns_copy_pageable_d2h{0};
     std::atomic<uint64_t> n_syncs_elided{0};
+    std::atomic<uint64_t> n_copy_async_h2d{0};
     std::atomic<uint64_t> n_graph_entries{0};
     std::atomic<uint64_t> ns_graph_entry_total{0};
 };
@@ -972,7 +985,7 @@ static void wp_sched_split_stats_print(void) {
     fprintf(stderr, "wp split-stats: forwards=%llu splits=%llu switches=%llu sync_calls=%llu ns_sync_total=%llu "
             "event_waits=%llu ns_event_wait_total=%llu copy_tensors=%llu ns_copy_total=%llu "
             "copy_pinned_d2h=%llu ns_copy_pinned_d2h=%llu copy_pageable_d2h=%llu ns_copy_pageable_d2h=%llu syncs_elided=%llu "
-            "graph_entries=%llu ns_graph_entry_total=%llu interval(forwards=%llu splits=%llu switches=%llu "
+            "async_h2d=%llu graph_entries=%llu ns_graph_entry_total=%llu interval(forwards=%llu splits=%llu switches=%llu "
             "sync_calls=%llu ns_sync_total=%llu event_waits=%llu ns_event_wait_total=%llu "
             "copy_tensors=%llu ns_copy_total=%llu copy_pinned_d2h=%llu ns_copy_pinned_d2h=%llu "
             "copy_pageable_d2h=%llu ns_copy_pageable_d2h=%llu syncs_elided=%llu graph_entries=%llu ns_graph_entry_total=%llu)\n",
@@ -983,6 +996,7 @@ static void wp_sched_split_stats_print(void) {
             (unsigned long long) ns_copy_total, (unsigned long long) n_copy_pinned_d2h,
             (unsigned long long) ns_copy_pinned_d2h, (unsigned long long) n_copy_pageable_d2h,
             (unsigned long long) ns_copy_pageable_d2h, (unsigned long long) n_syncs_elided,
+            (unsigned long long) g_wp_sched_split_stats.n_copy_async_h2d.load(std::memory_order_relaxed),
             (unsigned long long) n_graph_entries,
             (unsigned long long) ns_graph_entry_total,
             (unsigned long long) interval_n_forwards, (unsigned long long) interval_n_splits,
@@ -1010,6 +1024,7 @@ static void wp_sched_split_stats_add(const wp_sched_split_stats & stats) {
     g_wp_sched_split_stats.n_copy_pageable_d2h.fetch_add(stats.n_copy_pageable_d2h, std::memory_order_relaxed);
     g_wp_sched_split_stats.ns_copy_pageable_d2h.fetch_add(stats.ns_copy_pageable_d2h, std::memory_order_relaxed);
     g_wp_sched_split_stats.n_syncs_elided.fetch_add(stats.n_syncs_elided, std::memory_order_relaxed);
+    g_wp_sched_split_stats.n_copy_async_h2d.fetch_add(stats.n_copy_async_h2d, std::memory_order_relaxed);
     g_wp_sched_split_stats.n_graph_entries.fetch_add(stats.n_graph_entries, std::memory_order_relaxed);
     g_wp_sched_split_stats.ns_graph_entry_total.fetch_add(stats.ns_graph_entry_total, std::memory_order_relaxed);
 
@@ -1043,6 +1058,19 @@ static bool wp_sched_copy_to_pinned_host_async(
         const struct ggml_tensor * dst) {
     return wp_sched_pinned_d2h_enabled() && producer->iface.get_tensor_async != NULL &&
            wp_sched_copy_uses_pinned_host(producer, src, dst);
+}
+
+// WP_SCHED_SINGLE_D2H_SYNC (default ON, 0 disables): queue every pinned D2H
+// input copy of a split asynchronously and do ONE compute-stream sync per
+// producer backend before the CPU consumer split runs, instead of one
+// cudaStreamSynchronize per input (router x/ids/weights each paid a full host
+// round trip, ~3 per MoE layer).
+static bool wp_sched_single_d2h_sync_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("WP_SCHED_SINGLE_D2H_SYNC");
+        return (e == nullptr || e[0] == '\0' || strcmp(e, "0") != 0) ? 1 : 0;
+    }();
+    return on != 0;
 }
 
 // Root parent + absolute byte offset for a (possibly multi-level) view.
@@ -1122,6 +1150,14 @@ struct ggml_backend_sched {
     // ggml_backend_sched_compute_runner::stage_user_input). n_copies > 1 only.
     ggml_backend_buffer_t input_staging[GGML_SCHED_MAX_COPIES];
     size_t                input_staging_size[GGML_SCHED_MAX_COPIES];
+
+    // Pinned host arena for async H2D of CPU-split outputs (WP_SCHED_ASYNC_H2D),
+    // one per backend. Slices are bump-allocated per compute and never reused
+    // within a compute; reuse across computes is gated by wp_h2d_dirty (a
+    // compute-stream sync before the first overwrite). See wp_sched_async_h2d.
+    ggml_backend_buffer_t wp_h2d_arena[GGML_SCHED_MAX_BACKENDS];
+    size_t                wp_h2d_arena_size[GGML_SCHED_MAX_BACKENDS];
+    bool                  wp_h2d_dirty[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2041,6 +2077,76 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Async H2D for a host-resident split input (e.g. the CPU expert-sum / `issued`
+// outputs consumed by the next GPU split), n_copies == 1 only.
+//
+// The data is memcpy'd into a pinned arena slice and enqueued with
+// set_tensor_async on the consumer's own compute stream, so it is
+// stream-ordered after the work already queued there and before the split's
+// kernels, instead of the blocking null-stream cudaMemcpy of
+// buffer set_tensor (device-wide drain on ROCm).
+//
+// Lifetime of the slice: slices are bump-allocated from *off, which restarts at
+// 0 every compute, so a slice is never rewritten within one compute. Across
+// computes the first stage of a compute (*off == 0) calls drain() (a compute
+// stream sync) if any slice was enqueued since the last drain, so the host
+// never overwrites a slice whose DMA could still be pending. Source memory
+// (the CPU tensor) is fully consumed by the memcpy before return.
+// Returns false (caller falls back to the blocking copy) when not applicable.
+template<typename DrainFn>
+static bool wp_sched_async_h2d(
+        ggml_backend_sched_t sched, int split_backend_id,
+        const struct ggml_tensor * input, struct ggml_tensor * input_cpy,
+        size_t * off, DrainFn && drain) {
+    if (!wp_sched_async_h2d_enabled() || sched->n_copies > 1) {
+        return false;
+    }
+    ggml_backend_t split_backend = sched->backends[split_backend_id];
+    if (split_backend->iface.set_tensor_async == NULL ||
+        ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    if (input->data == NULL || input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer) ||
+        !ggml_is_contiguous(input) || input_cpy->buffer == NULL) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(input);
+    const size_t max_arena = 16u * 1024 * 1024;
+    if (nbytes == 0 || nbytes > max_arena / 4) {
+        return false;
+    }
+    const size_t align = 256;
+    const size_t start = (*off + align - 1) / align * align;
+    if (start + nbytes > max_arena) {
+        return false;
+    }
+    ggml_backend_buffer_t & arena = sched->wp_h2d_arena[split_backend_id];
+    if (arena == NULL) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(split_backend->device);
+        if (host_buft == NULL) {
+            return false;
+        }
+        arena = ggml_backend_buft_alloc_buffer(host_buft, max_arena);
+        if (arena == NULL) {
+            return false;
+        }
+        sched->wp_h2d_arena_size[split_backend_id] = ggml_backend_buffer_get_size(arena);
+    }
+    if (start + nbytes > sched->wp_h2d_arena_size[split_backend_id]) {
+        return false;
+    }
+    if (*off == 0 && sched->wp_h2d_dirty[split_backend_id]) {
+        drain();
+        sched->wp_h2d_dirty[split_backend_id] = false;
+    }
+    char * stage = (char *) ggml_backend_buffer_get_base(arena) + start;
+    memcpy(stage, input->data, nbytes);
+    ggml_backend_tensor_set_async(split_backend, input_cpy, stage, 0, nbytes);
+    sched->wp_h2d_dirty[split_backend_id] = true;
+    *off = start + nbytes;
+    return true;
+}
+
 template<bool collect_split_stats>
 struct ggml_backend_sched_compute_runner {
     ggml_backend_sched_t sched;
@@ -2068,6 +2174,7 @@ struct ggml_backend_sched_compute_runner {
     // stream, so it queues behind the in-flight graphs instead of draining
     // them. WP_SCHED_SYNC_INPUTS=1 restores the synchronous copy for A/B.
     size_t staging_used = 0;
+    size_t h2d_off = 0; // wp_sched_async_h2d arena cursor, restarts per compute (runner is per compute)
 
     bool stage_user_input(int split_backend_id, const struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
         static const bool disabled = getenv("WP_SCHED_SYNC_INPUTS") != NULL;
@@ -2168,6 +2275,7 @@ struct ggml_backend_sched_compute_runner {
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         bool split_backend_ready_for_input_copies = false;
+        std::vector<ggml_backend_t> pending_d2h_sync;
 
         if constexpr (collect_split_stats) {
             if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -2360,9 +2468,27 @@ struct ggml_backend_sched_compute_runner {
                     }
                     if (wp_sched_copy_to_pinned_host_async(input_backend, input, input_cpy)) {
                         ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
-                        synchronize_compute_stream(input_backend);
+                        if (wp_sched_single_d2h_sync_enabled()) {
+                            // deferred: one sync after the input loop (consumer is a
+                            // CPU split that only runs after prepare returns)
+                            if (std::find(pending_d2h_sync.begin(), pending_d2h_sync.end(), input_backend) == pending_d2h_sync.end()) {
+                                pending_d2h_sync.push_back(input_backend);
+                            }
+                        } else {
+                            synchronize_compute_stream(input_backend);
+                        }
                         copy_pinned_d2h = true;
                         if constexpr (collect_split_stats) {
+                            ++split_stats.n_syncs_elided;
+                        }
+                    } else if (wp_sched_async_h2d_enabled() && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+                               (synchronize_backend(input_backend),
+                                wp_sched_async_h2d(sched, split_backend_id, input, input_cpy, &h2d_off,
+                                                   [&] { synchronize_compute_stream(split_backend); }))) {
+                        // CPU-split output -> GPU split: pinned staging + async H2D on
+                        // the consumer's stream (see wp_sched_async_h2d)
+                        if constexpr (collect_split_stats) {
+                            ++split_stats.n_copy_async_h2d;
                             ++split_stats.n_syncs_elided;
                         }
                     } else if (input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
@@ -2413,6 +2539,11 @@ struct ggml_backend_sched_compute_runner {
                 }
             }
         }
+
+        for (ggml_backend_t pending : pending_d2h_sync) {
+            synchronize_compute_stream(pending);
+        }
+        pending_d2h_sync.clear();
 
         if (tp_phase_dbg && ggml_time_us() - dbg_t0 > 30000) {
             fprintf(stderr, "TPPHASE prepare split=%d backend=%s total_us=%lld inputs:%s\n", split_id, ggml_backend_name(split_backend),
@@ -2578,6 +2709,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
     int prev_backend_id = -1;
     int unsynced_backend_id = -1;
+    size_t h2d_off = 0; // wp_sched_async_h2d arena cursor, restarts per compute
 
     auto sync_backend = [&](int backend_id) {
         if (backend_id < 0) {
@@ -2629,6 +2761,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         bool split_backend_ready_for_input_copies = false;
+        std::vector<ggml_backend_t> pending_d2h_sync;
 
         if constexpr (collect_split_stats) {
             if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -2807,9 +2940,27 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     }
                     if (wp_sched_copy_to_pinned_host_async(input_backend, input, input_cpy)) {
                         ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
-                        synchronize_compute_stream(input_backend);
+                        if (wp_sched_single_d2h_sync_enabled()) {
+                            // deferred: one sync after the input loop (consumer is a
+                            // CPU split that only runs after prepare returns)
+                            if (std::find(pending_d2h_sync.begin(), pending_d2h_sync.end(), input_backend) == pending_d2h_sync.end()) {
+                                pending_d2h_sync.push_back(input_backend);
+                            }
+                        } else {
+                            synchronize_compute_stream(input_backend);
+                        }
                         copy_pinned_d2h = true;
                         if constexpr (collect_split_stats) {
+                            ++split_stats.n_syncs_elided;
+                        }
+                    } else if (wp_sched_async_h2d_enabled() && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+                               (synchronize_backend(input_backend),
+                                wp_sched_async_h2d(sched, split_backend_id, input, input_cpy, &h2d_off,
+                                                   [&] { synchronize_compute_stream(split_backend); }))) {
+                        // CPU-split output -> GPU split: pinned staging + async H2D on
+                        // the consumer's stream (see wp_sched_async_h2d)
+                        if constexpr (collect_split_stats) {
+                            ++split_stats.n_copy_async_h2d;
                             ++split_stats.n_syncs_elided;
                         }
                     } else if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -2854,6 +3005,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 }
             }
         }
+
+        for (ggml_backend_t pending : pending_d2h_sync) {
+            synchronize_compute_stream(pending);
+        }
+        pending_d2h_sync.clear();
 
         // Complete deferred HIP multi-input stages after all split inputs are
         // queued and BEFORE eval_cb / graph_compute (WP ensure must see staged
@@ -3060,6 +3216,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
         if (sched->input_staging[c] != NULL) {
             ggml_backend_buffer_free(sched->input_staging[c]);
+        }
+    }
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        if (sched->wp_h2d_arena[b] != NULL) {
+            ggml_backend_buffer_free(sched->wp_h2d_arena[b]);
         }
     }
     ggml_gallocr_free(sched->galloc);
