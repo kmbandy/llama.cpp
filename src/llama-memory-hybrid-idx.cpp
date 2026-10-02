@@ -80,7 +80,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, idx_type_k, idx_type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, /* filter_authoritative */ false, "idx_");
-    }()) {}
+    }()) {
+    full_ctx_idx = model.arch != LLM_ARCH_QWEN4EXP;
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -539,9 +541,31 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_st
 // This is a deliberate trade: the 1809 MiB reserve is the worst case for a full 512-token prefill
 // ubatch, which this workload does not hit. If one ever does, the growth can fail where the
 // reserve would have failed at load instead. Revisit if the spine gets a card to itself.
+//
+// Scoped to qwen4exp (get_full_ctx_idx): upstream's GLM5-Next graph requires the indexer context
+// to build at all, so every other arch gets upstream's full context, k-pool state included.
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
     llama_memory_hybrid_context(mem),
-    mem(mem) {}
+    mem(mem),
+    // graph reservation walks a full context, and the sparse attention is built only when this is set
+    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
+    ns_ubatch(mem->get_mem_idx() == nullptr || !mem->get_full_ctx_idx() ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    ctx_idx(mem->get_mem_idx() == nullptr || !mem->get_full_ctx_idx() ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx())) {
+    if (kpool_track()) {
+        mem->kpool_layout_update();
+        auto st = kpool_build_sizes();
+        const auto * idx = mem->get_mem_idx();
+        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
+        st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_new   = st.n_pool_real;
+        st.n_new_g = std::max(st.n_new, 1u);
+        kpool_st = std::make_unique<kpool_state>(std::move(st));
+        i_kpool  = 0;
+    }
+}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,

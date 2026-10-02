@@ -1369,7 +1369,9 @@ void ggml_compute_forward_mul_mat(
     }
 
     // If tiled is supported, it will execute the full op here and we return
-    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
+    // fork: not for a pinned op -- tiled is picked by batch width, which would break the
+    // width-independent result the pin promises (same rule as llamafile_sgemm below)
+    if (hint != GGML_HINT_MUL_MAT_PIN && ggml_compute_forward_mul_mat_tiled(params, dst)) {
         return;
     }
 
@@ -1875,8 +1877,9 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         // tiled takes over if profitable for this expert (see tiled.h), but never when the
-        // expert worker supplies its own per-expert base pointers (WP gather / BATCH_MMID arena)
-        if (expert_ptrs == NULL &&
+        // expert worker supplies its own per-expert base pointers (WP gather / BATCH_MMID arena),
+        // nor for a pinned op (tiled is picked by width)
+        if (expert_ptrs == NULL && ggml_get_op_params_i32(dst, 1) != GGML_HINT_MUL_MAT_PIN &&
             ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }

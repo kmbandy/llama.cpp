@@ -89,6 +89,10 @@ public:
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
+    // fork: whether the full memory context (graph reservation) carries the indexer context.
+    // false for qwen4exp only, see the full-context ctor in the .cpp
+    bool get_full_ctx_idx() const { return full_ctx_idx; }
+
     // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
     bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
 
@@ -125,6 +129,8 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    bool full_ctx_idx = true;
 
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
@@ -222,7 +228,7 @@ private:
     // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
     const slot_info_vec_t sinfos_kpool;
 
-    // null unless the model has an indexer; also null for the full context (deliberate, see the .cpp)
+    // null unless the model has an indexer; also null for the qwen4exp full context (deliberate, see the .cpp)
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
