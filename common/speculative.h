@@ -89,6 +89,10 @@ void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// fork: the speculative implementations still consume llama_batch; this overload lets upstream's
+// common_batch callers through by flattening the batch
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+
 // MAD-LAB: prefill-sync pipelining (see draft-sync-cost-0912.txt). Resolves
 // whatever a prior common_speculative_process() call deferred (currently
 // only draft-mtp's single-head path defers anything; every other

@@ -4919,6 +4919,50 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+    const int32_t n = batch.size();
+    if (n == 0) {
+        return common_speculative_process(spec, llama_batch {});
+    }
+
+    const bool   has_token = batch.has_token();
+    const bool   has_embd  = batch.has_embd();
+    const size_t n_embd    = has_embd ? batch.tokens[0].embd.n_rows * batch.tokens[0].embd.n_embd : 0;
+
+    std::vector<llama_token>               token(n);
+    std::vector<float>                     embd(n_embd * n);
+    std::vector<llama_pos>                 pos(n);
+    std::vector<int32_t>                   n_seq_id(n);
+    std::vector<std::vector<llama_seq_id>> seq_ids(n);
+    std::vector<llama_seq_id *>            seq_id(n);
+    std::vector<int8_t>                    logits(n);
+
+    for (int32_t i = 0; i < n; ++i) {
+        const auto & t = batch.tokens[i];
+        token[i] = t.id;
+        pos[i]   = t.pos[0];
+        if (has_embd) {
+            std::memcpy(embd.data() + (size_t) i * n_embd, t.embd.data, n_embd * sizeof(float));
+        }
+        seq_ids[i].push_back(t.seq_id);
+        seq_ids[i].insert(seq_ids[i].end(), t.seq_ids_extra.begin(), t.seq_ids_extra.end());
+        n_seq_id[i] = (int32_t) seq_ids[i].size();
+        seq_id[i]   = seq_ids[i].data();
+        logits[i]   = t.output;
+    }
+
+    llama_batch b = {};
+    b.n_tokens = n;
+    b.token    = has_token ? token.data() : nullptr;
+    b.embd     = has_embd  ? embd.data()  : nullptr;
+    b.pos      = pos.data();
+    b.n_seq_id = n_seq_id.data();
+    b.seq_id   = seq_id.data();
+    b.logits   = logits.data();
+
+    return common_speculative_process(spec, b);
+}
+
 bool common_speculative_flush_prefill(common_speculative * spec) {
     bool result = true;
 
