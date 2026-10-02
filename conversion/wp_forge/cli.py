@@ -59,7 +59,54 @@ def _dry_run_json(rplan) -> dict:
     }
 
 
+def _run_convert(args) -> int:
+    from . import convert as convert_mod
+    from .sink import sink_for
+
+    plan = plan_mod.load_convert_plan(args.plan)
+    machines = machines_mod.load_machines(args.machines or plan.machines_path)
+    rc, rules, ml8 = plan_mod.resolve_convert(plan, machines)
+    workdir = Path(args.workdir)
+    emit = lambda e: print(json.dumps(e), flush=True)  # noqa: E731
+    local_out = Path(rc.out_path) if rc.machine.is_local else workdir / f"{plan.name}.gguf"
+    kw = dict(cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+              workers=args.workers if args.workers > 1 else None, converter=plan.converter)
+
+    est = convert_mod.convert(plan.source, local_out, rules, ml8, dry_run=True, events=emit, **kw)
+    if args.dry_run:
+        print(json.dumps({**est.summary(), "out": rc.out_path,
+                          "tensors": [asdict(d) for d in est.decisions]}, indent=2))
+        return 0
+    need = int(est.bytes * 1.05)
+    short = []
+    if machines_mod.free_bytes(rc.machine, rc.out_path.rsplit("/", 1)[0]) < need:
+        short.append(f"{rc.machine.name}:{rc.out_path} needs {need} bytes")
+    if not rc.machine.is_local and shutil.disk_usage(workdir).free < need:
+        short.append(f"workdir {workdir} needs {need} bytes")
+    if short:
+        raise job_mod.PreflightError("; ".join(short))
+    _log(f"wp-forge: convert {plan.source} -> {rc.machine.name}:{rc.out_path} (~{est.bytes / 1e9:.2f} GB)")
+    res = convert_mod.convert(plan.source, local_out, rules, ml8, events=emit,
+                              stamp={"plan": plan.name, "commit": _commit()}, **kw)
+    if not rc.machine.is_local:
+        sink = sink_for(rc.machine, rc.out_path.rsplit("/", 1)[0])
+        sink.mkdir()
+        sink.put_file(local_out, rc.out_path.rsplit("/", 1)[1])
+        local_out.unlink()
+    emit({"kind": "stage_done", "stage": "convert", **res.summary(), "out": rc.out_path})
+    return 0
+
+
+def _commit() -> str:
+    import subprocess
+    r = subprocess.run(["git", "-C", str(Path(__file__).parent), "rev-parse", "--short", "HEAD"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
 def _run(args) -> int:
+    if plan_mod.is_convert_plan(args.plan):
+        return _run_convert(args)
     plan = plan_mod.load_plan(args.plan)
     machines = machines_mod.load_machines(args.machines)
     workdir = Path(args.workdir)

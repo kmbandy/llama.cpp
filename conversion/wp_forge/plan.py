@@ -400,3 +400,100 @@ def resolve(plan: Plan, hparams: dict, machines: dict[str, Machine], *, source_i
     sc_dir = _dest_dir(scm, plan.sidecars.path, plan.name, None)
     sidecar_paths = {cls: f"{sc_dir}/{plan.name}-{cls}.gguf" for cls in arch.sidecars}
     return ResolvedPlan(plan, arch, hparams, machines, spine_path, sidecar_paths, sets, bundle_dir)
+
+
+# --- convert mode: any model -> one GGUF (convert.py) ---
+#
+# A plan with no `experts:` block is a convert plan:
+#   name: clef-ml8-4
+#   source: hf:Cloudflare/clef        # or dir:<path> / gguf:<path>
+#   output: {machine: mad-lab-main, path: /mnt/nvme/models}   # file: <path>/<name>.gguf
+#   quant: {default: ml8_4, rules: [{match: ..., type: ...}], imatrix: ...}
+#   ml8: {rotation_seed: 0, max_b: 1024, fit_rows: 65536, local_b: 128, rotation: kronecker}
+#   converter: {mtp: auto, fuse_qkv: false, fuse_gate_up_exps: false, fp8_as_q8: false}
+
+@dataclass
+class ConvertPlan:
+    name: str
+    source: str
+    machines_path: Path | None
+    output: Placement
+    quant: dict
+    ml8: dict
+    converter: dict
+
+
+@dataclass
+class ResolvedConvert:
+    plan: ConvertPlan
+    machine: Machine
+    out_path: str  # absolute on the output machine
+
+
+def is_convert_plan(path: Path) -> bool:
+    raw = yaml.safe_load(Path(path).read_text())
+    return isinstance(raw, dict) and "experts" not in raw
+
+
+def load_convert_plan(path: Path) -> ConvertPlan:
+    raw = yaml.safe_load(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise PlanError("plan yaml: top level must be a mapping")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", str(raw.get("name", ""))):
+        raise PlanError("name: required, [A-Za-z0-9._-]+")
+    src = str(raw.get("source", ""))
+    if not src.startswith(("hf:", "dir:", "gguf:")):
+        raise PlanError("source: must be hf:<repo>, dir:<path> or gguf:<path>")
+    unknown = set(raw) - {"name", "source", "machines", "output", "quant", "ml8", "converter"}
+    if unknown:
+        raise PlanError(f"convert plan: unknown key(s) {sorted(unknown)}")
+    ml8 = raw.get("ml8") or {}
+    if not isinstance(ml8, dict):
+        raise PlanError("ml8: must be a mapping")
+    return ConvertPlan(
+        name=raw["name"], source=src,
+        machines_path=Path(raw["machines"]).expanduser() if raw.get("machines") else None,
+        output=_placement(raw.get("output"), None, "output"),
+        quant=raw.get("quant") or {}, ml8=ml8, converter=_converter_opts(raw.get("converter")),
+    )
+
+
+def _converter_opts(v: object) -> dict:
+    from .convert import CONVERTER_OPTS
+    if v is None:
+        return {}
+    if not isinstance(v, dict) or set(v) - set(CONVERTER_OPTS):
+        raise PlanError(f"converter: want a mapping with keys from {CONVERTER_OPTS}")
+    if "mtp" in v and str(v["mtp"]).lower() not in ("auto", "true", "false"):
+        raise PlanError("converter.mtp: auto, true or false")
+    return dict(v)
+
+
+def resolve_convert(plan: ConvertPlan, machines: dict[str, Machine]):
+    """-> (ResolvedConvert, QuantRules, Ml8Opts)."""
+    from .convert import Ml8Opts
+    from .rules import QuantRules, RulesError
+
+    if plan.output.machine not in machines:
+        raise PlanError(f"machine '{plan.output.machine}' not in machines.json (have: {', '.join(sorted(machines))})")
+    try:
+        rules = QuantRules.parse(plan.quant)
+    except RulesError as e:
+        raise PlanError(str(e)) from e
+    rd = plan.ml8
+    unknown = set(rd) - {"rotation", "rotation_seed", "max_b", "fit_rows", "local_b"}
+    if unknown:
+        raise PlanError(f"ml8: unknown key(s) {sorted(unknown)}")
+    rotation = str(rd.get("rotation", "kronecker")).lower()
+    if rotation not in ML8_ROTATIONS:
+        raise PlanError(f"ml8.rotation: {rotation!r} not one of {ML8_ROTATIONS}")
+    try:
+        opts = Ml8Opts(rotation, int(rd.get("rotation_seed", 0)), int(rd.get("max_b", 1024)),
+                       int(rd.get("fit_rows", 65536)), int(rd.get("local_b", 128)))
+    except (TypeError, ValueError):
+        raise PlanError("ml8: rotation_seed/max_b/fit_rows/local_b must be ints")
+    if opts.max_b < 1 or opts.max_b & (opts.max_b - 1):
+        raise PlanError(f"ml8.max_b: must be a positive power of 2, got {opts.max_b}")
+    m = machines[plan.output.machine]
+    root = expand_remote_home(m, (plan.output.path or m.models_dir).rstrip("/"))
+    return ResolvedConvert(plan, m, f"{root}/{plan.name}.gguf"), rules, opts

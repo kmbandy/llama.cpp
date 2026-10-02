@@ -1,0 +1,13 @@
+# Cloudflare CLEF (Qwen3.8-27B + merged rank-256 LoRA, arch qwen35) at ml8-4 for
+# the mneme System-1 decision model on the 16 GB RX 6900 XT (mad-lab-2026). Text model only:
+# the converter does not emit the vision tower. CLEF's joint head reads hidden
+# states, not logits, so output.weight is dropped (the loader then ties output
+# to token_embd); the head takes its lm_head rows from the source safetensors.
+name: clef-ml8-4
+source: hf:Cloudflare/clef
+output: {machine: mad-lab-2026, path: /mnt/nvme/clef}
+quant:
+  default: ml8_4
+  rules:
+    - {match: '^output\.weight$', type: drop}
+    - {match: '^token_embd\.weight$', type: q8_0}
