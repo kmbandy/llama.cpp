@@ -190,6 +190,8 @@ enum common_speculative_type {
 enum common_speculative_draft_conf_mode {
     COMMON_SPECULATIVE_DRAFT_CONF_MODE_CHAIN,
     COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN,
+    // keep drafting while the prefix-survival product prod_{j<=i} c_j >= conf_prefix_min
+    COMMON_SPECULATIVE_DRAFT_CONF_MODE_PREFIX,
 };
 
 // Grammar type enumeration
@@ -354,6 +356,10 @@ struct common_params_speculative_draft {
     float conf_min = 0.0f;
     // MAD-LAB: default preserves the existing draft-length policy byte-for-byte.
     common_speculative_draft_conf_mode conf_mode = COMMON_SPECULATIVE_DRAFT_CONF_MODE_CHAIN;
+    // MAD-LAB: prefix mode only. Draft position i iff the probability that the whole
+    // prefix 0..i is accepted (product of the per-position conditionals) is >= this;
+    // 0 disables. conf_min is ignored in prefix mode.
+    float conf_prefix_min = 0.27f;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
