@@ -193,6 +193,8 @@ struct llama_context {
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
 
+    bool get_causal_attn() const;
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -251,6 +253,11 @@ struct llama_context {
     // exclusions this file adds beyond the architect's list (output_layer_inp).
     bool layer_cut_eligible(const llama_ubatch & ubatch, llm_graph_type gtype) const;
 
+    // sparse_outputs: honour the per-token output flags (fork, legacy llama_batch with logits)
+    int encode(const llama_batch_ext & batch_inp, bool sparse_outputs = false);
+    int decode(const llama_batch_ext & batch_inp);
+
+    // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
@@ -401,7 +408,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
                               ggml_backend_sched_t sched_override = nullptr);
 
     //
@@ -492,6 +499,7 @@ public:
     // locally. Returns false when the peer connection is gone, which the caller turns into a
     // failed decode rather than a hang.
     bool tp_mirror_batch(const llama_batch & batch, bool is_encode);
+    bool tp_mirror_batch(const llama_batch_ext & batch, bool is_encode);
     bool tp_mirror_ctrl (uint8_t op, int32_t a, int32_t b, int32_t c, int32_t d, uint8_t b0);
 
     // Follower side. Receive and apply exactly one message. Returns a llama_tp_step_status.
@@ -637,6 +645,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     // MAD-LAB (WP_LAYER_INP_NARROW_SYNC): per-layer backend event, recorded
     // immediately after extract_layer_inputs()'s ggml_backend_tensor_get_async()
