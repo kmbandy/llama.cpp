@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -1762,7 +1763,7 @@ void graph_dispatcher::end_decode() noexcept {
     // PREDICTION CADENCE. Emitted once per decode so a run's log says how often
     // the predictor actually ran, rather than how often it was asked to. See the
     // latest-wins comment in enqueue_prediction.
-    if (router2_topm() > 0) {
+    if (collect_stats_ && router2_topm() > 0) {
         const uint64_t offered = pred_offered();
         const uint64_t dropped = pred_dropped();
         if (offered > 0) {
@@ -2245,6 +2246,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             make_assignments(selected_experts, weights, n_tokens, context->token_offset);
 
         std::vector<pipe_expert_assignment> full_assignments;
+        std::function<void()> post_send_hints; // WP_ISSUE_HINTS_AFTER_SEND
         const std::vector<pipe_expert_assignment> * layer_assignments = nullptr;
         uint32_t layer_n_tokens = 0;
         if (context->chunk_index == 0) {
@@ -2267,19 +2269,71 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             full_assignments = make_assignments(full_selected, full_weights, full_tokens, 0);
             layer_assignments = &full_assignments;
             layer_n_tokens = (uint32_t) full_tokens;
-            if (owner->router2_topm() > 0) {
-                owner->flush_predicted_hints();
-                owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
+            // WP_ISSUE_HINTS_AFTER_SEND (default ON, 0 restores the old order):
+            // the hint bookkeeping used to sit in front of begin_dispatch (issue_v
+            // mean 18.9 ms/step vs median 6). Move the parts that never touch a
+            // worker socket -- enqueue_prediction (hands the snapshot to the scorer
+            // thread), note_dispatched_experts (host state), the probe dump and the
+            // routing capture -- to after the request is sent. flush_predicted_hints
+            // and prefetch_layer_ahead DO send frames, and send_prefetch_hints
+            // declines while a request is in flight unless WP_HINT_INFLIGHT=1, so
+            // moving them would silently drop hints (different wire bytes); they
+            // follow the send only when WP_HINT_INFLIGHT=1 makes that lossless.
+            static const bool hints_after_send = [] {
+                const char * e = std::getenv("WP_ISSUE_HINTS_AFTER_SEND");
+                return e == nullptr || e[0] == '\0' || std::strcmp(e, "0") != 0;
+            }();
+            static const bool hint_inflight = [] {
+                const char * e = std::getenv("WP_HINT_INFLIGHT");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (!hints_after_send) {
+                if (owner->router2_topm() > 0) {
+                    owner->flush_predicted_hints();
+                    owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
+                }
+                owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
+                ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
+                                     full_tokens, n_embd, n_expert_used);
+                if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
+                    capture_prefix != nullptr && capture_prefix[0] != '\0') {
+                    owner->capture_routing(capture_prefix, context->layer, full_wire_activations,
+                                           full_selected, full_tokens, n_expert_used);
+                }
+                owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
+            } else {
+                const bool defer_sock = hint_inflight;
+                if (!defer_sock) {
+                    // socket-touching hints stay ahead of the send (in_flight == 0)
+                    // flush before enqueue, as before
+                    if (owner->router2_topm() > 0) {
+                        owner->flush_predicted_hints();
+                    }
+                    owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
+                }
+                const int32_t layer_id = context->layer;
+                post_send_hints = [owner, layer_id, full_tokens, full_selected, full_weights, n_embd, n_expert_used,
+                                   defer_sock, &full_assignments,
+                                   wire = std::move(full_wire_activations)]() {
+                    if (owner->router2_topm() > 0) {
+                        if (defer_sock) {
+                            owner->flush_predicted_hints();
+                        }
+                        owner->enqueue_prediction(layer_id, wire, full_tokens);
+                    }
+                    owner->note_dispatched_experts(layer_id, full_assignments, (uint32_t) full_tokens);
+                    ml8_probe_maybe_dump(layer_id, wire, full_selected, full_weights,
+                                         full_tokens, n_embd, n_expert_used);
+                    if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
+                        capture_prefix != nullptr && capture_prefix[0] != '\0') {
+                        owner->capture_routing(capture_prefix, layer_id, wire,
+                                               full_selected, full_tokens, n_expert_used);
+                    }
+                    if (defer_sock) {
+                        owner->prefetch_layer_ahead(layer_id, (uint32_t) full_tokens);
+                    }
+                };
             }
-            owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
-            ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
-                                 full_tokens, n_embd, n_expert_used);
-            if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
-                capture_prefix != nullptr && capture_prefix[0] != '\0') {
-                owner->capture_routing(capture_prefix, context->layer, full_wire_activations,
-                                       full_selected, full_tokens, n_expert_used);
-            }
-            owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
         }
 
         const uint64_t seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
@@ -2288,6 +2342,9 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                                                        wire_activations, assignments, context->swiglu_clamp,
                                                        (uint32_t) context->chunk_index, layer_assignments,
                                                        layer_n_tokens, "graph_dispatcher::compute_issue");
+        if (post_send_hints) {
+            post_send_hints();
+        }
         if (context->chunk_count > 1 && context->chunk_index == 1) {
             static const bool trace = [] {
                 const char * e = std::getenv("WP_DISPATCH_CHUNKS_TRACE");

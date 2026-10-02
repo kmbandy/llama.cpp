@@ -32,6 +32,7 @@ bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int6
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -61,8 +62,10 @@ bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int6
 #include <poll.h>            // ppoll needs _GNU_SOURCE, which glibc sets via -std=gnu++
 
 #if defined(__linux__)
+#  include <csignal>
 #  include <dlfcn.h>
 #  include <fcntl.h>
+#  include <sys/socket.h>
 #  include <sys/stat.h>
 #  include <sys/types.h>
 #  include <unistd.h>
@@ -1863,6 +1866,7 @@ struct RequestStats {
     uint64_t n_batch_mmid_hit = 0;
     uint64_t n_cpu_tier = 0;   // WP_EXPERT_CPU_TIER
     uint64_t n_cpu_tier_ram_hit = 0;   // WP_EXPERT_CPU_TIER
+    uint64_t n_cpu_tier_gu_early = 0;   // WP_EXPERT_CPU_TIER_CHUNK_COMPUTE
     uint64_t ns_cpu_tier_compute = 0;   // WP_EXPERT_CPU_TIER
     uint64_t ns_cpu_tier_wait = 0;   // WP_EXPERT_CPU_TIER
     uint64_t n_batch_mmid_fallback = 0;
@@ -2211,6 +2215,7 @@ public:
         n_batch_mmid_hit_ += request.n_batch_mmid_hit;
         n_cpu_tier_ += request.n_cpu_tier;
         n_cpu_tier_ram_hit_ += request.n_cpu_tier_ram_hit;
+        n_cpu_tier_gu_early_ += request.n_cpu_tier_gu_early;
         ns_cpu_tier_compute_ += request.ns_cpu_tier_compute;
         ns_cpu_tier_wait_ += request.ns_cpu_tier_wait;
         n_batch_mmid_fallback_ += request.n_batch_mmid_fallback;
@@ -2512,6 +2517,7 @@ private:
                   << " n_batch_mmid_hit=" << n_batch_mmid_hit_
                   << " n_cpu_tier=" << n_cpu_tier_
                   << " n_cpu_tier_ram_hit=" << n_cpu_tier_ram_hit_
+                  << " n_cpu_tier_gu_early=" << n_cpu_tier_gu_early_
                   << " ns_cpu_tier_compute=" << ns_cpu_tier_compute_
                   << " ns_cpu_tier_wait=" << ns_cpu_tier_wait_
                   << " n_pf_issued=" << n_pf_issued_
@@ -2697,6 +2703,7 @@ private:
     uint64_t          n_batch_mmid_hit_ = 0;
     uint64_t          n_cpu_tier_ = 0;
     uint64_t          n_cpu_tier_ram_hit_ = 0;
+    uint64_t          n_cpu_tier_gu_early_ = 0;
     uint64_t          ns_cpu_tier_compute_ = 0;
     uint64_t          ns_cpu_tier_wait_ = 0;
     uint64_t          n_pf_issued_ = 0;
@@ -5502,6 +5509,60 @@ public:
     // file use this to route into seed_pages() instead of pin_pages().
     bool pin_seed_enabled() const { return pin_seed_enabled_; }
 
+    // *** PARK / UNPARK SUPPORT (see Worker::park). ***
+    // All of these assume the caller holds this device's mutex and that no
+    // dispatch is in flight (Worker::park quiesces first). They never run on
+    // the default serving path.
+    //
+    // SeedItem: one page of a hottest-first residency list. `heat` is the
+    // demand-reference count the page had (max of demand_count_, the LFU
+    // history and its slot's uses), `pinned` re-applies slot.pinned after the
+    // page lands again (WP_EXPERT_PIN_MODE=pin).
+    struct SeedItem {
+        const ExpertPage * page   = nullptr;
+        uint64_t           heat   = 0;
+        bool               pinned = false;
+    };
+    // True while the slot arenas are freed (between park_release_arenas and
+    // unpark_realloc).
+    bool     arenas_released() const { return arenas_released_; }
+    // Total bytes of every live slot arena (incl. pad tails).
+    uint64_t arena_bytes_allocated() const;
+    // Every VALID slot's page with its heat, in slot order (caller sorts).
+    void     collect_vram_pages(std::vector<SeedItem> & out) const;
+    // Heat of a page that is NOT necessarily in a slot (RAM-tier snapshot).
+    uint64_t page_heat(const ExpertPage & page) const;
+    // Nothing in flight that could touch a slot or a slot arena. `why`
+    // names the first violated condition.
+    bool     park_quiescent(std::string & why) const;
+    // D2H-copy VRAM-resident pages (given hottest-first) into free RAM-tier
+    // entries. Never evicts: stops the moment the tier has no free room, so a
+    // hotter RAM page is never displaced. Returns pages demoted.
+    size_t   park_demote(const std::vector<SeedItem> & hot_first, uint64_t & bytes,
+                         uint64_t & not_demoted);
+    // Invalidate every slot and free every slot arena. Returns bytes freed.
+    uint64_t park_release_arenas();
+    // Re-allocate the arenas exactly as the constructor did and re-point every
+    // slot at its old (arena, offset). Slots come back EMPTY. Throws, leaving
+    // the pool parked and nothing allocated, if the device cannot supply the
+    // memory yet.
+    void     unpark_realloc();
+    // Next up-to-`max_pages` items of `list` (from `cursor`) that still have a
+    // free slot of a fitting class and are not already resident. Sets `done`
+    // when the list is exhausted or no slot is free any more -- seeding never
+    // evicts a page.
+    void     seed_pick(const std::vector<SeedItem> & list, size_t & cursor,
+                       size_t max_pages, std::vector<SeedItem> & out, bool & done);
+    // Land `chunk` through ensure_batch (ONE batched, multi-reader read, RAM
+    // hits H2D straight from the arena), then stamp heat on the slots like
+    // seed_pages does. Returns pages that landed.
+    size_t   seed_land(const std::vector<SeedItem> & chunk);
+    // Park support for the background RAM-tier writers: stop the CPU prefetch
+    // thread from taking arena entries (and drop its queue), and report
+    // whether the demote thread / prefetch thread are idle.
+    void     pf_pause(bool on);
+    bool     bg_idle(std::string & why) const;
+
     struct Loaded {
         ggml_backend_buffer_t buffer = nullptr;
         void *                base   = nullptr;
@@ -6008,6 +6069,16 @@ public:
         // Demand decode/verify only: never a speculative or prefill call.
         const bool cpu_tier_this_call = cpu_tier_enabled() && count_demand && !spec_call &&
             n_tokens >= 1 && n_tokens <= cpu_tier_max_tokens();
+        // Call-based decay: once per tier-eligible dispatch call (not per
+        // page), so lifetime counts cannot saturate past PROMOTE and switch
+        // the tier off on a long-running worker.
+        if (cpu_tier_this_call && cpu_tier_halflife_calls() != 0 &&
+                ++cpu_tier_call_total_ >= cpu_tier_halflife_calls()) {
+            cpu_tier_call_total_ = 0;
+            for (auto & kv : cpu_tier_refs_) {
+                kv.second >>= 1;
+            }
+        }
         try {
             std::vector<size_t> pageins;
             pageins.reserve(pages.size());
@@ -7050,7 +7121,7 @@ public:
 
     // Frame thread (== dispatch thread, so find_slot/fd_for are safe here).
     void cpu_pf_enqueue(const ExpertPage & page) {
-        if (page.cache_id < 0 || page.is_resident) {
+        if (page.cache_id < 0 || page.is_resident || pf_paused_.load(std::memory_order_relaxed)) {
             return;
         }
         if (find_slot(page) != slots_.size()) {
@@ -7899,9 +7970,39 @@ private:
         }();
         return v;
     }
+    // WP_EXPERT_CPU_TIER_CHUNK_COMPUTE=1: with chunked NVMe reads, run a page's
+    // gate/up projections (+ swiglu) as soon as the chunks that hold the gate and
+    // up roles have landed, while the remaining chunk(s) (down) are still being
+    // read; the down projection runs after the page settles, exactly as before.
+    // Same graph nodes and shapes, only split across two graphs: bit-exact. Needs
+    // WP_EXPERT_CPU_TIER_READ_CHUNKS > 1. Default 0 (today's path).
+    static bool cpu_tier_chunk_compute() {
+        static const bool v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_CHUNK_COMPUTE");
+            return e != nullptr && e[0] == '1';
+        }();
+        return v;
+    }
     // Every this many tier demand references, halve every page's count (0 = never).
     static uint64_t cpu_tier_halflife() {
         static const uint64_t v = cpu_tier_env_u64("WP_EXPERT_CPU_TIER_HALFLIFE", 0);
+        return v;
+    }
+    // Every this many tier-eligible decode dispatch calls, halve every page's
+    // count (0 = never). Default is NONZERO on purpose: with lifetime counts
+    // every page eventually passes PROMOTE and the tier silently stops firing
+    // on long-running workers (live: tier 0.000, page-in 0.31-0.37; benches
+    // restart workers so never saw it). 1200 ~ 30 verify steps x 40 layers.
+    // Unlike cpu_tier_env_u64, an explicit 0 is honoured (disables).
+    static uint64_t cpu_tier_halflife_calls() {
+        static const uint64_t v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_HALFLIFE_CALLS");
+            if (e == nullptr || e[0] == '\0') {
+                return (uint64_t) 1200;
+            }
+            const long long n = std::strtoll(e, nullptr, 10);
+            return n > 0 ? (uint64_t) n : (uint64_t) 0;
+        }();
         return v;
     }
 
@@ -8056,8 +8157,13 @@ private:
                 }
                 job = std::move(demote_q_.front());
                 demote_q_.pop_front();
+                ++demote_active_;
             }
             demote_core(*job.victim, job.raw);
+            {
+                std::lock_guard<std::mutex> lock(demote_mu_);
+                --demote_active_;
+            }
             {
                 std::lock_guard<std::mutex> lock(job.ticket->m);
                 job.ticket->done = true;
@@ -8082,7 +8188,7 @@ private:
         ggml_tensor *                 raw    = nullptr;
         std::shared_ptr<DemoteTicket> ticket;
     };
-    std::mutex                demote_mu_;
+    mutable std::mutex        demote_mu_;
     std::condition_variable   demote_cv_;
     std::deque<DemoteJob>     demote_q_;
     std::thread               demote_thread_;
@@ -8169,7 +8275,15 @@ private:
             return true;   // never touches the arena (unless a stripe falls back: I2)
         }
         acquire_drain_quota(pagein, conn_index);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        static const long seed_reserve_ms = [] {
+            const char * e = std::getenv("WP_EXPERT_PARK_SEED_RESERVE_MS");
+            const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 100;
+            return v > 0 ? v : 100L;
+        }();
+        const auto deadline = std::chrono::steady_clock::now() +
+            (seed_bounded_.load(std::memory_order_relaxed)
+                 ? std::chrono::milliseconds(seed_reserve_ms)
+                 : std::chrono::milliseconds(60000));
         bool waited = false;
         while (true) {
             // C1: a page another thread is READING right now (a speculative
@@ -9971,6 +10085,7 @@ private:
     // count), touched only under ensure_batch's serialization.
     std::unordered_map<int, uint32_t> cpu_tier_refs_;
     uint64_t                   cpu_tier_ref_total_ = 0;
+    uint64_t                   cpu_tier_call_total_ = 0;   // WP_EXPERT_CPU_TIER_HALFLIFE_CALLS
     // WP_EXPERT_SPEC_LEASE -- evictions a speculative page survives before it
     // becomes an ordinary eviction candidate. 0 restores the old first-victim
     // behaviour exactly, so the lease is A/B-able on one binary.
@@ -10242,7 +10357,7 @@ private:
         const ExpertPage * page;
         int                fd;
     };
-    std::mutex                      pf_mu_;
+    mutable std::mutex              pf_mu_;
     std::condition_variable         pf_cv_;
     std::deque<PfItem>              pf_q_;
     std::thread                     pf_thread_;
@@ -10263,6 +10378,9 @@ private:
     PfGate cpu_pf_gate(const ExpertPage & page) {
         bool yielded = false;
         for (;;) {
+            if (pf_paused_.load(std::memory_order_relaxed)) {
+                return PfGate::Stale;   // park: abandon the page mid-read
+            }
             if (landing_boosted(page.cache_id)) {
                 return PfGate::Go;
             }
@@ -10301,6 +10419,14 @@ private:
                 }
                 it = pf_q_.front();
                 pf_q_.pop_front();
+                pf_active_.fetch_add(1, std::memory_order_relaxed);
+            }
+            struct PfActiveGuard {
+                std::atomic<int> & c;
+                ~PfActiveGuard() { c.fetch_sub(1, std::memory_order_relaxed); }
+            } pf_active_guard{ pf_active_ };
+            if (pf_paused_.load(std::memory_order_relaxed)) {
+                continue;   // parked: take no RAM-tier room
             }
             const ExpertPage & page = *it.page;
             // The page may have landed or started reading since it was queued.
@@ -10410,6 +10536,18 @@ private:
         return v > 0 ? (uint64_t) v : (uint64_t) 4096;
     }();
     void note_demand_reference(const ExpertPage & page) {
+        // Park heat: a cheap lifetime demand-reference counter, kept
+        // regardless of WP_EXPERT_LFU_HISTORY so a park snapshot can rank RAM-tier
+        // pages (which have no slot, hence no slot.uses) as well as VRAM ones.
+        if (page.cache_id >= 0) {
+            const size_t heat_id = (size_t) page.cache_id;
+            if (heat_id >= demand_count_.size()) {
+                demand_count_.resize(heat_id + 1, 0);
+            }
+            if (demand_count_[heat_id] != std::numeric_limits<uint32_t>::max()) {
+                ++demand_count_[heat_id];
+            }
+        }
         if (!lfu_history_enabled_ || page.cache_id < 0) {
             return;
         }
@@ -10523,6 +10661,21 @@ private:
         }
     };
     std::vector<CpuArenaMem>   cpu_arena_owned_;
+    // PARK / UNPARK state. demand_count_: lifetime demand references per
+    // cache_id (heat for park snapshots). park_slot_arena_: for each slot, the
+    // index of the arena it was carved from, recorded at park so unpark can
+    // re-carve the identical layout (allocate_slot_arenas is deterministic).
+    std::vector<uint32_t>      demand_count_;
+    std::vector<uint32_t>      park_slot_arena_;
+    size_t                     park_arena_count_ = 0;
+    bool                       arenas_released_ = false;
+    // Seed page-ins must never wait on the arena for the usual 60 s with the
+    // device mutex held: while set, reserve_arena_for_pagein's deadline is
+    // WP_EXPERT_PARK_SEED_RESERVE_MS (default 100) and a refusal fails the chunk.
+    std::atomic<bool>          seed_bounded_{false};
+    std::atomic<bool>          pf_paused_{false};
+    std::atomic<int>           pf_active_{0};
+    int                        demote_active_ = 0;   // guarded by demote_mu_
     // The large backing allocations every slot is carved from. Declared BEFORE
     // slots_ so it outlives them: Slot::buffer points in here and does not own.
     std::vector<buffer_ptr>    arenas_;
@@ -10651,6 +10804,330 @@ size_t ExpertSlotPool::seed_pages(const std::vector<std::pair<const ExpertPage *
         ++n_seeded;
     }
     return n_seeded;
+}
+
+// ---------------------------------------------------------------------------
+// PARK / UNPARK (pool side). See Worker::park for the control flow and the
+// thread-safety argument; everything here runs with the device mutex held and
+// the worker quiesced.
+// ---------------------------------------------------------------------------
+
+uint64_t ExpertSlotPool::arena_bytes_allocated() const {
+    uint64_t total = 0;
+    for (const buffer_ptr & buffer : arenas_) {
+        if (buffer) {
+            total += (uint64_t) ggml_backend_buffer_get_size(buffer.get());
+        }
+    }
+    return total;
+}
+
+uint64_t ExpertSlotPool::page_heat(const ExpertPage & page) const {
+    uint64_t heat = 0;
+    if (page.cache_id >= 0 && (size_t) page.cache_id < demand_count_.size()) {
+        heat = demand_count_[(size_t) page.cache_id];
+    }
+    return std::max(heat, history_uses(page));
+}
+
+void ExpertSlotPool::collect_vram_pages(std::vector<SeedItem> & out) const {
+    for (const Slot & slot : slots_) {
+        if (!slot.valid || slot.page == nullptr) {
+            continue;
+        }
+        SeedItem item;
+        item.page   = slot.page;
+        item.heat   = std::max(page_heat(*slot.page), slot.uses);
+        item.pinned = slot.pinned;
+        out.push_back(item);
+    }
+}
+
+bool ExpertSlotPool::park_quiescent(std::string & why) const {
+    if (!spec_batches_.empty()) {
+        why = "speculative page-in batch still in flight";
+        return false;
+    }
+    if (spec_host_in_flight()) {
+        why = "host landing thread still running";
+        return false;
+    }
+    if (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
+        why = "demand/cpu-tier reads still pending";
+        return false;
+    }
+    for (const Slot & slot : slots_) {
+        if (slot.pin_count != 0) {
+            why = "a slot is still pinned by a live batch";
+            return false;
+        }
+    }
+    return true;
+}
+
+void ExpertSlotPool::pf_pause(bool on) {
+    pf_paused_.store(on, std::memory_order_relaxed);
+    if (on) {
+        std::lock_guard<std::mutex> lock(pf_mu_);
+        pf_q_.clear();
+    }
+}
+
+bool ExpertSlotPool::bg_idle(std::string & why) const {
+    {
+        std::lock_guard<std::mutex> lock(demote_mu_);
+        if (!demote_q_.empty() || demote_active_ != 0) {
+            why = "victim-demote thread busy";
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(pf_mu_);
+        if (!pf_q_.empty() || pf_active_.load(std::memory_order_relaxed) != 0) {
+            why = "CPU prefetch thread busy";
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t ExpertSlotPool::park_demote(const std::vector<SeedItem> & hot_first,
+                                   uint64_t & bytes, uint64_t & not_demoted) {
+    size_t n = 0;
+    const size_t entry = arena_.entry_bytes();
+    const size_t tier  = arena_.tier_bytes();
+    if (entry == 0 || tier == 0) {
+        not_demoted += hot_first.size();   // no retention tier configured
+        return 0;
+    }
+    for (size_t i = 0; i < hot_first.size(); ++i) {
+        const ExpertPage * page = hot_first[i].page;
+        if (page == nullptr) {
+            continue;
+        }
+        const size_t slot_index = find_slot(*page);
+        if (slot_index == slots_.size()) {
+            continue;
+        }
+        // Already in (or being read into) the RAM tier: nothing to copy.
+        if (arena_.state_of(page->cache_id) != wp::HostArena::State::Free) {
+            continue;
+        }
+        // Free-room-only rule. begin_read() would evict the LRU entry when no
+        // entry is Free; staying under the retention cap means a Free entry
+        // exists (budget = tier + in-flight entries), so nothing hotter is
+        // ever displaced. Hottest-first order means the first miss ends it.
+        if (arena_.resident_bytes() + entry > tier) {
+            not_demoted += hot_first.size() - i;
+            break;
+        }
+        demote_core(*page, slots_[slot_index].raw);
+        if (arena_.state_of(page->cache_id) == wp::HostArena::State::Resident) {
+            ++n;
+            bytes += page->size;
+        } else {
+            ++not_demoted;
+        }
+    }
+    return n;
+}
+
+uint64_t ExpertSlotPool::park_release_arenas() {
+    if (arenas_released_) {
+        return 0;
+    }
+    std::unordered_map<ggml_backend_buffer_t, uint32_t> arena_index;
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < arenas_.size(); ++i) {
+        arena_index[arenas_[i].get()] = (uint32_t) i;
+        bytes += (uint64_t) ggml_backend_buffer_get_size(arenas_[i].get());
+    }
+    park_slot_arena_.assign(slots_.size(), std::numeric_limits<uint32_t>::max());
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        const auto it = arena_index.find(slots_[i].buffer);
+        if (it == arena_index.end()) {
+            throw std::runtime_error("park: slot does not belong to a known arena");
+        }
+        park_slot_arena_[i] = it->second;
+    }
+    park_arena_count_ = arenas_.size();
+    for (Slot & slot : slots_) {
+        slot.valid = false;
+        slot.page = nullptr;
+        slot.key = {};
+        slot.cache_id = -1;
+        slot.size = 0;
+        slot.upload_hash = 0;
+        slot.upload_hash_valid = false;
+        slot.tick = 0;
+        slot.uses = 0;
+        slot.lease_until = 0;
+        slot.pin_count = 0;
+        slot.spec_pending = false;
+        slot.layer_ahead = false;
+        slot.layer_ahead_depth = 0;
+        slot.pinned = false;
+        slot.buffer = nullptr;
+        if (slot.raw != nullptr) {
+            slot.raw->buffer = nullptr;
+            slot.raw->data = nullptr;
+        }
+    }
+    slot_index_.clear();
+    n_pinned_ = 0;
+    n_spec_pending_ = 0;
+    arena_layout_.reset();
+    // buffer_ptr's deleter is ggml_backend_buffer_free: this is the VRAM free.
+    arenas_.clear();
+    arena_usable_slots_.clear();
+    arena_pad_slots_.clear();
+    arena_class_starts_.clear();
+    pad_extra_bytes_ = 0;
+    arenas_released_ = true;
+    return bytes;
+}
+
+void ExpertSlotPool::unpark_realloc() {
+    if (!arenas_released_) {
+        return;
+    }
+    try {
+        allocate_slot_arenas();
+        if (arenas_.size() != park_arena_count_) {
+            throw std::runtime_error("unpark: arena count changed across park");
+        }
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            Slot & slot = slots_[i];
+            const uint32_t arena_index = park_slot_arena_.at(i);
+            if (arena_index >= arenas_.size()) {
+                throw std::runtime_error("unpark: slot arena index out of range");
+            }
+            ggml_backend_buffer_t arena = arenas_[arena_index].get();
+            const uint64_t arena_bytes = (uint64_t) ggml_backend_buffer_get_size(arena);
+            if (slot.offset > arena_bytes || slot.capacity > arena_bytes - slot.offset) {
+                throw std::runtime_error("unpark: slot does not fit its re-allocated arena");
+            }
+            uint8_t * const base = (uint8_t *) ggml_backend_buffer_get_base(arena);
+            if (base == nullptr) {
+                throw std::runtime_error("unpark: arena has no base pointer");
+            }
+            slot.buffer = arena;
+            slot.raw->buffer = arena;
+            slot.raw->data = base + slot.offset;
+            if (ggml_backend_buffer_init_tensor(arena, slot.raw) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("unpark: failed to initialize expert slot tensor");
+            }
+        }
+        arena_layout_ = compute_arena_layout();
+    } catch (...) {
+        for (Slot & slot : slots_) {
+            slot.buffer = nullptr;
+            if (slot.raw != nullptr) {
+                slot.raw->buffer = nullptr;
+                slot.raw->data = nullptr;
+            }
+        }
+        arenas_.clear();
+        arena_usable_slots_.clear();
+        arena_pad_slots_.clear();
+        arena_class_starts_.clear();
+        pad_extra_bytes_ = 0;
+        arena_layout_.reset();
+        throw;
+    }
+    arenas_released_ = false;
+}
+
+void ExpertSlotPool::seed_pick(const std::vector<SeedItem> & list, size_t & cursor,
+                               size_t max_pages, std::vector<SeedItem> & out, bool & done) {
+    out.clear();
+    // Live census of FREE slots by (reserved?, capacity). Mirrors the first
+    // pass of select_victim_impl (smallest fitting free slot, reserved-ness
+    // must match, reserved pages may fall back to a general slot) so a page
+    // is accepted only when ensure_batch will land it in a free slot instead
+    // of evicting a valid one.
+    std::map<uint64_t, size_t> free_reserved;
+    std::map<uint64_t, size_t> free_general;
+    size_t total_free = 0;
+    for (const Slot & slot : slots_) {
+        if (slot.valid || slot.pinned || slot.pin_count != 0) {
+            continue;
+        }
+        ++(slot.reserved ? free_reserved : free_general)[slot.capacity];
+        ++total_free;
+    }
+    const auto take = [&](std::map<uint64_t, size_t> & census, uint64_t size) {
+        auto it = census.lower_bound(size);
+        if (it == census.end()) {
+            return false;
+        }
+        if (--it->second == 0) {
+            census.erase(it);
+        }
+        --total_free;
+        return true;
+    };
+    while (cursor < list.size() && out.size() < max_pages && total_free > 0) {
+        const SeedItem & item = list[cursor++];
+        const ExpertPage * page = item.page;
+        if (page == nullptr || page->is_resident || find_slot(*page) != slots_.size()) {
+            continue;
+        }
+        const bool wants_reserved =
+            std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page->layer);
+        const bool ok = wants_reserved
+            ? (take(free_reserved, page->size) || take(free_general, page->size))
+            : take(free_general, page->size);
+        if (ok) {
+            out.push_back(item);
+        }
+    }
+    done = cursor >= list.size() || total_free == 0;
+}
+
+size_t ExpertSlotPool::seed_land(const std::vector<SeedItem> & chunk) {
+    if (chunk.empty()) {
+        return 0;
+    }
+    std::vector<const ExpertPage *> pages;
+    pages.reserve(chunk.size());
+    for (const SeedItem & item : chunk) {
+        pages.push_back(item.page);
+    }
+    // count_demand=false: a seed is not a demand reference. Same call
+    // seed_pages makes, but for a whole chunk, so the pool's reader threads
+    // read the missing pages concurrently and RAM-tier hits take the arena
+    // H2D path.
+    struct BoundedScope {
+        std::atomic<bool> & flag;
+        explicit BoundedScope(std::atomic<bool> & f) : flag(f) { flag.store(true); }
+        ~BoundedScope() { flag.store(false); }
+    } bounded{ seed_bounded_ };
+    Batch batch = ensure_batch(pages, false, {}, 0, -1, nullptr, false);
+    batch.complete();
+    size_t landed = 0;
+    for (const SeedItem & item : chunk) {
+        const size_t slot_index = find_slot(*item.page);
+        if (slot_index == slots_.size()) {
+            continue;
+        }
+        Slot & slot = slots_[slot_index];
+        slot.uses = std::max(slot.uses, item.heat);
+        slot.tick = ++tick_;
+        if (lfu_history_enabled_ && item.page->cache_id >= 0) {
+            const size_t index = (size_t) item.page->cache_id;
+            if (index >= lfu_history_.size()) {
+                lfu_history_.resize(index + 1, 0);
+            }
+            lfu_history_[index] = std::max(lfu_history_[index], item.heat);
+        }
+        if (item.pinned && !slot.pinned) {
+            slot.pinned = true;
+            ++n_pinned_;
+        }
+        ++landed;
+    }
+    return landed;
 }
 
 ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
@@ -11430,6 +11907,9 @@ public:
     // Do not move it to a background thread: Vulkan command pools have thread
     // affinity, so concurrent submits risk corruption even behind a mutex.
     void keepalive_tick() {
+        if (parked()) {
+            return;   // no device memory to compute on while parked
+        }
         if (keepalive_graph_ != nullptr) {
             ggml_backend_graph_compute(backend_.get(), keepalive_graph_);
         }
@@ -11438,12 +11918,341 @@ public:
     bool keepalive_enabled() const { return keepalive_us_ > 0 && keepalive_graph_ != nullptr; }
     int  keepalive_us()      const { return keepalive_us_; }
 
+    // *** PARK / UNPARK (device side). ***
+    // Driven by Worker::park / Worker::unpark with THIS device's mutex held
+    // and no frame in flight. `parked_` is only ever flipped under that mutex;
+    // it is atomic so the lock-free idle-pump checks (keepalive_enabled /
+    // has_spec_work, which Worker evaluates before taking the mutex) are
+    // race-free reads, and every state-touching entry point re-checks it
+    // inside the mutex.
+    struct ParkRow {
+        ExpertSlotPool::SeedItem item;
+        bool                     vram = false;   // held a VRAM slot at park time
+    };
+    struct ParkStats {
+        size_t   n_vram = 0;
+        size_t   n_ram = 0;
+        size_t   demoted = 0;
+        uint64_t demoted_bytes = 0;
+        uint64_t not_demoted = 0;
+        uint64_t freed_arena_bytes = 0;
+        uint64_t freed_compute_bytes = 0;
+        uint64_t dev_free_before = 0;
+        uint64_t dev_free_after = 0;
+        uint64_t dev_total = 0;
+        double   ms = 0.0;
+    };
+
+    bool parked() const { return parked_.load(std::memory_order_acquire); }
+    // HIP/CUDA only: the realloc and the seed run on a thread other than the
+    // serving thread, which is established-safe for HIP/CUDA (multi-conn
+    // already does it) but NOT for Vulkan (command-pool thread affinity) and
+    // meaningless for CPU (the arena is host RAM).
+    bool can_park() const {
+        return is_hip_or_cuda_backend() && pool_.arena_bytes_allocated() != 0;
+    }
+    const std::vector<ParkRow> & park_rows() const { return park_rows_; }
+
+    bool park(ParkStats & st, std::string & why) {
+        if (parked()) {
+            return true;
+        }
+        if (!can_park()) {
+            why = "backend is not ROCm/CUDA, or it has no slot arenas";
+            return false;
+        }
+        if (!split_pending_by_conn_.empty()) {
+            why = "a BEGIN/ACTS split dispatch is still open";
+            return false;
+        }
+        if (!early_cpu_job_by_conn_.empty()) {
+            why = "an early CPU-tier job is still open";
+            return false;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto deadline = t0 + std::chrono::seconds(10);
+        park_rows_.clear();
+        seed_cancel();
+        // The CPU prefetch thread must not take RAM-tier room (or read) while
+        // we snapshot and demote; resumed on any failure and at unpark.
+        pool_.pf_pause(true);
+        struct PfResume {
+            ExpertSlotPool & pool;
+            bool armed = true;
+            ~PfResume() { if (armed) { pool.pf_pause(false); } }
+        } pf_resume{ pool_ };
+        // Speculative / prefetch machinery: drop what is queued, retire what is
+        // in flight (blocking drain: H2D of landed pages, pins released), and
+        // wait out the host landing threads.
+        drop_spec_work();
+        pool_.spec_pagein_poll(true);
+        while (pool_.spec_host_in_flight() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            pool_.spec_host_reap();
+        }
+        pool_.spec_host_reap();
+        // Every other writer of the RAM tier / reader of slots: the CPU-tier
+        // executor (IO tasks queued OR already popped, compute queue), the
+        // victim-demote thread and the CPU prefetch thread. None touches a slot
+        // arena, but all must be still before we copy into / snapshot the tier.
+        for (;;) {
+            bool idle = false;
+            {
+                std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+                idle = cpu_tier_io_q_.empty() && cpu_tier_compute_q_.empty() &&
+                       cpu_tier_io_active_.load(std::memory_order_relaxed) == 0;
+            }
+            std::string bg_why;
+            if (idle && pool_.bg_idle(bg_why)) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                why = idle ? "background RAM-tier writer still busy" :
+                             "CPU-tier executor still has queued or running work";
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!pool_.park_quiescent(why)) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_.get());
+        size_t dev_free = 0;
+        size_t dev_total = 0;
+        if (dev != nullptr) {
+            ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        }
+        st.dev_free_before = dev_free;
+        st.dev_total = dev_total;
+        try {
+            // Fence everything issued on the backend BEFORE any D2H or free.
+            ggml_backend_synchronize(backend_.get());
+
+            // --- residency snapshot, hottest first ---
+            std::vector<ExpertSlotPool::SeedItem> vram;
+            pool_.collect_vram_pages(vram);
+            std::unordered_set<int> in_vram;
+            park_rows_.reserve(vram.size() + 1024);
+            for (const ExpertSlotPool::SeedItem & item : vram) {
+                in_vram.insert(item.page->cache_id);
+                park_rows_.push_back(ParkRow{ item, true });
+            }
+            st.n_vram = vram.size();
+            for (const auto & kv : catalog_.pages) {
+                const ExpertPage & page = kv.second;
+                if (page.is_resident || page.cache_id < 0 || in_vram.count(page.cache_id) != 0) {
+                    continue;
+                }
+                if (page_owner_ && !page_owner_(page.layer, page.expert)) {
+                    continue;
+                }
+                if (pool_.arena().state_of(page.cache_id) != wp::HostArena::State::Resident) {
+                    continue;
+                }
+                ExpertSlotPool::SeedItem item;
+                item.page = &page;
+                item.heat = pool_.page_heat(page);
+                park_rows_.push_back(ParkRow{ item, false });
+                ++st.n_ram;
+            }
+            std::stable_sort(park_rows_.begin(), park_rows_.end(),
+                             [](const ParkRow & a, const ParkRow & b) {
+                if (a.item.heat != b.item.heat) {
+                    return a.item.heat > b.item.heat;
+                }
+                if (a.item.page->layer != b.item.page->layer) {
+                    return a.item.page->layer < b.item.page->layer;
+                }
+                return a.item.page->expert < b.item.page->expert;
+            });
+
+            // --- OPT-IN: demote VRAM pages into free RAM-tier room, hottest
+            // first (WP_EXPERT_PARK_DEMOTE=1; default OFF). The D2H -> RAM ->
+            // H2D round trip is not verified on this rig, so by default pages
+            // are simply re-read from NVMe at unpark.
+            const char * demote_env = std::getenv("WP_EXPERT_PARK_DEMOTE");
+            if (demote_env != nullptr && demote_env[0] == '1') {
+                std::vector<ExpertSlotPool::SeedItem> hot_first;
+                hot_first.reserve(vram.size());
+                for (const ParkRow & row : park_rows_) {
+                    if (row.vram) {
+                        hot_first.push_back(row.item);
+                    }
+                }
+                st.demoted = pool_.park_demote(hot_first, st.demoted_bytes, st.not_demoted);
+                ggml_backend_synchronize(backend_.get());
+            }
+
+            // --- free the device memory ---
+            st.freed_compute_bytes = release_compute_buffers();
+            // Per-depth layer-ahead targets reference pages by slot-era state.
+            ahead_targets_.clear();
+            ahead_target_ = -1;
+            st.freed_arena_bytes = pool_.park_release_arenas();
+        } catch (...) {
+            park_rows_.clear();   // never publish a snapshot of a failed park
+            throw;
+        }
+        parked_.store(true, std::memory_order_release);
+        pf_resume.armed = false;   // stays paused until unpark
+        if (dev != nullptr) {
+            ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        }
+        st.dev_free_after = dev_free;
+        st.ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
+
+    // Re-allocate the arenas. Slots come back empty; seeding is separate.
+    bool unpark(double & realloc_ms, std::string & err) {
+        if (!parked()) {
+            return true;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            pool_.unpark_realloc();
+        } catch (const std::exception & e) {
+            err = e.what();
+            return false;
+        }
+        realloc_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        pool_.pf_pause(false);
+        parked_.store(false, std::memory_order_release);
+        return true;
+    }
+
+    // Build the ordered seed list from a hottest-first residency list: keep
+    // only what a free slot can take (never evicting), then put pages that are
+    // in the RAM tier right now ahead of the NVMe ones (H2D first, reads
+    // second), each group still hottest-first.
+    void seed_prepare(const std::vector<ExpertSlotPool::SeedItem> & hottest_first,
+                      size_t & n_selected, size_t & n_ram) {
+        seed_list_.clear();
+        seed_cursor_ = 0;
+        seed_ram_items_ = 0;
+        std::vector<ExpertSlotPool::SeedItem> accepted;
+        size_t cursor = 0;
+        bool done = false;
+        pool_.seed_pick(hottest_first, cursor, std::numeric_limits<size_t>::max(),
+                        accepted, done);
+        std::vector<ExpertSlotPool::SeedItem> nvme;
+        for (const ExpertSlotPool::SeedItem & item : accepted) {
+            if (pool_.arena().state_of(item.page->cache_id) == wp::HostArena::State::Resident) {
+                seed_list_.push_back(item);
+            } else {
+                nvme.push_back(item);
+            }
+        }
+        seed_ram_items_ = seed_list_.size();
+        seed_list_.insert(seed_list_.end(), nvme.begin(), nvme.end());
+        n_selected = seed_list_.size();
+        n_ram = seed_ram_items_;
+    }
+    void seed_prepare_from_park_rows(size_t & n_selected, size_t & n_ram) {
+        std::vector<ExpertSlotPool::SeedItem> rows;
+        rows.reserve(park_rows_.size());
+        for (const ParkRow & row : park_rows_) {
+            rows.push_back(row.item);
+        }
+        seed_prepare(rows, n_selected, n_ram);
+    }
+    // Startup seed from a park file: resolve (layer, expert, heat, pinned).
+    void seed_prepare_from_file_rows(
+            const std::vector<std::tuple<int, int, uint64_t, bool>> & rows,
+            size_t & n_selected, size_t & n_ram) {
+        std::vector<ExpertSlotPool::SeedItem> items;
+        items.reserve(rows.size());
+        for (const auto & row : rows) {
+            const auto it = catalog_.pages.find({ std::get<0>(row), std::get<1>(row) });
+            if (it == catalog_.pages.end() || it->second.is_resident) {
+                continue;
+            }
+            if (page_owner_ && !page_owner_(it->second.layer, it->second.expert)) {
+                continue;
+            }
+            ExpertSlotPool::SeedItem item;
+            item.page = &it->second;
+            item.heat = std::get<2>(row);
+            item.pinned = std::get<3>(row);
+            items.push_back(item);
+        }
+        std::stable_sort(items.begin(), items.end(),
+                         [](const ExpertSlotPool::SeedItem & a, const ExpertSlotPool::SeedItem & b) {
+            return a.heat > b.heat;
+        });
+        seed_prepare(items, n_selected, n_ram);
+    }
+    bool seed_pending() const { return seed_cursor_ < seed_list_.size(); }
+    bool has_any_split_dispatch() const { return !split_pending_by_conn_.empty(); }
+    bool seed_in_ram_phase() const { return seed_cursor_ < seed_ram_items_; }
+    void seed_cancel() { seed_cursor_ = seed_list_.size(); }
+    // One bounded seed step (caller holds the device mutex). Returns true while
+    // more remains. Throws like ensure_batch; the caller cancels on throw.
+    bool seed_step(size_t max_pages, size_t & landed, uint64_t & bytes) {
+        landed = 0;
+        bytes = 0;
+        if (parked() || seed_cursor_ >= seed_list_.size()) {
+            return false;
+        }
+        std::vector<ExpertSlotPool::SeedItem> chunk;
+        bool done = false;
+        pool_.seed_pick(seed_list_, seed_cursor_, max_pages, chunk, done);
+        if (!chunk.empty()) {
+            landed = pool_.seed_land(chunk);
+            for (const ExpertSlotPool::SeedItem & item : chunk) {
+                bytes += item.page->size;
+            }
+        }
+        if (done) {
+            seed_cursor_ = seed_list_.size();
+        }
+        return !done;
+    }
+
+    // The large device allocations other than the slot arenas that park frees:
+    // every cached graph's gallocr buffer (and its persistent plan), the shared
+    // compute gallocr, and the grouped-GEMV scratch. All are rebuilt on demand
+    // by the same code that built them the first time. The io / params / small
+    // io buffers are deliberately KEPT (tens of KiB to a few MiB, and
+    // generation-tracked).
+    uint64_t release_compute_buffers() {
+        uint64_t bytes = 0;
+        for (auto & kv : graph_cache_) {
+            if (kv.second.galloc) {
+                bytes += (uint64_t) ggml_gallocr_get_buffer_size(kv.second.galloc.get(), 0);
+            }
+            release_persistent_plan(kv.second.persistent_plan);
+        }
+        graph_cache_.clear();
+        for (auto & kv : arena_graph_cache_) {
+            if (kv.second.galloc) {
+                bytes += (uint64_t) ggml_gallocr_get_buffer_size(kv.second.galloc.get(), 0);
+            }
+            release_persistent_plan(kv.second.persistent_plan);
+        }
+        arena_graph_cache_.clear();
+        if (compute_galloc_) {
+            bytes += (uint64_t) ggml_gallocr_get_buffer_size(compute_galloc_.get(), 0);
+        }
+        compute_galloc_.reset(ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend_.get())));
+        bytes += (uint64_t) batch_scratch_size_;
+        batch_scratch_.reset();
+        batch_scratch_size_ = 0;
+        return bytes;
+    }
+
     // Record a prefetch hint. READS NOTHING YET -- see the frame-loop
     // comment. Experts outside this worker's shard are counted separately rather
     // than rejected: the spine routes by the same static hash the dispatch uses,
     // so a nonzero foreign count means the two disagree, which is a spine bug
     // that would otherwise show up only as prefetch mysteriously not helping.
     void note_prefetch_hint(const pipe_expert_prefetch_hint & hint) {
+        if (parked()) {
+            return;   // advisory only; a parked worker has no slots to prefetch into
+        }
         ++hint_frames_;
         hint_experts_ += hint.expert_ids.size();
         log_hint_ids(hint);
@@ -11914,6 +12723,9 @@ public:
     // pipeline to issue the next one. That cost is why this was written
     // submit-only; a permanently wedged pipeline is the higher price.
     void spec_pagein_after_dispatch() {
+        if (parked()) {
+            return;
+        }
         if (spec_submit_interleave_enabled_ && spec_enabled_) {
             (void) spec_pagein_step(/*harvest=*/ true);
         }
@@ -11941,6 +12753,9 @@ public:
     // predicted is already resident", and those need completely different fixes.
     // Counting them costs an increment on a path that is already doing I/O.
     bool spec_pagein_step(bool harvest = true) {
+        if (parked()) {
+            return false;
+        }
         ++pump_calls_;
         // Host landings run on their own reader thread and never touch the GPU,
         // so they are reaped and refilled independently of the VRAM path.
@@ -12024,6 +12839,9 @@ public:
     // A speculative read in flight is work in progress, not idleness -- the pump
     // must keep spinning to harvest it even when the queue is empty.
     bool has_spec_work() const {
+        if (parked()) {
+            return false;
+        }
         return !spec_queue_.empty() || !host_queue_.empty() ||
                pool_.spec_any_in_flight() || pool_.spec_host_in_flight();
     }
@@ -12033,7 +12851,7 @@ public:
     // reader thread we are waiting on the disk, not on ourselves, and spinning
     // would burn a core for the 3-5 ms of the read while doing nothing.
     bool has_spec_submit_work() const {
-        if (spec_prefill_gate_active_) {
+        if (parked() || spec_prefill_gate_active_) {
             return false;   // gated: nothing may be submitted, so do not spin
         }
         // !pool_.spec_in_flight() here means "not at the WP_EXPERT_SPEC_MAX_
@@ -12480,6 +13298,11 @@ public:
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
             int conn_index = -1,
             uint64_t trace_req = 0) {
+        if (parked()) {
+            // Tripwire only: Worker::park_frame_enter auto-unparks before any
+            // dispatch frame reaches here.
+            throw std::runtime_error("expert worker is parked (slot arenas freed)");
+        }
         // RAII so every exit path counts -- dispatch() returns from several
         // places and throws from more.
         struct DispatchTotalScope {
@@ -13136,6 +13959,9 @@ public:
     void begin_split_dispatch(const pipe_expert_dispatch_begin & begin, uint64_t seq_id,
                               int conn_index = -1,
                               std::unique_lock<std::mutex> * gpu_lock = nullptr) {
+        if (parked()) {
+            throw std::runtime_error("expert worker is parked (slot arenas freed)");
+        }
         if (split_pending_by_conn_.count(conn_index) != 0) {
             throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                       "expert dispatch BEGIN arrived before ACTS");
@@ -16444,6 +17270,13 @@ private:
         std::mutex                             m;
         std::condition_variable                cv;
         std::deque<size_t>                     landed;      // k, in arrival order
+        // CPU_TIER_CHUNK_COMPUTE: pages whose gate/up chunks landed before the
+        // page settled (k, guarded by m); hidden[k]/gu_done[k]/n_gu_early are
+        // touched only by the compute thread (n_gu_early is read after finished).
+        std::deque<size_t>                     gu_ready;
+        std::vector<std::vector<float>>        hidden;
+        std::vector<char>                      gu_done;
+        size_t                                 n_gu_early = 0;
         size_t                                 n_settled = 0;   // landed or failed
         size_t                                 n_ram_hit = 0;
         uint64_t                               ns_compute = 0;
@@ -16457,6 +17290,17 @@ private:
             ExpertSlotPool::HostPage     hp;
             std::atomic<size_t>          remaining{0};
             std::atomic<bool>            failed{false};
+            // CPU_TIER_CHUNK_COMPUTE. gu_need[c]: chunk c overlaps the gate or up
+            // role; gu_remaining counts the needed chunks not yet landed (0 and
+            // !gu_enabled when the feature is off or every chunk is needed).
+            // gu_mu is held by the compute thread while it reads the in-flight
+            // page, and by the failing last chunk before it drops the entry.
+            // settled is guarded by job.m.
+            std::vector<uint8_t>         gu_need;
+            std::atomic<size_t>          gu_remaining{0};
+            bool                         gu_enabled = false;
+            bool                         settled = false;
+            std::mutex                   gu_mu;
         };
         std::vector<std::unique_ptr<PageRead>> reads;
         bool                                   compute_queued = false;   // dispatch thread only
@@ -16496,6 +17340,8 @@ private:
         job->holds.resize(job->index.size());
         job->partials.resize(job->index.size());
         job->reads.resize(job->index.size());
+        job->hidden.resize(job->index.size());
+        job->gu_done.assign(job->index.size(), 0);
         (void) request;
         {
             std::lock_guard<std::mutex> lock(cpu_tier_mu_);
@@ -16507,12 +17353,15 @@ private:
                 cpu_tier_threads_.emplace_back([this] { cpu_tier_compute_loop(); });
                 std::fprintf(stderr,
                     "wp: WP_EXPERT_CPU_TIER=1: promote=%u max=%zu max_tokens=%u io=%zu "
-                    "compute_threads=%d halflife=%llu read_chunks=%zu early_io=%d\n",
+                    "compute_threads=%d halflife=%llu halflife_calls=%llu read_chunks=%zu early_io=%d "
+                    "chunk_compute=%d\n",
                     ExpertSlotPool::cpu_tier_promote(), ExpertSlotPool::cpu_tier_max(),
                     ExpertSlotPool::cpu_tier_max_tokens(), n_io, cpu_tier_compute_threads(),
                     (unsigned long long) ExpertSlotPool::cpu_tier_halflife(),
+                    (unsigned long long) ExpertSlotPool::cpu_tier_halflife_calls(),
                     ExpertSlotPool::cpu_tier_read_chunks(),
-                    (int) ExpertSlotPool::cpu_tier_early_io());
+                    (int) ExpertSlotPool::cpu_tier_early_io(),
+                    (int) ExpertSlotPool::cpu_tier_chunk_compute());
             }
             // These reads are DEMAND: count them from queueing until settled so
             // the prefetch reader (and the preempt gate) hold off for them.
@@ -16587,6 +17436,7 @@ private:
         }
         request_stats.n_cpu_tier          += job->index.size();
         request_stats.n_cpu_tier_ram_hit  += job->n_ram_hit;
+        request_stats.n_cpu_tier_gu_early += job->n_gu_early;
         request_stats.ns_cpu_tier_compute += job->ns_compute;
     }
 
@@ -16610,6 +17460,9 @@ private:
         pool_.cpu_tier_demand_end();   // pairs with cpu_tier_demand_begin at submit
         {
             std::lock_guard<std::mutex> lock(job.m);
+            if (job.reads[k]) {
+                job.reads[k]->settled = true;   // no more early gate/up pushes
+            }
             if (landed) {
                 job.n_ram_hit += ram_hit ? 1 : 0;
                 job.landed.push_back(k);
@@ -16624,12 +17477,19 @@ private:
     // Chunk c of page k. The last chunk to finish (remaining -> 0) closes the
     // arena read EXACTLY once: finish_read(ok) if every chunk succeeded, else
     // finish_read(false), and settles the page.
-    void cpu_tier_read_chunk(const std::shared_ptr<CpuTierJob> & job, size_t k, size_t off, size_t len) {
+    //
+    // CPU_TIER_CHUNK_COMPUTE: the chunk that completes the set covering the gate
+    // and up roles, when it is not also the page's last chunk, hands the page to
+    // the compute thread (gu_ready) to run gate/up while the rest still reads.
+    void cpu_tier_read_chunk(const std::shared_ptr<CpuTierJob> & job, size_t k, size_t c,
+                             size_t off, size_t len) {
         CpuTierJob::PageRead & pr = *job->reads[k];
         std::exception_ptr err;
+        bool read_ok = false;
         if (!pr.failed.load(std::memory_order_relaxed)) {
             try {
                 pool_.read_host_chunk(*pr.page, pr.fd, pr.data, off, len);
+                read_ok = true;
             } catch (...) {
                 err = std::current_exception();
                 pr.failed.store(true, std::memory_order_relaxed);
@@ -16639,11 +17499,35 @@ private:
                 }
             }
         }
+        // acq_rel: the thread that takes gu_remaining to 0 sees every needed
+        // chunk's bytes (each decrement releases its own pread).
+        const bool gu_fire = read_ok && pr.gu_enabled && pr.gu_need[c] != 0 &&
+            pr.gu_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
         if (pr.remaining.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+            if (gu_fire) {
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(job->m);
+                    if (!pr.settled && !job->error) {
+                        job->gu_ready.push_back(k);
+                        queued = true;
+                    }
+                }
+                if (queued) {
+                    job->cv.notify_all();
+                }
+            }
             return;
         }
         const bool ok = !pr.failed.load(std::memory_order_relaxed);
-        pool_.finish_host_read(*pr.page, pr.hp, ok);
+        if (ok) {
+            pool_.finish_host_read(*pr.page, pr.hp, ok);
+        } else {
+            // The compute thread may be reading the in-flight page (early gate/up):
+            // let it finish before the entry is dropped for reuse.
+            std::lock_guard<std::mutex> gu_lock(pr.gu_mu);
+            pool_.finish_host_read(*pr.page, pr.hp, ok);
+        }
         if (ok) {
             job->holds[k] = pr.hp;
         }
@@ -16682,13 +17566,18 @@ private:
                 }
                 task = std::move(cpu_tier_io_q_.front());
                 cpu_tier_io_q_.pop_front();
+                cpu_tier_io_active_.fetch_add(1, std::memory_order_relaxed);
             }
+            struct IoActiveGuard {
+                std::atomic<int> & c;
+                ~IoActiveGuard() { c.fetch_sub(1, std::memory_order_relaxed); }
+            } io_active_guard{ cpu_tier_io_active_ };
             const std::shared_ptr<CpuTierJob> & job = task.job;
             const size_t k = task.k;
             if (task.chunk >= 0) {
                 const size_t size = (size_t) job->pages[k]->size;
                 const auto r = cpu_tier_chunk_range(size, (size_t) task.chunk);
-                cpu_tier_read_chunk(job, k, r.first, r.second);
+                cpu_tier_read_chunk(job, k, (size_t) task.chunk, r.first, r.second);
                 continue;
             }
             try {
@@ -16719,6 +17608,31 @@ private:
                 }
                 pr->data = data;
                 pr->remaining.store(n, std::memory_order_relaxed);
+                if (ExpertSlotPool::cpu_tier_chunk_compute()) {
+                    // Chunks overlapping the gate or up byte range (blob layout, the
+                    // one the CPU tier computes from). If every chunk is needed there
+                    // is nothing to overlap: leave the page on the plain path.
+                    const auto g = page.roles.find("gate");
+                    const auto u = page.roles.find("up");
+                    if (g != page.roles.end() && u != page.roles.end()) {
+                        pr->gu_need.assign(n, 0);
+                        size_t need = 0;
+                        for (size_t c = 0; c < n; ++c) {
+                            const auto r = cpu_tier_chunk_range(size, c);
+                            const auto hit = [&](const MemberSpan & m) {
+                                return m.offset < r.first + r.second && r.first < m.offset + m.size;
+                            };
+                            if (hit(g->second) || hit(u->second)) {
+                                pr->gu_need[c] = 1;
+                                ++need;
+                            }
+                        }
+                        if (need > 0 && need < n) {
+                            pr->gu_remaining.store(need, std::memory_order_relaxed);
+                            pr->gu_enabled = true;
+                        }
+                    }
+                }
                 job->reads[k] = std::move(pr);   // reads[k] is touched only after this point
                 {
                     // Front of the queue: finish this page before starting
@@ -16730,7 +17644,7 @@ private:
                 }
                 cpu_tier_cv_.notify_all();
                 const auto r = cpu_tier_chunk_range(size, 0);
-                cpu_tier_read_chunk(job, k, r.first, r.second);
+                cpu_tier_read_chunk(job, k, 0, r.first, r.second);
             } catch (...) {
                 // Only reached before any chunk was queued (acquire failed):
                 // no entry is reserved, nothing to finish.
@@ -16761,14 +17675,60 @@ private:
             const size_t n = job->index.size();
             for (;;) {
                 size_t k = 0;
+                bool early = false;
                 {
                     std::unique_lock<std::mutex> lock(job->m);
-                    job->cv.wait(lock, [&] { return !job->landed.empty() || job->n_settled == n; });
-                    if (job->landed.empty()) {
+                    job->cv.wait(lock, [&] {
+                        return !job->landed.empty() || !job->gu_ready.empty() ||
+                               job->n_settled == n;
+                    });
+                    if (!job->landed.empty()) {
+                        k = job->landed.front();
+                        job->landed.pop_front();
+                        // A settled page takes the full path below; drop its early request.
+                        job->gu_ready.erase(
+                            std::remove(job->gu_ready.begin(), job->gu_ready.end(), k),
+                            job->gu_ready.end());
+                    } else if (job->n_settled == n) {
                         break;   // every page settled and consumed
+                    } else {
+                        k = job->gu_ready.front();
+                        job->gu_ready.pop_front();
+                        early = true;
                     }
-                    k = job->landed.front();
-                    job->landed.pop_front();
+                }
+                if (early) {
+                    // Gate/up of an in-flight page. It stays reserved (not borrowed
+                    // yet) until its last chunk lands; only the compute thread reads
+                    // it, and only the gate/up chunks, which have all landed.
+                    bool skip = false;
+                    {
+                        std::lock_guard<std::mutex> lock(job->m);
+                        skip = job->error != nullptr;
+                    }
+                    if (!skip) {
+                        CpuTierJob::PageRead & pr = *job->reads[k];
+                        try {
+                            if (!cpu || !galloc) {
+                                throw std::runtime_error("failed to initialize the CPU tier backend");
+                            }
+                            std::lock_guard<std::mutex> gu_lock(pr.gu_mu);
+                            if (!pr.failed.load(std::memory_order_relaxed)) {
+                                const auto t0 = std::chrono::steady_clock::now();
+                                cpu_tier_compute_one(*job, k, cpu.get(), galloc.get(), 1, pr.data);
+                                job->ns_compute += (uint64_t) std::chrono::duration_cast<
+                                    std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                                job->gu_done[k] = 1;
+                                ++job->n_gu_early;
+                            }
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(job->m);
+                            if (!job->error) {
+                                job->error = std::current_exception();
+                            }
+                        }
+                    }
+                    continue;
                 }
                 bool failed = false;
                 {
@@ -16781,7 +17741,8 @@ private:
                             throw std::runtime_error("failed to initialize the CPU tier backend");
                         }
                         const auto t0 = std::chrono::steady_clock::now();
-                        cpu_tier_compute_one(*job, k, cpu.get(), galloc.get());
+                        cpu_tier_compute_one(*job, k, cpu.get(), galloc.get(),
+                                             job->gu_done[k] ? 2 : 0, job->holds[k].data);
                         job->ns_compute += (uint64_t) std::chrono::duration_cast<
                             std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
                     } catch (...) {
@@ -16802,8 +17763,13 @@ private:
     }
 
     // One routed expert's weighted FFN on the CPU, from its arena bytes (file
-    // layout: MemberSpan::offset, not device_offset).
-    void cpu_tier_compute_one(CpuTierJob & job, size_t k, ggml_backend_t cpu, ggml_gallocr_t galloc) {
+    // layout: MemberSpan::offset, not device_offset). `data` is the page base.
+    // stage 0 = whole FFN (today's single graph). CPU_TIER_CHUNK_COMPUTE splits
+    // the same nodes in two graphs: stage 1 = gate/up/clamp/swiglu into
+    // job.hidden[k] (reads only the gate and up bytes of `data`), stage 2 = down
+    // + routing weight from job.hidden[k] into job.partials[k].
+    void cpu_tier_compute_one(CpuTierJob & job, size_t k, ggml_backend_t cpu, ggml_gallocr_t galloc,
+                              int stage, const void * data) {
         const pipe_expert_dispatch_req & request = *job.request;
         const ExpertPage & page = *job.pages[k];
         const pipe_expert_assignment & assignment = request.assignments[job.index[k]];
@@ -16822,7 +17788,9 @@ private:
             }
         }
         std::vector<float> & out = job.partials[k];
-        out.assign((size_t) request.n_tokens * (size_t) n_embd, 0.0f);
+        if (stage != 1) {
+            out.assign((size_t) request.n_tokens * (size_t) n_embd, 0.0f);
+        }
         if (rows.empty()) {
             return;
         }
@@ -16840,7 +17808,7 @@ private:
         // request, and a CPU buffer must be TENSOR_ALIGNMENT-aligned, so they are
         // graph inputs copied in after allocation.
         buffer_ptr weight_buffer(ggml_backend_cpu_buffer_from_ptr(
-            const_cast<void *>(job.holds[k].data), (size_t) page.size));
+            const_cast<void *>(data), (size_t) page.size));
         if (!weight_buffer) {
             throw std::runtime_error("failed to wrap CPU tier expert weights");
         }
@@ -16853,8 +17821,6 @@ private:
         if (!ctx) {
             throw std::runtime_error("failed to allocate CPU tier graph metadata");
         }
-        ggml_tensor * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, m);
-        ggml_set_input(input);
         const auto role = [&](const char * name) {
             const RoleSpec & spec = specs.at(name);
             ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
@@ -16862,30 +17828,60 @@ private:
                           page.roles.at(name).offset);
             return t;
         };
-        ggml_tensor * gate = role("gate");
-        ggml_tensor * up   = role("up");
-        ggml_tensor * down = role("down");
-        ggml_tensor * gate_x = ggml_mul_mat(ctx.get(), gate, input);
-        ggml_tensor * up_x   = ggml_mul_mat(ctx.get(), up, input);
-        if (request.swiglu_clamp > 1e-6f) {
-            up_x   = ggml_clamp(ctx.get(), up_x, -request.swiglu_clamp, request.swiglu_clamp);
-            gate_x = ggml_clamp(ctx.get(), gate_x, -INFINITY, request.swiglu_clamp);
+        ggml_tensor * input  = nullptr;
+        ggml_tensor * hidden = nullptr;
+        if (stage != 2) {
+            input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, m);
+            ggml_set_input(input);
+            ggml_tensor * gate = role("gate");
+            ggml_tensor * up   = role("up");
+            ggml_tensor * gate_x = ggml_mul_mat(ctx.get(), gate, input);
+            ggml_tensor * up_x   = ggml_mul_mat(ctx.get(), up, input);
+            if (request.swiglu_clamp > 1e-6f) {
+                up_x   = ggml_clamp(ctx.get(), up_x, -request.swiglu_clamp, request.swiglu_clamp);
+                gate_x = ggml_clamp(ctx.get(), gate_x, -INFINITY, request.swiglu_clamp);
+            }
+            hidden = ggml_swiglu_split(ctx.get(), gate_x, up_x);
+        } else {
+            // Same F32 [ff, m] the single graph feeds its down mul_mat.
+            hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, specs.at("down").ne0, m);
+            ggml_set_input(hidden);
+            if (job.hidden[k].size() != (size_t) ggml_nelements(hidden)) {
+                throw std::runtime_error("cpu tier early hidden has the wrong size");
+            }
         }
-        ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate_x, up_x);
-        ggml_tensor * output = ggml_mul_mat(ctx.get(), down, hidden);
-        ggml_tensor * route  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, m);
-        ggml_set_input(route);
-        ggml_tensor * weighted = ggml_mul(ctx.get(), output, route);
-        ggml_set_output(weighted);
+        ggml_tensor * route    = nullptr;
+        ggml_tensor * weighted = nullptr;
+        if (stage != 1) {
+            ggml_tensor * down = role("down");
+            ggml_tensor * output = ggml_mul_mat(ctx.get(), down, hidden);
+            route = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, m);
+            ggml_set_input(route);
+            weighted = ggml_mul(ctx.get(), output, route);
+            ggml_set_output(weighted);
+        } else {
+            ggml_set_output(hidden);
+        }
         ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 16, false);
-        ggml_build_forward_expand(graph, weighted);
+        ggml_build_forward_expand(graph, stage == 1 ? hidden : weighted);
         if (!ggml_gallocr_alloc_graph(galloc, graph)) {
             throw std::runtime_error("failed to allocate CPU tier graph");
         }
-        ggml_backend_tensor_set(input, x.data(), 0, ggml_nbytes(input));
-        ggml_backend_tensor_set(route, w.data(), 0, ggml_nbytes(route));
+        if (input != nullptr) {
+            ggml_backend_tensor_set(input, x.data(), 0, ggml_nbytes(input));
+        } else {
+            ggml_backend_tensor_set(hidden, job.hidden[k].data(), 0, ggml_nbytes(hidden));
+        }
+        if (route != nullptr) {
+            ggml_backend_tensor_set(route, w.data(), 0, ggml_nbytes(route));
+        }
         if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("CPU tier graph compute failed");
+        }
+        if (stage == 1) {
+            job.hidden[k].resize((size_t) ggml_nelements(hidden));
+            ggml_backend_tensor_get(hidden, job.hidden[k].data(), 0, ggml_nbytes(hidden));
+            return;
         }
         std::vector<float> y((size_t) m * (size_t) n_embd);
         ggml_backend_tensor_get(weighted, y.data(), 0, y.size() * sizeof(float));
@@ -19548,6 +20544,7 @@ private:
     std::mutex                                               cpu_tier_mu_;
     std::condition_variable                                  cpu_tier_cv_;
     std::deque<CpuTierIoTask>                                cpu_tier_io_q_;
+    std::atomic<int>                                         cpu_tier_io_active_{0};
     std::unordered_map<int, std::shared_ptr<CpuTierJob>>     early_cpu_job_by_conn_;
     std::deque<std::shared_ptr<CpuTierJob>>                  cpu_tier_compute_q_;
     std::vector<std::thread>                                 cpu_tier_threads_;
@@ -19719,6 +20716,16 @@ private:
     // Keyed by conn_index -- see the long comment above begin_split_dispatch()
     // for why this must not be a single Worker-wide std::optional.
     std::unordered_map<int, split_pending> split_pending_by_conn_;
+    // PARK / UNPARK. parked_: slot arenas are freed (see park()). park_rows_:
+    // the residency snapshot taken at park, hottest first. seed_list_ /
+    // seed_cursor_ / seed_ram_items_: the ordered background refill (RAM-tier
+    // pages first, then NVMe), consumed by Worker's seed thread under the
+    // device mutex.
+    std::atomic<bool> parked_{false};
+    std::vector<ParkRow> park_rows_;
+    std::vector<ExpertSlotPool::SeedItem> seed_list_;
+    size_t seed_cursor_ = 0;
+    size_t seed_ram_items_ = 0;
 };
 
 DeviceWorker::~DeviceWorker() {
@@ -19830,6 +20837,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_batch_mmid_hit += src.n_batch_mmid_hit;
     dst.n_cpu_tier += src.n_cpu_tier;
     dst.n_cpu_tier_ram_hit += src.n_cpu_tier_ram_hit;
+    dst.n_cpu_tier_gu_early += src.n_cpu_tier_gu_early;
     dst.ns_cpu_tier_compute += src.ns_cpu_tier_compute;
     dst.ns_cpu_tier_wait += src.ns_cpu_tier_wait;
     dst.n_batch_mmid_fallback += src.n_batch_mmid_fallback;
@@ -20418,7 +21426,749 @@ public:
         }
     }
 
+    // ======================================================================
+    // *** PARK / UNPARK -- give the VRAM back without killing the process. ***
+    //
+    // Triggers: SIGUSR1 = park, SIGUSR2 = unpark (control thread in run();
+    // the handlers only write one byte to a pipe). A DISPATCH-type frame that
+    // arrives while parked auto-unparks (park_frame_enter), then proceeds.
+    //
+    // NOTE: after an unpark, greedy output can legitimately differ from a
+    // never-parked run. Residency selects the compute path (CPU tier vs GPU,
+    // batch-mmid / arena eligibility), so a different residency history means
+    // different (equally valid) numerics. Compare against a fresh worker with
+    // the same residency history, or at KLD level -- not bit-for-bit.
+    //
+    // CONCURRENCY SUMMARY: the seed has no thread of its own; it runs as an
+    // idle-pump chunk on the serving thread (seed_pump), so it is exclusive
+    // with dispatch by construction and on the same thread dispatch uses.
+    // Park/unpark device work goes through run_on_device, and
+    // DeviceExecutor::own makes each executor use (dispatch's submit..join, or
+    // a run()) mutually exclusive.
+    //
+    // PARK, in order:
+    //   1. state -> Parking: new transactions wait at park_frame_enter; frames
+    //      of a transaction already open (BEGIN->ACTS, streamed chunks) are
+    //      still admitted so they can finish. The background seed is stopped
+    //      and joined.
+    //   2. wait until zero frames are in flight and no transaction is open
+    //      (WP_EXPERT_PARK_QUIESCE_MS, default 30000, else park aborts and the
+    //      worker stays Active).
+    //   3. per GPU device, under that device's mutex (and on the device's
+    //      executor thread when WP_HIP_GRAPHS needs one): drop + drain every
+    //      speculative batch, join host landing threads, snapshot residency
+    //      hottest-first, D2H-demote VRAM pages into FREE RAM-tier room
+    //      (never evicting), free cached-graph / compute / scratch buffers and
+    //      the slot arenas.
+    //   4. write the snapshot to WP_EXPERT_PARK_FILE.
+    // UNPARK: re-allocate the arenas (same layout), then start ONE background
+    // seed thread: RAM-tier pages first (H2D straight from the host arena),
+    // NVMe pages second, each hottest-first, in small batched chunks through
+    // ensure_batch; chunks shrink to WP_EXPERT_PARK_SEED_SLICE_MS (default 8)
+    // while requests are flowing, and the seed never evicts: it stops when no
+    // free slot is left.
+    // ======================================================================
+    enum class ParkState { Active, Parking, Parked, Unparking };
+    struct SeedRun {
+        std::chrono::steady_clock::time_point t_start{};
+        std::chrono::steady_clock::time_point t_dev{};
+        std::string  reason;
+        size_t       dev = 0;
+        bool         dev_started = false;
+        size_t       landed_dev = 0;
+        size_t       landed_ram = 0;
+        uint64_t     bytes_dev = 0;
+        size_t       all_landed = 0;
+        uint64_t     all_bytes = 0;
+        double       per_page_ms = 6.0;
+        int          fails = 0;
+    };
+    void set_park_file(const std::string & path) { park_file_ = path; }
+
+    // WP_EXPERT_PARK_ON_DISCONNECT=1 (default off): follow the spine's
+    // lifecycle. conn_opened/conn_closed count live connections; when the
+    // last REAL one closes the worker parks ("disconnect") and logs the time
+    // to VRAM freed. A new connection that arrives while that park runs is
+    // accepted after it finishes (or on another slot thread), finds the worker
+    // parked and unparks ("connect"); if one is already open when the park
+    // completes it is unparked immediately.
+    static bool park_on_disconnect() {
+        static const bool on = [] {
+            const char * e = std::getenv("WP_EXPERT_PARK_ON_DISCONNECT");
+            return e != nullptr && e[0] == '1';
+        }();
+        return on;
+    }
+    void conn_opened() { conn_open_.fetch_add(1, std::memory_order_acq_rel); }
+    bool parked_now() {
+        std::lock_guard<std::mutex> lock(park_mu_);
+        return park_state_ == ParkState::Parked;
+    }
+    void conn_closed(bool real) noexcept {
+        const int left = conn_open_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (!park_on_disconnect() || !real || left != 0) {
+            return;
+        }
+        try {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "wp expert worker: last spine connection closed: parking "
+                                 "(reason=disconnect)\n");
+            const bool ok = park("disconnect");
+            std::fprintf(stderr, "wp expert worker: disconnect -> %s in %.1f ms\n",
+                         ok ? "VRAM freed" : "park did not complete",
+                         std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t0).count());
+            if (conn_open_.load(std::memory_order_acquire) > 0) {
+                unpark("connect during park");
+            }
+        } catch (...) {
+        }
+    }
+
+    // Called by serve_connection for every dispatch-type frame, BEFORE any
+    // pool state is touched and before gpu_lock is taken.
+    //
+    // DEFAULT PATH (no park/seed ever requested): two atomic ops (one
+    // fetch_add here, one fetch_sub in park_frame_leave) and no mutex, no
+    // clock read, no set, no device-mutex access. Returns 1.
+    // Once park_armed_ is set (first SIGUSR1 or first seed) frames take the
+    // locked path (returns 2): they block while a park quiesces, and a frame
+    // that finds the worker parked unparks it (this thread does the
+    // re-allocation) and then proceeds.
+    // Returns 0 + `err` if the unpark could not allocate; the frame is then
+    // answered with an error and the connection is kept (the worker stays
+    // parked; the next dispatch frame retries).
+    int park_frame_enter(int conn_index, bool stream_active, std::string & err) {
+        if (!park_armed_.load(std::memory_order_acquire)) {
+            park_fast_inflight_.fetch_add(1, std::memory_order_seq_cst);
+            if (!park_armed_.load(std::memory_order_seq_cst)) {
+                return 1;
+            }
+            park_fast_leave();   // armed in between: back out, take the locked path
+        }
+        // Computed before park_mu_ (device mutex, never nested inside it).
+        const bool mid_txn = stream_active || has_split_dispatch(conn_index);
+        std::unique_lock<std::mutex> lock(park_mu_);
+        for (;;) {
+            if (park_state_ == ParkState::Active) {
+                break;
+            }
+            if (park_state_ == ParkState::Parking &&
+                    (mid_txn || park_txn_conns_.count(conn_index) != 0)) {
+                break;   // finish the transaction this connection already opened
+            }
+            if (park_state_ == ParkState::Parked) {
+                if (!unpark_locked(lock, "first dispatch request", err)) {
+                    return 0;
+                }
+                continue;
+            }
+            park_cv_.wait(lock);
+        }
+        ++park_inflight_;
+        park_inflight_atomic_.store(park_inflight_, std::memory_order_relaxed);
+        park_last_frame_ns_.store(park_now_ns(), std::memory_order_relaxed);
+        return 2;
+    }
+
+    // `mode` is park_frame_enter's return. `txn_open` (locked path only): this
+    // connection is still mid-transaction after the frame (split BEGIN awaiting
+    // ACTS, or streamed chunks) -- park must wait for it. serve_connection
+    // computes it while gpu_lock is still held (ParkTxnProbe).
+    void park_frame_leave(int conn_index, int mode, bool txn_open) {
+        if (mode == 1) {
+            park_fast_leave();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(park_mu_);
+            --park_inflight_;
+            park_inflight_atomic_.store(park_inflight_, std::memory_order_relaxed);
+            if (txn_open) {
+                park_txn_conns_.insert(conn_index);
+            } else {
+                park_txn_conns_.erase(conn_index);
+            }
+            park_last_frame_ns_.store(park_now_ns(), std::memory_order_relaxed);
+        }
+        park_cv_.notify_all();
+    }
+
+    void park_conn_closed(int conn_index) noexcept {
+        if (!park_armed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        try {
+            {
+                std::lock_guard<std::mutex> lock(park_mu_);
+                park_txn_conns_.erase(conn_index);
+            }
+            park_cv_.notify_all();
+        } catch (...) {
+        }
+    }
+
+    // Park / unpark requests are applied in arrival order: a request that
+    // arrives while another thread is mid-transition (an auto-unpark on a
+    // serving thread) waits for it to finish and is then applied, never
+    // dropped. Requests on the control thread are serialized by the pipe.
+    bool park(const char * why) {
+        std::unique_lock<std::mutex> lock(park_mu_);
+        park_cv_.wait(lock, [&] {
+            return park_state_ == ParkState::Active || park_state_ == ParkState::Parked;
+        });
+        if (park_state_ != ParkState::Active) {
+            std::fprintf(stderr, "wp expert worker: park (%s) ignored: already parked\n", why);
+            return false;
+        }
+        bool any = false;
+        for (const std::unique_ptr<DeviceWorker> & dev : devices_) {
+            any = any || dev->can_park();
+        }
+        if (!any) {
+            std::fprintf(stderr,
+                         "wp expert worker: park (%s) ignored: no ROCm/CUDA device with slot arenas\n",
+                         why);
+            return false;
+        }
+        park_armed_.store(true, std::memory_order_seq_cst);
+        set_park_state(ParkState::Parking);
+        // Stop the background seed (it only ever runs between frames on the
+        // serving thread; taking seed_mu_ waits out a chunk in progress).
+        {
+            lock.unlock();
+            std::lock_guard<std::mutex> seed_lock(seed_mu_);
+            seed_active_.store(false, std::memory_order_release);
+            lock.lock();
+        }
+        const long quiesce_ms = park_env_ll("WP_EXPERT_PARK_QUIESCE_MS", 30000);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(quiesce_ms);
+        for (;;) {
+            bool quiet = park_inflight_ == 0 && park_txn_conns_.empty() &&
+                         park_fast_inflight_.load(std::memory_order_seq_cst) == 0;
+            if (quiet) {
+                // A transaction opened by a frame that ran before park_armed_
+                // flipped is invisible to park_txn_conns_; ask the pools.
+                lock.unlock();
+                quiet = !split_pending_any();
+                lock.lock();
+                quiet = quiet && park_inflight_ == 0 &&
+                        park_fast_inflight_.load(std::memory_order_seq_cst) == 0;
+            }
+            if (quiet) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                std::fprintf(stderr,
+                             "wp expert worker: park (%s) ABORTED: %d frame(s) in flight / %zu open "
+                             "transaction(s) after %ld ms; still serving\n",
+                             why, park_inflight_ + park_fast_inflight_.load(),
+                             park_txn_conns_.size(), quiesce_ms);
+                set_park_state(ParkState::Active);
+                lock.unlock();
+                park_cv_.notify_all();
+                return false;
+            }
+            park_cv_.wait_for(lock, std::chrono::milliseconds(20));
+        }
+        lock.unlock();
+        const bool ok = do_park(why);
+        lock.lock();
+        set_park_state(ok ? ParkState::Parked : ParkState::Active);
+        lock.unlock();
+        park_cv_.notify_all();
+        return ok;
+    }
+
+    bool unpark(const char * why) {
+        std::unique_lock<std::mutex> lock(park_mu_);
+        park_cv_.wait(lock, [&] {
+            return park_state_ == ParkState::Active || park_state_ == ParkState::Parked;
+        });
+        if (park_state_ != ParkState::Parked) {
+            std::fprintf(stderr, "wp expert worker: unpark (%s) ignored: not parked\n", why);
+            return false;
+        }
+        std::string err;
+        const bool ok = unpark_locked(lock, why, err);
+        if (!ok) {
+            std::fprintf(stderr, "wp expert worker: unpark (%s) FAILED: %s\n", why, err.c_str());
+        }
+        return ok;
+    }
+
+    // WP_EXPERT_SEED_FROM_PARK=1: warm a freshly started worker from a park
+    // file with the same background hottest-first seed. Call once, before
+    // serving starts.
+    bool seed_from_park_file(const std::string & path) {
+        std::map<std::string, std::vector<std::tuple<int, int, uint64_t, bool>>> sections;
+        if (!parse_park_file(path, sections)) {
+            std::fprintf(stderr, "wp expert worker: WP_EXPERT_SEED_FROM_PARK=1 but %s is "
+                                 "missing/empty; starting cold\n", path.c_str());
+            return false;
+        }
+        size_t total = 0;
+        size_t total_ram = 0;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            DeviceWorker & dev = *devices_[i];
+            if (!dev.can_park()) {
+                continue;
+            }
+            auto it = sections.find(dev.device_name());
+            if (it == sections.end()) {
+                it = sections.find(std::string());
+            }
+            if (it == sections.end()) {
+                continue;
+            }
+            size_t sel = 0;
+            size_t ram = 0;
+            {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                dev.seed_prepare_from_file_rows(it->second, sel, ram);
+            }
+            total += sel;
+            total_ram += ram;
+            std::fprintf(stderr, "wp expert worker: seed-from-park device=%s file=%s rows=%zu "
+                                 "seed_pages=%zu (ram_tier=%zu)\n",
+                         dev.device_name().c_str(), path.c_str(), it->second.size(), sel, ram);
+        }
+        if (total == 0) {
+            return false;
+        }
+        std::fprintf(stderr, "wp expert worker: seed-from-park: %zu page(s) planned "
+                             "(%zu from the RAM tier), seeding between frames\n",
+                     total, total_ram);
+        begin_seed("startup seed from park file");
+        return true;
+    }
+
+    // *** BACKGROUND SEED: RUNS ON THE SERVING THREAD, BETWEEN FRAMES. ***
+    // Called from serve_connection's idle pump (await_request), the same place
+    // and thread that already runs keepalive_tick / spec_pagein_step. That is
+    // the whole concurrency design: the seed is never a second thread, so it
+    // cannot race dispatch for a device executor, cannot violate the
+    // per-device thread-affinity rule (it goes through the same executor
+    // dispatch would use, via run_on_device), and cannot overlap a frame. It
+    // does ONE bounded chunk per call and returns; the pump's ppoll re-checks
+    // the socket before every chunk, so a pending request always wins.
+    //   txn_open: a BEGIN->ACTS or chunk stream is open on this connection
+    //             (demand pins / arena entries are held): never seed then.
+    //   busy:     a request was served within the last 50 ms; chunks shrink to
+    //             ~WP_EXPERT_PARK_SEED_SLICE_MS (0 = do not seed while busy).
+    // Pump is not run under WP_WORKER_MULTI_CONN or WP_WORKER_PIPELINE (they
+    // already skip it), so the seed simply does not progress there.
+    bool seed_active() const { return seed_active_.load(std::memory_order_acquire); }
+    bool park_armed() const { return park_armed_.load(std::memory_order_acquire); }
+
+    bool seed_pump(bool txn_open, bool busy) {
+        if (!seed_active_.load(std::memory_order_acquire) || txn_open ||
+                park_flag_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        static const long ram_chunk  = std::max(1L, park_env_ll("WP_EXPERT_PARK_SEED_RAM_CHUNK", 16));
+        static const long nvme_chunk = std::max(1L, park_env_ll("WP_EXPERT_PARK_SEED_CHUNK", 8));
+        static const long slice_ms   = park_env_ll("WP_EXPERT_PARK_SEED_SLICE_MS", 8);
+        if (busy && slice_ms == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> seed_lock(seed_mu_);
+        if (!seed_active_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        SeedRun & r = seed_run_;
+        while (r.dev < devices_.size()) {
+            const size_t i = r.dev;
+            DeviceWorker & dev = *devices_[i];
+            int      status = 0;      // 0 nothing left, 1 more, 2 finished this device
+            size_t   landed = 0;
+            uint64_t bytes = 0;
+            double   step_ms = 0.0;
+            bool     ram_phase = false;
+            run_on_device(i, [&] {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                if (dev.parked() || !dev.seed_pending()) {
+                    return;
+                }
+                ram_phase = dev.seed_in_ram_phase();
+                size_t n = (size_t) (ram_phase ? ram_chunk : nvme_chunk);
+                if (busy) {
+                    n = std::min(n, (size_t) std::max(
+                        1.0, (double) slice_ms / std::max(r.per_page_ms, 0.5)));
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                try {
+                    status = dev.seed_step(n, landed, bytes) ? 1 : 2;
+                } catch (const std::exception & e) {
+                    // Includes the bounded arena reservation timing out: give
+                    // up on THIS chunk (the cursor already moved past it) and
+                    // never wait on the arena with the device mutex held.
+                    std::fprintf(stderr, "wp expert worker: seed chunk abandoned on device=%s: %s\n",
+                                 dev.device_name().c_str(), e.what());
+                    status = 1;
+                    if (++r.fails >= 3) {
+                        dev.seed_cancel();
+                        status = 2;
+                    }
+                }
+                step_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+            });
+            if (status == 0) {
+                finish_seed_device(r, dev);
+                ++r.dev;
+                continue;
+            }
+            if (!r.dev_started) {
+                r.dev_started = true;
+                r.t_dev = std::chrono::steady_clock::now();
+            }
+            if (landed > 0) {
+                r.per_page_ms = 0.7 * r.per_page_ms + 0.3 * (step_ms / (double) landed);
+                r.landed_dev += landed;
+                r.bytes_dev += bytes;
+                if (ram_phase) {
+                    r.landed_ram += landed;
+                }
+            }
+            if (status == 2) {
+                finish_seed_device(r, dev);
+                ++r.dev;
+            }
+            return true;
+        }
+        std::fprintf(stderr,
+            "wp expert worker: SEED finished (%s): pages=%zu bytes=%llu total_seconds=%.3f\n",
+            r.reason.c_str(), r.all_landed, (unsigned long long) r.all_bytes,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - r.t_start).count());
+        std::fflush(stderr);
+        seed_active_.store(false, std::memory_order_release);
+        return false;
+    }
+
+
+private:
+    static int64_t park_now_ns() {
+        return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    static long park_env_ll(const char * name, long def) {
+        const char * e = std::getenv(name);
+        if (e == nullptr || e[0] == '\0') {
+            return def;
+        }
+        const long v = std::strtol(e, nullptr, 10);
+        return v >= 0 ? v : def;
+    }
+
+    // Lock-protected state change; mirrors the non-Active states into the
+    // lock-free flag the idle pumps read.
+    void set_park_state(ParkState state) {
+        park_state_ = state;
+        park_flag_.store(state != ParkState::Active, std::memory_order_release);
+    }
+
+    bool device_uses_executor(size_t i) const {
+        return hip_graph_executor_needed(i) || (device_parallel_ && devices_.size() > 1);
+    }
+
+    // Run `fn` on the thread dispatch would drive device `i` from: its
+    // executor when dispatch uses one (HIP graphs, or multi-device parallel
+    // dispatch), else the calling thread. DeviceExecutor::run holds the
+    // executor's ownership mutex for the whole call, so it is excluded from
+    // dispatch's submit..join span on the same executor.
+    void run_on_device(size_t i, const std::function<void()> & fn) {
+        if (device_uses_executor(i)) {
+            ensure_device_executor(i);
+            device_exec_[i]->run(fn);
+        } else {
+            fn();
+        }
+    }
+
+    void park_fast_leave() {
+        if (park_fast_inflight_.fetch_sub(1, std::memory_order_seq_cst) == 1 &&
+                park_armed_.load(std::memory_order_seq_cst)) {
+            {
+                std::lock_guard<std::mutex> lock(park_mu_);   // no lost wakeup
+            }
+            park_cv_.notify_all();
+        }
+    }
+
+    bool split_pending_any() {
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            if (devices_[i]->has_any_split_dispatch()) {
+                return true;
+            }
+        }
+        std::lock_guard<std::mutex> lock(split_mutex_);
+        return !split_pending_by_conn_.empty();
+    }
+
+    // Called with park_mu_ held (via `lock`) and park_state_ == Parked.
+    // Returns with the lock held again; state is Active on success, Parked on
+    // failure. The lock is dropped for the re-allocation so frames of other
+    // connections just wait on park_cv_ (state Unparking).
+    bool unpark_locked(std::unique_lock<std::mutex> & lock, const char * why,
+                       std::string & err) {
+        set_park_state(ParkState::Unparking);
+        lock.unlock();
+        const bool ok = do_unpark(why, err);
+        lock.lock();
+        set_park_state(ok ? ParkState::Active : ParkState::Parked);
+        park_cv_.notify_all();
+        return ok;
+    }
+
+    bool do_park(const char * why) {
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t n_parked = 0;
+        uint64_t freed_total = 0;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            DeviceWorker & dev = *devices_[i];
+            if (!dev.can_park()) {
+                std::fprintf(stderr, "wp expert worker: park: device=%s not parked "
+                                     "(not ROCm/CUDA, or no slot arenas)\n",
+                             dev.device_name().c_str());
+                continue;
+            }
+            DeviceWorker::ParkStats st;
+            std::string reason;
+            bool ok = false;
+            run_on_device(i, [&] {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                try {
+                    ok = dev.park(st, reason);
+                } catch (const std::exception & e) {
+                    ok = false;
+                    reason = e.what();
+                }
+            });
+            if (!ok) {
+                std::fprintf(stderr, "wp expert worker: park FAILED device=%s: %s\n",
+                             dev.device_name().c_str(), reason.c_str());
+                continue;
+            }
+            ++n_parked;
+            const uint64_t freed = st.freed_arena_bytes + st.freed_compute_bytes;
+            freed_total += freed;
+            std::fprintf(stderr,
+                "wp expert worker: PARKED (%s) device=%s freed_bytes=%llu (%.2f GiB: "
+                "slot_arenas=%llu compute_graph_scratch=%llu) device_free %.2f -> %.2f GiB "
+                "of %.2f GiB; snapshot vram_pages=%zu ram_only_pages=%zu; demoted_to_ram=%zu "
+                "(%.2f GiB) not_demoted=%llu; park_ms=%.1f\n",
+                why, dev.device_name().c_str(), (unsigned long long) freed,
+                (double) freed / (1024.0 * 1024.0 * 1024.0),
+                (unsigned long long) st.freed_arena_bytes,
+                (unsigned long long) st.freed_compute_bytes,
+                (double) st.dev_free_before / (1024.0 * 1024.0 * 1024.0),
+                (double) st.dev_free_after / (1024.0 * 1024.0 * 1024.0),
+                (double) st.dev_total / (1024.0 * 1024.0 * 1024.0),
+                st.n_vram, st.n_ram, st.demoted,
+                (double) st.demoted_bytes / (1024.0 * 1024.0 * 1024.0),
+                (unsigned long long) st.not_demoted, st.ms);
+        }
+        if (n_parked == 0) {
+            return false;
+        }
+        write_park_file();
+        std::fprintf(stderr,
+            "wp expert worker: PARKED total freed_bytes=%llu (%.2f GiB) devices=%zu in %.1f ms; "
+            "process, HIP context and RAM tier stay alive; listening\n",
+            (unsigned long long) freed_total,
+            (double) freed_total / (1024.0 * 1024.0 * 1024.0), n_parked,
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count());
+        std::fflush(stderr);
+        return true;
+    }
+
+    bool do_unpark(const char * why, std::string & err) {
+        bool all_ok = true;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            DeviceWorker & dev = *devices_[i];
+            if (!dev.parked()) {
+                continue;
+            }
+            double realloc_ms = 0.0;
+            size_t sel = 0;
+            size_t ram = 0;
+            std::string e;
+            bool ok = false;
+            run_on_device(i, [&] {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                ok = dev.unpark(realloc_ms, e);
+                if (ok) {
+                    dev.seed_prepare_from_park_rows(sel, ram);
+                }
+            });
+            if (!ok) {
+                all_ok = false;
+                err = dev.device_name() + ": " + e;
+                std::fprintf(stderr, "wp expert worker: UNPARK FAILED device=%s: %s "
+                                     "(still parked; next dispatch retries)\n",
+                             dev.device_name().c_str(), e.c_str());
+                continue;
+            }
+            std::fprintf(stderr,
+                "wp expert worker: UNPARKED (%s) device=%s realloc_ms=%.1f seed_plan: "
+                "pages=%zu (ram_tier_first=%zu, nvme=%zu)\n",
+                why, dev.device_name().c_str(), realloc_ms, sel, ram, sel - ram);
+        }
+        if (!all_ok) {
+            return false;
+        }
+        begin_seed(why);
+        return true;
+    }
+
+    // Arm a seed from the per-device lists prepared under the device mutex
+    // (seed_prepare*). The seed itself runs in seed_pump on the serving thread.
+    void begin_seed(const char * why) {
+        bool any = false;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            bool pending = false;
+            {
+                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                pending = devices_[i]->seed_pending();
+            }
+            if (pending) {
+                any = true;
+                if (device_uses_executor(i)) {
+                    ensure_device_executor(i);   // created here, before any pump
+                }
+            }
+        }
+        if (!any) {
+            return;
+        }
+        std::lock_guard<std::mutex> seed_lock(seed_mu_);
+        seed_run_ = SeedRun{};
+        seed_run_.t_start = std::chrono::steady_clock::now();
+        seed_run_.reason = why;
+        park_armed_.store(true, std::memory_order_seq_cst);
+        seed_active_.store(true, std::memory_order_release);
+    }
+
+    void finish_seed_device(SeedRun & r, DeviceWorker & dev) {
+        if (!r.dev_started) {
+            return;
+        }
+        const double sec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - r.t_dev).count();
+        std::fprintf(stderr,
+            "wp expert worker: SEED device=%s seeded_pages=%zu (from_ram_tier=%zu) "
+            "bytes=%llu seed_seconds=%.3f GB/s=%.2f\n",
+            dev.device_name().c_str(), r.landed_dev, r.landed_ram,
+            (unsigned long long) r.bytes_dev, sec,
+            sec > 0.0 ? ((double) r.bytes_dev / 1e9) / sec : 0.0);
+        r.all_landed += r.landed_dev;
+        r.all_bytes += r.bytes_dev;
+        r.landed_dev = 0;
+        r.landed_ram = 0;
+        r.bytes_dev = 0;
+        r.dev_started = false;
+        r.fails = 0;
+    }
+
+    // "# device NAME" opens a section; "layer expert  # heat [V|R] [P]" rows.
+    // Rows before any header go to section "" (applies to any device).
+    static bool parse_park_file(
+            const std::string & path,
+            std::map<std::string, std::vector<std::tuple<int, int, uint64_t, bool>>> & out) {
+        std::ifstream in(path);
+        if (!in) {
+            return false;
+        }
+        std::string section;
+        std::string line;
+        size_t rows = 0;
+        while (std::getline(in, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            if (line[0] == '#') {
+                if (line.compare(0, 9, "# device ") == 0) {
+                    section = line.substr(9);
+                }
+                continue;
+            }
+            std::istringstream input(line);
+            int layer = -1;
+            int expert = -1;
+            if (!(input >> layer >> expert)) {
+                continue;
+            }
+            uint64_t heat = 1;
+            bool pinned = false;
+            const size_t hash = line.find('#');
+            if (hash != std::string::npos) {
+                std::istringstream tail(line.substr(hash + 1));
+                uint64_t parsed = 0;
+                if (tail >> parsed) {
+                    heat = parsed;
+                }
+                std::string tok;
+                while (tail >> tok) {
+                    if (tok == "P") {
+                        pinned = true;
+                    }
+                }
+            }
+            out[section].emplace_back(layer, expert, heat, pinned);
+            ++rows;
+        }
+        return rows != 0;
+    }
+
+    // Residency snapshot of every parked device, hottest first (tmp + rename).
+    // Same "layer expert  # count" shape as WP_EXPERT_COUNTS_DUMP, so it is
+    // also a valid WP_EXPERT_PIN_FILE; the tier tag after the count is ignored
+    // by that loader.
+    void write_park_file() const {
+        if (park_file_.empty()) {
+            return;
+        }
+        const std::string tmp = park_file_ + ".tmp";
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out) {
+            std::fprintf(stderr, "wp expert worker: park snapshot: cannot write %s\n", tmp.c_str());
+            return;
+        }
+        out << "# wp-expert-worker park snapshot v1 t=" << (long long) std::time(nullptr) << '\n'
+            << "# rows: layer expert  # heat tier [P]; tier V = held a VRAM slot, "
+               "R = RAM tier only; hottest first per device\n";
+        size_t rows = 0;
+        for (const std::unique_ptr<DeviceWorker> & dev : devices_) {
+            if (!dev->parked() || dev->park_rows().empty()) {
+                continue;
+            }
+            out << "# device " << dev->device_name() << '\n';
+            for (const DeviceWorker::ParkRow & row : dev->park_rows()) {
+                out << row.item.page->layer << ' ' << row.item.page->expert << "  # "
+                    << row.item.heat << ' ' << (row.vram ? 'V' : 'R')
+                    << (row.item.pinned ? " P" : "") << '\n';
+                ++rows;
+            }
+        }
+        out.close();
+        if (out && std::rename(tmp.c_str(), park_file_.c_str()) == 0) {
+            std::fprintf(stderr, "wp expert worker: park snapshot written: %s (%zu rows)\n",
+                         park_file_.c_str(), rows);
+        } else {
+            std::fprintf(stderr, "wp expert worker: park snapshot: write/rename to %s failed\n",
+                         park_file_.c_str());
+        }
+    }
+
+public:
     void keepalive_tick() {
+        if (park_flag_.load(std::memory_order_acquire)) {
+            return;
+        }
         for (size_t i = 0; i < devices_.size(); ++i) {
             if (hip_graph_executor_needed(i)) {
                 ensure_device_executor(i);
@@ -20434,6 +22184,9 @@ public:
     }
 
     bool keepalive_enabled() const {
+        if (park_flag_.load(std::memory_order_acquire)) {
+            return false;
+        }
         for (const std::unique_ptr<DeviceWorker> & device : devices_) {
             if (device->keepalive_enabled()) {
                 return true;
@@ -20453,6 +22206,12 @@ public:
     }
 
     bool has_spec_work() const {
+        if (park_flag_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (seed_active_.load(std::memory_order_acquire)) {
+            return true;
+        }
         for (size_t i = 0; i < devices_.size(); ++i) {
             std::lock_guard<std::mutex> lock(device_mutexes_[i]);
             if (devices_[i]->has_spec_work()) {
@@ -20463,6 +22222,12 @@ public:
     }
 
     bool has_spec_submit_work() const {
+        if (park_flag_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (seed_active_.load(std::memory_order_acquire)) {
+            return true;
+        }
         for (size_t i = 0; i < devices_.size(); ++i) {
             std::lock_guard<std::mutex> lock(device_mutexes_[i]);
             if (devices_[i]->has_spec_submit_work()) {
@@ -20481,6 +22246,9 @@ public:
 
     bool spec_pagein_step(bool harvest = true) {
         bool result = false;
+        if (park_flag_.load(std::memory_order_acquire)) {
+            return false;
+        }
         for (size_t i = 0; i < devices_.size(); ++i) {
             if (hip_graph_executor_needed(i)) {
                 ensure_device_executor(i);
@@ -20499,6 +22267,9 @@ public:
     }
 
     void spec_pagein_after_dispatch() {
+        if (park_flag_.load(std::memory_order_acquire)) {
+            return;
+        }
         for (size_t i = 0; i < devices_.size(); ++i) {
             if (hip_graph_executor_needed(i)) {
                 ensure_device_executor(i);
@@ -20691,6 +22462,12 @@ public:
             // WP_CPU_TIER_CPUS.
             const bool cpu_overlap = cpu_tier_overlap_enabled();
             std::vector<size_t> launched;
+            // Executor ownership for each launched device, held from submit()
+            // until the end of this block (after every join_one): see
+            // DeviceExecutor::own. Acquired in launch order, which is the same
+            // for every dispatch thread; park/seed hold at most one at a time.
+            std::vector<std::unique_lock<std::mutex>> exec_own;
+            exec_own.reserve(by_device.size() + 1);
             size_t cpu_device = SIZE_MAX;
             // The CPU tier's executor is the only one that gets pinned, and the
             // only one for which pinning is meaningful -- WP_CPU_TIER_PIN, off
@@ -20718,6 +22495,7 @@ public:
             // memory-access fault for it).
             if (cpu_overlap && cpu_device != SIZE_MAX) {
                 ensure_exec(cpu_device);
+                exec_own.emplace_back(device_exec_[cpu_device]->own);
                 device_exec_[cpu_device]->submit(
                     [run_device, cpu_device] { run_device(cpu_device); });
                 launched.push_back(cpu_device);
@@ -20725,6 +22503,7 @@ public:
             for (size_t d = 0; d < by_device.size(); ++d) {
                 if (by_device[d].empty() || d == cpu_device) { continue; }
                 ensure_exec(d);
+                exec_own.emplace_back(device_exec_[d]->own);
                 device_exec_[d]->submit([run_device, d] { run_device(d); });
                 launched.push_back(d);
             }
@@ -20782,6 +22561,7 @@ public:
             if (cpu_device != SIZE_MAX) {
                 if (!cpu_overlap) {
                     ensure_exec(cpu_device);
+                    exec_own.emplace_back(device_exec_[cpu_device]->own);
                     device_exec_[cpu_device]->submit(
                         [run_device, cpu_device] { run_device(cpu_device); });
                 }
@@ -22202,6 +23982,33 @@ private:
     std::vector<std::unique_ptr<DeviceWorker>> devices_;
     std::vector<DeviceReqLog> last_device_reqlog_;
     mutable std::vector<std::mutex> device_mutexes_;
+
+    // *** PARK / UNPARK STATE (see park()). Declared after devices_ so the
+    // seed thread is joined BEFORE any device is destroyed. ***
+    std::mutex                              park_mu_;
+    std::condition_variable                 park_cv_;
+    ParkState                               park_state_ = ParkState::Active;
+    int                                     park_inflight_ = 0;
+    std::set<int>                           park_txn_conns_;
+    // != Active. Read lock-free by the idle pumps (keepalive/speculative).
+    std::atomic<bool>                       park_flag_{false};
+    // Last dispatch-frame enter/leave, steady_clock ns: the seed thread
+    // yields to serving traffic on this.
+    std::atomic<int64_t>                    park_last_frame_ns_{0};
+    std::atomic<int>                        park_inflight_atomic_{0};
+    std::string                             park_file_;
+    // park_armed_: set at the first park request or seed and never cleared.
+    // While false every dispatch frame takes the lock-free path
+    // (park_fast_inflight_ only). park_fast_inflight_ counts frames on that
+    // path so a park that arms the flag can still wait them out.
+    std::atomic<bool>                       park_armed_{false};
+    std::atomic<int>                        conn_open_{0};
+    std::atomic<int>                        park_fast_inflight_{0};
+    // Background seed state; seed_mu_ guards seed_run_ and orders begin/stop
+    // against the serving thread's seed_pump chunk.
+    std::mutex        seed_mu_;
+    SeedRun           seed_run_;
+    std::atomic<bool> seed_active_{false};
     std::unique_ptr<pipe_expert_shm_ring> local_shm_;
     uint32_t local_shm_tokens_ = 0;
 
@@ -22245,6 +24052,15 @@ private:
     // changed Vulkan submit 389 -> 254 us and decode 6.47 -> 7.4 t/s.
     // Both were CPU starvation on that box.
     struct DeviceExecutor {
+        // OWNERSHIP of the executor for one logical use. The executor has a
+        // single task slot: submit() overwrites it without waiting, and
+        // run()/join_one() only wait for idle, so two users interleaving
+        // (dispatch's submit..join span vs a park/seed run()) could overwrite
+        // each other's task or return from join early. Every run() holds
+        // `own` for its whole call, and dispatch's parallel path holds it from
+        // submit() to join_one() of each device it launches. Uncontended on the
+        // default path (one lock/unlock per device per frame).
+        std::mutex              own;
         std::thread             thread;
         std::mutex              mu;
         std::condition_variable cv_task;
@@ -22315,6 +24131,7 @@ private:
             cv_task.notify_one();
         }
         void run(std::function<void()> job) {
+            std::lock_guard<std::mutex> own_lock(own);
             {
                 std::unique_lock<std::mutex> lock(mu);
                 cv_done.wait(lock, [this] { return idle; });
@@ -23173,6 +24990,10 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     struct PendingCleanup {
         Worker & worker;
         int      conn_index;
+        // This connection counts as a real spine connection (it unparked the
+        // worker at connect, or passed a dispatch frame). Probe / health
+        // connections never set it, so their close never triggers a park.
+        bool     real = false;
         ~PendingCleanup() {
             // Connection close is NOT inside the per-request gpu_lock below
             // (that lock is scoped to one loop iteration; this destructor
@@ -23197,8 +25018,42 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             } else {
                 worker.abandon_split_dispatch(conn_index);
             }
+            // A connection that died mid-transaction must not keep a park
+            // waiting on it.
+            worker.park_conn_closed(conn_index);
+            // WP_EXPERT_PARK_ON_DISCONNECT: the last real connection closing
+            // parks the worker (runs on this, the closing, thread).
+            worker.conn_closed(real);
         }
     } pending_cleanup{ worker, conn_index };
+    worker.conn_opened();
+    // WP_EXPERT_PARK_ON_DISCONNECT: a connection accepted while parked
+    // unparks the worker at once (so the seed overlaps the spine's own model
+    // load) -- but only if it is not a bare TCP probe: it must still be open
+    // and not have closed after a short grace (WP_EXPERT_PARK_CONNECT_GRACE_MS,
+    // default 300), or have sent a frame. A connect-and-close probe is
+    // ignored entirely and never parks or unparks anything.
+    if (Worker::park_on_disconnect() && worker.parked_now()) {
+        const long grace_ms = std::max(0L, [] {
+            const char * e = std::getenv("WP_EXPERT_PARK_CONNECT_GRACE_MS");
+            return (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 300L;
+        }());
+        const int fd = socket.poll_fd();
+        bool alive = fd >= 0;
+        if (alive) {
+            struct pollfd pfd { fd, POLLIN, 0 };
+            const int pr = ::poll(&pfd, 1, (int) grace_ms);
+            if (pr > 0) {
+                char c = 0;
+                const ssize_t n = ::recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+                alive = n > 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+            }
+        }
+        if (alive) {
+            worker.unpark("connect");
+            pending_cleanup.real = true;
+        }
+    }
     const pipe_expert_hello mine = worker.hello();
     const std::vector<uint8_t> hello_payload = pipe_encode_expert_hello(mine);
     if (!pipe_send_frame(
@@ -23517,6 +25372,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             return;
         }
         for (;;) {
+            // The background park/unpark seed (Worker::seed_pump) keeps this
+            // loop alive the same way a spec queue does.
             // Re-checked every iteration, not just on entry. Without this, a
             // worker with the pump OFF that finishes its spec queue would sit in
             // a zero-timeout ppoll spinning a core: nothing left to read, and a
@@ -23535,8 +25392,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             // in flight we are waiting on the reader thread, so poll on the
             // ordinary period and harvest when it lands. Spinning there would
             // burn a core for the whole 3-5 ms read and buy nothing.
-            const long ns = worker.has_spec_submit_work() ? 0L
-                                                          : (long) worker.keepalive_us() * 1000L;
+            long ns = worker.has_spec_submit_work() ? 0L
+                                                    : (long) worker.keepalive_us() * 1000L;
+            if (ns == 0 && !worker.has_spec_submit_work()) {
+                ns = 1000000L;   // seed pending but not runnable (txn open): do not spin
+            }
             struct timespec ts { ns / 1000000000L, ns % 1000000000L };
             const int r = ::ppoll(&pfd, 1, &ts, nullptr);
             if (r != 0) {
@@ -23545,6 +25405,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 // idle window will take it, and if the layer has moved on the
                 // idle timeout below discards it.
                 return;   // data ready, or an error recv_data will surface
+            }
+            // Park/unpark seed: one bounded chunk between frames, on THIS
+            // thread, only when no transaction is open on this connection.
+            // Runs before the idle cut-off below so an idle worker still
+            // refills after an unpark.
+            if (worker.seed_active()) {
+                const bool busy_now =
+                    std::chrono::steady_clock::now() - last_request_at < std::chrono::milliseconds(50);
+                if (worker.seed_pump(stream_dispatch.active ||
+                                         worker.has_split_dispatch(conn_index), busy_now)) {
+                    continue;
+                }
             }
             if (std::chrono::steady_clock::now() - last_request_at > KEEPALIVE_IDLE_MS) {
                 // Idle long enough that any hinted layer is far behind us.
@@ -23818,6 +25690,45 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         shm_request_ref = {};
         shm_request_data = nullptr;
         shm_request_length = 0;
+        // PARK / UNPARK GATE (see Worker::park). Every dispatch-type frame
+        // passes through here BEFORE it can touch pool state or take
+        // gpu_lock: while a park is quiescing the frame waits (unless its
+        // connection already opened a transaction); while parked, the frame
+        // auto-unparks the worker and then proceeds. Declared before gpu_lock
+        // so it is released after it. DEFAULT PATH (no park/seed ever
+        // requested): two atomic ops per frame, no mutex, no clock read, no
+        // device-mutex access (mode 1). Only after the first SIGUSR1 / seed
+        // does it take the locked path (mode 2), where txn_open is computed by
+        // ParkTxnProbe while gpu_lock is still held.
+        struct ParkFrameScope {
+            Worker &     worker;
+            int          conn_index;
+            const bool & stream_active;
+            int          mode = 0;
+            bool         txn_open = false;
+            ~ParkFrameScope() {
+                if (mode != 0) {
+                    worker.park_frame_leave(conn_index, mode, txn_open);
+                }
+            }
+        } park_scope{ worker, conn_index, stream_dispatch.active };
+        if (type == PIPE_EXPERT_DISPATCH_REQ || type == PIPE_EXPERT_SHM_DISPATCH_REQ ||
+            type == PIPE_EXPERT_DISPATCH_BEGIN || type == PIPE_EXPERT_DISPATCH_ACTS ||
+            type == PIPE_EXPERT_DISPATCH_ACTS_PUBLISH || type == PIPE_EXPERT_DISPATCH_ACTS_REF ||
+            type == PIPE_EXPERT_DISPATCH_CHUNK) {
+            std::string park_err;
+            const int park_mode = worker.park_frame_enter(
+                conn_index, stream_dispatch.active, park_err);
+            if (park_mode == 0) {
+                // Keep the connection: answer this frame with an error and wait
+                // for the next one (which retries the unpark).
+                send_response_error(seq_id, PIPE_ERR_EXPERT_COMPUTE,
+                                    "expert worker unpark failed: " + park_err);
+                continue;
+            }
+            park_scope.mode = park_mode;
+            pending_cleanup.real = true;
+        }
         // WP_WORKER_MULTI_CONN: default-held for the whole per-request
         // handling below, same shape as the probe (RAII releases it on
         // every exit from this scope -- return, continue, or falling off
@@ -23843,6 +25754,19 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         if (g_worker_gpu_mutex != nullptr) {
             gpu_lock = std::unique_lock<std::mutex>(*g_worker_gpu_mutex);
         }
+        // Declared after gpu_lock, so it runs while gpu_lock is still held:
+        // records whether this connection is mid-transaction (locked park path
+        // only) for Worker::park's quiesce.
+        struct ParkTxnProbe {
+            ParkFrameScope & scope;
+            Worker &         worker;
+            ~ParkTxnProbe() {
+                if (scope.mode == 2) {
+                    scope.txn_open = scope.stream_active ||
+                                     worker.has_split_dispatch(scope.conn_index);
+                }
+            }
+        } park_txn_probe{ park_scope, worker };
         if (stream_dispatch.active &&
             (type != PIPE_EXPERT_DISPATCH_CHUNK || seq_id != stream_dispatch.seq_id)) {
             send_response_error(seq_id, PIPE_ERR_BAD_FRAME,
@@ -24774,6 +26698,133 @@ ResourcePlan inspect_resources(const Options & options) {
     return worker.resources();
 }
 
+namespace {
+
+// *** PARK / UNPARK CONTROL ***
+// SIGUSR1 = park, SIGUSR2 = unpark. Nothing else in this process installs a
+// handler for either (the only other SIGUSR2 user is ggml-cuda's AllReduce
+// stall-watchdog backtrace, which this worker never initialises). The handler
+// is async-signal-safe: it writes one byte to a non-blocking pipe and returns;
+// all real work happens on the control thread below.
+int g_park_pipe[2] = { -1, -1 };
+
+void park_signal_handler(int sig) {
+    const int saved_errno = errno;
+    if (g_park_pipe[1] >= 0) {
+        const char c = sig == SIGUSR1 ? 'P' : 'U';
+        const ssize_t r = ::write(g_park_pipe[1], &c, 1);
+        (void) r;
+    }
+    errno = saved_errno;
+}
+
+// WP_EXPERT_PARK_FILE, else next to the worker's other logs (the directory of
+// WP_EXPERT_COUNTS_DUMP / WP_HINT_LOG / WP_PAGEIN_LOG / WP_EXPERT_PIN_FILE,
+// first one set), else the cwd. Named per listen port so workers sharing a log
+// directory do not clobber each other.
+std::string park_file_path(int port) {
+    if (const char * e = std::getenv("WP_EXPERT_PARK_FILE"); e != nullptr && e[0] != '\0') {
+        return e;
+    }
+    fs::path dir = ".";
+    for (const char * name : { "WP_EXPERT_COUNTS_DUMP", "WP_HINT_LOG", "WP_PAGEIN_LOG",
+                               "WP_EXPERT_PIN_FILE" }) {
+        const char * e = std::getenv(name);
+        if (e != nullptr && e[0] != '\0') {
+            const fs::path parent = fs::path(e).parent_path();
+            dir = parent.empty() ? fs::path(".") : parent;
+            break;
+        }
+    }
+    return (dir / ("wp-expert-park-" + std::to_string(port) + ".txt")).string();
+}
+
+struct ParkControl {
+    Worker &    worker;
+    std::thread thread;
+    bool        installed = false;
+
+    explicit ParkControl(Worker & w) : worker(w) {}
+    ParkControl(const ParkControl &) = delete;
+    ParkControl & operator=(const ParkControl &) = delete;
+
+    void start() {
+#if defined(__linux__)
+        if (::pipe2(g_park_pipe, O_CLOEXEC) != 0) {
+            std::fprintf(stderr, "wp expert worker: park control disabled: pipe2: %s\n",
+                         std::strerror(errno));
+            g_park_pipe[0] = g_park_pipe[1] = -1;
+            return;
+        }
+        const int fl = ::fcntl(g_park_pipe[1], F_GETFL, 0);
+        if (fl >= 0) {
+            ::fcntl(g_park_pipe[1], F_SETFL, fl | O_NONBLOCK);
+        }
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = park_signal_handler;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGUSR1, &sa, nullptr);
+        ::sigaction(SIGUSR2, &sa, nullptr);
+        installed = true;
+        const int read_fd = g_park_pipe[0];
+        thread = std::thread([this, read_fd] {
+            for (;;) {
+                char c = 0;
+                const ssize_t n = ::read(read_fd, &c, 1);
+                if (n < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (n <= 0 || c == 'Q') {
+                    return;
+                }
+                try {
+                    if (c == 'P') {
+                        std::fprintf(stderr, "wp expert worker: SIGUSR1 received: park\n");
+                        worker.park("SIGUSR1");
+                    } else if (c == 'U') {
+                        std::fprintf(stderr, "wp expert worker: SIGUSR2 received: unpark\n");
+                        worker.unpark("SIGUSR2");
+                    }
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr, "wp expert worker: park control error: %s\n", e.what());
+                }
+            }
+        });
+#endif
+    }
+
+    ~ParkControl() {
+#if defined(__linux__)
+        if (!installed) {
+            return;
+        }
+        ::signal(SIGUSR1, SIG_DFL);
+        ::signal(SIGUSR2, SIG_DFL);
+        const char q = 'Q';
+        const int wfd = g_park_pipe[1];
+        g_park_pipe[1] = -1;
+        if (wfd >= 0) {
+            const ssize_t r = ::write(wfd, &q, 1);
+            (void) r;
+        }
+        if (thread.joinable()) {
+            thread.join();
+        }
+        if (wfd >= 0) {
+            ::close(wfd);
+        }
+        if (g_park_pipe[0] >= 0) {
+            ::close(g_park_pipe[0]);
+            g_park_pipe[0] = -1;
+        }
+#endif
+    }
+};
+
+} // namespace
+
 int run(const Options & options) {
     std::vector<std::string> devices = options.devices;
     if (devices.empty() && !options.device.empty()) {
@@ -25011,6 +27062,26 @@ int run(const Options & options) {
     // the read-path line and the numbers you need are invisible. Cost me a
     // diagnosis today; the banner is worth nothing if it arrives at exit.
     std::cout << std::flush;
+
+    // PARK / UNPARK control: SIGUSR1 = park, SIGUSR2 = unpark (see Worker::park).
+    // Declared after `worker` so the control thread is joined before the
+    // worker is destroyed. The handlers only write a byte to a pipe.
+    const std::string park_file = park_file_path(options.listen_port);
+    worker.set_park_file(park_file);
+    ParkControl park_control(worker);
+    if (const char * e = std::getenv("WP_EXPERT_SEED_FROM_PARK");
+            e != nullptr && e[0] == '1') {
+        if (fs::exists(park_file)) {
+            worker.seed_from_park_file(park_file);
+        } else {
+            std::fprintf(stderr, "wp expert worker: WP_EXPERT_SEED_FROM_PARK=1 but %s does "
+                                 "not exist; starting cold\n", park_file.c_str());
+        }
+    }
+    // Signal handlers are armed only after the startup seed has been planned.
+    park_control.start();
+    std::fprintf(stderr, "wp expert worker: park control armed: SIGUSR1=park SIGUSR2=unpark "
+                         "park_file=%s\n", park_file.c_str());
 
     // WP_WORKER_MULTI_CONN=N (N>=2) -- see g_worker_gpu_mutex comment above
     // serve_connection for the lock design. Unset/absent/"1"/anything <2 is

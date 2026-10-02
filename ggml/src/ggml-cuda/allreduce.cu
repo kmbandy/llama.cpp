@@ -1165,7 +1165,13 @@ extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * 
         block_ml8_4_wire * d_dst = nullptr;
     };
     static std::mutex mu;
-    static scratch s;
+    // One scratch per device: the spine packs on two devices alternately, and a
+    // single slot freed/re-created its buffers and stream on every switch.
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    static scratch s_dev[GGML_CUDA_MAX_DEVICES];
+    scratch & s = s_dev[dev];
     std::lock_guard<std::mutex> lock(mu);
     if (s.stream == nullptr || s.dev != dev) {
         if (s.d_src != nullptr) { cudaFree(s.d_src); s.d_src = nullptr; }
@@ -1228,7 +1234,13 @@ extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4_device(const f
         block_ml8_4_wire * d_dst  = nullptr;
     };
     static std::mutex mu;
-    static scratch s;
+    // One scratch per device: the spine packs on two devices alternately, and a
+    // single slot freed/re-created its buffers and stream on every switch.
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    static scratch s_dev[GGML_CUDA_MAX_DEVICES];
+    scratch & s = s_dev[dev];
     std::lock_guard<std::mutex> lock(mu);
     if (s.stream == nullptr || s.dev != dev) {
         if (s.d_dst != nullptr) { cudaFree(s.d_dst); s.d_dst = nullptr; }

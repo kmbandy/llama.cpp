@@ -47,6 +47,20 @@ static bool wp_dspark_debug() {
     return s_on;
 }
 
+// WP_DSPARK_CONF_LOG=<path>: calibration log for the DSpark confidence head. One line per
+// drafted position per verify step, appended when the target verdict arrives (accept()):
+//   step seq pos conf prefix accepted
+// conf is the raw head output c_i, prefix is prod_{j<=i} c_j, accepted is 1/0. Read once;
+// unset = nullptr, so the off path is one predictable branch and no state is kept.
+// Read-only: it never changes what is drafted. Works in every conf mode.
+static FILE * wp_dspark_conf_log() {
+    static FILE * s_f = [](){
+        const char * e = std::getenv("WP_DSPARK_CONF_LOG");
+        return (e && e[0]) ? std::fopen(e, "a") : nullptr;
+    }();
+    return s_f;
+}
+
 // WP_SPEC_PREFILL_STATS=1: see common_speculative_wp_prefill_call_stats in
 // speculative.h. Read once; when unset, process() takes none of the
 // std::chrono timestamps below the gate -- same zero-cost-when-off shape as
@@ -1188,6 +1202,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // what the expert-level gate in prefetch_for_tokens spends its budget on.
     std::vector<float> prev_draft_conf;
 
+    // WP_DSPARK_CONF_LOG: per-seq confidences of the last draft, awaiting its verdict.
+    std::vector<std::vector<float>> log_conf;
+    uint64_t                        log_step = 0;
+
     std::vector<std::vector<float>> capture_embd;
     int32_t capture_n_embd = 0;
 
@@ -1370,9 +1388,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // INFO maps to 4 and is filtered, WARN maps to 2 and passes. A gate whose
         // value you cannot see in the log has cost this project multiple
         // retracted measurement sets.
-        LOG_WRN("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f, conf_mode=%s (0=gate off)\n",
+        LOG_WRN("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f, conf_mode=%s, conf_prefix_min=%.2f (0=gate off)\n",
                 __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min,
-                this->params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN ? "per-token" : "chain");
+                this->params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN ? "per-token" :
+                this->params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PREFIX ? "prefix" : "chain",
+                (double) this->params.conf_prefix_min);
         LOG_WRN("%s: - block_size=%d (source=%s), mask_token_id=%d, n_extract=%u, hc_mult=%d, sample_from_anchor=%s, causal_attn=%s\n", __func__, block_size, block_size_source, mask_token_id, target_layer_ids_n, hc_mult, sample_from_anchor ? "true" : "false", causal_attn ? "true" : "false");
         // MAD-LAB 2026-09-07: causal_attn and the tap list are the two head-metadata
         // values that silently ran on defaults before the 2026-09-07 probe hoist, and
@@ -2313,6 +2333,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                float prefix_prod = 1.0f;
+
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
@@ -2322,7 +2344,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // MAD-LAB: chain mode keeps the legacy ungated first position;
                     // per-token mode applies the floor to every predicted position.
                     const bool gate_position = params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN || i > 0;
-                    if (gate_position && conf && params.conf_min > 0.0f && gate_conf < params.conf_min) {
+
+                    // MAD-LAB: prefix mode drafts position i only if the whole prefix survives,
+                    // prod_{j<=i} c_j >= conf_prefix_min. The product starts at the first drafted
+                    // position and also gates it (a lone c_0 below T drafts nothing); a position
+                    // that stops the loop here is not drafted, so nothing needs rolling back.
+                    // Without a confidence row there is nothing to gate on, as in the other modes.
+                    if (params.conf_mode == COMMON_SPECULATIVE_DRAFT_CONF_MODE_PREFIX) {
+                        prefix_prod *= raw_conf;
+                        if (conf && prefix_prod < params.conf_prefix_min) {
+                            break;
+                        }
+                    } else if (gate_position && conf && params.conf_min > 0.0f && gate_conf < params.conf_min) {
                         break;
                     }
 
@@ -2403,6 +2436,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // WP_DSPARK_CONF_LOG: remember what was drafted until accept() reports the verdict.
+        if (is_dspark && wp_dspark_conf_log() != nullptr) {
+            log_conf.resize(n_seq);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                log_conf[seq_id] = i_block_beg[seq_id] < 0 ? std::vector<float>() : draft_conf[seq_id];
+            }
+        }
+
         // Draft-driven expert prefetch: pass actual draft token ids so the
         // pager can resolve DS4 hash-layer tid2eid experts (cold pages) and
         // pin last-pass actives across the draft->verify gap. Empty clears.
@@ -2447,9 +2488,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         dbg_n_draft++;
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         // Clear draft-window + retain pins after target verify.
         llama_wp_on_draft_tokens(this->params.ctx_tgt, nullptr, 0);
+
+        // n_accepted counts accepted draft tokens (bonus excluded), so position i was
+        // accepted iff i < n_accepted. is_other = another impl's verdict, not ours.
+        FILE * f = is_other ? nullptr : wp_dspark_conf_log();
+        if (f != nullptr && seq_id >= 0 && (size_t) seq_id < log_conf.size() && !log_conf[seq_id].empty()) {
+            float prefix = 1.0f;
+            for (size_t i = 0; i < log_conf[seq_id].size(); ++i) {
+                prefix *= log_conf[seq_id][i];
+                std::fprintf(f, "%" PRIu64 " %d %zu %.6f %.6f %d\n",
+                        log_step, (int) seq_id, i, (double) log_conf[seq_id][i], (double) prefix, i < n_accepted ? 1 : 0);
+            }
+            std::fflush(f);
+            log_conf[seq_id].clear();
+            log_step++;
+        }
     }
 
     bool get_draft_capture(llama_seq_id seq_id, const float *& embeddings, int32_t & n_embd) const override {

@@ -677,6 +677,17 @@ static bool wp_layer_inp_narrow_sync_enabled() {
     return enabled;
 }
 
+// WP_SPINE_LAYER_PROFILE_MIN_TOKENS (default 64 = prefill only, the old
+// hard-coded gate). Set to 1 to profile decode / spec-verify ubatches too.
+static uint32_t wp_spine_layer_profile_min_tokens() {
+    static const uint32_t v = [] {
+        const char * e = std::getenv("WP_SPINE_LAYER_PROFILE_MIN_TOKENS");
+        const long n = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 64;
+        return n > 0 ? (uint32_t) n : 64u;
+    }();
+    return v;
+}
+
 static void wp_spine_layer_profile_split_cb(
         const char * backend_name,
         const ggml_cgraph * graph,
@@ -3604,7 +3615,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static const bool wp_spine_each = wp_spine_stats && wp_spine_env[0] == '2';
     const bool wp_spine_profile_trace = wp_spine_profile_trace_enabled() && !is_draft_ctx(cparams);
     const bool wp_spine_layer_profile = wp_spine_layer_profile_enabled() &&
-                                        ubatch.n_tokens >= 64 &&
+                                        ubatch.n_tokens >= wp_spine_layer_profile_min_tokens() &&
                                         !is_draft_ctx(cparams) &&
                                         expert_dispatch != nullptr;
     static std::atomic<uint64_t> wp_spine_layer_profile_ubatch_index{ 0 };

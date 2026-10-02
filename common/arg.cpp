@@ -4212,6 +4212,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-autosave"}, "PATH",
+        "file to save slot 0 state (KV, draft KV, checkpoints) to on graceful shutdown and restore from at startup (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.slot_autosave = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
@@ -4827,17 +4834,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     // MAD-LAB: opt-in conditional confidence gate for DSpark.
     add_opt(common_arg(
         {"--spec-draft-conf-mode"}, "MODE",
-        "DSpark confidence gate mode: chain or per-token (default: chain)",
+        "DSpark confidence gate mode: chain, per-token or prefix (default: chain)",
         [](common_params & params, const std::string & value) {
             if (value == "chain") {
                 params.speculative.draft.conf_mode = COMMON_SPECULATIVE_DRAFT_CONF_MODE_CHAIN;
             } else if (value == "per-token") {
                 params.speculative.draft.conf_mode = COMMON_SPECULATIVE_DRAFT_CONF_MODE_PER_TOKEN;
+            } else if (value == "prefix") {
+                params.speculative.draft.conf_mode = COMMON_SPECULATIVE_DRAFT_CONF_MODE_PREFIX;
             } else {
                 throw std::invalid_argument("invalid DSpark confidence gate mode: " + value);
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CONF_MODE"));
+    add_opt(common_arg(
+        {"--spec-draft-conf-prefix-min"}, "T",
+        string_format(
+            "DSpark prefix gate (--spec-draft-conf-mode prefix): draft position i only while the product of "
+            "confidences over positions 0..i is >= T (0.0 = disabled) (default: %.2f)",
+            (double) params.speculative.draft.conf_prefix_min),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.conf_prefix_min = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CONF_PREFIX_MIN"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
