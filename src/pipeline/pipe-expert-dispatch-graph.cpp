@@ -1762,7 +1762,7 @@ void graph_dispatcher::end_decode() noexcept {
     // PREDICTION CADENCE. Emitted once per decode so a run's log says how often
     // the predictor actually ran, rather than how often it was asked to. See the
     // latest-wins comment in enqueue_prediction.
-    if (router2_topm() > 0) {
+    if (collect_stats_ && router2_topm() > 0) {
         const uint64_t offered = pred_offered();
         const uint64_t dropped = pred_dropped();
         if (offered > 0) {
