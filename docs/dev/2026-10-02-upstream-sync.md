@@ -127,3 +127,25 @@ Upstream skips `updateDescriptorSets` when a set already holds identical binding
 - `tools/cli/cli.cpp`: upstream's `llama_backend_init` (#29632) moved before the fork's TP-follower branch, which does not init the backend itself.
 - `conversion/qwen.py` DFlash: fork `hc_mult` + upstream partial-rotary and value-scale keys.
 - `test-backend-ops.cpp`: fork `TURBO_WHT` + upstream W4A8/W4A4 cases.
+
+## Fixes found by building and testing (follow-up commits)
+- `glm5-next.cpp` (new upstream) defined a static `dsv4_view_2d`. It clashed with the fork's shared declaration in `models.h`, and the two were identical, so glm5-next now uses the shared one.
+- **GLM5-Next memory.** `llama_memory_hybrid_idx` takes the fork's indexer cache types; the new GLM5-Next site passes F16, as qwen4exp does. GLM5-Next's graph also asserts that the full memory context has the indexer, which crashed `test-generate-models`. The fork's null-indexer divergence (above) is now scoped to qwen4exp, and every other arch gets upstream's full context.
+- **CPU pinned ops.** Upstream's tiled CPU mul_mat now covers k-quants (#27851) and is picked by batch width. That broke the pin contract: `test-wp-mul-mat-pin` failed because q4_K/q5_K results differed between widths. Pinned MUL_MAT / MUL_MAT_ID now skip tiled, as they already skip `llamafile_sgemm`.
+- **Upstream `common_batch` callers.** `speculative-simple` and the mtmd post-decode callback now pass `common_batch` / an embd view, so `common_speculative_process(spec, const common_batch &)` flattens them into the fork's `llama_batch`. The server's mtmd callback rebuilds one, and the shared-prefix child loop iterates the stream's `server_slot *`.
+- **Vulkan.** `mul_mat_vec_id` already had the fork's arena-stride `stride_batch_x`; upstream's in-place stride now assigns it instead of redeclaring it.
+
+## Verification
+- Build: clang, CPU + Vulkan + tests, all targets clean. CUDA was not compile-checked (no toolkit here), so the `.cu` resolutions above are by reading only.
+- ctest (excluding test-backend-ops), compared against a clean build of pre-merge origin/master `9d59f23e7` with its own generated test models:
+  - These fail identically on the baseline:
+    - `test-dsv41-load` / `-decode`
+    - `test-arg-parser`
+    - `test-paged-decode-oracle`
+    - `test-wp-expert-worker`
+    - `test-routed-experts-external`
+    - `test-quantize-fns` (turbo2/3/4)
+    - `test-ml8-registry`
+    - the download / eval-callback tests (no network)
+  - `test-save-load-state` and `test-recurrent-state-rollback` fail for `qwen35-dense`, `qwen35moe-moe` and `qwen3next-moe` on both. The model saver writes the fork's `ssm_a_log` sidecar into the generated GGUF, and the loader then counts one tensor too many. This is pre-existing and worth a separate fix.
+  - No new failures after the fixes above.
