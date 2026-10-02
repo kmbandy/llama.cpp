@@ -1,8 +1,9 @@
 // system1-rows: batched hidden-state row extraction for mneme's System-1 labeller.
 //
 // Reads JSONL on stdin -- one "entry" per line:
-//   {"id": str, "state": [int], "branches": [{"ids": [int], "outs": [int]}]}
-// "outs" are offsets into that branch's own "ids" array.
+//   {"id": str, "state": [int], "state_outs": [int] (optional), "branches": [{"ids": [int], "outs": [int]}]}
+// "outs" are offsets into that branch's own "ids" array; "state_outs" are offsets into "state".
+// State rows come first in the output, then each branch's rows.
 //
 // For each entry, the tokens in "state" are decoded first (the shared prefix / prompt
 // context), then each branch's "ids" are decoded as a continuation of that state. Only
@@ -17,6 +18,8 @@
 //
 // See tools/system1-rows brief: .superpowers/sdd/2026-09-27-system1-2b-plan/task-1-brief.md
 #include "llama.h"
+#include "llama-ext.h"
+#include "ggml.h"
 #include "ggml-backend.h"
 
 #include <nlohmann/json.hpp>
@@ -54,6 +57,9 @@ struct Args {
     int64_t     vram_margin_mib = 512;
     int32_t     n_threads       = 4;
     bool        no_copy         = false;
+    bool        no_output_head  = false;
+    bool        out_f16         = false;
+    std::vector<std::string> cpu_tensors; // tensor name regexes kept in host memory
 };
 
 void print_usage(const char * argv0) {
@@ -70,11 +76,16 @@ void print_usage(const char * argv0) {
         "  --threads N               CPU threads for generation (default 4)\n"
         "  --no-copy                 control mode: decode every branch as state+branch from\n"
         "                            scratch, without the sequence-copy batching scheme\n"
+        "  --no-output-head          do not build the LM head; rows are the post-output_norm hidden state\n"
+        "  --cpu-tensor REGEX        keep tensors matching REGEX in host memory (repeatable)\n"
+        "  --out-f16                 write rows as f16 instead of f32\n"
         "  --help                    show this message and exit\n"
         "\n"
-        "Reads JSONL on stdin: {\"id\": str, \"state\": [int], \"branches\": [{\"ids\": [int], \"outs\": [int]}]}\n"
-        "Writes binary float32 rows to --out (n_embd floats per row, one row per flagged\n"
-        "position, entries in input order, branches in order, positions in position order).\n"
+        "Reads JSONL on stdin: {\"id\": str, \"state\": [int], \"state_outs\": [int] (optional),\n"
+        "                       \"branches\": [{\"ids\": [int], \"outs\": [int]}]}\n"
+        "Writes binary float32 (or f16) rows to --out (n_embd values per row, one row per flagged\n"
+        "position, entries in input order, state rows first, then branches in order, positions in\n"
+        "position order).\n"
         "Writes one JSON line per input entry to stdout: {\"id\", \"ok\", \"rows\", \"error\"}.\n",
         argv0);
 }
@@ -170,6 +181,12 @@ std::optional<Args> parse_args(int argc, char ** argv) {
             a.n_threads = (int32_t) v;
         } else if (arg == "--no-copy") {
             a.no_copy = true;
+        } else if (arg == "--no-output-head") {
+            a.no_output_head = true;
+        } else if (arg == "--out-f16") {
+            a.out_f16 = true;
+        } else if (arg == "--cpu-tensor") {
+            a.cpu_tensors.push_back(need_value(i, "--cpu-tensor"));
         } else {
             fatal_usage("unrecognized argument: " + arg);
         }
@@ -197,6 +214,7 @@ struct BranchIn {
 struct EntryIn {
     std::string           id;
     std::vector<llama_token> state;
+    std::vector<int32_t>     state_outs; // offsets into state
     std::vector<BranchIn>    branches;
     size_t                   line_no = 0;
 };
@@ -207,6 +225,8 @@ struct EntryOut {
     std::string error;
     // rows[branch] = flat n_embd * outs.size() floats, in position order.
     std::vector<std::vector<float>> rows;
+    // state rows: flat n_embd * state_outs.size() floats, in position order.
+    std::vector<float> state_rows;
 };
 
 // Validates and parses every line of stdin into `entries`. Exits 2 (via fatal_line) on
@@ -262,6 +282,27 @@ std::vector<EntryIn> read_and_validate_input(std::istream & in) {
         }
         if (e.state.empty()) {
             fatal_line(line_no, "empty state");
+        }
+
+        if (j.contains("state_outs")) {
+            if (!j["state_outs"].is_array()) {
+                fatal_line(line_no, "\"state_outs\" must be an array of int");
+            }
+            std::set<int32_t> seen_state_outs;
+            for (const auto & off : j["state_outs"]) {
+                if (!off.is_number_integer()) {
+                    fatal_line(line_no, "\"state_outs\" must contain only integers");
+                }
+                const int64_t o = off.get<int64_t>();
+                if (o < 0 || o >= (int64_t) e.state.size()) {
+                    fatal_line(line_no, "state_outs offset " + std::to_string(o) +
+                            " is outside the state (state has " + std::to_string(e.state.size()) + " ids)");
+                }
+                if (!seen_state_outs.insert((int32_t) o).second) {
+                    fatal_line(line_no, "duplicate state_outs offset " + std::to_string(o));
+                }
+                e.state_outs.push_back((int32_t) o);
+            }
         }
 
         if (!j.contains("branches") || !j["branches"].is_array()) {
@@ -462,7 +503,7 @@ struct Runner {
                     llama_batch_free(b);
                     return false;
                 }
-                auto & row = results[k.entry].rows[k.branch];
+                auto & row = k.branch < 0 ? results[k.entry].state_rows : results[k.entry].rows[k.branch];
                 row.insert(row.end(), e, e + n_embd);
             }
 
@@ -553,14 +594,22 @@ long run_batched(llama_context * ctx, const std::vector<EntryIn> & entries, std:
         // phase 1: decode states, interleaved by position across seqs 0..group.size()-1
         std::vector<Tok> toks;
         size_t longest = 0;
-        for (size_t idx : group) {
-            longest = std::max(longest, entries[idx].state.size());
+        std::vector<std::vector<char>> want_state(group.size());
+        for (size_t s = 0; s < group.size(); s++) {
+            const auto & entry = entries[group[s]];
+            longest = std::max(longest, entry.state.size());
+            want_state[s].assign(entry.state.size(), 0);
+            for (int32_t o : entry.state_outs) {
+                want_state[s][o] = 1;
+            }
         }
+        // positions interleave across sequences, but each entry only gets its own rows,
+        // so its state rows stay in position order
         for (size_t p = 0; p < longest; p++) {
             for (size_t s = 0; s < group.size(); s++) {
                 const auto & state = entries[group[s]].state;
                 if (p < state.size()) {
-                    toks.push_back({ state[p], (llama_pos) p, (llama_seq_id) s, false, group[s], -1 });
+                    toks.push_back({ state[p], (llama_pos) p, (llama_seq_id) s, (bool) want_state[s][p], group[s], -1 });
                 }
             }
         }
@@ -629,6 +678,26 @@ long run_no_copy(llama_context * ctx, const std::vector<EntryIn> & entries, std:
             continue; // already excluded (e.g. an out-of-vocab token id)
         }
         const auto & entry = entries[i];
+        std::vector<char> want_state(entry.state.size(), 0);
+        for (int32_t o : entry.state_outs) {
+            want_state[o] = 1;
+        }
+        if (entry.branches.empty()) {
+            if (entry.state.size() > n_ctx) {
+                results[i].error = "entry does not fit in context (state = " +
+                        std::to_string(entry.state.size()) + " > --ctx " + std::to_string(n_ctx) + ")";
+                continue;
+            }
+            llama_memory_clear(mem, true);
+            std::vector<Tok> toks;
+            for (size_t p = 0; p < entry.state.size(); p++) {
+                toks.push_back({ entry.state[p], (llama_pos) p, 0, (bool) want_state[p], i, -1 });
+            }
+            if (!runner.run(toks, results) && results[i].error.empty()) {
+                results[i].error = "decode failed";
+            }
+            continue;
+        }
         for (size_t bi = 0; bi < entry.branches.size(); bi++) {
             const auto & branch = entry.branches[bi];
             const uint64_t need = entry.state.size() + branch.ids.size();
@@ -644,7 +713,9 @@ long run_no_copy(llama_context * ctx, const std::vector<EntryIn> & entries, std:
             std::vector<Tok> toks;
             toks.reserve(entry.state.size() + branch.ids.size());
             for (size_t p = 0; p < entry.state.size(); p++) {
-                toks.push_back({ entry.state[p], (llama_pos) p, 0, false, i, (int32_t) bi });
+                // state rows are taken once, on the first branch's pass
+                const bool want = bi == 0 && want_state[p];
+                toks.push_back({ entry.state[p], (llama_pos) p, 0, want, i, want ? -1 : (int32_t) bi });
             }
             std::vector<char> want(branch.ids.size(), 0);
             for (int32_t o : branch.outs) {
@@ -689,6 +760,14 @@ int main(int argc, char ** argv) {
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
+    std::vector<llama_model_tensor_buft_override> overrides;
+    for (const auto & pat : args.cpu_tensors) {
+        overrides.push_back({ pat.c_str(), ggml_backend_cpu_buffer_type() });
+    }
+    if (!overrides.empty()) {
+        overrides.push_back({ nullptr, nullptr });
+        mp.tensor_buft_overrides = overrides.data();
+    }
     llama_model * model = llama_model_load_from_file(args.model.c_str(), mp);
     if (model == nullptr) {
         fatal_runtime("failed to load model: " + args.model);
@@ -716,6 +795,9 @@ int main(int argc, char ** argv) {
     llama_context * ctx = sized.ctx;
     const int32_t g = sized.g;
     fprintf(stderr, "system1-rows: using G=%d\n", g);
+    if (args.no_output_head) {
+        llama_set_no_output_head(ctx, true);
+    }
 
     if (lora != nullptr) {
         float scale = 1.0f;
@@ -747,8 +829,8 @@ int main(int argc, char ** argv) {
             r.ok = false;
             continue;
         }
-        bool mismatch = false;
-        for (size_t bi = 0; bi < entries[i].branches.size(); bi++) {
+        bool mismatch = r.state_rows.size() != entries[i].state_outs.size() * (size_t) n_embd;
+        for (size_t bi = 0; bi < entries[i].branches.size() && !mismatch; bi++) {
             if (r.rows[bi].size() != entries[i].branches[bi].outs.size() * (size_t) n_embd) {
                 mismatch = true;
                 break;
@@ -761,6 +843,7 @@ int main(int argc, char ** argv) {
         }
         r.ok = true;
         n_entries_ok++;
+        total_rows += (long) (r.state_rows.size() / (size_t) n_embd);
         for (const auto & row : r.rows) {
             total_rows += (long) (row.size() / (size_t) n_embd);
         }
@@ -781,16 +864,24 @@ int main(int argc, char ** argv) {
                 confirmed_upto = i + 1;
                 continue;
             }
-            bool entry_ok = true;
-            for (const auto & row : results[i].rows) {
+            std::vector<ggml_fp16_t> half;
+            auto write_row = [&](const std::vector<float> & row) -> bool {
                 if (row.empty()) {
-                    continue;
+                    return true;
                 }
-                const size_t wrote = fwrite(row.data(), sizeof(float), row.size(), out);
-                if (wrote != row.size()) {
-                    entry_ok = false;
+                if (!args.out_f16) {
+                    return fwrite(row.data(), sizeof(float), row.size(), out) == row.size();
+                }
+                half.resize(row.size());
+                ggml_fp32_to_fp16_row(row.data(), half.data(), (int64_t) row.size());
+                return fwrite(half.data(), sizeof(ggml_fp16_t), half.size(), out) == half.size();
+            };
+            bool entry_ok = write_row(results[i].state_rows);
+            for (const auto & row : results[i].rows) {
+                if (!entry_ok) {
                     break;
                 }
+                entry_ok = write_row(row);
             }
             if (!entry_ok) {
                 write_ok = false;
@@ -825,6 +916,7 @@ int main(int argc, char ** argv) {
     for (const auto & r : results) {
         long n_rows = 0;
         if (r.ok) {
+            n_rows += (long) (r.state_rows.size() / (size_t) n_embd);
             for (const auto & row : r.rows) {
                 n_rows += (long) (row.size() / (size_t) n_embd);
             }

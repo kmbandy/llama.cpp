@@ -132,6 +132,14 @@ expect_exit "duplicate outs offset exits 2" 2 \
   "{\"id\":\"a\",\"state\":$VALID_STATE_TOKS,\"branches\":[{\"ids\":[10,11],\"outs\":[1,1]}]}
 " --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
 echo "$LAST_OUT" | grep -qi "model" && fail "duplicate-outs error message mentions 'model' (should be about input)"
+
+expect_exit "state_outs offset outside the state exits 2" 2 \
+  "{\"id\":\"a\",\"state\":[1,2,3],\"state_outs\":[0,3],\"branches\":[]}
+" --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
+
+expect_exit "duplicate state_outs offset exits 2" 2 \
+  "{\"id\":\"a\",\"state\":[1,2,3],\"state_outs\":[1,1],\"branches\":[]}
+" --model "$NONEXISTENT_MODEL" --out "$TMPDIR_T/out.bin"
 echo "$LAST_OUT" | grep -qi "duplicate" || fail "duplicate-outs error message doesn't say duplicate"
 
 # --- missing --model file with VALID input: exit 1 (model load failure) -------------
