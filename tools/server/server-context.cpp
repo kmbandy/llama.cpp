@@ -1319,12 +1319,28 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
                 void * cb_data = slot.spec;
-                static auto cb = [](llama_batch batch, void * user_data) {
+                static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) -> int32_t {
                     common_speculative * spec = static_cast<common_speculative *>(user_data);
-                    if (!common_speculative_process(spec, batch)) {
-                        return 1;
+
+                    // upstream's helper now hands over a view; rebuild the llama_batch the fork's
+                    // speculative implementations consume (pos is section-major in both)
+                    std::vector<int32_t>      n_seq_id(b->n_tokens, 1);
+                    std::vector<llama_seq_id> seq_id_val(b->n_tokens, b->seq_id);
+                    std::vector<llama_seq_id *> seq_id(b->n_tokens);
+                    std::vector<int8_t>       logits(b->n_tokens, 0);
+                    for (int32_t i = 0; i < b->n_tokens; ++i) {
+                        seq_id[i] = &seq_id_val[i];
                     }
-                    return 0;
+
+                    llama_batch batch = {};
+                    batch.n_tokens = b->n_tokens;
+                    batch.embd     = const_cast<float *>(b->embd);
+                    batch.pos      = const_cast<llama_pos *>(b->pos);
+                    batch.n_seq_id = n_seq_id.data();
+                    batch.seq_id   = seq_id.data();
+                    batch.logits   = logits.data();
+
+                    return common_speculative_process(spec, batch) ? 0 : 1;
                 };
 
                 llama_pos new_n_past; // unused for now
@@ -6462,7 +6478,8 @@ private:
                     bool wait_shared = false;
                     if (slot.task->n_tokens_shared > 0) {
                         const bool is_shared_done = slot.prompt.n_tokens() == slot.task->n_tokens_shared;
-                        for (auto & other : slots) {
+                        for (server_slot * other_ptr : slots) {
+                            server_slot & other = *other_ptr;
                             if (other.state != SLOT_STATE_WAIT_OTHER || other.task->id_parent != slot.task->id) {
                                 continue;
                             }
