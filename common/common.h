@@ -876,6 +876,7 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    std::string slot_autosave;      // MAD-LAB: file path; slot 0 state is saved on graceful shutdown and restored at startup (empty = off)
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

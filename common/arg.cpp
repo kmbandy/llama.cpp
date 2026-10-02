@@ -4212,6 +4212,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-autosave"}, "PATH",
+        "file to save slot 0 state (KV, draft KV, checkpoints) to on graceful shutdown and restore from at startup (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.slot_autosave = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

@@ -2932,6 +2932,371 @@ private:
         return nullptr;
     }
 
+    // MAD-LAB --slot-autosave: persist slot 0 (target seq state, draft seq state, speculator
+    // state, prompt tokens, context checkpoints) across a graceful shutdown, and restore it at
+    // startup before the server reports ready. Single file, written to <path>.tmp then renamed.
+    //
+    // layout (host endian, same-machine only):
+    //   hdr | identity string | tokens | tgt state | dft state | spec state | n_ckpt * (rec | tgt | dft | spec) | trailer
+    struct slot_autosave_hdr {
+        char     magic[8];
+        uint32_t version;
+        uint32_t n_ckpt;
+        uint32_t id_len;
+        uint32_t reserved;
+        int64_t  n_tokens;
+        int64_t  pos_max_tgt;
+        int64_t  pos_max_dft;
+        uint64_t sz_tok;
+        uint64_t sz_tgt;
+        uint64_t sz_dft;
+        uint64_t sz_spec;
+    };
+
+    struct slot_autosave_ckpt_rec {
+        int64_t  n_tokens;
+        int32_t  pos_min;
+        int32_t  pos_max;
+        uint64_t sz_tgt;
+        uint64_t sz_dft;
+        uint64_t sz_spec;
+    };
+
+    static constexpr uint32_t SLOT_AUTOSAVE_VERSION = 1;
+    static constexpr char SLOT_AUTOSAVE_MAGIC[8]   = {'W','P','S','L','O','T','A','S'};
+    static constexpr char SLOT_AUTOSAVE_TRAILER[8] = {'S','A','T','R','A','I','L','R'};
+
+    // everything that must be identical for the saved state to be valid in this process
+    std::string slot_autosave_identity(const server_slot & slot) const {
+        std::error_code ec;
+        const auto & mpath = params_base.model.path;
+        const auto msize   = std::filesystem::file_size(mpath, ec);
+        const auto mtime   = std::filesystem::last_write_time(mpath, ec).time_since_epoch().count();
+
+        std::string spec_types;
+        for (const auto t : params_base.speculative.types) {
+            spec_types += common_speculative_type_to_str(t) + ",";
+        }
+
+        return string_format(
+            "build=%s;model=%s;msize=%ju;mtime=%lld;n_ctx=%d;slot_n_ctx=%d;n_slots=%zu;ctk=%d;ctv=%d;"
+            "spec=%s;dft=%d;dft_n_ctx=%d;dft_msize=%zu;dft_ctk=%d;dft_ctv=%d;mtmd=%d",
+            llama_build_info(), mpath.c_str(), (uintmax_t) msize, (long long) mtime,
+            n_ctx, slot.n_ctx, slots.size(), (int) params_base.cache_type_k, (int) params_base.cache_type_v,
+            spec_types.c_str(), slot.ctx_dft != nullptr,
+            slot.ctx_dft ? (int) llama_n_ctx(slot.ctx_dft) : 0,
+            model_dft ? (size_t) llama_model_size(model_dft) : (size_t) 0,
+            (int) params_base.speculative.draft.cache_type_k, (int) params_base.speculative.draft.cache_type_v,
+            mctx != nullptr);
+    }
+
+    // called on the main thread after start_loop() returned (queue stopped, nothing is decoding)
+    void slot_autosave() {
+        const std::string & path = params_base.slot_autosave;
+        if (path.empty()) {
+            return;
+        }
+        if (sleeping || ctx_tgt == nullptr) {
+            SRV_INF("%s", "slot autosave: skipped, server is sleeping (no context)\n");
+            return;
+        }
+
+        server_slot * slot = get_slot_by_id(0);
+        if (slot == nullptr || slot->ctx_tgt == nullptr) {
+            return;
+        }
+
+        size_t n_skipped = 0;
+        for (const auto & other : slots) {
+            if (&other != slot && other.prompt.n_tokens() > 0) {
+                n_skipped++;
+            }
+        }
+        if (n_skipped > 0) {
+            SRV_WRN("slot autosave: only slot 0 is saved, %zu other slot(s) with cached prompts skipped\n", n_skipped);
+        }
+
+        if (slot->is_processing()) {
+            SRV_WRN("%s", "slot autosave: slot 0 is mid-request, skipped\n");
+            return;
+        }
+        if (slot->prompt.n_tokens() == 0) {
+            SRV_INF("%s", "slot autosave: slot 0 has an empty prompt, nothing to save\n");
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        const llama_seq_id seq = slot->stream_slot_idx;
+        const std::string tmp  = path + ".tmp";
+        FILE * f = nullptr;
+
+        try {
+            if (slot->can_speculate() && !common_speculative_flush_prefill(slot->spec)) {
+                throw std::runtime_error("failed to flush pending speculative prefill state");
+            }
+
+            const std::vector<char> packed = slot->prompt.tokens.serialize(); // throws on multimodal chunks
+
+            const llama_pos pos_max_tgt = llama_memory_seq_pos_max(llama_get_memory(slot->ctx_tgt), seq);
+            const llama_pos pos_max_dft = slot->ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(slot->ctx_dft), seq) : -1;
+            if (pos_max_tgt < 0) {
+                throw std::runtime_error("target KV cache is empty");
+            }
+
+            std::vector<uint8_t> data_tgt(llama_state_seq_get_size_ext(slot->ctx_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE));
+            if (llama_state_seq_get_data_ext(slot->ctx_tgt, data_tgt.data(), data_tgt.size(), seq, LLAMA_STATE_SEQ_FLAGS_NONE) != data_tgt.size()) {
+                throw std::runtime_error("failed to read target seq state");
+            }
+
+            std::vector<uint8_t> data_dft;
+            if (slot->ctx_dft) {
+                data_dft.resize(llama_state_seq_get_size_ext(slot->ctx_dft, seq, LLAMA_STATE_SEQ_FLAGS_NONE));
+                if (llama_state_seq_get_data_ext(slot->ctx_dft, data_dft.data(), data_dft.size(), seq, LLAMA_STATE_SEQ_FLAGS_NONE) != data_dft.size()) {
+                    throw std::runtime_error("failed to read draft seq state");
+                }
+            }
+
+            std::vector<uint8_t> data_spec;
+            common_speculative_get_state(slot->spec, seq, data_spec);
+
+            const std::string identity = slot_autosave_identity(*slot);
+
+            slot_autosave_hdr hdr = {};
+            memcpy(hdr.magic, SLOT_AUTOSAVE_MAGIC, sizeof(hdr.magic));
+            hdr.version     = SLOT_AUTOSAVE_VERSION;
+            hdr.n_ckpt      = (uint32_t) slot->prompt.checkpoints.size();
+            hdr.id_len      = (uint32_t) identity.size();
+            hdr.n_tokens    = slot->prompt.n_tokens();
+            hdr.pos_max_tgt = pos_max_tgt;
+            hdr.pos_max_dft = pos_max_dft;
+            hdr.sz_tok      = packed.size();
+            hdr.sz_tgt      = data_tgt.size();
+            hdr.sz_dft      = data_dft.size();
+            hdr.sz_spec     = data_spec.size();
+
+            f = fopen(tmp.c_str(), "wb");
+            if (f == nullptr) {
+                throw std::runtime_error("cannot open " + tmp + " for writing");
+            }
+
+            bool ok = true;
+            const auto put = [&](const void * p, size_t n) {
+                ok = ok && (n == 0 || fwrite(p, 1, n, f) == n);
+            };
+
+            put(&hdr, sizeof(hdr));
+            put(identity.data(), identity.size());
+            put(packed.data(),   packed.size());
+            put(data_tgt.data(), data_tgt.size());
+            put(data_dft.data(), data_dft.size());
+            put(data_spec.data(), data_spec.size());
+
+            size_t n_ckpt_bytes = 0;
+            for (const auto & ckpt : slot->prompt.checkpoints) {
+                ckpt.wait_tgt("slot_autosave"); // a WP_CKPT_ASYNC capture may still be in flight
+                ckpt.wait_dft("slot_autosave");
+
+                slot_autosave_ckpt_rec rec = {};
+                rec.n_tokens = ckpt.n_tokens;
+                rec.pos_min  = ckpt.pos_min;
+                rec.pos_max  = ckpt.pos_max;
+                rec.sz_tgt   = ckpt.data_tgt.size();
+                rec.sz_dft   = ckpt.data_dft.size();
+                rec.sz_spec  = ckpt.data_spec.size();
+                put(&rec, sizeof(rec));
+                put(ckpt.data_tgt.data(),  ckpt.data_tgt.size());
+                put(ckpt.data_dft.data(),  ckpt.data_dft.size());
+                put(ckpt.data_spec.data(), ckpt.data_spec.size());
+                n_ckpt_bytes += ckpt.size();
+            }
+
+            put(SLOT_AUTOSAVE_TRAILER, sizeof(SLOT_AUTOSAVE_TRAILER));
+
+            ok = ok && fflush(f) == 0 && fsync(fileno(f)) == 0;
+            ok = (fclose(f) == 0) && ok;
+            f = nullptr;
+            if (!ok) {
+                throw std::runtime_error("write error on " + tmp);
+            }
+
+            std::error_code ec;
+            std::filesystem::rename(tmp, path, ec);
+            if (ec) {
+                throw std::runtime_error("rename failed: " + ec.message());
+            }
+
+            const double n_bytes = (double) (sizeof(hdr) + identity.size() + packed.size() + data_tgt.size() +
+                                             data_dft.size() + data_spec.size() + n_ckpt_bytes);
+            SRV_INF("slot autosave: saved %d tokens to '%s': %.1f MiB (tgt %.1f, dft %.1f, %u checkpoints %.1f) in %.0f ms\n",
+                    (int) hdr.n_tokens, path.c_str(), n_bytes / 1048576.0, data_tgt.size() / 1048576.0,
+                    data_dft.size() / 1048576.0, hdr.n_ckpt, n_ckpt_bytes / 1048576.0,
+                    (ggml_time_us() - t_start) / 1000.0);
+        } catch (const std::exception & err) {
+            if (f != nullptr) {
+                fclose(f);
+            }
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            SRV_WRN("slot autosave: FAILED, no state saved (%s)\n", err.what());
+        }
+    }
+
+    // called on the main thread after load_model() succeeded and before the server reports ready.
+    // never throws; on any problem the file is removed and the slot is left cold.
+    void slot_autorestore() {
+        const std::string & path = params_base.slot_autosave;
+        if (path.empty()) {
+            return;
+        }
+
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            SRV_INF("slot autorestore: no file at '%s', starting cold\n", path.c_str());
+            return;
+        }
+
+        server_slot * slot = sleeping ? nullptr : get_slot_by_id(0);
+        if (slot == nullptr || slot->ctx_tgt == nullptr) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        const llama_seq_id seq = slot->stream_slot_idx;
+        FILE * f = fopen(path.c_str(), "rb");
+        std::string why;
+        size_t n_bytes = 0;
+
+        try {
+            if (f == nullptr) {
+                throw std::runtime_error("cannot open file");
+            }
+
+            const uintmax_t fsize = std::filesystem::file_size(path, ec);
+            size_t remaining = ec ? 0 : (size_t) fsize;
+
+            // reads exactly n bytes, bounded by what is left in the file
+            const auto get = [&](void * p, size_t n) {
+                if (n > remaining || (n > 0 && fread(p, 1, n, f) != n)) {
+                    throw std::runtime_error("truncated or corrupt file");
+                }
+                remaining -= n;
+            };
+            const auto get_vec = [&](std::vector<uint8_t> & v, uint64_t n) {
+                if (n > remaining) {
+                    throw std::runtime_error("truncated or corrupt file");
+                }
+                v.resize(n);
+                get(v.data(), n);
+            };
+
+            slot_autosave_hdr hdr = {};
+            get(&hdr, sizeof(hdr));
+            if (memcmp(hdr.magic, SLOT_AUTOSAVE_MAGIC, sizeof(hdr.magic)) != 0) {
+                throw std::runtime_error("bad magic");
+            }
+            if (hdr.version != SLOT_AUTOSAVE_VERSION) {
+                throw std::runtime_error(string_format("unsupported version %u (want %u)", hdr.version, SLOT_AUTOSAVE_VERSION));
+            }
+            if (hdr.id_len > 65536 || hdr.n_ckpt > 4096 || hdr.n_tokens <= 0) {
+                throw std::runtime_error("implausible header");
+            }
+
+            std::string identity(hdr.id_len, '\0');
+            get(identity.data(), identity.size());
+            const std::string identity_now = slot_autosave_identity(*slot);
+            if (identity != identity_now) {
+                throw std::runtime_error("config mismatch, file: {" + identity + "} now: {" + identity_now + "}");
+            }
+
+            if (hdr.n_tokens > slot->n_ctx) {
+                throw std::runtime_error("saved prompt does not fit in the slot context");
+            }
+            if (hdr.sz_tok % sizeof(llama_token) != 0) {
+                throw std::runtime_error("bad token section size");
+            }
+            if ((slot->ctx_dft != nullptr) != (hdr.sz_dft > 0)) {
+                throw std::runtime_error("draft state presence does not match the current draft context");
+            }
+
+            llama_tokens packed(hdr.sz_tok / sizeof(llama_token));
+            get(packed.data(), hdr.sz_tok);
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+            if ((int64_t) restored.size() != hdr.n_tokens) {
+                throw std::runtime_error("token count mismatch");
+            }
+            if (!restored.validate(slot->ctx_tgt)) {
+                throw std::runtime_error("invalid tokens in file");
+            }
+
+            std::vector<uint8_t> data;
+
+            get_vec(data, hdr.sz_tgt);
+            if (llama_state_seq_set_data_ext(slot->ctx_tgt, data.data(), data.size(), seq, 0) != data.size()) {
+                throw std::runtime_error("failed to restore target seq state");
+            }
+            if (llama_memory_seq_pos_max(llama_get_memory(slot->ctx_tgt), seq) != hdr.pos_max_tgt) {
+                throw std::runtime_error("target pos_max after restore does not match the file");
+            }
+
+            if (slot->ctx_dft) {
+                get_vec(data, hdr.sz_dft);
+                if (llama_state_seq_set_data_ext(slot->ctx_dft, data.data(), data.size(), seq, 0) != data.size()) {
+                    throw std::runtime_error("failed to restore draft seq state");
+                }
+                if (llama_memory_seq_pos_max(llama_get_memory(slot->ctx_dft), seq) != hdr.pos_max_dft) {
+                    throw std::runtime_error("draft pos_max after restore does not match the file");
+                }
+            }
+
+            get_vec(data, hdr.sz_spec);
+            if (!data.empty()) {
+                common_speculative_set_state(slot->spec, seq, data);
+            }
+
+            slot->prompt.clear();
+            slot->prompt.tokens = std::move(restored);
+
+            for (uint32_t i = 0; i < hdr.n_ckpt; i++) {
+                slot_autosave_ckpt_rec rec = {};
+                get(&rec, sizeof(rec));
+
+                common_prompt_checkpoint ckpt;
+                ckpt.update_pos(rec.n_tokens, rec.pos_min, rec.pos_max);
+                get_vec(ckpt.data_tgt,  rec.sz_tgt);
+                get_vec(ckpt.data_dft,  rec.sz_dft);
+                get_vec(ckpt.data_spec, rec.sz_spec);
+                slot->prompt.checkpoints.push_back(std::move(ckpt));
+            }
+
+            char trailer[sizeof(SLOT_AUTOSAVE_TRAILER)];
+            get(trailer, sizeof(trailer));
+            if (memcmp(trailer, SLOT_AUTOSAVE_TRAILER, sizeof(trailer)) != 0 || remaining != 0) {
+                throw std::runtime_error("bad trailer");
+            }
+
+            n_bytes = (size_t) fsize;
+            fclose(f);
+            f = nullptr;
+
+            SRV_INF("slot autorestore: restored %d tokens from '%s': %.1f MiB (%zu checkpoints) in %.0f ms\n",
+                    slot->prompt.n_tokens(), path.c_str(), n_bytes / 1048576.0, slot->prompt.checkpoints.size(),
+                    (ggml_time_us() - t_start) / 1000.0);
+            return;
+        } catch (const std::exception & err) {
+            why = err.what();
+        }
+
+        // failure: leave slot 0 cold and remove the file so it is not retried
+        if (f != nullptr) {
+            fclose(f);
+        }
+        slot->prompt_clear();
+        slot->mem.seq_rm(seq, -1, -1);
+        common_speculative_reset(slot->spec, seq);
+        std::filesystem::remove(path, ec);
+        SRV_WRN("slot autorestore: REJECTED '%s' (%s), file removed, starting cold\n", path.c_str(), why.c_str());
+    }
+
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
         if (cmpl_id.empty()) {
             return nullptr;
@@ -7227,6 +7592,14 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::slot_autosave() {
+    impl->slot_autosave();
+}
+
+void server_context::slot_autorestore() {
+    impl->slot_autorestore();
 }
 
 llama_context * server_context::get_llama_context() const {

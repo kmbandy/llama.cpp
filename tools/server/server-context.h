@@ -97,6 +97,11 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // --slot-autosave: no-ops unless the flag is set. main thread only.
+    // restore: after load_model(), before reporting ready. save: after start_loop() returned.
+    void slot_autorestore();
+    void slot_autosave();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
