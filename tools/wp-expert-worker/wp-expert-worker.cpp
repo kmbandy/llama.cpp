@@ -12201,6 +12201,46 @@ public:
         });
     }
 
+    // Stop-snapshot only: a startup / unpark seed that has not finished still
+    // owes pages (VRAM list remainder -> V rows, RAM-tier list remainder -> R
+    // rows, original heat and pinned tag). Add them to `rows`, skipping pages
+    // already present (landed), and re-sort hottest-first. Caller holds the
+    // device mutex. Returns rows added.
+    size_t append_pending_seed(std::vector<ParkRow> & rows) {
+        std::unordered_set<int> have;
+        for (const ParkRow & row : rows) {
+            have.insert(row.item.page->cache_id);
+        }
+        size_t added = 0;
+        const auto add = [&](const ExpertSlotPool::SeedItem & item, bool vram) {
+            if (item.page == nullptr || have.count(item.page->cache_id) != 0) {
+                return;
+            }
+            have.insert(item.page->cache_id);
+            rows.push_back(ParkRow{ item, vram });
+            ++added;
+        };
+        for (size_t i = seed_cursor_; i < seed_list_.size(); ++i) {
+            add(seed_list_[i], true);
+        }
+        for (size_t i = ram_cursor_; i < ram_list_.size(); ++i) {
+            add(ram_list_[i], false);
+        }
+        if (added != 0) {
+            std::stable_sort(rows.begin(), rows.end(),
+                             [](const ParkRow & a, const ParkRow & b) {
+                if (a.item.heat != b.item.heat) {
+                    return a.item.heat > b.item.heat;
+                }
+                if (a.item.page->layer != b.item.page->layer) {
+                    return a.item.page->layer < b.item.page->layer;
+                }
+                return a.item.page->expert < b.item.page->expert;
+            });
+        }
+        return added;
+    }
+
     // Re-allocate the arenas. Slots come back empty; seeding is separate.
     bool unpark(double & realloc_ms, std::string & err) {
         if (!parked()) {
@@ -21848,9 +21888,11 @@ public:
     // atomically in the park-file format. The caller exits the process; the
     // worker is left in the Parking state on purpose. A quiesce timeout still
     // snapshots (residency bookkeeping is mutex-protected).
-    bool stop_snapshot(std::string & path, size_t & rows, std::string & err) {
+    bool stop_snapshot(std::string & path, size_t & rows, size_t & pending,
+                       std::string & err) {
         path = park_file_;
         rows = 0;
+        pending = 0;
         if (park_file_.empty()) {
             err = "no park file path";
             return false;
@@ -21924,6 +21966,8 @@ public:
                 size_t n_vram = 0;
                 size_t n_ram = 0;
                 dev.snapshot_residency(dev_rows, n_vram, n_ram);
+                // A seed still in progress: write landed + not-yet-landed.
+                pending += dev.append_pending_seed(dev_rows);
             }
             if (!dev_rows.empty()) {
                 sections.emplace_back(dev.device_name(), to_file_rows(dev_rows));
@@ -27168,15 +27212,20 @@ struct ParkControl {
                     std::string path;
                     std::string err;
                     size_t rows = 0;
+                    size_t pending = 0;
                     bool ok = false;
                     try {
-                        ok = worker.stop_snapshot(path, rows, err);
+                        ok = worker.stop_snapshot(path, rows, pending, err);
                     } catch (const std::exception & e) {
                         err = e.what();
                     } catch (...) {
                         err = "unknown exception";
                     }
-                    if (ok) {
+                    if (ok && pending != 0) {
+                        std::fprintf(stderr, "wp expert worker: stop snapshot written: %s "
+                                             "(%zu rows, %zu from pending seed)\n",
+                                     path.c_str(), rows, pending);
+                    } else if (ok) {
                         std::fprintf(stderr, "wp expert worker: stop snapshot written: %s "
                                              "(%zu rows)\n", path.c_str(), rows);
                     } else {
@@ -27515,10 +27564,11 @@ int run(const Options & options) {
     //
     // SHUTDOWN: this loop has no in-process stop condition -- an
     // orchestrator drives connect/disconnect cycles, this worker does not
-    // decide when it's done. No signal handler is installed here (same as
-    // the single-connection default path above), so SIGTERM's default
-    // disposition (terminate) applies immediately, even with every slot
-    // thread blocked in accept() or mid-request. The orchestrator-visible
+    // decide when it's done. SIGTERM/SIGINT are handled by the ParkControl
+    // armed above (same as the single-connection path): the control thread
+    // quiesces, writes the stop snapshot and _exit(0)s, even with every slot
+    // thread blocked in accept() or mid-request; WP_EXPERT_STOP_SNAPSHOT=0
+    // restores the default terminate disposition. The orchestrator-visible
     // change from the old accept-exactly-N probe is: this worker no longer
     // exits on its own once the streams close, so re-running the probe
     // comparison against this version means killing the process
