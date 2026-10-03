@@ -57,6 +57,8 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    server-router-groups.cpp
+    server-router-groups.h
     server-router-ledger.cpp
     server-router-ledger.h
     server-router-policy.cpp

@@ -6,6 +6,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-queue.h"
+#include "server-router-groups.h"
 #include "server-router-probe.h"
 
 #include <atomic>
@@ -132,6 +133,24 @@ struct server_model_meta {
     // POSITIONAL aggregate initialisers in several places, so a field inserted anywhere
     // above silently shifts every one of them onto the wrong member.
     std::vector<std::string> env_overrides;
+
+    // Model-group keys (see server-router-groups.h), captured at placement-parse time for the
+    // same strip-in-update_args() reason as env_overrides. Also at the END of the struct.
+    // vram_mb / ram_mb for a worker are placement.vram_mb_override / ram_mb_override.
+    router_kind              kind = ROUTER_KIND_MODEL;
+    std::vector<std::string> depends;     // spine only: names of its kind=external workers
+    std::string              group;       // spine: own name; worker: its spine; "" = not in a group
+    std::string              launch;      // worker: full command line, verbatim
+    std::string              machine;     // "" = the router's own machine
+    std::string              gpu;         // device name as written in the preset
+    std::string              park_file;
+    router_park_mode         park_mode = ROUTER_PARK_NONE;
+    std::string              slot_autosave;
+    int                      startup_timeout_s = 300;
+
+    bool is_external() const {
+        return kind == ROUTER_KIND_EXTERNAL;
+    }
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;

@@ -5440,6 +5440,48 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     ).set_env("LLAMA_ARG_ROUTER_RAM_MB").set_preset_only());
 
     args.push_back(common_arg(
+        {"machine"}, "NAME",
+        "in server router mode, machine this section runs on (default: the router's own machine)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_MACHINE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"kind"}, "model|external",
+        "in server router mode, 'external' declares a worker process launched by 'launch' that is part of a model group, not a requestable model (default: model)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_KIND").set_preset_only());
+
+    args.push_back(common_arg(
+        {"depends"}, "NAME[,NAME]",
+        "in server router mode, kind=external sections that form this model's group",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_DEPENDS").set_preset_only());
+
+    args.push_back(common_arg(
+        {"launch"}, "CMD",
+        "in server router mode, full command line that starts a kind=external worker",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_LAUNCH").set_preset_only());
+
+    args.push_back(common_arg(
+        {"park-file"}, "PATH",
+        "in server router mode, file a kind=external worker parks its state into",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PARK_FILE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"park-mode"}, "none|opt-in",
+        "in server router mode, 'opt-in' reserves the SIGUSR1/SIGUSR2 park path for this worker (default: none)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PARK_MODE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"startup-timeout"}, "SECONDS",
+        "in server router mode, how long a model group may take to come up (default: 300)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_STARTUP_TIMEOUT").set_preset_only());
+
+    args.push_back(common_arg(
         {"env"}, "K=V[,K=V,-K]",
         "in server router mode, per-model environment for THIS model's child process only.\n"
         "Comma-separated. 'K=V' sets K, and a leading '-' ('-K') REMOVES K from the child's\n"

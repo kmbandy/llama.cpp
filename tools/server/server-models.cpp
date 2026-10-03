@@ -11,6 +11,7 @@
 #include "hf-cache.h"
 #include "http.h"
 #include "subproc.h"
+#include "server-router-groups.h"
 #include "server-router-ledger.h"
 #include "server-router-policy.h"
 #include "server-router-probe.h"
@@ -509,6 +510,13 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option(ROUTER_ARG_PINNED);
     preset.unset_option(ROUTER_ARG_EXCLUSIVE);
     preset.unset_option(ROUTER_ARG_IDLE_TIMEOUT);
+    preset.unset_option(ROUTER_ARG_KIND);
+    preset.unset_option(ROUTER_ARG_DEPENDS);
+    preset.unset_option(ROUTER_ARG_LAUNCH);
+    preset.unset_option(ROUTER_ARG_PARK_FILE);
+    preset.unset_option(ROUTER_ARG_PARK_MODE);
+    preset.unset_option(ROUTER_ARG_MACHINE);
+    preset.unset_option(ROUTER_ARG_STARTUP_TIMEOUT);
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
@@ -839,7 +847,9 @@ void server_models::add_model(server_model_meta && meta) {
 
     parse_model_placement(meta);
     meta.update_args(ctx_preset, bin_path); // render args
-    meta.update_caps();
+    if (!meta.is_external()) {
+        meta.update_caps(); // a worker has no model of its own to probe
+    }
     std::string name = meta.name;
     mapping[name] = instance_t{
         /* subproc */ std::make_shared<server_subproc>(),
@@ -1127,6 +1137,22 @@ void server_models::parse_model_placement(server_model_meta & meta) {
     // Same capture-now hazard as vram-mb above: unset_reserved_args() strips
     // ROUTER_ARG_ENV from the preset in place right after this runs.
     parse_model_env(meta);
+
+    // Model-group keys: same capture-now hazard (kind/depends/launch/... are stripped by
+    // unset_reserved_args()). slot-autosave is NOT stripped: it is a real llama-server flag
+    // and reaches the spine child through the preset as LLAMA_ARG_SLOT_AUTOSAVE.
+    {
+        const router_group_section sec = router_group_parse_section(meta.preset, meta.name);
+        meta.kind              = sec.kind;
+        meta.depends           = sec.depends;
+        meta.launch            = sec.launch;
+        meta.machine           = sec.machine;
+        meta.gpu               = sec.gpu;
+        meta.park_file         = sec.park_file;
+        meta.park_mode         = sec.park_mode;
+        meta.slot_autosave     = sec.slot_autosave;
+        meta.startup_timeout_s = sec.startup_timeout_s;
+    }
 
     std::string gpu;
     if (meta.preset.get_option(ROUTER_ARG_GPU, gpu)) {
@@ -1859,6 +1885,18 @@ void server_models::load_models() {
         preset.merge(base_preset);
     }
 
+    // model groups: validate the whole preset set now so a bad group fails the load with a
+    // message naming the section (throws std::runtime_error)
+    std::map<std::string, std::string> worker_to_spine;
+    {
+        std::vector<router_group_section> sections;
+        sections.reserve(final_presets.size());
+        for (const auto & [name, preset] : final_presets) {
+            sections.push_back(router_group_parse_section(preset, name));
+        }
+        worker_to_spine = router_groups_resolve(sections);
+    }
+
     auto get_source = [&](const std::string & name) {
         return source_map.count(name) ? source_map.at(name) : SERVER_MODEL_SOURCE_PRESET;
     };
@@ -1951,6 +1989,16 @@ void server_models::load_models() {
             }
         }
     };
+    auto apply_groups = [&]() {
+        for (auto & [name, inst] : mapping) {
+            auto it = worker_to_spine.find(name);
+            if (it != worker_to_spine.end()) {
+                inst.meta.group = it->second;
+            } else {
+                inst.meta.group = inst.meta.depends.empty() ? std::string() : name;
+            }
+        }
+    };
     auto apply_hidden = [&]() {
         for (auto & [name, inst] : mapping) {
             inst.meta.hidden = hidden_models.count(name) > 0;
@@ -2004,6 +2052,7 @@ void server_models::load_models() {
         apply_stop_timeout();
         log_idle_timeouts();
         apply_hidden();
+        apply_groups();
         log_available_models();
 
         // skipped on reload, see startup_models
@@ -2011,6 +2060,9 @@ void server_models::load_models() {
             std::vector<std::string> models_to_load;
             for (const auto & [name, inst] : mapping) {
                 std::string val;
+                if (inst.meta.is_external()) {
+                    continue; // workers are brought up with their group, never as a model
+                }
                 if (inst.meta.preset.get_option(COMMON_ARG_PRESET_LOAD_ON_STARTUP, val) && common_arg_utils::is_truthy(val)) {
                     models_to_load.push_back(name);
                 }
@@ -2152,6 +2204,7 @@ void server_models::load_models() {
         apply_stop_timeout();
         log_idle_timeouts();
         apply_hidden();
+        apply_groups();
 
         // clear reload flag under the lock, this releases the load() calls waiting on !is_reloading
         is_reloading = false;
@@ -2285,6 +2338,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
     if (!opts.custom_meta.has_value()) {
         if (!has_model(name)) {
+            throw std::runtime_error("model name=" + name + " is not found");
+        }
+        if (auto m = get_meta(name); m.has_value() && m->is_external()) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
         if (!gpu_placement_enabled) {
@@ -3331,6 +3387,11 @@ static bool router_validate_model(std::string & name, server_models & models, bo
         res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
+    if (meta->is_external()) {
+        // a group worker is not a model: same answer as an unknown name
+        res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
+        return false;
+    }
     // resolve alias to canonical model name
     name = meta->name;
     if (models_autoload) {
@@ -3593,6 +3654,9 @@ void server_models_routes::init_routes() {
             if (meta.hidden) {
                 continue; // cache model deduplicated by a preset
             }
+            if (meta.is_external() && req.path.rfind("/v1/", 0) == 0) {
+                continue; // group workers are listed in /models only, never as OAI models
+            }
             json status {
                 {"value",  server_model_status_to_string(meta.status)},
                 {"args",   meta.args},
@@ -3646,6 +3710,11 @@ void server_models_routes::init_routes() {
                 {"need_bytes", meta.placement.need_bytes_per_dev},
             };
             model_info["placement"] = placement;
+            model_info["kind"]  = meta.is_external() ? "external" : "model";
+            model_info["group"] = meta.group.empty() ? json(nullptr) : json(meta.group);
+            if (!meta.depends.empty()) {
+                model_info["depends"] = meta.depends;
+            }
             // -1 in the ledger means "inherit global"; clients that want the
             // actual sweeper value can use idle_timeout_effective.
             model_info["idle_timeout"] = meta.idle_timeout;
