@@ -99,26 +99,61 @@ static int child_port(const std::vector<std::string> & args, const std::vector<s
 }
 
 #ifndef _WIN32
-// The real /proc (never the fake root: signals are real) says pid is alive (not a zombie)
-// and still carries LLAMA_ROUTER_GEN=gen, i.e. it is the same process and not a reused PID.
-static bool same_tagged_process(int pid, const std::string & gen) {
-    if (pid <= 0) {
-        return false;
-    }
+static constexpr unsigned long NODE_PF_KTHREAD = 0x00200000; // task flag of a kernel thread
+
+// state and flags of a PID from the real /proc/<pid>/stat; false when it does not exist
+static bool read_real_stat(int pid, char & state, unsigned long & flags) {
     std::string stat;
-    if (!read_whole_file("/proc/" + std::to_string(pid) + "/stat", stat)) {
+    if (pid <= 0 || !read_whole_file("/proc/" + std::to_string(pid) + "/stat", stat)) {
         return false;
     }
     const size_t rp = stat.rfind(')');
     if (rp == std::string::npos || rp + 2 >= stat.size()) {
         return false;
     }
-    const char state = stat[rp + 2];
-    if (state == 'Z' || state == 'X') {
+    state = stat[rp + 2];
+    // after ")": state ppid pgrp session tty_nr tpgid flags ...
+    std::istringstream rest(stat.substr(rp + 2));
+    std::string field;
+    flags = 0;
+    for (int i = 0; i < 7 && (rest >> field); i++) {
+        if (i == 6) {
+            flags = std::strtoul(field.c_str(), nullptr, 10);
+        }
+    }
+    return true;
+}
+
+// Before a signal (the real /proc, never the fake root: signals are real): pid is alive, not a
+// zombie, and verifiably still carries LLAMA_ROUTER_GEN=gen, i.e. it is the same process and
+// not a reused PID. Strict: a process whose environ cannot be read is not signalled.
+static bool same_tagged_process(int pid, const std::string & gen) {
+    char state = 0;
+    unsigned long flags = 0;
+    if (!read_real_stat(pid, state, flags) || state == 'Z' || state == 'X') {
         return false;
     }
     std::string now_gen;
     return router_env_get(read_proc_environ("", pid), ROUTER_ENV_GEN, now_gen) && now_gen == gen;
+}
+
+// Liveness of a process that is not our child (adopted, orphan): gone once its PID is free, a
+// zombie, a kernel thread, or a different process (a non-empty environ without our gen). A
+// process that is exiting has already dropped its memory map, so its environ reads empty for
+// a while before it turns into a zombie; it still holds its files (GPU memory) then, so it
+// counts as alive rather than as "exited" too early.
+static bool tagged_process_alive(int pid, const std::string & gen) {
+    char state = 0;
+    unsigned long flags = 0;
+    if (!read_real_stat(pid, state, flags) || state == 'Z' || state == 'X' || (flags & NODE_PF_KTHREAD)) {
+        return false;
+    }
+    const std::vector<std::string> env = read_proc_environ("", pid);
+    if (env.empty()) {
+        return true; // exiting (or unreadable): the PID is still taken, by the same process
+    }
+    std::string now_gen;
+    return router_env_get(env, ROUTER_ENV_GEN, now_gen) && now_gen == gen;
 }
 #endif
 
@@ -811,7 +846,7 @@ void server_node::run() {
                 bool gone = false;
                 if (c.adopted) {
 #ifndef _WIN32
-                    gone = !same_tagged_process(c.pid, c.gen);
+                    gone = !tagged_process_alive(c.pid, c.gen);
 #else
                     gone = true;
 #endif
@@ -848,20 +883,24 @@ void server_node::run() {
                     ev["gen"]    = o->gen;
                     push_event_locked(ev);
                 };
-                if (!same_tagged_process(o->pid, o->gen)) {
+                if (!tagged_process_alive(o->pid, o->gen)) {
                     o->done = true;
                     orphan_event("gone");
                     continue;
                 }
                 if (!o->terminating && now >= o->adopt_deadline) {
                     NODE_WRN("SIGTERM orphan pid %d ('%s', gen %s): not adopted\n", o->pid, o->name.c_str(), o->gen.c_str());
-                    kill(o->pid, SIGTERM);
+                    if (same_tagged_process(o->pid, o->gen)) {
+                        kill(o->pid, SIGTERM);
+                    }
                     o->terminating   = true;
                     o->kill_deadline = now + cfg.orphan_kill_grace_ms;
                     orphan_event("term");
                 } else if (o->terminating && !o->killed && now >= o->kill_deadline) {
                     NODE_WRN("SIGKILL orphan pid %d ('%s'): ignored SIGTERM\n", o->pid, o->name.c_str());
-                    kill(o->pid, SIGKILL);
+                    if (same_tagged_process(o->pid, o->gen)) {
+                        kill(o->pid, SIGKILL);
+                    }
                     o->killed = true;
                     orphan_event("kill");
                 }

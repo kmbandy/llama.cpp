@@ -176,6 +176,9 @@ static void test_params_and_token() {
 // helpers
 //
 
+// The test's own view, independent of the node's liveness logic: a zombie counts as dead. The
+// "orphans" below are children of this test process, so they stay zombies until the test joins
+// them; a real orphan is reparented to init / a subreaper and reaped there.
 static bool pid_alive(int pid) {
     std::ifstream in("/proc/" + std::to_string(pid) + "/stat");
     if (!in.good()) {
