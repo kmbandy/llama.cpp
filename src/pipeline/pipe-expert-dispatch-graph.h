@@ -183,11 +183,21 @@ class graph_dispatcher {
     // WP_PREDICT_MAX_TOKENS=n (default 16): skip capture for wider batches.
     static int predict_max_tokens();
 
+    // WP_HINT_ROUTER2_ROW_QUOTA (default 1; 0 = the old vote-ranked union
+    // capped at 16): per-verify-row quotas, see router2_row_tiers().
+    // WP_HINT_ROUTER2_ROW_CAP (default 0 = top-M) caps one row's picks;
+    // WP_HINT_ROUTER2_TOTAL_CAP (default 20; 0 = none) caps the deduped hints
+    // per target layer across all rows.
+    static bool   router2_row_quota();
+    static int    router2_row_cap();
+    static size_t router2_total_cap();
+
     // Softmax probability floor for router-predicted hints (WP_HINT_ROUTER2_CONF,
     // default 0.10 -- the value the whole-expert pager settled on). 0 = no gate.
     static float router2_conf_min();
-    // How many layers ahead to predict (WP_HINT_ROUTER2_K, default 1 = just the
-    // L+2 target this path has always had). Depth d gets a HALVED top-M and a
+    // How many layers ahead to predict (WP_HINT_ROUTER2_K, default 4: a COUNT of
+    // consecutive targets L+2 .. L+K+1, not a single distance; 1 = just the
+    // L+2 target this path used to have). Depth d gets a HALVED top-M and a
     // RAISED floor, because prediction quality decays with distance and the
     // whole-expert measurements showed the tail is where the wasted bytes are.
     static int   router2_lookahead();
@@ -396,7 +406,12 @@ class graph_dispatcher {
     size_t                                         pred_queue_hwm_ = 0;
     struct pred_result {
         uint32_t             n_tokens = 0;
-        std::vector<int32_t> experts;
+        std::vector<int32_t> experts;   // ascending union (repeat-suppression key)
+        // Row-quota mode (WP_HINT_ROUTER2_ROW_QUOTA): priority-ordered tiers,
+        // each ascending, whose union is `experts`. Sent as one frame per tier
+        // so the worker's per-step cap truncates the LAST rows first. Empty =
+        // legacy single vote-ranked set.
+        std::vector<std::vector<int32_t>> tiers;
     };
     // Ready sets awaiting flush, keyed by target layer (a newer set for the
     // same target overwrites -- same staleness argument).

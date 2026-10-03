@@ -112,7 +112,75 @@ std::vector<int32_t> rank_top_gated(const std::vector<double> & scores,
     return kept;
 }
 
+// One token's router pass: raw logits, DS4 selection scores (sqrt(softplus)
+// + bias), `order` reset to 0..n_expert-1, and the best softmax probability
+// over the RAW logits (what the confidence gate reads).
+double router2_score_token(const float * h, const float * weights, const float * bias,
+                           int32_t n_expert, int32_t n_embd,
+                           std::vector<double> & logits, std::vector<double> & scores,
+                           std::vector<int32_t> & order) {
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (int32_t expert = 0; expert < n_expert; ++expert) {
+        const float * row = weights + (size_t) expert * (size_t) n_embd;
+        float         d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        int32_t       i  = 0;
+        for (; i + 3 < n_embd; i += 4) {
+            d0 += h[i]     * row[i];
+            d1 += h[i + 1] * row[i + 1];
+            d2 += h[i + 2] * row[i + 2];
+            d3 += h[i + 3] * row[i + 3];
+        }
+        float dot = d0 + d1 + d2 + d3;
+        for (; i < n_embd; ++i) {
+            dot += h[i] * row[i];
+        }
+        logits[(size_t) expert] = (double) dot;
+        const float softplus =
+            std::max(dot, 0.0f) + std::log1p(std::exp(-std::fabs(dot)));
+        scores[(size_t) expert] = (double) std::sqrt(softplus) + (double) bias[expert];
+        order[(size_t) expert]  = expert;
+        max_logit = std::max(max_logit, logits[(size_t) expert]);
+    }
+    double denom = 0.0;
+    for (int32_t expert = 0; expert < n_expert; ++expert) {
+        denom += std::exp(logits[(size_t) expert] - max_logit);
+    }
+    if (!(denom > 0.0)) {
+        denom = 1.0;
+    }
+    double best_p = 0.0;
+    for (int32_t expert = 0; expert < n_expert; ++expert) {
+        best_p = std::max(best_p, std::exp(logits[(size_t) expert] - max_logit) / denom);
+    }
+    return best_p;
+}
+
 }  // namespace
+
+float router2_margin() {
+    static const float value = [] {
+        const char * e = std::getenv("WP_HINT_ROUTER2_MARGIN");
+        if (e == nullptr || e[0] == '\0') {
+            return 0.15f;   // was 0.0 (gate off) in-tree; 0.15 sits in the 0.1-0.2 band the
+                            // offline scoring picked (63% useful at 0.2, 26% with no gate)
+        }
+        const float f = std::strtof(e, nullptr);
+        return f > 0.0f ? f : 0.0f;   // 0 = margin gate off (old default)
+    }();
+    return value;
+}
+
+float router2_margin_late() {
+    static const float value = [] {
+        const char * e = std::getenv("WP_HINT_ROUTER2_MARGIN_LATE");
+        if (e == nullptr || e[0] == '\0') {
+            return router2_margin();   // unset: rows >= 2 use the same margin
+        }
+        const float f = std::strtof(e, nullptr);
+        return f > 0.0f ? f : 0.0f;
+    }();
+    return value;
+}
 
 std::vector<int32_t> router2_top_experts(const float * weights,
                                          const float * bias,
@@ -156,47 +224,13 @@ std::vector<int32_t> router2_top_experts(const float *      weights,
     double best_p = 0.0;
     for (int64_t token = 0; token < n_tokens; ++token) {
         const float * h = activations + (size_t) token * (size_t) n_embd;
-        double        max_logit = -std::numeric_limits<double>::infinity();
-        for (int32_t expert = 0; expert < n_expert; ++expert) {
-            const float * row = weights + (size_t) expert * (size_t) n_embd;
-            float         d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-            int32_t       i  = 0;
-            for (; i + 3 < n_embd; i += 4) {
-                d0 += h[i]     * row[i];
-                d1 += h[i + 1] * row[i + 1];
-                d2 += h[i + 2] * row[i + 2];
-                d3 += h[i + 3] * row[i + 3];
-            }
-            float dot = d0 + d1 + d2 + d3;
-            for (; i < n_embd; ++i) {
-                dot += h[i] * row[i];
-            }
-            logits[(size_t) expert] = (double) dot;
-            const float softplus =
-                std::max(dot, 0.0f) + std::log1p(std::exp(-std::fabs(dot)));
-            scores[(size_t) expert] = (double) std::sqrt(softplus) + (double) bias[expert];
-            order[(size_t) expert]  = expert;
-            max_logit = std::max(max_logit, logits[(size_t) expert]);
-        }
-        double denom = 0.0;
-        for (int32_t expert = 0; expert < n_expert; ++expert) {
-            denom += std::exp(logits[(size_t) expert] - max_logit);
-        }
-        if (!(denom > 0.0)) {
-            denom = 1.0;
-        }
-        for (int32_t expert = 0; expert < n_expert; ++expert) {
-            best_p = std::max(best_p,
-                              std::exp(logits[(size_t) expert] - max_logit) / denom);
-        }
-        // WP_HINT_ROUTER2_MARGIN=x keeps only experts whose score beats this
+        best_p = std::max(best_p, router2_score_token(h, weights, bias, n_expert, n_embd,
+                                                      logits, scores, order));
+        // WP_HINT_ROUTER2_MARGIN=x (default 0.15; 0 = off) keeps only experts whose score beats this
         // token's (top_m+1)-th best by at least x. Offline on DS4.1 decode
         // (~/ds4-runs/dsv41/pred/score3.py, L+2 top-6): no gate reads 26%
         // useful at 44% miss recall, 0.2 reads 63% useful at 20% recall.
-        static const float margin = [] {
-            const char * e = std::getenv("WP_HINT_ROUTER2_MARGIN");
-            return e != nullptr && e[0] != '\0' ? std::strtof(e, nullptr) : 0.0f;
-        }();
+        const float margin = router2_margin();
         const int32_t n_sort = margin > 0.0f ? std::min(top_m + 1, n_expert) : top_m;
         std::partial_sort(order.begin(), order.begin() + n_sort, order.end(),
                           [&scores](int32_t a, int32_t b) {
@@ -239,6 +273,91 @@ std::vector<int32_t> router2_top_experts(const float *      weights,
     }
     // Caller receives its own copy -- scratch.kept is overwritten next call.
     return std::vector<int32_t>(kept.begin(), kept.end());
+}
+
+std::vector<std::vector<int32_t>> router2_row_tiers(const float *     weights,
+                                                    const float *     bias,
+                                                    const float *     activations,
+                                                    int64_t           n_tokens,
+                                                    int32_t           n_expert,
+                                                    int32_t           n_embd,
+                                                    int32_t           top_m,
+                                                    int32_t           row_cap,
+                                                    float             min_conf,
+                                                    float             margin,
+                                                    float             margin_late,
+                                                    size_t            total_cap,
+                                                    router2_scratch & scratch) {
+    std::vector<std::vector<int32_t>> tiers;
+    if (weights == nullptr || bias == nullptr || activations == nullptr || n_tokens <= 0 || n_expert <= 0 ||
+        n_embd <= 0 || top_m <= 0) {
+        return tiers;
+    }
+    top_m = std::min(top_m, n_expert);
+    const int32_t cap = row_cap > 0 ? std::min(row_cap, top_m) : top_m;
+
+    std::vector<int> &     seen   = scratch.hits;   // dedup across rows
+    std::vector<double> &  logits = scratch.logits;
+    std::vector<double> &  scores = scratch.scores;
+    std::vector<int32_t> & order  = scratch.order;
+    seen.assign((size_t) n_expert, 0);
+    logits.resize((size_t) n_expert);
+    scores.resize((size_t) n_expert);
+    order.resize((size_t) n_expert);
+
+    // Score every row first: the confidence gate is all-or-nothing on the
+    // layer (best p over ALL rows), so a layer that fails it must emit
+    // nothing, not just row 0's share.
+    double best_p = 0.0;
+    std::vector<std::vector<int32_t>> ranked((size_t) n_tokens);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        const float * h = activations + (size_t) token * (size_t) n_embd;
+        best_p = std::max(best_p, router2_score_token(h, weights, bias, n_expert, n_embd,
+                                                      logits, scores, order));
+        const float   m      = token >= 2 ? margin_late : margin;
+        const int32_t n_sort = m > 0.0f ? std::min(cap + 1, n_expert) : cap;
+        std::partial_sort(order.begin(), order.begin() + n_sort, order.end(),
+                          [&scores](int32_t a, int32_t b) {
+                              if (scores[(size_t) a] != scores[(size_t) b]) {
+                                  return scores[(size_t) a] > scores[(size_t) b];
+                              }
+                              return a < b;
+                          });
+        const double floor_score = m > 0.0f && n_sort > cap
+            ? scores[(size_t) order[(size_t) cap]] + (double) m
+            : -std::numeric_limits<double>::infinity();
+        // Best-ranked first: a total_cap cut below drops the weakest picks.
+        for (int32_t i = 0; i < cap; ++i) {
+            if (scores[(size_t) order[(size_t) i]] >= floor_score) {
+                ranked[(size_t) token].push_back(order[(size_t) i]);
+            }
+        }
+    }
+    if (min_conf > 0.0f && best_p < (double) min_conf) {
+        return tiers;
+    }
+    // Row 0 first, then each later row's experts not already claimed. Every
+    // row keeps its own quota (nothing here ranks rows against each other),
+    // which is the point: a vote-ranked global cap starves late rows.
+    size_t total = 0;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        std::vector<int32_t> tier;
+        for (const int32_t expert : ranked[(size_t) token]) {
+            if (total_cap != 0 && total >= total_cap) {
+                break;
+            }
+            if (seen[(size_t) expert] == 0) {
+                seen[(size_t) expert] = 1;
+                tier.push_back(expert);
+                ++total;
+            }
+        }
+        if (!tier.empty()) {
+            std::sort(tier.begin(), tier.end());   // the wire's ascending order
+            tiers.push_back(std::move(tier));
+        }
+    }
+    return tiers;
 }
 
 uint64_t ngram_hint_table::key(int32_t token, int32_t layer) {

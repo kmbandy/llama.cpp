@@ -68,6 +68,35 @@ std::vector<int32_t> router2_top_experts(const float * weights,
                                          float         min_conf,
                                          router2_scratch & scratch);
 
+// Margin gate shared by both scorers. WP_HINT_ROUTER2_MARGIN (default 0.15;
+// 0 = off, the old in-tree default) and WP_HINT_ROUTER2_MARGIN_LATE (rows >= 2
+// of the row-tier scorer; default = the main margin).
+float router2_margin();
+float router2_margin_late();
+
+// ROW-AWARE variant of router2_top_experts. Instead of one union capped by
+// votes, return one ascending TIER per verify row, in priority order: tier 0
+// is row 0's top-`row_cap` (0 = top_m) experts, tier r is row r's picks not
+// already claimed by an earlier tier. Within a tier, picks are the row's best
+// by selection score; `total_cap` (0 = none) truncates the tail of the LAST
+// tiers first, so row 0 is never starved by later rows. The caller sends one
+// hint frame per tier, in order, because the wire itself is ascending-only and
+// cannot carry a priority order. Same all-or-nothing confidence gate as above.
+// Rows 0-1 use `margin`, rows >= 2 use `margin_late`.
+std::vector<std::vector<int32_t>> router2_row_tiers(const float *     weights,
+                                                    const float *     bias,
+                                                    const float *     activations,
+                                                    int64_t           n_tokens,
+                                                    int32_t           n_expert,
+                                                    int32_t           n_embd,
+                                                    int32_t           top_m,
+                                                    int32_t           row_cap,
+                                                    float             min_conf,
+                                                    float             margin,
+                                                    float             margin_late,
+                                                    size_t            total_cap,
+                                                    router2_scratch & scratch);
+
 // WPNGRAM v1 is little-endian: header(version, dimensions, row count), one
 // popularity row per layer, then keyed token rows. Each row stores its full
 // count total plus up to 16 (u16 expert, u32 count) entries.

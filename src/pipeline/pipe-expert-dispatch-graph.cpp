@@ -1205,7 +1205,7 @@ int graph_dispatcher::router2_lookahead() {
     static const int value = [] {
         const char * v = std::getenv("WP_HINT_ROUTER2_K");
         if (v == nullptr || v[0] == '\0') {
-            return 1;
+            return 4;   // was 1. K is a COUNT: targets L+2 .. L+K+1 are all scored.
         }
         // Clamped only to the model's layer count -- 8 was a number I picked,
         // and it was cutting off exactly the horizon that makes prefetch work.
@@ -1215,6 +1215,41 @@ int graph_dispatcher::router2_lookahead() {
         // landings this rig has ever recorded. Precision decays with distance,
         // which is what the top-M halving and the rising floor are for.
         return std::min(128, std::max(1, std::atoi(v)));
+    }();
+    return value;
+}
+
+bool graph_dispatcher::router2_row_quota() {
+    static const bool value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_ROW_QUOTA");
+        return v == nullptr || v[0] == '\0' || v[0] != '0';   // default ON; 0 = old vote cap
+    }();
+    return value;
+}
+
+int graph_dispatcher::router2_row_cap() {
+    static const int value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_ROW_CAP");
+        if (v == nullptr || v[0] == '\0') {
+            return 0;   // 0 = each row gets its full top-M
+        }
+        return std::min<int32_t>(PREFETCH_HINT_MAX_EXPERTS, std::max(0, std::atoi(v)));
+    }();
+    return value;
+}
+
+size_t graph_dispatcher::router2_total_cap() {
+    // 20 per target layer = the worker's WP_EXPERT_CPU_TIER_PREFETCH_MAX (80
+    // per decode step) split over the default K=4 layers. 6 rows x top-6 is 36
+    // before dedup; rows overlap heavily so ~15-25 survive, i.e. the cap bites
+    // only on unusually diverse batches and trims the lowest rows first.
+    static const size_t value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_TOTAL_CAP");
+        if (v == nullptr || v[0] == '\0') {
+            return (size_t) 20;
+        }
+        const long n = strtol(v, nullptr, 10);
+        return n > 0 ? (size_t) n : (size_t) 0;   // 0 = uncapped
     }();
     return value;
 }
@@ -1414,15 +1449,32 @@ void graph_dispatcher::predictor_loop() {
                 const float   conf =
                     std::min(1.0f, router2_conf_min() + (float) d * router2_conf_step());
                 const router_layer & rl = it->second;
-                std::vector<int32_t> experts = router2_top_experts(
-                    rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
-                    n_expert, n_embd, m, conf, scratch);
+                std::vector<int32_t>              experts;
+                std::vector<std::vector<int32_t>> tiers;
+                if (router2_row_quota()) {
+                    // Per-row quotas, deduped across rows, row 0 first. The
+                    // vote-ranked path below cut the union to 16 by votes,
+                    // which starves the later draft rows (coverage row0 22% ->
+                    // row5 10%).
+                    tiers = router2_row_tiers(
+                        rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
+                        n_expert, n_embd, m, router2_row_cap(), conf,
+                        router2_margin(), router2_margin_late(), router2_total_cap(), scratch);
+                    for (const std::vector<int32_t> & tier : tiers) {
+                        experts.insert(experts.end(), tier.begin(), tier.end());
+                    }
+                    std::sort(experts.begin(), experts.end());
+                } else {
+                    experts = router2_top_experts(
+                        rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
+                        n_expert, n_embd, m, conf, scratch);
+                }
                 if (experts.empty()) {
                     continue;   // the gate rejected the whole layer: correct, not a failure
                 }
                 {
                     std::lock_guard<std::mutex> lock(pred_mutex_);
-                    pred_ready_[target] = { (uint32_t) job.n_tokens, std::move(experts) };
+                    pred_ready_[target] = { (uint32_t) job.n_tokens, std::move(experts), std::move(tiers) };
                 }
             }
         } catch (...) {
@@ -1448,11 +1500,15 @@ void graph_dispatcher::flush_predicted_hints() noexcept {
         }
         // Cap so reuse (32) + router2 fits the 64-deep worker queue. Default 16
         // PAGES PER DECODE, not per flush. 0 = uncapped. Soonest layer first,
-        // all-or-nothing per layer.
+        // all-or-nothing per layer (row-quota mode: per tier, row 0 first).
         static const size_t page_budget = [] {
             const char * e = std::getenv("WP_HINT_ROUTER2_PAGES");
             if (e == nullptr || e[0] == '\0') {
-                return (size_t) 16;
+                // Row-quota hints are ~20/layer x K layers: a 16-page budget
+                // would pass one layer and stop. Default to the worker's
+                // WP_EXPERT_CPU_TIER_PREFETCH_MAX; the old 16 stays the
+                // default for the vote-ranked mode.
+                return router2_row_quota() ? (size_t) 80 : (size_t) 16;
             }
             const long v = strtol(e, nullptr, 10);
             return v > 0 ? (size_t) v : (size_t) 0;
@@ -1468,6 +1524,36 @@ void graph_dispatcher::flush_predicted_hints() noexcept {
             }
             std::vector<int32_t> & previous = last_pred_hint_[entry.first];
             if (previous == experts) {
+                continue;
+            }
+            if (!entry.second.tiers.empty()) {
+                // Row-quota mode: one frame per tier, row 0 first, so the
+                // worker's per-step cap (which keeps arrival order) truncates
+                // the later rows. The wire is strictly ascending and cannot
+                // carry a priority order inside one frame.
+                std::vector<int32_t> sent_union;
+                bool                 out_of_budget = false;
+                for (const std::vector<int32_t> & tier : entry.second.tiers) {
+                    if (page_budget != 0 &&
+                        router2_pages_this_decode_ + tier.size() > page_budget) {
+                        out_of_budget = true;
+                        break;
+                    }
+                    if (remote.send_prefetch_hints(entry.first, tier, PIPE_HINT_PREDICTED,
+                                                   entry.second.n_tokens) == 0) {
+                        out_of_budget = true;   // declined/failed: stop for this flush too
+                        break;
+                    }
+                    router2_pages_this_decode_ += tier.size();
+                    sent_union.insert(sent_union.end(), tier.begin(), tier.end());
+                }
+                if (!sent_union.empty()) {
+                    std::sort(sent_union.begin(), sent_union.end());
+                    previous = std::move(sent_union);
+                }
+                if (out_of_budget) {
+                    break;
+                }
                 continue;
             }
             const size_t n = remote.send_prefetch_hints(entry.first, experts,
