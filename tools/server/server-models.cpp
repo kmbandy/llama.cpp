@@ -2197,6 +2197,13 @@ void server_models::queue_runner_loop() {
         }
         lk.unlock();
         for (const auto & [n, o] : todo) {
+            {
+                // a cancel (or a spawn by someone else) since the snapshot: not retried
+                std::lock_guard<std::mutex> l(mutex);
+                if (shutting_down || !queued_loads.count(n) || router_cancel_moved(o.cancel_gen, cancel_gen_locked(n))) {
+                    continue;
+                }
+            }
             try {
                 load(n, o);
             } catch (const router_queued_error &) {
@@ -2228,7 +2235,7 @@ void server_models::on_queued(const std::string & name, const load_options & opt
 
     // a load whose queued entry was cancelled meanwhile does not queue again
     auto cancelled_locked = [&]() {
-        return opts.cancel_gen.has_value() && cancel_gen_locked(name) != *opts.cancel_gen;
+        return router_cancel_moved(opts.cancel_gen, cancel_gen_locked(name));
     };
     {
         std::lock_guard<std::mutex> lk(mutex);
@@ -3403,6 +3410,10 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
         if (stopping_models.count(name)) {
             throw std::runtime_error("load of model group '" + name + "' was cancelled");
         }
+        if (router_cancel_moved(opts.cancel_gen, cancel_gen_locked(name))) {
+            // checked again before the spine; this one spares starting the workers
+            throw router_refused_error("the queued load of model group '" + name + "' was cancelled");
+        }
         auto & rt = groups[name];
         // the previous load's workers object (all stopped, see the wait above). Its destructor
         // joins its thread, which may still be finishing a callback that takes `mutex`: drop it
@@ -3459,6 +3470,12 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
 
     if (shutting_down) {
         throw router_refused_error("router is shutting down");
+    }
+    // admitted, but its queued entry was cancelled meanwhile (POST /models/unload): the cancel
+    // wins. Thrown before anything is spawned: the guard rolls the placement back and load()
+    // releases the claims this attempt took.
+    if (router_cancel_moved(opts.cancel_gen, cancel_gen_locked(name))) {
+        throw router_refused_error("the queued load of model '" + name + "' was cancelled");
     }
     // spawning now: no longer a queued load (its board queue slot is left by load())
     queued_loads.erase(name);
@@ -4117,7 +4134,7 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             if (it == mapping.end()) {
                 break; // removed by another code path, nothing to wait for
             }
-            if (cancel_gen_locked(name) != gen0) {
+            if (router_cancel_moved(gen0, cancel_gen_locked(name))) {
                 throw router_refused_error("the queued load of model '" + name + "' was cancelled");
             }
             if (stopping_models.count(name)) {

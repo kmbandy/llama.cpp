@@ -135,6 +135,10 @@ router_queue_wait router_queue_wait_decision(bool cancelled, bool client_gone, i
     return ROUTER_WAIT_CONTINUE;
 }
 
+bool router_cancel_moved(const std::optional<uint64_t> & expected, uint64_t current) {
+    return expected.has_value() && *expected != current;
+}
+
 router_probation_action router_board_probation_action(bool ours, bool waited_for, bool claim_in_flight) {
     if (ours || claim_in_flight) {
         return ROUTER_PROBATION_KEEP;
@@ -693,6 +697,7 @@ void router_board_agent::stop() {
         }
         joined.clear();
         joined_prio.clear();
+        join_info.clear();
     }
     for (const auto & c : all) {
         std::string err;
@@ -785,6 +790,24 @@ std::map<std::string, std::set<std::string>> router_board_agent::held() const {
     return out;
 }
 
+// caller holds mu: `queue_owner` no longer waits for `resource`
+void router_board_agent::unjoin_locked(const std::string & resource, const std::string & queue_owner) {
+    auto j = joined.find(resource);
+    if (j == joined.end()) {
+        return;
+    }
+    j->second.erase(queue_owner);
+    auto ji = join_info.find(resource);
+    if (ji != join_info.end()) {
+        ji->second.erase(queue_owner);
+    }
+    if (j->second.empty()) {
+        joined.erase(j);
+        joined_prio.erase(resource);
+        join_info.erase(resource);
+    }
+}
+
 router_board_claim_result router_board_agent::acquire(const std::string & owner, const std::string & queue_owner,
                                                       const std::string & resource, const std::string & note,
                                                       admission_priority priority) {
@@ -794,6 +817,21 @@ router_board_claim_result router_board_agent::acquire(const std::string & owner,
         if (stopped) {
             router_board_claim_result r;
             r.error = "board agent stopped";
+            return r;
+        }
+        // already held for this owner (e.g. a queue turn the agent confirmed): no second POST,
+        // which the board would answer with a second claim
+        auto have = std::find_if(claims.begin(), claims.end(),
+                                 [&](const held_claim & c) { return c.owner == owner && c.resource == resource; });
+        if (have != claims.end()) {
+            router_board_claim_result r;
+            r.ok       = true;
+            r.granted  = true;
+            r.claim_id = have->claim_id;
+            r.status   = 200;
+            if (!queue_owner.empty()) {
+                unjoin_locked(resource, queue_owner);
+            }
             return r;
         }
         pending[resource]++; // protects a probation claim of ours on it from the cleanup in tick()
@@ -810,34 +848,49 @@ router_board_claim_result router_board_agent::acquire(const std::string & owner,
         }
     }
     router_board_claim_result r = client.claim(cfg.machine, resource, note, priority, cfg.ttl_hours);
-    std::lock_guard<std::mutex> lk(mu);
-    if (--pending[resource] <= 0) {
-        pending.erase(resource);
-    }
-    if (r.ok && r.granted) {
-        // a probation claim the queue handed us is confirmed in place: same id
-        const bool known = std::any_of(claims.begin(), claims.end(),
-                                       [&](const held_claim & c) { return c.claim_id == r.claim_id; });
-        if (!known) {
-            const int64_t now = board_now_ms();
-            claims.push_back({ owner, resource, r.claim_id, now, now });
+    bool give_back = false;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (--pending[resource] <= 0) {
+            pending.erase(resource);
         }
-        auto j = joined.find(resource);
-        if (j != joined.end() && !queue_owner.empty()) {
-            j->second.erase(queue_owner); // our turn came: no longer waiting for it
-            if (j->second.empty()) {
-                joined.erase(j);
-                joined_prio.erase(resource);
+        if (stopped) {
+            // stop() ran while this claim was in flight: it already released what it knew of
+            give_back = r.ok && r.granted;
+        } else if (r.ok && r.granted) {
+            // a probation claim the queue handed us is confirmed in place: same id
+            const bool known = std::any_of(claims.begin(), claims.end(),
+                                           [&](const held_claim & c) { return c.claim_id == r.claim_id; });
+            if (!known) {
+                const int64_t now = board_now_ms();
+                claims.push_back({ owner, resource, r.claim_id, now, now });
             }
+            if (!queue_owner.empty()) {
+                unjoin_locked(resource, queue_owner); // our turn came: no longer waiting for it
+            }
+        } else if (r.ok && r.queued && !queue_owner.empty()) {
+            joined[resource].insert(queue_owner);
+            auto p = joined_prio.find(resource);
+            if (p == joined_prio.end() || priority > p->second) {
+                joined_prio[resource] = priority;
+            }
+            auto & info = join_info[resource];
+            auto it = info.find(queue_owner);
+            if (it == info.end()) {
+                info[queue_owner] = { queue_owner, priority, board_now_ms() };
+            } else if (priority > it->second.priority) {
+                it->second.priority = priority; // keeps its place in time
+            }
+        } else if (!r.ok) {
+            BRD_WRN("claim of %s for %s failed: %s\n", resource.c_str(), owner.c_str(), r.error.c_str());
         }
-    } else if (r.ok && r.queued && !queue_owner.empty()) {
-        joined[resource].insert(queue_owner);
-        auto p = joined_prio.find(resource);
-        if (p == joined_prio.end() || priority > p->second) {
-            joined_prio[resource] = priority;
-        }
-    } else if (!r.ok) {
-        BRD_WRN("claim of %s for %s failed: %s\n", resource.c_str(), owner.c_str(), r.error.c_str());
+    }
+    if (give_back) {
+        std::string err;
+        client.release(r.claim_id, err);
+        r.ok      = false;
+        r.granted = false;
+        r.error   = "board agent stopped";
     }
     return r;
 }
@@ -874,9 +927,14 @@ void router_board_agent::leave_queue(const std::string & queue_owner) {
         std::lock_guard<std::mutex> lk(mu);
         for (auto it = joined.begin(); it != joined.end();) {
             it->second.erase(queue_owner);
+            auto ji = join_info.find(it->first);
+            if (ji != join_info.end()) {
+                ji->second.erase(queue_owner);
+            }
             if (it->second.empty()) {
                 to_leave.push_back(it->first);
                 joined_prio.erase(it->first);
+                join_info.erase(it->first);
                 it = joined.erase(it);
             } else {
                 ++it;
@@ -1140,7 +1198,20 @@ void router_board_agent::tick() {
                 t.resource = c.resource;
                 t.action   = router_board_probation_action(ours, waited, pending.count(c.resource) > 0);
                 if (waited) {
-                    t.owner = *j->second.begin();
+                    // the turn goes to the load the router serves first: priority, then age
+                    std::vector<router_queue_item> items;
+                    auto ji = join_info.find(c.resource);
+                    for (const auto & o : j->second) {
+                        router_queue_item item{ o, ADMISSION_PRIORITY_MIDDLE, 0 };
+                        if (ji != join_info.end()) {
+                            auto it = ji->second.find(o);
+                            if (it != ji->second.end()) {
+                                item = it->second;
+                            }
+                        }
+                        items.push_back(item);
+                    }
+                    t.owner = router_queue_service_order(items).front();
                     auto p  = joined_prio.find(c.resource);
                     t.priority = p != joined_prio.end() ? p->second : ADMISSION_PRIORITY_MIDDLE;
                 }

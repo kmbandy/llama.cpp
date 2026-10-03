@@ -117,6 +117,12 @@ enum router_queue_wait {
 };
 router_queue_wait router_queue_wait_decision(bool cancelled, bool client_gone, int64_t waited_ms, int64_t max_wait_ms);
 
+// A load carrying the cancel generation its queued entry had when the request began
+// (`expected`; none = not tied to a queued entry): true once a cancel moved it (`current`).
+// Checked when a load would queue again, right before a queue retry starts, and right before a
+// child is spawned, so a cancel always wins over a retry that admission let through.
+bool router_cancel_moved(const std::optional<uint64_t> & expected, uint64_t current);
+
 // What the board agent does with a probation claim (a queue turn) the board handed the router.
 enum router_probation_action {
     ROUTER_PROBATION_KEEP    = 0, // already ours, or a claim for it is in flight
@@ -338,6 +344,7 @@ class router_board_agent {
     };
 
     void release_claims(std::vector<held_claim> victims);
+    void unjoin_locked(const std::string & resource, const std::string & queue_owner);
     void release_dead_from(const std::vector<router_board_resident> & residents, int64_t since_ms);
     void startup_sweep();
 
@@ -351,6 +358,7 @@ class router_board_agent {
     std::vector<held_claim>                      claims;
     std::map<std::string, std::set<std::string>> joined;   // resource -> queue owners waiting for it
     std::map<std::string, admission_priority>    joined_prio; // resource -> priority of the router's board queue slot
+    std::map<std::string, std::map<std::string, router_queue_item>> join_info; // resource -> queue owner -> its priority / join time
     std::map<std::string, int>                   pending;  // resource -> claims in flight
     std::set<std::string>                        notified; // "claim_id:kind"
     std::map<std::string, int64_t>               retake_after; // "owner|resource" -> earliest re-claim (ms)

@@ -64,6 +64,7 @@ struct fake_board {
     std::vector<claim_row> claims;
     std::vector<queue_row> queue;
     int                    n_patch = 0;
+    int                    n_claim_post = 0;
     int                    n_leave = 0;
     std::vector<std::pair<std::string, std::string>> notifies; // claim_id, kind
     std::string            token = "test-token";
@@ -287,6 +288,7 @@ struct fake_board {
                 return reply(res, 401, error_body("missing or invalid bearer token"));
             }
             std::lock_guard<std::mutex> lk(mu);
+            n_claim_post++;
             const json b = json::parse(req.body);
             if (b.value("machine", "").empty() || b.value("resource", "").empty()) {
                 return reply(res, 400, error_body("machine and resource are required"));
@@ -740,25 +742,35 @@ static void test_agent() {
         CHECK(fb.notifies.size() == 1);
     }
 
-    // the session releases: the board hands the router a probation claim; the agent reports the
-    // change, keeps the turn for the waiting load, and claiming confirms it in place
+    // the session releases: the board hands the router a probation claim (a queue turn); the
+    // agent's tick confirms it itself for the waiting load (PROBATION_S is short) and reports the
+    // change; the load's own claim then returns that same claim without a second POST
     const int changed_before = fh.changed.load();
     fb.session_release("session-1");
     agent.tick();
     CHECK(fh.changed.load() > changed_before);
     std::string turn;
+    int posts = 0;
     {
         std::lock_guard<std::mutex> lk(fb.mu);
         const auto * c = fb.find_live("llama-router", "gpu:ROCm1");
-        CHECK(c != nullptr && c->probation);
-        turn = c->id;
+        CHECK(c != nullptr && c->holder == "llama-router" && !c->probation); // live, ours, confirmed
+        turn  = c->id;
+        posts = fb.n_claim_post;
+    }
+    {
+        const auto held = agent.held();
+        auto it = held.find("llama-8b"); // recorded for the waiting load
+        CHECK(it != held.end() && it->second.count("gpu:ROCm1") == 1);
     }
     auto g = agent.acquire("llama-8b", "llama-8b", "gpu:ROCm1", "llama-8b", ADMISSION_PRIORITY_MIDDLE);
     CHECK(g.ok && g.granted && g.claim_id == turn);
     {
         std::lock_guard<std::mutex> lk(fb.mu);
+        CHECK(fb.n_claim_post == posts); // no second POST (the board would make a second claim)
         CHECK(!fb.find_live("llama-router", "gpu:ROCm1")->probation);
     }
+    CHECK(fb.live("llama-router", "gpu:ROCm1") == 1);
     agent.leave_queue("llama-8b"); // nothing left to leave
     fh.set({ running("llama-8b", { "gpu:ROCm1" }) });
     sleep_ms(5);
@@ -870,6 +882,17 @@ static void test_wait_decision() {
     CHECK(router_queue_wait_decision(true, false, 0, max) == ROUTER_WAIT_CANCELLED);
 }
 
+static void test_cancel_moved() {
+    // a load not tied to a queued entry (startup, a plain request) is never cancelled this way
+    CHECK(!router_cancel_moved(std::nullopt, 0));
+    CHECK(!router_cancel_moved(std::nullopt, 7));
+    // unchanged generation: the retry / spawn goes ahead
+    CHECK(!router_cancel_moved(std::optional<uint64_t>(3), 3));
+    // a cancel moved it after the request (or the runner's snapshot): skip the retry, refuse the spawn
+    CHECK(router_cancel_moved(std::optional<uint64_t>(3), 4));
+    CHECK(router_cancel_moved(std::optional<uint64_t>(0), 1));
+}
+
 static void test_probation_action() {
     // ours (already confirmed) or a claim in flight: leave it
     CHECK(router_board_probation_action(true, true, false) == ROUTER_PROBATION_KEEP);
@@ -976,6 +999,8 @@ static void test_agent_priority_and_turns() {
     CHECK(fh.changed.load() > changed_before);
     const auto held = agent.held();
     CHECK(held.size() == 1 && held.begin()->second == std::set<std::string>{ "gpu:R9700" });
+    // recorded for the load served first: load-b (highest), not load-a (alphabetically first)
+    CHECK(held.begin()->first == "load-b");
     agent.tick();
     CHECK(fb.live("llama-router", "gpu:R9700") == 1); // still kept: its owner is a queued load
 
@@ -1006,6 +1031,7 @@ int main() {
     test_agent_outage();
     test_queue_order();
     test_wait_decision();
+    test_cancel_moved();
     test_probation_action();
     test_waiters_block();
     test_agent_priority_and_turns();
