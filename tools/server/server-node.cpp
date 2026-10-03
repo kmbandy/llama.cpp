@@ -11,6 +11,7 @@
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -20,7 +21,11 @@
 #include <sstream>
 
 #ifndef _WIN32
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 extern char ** environ;
@@ -81,21 +86,12 @@ static std::vector<std::string> read_proc_environ(const std::string & root, int 
     return split_nul(blob);
 }
 
-// The port a child listens on: --port / --listen in its argv, else LLAMA_ARG_PORT in its env.
-static int child_port(const std::vector<std::string> & args, const std::vector<std::string> & env) {
+// The port a child listens on: --port / --listen in its argv; 0 if none. Never read from env:
+// an inherited LLAMA_ARG_PORT is the node's own, not the child's.
+static int child_port(const std::vector<std::string> & args) {
     std::string host;
     const int port = router_launch_endpoint(args, host);
-    if (port > 0) {
-        return port;
-    }
-    std::string v;
-    if (router_env_get(env, "LLAMA_ARG_PORT", v)) {
-        const int p = std::atoi(v.c_str());
-        if (p > 0 && p < 65536) {
-            return p;
-        }
-    }
-    return 0;
+    return port > 0 ? port : 0;
 }
 
 #ifndef _WIN32
@@ -170,12 +166,17 @@ std::vector<std::string> server_node_default_env() {
         }
     }
 #endif
-    // the node's own flags: a llama-server child that inherited LLAMA_ARG_ROUTER_NODE would
-    // come up as a node itself
-    for (const char * key : { "LLAMA_ARG_ROUTER_NODE", "LLAMA_ARG_NODE_TOKEN_FILE", "LLAMA_ARG_NODE_BIND",
-                              "LLAMA_ARG_BOARD_URL", "LLAMA_ARG_BOARD_TOKEN_FILE" }) {
-        router_env_unset(env, key);
-    }
+    // The router's reserved names (the same set unset_reserved_args keeps out of a child's
+    // options: TLS, API keys, model registry, board, node flags, LLAMA_ARG_ROUTER_*), plus this
+    // process's own address and model: a llama-server child that inherited LLAMA_ARG_ROUTER_NODE
+    // would come up as a node, one that inherited LLAMA_ARG_PORT would bind the node's port.
+    static const char * const own[] = { "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_MODEL",
+                                         "LLAMA_ARG_MMPROJ", "LLAMA_ARG_ALIAS", "LLAMA_ARG_HF_REPO" };
+    env.erase(std::remove_if(env.begin(), env.end(), [](const std::string & e) {
+        const std::string key = e.substr(0, e.find('='));
+        return router_is_reserved_option_key(key) ||
+               std::any_of(std::begin(own), std::end(own), [&](const char * k) { return key == k; });
+    }), env.end());
     return env;
 }
 
@@ -227,6 +228,9 @@ server_node::server_node(server_node_config cfg_in) : cfg(std::move(cfg_in)) {
 }
 
 server_node::~server_node() {
+    // closing first: a spawn that has not inserted its child yet sees it under `mu` and kills
+    // its child itself, so nothing lands in the table after the stop loop below
+    close_events();
     {
         std::lock_guard<std::mutex> lk(mu);
         const int64_t deadline = steady_ms() + cfg.shutdown_grace_ms;
@@ -264,13 +268,27 @@ server_node::~server_node() {
             NODE_INF("stopping %zu child(ren), SIGKILL after %" PRId64 " ms\n", n, cfg.shutdown_grace_ms);
         }
     }
-    close_events();
     waiter.wake();
     {
         std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [this]() {
+        // bounded: a child stuck in D state, or an adopted PID that keeps looking alive, must not
+        // hang the exit; past the SIGKILL deadline plus a grace it is abandoned
+        const auto give_up = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(std::max<int64_t>(0, cfg.shutdown_grace_ms) +
+                                                       std::max<int64_t>(0, cfg.abandon_grace_ms));
+        const bool all_gone = cv.wait_until(lk, give_up, [this]() {
             return std::all_of(table.begin(), table.end(), [](const auto & kv) { return kv.second->exited; });
         });
+        if (!all_gone) {
+            for (auto & [name, c] : table) {
+                if (!c->exited) {
+                    NODE_WRN("abandoning %s (pid %d): still not gone %" PRId64 " ms after SIGKILL\n",
+                             name.c_str(), c->pid, cfg.abandon_grace_ms);
+                    c->exited    = true;
+                    c->exit_code = -1;
+                }
+            }
+        }
         quit = true;
     }
     waiter.wake();
@@ -338,14 +356,18 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
         throw server_node_error(400, "args[0] must be an absolute path (PATH is never searched): " + req.args[0]);
     }
 
+    if (req.port < 0 || req.port > 65535) {
+        throw server_node_error(400, "port must be 0..65535");
+    }
     std::vector<std::string> env = cfg.base_env;
     for (const auto & e : req.env) {
-        const size_t eq = e.find('=');
-        if (eq == std::string::npos || eq == 0) {
-            throw server_node_error(400, "env entry is not NAME=VALUE: " + e);
+        const std::string bad = router_env_override_error(e);
+        if (!bad.empty()) {
+            throw server_node_error(400, bad);
         }
-        router_env_set(env, e.substr(0, eq), e.substr(eq + 1));
     }
+    // the router's own preset `env` semantics: KEY=VALUE sets, -KEY unsets
+    router_env_apply_overrides(env, req.env);
     router_env_set(env, ROUTER_ENV_GEN, req.gen);
     router_env_set(env, ROUTER_ENV_ROUTER_PID, std::to_string(cfg.self_pid));
     router_env_set(env, ROUTER_ENV_CHILD, req.name);
@@ -355,7 +377,7 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
         throw server_node_error(400, "refusing to spawn '" + req.name + "': " + bad_tmp + " is not a directory");
     }
 
-    const int port = child_port(req.args, env);
+    const int port = req.port > 0 ? req.port : child_port(req.args);
 
     {
         std::lock_guard<std::mutex> lk(mu);
@@ -378,22 +400,33 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
     }
 
     node_child_info info;
+    bool closed = false;
     {
         std::lock_guard<std::mutex> lk(mu);
         spawning.erase(req.name);
         if (!ok) {
             throw server_node_error(500, "failed to spawn '" + req.name + "': " + req.args[0]);
         }
-        auto c = std::make_shared<child>();
-        c->name       = req.name;
-        c->gen        = req.gen;
-        c->pid        = proc->sproc.pid();
-        c->port       = port;
-        c->proc       = std::move(proc);
-        c->started_ms = unix_ms();
-        table[req.name] = c;
-        info = info_of(*c);
-        push_event_locked(child_event_json_locked(*c));
+        // the node started closing while we spawned: the destructor's stop loop has run (or
+        // will not see this child), so it must not enter the table
+        closed = quit || closing_flag.load();
+        if (!closed) {
+            auto c = std::make_shared<child>();
+            c->name       = req.name;
+            c->gen        = req.gen;
+            c->pid        = proc->sproc.pid();
+            c->port       = port;
+            c->proc       = std::move(proc);
+            c->started_ms = unix_ms();
+            table[req.name] = c;
+            info = info_of(*c);
+            push_event_locked(child_event_json_locked(*c));
+        }
+    }
+    if (closed) {
+        proc->terminate(); // SIGKILL: it never ran as one of ours
+        proc->join();
+        throw server_node_error(503, "node is shutting down");
     }
     NODE_INF("spawned %s (pid %d, port %d, gen %s): %s\n", info.name.c_str(), info.pid, info.port,
              req.gen.c_str(), req.args[0].c_str());
@@ -567,7 +600,7 @@ node_child_info server_node::adopt(const std::string & name, const std::string &
     c->name       = name;
     c->gen        = gen;
     c->pid        = o->pid;
-    c->port       = child_port(args, read_proc_environ(cfg.proc_root, o->pid));
+    c->port       = child_port(args);
     c->adopted    = true;
     c->eof        = true;
     c->started_ms = unix_ms();
@@ -977,6 +1010,53 @@ std::vector<std::string> server_node_bind_hosts(const std::string & node_bind) {
     return out;
 }
 
+// "" when `host` resolves only to specific addresses; else why it is refused. Resolved the way
+// the listener will see it (getaddrinfo, so "0", "000.0.0.0", "::0", "[::]", "::ffff:0.0.0.0"
+// are all caught), not by spelling.
+static std::string server_node_bind_wildcard_error(const std::string & host_in) {
+    std::string host = host_in;
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    if (host.empty() || host == "*") {
+        return "a wildcard address is refused, name the LAN / Tailscale address";
+    }
+#ifndef _WIN32
+    addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo * res = nullptr;
+    const int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    if (rc != 0 || res == nullptr) {
+        return std::string("cannot resolve it: ") + gai_strerror(rc);
+    }
+    bool wildcard = false;
+    for (const addrinfo * ai = res; ai != nullptr; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET) {
+            const auto * a = (const sockaddr_in *) ai->ai_addr;
+            wildcard = wildcard || a->sin_addr.s_addr == htonl(INADDR_ANY);
+        } else if (ai->ai_family == AF_INET6) {
+            const auto * a = (const sockaddr_in6 *) ai->ai_addr;
+            const bool any    = IN6_IS_ADDR_UNSPECIFIED(&a->sin6_addr);
+            // ::ffff:0.0.0.0 is the IPv4 wildcard in IPv6 clothing
+            const bool mapped = IN6_IS_ADDR_V4MAPPED(&a->sin6_addr) &&
+                                a->sin6_addr.s6_addr[12] == 0 && a->sin6_addr.s6_addr[13] == 0 &&
+                                a->sin6_addr.s6_addr[14] == 0 && a->sin6_addr.s6_addr[15] == 0;
+            wildcard = wildcard || any || mapped;
+        }
+    }
+    freeaddrinfo(res);
+    if (wildcard) {
+        return "a wildcard address is refused, name the LAN / Tailscale address";
+    }
+#else
+    if (host == "0.0.0.0" || host == "::") {
+        return "a wildcard address is refused, name the LAN / Tailscale address";
+    }
+#endif
+    return "";
+}
+
 std::string server_node_check_params(const common_params & params) {
     if (!params.router_node) {
         return "";
@@ -1003,14 +1083,23 @@ std::string server_node_check_params(const common_params & params) {
         return "--router-node requires --node-bind ADDR[,ADDR] (the LAN / Tailscale addresses to listen on)";
     }
     for (const auto & h : hosts) {
-        if (h == "0.0.0.0" || h == "::" || h == "[::]" || h == "*") {
-            return "--node-bind " + h + ": a wildcard address is refused, name the LAN / Tailscale address";
-        }
         if (string_ends_with(h, ".sock")) {
             return "--node-bind " + h + ": the leader reaches the node over TCP, a UNIX socket is refused";
         }
+        const std::string why = server_node_bind_wildcard_error(h);
+        if (!why.empty()) {
+            return "--node-bind " + h + ": " + why;
+        }
     }
     return "";
+}
+
+bool server_node_clamp_timeout_s(double v, int & out) {
+    if (!std::isfinite(v)) {
+        return false;
+    }
+    out = (int) std::min(3600.0, std::max(0.0, v));
+    return true;
 }
 
 int server_node_parse_signal(const json & sig) {
@@ -1109,21 +1198,30 @@ server_node_routes::server_node_routes(server_node & node, std::string token) : 
             }
             r.args.push_back(a.get<std::string>());
         }
+        if (body.contains("port") && !body.at("port").is_null()) {
+            if (!body.at("port").is_number_integer()) {
+                throw server_node_error(400, "port must be an integer");
+            }
+            r.port = body.at("port").get<int>();
+        }
         if (body.contains("env") && !body.at("env").is_null()) {
             const json & env = body.at("env");
             if (env.is_array()) {
                 for (const auto & e : env) {
                     if (!e.is_string()) {
-                        throw server_node_error(400, "env entries must be \"NAME=VALUE\" strings");
+                        throw server_node_error(400, "env entries must be \"NAME=VALUE\" or \"-NAME\" strings");
                     }
                     r.env.push_back(e.get<std::string>());
                 }
             } else if (env.is_object()) {
                 for (const auto & kv : env.items()) {
-                    if (!kv.value().is_string()) {
-                        throw server_node_error(400, "env values must be strings");
+                    if (kv.value().is_null()) {
+                        r.env.push_back("-" + kv.key()); // {K: null} unsets K
+                    } else if (kv.value().is_string()) {
+                        r.env.push_back(kv.key() + "=" + kv.value().get<std::string>());
+                    } else {
+                        throw server_node_error(400, "env values must be strings (or null to unset)");
                     }
-                    r.env.push_back(kv.key() + "=" + kv.value().get<std::string>());
                 }
             } else {
                 throw server_node_error(400, "env must be an array of \"NAME=VALUE\" or an object");
@@ -1140,7 +1238,9 @@ server_node_routes::server_node_routes(server_node & node, std::string token) : 
             if (!body.at("timeout_s").is_number()) {
                 throw server_node_error(400, "timeout_s must be a number");
             }
-            timeout_s = (int) body.at("timeout_s").get<double>();
+            if (!server_node_clamp_timeout_s(body.at("timeout_s").get<double>(), timeout_s)) {
+                throw server_node_error(400, "timeout_s must be a finite number");
+            }
         }
         std::string method = body_string(body, "method", false);
         if (method.empty()) {

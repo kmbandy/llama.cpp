@@ -24,6 +24,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -96,6 +97,55 @@ static void test_machines() {
 }
 
 //
+// env: preset-style overrides (shared with the router's own child path) and the reserved strip
+//
+
+static bool env_has(const std::vector<std::string> & env, const std::string & key) {
+    std::string v;
+    return router_env_get(env, key, v);
+}
+
+static void test_env_overrides_and_reserved() {
+    std::vector<std::string> env = { "A=0", "B=x", "B=y", "C=z" };
+    router_env_apply_overrides(env, { "A=1", "-B", "A=2", "-", "-C=1", "NOEQ" }); // malformed ones skipped
+    std::string v;
+    CHECK(router_env_get(env, "A", v) && v == "2");
+    CHECK(std::count_if(env.begin(), env.end(), [](const std::string & e) { return e.rfind("A=", 0) == 0; }) == 1);
+    CHECK(!env_has(env, "B"));
+    CHECK(router_env_get(env, "C", v) && v == "z");
+    CHECK(router_env_override_error("K=V").empty() && router_env_override_error("-K").empty());
+    CHECK(!router_env_override_error("").empty() && !router_env_override_error("-").empty());
+    CHECK(!router_env_override_error("-K=V").empty() && !router_env_override_error("NOEQ").empty());
+    CHECK(!router_env_override_error("=V").empty());
+
+    CHECK(router_is_reserved_option_key("LLAMA_API_KEY"));
+    CHECK(router_is_reserved_option_key("LLAMA_ARG_MODELS_DIR"));
+    CHECK(router_is_reserved_option_key("LLAMA_ARG_ROUTER_GPU"));
+    CHECK(router_is_reserved_option_key("LLAMA_ARG_ROUTER_NODE"));
+    CHECK(!router_is_reserved_option_key("LLAMA_ARG_CTX_SIZE"));
+
+#ifndef _WIN32
+    // the node's base env drops the reserved names and its own address / model
+    const char * stripped[] = { "LLAMA_API_KEY", "LLAMA_ARG_API_KEY_FILE", "LLAMA_ARG_SSL_KEY_FILE", "LLAMA_ARG_MODELS_DIR",
+                                "LLAMA_ARG_ROUTER_GPU", "LLAMA_ARG_ROUTER_NODE", "LLAMA_ARG_NODE_BIND",
+                                "LLAMA_ARG_BOARD_URL", "LLAMA_ARG_PORT", "LLAMA_ARG_HOST", "LLAMA_ARG_MODEL" };
+    for (const char * k : stripped) {
+        setenv(k, "leak", 1);
+    }
+    setenv("NODE_TEST_SAFE", "1", 1);
+    setenv("LLAMA_ARG_CTX_SIZE", "4096", 1); // an ordinary child option still passes
+    const std::vector<std::string> base = server_node_default_env();
+    for (const char * k : stripped) {
+        CHECK(!env_has(base, k));
+        unsetenv(k);
+    }
+    CHECK(env_has(base, "NODE_TEST_SAFE") && env_has(base, "LLAMA_ARG_CTX_SIZE"));
+    unsetenv("NODE_TEST_SAFE");
+    unsetenv("LLAMA_ARG_CTX_SIZE");
+#endif
+}
+
+//
 // startup validation + token
 //
 
@@ -133,11 +183,21 @@ static void test_params_and_token() {
         CHECK(!server_node_check_params(q).empty());
     }
     {
+        // wildcards are refused in any spelling (resolved, not string-matched)
         common_params q = p;
-        q.node_bind = "0.0.0.0";
-        CHECK(!server_node_check_params(q).empty());
+        for (const char * w : { "0.0.0.0", "0", "000.0.0.0", "::", "[::]", "::0", "[::0]", "0:0:0:0:0:0:0:0",
+                                "::ffff:0.0.0.0", "*", "127.0.0.1,0.0.0.0" }) {
+            q.node_bind = w;
+            CHECK(has(server_node_check_params(q), "wildcard"));
+        }
         q.node_bind = "";
         CHECK(!server_node_check_params(q).empty());
+        q.node_bind = "no-such-host.invalid";
+        CHECK(!server_node_check_params(q).empty());
+        for (const char * ok : { "127.0.0.1", "::1", "[::1]", "localhost" }) {
+            q.node_bind = ok;
+            CHECK(server_node_check_params(q).empty());
+        }
     }
     {
         common_params q = p;
@@ -157,6 +217,14 @@ static void test_params_and_token() {
     CHECK(!server_node_token_matches("tok", "tok"));
     CHECK(!server_node_token_matches("tok", ""));
     CHECK(!server_node_token_matches("", "Bearer "));
+
+    // /node/stop timeout_s: clamped to 0..3600, non-finite refused
+    int t = -1;
+    CHECK(server_node_clamp_timeout_s(1e12, t) && t == 3600);
+    CHECK(server_node_clamp_timeout_s(-5, t) && t == 0);
+    CHECK(server_node_clamp_timeout_s(2.7, t) && t == 2);
+    CHECK(!server_node_clamp_timeout_s(std::numeric_limits<double>::infinity(), t));
+    CHECK(!server_node_clamp_timeout_s(std::numeric_limits<double>::quiet_NaN(), t));
 
     CHECK(server_node_parse_signal(json(15)) == 15);
 #ifndef _WIN32
@@ -338,6 +406,48 @@ static void test_core_spawn_stop_state() {
     // node exit kills children: the destructor stops it
 }
 
+// -KEY unsets reach the child; the port is never read from env; a closing node refuses spawns
+static void test_core_env_port_closing() {
+    server_node_config cfg = test_config();
+    cfg.base_env.push_back("NODE_TEST_UNSET=present");
+    server_node node(cfg);
+    uint64_t cursor = node.next_seq();
+    std::vector<json> evs;
+
+    node_spawn_request r;
+    r.name = "envy";
+    r.gen  = "gen-a";
+    r.args = { "/bin/sh", "-c", "echo u=[$NODE_TEST_UNSET] k=[$KEEP]; exec sleep 60" };
+    r.env  = { "-NODE_TEST_UNSET", "KEEP=1", "LLAMA_ARG_PORT=4321" };
+    const node_child_info info = node.spawn(r);
+    CHECK(info.port == 0); // LLAMA_ARG_PORT in env is not where the port comes from
+    CHECK(wait_for_events(node, cursor, evs, [](const std::vector<json> & a) { return saw_line(a, "envy", "u=[] k=[1]"); }, 5000));
+
+    node_spawn_request p = r;
+    p.name = "ported";
+    p.args = { "/bin/sh", "-c", "exec sleep 60" };
+    p.env  = {};
+    p.port = 5555;
+    CHECK(node.spawn(p).port == 5555);
+
+    node_spawn_request bad = p;
+    bad.name = "bad";
+    bad.port = 70000;
+    CHECK(expect_error([&]() { node.spawn(bad); }) == 400);
+    bad.port = 0;
+    bad.env  = { "-" };
+    CHECK(expect_error([&]() { node.spawn(bad); }) == 400);
+    bad.env  = { "-A=B" };
+    CHECK(expect_error([&]() { node.spawn(bad); }) == 400);
+
+    // shutting down: no new children
+    node.close_events();
+    node_spawn_request late = p;
+    late.name = "late";
+    CHECK(expect_error([&]() { node.spawn(late); }) == 503);
+    CHECK(find_child(node, "late").pid == 0);
+}
+
 static void test_core_destructor_kills_children() {
     int pid = 0;
     {
@@ -491,7 +601,10 @@ static void test_orphan_sweep_and_adopt() {
 //
 
 static void test_http() {
-    server_node node(test_config());
+    server_node_config cfg = test_config();
+    cfg.base_env.push_back("NODE_HTTP_A=1");
+    cfg.base_env.push_back("NODE_HTTP_B=2");
+    server_node node(cfg);
     server_node_routes routes(node, "node-token");
 
     common_params params; // must outlive the server (its middleware refers to it)
@@ -604,14 +717,42 @@ static void test_http() {
     auto sg2 = cli.Post("/node/signal", auth, sig.dump(), "application/json");
     CHECK(sg2 && sg2->status == 409);
 
-    // spawn + stop over HTTP with wait
+    // unsets over HTTP: "-K" in the array form, null in the object form
+    {
+        const uint64_t s2 = node.next_seq();
+        json b = json::object();
+        b["name"] = "unset";
+        b["gen"]  = "gen-h";
+        b["args"] = json::array({ "/bin/sh", "-c", "echo a=[$NODE_HTTP_A] b=[$NODE_HTTP_B]" });
+        b["env"]  = json::array({ "-NODE_HTTP_A" });
+        auto r1 = cli.Post("/node/spawn", auth, b.dump(), "application/json");
+        CHECK(r1 && r1->status == 200);
+        json eo = json::object();
+        eo["NODE_HTTP_B"] = nullptr;
+        b["name"] = "unset2";
+        b["env"]  = eo;
+        auto r2 = cli.Post("/node/spawn", auth, b.dump(), "application/json");
+        CHECK(r2 && r2->status == 200);
+        uint64_t c2 = s2;
+        std::vector<json> got;
+        CHECK(wait_for_events(node, c2, got, [](const std::vector<json> & a) {
+            return std::any_of(a.begin(), a.end(), [](const json & e) {
+                       return e.value("name", std::string()) == "unset" && has(e.value("line", std::string()), "a=[] b=[2]");
+                   }) &&
+                   std::any_of(a.begin(), a.end(), [](const json & e) {
+                       return e.value("name", std::string()) == "unset2" && has(e.value("line", std::string()), "a=[1] b=[]");
+                   });
+        }, 5000));
+    }
+
+    // spawn + stop over HTTP with wait; a huge timeout_s is clamped, not overflowed
     body["name"] = "web2";
     body["args"] = json::array({ "/bin/sh", "-c", "exec sleep 60" });
     auto sp2 = cli.Post("/node/spawn", auth, body.dump(), "application/json");
     CHECK(sp2 && sp2->status == 200);
     const int pid2 = json::parse(sp2->body).at("pid").get<int>();
     stop["name"]      = "web2";
-    stop["timeout_s"] = 5;
+    stop["timeout_s"] = 1e12;
     auto so2 = cli.Post("/node/stop", auth, stop.dump(), "application/json");
     CHECK(so2 && so2->status == 200 && json::parse(so2->body).at("status").get<std::string>() == "exited");
     CHECK(!pid_alive(pid2));
@@ -632,10 +773,12 @@ int main() {
     signal(SIGPIPE, SIG_IGN);
 #endif
     test_machines();
+    test_env_overrides_and_reserved();
     test_params_and_token();
 #ifndef _WIN32
     test_core_spawn_stop_state();
     test_core_destructor_kills_children();
+    test_core_env_port_closing();
     test_orphan_sweep_and_adopt();
     test_http();
     if (have_python3()) {

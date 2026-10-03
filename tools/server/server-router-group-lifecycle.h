@@ -99,6 +99,20 @@ void router_env_unset(std::vector<std::string> & env, const std::string & key);
 // Last definition of key; false when unset.
 bool router_env_get(const std::vector<std::string> & env, const std::string & key, std::string & value);
 
+// One preset-style env override: "KEY=VALUE" sets KEY, "-KEY" removes it. "" when well formed,
+// else why not (empty key, bare "-", "-KEY=..." , no '=').
+std::string router_env_override_error(const std::string & entry);
+
+// Applies overrides in order: "KEY=VALUE" replaces every definition of KEY, "-KEY" removes
+// every definition. Malformed entries (router_env_override_error) are skipped.
+void router_env_apply_overrides(std::vector<std::string> & env, const std::vector<std::string> & overrides);
+
+// Option / env names that configure the router (or node) itself: TLS, API keys, the model
+// registry, GPU slots, board and node flags. A child must never get them from the router's
+// own configuration; LLAMA_ARG_ROUTER_* (per-model router keys) are reserved as well.
+const std::vector<std::string> & router_reserved_option_keys();
+bool router_is_reserved_option_key(const std::string & key);
+
 // The rest of a worker's env, on top of `env` (router env + the preset `env` key): the
 // launch line's leading NAME=VALUE words, then WP_EXPERT_PARK_FILE=<park_file> and
 // WP_EXPERT_SEED_FROM_PARK=1 when a park file is set, then LLAMA_ROUTER_GEN=<gen>.

@@ -302,6 +302,68 @@ bool router_env_get(const std::vector<std::string> & env, const std::string & ke
     return found;
 }
 
+std::string router_env_override_error(const std::string & entry) {
+    if (entry.empty()) {
+        return "empty env entry";
+    }
+    if (entry[0] == '-') {
+        const std::string key = entry.substr(1);
+        if (key.empty() || key.find('=') != std::string::npos) {
+            return "malformed env removal '" + entry + "' (expected -KEY)";
+        }
+        return "";
+    }
+    const size_t eq = entry.find('=');
+    if (eq == std::string::npos || eq == 0) {
+        return "malformed env entry '" + entry + "' (expected KEY=VALUE or -KEY)";
+    }
+    return "";
+}
+
+void router_env_apply_overrides(std::vector<std::string> & env, const std::vector<std::string> & overrides) {
+    for (const auto & entry : overrides) {
+        if (!router_env_override_error(entry).empty()) {
+            continue;
+        }
+        if (entry[0] == '-') {
+            router_env_unset(env, entry.substr(1));
+        } else {
+            const size_t eq = entry.find('=');
+            router_env_set(env, entry.substr(0, eq), entry.substr(eq + 1));
+        }
+    }
+}
+
+const std::vector<std::string> & router_reserved_option_keys() {
+    static const std::vector<std::string> keys = {
+        "LLAMA_ARG_SSL_KEY_FILE",
+        "LLAMA_ARG_SSL_CERT_FILE",
+        "LLAMA_API_KEY",
+        "LLAMA_ARG_API_KEY_FILE",
+        "LLAMA_ARG_MODELS_DIR",
+        "LLAMA_ARG_MODELS_MAX",
+        "LLAMA_ARG_MODELS_PRESET",
+        "LLAMA_ARG_MODELS_AUTOLOAD",
+        "LLAMA_ARG_MODELS_IDLE_TIMEOUT",
+        "LLAMA_ARG_MODELS_QUEUE_MAX_WAIT_S",
+        "LLAMA_ARG_GPUS",
+        "LLAMA_ARG_BOARD_URL",
+        "LLAMA_ARG_BOARD_TOKEN_FILE",
+        "LLAMA_ARG_NODE_TOKEN_FILE",
+        "LLAMA_ARG_NODE_BIND",
+    };
+    return keys;
+}
+
+bool router_is_reserved_option_key(const std::string & key) {
+    static const std::string router_prefix = "LLAMA_ARG_ROUTER_"; // ROUTER_ARG_*, LLAMA_ARG_ROUTER_NODE
+    if (key.compare(0, router_prefix.size(), router_prefix) == 0) {
+        return true;
+    }
+    const auto & keys = router_reserved_option_keys();
+    return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
 std::vector<std::string> router_worker_env(std::vector<std::string> env, const std::vector<std::string> & launch_env,
                                            const std::string & park_file, const std::string & gen) {
     for (const auto & a : launch_env) {

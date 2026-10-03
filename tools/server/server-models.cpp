@@ -506,22 +506,11 @@ static std::filesystem::path get_server_exec_path() {
 }
 
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
-    preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
-    preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
-    preset.unset_option("LLAMA_API_KEY");
-    preset.unset_option("LLAMA_ARG_API_KEY_FILE");
-    preset.unset_option("LLAMA_ARG_MODELS_DIR");
-    preset.unset_option("LLAMA_ARG_MODELS_MAX");
-    preset.unset_option("LLAMA_ARG_MODELS_PRESET");
-    preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
-    preset.unset_option("LLAMA_ARG_MODELS_IDLE_TIMEOUT");
-    preset.unset_option("LLAMA_ARG_MODELS_QUEUE_MAX_WAIT_S");
-    preset.unset_option("LLAMA_ARG_GPUS");
-    preset.unset_option("LLAMA_ARG_BOARD_URL");
-    preset.unset_option("LLAMA_ARG_BOARD_TOKEN_FILE");
+    // shared with the router node, which strips the same names from its children's base env
+    for (const auto & key : router_reserved_option_keys()) {
+        preset.unset_option(key);
+    }
     preset.unset_option("LLAMA_ARG_ROUTER_NODE");
-    preset.unset_option("LLAMA_ARG_NODE_TOKEN_FILE");
-    preset.unset_option("LLAMA_ARG_NODE_BIND");
     preset.unset_option(ROUTER_ARG_PRIORITY);
     preset.unset_option(ROUTER_ARG_GPU);
     preset.unset_option(ROUTER_ARG_VRAM_MB);
@@ -3077,21 +3066,12 @@ void server_models::unload_lru() {
 // REPLACE any existing definition rather than being appended: duplicate KEY= entries in envp
 // resolve inconsistently across libc getenv implementations.
 static void apply_env_overrides(std::vector<std::string> & env, const std::vector<std::string> & overrides, const std::string & name, bool verbose = true) {
-    for (const auto & override_entry : overrides) {
-        const bool remove = override_entry[0] == '-';
-        const std::string key = remove
-            ? override_entry.substr(1)
-            : override_entry.substr(0, override_entry.find('='));
-        const std::string prefix = key + "=";
-        for (auto it = env.begin(); it != env.end(); ) {
-            it = it->compare(0, prefix.size(), prefix) == 0 ? env.erase(it) : it + 1;
-        }
-        if (!remove) {
-            env.push_back(override_entry);
-        }
-        if (verbose) {
+    router_env_apply_overrides(env, overrides); // same semantics the router node applies to spawn env
+    if (verbose) {
+        for (const auto & override_entry : overrides) {
+            const bool remove = !override_entry.empty() && override_entry[0] == '-';
             SRV_INF("model '%s': env %s%s\n", name.c_str(),
-                    remove ? "unset " : "", remove ? key.c_str() : override_entry.c_str());
+                    remove ? "unset " : "", remove ? override_entry.c_str() + 1 : override_entry.c_str());
         }
     }
 }
