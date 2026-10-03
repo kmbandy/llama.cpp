@@ -314,6 +314,21 @@ void router_args_set_port(std::vector<std::string> & args, int port) {
     args.push_back(p);
 }
 
+void router_args_set_host(std::vector<std::string> & args, const std::string & host) {
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "--host" && i + 1 < args.size()) {
+            args[i + 1] = host;
+            return;
+        }
+        if (args[i].rfind("--host=", 0) == 0) {
+            args[i] = "--host=" + host;
+            return;
+        }
+    }
+    args.push_back("--host");
+    args.push_back(host);
+}
+
 //
 // environment helpers
 //

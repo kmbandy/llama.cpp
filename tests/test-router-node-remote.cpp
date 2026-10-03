@@ -7,6 +7,7 @@
 
 #include "server-node.h"
 #include "server-router-node-client.h"
+#include "server-router-group-lifecycle.h"
 
 #include "common.h"
 
@@ -17,6 +18,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -253,9 +255,39 @@ static std::shared_ptr<router_node_link> make_link(const std::string & url, cons
 int main() {
     signal(SIGPIPE, SIG_IGN);
 
+    // pure helpers: --host rewrite, per-child key, bearer injection, stop-flag decision
+    {
+        std::vector<std::string> a = { "srv", "--host", "0.0.0.0", "--port", "1" };
+        router_args_set_host(a, "10.0.0.5");
+        assert((a == std::vector<std::string>{ "srv", "--host", "10.0.0.5", "--port", "1" }));
+        std::vector<std::string> b = { "srv", "--host=0.0.0.0" };
+        router_args_set_host(b, "10.0.0.5");
+        assert((b == std::vector<std::string>{ "srv", "--host=10.0.0.5" }));
+        std::vector<std::string> c = { "srv" };
+        router_args_set_host(c, "10.0.0.5");
+        assert((c == std::vector<std::string>{ "srv", "--host", "10.0.0.5" }));
+
+        const std::string k1 = router_child_key_generate();
+        const std::string k2 = router_child_key_generate();
+        assert(k1.size() == 32 && k1 != k2);
+
+        std::map<std::string, std::string> h = { { "authorization", "Bearer client" }, { "AUTHORIZATION", "x" },
+                                                  { "Content-Type", "application/json" } };
+        router_child_auth_headers(h, k1);
+        assert(h.size() == 2 && h.at("Authorization") == "Bearer " + k1 && h.at("Content-Type") == "application/json");
+        std::map<std::string, std::string> h2 = { { "authorization", "Bearer client" } };
+        router_child_auth_headers(h2, ""); // local child: untouched
+        assert(h2.size() == 1 && h2.at("authorization") == "Bearer client");
+
+        // an orphan's exit drops the stop flag only when its entry is gone, never a newer instance's
+        assert(router_orphan_exit_clears_stop_flag(false));
+        assert(!router_orphan_exit_clears_stop_flag(true));
+    }
+
     server_node_config ncfg = server_node_default_config();
     ncfg.heartbeat_ms      = 300;
     ncfg.shutdown_grace_ms = 3000;
+    ncfg.child_host        = "127.0.0.2"; // the daemon's first --node-bind: what an allocated child is told to bind
     server_node        node(ncfg);
     server_node_routes routes(node, TOKEN);
 
@@ -310,6 +342,24 @@ int main() {
             (void) st;
             assert(w.wait_exit(10000));
             assert(!pid_alive(info.pid));
+        }
+
+        // a node-allocated child binds the node's address (never the leader's 0.0.0.0) and sees the
+        // per-child key the leader put in its env
+        {
+            watch_log w;
+            node_spawn_request r = sh("keyed", "echo \"$0 $1 $2 $3 key=$LLAMA_API_KEY\"; exec sleep 30");
+            r.args.push_back("--host");
+            r.args.push_back("0.0.0.0");
+            r.args.push_back("--port");
+            r.args.push_back("1");
+            r.alloc_port = true;
+            r.env.push_back("LLAMA_API_KEY=child-secret-key");
+            const node_child_info info = link->spawn(r, w.watch());
+            assert(info.port > 0);
+            assert(w.wait_line("--host 127.0.0.2 --port " + std::to_string(info.port) + " key=child-secret-key", 10000));
+            link->stop("keyed", 5, "term");
+            assert(w.wait_exit(10000));
         }
 
         // a name that is still running: 409 after the retry window; the first child is untouched

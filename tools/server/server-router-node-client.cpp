@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
+#include <random>
 
 #ifndef _WIN32
 #include <signal.h>
@@ -1279,4 +1280,30 @@ std::shared_ptr<router_node_link> router_node_make_remote(router_node_link_confi
         throw std::runtime_error(err);
     }
     return std::make_shared<router_node_remote_impl>(std::move(cfg), base, host, token);
+}
+
+std::string router_child_key_generate() {
+    std::random_device rd;
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    for (int i = 0; i < 32; i++) {
+        out.push_back(hex[rd() & 0xf]);
+    }
+    return out;
+}
+
+void router_child_auth_headers(std::map<std::string, std::string> & headers, const std::string & key) {
+    if (key.empty()) {
+        return;
+    }
+    for (auto it = headers.begin(); it != headers.end();) {
+        std::string lower = it->first;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        if (lower == "authorization") {
+            it = headers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    headers["Authorization"] = "Bearer " + key;
 }

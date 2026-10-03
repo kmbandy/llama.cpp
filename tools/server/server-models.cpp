@@ -475,8 +475,10 @@ static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & ve
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
-    // a child on another machine must accept the router's connection from the LAN
-    preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  host.empty() ? CHILD_ADDR : "0.0.0.0");
+    // a child on another machine gets its --host from that machine's node (its own bind address)
+    if (host.empty()) {
+        preset.set_option(ctx_preset, "LLAMA_ARG_HOST", CHILD_ADDR);
+    }
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
     if (!placement.devs.empty()) {
@@ -3457,6 +3459,7 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     inst.meta             = meta;
     inst.meta.port        = remote ? 0 : common_http_get_free_port(); // remote: the node picks (alloc_port)
     inst.meta.host        = remote ? node->host() : std::string();
+    inst.meta.child_key   = remote ? router_child_key_generate() : std::string();
     inst.meta.status      = SERVER_MODEL_STATUS_LOADING;
     inst.meta.loaded_info = json{};
     inst.meta.last_used   = ggml_time_ms();
@@ -3498,6 +3501,10 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     req.alloc_port = remote;
     req.env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
     req.env.insert(req.env.end(), meta.env_overrides.begin(), meta.env_overrides.end());
+    if (remote) {
+        // a remote child listens on the LAN: it only answers the router, which holds this key
+        req.env.push_back("LLAMA_API_KEY=" + inst.meta.child_key);
+    }
     if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
         req.env.push_back("LLAMA_SERVER_CHILD_MODE=download");
         req.env.push_back("LLAMA_ARG_HF_REPO=" + name);
@@ -3520,6 +3527,12 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     mapping[name] = inst;
     auto restore_entry = [&]() {
         auto it = mapping.find(name);
+        if (it == mapping.end() || it->second.child == child) {
+            // an unload / eviction that arrived during the spawn set the flag for THIS attempt (its
+            // stop was a no-op: no pid yet); with the attempt gone it must not stop the next load.
+            // Not when a newer instance holds the entry: the flag is then its own.
+            stopping_models.erase(name);
+        }
         if (it != mapping.end() && it->second.child == child) {
             if (previous.has_value()) {
                 it->second = *previous;
@@ -3579,8 +3592,11 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
         }
         load_attempt_guard.release();
         group_started.reset(); // the spine's exit now drives the workers' stop (on_child_exit)
-        if (stopping_models.count(name)) {
-            // an unload / eviction arrived while the child was being spawned
+        if (stopping_models.count(name) || shutting_down) {
+            // an unload / eviction / router shutdown arrived while the child was being spawned
+            if (shutting_down) {
+                stopping_models.insert(name);
+            }
             stop_child_locked(it->second, false);
         }
         notify_sse("model_status", name, {
@@ -3899,8 +3915,10 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
         std::lock_guard<std::mutex> lk(mutex);
         auto it = mapping.find(name);
         if (it == mapping.end() || it->second.child != proc) {
-            stopping_models.erase(name);
-            return; // entry erased, or a newer instance took the name
+            if (router_orphan_exit_clears_stop_flag(it != mapping.end())) {
+                stopping_models.erase(name);
+            }
+            return; // entry erased, or a newer instance took the name: its flag is not ours
         }
         if (mode == SERVER_CHILD_MODE_NORMAL) {
             auto g = groups.find(name);
@@ -4353,13 +4371,15 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
     if (!req.query_string.empty()) {
         proxy_path += '?' + req.query_string;
     }
+    std::map<std::string, std::string> proxy_headers = req.headers;
+    router_child_auth_headers(proxy_headers, meta->child_key); // overwrites a client Authorization
     auto proxy = std::make_unique<server_http_proxy>(
             method,
             "http",
             meta->child_host(),
             meta->port,
             proxy_path,
-            req.headers,
+            proxy_headers,
             req.body,
             req.files,
             // a detached request belongs to a replay session
@@ -5489,13 +5509,15 @@ void server_models_routes::init_routes() {
         }
         SRV_TRC("proxying stream resume to model %s on port %d, path=%s\n",
                 owner->name.c_str(), owner->port, child_path.c_str());
+        std::map<std::string, std::string> resume_headers = req.headers;
+        router_child_auth_headers(resume_headers, owner->child_key);
         auto proxy = std::make_unique<server_http_proxy>(
                 "GET",
                 "http",
                 owner->child_host(),
                 owner->port,
                 child_path,
-                req.headers,
+                resume_headers,
                 req.body,
                 req.files,
                 req.should_stop,
@@ -5527,18 +5549,23 @@ void server_models_routes::init_routes() {
 
         // group requested ids by the child port that owns them, drop ids that map to nothing
         std::map<std::pair<std::string, int>, json> per_child;
+        std::map<std::pair<std::string, int>, std::string> child_keys;
         for (const auto & cid : requested) {
             auto owner = resolve_child_for_conv(models, cid);
             if (!owner.has_value()) {
                 continue;
             }
             per_child[{ owner->child_host(), owner->port }].push_back(cid);
+            child_keys[{ owner->child_host(), owner->port }] = owner->child_key;
         }
 
         json aggregated = json::array();
         for (auto & [addr, ids] : per_child) {
             json child_body = {{"conversation_ids", ids}};
             httplib::Client cli(addr.first, addr.second);
+            if (!child_keys[addr].empty()) {
+                cli.set_bearer_token_auth(child_keys[addr]);
+            }
             cli.set_connection_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_read_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
@@ -5577,6 +5604,9 @@ void server_models_routes::init_routes() {
         auto owner = resolve_child_for_conv(models, conv_id);
         if (owner.has_value()) {
             httplib::Client cli(owner->child_host(), owner->port);
+            if (!owner->child_key.empty()) {
+                cli.set_bearer_token_auth(owner->child_key);
+            }
             cli.set_connection_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_read_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);

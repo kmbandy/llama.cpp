@@ -97,6 +97,8 @@ std::string router_launch_listen_host(const std::vector<std::string> & words);
 // Sets the port of an argv: replaces the value of `--port N` / `--port=N`, else appends
 // `--port N`. Used when a node allocates a child's port.
 void router_args_set_port(std::vector<std::string> & args, int port);
+// Same for `--host`: replaces an existing `--host X` / `--host=X`, else appends `--host X`.
+void router_args_set_host(std::vector<std::string> & args, const std::string & host);
 
 //
 // environment helpers ("KEY=VALUE" lists)

@@ -175,6 +175,9 @@ struct server_model_meta {
     // else the host of its node (machines.json router_node). `port` is the node's choice there.
     std::string              host;
     std::string              child_host() const { return host.empty() ? std::string("127.0.0.1") : host; }
+    // API key of a child on another machine (random per spawn, sent as LLAMA_API_KEY in its env);
+    // the router sends it as a bearer on every request it proxies there. "" = local child.
+    std::string              child_key;
 
     bool is_external() const {
         return kind == ROUTER_KIND_EXTERNAL;

@@ -124,7 +124,9 @@ static int llama_router_node(common_params & params) {
     params.ui        = false;
 
     // destroyed last: its destructor stops every child still running
-    server_node node;
+    server_node_config node_cfg = server_node_default_config();
+    node_cfg.child_host = params.hostnames.front(); // validated: non-empty, not a wildcard / socket
+    server_node node(node_cfg);
     const size_t n_orphans = node.collect_orphans();
     if (n_orphans > 0) {
         SRV_WRN("%zu process(es) left by a previous generation: adoptable by the leader for %d s, then stopped\n",

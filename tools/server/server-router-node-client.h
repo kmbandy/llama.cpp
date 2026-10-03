@@ -260,6 +260,18 @@ class router_node_link {
     bool                              cmd_quit = false;
 };
 
+// Per-child API key for a child on another machine (it listens on the LAN): 32 random hex chars.
+std::string router_child_key_generate();
+// Sets `Authorization: Bearer <key>` on a proxied request's headers, dropping whatever the client
+// sent under any case of the name. An empty key leaves the headers untouched (local children).
+void router_child_auth_headers(std::map<std::string, std::string> & headers, const std::string & key);
+// What the exit of a child does to the model's stop flag (stopping_models) when the entry does not
+// hold that child: dropped only if the entry is gone; an entry held by a newer instance (or a
+// restored previous one) keeps its flag, which belongs to it, not to the exiting orphan.
+inline bool router_orphan_exit_clears_stop_flag(bool entry_exists) {
+    return !entry_exists;
+}
+
 // The leader's own machine: an in-process server_node (owned by the link).
 std::shared_ptr<router_node_link> router_node_make_local(router_node_link_config cfg, server_node_config node_cfg);
 // Another machine: its --router-node daemon at `url`, bearer `token`.

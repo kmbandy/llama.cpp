@@ -392,6 +392,10 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
             throw server_node_error(500, "no free port for '" + req.name + "'");
         }
         router_args_set_port(args, port);
+        if (!cfg.child_host.empty()) {
+            // a remote child listens on the node's own (non-wildcard) bind address only
+            router_args_set_host(args, cfg.child_host);
+        }
     }
 
     {
