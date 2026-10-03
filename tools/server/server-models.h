@@ -77,6 +77,7 @@ static std::string server_model_source_to_string(server_model_source source) {
 struct server_gpu_slot {
     std::string dev_name;
     std::string vram_probe;
+    std::string pdev; // PCI address resolved from vram_probe; "" for NVML / unresolved (whole-card)
     int64_t total_bytes = 0;
     int64_t reserved_bytes = 0;
     std::string exclusive_holder;
@@ -92,6 +93,8 @@ struct server_model_placement {
     // MUST be captured here rather than read from the preset at use time: update_args() calls
     // unset_reserved_args(), which strips the router-only options from the preset in place.
     int64_t vram_mb_override = -1;
+    // Preset `ram-mb`: host RAM this model needs (MiB). -1 = unset (RAM gate skipped). Same capture-now rule.
+    int64_t ram_mb_override = -1;
 };
 
 struct server_model_meta {
@@ -290,12 +293,17 @@ private:
     static bool model_wants_exclusive(const server_model_meta & meta);
     void validate_gpu_slots();
     json gpu_slots_json();
+    json machines_json();
     void credit_gpu_reservation_locked(const std::string & name);
     void reconcile_gpu_reservation_locked(const std::string & name);
     void ensure_gpu_placement(const std::string & name, server_model_meta & meta, server_child_mode mode, std::unique_lock<std::mutex> & lk);
     void reserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
     std::vector<std::string> choose_gpu_evictions_locked(const std::string & name, const server_model_placement & placement);
     int64_t read_physical_free_bytes(const server_gpu_slot & slot) const;
+    std::set<int> router_child_pids_locked() const;
+    int64_t foreign_vram_bytes_locked(const server_gpu_slot & slot) const;
+    int64_t free_ram_bytes_locked(const std::string & exclude) const; // MemAvailable - headroom - RAM of other still-loading models; -1 = unknown
+    std::vector<std::string> choose_ram_evictions_locked(const std::string & name, int64_t need_ram);
     int64_t effective_free_bytes_locked(const server_gpu_slot & slot) const;
     std::vector<int64_t> estimate_need_bytes(const server_model_meta & meta);
 

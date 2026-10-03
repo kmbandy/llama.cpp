@@ -11,6 +11,8 @@
 #include "hf-cache.h"
 #include "http.h"
 #include "subproc.h"
+#include "server-router-ledger.h"
+#include "server-router-probe.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <cinttypes>
@@ -52,6 +54,7 @@ extern char **environ;
 
 static constexpr const char * ROUTER_ARG_GPU          = "LLAMA_ARG_ROUTER_GPU";
 static constexpr const char * ROUTER_ARG_VRAM_MB      = "LLAMA_ARG_ROUTER_VRAM_MB";
+static constexpr const char * ROUTER_ARG_RAM_MB      = "LLAMA_ARG_ROUTER_RAM_MB";
 static constexpr const char * ROUTER_ARG_ENV          = "LLAMA_ARG_ROUTER_ENV";
 static constexpr const char * ROUTER_ARG_PINNED       = "LLAMA_ARG_ROUTER_PINNED";
 static constexpr const char * ROUTER_ARG_EXCLUSIVE    = "LLAMA_ARG_ROUTER_EXCLUSIVE";
@@ -500,6 +503,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_GPUS");
     preset.unset_option(ROUTER_ARG_GPU);
     preset.unset_option(ROUTER_ARG_VRAM_MB);
+    preset.unset_option(ROUTER_ARG_RAM_MB);
     preset.unset_option(ROUTER_ARG_ENV);
     preset.unset_option(ROUTER_ARG_PINNED);
     preset.unset_option(ROUTER_ARG_EXCLUSIVE);
@@ -846,6 +850,70 @@ static int64_t parse_mb_to_bytes(const std::string & value) {
     return std::stoll(value) * 1024LL * 1024LL;
 }
 
+// Physical VRAM total of a probe, bytes; -1 if it cannot be read. For a sysfs probe
+// (".../mem_info_vram_used") the sibling mem_info_vram_total is read; for "nvml:N" nvidia-smi is asked.
+static int64_t read_probe_total_bytes(const std::string & vram_probe) {
+    if (vram_probe.rfind("nvml:", 0) == 0) {
+        const std::string idx = vram_probe.substr(strlen("nvml:"));
+        const std::string cmd = "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i " + idx + " 2>/dev/null";
+        FILE * pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            return -1;
+        }
+        char buffer[128] = {};
+        std::string out;
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            out = buffer;
+        }
+        pclose(pipe);
+        try {
+            return parse_mb_to_bytes(string_strip(out));
+        } catch (...) {
+            return -1;
+        }
+    }
+    const std::string suffix = "mem_info_vram_used";
+    if (vram_probe.size() < suffix.size() ||
+            vram_probe.compare(vram_probe.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return -1;
+    }
+    std::ifstream file(vram_probe.substr(0, vram_probe.size() - suffix.size()) + "mem_info_vram_total");
+    int64_t total = -1;
+    if (file >> total) {
+        return total;
+    }
+    return -1;
+}
+
+// Card-wide VRAM in use, bytes; -1 if the probe cannot be read.
+static int64_t read_vram_used_bytes(const server_gpu_slot & slot) {
+    if (slot.vram_probe.rfind("nvml:", 0) == 0) {
+        const std::string idx = slot.vram_probe.substr(strlen("nvml:"));
+        const std::string cmd = "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i " + idx + " 2>/dev/null";
+        FILE * pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            return -1;
+        }
+        char buffer[128] = {};
+        std::string out;
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            out = buffer;
+        }
+        pclose(pipe);
+        try {
+            return parse_mb_to_bytes(string_strip(out));
+        } catch (...) {
+            return -1;
+        }
+    }
+    std::ifstream file(slot.vram_probe);
+    int64_t used = 0;
+    if (file >> used) {
+        return used;
+    }
+    return -1;
+}
+
 bool server_models::load_gpu_config(const common_preset & global_preset) {
     if (gpu_placement_enabled) {
         return true;
@@ -873,8 +941,19 @@ bool server_models::load_gpu_config(const common_preset & global_preset) {
         }
         server_gpu_slot slot;
         slot.dev_name = entry.substr(0, p0);
-        slot.total_bytes = parse_mb_to_bytes(entry.substr(p0 + 1, p1 - p0 - 1));
         slot.vram_probe = entry.substr(p1 + 1);
+        // total_mb is an optional OVERRIDE of the slot total: empty or 0 means "use the
+        // probe's physical total" (whole card). A positive value caps the slot below that.
+        const std::string mb_str = string_strip(entry.substr(p0 + 1, p1 - p0 - 1));
+        const int64_t override_bytes = mb_str.empty() ? 0 : parse_mb_to_bytes(mb_str);
+        const int64_t probe_total = read_probe_total_bytes(slot.vram_probe);
+        slot.total_bytes = override_bytes > 0 ? override_bytes : probe_total;
+        if (override_bytes > 0 && probe_total > 0 && override_bytes < probe_total) {
+            SRV_WRN("GPU slot %s: declared total %" PRId64 " MB caps the physical %" PRId64 " MB; "
+                    "leave total_mb empty to use the whole card\n",
+                    slot.dev_name.c_str(), override_bytes / (1024 * 1024), probe_total / (1024 * 1024));
+        }
+        slot.pdev = pdev_for_probe(slot.vram_probe); // "" for NVML: whole-card, no per-PID view
         if (slot.dev_name.empty() || slot.total_bytes <= 0 || slot.vram_probe.empty()) {
             throw std::runtime_error("invalid --gpus entry '" + entry + "'");
         }
@@ -963,6 +1042,28 @@ static void parse_model_vram_mb(server_model_meta & meta) {
     }
 }
 
+// Parse preset ram-mb into meta.placement.ram_mb_override (in MiB).
+// -1 = unset: the RAM gate is skipped for this model (its host footprint is unknown).
+static void parse_model_ram_mb(server_model_meta & meta) {
+    meta.placement.ram_mb_override = -1;
+    std::string val;
+    if (!meta.preset.get_option(ROUTER_ARG_RAM_MB, val) || val.empty()) {
+        return;
+    }
+    try {
+        const int64_t mb = std::stoll(val);
+        if (mb <= 0) {
+            SRV_WRN("invalid ram-mb '%s' for model '%s' (must be positive); RAM gate disabled for it\n",
+                    val.c_str(), meta.name.c_str());
+            return;
+        }
+        meta.placement.ram_mb_override = mb;
+    } catch (...) {
+        SRV_WRN("invalid ram-mb '%s' for model '%s'; RAM gate disabled for it\n",
+                val.c_str(), meta.name.c_str());
+    }
+}
+
 // Parse the preset's `env` into meta.env_overrides. Entries are comma-separated;
 // "KEY=VALUE" sets, a leading '-' ("-KEY") removes. Malformed entries are dropped
 // with a warning rather than failing the load: a typo in one tuning var should not
@@ -1018,6 +1119,9 @@ void server_models::parse_model_placement(server_model_meta & meta) {
     // Parsed before the `gpu.empty() || "any"` early-return below so that models without
     // an explicit slot still get their override.
     parse_model_vram_mb(meta);
+
+    // ram-mb: same capture-now hazard as vram-mb.
+    parse_model_ram_mb(meta);
 
     // Same capture-now hazard as vram-mb above: unset_reserved_args() strips
     // ROUTER_ARG_ENV from the preset in place right after this runs.
@@ -1078,30 +1182,8 @@ void server_models::validate_gpu_slots() {
 }
 
 int64_t server_models::read_physical_free_bytes(const server_gpu_slot & slot) const {
-    if (slot.vram_probe.rfind("nvml:", 0) == 0) {
-        const std::string idx = slot.vram_probe.substr(strlen("nvml:"));
-        const std::string cmd = "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i " + idx + " 2>/dev/null";
-        FILE * pipe = popen(cmd.c_str(), "r");
-        if (!pipe) {
-            return slot.total_bytes;
-        }
-        char buffer[128] = {};
-        std::string out;
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            out = buffer;
-        }
-        pclose(pipe);
-        try {
-            const int64_t used = parse_mb_to_bytes(string_strip(out));
-            return std::max<int64_t>(0, slot.total_bytes - used);
-        } catch (...) {
-            return slot.total_bytes;
-        }
-    }
-
-    std::ifstream file(slot.vram_probe);
-    int64_t used = 0;
-    if (file >> used) {
+    const int64_t used = read_vram_used_bytes(slot);
+    if (used >= 0) {
         return std::max<int64_t>(0, slot.total_bytes - used);
     }
     SRV_WRN("failed to read VRAM probe '%s' for %s, trusting declared total\n",
@@ -1109,25 +1191,116 @@ int64_t server_models::read_physical_free_bytes(const server_gpu_slot & slot) co
     return slot.total_bytes;
 }
 
+// PIDs of the router's own model children. Their VRAM is accounted through the slot
+// reservation, so they must be excluded from "foreign" usage (never counted twice).
+std::set<int> server_models::router_child_pids_locked() const {
+    std::set<int> pids;
+    for (const auto & [_, inst] : mapping) {
+        if (inst.subproc && !inst.subproc->stopped) {
+            const int pid = inst.subproc->sproc.pid();
+            if (pid > 0) {
+                pids.insert(pid);
+            }
+        }
+    }
+    return pids;
+}
+
+int64_t server_models::foreign_vram_bytes_locked(const server_gpu_slot & slot) const {
+    if (slot.pdev.empty()) {
+        return 0;
+    }
+    return ledger_foreign_vram(probe_fdinfo_vram(""), router_child_pids_locked(), slot.pdev);
+}
+
+int64_t server_models::free_ram_bytes_locked(const std::string & exclude) const {
+    const int64_t headroom = (int64_t) base_params.router_ram_headroom_mb * 1024LL * 1024LL;
+    int64_t free = ledger_free_ram(probe_mem_available(""), headroom);
+    if (free < 0) {
+        return -1;
+    }
+    // A model that is still loading has not faulted its host memory in yet, so
+    // MemAvailable does not reflect it: hold its declared ram-mb back.
+    for (const auto & [other, inst] : mapping) {
+        if (other != exclude && inst.meta.status == SERVER_MODEL_STATUS_LOADING && inst.meta.placement.ram_mb_override > 0) {
+            free -= inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
+        }
+    }
+    return std::max<int64_t>(0, free);
+}
+
+std::vector<std::string> server_models::choose_ram_evictions_locked(const std::string & name, int64_t need_ram) {
+    std::vector<std::string> victims;
+    int64_t free = free_ram_bytes_locked(name);
+    if (need_ram <= 0 || ledger_ram_fits(free, need_ram)) {
+        return victims;
+    }
+    std::vector<std::pair<int64_t, std::string>> residents;
+    for (const auto & [other, inst] : mapping) {
+        if (other == name || !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING ||
+                inst.meta.placement.pinned || inst.req_count > 0 || stopping_models.count(other)) {
+            continue;
+        }
+        residents.push_back({ inst.meta.last_used, other });
+    }
+    std::sort(residents.begin(), residents.end());
+    for (const auto & resident : residents) {
+        if (ledger_ram_fits(free, need_ram)) {
+            break;
+        }
+        const auto & inst = mapping.at(resident.second);
+        int64_t released = 0;
+        const auto mem = inst.subproc ? probe_proc_mem("", inst.subproc->sproc.pid()) : std::nullopt;
+        if (mem.has_value()) {
+            released = mem->rss_anon + mem->rss_shmem;
+        } else if (inst.meta.placement.ram_mb_override > 0) {
+            released = inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
+        }
+        victims.push_back(resident.second);
+        free += released;
+    }
+    if (!ledger_ram_fits(free, need_ram)) {
+        throw std::runtime_error("not enough host RAM for model '" + name + "': needs " +
+                                 std::to_string(need_ram / (1024 * 1024)) + " MB, free " +
+                                 std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name)) / (1024 * 1024)) +
+                                 " MB after headroom, and no idle model can be evicted to make room");
+    }
+    return victims;
+}
+
 int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot) const {
-    const int64_t physical_free = read_physical_free_bytes(slot);
-    const int64_t ledger_free = std::max<int64_t>(0, slot.total_bytes - slot.reserved_bytes);
-    return std::min(physical_free, ledger_free);
+    const ledger_slot ls = { ledger_slot_id("", slot.dev_name), slot.pdev, slot.total_bytes, slot.reserved_bytes };
+    return ledger_free_vram(ls, foreign_vram_bytes_locked(slot), read_vram_used_bytes(slot));
 }
 
 json server_models::gpu_slots_json() {
     std::lock_guard<std::mutex> lk(mutex);
     json out = json::array();
     for (const auto & slot : gpu_slots) {
+        const int64_t foreign = foreign_vram_bytes_locked(slot);
         out.push_back({
             {"name", slot.dev_name},
+            {"id", ledger_slot_id("", slot.dev_name)},
             {"total_bytes", slot.total_bytes},
             {"reserved_bytes", slot.reserved_bytes},
             {"physical_free_bytes", read_physical_free_bytes(slot)},
+            {"foreign_mb", foreign / (1024 * 1024)},
+            {"free_mb", effective_free_bytes_locked(slot) / (1024 * 1024)},
             {"exclusive_holder", slot.exclusive_holder},
         });
     }
     return out;
+}
+
+json server_models::machines_json() {
+    std::lock_guard<std::mutex> lk(mutex);
+    const int64_t ram_free = free_ram_bytes_locked("");
+    return json::array({ json{
+        {"name", "local"},
+        {"ram_available_mb", probe_mem_available("") < 0 ? -1 : probe_mem_available("") / (1024 * 1024)},
+        {"ram_headroom_mb", base_params.router_ram_headroom_mb},
+        {"ram_free_mb", ram_free < 0 ? -1 : ram_free / (1024 * 1024)},
+    } });
 }
 
 static int find_slot_index(const std::vector<server_gpu_slot> & slots, const std::string & dev) {
@@ -1387,6 +1560,20 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     }
     lk.lock();
 
+    // Host RAM must fit too. A shortfall evicts idle residents (LRU) just like VRAM does;
+    // refusing here, before anything is reserved, leaves the ledger untouched.
+    std::vector<std::string> ram_evict;
+    if (meta.placement.ram_mb_override > 0) {
+        ram_evict = choose_ram_evictions_locked(name, meta.placement.ram_mb_override * 1024LL * 1024LL);
+    }
+    auto merge_ram_evictions = [&ram_evict](std::vector<std::string> & evict) {
+        for (const auto & victim : ram_evict) {
+            if (std::find(evict.begin(), evict.end(), victim) == evict.end()) {
+                evict.push_back(victim);
+            }
+        }
+    };
+
     if (meta.placement.exclusive) {
         // Split weights only mean something across a MULTI-GPU span. Single-GPU models are
         // exclusive by default now, so gate ONLY this on the span -- everything below
@@ -1424,6 +1611,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         }
 
         std::vector<std::string> evict = choose_gpu_evictions_locked(name, meta.placement);
+        merge_ram_evictions(evict);
         reserve_gpu_placement_locked(name, meta.placement);
         for (const auto & victim : evict) {
             SRV_INF("router placement: evicting %s to make room for %s (exclusive: one model per GPU)\n", victim.c_str(), name.c_str());
@@ -1532,6 +1720,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         best_idx = best->idx;
         evict = best->victims;
     }
+    merge_ram_evictions(evict);
 
     meta.placement.devs = { gpu_slots[best_idx].dev_name };
     meta.placement.need_bytes_per_dev = { need };
@@ -3427,6 +3616,7 @@ void server_models_routes::init_routes() {
         res_ok(res, {
             {"data", models_json},
             {"devices", models.gpu_slots_json()},
+            {"machines", models.machines_json()},
             {"object", "list"},
         });
         return res;

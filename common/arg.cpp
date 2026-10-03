@@ -4274,8 +4274,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_IDLE_TIMEOUT"));
     add_opt(common_arg(
+        {"--models-ram-headroom-mb"}, "N",
+        string_format("for router server, host RAM (MB) to keep free: a model load must fit in\n"
+                      "MemAvailable minus this headroom, else idle models are evicted (default: %d)",
+                      params.router_ram_headroom_mb),
+        [](common_params & params, int value) {
+            params.router_ram_headroom_mb = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_RAM_HEADROOM_MB"));
+    add_opt(common_arg(
         {"--gpus"}, "SPEC",
-        "for router server, declared GPU slots as name:total_mb:probe[,name:total_mb:probe...]",
+        "for router server, declared GPU slots as name:total_mb:probe[,name:total_mb:probe...]\n"
+        "total_mb may be empty or 0 (name::probe) to use the probe's physical total; a positive\n"
+        "value overrides (caps) the total",
         [](common_params & params, const std::string & value) {
             params.router_gpus = value;
         }
@@ -5421,6 +5432,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, override estimated VRAM for placement",
         [](common_params &, int) { /* unused */ }
     ).set_env("LLAMA_ARG_ROUTER_VRAM_MB").set_preset_only());
+
+    args.push_back(common_arg(
+        {"ram-mb"}, "N",
+        "in server router mode, host RAM this model needs; a load must fit in MemAvailable minus the router headroom",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_RAM_MB").set_preset_only());
 
     args.push_back(common_arg(
         {"env"}, "K=V[,K=V,-K]",
