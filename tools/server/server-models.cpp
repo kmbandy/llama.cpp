@@ -2455,8 +2455,8 @@ std::vector<std::string> server_models::pool_slot_ids_locked(const server_model_
         if (!allow.empty() && allow.count(slot.id()) == 0) {
             continue;
         }
-        // `placement = any` without a preset machine spans every machine; otherwise (the older pool form,
-        // or a machine named) the slots of that machine
+        // `placement = any` without a preset machine spans every machine; otherwise (a machine named) the
+        // slots of that machine
         if (!meta.placement.pool_any_machine && slot.machine != machine) {
             continue;
         }
@@ -3104,11 +3104,15 @@ json server_models::load_async(const std::string & name, const router_request_op
 json server_models::hold(const std::string & model, int64_t ttl_s, const std::string & owner, const std::string & lease) {
     std::lock_guard<std::mutex> lk(mutex);
     std::string name;
-    if (mapping.count(model)) {
-        name = model;
+    auto direct = mapping.find(model);
+    if (direct != mapping.end()) {
+        // a pool replica is not addressable by name: same answer as an unknown model
+        if (direct->second.meta.replica_of.empty()) {
+            name = model;
+        }
     } else {
         for (const auto & [key, inst] : mapping) {
-            if (inst.meta.aliases.count(model)) {
+            if (inst.meta.replica_of.empty() && inst.meta.aliases.count(model)) {
                 name = key;
                 break;
             }
@@ -6081,7 +6085,7 @@ void server_models_routes::init_routes() {
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
         auto model = models.get_meta(name);
-        if (!model.has_value()) {
+        if (!model.has_value() || !model->replica_of.empty()) { // a pool replica is never addressed by name
             res_err(res, format_error_response("model is not found", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
