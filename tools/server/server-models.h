@@ -6,6 +6,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-queue.h"
+#include "server-router-probe.h"
 
 #include <atomic>
 #include <thread>
@@ -300,11 +301,19 @@ private:
     void reserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
     std::vector<std::string> choose_gpu_evictions_locked(const std::string & name, const server_model_placement & placement);
     int64_t read_physical_free_bytes(const server_gpu_slot & slot) const;
+    int64_t physical_free_from_used(const server_gpu_slot & slot, int64_t used) const; // used < 0 = probe failed
     std::set<int> router_child_pids_locked() const;
-    int64_t foreign_vram_bytes_locked(const server_gpu_slot & slot) const;
+    // One /proc fdinfo scan + router-PID set, taken once per listing/admission and passed down.
+    struct vram_snapshot {
+        std::vector<proc_vram> usage;
+        std::set<int>          router_pids;
+    };
+    vram_snapshot take_vram_snapshot_locked() const;
+    int64_t foreign_vram_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
     int64_t free_ram_bytes_locked(const std::string & exclude) const; // MemAvailable - headroom - RAM of other still-loading models; -1 = unknown
     std::vector<std::string> choose_ram_evictions_locked(const std::string & name, int64_t need_ram);
-    int64_t effective_free_bytes_locked(const server_gpu_slot & slot) const;
+    int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
+    int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap, int64_t sysfs_used) const;
     std::vector<int64_t> estimate_need_bytes(const server_model_meta & meta);
 
 public:

@@ -24,11 +24,24 @@ int main() {
         };
         const std::set<int> router = { 100 };
         assert(ledger_foreign_vram(usage, router, PD) == 1500 * MB);
-        // router child not double-counted: with every PID being a router child, foreign is 0
+        // with every PID being a router child, foreign is 0
         assert(ledger_foreign_vram(usage, { 100, 200, 300 }, PD) == 0);
         // unknown pdev (NVML / unresolved): no per-PID view
         assert(ledger_foreign_vram(usage, router, "") == 0);
         assert(ledger_foreign_vram({}, router, PD) == 0);
+    }
+
+    // router child not double-counted: reserved 4000 MB AND visible as 4000 MB in fdinfo.
+    // Its PID is a router PID, so foreign is 0 and the card is charged once (via the
+    // reservation): free = total - 4000, not total - 8000.
+    {
+        const std::vector<proc_vram> usage = { { 100, PD, 4000 * MB } };
+        const int64_t foreign = ledger_foreign_vram(usage, { 100 }, PD);
+        assert(foreign == 0);
+        const ledger_slot s = { "cuda0", PD, 16000 * MB, 4000 * MB };
+        assert(ledger_free_vram(s, foreign, 4000 * MB) == 12000 * MB);
+        // had the child been counted as foreign too, free would wrongly halve the headroom
+        assert(ledger_free_vram(s, 4000 * MB, -1) == 8000 * MB);
     }
 
     // formula table: free = min(total - reserved - foreign, total - sysfs_used)

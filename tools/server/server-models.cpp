@@ -12,6 +12,7 @@
 #include "http.h"
 #include "subproc.h"
 #include "server-router-ledger.h"
+#include "server-router-policy.h"
 #include "server-router-probe.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
@@ -1182,7 +1183,10 @@ void server_models::validate_gpu_slots() {
 }
 
 int64_t server_models::read_physical_free_bytes(const server_gpu_slot & slot) const {
-    const int64_t used = read_vram_used_bytes(slot);
+    return physical_free_from_used(slot, read_vram_used_bytes(slot));
+}
+
+int64_t server_models::physical_free_from_used(const server_gpu_slot & slot, int64_t used) const {
     if (used >= 0) {
         return std::max<int64_t>(0, slot.total_bytes - used);
     }
@@ -1206,11 +1210,25 @@ std::set<int> server_models::router_child_pids_locked() const {
     return pids;
 }
 
-int64_t server_models::foreign_vram_bytes_locked(const server_gpu_slot & slot) const {
+// One fdinfo scan + one router-PID set per top-level operation (a listing or a placement
+// admission), shared by every slot it inspects. The scan walks all of /proc, so doing it
+// per slot under the router mutex is wasteful. Skipped when no slot has a PCI address.
+server_models::vram_snapshot server_models::take_vram_snapshot_locked() const {
+    vram_snapshot snap;
+    const bool any_pdev = std::any_of(gpu_slots.begin(), gpu_slots.end(),
+        [](const server_gpu_slot & s) { return !s.pdev.empty(); });
+    if (any_pdev) {
+        snap.usage       = probe_fdinfo_vram("");
+        snap.router_pids = router_child_pids_locked();
+    }
+    return snap;
+}
+
+int64_t server_models::foreign_vram_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const {
     if (slot.pdev.empty()) {
         return 0;
     }
-    return ledger_foreign_vram(probe_fdinfo_vram(""), router_child_pids_locked(), slot.pdev);
+    return ledger_foreign_vram(snap.usage, snap.router_pids, slot.pdev);
 }
 
 int64_t server_models::free_ram_bytes_locked(const std::string & exclude) const {
@@ -1268,24 +1286,30 @@ std::vector<std::string> server_models::choose_ram_evictions_locked(const std::s
     return victims;
 }
 
-int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot) const {
+int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap, int64_t sysfs_used) const {
     const ledger_slot ls = { ledger_slot_id("", slot.dev_name), slot.pdev, slot.total_bytes, slot.reserved_bytes };
-    return ledger_free_vram(ls, foreign_vram_bytes_locked(slot), read_vram_used_bytes(slot));
+    return ledger_free_vram(ls, foreign_vram_bytes_locked(slot, snap), sysfs_used);
+}
+
+int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const {
+    return effective_free_bytes_locked(slot, snap, read_vram_used_bytes(slot));
 }
 
 json server_models::gpu_slots_json() {
     std::lock_guard<std::mutex> lk(mutex);
     json out = json::array();
+    const vram_snapshot snap = take_vram_snapshot_locked();
     for (const auto & slot : gpu_slots) {
-        const int64_t foreign = foreign_vram_bytes_locked(slot);
+        const int64_t foreign = foreign_vram_bytes_locked(slot, snap);
+        const int64_t used    = read_vram_used_bytes(slot); // read once for both fields below
         out.push_back({
             {"name", slot.dev_name},
             {"id", ledger_slot_id("", slot.dev_name)},
             {"total_bytes", slot.total_bytes},
             {"reserved_bytes", slot.reserved_bytes},
-            {"physical_free_bytes", read_physical_free_bytes(slot)},
+            {"physical_free_bytes", physical_free_from_used(slot, used)},
             {"foreign_mb", foreign / (1024 * 1024)},
-            {"free_mb", effective_free_bytes_locked(slot) / (1024 * 1024)},
+            {"free_mb", effective_free_bytes_locked(slot, snap, used) / (1024 * 1024)},
             {"exclusive_holder", slot.exclusive_holder},
         });
     }
@@ -1501,6 +1525,7 @@ std::vector<std::string> server_models::choose_gpu_evictions_locked(const std::s
         return evict;
     }
     std::set<std::string> dev_set(placement.devs.begin(), placement.devs.end());
+    std::vector<evict_resident> overlapping;
     for (const auto & [other_name, inst] : mapping) {
         if (other_name == name || !inst.meta.is_running()) {
             continue;
@@ -1512,14 +1537,23 @@ std::vector<std::string> server_models::choose_gpu_evictions_locked(const std::s
         if (!overlaps) {
             continue;
         }
-        if (inst.meta.placement.pinned) {
-            // A pinned resident is a hard hold: it makes its GPU unavailable to every
-            // other model until a human unpins it. This is what protects an in-flight
-            // kernel/weight-paging experiment from having a model dropped on top of it.
+        overlapping.push_back({ other_name, inst.meta.last_used, inst.meta.placement.pinned, inst.req_count });
+    }
+    // Exclusive placement needs every overlapping resident gone, so one that cannot be
+    // evicted refuses the load. A pinned resident is a hard hold: it makes its GPU
+    // unavailable to every other model until a human unpins it (protects an in-flight
+    // kernel/weight-paging experiment). A busy one has requests in flight that killing
+    // it would drop; the caller can retry once it is idle.
+    if (const auto blocker = evict_find_blocker(overlapping)) {
+        if (blocker->pinned) {
             throw std::runtime_error("model '" + name + "' cannot load: GPU is held by pinned model '"
-                                     + other_name + "' (unpin it first)");
+                                     + blocker->name + "' (unpin it first)");
         }
-        evict.push_back(other_name);
+        throw std::runtime_error("model '" + name + "' cannot load: GPU is in use by busy model '"
+                                 + blocker->name + "' (in-flight requests; try again when idle)");
+    }
+    for (const auto & r : overlapping) {
+        evict.push_back(r.name);
     }
     return evict;
 }
@@ -1638,6 +1672,8 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     }
 
     const int64_t need = needs.empty() ? 0 : needs[0];
+    // One /proc scan for this whole admission, shared by every slot check below.
+    const vram_snapshot snap = take_vram_snapshot_locked();
     int best_idx = -1;
     int64_t best_free = -1;
     for (const auto & dev : meta.placement.devs) {
@@ -1646,7 +1682,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name) {
             continue;
         }
-        const int64_t free = effective_free_bytes_locked(slot);
+        const int64_t free = effective_free_bytes_locked(slot, snap);
         if (free >= need + ROUTER_GPU_MARGIN_BYTES && free > best_free) {
             best_free = free;
             best_idx = idx;
@@ -1670,26 +1706,27 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
                     continue;
                 }
             }
-            std::vector<std::pair<int64_t, std::string>> residents;
+            std::vector<evict_resident> all_residents;
             for (const auto & [other_name, inst] : mapping) {
-                if (other_name == name || !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING || inst.meta.placement.pinned) {
+                if (other_name == name || !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING) {
                     continue;
                 }
                 if (std::find(inst.meta.placement.devs.begin(), inst.meta.placement.devs.end(), slot.dev_name) != inst.meta.placement.devs.end()) {
-                    residents.push_back({ inst.meta.last_used, other_name });
+                    all_residents.push_back({ other_name, inst.meta.last_used, inst.meta.placement.pinned, inst.req_count });
                 }
             }
-            std::sort(residents.begin(), residents.end());
-            int64_t free = effective_free_bytes_locked(slot);
+            // LRU order; pinned and busy (req_count > 0) residents are never victims
+            const std::vector<evict_resident> residents = evict_pick_lru(all_residents);
+            int64_t free = effective_free_bytes_locked(slot, snap);
             candidate_t cand;
             cand.idx = idx;
             for (const auto & resident : residents) {
                 if (free >= need + ROUTER_GPU_MARGIN_BYTES) {
                     break;
                 }
-                cand.victims.push_back(resident.second);
-                cand.newest_last_used = resident.first;
-                auto it = mapping.find(resident.second);
+                cand.victims.push_back(resident.name);
+                cand.newest_last_used = resident.last_used;
+                auto it = mapping.find(resident.name);
                 if (it != mapping.end() && !it->second.meta.placement.need_bytes_per_dev.empty()) {
                     const auto & victim_placement = it->second.meta.placement;
                     auto dev_it = std::find(victim_placement.devs.begin(), victim_placement.devs.end(), slot.dev_name);
@@ -2410,6 +2447,18 @@ void server_models::load(const std::string & name, const load_options & opts) {
             }
             SRV_INF("model '%s': env %s%s\n", inst.meta.name.c_str(),
                     remove ? "unset " : "", remove ? key.c_str() : override_entry.c_str());
+        }
+
+        // Final env = inherited router env + preset `env`, nothing else. A temp dir that
+        // points at a non-directory (e.g. TMPDIR=/etc/passwd) fails every tmpfile the child
+        // makes in confusing ways, so refuse the load up front. The guard rolls back.
+        {
+            const std::string bad = env_temp_dir_violation(child_env);
+            if (!bad.empty()) {
+                const std::string var = bad.substr(0, bad.find('='));
+                throw std::runtime_error("model '" + name + "' cannot load: " + var +
+                                         " is not a directory (" + bad + ")");
+            }
         }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
