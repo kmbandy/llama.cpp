@@ -178,6 +178,12 @@ std::string router_replica_name(const std::string & alias, int k);
 // splits a registry name into its alias and replica number (1 when it is no replica name)
 bool router_replica_split(const std::string & name, std::string & alias, int & k);
 
+// true when `name` ends in `~r<digits>` (after at least one character): the form reserved for replica
+// entries of a pool alias. A preset section may not be named like that; a client may not request it.
+bool router_replica_name_reserved(const std::string & name);
+// true when `slot` is among `held` (the devs a sibling replica placed): one replica per slot.
+bool router_replica_slot_taken(const std::string & slot, const std::vector<std::string> & held);
+
 // The slots a placement of this pool instance may use: the pool's slots (`all`, already narrowed
 // to the allow-list / preset machine by the caller) that are `usable` (online) and not held by a
 // sibling replica (`taken`): one replica per slot.

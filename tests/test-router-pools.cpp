@@ -89,6 +89,32 @@ int main() {
         assert(router_replica_split("a~rb~r12", a, k) && a == "a~rb" && k == 12);
     }
 
+    // ---- names reserved for replica entries: no preset section / request may use them
+    {
+        assert(router_replica_name_reserved("q~r2"));
+        assert(router_replica_name_reserved("q~r1"));
+        assert(router_replica_name_reserved("q~r17"));
+        assert(router_replica_name_reserved("a~rb~r3"));
+        assert(!router_replica_name_reserved("q"));
+        assert(!router_replica_name_reserved("q~r"));
+        assert(!router_replica_name_reserved("q~rx"));
+        assert(!router_replica_name_reserved("q~r2x"));
+        assert(!router_replica_name_reserved("~r2")); // nothing before the suffix: not a replica name
+        // every name the replica scheme generates is reserved (so a preset can never collide with one)
+        for (int k = 2; k < 70; ++k) {
+            assert(router_replica_name_reserved(router_replica_name("qwen", k)));
+        }
+        assert(!router_replica_name_reserved(router_replica_name("qwen", 1))); // replica 1 is the alias
+    }
+
+    // ---- one replica per slot: a pick is published at once, a sibling's published slot is taken
+    {
+        const std::vector<std::string> sibling = { "m2/g0" };
+        assert(router_replica_slot_taken("m2/g0", sibling));
+        assert(!router_replica_slot_taken("g0", sibling));
+        assert(!router_replica_slot_taken("g0", {}));
+    }
+
     // ---- the slots a placement may use
     {
         const std::vector<std::string> all = { "g0", "g1", "m2/g0" };

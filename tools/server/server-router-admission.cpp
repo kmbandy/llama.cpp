@@ -472,6 +472,23 @@ bool router_replica_split(const std::string & name, std::string & alias, int & k
     return true;
 }
 
+bool router_replica_name_reserved(const std::string & name) {
+    const size_t pos = name.rfind("~r");
+    if (pos == std::string::npos || pos == 0 || pos + 2 >= name.size()) {
+        return false;
+    }
+    for (size_t i = pos + 2; i < name.size(); ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool router_replica_slot_taken(const std::string & slot, const std::vector<std::string> & held) {
+    return std::find(held.begin(), held.end(), slot) != held.end();
+}
+
 std::vector<std::string> router_pool_slots(const std::vector<std::string> & all, const std::function<bool(const std::string &)> & usable,
                                            const std::set<std::string> & taken) {
     std::vector<std::string> out;
