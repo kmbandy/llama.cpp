@@ -7261,6 +7261,10 @@ public:
     uint64_t host_spec_errors() const { return host_errors_.load(std::memory_order_relaxed); }
     uint64_t host_spec_promotions() const { return arena_.spec_promotions(); }
     uint64_t host_spec_wasted() const { return arena_.spec_evicted_unused(); }
+    size_t   pf_quar_resident()       const { return arena_.quar_resident(); }
+    uint64_t pf_quar_confirmed()      const { return arena_.quar_confirmed(); }
+    uint64_t pf_quar_evicted_unused() const { return arena_.quar_evicted_unused(); }
+    uint64_t pf_quar_skipped_full()   const { return arena_.quar_skipped_full(); }
     uint64_t host_skip_bad()   const { return host_skip_bad_; }
     uint64_t host_skip_pin()   const { return host_skip_pin_; }
     uint64_t host_skip_vram()  const { return host_skip_vram_; }
@@ -12927,7 +12931,7 @@ public:
     // n_pagein and bytes_read because spend and saving are only interpretable
     // together.
     std::string prefetch_hint_line() const {
-        char buf[1600];
+        char buf[2400];
         std::snprintf(buf, sizeof(buf),
                       "frames=%llu experts=%llu "
                       "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
@@ -12995,11 +12999,13 @@ public:
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_ahead(),
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_behind(),
                       (unsigned long long) pool_.n_layerahead_spec_deferred());
-        char split[512];
+        char split[768];
         std::snprintf(split, sizeof(split),
                       " host_skip_vram_late=%llu host_landed_late=%llu "
                       "host_begin_refused=%llu host_waited_inflight=%llu host_boosted=%llu "
-                      "n_pf[issued/landed/used/stale/yield/capped]=%llu/%llu/%llu/%llu/%llu/%llu n_pf_late_fin=%llu host_by_dist=[",
+                      "n_pf[issued/landed/used/stale/yield/capped]=%llu/%llu/%llu/%llu/%llu/%llu n_pf_late_fin=%llu "
+                      "pf_quar_resident=%zu pf_quar_confirmed=%llu pf_quar_evicted_unused=%llu "
+                      "pf_quar_skipped_full=%llu host_by_dist=[",
                       (unsigned long long) pool_.host_skip_vram_late(),
                       (unsigned long long) pool_.host_landed_late(),
                       (unsigned long long) pool_.host_begin_refused(),
@@ -13008,7 +13014,11 @@ public:
                       (unsigned long long) pool_.pf_issued(), (unsigned long long) pool_.pf_landed(),
                       (unsigned long long) pool_.pf_used(), (unsigned long long) pool_.pf_stale_dropped(),
                       (unsigned long long) pool_.pf_yield(), (unsigned long long) pool_.pf_capped(),
-                      (unsigned long long) pool_.pf_finished_late());
+                      (unsigned long long) pool_.pf_finished_late(),
+                      pool_.pf_quar_resident(),
+                      (unsigned long long) pool_.pf_quar_confirmed(),
+                      (unsigned long long) pool_.pf_quar_evicted_unused(),
+                      (unsigned long long) pool_.pf_quar_skipped_full());
         return std::string(buf) + split + pool_.host_outcome_by_dist() + "]";
     }
 
@@ -21069,6 +21079,21 @@ public:
                 const long v = std::strtol(e, nullptr, 10);
                 if (v >= 0 && v <= 100) {
                     cfg.spec_frac_pct = (int) v;
+                }
+            }
+            // WP_EXPERT_CPU_TIER_PF_QUARANTINE=1 (default 0 = old behavior):
+            // prefetch-landed pages are unconfirmed "quarantined" entries,
+            // capped at WP_EXPERT_CPU_TIER_PF_QUARANTINE_PCT (default 10) of
+            // the tier, evicted before any demand page, and a full
+            // quarantine only ever recycles its own oldest entry. See
+            // wp::HostArena::Config::pf_quarantine.
+            if (const char * e = std::getenv("WP_EXPERT_CPU_TIER_PF_QUARANTINE")) {
+                cfg.pf_quarantine = std::strcmp(e, "1") == 0;
+            }
+            if (const char * e = std::getenv("WP_EXPERT_CPU_TIER_PF_QUARANTINE_PCT")) {
+                const long v = std::strtol(e, nullptr, 10);
+                if (v >= 1 && v <= 100) {
+                    cfg.pf_quarantine_pct = (int) v;
                 }
             }
             if (const char * e = std::getenv("WP_HOST_ARENA_CHUNK_BYTES")) {

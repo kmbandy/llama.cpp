@@ -81,6 +81,10 @@ void HostArena::shutdown() {
     spec_promotions_      = 0;
     reject_promotions_    = 0;
     spec_promotions_rejected_ = 0;
+    quar_n_               = 0;
+    quar_confirmed_       = 0;
+    quar_evicted_unused_  = 0;
+    quar_skipped_full_    = 0;
     std::fill(std::begin(spec_used_by_tag_), std::end(spec_used_by_tag_), 0);
     std::fill(std::begin(spec_unused_by_tag_), std::end(spec_unused_by_tag_), 0);
     begin_read_refusals_  = 0;
@@ -129,6 +133,20 @@ void HostArena::touch_locked_(size_t idx) {
 
 size_t HostArena::spec_cap_entries_() const {
     return entries_.size() * (size_t) cfg_.spec_frac_pct / 100;
+}
+
+size_t HostArena::quar_cap_entries_() const {
+    const size_t tier_entries = (cfg_.tier_bytes > 0 && cfg_.entry_bytes > 0)
+        ? std::min(cfg_.tier_bytes / cfg_.entry_bytes, entries_.size())
+        : entries_.size();
+    const int pct = std::max(1, std::min(100, cfg_.pf_quarantine_pct));
+    return std::max<size_t>(1, tier_entries * (size_t) pct / 100);
+}
+
+void HostArena::quar_clear_locked_(Entry & e) {
+    if (!e.quar) return;
+    e.quar = false;
+    if (quar_n_ > 0) --quar_n_;
 }
 
 size_t HostArena::pinned_cap_entries_() const {
@@ -346,7 +364,9 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
         if (!e.ever_borrowed) {
             ++spec_evicted_unused_;
             ++spec_unused_by_tag_[e.tag];
+            if (e.quar) ++quar_evicted_unused_;
         }
+        quar_clear_locked_(e);
         ++evictions_spec_;
     } else if (from == ListLoc::RejectLru) {
         reject_lru_.erase(e.lru_pos);
@@ -457,7 +477,35 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
     }
 
     size_t idx;
-    if (speculative) {
+    if (speculative && cfg_.pf_quarantine) {
+        // Quarantine admission (see Config::pf_quarantine). quar_n_ counts
+        // Reading + unconfirmed Resident, so the cap holds across concurrent
+        // prefetch readers. At the cap the ONLY legal victim is the oldest
+        // evictable quarantined entry (SpecOnly: never reject_lru_/lru_, so
+        // never a confirmed page); a Reading or borrowed one is not in
+        // spec_lru_ / is skipped in place, so if none is evictable we refuse
+        // rather than touch the confirmed side.
+        if (quar_n_ >= quar_cap_entries_()) {
+            if (!evict_one_locked_(EvictScope::SpecOnly)) {
+                ++quar_skipped_full_;
+                ++begin_read_refusals_;
+                return false;
+            }
+            idx = free_.back();
+            free_.pop_back();
+        } else if (!free_.empty()) {
+            idx = free_.back();
+            free_.pop_back();
+        } else if (evict_one_locked_(
+                       (cfg_.freq_admission || cfg_.protect_demand_from_spec)
+                           ? EvictScope::SpecOrReject : EvictScope::Any)) {
+            idx = free_.back();
+            free_.pop_back();
+        } else {
+            ++begin_read_refusals_;
+            return false;
+        }
+    } else if (speculative) {
         const size_t spec_cap_bytes = spec_cap_entries_() * cfg_.entry_bytes;
         if (spec_bytes_ + cfg_.entry_bytes > spec_cap_bytes) {
             // Spec budget already full: the victim MUST come from the
@@ -554,6 +602,8 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
     e.pinned      = false;
     e.ever_borrowed = false;
     e.drop_when_idle = false;
+    e.quar        = speculative && cfg_.pf_quarantine;
+    if (e.quar) ++quar_n_;
     e.tag         = 0;
     e.gen         = next_gen_++;
     e.loc         = ListLoc::None;
@@ -597,6 +647,7 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borr
     } else {
         // Reading -> Free: discard the bytes, the page never landed.
         by_page_.erase(it);
+        quar_clear_locked_(e);
         e.state    = State::Free;
         e.page_idx = -1;
         e.gen      = kInvalidHandle;
@@ -675,6 +726,8 @@ bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out,
             spec_bytes_ -= cfg_.entry_bytes;
             ++spec_promotions_;
             ++spec_used_by_tag_[e.tag];
+            if (e.quar) ++quar_confirmed_;
+            quar_clear_locked_(e);
             if (reject_promotion) {
                 insert_mru_locked_(idx, ListLoc::RejectLru);
                 ++spec_promotions_rejected_;
@@ -720,6 +773,7 @@ bool HostArena::drop_if_idle_locked_(size_t idx) {
     }
     remove_from_list_locked_(idx);
     if (e.speculative) spec_bytes_ -= cfg_.entry_bytes;
+    quar_clear_locked_(e);
     resident_count_ -= 1;
     resident_bytes_ -= cfg_.entry_bytes;
     by_page_.erase(e.page_idx);
@@ -801,6 +855,8 @@ bool HostArena::pin(int page_idx) {
         spec_bytes_ -= cfg_.entry_bytes;
         ++spec_promotions_;
         ++spec_used_by_tag_[e.tag];
+        if (e.quar) ++quar_confirmed_;
+        quar_clear_locked_(e);
     }
     e.pinned = true;
     pinned_bytes_ += cfg_.entry_bytes;
@@ -865,6 +921,12 @@ uint64_t HostArena::reject_promotions() const { std::lock_guard<std::mutex> lock
 uint64_t HostArena::spec_promotions_rejected() const { std::lock_guard<std::mutex> lock(mu_); return spec_promotions_rejected_; }
 uint64_t HostArena::lookups()     const { std::lock_guard<std::mutex> lock(mu_); return lookups_; }
 uint64_t HostArena::lookup_hits() const { std::lock_guard<std::mutex> lock(mu_); return lookup_hits_; }
+size_t   HostArena::quar_resident()       const { std::lock_guard<std::mutex> lock(mu_); return spec_lru_.size(); }
+size_t   HostArena::quar_reserved()       const { std::lock_guard<std::mutex> lock(mu_); return quar_n_; }
+size_t   HostArena::quar_cap_entries()    const { std::lock_guard<std::mutex> lock(mu_); return quar_cap_entries_(); }
+uint64_t HostArena::quar_confirmed()      const { std::lock_guard<std::mutex> lock(mu_); return quar_confirmed_; }
+uint64_t HostArena::quar_evicted_unused() const { std::lock_guard<std::mutex> lock(mu_); return quar_evicted_unused_; }
+uint64_t HostArena::quar_skipped_full()   const { std::lock_guard<std::mutex> lock(mu_); return quar_skipped_full_; }
 uint64_t HostArena::drops()       const { std::lock_guard<std::mutex> lock(mu_); return drops_; }
 
 }  // namespace wp

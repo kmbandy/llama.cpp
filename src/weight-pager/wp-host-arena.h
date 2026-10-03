@@ -99,6 +99,19 @@ public:
         // before -- this only stops a *speculative* reservation from being
         // the one to evict it.
         bool   protect_demand_from_spec = false;
+        // WP_EXPERT_CPU_TIER_PF_QUARANTINE in the worker. Default false:
+        // byte-for-byte the behaviour above (spec_frac_pct cap on LANDED
+        // speculative bytes). When true, every speculative reservation is a
+        // "quarantined" entry: it counts against pf_quarantine_pct of the
+        // tier from begin_read() onward (Reading included, so N concurrent
+        // prefetch readers cannot overshoot the cap by their in-flight
+        // count), it lands in spec_lru_ (cold end of eviction order, oldest
+        // first), and once the quarantine is full a new speculative
+        // reservation can only evict the oldest evictable quarantined entry
+        // (never a confirmed page) or is refused. A demand borrow()/pin()
+        // confirms the entry out of the quarantine.
+        bool   pf_quarantine     = false;
+        int    pf_quarantine_pct = 10;   // % of the tier (tier_bytes/entry_bytes, else all entries)
     };
     // alloc(bytes) returns 4096-aligned memory or nullptr; free(ptr, bytes).
     using Allocator   = std::function<void *(size_t)>;
@@ -274,6 +287,18 @@ public:
     uint64_t lookups()      const;   // every borrow() call, hit or miss
     uint64_t lookup_hits()  const;   // borrow() calls that found the page Resident
 
+    // pf_quarantine only (all 0 when off). quar_resident() is a gauge: landed,
+    // still-unconfirmed entries. quar_confirmed(): demand borrow()/pin() on a
+    // quarantined entry. quar_evicted_unused(): quarantined entries evicted
+    // with no borrow ever. quar_skipped_full(): speculative reservations
+    // refused because the quarantine was full and nothing in it was evictable.
+    size_t   quar_resident()       const;
+    size_t   quar_reserved()       const;   // quar_resident + Reading quarantined
+    size_t   quar_cap_entries()    const;
+    uint64_t quar_confirmed()      const;
+    uint64_t quar_evicted_unused() const;
+    uint64_t quar_skipped_full()   const;
+
 
 private:
     // Which LRU list (if any) currently holds this entry. Pinned and Reading
@@ -289,6 +314,7 @@ private:
         bool     pinned       = false;
         bool     drop_when_idle = false;  // mark_drop(): free on the last release
         uint8_t  tag          = 0;        // set_spec_tag(); reset by begin_read
+        bool     quar          = false;   // pf_quarantine: counted in quar_n_ (Reading or unconfirmed Resident)
         bool     ever_borrowed = false;   // set by any borrow() (demand or peek), reset
                                            // when the entry becomes Reading again; an
                                            // eviction while still speculative only counts
@@ -333,6 +359,9 @@ private:
     void     insert_mru_locked_(size_t idx, ListLoc loc);
     void     touch_locked_(size_t idx);
     size_t   spec_cap_entries_() const;
+    size_t   quar_cap_entries_() const;
+    // Caller holds mu_. Drops e out of the quarantine count (no-op if it is not in it).
+    void     quar_clear_locked_(Entry & e);
     size_t   pinned_cap_entries_() const;
 
     // --- frequency sketch (freq_admission only) -----------------------------
@@ -404,6 +433,10 @@ private:
     uint64_t lookups_     = 0;
     uint64_t lookup_hits_ = 0;
     uint64_t drops_       = 0;
+    size_t   quar_n_                = 0;   // quarantined entries, Reading + unconfirmed Resident
+    uint64_t quar_confirmed_        = 0;
+    uint64_t quar_evicted_unused_   = 0;
+    uint64_t quar_skipped_full_     = 0;
     uint64_t spec_used_by_tag_[256]   = {};
     uint64_t spec_unused_by_tag_[256] = {};
 
