@@ -244,6 +244,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // register API routes
     server_child child; // only used in non-router mode
     server_routes routes(params, ctx_server);
+    server_http_context::handler_t get_models_v1 = routes.get_models; // router mode swaps in the OAI-only listing
     server_tools tools;
 
     std::optional<server_models_routes> models_routes{};
@@ -293,6 +294,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
+        get_models_v1                      = models_routes->get_router_models_oai;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
@@ -308,7 +310,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
-    ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
+    ctx_http.get ("/v1/models",                ex_wrapper(get_models_v1));
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));

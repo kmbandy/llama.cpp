@@ -55,3 +55,13 @@ router_group_section router_group_parse_section(const common_preset & preset, co
 // launch, `depends` names a missing section or one that is not kind=external, a worker is
 // referenced by two groups (or twice by one), or an external itself declares depends.
 std::map<std::string, std::string> router_groups_resolve(const std::vector<router_group_section> & sections);
+
+// A request may name only a real model; a kind=external worker answers like an unknown name.
+inline bool router_model_requestable(router_kind kind) {
+    return kind == ROUTER_KIND_MODEL;
+}
+
+// /v1/models is the OAI view: loadable models only. (/models lists every section.)
+inline bool router_model_in_oai_listing(router_kind kind) {
+    return kind == ROUTER_KIND_MODEL;
+}

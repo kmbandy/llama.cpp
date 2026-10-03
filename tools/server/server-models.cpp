@@ -2171,7 +2171,9 @@ void server_models::load_models() {
 
             inst.meta.exit_code = 0; // clear failed state so the model can be reloaded
             inst.meta.update_args(ctx_preset, bin_path);
-            inst.meta.update_caps();
+            if (!inst.meta.is_external()) {
+                inst.meta.update_caps();
+            }
         }
 
         // add models that are new in this reload, load-on-startup is not honored here since a
@@ -2340,7 +2342,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (!has_model(name)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        if (auto m = get_meta(name); m.has_value() && m->is_external()) {
+        if (auto m = get_meta(name); m.has_value() && !router_model_requestable(m->kind)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
         if (!gpu_placement_enabled) {
@@ -3387,7 +3389,7 @@ static bool router_validate_model(std::string & name, server_models & models, bo
         res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
-    if (meta->is_external()) {
+    if (!router_model_requestable(meta->kind)) {
         // a group worker is not a model: same answer as an unknown name
         res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
         return false;
@@ -3641,7 +3643,8 @@ void server_models_routes::init_routes() {
         return res;
     };
 
-    this->get_router_models = [this](const server_http_req & req) {
+    // one body, two registrations: /models lists everything, /v1/models is the OAI view
+    auto list_models = [this](const server_http_req & req, bool oai_listing) {
         bool reload = !req.get_param("reload", "").empty();
         if (reload) {
             models.load_models();
@@ -3654,8 +3657,8 @@ void server_models_routes::init_routes() {
             if (meta.hidden) {
                 continue; // cache model deduplicated by a preset
             }
-            if (meta.is_external() && req.path.rfind("/v1/", 0) == 0) {
-                continue; // group workers are listed in /models only, never as OAI models
+            if (oai_listing && !router_model_in_oai_listing(meta.kind)) {
+                continue;
             }
             json status {
                 {"value",  server_model_status_to_string(meta.status)},
@@ -3739,6 +3742,8 @@ void server_models_routes::init_routes() {
         });
         return res;
     };
+    this->get_router_models     = [list_models](const server_http_req & req) { return list_models(req, false); };
+    this->get_router_models_oai = [list_models](const server_http_req & req) { return list_models(req, true); };
 
     this->post_router_models_unload = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();

@@ -85,9 +85,13 @@ int main() {
         assert(groups.size() == 2);
         assert(groups.at("dsv41-w-main") == "dsv41");
         assert(groups.at("dsv41-w-2026") == "dsv41");
-        // only externals are not requestable: the spine is a normal model
-        assert(spine.kind != ROUTER_KIND_EXTERNAL);
-        assert(w_main.kind == ROUTER_KIND_EXTERNAL && w_2026.kind == ROUTER_KIND_EXTERNAL);
+        // requestability and the /v1/models listing, decided from the parsed kinds
+        assert(router_model_requestable(spine.kind));
+        assert(!router_model_requestable(w_main.kind));
+        assert(!router_model_requestable(w_2026.kind));
+        assert(router_model_in_oai_listing(spine.kind));
+        assert(!router_model_in_oai_listing(w_main.kind));
+        assert(!router_model_in_oai_listing(w_2026.kind));
     }
 
     // a preset with no group keys is a plain model in no group
