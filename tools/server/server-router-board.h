@@ -23,6 +23,7 @@
 // the poll thread for residents still running, and renewals / releases retry every tick.
 
 #include "server-router-admission.h"
+#include "server-router-machines.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -147,12 +148,7 @@ void router_queued_response(const router_queued_info & info, int & status, std::
 // either side of '=' is empty.
 bool router_gpu_name_split(const std::string & field, std::string & dev, std::string & board_name);
 
-// The `local: true` entry of machines.json ({name: {local?, ...}}); "" when none / unparsable.
-std::string router_parse_local_machine(const std::string & machines_json);
-
-// Local machine name: machines.json at `path` (default ~/.config/mad-lab-agents/machines.json
-// when empty), else the short hostname, else "local".
-std::string router_local_machine(const std::string & path = "");
+// router_local_machine() / router_parse_local_machine(): server-router-machines.h
 
 //
 // board data

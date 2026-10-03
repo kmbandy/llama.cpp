@@ -4309,6 +4309,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BOARD_TOKEN_FILE"));
     add_opt(common_arg(
+        {"--router-node"},
+        "run as a router node: spawn, stop and signal model processes on this machine on behalf of\n"
+        "the leader router, and report their VRAM / RAM (/node/* routes). Needs --node-token-file and\n"
+        "--node-bind; never loads a model and never talks to the board (no --board-url)",
+        [](common_params & params) {
+            params.router_node = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ROUTER_NODE"));
+    add_opt(common_arg(
+        {"--node-token-file"}, "PATH",
+        "for router node, file holding the bearer token required on every /node/* route\n"
+        "(missing, unreadable or empty: the node refuses to start)",
+        [](common_params & params, const std::string & value) {
+            params.node_token_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NODE_TOKEN_FILE"));
+    add_opt(common_arg(
+        {"--node-bind"}, "ADDR[,ADDR]",
+        "for router node, the LAN / Tailscale addresses to listen on (replaces --host; wildcard\n"
+        "addresses are refused); the port is --port",
+        [](common_params & params, const std::string & value) {
+            params.node_bind = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NODE_BIND"));
+    add_opt(common_arg(
         {"--models-queue-max-wait-s"}, "SECONDS",
         string_format("for router server, longest a `lowest`-priority request waits for its queued model before\n"
                       "it is answered 503 + Retry-After (the load stays queued) (default: %d, 0 = no bound)",

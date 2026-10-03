@@ -10,13 +10,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <iterator>
 #include <sstream>
-
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 using json = common_json;
 
@@ -207,52 +202,6 @@ bool router_gpu_name_split(const std::string & field, std::string & dev, std::st
     dev        = trim(field.substr(0, eq));
     board_name = trim(field.substr(eq + 1));
     return !dev.empty() && !board_name.empty();
-}
-
-std::string router_parse_local_machine(const std::string & machines_json) {
-    try {
-        const json j = json::parse(machines_json);
-        if (!j.is_object()) {
-            return "";
-        }
-        for (const auto & [name, entry] : j.items()) {
-            if (entry.is_object() && entry.contains("local") && entry.at("local").is_boolean() && entry.at("local").get<bool>()) {
-                return name;
-            }
-        }
-    } catch (const std::exception &) {
-        return "";
-    }
-    return "";
-}
-
-std::string router_local_machine(const std::string & path_in) {
-    std::string path = path_in;
-    if (path.empty()) {
-        const char * home = std::getenv("HOME");
-        if (home != nullptr && home[0] != '\0') {
-            path = std::string(home) + "/.config/mad-lab-agents/machines.json";
-        }
-    }
-    if (!path.empty()) {
-        std::ifstream f(path);
-        if (f) {
-            std::stringstream ss;
-            ss << f.rdbuf();
-            const std::string name = router_parse_local_machine(ss.str());
-            if (!name.empty()) {
-                return name;
-            }
-        }
-    }
-#ifndef _WIN32
-    char buf[256] = {};
-    if (gethostname(buf, sizeof(buf) - 1) == 0 && buf[0] != '\0') {
-        std::string host = buf;
-        return host.substr(0, host.find('.'));
-    }
-#endif
-    return "local";
 }
 
 //

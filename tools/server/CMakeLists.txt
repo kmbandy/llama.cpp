@@ -57,6 +57,8 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    server-node.cpp
+    server-node.h
     server-router-admission.cpp
     server-router-admission.h
     server-router-board.cpp
@@ -69,6 +71,8 @@ add_library(${TARGET}
     server-router-holds.h
     server-router-ledger.cpp
     server-router-ledger.h
+    server-router-machines.cpp
+    server-router-machines.h
     server-router-policy.cpp
     server-router-policy.h
     server-router-probe.cpp

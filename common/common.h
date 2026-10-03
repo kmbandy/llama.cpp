@@ -876,6 +876,9 @@ struct common_params {
     std::string router_board_url = "";        // router: coordination board base URL ("" = board features off)
     std::string router_board_token_file = ""; // router: file holding the board's bearer token
     int models_queue_max_wait_s = 3600;       // router: longest a `lowest` request waits for its queued model (0 = no bound)
+    bool router_node = false;                 // --router-node: run as a machine's node daemon (spawns children for the leader)
+    std::string node_token_file = "";         // router node: file holding the bearer token every /node/* route checks
+    std::string node_bind = "";               // router node: LAN / Tailscale addresses to listen on, comma-separated
 
     bool log_json = false;
 

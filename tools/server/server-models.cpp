@@ -519,6 +519,9 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_GPUS");
     preset.unset_option("LLAMA_ARG_BOARD_URL");
     preset.unset_option("LLAMA_ARG_BOARD_TOKEN_FILE");
+    preset.unset_option("LLAMA_ARG_ROUTER_NODE");
+    preset.unset_option("LLAMA_ARG_NODE_TOKEN_FILE");
+    preset.unset_option("LLAMA_ARG_NODE_BIND");
     preset.unset_option(ROUTER_ARG_PRIORITY);
     preset.unset_option(ROUTER_ARG_GPU);
     preset.unset_option(ROUTER_ARG_VRAM_MB);

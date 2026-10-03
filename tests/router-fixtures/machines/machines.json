@@ -1,0 +1,5 @@
+{
+  "mad-lab-main": {"local": true, "tui_color": "green"},
+  "mad-lab-2026": {"ssh": "kmbandy@mad-lab-2026", "models_dir": "/mnt/nvme", "router_node": "http://192.168.1.33:8094", "gpus": ["R9700"], "future": {"nested": 1}},
+  "laptop": "not-an-object"
+}
