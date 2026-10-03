@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -651,5 +652,22 @@ ggml_tensor * scatter_add_compact_rows(
         struct ggml_tensor * dest,
         struct ggml_tensor * compact,
         struct ggml_tensor * idx);
+
+// Park / stop-snapshot file (one row per page: "layer expert  # heat V|R [P]"
+// under "# device NAME" sections, hottest first). Written tmp + rename.
+struct ParkFileRow {
+    int      layer  = -1;
+    int      expert = -1;
+    uint64_t heat   = 1;
+    bool     vram   = false;   // V: held a VRAM slot; R: RAM tier only
+    bool     pinned = false;   // P tag
+};
+using ParkFileSections = std::vector<std::pair<std::string, std::vector<ParkFileRow>>>;
+// err: 0 ok, 1 cannot open the temp file, 2 write/rename failed.
+bool park_file_write(const std::string & path, const ParkFileSections & sections,
+                     size_t & rows, int & err);
+// False when the file is missing or has no rows.
+bool park_file_parse(const std::string & path,
+                     std::map<std::string, std::vector<ParkFileRow>> & out);
 
 } // namespace wp_expert_worker
