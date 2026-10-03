@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <thread>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -169,6 +170,11 @@ struct server_model_meta {
 
     // asked to stop, still running (filled into the copies like queue_info)
     bool stopping = false;
+
+    // Where the running child listens, as the router reaches it: "" = this machine (127.0.0.1),
+    // else the host of its node (machines.json router_node). `port` is the node's choice there.
+    std::string              host;
+    std::string              child_host() const { return host.empty() ? std::string("127.0.0.1") : host; }
 
     bool is_external() const {
         return kind == ROUTER_KIND_EXTERNAL;
@@ -623,6 +629,13 @@ private:
     // this machine's node: every child of the router is spawned, stopped and watched through it.
     // Declared after the monitor: destroyed (its threads joined) before it.
     std::shared_ptr<router_node_link> local_node;
+    // the other machines' nodes (machines.json `router_node`, --node-token-file): machine -> link.
+    // Empty without a token file. Their sync calls are HTTP: never made with `mutex` held.
+    std::map<std::string, std::shared_ptr<router_node_link>> remote_nodes;
+    // The node a section's `machine=` names: local_node for this machine (empty / "local" / its own
+    // name), else that machine's remote link; nullptr (err set) when there is none.
+    std::shared_ptr<router_node_link> node_for_machine(const std::string & machine, std::string & err) const;
+    bool machine_is_remote(const std::string & machine) const;
 };
 
 struct server_child {

@@ -43,6 +43,7 @@
 static constexpr int64_t ROUTER_NODE_OFFLINE_MS_DEFAULT = 10000; // heartbeat lost
 static constexpr int64_t ROUTER_NODE_PROBE_MS_DEFAULT   = 5000;  // /node/state refresh
 static constexpr int     ROUTER_NODE_RETRY_AFTER_S      = 10;    // Retry-After of a 503 for an offline machine
+static constexpr int64_t ROUTER_NODE_SPAWN_409_RETRY_MS = 2000;  // a spawn refused 409 (name still held) is retried this long
 static constexpr int     ROUTER_NODE_RECONCILE_STOP_S   = 40;    // stop bound for what a reconcile stops (worker quiesce + grace)
 
 //
@@ -139,6 +140,9 @@ void router_slot_split(const std::string & id, std::string & machine, std::strin
 //
 
 struct router_node_watch {
+    // the node accepted the spawn (info: pid, port); before any line or exit of it is delivered. Runs
+    // on the thread that called spawn(), no link lock held.
+    std::function<void(const node_child_info & info)> on_spawn;
     std::function<void(const std::string & line)>     on_line; // one output line, without the newline
     std::function<void(const node_child_info & info)> on_exit; // exactly once; exit_code -1 when unknown
 };
@@ -237,6 +241,7 @@ class router_node_link {
         std::vector<json> pending;     // events that arrived while the spawn was in flight
     };
 
+    node_child_info spawn_once(const node_spawn_request & req, const router_node_watch & w);
     void dispatch_locked_d(const json & ev); // dispatch_mu held
     void fire_exit(const std::shared_ptr<watch_entry> & e, const std::string & name, const node_child_info & info);
     std::shared_ptr<watch_entry> take_watch(const std::string & name, int pid);

@@ -12,6 +12,7 @@
 #include "http.h"
 #include "subproc.h"
 #include "server-router-node-client.h"
+#include "server-router-machines.h"
 #include "server-router-groups.h"
 #include "server-router-ledger.h"
 #include "server-router-policy.h"
@@ -93,13 +94,14 @@ struct server_monitor {
     }
 
     // callbacks for router_node_link::spawn(); they only queue
-    router_node_watch make_watch(const std::string & name, std::shared_ptr<server_child_ref> child, server_child_mode mode, int port) {
+    // `tag` prefixes the child's output lines in the router log (its port; machine/name when remote)
+    router_node_watch make_watch(const std::string & name, std::shared_ptr<server_child_ref> child, server_child_mode mode, std::string tag) {
         router_node_watch w;
-        w.on_line = [this, name, port](const std::string & line) {
-            push({ item_t::LINE, name, port, line, nullptr, SERVER_CHILD_MODE_NORMAL, 0 });
+        w.on_line = [this, name, tag](const std::string & line) {
+            push({ item_t::LINE, name, tag, line, nullptr, SERVER_CHILD_MODE_NORMAL, 0 });
         };
-        w.on_exit = [this, name, child, mode, port](const node_child_info & info) {
-            push({ item_t::EXIT, name, port, "", child, mode, info.exit_code });
+        w.on_exit = [this, name, child, mode, tag](const node_child_info & info) {
+            push({ item_t::EXIT, name, tag, "", child, mode, info.exit_code });
         };
         return w;
     }
@@ -108,7 +110,7 @@ private:
     struct item_t {
         enum { LINE, EXIT } type;
         std::string name;
-        int         port;
+        std::string tag;
         std::string line;
         std::shared_ptr<server_child_ref> child;
         server_child_mode mode;
@@ -138,10 +140,10 @@ private:
             if (it.type == item_t::LINE) {
                 const std::string line = it.line + "\n";
                 if (string_starts_with(line, CMD_CHILD_TO_ROUTER_STATE)) {
-                    LOG_DBG("[%5d] %s", it.port, line.c_str()); // prevent spamming the log
+                    LOG_DBG("[%s] %s", it.tag.c_str(), line.c_str()); // prevent spamming the log
                     models.handle_child_state(it.name, line);
                 } else {
-                    LOG("[%5d] %s", it.port, line.c_str()); // forward log
+                    LOG("[%s] %s", it.tag.c_str(), line.c_str()); // forward log
                 }
             } else {
                 it.child->stopped.store(true, std::memory_order_release);
@@ -473,7 +475,8 @@ static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & ve
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
-    preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
+    // a child on another machine must accept the router's connection from the LAN
+    preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  host.empty() ? CHILD_ADDR : "0.0.0.0");
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
     if (!placement.devs.empty()) {
@@ -637,6 +640,45 @@ server_models::server_models(
     // yielding idle GPUs to them. No --board-url: all of it is off and the router behaves as
     // before (holds, priorities and the busy-resident queue still work).
     local_machine = router_local_machine();
+
+    // The other machines' nodes: one link per machines.json entry with a `router_node` URL, bearer
+    // token from --node-token-file (the file the nodes were started with). Each is offline until its
+    // event stream answers; a spawn then fails cleanly (503) and the machine's models stay unloaded.
+    if (!base_params.node_token_file.empty()) {
+        std::string token_err;
+        const std::string token = server_node_read_token(base_params.node_token_file, token_err);
+        machines_registry reg   = load_machines();
+        if (!token_err.empty()) {
+            SRV_WRN("--node-token-file: %s; no remote machines\n", token_err.c_str());
+        } else if (!reg.ok()) {
+            SRV_WRN("%s; no remote machines\n", reg.error.c_str());
+        } else {
+            for (const auto & m : reg.machines) {
+                if (m.router_node.empty() || m.local || m.name == local_machine || router_machine_is_local(m.name)) {
+                    continue;
+                }
+                try {
+                    router_node_link_config lc;
+                    lc.machine = m.name;
+                    lc.gen     = router_gen;
+                    auto link  = router_node_make_remote(lc, m.router_node, token);
+                    router_node_hooks hooks;
+                    // a child the node runs that this router no longer wants is stopped at reconcile
+                    hooks.wanted = [this](const std::string & child) {
+                        std::lock_guard<std::mutex> lk(mutex);
+                        auto it = mapping.find(child);
+                        return it != mapping.end() && it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED;
+                    };
+                    link->set_hooks(std::move(hooks));
+                    link->start();
+                    remote_nodes[m.name] = link;
+                    SRV_INF("machine '%s': node %s\n", m.name.c_str(), m.router_node.c_str());
+                } catch (const std::exception & e) {
+                    SRV_WRN("machine '%s': bad router_node '%s': %s\n", m.name.c_str(), m.router_node.c_str(), e.what());
+                }
+            }
+        }
+    }
     if (!base_params.router_board_url.empty()) {
         std::string token;
         if (base_params.router_board_token_file.empty()) {
@@ -699,9 +741,30 @@ server_models::~server_models() {
         }
     }
     dying.clear();
+    for (auto & [_, link] : remote_nodes) {
+        link->shutdown(); // only the link: a remote node keeps its children for the next router generation
+    }
     if (local_node) {
         local_node->shutdown(); // whatever still runs is stopped by its node
     }
+}
+
+std::shared_ptr<router_node_link> server_models::node_for_machine(const std::string & machine, std::string & err) const {
+    if (machine.empty() || machine == local_machine || router_machine_is_local(machine)) {
+        return local_node;
+    }
+    auto it = remote_nodes.find(machine);
+    if (it != remote_nodes.end()) {
+        return it->second;
+    }
+    err = "machine '" + machine + "' has no router node (needs --node-token-file and a router_node URL for it in machines.json)";
+    return nullptr;
+}
+
+bool server_models::machine_is_remote(const std::string & machine) const {
+    std::string err;
+    auto node = node_for_machine(machine, err);
+    return node && node->remote();
 }
 
 std::optional<std::filesystem::file_time_type> server_models::get_models_preset_mtime() const {
@@ -1794,6 +1857,12 @@ void server_models::evict_and_wait_locked(const std::string & name, const std::v
 
 void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, const load_options & opts, std::unique_lock<std::mutex> & lk) {
     const server_child_mode mode = opts.mode;
+    if (machine_is_remote(meta.machine)) {
+        // The local GPU slots and RAM are not that machine's: its VRAM ledger and admission are
+        // not wired yet (slots per machine), so a model there loads unplaced.
+        SRV_INF("model '%s' runs on machine '%s': local GPU placement / admission skipped\n", name.c_str(), meta.machine.c_str());
+        return;
+    }
     if (!gpu_placement_enabled) {
         if (mode == SERVER_CHILD_MODE_NORMAL && !meta.placement.devs.empty()) {
             throw std::runtime_error("model '" + name + "' uses router gpu= but no router GPU slot table is configured");
@@ -3368,88 +3437,159 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     // spawning now: no longer a queued load (its board queue slot is left by load())
     queued_loads.erase(name);
 
+    // The node this child runs on: this machine's (in process) or another machine's over HTTP.
+    std::string node_err;
+    std::shared_ptr<router_node_link> node = node_for_machine(meta.machine, node_err);
+    if (!node) {
+        throw std::runtime_error("model '" + name + "': " + node_err);
+    }
+    const bool remote = node->remote();
+    std::string bin = bin_path;
+    if (remote) {
+        bin = node->exe(); // llama-server children run as the node's own binary
+        if (!node->online() || bin.empty()) {
+            throw std::runtime_error("failed to spawn server instance: machine '" + node->machine() + "' is offline");
+        }
+    }
+
     // prepare new instance info
     instance_t inst;
     inst.meta             = meta;
-    inst.meta.port        = common_http_get_free_port();
+    inst.meta.port        = remote ? 0 : common_http_get_free_port(); // remote: the node picks (alloc_port)
+    inst.meta.host        = remote ? node->host() : std::string();
     inst.meta.status      = SERVER_MODEL_STATUS_LOADING;
     inst.meta.loaded_info = json{};
     inst.meta.last_used   = ggml_time_ms();
 
-    if (inst.meta.port <= 0) {
+    if (!remote && inst.meta.port <= 0) {
         throw std::runtime_error("failed to get a port number");
     }
 
     auto child = std::make_shared<server_child_ref>();
-    child->node = local_node;
+    child->node = node;
     child->name = name;
     inst.child  = child;
-    {
-        SRV_INF("spawning server instance with name=%s on port %d\n", inst.meta.name.c_str(), inst.meta.port);
 
-        inst.meta.update_args(ctx_preset, bin_path); // render args
+    SRV_INF("spawning server instance with name=%s on %s\n", inst.meta.name.c_str(),
+            remote ? ("machine " + node->machine() + " (port by its node)").c_str() : ("port " + std::to_string(inst.meta.port)).c_str());
 
-        std::vector<std::string> child_args = inst.meta.args; // copy
-        // child_env: built and temp-dir checked before placement (see above)
+    inst.meta.update_args(ctx_preset, bin); // render args
 
-        if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
-            inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
-            child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
-            child_env.push_back("LLAMA_ARG_HF_REPO=" + name);
-        } else if (opts.mode == SERVER_CHILD_MODE_ESTIMATE) {
-            child_env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
-        }
+    std::vector<std::string> child_args = inst.meta.args; // copy
+    // child_env: built and temp-dir checked before placement (see above)
 
-        SRV_INF("%s", "spawning server instance with args:\n");
-        for (const auto & arg : child_args) {
-            SRV_INF("  %s\n", arg.c_str());
-        }
-        inst.meta.args = child_args; // save for debugging
-
-        // The node (this machine's, in process) starts the child from the router env plus these
-        // overrides: the same final environment as child_env, built above and temp-dir checked.
-        node_spawn_request req;
-        req.name = name;
-        req.gen  = router_gen;
-        req.args = child_args;
-        req.port = inst.meta.port;
-        req.env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
-        req.env.insert(req.env.end(), meta.env_overrides.begin(), meta.env_overrides.end());
-        if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
-            req.env.push_back("LLAMA_SERVER_CHILD_MODE=download");
-            req.env.push_back("LLAMA_ARG_HF_REPO=" + name);
-        } else if (opts.mode == SERVER_CHILD_MODE_ESTIMATE) {
-            req.env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
-        }
-        node_child_info spawned;
-        try {
-            spawned = local_node->spawn(req, monitor->make_watch(name, child, opts.mode, inst.meta.port));
-        } catch (const std::exception & e) {
-            load_attempt_guard.reset(); // also stops a group's workers
-            throw std::runtime_error(std::string("failed to spawn server instance: ") + e.what());
-        }
-        child->pid.store(spawned.pid);
-        load_attempt_guard.release();
-        group_started.reset(); // the spine's exit now drives the workers' stop (on_child_exit)
+    if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
+        inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
     }
 
-    // old process should have exited already, but just in case, we clean it up here
+    SRV_INF("%s", "spawning server instance with args:\n");
+    for (const auto & arg : child_args) {
+        SRV_INF("  %s\n", arg.c_str());
+    }
+    inst.meta.args = child_args; // save for debugging
+
+    // The node starts the child from its own base env plus these overrides (the router's env
+    // for this machine's in-process node): preset env + router vars only; "-KEY" unsets pass through.
+    node_spawn_request req;
+    req.name       = name;
+    req.gen        = router_gen;
+    req.args       = child_args;
+    req.port       = inst.meta.port;
+    req.alloc_port = remote;
+    req.env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+    req.env.insert(req.env.end(), meta.env_overrides.begin(), meta.env_overrides.end());
+    if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
+        req.env.push_back("LLAMA_SERVER_CHILD_MODE=download");
+        req.env.push_back("LLAMA_ARG_HF_REPO=" + name);
+    } else if (opts.mode == SERVER_CHILD_MODE_ESTIMATE) {
+        req.env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
+    }
+
+    // Reserve under the lock, spawn without it, record under it again. A remote spawn is HTTP
+    // and a local one a fork/exec: neither may hold `mutex`. The reserved entry (status
+    // LOADING / DOWNLOADING, our child ref) is what an exit, a state line or a stop that
+    // arrives during the spawn finds; on failure the previous entry is put back.
+    std::optional<instance_t> previous;
+    {
+        auto pit = mapping.find(name);
+        if (pit != mapping.end()) {
+            previous = pit->second;
+        }
+    }
+    const server_model_status reserved_status = inst.meta.status;
+    mapping[name] = inst;
+    auto restore_entry = [&]() {
+        auto it = mapping.find(name);
+        if (it != mapping.end() && it->second.child == child) {
+            if (previous.has_value()) {
+                it->second = *previous;
+            } else {
+                mapping.erase(it);
+            }
+        }
+        cv.notify_all();
+    };
+
+    router_node_watch watch = monitor->make_watch(name, child, opts.mode,
+        remote ? node->machine() + "/" + name : string_format("%5d", inst.meta.port));
+    // the node's answer (pid, the port it chose) is recorded before any of the child's output is
+    // applied, so a ready line never meets a model without its address
+    watch.on_spawn = [this, name, child, node, remote](const node_child_info & info) {
+        std::lock_guard<std::mutex> l(mutex);
+        child->pid.store(info.pid);
+        auto it = mapping.find(name);
+        if (it != mapping.end() && it->second.child == child) {
+            if (remote && info.port > 0) {
+                it->second.meta.port = info.port;
+                it->second.meta.host = node->host();
+            }
+        }
+    };
+
+    lk.unlock();
+    node_child_info spawned;
+    std::string spawn_err;
+    try {
+        spawned = node->spawn(req, std::move(watch));
+    } catch (const std::exception & e) {
+        spawn_err = e.what();
+    }
+    lk.lock();
+
+    if (!spawn_err.empty()) {
+        restore_entry();
+        load_attempt_guard.reset(); // also stops a group's workers
+        throw std::runtime_error("failed to spawn server instance: " + spawn_err);
+    }
     {
         auto it = mapping.find(name);
-        if (it != mapping.end() && it->second.child && it->second.child->alive()) {
-            SRV_WRN("old process for model name=%s is still alive, this is unexpected\n", name.c_str());
-            it->second.child->kill(); // force kill
+        const bool ours = it != mapping.end() && it->second.child == child;
+        std::string bad;
+        if (!ours) {
+            bad = "the model entry changed during the spawn";
+        } else if (remote && spawned.port <= 0) {
+            bad = "node " + node->machine() + " did not report the child's port";
+        }
+        if (!bad.empty()) {
+            // what did start is stopped (its exit finds no matching entry and is dropped)
+            node->stop_async(name, spawned.pid, 10, "term");
+            restore_entry();
+            load_attempt_guard.reset();
+            throw std::runtime_error("failed to spawn server instance: " + bad);
+        }
+        load_attempt_guard.release();
+        group_started.reset(); // the spine's exit now drives the workers' stop (on_child_exit)
+        if (stopping_models.count(name)) {
+            // an unload / eviction arrived while the child was being spawned
+            stop_child_locked(it->second, false);
+        }
+        notify_sse("model_status", name, {
+            {"status", server_model_status_to_string(reserved_status)},
+        });
+        if (opts.mode == SERVER_CHILD_MODE_NORMAL) {
+            notify_state("loading", name, it->second.meta.placement.devs, "spawned");
         }
     }
-
-    notify_sse("model_status", name, {
-        {"status", server_model_status_to_string(inst.meta.status)},
-    });
-    if (opts.mode == SERVER_CHILD_MODE_NORMAL) {
-        notify_state("loading", name, inst.meta.placement.devs, "spawned");
-    }
-
-    mapping[name] = std::move(inst);
     cv.notify_all();
     return true;
 }
@@ -3565,10 +3705,12 @@ std::vector<router_worker_spec> server_models::prepare_group_locked(const std::s
             throw std::runtime_error("model group '" + name + "': worker '" + dep + "' is not a kind=external section");
         }
         const auto & w = it->second.meta;
-        if (!router_machine_is_local(w.machine)) {
-            throw std::runtime_error("model group '" + name + "': worker '" + dep + "' is on machine '" + w.machine +
-                                     "'; only workers on the router's own machine are supported so far");
+        std::string node_err;
+        std::shared_ptr<router_node_link> node = node_for_machine(w.machine, node_err);
+        if (!node) {
+            throw std::runtime_error("model group '" + name + "': worker '" + dep + "': " + node_err);
         }
+        const bool remote = node->remote();
         router_launch launch;
         const std::string err = router_parse_launch(w.launch, launch);
         if (!err.empty()) {
@@ -3578,12 +3720,36 @@ std::vector<router_worker_spec> server_models::prepare_group_locked(const std::s
         router_worker_spec spec;
         spec.name = dep;
         spec.argv = launch.argv;
-        std::vector<std::string> env = base_env; // carries LLAMA_ROUTER_GEN / LLAMA_ROUTER_PID
-        apply_env_overrides(env, w.env_overrides, dep, verbose);
-        spec.env = router_worker_env(std::move(env), launch.env, w.park_file, router_gen);
-        check_temp_dirs(spec.env, dep);
+        if (remote) {
+            // The node's own env is the base; the request carries the preset env + the launch's
+            // and park variables only ("-KEY" unsets pass through); the node stamps GEN/PID/CHILD.
+            std::vector<std::string> env = w.env_overrides;
+            for (const auto & a : launch.env) {
+                env.push_back(a);
+            }
+            if (!w.park_file.empty()) {
+                env.push_back(std::string(WP_ENV_PARK_FILE) + "=" + w.park_file);
+                env.push_back(std::string(WP_ENV_SEED_FROM_PARK) + "=1");
+            }
+            for (const auto & e : env) {
+                const std::string bad = router_env_override_error(e);
+                if (!bad.empty()) {
+                    throw std::runtime_error("model group '" + name + "': worker '" + dep + "': " + bad);
+                }
+            }
+            spec.env  = std::move(env);
+            spec.node = node;
+        } else {
+            std::vector<std::string> env = base_env; // carries LLAMA_ROUTER_GEN / LLAMA_ROUTER_PID
+            apply_env_overrides(env, w.env_overrides, dep, verbose);
+            spec.env = router_worker_env(std::move(env), launch.env, w.park_file, router_gen);
+            check_temp_dirs(spec.env, dep);
+        }
 
         int port = router_launch_endpoint(launch.words, spec.host);
+        if (remote) {
+            spec.host = node->host(); // reached at the node's address; a listen address of the launch does not matter
+        }
         if (w.worker_port > 0) {
             port = w.worker_port;
         }
@@ -4190,7 +4356,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
     auto proxy = std::make_unique<server_http_proxy>(
             method,
             "http",
-            CHILD_ADDR,
+            meta->child_host(),
             meta->port,
             proxy_path,
             req.headers,
@@ -5326,7 +5492,7 @@ void server_models_routes::init_routes() {
         auto proxy = std::make_unique<server_http_proxy>(
                 "GET",
                 "http",
-                CHILD_ADDR,
+                owner->child_host(),
                 owner->port,
                 child_path,
                 req.headers,
@@ -5360,19 +5526,19 @@ void server_models_routes::init_routes() {
         }
 
         // group requested ids by the child port that owns them, drop ids that map to nothing
-        std::unordered_map<int, json> per_child;
+        std::map<std::pair<std::string, int>, json> per_child;
         for (const auto & cid : requested) {
             auto owner = resolve_child_for_conv(models, cid);
             if (!owner.has_value()) {
                 continue;
             }
-            per_child[owner->port].push_back(cid);
+            per_child[{ owner->child_host(), owner->port }].push_back(cid);
         }
 
         json aggregated = json::array();
-        for (auto & [port, ids] : per_child) {
+        for (auto & [addr, ids] : per_child) {
             json child_body = {{"conversation_ids", ids}};
-            httplib::Client cli(CHILD_ADDR, port);
+            httplib::Client cli(addr.first, addr.second);
             cli.set_connection_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_read_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
@@ -5410,7 +5576,7 @@ void server_models_routes::init_routes() {
         std::string child_path = "/v1/stream?conv_id=" + encode_qs(conv_id);
         auto owner = resolve_child_for_conv(models, conv_id);
         if (owner.has_value()) {
-            httplib::Client cli(CHILD_ADDR, owner->port);
+            httplib::Client cli(owner->child_host(), owner->port);
             cli.set_connection_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_read_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);

@@ -65,6 +65,7 @@ struct server_node_config {
     int64_t                  shutdown_grace_ms  = NODE_SHUTDOWN_GRACE_MS_DEFAULT;
     int64_t                  abandon_grace_ms   = 10000; // after the shutdown SIGKILL: stop waiting, log, exit anyway
     size_t                   event_backlog      = 4096; // events kept for late / resuming subscribers
+    bool                     log_lines          = true; // echo every child output line to the log (the --router-node daemon); an in-process node's owner logs them itself
     std::string              exe;               // this binary (state / heartbeat `exe`): the leader runs llama-server children as it
 };
 

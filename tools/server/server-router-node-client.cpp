@@ -444,6 +444,23 @@ void router_node_link::refresh_probe() {
 }
 
 node_child_info router_node_link::spawn(const node_spawn_request & req, router_node_watch w) {
+    // A child that just exited (a reload, a download that hands over to the model) still holds its
+    // name until its exit event has been delivered: retry a 409 briefly before giving up.
+    const int64_t deadline = steady_ms() + ROUTER_NODE_SPAWN_409_RETRY_MS;
+    while (true) {
+        try {
+            return spawn_once(req, w);
+        } catch (const server_node_error & err) {
+            if (err.status != 409 || steady_ms() >= deadline) {
+                throw;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+node_child_info router_node_link::spawn_once(const node_spawn_request & req, const router_node_watch & w_in) {
+    router_node_watch w = w_in;
     auto e = std::make_shared<watch_entry>();
     {
         std::lock_guard<std::mutex> lk(mu);
@@ -473,6 +490,9 @@ node_child_info router_node_link::spawn(const node_spawn_request & req, router_n
     } catch (const std::exception & err) {
         drop();
         throw server_node_error(500, err.what());
+    }
+    if (w.on_spawn) {
+        w.on_spawn(info);
     }
     // events that came in while the spawn was in flight, in order, before any later one
     std::lock_guard<std::mutex> d(dispatch_mu);
@@ -550,9 +570,7 @@ void router_node_link::dispatch_locked_d(const json & ev) {
         }
     }
     if (type == "line") {
-        if (remote()) {
-            LOG("[%s/%s] %s\n", cfg.machine.c_str(), name.c_str(), jstr(ev, "line").c_str());
-        }
+        // not logged here: the watcher (the router's monitor / group thread) logs each line once
         if (e && e->w.on_line) {
             e->w.on_line(jstr(ev, "line"));
         }
@@ -1247,6 +1265,7 @@ class router_node_remote_impl : public router_node_link {
 } // namespace
 
 std::shared_ptr<router_node_link> router_node_make_local(router_node_link_config cfg, server_node_config node_cfg) {
+    node_cfg.log_lines = false; // the link's watcher logs the lines (once)
     return std::make_shared<router_node_local_impl>(std::move(cfg), std::move(node_cfg));
 }
 

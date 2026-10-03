@@ -4319,8 +4319,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ROUTER_NODE"));
     add_opt(common_arg(
         {"--node-token-file"}, "PATH",
-        "for router node, file holding the bearer token required on every /node/* route\n"
-        "(missing, unreadable or empty: the node refuses to start)",
+        "file holding the bearer token required on every /node/* route (missing, unreadable or empty:\n"
+        "a router node refuses to start). For the leader router: the same token, sent to the nodes of\n"
+        "the machines in machines.json that have a router_node URL",
         [](common_params & params, const std::string & value) {
             params.node_token_file = value;
         }

@@ -784,7 +784,9 @@ static std::string strip_eol(std::string s) {
 
 void server_node::handle_line_locked(child & c, const std::string & raw) {
     const std::string line = strip_eol(raw);
-    LOG("[%s] %s\n", c.name.c_str(), line.c_str());
+    if (cfg.log_lines) {
+        LOG("[%s] %s\n", c.name.c_str(), line.c_str());
+    }
     json ev = json::object();
     ev["type"] = "line";
     ev["name"] = c.name;
