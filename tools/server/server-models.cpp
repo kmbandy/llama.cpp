@@ -1308,18 +1308,6 @@ bool server_models::same_group_locked(const std::string & a, const std::string &
            ia->second.meta.group == ib->second.meta.group;
 }
 
-// A worker is never a victim on its own: evicting it means evicting its group, so it is
-// represented by its spine -- the spine's name, LRU stamp, pin and in-flight requests.
-evict_resident server_models::group_resident_locked(const std::string & name) const {
-    const std::string who = group_spine_locked(name);
-    auto it = mapping.find(who);
-    if (it == mapping.end()) {
-        it = mapping.find(name);
-    }
-    const auto & inst = it->second;
-    return { it->first, inst.meta.last_used, inst.meta.placement.pinned, inst.req_count };
-}
-
 // One fdinfo scan + one router-PID set per top-level operation (a listing or a placement
 // admission), shared by every slot it inspects. The scan walks all of /proc, so doing it
 // per slot under the router mutex is wasteful. Skipped when no slot has a PCI address.
@@ -1357,61 +1345,37 @@ int64_t server_models::free_ram_bytes_locked(const std::string & exclude) const 
     return std::max<int64_t>(0, free);
 }
 
-std::vector<std::string> server_models::choose_ram_evictions_locked(const std::string & name, int64_t need_ram) {
-    std::vector<std::string> victims;
-    int64_t free = free_ram_bytes_locked(name);
-    if (need_ram <= 0 || ledger_ram_fits(free, need_ram)) {
-        return victims;
+int64_t server_models::resident_ram_bytes_locked(const std::string & name) const {
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        return 0;
     }
-    std::vector<std::pair<int64_t, std::string>> residents;
-    for (const auto & [other, inst] : mapping) {
-        // a worker leaves with its spine, which is the resident that stands for the group
-        if (other == name || inst.meta.is_external() || same_group_locked(other, name) ||
-                !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING ||
-                inst.meta.placement.pinned || inst.req_count > 0 || stopping_models.count(other)) {
-            continue;
-        }
-        residents.push_back({ inst.meta.last_used, other });
-    }
-    std::sort(residents.begin(), residents.end());
-    for (const auto & resident : residents) {
-        if (ledger_ram_fits(free, need_ram)) {
-            break;
-        }
-        const auto & inst = mapping.at(resident.second);
-        int64_t released = 0;
-        const auto mem = inst.subproc ? probe_proc_mem("", inst.subproc->sproc.pid()) : std::nullopt;
-        if (mem.has_value()) {
-            released = mem->rss_anon + mem->rss_shmem;
-        } else if (inst.meta.placement.ram_mb_override > 0) {
-            released = inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
-        }
-        // a group spine releases its workers' host memory too
-        auto g = groups.find(resident.second);
+    const auto & inst = it->second;
+    int pid = 0;
+    if (inst.meta.is_external()) {
+        // a worker's process belongs to its group runtime; pending / exited workers hold nothing
+        auto g = groups.find(inst.meta.group);
         if (g != groups.end() && g->second.workers) {
             for (const auto & w : g->second.workers->status()) {
-                if (w.state == "exited" || w.state == "pending") {
-                    continue;
-                }
-                const auto wmem = w.pid > 0 ? probe_proc_mem("", w.pid) : std::nullopt;
-                auto wit = mapping.find(w.name);
-                if (wmem.has_value()) {
-                    released += wmem->rss_anon + wmem->rss_shmem;
-                } else if (wit != mapping.end() && wit->second.meta.placement.ram_mb_override > 0) {
-                    released += wit->second.meta.placement.ram_mb_override * 1024LL * 1024LL;
+                if (w.name == name) {
+                    if (w.state == "exited" || w.state == "pending") {
+                        return 0;
+                    }
+                    pid = w.pid;
                 }
             }
         }
-        victims.push_back(resident.second);
-        free += released;
+    } else if (inst.subproc) {
+        pid = inst.subproc->sproc.pid();
     }
-    if (!ledger_ram_fits(free, need_ram)) {
-        throw std::runtime_error("not enough host RAM for model '" + name + "': needs " +
-                                 std::to_string(need_ram / (1024 * 1024)) + " MB, free " +
-                                 std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name)) / (1024 * 1024)) +
-                                 " MB after headroom, and no idle model can be evicted to make room");
+    const auto mem = pid > 0 ? probe_proc_mem("", pid) : std::nullopt;
+    if (mem.has_value()) {
+        return mem->rss_anon + mem->rss_shmem;
     }
-    return victims;
+    if (inst.meta.placement.ram_mb_override > 0) {
+        return inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
+    }
+    return 0;
 }
 
 int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap, int64_t sysfs_used) const {
@@ -1647,49 +1611,130 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
     return result;
 }
 
-std::vector<std::string> server_models::choose_gpu_evictions_locked(const std::string & name, const server_model_placement & placement) {
-    std::vector<std::string> evict;
-    if (!placement.exclusive) {
-        return evict;
-    }
-    std::set<std::string> dev_set(placement.devs.begin(), placement.devs.end());
-    std::vector<evict_resident> overlapping;
-    for (const auto & [other_name, inst] : mapping) {
-        if (other_name == name || same_group_locked(other_name, name) || !inst.meta.is_running()) {
-            continue;
+admission_result server_models::decide_admission_locked(const std::string & name, const server_model_meta & meta,
+                                                        std::vector<admission_candidate> candidates, bool exclusive) {
+    bool need_ram = false;
+    std::set<std::string> cand_slots;
+    for (const auto & c : candidates) {
+        for (const auto & r : c.ram) {
+            need_ram = need_ram || r.bytes > 0;
         }
-        bool overlaps = false;
-        for (const auto & dev : inst.meta.placement.devs) {
-            overlaps = overlaps || dev_set.count(dev) > 0;
-        }
-        if (!overlaps) {
-            continue;
-        }
-        // a worker on this GPU is evicted by evicting its group (its spine)
-        const evict_resident r = group_resident_locked(other_name);
-        const bool seen = std::any_of(overlapping.begin(), overlapping.end(),
-                                      [&](const evict_resident & o) { return o.name == r.name; });
-        if (!seen) {
-            overlapping.push_back(r);
+        for (const auto & v : c.vram) {
+            cand_slots.insert(v.slot);
         }
     }
-    // Exclusive placement needs every overlapping resident gone, so one that cannot be
-    // evicted refuses the load. A pinned resident is a hard hold: it makes its GPU
-    // unavailable to every other model until a human unpins it (protects an in-flight
-    // kernel/weight-paging experiment). A busy one has requests in flight that killing
-    // it would drop; the caller can retry once it is idle.
-    if (const auto blocker = evict_find_blocker(overlapping)) {
-        if (blocker->pinned) {
+
+    // slot ids are the bare device names while the router is local-only (ledger_slot_id("", dev))
+    admission_input in;
+    in.alias        = name;
+    in.group        = meta.group;
+    in.priority     = ADMISSION_PRIORITY_MIDDLE; // per-request priority arrives with the board client
+    in.exclusive    = exclusive;
+    in.margin_bytes = ROUTER_GPU_MARGIN_BYTES;
+    in.candidates   = std::move(candidates);
+
+    // An exclusive load's VRAM is not gated, so it skips the /proc scan; otherwise one scan
+    // for this whole admission, shared by every candidate slot.
+    const bool gate_vram = !exclusive && !cand_slots.empty();
+    const vram_snapshot snap = gate_vram ? take_vram_snapshot_locked() : vram_snapshot{};
+    for (const auto & slot : gpu_slots) {
+        const bool read = gate_vram && cand_slots.count(slot.dev_name) > 0;
+        in.slots.push_back({ slot.dev_name, "", "gpu:" + slot.dev_name, read ? effective_free_bytes_locked(slot, snap) : 0 });
+    }
+    in.machines.push_back({ "", "ram", need_ram ? free_ram_bytes_locked(name) : -1 });
+
+    for (const auto & [other, inst] : mapping) {
+        if (other == name || same_group_locked(other, name) || !inst.meta.is_running()) {
+            continue;
+        }
+        const auto & p = inst.meta.placement;
+        bool on_candidate = false;
+        for (const auto & dev : p.devs) {
+            on_candidate = on_candidate || cand_slots.count(dev) > 0;
+        }
+        // a sleeping model is only cleared off the cards of an exclusive load
+        if (inst.meta.status == SERVER_MODEL_STATUS_SLEEPING && !(exclusive && on_candidate)) {
+            continue;
+        }
+        admission_resident r;
+        r.name  = other;
+        r.group = inst.meta.group; // spine: own name; worker: its spine -> evicted as one group
+        for (size_t i = 0; i < p.devs.size(); ++i) {
+            const int64_t bytes = i < p.need_bytes_per_dev.size() ? p.need_bytes_per_dev[i]
+                                : p.need_bytes_per_dev.empty() ? 0 : p.need_bytes_per_dev.front();
+            r.vram.push_back({ p.devs[i], bytes });
+            const int idx = find_slot_index(gpu_slots, p.devs[i]);
+            r.exclusive = r.exclusive || (idx >= 0 && gpu_slots[idx].exclusive_holder == other);
+        }
+        // host RAM is only probed when this load needs some
+        r.ram       = { { "", need_ram ? resident_ram_bytes_locked(other) : 0 } };
+        r.last_used = inst.meta.last_used;
+        r.busy      = inst.req_count > 0;
+        r.pinned    = p.pinned;
+        in.residents.push_back(std::move(r));
+    }
+    // holds and board claims arrive with the board client: none yet
+
+    admission_result res = decide_admission(in);
+    if (res.verdict != ADMISSION_QUEUE) {
+        return res;
+    }
+
+    // Queueing arrives with the board client; until then a `queue` verdict refuses the load.
+    SRV_INF("router admission for %s: queue (blocked=%s by='%s' on='%s')\n", name.c_str(),
+            admission_block_str(res.blocked), res.blocked_by.c_str(), res.blocked_on.c_str());
+    if (res.blocked_on_ram) {
+        int64_t need = 0;
+        for (const auto & r : in.candidates[res.candidate].ram) {
+            need += std::max<int64_t>(0, r.bytes);
+        }
+        throw std::runtime_error("not enough host RAM for model '" + name + "': needs " +
+                                 std::to_string(need / (1024 * 1024)) + " MB, free " +
+                                 std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name)) / (1024 * 1024)) +
+                                 " MB after headroom, and no idle model can be evicted to make room");
+    }
+    switch (res.blocked) {
+        case ADMISSION_BLOCK_PINNED:
             throw std::runtime_error("model '" + name + "' cannot load: GPU is held by pinned model '"
-                                     + blocker->name + "' (unpin it first)");
+                                     + res.blocked_by + "' (unpin it first)");
+        case ADMISSION_BLOCK_BUSY:
+            throw std::runtime_error("model '" + name + "' cannot load: GPU is in use by busy model '"
+                                     + res.blocked_by + "' (in-flight requests; try again when idle)");
+        case ADMISSION_BLOCK_HELD:
+            throw std::runtime_error("model '" + name + "' cannot load: GPU is held by model '"
+                                     + res.blocked_by + "' (hold lease)");
+        case ADMISSION_BLOCK_CLAIM:
+            throw std::runtime_error("model '" + name + "' cannot load: " + res.blocked_on
+                                     + " is claimed on the board by '" + res.blocked_by + "'");
+        default:
+            throw std::runtime_error("no configured GPU slot has enough capacity for model '" + name + "'");
+    }
+}
+
+void server_models::evict_and_wait_locked(const std::string & name, const std::vector<std::string> & victims, std::unique_lock<std::mutex> & lk) {
+    for (const auto & victim : victims) {
+        SRV_INF("router placement: evicting %s to make room for %s\n", victim.c_str(), name.c_str());
+        auto it = mapping.find(victim);
+        const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
+        if (loading) {
+            it->second.subproc->terminate();
         }
-        throw std::runtime_error("model '" + name + "' cannot load: GPU is in use by busy model '"
-                                 + blocker->name + "' (in-flight requests; try again when idle)");
+        // marks the victim stopping and hands the stop to the monitor (upstream #28555); a group
+        // victim is named after its spine, which stops the whole group
+        request_stop(victim, !loading);
     }
-    for (const auto & r : overlapping) {
-        evict.push_back(r.name);
+    if (victims.empty()) {
+        return;
     }
-    return evict;
+    cv.wait(lk, [&]() {
+        for (const auto & victim : victims) {
+            auto it = mapping.find(victim);
+            if (it != mapping.end() && it->second.meta.is_running()) {
+                return false;
+            }
+        }
+        return true;
+    });
 }
 
 void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, server_child_mode mode, std::unique_lock<std::mutex> & lk) {
@@ -1703,29 +1748,19 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         return;
     }
 
+    // Host RAM must fit too: a shortfall evicts idle residents (LRU) just like VRAM does.
+    std::vector<admission_machine_bytes> ram_need;
+    if (meta.placement.ram_mb_override > 0) {
+        ram_need = { { "", meta.placement.ram_mb_override * 1024LL * 1024LL } };
+    }
+
     if (meta.is_external() && meta.placement.devs.empty()) {
         // a worker without gpu= holds no GPU slot; only its host RAM is gated
-        if (meta.placement.ram_mb_override > 0) {
-            const std::vector<std::string> evict =
-                choose_ram_evictions_locked(name, meta.placement.ram_mb_override * 1024LL * 1024LL);
-            for (const auto & victim : evict) {
-                SRV_INF("router placement evicting name=%s for worker %s (host RAM)\n", victim.c_str(), name.c_str());
-                auto it = mapping.find(victim);
-                const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
-                if (loading) {
-                    it->second.subproc->terminate();
-                }
-                request_stop(victim, !loading);
-            }
-            cv.wait(lk, [&]() {
-                for (const auto & victim : evict) {
-                    auto it = mapping.find(victim);
-                    if (it != mapping.end() && it->second.meta.is_running()) {
-                        return false;
-                    }
-                }
-                return true;
-            });
+        if (!ram_need.empty()) {
+            admission_candidate c;
+            c.ram = ram_need;
+            const admission_result res = decide_admission_locked(name, meta, { c }, false);
+            evict_and_wait_locked(name, res.victims, lk);
         }
         return;
     }
@@ -1763,20 +1798,6 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         lk.lock();
     }
 
-    // Host RAM must fit too. A shortfall evicts idle residents (LRU) just like VRAM does;
-    // refusing here, before anything is reserved, leaves the ledger untouched.
-    std::vector<std::string> ram_evict;
-    if (meta.placement.ram_mb_override > 0) {
-        ram_evict = choose_ram_evictions_locked(name, meta.placement.ram_mb_override * 1024LL * 1024LL);
-    }
-    auto merge_ram_evictions = [&ram_evict](std::vector<std::string> & evict) {
-        for (const auto & victim : ram_evict) {
-            if (std::find(evict.begin(), evict.end(), victim) == evict.end()) {
-                evict.push_back(victim);
-            }
-        }
-    };
-
     if (meta.placement.exclusive) {
         // Split weights only mean something across a MULTI-GPU span. Single-GPU models are
         // exclusive by default now, so gate ONLY this on the span -- everything below
@@ -1813,169 +1834,36 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
             meta.placement.need_bytes_per_dev.assign(needs.begin(), needs.begin() + std::min(needs.size(), meta.placement.devs.size()));
         }
 
-        std::vector<std::string> evict = choose_gpu_evictions_locked(name, meta.placement);
-        merge_ram_evictions(evict);
+        // one candidate: every span card. Every other resident there goes (one model per GPU).
+        admission_candidate c;
+        for (size_t i = 0; i < meta.placement.devs.size(); ++i) {
+            const int64_t bytes = i < meta.placement.need_bytes_per_dev.size() ? meta.placement.need_bytes_per_dev[i] : 0;
+            c.vram.push_back({ meta.placement.devs[i], bytes });
+        }
+        c.ram = ram_need;
+        const admission_result res = decide_admission_locked(name, meta, { c }, true);
         reserve_gpu_placement_locked(name, meta.placement);
-        for (const auto & victim : evict) {
-            SRV_INF("router placement: evicting %s to make room for %s (exclusive: one model per GPU)\n", victim.c_str(), name.c_str());
-            auto it = mapping.find(victim);
-            const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
-            if (loading) {
-                it->second.subproc->terminate();
-            }
-            // marks the victim stopping and hands the stop to the monitor (upstream #28555)
-            request_stop(victim, !loading);
-        }
-        if (!evict.empty()) {
-            cv.wait(lk, [&]() {
-                for (const auto & victim : evict) {
-                    auto it = mapping.find(victim);
-                    if (it != mapping.end() && it->second.meta.is_running()) {
-                        return false;
-                    }
-                }
-                return true;
-            });
-        }
+        evict_and_wait_locked(name, res.victims, lk);
         return;
     }
 
+    // one candidate per listed slot; admission picks the one needing the fewest/cheapest
+    // victims, then the most free VRAM
     const int64_t need = needs.empty() ? 0 : needs[0];
-    // One /proc scan for this whole admission, shared by every slot check below.
-    const vram_snapshot snap = take_vram_snapshot_locked();
-    int best_idx = -1;
-    int64_t best_free = -1;
+    std::vector<admission_candidate> candidates;
     for (const auto & dev : meta.placement.devs) {
-        const int idx = find_slot_index(gpu_slots, dev);
-        const auto & slot = gpu_slots[idx];
-        if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name && !same_group_locked(slot.exclusive_holder, name)) {
-            continue;
-        }
-        const int64_t free = effective_free_bytes_locked(slot, snap);
-        if (free >= need + ROUTER_GPU_MARGIN_BYTES && free > best_free) {
-            best_free = free;
-            best_idx = idx;
-        }
+        admission_candidate c;
+        c.vram = { { dev, need } };
+        c.ram  = ram_need;
+        candidates.push_back(std::move(c));
     }
+    const admission_result res = decide_admission_locked(name, meta, std::move(candidates), false);
+    GGML_ASSERT(res.slots.size() == 1);
 
-    std::vector<std::string> evict;
-    if (best_idx < 0) {
-        struct candidate_t {
-            int idx = -1;
-            std::vector<std::string> victims;
-            int64_t newest_last_used = 0;
-        };
-        std::optional<candidate_t> best;
-        for (const auto & dev : meta.placement.devs) {
-            const int idx = find_slot_index(gpu_slots, dev);
-            const auto & slot = gpu_slots[idx];
-            if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name && !same_group_locked(slot.exclusive_holder, name)) {
-                auto holder = mapping.find(group_spine_locked(slot.exclusive_holder));
-                if (holder != mapping.end() && holder->second.meta.placement.pinned) {
-                    continue;
-                }
-            }
-            std::vector<evict_resident> all_residents;
-            for (const auto & [other_name, inst] : mapping) {
-                if (other_name == name || same_group_locked(other_name, name) || !inst.meta.is_running() ||
-                        inst.meta.status == SERVER_MODEL_STATUS_SLEEPING) {
-                    continue;
-                }
-                if (std::find(inst.meta.placement.devs.begin(), inst.meta.placement.devs.end(), slot.dev_name) != inst.meta.placement.devs.end()) {
-                    // a worker here is evicted by evicting its group (its spine)
-                    const evict_resident r = group_resident_locked(other_name);
-                    const bool seen = std::any_of(all_residents.begin(), all_residents.end(),
-                                                  [&](const evict_resident & o) { return o.name == r.name; });
-                    if (!seen) {
-                        all_residents.push_back(r);
-                    }
-                }
-            }
-            // LRU order; pinned and busy (req_count > 0) residents are never victims
-            const std::vector<evict_resident> residents = evict_pick_lru(all_residents);
-            int64_t free = effective_free_bytes_locked(slot, snap);
-            candidate_t cand;
-            cand.idx = idx;
-            for (const auto & resident : residents) {
-                if (free >= need + ROUTER_GPU_MARGIN_BYTES) {
-                    break;
-                }
-                cand.victims.push_back(resident.name);
-                cand.newest_last_used = resident.last_used;
-                auto it = mapping.find(resident.name);
-                if (it != mapping.end() && !it->second.meta.depends.empty()) {
-                    // a group: what its members hold on this slot
-                    std::vector<std::string> members = it->second.meta.depends;
-                    members.push_back(resident.name);
-                    for (const auto & member : members) {
-                        auto mit = mapping.find(member);
-                        if (mit == mapping.end()) {
-                            continue;
-                        }
-                        const auto & mp = mit->second.meta.placement;
-                        for (size_t d = 0; d < mp.devs.size() && d < mp.need_bytes_per_dev.size(); ++d) {
-                            if (mp.devs[d] == slot.dev_name) {
-                                free += mp.need_bytes_per_dev[d];
-                            }
-                        }
-                    }
-                } else if (it != mapping.end() && !it->second.meta.placement.need_bytes_per_dev.empty()) {
-                    const auto & victim_placement = it->second.meta.placement;
-                    auto dev_it = std::find(victim_placement.devs.begin(), victim_placement.devs.end(), slot.dev_name);
-                    if (dev_it != victim_placement.devs.end()) {
-                        size_t dev_idx = std::distance(victim_placement.devs.begin(), dev_it);
-                        if (dev_idx < victim_placement.need_bytes_per_dev.size()) {
-                            free += victim_placement.need_bytes_per_dev[dev_idx];
-                        } else {
-                            free += victim_placement.need_bytes_per_dev.front();
-                        }
-                    } else {
-                        free += victim_placement.need_bytes_per_dev.front();
-                    }
-                }
-            }
-            if (free < need + ROUTER_GPU_MARGIN_BYTES) {
-                continue;
-            }
-            if (!best.has_value() ||
-                    cand.victims.size() < best->victims.size() ||
-                    (cand.victims.size() == best->victims.size() && cand.newest_last_used < best->newest_last_used)) {
-                best = cand;
-            }
-        }
-        if (!best.has_value()) {
-            throw std::runtime_error("no configured GPU slot has enough capacity for model '" + name + "'");
-        }
-        best_idx = best->idx;
-        evict = best->victims;
-    }
-    merge_ram_evictions(evict);
-
-    meta.placement.devs = { gpu_slots[best_idx].dev_name };
+    meta.placement.devs = res.slots;
     meta.placement.need_bytes_per_dev = { need };
     reserve_gpu_placement_locked(name, meta.placement);
-
-    for (const auto & victim : evict) {
-        SRV_INF("router placement evicting name=%s for model %s\n", victim.c_str(), name.c_str());
-        auto it = mapping.find(victim);
-        const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
-        if (loading) {
-            it->second.subproc->terminate();
-        }
-        // marks the victim stopping and hands the stop to the monitor (upstream #28555)
-        request_stop(victim, !loading);
-    }
-    if (!evict.empty()) {
-        cv.wait(lk, [&]() {
-            for (const auto & victim : evict) {
-                auto it = mapping.find(victim);
-                if (it != mapping.end() && it->second.meta.is_running()) {
-                    return false;
-                }
-            }
-            return true;
-        });
-    }
+    evict_and_wait_locked(name, res.victims, lk);
 }
 
 void server_models::notify_sse(const std::string & event, const std::string & model_id, const json & data) {

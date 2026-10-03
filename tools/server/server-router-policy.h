@@ -14,20 +14,23 @@ struct evict_resident {
     int64_t     last_used = 0;
     bool        pinned    = false;
     int         req_count = 0; // in-flight requests; > 0 means busy
+    bool        held      = false; // under a hold lease: never a victim, like pinned
 };
 
-// Residents that may be evicted, least recently used first (ties by name). Pinned and busy
-// residents are never returned: killing a child with in-flight requests drops them.
-std::vector<evict_resident> evict_pick_lru(const std::vector<evict_resident> & residents);
+// Residents that may be evicted, least recently used first (ties by name). Pinned and held
+// residents are never returned. Busy ones (in-flight requests, which killing the child drops)
+// are returned only with allow_busy (a `highest` admission), and then after every idle one.
+std::vector<evict_resident> evict_pick_lru(const std::vector<evict_resident> & residents, bool allow_busy = false);
 
 struct evict_blocker {
     std::string name;
-    bool        pinned = false; // true: pinned; false: busy
+    bool        pinned = false; // true: pinned
+    bool        held   = false; // true: held (and not pinned); both false: busy
 };
 
 // For exclusive placement, where EVERY overlapping resident has to go: the first resident
-// that cannot be evicted (pinned or busy), if any. The load must then be refused.
-std::optional<evict_blocker> evict_find_blocker(const std::vector<evict_resident> & residents);
+// that cannot be evicted (pinned, held, or busy unless allow_busy), if any.
+std::optional<evict_blocker> evict_find_blocker(const std::vector<evict_resident> & residents, bool allow_busy = false);
 
 // Checks TEMP / TMP / TMPDIR of a final child environment ("KEY=VALUE" entries; the last
 // definition of a key wins). Returns the offending entry ("TMPDIR=/etc/passwd") when a

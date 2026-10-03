@@ -6,6 +6,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-queue.h"
+#include "server-router-admission.h"
 #include "server-router-groups.h"
 #include "server-router-group-lifecycle.h"
 #include "server-router-policy.h"
@@ -343,7 +344,12 @@ private:
     void reconcile_gpu_reservation_locked(const std::string & name);
     void ensure_gpu_placement(const std::string & name, server_model_meta & meta, server_child_mode mode, std::unique_lock<std::mutex> & lk);
     void reserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
-    std::vector<std::string> choose_gpu_evictions_locked(const std::string & name, const server_model_placement & placement);
+    // gathers the inputs for decide_admission() (server-router-admission.h) and runs it; a
+    // `queue` verdict throws (request queueing is not wired yet), naming what is in the way
+    admission_result decide_admission_locked(const std::string & name, const server_model_meta & meta,
+                                             std::vector<admission_candidate> candidates, bool exclusive);
+    // stops the admission's victims and waits (unlocked) until none of them is running
+    void evict_and_wait_locked(const std::string & name, const std::vector<std::string> & victims, std::unique_lock<std::mutex> & lk);
     int64_t read_physical_free_bytes(const server_gpu_slot & slot) const;
     int64_t physical_free_from_used(const server_gpu_slot & slot, int64_t used) const; // used < 0 = probe failed
     std::set<int> router_child_pids_locked() const;
@@ -351,8 +357,6 @@ private:
     // model groups (caller holds mutex unless noted)
     std::string group_spine_locked(const std::string & name) const; // worker -> its spine; else name
     bool same_group_locked(const std::string & a, const std::string & b) const;
-    // an eviction candidate as the policy sees it: a worker stands for its whole group
-    evict_resident group_resident_locked(const std::string & name) const;
     std::vector<router_worker_spec> prepare_group_locked(const std::string & name, const server_model_meta & spine_meta, bool verbose = true);
     json group_status_json_locked(const std::string & spine) const;
     void set_worker_status_locked(const std::string & worker, server_model_status status, int exit_code = 0);
@@ -368,7 +372,7 @@ private:
     vram_snapshot take_vram_snapshot_locked() const;
     int64_t foreign_vram_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
     int64_t free_ram_bytes_locked(const std::string & exclude) const; // MemAvailable - headroom - RAM of other still-loading models; -1 = unknown
-    std::vector<std::string> choose_ram_evictions_locked(const std::string & name, int64_t need_ram);
+    int64_t resident_ram_bytes_locked(const std::string & name) const; // rss (anon+shmem), else ram-mb, else 0
     int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
     int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap, int64_t sysfs_used) const;
     std::vector<int64_t> estimate_need_bytes(const server_model_meta & meta);

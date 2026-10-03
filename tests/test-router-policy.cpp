@@ -52,6 +52,26 @@ int main() {
         assert(pinned.has_value() && pinned->name == "p" && pinned->pinned);
     }
 
+    // held is never a victim; allow_busy (a `highest` admission) returns busy after idle
+    {
+        const std::vector<evict_resident> residents = {
+            { "busy-old", 1, false, 2, false },
+            { "held",     2, false, 0, true  },
+            { "idle-new", 8, false, 0, false },
+            { "idle-old", 4, false, 0, false },
+        };
+        const auto idle_only = evict_pick_lru(residents);
+        assert(idle_only.size() == 2 && idle_only[0].name == "idle-old" && idle_only[1].name == "idle-new");
+        const auto with_busy = evict_pick_lru(residents, /*allow_busy=*/true);
+        assert(with_busy.size() == 3);
+        assert(with_busy[0].name == "idle-old" && with_busy[1].name == "idle-new" && with_busy[2].name == "busy-old");
+        assert(!has(with_busy, "held"));
+
+        const auto held = evict_find_blocker({ { "h", 1, false, 0, true } }, true);
+        assert(held.has_value() && held->name == "h" && held->held && !held->pinned);
+        assert(!evict_find_blocker({ { "busy", 2, false, 3, false } }, true).has_value());
+    }
+
     // temp-dir env scrub
     {
         namespace fs = std::filesystem;
