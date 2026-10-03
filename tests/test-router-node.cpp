@@ -460,8 +460,11 @@ static void test_orphan_sweep_and_adopt() {
         CHECK(pid_alive(plain_pid));
 
         // the adopted one is driven like a child: state shows it, stop signals it
+        // keep the state alive: a range-for over node.state().at(...) would iterate a dangling
+        // reference into a destroyed temporary
+        const json adopted_state = node.state();
         bool listed = false;
-        for (const auto & c : node.state().at("children")) {
+        for (const auto & c : adopted_state.at("children")) {
             listed = listed || (c.at("name").get<std::string>() == "w-keep" && c.at("pid").get<int>() == keep_pid &&
                                 c.at("adopted").get<bool>());
         }
