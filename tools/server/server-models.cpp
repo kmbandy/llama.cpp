@@ -515,6 +515,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
     preset.unset_option("LLAMA_ARG_MODELS_IDLE_TIMEOUT");
+    preset.unset_option("LLAMA_ARG_MODELS_QUEUE_MAX_WAIT_S");
     preset.unset_option("LLAMA_ARG_GPUS");
     preset.unset_option("LLAMA_ARG_BOARD_URL");
     preset.unset_option("LLAMA_ARG_BOARD_TOKEN_FILE");
@@ -1753,7 +1754,7 @@ admission_result server_models::decide_admission_locked(const std::string & name
     }
     if (board) {
         // the cached board state (no HTTP here); an unavailable board gives no claims
-        in.claims = board->admission_claims(machine_resources_locked());
+        in.claims = board->admission_claims(machine_resources_locked(), in.priority);
     }
 
     admission_result res = decide_admission(in);
@@ -2126,7 +2127,8 @@ std::vector<router_board_resident> server_models::board_residents() {
     std::lock_guard<std::mutex> lk(mutex);
     std::vector<router_board_resident> out;
     for (const auto & [name, inst] : mapping) {
-        const bool loading = loading_owners.count(name) > 0;
+        // a queued load (and its group's workers) keeps its claims too, e.g. a confirmed queue turn
+        const bool loading = loading_owners.count(name) > 0 || queued_loads.count(group_spine_locked(name)) > 0;
         if (!inst.meta.is_running() && !loading) {
             continue;
         }
@@ -2181,14 +2183,20 @@ void server_models::queue_runner_loop() {
         if (queued_loads.empty()) {
             continue;
         }
-        std::vector<std::pair<std::string, router_request_opts>> todo;
+        // service order: priority, then queued-at (what queue_pos reports)
+        std::vector<router_queue_item> items;
         for (const auto & [n, q] : queued_loads) {
-            todo.push_back({ n, q.req });
+            items.push_back({ n, q.info.priority, q.since_ms });
+        }
+        std::vector<std::pair<std::string, load_options>> todo;
+        for (const auto & n : router_queue_service_order(items)) {
+            load_options o;
+            o.req        = queued_loads[n].req;
+            o.cancel_gen = cancel_gen_locked(n); // a cancel during the retry sticks
+            todo.push_back({ n, o });
         }
         lk.unlock();
-        for (const auto & [n, req] : todo) {
-            load_options o;
-            o.req = req;
+        for (const auto & [n, o] : todo) {
             try {
                 load(n, o);
             } catch (const router_queued_error &) {
@@ -2218,7 +2226,39 @@ void server_models::on_queued(const std::string & name, const load_options & opt
     info.reason = info.board ? info.blocked_on + " is claimed on the board by " + info.blocked_by
                              : "model '" + info.blocked_by + "' is busy";
 
+    // a load whose queued entry was cancelled meanwhile does not queue again
+    auto cancelled_locked = [&]() {
+        return opts.cancel_gen.has_value() && cancel_gen_locked(name) != *opts.cancel_gen;
+    };
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (cancelled_locked()) {
+            throw router_refused_error("the queued load of model '" + name + "' was cancelled");
+        }
+    }
+
+    // Blocked only by sessions waiting in the board queue (nobody else holds it: e.g. the router
+    // drains the GPU for them)? Then the router does not claim it, which the board would grant.
+    bool waiter_block = false;
     if (info.board && board) {
+        const router_board_snapshot snap = board->snapshot();
+        const bool held = std::any_of(snap.claims.begin(), snap.claims.end(), [&](const router_board_claim & c) {
+            return c.holder != ROUTER_BOARD_HOLDER && (c.resource == res.blocked_on || c.resource == ROUTER_BOARD_MACHINE_RES);
+        });
+        waiter_block = raced == nullptr && !held;
+        if (waiter_block) {
+            int ahead = 0;
+            for (const auto & e : snap.queue) {
+                if (e.holder != ROUTER_BOARD_HOLDER && (e.resource == res.blocked_on || e.resource == ROUTER_BOARD_MACHINE_RES)) {
+                    ahead++;
+                }
+            }
+            info.queue_pos = ahead + 1;
+            info.reason    = info.blocked_by + " is waiting in the board queue for " + info.blocked_on;
+        }
+    }
+
+    if (info.board && board && !waiter_block) {
         // join the board queue (idempotent per resource: the board keeps one slot for the router)
         router_board_claim_result jr = raced != nullptr ? *raced
                                                         : board->acquire(name, name, res.blocked_on, name, info.priority);
@@ -2248,21 +2288,30 @@ void server_models::on_queued(const std::string & name, const load_options & opt
         if (shutting_down) {
             throw router_refused_error("router is shutting down");
         }
-        if (!info.board) {
-            // place among the router's own loads waiting on the same resident
-            int pos = 1;
-            for (const auto & [n, q] : queued_loads) {
-                if (n != name && !q.info.board && q.info.blocked_by == info.blocked_by && q.info.priority >= info.priority) {
-                    pos++;
-                }
-            }
-            info.queue_pos = pos;
+        if (cancelled_locked()) {
+            throw router_refused_error("the queued load of model '" + name + "' was cancelled");
         }
         auto it = queued_loads.find(name);
+        const int64_t since = it != queued_loads.end() ? it->second.since_ms : ggml_time_ms();
+        if (!info.board) {
+            // place among the router's own loads waiting on the same resident, in service order
+            std::vector<router_queue_item> items = { { name, info.priority, since } };
+            for (const auto & [n, q] : queued_loads) {
+                if (n != name && !q.info.board && q.info.blocked_by == info.blocked_by) {
+                    items.push_back({ n, q.info.priority, q.since_ms });
+                }
+            }
+            info.queue_pos = router_queue_position(items, name);
+        }
         changed = it == queued_loads.end() || it->second.info.queue_pos != info.queue_pos ||
                   it->second.info.blocked_by != info.blocked_by || it->second.info.blocked_on != info.blocked_on ||
                   it->second.info.priority != info.priority;
-        queued_loads[name] = { info, opts.req };
+        queued_loads[name] = { info, opts.req, since };
+    }
+    if (board) {
+        // claims an earlier round of this attempt took for a placement it will not use; the
+        // queued load counts as alive, so a queue turn it holds stays
+        board->release_dead();
     }
     if (changed) {
         SRV_INF("load of %s queued: %s (position %d)\n", name.c_str(), info.reason.c_str(), info.queue_pos);
@@ -2290,12 +2339,19 @@ void server_models::drop_queued(const std::string & name, const std::string & re
     notify_state("blocked", name, {}, reason, extra);
 }
 
+uint64_t server_models::cancel_gen_locked(const std::string & name) const {
+    auto it = queue_cancel_gen.find(name);
+    return it == queue_cancel_gen.end() ? 0 : it->second;
+}
+
 bool server_models::cancel_queued(const std::string & name) {
     {
         std::lock_guard<std::mutex> lk(mutex);
         if (!queued_loads.count(name)) {
             return false;
         }
+        queue_cancel_gen[name]++; // waiters and in-flight retries fail instead of queueing again
+        cv.notify_all();
     }
     drop_queued(name, "queued load cancelled");
     return true;
@@ -2366,6 +2422,10 @@ json server_models::load_async(const std::string & name, const router_request_op
         }
         load_options o;
         o.req = req;
+        {
+            std::lock_guard<std::mutex> l(mutex);
+            o.cancel_gen = cancel_gen_locked(name);
+        }
         std::thread th([this, name, o, outcome, done]() {
             std::exception_ptr err;
             try {
@@ -2400,7 +2460,7 @@ json server_models::load_async(const std::string & name, const router_request_op
         }
         return out;
     }
-    out["state"] = meta.has_value() && meta->is_ready_or_sleep() ? "ready" : "loading";
+    out["state"] = !meta.has_value() ? "loading" : meta->stopping ? "stopping" : meta->is_ready_or_sleep() ? "ready" : "loading";
     return out;
 }
 
@@ -2931,6 +2991,7 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         server_model_meta out = it->second.meta;
         out.group_info = group_status_json_locked(it->first);
         out.queue_info = queue_info(it->first, out);
+        out.stopping   = stopping_models.count(it->first) > 0;
         return out;
     }
     for (const auto & [key, inst] : mapping) {
@@ -2938,6 +2999,7 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
             server_model_meta out = inst.meta;
             out.group_info = group_status_json_locked(key);
             out.queue_info = queue_info(key, out);
+            out.stopping   = stopping_models.count(key) > 0;
             return out;
         }
     }
@@ -2957,6 +3019,7 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     for (const auto & [name, inst] : mapping) {
         result.push_back(inst.meta);
         result.back().group_info = group_status_json_locked(name);
+        result.back().stopping   = stopping_models.count(name) > 0;
         auto q = queued_loads.find(name);
         if (q != queued_loads.end() && inst.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
             result.back().queue_info = json::parse(router_queued_info_json(q->second.info));
@@ -3074,9 +3137,6 @@ void server_models::load(const std::string & name, const load_options & opts) {
         spawned = load_impl(name, opts);
     } catch (const router_queue_signal & sig) {
         unregister();
-        if (board) {
-            board->release_dead(); // claims this attempt took for a placement it will not use
-        }
         on_queued(name, opts, sig.res, sig.raced.has_value() ? &*sig.raced : nullptr); // throws router_queued_error
     } catch (const std::exception & e) {
         unregister();

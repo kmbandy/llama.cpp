@@ -4309,6 +4309,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BOARD_TOKEN_FILE"));
     add_opt(common_arg(
+        {"--models-queue-max-wait-s"}, "SECONDS",
+        string_format("for router server, longest a `lowest`-priority request waits for its queued model before\n"
+                      "it is answered 503 + Retry-After (the load stays queued) (default: %d, 0 = no bound)",
+                      params.models_queue_max_wait_s),
+        [](common_params & params, int value) {
+            params.models_queue_max_wait_s = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_QUEUE_MAX_WAIT_S"));
+    add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
         string_format("whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled"),

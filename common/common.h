@@ -875,6 +875,7 @@ struct common_params {
     std::string router_gpus = "";       // declared router GPU slots: name[=board name]:total_mb:probe,...
     std::string router_board_url = "";        // router: coordination board base URL ("" = board features off)
     std::string router_board_token_file = ""; // router: file holding the board's bearer token
+    int models_queue_max_wait_s = 3600;       // router: longest a `lowest` request waits for its queued model (0 = no bound)
 
     bool log_json = false;
 

@@ -101,6 +101,47 @@ bool router_request_waits_in_queue(admission_priority p) {
     return p == ADMISSION_PRIORITY_LOWEST;
 }
 
+std::vector<std::string> router_queue_service_order(const std::vector<router_queue_item> & items) {
+    std::vector<router_queue_item> sorted = items;
+    std::sort(sorted.begin(), sorted.end(), [](const router_queue_item & a, const router_queue_item & b) {
+        if (a.priority != b.priority) {
+            return a.priority > b.priority; // ADMISSION_PRIORITY_HIGHEST is the largest
+        }
+        return a.since_ms != b.since_ms ? a.since_ms < b.since_ms : a.name < b.name;
+    });
+    std::vector<std::string> out;
+    for (const auto & i : sorted) {
+        out.push_back(i.name);
+    }
+    return out;
+}
+
+int router_queue_position(const std::vector<router_queue_item> & items, const std::string & name) {
+    const auto order = router_queue_service_order(items);
+    auto it = std::find(order.begin(), order.end(), name);
+    return it == order.end() ? 0 : (int) (it - order.begin()) + 1;
+}
+
+router_queue_wait router_queue_wait_decision(bool cancelled, bool client_gone, int64_t waited_ms, int64_t max_wait_ms) {
+    if (cancelled) {
+        return ROUTER_WAIT_CANCELLED;
+    }
+    if (client_gone) {
+        return ROUTER_WAIT_ABORTED;
+    }
+    if (max_wait_ms > 0 && waited_ms >= max_wait_ms) {
+        return ROUTER_WAIT_TIMED_OUT;
+    }
+    return ROUTER_WAIT_CONTINUE;
+}
+
+router_probation_action router_board_probation_action(bool ours, bool waited_for, bool claim_in_flight) {
+    if (ours || claim_in_flight) {
+        return ROUTER_PROBATION_KEEP;
+    }
+    return waited_for ? ROUTER_PROBATION_CONFIRM : ROUTER_PROBATION_RELEASE;
+}
+
 static std::string queued_message(const router_queued_info & info) {
     std::string msg = "model '" + info.model + "' is queued";
     if (info.queue_pos > 0) {
@@ -361,19 +402,30 @@ router_board_claim_result router_board_parse_claim_response(int status, const st
 }
 
 std::vector<admission_claim> router_board_admission_claims(const router_board_snapshot & snap,
-                                                           const std::vector<std::string> & machine_resources) {
+                                                           const std::vector<std::string> & machine_resources,
+                                                           admission_priority load_priority) {
     std::vector<admission_claim> out;
     if (!snap.ok) {
         return out;
     }
-    for (const auto & c : snap.claims) {
-        const bool router = c.holder == ROUTER_BOARD_HOLDER;
-        if (c.resource == ROUTER_BOARD_MACHINE_RES) {
+    auto add = [&](const std::string & id, const std::string & resource, const std::string & holder, bool router,
+                   admission_priority prio) {
+        if (resource == ROUTER_BOARD_MACHINE_RES) {
             for (const auto & r : machine_resources) {
-                out.push_back({ c.id, r, c.holder, router, c.priority });
+                out.push_back({ id, r, holder, router, prio });
             }
         } else {
-            out.push_back({ c.id, c.resource, c.holder, router, c.priority });
+            out.push_back({ id, resource, holder, router, prio });
+        }
+    };
+    for (const auto & c : snap.claims) {
+        add(c.id, c.resource, c.holder, c.holder == ROUTER_BOARD_HOLDER, c.priority);
+    }
+    if (load_priority != ADMISSION_PRIORITY_HIGHEST) {
+        for (const auto & e : snap.queue) {
+            if (e.holder != ROUTER_BOARD_HOLDER && e.priority >= load_priority) {
+                add(ROUTER_BOARD_WAITER_PREFIX + e.id, e.resource, e.holder, false, e.priority);
+            }
         }
     }
     return out;
@@ -640,6 +692,7 @@ void router_board_agent::stop() {
             queues.push_back(res);
         }
         joined.clear();
+        joined_prio.clear();
     }
     for (const auto & c : all) {
         std::string err;
@@ -704,9 +757,10 @@ router_board_snapshot router_board_agent::snapshot() const {
     return cache;
 }
 
-std::vector<admission_claim> router_board_agent::admission_claims(const std::vector<std::string> & machine_resources) const {
+std::vector<admission_claim> router_board_agent::admission_claims(const std::vector<std::string> & machine_resources,
+                                                                  admission_priority load_priority) const {
     std::lock_guard<std::mutex> lk(mu);
-    return router_board_admission_claims(cache, machine_resources);
+    return router_board_admission_claims(cache, machine_resources, load_priority);
 }
 
 std::vector<std::string> router_board_agent::missing(const std::string & owner, const std::vector<std::string> & resources) const {
@@ -734,9 +788,26 @@ std::map<std::string, std::set<std::string>> router_board_agent::held() const {
 router_board_claim_result router_board_agent::acquire(const std::string & owner, const std::string & queue_owner,
                                                       const std::string & resource, const std::string & note,
                                                       admission_priority priority) {
+    bool rejoin = false;
     {
         std::lock_guard<std::mutex> lk(mu);
+        if (stopped) {
+            router_board_claim_result r;
+            r.error = "board agent stopped";
+            return r;
+        }
         pending[resource]++; // protects a probation claim of ours on it from the cleanup in tick()
+        auto j = joined.find(resource);
+        auto p = joined_prio.find(resource);
+        rejoin = !queue_owner.empty() && j != joined.end() && !j->second.empty() && p != joined_prio.end() && priority > p->second;
+    }
+    if (rejoin) {
+        // the board keeps the slot's first priority: leave it, the claim below joins again higher
+        std::string err;
+        if (client.leave_queue(cfg.machine, resource, err) == ROUTER_BOARD_FAILED) {
+            BRD_WRN("could not leave the queue for %s to re-join at %s: %s\n", resource.c_str(),
+                    admission_priority_str(priority), err.c_str());
+        }
     }
     router_board_claim_result r = client.claim(cfg.machine, resource, note, priority, cfg.ttl_hours);
     std::lock_guard<std::mutex> lk(mu);
@@ -756,10 +827,15 @@ router_board_claim_result router_board_agent::acquire(const std::string & owner,
             j->second.erase(queue_owner); // our turn came: no longer waiting for it
             if (j->second.empty()) {
                 joined.erase(j);
+                joined_prio.erase(resource);
             }
         }
     } else if (r.ok && r.queued && !queue_owner.empty()) {
         joined[resource].insert(queue_owner);
+        auto p = joined_prio.find(resource);
+        if (p == joined_prio.end() || priority > p->second) {
+            joined_prio[resource] = priority;
+        }
     } else if (!r.ok) {
         BRD_WRN("claim of %s for %s failed: %s\n", resource.c_str(), owner.c_str(), r.error.c_str());
     }
@@ -768,8 +844,8 @@ router_board_claim_result router_board_agent::acquire(const std::string & owner,
 
 void router_board_agent::notify(const std::vector<admission_notify> & list, const std::string & content) {
     for (const auto & n : list) {
-        if (n.holder == ROUTER_BOARD_HOLDER || n.claim_id.empty()) {
-            continue; // never notify ourselves
+        if (n.holder == ROUTER_BOARD_HOLDER || n.claim_id.empty() || n.claim_id.rfind(ROUTER_BOARD_WAITER_PREFIX, 0) == 0) {
+            continue; // never notify ourselves, nor a session that is only waiting in the queue
         }
         const std::string key = n.claim_id + ":" + admission_notify_kind_str(n.kind);
         {
@@ -800,6 +876,7 @@ void router_board_agent::leave_queue(const std::string & queue_owner) {
             it->second.erase(queue_owner);
             if (it->second.empty()) {
                 to_leave.push_back(it->first);
+                joined_prio.erase(it->first);
                 it = joined.erase(it);
             } else {
                 ++it;
@@ -1037,9 +1114,18 @@ void router_board_agent::tick() {
         }
     }
 
-    // 6. probation claims the queue handed the router that no queued load waits for any more
+    // 6. queue turns (probation claims the board handed the router): confirm them here for the
+    //    queued load that waits (PROBATION_S is short, and a load retry may be stuck behind a
+    //    long load), release them when nobody waits any more
     {
-        std::vector<held_claim> stale;
+        struct turn_t {
+            std::string             id;
+            std::string             resource;
+            std::string             owner;
+            admission_priority      priority = ADMISSION_PRIORITY_MIDDLE;
+            router_probation_action action   = ROUTER_PROBATION_KEEP;
+        };
+        std::vector<turn_t> turns;
         {
             std::lock_guard<std::mutex> lk(mu);
             for (const auto & c : snap.claims) {
@@ -1047,16 +1133,34 @@ void router_board_agent::tick() {
                     continue;
                 }
                 const bool ours = std::any_of(claims.begin(), claims.end(), [&](const held_claim & x) { return x.claim_id == c.id; });
-                if (ours || joined.count(c.resource) || pending.count(c.resource)) {
-                    continue;
+                auto j = joined.find(c.resource);
+                const bool waited = j != joined.end() && !j->second.empty();
+                turn_t t;
+                t.id       = c.id;
+                t.resource = c.resource;
+                t.action   = router_board_probation_action(ours, waited, pending.count(c.resource) > 0);
+                if (waited) {
+                    t.owner = *j->second.begin();
+                    auto p  = joined_prio.find(c.resource);
+                    t.priority = p != joined_prio.end() ? p->second : ADMISSION_PRIORITY_MIDDLE;
                 }
-                stale.push_back({ "(queue turn)", c.resource, c.id, 0, 0 });
+                turns.push_back(t);
             }
         }
-        for (const auto & c : stale) {
-            std::string e;
-            client.release(c.claim_id, e);
-            BRD_INF("released a queue turn on %s nobody waits for any more\n", c.resource.c_str());
+        for (const auto & t : turns) {
+            if (t.action == ROUTER_PROBATION_CONFIRM) {
+                // claiming it again confirms it in place; recorded for the waiting load, which the
+                // router counts as alive while it is queued
+                const router_board_claim_result cr = acquire(t.owner, t.owner, t.resource, t.owner, t.priority);
+                if (cr.ok && cr.granted) {
+                    BRD_INF("confirmed the queue turn on %s for %s (claim %s)\n", t.resource.c_str(), t.owner.c_str(), cr.claim_id.c_str());
+                    changed = true;
+                }
+            } else if (t.action == ROUTER_PROBATION_RELEASE) {
+                std::string e;
+                client.release(t.id, e);
+                BRD_INF("released a queue turn on %s nobody waits for any more\n", t.resource.c_str());
+            }
         }
     }
 

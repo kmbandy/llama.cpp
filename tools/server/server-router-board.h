@@ -96,6 +96,35 @@ struct router_refused_error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The router's own queue (loads waiting on a board claim or a busy resident).
+struct router_queue_item {
+    std::string        name;
+    admission_priority priority = ADMISSION_PRIORITY_MIDDLE;
+    int64_t            since_ms = 0; // when it was first queued
+};
+
+// Service order: priority (highest first), then queued-at (oldest first), then name.
+std::vector<std::string> router_queue_service_order(const std::vector<router_queue_item> & items);
+// 1-based place of `name` in service order among `items`; 0 if it is not there
+int router_queue_position(const std::vector<router_queue_item> & items, const std::string & name);
+
+// What a request waiting for its queued model does next (checked in this order).
+enum router_queue_wait {
+    ROUTER_WAIT_CONTINUE  = 0,
+    ROUTER_WAIT_CANCELLED = 1, // the queued load was cancelled (POST /models/unload): error, never re-queue
+    ROUTER_WAIT_ABORTED   = 2, // the client went away
+    ROUTER_WAIT_TIMED_OUT = 3, // waited max_wait_ms (> 0): 503 + Retry-After
+};
+router_queue_wait router_queue_wait_decision(bool cancelled, bool client_gone, int64_t waited_ms, int64_t max_wait_ms);
+
+// What the board agent does with a probation claim (a queue turn) the board handed the router.
+enum router_probation_action {
+    ROUTER_PROBATION_KEEP    = 0, // already ours, or a claim for it is in flight
+    ROUTER_PROBATION_CONFIRM = 1, // a queued load waits for the resource: confirm it now (PROBATION_S is short)
+    ROUTER_PROBATION_RELEASE = 2, // nobody waits for it any more
+};
+router_probation_action router_board_probation_action(bool ours, bool waited_for, bool claim_in_flight);
+
 // JSON object {state: "queued", queue_pos, blocked_by, blocked_on, board, priority, reason}
 std::string router_queued_info_json(const router_queued_info & info);
 
@@ -171,8 +200,14 @@ router_board_claim_result router_board_parse_claim_response(int status, const st
 // Admission claims from the cache: every active claim on the machine; holder `llama-router`
 // is is_router (never blocks). A whole-machine claim stands for every resource listed in
 // `machine_resources`. An unavailable cache gives none (loads go ahead).
+// Sessions already waiting in the board queue block a `middle` / `lowest` load too (a waiter of
+// at least its priority), so a new router load never jumps ahead of them, e.g. onto a GPU the
+// router is draining for them; their claim_id is "queue:<id>" (never notified). A `highest`
+// load is blocked only by holders (it queues at the head behind them).
 std::vector<admission_claim> router_board_admission_claims(const router_board_snapshot & snap,
-                                                           const std::vector<std::string> & machine_resources);
+                                                           const std::vector<std::string> & machine_resources,
+                                                           admission_priority load_priority);
+static constexpr const char * ROUTER_BOARD_WAITER_PREFIX = "queue:";
 
 // Of the resources the router holds, those someone other than the router is queued for (a
 // queued whole-machine entry contests every one of them).
@@ -267,7 +302,8 @@ class router_board_agent {
     // cache (no HTTP)
     bool                         available() const;
     router_board_snapshot        snapshot() const;
-    std::vector<admission_claim> admission_claims(const std::vector<std::string> & machine_resources) const;
+    std::vector<admission_claim> admission_claims(const std::vector<std::string> & machine_resources,
+                                                  admission_priority load_priority) const;
     // of `resources`, those `owner` holds no claim on
     std::vector<std::string>     missing(const std::string & owner, const std::vector<std::string> & resources) const;
     std::map<std::string, std::set<std::string>> held() const; // owner -> resources
@@ -275,7 +311,9 @@ class router_board_agent {
     // HTTP: never call these with a router lock held.
     //
     // Claim `resource` for `owner`. Granted -> recorded. Queued -> recorded as joined by
-    // `queue_owner` (the load that waits; left with leave_queue()).
+    // `queue_owner` (the load that waits; left with leave_queue()). The board keeps one queue
+    // slot per (machine, resource, holder) at the priority it was joined with: a queue owner
+    // joining at a higher priority leaves and re-joins at it. Refused after stop().
     router_board_claim_result acquire(const std::string & owner, const std::string & queue_owner,
                                       const std::string & resource, const std::string & note, admission_priority priority);
     // Tells each holder once per (claim, kind); never a `llama-router` claim.
@@ -312,6 +350,7 @@ class router_board_agent {
     std::string                                  cache_sig;
     std::vector<held_claim>                      claims;
     std::map<std::string, std::set<std::string>> joined;   // resource -> queue owners waiting for it
+    std::map<std::string, admission_priority>    joined_prio; // resource -> priority of the router's board queue slot
     std::map<std::string, int>                   pending;  // resource -> claims in flight
     std::set<std::string>                        notified; // "claim_id:kind"
     std::map<std::string, int64_t>               retake_after; // "owner|resource" -> earliest re-claim (ms)
