@@ -11,6 +11,7 @@
 #include "hf-cache.h"
 #include "http.h"
 #include "subproc.h"
+#include "server-router-node-client.h"
 #include "server-router-groups.h"
 #include "server-router-ledger.h"
 #include "server-router-policy.h"
@@ -68,218 +69,107 @@ static constexpr const char * ROUTER_LOAD_TIMEOUT     = "LLAMA_SERVER_ROUTER_LOA
 
 static constexpr int DEFAULT_ROUTER_LOAD_TIMEOUT_S = 900;
 
-// note: SIGPIPE is ignored by the server
-static void request_child_exit(server_subproc & proc) {
-    FILE * stdin_file = proc.sproc.stdin_file();
-    if (stdin_file) {
-        fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
-        fflush(stdin_file);
-    }
-}
-
 static bool router_machine_is_local(const std::string & machine); // defined with the group helpers below
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
 #define CHILD_ADDR "127.0.0.1"
 
-// single-threaded, watching all child processes at once
+// One thread that handles what the children of the router's node report: output lines and exits
+// arrive from the node link's event thread (which must never wait for the router's mutex), are
+// queued here in order and applied one at a time. The node core reaps every child.
 struct server_monitor {
     server_monitor(server_models & models) : models(models) {
         th = std::thread([this]() { run(); });
     }
 
     ~server_monitor() {
-        push({ cmd_t::QUIT, {}, "", 0, false });
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            quit = true;
+        }
+        cv.notify_all();
         th.join();
     }
 
-    // thread-safe
-    void watch(const std::string & name, std::shared_ptr<server_subproc> proc, server_child_mode mode, int port) {
-        child_t c;
-        c.name = name;
-        c.proc = std::move(proc);
-        c.mode = mode;
-        c.port = port;
-        if (!c.proc->has_output()) {
-            SRV_ERR("failed to get stdout/stderr of child process for name=%s\n", name.c_str());
-            c.eof = true;
-        }
-        push({ cmd_t::WATCH, std::move(c), "", 0, false });
-    }
-
-    // thread-safe
-    void stop(const std::string & name, int stop_timeout, bool send_exit) {
-        push({ cmd_t::STOP, {}, name, stop_timeout, send_exit });
+    // callbacks for router_node_link::spawn(); they only queue
+    router_node_watch make_watch(const std::string & name, std::shared_ptr<server_child_ref> child, server_child_mode mode, int port) {
+        router_node_watch w;
+        w.on_line = [this, name, port](const std::string & line) {
+            push({ item_t::LINE, name, port, line, nullptr, SERVER_CHILD_MODE_NORMAL, 0 });
+        };
+        w.on_exit = [this, name, child, mode, port](const node_child_info & info) {
+            push({ item_t::EXIT, name, port, "", child, mode, info.exit_code });
+        };
+        return w;
     }
 
 private:
-    struct child_t {
+    struct item_t {
+        enum { LINE, EXIT } type;
         std::string name;
-        std::shared_ptr<server_subproc> proc;
-        server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
-        int port = 0;
-        std::string buf;      // partial line
-        bool eof = false;     // output closed, waiting for the process to be reaped
-        int64_t deadline = 0; // force-kill time in ms, 0 when no stop is pending
+        int         port;
+        std::string line;
+        std::shared_ptr<server_child_ref> child;
+        server_child_mode mode;
+        int exit_code;
     };
 
-    struct cmd_t {
-        enum { WATCH, STOP, QUIT } type;
-        child_t child;
-        std::string name;
-        int  stop_timeout;
-        bool send_exit;
-    };
-
-    void push(cmd_t && cmd) {
+    void push(item_t && it) {
         {
             std::lock_guard<std::mutex> lk(mu);
-            cmds.push_back(std::move(cmd));
+            q.push_back(std::move(it));
         }
-        waiter.wake();
-    }
-
-    // returns true if the loop should exit
-    bool handle_commands() {
-        std::deque<cmd_t> batch;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            batch.swap(cmds);
-        }
-        for (auto & cmd : batch) {
-            switch (cmd.type) {
-                case cmd_t::WATCH:
-                    children.push_back(std::move(cmd.child));
-                    break;
-                case cmd_t::STOP:
-                    // the newest child with this name is the one the registry knows
-                    for (auto it = children.rbegin(); it != children.rend(); ++it) {
-                        if (it->name != cmd.name) {
-                            continue;
-                        }
-                        if (cmd.send_exit && !it->eof) {
-                            request_child_exit(*it->proc);
-                        }
-                        it->deadline = ggml_time_ms() + (int64_t) cmd.stop_timeout * 1000;
-                        break;
-                    }
-                    break;
-                case cmd_t::QUIT:
-                    return true;
-            }
-        }
-        return false;
-    }
-
-    // read what the child wrote, forward complete lines
-    void read_output(child_t & c) {
-        char chunk[4096];
-        while (!c.eof) {
-            int n = c.proc->read_output(chunk, sizeof(chunk));
-            if (n < 0) {
-                c.eof = true;
-                break;
-            }
-            if (n == 0) {
-                break;
-            }
-            c.buf.append(chunk, (size_t) n);
-            size_t start = 0;
-            while (true) {
-                size_t nl = c.buf.find('\n', start);
-                if (nl == std::string::npos) {
-                    break;
-                }
-                std::string line = c.buf.substr(start, nl + 1 - start);
-                start = nl + 1;
-                on_line(c, line);
-            }
-            c.buf.erase(0, start);
-            if (c.buf.size() > max_line) {
-                c.buf.clear(); // a child that never writes a newline must not grow this without bound
-            }
-        }
-        if (c.eof && !c.buf.empty()) {
-            on_line(c, c.buf);
-            c.buf.clear();
-        }
-    }
-
-    void on_line(child_t & c, const std::string & line) {
-        if (string_starts_with(line, CMD_CHILD_TO_ROUTER_STATE)) {
-            LOG_DBG("[%5d] %s", c.port, line.c_str()); // prevent spamming the log
-            models.handle_child_state(c.name, line);
-        } else {
-            LOG("[%5d] %s", c.port, line.c_str()); // forward log
-        }
+        cv.notify_all();
     }
 
     void run() {
         while (true) {
-            if (handle_commands()) {
-                return;
+            item_t it;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [this]() { return quit || !q.empty(); });
+                if (q.empty()) {
+                    return; // quit, and everything queued was applied
+                }
+                it = std::move(q.front());
+                q.pop_front();
             }
-
-            // wait for output, a wakeup, or the next deadline;
-            // a child whose output closed is polled for its exit every 50 ms
-            int64_t now     = ggml_time_ms();
-            int64_t timeout = -1;
-            for (const auto & c : children) {
-                if (c.eof) {
-                    timeout = timeout < 0 ? 50 : std::min<int64_t>(timeout, 50);
-                }
-                if (c.deadline) {
-                    int64_t d = std::max<int64_t>(0, c.deadline - now);
-                    timeout = timeout < 0 ? d : std::min(timeout, d);
-                }
-            }
-            std::vector<server_subproc *> procs;
-            std::vector<child_t *>        owners;
-            for (auto & c : children) {
-                if (!c.eof) {
-                    procs.push_back(c.proc.get());
-                    owners.push_back(&c);
-                }
-            }
-            std::vector<bool> ready;
-            waiter.wait(procs, ready, timeout);
-            for (size_t i = 0; i < owners.size(); i++) {
-                if (ready[i]) {
-                    read_output(*owners[i]);
-                }
-            }
-
-            // deadlines and exits
-            now = ggml_time_ms();
-            for (auto it = children.begin(); it != children.end();) {
-                if (it->deadline && now >= it->deadline && !it->proc->stopped.load(std::memory_order_acquire)) {
-                    SRV_WRN("force-killing model instance name=%s after timeout\n", it->name.c_str());
-                    it->proc->terminate();
-                    it->deadline = 0;
-                }
-                if (it->eof && !it->proc->is_alive()) {
-                    int exit_code = it->proc->join();
-                    it->proc->stopped.store(true, std::memory_order_release);
-                    models.on_child_exit(it->name, it->proc, it->mode, exit_code);
-                    SRV_INF("instance name=%s exited with status %d\n", it->name.c_str(), exit_code);
-                    it = children.erase(it);
+            if (it.type == item_t::LINE) {
+                const std::string line = it.line + "\n";
+                if (string_starts_with(line, CMD_CHILD_TO_ROUTER_STATE)) {
+                    LOG_DBG("[%5d] %s", it.port, line.c_str()); // prevent spamming the log
+                    models.handle_child_state(it.name, line);
                 } else {
-                    ++it;
+                    LOG("[%5d] %s", it.port, line.c_str()); // forward log
                 }
+            } else {
+                it.child->stopped.store(true, std::memory_order_release);
+                models.on_child_exit(it.name, it.child, it.mode, it.exit_code);
+                SRV_INF("instance name=%s exited with status %d\n", it.name.c_str(), it.exit_code);
             }
         }
     }
 
-    static constexpr size_t max_line = 1024 * 1024;
-
     server_models & models;
     std::mutex mu;
-    std::deque<cmd_t> cmds;
-    std::vector<child_t> children; // monitor thread only
-    server_subproc::waiter waiter;
+    std::condition_variable cv;
+    std::deque<item_t> q;
+    bool quit = false;
     std::thread th;
 };
+
+void server_child_ref::kill() const {
+    if (node && pid.load() > 0) {
+        node->signal_async(name, pid.load(), 9);
+    }
+}
+
+void server_child_ref::request_exit(int timeout_s) const {
+    if (node && pid.load() > 0) {
+        node->stop_async(name, pid.load(), timeout_s, "stdin");
+    }
+}
 
 struct server_lru_sched {
     server_lru_sched(server_models & models) : models(models) {}
@@ -720,6 +610,17 @@ server_models::server_models(
     }
 #endif
 
+    // This machine's node, in process: it owns every child of the router (spawn, stdin command,
+    // TERM / KILL, output, reaping). Its base env is the router's; each spawn adds its overrides.
+    {
+        server_node_config ncfg = server_node_default_config();
+        ncfg.base_env = base_env;
+        router_node_link_config lc;
+        lc.gen = router_gen;
+        local_node = router_node_make_local(lc, std::move(ncfg));
+        local_node->start();
+    }
+
     // set binary path
     try {
         bin_path = get_server_exec_path().string();
@@ -798,6 +699,9 @@ server_models::~server_models() {
         }
     }
     dying.clear();
+    if (local_node) {
+        local_node->shutdown(); // whatever still runs is stopped by its node
+    }
 }
 
 std::optional<std::filesystem::file_time_type> server_models::get_models_preset_mtime() const {
@@ -884,7 +788,8 @@ void server_models::reload_models_preset_if_changed(server_model_meta & meta) {
 }
 
 void server_models::instance_t::request_exit() const {
-    request_child_exit(*subproc);
+    // no deadline of its own beyond the model's stop-timeout: the child leaves on the command
+    child->request_exit(std::max(1, meta.stop_timeout));
 }
 
 void server_models::add_model(server_model_meta && meta) {
@@ -943,7 +848,7 @@ void server_models::add_model(server_model_meta && meta) {
     }
     std::string name = meta.name;
     mapping[name] = instance_t{
-        /* subproc */ std::make_shared<server_subproc>(),
+        /* child   */ std::make_shared<server_child_ref>(),
         /* meta    */ std::move(meta)
     };
 }
@@ -1336,8 +1241,8 @@ int64_t server_models::physical_free_from_used(const server_gpu_slot & slot, int
 std::set<int> server_models::router_child_pids_locked() const {
     std::set<int> pids;
     for (const auto & [_, inst] : mapping) {
-        if (inst.subproc && !inst.subproc->stopped) {
-            const int pid = inst.subproc->sproc.pid();
+        if (inst.child && !inst.child->stopped) {
+            const int pid = inst.child->pid.load();
             if (pid > 0) {
                 pids.insert(pid);
             }
@@ -1425,8 +1330,8 @@ int64_t server_models::resident_ram_bytes_locked(const std::string & name) const
                 }
             }
         }
-    } else if (inst.subproc) {
-        pid = inst.subproc->sproc.pid();
+    } else if (inst.child) {
+        pid = inst.child->pid.load();
     }
     const auto mem = pid > 0 ? probe_proc_mem("", pid) : std::nullopt;
     if (mem.has_value()) {
@@ -1867,7 +1772,7 @@ void server_models::evict_and_wait_locked(const std::string & name, const std::v
                      "evicted to make room for " + name);
         const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
         if (loading) {
-            it->second.subproc->terminate();
+            it->second.child->kill();
         }
         // marks the victim stopping and hands the stop to the monitor (upstream #28555); a group
         // victim is named after its spine, which stops the whole group
@@ -3475,7 +3380,10 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
         throw std::runtime_error("failed to get a port number");
     }
 
-    inst.subproc = std::make_shared<server_subproc>();
+    auto child = std::make_shared<server_child_ref>();
+    child->node = local_node;
+    child->name = name;
+    inst.child  = child;
     {
         SRV_INF("spawning server instance with name=%s on port %d\n", inst.meta.name.c_str(), inst.meta.port);
 
@@ -3498,13 +3406,29 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
         }
         inst.meta.args = child_args; // save for debugging
 
-        // TODO @ngxson : maybe separate stdout and stderr in the future
-        //                so that we can use stdout for commands and stderr for logging
-        int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-        if (!inst.subproc->sproc.create(child_args, options, child_env)) {
-            load_attempt_guard.reset(); // also stops a group's workers
-            throw std::runtime_error("failed to spawn server instance");
+        // The node (this machine's, in process) starts the child from the router env plus these
+        // overrides: the same final environment as child_env, built above and temp-dir checked.
+        node_spawn_request req;
+        req.name = name;
+        req.gen  = router_gen;
+        req.args = child_args;
+        req.port = inst.meta.port;
+        req.env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        req.env.insert(req.env.end(), meta.env_overrides.begin(), meta.env_overrides.end());
+        if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
+            req.env.push_back("LLAMA_SERVER_CHILD_MODE=download");
+            req.env.push_back("LLAMA_ARG_HF_REPO=" + name);
+        } else if (opts.mode == SERVER_CHILD_MODE_ESTIMATE) {
+            req.env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
         }
+        node_child_info spawned;
+        try {
+            spawned = local_node->spawn(req, monitor->make_watch(name, child, opts.mode, inst.meta.port));
+        } catch (const std::exception & e) {
+            load_attempt_guard.reset(); // also stops a group's workers
+            throw std::runtime_error(std::string("failed to spawn server instance: ") + e.what());
+        }
+        child->pid.store(spawned.pid);
         load_attempt_guard.release();
         group_started.reset(); // the spine's exit now drives the workers' stop (on_child_exit)
     }
@@ -3512,9 +3436,9 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     // old process should have exited already, but just in case, we clean it up here
     {
         auto it = mapping.find(name);
-        if (it != mapping.end() && it->second.subproc && it->second.subproc->is_alive()) {
+        if (it != mapping.end() && it->second.child && it->second.child->alive()) {
             SRV_WRN("old process for model name=%s is still alive, this is unexpected\n", name.c_str());
-            it->second.subproc->terminate(); // force kill
+            it->second.child->kill(); // force kill
         }
     }
 
@@ -3525,10 +3449,7 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
         notify_state("loading", name, inst.meta.placement.devs, "spawned");
     }
 
-    auto proc = inst.subproc;
-    int  port = inst.meta.port;
     mapping[name] = std::move(inst);
-    monitor->watch(name, proc, opts.mode, port);
     cv.notify_all();
     return true;
 }
@@ -3543,7 +3464,7 @@ void server_models::request_stop(const std::string & name_in, bool send_exit, bo
     if (name != name_in) {
         const bool loading = it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
         if (loading) {
-            it->second.subproc->terminate();
+            it->second.child->kill();
         }
         send_exit = !loading;
     }
@@ -3558,7 +3479,17 @@ void server_models::request_stop(const std::string & name_in, bool send_exit, bo
                 name.c_str(), it->second.req_count, bound_s);
         return;
     }
-    monitor->stop(name, it->second.meta.stop_timeout, send_exit);
+    stop_child_locked(it->second, send_exit);
+}
+
+// Hands the stop to the node: the exit command on the child's stdin (send_exit), SIGKILL when
+// stop-timeout passes; a child that was already force-killed just gets the deadline (SIGTERM).
+// Non-blocking (queued to the node link's command thread), so safe under `mutex`.
+void server_models::stop_child_locked(instance_t & inst, bool send_exit) {
+    if (inst.child && inst.child->node && inst.child->pid.load() > 0) {
+        inst.child->node->stop_async(inst.child->name, inst.child->pid.load(),
+                                     std::max(1, inst.meta.stop_timeout), send_exit ? "stdin" : "term");
+    }
 }
 
 void server_models::maybe_finish_drain_locked(const std::string & name, bool force) {
@@ -3576,7 +3507,7 @@ void server_models::maybe_finish_drain_locked(const std::string & name, bool for
             SRV_WRN("group %s: stopping with %d request(s) still in flight (drain bound reached)\n",
                     name.c_str(), it->second.req_count);
         }
-        monitor->stop(name, it->second.meta.stop_timeout, true);
+        stop_child_locked(it->second, true);
     }
 }
 
@@ -3740,7 +3671,7 @@ void server_models::on_group_worker_exit(const std::string & spine, const router
             spine.c_str(), reason.c_str());
     const bool loading = it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
     if (loading) {
-        it->second.subproc->terminate();
+        it->second.child->kill();
     }
     request_stop(spine, !loading, /*drain=*/false);
 }
@@ -3797,11 +3728,11 @@ void server_models::on_group_stopped(const std::string & spine, const router_wor
     cv.notify_all();
 }
 
-void server_models::on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code) {
+void server_models::on_child_exit(const std::string & name, const std::shared_ptr<server_child_ref> & proc, server_child_mode mode, int exit_code) {
     {
         std::lock_guard<std::mutex> lk(mutex);
         auto it = mapping.find(name);
-        if (it == mapping.end() || it->second.subproc != proc) {
+        if (it == mapping.end() || it->second.child != proc) {
             stopping_models.erase(name);
             return; // entry erased, or a newer instance took the name
         }
@@ -3850,7 +3781,7 @@ void server_models::unload(const std::string & name_in) {
             if (loading) {
                 // special case: if model is in loading state, unloading means force-killing it
                 SRV_WRN("model name=%s is still loading, force-killing\n", name.c_str());
-                it->second.subproc->terminate();
+                it->second.child->kill();
             }
             request_stop(name, !loading);
             // status change will be handled by the monitor
@@ -3873,7 +3804,7 @@ void server_models::unload_all() {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
             bool loading = inst.meta.status == SERVER_MODEL_STATUS_LOADING;
             if (loading) {
-                inst.subproc->terminate();
+                inst.child->kill();
             }
             request_stop(name, !loading);
         }
@@ -4006,7 +3937,7 @@ bool server_models::remove(const std::string & name) {
         SRV_INF("stopping model instance name=%s\n", name.c_str());
         bool loading = it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
         if (loading) {
-            it->second.subproc->terminate();
+            it->second.child->kill();
         }
         request_stop(name, !loading);
     }

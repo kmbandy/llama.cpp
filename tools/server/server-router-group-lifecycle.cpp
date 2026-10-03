@@ -1,6 +1,7 @@
 #include "server-router-group-lifecycle.h"
 
 #include "log.h"
+#include "server-router-node-client.h"
 
 #include <algorithm>
 #include <cctype>
@@ -695,10 +696,19 @@ std::vector<int> router_sweep_stale_children(const std::string & root, const std
 // router_worker_group
 //
 
-router_worker_group::router_worker_group(std::string group, std::vector<router_worker_spec> specs, callbacks cb, int64_t kill_grace_ms)
-        : group(std::move(group)), cb(std::move(cb)), kill_grace_ms(kill_grace_ms) {
+router_worker_group::router_worker_group(std::string group, std::vector<router_worker_spec> specs, callbacks cb,
+                                         int64_t kill_grace_ms, std::string gen_in)
+        : group(std::move(group)), cb(std::move(cb)), kill_grace_ms(kill_grace_ms), gen(std::move(gen_in)) {
+    st = std::make_shared<shared_state>();
+    if (gen.empty() && !specs.empty()) {
+        router_env_get(specs[0].env, "LLAMA_ROUTER_GEN", gen);
+    }
+    if (gen.empty()) {
+        gen = "router";
+    }
     members.resize(specs.size());
     for (size_t i = 0; i < specs.size(); i++) {
+        members[i].node = specs[i].node;
         members[i].spec = std::move(specs[i]);
     }
     th = std::thread([this]() { run(); });
@@ -706,22 +716,34 @@ router_worker_group::router_worker_group(std::string group, std::vector<router_w
 
 router_worker_group::~router_worker_group() {
     {
-        std::lock_guard<std::mutex> lk(mu);
+        std::unique_lock<std::mutex> lk(st->mu);
         closing = true;
         for (auto & m : members) {
             if (m.spawned && !m.exited) {
                 m.kill_pending = true;
             }
         }
-    }
-    waiter.wake();
-    {
-        std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [this]() { return all_spawned_exited_locked(); });
+        st->cv.notify_all();
+        wait_exits_bounded(lk, 15000);
         quit = true;
+        st->cv.notify_all();
     }
-    waiter.wake();
     th.join();
+    if (private_node) {
+        private_node->shutdown();
+    }
+}
+
+std::shared_ptr<router_node_link> router_worker_group::own_node() {
+    if (!private_node) {
+        server_node_config ncfg = server_node_default_config();
+        ncfg.base_env.clear(); // the specs' env is the final environment
+        router_node_link_config lc;
+        lc.gen = gen;
+        private_node = router_node_make_local(lc, std::move(ncfg));
+        private_node->start();
+    }
+    return private_node;
 }
 
 bool router_worker_group::all_spawned_exited_locked() const {
@@ -731,6 +753,34 @@ bool router_worker_group::all_spawned_exited_locked() const {
         }
     }
     return true;
+}
+
+void router_worker_group::wait_exits_bounded(std::unique_lock<std::mutex> & lk, int64_t bound_ms) {
+    int64_t grace = 0;
+    for (const auto & m : members) {
+        grace = std::max(grace, m.spec.quiesce_ms + kill_grace_ms);
+    }
+    const bool done = st->cv.wait_for(lk, std::chrono::milliseconds(bound_ms + grace), [this]() { return all_spawned_exited_locked(); });
+    if (done) {
+        return;
+    }
+    // a node that does not answer: give up on what is left (its link reports the exit if it ever comes)
+    std::vector<std::pair<std::shared_ptr<router_node_link>, std::string>> drop;
+    for (auto & m : members) {
+        if (m.spawned && !m.exited) {
+            LOG_WRN("group %s: worker %s (pid %d) did not exit in time, giving up on it\n", group.c_str(), m.spec.name.c_str(), m.pid);
+            m.exited = true;
+            m.stopping = true;
+            drop.emplace_back(m.node, m.spec.name);
+        }
+    }
+    lk.unlock();
+    for (const auto & [node, name] : drop) {
+        if (node) {
+            node->unwatch(name);
+        }
+    }
+    lk.lock();
 }
 
 void router_worker_group::handle_line_locked(member & m, const std::string & raw, std::vector<std::pair<std::string, std::string>> & lines_out) {
@@ -768,133 +818,119 @@ void router_worker_group::handle_line_locked(member & m, const std::string & raw
     }
 }
 
-void router_worker_group::read_output_locked(member & m, std::vector<std::pair<std::string, std::string>> & lines_out) {
-    static constexpr size_t max_line = 1024 * 1024;
-    char chunk[4096];
-    while (!m.eof) {
-        const int n = m.proc->read_output(chunk, sizeof(chunk));
-        if (n < 0) {
-            m.eof = true;
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        m.buf.append(chunk, (size_t) n);
-        size_t start = 0;
-        while (true) {
-            const size_t nl = m.buf.find('\n', start);
-            if (nl == std::string::npos) {
-                break;
-            }
-            handle_line_locked(m, m.buf.substr(start, nl - start), lines_out);
-            start = nl + 1;
-        }
-        m.buf.erase(0, start);
-        if (m.buf.size() > max_line) {
-            m.buf.clear();
-        }
-    }
-    if (m.eof && !m.buf.empty()) {
-        handle_line_locked(m, m.buf, lines_out);
-        m.buf.clear();
-    }
-}
-
 void router_worker_group::run() {
-    std::vector<std::pair<std::string, std::string>> lines;
+    struct command {
+        size_t                            idx = 0;
+        std::shared_ptr<router_node_link> node;
+        std::string                       name;
+        bool                              kill = false;
+        int                               timeout_s = 0;
+    };
     while (true) {
-        std::vector<server_subproc *> procs;
-        std::vector<size_t>           owners;
-        int64_t                       timeout = -1;
+        std::vector<std::pair<std::string, std::string>>       lines;
+        std::vector<std::tuple<std::string, int, std::string>> unexpected;
+        std::vector<command>                                   cmds;
+        bool                                                   fire_stopped = false;
         {
-            std::lock_guard<std::mutex> lk(mu);
+            std::unique_lock<std::mutex> lk(st->mu);
+            // the node enforces TERM -> KILL as well (a node we cannot reach still does); this thread
+            // adds the same deadline with millisecond precision
+            auto cmd_due = [&]() {
+                const int64_t now = now_ms();
+                for (const auto & m : members) {
+                    if (!m.spawned || m.exited || m.pid <= 0) {
+                        continue;
+                    }
+                    if ((m.term_pending || m.kill_pending) && now >= m.retry_at) {
+                        return true;
+                    }
+                    if (m.kill_deadline && now >= m.kill_deadline) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            int64_t wait = 200;
+            {
+                const int64_t now = now_ms();
+                for (const auto & m : members) {
+                    if (m.spawned && !m.exited && m.kill_deadline) {
+                        wait = std::min<int64_t>(wait, std::max<int64_t>(1, m.kill_deadline - now));
+                    }
+                    if (m.spawned && !m.exited && (m.term_pending || m.kill_pending) && m.retry_at > now) {
+                        wait = std::min<int64_t>(wait, m.retry_at - now);
+                    }
+                }
+            }
+            st->cv.wait_for(lk, std::chrono::milliseconds(wait), [&]() { return quit || !st->events.empty() || cmd_due(); });
             if (quit) {
                 return;
             }
+
+            while (!st->events.empty()) {
+                const event ev = std::move(st->events.front());
+                st->events.pop_front();
+                member & m = members[ev.idx];
+                if (!ev.exit) {
+                    if (!m.exited) {
+                        handle_line_locked(m, ev.line, lines);
+                    }
+                    continue;
+                }
+                if (m.exited) {
+                    continue;
+                }
+                m.exit_code     = ev.exit_code;
+                m.killed        = m.killed || ev.killed;
+                m.exited        = true;
+                m.kill_deadline = 0;
+                m.term_pending  = false;
+                m.kill_pending  = false;
+                LOG_INF("group %s: worker %s (pid %d) exited with status %d%s\n", group.c_str(),
+                        m.spec.name.c_str(), m.pid, m.exit_code, m.killed ? " (killed)" : "");
+                if (armed && !stop_requested && !m.stopping && !closing) {
+                    std::string reason = string_format("worker '%s' exited with status %d", m.spec.name.c_str(), m.exit_code);
+                    if (!m.error.empty()) {
+                        reason += ": " + m.error;
+                    }
+                    unexpected.emplace_back(m.spec.name, m.exit_code, reason);
+                }
+            }
+
             const int64_t now = now_ms();
             for (size_t i = 0; i < members.size(); i++) {
-                const auto & m = members[i];
-                if (!m.spawned || m.exited) {
+                member & m = members[i];
+                if (!m.spawned || m.exited || m.pid <= 0 || !m.node) {
                     continue;
                 }
-                // exits are polled, not inferred from EOF: a grandchild may hold the pipe open
-                timeout = timeout < 0 ? 100 : std::min<int64_t>(timeout, 100);
-                if (m.kill_deadline) {
-                    timeout = std::min<int64_t>(timeout, std::max<int64_t>(0, m.kill_deadline - now));
+                if (m.kill_deadline && now >= m.kill_deadline) {
+                    m.kill_pending  = true;
+                    m.kill_deadline = 0;
                 }
-                if (m.term_pending || m.kill_pending) {
-                    timeout = 0;
-                }
-                if (!m.eof) {
-                    procs.push_back(m.proc.get());
-                    owners.push_back(i);
-                }
-            }
-        }
-
-        std::vector<bool> ready;
-        waiter.wait(procs, ready, timeout);
-
-        std::vector<std::tuple<std::string, int, std::string>> unexpected;
-        bool fire_stopped = false;
-        lines.clear();
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            for (size_t k = 0; k < owners.size(); k++) {
-                if (k < ready.size() && ready[k]) {
-                    read_output_locked(members[owners[k]], lines);
-                }
-            }
-            const int64_t now = now_ms();
-            for (auto & m : members) {
-                if (!m.spawned || m.exited) {
+                if (now < m.retry_at) {
                     continue;
                 }
-                if (m.term_pending) {
+                if (m.kill_pending) {
+                    m.kill_pending = false;
                     m.term_pending = false;
                     m.stopping     = true;
-                    const int pid  = m.proc->sproc.pid(); // 0 once reaped; only this thread reaps
-                    if (pid > 0) {
-#ifndef _WIN32
-                        LOG_INF("group %s: SIGTERM worker %s (pid %d), SIGKILL in %" PRId64 " ms\n",
-                                group.c_str(), m.spec.name.c_str(), pid, m.spec.quiesce_ms + kill_grace_ms);
-                        kill(pid, SIGTERM);
-                        m.kill_deadline = now + m.spec.quiesce_ms + kill_grace_ms;
-#else
-                        m.kill_pending = true;
-#endif
-                    }
-                }
-                if (m.kill_pending || (m.kill_deadline && now >= m.kill_deadline)) {
+                    m.killed       = true;
+                    LOG_WRN("group %s: SIGKILL worker %s (pid %d)\n", group.c_str(), m.spec.name.c_str(), m.pid);
+                    command c;
+                    c.idx = i; c.node = m.node; c.name = m.spec.name; c.kill = true;
+                    cmds.push_back(std::move(c));
+                } else if (m.term_pending) {
+                    m.term_pending = false;
                     m.stopping     = true;
-                    m.kill_deadline = 0;
-                    m.kill_pending = false;
-                    if (m.proc->sproc.pid() > 0) {
-                        LOG_WRN("group %s: SIGKILL worker %s (pid %d)\n", group.c_str(), m.spec.name.c_str(), m.pid);
-                        m.proc->terminate();
-                        m.killed = true;
-                    }
-                }
-                if (!m.proc->is_alive()) {
-                    read_output_locked(m, lines); // whatever it wrote before going
-                    if (!m.buf.empty()) {
-                        handle_line_locked(m, m.buf, lines);
-                        m.buf.clear();
-                    }
-                    m.exit_code     = m.proc->join();
-                    m.exited        = true;
-                    m.eof           = true; // the pipe is closed by join(), never read it again
-                    m.kill_deadline = 0;
-                    LOG_INF("group %s: worker %s (pid %d) exited with status %d%s\n", group.c_str(),
-                            m.spec.name.c_str(), m.pid, m.exit_code, m.killed ? " (killed)" : "");
-                    if (armed && !stop_requested && !m.stopping && !closing) {
-                        std::string reason = string_format("worker '%s' exited with status %d", m.spec.name.c_str(), m.exit_code);
-                        if (!m.error.empty()) {
-                            reason += ": " + m.error;
-                        }
-                        unexpected.emplace_back(m.spec.name, m.exit_code, reason);
-                    }
+                    const int64_t bound_ms = m.spec.quiesce_ms + kill_grace_ms;
+                    LOG_INF("group %s: SIGTERM worker %s (pid %d), SIGKILL in %" PRId64 " ms\n",
+                            group.c_str(), m.spec.name.c_str(), m.pid, bound_ms);
+                    m.kill_deadline = now + bound_ms;
+                    command c;
+                    c.idx = i; c.node = m.node; c.name = m.spec.name; c.kill = false;
+                    // the node's own SIGKILL is the backstop, a second after ours
+                    c.timeout_s = (int) ((bound_ms + 999) / 1000) + 1;
+                    cmds.push_back(std::move(c));
                 }
             }
             if (stop_requested && !stop_fired && all_spawned_exited_locked()) {
@@ -902,7 +938,38 @@ void router_worker_group::run() {
                 fire_stopped = !closing;
             }
         }
-        cv.notify_all();
+        st->cv.notify_all();
+
+        // node calls with no lock held (a remote node's are HTTP)
+        for (const auto & c : cmds) {
+            bool retry = false;
+            try {
+                if (c.kill) {
+                    c.node->signal(c.name, 9);
+                } else {
+                    c.node->stop(c.name, c.timeout_s, "term");
+                }
+            } catch (const server_node_error & e) {
+                // 404 / 409: it is gone or already going; its exit event follows
+                if (e.status != 404 && e.status != 409) {
+                    LOG_WRN("group %s: %s of worker %s failed: %s (retrying)\n", group.c_str(),
+                            c.kill ? "SIGKILL" : "SIGTERM", c.name.c_str(), e.what());
+                    retry = true;
+                }
+            } catch (const std::exception & e) {
+                LOG_WRN("group %s: %s of worker %s failed: %s (retrying)\n", group.c_str(),
+                        c.kill ? "SIGKILL" : "SIGTERM", c.name.c_str(), e.what());
+                retry = true;
+            }
+            if (retry) {
+                std::lock_guard<std::mutex> lk(st->mu);
+                member & m = members[c.idx];
+                if (!m.exited) {
+                    (c.kill ? m.kill_pending : m.term_pending) = true;
+                    m.retry_at = now_ms() + 1000;
+                }
+            }
+        }
 
         if (cb.on_line) {
             for (const auto & [name, line] : lines) {
@@ -934,8 +1001,8 @@ void router_worker_group::teardown_failed_start(std::unique_lock<std::mutex> & l
             }
         }
     }
-    waiter.wake();
-    cv.wait(lk, [this]() { return all_spawned_exited_locked(); });
+    st->cv.notify_all();
+    wait_exits_bounded(lk, 15000);
 }
 
 bool router_worker_group::start(std::string & err, const std::function<bool()> & cancelled) {
@@ -955,34 +1022,63 @@ bool router_worker_group::start(std::string & err, const std::function<bool()> &
     }
 
     const int64_t t0 = now_ms();
-    for (auto & m : members) {
-        auto proc = std::make_unique<server_subproc>();
+    for (size_t i = 0; i < members.size(); i++) {
+        member & m = members[i];
         LOG_INF("group %s: starting worker %s (expects %s:%d)\n", group.c_str(), m.spec.name.c_str(),
                 m.spec.host.c_str(), m.spec.port);
         for (const auto & a : m.spec.argv) {
             LOG_INF("  %s\n", a.c_str());
         }
-        // argv[0] is absolute (router_parse_launch), so no PATH search
-        const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-        if (!proc->sproc.create(m.spec.argv, options, m.spec.env)) {
-            err = string_format("worker '%s': failed to spawn '%s'", m.spec.name.c_str(),
-                                m.spec.argv.empty() ? "" : m.spec.argv[0].c_str());
-            std::unique_lock<std::mutex> lk(mu);
+        if (!m.node) {
+            m.node = own_node();
+        }
+        node_spawn_request req;
+        req.name = m.spec.name;
+        req.gen  = gen;
+        req.args = m.spec.argv; // argv[0] is absolute (router_parse_launch), so no PATH search
+        req.env  = m.spec.env;
+        req.port = m.spec.port;
+
+        std::shared_ptr<shared_state> state = st;
+        router_node_watch w;
+        w.on_line = [state, i](const std::string & line) {
+            {
+                std::lock_guard<std::mutex> lk(state->mu);
+                event ev;
+                ev.idx  = i;
+                ev.line = line;
+                state->events.push_back(std::move(ev));
+            }
+            state->cv.notify_all();
+        };
+        w.on_exit = [state, i](const node_child_info & info) {
+            {
+                std::lock_guard<std::mutex> lk(state->mu);
+                event ev;
+                ev.exit      = true;
+                ev.idx       = i;
+                ev.exit_code = info.exit_code;
+                ev.killed    = info.killed;
+                state->events.push_back(std::move(ev));
+            }
+            state->cv.notify_all();
+        };
+        try {
+            const node_child_info info = m.node->spawn(req, std::move(w));
+            std::lock_guard<std::mutex> lk(st->mu);
+            m.pid     = info.pid;
+            m.spawned = true;
+        } catch (const std::exception & e) {
+            err = string_format("worker '%s': failed to spawn '%s': %s", m.spec.name.c_str(),
+                                m.spec.argv.empty() ? "" : m.spec.argv[0].c_str(), e.what());
+            std::unique_lock<std::mutex> lk(st->mu);
             teardown_failed_start(lk);
             return false;
         }
-        proc->has_output(); // sets the pipe non-blocking before the group thread reads it
-        const int pid = proc->sproc.pid();
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            m.proc    = std::move(proc);
-            m.pid     = pid;
-            m.spawned = true;
-        }
-        waiter.wake();
+        st->cv.notify_all();
     }
 
-    std::unique_lock<std::mutex> lk(mu);
+    std::unique_lock<std::mutex> lk(st->mu);
     while (true) {
         // failures the group thread saw
         for (auto & m : members) {
@@ -1042,14 +1138,14 @@ bool router_worker_group::start(std::string & err, const std::function<bool()> &
                 return false;
             }
         }
-        cv.wait_for(lk, std::chrono::milliseconds(200));
+        st->cv.wait_for(lk, std::chrono::milliseconds(200));
     }
 #endif
 }
 
 void router_worker_group::request_stop() {
     {
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<std::mutex> lk(st->mu);
         if (stop_requested) {
             return;
         }
@@ -1060,21 +1156,21 @@ void router_worker_group::request_stop() {
             }
         }
     }
-    waiter.wake();
+    st->cv.notify_all();
 }
 
 bool router_worker_group::wait_stopped(int64_t timeout_ms) {
-    std::unique_lock<std::mutex> lk(mu);
+    std::unique_lock<std::mutex> lk(st->mu);
     auto done = [this]() { return all_spawned_exited_locked() && (!stop_requested || stop_fired); };
     if (timeout_ms < 0) {
-        cv.wait(lk, done);
+        st->cv.wait(lk, done);
         return true;
     }
-    return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), done);
+    return st->cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), done);
 }
 
 std::set<int> router_worker_group::pids() const {
-    std::lock_guard<std::mutex> lk(mu);
+    std::lock_guard<std::mutex> lk(st->mu);
     std::set<int> out;
     for (const auto & m : members) {
         if (m.spawned && !m.exited && m.pid > 0) {
@@ -1085,16 +1181,17 @@ std::set<int> router_worker_group::pids() const {
 }
 
 bool router_worker_group::all_exited() const {
-    std::lock_guard<std::mutex> lk(mu);
+    std::lock_guard<std::mutex> lk(st->mu);
     return all_spawned_exited_locked();
 }
 
 std::vector<router_worker_state> router_worker_group::status() const {
-    std::lock_guard<std::mutex> lk(mu);
+    std::lock_guard<std::mutex> lk(st->mu);
     std::vector<router_worker_state> out;
     for (const auto & m : members) {
         router_worker_state s;
         s.name            = m.spec.name;
+        s.machine         = m.node ? m.node->machine() : "";
         s.pid             = m.pid;
         s.host            = m.spec.host;
         s.port            = m.spec.port;

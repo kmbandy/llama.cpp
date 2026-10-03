@@ -59,6 +59,8 @@ add_library(${TARGET}
     server-models.h
     server-node.cpp
     server-node.h
+    server-router-node-client.cpp
+    server-router-node-client.h
     server-router-admission.cpp
     server-router-admission.h
     server-router-board.cpp

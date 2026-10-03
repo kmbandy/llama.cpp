@@ -197,6 +197,20 @@ struct server_model_meta {
 struct server_models_routes;
 struct server_lru_sched; // defined in server-models.cpp
 struct server_monitor;   // defined in server-models.cpp
+class router_node_link;  // server-router-node-client.h
+
+// The router's handle on one child (spine, plain model, download) it runs through a node link.
+struct server_child_ref {
+    std::shared_ptr<router_node_link> node;    // null until spawned
+    std::string                       name;    // the child's name on its node
+    std::atomic<int>                  pid{0};
+    std::atomic<bool>                 stopped{false}; // its exit was seen
+    bool alive() const { return node && pid.load() > 0 && !stopped.load(); }
+    // SIGKILL, queued to the node link's command thread: safe under any lock
+    void kill() const;
+    // the exit command on the child's stdin (SIGKILL after timeout_s), queued
+    void request_exit(int timeout_s) const;
+};
 
 struct server_models {
     friend struct server_models_routes;
@@ -205,7 +219,7 @@ struct server_models {
 
 private:
     struct instance_t {
-        std::shared_ptr<server_subproc> subproc; // shared with the monitor thread
+        std::shared_ptr<server_child_ref> child; // shared with the monitor thread
         server_model_meta meta;
         // Requests currently being proxied to this model. The idle sweeper refuses to
         // unload a model with any in flight -- `meta.last_used` is stamped when a request
@@ -493,8 +507,10 @@ private:
     // not thread-safe, caller must hold mutex
     void request_stop(const std::string & name, bool send_exit = true, bool drain = true);
 
+    void stop_child_locked(instance_t & inst, bool send_exit);
+
     // called by the monitor once a child exited and was reaped
-    void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code);
+    void on_child_exit(const std::string & name, const std::shared_ptr<server_child_ref> & proc, server_child_mode mode, int exit_code);
 
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
@@ -601,8 +617,12 @@ public:
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
 private:
-    // one thread watching every child; keep last, the destructor joins the thread
+    // one thread handling every child's output lines and exit (the node link hands them over);
+    // keep last, the destructor joins the thread
     std::unique_ptr<server_monitor> monitor;
+    // this machine's node: every child of the router is spawned, stopped and watched through it.
+    // Declared after the monitor: destroyed (its threads joined) before it.
+    std::shared_ptr<router_node_link> local_node;
 };
 
 struct server_child {

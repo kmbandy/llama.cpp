@@ -260,7 +260,6 @@ class router_worker_group {
     struct member {
         router_worker_spec                spec;
         std::shared_ptr<router_node_link> node;
-        bool                              eof = false;   // unused (kept for layout clarity)
         bool                              spawned = false;
         bool                              ready = false;
         bool                              exited = false;
@@ -268,6 +267,7 @@ class router_worker_group {
         bool                              killed = false;
         bool                              term_pending = false;
         bool                              kill_pending = false;
+        int64_t                           kill_deadline = 0; // our own SIGKILL deadline (steady ms)
         int64_t                           retry_at = 0;  // a command the node did not take: try again then
         int                               pid = 0;
         int                               exit_code = -1;
