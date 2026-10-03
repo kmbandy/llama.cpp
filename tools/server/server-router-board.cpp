@@ -204,6 +204,41 @@ bool router_gpu_name_split(const std::string & field, std::string & dev, std::st
     return !dev.empty() && !board_name.empty();
 }
 
+std::string router_board_qualify(const std::string & resource, const std::string & machine, const std::string & local_machine) {
+    if (machine.empty() || machine == local_machine) {
+        return resource;
+    }
+    return resource + "@" + machine;
+}
+
+std::string router_board_res_machine(const std::string & qualified) {
+    const size_t at = qualified.rfind('@');
+    return at == std::string::npos ? std::string() : qualified.substr(at + 1);
+}
+
+void router_board_unqualify(const std::string & qualified, const std::string & local_machine,
+                            std::string & resource, std::string & machine) {
+    const size_t at = qualified.rfind('@');
+    if (at == std::string::npos) {
+        resource = qualified;
+        machine  = local_machine;
+    } else {
+        resource = qualified.substr(0, at);
+        machine  = qualified.substr(at + 1);
+    }
+}
+
+bool router_board_is_machine_res(const std::string & qualified) {
+    const size_t at = qualified.rfind('@');
+    return (at == std::string::npos ? qualified : qualified.substr(0, at)) == ROUTER_BOARD_MACHINE_RES;
+}
+
+bool router_board_claim_covers(const std::string & claim_resource, const std::string & resource) {
+    return claim_resource == resource ||
+           (router_board_is_machine_res(claim_resource) &&
+            router_board_res_machine(claim_resource) == router_board_res_machine(resource));
+}
+
 //
 // board data
 //
@@ -363,9 +398,11 @@ std::vector<admission_claim> router_board_admission_claims(const router_board_sn
     }
     auto add = [&](const std::string & id, const std::string & resource, const std::string & holder, bool router,
                    admission_priority prio) {
-        if (resource == ROUTER_BOARD_MACHINE_RES) {
+        if (router_board_is_machine_res(resource)) {
             for (const auto & r : machine_resources) {
-                out.push_back({ id, r, holder, router, prio });
+                if (router_board_res_machine(r) == router_board_res_machine(resource)) {
+                    out.push_back({ id, r, holder, router, prio });
+                }
             }
         } else {
             out.push_back({ id, resource, holder, router, prio });
@@ -393,8 +430,12 @@ std::set<std::string> router_board_contested(const router_board_snapshot & snap,
         if (e.holder == ROUTER_BOARD_HOLDER) {
             continue;
         }
-        if (e.resource == ROUTER_BOARD_MACHINE_RES) {
-            out.insert(held.begin(), held.end());
+        if (router_board_is_machine_res(e.resource)) {
+            for (const auto & h : held) {
+                if (router_board_res_machine(h) == router_board_res_machine(e.resource)) {
+                    out.insert(h);
+                }
+            }
         } else if (held.count(e.resource)) {
             out.insert(e.resource);
         }
@@ -657,7 +698,7 @@ void router_board_agent::stop() {
     }
     for (const auto & r : queues) {
         std::string err;
-        if (client.leave_queue(cfg.machine, r, err) == ROUTER_BOARD_FAILED) {
+        if (leave_queue_res(r, err) == ROUTER_BOARD_FAILED) {
             BRD_WRN("could not leave the queue for %s at shutdown: %s\n", r.c_str(), err.c_str());
         }
     }
@@ -666,11 +707,45 @@ void router_board_agent::stop() {
     }
 }
 
+bool router_board_agent::poll_machines(std::vector<router_board_claim> & cl, std::vector<router_board_queue_entry> & q,
+                                       std::string & err) const {
+    cl.clear();
+    q.clear();
+    std::vector<std::string> machines = { cfg.machine };
+    machines.insert(machines.end(), cfg.extra_machines.begin(), cfg.extra_machines.end());
+    for (const auto & m : machines) {
+        std::vector<router_board_claim>       c;
+        std::vector<router_board_queue_entry> e;
+        if (!client.list_claims(m, c, err) || !client.list_queue(m, e, err)) {
+            return false;
+        }
+        for (auto & x : c) {
+            x.machine  = m;
+            x.resource = router_board_qualify(x.resource, m, cfg.machine);
+            cl.push_back(std::move(x));
+        }
+        for (auto & x : e) {
+            x.machine  = m;
+            x.resource = router_board_qualify(x.resource, m, cfg.machine);
+            q.push_back(std::move(x));
+        }
+    }
+    return true;
+}
+
+router_board_rc router_board_agent::leave_queue_res(const std::string & qualified, std::string & err) const {
+    std::string resource;
+    std::string machine;
+    router_board_unqualify(qualified, cfg.machine, resource, machine);
+    return client.leave_queue(machine, resource, err);
+}
+
 void router_board_agent::startup_sweep() {
+    // every managed machine: what a previous router generation left there
     std::vector<router_board_claim> cl;
     std::vector<router_board_queue_entry> q;
     std::string err;
-    if (!client.list_claims(cfg.machine, cl, err)) {
+    if (!poll_machines(cl, q, err)) {
         BRD_WRN("board unavailable at startup (%s); continuing without it until it answers\n", err.c_str());
         return;
     }
@@ -684,20 +759,18 @@ void router_board_agent::startup_sweep() {
         }
     }
     std::set<std::string> queues;
-    if (client.list_queue(cfg.machine, q, err)) {
-        for (const auto & e : q) {
-            if (e.holder == ROUTER_BOARD_HOLDER) {
-                queues.insert(e.resource);
-            }
+    for (const auto & e : q) {
+        if (e.holder == ROUTER_BOARD_HOLDER) {
+            queues.insert(e.resource);
         }
     }
     for (const auto & r : queues) {
         std::string e;
-        client.leave_queue(cfg.machine, r, e);
+        leave_queue_res(r, e);
     }
     if (n_claims > 0 || !queues.empty()) {
-        BRD_INF("released %zu claim(s) and left %zu queue(s) a previous router left on %s\n",
-                n_claims, queues.size(), cfg.machine.c_str());
+        BRD_INF("released %zu claim(s) and left %zu queue(s) a previous router left on %s (+%zu other machine(s))\n",
+                n_claims, queues.size(), cfg.machine.c_str(), cfg.extra_machines.size());
     }
 }
 
@@ -791,12 +864,15 @@ router_board_claim_result router_board_agent::acquire(const std::string & owner,
     if (rejoin) {
         // the board keeps the slot's first priority: leave it, the claim below joins again higher
         std::string err;
-        if (client.leave_queue(cfg.machine, resource, err) == ROUTER_BOARD_FAILED) {
+        if (leave_queue_res(resource, err) == ROUTER_BOARD_FAILED) {
             BRD_WRN("could not leave the queue for %s to re-join at %s: %s\n", resource.c_str(),
                     admission_priority_str(priority), err.c_str());
         }
     }
-    router_board_claim_result r = client.claim(cfg.machine, resource, note, priority, cfg.ttl_hours);
+    std::string plain_resource;
+    std::string claim_machine;
+    router_board_unqualify(resource, cfg.machine, plain_resource, claim_machine);
+    router_board_claim_result r = client.claim(claim_machine, plain_resource, note, priority, cfg.ttl_hours);
     bool give_back = false;
     {
         std::lock_guard<std::mutex> lk(mu);
@@ -892,7 +968,7 @@ void router_board_agent::leave_queue(const std::string & queue_owner) {
     }
     for (const auto & r : to_leave) {
         std::string err;
-        if (client.leave_queue(cfg.machine, r, err) == ROUTER_BOARD_FAILED) {
+        if (leave_queue_res(r, err) == ROUTER_BOARD_FAILED) {
             BRD_WRN("could not leave the queue for %s: %s\n", r.c_str(), err.c_str());
         }
     }
@@ -995,7 +1071,7 @@ void router_board_agent::tick() {
     std::vector<router_board_claim>       cl;
     std::vector<router_board_queue_entry> q;
     std::string err;
-    const bool ok = client.list_claims(cfg.machine, cl, err) && client.list_queue(cfg.machine, q, err);
+    const bool ok = poll_machines(cl, q, err);
     bool changed = false;
     {
         std::lock_guard<std::mutex> lk(mu);
@@ -1083,7 +1159,7 @@ void router_board_agent::tick() {
         }
         for (const auto & res : missing(r.name, r.resources)) {
             const bool foreign = std::any_of(snap.claims.begin(), snap.claims.end(), [&](const router_board_claim & c) {
-                return c.holder != ROUTER_BOARD_HOLDER && (c.resource == res || c.resource == ROUTER_BOARD_MACHINE_RES);
+                return c.holder != ROUTER_BOARD_HOLDER && router_board_claim_covers(c.resource, res);
             });
             if (foreign) {
                 continue;
@@ -1114,7 +1190,7 @@ void router_board_agent::tick() {
                 }
                 if (!waited_for) {
                     std::string e;
-                    client.leave_queue(cfg.machine, res, e);
+                    leave_queue_res(res, e);
                 }
                 BRD_WRN("%s runs on %s, which %s claimed meanwhile\n", r.name.c_str(), res.c_str(), cr.held_by.c_str());
             }
@@ -1197,7 +1273,7 @@ void router_board_agent::tick() {
             std::string who;
             std::string what;
             for (const auto & e : snap.queue) {
-                if (e.holder != ROUTER_BOARD_HOLDER && (contested.count(e.resource) || e.resource == ROUTER_BOARD_MACHINE_RES)) {
+                if (e.holder != ROUTER_BOARD_HOLDER && (contested.count(e.resource) || router_board_is_machine_res(e.resource))) {
                     who  = e.holder;
                     what = e.resource;
                     break;

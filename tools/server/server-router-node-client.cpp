@@ -292,6 +292,52 @@ void router_slot_split(const std::string & id, std::string & machine, std::strin
     }
 }
 
+std::string router_slot_resolve(const std::string & gpu, const std::string & machine,
+                                const std::function<bool(const std::string &)> & is_local) {
+    std::string m;
+    std::string dev;
+    const size_t slash = gpu.find('/');
+    if (slash == std::string::npos) {
+        m   = machine;
+        dev = gpu;
+    } else {
+        m   = gpu.substr(0, slash);
+        dev = gpu.substr(slash + 1);
+    }
+    if (is_local && is_local(m)) {
+        m.clear();
+    }
+    return m.empty() ? dev : m + "/" + dev;
+}
+
+bool router_node_offline_due(bool online, int64_t last_rx_ms, int64_t now_ms, int64_t offline_ms) {
+    return online && now_ms - last_rx_ms >= offline_ms;
+}
+
+bool router_node_online_due(bool online, int64_t last_rx_ms, int64_t now_ms, int64_t offline_ms) {
+    return !online && now_ms - last_rx_ms < offline_ms;
+}
+
+bool router_machine_availability::set_online(const std::string & machine, bool online) {
+    if (machine.empty()) {
+        return false;
+    }
+    return online ? offline.erase(machine) > 0 : offline.insert(machine).second;
+}
+
+std::string router_machine_availability::first_offline(const std::vector<std::string> & machines) const {
+    for (const auto & m : machines) {
+        if (is_offline(m)) {
+            return m;
+        }
+    }
+    return "";
+}
+
+std::string router_effective_status(const std::string & status, bool machine_offline) {
+    return machine_offline ? "unavailable" : status;
+}
+
 static bool is_pdev_at(const std::string & s, size_t i) {
     // dddd:bb:dd.f (hex)
     static const char * shape = "hhhh:hh:hh.h";
@@ -601,7 +647,7 @@ void router_node_link::check_offline() {
     if (!remote() || !online_flag.load()) {
         return;
     }
-    if (steady_ms() - last_rx_ms.load() < cfg.offline_ms) {
+    if (!router_node_offline_due(true, last_rx_ms.load(), steady_ms(), cfg.offline_ms)) {
         return;
     }
     online_flag.store(false);
@@ -832,7 +878,7 @@ void router_node_link::reconcile() {
         std::lock_guard<std::mutex> lk(mu);
         reconcile_pending = false;
     }
-    if (remote() && !online_flag.load() && steady_ms() - last_rx_ms.load() < cfg.offline_ms) {
+    if (remote() && router_node_online_due(online_flag.load(), last_rx_ms.load(), steady_ms(), cfg.offline_ms)) {
         online_flag.store(true);
         NLC_INF("node %s online (%zu kept, %zu re-adopted, %zu stopped, %zu gone)\n", cfg.machine.c_str(),
                 plan.keep.size(), plan.adopt.size(), plan.stop.size() + plan.adopt_stop.size(), plan.lost.size());

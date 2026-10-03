@@ -500,6 +500,54 @@ int main() {
             assert(w2.n_exits() == 1);
         }
 
+        // heartbeat loss and recovery (offline_ms 1 s): silent node -> offline + hook(false), spawns refused
+        // 503; back -> reconcile -> online + hook(true). A child of the current gen the leader still wants
+        // is kept (no exit reported), one it no longer wants is stopped by the reconcile.
+        {
+            std::atomic<int>  n_off{ 0 };
+            std::atomic<int>  n_on{ 0 };
+            std::atomic<bool> drop_unwanted{ false };
+            router_node_link_config lc;
+            lc.machine    = "box3";
+            lc.gen        = GEN;
+            lc.offline_ms = 1000;
+            auto hb = router_node_make_remote(lc, url, TOKEN);
+            router_node_hooks hooks;
+            hooks.wanted    = [&](const std::string & n) { return !(n == "hb-unwanted" && drop_unwanted.load()); };
+            hooks.on_online = [&](bool on) { (on ? n_on : n_off)++; };
+            hb->set_hooks(std::move(hooks));
+            hb->start();
+            assert(wait_until([&]() { return hb->online(); }, 15000));
+            assert(n_on.load() == 1 && n_off.load() == 0);
+
+            watch_log wk;
+            watch_log wu;
+            const node_child_info ik = hb->spawn(sh("hb-keep", "exec sleep 30"), wk.watch());
+            hb->spawn(sh("hb-unwanted", "exec sleep 30"), wu.watch());
+
+            proxy.sever();
+            assert(wait_until([&]() { return !hb->online(); }, 8000));
+            assert(n_off.load() == 1);
+            int status = -1;
+            try {
+                watch_log wx;
+                hb->spawn(sh("hb-refused", "true"), wx.watch());
+            } catch (const server_node_error & e) {
+                status = e.status;
+            }
+            assert(status == 503);
+
+            drop_unwanted.store(true);
+            proxy.resume();
+            assert(wait_until([&]() { return hb->online(); }, 15000));
+            assert(n_on.load() == 2);
+            assert(wu.wait_exit(15000)); // stopped by the reconcile
+            assert(wk.n_exits() == 0 && pid_alive(ik.pid));
+            hb->stop("hb-keep", 5, "term");
+            assert(wk.wait_exit(10000));
+            hb->shutdown();
+        }
+
         link->shutdown();
     }
 

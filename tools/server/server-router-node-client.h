@@ -135,6 +135,31 @@ std::string router_probe_pdev(const std::string & probe);
 // Splits a slot id "<machine>/<dev>" ("<dev>" = local).
 void router_slot_split(const std::string & id, std::string & machine, std::string & dev);
 
+// A preset `gpu=` entry as a slot id. "<machine>/<dev>" names its machine; a bare device name is on
+// `machine` (the preset's `machine=`, "" = this machine). The local machine (is_local) is dropped:
+// a local slot's id is the bare device, so single-machine presets and placements read as before.
+std::string router_slot_resolve(const std::string & gpu, const std::string & machine,
+                                const std::function<bool(const std::string &)> & is_local);
+
+// Heartbeat loss: a remote node that is online and silent for offline_ms goes offline; one that is
+// offline and was heard from within offline_ms is back (after its reconcile). Pure: the clocks are
+// arguments.
+bool router_node_offline_due(bool online, int64_t last_rx_ms, int64_t now_ms, int64_t offline_ms);
+bool router_node_online_due(bool online, int64_t last_rx_ms, int64_t now_ms, int64_t offline_ms);
+
+// Which machines are offline, as the router sees them. Marking is reversible: set_online() flips it
+// back and reports whether anything changed. "" (this machine) is never offline.
+struct router_machine_availability {
+    std::set<std::string> offline;
+    bool set_online(const std::string & machine, bool online);
+    bool is_offline(const std::string & machine) const { return !machine.empty() && offline.count(machine) > 0; }
+    // the first of `machines` that is offline; "" when none is
+    std::string first_offline(const std::vector<std::string> & machines) const;
+};
+
+// The status a model shows: "unavailable" while its machine is offline, else its own status.
+std::string router_effective_status(const std::string & status, bool machine_offline);
+
 //
 // the link
 //

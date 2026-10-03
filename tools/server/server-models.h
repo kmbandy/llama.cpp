@@ -8,6 +8,7 @@
 #include "server-queue.h"
 #include "server-router-admission.h"
 #include "server-router-board.h"
+#include "server-router-node-client.h"
 #include "server-router-holds.h"
 #include "server-router-groups.h"
 #include "server-router-group-lifecycle.h"
@@ -83,6 +84,7 @@ static std::string server_model_source_to_string(server_model_source source) {
 }
 
 struct server_gpu_slot {
+    std::string machine; // "" = this machine; else the machine whose node reports this card (gpus= "<machine>/<dev>")
     std::string dev_name;
     std::string board_name; // the GPU's name on the coordination board (gpus= dev=board); "" = dev_name
     std::string vram_probe;
@@ -90,6 +92,10 @@ struct server_gpu_slot {
     int64_t total_bytes = 0;
     int64_t reserved_bytes = 0;
     std::string exclusive_holder;
+    // The slot id: "<machine>/<dev>" for another machine's card, the bare device for this machine's
+    // (single-machine configs, placements and /models read exactly as before).
+    std::string id() const { return machine.empty() ? dev_name : machine + "/" + dev_name; }
+    bool remote() const { return !machine.empty(); }
 };
 
 struct server_model_placement {
@@ -179,6 +185,12 @@ struct server_model_meta {
     // the router sends it as a bearer on every request it proxies there. "" = local child.
     std::string              child_key;
 
+    // The machine of this model (or of one of its group's workers) is offline (its node's heartbeat
+    // is lost): the model is `unavailable`. Filled into the copies get_meta() / get_all_meta() hand
+    // out, never kept in the registry: reversible by construction.
+    bool                     unavailable = false;
+    std::string              unavailable_machine;
+
     bool is_external() const {
         return kind == ROUTER_KIND_EXTERNAL;
     }
@@ -250,6 +262,8 @@ private:
     bool gpu_placement_enabled = false;
 
 public:
+    const std::string & local_machine_name() const { return local_machine; }
+
     // Runtime master switch for on-demand loading. Seeded from --models-autoload, but
     // flippable at runtime via POST /models/autoload so a human can take the GPUs back
     // (gaming, kernel work) without stopping the router: while this is false the router
@@ -429,24 +443,31 @@ private:
     struct vram_snapshot {
         std::vector<proc_vram> usage;
         std::set<int>          router_pids;
+        std::map<std::string, router_node_probe> nodes; // remote machine -> its node's cached /node/state probe
     };
     vram_snapshot take_vram_snapshot_locked() const;
     int64_t foreign_vram_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
-    int64_t free_ram_bytes_locked(const std::string & exclude) const; // MemAvailable - headroom - RAM of other still-loading models; -1 = unknown
-    int64_t resident_ram_bytes_locked(const std::string & name) const; // rss (anon+shmem), else ram-mb, else 0
+    // MemAvailable - headroom - RAM of other still-loading models on `machine` ("" = this machine; another
+    // machine's from its node's probe); -1 = unknown
+    int64_t free_ram_bytes_locked(const std::string & exclude, const std::string & machine = "") const;
+    int64_t resident_ram_bytes_locked(const std::string & name) const; // rss (anon+shmem, from the model's node), else ram-mb, else 0
     int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
     int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap, int64_t sysfs_used) const;
+    // card-wide VRAM used on a slot: the local sysfs / NVML probe, or the node's reading; -1 = unknown
+    int64_t slot_used_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
     std::vector<int64_t> estimate_need_bytes(const server_model_meta & meta);
 
     // coordination board (server-router-board.h); null = no --board-url, board features off
     std::unique_ptr<router_board_agent> board;
     std::string local_machine; // this machine's name (machines.json `local: true`, else hostname)
-    std::string board_gpu_resource(const std::string & dev) const;         // "gpu:<board name>"
+    std::string board_gpu_resource(const std::string & slot_id) const;     // "gpu:<board name>" ("...@<machine>" on another machine)
     std::vector<std::string> board_resources_locked(const server_model_meta & meta) const; // what a resident holds
     std::vector<std::string> machine_resources_locked() const;             // every resource on this machine
     std::vector<router_board_resident> board_residents();                  // board agent callback
     void board_yield(const std::string & name, const std::string & reason); // board agent callback
     std::string admission_machine(const std::string & requested) const;    // the local machine -> ""
+    std::string board_ram_resource(const std::string & machine) const;     // "ram" / "ram@<machine>"
+    bool machine_is_local_name(const std::string & machine) const;         // "", "local", own name / hostname
     admission_priority effective_priority(const router_request_opts & req, const server_model_meta & meta) const;
 
     // hold leases (server-router-holds.h); guarded by `mutex`. A worker is held through its spine.
@@ -639,6 +660,24 @@ private:
     // name), else that machine's remote link; nullptr (err set) when there is none.
     std::shared_ptr<router_node_link> node_for_machine(const std::string & machine, std::string & err) const;
     bool machine_is_remote(const std::string & machine) const;
+
+    // Heartbeat loss. `availability` (guarded by `mutex`) holds the machines whose node is offline; their
+    // slots are skipped by pools and admission, their models are `unavailable`, requests for them get 503.
+    // All of it is derived from this set, so a node coming back (after its reconcile) undoes it.
+    router_machine_availability availability;
+    bool machine_offline_locked(const std::string & machine) const; // "" / local: never
+    // the offline machine this model (or a worker of its group) needs; "" = none
+    std::string offline_machine_locked(const server_model_meta & meta) const;
+    // link hook: machine's node went offline / is back
+    void on_machine_online(const std::string & machine, bool online);
+    // one-shot child (estimate, --list-devices) through this machine's node: its output lines, its exit code
+    bool run_oneshot(const std::string & name, const std::vector<std::string> & args, const std::vector<std::string> & env,
+                     const std::function<void(const std::string &)> & on_line, int & exit_code, std::string & err);
+    std::atomic<int> oneshot_seq{0};
+public:
+    // the offline machine a request for `name` would need ("" = available); takes the lock
+    std::string unavailable_machine(const std::string & name);
+private:
 };
 
 struct server_child {

@@ -150,6 +150,22 @@ bool router_gpu_name_split(const std::string & field, std::string & dev, std::st
 
 // router_local_machine() / router_parse_local_machine(): server-router-machines.h
 
+// Board resources are per machine. On the agent's own machine a resource is its plain name
+// ("gpu:R9700", "ram", "machine"); on another machine the name carries "@<machine>"
+// ("gpu:6900XT@mad-lab-2026", "ram@mad-lab-2026", "machine@mad-lab-2026"). The agent, the
+// admission inputs and the claims it takes all use these qualified names; the board itself is
+// always called with (machine, plain resource).
+std::string router_board_qualify(const std::string & resource, const std::string & machine, const std::string & local_machine);
+void        router_board_unqualify(const std::string & qualified, const std::string & local_machine,
+                                   std::string & resource, std::string & machine);
+// the machine part of a qualified name; "" = the agent's own machine
+std::string router_board_res_machine(const std::string & qualified);
+// a whole-machine claim ("machine" / "machine@M")
+bool router_board_is_machine_res(const std::string & qualified);
+// A claim or queue entry on `claim_resource` stands in the way of `resource`: the same resource, or
+// a whole-machine claim on the machine that resource is on.
+bool router_board_claim_covers(const std::string & claim_resource, const std::string & resource);
+
 //
 // board data
 //
@@ -273,7 +289,8 @@ class router_board_client {
 struct router_board_config {
     std::string url;
     std::string token;
-    std::string machine;
+    std::string machine;                         // the router's own machine
+    std::vector<std::string> extra_machines;     // other machines whose resources the router claims (polled, swept)
     int         poll_ms    = 3000;
     int64_t     renew_ms   = 10LL * 60 * 1000;
     int         ttl_hours  = 1;
@@ -343,6 +360,10 @@ class router_board_agent {
     void unjoin_locked(const std::string & resource, const std::string & queue_owner);
     void release_dead_from(const std::vector<router_board_resident> & residents, int64_t since_ms);
     void startup_sweep();
+    // claims and queue of every managed machine; resources of other machines qualified (router_board_qualify)
+    bool poll_machines(std::vector<router_board_claim> & cl, std::vector<router_board_queue_entry> & q, std::string & err) const;
+    // client.leave_queue for a qualified resource
+    router_board_rc leave_queue_res(const std::string & qualified, std::string & err) const;
 
     router_board_config cfg;
     router_board_host   host;

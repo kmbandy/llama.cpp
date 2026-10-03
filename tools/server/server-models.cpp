@@ -196,6 +196,10 @@ struct server_lru_sched {
             if (m.second.meta.is_external()) {
                 continue;
             }
+            // on an offline machine: its node cannot be told to stop it
+            if (!models.offline_machine_locked(m.second.meta).empty()) {
+                continue;
+            }
             // FORK GUARD: pinned is a HARD HOLD. A pinned resident owns its GPU until a
             // human unpins it (the DSWS / weight-paging case). Evicting one pulls the card
             // out from under work that asked to keep it.
@@ -287,7 +291,8 @@ struct server_lru_sched {
         int n_running  = 0;
         int n_stopping = 0;
         for (const auto & m : models.mapping) {
-            if (m.second.meta.is_running() && !m.second.meta.is_external()) { // a group takes one slot
+            if (m.second.meta.is_running() && !m.second.meta.is_external() &&
+                    models.offline_machine_locked(m.second.meta).empty()) { // a group takes one slot
                 n_running++;
                 if (models.stopping_models.count(m.first)) {
                     n_stopping++;
@@ -338,10 +343,14 @@ struct server_lru_sched {
         GGML_ASSERT(lk.owns_lock() && lk.mutex() == &models.mutex);
     }
 
+    // models_max is router-wide: a child on another machine takes a slot like a local one. A model on a
+    // machine whose node is offline does not (it cannot be started or stopped now, and counting it would
+    // block every load until the node is back).
     size_t count_running() {
         size_t count = 0;
         for (const auto & m : models.mapping) {
-            if (m.second.meta.is_running() && !m.second.meta.is_external()) { // a group takes one slot
+            if (m.second.meta.is_running() && !m.second.meta.is_external() &&
+                    models.offline_machine_locked(m.second.meta).empty()) { // a group takes one slot
                 count++;
             }
         }
@@ -483,7 +492,11 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
     if (!placement.devs.empty()) {
         std::string dev_list;
-        for (const auto & dev : placement.devs) {
+        for (const auto & slot_id : placement.devs) {
+            // slot ids are "<machine>/<dev>": the child (on that machine) knows the bare device
+            std::string slot_machine;
+            std::string dev;
+            router_slot_split(slot_id, slot_machine, dev);
             if (!dev_list.empty()) {
                 dev_list += ",";
             }
@@ -634,6 +647,8 @@ server_models::server_models(
         LOG_WRN("failed to get server executable path: %s\n", e.what());
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
+    // this machine's name first: `gpus=` slots and preset `gpu=` entries resolve against it
+    local_machine = router_local_machine();
     load_models();
     autoload_enabled.store(params.models_autoload, std::memory_order_relaxed);
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
@@ -641,7 +656,6 @@ server_models::server_models(
     // The coordination board: claims for what the router loads, queueing behind sessions,
     // yielding idle GPUs to them. No --board-url: all of it is off and the router behaves as
     // before (holds, priorities and the busy-resident queue still work).
-    local_machine = router_local_machine();
 
     // The other machines' nodes: one link per machines.json entry with a `router_node` URL, bearer
     // token from --node-token-file (the file the nodes were started with). Each is offline until its
@@ -666,12 +680,20 @@ server_models::server_models(
                     auto link  = router_node_make_remote(lc, m.router_node, token);
                     router_node_hooks hooks;
                     // a child the node runs that this router no longer wants is stopped at reconcile
+                    // (an unload asked while the node was unreachable counts as unwanted: its stop
+                    // never arrived, the reconcile sends it)
                     hooks.wanted = [this](const std::string & child) {
                         std::lock_guard<std::mutex> lk(mutex);
                         auto it = mapping.find(child);
-                        return it != mapping.end() && it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED;
+                        return it != mapping.end() && it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED &&
+                               stopping_models.count(child) == 0;
                     };
+                    // heartbeat lost / back: the machine's slots and models go unavailable / come back
+                    const std::string machine_name = m.name;
+                    hooks.on_online = [this, machine_name](bool online) { on_machine_online(machine_name, online); };
                     link->set_hooks(std::move(hooks));
+                    // offline until its first heartbeat has been reconciled (on_online(true) clears this)
+                    availability.set_online(m.name, false);
                     link->start();
                     remote_nodes[m.name] = link;
                     SRV_INF("machine '%s': node %s\n", m.name.c_str(), m.router_node.c_str());
@@ -679,6 +701,12 @@ server_models::server_models(
                     SRV_WRN("machine '%s': bad router_node '%s': %s\n", m.name.c_str(), m.router_node.c_str(), e.what());
                 }
             }
+        }
+    }
+    for (const auto & slot : gpu_slots) {
+        if (slot.remote() && remote_nodes.find(slot.machine) == remote_nodes.end()) {
+            SRV_WRN("GPU slot '%s' is on machine '%s', which has no router node (--node-token-file and a router_node URL in "
+                    "machines.json): models placed there cannot start\n", slot.id().c_str(), slot.machine.c_str());
         }
     }
     if (!base_params.router_board_url.empty()) {
@@ -700,6 +728,9 @@ server_models::server_models(
         cfg.url     = base_params.router_board_url;
         cfg.token   = token;
         cfg.machine = local_machine;
+        for (const auto & [machine_name, _] : remote_nodes) {
+            cfg.extra_machines.push_back(machine_name); // claims, queues and sweeps cover every managed machine
+        }
         router_board_host host;
         host.residents = [this]() { return board_residents(); };
         host.yield     = [this](const std::string & name, const std::string & reason) { board_yield(name, reason); };
@@ -959,6 +990,9 @@ static int64_t read_probe_total_bytes(const std::string & vram_probe) {
 
 // Card-wide VRAM in use, bytes; -1 if the probe cannot be read.
 static int64_t read_vram_used_bytes(const server_gpu_slot & slot) {
+    if (slot.remote()) {
+        return -1; // another machine's card: its node reports it (slot_used_bytes_locked)
+    }
     if (slot.vram_probe.rfind("nvml:", 0) == 0) {
         const std::string idx = slot.vram_probe.substr(strlen("nvml:"));
         const std::string cmd = "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i " + idx + " 2>/dev/null";
@@ -1001,40 +1035,42 @@ bool server_models::load_gpu_config(const common_preset & global_preset) {
         return false;
     }
 
-    for (auto entry : string_split<std::string>(spec, ',')) {
-        entry = string_strip(entry);
-        if (entry.empty()) {
-            continue;
-        }
-        const size_t p0 = entry.find(':');
-        const size_t p1 = p0 == std::string::npos ? std::string::npos : entry.find(':', p0 + 1);
-        if (p0 == std::string::npos || p1 == std::string::npos) {
-            throw std::runtime_error("invalid --gpus entry '" + entry + "', expected name:total_mb:probe");
-        }
+    // [machine/]dev[=board]:total_mb:probe, comma separated. An entry without a machine (or with this
+    // machine's own name) is a slot here; "<machine>/<dev>" is a card on another machine, read through
+    // that machine's node (its total_mb and a PCI-address probe are then required).
+    std::vector<router_gpu_spec_entry> entries;
+    const std::string spec_err = router_parse_gpus_spec(spec, [this](const std::string & m) { return machine_is_local_name(m); }, entries);
+    if (!spec_err.empty()) {
+        throw std::runtime_error(spec_err);
+    }
+    for (const auto & entry : entries) {
         server_gpu_slot slot;
-        // "ROCm0=R9700": the device, then its name on the coordination board
-        if (!router_gpu_name_split(entry.substr(0, p0), slot.dev_name, slot.board_name)) {
-            throw std::runtime_error("invalid --gpus entry '" + entry + "', expected name[=board]:total_mb:probe");
+        slot.machine    = entry.machine;
+        slot.dev_name   = entry.dev;
+        slot.board_name = entry.board;
+        slot.vram_probe = entry.probe;
+        if (slot.remote()) {
+            slot.total_bytes = entry.total_mb * 1024LL * 1024LL;
+            slot.pdev        = entry.pdev;
+        } else {
+            // total_mb is an optional OVERRIDE of the slot total: empty or 0 means "use the
+            // probe's physical total" (whole card). A positive value caps the slot below that.
+            const int64_t override_bytes = entry.total_mb * 1024LL * 1024LL;
+            const int64_t probe_total = read_probe_total_bytes(slot.vram_probe);
+            slot.total_bytes = override_bytes > 0 ? override_bytes : probe_total;
+            if (override_bytes > 0 && probe_total > 0 && override_bytes < probe_total) {
+                SRV_WRN("GPU slot %s: declared total %" PRId64 " MB caps the physical %" PRId64 " MB; "
+                        "leave total_mb empty to use the whole card\n",
+                        slot.dev_name.c_str(), override_bytes / (1024 * 1024), probe_total / (1024 * 1024));
+            }
+            slot.pdev = pdev_for_probe(slot.vram_probe); // "" for NVML: whole-card, no per-PID view
         }
-        slot.vram_probe = entry.substr(p1 + 1);
-        // total_mb is an optional OVERRIDE of the slot total: empty or 0 means "use the
-        // probe's physical total" (whole card). A positive value caps the slot below that.
-        const std::string mb_str = string_strip(entry.substr(p0 + 1, p1 - p0 - 1));
-        const int64_t override_bytes = mb_str.empty() ? 0 : parse_mb_to_bytes(mb_str);
-        const int64_t probe_total = read_probe_total_bytes(slot.vram_probe);
-        slot.total_bytes = override_bytes > 0 ? override_bytes : probe_total;
-        if (override_bytes > 0 && probe_total > 0 && override_bytes < probe_total) {
-            SRV_WRN("GPU slot %s: declared total %" PRId64 " MB caps the physical %" PRId64 " MB; "
-                    "leave total_mb empty to use the whole card\n",
-                    slot.dev_name.c_str(), override_bytes / (1024 * 1024), probe_total / (1024 * 1024));
-        }
-        slot.pdev = pdev_for_probe(slot.vram_probe); // "" for NVML: whole-card, no per-PID view
         if (slot.dev_name.empty() || slot.total_bytes <= 0 || slot.vram_probe.empty()) {
-            throw std::runtime_error("invalid --gpus entry '" + entry + "'");
+            throw std::runtime_error("invalid --gpus entry for slot '" + slot.id() + "'");
         }
         for (const auto & existing : gpu_slots) {
-            if (existing.dev_name == slot.dev_name) {
-                throw std::runtime_error("duplicate GPU slot '" + slot.dev_name + "'");
+            if (existing.id() == slot.id()) {
+                throw std::runtime_error("duplicate GPU slot '" + slot.id() + "'");
             }
         }
         gpu_slots.push_back(std::move(slot));
@@ -1242,11 +1278,23 @@ void server_models::parse_model_placement(server_model_meta & meta) {
         return;
     }
 
+    // `gpu=` entries are slot ids: "<machine>/<dev>", or a bare device on the preset's `machine=` (this
+    // machine's when it names none). A section whose slots are all on one other machine runs there.
+    const auto is_local = [this](const std::string & m) { return machine_is_local_name(m); };
+    std::set<std::string> dev_machines;
     for (auto dev : string_split<std::string>(gpu, ',')) {
         dev = string_strip(dev);
         if (!dev.empty()) {
-            meta.placement.devs.push_back(dev);
+            const std::string id = router_slot_resolve(dev, meta.machine, is_local);
+            std::string id_machine;
+            std::string id_dev;
+            router_slot_split(id, id_machine, id_dev);
+            dev_machines.insert(id_machine);
+            meta.placement.devs.push_back(id);
         }
+    }
+    if (meta.machine.empty() && dev_machines.size() == 1 && !dev_machines.begin()->empty()) {
+        meta.machine = *dev_machines.begin();
     }
     meta.placement.exclusive = model_wants_exclusive(meta) || meta.placement.devs.size() > 1;
 
@@ -1262,30 +1310,84 @@ void server_models::parse_model_placement(server_model_meta & meta) {
 }
 
 void server_models::validate_gpu_slots() {
+    // only this machine's slots: another machine's cards are seen through its node. The check
+    // child runs through this machine's node like every other child.
+    const bool any_local = std::any_of(gpu_slots.begin(), gpu_slots.end(), [](const server_gpu_slot & s) { return !s.remote(); });
+    if (!any_local) {
+        return;
+    }
     std::vector<std::string> args = { bin_path, "--list-devices" };
-    std::vector<std::string> env = base_env;
-    common_subproc proc;
-    int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-    if (!proc.create(args, options, env)) {
-        throw std::runtime_error("failed to spawn --list-devices for router GPU validation");
-    }
     std::string output;
-    FILE * stdout_file = proc.stdout_file();
-    if (stdout_file) {
-        char buffer[4096];
-        while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
-            output += buffer;
-        }
+    int exit_code = -1;
+    std::string err;
+    if (!run_oneshot("list-devices", args, {}, [&output](const std::string & line) { output += line + "\n"; }, exit_code, err)) {
+        throw std::runtime_error("failed to spawn --list-devices for router GPU validation: " + err);
     }
-    const int exit_code = proc.join();
     if (exit_code != 0) {
         throw std::runtime_error("--list-devices validation child exited with status " + std::to_string(exit_code));
     }
     for (const auto & slot : gpu_slots) {
+        if (slot.remote()) {
+            continue;
+        }
         if (output.find(slot.dev_name + ":") == std::string::npos) {
             throw std::runtime_error("configured GPU slot '" + slot.dev_name + "' was not found in --list-devices output");
         }
     }
+}
+
+// A short-lived child (estimate, --list-devices) on this machine's node: the same spawn / watch path
+// as every other child, so nothing is forked behind the node's back. Blocks until it exited; never
+// call with `mutex` held. `env` are overrides on the node's base env (the router's env).
+bool server_models::run_oneshot(const std::string & name, const std::vector<std::string> & args, const std::vector<std::string> & env,
+                                const std::function<void(const std::string &)> & on_line, int & exit_code, std::string & err) {
+    struct shot_state {
+        std::mutex              mu;
+        std::condition_variable cv;
+        bool                    done = false;
+        int                     code = -1;
+    };
+    auto st = std::make_shared<shot_state>();
+    const std::string unique = name + "-" + std::to_string(oneshot_seq.fetch_add(1) + 1);
+
+    node_spawn_request req;
+    req.name = unique;
+    req.gen  = router_gen;
+    req.args = args;
+    req.env  = env;
+
+    router_node_watch watch;
+    watch.on_line = [st, on_line](const std::string & line) {
+        std::lock_guard<std::mutex> l(st->mu);
+        if (on_line) {
+            on_line(line);
+        }
+    };
+    watch.on_exit = [st](const node_child_info & info) {
+        std::lock_guard<std::mutex> l(st->mu);
+        st->code = info.exit_code;
+        st->done = true;
+        st->cv.notify_all();
+    };
+    try {
+        local_node->spawn(req, watch);
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
+    }
+    std::unique_lock<std::mutex> l(st->mu);
+    if (!st->cv.wait_for(l, std::chrono::minutes(30), [&]() { return st->done; })) {
+        l.unlock();
+        try {
+            local_node->stop(unique, 5, "both");
+        } catch (...) {
+        }
+        local_node->unwatch(unique);
+        err = "timed out";
+        return false;
+    }
+    exit_code = st->code;
+    return true;
 }
 
 int64_t server_models::read_physical_free_bytes(const server_gpu_slot & slot) const {
@@ -1296,8 +1398,10 @@ int64_t server_models::physical_free_from_used(const server_gpu_slot & slot, int
     if (used >= 0) {
         return std::max<int64_t>(0, slot.total_bytes - used);
     }
-    SRV_WRN("failed to read VRAM probe '%s' for %s, trusting declared total\n",
-            slot.vram_probe.c_str(), slot.dev_name.c_str());
+    if (!slot.remote()) {
+        SRV_WRN("failed to read VRAM probe '%s' for %s, trusting declared total\n",
+                slot.vram_probe.c_str(), slot.dev_name.c_str());
+    }
     return slot.total_bytes;
 }
 
@@ -1344,10 +1448,17 @@ bool server_models::same_group_locked(const std::string & a, const std::string &
 server_models::vram_snapshot server_models::take_vram_snapshot_locked() const {
     vram_snapshot snap;
     const bool any_pdev = std::any_of(gpu_slots.begin(), gpu_slots.end(),
-        [](const server_gpu_slot & s) { return !s.pdev.empty(); });
+        [](const server_gpu_slot & s) { return !s.remote() && !s.pdev.empty(); });
     if (any_pdev) {
         snap.usage       = probe_fdinfo_vram("");
         snap.router_pids = router_child_pids_locked();
+    }
+    // another machine's cards: its node's cached probe (no HTTP here)
+    for (const auto & slot : gpu_slots) {
+        if (slot.remote() && snap.nodes.find(slot.machine) == snap.nodes.end()) {
+            auto it = remote_nodes.find(slot.machine);
+            snap.nodes[slot.machine] = it != remote_nodes.end() ? it->second->probe() : router_node_probe{};
+        }
     }
     return snap;
 }
@@ -1356,21 +1467,42 @@ int64_t server_models::foreign_vram_bytes_locked(const server_gpu_slot & slot, c
     if (slot.pdev.empty()) {
         return 0;
     }
+    if (slot.remote()) {
+        // PIDs on the node's box that are not the node's children (the router's own children there
+        // are in the slot reservation already)
+        auto it = snap.nodes.find(slot.machine);
+        return it == snap.nodes.end() ? 0 : ledger_foreign_vram(it->second.vram, it->second.child_pids, slot.pdev);
+    }
     return ledger_foreign_vram(snap.usage, snap.router_pids, slot.pdev);
 }
 
-int64_t server_models::free_ram_bytes_locked(const std::string & exclude) const {
+int64_t server_models::free_ram_bytes_locked(const std::string & exclude, const std::string & machine) const {
+    const bool remote = !machine.empty() && !machine_is_local_name(machine);
+    int64_t available = -1;
+    if (remote) {
+        auto it = remote_nodes.find(machine);
+        if (it != remote_nodes.end()) {
+            available = it->second->probe().mem_available; // the node's MemAvailable; -1 until it reported
+        }
+    } else {
+        available = probe_mem_available("");
+    }
     const int64_t headroom = (int64_t) base_params.router_ram_headroom_mb * 1024LL * 1024LL;
-    int64_t free = ledger_free_ram(probe_mem_available(""), headroom);
+    int64_t free = ledger_free_ram(available, headroom);
     if (free < 0) {
         return -1;
     }
     // A model that is still loading has not faulted its host memory in yet, so
-    // MemAvailable does not reflect it: hold its declared ram-mb back.
+    // MemAvailable does not reflect it: hold its declared ram-mb back (that machine's models only).
     for (const auto & [other, inst] : mapping) {
-        if (other != exclude && inst.meta.status == SERVER_MODEL_STATUS_LOADING && inst.meta.placement.ram_mb_override > 0) {
-            free -= inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
+        if (other == exclude || inst.meta.status != SERVER_MODEL_STATUS_LOADING || inst.meta.placement.ram_mb_override <= 0) {
+            continue;
         }
+        const bool other_remote = !inst.meta.machine.empty() && !machine_is_local_name(inst.meta.machine);
+        if (other_remote != remote || (remote && inst.meta.machine != machine)) {
+            continue;
+        }
+        free -= inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
     }
     return std::max<int64_t>(0, free);
 }
@@ -1398,9 +1530,20 @@ int64_t server_models::resident_ram_bytes_locked(const std::string & name) const
     } else if (inst.child) {
         pid = inst.child->pid.load();
     }
-    const auto mem = pid > 0 ? probe_proc_mem("", pid) : std::nullopt;
-    if (mem.has_value()) {
-        return mem->rss_anon + mem->rss_shmem;
+    if (pid > 0 && !inst.meta.machine.empty() && !machine_is_local_name(inst.meta.machine)) {
+        // a child on another machine: RSS as its node reports it
+        auto nit = remote_nodes.find(inst.meta.machine);
+        if (nit != remote_nodes.end()) {
+            const int64_t rss = router_node_child_ram(nit->second->probe(), pid);
+            if (rss >= 0) {
+                return rss;
+            }
+        }
+    } else {
+        const auto mem = pid > 0 ? probe_proc_mem("", pid) : std::nullopt;
+        if (mem.has_value()) {
+            return mem->rss_anon + mem->rss_shmem;
+        }
     }
     if (inst.meta.placement.ram_mb_override > 0) {
         return inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
@@ -1409,12 +1552,30 @@ int64_t server_models::resident_ram_bytes_locked(const std::string & name) const
 }
 
 int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap, int64_t sysfs_used) const {
-    const ledger_slot ls = { ledger_slot_id("", slot.dev_name), slot.pdev, slot.total_bytes, slot.reserved_bytes };
+    const ledger_slot ls = { slot.id(), slot.pdev, slot.total_bytes, slot.reserved_bytes };
+    if (slot.remote()) {
+        // the Task 2 formula with the node's numbers: foreign = PIDs there that are not its children,
+        // sysfs used from its devices
+        auto it = snap.nodes.find(slot.machine);
+        return it == snap.nodes.end() ? ledger_free_vram(ls, 0, -1) : router_node_free_vram(it->second, ls);
+    }
     return ledger_free_vram(ls, foreign_vram_bytes_locked(slot, snap), sysfs_used);
 }
 
+int64_t server_models::slot_used_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const {
+    if (!slot.remote()) {
+        return read_vram_used_bytes(slot);
+    }
+    auto it = snap.nodes.find(slot.machine);
+    if (it == snap.nodes.end() || !it->second.ok) {
+        return -1;
+    }
+    auto d = it->second.sysfs_used.find(slot.pdev);
+    return d == it->second.sysfs_used.end() ? -1 : d->second;
+}
+
 int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const {
-    return effective_free_bytes_locked(slot, snap, read_vram_used_bytes(slot));
+    return effective_free_bytes_locked(slot, snap, slot.remote() ? -1 : read_vram_used_bytes(slot));
 }
 
 json server_models::gpu_slots_json() {
@@ -1423,11 +1584,14 @@ json server_models::gpu_slots_json() {
     const vram_snapshot snap = take_vram_snapshot_locked();
     for (const auto & slot : gpu_slots) {
         const int64_t foreign = foreign_vram_bytes_locked(slot, snap);
-        const int64_t used    = read_vram_used_bytes(slot); // read once for both fields below
+        const int64_t used    = slot_used_bytes_locked(slot, snap); // read once for both fields below
         out.push_back({
             {"name", slot.dev_name},
-            {"id", ledger_slot_id("", slot.dev_name)},
-            {"board_resource", board_gpu_resource(slot.dev_name)},
+            {"id", slot.id()},
+            {"machine", slot.remote() ? slot.machine : local_machine},
+            {"remote", slot.remote()},
+            {"online", !machine_offline_locked(slot.machine)},
+            {"board_resource", board_gpu_resource(slot.id())},
             {"total_bytes", slot.total_bytes},
             {"reserved_bytes", slot.reserved_bytes},
             {"physical_free_bytes", physical_free_from_used(slot, used)},
@@ -1441,18 +1605,34 @@ json server_models::gpu_slots_json() {
 
 json server_models::machines_json() {
     std::lock_guard<std::mutex> lk(mutex);
+    json out = json::array();
     const int64_t ram_free = free_ram_bytes_locked("");
-    return json::array({ json{
-        {"name", "local"},
+    out.push_back(json{
+        {"name", "local"}, // as before; `machine` is this machine's own name
+        {"machine", local_machine},
+        {"online", true},
         {"ram_available_mb", probe_mem_available("") < 0 ? -1 : probe_mem_available("") / (1024 * 1024)},
         {"ram_headroom_mb", base_params.router_ram_headroom_mb},
         {"ram_free_mb", ram_free < 0 ? -1 : ram_free / (1024 * 1024)},
-    } });
+    });
+    for (const auto & [machine, link] : remote_nodes) {
+        const router_node_probe probe = link->probe();
+        const int64_t free = free_ram_bytes_locked("", machine);
+        out.push_back(json{
+            {"name", machine},
+            {"machine", machine},
+            {"online", !machine_offline_locked(machine)},
+            {"ram_available_mb", probe.mem_available < 0 ? -1 : probe.mem_available / (1024 * 1024)},
+            {"ram_headroom_mb", base_params.router_ram_headroom_mb},
+            {"ram_free_mb", free < 0 ? -1 : free / (1024 * 1024)},
+        });
+    }
+    return out;
 }
 
 static int find_slot_index(const std::vector<server_gpu_slot> & slots, const std::string & dev) {
     for (size_t i = 0; i < slots.size(); ++i) {
-        if (slots[i].dev_name == dev) {
+        if (slots[i].id() == dev) { // `dev` is a slot id: the bare device for this machine's
             return (int) i;
         }
     }
@@ -1570,6 +1750,12 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
     if (meta.placement.vram_mb_override >= 0) {
         return { meta.placement.vram_mb_override * 1024LL * 1024LL };
     }
+    // No remote estimate: the estimate child loads the model's file, which is on the other machine
+    // (the router would be measuring a path of its own box). A model there declares its `vram-mb`.
+    if (!meta.machine.empty() && !machine_is_local_name(meta.machine)) {
+        throw std::runtime_error("model '" + meta.name + "' runs on machine '" + meta.machine +
+                                 "': set vram-mb in its preset (VRAM is estimated on this machine only)");
+    }
 
     const std::string key = estimate_need_bytes_key(meta);
 
@@ -1598,40 +1784,36 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
 
     server_model_meta est = meta;
     est.update_args(ctx_preset, bin_path);
+    // The estimate child runs through this machine's node like every other child (its env is the
+    // node's base env = the router's, plus these two).
     std::vector<std::string> child_args = est.args;
-    std::vector<std::string> child_env  = base_env;
-    child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
-    child_env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
-
-    common_subproc proc;
-    int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-    if (!proc.create(child_args, options, child_env)) {
-        throw std::runtime_error("failed to spawn estimate child for model " + meta.name);
-    }
+    const std::vector<std::string> child_env = {
+        "LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port),
+        "LLAMA_SERVER_CHILD_MODE=estimate",
+    };
 
     std::vector<int64_t> result;
-    FILE * stdout_file = proc.stdout_file();
-    if (stdout_file) {
-        char buffer[128 * 1024];
-        while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
-            LOG("[estimate:%s] %s", meta.name.c_str(), buffer);
-            std::string line(buffer);
-            if (!string_starts_with(line.c_str(), CMD_CHILD_TO_ROUTER_STATE)) {
-                continue;
-            }
-            json data = json::parse_no_throw(line.substr(strlen(CMD_CHILD_TO_ROUTER_STATE)));
-            if (data.is_discarded()) {
-                continue;
-            }
-            json payload = json_value(data, "payload", json{});
-            if (payload.contains("need_bytes_per_dev") && payload["need_bytes_per_dev"].is_array()) {
-                for (const auto & v : payload["need_bytes_per_dev"]) {
-                    result.push_back(v.get<int64_t>());
-                }
+    int exit_code = -1;
+    std::string shot_err;
+    const bool ran = run_oneshot("estimate", child_args, child_env, [&](const std::string & line_in) {
+        LOG("[estimate:%s] %s\n", meta.name.c_str(), line_in.c_str());
+        if (!string_starts_with(line_in.c_str(), CMD_CHILD_TO_ROUTER_STATE)) {
+            return;
+        }
+        json data = json::parse_no_throw(line_in.substr(strlen(CMD_CHILD_TO_ROUTER_STATE)));
+        if (data.is_discarded()) {
+            return;
+        }
+        json payload = json_value(data, "payload", json{});
+        if (payload.contains("need_bytes_per_dev") && payload["need_bytes_per_dev"].is_array()) {
+            for (const auto & v : payload["need_bytes_per_dev"]) {
+                result.push_back(v.get<int64_t>());
             }
         }
+    }, exit_code, shot_err);
+    if (!ran) {
+        throw std::runtime_error("failed to spawn estimate child for model " + meta.name + ": " + shot_err);
     }
-    const int exit_code = proc.join();
     if (exit_code != 0 || result.empty()) {
         throw std::runtime_error("estimate child failed for model " + meta.name);
     }
@@ -1652,23 +1834,30 @@ struct router_queue_signal {
 admission_result server_models::decide_admission_locked(const std::string & name, const server_model_meta & meta,
                                                         std::vector<admission_candidate> candidates, bool exclusive,
                                                         const load_options & opts) {
-    bool need_ram = false;
     std::set<std::string> cand_slots;
     for (const auto & c : candidates) {
-        for (const auto & r : c.ram) {
-            need_ram = need_ram || r.bytes > 0;
-        }
         for (const auto & v : c.vram) {
             cand_slots.insert(v.slot);
         }
     }
 
-    // slot ids are the bare device names while the router is local-only (ledger_slot_id("", dev))
+    // Slot ids are "<machine>/<dev>" for another machine's card, the bare device for this machine's;
+    // a machine key is "" for this machine, else its name (admission_machine).
+    std::map<std::string, bool> ram_machines; // machines whose host RAM this load needs (key -> true)
+    for (const auto & c : candidates) {
+        for (const auto & r : c.ram) {
+            if (r.bytes > 0) {
+                ram_machines[r.machine] = true;
+            }
+        }
+    }
     admission_input in;
     in.alias        = name;
     in.group        = meta.group;
     in.priority     = effective_priority(opts.req, meta);
-    in.machine      = admission_machine(opts.req.machine);
+    // a worker's machine is its own (declared in its section): the request's machine override picks among
+    // the spine's / model's placements only
+    in.machine      = meta.is_external() ? std::string() : admission_machine(opts.req.machine);
     in.exclusive    = exclusive;
     in.margin_bytes = ROUTER_GPU_MARGIN_BYTES;
     in.candidates   = std::move(candidates);
@@ -1678,13 +1867,21 @@ admission_result server_models::decide_admission_locked(const std::string & name
     const bool gate_vram = !exclusive && !cand_slots.empty();
     const vram_snapshot snap = gate_vram ? take_vram_snapshot_locked() : vram_snapshot{};
     for (const auto & slot : gpu_slots) {
-        const bool read = gate_vram && cand_slots.count(slot.dev_name) > 0;
-        in.slots.push_back({ slot.dev_name, "", board_gpu_resource(slot.dev_name), read ? effective_free_bytes_locked(slot, snap) : 0 });
+        const bool read = gate_vram && cand_slots.count(slot.id()) > 0;
+        in.slots.push_back({ slot.id(), slot.machine, board_gpu_resource(slot.id()), read ? effective_free_bytes_locked(slot, snap) : 0 });
     }
-    in.machines.push_back({ "", ROUTER_BOARD_RAM_RESOURCE, need_ram ? free_ram_bytes_locked(name) : -1 });
+    // every machine's host RAM: this one's, and each remote node's (its MemAvailable)
+    in.machines.push_back({ "", board_ram_resource(""), ram_machines.count("") ? free_ram_bytes_locked(name, "") : -1 });
+    for (const auto & [machine, _] : remote_nodes) {
+        in.machines.push_back({ machine, board_ram_resource(machine), ram_machines.count(machine) ? free_ram_bytes_locked(name, machine) : -1 });
+    }
 
     for (const auto & [other, inst] : mapping) {
         if (other == name || same_group_locked(other, name) || !inst.meta.is_running()) {
+            continue;
+        }
+        // a resident on an offline machine cannot be stopped from here, and frees nothing now
+        if (machine_offline_locked(inst.meta.machine)) {
             continue;
         }
         const auto & p = inst.meta.placement;
@@ -1706,8 +1903,9 @@ admission_result server_models::decide_admission_locked(const std::string & name
             const int idx = find_slot_index(gpu_slots, p.devs[i]);
             r.exclusive = r.exclusive || (idx >= 0 && gpu_slots[idx].exclusive_holder == other);
         }
-        // host RAM is only probed when this load needs some
-        r.ram       = { { "", need_ram ? resident_ram_bytes_locked(other) : 0 } };
+        // host RAM is only probed when this load needs some on that machine
+        const std::string rmachine = admission_machine(inst.meta.machine);
+        r.ram       = { { rmachine, ram_machines.count(rmachine) ? resident_ram_bytes_locked(other) : 0 } };
         r.last_used = inst.meta.last_used;
         r.busy      = inst.req_count > 0;
         r.pinned    = p.pinned;
@@ -1737,8 +1935,9 @@ admission_result server_models::decide_admission_locked(const std::string & name
         }
         throw router_refused_error("not enough host RAM for model '" + name + "': needs " +
                                    std::to_string(need / (1024 * 1024)) + " MB, free " +
-                                   std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name)) / (1024 * 1024)) +
-                                   " MB after headroom, and no idle model can be evicted to make room");
+                                   std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name, res.blocked_on)) / (1024 * 1024)) +
+                                   " MB" + (res.blocked_on.empty() ? std::string() : " on machine '" + res.blocked_on + "'") +
+                                   " after headroom, and no idle model can be evicted to make room");
     }
     switch (res.blocked) {
         case ADMISSION_BLOCK_PINNED:
@@ -1859,11 +2058,11 @@ void server_models::evict_and_wait_locked(const std::string & name, const std::v
 
 void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, const load_options & opts, std::unique_lock<std::mutex> & lk) {
     const server_child_mode mode = opts.mode;
-    if (machine_is_remote(meta.machine)) {
-        // The local GPU slots and RAM are not that machine's: its VRAM ledger and admission are
-        // not wired yet (slots per machine), so a model there loads unplaced.
-        SRV_INF("model '%s' runs on machine '%s': local GPU placement / admission skipped\n", name.c_str(), meta.machine.c_str());
-        return;
+    if (mode == SERVER_CHILD_MODE_NORMAL) {
+        const std::string off = offline_machine_locked(meta);
+        if (!off.empty()) {
+            throw router_unavailable_error(off, "model '" + name + "' is unavailable: machine '" + off + "' is offline");
+        }
     }
     if (!gpu_placement_enabled) {
         if (mode == SERVER_CHILD_MODE_NORMAL && !meta.placement.devs.empty()) {
@@ -1875,26 +2074,53 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         return;
     }
 
+    // the machine key of this model: "" = this machine, else its name. A remote model is admitted like a
+    // local one, against its machine's slots and host RAM (from its node's probe).
+    const std::string mkey = admission_machine(meta.machine);
+
     // Host RAM must fit too: a shortfall evicts idle residents (LRU) just like VRAM does.
     std::vector<admission_machine_bytes> ram_need;
     if (meta.placement.ram_mb_override > 0) {
-        ram_need = { { "", meta.placement.ram_mb_override * 1024LL * 1024LL } };
+        ram_need = { { mkey, meta.placement.ram_mb_override * 1024LL * 1024LL } };
     }
 
-    if (meta.is_external() && meta.placement.devs.empty()) {
-        // a worker without gpu= holds no GPU slot; only its host RAM is gated
+    // the ram-mb need on `machine` (a slot's machine key)
+    auto ram_for = [&](const std::string & machine) {
+        std::vector<admission_machine_bytes> out;
+        if (meta.placement.ram_mb_override > 0) {
+            out.push_back({ machine, meta.placement.ram_mb_override * 1024LL * 1024LL });
+        }
+        return out;
+    };
+
+    auto ram_only = [&]() {
+        // holds no GPU slot (a worker without gpu=, a machine with no declared slots): only its host RAM is gated
         if (!ram_need.empty()) {
             admission_candidate c;
-            c.ram = ram_need;
+            c.machine = mkey;
+            c.ram     = ram_need;
             const admission_result res = admit_locked(name, meta, { c }, false, opts, lk);
             evict_and_wait_locked(name, res.victims, lk);
         }
+    };
+
+    if (meta.is_external() && meta.placement.devs.empty()) {
+        ram_only();
         return;
     }
 
     if (meta.placement.devs.empty()) {
+        // no gpu=: the slots of this model's machine
         for (const auto & slot : gpu_slots) {
-            meta.placement.devs.push_back(slot.dev_name);
+            if (slot.machine == mkey) {
+                meta.placement.devs.push_back(slot.id());
+            }
+        }
+        if (meta.placement.devs.empty()) {
+            SRV_INF("model '%s': no GPU slot is declared on machine '%s'; only its host RAM is gated\n", name.c_str(),
+                    mkey.empty() ? local_machine.c_str() : mkey.c_str());
+            ram_only();
+            return;
         }
     }
     for (const auto & dev : meta.placement.devs) {
@@ -1906,6 +2132,38 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     // single-GPU model silently loses its exclusivity here and the ledger is free to
     // co-locate something alongside it.
     meta.placement.exclusive = model_wants_exclusive(meta) || meta.placement.devs.size() > 1;
+
+    // One llama-server runs on one machine: a span (exclusive) is on the slots' machine, which must
+    // be the model's. (A pool picks its slot below and then its machine.)
+    const auto slot_machine_of = [this](const std::string & dev) -> std::string {
+        const int idx = find_slot_index(gpu_slots, dev);
+        return idx >= 0 ? gpu_slots[idx].machine : std::string();
+    };
+    std::vector<std::string> pool_devs;
+    if (meta.placement.exclusive) {
+        const std::string first = slot_machine_of(meta.placement.devs.front());
+        for (const auto & dev : meta.placement.devs) {
+            if (slot_machine_of(dev) != first) {
+                throw std::runtime_error("model '" + name + "': its gpu slots span machines (" + meta.placement.devs.front() +
+                                         ", " + dev + "); one process cannot");
+            }
+        }
+        if (first != mkey) {
+            if (!meta.machine.empty() || meta.is_external()) {
+                throw std::runtime_error("model '" + name + "': machine '" + (meta.machine.empty() ? local_machine : meta.machine) +
+                                         "' does not hold gpu slot '" + meta.placement.devs.front() + "'");
+            }
+            meta.machine = first; // gpu=<machine>/<dev> alone says where it runs
+        }
+    } else {
+        // pools skip the slots of offline machines (meta.placement.devs keeps the whole pool: the
+        // machine coming back brings its slots back)
+        pool_devs = router_online_slots(meta.placement.devs, slot_machine_of, availability.offline);
+        if (pool_devs.empty()) {
+            const std::string off = slot_machine_of(meta.placement.devs.front());
+            throw router_unavailable_error(off, "model '" + name + "' is unavailable: machine '" + off + "' is offline");
+        }
+    }
 
     std::vector<int64_t> needs;
     if (meta.is_external()) {
@@ -1967,7 +2225,8 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
             const int64_t bytes = i < meta.placement.need_bytes_per_dev.size() ? meta.placement.need_bytes_per_dev[i] : 0;
             c.vram.push_back({ meta.placement.devs[i], bytes });
         }
-        c.ram = ram_need;
+        c.machine = slot_machine_of(meta.placement.devs.front());
+        c.ram     = ram_for(c.machine);
         const admission_result res = admit_locked(name, meta, { c }, true, opts, lk);
         reserve_gpu_placement_locked(name, meta.placement);
         evict_and_wait_locked(name, res.victims, lk);
@@ -1978,16 +2237,20 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     // victims, then the most free VRAM
     const int64_t need = needs.empty() ? 0 : needs[0];
     std::vector<admission_candidate> candidates;
-    for (const auto & dev : meta.placement.devs) {
+    for (const auto & dev : pool_devs) {
         admission_candidate c;
-        c.vram = { { dev, need } };
-        c.ram  = ram_need;
+        c.machine = slot_machine_of(dev); // each slot: its machine's host RAM too
+        c.vram    = { { dev, need } };
+        c.ram     = ram_for(c.machine);
         candidates.push_back(std::move(c));
     }
     const admission_result res = admit_locked(name, meta, candidates, false, opts, lk);
     GGML_ASSERT(res.slots.size() == 1);
 
     meta.placement.devs = res.slots;
+    if (!meta.is_external()) {
+        meta.machine = slot_machine_of(res.slots[0]); // the pool's pick decides where it runs
+    }
     meta.placement.need_bytes_per_dev = { need };
     reserve_gpu_placement_locked(name, meta.placement);
     evict_and_wait_locked(name, res.victims, lk);
@@ -2010,7 +2273,15 @@ void server_models::notify_state(const std::string & event, const std::string & 
                                  const std::string & reason, const json & extra) {
     json data = json::object();
     data["model"]   = name;
-    data["machine"] = local_machine;
+    {
+        // the machine the slots are on (a slot id is "<machine>/<dev>" for another machine's card)
+        std::string slot_machine;
+        std::string slot_dev;
+        if (!slots.empty()) {
+            router_slot_split(slots.front(), slot_machine, slot_dev);
+        }
+        data["machine"] = slot_machine.empty() ? local_machine : slot_machine;
+    }
     data["slots"]   = slots;
     data["reason"]  = reason;
     if (extra.is_object()) {
@@ -2025,12 +2296,19 @@ void server_models::notify_state(const std::string & event, const std::string & 
 // coordination board, holds, queued loads
 //
 
-std::string server_models::board_gpu_resource(const std::string & dev) const {
-    const int idx = find_slot_index(gpu_slots, dev);
-    if (idx >= 0 && !gpu_slots[idx].board_name.empty()) {
-        return "gpu:" + gpu_slots[idx].board_name;
+std::string server_models::board_gpu_resource(const std::string & slot_id) const {
+    // "gpu:<board name>" on this machine; on another machine's slot "gpu:<board name>@<machine>" (the
+    // board is called with that machine's name and the plain resource, see router_board_unqualify)
+    const int idx = find_slot_index(gpu_slots, slot_id);
+    if (idx < 0) {
+        return "gpu:" + slot_id;
     }
-    return "gpu:" + dev;
+    const auto & slot = gpu_slots[idx];
+    return router_board_qualify("gpu:" + (slot.board_name.empty() ? slot.dev_name : slot.board_name), slot.machine, "");
+}
+
+std::string server_models::board_ram_resource(const std::string & machine) const {
+    return router_board_qualify(ROUTER_BOARD_RAM_RESOURCE, machine, "");
 }
 
 std::vector<std::string> server_models::board_resources_locked(const server_model_meta & meta) const {
@@ -2047,17 +2325,22 @@ std::vector<std::string> server_models::board_resources_locked(const server_mode
         }
     }
     if (meta.placement.ram_mb_override > 0) {
-        out.push_back(ROUTER_BOARD_RAM_RESOURCE);
+        // the RAM of the machine this process runs on
+        out.push_back(board_ram_resource(admission_machine(meta.machine)));
     }
     return out;
 }
 
 std::vector<std::string> server_models::machine_resources_locked() const {
+    // every resource on every managed machine: its slots and its RAM
     std::vector<std::string> out;
     for (const auto & slot : gpu_slots) {
-        out.push_back(board_gpu_resource(slot.dev_name));
+        out.push_back(board_gpu_resource(slot.id()));
     }
-    out.push_back(ROUTER_BOARD_RAM_RESOURCE);
+    out.push_back(board_ram_resource(""));
+    for (const auto & [machine, _] : remote_nodes) {
+        out.push_back(board_ram_resource(machine));
+    }
     return out;
 }
 
@@ -2084,6 +2367,85 @@ std::string server_models::admission_machine(const std::string & requested) cons
         return "";
     }
     return requested;
+}
+
+bool server_models::machine_is_local_name(const std::string & machine) const {
+    return machine.empty() || machine == local_machine || router_machine_is_local(machine);
+}
+
+bool server_models::machine_offline_locked(const std::string & machine) const {
+    if (machine_is_local_name(machine)) {
+        return false;
+    }
+    return availability.is_offline(machine);
+}
+
+std::string server_models::offline_machine_locked(const server_model_meta & meta) const {
+    std::vector<std::string> machines = { meta.machine };
+    for (const auto & dep : meta.depends) { // a group: its workers' machines too
+        auto it = mapping.find(dep);
+        if (it != mapping.end()) {
+            machines.push_back(it->second.meta.machine);
+        }
+    }
+    machines.erase(std::remove_if(machines.begin(), machines.end(), [this](const std::string & m) { return machine_is_local_name(m); }),
+                   machines.end());
+    return availability.first_offline(machines);
+}
+
+std::string server_models::unavailable_machine(const std::string & name) {
+    std::lock_guard<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        for (const auto & [key, inst] : mapping) {
+            if (inst.meta.aliases.count(name)) {
+                it = mapping.find(key);
+                break;
+            }
+        }
+    }
+    return it == mapping.end() ? std::string() : offline_machine_locked(it->second.meta);
+}
+
+// A node's heartbeat was lost / is back (called by its link, after the reconcile when back). Nothing is
+// torn down: the machine is only marked, and every consumer (pools, admission, requests, /models)
+// derives from the mark, so clearing it restores everything. The children stay in the registry; the link's
+// reconcile decides what the node still runs (kept / re-adopted / stopped / gone).
+void server_models::on_machine_online(const std::string & machine, bool online) {
+    std::vector<std::pair<std::string, std::string>> changed; // model -> status to announce
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!availability.set_online(machine, online)) {
+            return;
+        }
+        SRV_WRN("machine '%s' is %s: its GPU slots and models are %s\n", machine.c_str(),
+                online ? "back online" : "offline (heartbeat lost)", online ? "available again" : "unavailable");
+        for (const auto & [name, inst] : mapping) {
+            if (inst.meta.is_external() || inst.meta.hidden) {
+                continue;
+            }
+            const std::vector<std::string> ms = [&]() {
+                std::vector<std::string> v = { inst.meta.machine };
+                for (const auto & dep : inst.meta.depends) {
+                    auto w = mapping.find(dep);
+                    if (w != mapping.end()) {
+                        v.push_back(w->second.meta.machine);
+                    }
+                }
+                return v;
+            }();
+            if (std::find(ms.begin(), ms.end(), machine) != ms.end()) {
+                changed.emplace_back(name, router_effective_status(server_model_status_to_string(inst.meta.status), !online));
+            }
+        }
+        bump_queue_locked(); // queued loads re-evaluate (a pool may have a slot again)
+    }
+    for (const auto & [name, status] : changed) {
+        notify_sse("status_change", name, { {"status", status}, {"machine", machine}, {"online", online} });
+    }
+    if (board) {
+        board->wake();
+    }
 }
 
 void server_models::bump_queue_locked() {
@@ -2218,13 +2580,13 @@ void server_models::on_queued(const std::string & name, const load_options & opt
     if (info.board && board) {
         const router_board_snapshot snap = board->snapshot();
         const bool held = std::any_of(snap.claims.begin(), snap.claims.end(), [&](const router_board_claim & c) {
-            return c.holder != ROUTER_BOARD_HOLDER && (c.resource == res.blocked_on || c.resource == ROUTER_BOARD_MACHINE_RES);
+            return c.holder != ROUTER_BOARD_HOLDER && router_board_claim_covers(c.resource, res.blocked_on);
         });
         waiter_block = raced == nullptr && !held;
         if (waiter_block) {
             int ahead = 0;
             for (const auto & e : snap.queue) {
-                if (e.holder != ROUTER_BOARD_HOLDER && (e.resource == res.blocked_on || e.resource == ROUTER_BOARD_MACHINE_RES)) {
+                if (e.holder != ROUTER_BOARD_HOLDER && router_board_claim_covers(e.resource, res.blocked_on)) {
                     ahead++;
                 }
             }
@@ -2967,6 +3329,8 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         out.group_info = group_status_json_locked(it->first);
         out.queue_info = queue_info(it->first, out);
         out.stopping   = stopping_models.count(it->first) > 0;
+        out.unavailable_machine = offline_machine_locked(out);
+        out.unavailable         = !out.unavailable_machine.empty();
         return out;
     }
     for (const auto & [key, inst] : mapping) {
@@ -2975,6 +3339,8 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
             out.group_info = group_status_json_locked(key);
             out.queue_info = queue_info(key, out);
             out.stopping   = stopping_models.count(key) > 0;
+            out.unavailable_machine = offline_machine_locked(out);
+            out.unavailable         = !out.unavailable_machine.empty();
             return out;
         }
     }
@@ -2995,6 +3361,8 @@ std::vector<server_model_meta> server_models::get_all_meta() {
         result.push_back(inst.meta);
         result.back().group_info = group_status_json_locked(name);
         result.back().stopping   = stopping_models.count(name) > 0;
+        result.back().unavailable_machine = offline_machine_locked(inst.meta);
+        result.back().unavailable         = !result.back().unavailable_machine.empty();
         auto q = queued_loads.find(name);
         if (q != queued_loads.end() && inst.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
             result.back().queue_info = json::parse(router_queued_info_json(q->second.info));
@@ -3082,6 +3450,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
         auto it = mapping.find(name);
         if (it != mapping.end()) {
+            // a model (or a group worker) on a machine whose node is offline cannot be started: 503 +
+            // Retry-After (the machine coming back makes the same load work again)
+            const std::string off = offline_machine_locked(it->second.meta);
+            if (!off.empty()) {
+                throw router_unavailable_error(off, "model '" + name + "' is unavailable: machine '" + off + "' is offline");
+            }
             owners.insert(owners.end(), it->second.meta.depends.begin(), it->second.meta.depends.end());
         }
         for (const auto & o : owners) {
@@ -4178,6 +4552,10 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
+    if (meta->unavailable) {
+        throw router_unavailable_error(meta->unavailable_machine, "model '" + name + "' is unavailable: machine '" +
+                                       meta->unavailable_machine + "' is offline");
+    }
     bool stopping;
     bool wait_in_queue; // a queued load: `lowest` waits for it, `middle` / `highest` get told now
     uint64_t gen0;      // a cancel of the queued load moves this: the wait fails, nothing re-queues
@@ -4832,6 +5210,20 @@ static void res_queued(std::unique_ptr<server_http_res> & res, const router_queu
     }
 }
 
+// 503 + Retry-After for a model whose machine is offline (heartbeat lost)
+static void res_unavailable(std::unique_ptr<server_http_res> & res, const std::string & model, const std::string & machine,
+                            const std::string & reason) {
+    int status = 503;
+    std::string body;
+    std::map<std::string, std::string> headers;
+    router_unavailable_response(model, machine, reason, status, body, headers);
+    res->status = status;
+    res->data   = body;
+    for (const auto & [k, v] : headers) {
+        res->headers[k] = v;
+    }
+}
+
 // ensure_model_ready() for a request, its failures as the HTTP answer: 503 + Retry-After + queue
 // info for a queued model (middle / highest, or a `lowest` wait past its bound), 503 otherwise.
 // `waited` (optional) reports whether a load was waited for.
@@ -4845,6 +5237,9 @@ static bool router_ensure_ready(server_models & models, const std::string & name
         }
     } catch (const router_queued_error & e) {
         res_queued(res, e.info);
+        return false;
+    } catch (const router_unavailable_error & e) {
+        res_unavailable(res, name, e.machine, e.what());
         return false;
     } catch (const std::runtime_error & e) {
         res_err(res, {
@@ -4876,6 +5271,11 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     }
     // resolve alias to canonical model name
     name = meta->name;
+    if (meta->unavailable) {
+        // its machine's node is silent: 503 + Retry-After whether or not the model was loaded
+        res_unavailable(res, name, meta->unavailable_machine, "");
+        return false;
+    }
     if (models_autoload) {
         if (!router_ensure_ready(models, name, res, ro, should_stop, queue_should_stop)) {
             return false;
@@ -5029,7 +5429,7 @@ void server_models_routes::init_routes() {
         json unhealthy = json::array();
         size_t running = 0, loading = 0, sleeping = 0, failed_count = 0;
         for (const auto & meta : all_models) {
-            const std::string s = server_model_status_to_string(meta.status);
+            const std::string s = router_effective_status(server_model_status_to_string(meta.status), meta.unavailable);
             by_status[s] = by_status.value(s, 0) + 1;
             if (meta.status == SERVER_MODEL_STATUS_LOADING)  { loading++; }
             if (meta.status == SERVER_MODEL_STATUS_SLEEPING) { sleeping++; }
@@ -5177,6 +5577,8 @@ void server_models_routes::init_routes() {
             json out = json::parse(router_queued_info_json(e.info));
             out["model"] = meta->name;
             answer(202, out);
+        } catch (const router_unavailable_error & e) {
+            res_unavailable(res, meta->name, e.machine, e.what());
         } catch (const std::exception & e) {
             res_err(res, {
                 {"message", e.what()},
@@ -5205,9 +5607,14 @@ void server_models_routes::init_routes() {
                 continue;
             }
             json status {
-                {"value",  server_model_status_to_string(meta.status)},
+                {"value",  router_effective_status(server_model_status_to_string(meta.status), meta.unavailable)},
                 {"args",   meta.args},
             };
+            if (meta.unavailable) {
+                // its machine's node is silent: the model is back as it was once the heartbeat returns
+                status["unavailable"]         = true;
+                status["unavailable_machine"] = meta.unavailable_machine;
+            }
             if (!meta.preset.name.empty()) {
                 common_preset preset_copy = meta.preset;
                 unset_reserved_args(preset_copy, false);
@@ -5263,6 +5670,8 @@ void server_models_routes::init_routes() {
                 // {"need_download", meta.need_download},
                 // TODO: add other fields, may require reading GGUF metadata
             };
+            // where it runs: its machine's name (this machine's own when the preset names none)
+            model_info["machine"] = meta.machine.empty() ? models.local_machine_name() : meta.machine;
             json placement = {
                 {"devices", meta.placement.devs},
                 {"split", meta.placement.split},
