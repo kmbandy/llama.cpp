@@ -3137,7 +3137,16 @@ void server_models::load(const std::string & name, const load_options & opts) {
         spawned = load_impl(name, opts);
     } catch (const router_queue_signal & sig) {
         unregister();
-        on_queued(name, opts, sig.res, sig.raced.has_value() ? &*sig.raced : nullptr); // throws router_queued_error
+        try {
+            on_queued(name, opts, sig.res, sig.raced.has_value() ? &*sig.raced : nullptr); // throws router_queued_error
+        } catch (const router_queued_error &) {
+            throw; // recorded; on_queued() already released what this attempt does not need
+        } catch (...) {
+            if (board) {
+                board->release_dead(); // cancelled / shutting down: nothing of this attempt stays
+            }
+            throw;
+        }
     } catch (const std::exception & e) {
         unregister();
         if (board) {
@@ -4049,22 +4058,28 @@ void server_models::wait(std::unique_lock<std::mutex> & lk, const std::string & 
 }
 
 bool server_models::ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop,
-                                       const router_request_opts & req) {
+                                       const router_request_opts & req, const std::function<bool()> & queue_should_stop) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
     bool stopping;
     bool wait_in_queue; // a queued load: `lowest` waits for it, `middle` / `highest` get told now
+    uint64_t gen0;      // a cancel of the queued load moves this: the wait fails, nothing re-queues
     {
         std::lock_guard<std::mutex> lk(mutex);
         stopping = stopping_models.count(name) > 0;
+        gen0     = cancel_gen_locked(name);
         auto it = mapping.find(name);
         wait_in_queue = router_request_waits_in_queue(it != mapping.end() ? effective_priority(req, it->second.meta)
                                                                           : (req.priority_set ? req.priority : ADMISSION_PRIORITY_MIDDLE));
     }
     load_options lo;
-    lo.req = req;
+    lo.req        = req;
+    lo.cancel_gen = gen0;
+    const std::function<bool()> & client_gone = queue_should_stop ? queue_should_stop : should_stop;
+    const int64_t max_wait_ms = (int64_t) std::max(0, base_params.models_queue_max_wait_s) * 1000;
+    int64_t queue_wait_start  = 0;
     if (!stopping && meta->is_ready()) {
         return false; // ready for taking requests
     }
@@ -4102,6 +4117,9 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             if (it == mapping.end()) {
                 break; // removed by another code path, nothing to wait for
             }
+            if (cancel_gen_locked(name) != gen0) {
+                throw router_refused_error("the queued load of model '" + name + "' was cancelled");
+            }
             if (stopping_models.count(name)) {
                 // a stopping instance takes no new request, the next instance serves it
                 if (!queued) {
@@ -4130,8 +4148,17 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                     if (!wait_in_queue) {
                         throw router_queued_error(q->second.info);
                     }
-                    if (should_stop && should_stop()) {
-                        throw std::runtime_error("request cancelled while model name=" + name + " was queued");
+                    const int64_t now = ggml_time_ms();
+                    if (queue_wait_start == 0) {
+                        queue_wait_start = now;
+                    }
+                    switch (router_queue_wait_decision(false, client_gone && client_gone(), now - queue_wait_start, max_wait_ms)) {
+                        case ROUTER_WAIT_ABORTED:
+                            throw std::runtime_error("request cancelled while model name=" + name + " was queued");
+                        case ROUTER_WAIT_TIMED_OUT:
+                            throw router_queued_error(q->second.info); // 503 + Retry-After; the load stays queued
+                        default:
+                            break;
                     }
                     cv.wait_for(lk, std::chrono::milliseconds(200));
                     continue;
@@ -4688,8 +4715,34 @@ static void res_queued(std::unique_ptr<server_http_res> & res, const router_queu
     }
 }
 
+// ensure_model_ready() for a request, its failures as the HTTP answer: 503 + Retry-After + queue
+// info for a queued model (middle / highest, or a `lowest` wait past its bound), 503 otherwise.
+// `waited` (optional) reports whether a load was waited for.
+static bool router_ensure_ready(server_models & models, const std::string & name, std::unique_ptr<server_http_res> & res,
+                                const router_request_opts & ro, const std::function<bool()> & should_stop,
+                                const std::function<bool()> & queue_should_stop, bool * waited = nullptr) {
+    try {
+        const bool w = models.ensure_model_ready(name, should_stop, ro, queue_should_stop);
+        if (waited != nullptr) {
+            *waited = w;
+        }
+    } catch (const router_queued_error & e) {
+        res_queued(res, e.info);
+        return false;
+    } catch (const std::runtime_error & e) {
+        res_err(res, {
+            {"message", e.what()},
+            {"type", "server_error"},
+            {"code", 503},
+        });
+        return false;
+    }
+    return true;
+}
+
 static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res,
-                                  const router_request_opts & ro = {}, const std::function<bool()> & should_stop = nullptr) {
+                                  const router_request_opts & ro = {}, const std::function<bool()> & should_stop = nullptr,
+                                  const std::function<bool()> & queue_should_stop = nullptr) {
     if (name.empty()) {
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
         return false;
@@ -4707,17 +4760,7 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     // resolve alias to canonical model name
     name = meta->name;
     if (models_autoload) {
-        try {
-            models.ensure_model_ready(name, should_stop, ro);
-        } catch (const router_queued_error & e) {
-            res_queued(res, e.info);
-            return false;
-        } catch (const std::runtime_error & e) {
-            res_err(res, {
-                {"message", e.what()},
-                {"type", "server_error"},
-                {"code", 503},
-            });
+        if (!router_ensure_ready(models, name, res, ro, should_stop, queue_should_stop)) {
             return false;
         }
     } else {
@@ -4904,11 +4947,11 @@ void server_models_routes::init_routes() {
         if (!router_request_opts_from(req, nullptr, ro, error_res)) {
             return error_res;
         }
-        if (!router_validate_model(name, models, autoload, error_res, ro, req.should_stop)) {
+        if (!router_validate_model(name, models, autoload, error_res, ro, req.should_stop, req.should_stop)) {
             return error_res;
         }
-        if (autoload) {
-            models.ensure_model_ready(name, req.should_stop, ro);
+        if (autoload && !router_ensure_ready(models, name, error_res, ro, req.should_stop, req.should_stop)) {
+            return error_res;
         }
         return models.proxy_request(req, method, name, false);
     };
@@ -4936,7 +4979,8 @@ void server_models_routes::init_routes() {
         bool autoload = is_autoload(params, req, models);
         // a session request (X-Conversation-Id) is not cancelled by its socket, see below
         const bool session = !server_stream_conv_id_from_headers(req.headers).empty();
-        if (!router_validate_model(name, models, autoload, error_res, ro, session ? std::function<bool()>() : req.should_stop)) {
+        // a queue wait is cancelled by a dead socket for every request, sessions included
+        if (!router_validate_model(name, models, autoload, error_res, ro, session ? std::function<bool()>() : req.should_stop, req.should_stop)) {
             return error_res;
         }
         // remember which child serves this conversation so the stream routes can route straight
@@ -4947,7 +4991,10 @@ void server_models_routes::init_routes() {
         uint64_t ticket = models.conv_models.remember(conv_id, name);
         // a dead socket must not cancel a session request, only a stop does (checked right below)
         auto should_stop = ticket == 0 ? req.should_stop : nullptr;
-        bool waited = autoload && models.ensure_model_ready(name, should_stop, ro);
+        bool waited = false;
+        if (autoload && !router_ensure_ready(models, name, error_res, ro, should_stop, req.should_stop, &waited)) {
+            return error_res;
+        }
         if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
             SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
                     conv_id.c_str(), name.c_str());
@@ -4983,6 +5030,14 @@ void server_models_routes::init_routes() {
             res->status = status;
             res->data   = safe_json_to_str(out);
         };
+        if (meta->stopping && meta->is_running()) {
+            // on its way down: not ready, and a load now would find it still running
+            json out = json::object();
+            out["model"] = meta->name;
+            out["state"] = "stopping";
+            answer(202, out);
+            return res;
+        }
         if (meta->is_ready_or_sleep()) {
             json out = json::object();
             out["model"] = meta->name;

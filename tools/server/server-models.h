@@ -167,6 +167,9 @@ struct server_model_meta {
     // get_meta()/get_all_meta() hand out, never kept in the registry.
     json queue_info = nullptr;
 
+    // asked to stop, still running (filled into the copies like queue_info)
+    bool stopping = false;
+
     bool is_external() const {
         return kind == ROUTER_KIND_EXTERNAL;
     }
@@ -360,6 +363,9 @@ public:
         std::optional<server_model_meta> custom_meta = std::nullopt;
         // the request's priority (unset: the model's preset `priority`) and machine override
         router_request_opts req;
+        // cancel generation of the model's queued load when the request began: if a cancel
+        // (POST /models/unload) moved it since, the load fails instead of queueing again
+        std::optional<uint64_t> cancel_gen;
     };
 
 private:
@@ -430,8 +436,11 @@ private:
     struct queued_load {
         router_queued_info  info;
         router_request_opts req;
+        int64_t             since_ms = 0; // first queued (service order: priority, then this)
     };
     std::map<std::string, queued_load> queued_loads;
+    std::map<std::string, uint64_t>    queue_cancel_gen; // model -> cancels of its queued load so far
+    uint64_t cancel_gen_locked(const std::string & name) const;
     uint64_t queue_epoch = 0;
     void bump_queue_locked(); // caller holds mutex; wakes queue_th
     std::thread queue_th;
@@ -573,8 +582,11 @@ public:
     // if models_max is reached, the request waits in a queue until a slot frees up
     // throws if the load fails, or if should_stop fires while waiting
     // a queued load: `lowest` keeps waiting; `middle` / `highest` throw router_queued_error
+    // queue_should_stop: the client went away (also for session requests, whose load wait
+    // ignores the socket); a `lowest` wait in the queue is bounded by --models-queue-max-wait-s
+    // (then router_queued_error); a cancel of the queued load fails the wait (router_refused_error)
     bool ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop = nullptr,
-                            const router_request_opts & req = {});
+                            const router_request_opts & req = {}, const std::function<bool()> & queue_should_stop = nullptr);
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);

@@ -595,13 +595,13 @@ static void test_claims_and_yield_selection() {
         { "c1", "m1", "machine", "sess-1", "", ADMISSION_PRIORITY_MIDDLE, false },  // whole machine
         { "c2", "m1", "gpu:R9700", "llama-router", "qwen", ADMISSION_PRIORITY_MIDDLE, false },
     };
-    const auto ac = router_board_admission_claims(snap, { "gpu:R9700", "gpu:ROCm1", "ram" });
+    const auto ac = router_board_admission_claims(snap, { "gpu:R9700", "gpu:ROCm1", "ram" }, ADMISSION_PRIORITY_MIDDLE);
     CHECK(ac.size() == 4);
     CHECK(std::count_if(ac.begin(), ac.end(), [](const admission_claim & c) { return c.claim_id == "c1"; }) == 3);
     CHECK(std::any_of(ac.begin(), ac.end(), [](const admission_claim & c) { return c.claim_id == "c2" && c.is_router; }));
     CHECK(std::none_of(ac.begin(), ac.end(), [](const admission_claim & c) { return c.claim_id == "c1" && c.is_router; }));
     snap.ok = false;
-    CHECK(router_board_admission_claims(snap, { "gpu:R9700" }).empty()); // outage: nothing blocks
+    CHECK(router_board_admission_claims(snap, { "gpu:R9700" }, ADMISSION_PRIORITY_MIDDLE).empty()); // outage: nothing blocks
     snap.ok = true;
 
     snap.queue = { { "q1", "m1", "gpu:R9700", "sess-2", ADMISSION_PRIORITY_MIDDLE },
@@ -717,7 +717,7 @@ static void test_agent() {
     in.priority   = ADMISSION_PRIORITY_MIDDLE;
     in.candidates = { admission_candidate{ "", { { "ROCm1", 1 } }, {} } };
     in.slots      = { { "ROCm1", "", "gpu:ROCm1", 1LL << 40 } };
-    in.claims     = agent.admission_claims({ "gpu:R9700", "gpu:ROCm1", "ram" });
+    in.claims     = agent.admission_claims({ "gpu:R9700", "gpu:ROCm1", "ram" }, in.priority);
     const admission_result res = decide_admission(in);
     CHECK(res.verdict == ADMISSION_QUEUE && res.blocked == ADMISSION_BLOCK_CLAIM && res.blocked_by == "session-1");
     CHECK(router_admission_queue_action(res) == ROUTER_QUEUE_WAIT);
@@ -828,10 +828,169 @@ static void test_agent_outage() {
     fh.set({ running("qwen", { "gpu:R9700" }) });
     agent.tick();
     CHECK(!agent.available());
-    CHECK(agent.admission_claims({ "gpu:R9700", "ram" }).empty()); // admit as if nothing were claimed
+    CHECK(agent.admission_claims({ "gpu:R9700", "ram" }, ADMISSION_PRIORITY_MIDDLE).empty()); // admit as if nothing were claimed
     auto r = agent.acquire("qwen", "qwen", "gpu:R9700", "qwen", ADMISSION_PRIORITY_MIDDLE);
     CHECK(!r.ok && !r.granted && !r.queued);
     agent.stop();
+}
+
+//
+// fix round 1: queue order, sticky cancel / bounded wait, queue turns, session waiters
+//
+
+static void test_queue_order() {
+    using P = admission_priority;
+    const std::vector<router_queue_item> items = {
+        { "a-mid-old", P::ADMISSION_PRIORITY_MIDDLE, 100 },
+        { "b-low", P::ADMISSION_PRIORITY_LOWEST, 50 },
+        { "c-high-new", P::ADMISSION_PRIORITY_HIGHEST, 300 },
+        { "d-mid-new", P::ADMISSION_PRIORITY_MIDDLE, 200 },
+        { "e-high-old", P::ADMISSION_PRIORITY_HIGHEST, 10 },
+    };
+    // priority first (highest -> lowest), then oldest first: not the alphabetical map order
+    CHECK((router_queue_service_order(items) == std::vector<std::string>{ "e-high-old", "c-high-new", "a-mid-old", "d-mid-new", "b-low" }));
+    CHECK(router_queue_position(items, "e-high-old") == 1);
+    CHECK(router_queue_position(items, "d-mid-new") == 4);
+    CHECK(router_queue_position(items, "b-low") == 5);
+    CHECK(router_queue_position(items, "missing") == 0);
+    // same priority and time: by name, stable
+    CHECK((router_queue_service_order({ { "y", P::ADMISSION_PRIORITY_MIDDLE, 1 }, { "x", P::ADMISSION_PRIORITY_MIDDLE, 1 } }) ==
+           std::vector<std::string>{ "x", "y" }));
+}
+
+static void test_wait_decision() {
+    const int64_t max = 3600 * 1000;
+    CHECK(router_queue_wait_decision(false, false, 0, max) == ROUTER_WAIT_CONTINUE);
+    CHECK(router_queue_wait_decision(false, false, max - 1, max) == ROUTER_WAIT_CONTINUE);
+    CHECK(router_queue_wait_decision(false, false, max, max) == ROUTER_WAIT_TIMED_OUT); // 503 + Retry-After
+    CHECK(router_queue_wait_decision(false, false, 10 * max, 0) == ROUTER_WAIT_CONTINUE); // 0 = no bound
+    CHECK(router_queue_wait_decision(false, true, 0, max) == ROUTER_WAIT_ABORTED);       // client went away
+    // a cancel wins over everything: the waiter fails, it never re-queues the load
+    CHECK(router_queue_wait_decision(true, true, 10 * max, max) == ROUTER_WAIT_CANCELLED);
+    CHECK(router_queue_wait_decision(true, false, 0, max) == ROUTER_WAIT_CANCELLED);
+}
+
+static void test_probation_action() {
+    // ours (already confirmed) or a claim in flight: leave it
+    CHECK(router_board_probation_action(true, true, false) == ROUTER_PROBATION_KEEP);
+    CHECK(router_board_probation_action(false, true, true) == ROUTER_PROBATION_KEEP);
+    CHECK(router_board_probation_action(false, false, true) == ROUTER_PROBATION_KEEP);
+    // a queued load waits for it: the agent confirms it itself, not the (serial) load retry
+    CHECK(router_board_probation_action(false, true, false) == ROUTER_PROBATION_CONFIRM);
+    // nobody waits: give it back
+    CHECK(router_board_probation_action(false, false, false) == ROUTER_PROBATION_RELEASE);
+}
+
+static void test_waiters_block() {
+    router_board_snapshot snap;
+    snap.ok     = true;
+    snap.claims = { { "c1", "m1", "gpu:R9700", "llama-router", "qwen", ADMISSION_PRIORITY_MIDDLE, false } }; // being drained
+    snap.queue  = { { "q1", "m1", "gpu:R9700", "sess-2", ADMISSION_PRIORITY_MIDDLE },
+                    { "q2", "m1", "gpu:ROCm1", "sess-3", ADMISSION_PRIORITY_LOWEST },
+                    { "q3", "m1", "gpu:ROCm1", "llama-router", ADMISSION_PRIORITY_HIGHEST } };
+    const std::vector<std::string> res = { "gpu:R9700", "gpu:ROCm1", "ram" };
+
+    // middle: sess-2 (middle) blocks gpu:R9700; sess-3 (lowest) is behind us; our own entry never blocks
+    const auto mid = router_board_admission_claims(snap, res, ADMISSION_PRIORITY_MIDDLE);
+    CHECK(mid.size() == 2);
+    CHECK(std::any_of(mid.begin(), mid.end(), [](const admission_claim & c) {
+        return c.claim_id == "queue:q1" && c.resource == "gpu:R9700" && c.holder == "sess-2" && !c.is_router;
+    }));
+    // lowest: both session waiters are ahead of it
+    CHECK(router_board_admission_claims(snap, res, ADMISSION_PRIORITY_LOWEST).size() == 3);
+    // highest: only holders block (it queues at the head behind them)
+    CHECK(router_board_admission_claims(snap, res, ADMISSION_PRIORITY_HIGHEST).size() == 1);
+
+    // admission: the router's own claim never blocks, the waiter does at middle, not at highest
+    admission_input in;
+    in.alias      = "llama-8b";
+    in.candidates = { admission_candidate{ "", { { "ROCm0", 1 } }, {} } };
+    in.slots      = { { "ROCm0", "", "gpu:R9700", 1LL << 40 } };
+    in.priority   = ADMISSION_PRIORITY_MIDDLE;
+    in.claims     = mid;
+    admission_result r = decide_admission(in);
+    CHECK(r.verdict == ADMISSION_QUEUE && r.blocked == ADMISSION_BLOCK_CLAIM && r.blocked_by == "sess-2");
+    CHECK(router_admission_queue_action(r) == ROUTER_QUEUE_WAIT);
+    in.priority = ADMISSION_PRIORITY_HIGHEST;
+    in.claims   = router_board_admission_claims(snap, res, ADMISSION_PRIORITY_HIGHEST);
+    r = decide_admission(in);
+    CHECK(r.verdict == ADMISSION_ADMIT);
+}
+
+static void test_agent_priority_and_turns() {
+    fake_board fb;
+    fb.start();
+    fake_host fh;
+    router_board_config cfg;
+    cfg.url        = fb.url();
+    cfg.token      = "test-token";
+    cfg.machine    = "m1";
+    cfg.timeout_ms = 2000;
+    router_board_agent agent(cfg, fh.host());
+    agent.start(false);
+
+    CHECK(!fb.session_claim("session-1", "gpu:R9700").empty());
+    // the router's slot joins at lowest ...
+    auto a = agent.acquire("load-a", "load-a", "gpu:R9700", "load-a", ADMISSION_PRIORITY_LOWEST);
+    CHECK(a.ok && a.queued);
+    auto router_slot_priority = [&]() {
+        std::lock_guard<std::mutex> lk(fb.mu);
+        std::string p;
+        int n = 0;
+        for (const auto & q : fb.queue) {
+            if (q.status == "waiting" && q.session_id == "llama-router") {
+                p = q.priority;
+                n++;
+            }
+        }
+        return n == 1 ? p : std::string("count=") + std::to_string(n);
+    };
+    CHECK(router_slot_priority() == "lowest");
+    // ... a load joining at highest leaves and re-joins the slot at highest
+    auto b = agent.acquire("load-b", "load-b", "gpu:R9700", "load-b", ADMISSION_PRIORITY_HIGHEST);
+    CHECK(b.ok && b.queued);
+    CHECK(router_slot_priority() == "highest");
+    // a later middle joiner does not lower it
+    CHECK(agent.acquire("load-c", "load-c", "gpu:R9700", "load-c", ADMISSION_PRIORITY_MIDDLE).queued);
+    CHECK(router_slot_priority() == "highest");
+
+    // the session releases: the agent confirms the queue turn itself, for a waiting load, and
+    // keeps it while that load is queued (alive, loading)
+    router_board_resident qa;
+    qa.name    = "load-a";
+    qa.alive   = true;
+    qa.loading = true;
+    router_board_resident qb = qa;
+    qb.name = "load-b";
+    router_board_resident qc = qa;
+    qc.name = "load-c";
+    fh.set({ qa, qb, qc });
+    fb.session_release("session-1");
+    const int changed_before = fh.changed.load();
+    agent.tick();
+    {
+        std::lock_guard<std::mutex> lk(fb.mu);
+        const auto * c = fb.find_live("llama-router", "gpu:R9700");
+        CHECK(c != nullptr && !c->probation); // confirmed in place, not left to expire
+    }
+    CHECK(fh.changed.load() > changed_before);
+    const auto held = agent.held();
+    CHECK(held.size() == 1 && held.begin()->second == std::set<std::string>{ "gpu:R9700" });
+    agent.tick();
+    CHECK(fb.live("llama-router", "gpu:R9700") == 1); // still kept: its owner is a queued load
+
+    // the queued loads are gone (cancelled): the turn is released
+    fh.set({});
+    sleep_ms(5);
+    agent.tick();
+    CHECK(fb.live("llama-router", "gpu:R9700") == 0);
+
+    // after stop() no claim is ever taken
+    agent.stop();
+    auto late = agent.acquire("late", "", "gpu:ROCm3", "late", ADMISSION_PRIORITY_MIDDLE);
+    CHECK(!late.ok && !late.granted);
+    CHECK(fb.live("llama-router") == 0);
+    fb.stop();
 }
 
 int main() {
@@ -845,6 +1004,11 @@ int main() {
     test_claims_and_yield_selection();
     test_agent();
     test_agent_outage();
+    test_queue_order();
+    test_wait_decision();
+    test_probation_action();
+    test_waiters_block();
+    test_agent_priority_and_turns();
     printf("test-router-board: OK\n");
     return 0;
 }
