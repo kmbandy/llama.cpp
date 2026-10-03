@@ -59,6 +59,8 @@ add_library(${TARGET}
     server-models.h
     server-router-groups.cpp
     server-router-groups.h
+    server-router-group-lifecycle.cpp
+    server-router-group-lifecycle.h
     server-router-ledger.cpp
     server-router-ledger.h
     server-router-policy.cpp

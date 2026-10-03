@@ -5482,6 +5482,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     ).set_env("LLAMA_ARG_ROUTER_STARTUP_TIMEOUT").set_preset_only());
 
     args.push_back(common_arg(
+        {"worker-port"}, "PORT",
+        "in server router mode, TCP port a kind=external worker listens on; only needed when it cannot be read from 'launch' (--listen HOST:PORT or --port N)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_WORKER_PORT").set_preset_only());
+
+    args.push_back(common_arg(
         {"env"}, "K=V[,K=V,-K]",
         "in server router mode, per-model environment for THIS model's child process only.\n"
         "Comma-separated. 'K=V' sets K, and a leading '-' ('-K') REMOVES K from the child's\n"

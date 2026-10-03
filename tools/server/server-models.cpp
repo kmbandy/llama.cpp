@@ -29,6 +29,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <cstring>
+#include <cctype>
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
@@ -39,6 +40,7 @@
 #include <cstring>
 
 #ifndef _WIN32
+#include <unistd.h>
 extern char **environ;
 #endif
 
@@ -295,6 +297,10 @@ struct server_lru_sched {
             if (m.second.req_count != 0 || !m.second.meta.is_ready_or_sleep()) {
                 continue;
             }
+            // a group worker goes with its spine, never on its own
+            if (m.second.meta.is_external()) {
+                continue;
+            }
             // FORK GUARD: pinned is a HARD HOLD. A pinned resident owns its GPU until a
             // human unpins it (the DSWS / weight-paging case). Evicting one pulls the card
             // out from under work that asked to keep it.
@@ -382,7 +388,7 @@ struct server_lru_sched {
         int n_running  = 0;
         int n_stopping = 0;
         for (const auto & m : models.mapping) {
-            if (m.second.meta.is_running()) {
+            if (m.second.meta.is_running() && !m.second.meta.is_external()) { // a group takes one slot
                 n_running++;
                 if (models.stopping_models.count(m.first)) {
                     n_stopping++;
@@ -436,7 +442,7 @@ struct server_lru_sched {
     size_t count_running() {
         size_t count = 0;
         for (const auto & m : models.mapping) {
-            if (m.second.meta.is_running()) {
+            if (m.second.meta.is_running() && !m.second.meta.is_external()) { // a group takes one slot
                 count++;
             }
         }
@@ -517,6 +523,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option(ROUTER_ARG_PARK_MODE);
     preset.unset_option(ROUTER_ARG_MACHINE);
     preset.unset_option(ROUTER_ARG_STARTUP_TIMEOUT);
+    preset.unset_option(ROUTER_ARG_WORKER_PORT);
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
@@ -681,6 +688,35 @@ server_models::server_models(
     // do not propagate these options, but allow preset to explicitly set them
     base_preset.unset_option("LLAMA_ARG_LOG_FILE");
 
+    // Every child this router spawns (spines, workers, estimate/probe children) carries this
+    // start's generation and our PID, so a later router can tell what a dead one left behind.
+    router_gen = router_generation_new();
+    {
+        auto set_env = [this](const std::string & key, const std::string & value) {
+            const std::string prefix = key + "=";
+            base_env.erase(std::remove_if(base_env.begin(), base_env.end(), [&](const std::string & e) {
+                return e.compare(0, prefix.size(), prefix) == 0;
+            }), base_env.end());
+            base_env.push_back(prefix + value);
+        };
+        set_env(ROUTER_ENV_GEN, router_gen);
+#ifndef _WIN32
+        set_env(ROUTER_ENV_ROUTER_PID, std::to_string((int) getpid()));
+#endif
+    }
+#ifndef _WIN32
+    // Kill what a previous router generation left behind (workers do not watch their stdin, so
+    // they outlive a crashed router). TERM first: a worker writes its stop snapshot on TERM.
+    {
+        const auto swept = router_sweep_stale_children("", router_gen, (unsigned) getuid(), (int) getpid(),
+                                                       ROUTER_WORKER_QUIESCE_MS_DEFAULT + ROUTER_WORKER_KILL_GRACE_MS);
+        if (!swept.empty()) {
+            SRV_WRN("stopped %zu process(es) left behind by a previous router generation\n", swept.size());
+        }
+        SRV_INF("router generation %s\n", router_gen.c_str());
+    }
+#endif
+
     // set binary path
     try {
         bin_path = get_server_exec_path().string();
@@ -707,6 +743,19 @@ server_models::~server_models() {
     if (idle_th.joinable()) {
         idle_th.join();
     }
+    // Worker groups go before the monitor. Destroyed outside the lock: a group's destructor
+    // joins its thread, which may be inside a callback waiting for `mutex`. Anything still
+    // running here (no unload_all() before shutdown) is SIGKILLed by the destructor.
+    std::vector<std::shared_ptr<router_worker_group>> dying;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (auto & [_, rt] : groups) {
+            if (rt.workers) {
+                dying.push_back(std::move(rt.workers));
+            }
+        }
+    }
+    dying.clear();
 }
 
 std::optional<std::filesystem::file_time_type> server_models::get_models_preset_mtime() const {
@@ -1152,6 +1201,7 @@ void server_models::parse_model_placement(server_model_meta & meta) {
         meta.park_mode         = sec.park_mode;
         meta.slot_autosave     = sec.slot_autosave;
         meta.startup_timeout_s = sec.startup_timeout_s;
+        meta.worker_port       = sec.worker_port;
     }
 
     std::string gpu;
@@ -1233,7 +1283,41 @@ std::set<int> server_models::router_child_pids_locked() const {
             }
         }
     }
+    // group workers are router-owned too; their declared vram-mb is in the slot reservation
+    for (const auto & [_, rt] : groups) {
+        if (rt.workers) {
+            const std::set<int> w = rt.workers->pids();
+            pids.insert(w.begin(), w.end());
+        }
+    }
     return pids;
+}
+
+std::string server_models::group_spine_locked(const std::string & name) const {
+    auto it = mapping.find(name);
+    if (it != mapping.end() && it->second.meta.is_external() && !it->second.meta.group.empty()) {
+        return it->second.meta.group;
+    }
+    return name;
+}
+
+bool server_models::same_group_locked(const std::string & a, const std::string & b) const {
+    auto ia = mapping.find(a);
+    auto ib = mapping.find(b);
+    return ia != mapping.end() && ib != mapping.end() && !ia->second.meta.group.empty() &&
+           ia->second.meta.group == ib->second.meta.group;
+}
+
+// A worker is never a victim on its own: evicting it means evicting its group, so it is
+// represented by its spine -- the spine's name, LRU stamp, pin and in-flight requests.
+evict_resident server_models::group_resident_locked(const std::string & name) const {
+    const std::string who = group_spine_locked(name);
+    auto it = mapping.find(who);
+    if (it == mapping.end()) {
+        it = mapping.find(name);
+    }
+    const auto & inst = it->second;
+    return { it->first, inst.meta.last_used, inst.meta.placement.pinned, inst.req_count };
 }
 
 // One fdinfo scan + one router-PID set per top-level operation (a listing or a placement
@@ -1281,7 +1365,9 @@ std::vector<std::string> server_models::choose_ram_evictions_locked(const std::s
     }
     std::vector<std::pair<int64_t, std::string>> residents;
     for (const auto & [other, inst] : mapping) {
-        if (other == name || !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING ||
+        // a worker leaves with its spine, which is the resident that stands for the group
+        if (other == name || inst.meta.is_external() || same_group_locked(other, name) ||
+                !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING ||
                 inst.meta.placement.pinned || inst.req_count > 0 || stopping_models.count(other)) {
             continue;
         }
@@ -1299,6 +1385,22 @@ std::vector<std::string> server_models::choose_ram_evictions_locked(const std::s
             released = mem->rss_anon + mem->rss_shmem;
         } else if (inst.meta.placement.ram_mb_override > 0) {
             released = inst.meta.placement.ram_mb_override * 1024LL * 1024LL;
+        }
+        // a group spine releases its workers' host memory too
+        auto g = groups.find(resident.second);
+        if (g != groups.end() && g->second.workers) {
+            for (const auto & w : g->second.workers->status()) {
+                if (w.state == "exited" || w.state == "pending") {
+                    continue;
+                }
+                const auto wmem = w.pid > 0 ? probe_proc_mem("", w.pid) : std::nullopt;
+                auto wit = mapping.find(w.name);
+                if (wmem.has_value()) {
+                    released += wmem->rss_anon + wmem->rss_shmem;
+                } else if (wit != mapping.end() && wit->second.meta.placement.ram_mb_override > 0) {
+                    released += wit->second.meta.placement.ram_mb_override * 1024LL * 1024LL;
+                }
+            }
         }
         victims.push_back(resident.second);
         free += released;
@@ -1553,7 +1655,7 @@ std::vector<std::string> server_models::choose_gpu_evictions_locked(const std::s
     std::set<std::string> dev_set(placement.devs.begin(), placement.devs.end());
     std::vector<evict_resident> overlapping;
     for (const auto & [other_name, inst] : mapping) {
-        if (other_name == name || !inst.meta.is_running()) {
+        if (other_name == name || same_group_locked(other_name, name) || !inst.meta.is_running()) {
             continue;
         }
         bool overlaps = false;
@@ -1563,7 +1665,13 @@ std::vector<std::string> server_models::choose_gpu_evictions_locked(const std::s
         if (!overlaps) {
             continue;
         }
-        overlapping.push_back({ other_name, inst.meta.last_used, inst.meta.placement.pinned, inst.req_count });
+        // a worker on this GPU is evicted by evicting its group (its spine)
+        const evict_resident r = group_resident_locked(other_name);
+        const bool seen = std::any_of(overlapping.begin(), overlapping.end(),
+                                      [&](const evict_resident & o) { return o.name == r.name; });
+        if (!seen) {
+            overlapping.push_back(r);
+        }
     }
     // Exclusive placement needs every overlapping resident gone, so one that cannot be
     // evicted refuses the load. A pinned resident is a hard hold: it makes its GPU
@@ -1595,6 +1703,33 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         return;
     }
 
+    if (meta.is_external() && meta.placement.devs.empty()) {
+        // a worker without gpu= holds no GPU slot; only its host RAM is gated
+        if (meta.placement.ram_mb_override > 0) {
+            const std::vector<std::string> evict =
+                choose_ram_evictions_locked(name, meta.placement.ram_mb_override * 1024LL * 1024LL);
+            for (const auto & victim : evict) {
+                SRV_INF("router placement evicting name=%s for worker %s (host RAM)\n", victim.c_str(), name.c_str());
+                auto it = mapping.find(victim);
+                const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
+                if (loading) {
+                    it->second.subproc->terminate();
+                }
+                request_stop(victim, !loading);
+            }
+            cv.wait(lk, [&]() {
+                for (const auto & victim : evict) {
+                    auto it = mapping.find(victim);
+                    if (it != mapping.end() && it->second.meta.is_running()) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+        }
+        return;
+    }
+
     if (meta.placement.devs.empty()) {
         for (const auto & slot : gpu_slots) {
             meta.placement.devs.push_back(slot.dev_name);
@@ -1611,14 +1746,22 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     meta.placement.exclusive = model_wants_exclusive(meta) || meta.placement.devs.size() > 1;
 
     std::vector<int64_t> needs;
-    lk.unlock();
-    try {
-        needs = estimate_need_bytes(meta);
-    } catch (...) {
+    if (meta.is_external()) {
+        // a worker has no model to estimate: its declared vram-mb is what it reserves
+        if (meta.placement.vram_mb_override < 0) {
+            SRV_WRN("worker '%s' has gpu= but no vram-mb; reserving nothing on its GPU\n", name.c_str());
+        }
+        needs = { std::max<int64_t>(0, meta.placement.vram_mb_override) * 1024LL * 1024LL };
+    } else {
+        lk.unlock();
+        try {
+            needs = estimate_need_bytes(meta);
+        } catch (...) {
+            lk.lock();
+            throw;
+        }
         lk.lock();
-        throw;
     }
-    lk.lock();
 
     // Host RAM must fit too. A shortfall evicts idle residents (LRU) just like VRAM does;
     // refusing here, before anything is reserved, leaves the ledger untouched.
@@ -1705,7 +1848,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     for (const auto & dev : meta.placement.devs) {
         const int idx = find_slot_index(gpu_slots, dev);
         const auto & slot = gpu_slots[idx];
-        if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name) {
+        if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name && !same_group_locked(slot.exclusive_holder, name)) {
             continue;
         }
         const int64_t free = effective_free_bytes_locked(slot, snap);
@@ -1726,19 +1869,26 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         for (const auto & dev : meta.placement.devs) {
             const int idx = find_slot_index(gpu_slots, dev);
             const auto & slot = gpu_slots[idx];
-            if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name) {
-                auto holder = mapping.find(slot.exclusive_holder);
+            if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name && !same_group_locked(slot.exclusive_holder, name)) {
+                auto holder = mapping.find(group_spine_locked(slot.exclusive_holder));
                 if (holder != mapping.end() && holder->second.meta.placement.pinned) {
                     continue;
                 }
             }
             std::vector<evict_resident> all_residents;
             for (const auto & [other_name, inst] : mapping) {
-                if (other_name == name || !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING) {
+                if (other_name == name || same_group_locked(other_name, name) || !inst.meta.is_running() ||
+                        inst.meta.status == SERVER_MODEL_STATUS_SLEEPING) {
                     continue;
                 }
                 if (std::find(inst.meta.placement.devs.begin(), inst.meta.placement.devs.end(), slot.dev_name) != inst.meta.placement.devs.end()) {
-                    all_residents.push_back({ other_name, inst.meta.last_used, inst.meta.placement.pinned, inst.req_count });
+                    // a worker here is evicted by evicting its group (its spine)
+                    const evict_resident r = group_resident_locked(other_name);
+                    const bool seen = std::any_of(all_residents.begin(), all_residents.end(),
+                                                  [&](const evict_resident & o) { return o.name == r.name; });
+                    if (!seen) {
+                        all_residents.push_back(r);
+                    }
                 }
             }
             // LRU order; pinned and busy (req_count > 0) residents are never victims
@@ -1753,7 +1903,23 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
                 cand.victims.push_back(resident.name);
                 cand.newest_last_used = resident.last_used;
                 auto it = mapping.find(resident.name);
-                if (it != mapping.end() && !it->second.meta.placement.need_bytes_per_dev.empty()) {
+                if (it != mapping.end() && !it->second.meta.depends.empty()) {
+                    // a group: what its members hold on this slot
+                    std::vector<std::string> members = it->second.meta.depends;
+                    members.push_back(resident.name);
+                    for (const auto & member : members) {
+                        auto mit = mapping.find(member);
+                        if (mit == mapping.end()) {
+                            continue;
+                        }
+                        const auto & mp = mit->second.meta.placement;
+                        for (size_t d = 0; d < mp.devs.size() && d < mp.need_bytes_per_dev.size(); ++d) {
+                            if (mp.devs[d] == slot.dev_name) {
+                                free += mp.need_bytes_per_dev[d];
+                            }
+                        }
+                    }
+                } else if (it != mapping.end() && !it->second.meta.placement.need_bytes_per_dev.empty()) {
                     const auto & victim_placement = it->second.meta.placement;
                     auto dev_it = std::find(victim_placement.devs.begin(), victim_placement.devs.end(), slot.dev_name);
                     if (dev_it != victim_placement.devs.end()) {
@@ -2268,11 +2434,15 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
 
     auto it = mapping.find(name);
     if (it != mapping.end()) {
-        return it->second.meta;
+        server_model_meta out = it->second.meta;
+        out.group_info = group_status_json_locked(it->first);
+        return out;
     }
     for (const auto & [key, inst] : mapping) {
         if (inst.meta.aliases.count(name)) {
-            return inst.meta;
+            server_model_meta out = inst.meta;
+            out.group_info = group_status_json_locked(key);
+            return out;
         }
     }
     return std::nullopt;
@@ -2290,6 +2460,7 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     result.reserve(mapping.size());
     for (const auto & [name, inst] : mapping) {
         result.push_back(inst.meta);
+        result.back().group_info = group_status_json_locked(name);
     }
     return result;
 }
@@ -2328,6 +2499,37 @@ void server_models::unload_lru() {
     });
 }
 
+// Per-model `env` from the preset, applied OVER the environment the router inherited. Entries
+// REPLACE any existing definition rather than being appended: duplicate KEY= entries in envp
+// resolve inconsistently across libc getenv implementations.
+static void apply_env_overrides(std::vector<std::string> & env, const std::vector<std::string> & overrides, const std::string & name) {
+    for (const auto & override_entry : overrides) {
+        const bool remove = override_entry[0] == '-';
+        const std::string key = remove
+            ? override_entry.substr(1)
+            : override_entry.substr(0, override_entry.find('='));
+        const std::string prefix = key + "=";
+        for (auto it = env.begin(); it != env.end(); ) {
+            it = it->compare(0, prefix.size(), prefix) == 0 ? env.erase(it) : it + 1;
+        }
+        if (!remove) {
+            env.push_back(override_entry);
+        }
+        SRV_INF("model '%s': env %s%s\n", name.c_str(),
+                remove ? "unset " : "", remove ? key.c_str() : override_entry.c_str());
+    }
+}
+
+// Final env = inherited router env + preset `env`. A temp dir that points at a non-directory
+// (e.g. TMPDIR=/etc/passwd) fails every tmpfile the child makes in confusing ways: refuse.
+static void check_temp_dirs(const std::vector<std::string> & env, const std::string & name) {
+    const std::string bad = env_temp_dir_violation(env);
+    if (!bad.empty()) {
+        const std::string var = bad.substr(0, bad.find('='));
+        throw std::runtime_error("model '" + name + "' cannot load: " + var + " is not a directory (" + bad + ")");
+    }
+}
+
 void server_models::load(const std::string & name) {
     load(name, load_options{});
 }
@@ -2355,6 +2557,18 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // against the freshest preset and a consistent mapping state
     cv.wait(lk, [this]() { return !is_reloading; });
 
+    // A model group: one spine plus the workers it depends on. A previous load of this group
+    // may still be stopping its workers (spine already down): wait for that to finish, so two
+    // generations of a worker never overlap on its port and GPU.
+    const bool is_group = opts.mode == SERVER_CHILD_MODE_NORMAL && !opts.custom_meta.has_value() &&
+                          mapping.count(name) && !mapping[name].meta.depends.empty();
+    if (is_group) {
+        cv.wait(lk, [this, &name]() {
+            auto g = groups.find(name);
+            return !is_reloading && (g == groups.end() || g->second.stop_done);
+        });
+    }
+
     auto meta = opts.custom_meta.has_value() ? *opts.custom_meta : mapping[name].meta;
     if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model %s is not ready\n", name.c_str());
@@ -2366,7 +2580,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
     }
 
     bool marked_loading = false;
-    if (gpu_placement_enabled && opts.mode == SERVER_CHILD_MODE_NORMAL && !opts.custom_meta.has_value()) {
+    // a group is marked loading up front too: its workers come up before the spine is spawned,
+    // and nobody else may start the same group meanwhile
+    if ((gpu_placement_enabled || is_group) && opts.mode == SERVER_CHILD_MODE_NORMAL && !opts.custom_meta.has_value()) {
         auto it = mapping.find(name);
         if (it != mapping.end()) {
             it->second.meta.status = SERVER_MODEL_STATUS_LOADING;
@@ -2406,18 +2622,67 @@ void server_models::load(const std::string & name, const load_options & opts) {
         marked_loading = false;
         cv.notify_all();
     };
+    // group members: placed (and marked loading) before the start, or already started
+    std::vector<std::string>             workers_marked;
+    std::shared_ptr<router_worker_group> group_started;
+    auto rollback_group = [&]() {
+        if (group_started) {
+            // the workers are up: stop them the normal way; on_group_stopped() marks them
+            // unloaded, and the next load of this group waits for that
+            group_started->request_stop();
+            group_started.reset();
+        } else {
+            for (const auto & w : workers_marked) {
+                auto wit = mapping.find(w);
+                if (wit != mapping.end() && wit->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+                    set_worker_status_locked(w, SERVER_MODEL_STATUS_UNLOADED); // credits its reservation
+                }
+            }
+        }
+        workers_marked.clear();
+    };
     auto rollback_load_attempt = [&](void *) {
         if (!lk.owns_lock()) {
             lk.lock();
         }
+        rollback_group();
         rollback_gpu_reservation();
         rollback_loading_status();
     };
     std::unique_ptr<void, decltype(rollback_load_attempt)> load_attempt_guard(reinterpret_cast<void *>(1), rollback_load_attempt);
 
+    // The child environments are final before placement: a load that is refused for its env
+    // must not have evicted anything first.
+    std::vector<std::string> child_env = base_env; // carries LLAMA_ROUTER_GEN / LLAMA_ROUTER_PID
+    child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+    apply_env_overrides(child_env, meta.env_overrides, meta.name);
+    check_temp_dirs(child_env, name);
+    std::vector<router_worker_spec> worker_specs;
+    if (is_group) {
+        worker_specs = prepare_group_locked(name, meta); // launch, port, env (+ temp-dir check) of every worker
+    }
+
     ensure_gpu_placement(name, meta, opts.mode, lk);
     if (gpu_placement_enabled && opts.mode == SERVER_CHILD_MODE_NORMAL && !meta.placement.need_bytes_per_dev.empty()) {
         placement_reserved = true;
+    }
+
+    // Admission covers the whole group: each worker's vram-mb on its gpu slot and ram-mb on
+    // this machine. A worker marked loading holds its ram-mb back from the next one's check.
+    for (const auto & spec : worker_specs) {
+        auto wit = mapping.find(spec.name);
+        if (wit == mapping.end()) {
+            throw std::runtime_error("model group '" + name + "': worker '" + spec.name + "' disappeared during the load");
+        }
+        server_model_meta wmeta = wit->second.meta;
+        ensure_gpu_placement(spec.name, wmeta, opts.mode, lk); // may wait (unlocked) for evictions
+        wit = mapping.find(spec.name);
+        if (wit == mapping.end()) {
+            throw std::runtime_error("model group '" + name + "': worker '" + spec.name + "' disappeared during the load");
+        }
+        wit->second.meta.placement = wmeta.placement; // so set_worker_status_locked() can credit it
+        set_worker_status_locked(spec.name, SERVER_MODEL_STATUS_LOADING);
+        workers_marked.push_back(spec.name);
     }
 
     // Re-check capacity under the lock to prevent concurrent loads from
@@ -2430,10 +2695,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // Download workers do not use models_max slots.
     if (!gpu_placement_enabled && opts.mode == SERVER_CHILD_MODE_NORMAL && base_params.models_max > 0) {
         const int64_t capacity_deadline = ggml_time_ms() + 30000; // 30s cap, then surface a retriable error
-        auto count_running = [this]() {
+        auto count_running = [this, &name]() {
             size_t n = 0;
             for (const auto & m : mapping) {
-                if (m.second.meta.is_running()) {
+                // a group takes one slot; a group spine marked loading by this call is not "another" model
+                if (m.first != name && m.second.meta.is_running() && !m.second.meta.is_external()) {
                     n++;
                 }
             }
@@ -2452,7 +2718,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
             lk.lock();
             cv.wait(lk, [this]() { return !is_reloading; });
             auto it = mapping.find(name);
-            if (it == mapping.end() || it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+            // a group spine is marked loading by this call itself; a stop request cancels it
+            const server_model_status own_status = marked_loading ? SERVER_MODEL_STATUS_LOADING : SERVER_MODEL_STATUS_UNLOADED;
+            if (it == mapping.end() || it->second.meta.status != own_status || stopping_models.count(name)) {
                 // a concurrent path took over this model while we were evicting
                 SRV_INF("model %s no longer loadable after capacity wait\n", name.c_str());
                 return;
@@ -2463,6 +2731,65 @@ void server_models::load(const std::string & name, const load_options & opts) {
                 cv.wait_for(lk, std::chrono::milliseconds(200));
             }
         }
+    }
+
+    // Workers first: the spine is spawned only once every worker accepts TCP.
+    if (is_group) {
+        if (stopping_models.count(name)) {
+            throw std::runtime_error("load of model group '" + name + "' was cancelled");
+        }
+        auto & rt = groups[name];
+        // the previous load's workers object (all stopped, see the wait above). Its destructor
+        // joins its thread, which may still be finishing a callback that takes `mutex`: drop it
+        // only once the lock is released below.
+        std::shared_ptr<router_worker_group> retired = std::move(rt.workers);
+        rt = group_runtime{};
+        rt.stop_done = false;
+
+        auto holder = std::make_shared<const router_worker_group *>(nullptr);
+        router_worker_group::callbacks cb;
+        cb.on_unexpected_exit = [this, name, holder](const std::string & worker, int code, const std::string & reason) {
+            on_group_worker_exit(name, *holder, worker, code, reason);
+        };
+        cb.on_stopped = [this, name, holder]() {
+            on_group_stopped(name, *holder);
+        };
+        auto grp = std::make_shared<router_worker_group>(name, worker_specs, std::move(cb));
+        *holder = grp.get(); // published to the group thread through its lock in start()
+        rt.workers = grp;
+
+        lk.unlock();
+        retired.reset();
+        std::string err;
+        const bool ok = grp->start(err, [this, name]() {
+            std::lock_guard<std::mutex> l(mutex);
+            return stopping_models.count(name) > 0; // unload() / eviction / load timeout while starting
+        });
+        lk.lock();
+        if (!ok) {
+            // start() already tore down and reaped every worker it had started
+            auto g = groups.find(name);
+            if (g != groups.end() && g->second.workers == grp) {
+                g->second.stop_done = true;
+                g->second.failed    = err.find("cancelled") == std::string::npos;
+                g->second.reason    = err;
+            }
+            for (const auto & w : grp->status()) {
+                if (!w.error.empty()) { // the worker that failed the start shows as failed
+                    set_worker_status_locked(w.name, SERVER_MODEL_STATUS_UNLOADED, w.exit_code > 0 ? w.exit_code : 1);
+                }
+            }
+            throw std::runtime_error("model group '" + name + "' failed to start: " + err);
+        }
+        group_started = grp;
+        workers_marked.clear(); // from here on, on_group_stopped() owns the workers' status
+        for (const auto & spec : worker_specs) {
+            set_worker_status_locked(spec.name, SERVER_MODEL_STATUS_LOADED);
+        }
+        if (stopping_models.count(name)) {
+            throw std::runtime_error("load of model group '" + name + "' was cancelled");
+        }
+        SRV_INF("group %s: all workers ready, spawning the spine\n", name.c_str());
     }
 
     // prepare new instance info
@@ -2484,40 +2811,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         inst.meta.update_args(ctx_preset, bin_path); // render args
 
         std::vector<std::string> child_args = inst.meta.args; // copy
-        std::vector<std::string> child_env  = base_env; // copy
-        child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
-
-        // Per-model `env` from the preset, applied OVER the environment the router
-        // inherited. Entries REPLACE any existing definition rather than being appended:
-        // duplicate KEY= entries in envp resolve inconsistently across libc getenv
-        // implementations, so "override" has to mean override, not "hope the later one wins".
-        for (const auto & override_entry : inst.meta.env_overrides) {
-            const bool remove = override_entry[0] == '-';
-            const std::string key = remove
-                ? override_entry.substr(1)
-                : override_entry.substr(0, override_entry.find('='));
-            const std::string prefix = key + "=";
-            for (auto it = child_env.begin(); it != child_env.end(); ) {
-                it = it->compare(0, prefix.size(), prefix) == 0 ? child_env.erase(it) : it + 1;
-            }
-            if (!remove) {
-                child_env.push_back(override_entry);
-            }
-            SRV_INF("model '%s': env %s%s\n", inst.meta.name.c_str(),
-                    remove ? "unset " : "", remove ? key.c_str() : override_entry.c_str());
-        }
-
-        // Final env = inherited router env + preset `env`, nothing else. A temp dir that
-        // points at a non-directory (e.g. TMPDIR=/etc/passwd) fails every tmpfile the child
-        // makes in confusing ways, so refuse the load up front. The guard rolls back.
-        {
-            const std::string bad = env_temp_dir_violation(child_env);
-            if (!bad.empty()) {
-                const std::string var = bad.substr(0, bad.find('='));
-                throw std::runtime_error("model '" + name + "' cannot load: " + var +
-                                         " is not a directory (" + bad + ")");
-            }
-        }
+        // child_env: built and temp-dir checked before placement (see above)
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
@@ -2537,10 +2831,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
         //                so that we can use stdout for commands and stderr for logging
         int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
         if (!inst.subproc->sproc.create(child_args, options, child_env)) {
-            load_attempt_guard.reset();
+            load_attempt_guard.reset(); // also stops a group's workers
             throw std::runtime_error("failed to spawn server instance");
         }
         load_attempt_guard.release();
+        group_started.reset(); // the spine's exit now drives the workers' stop (on_child_exit)
     }
 
     // old process should have exited already, but just in case, we clean it up here
@@ -2563,13 +2858,252 @@ void server_models::load(const std::string & name, const load_options & opts) {
     cv.notify_all();
 }
 
-void server_models::request_stop(const std::string & name, bool send_exit) {
+void server_models::request_stop(const std::string & name_in, bool send_exit, bool drain) {
+    // a worker is stopped by stopping its group, which starts at the spine
+    const std::string name = group_spine_locked(name_in);
     auto it = mapping.find(name);
     if (it == mapping.end() || stopping_models.count(name)) {
         return;
     }
+    if (name != name_in) {
+        const bool loading = it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
+        if (loading) {
+            it->second.subproc->terminate();
+        }
+        send_exit = !loading;
+    }
     stopping_models.insert(name);
+    auto g = groups.find(name);
+    if (g != groups.end() && drain && send_exit && it->second.req_count > 0) {
+        // unload order for a group: drain the spine's requests (no new ones are routed to a
+        // stopping model), then stop it; bounded by its stop-timeout (idle sweeper enforces it)
+        const int bound_s = std::max(1, it->second.meta.stop_timeout);
+        g->second.drain_deadline = ggml_time_ms() + (int64_t) bound_s * 1000;
+        SRV_INF("group %s: draining %d in-flight request(s) before stopping (up to %d s)\n",
+                name.c_str(), it->second.req_count, bound_s);
+        return;
+    }
     monitor->stop(name, it->second.meta.stop_timeout, send_exit);
+}
+
+void server_models::maybe_finish_drain_locked(const std::string & name, bool force) {
+    auto g = groups.find(name);
+    if (g == groups.end() || g->second.drain_deadline == 0) {
+        return;
+    }
+    auto it = mapping.find(name);
+    if (!force && it != mapping.end() && it->second.req_count > 0) {
+        return;
+    }
+    g->second.drain_deadline = 0;
+    if (it != mapping.end()) {
+        if (it->second.req_count > 0) {
+            SRV_WRN("group %s: stopping with %d request(s) still in flight (drain bound reached)\n",
+                    name.c_str(), it->second.req_count);
+        }
+        monitor->stop(name, it->second.meta.stop_timeout, true);
+    }
+}
+
+void server_models::set_worker_status_locked(const std::string & worker, server_model_status status, int exit_code) {
+    auto it = mapping.find(worker);
+    if (it == mapping.end()) {
+        return;
+    }
+    auto & meta = it->second.meta;
+    if (status == SERVER_MODEL_STATUS_UNLOADED && !meta.placement.need_bytes_per_dev.empty()) {
+        credit_gpu_reservation_locked(worker);
+    }
+    meta.status    = status;
+    meta.exit_code = exit_code;
+    if (status != SERVER_MODEL_STATUS_UNLOADED) {
+        meta.last_used = ggml_time_ms();
+    }
+    json data = { {"status", server_model_status_to_string(status)} };
+    if (status == SERVER_MODEL_STATUS_UNLOADED) {
+        data["exit_code"] = exit_code;
+    }
+    notify_sse("status_change", worker, data); // does not take the lock
+    cv.notify_all();
+}
+
+// local-only for now: a worker must be on the router's own machine
+static bool router_machine_is_local(const std::string & machine) {
+    if (machine.empty() || machine == "local" || machine == "localhost") {
+        return true;
+    }
+#ifndef _WIN32
+    char buf[256] = {};
+    if (gethostname(buf, sizeof(buf) - 1) == 0) {
+        auto lower = [](std::string v) {
+            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+            return v;
+        };
+        const std::string host  = lower(buf);
+        const std::string want  = lower(machine);
+        const std::string short_host = host.substr(0, host.find('.'));
+        return want == host || want == short_host;
+    }
+#endif
+    return false;
+}
+
+std::vector<router_worker_spec> server_models::prepare_group_locked(const std::string & name, const server_model_meta & spine_meta) {
+    std::vector<router_worker_spec> specs;
+    for (const auto & dep : spine_meta.depends) {
+        auto it = mapping.find(dep);
+        if (it == mapping.end() || !it->second.meta.is_external()) {
+            throw std::runtime_error("model group '" + name + "': worker '" + dep + "' is not a kind=external section");
+        }
+        const auto & w = it->second.meta;
+        if (!router_machine_is_local(w.machine)) {
+            throw std::runtime_error("model group '" + name + "': worker '" + dep + "' is on machine '" + w.machine +
+                                     "'; only workers on the router's own machine are supported so far");
+        }
+        router_launch launch;
+        const std::string err = router_parse_launch(w.launch, launch);
+        if (!err.empty()) {
+            throw std::runtime_error("model group '" + name + "': worker '" + dep + "': " + err);
+        }
+
+        router_worker_spec spec;
+        spec.name = dep;
+        spec.argv = launch.argv;
+        std::vector<std::string> env = base_env; // carries LLAMA_ROUTER_GEN / LLAMA_ROUTER_PID
+        apply_env_overrides(env, w.env_overrides, dep);
+        spec.env = router_worker_env(std::move(env), launch.env, w.park_file, router_gen);
+        check_temp_dirs(spec.env, dep);
+
+        int port = router_launch_endpoint(launch.words, spec.host);
+        if (w.worker_port > 0) {
+            port = w.worker_port;
+        }
+        if (port <= 0) {
+            throw std::runtime_error("model group '" + name + "': cannot tell which port worker '" + dep +
+                                     "' listens on (no --listen HOST:PORT or --port N in launch); set worker-port");
+        }
+        spec.port              = port;
+        spec.startup_timeout_s = std::max(spine_meta.startup_timeout_s, w.startup_timeout_s);
+        spec.quiesce_ms        = router_env_quiesce_ms(spec.env);
+        specs.push_back(std::move(spec));
+    }
+    return specs;
+}
+
+json server_models::group_status_json_locked(const std::string & spine) const {
+    auto it = mapping.find(spine);
+    if (it == mapping.end() || it->second.meta.depends.empty()) {
+        return nullptr;
+    }
+    const auto & meta = it->second.meta;
+    auto rt = groups.find(spine);
+    const bool stopping = stopping_models.count(spine) > 0;
+    std::string status;
+    if (meta.is_ready_or_sleep()) {
+        status = stopping ? "stopping" : "ready";
+    } else if (meta.status == SERVER_MODEL_STATUS_LOADING) {
+        status = stopping ? "stopping" : "loading";
+    } else {
+        status = rt != groups.end() && rt->second.failed ? "failed" : "unloaded";
+    }
+    json workers = json::array();
+    if (rt != groups.end() && rt->second.workers) {
+        for (const auto & w : rt->second.workers->status()) {
+            workers.push_back({
+                {"name", w.name},
+                {"pid", w.pid},
+                {"host", w.host},
+                {"port", w.port},
+                {"state", w.state},
+                {"exit_code", w.exit_code},
+                {"killed", w.killed},
+                {"stop_snapshot", router_snapshot_result_str(w.snapshot)},
+                {"stop_snapshot_detail", w.snapshot_detail},
+                {"quiesce_timeout", w.quiesce_timeout},
+                {"error", w.error},
+            });
+        }
+    } else {
+        for (const auto & dep : meta.depends) {
+            workers.push_back({ {"name", dep}, {"state", "pending"}, {"stop_snapshot", "none"} });
+        }
+    }
+    json out = { {"status", status}, {"workers", workers} };
+    if (rt != groups.end() && !rt->second.reason.empty()) {
+        out["reason"] = rt->second.reason;
+    }
+    return out;
+}
+
+void server_models::on_group_worker_exit(const std::string & spine, const router_worker_group * g, const std::string & worker, int exit_code, const std::string & reason) {
+    std::unique_lock<std::mutex> lk(mutex);
+    auto rt = groups.find(spine);
+    if (rt == groups.end() || rt->second.workers.get() != g || rt->second.stop_done) {
+        return; // a group that is already gone
+    }
+    rt->second.failed = true;
+    if (rt->second.reason.empty()) {
+        rt->second.reason = reason;
+    }
+    set_worker_status_locked(worker, SERVER_MODEL_STATUS_UNLOADED, exit_code == 0 ? 1 : exit_code);
+    auto it = mapping.find(spine);
+    if (it == mapping.end() || !it->second.meta.is_running()) {
+        return;
+    }
+    if (stopping_models.count(spine)) {
+        maybe_finish_drain_locked(spine, true); // no point draining a group that lost a worker
+        return;
+    }
+    SRV_ERR("group %s failed (%s); stopping its spine, the next request reloads the whole group\n",
+            spine.c_str(), reason.c_str());
+    const bool loading = it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
+    if (loading) {
+        it->second.subproc->terminate();
+    }
+    request_stop(spine, !loading, /*drain=*/false);
+}
+
+void server_models::on_group_stopped(const std::string & spine, const router_worker_group * g) {
+    int  code = 0;
+    bool changed = false;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        auto rt = groups.find(spine);
+        if (rt == groups.end() || rt->second.workers.get() != g || rt->second.stop_done) {
+            return;
+        }
+        for (const auto & w : g->status()) {
+            auto wit = mapping.find(w.name);
+            if (wit != mapping.end() && wit->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+                set_worker_status_locked(w.name, SERVER_MODEL_STATUS_UNLOADED, std::max(0, w.exit_code));
+            }
+        }
+        code = rt->second.pending_exit.value_or(0);
+        if (rt->second.failed && code == 0) {
+            code = 1; // shows as failed; the next request loads the group again
+        }
+        rt->second.pending_exit.reset();
+        rt->second.drain_deadline = 0;
+        // last step of the unload order: the group is unloaded only now that its workers are gone
+        auto it = mapping.find(spine);
+        if (it != mapping.end()) {
+            auto & meta = it->second.meta;
+            if (!meta.placement.need_bytes_per_dev.empty()) {
+                credit_gpu_reservation_locked(spine);
+            }
+            changed = meta.status != SERVER_MODEL_STATUS_UNLOADED || meta.exit_code != code;
+            meta.status    = SERVER_MODEL_STATUS_UNLOADED;
+            meta.exit_code = code;
+            stopping_models.erase(spine);
+        }
+        rt->second.stop_done = true; // same critical section as the status change (see load())
+        sched->tick(lk);
+    }
+    SRV_INF("group %s unloaded (spine and all workers stopped)\n", spine.c_str());
+    if (changed) {
+        notify_sse("status_change", spine, { {"status", "unloaded"}, {"exit_code", code} });
+    }
+    cv.notify_all();
 }
 
 void server_models::on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code) {
@@ -2579,6 +3113,19 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
         if (it == mapping.end() || it->second.subproc != proc) {
             stopping_models.erase(name);
             return; // entry erased, or a newer instance took the name
+        }
+        if (mode == SERVER_CHILD_MODE_NORMAL) {
+            auto g = groups.find(name);
+            if (g != groups.end() && g->second.workers && !g->second.stop_done) {
+                // unload order: the spine is down, now its workers (TERM in parallel, KILL after
+                // quiesce + grace); on_group_stopped() marks the group unloaded once they are gone
+                SRV_INF("group %s: spine exited with status %d, stopping its workers\n", name.c_str(), exit_code);
+                g->second.pending_exit   = exit_code;
+                g->second.drain_deadline = 0;
+                stopping_models.insert(name); // nothing may be routed to it meanwhile
+                g->second.workers->request_stop();
+                return;
+            }
         }
     }
     if (mode == SERVER_CHILD_MODE_DOWNLOAD) {
@@ -2594,8 +3141,9 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
     }
 }
 
-void server_models::unload(const std::string & name) {
+void server_models::unload(const std::string & name_in) {
     std::unique_lock<std::mutex> lk(mutex);
+    const std::string name = group_spine_locked(name_in); // a worker unloads its whole group
     auto it = mapping.find(name);
     if (it != mapping.end()) {
         if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
@@ -2624,6 +3172,9 @@ void server_models::unload(const std::string & name) {
 void server_models::unload_all() {
     std::unique_lock<std::mutex> lk(mutex);
     for (auto & [name, inst] : mapping) {
+        if (inst.meta.is_external()) {
+            continue; // stopped with its spine; the wait below still waits for it
+        }
         if (inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
             SRV_INF("cancelling download for model name=%s\n", name.c_str());
             inst.request_exit();
@@ -2977,6 +3528,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             if (it->second.req_count > 0) {
                 it->second.req_count--;
                 if (it->second.req_count == 0) {
+                    maybe_finish_drain_locked(name, false); // a draining group spine stops now
                     sched->tick(lk);
                 }
             }
@@ -3034,9 +3586,18 @@ void server_models::idle_sweeper_loop() {
         {
             std::unique_lock<std::mutex> lk(mutex);
             const int64_t now = ggml_time_ms();
+            // group spines waiting for in-flight requests: stop them once their drain bound passes
+            for (auto & [spine, rt] : groups) {
+                if (rt.drain_deadline > 0 && now >= rt.drain_deadline) {
+                    maybe_finish_drain_locked(spine, true);
+                }
+            }
             for (const auto & [name, inst] : mapping) {
                 if (!inst.meta.is_running() || stopping_models.count(name)) {
                     continue;
+                }
+                if (inst.meta.is_external()) {
+                    continue; // idles and load-times out with its spine
                 }
                 if (inst.meta.placement.pinned || inst.req_count > 0) {
                     continue;
@@ -3676,6 +4237,11 @@ void server_models_routes::init_routes() {
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
+            }
+            if (!meta.group_info.is_null()) {
+                // group spine: loading / ready / stopping / failed / unloaded, and per worker its
+                // pid, state and which stop-snapshot line it printed (written / FAILED / timeout / none)
+                status["group"] = meta.group_info;
             }
 
             // pi coding agent multimodal compatibility

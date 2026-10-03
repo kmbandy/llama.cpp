@@ -18,6 +18,10 @@ static constexpr const char * ROUTER_ARG_PARK_FILE       = "LLAMA_ARG_ROUTER_PAR
 static constexpr const char * ROUTER_ARG_PARK_MODE       = "LLAMA_ARG_ROUTER_PARK_MODE";
 static constexpr const char * ROUTER_ARG_MACHINE         = "LLAMA_ARG_ROUTER_MACHINE";
 static constexpr const char * ROUTER_ARG_STARTUP_TIMEOUT = "LLAMA_ARG_ROUTER_STARTUP_TIMEOUT";
+// kind=external only: TCP port the worker listens on, when it cannot be read off `launch`
+// (`--listen HOST:PORT` / `--port N`). Not `port`: the router's own --port is merged into
+// every section, so LLAMA_ARG_PORT cannot tell a worker's port apart.
+static constexpr const char * ROUTER_ARG_WORKER_PORT     = "LLAMA_ARG_ROUTER_WORKER_PORT";
 // not router-only: forwarded to the spine child as-is (llama-server --slot-autosave)
 static constexpr const char * ROUTER_ARG_SLOT_AUTOSAVE   = "LLAMA_ARG_SLOT_AUTOSAVE";
 
@@ -43,11 +47,12 @@ struct router_group_section {
     router_park_mode         park_mode = ROUTER_PARK_NONE;
     std::string              slot_autosave;
     int                      startup_timeout_s = 300;
+    int                      worker_port = 0; // 0 = derive from launch
 };
 
 // Reads the group keys out of a preset. Must run before unset_reserved_args() strips the
 // router-only keys. Throws std::runtime_error naming the section on a bad kind / park-mode /
-// startup-timeout value.
+// startup-timeout / worker-port value.
 router_group_section router_group_parse_section(const common_preset & preset, const std::string & name);
 
 // Validates all sections together and returns worker name -> spine name. Throws

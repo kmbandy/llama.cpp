@@ -66,6 +66,19 @@ router_group_section router_group_parse_section(const common_preset & preset, co
         }
         s.startup_timeout_s = t;
     }
+    if (preset.get_option(ROUTER_ARG_WORKER_PORT, val) && !val.empty()) {
+        int p = 0;
+        try {
+            p = std::stoi(val);
+        } catch (...) {
+            p = 0;
+        }
+        if (p <= 0 || p > 65535) {
+            throw std::runtime_error(string_format(
+                "preset '%s': invalid worker-port '%s' (must be 1-65535)", name.c_str(), val.c_str()));
+        }
+        s.worker_port = p;
+    }
     return s;
 }
 

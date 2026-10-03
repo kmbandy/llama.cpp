@@ -147,5 +147,30 @@ int main() {
         assert(threw);
     }
 
+    // worker-port: parsed for an external, refused when out of range
+    {
+        const std::string path = "test-router-groups-tmp3.ini";
+        {
+            std::ofstream f(path);
+            f << "[w]\nkind = external\nlaunch = /bin/worker\nworker-port = 9100\n";
+        }
+        const auto sections = load_sections(path);
+        std::remove(path.c_str());
+        assert(find(sections, "w").worker_port == 9100);
+
+        {
+            std::ofstream f(path);
+            f << "[w]\nkind = external\nlaunch = /bin/worker\nworker-port = 70000\n";
+        }
+        bool threw = false;
+        try {
+            load_sections(path);
+        } catch (const std::runtime_error & e) {
+            threw = std::string(e.what()).find("worker-port") != std::string::npos;
+        }
+        std::remove(path.c_str());
+        assert(threw);
+    }
+
     return 0;
 }

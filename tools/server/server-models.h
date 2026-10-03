@@ -7,6 +7,8 @@
 #include "server-http.h"
 #include "server-queue.h"
 #include "server-router-groups.h"
+#include "server-router-group-lifecycle.h"
+#include "server-router-policy.h"
 #include "server-router-probe.h"
 
 #include <atomic>
@@ -147,6 +149,11 @@ struct server_model_meta {
     router_park_mode         park_mode = ROUTER_PARK_NONE;
     std::string              slot_autosave;
     int                      startup_timeout_s = 300;
+    int                      worker_port = 0; // worker: preset worker-port, 0 = read it off launch
+
+    // spine of a group: the group's status (workers, stop-snapshot lines). Filled into the
+    // copies get_meta()/get_all_meta() hand out, never kept in the registry.
+    json group_info = nullptr;
 
     bool is_external() const {
         return kind == ROUTER_KIND_EXTERNAL;
@@ -221,6 +228,24 @@ private:
 
     // models asked to stop, still counted as running until the monitor records their exit
     std::set<std::string> stopping_models;
+
+    // Model groups at run time, keyed by spine name; guarded by `mutex`. Lock order is always
+    // this->mutex -> router_worker_group's own lock; the group calls back with none held.
+    struct group_runtime {
+        // the workers of the current (or last) load; kept after it stopped for the status JSON,
+        // replaced by the next load. Never destroyed while `mutex` is held by a thread its
+        // callbacks could be waiting on (see load()).
+        std::shared_ptr<router_worker_group> workers;
+        bool               stop_done = true;   // on_group_stopped() ran for `workers` (or nothing to stop)
+        bool               failed = false;     // a worker died / failed to start: status "failed"
+        std::string        reason;
+        std::optional<int> pending_exit;       // spine already exited, waiting for its workers
+        int64_t            drain_deadline = 0; // >0: spine stop is waiting for in-flight requests
+    };
+    std::map<std::string, group_runtime> groups;
+
+    // this router start's generation, injected into every child as LLAMA_ROUTER_GEN
+    std::string router_gen;
 
     // set to true while load_models() is executing a reload; load() will wait until clear
     bool is_reloading = false;
@@ -322,6 +347,19 @@ private:
     int64_t read_physical_free_bytes(const server_gpu_slot & slot) const;
     int64_t physical_free_from_used(const server_gpu_slot & slot, int64_t used) const; // used < 0 = probe failed
     std::set<int> router_child_pids_locked() const;
+
+    // model groups (caller holds mutex unless noted)
+    std::string group_spine_locked(const std::string & name) const; // worker -> its spine; else name
+    bool same_group_locked(const std::string & a, const std::string & b) const;
+    // an eviction candidate as the policy sees it: a worker stands for its whole group
+    evict_resident group_resident_locked(const std::string & name) const;
+    std::vector<router_worker_spec> prepare_group_locked(const std::string & name, const server_model_meta & spine_meta);
+    json group_status_json_locked(const std::string & spine) const;
+    void set_worker_status_locked(const std::string & worker, server_model_status status, int exit_code = 0);
+    void maybe_finish_drain_locked(const std::string & name, bool force);
+    // callbacks from a router_worker_group thread (take the lock themselves)
+    void on_group_worker_exit(const std::string & spine, const router_worker_group * g, const std::string & worker, int exit_code, const std::string & reason);
+    void on_group_stopped(const std::string & spine, const router_worker_group * g);
     // One /proc fdinfo scan + router-PID set, taken once per listing/admission and passed down.
     struct vram_snapshot {
         std::vector<proc_vram> usage;
@@ -350,8 +388,10 @@ private:
     void add_model(server_model_meta && meta);
 
     // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
+    // a worker name stops its whole group (through the spine); a group spine with requests in
+    // flight first drains them (bounded by its stop-timeout) unless drain is false
     // not thread-safe, caller must hold mutex
-    void request_stop(const std::string & name, bool send_exit = true);
+    void request_stop(const std::string & name, bool send_exit = true, bool drain = true);
 
     // called by the monitor once a child exited and was reaped
     void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code);
