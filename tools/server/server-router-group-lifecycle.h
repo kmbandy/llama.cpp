@@ -11,6 +11,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -89,6 +90,14 @@ std::string router_parse_launch(const std::string & launch, router_launch & out)
 // 127.0.0.1. Returns the port, or -1 if none is given.
 int router_launch_endpoint(const std::vector<std::string> & words, std::string & host);
 
+// The host part of a `--listen HOST:PORT` / `--listen=HOST:PORT` word as written (brackets
+// stripped); "" when there is none or it is a wildcard (0.0.0.0, ::, *, empty).
+std::string router_launch_listen_host(const std::vector<std::string> & words);
+
+// Sets the port of an argv: replaces the value of `--port N` / `--port=N`, else appends
+// `--port N`. Used when a node allocates a child's port.
+void router_args_set_port(std::vector<std::string> & args, int port);
+
 //
 // environment helpers ("KEY=VALUE" lists)
 //
@@ -153,34 +162,43 @@ std::vector<int> router_sweep_stale_children(const std::string & root, const std
 // the worker group
 //
 
+class router_node_link; // server-router-node-client.h
+
 struct router_worker_spec {
     std::string              name;
     std::vector<std::string> argv;
-    std::vector<std::string> env;  // final environment, nothing is added
-    std::string              host = "127.0.0.1";
+    // env overrides ("KEY=VALUE" sets, "-KEY" unsets) on the base env of the node it runs on. The
+    // group's own in-process node (no `node`) has an empty base env: this is the final environment.
+    std::vector<std::string> env;
+    std::string              host = "127.0.0.1"; // where the router checks that it accepts TCP
     int                      port = 0;
     int                      startup_timeout_s = 300;
     int64_t                  quiesce_ms = ROUTER_WORKER_QUIESCE_MS_DEFAULT;
+    // the node it runs on (this machine's or another's); null = an in-process node of the group's own
+    std::shared_ptr<router_node_link> node;
 };
 
 // Point-in-time view of one worker, for the status JSON and tests.
 struct router_worker_state {
     std::string            name;
-    int                    pid  = 0; // 0 before spawn
+    std::string            machine;  // its node's machine ("" = this one)
+    int                    pid  = 0; // 0 before spawn; the PID on its machine
     std::string            host;
     int                    port = 0;
     std::string            state;    // "pending" | "starting" | "ready" | "stopping" | "exited"
     int                    exit_code = -1;
-    bool                   killed = false;          // the router had to SIGKILL it
+    bool                   killed = false;          // the router (or its node) had to SIGKILL it
     router_snapshot_result snapshot = ROUTER_SNAPSHOT_NONE;
     std::string            snapshot_detail;
     bool                   quiesce_timeout = false; // the timeout line was seen (a final line may follow)
     std::string            error;                   // Hip error line, or why the start failed
 };
 
-// Owns the worker processes of one group. One thread per group reads their output, reaps
-// them and enforces the TERM -> KILL deadlines; it is the only thread that reaps or signals
-// them, so a PID is never signalled after it was reaped (no PID-reuse race).
+// Owns the worker processes of one group. Each worker runs on a node (router_node_link): the
+// router's own machine or another one; its output lines and its exit come back as node events,
+// so a remote worker's stop-snapshot and Hip-error lines are classified exactly like a local
+// one's. One thread per group applies those events, sends the TERM / KILL commands (the node
+// enforces the TERM -> KILL deadline) and runs the callbacks.
 //
 // Callbacks run on the group thread with no lock of this class held. They must not destroy
 // this object (its destructor joins that thread).
@@ -195,9 +213,11 @@ class router_worker_group {
         std::function<void(const std::string & worker, const std::string & line)> on_line;
     };
 
+    // gen: LLAMA_ROUTER_GEN of the workers; "" = the one in each spec's env (else "router")
     router_worker_group(std::string group, std::vector<router_worker_spec> specs, callbacks cb,
-                        int64_t kill_grace_ms = ROUTER_WORKER_KILL_GRACE_MS);
-    // SIGKILLs anything still running (no callbacks fire), then joins the thread
+                        int64_t kill_grace_ms = ROUTER_WORKER_KILL_GRACE_MS, std::string gen = "");
+    // SIGKILLs anything still running (no callbacks fire), waits for the exits (bounded when a
+    // node does not answer), then joins the thread
     ~router_worker_group();
 
     router_worker_group(const router_worker_group &) = delete;
@@ -211,52 +231,68 @@ class router_worker_group {
     bool start(std::string & err, const std::function<bool()> & cancelled = nullptr);
 
     // Non-blocking. SIGTERM every live worker in parallel; each one that is still alive after
-    // its quiesce + kill grace gets SIGKILL. on_stopped fires once all have exited.
+    // its quiesce + kill grace gets SIGKILL (from its node). on_stopped fires once all have exited.
     void request_stop();
 
     // Blocks until every spawned worker has exited (and, if a stop was requested, on_stopped
     // has fired), or timeout_ms passes (< 0 = no limit). True when that happened.
     bool wait_stopped(int64_t timeout_ms);
 
-    std::set<int>                    pids() const; // live workers
+    std::set<int>                    pids() const; // live workers (PIDs on their own machines)
     std::vector<router_worker_state> status() const;
     bool                             all_exited() const;
 
   private:
+    struct event {
+        bool        exit = false; // else an output line
+        size_t      idx  = 0;
+        std::string line;
+        int         exit_code = -1;
+        bool        killed    = false;
+    };
+    // shared with the node watch callbacks, which may outlive this object
+    struct shared_state {
+        std::mutex              mu; // guards everything of the group
+        std::condition_variable cv;
+        std::deque<event>       events;
+    };
+
     struct member {
-        router_worker_spec              spec;
-        std::unique_ptr<server_subproc> proc;
-        std::string                     buf;          // partial line (group thread only)
-        bool                            eof = false;  // group thread only
-        bool                            spawned = false;
-        bool                            ready = false;
-        bool                            exited = false;
-        bool                            stopping = false;
-        bool                            killed = false;
-        bool                            term_pending = false;
-        bool                            kill_pending = false;
-        int64_t                         kill_deadline = 0;
-        int                             pid = 0;
-        int                             exit_code = -1;
-        bool                            hip_error = false;
-        std::string                     error;
-        router_snapshot_result          snapshot = ROUTER_SNAPSHOT_NONE;
-        std::string                     snapshot_detail;
-        bool                            quiesce_timeout = false;
+        router_worker_spec                spec;
+        std::shared_ptr<router_node_link> node;
+        bool                              eof = false;   // unused (kept for layout clarity)
+        bool                              spawned = false;
+        bool                              ready = false;
+        bool                              exited = false;
+        bool                              stopping = false;
+        bool                              killed = false;
+        bool                              term_pending = false;
+        bool                              kill_pending = false;
+        int64_t                           retry_at = 0;  // a command the node did not take: try again then
+        int                               pid = 0;
+        int                               exit_code = -1;
+        bool                              hip_error = false;
+        std::string                       error;
+        router_snapshot_result            snapshot = ROUTER_SNAPSHOT_NONE;
+        std::string                       snapshot_detail;
+        bool                              quiesce_timeout = false;
     };
 
     void run();
     void handle_line_locked(member & m, const std::string & line, std::vector<std::pair<std::string, std::string>> & lines_out);
-    void read_output_locked(member & m, std::vector<std::pair<std::string, std::string>> & lines_out);
     bool all_spawned_exited_locked() const;
     void teardown_failed_start(std::unique_lock<std::mutex> & lk);
+    // waits (lock held via lk) until every spawned worker exited or the bound passes; then gives
+    // up on the rest (unwatched, marked exited) so nothing waits forever on a node that is gone
+    void wait_exits_bounded(std::unique_lock<std::mutex> & lk, int64_t bound_ms);
+    std::shared_ptr<router_node_link> own_node();
 
     std::string group;
     callbacks   cb;
     int64_t     kill_grace_ms;
+    std::string gen;
 
-    mutable std::mutex      mu;
-    std::condition_variable cv;
+    std::shared_ptr<shared_state> st;
     std::vector<member>     members; // size fixed at construction
     bool                    armed          = false; // start() succeeded: exits are now unexpected
     bool                    stop_requested = false;
@@ -264,6 +300,6 @@ class router_worker_group {
     bool                    closing        = false; // destructor running: no more callbacks
     bool                    quit           = false;
 
-    server_subproc::waiter waiter;
+    std::shared_ptr<router_node_link> private_node; // for specs without a node
     std::thread            th;
 };

@@ -65,6 +65,7 @@ struct server_node_config {
     int64_t                  shutdown_grace_ms  = NODE_SHUTDOWN_GRACE_MS_DEFAULT;
     int64_t                  abandon_grace_ms   = 10000; // after the shutdown SIGKILL: stop waiting, log, exit anyway
     size_t                   event_backlog      = 4096; // events kept for late / resuming subscribers
+    std::string              exe;               // this binary (state / heartbeat `exe`): the leader runs llama-server children as it
 };
 
 // This process's environment without the router's reserved names (router_is_reserved_option_key:
@@ -82,6 +83,7 @@ struct node_spawn_request {
     std::vector<std::string> args; // full argv, args[0] absolute
     std::vector<std::string> env;  // preset-style overrides on the base env: "KEY=VALUE" sets, "-KEY" unsets
     int                      port = 0; // reported port; 0 = from --port / --listen in args (never from env)
+    bool                     alloc_port = false; // the node picks a free port, sets it as `--port` in args and reports it
 };
 
 // Point-in-time view of one table entry.
@@ -120,7 +122,8 @@ class server_node {
 
     // Starts a child. Throws server_node_error: 400 bad request (empty name/gen/args,
     // relative argv[0], malformed env entry, temp-dir violation), 409 a live child has that
-    // name, 500 spawn failure. A name whose previous child exited is reused.
+    // name, 500 spawn failure (or no free port for alloc_port). A name whose previous child
+    // exited is reused.
     node_child_info spawn(const node_spawn_request & req);
 
     // Non-blocking. method "both" (default): the router exit command on stdin + SIGTERM;
@@ -221,7 +224,7 @@ struct server_node_routes {
     server_node_routes(server_node & node, std::string token);
 
     // Every route answers 401 without the right bearer token.
-    //   POST /node/spawn  {name, gen, args: [..], env?: ["K=V" | "-K", ..] | {K: V | null}, port?} -> child info
+    //   POST /node/spawn  {name, gen, args: [..], env?: ["K=V" | "-K", ..] | {K: V | null}, port?, alloc_port?} -> child info
     //   POST /node/stop   {name, timeout_s? (0..3600, default 10), method?: both|stdin|term, wait?: bool} -> child info
     //   POST /node/signal {name, sig: 15 | "TERM" | "SIGTERM"}            -> child info
     //   POST /node/adopt  {name, gen}                                      -> child info

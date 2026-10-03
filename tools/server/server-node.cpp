@@ -5,6 +5,7 @@
 #include "server-router-probe.h"
 
 #include "common.h"
+#include "http.h" // common_http_get_free_port
 #include "log.h"
 
 #include <algorithm>
@@ -186,6 +187,11 @@ server_node_config server_node_default_config() {
 #ifndef _WIN32
     cfg.uid      = (unsigned) getuid();
     cfg.self_pid = (int) getpid();
+    std::error_code ec;
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        cfg.exe = exe.string();
+    }
 #endif
     return cfg;
 }
@@ -377,7 +383,16 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
         throw server_node_error(400, "refusing to spawn '" + req.name + "': " + bad_tmp + " is not a directory");
     }
 
-    const int port = req.port > 0 ? req.port : child_port(req.args);
+    std::vector<std::string> args = req.args;
+    int port = req.port > 0 ? req.port : child_port(args);
+    if (req.alloc_port) {
+        // the leader cannot know which ports are free here: pick one, put it on the command line
+        port = common_http_get_free_port();
+        if (port <= 0) {
+            throw server_node_error(500, "no free port for '" + req.name + "'");
+        }
+        router_args_set_port(args, port);
+    }
 
     {
         std::lock_guard<std::mutex> lk(mu);
@@ -394,7 +409,7 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
     // spawn without the lock: fork/exec of a big binary is not instant
     auto proc = std::make_unique<server_subproc>();
     const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-    const bool ok = proc->sproc.create(req.args, options, env);
+    const bool ok = proc->sproc.create(args, options, env);
     if (ok) {
         proc->has_output(); // non-blocking pipe before the reaper reads it
     }
@@ -690,6 +705,7 @@ json server_node::state() const {
 
     json out = json::object();
     out["node_pid"]      = cfg.self_pid;
+    out["exe"]           = cfg.exe;
     out["time_ms"]       = unix_ms();
     out["children"]      = jchildren;
     out["orphans"]       = jorphans;
@@ -745,6 +761,7 @@ json server_node::heartbeat_json() const {
     hb["type"]     = "heartbeat";
     hb["time_ms"]  = unix_ms();
     hb["node_pid"] = cfg.self_pid;
+    hb["exe"]      = cfg.exe;
     hb["next_seq"] = next_seq();
     hb["children"] = kids;
     return hb;
@@ -1203,6 +1220,12 @@ server_node_routes::server_node_routes(server_node & node, std::string token) : 
                 throw server_node_error(400, "port must be an integer");
             }
             r.port = body.at("port").get<int>();
+        }
+        if (body.contains("alloc_port") && !body.at("alloc_port").is_null()) {
+            if (!body.at("alloc_port").is_boolean()) {
+                throw server_node_error(400, "alloc_port must be a boolean");
+            }
+            r.alloc_port = body.at("alloc_port").get<bool>();
         }
         if (body.contains("env") && !body.at("env").is_null()) {
             const json & env = body.at("env");

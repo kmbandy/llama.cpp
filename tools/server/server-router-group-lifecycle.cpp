@@ -274,6 +274,45 @@ int router_launch_endpoint(const std::vector<std::string> & words, std::string &
     return -1;
 }
 
+std::string router_launch_listen_host(const std::vector<std::string> & words) {
+    for (size_t i = 0; i < words.size(); i++) {
+        std::string listen;
+        if (words[i] == "--listen" && i + 1 < words.size()) {
+            listen = words[i + 1];
+        } else if (words[i].rfind("--listen=", 0) == 0) {
+            listen = words[i].substr(strlen("--listen="));
+        } else {
+            continue;
+        }
+        const size_t c = listen.rfind(':');
+        std::string h = c == std::string::npos ? std::string() : listen.substr(0, c);
+        if (h.size() >= 2 && h.front() == '[' && h.back() == ']') {
+            h = h.substr(1, h.size() - 2);
+        }
+        if (h == "0.0.0.0" || h == "::" || h == "*") {
+            h.clear();
+        }
+        return h;
+    }
+    return "";
+}
+
+void router_args_set_port(std::vector<std::string> & args, int port) {
+    const std::string p = std::to_string(port);
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "--port" && i + 1 < args.size()) {
+            args[i + 1] = p;
+            return;
+        }
+        if (args[i].rfind("--port=", 0) == 0) {
+            args[i] = "--port=" + p;
+            return;
+        }
+    }
+    args.push_back("--port");
+    args.push_back(p);
+}
+
 //
 // environment helpers
 //
