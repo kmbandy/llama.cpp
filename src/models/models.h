@@ -1429,6 +1429,18 @@ struct llama_model_deepseek4 : public llama_model_base {
 // deepseek4.cpp: in-graph DSpark Markov bias + confidence head over res->t_logits / res->t_embd.
 void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens);
 
+// DSpark speculative sampling helpers (defined in dflash.cpp, shared with dsv4_build_dspark_head).
+// init returns false (and leaves gm untouched) unless cparams.dspark_sample is on.
+bool          llama_dspark_gumbel_init  (llm_graph_context & g, llama_dspark_gumbel & gm,
+                                         int64_t n_vocab, int64_t n_blocks, int64_t block_len);
+// next chain token of every block at position i: argmax(col/T + g); also recorded for export
+ggml_tensor * llama_dspark_gumbel_pick  (ggml_context * ctx0, llama_dspark_gumbel & gm, ggml_tensor * col, int64_t i);
+// record a position that has no sampled token (bonus anchor slot)
+void          llama_dspark_gumbel_skip  (ggml_context * ctx0, llama_dspark_gumbel & gm);
+// confidence [1, n_tok] + picked tokens -> nextn rows [n_embd, n_tok] (col 0 = conf, col 1 = token)
+ggml_tensor * llama_dspark_gumbel_pack  (ggml_context * ctx0, llama_dspark_gumbel & gm,
+                                         ggml_tensor * conf_tok, ggml_tensor * t_embd);
+
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

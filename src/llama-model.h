@@ -695,6 +695,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 //
 // Returns false when block_drafts exceeds the trained block_size; the caller should then
 // use `base` unbiased. Does not expand anything into a graph -- the caller owns gf.
+//
+// `gm` (optional, in-graph only) switches the Markov chain from argmax to Gumbel-max
+// sampling; see llama_dspark_gumbel below. nullptr keeps the greedy chain unchanged.
+struct llama_dspark_gumbel {
+    struct ggml_tensor * noise = nullptr; // F32 [n_vocab, block_len, n_blocks] graph input
+    struct ggml_tensor * inv_t = nullptr; // F32 [1, n_blocks] graph input
+    int64_t n_vocab = 0, n_blocks = 0, block_len = 0;
+    struct ggml_tensor * cat_tok = nullptr; // F32 [1, n_blocks] per position, position-major
+};
 bool llama_dspark_build_markov_graph(
         struct ggml_context      * ctx0,
         const struct llama_model & model,
@@ -703,7 +712,8 @@ bool llama_dspark_build_markov_graph(
         struct ggml_tensor       * conf_inp,  // F32 [n_embd, n_tok]
         int64_t                    n_blocks,
         struct ggml_tensor      ** out_logits,
-        struct ggml_tensor      ** out_conf);
+        struct ggml_tensor      ** out_conf,
+        struct llama_dspark_gumbel * gm = nullptr);
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;

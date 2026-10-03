@@ -12,6 +12,8 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -712,6 +714,219 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_spec_verify_stochastic(
+        size_t                        n_draft,
+        const llama_token           * draft,
+        const std::function<void(size_t, std::vector<llama_token_data> &)> & target_p,
+        const std::function<double(size_t, llama_token)>                    & q_prob,
+        const std::function<void(size_t, llama_token)>                      & on_token,
+        std::mt19937                & rng,
+        std::vector<float>          * accept_probs) {
+    std::vector<llama_token>      result;
+    std::vector<llama_token_data> cand;
+    result.reserve(n_draft + 1);
+
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+    // inverse-CDF draw from non-negative weights w (not necessarily normalized)
+    const auto draw = [&](const std::vector<double> & w, double sum) -> size_t {
+        const double target = uni(rng) * sum;
+        double run = 0.0;
+        size_t last = 0;
+        for (size_t j = 0; j < w.size(); ++j) {
+            if (w[j] > 0.0) {
+                last = j;
+                run += w[j];
+                if (run > target) {
+                    return j;
+                }
+            }
+        }
+        return last; // rounding: fall back to the last candidate with mass
+    };
+
+    std::vector<double> w;
+
+    for (size_t i = 0; i < n_draft; ++i) {
+        target_p(i, cand);
+
+        const llama_token x = draft[i];
+
+        double p_x = 0.0;
+        for (const auto & c : cand) {
+            if (c.id == x) {
+                p_x = c.p;
+                break;
+            }
+        }
+
+        const double q_x = q_prob(i, x);
+        const double a   = q_x > 0.0 ? std::min(1.0, p_x / q_x) : (p_x > 0.0 ? 1.0 : 0.0);
+
+        if (accept_probs) {
+            accept_probs->push_back((float) a);
+        }
+
+        if (uni(rng) < a) {
+            on_token(i, x);
+            result.push_back(x);
+            continue;
+        }
+
+        // rejected: resample from norm(max(0, p - q))
+        w.assign(cand.size(), 0.0);
+        double sum = 0.0;
+        for (size_t j = 0; j < cand.size(); ++j) {
+            w[j] = std::max(0.0, (double) cand[j].p - q_prob(i, cand[j].id));
+            sum += w[j];
+        }
+        if (!(sum > 0.0)) {
+            // p <= q everywhere up to rounding (only reachable when p ~= q): p itself is the safe choice
+            for (size_t j = 0; j < cand.size(); ++j) {
+                w[j] = cand[j].p;
+                sum += w[j];
+            }
+        }
+        const llama_token id = cand[draw(w, sum)].id;
+        on_token(i, id);
+        result.push_back(id);
+        return result;
+    }
+
+    // every draft token accepted: bonus token from p_n
+    target_p(n_draft, cand);
+    w.assign(cand.size(), 0.0);
+    double sum = 0.0;
+    for (size_t j = 0; j < cand.size(); ++j) {
+        w[j] = cand[j].p;
+        sum += w[j];
+    }
+    const llama_token id = cand[draw(w, sum)].id;
+    on_token(n_draft, id);
+    result.push_back(id);
+
+    return result;
+}
+
+bool common_sampler_spec_sampling_ok(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+    // Grammar: the grammar mask is applied after (or instead of) the plain chain, so the chain's
+    // candidates are not the distribution the grammar-constrained exact path samples from. Keep the
+    // exact-match path for grammar requests.
+    if (gsmpl->grmr) {
+        return false;
+    }
+    const auto & p = gsmpl->params;
+    if (!(p.temp > 0.0f) || p.mirostat != 0 || p.xtc_probability > 0.0f) {
+        return false;
+    }
+    for (const auto t : p.samplers) {
+        if (t == COMMON_SAMPLER_TYPE_ADAPTIVE_P) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens    & draft,
+        const float           * q_logits,
+        int32_t                 n_vocab_q,
+        float                   q_temp,
+        std::mt19937          & rng,
+        bool                    is_replay,
+        std::vector<float>    * accept_probs) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    llama_synchronize(ctx);
+
+    // backend sampling already picked the target tokens: no host distribution to test against
+    const bool backend_sampled = llama_get_sampled_token_ith(ctx, idxs.front()) != LLAMA_TOKEN_NULL;
+
+    if (is_replay && common_sampler_spec_sampling_ok(gsmpl)) {
+        // the draft is the stochastic round's own (already distribution-correct) output
+        std::vector<llama_token> result;
+        result.reserve(idxs.size());
+        for (size_t i = 0; i < draft.size(); ++i) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+        }
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()]);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return result;
+    }
+
+    if (!common_sampler_spec_sampling_ok(gsmpl) || backend_sampled || q_logits == nullptr ||
+            !(q_temp > 0.0f) || n_vocab_q <= 0) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft);
+    }
+
+    // per-position log-sum-exp of the draft logits at q_temp, computed lazily (a rejection stops the walk)
+    std::vector<double> q_max(draft.size(), 0.0);
+    std::vector<double> q_z  (draft.size(), 0.0);
+    std::vector<char>   q_ok (draft.size(), 0);
+    const double inv_t = 1.0 / (double) q_temp;
+
+    const auto q_prob = [&](size_t i, llama_token tok) -> double {
+        const float * row = q_logits + i * (size_t) n_vocab_q;
+        if (!q_ok[i]) {
+            double m = -INFINITY;
+            for (int32_t k = 0; k < n_vocab_q; ++k) {
+                m = std::max(m, (double) row[k]);
+            }
+            double z = 0.0;
+            for (int32_t k = 0; k < n_vocab_q; ++k) {
+                z += std::exp(((double) row[k] - m) * inv_t);
+            }
+            q_max[i] = m;
+            q_z  [i] = z;
+            q_ok [i] = 1;
+        }
+        if (tok < 0 || tok >= n_vocab_q || !(q_z[i] > 0.0)) {
+            return 0.0;
+        }
+        return std::exp(((double) row[tok] - q_max[i]) * inv_t) / q_z[i];
+    };
+
+    // target distribution = softmax over what the sampler chain left in cur_p (already temperature-scaled)
+    const auto target_p = [&](size_t i, std::vector<llama_token_data> & cand) {
+        common_sampler_sample(gsmpl, ctx, idxs[i]);
+
+        const auto & cp = gsmpl->cur_p;
+        cand.clear();
+        double m = -INFINITY;
+        for (size_t k = 0; k < cp.size; ++k) {
+            m = std::max(m, (double) cp.data[k].logit);
+        }
+        double z = 0.0;
+        for (size_t k = 0; k < cp.size; ++k) {
+            const double e = std::isinf(m) ? 0.0 : std::exp((double) cp.data[k].logit - m);
+            z += e;
+        }
+        for (size_t k = 0; k < cp.size; ++k) {
+            const double e = z > 0.0 ? std::exp((double) cp.data[k].logit - m) / z : (k == 0 ? 1.0 : 0.0);
+            if (e > 0.0) {
+                cand.push_back({ cp.data[k].id, cp.data[k].logit, (float) e });
+            }
+        }
+        if (cand.empty() && cp.size > 0) {
+            cand.push_back({ cp.data[0].id, cp.data[0].logit, 1.0f });
+        }
+    };
+
+    const auto on_token = [&](size_t, llama_token tok) {
+        common_sampler_accept(gsmpl, tok, true);
+    };
+
+    return common_spec_verify_stochastic(draft.size(), draft.data(), target_p, q_prob, on_token, rng, accept_probs);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

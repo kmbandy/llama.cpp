@@ -205,6 +205,12 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+
+    // DSpark speculative sampling (see llama_cparams::dspark_sample)
+    void set_dspark_sampling(bool value);
+    void set_dspark_noise(const float * noise, const float * inv_t, const llama_seq_id * seq_ids,
+                          int64_t n_vocab, int64_t n_blocks, int64_t block_len);
+    bool get_dspark_noise_applied() const { return dspark_state.applied; }
     void set_no_output_head(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
 
@@ -513,6 +519,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    llama_dspark_sample_state dspark_state;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

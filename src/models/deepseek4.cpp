@@ -375,6 +375,10 @@ void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, gg
     ggml_tensor * logits = nullptr;
     ggml_tensor * confidence = nullptr;
 
+    // speculative sampling (cparams.dspark_sample): Gumbel-max chain instead of argmax; off -> unchanged
+    llama_dspark_gumbel gm;
+    const bool sample = llama_dspark_gumbel_init(g, gm, n_vocab, n_blocks, block_tokens);
+
     for (int64_t i = 0; i < block_tokens; ++i) {
         ggml_tensor * markov_embd = ggml_get_rows(ctx0, model.dspark_markov_w1, prev);
         ggml_tensor * bias = ggml_mul_mat(ctx0, model.dspark_markov_w2, markov_embd);
@@ -393,7 +397,13 @@ void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, gg
         conf = ggml_sigmoid(ctx0, conf);
         confidence = confidence ? ggml_concat(ctx0, confidence, conf, 1) : conf;
 
-        if (i + 1 < block_tokens) {
+        if (sample) {
+            // last position's token is only exported for the verifier
+            ggml_tensor * tok = llama_dspark_gumbel_pick(ctx0, gm, col, i);
+            if (i + 1 < block_tokens) {
+                prev = tok;
+            }
+        } else if (i + 1 < block_tokens) {
             prev = ggml_argmax(ctx0, col);
         }
     }
@@ -402,7 +412,8 @@ void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, gg
     logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), n_vocab, n_tokens);
     confidence = ggml_reshape_3d(ctx0, confidence, 1, n_blocks, block_tokens);
     confidence = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, confidence, 0, 2, 1, 3)), 1, n_tokens);
-    confidence = ggml_repeat(ctx0, confidence, res->t_embd);
+    confidence = sample ? llama_dspark_gumbel_pack(ctx0, gm, confidence, res->t_embd)
+                        : ggml_repeat(ctx0, confidence, res->t_embd);
     res->t_logits = logits;
     res->t_h_nextn = confidence;
     ggml_build_forward_expand(g.gf, logits);

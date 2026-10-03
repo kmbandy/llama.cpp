@@ -4858,6 +4858,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CONF_PREFIX_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-sampling"}, "MODE",
+        "DSpark draft sampling: greedy or stochastic (default: greedy). stochastic samples the draft chain "
+        "(Gumbel-max) and verifies with speculative sampling so the output distribution equals the target's; "
+        "only used for requests with temperature > 0",
+        [](common_params & params, const std::string & value) {
+            if (value == "greedy") {
+                params.speculative.draft.sampling = COMMON_SPECULATIVE_DRAFT_SAMPLING_GREEDY;
+            } else if (value == "stochastic") {
+                params.speculative.draft.sampling = COMMON_SPECULATIVE_DRAFT_SAMPLING_STOCHASTIC;
+            } else {
+                throw std::invalid_argument("invalid DSpark draft sampling mode: " + value);
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",

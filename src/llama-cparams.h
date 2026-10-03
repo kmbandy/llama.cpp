@@ -7,6 +7,21 @@
 
 #define LLAMA_MAX_SEQ 256
 
+// Host-side state for stochastic DSpark draft chains (speculative sampling). Owned by the
+// llama_context; the graph input reads it in set_input(). Filled by the speculative driver
+// through llama_dspark_set_noise() right before each draft decode.
+struct llama_dspark_sample_state {
+    const float * noise = nullptr; // [n_blocks][block_len][n_vocab] Gumbel noise, nullptr = greedy chain
+    int64_t       n_vocab   = 0;
+    int64_t       n_blocks  = 0;
+    int64_t       block_len = 0;
+    std::vector<float> inv_t;      // [n_blocks] 1/T per block (1.0 for greedy blocks)
+    std::vector<llama_seq_id> seq_ids; // [n_blocks] sequence each host block belongs to
+    std::vector<float> zeros;      // scratch for the greedy / mismatch path
+    std::vector<float> ones;
+    bool          applied = false; // set by set_input(): the noise really was fed to the graph
+};
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -46,6 +61,11 @@ struct llama_cparams {
     // *after* setting res->t_embd so llama_get_embeddings() still returns the
     // post-output_norm hidden state.
     bool no_output_head = false;
+    // DSpark speculative sampling: build the draft Markov chain with Gumbel-max sampling
+    // (graph input noise + 1/T) instead of argmax, and export the chosen tokens on the
+    // nextn rows (column 1). Off by default: the graph is then byte-identical to before.
+    bool dspark_sample = false;
+    llama_dspark_sample_state * dspark_state = nullptr;
     // MAD-LAB system1-rows: opt-in sparse embedding outputs. See llama_context_params
     // ::embd_sparse_outputs in llama.h for the exact activation condition.
     bool embd_sparse_outputs = false;

@@ -619,6 +619,10 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+    // MAD-LAB: DSpark speculative sampling (--spec-draft-sampling stochastic)
+    common_speculative_draft_q spec_draft_q;      // draft distribution of spec_draft, filled by the drafter
+    std::mt19937               spec_accept_rng;   // accept/reject + residual + bonus draws
+    bool                       spec_replay_stoch = false; // the replayed draft is a stochastic round's output
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -759,6 +763,8 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
+            spec_replay_stoch = false;
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3686,6 +3692,17 @@ private:
                         task.params.sampling.reasoning_budget_tokens);
             }
 
+            if (spec && params_base.speculative.draft.sampling == COMMON_SPECULATIVE_DRAFT_SAMPLING_STOCHASTIC) {
+                // derived from the request seed so a fixed seed reproduces the draft noise and the
+                // accept/reject draws; xor keeps the stream apart from the target sampler's own
+                const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                    ? std::random_device{}()
+                    : task.params.sampling.seed;
+                slot.spec_accept_rng.seed(seed ^ 0x5DEECE66u);
+                slot.spec_draft_q.clear();
+                slot.spec_replay_stoch = false;
+            }
+
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
@@ -5639,6 +5656,16 @@ private:
                             /* .result   = */ &slot.spec_draft,
                         };
 
+                        // MAD-LAB: ask the drafter to sample its chain when the request can be verified
+                        // by speculative sampling (temp > 0, plain sampler chain); greedy otherwise.
+                        if (params_base.speculative.draft.sampling == COMMON_SPECULATIVE_DRAFT_SAMPLING_STOCHASTIC &&
+                                slot.task && common_sampler_spec_sampling_ok(slot.smpl.get())) {
+                            auto & dp = common_speculative_get_draft_params(spec, slot.stream_slot_idx);
+                            dp.temp       = slot.task->params.sampling.temp;
+                            dp.noise_seed = ((uint64_t) slot.spec_accept_rng() << 32) | (uint64_t) slot.spec_accept_rng();
+                            dp.q          = &slot.spec_draft_q;
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }
@@ -7235,12 +7262,32 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec);
-                auto accepted = synth_probs.empty()
+                // MAD-LAB: speculative sampling when the drafter sampled this draft (spec_draft_q holds one
+                // draft-logit row per token), or when replaying a stochastic round's already-accepted output.
+                const bool stoch_replay = slot.spec_is_replay && slot.spec_replay_stoch;
+                const bool stoch_round  = !stoch_replay && !slot.spec_is_replay &&
+                        slot.spec_draft_q.temp > 0.0f && slot.spec_draft_q.n() >= n_draft;
+                const bool use_stoch    = synth_probs.empty() && (stoch_replay || stoch_round);
+                std::vector<float> accept_probs;
+                auto accepted = use_stoch
+                    ? common_sampler_sample_and_accept_n_stochastic(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            stoch_replay ? nullptr : slot.spec_draft_q.logits.data(),
+                            slot.spec_draft_q.n_vocab, slot.spec_draft_q.temp,
+                            slot.spec_accept_rng, stoch_replay, &accept_probs)
+                    : synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 slot.spec_i_batch.clear();
+                slot.spec_draft_q.clear(); // consumed with its draft
+                if (use_stoch && !accept_probs.empty()) {
+                    float mean = 0.0f;
+                    for (float a : accept_probs) { mean += a; }
+                    SLT_DBG(slot, "speculative sampling: %zu/%zu tested, mean accept prob %.3f\n",
+                            accept_probs.size(), n_draft, mean / (float) accept_probs.size());
+                }
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -7304,6 +7351,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.spec_replay_stoch = use_stoch;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -7349,6 +7397,7 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+            slot.spec_replay_stoch = false;
 
             slot.stats.update_gen_last();
 
