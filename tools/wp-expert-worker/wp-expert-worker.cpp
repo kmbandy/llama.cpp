@@ -7106,7 +7106,18 @@ public:
     // dispatched is dropped mid-read, and landings are speculative arena
     // entries (never evicting borrowed/pinned/demand ones) that the tier's
     // borrow(demand=true) promotes. WP_EXPERT_CPU_TIER_PREFETCH_MAX bounds the
-    // pages queued per decode step (default 40).
+    // pages queued per decode step (default 80; was 40).
+    // WP_EXPERT_CPU_TIER_PREFETCH_THREADS=N (default 2, clamp 1..4; 1 = the
+    // old single reader) runs N readers off the one queue. Each reader gates
+    // every chunk on demand_reads_pending_ independently, so N readers never
+    // starve a demand read any more than one did; begin_read() is mutex-guarded
+    // and refuses a page already Reading/Resident, so two readers can never
+    // read the same page twice.
+    // WP_EXPERT_CPU_TIER_PREFETCH_FINISH_PCT=P (default 50; 0 = old behavior):
+    // a page whose layer has started is no longer dropped mid-read once >= P%
+    // of its bytes are in; the reader finishes it at full speed and the demand
+    // read that wants it waits on the Reading entry (reserve_wait) instead of
+    // re-reading from byte 0.
     static bool cpu_tier_prefetch_enabled() {
         static const bool v = [] {
             const char * e = std::getenv("WP_EXPERT_CPU_TIER");
@@ -7118,6 +7129,25 @@ public:
     // Spec-tag bit marking a prefetch landing, so its used/unused outcome is
     // countable apart from the old host landings (which use only 0x80 | dist).
     static constexpr uint8_t kTagPf = 0x40;
+
+    static size_t pf_thread_cap() {
+        static const size_t n = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_PREFETCH_THREADS");
+            const long   v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 2;
+            return (size_t) std::min<long>(4, std::max<long>(1, v));
+        }();
+        return n;
+    }
+    // Percent of a page's bytes already read at which a prefetch whose layer
+    // has started is allowed to finish instead of being dropped. 0 = off.
+    static size_t pf_finish_pct() {
+        static const size_t n = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_PREFETCH_FINISH_PCT");
+            const long   v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 50;
+            return (size_t) std::min<long>(100, std::max<long>(0, v));
+        }();
+        return n;
+    }
 
     // Frame thread (== dispatch thread, so find_slot/fd_for are safe here).
     void cpu_pf_enqueue(const ExpertPage & page) {
@@ -7140,7 +7170,7 @@ public:
         } catch (const std::exception &) {
             return;
         }
-        static const size_t cap = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_MAX", 40);
+        static const size_t cap = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_MAX", 80);
         {
             std::lock_guard<std::mutex> lock(pf_mu_);
             if (pf_step_count_ >= cap) {
@@ -7154,8 +7184,12 @@ public:
             }
             pf_q_.push_back(PfItem{&page, fd});
             ++pf_step_count_;
-            if (!pf_thread_.joinable()) {
-                pf_thread_ = std::thread([this] { cpu_pf_loop(); });
+            // Readers start lazily, one more per enqueue until the cap, so a
+            // run that never prefetches never spawns any. pf_threads_ is only
+            // touched under pf_mu_ (here) and in stop_cpu_pf (join, after
+            // pf_stop_ is set under the same lock).
+            if (!pf_stop_ && pf_threads_.size() < pf_thread_cap()) {
+                pf_threads_.emplace_back([this] { cpu_pf_loop(); });
             }
         }
         pf_cv_.notify_one();
@@ -7186,6 +7220,7 @@ public:
     uint64_t pf_stale_dropped() const { return n_pf_stale_dropped_.load(std::memory_order_relaxed); }
     uint64_t pf_yield() const         { return n_pf_yield_.load(std::memory_order_relaxed); }
     uint64_t pf_capped() const        { return n_pf_capped_.load(std::memory_order_relaxed); }
+    uint64_t pf_finished_late() const { return n_pf_finished_late_.load(std::memory_order_relaxed); }
     // Landed prefetch entries a demand borrow() later promoted (tag-counted).
     uint64_t pf_used() const {
         uint64_t n = 0;
@@ -7202,8 +7237,16 @@ public:
             pf_stop_ = true;
         }
         pf_cv_.notify_all();
-        if (pf_thread_.joinable()) {
-            pf_thread_.join();
+        // pf_stop_ is set, so no enqueue can add a reader any more.
+        std::vector<std::thread> threads;
+        {
+            std::lock_guard<std::mutex> lock(pf_mu_);
+            threads.swap(pf_threads_);
+        }
+        for (std::thread & t : threads) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
     }
 
@@ -10360,7 +10403,7 @@ private:
     mutable std::mutex              pf_mu_;
     std::condition_variable         pf_cv_;
     std::deque<PfItem>              pf_q_;
-    std::thread                     pf_thread_;
+    std::vector<std::thread>        pf_threads_;
     bool                            pf_stop_ = false;
     size_t                          pf_step_count_ = 0;
     std::atomic<int32_t>            pf_layer_{-1};
@@ -10370,12 +10413,16 @@ private:
     std::atomic<uint64_t>           n_pf_yield_{0};
     std::atomic<uint64_t>           n_pf_capped_{0};
     std::atomic<uint64_t>           n_pf_errors_{0};
+    std::atomic<uint64_t>           n_pf_finished_late_{0};   // read finished past its layer start
 
     enum class PfGate { Go, Stale, Stop };
     // Wait until no demand read is pending. A page a demand is already waiting
     // on (land_boost_) is exempt from both the yield and the staleness test:
     // abandoning it would make that demand read it a second time.
-    PfGate cpu_pf_gate(const ExpertPage & page) {
+    // `done` = bytes of the page already read: past WP_EXPERT_CPU_TIER_PREFETCH_FINISH_PCT
+    // a page whose layer has started is finished, not abandoned (its demand
+    // read is waiting on, or about to wait on, this very Reading entry).
+    PfGate cpu_pf_gate(const ExpertPage & page, size_t done = 0) {
         bool yielded = false;
         for (;;) {
             if (pf_paused_.load(std::memory_order_relaxed)) {
@@ -10391,6 +10438,12 @@ private:
                 }
             }
             if (page.layer <= pf_layer_.load(std::memory_order_relaxed)) {
+                const size_t pct = pf_finish_pct();
+                if (pct != 0 && done != 0 && done * 100 >= (size_t) page.size * pct) {
+                    // Full speed, no yield: the layer is running and the
+                    // demand read for this page counts in demand_reads_pending_.
+                    return PfGate::Go;
+                }
                 return PfGate::Stale;
             }
             if (demand_reads_pending_.load(std::memory_order_relaxed) <= 0) {
@@ -10452,10 +10505,15 @@ private:
             n_pf_issued_.fetch_add(1, std::memory_order_relaxed);
             bool ok = true;
             bool stopped = false;
+            bool late_finish = false;
             try {
                 size_t off = 0;
                 while (off < (size_t) page.size) {
-                    g = cpu_pf_gate(page);
+                    g = cpu_pf_gate(page, off);
+                    if (g == PfGate::Go && off != 0 &&
+                        page.layer <= pf_layer_.load(std::memory_order_relaxed)) {
+                        late_finish = true;
+                    }
                     if (g != PfGate::Go) {
                         ok = false;
                         stopped = g == PfGate::Stop;
@@ -10479,6 +10537,9 @@ private:
             arena_.finish_read(page.cache_id, handle, ok);
             if (ok) {
                 n_pf_landed_.fetch_add(1, std::memory_order_relaxed);
+                if (late_finish) {
+                    n_pf_finished_late_.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             if (tracked(page.cache_id)) {
                 land_boost_[page.cache_id].store(0, std::memory_order_relaxed);
@@ -12938,7 +12999,7 @@ public:
         std::snprintf(split, sizeof(split),
                       " host_skip_vram_late=%llu host_landed_late=%llu "
                       "host_begin_refused=%llu host_waited_inflight=%llu host_boosted=%llu "
-                      "n_pf[issued/landed/used/stale/yield/capped]=%llu/%llu/%llu/%llu/%llu/%llu host_by_dist=[",
+                      "n_pf[issued/landed/used/stale/yield/capped]=%llu/%llu/%llu/%llu/%llu/%llu n_pf_late_fin=%llu host_by_dist=[",
                       (unsigned long long) pool_.host_skip_vram_late(),
                       (unsigned long long) pool_.host_landed_late(),
                       (unsigned long long) pool_.host_begin_refused(),
@@ -12946,7 +13007,8 @@ public:
                       (unsigned long long) pool_.host_boosted(),
                       (unsigned long long) pool_.pf_issued(), (unsigned long long) pool_.pf_landed(),
                       (unsigned long long) pool_.pf_used(), (unsigned long long) pool_.pf_stale_dropped(),
-                      (unsigned long long) pool_.pf_yield(), (unsigned long long) pool_.pf_capped());
+                      (unsigned long long) pool_.pf_yield(), (unsigned long long) pool_.pf_capped(),
+                      (unsigned long long) pool_.pf_finished_late());
         return std::string(buf) + split + pool_.host_outcome_by_dist() + "]";
     }
 
