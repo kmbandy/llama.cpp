@@ -63,6 +63,7 @@ static constexpr const char * ROUTER_ARG_ENV          = "LLAMA_ARG_ROUTER_ENV";
 static constexpr const char * ROUTER_ARG_PINNED       = "LLAMA_ARG_ROUTER_PINNED";
 static constexpr const char * ROUTER_ARG_EXCLUSIVE    = "LLAMA_ARG_ROUTER_EXCLUSIVE";
 static constexpr const char * ROUTER_ARG_IDLE_TIMEOUT = "LLAMA_ARG_ROUTER_IDLE_TIMEOUT";
+static constexpr const char * ROUTER_ARG_PRIORITY     = "LLAMA_ARG_ROUTER_PRIORITY";
 static constexpr const char * ROUTER_LOAD_TIMEOUT     = "LLAMA_SERVER_ROUTER_LOAD_TIMEOUT";
 
 static constexpr int DEFAULT_ROUTER_LOAD_TIMEOUT_S = 900;
@@ -75,6 +76,8 @@ static void request_child_exit(server_subproc & proc) {
         fflush(stdin_file);
     }
 }
+
+static bool router_machine_is_local(const std::string & machine); // defined with the group helpers below
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -307,6 +310,10 @@ struct server_lru_sched {
             if (m.second.meta.placement.pinned) {
                 continue;
             }
+            // a hold lease is the same promise, made by an orchestrator for a while
+            if (models.is_held_locked(m.first)) {
+                continue;
+            }
             // already on its way out, or a queued request wants it
             if (models.stopping_models.count(m.first) || find(m.first)) {
                 continue;
@@ -509,6 +516,9 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
     preset.unset_option("LLAMA_ARG_MODELS_IDLE_TIMEOUT");
     preset.unset_option("LLAMA_ARG_GPUS");
+    preset.unset_option("LLAMA_ARG_BOARD_URL");
+    preset.unset_option("LLAMA_ARG_BOARD_TOKEN_FILE");
+    preset.unset_option(ROUTER_ARG_PRIORITY);
     preset.unset_option(ROUTER_ARG_GPU);
     preset.unset_option(ROUTER_ARG_VRAM_MB);
     preset.unset_option(ROUTER_ARG_RAM_MB);
@@ -728,6 +738,44 @@ server_models::server_models(
     load_models();
     autoload_enabled.store(params.models_autoload, std::memory_order_relaxed);
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
+
+    // The coordination board: claims for what the router loads, queueing behind sessions,
+    // yielding idle GPUs to them. No --board-url: all of it is off and the router behaves as
+    // before (holds, priorities and the busy-resident queue still work).
+    local_machine = router_local_machine();
+    if (!base_params.router_board_url.empty()) {
+        std::string token;
+        if (base_params.router_board_token_file.empty()) {
+            SRV_WRN("%s", "--board-url without --board-token-file: board writes (claims) will be refused\n");
+        } else {
+            std::ifstream f(base_params.router_board_token_file);
+            if (!f) {
+                SRV_WRN("cannot read board token file '%s': board writes (claims) will be refused\n",
+                        base_params.router_board_token_file.c_str());
+            } else {
+                std::stringstream ss;
+                ss << f.rdbuf();
+                token = string_strip(ss.str());
+            }
+        }
+        router_board_config cfg;
+        cfg.url     = base_params.router_board_url;
+        cfg.token   = token;
+        cfg.machine = local_machine;
+        router_board_host host;
+        host.residents = [this]() { return board_residents(); };
+        host.yield     = [this](const std::string & name, const std::string & reason) { board_yield(name, reason); };
+        host.changed   = [this]() {
+            std::lock_guard<std::mutex> lk(mutex);
+            bump_queue_locked();
+        };
+        board = std::make_unique<router_board_agent>(cfg, host);
+        board->start();
+        SRV_INF("coordination board %s, machine '%s', holder '%s'\n", cfg.url.c_str(), local_machine.c_str(), ROUTER_BOARD_HOLDER);
+    } else {
+        SRV_WRN("no --board-url: coordination board features are off (machine '%s')\n", local_machine.c_str());
+    }
+    queue_th = std::thread(&server_models::queue_runner_loop, this);
     // Always start the sweeper in router mode: effective timeout is per-model
     // (preset idle-timeout if set, else --models-idle-timeout). When every
     // effective value is 0 the loop is a no-op; when global is 0 but a model
@@ -739,6 +787,7 @@ server_models::server_models(
 // type at the header. Upstream added a `= default` dtor here for exactly that
 // reason; this one subsumes it and also joins the idle sweeper.
 server_models::~server_models() {
+    stop_threads();
     idle_stop.store(true, std::memory_order_relaxed);
     if (idle_th.joinable()) {
         idle_th.join();
@@ -1000,7 +1049,10 @@ bool server_models::load_gpu_config(const common_preset & global_preset) {
             throw std::runtime_error("invalid --gpus entry '" + entry + "', expected name:total_mb:probe");
         }
         server_gpu_slot slot;
-        slot.dev_name = entry.substr(0, p0);
+        // "ROCm0=R9700": the device, then its name on the coordination board
+        if (!router_gpu_name_split(entry.substr(0, p0), slot.dev_name, slot.board_name)) {
+            throw std::runtime_error("invalid --gpus entry '" + entry + "', expected name[=board]:total_mb:probe");
+        }
         slot.vram_probe = entry.substr(p1 + 1);
         // total_mb is an optional OVERRIDE of the slot total: empty or 0 means "use the
         // probe's physical total" (whole card). A positive value caps the slot below that.
@@ -1170,6 +1222,21 @@ void server_models::parse_model_placement(server_model_meta & meta) {
     // idle-timeout is not placement, but it lives in the same preset and is
     // re-parsed whenever placement is (load + hot reload paths).
     parse_model_idle_timeout(meta);
+
+    // priority: same capture-now hazard (stripped by unset_reserved_args())
+    meta.priority = ADMISSION_PRIORITY_MIDDLE;
+    {
+        std::string prio;
+        if (meta.preset.get_option(ROUTER_ARG_PRIORITY, prio) && !string_strip(prio).empty()) {
+            const auto p = admission_priority_parse(string_strip(prio));
+            if (p.has_value()) {
+                meta.priority = *p;
+            } else {
+                SRV_WRN("invalid priority '%s' for model '%s' (expected highest, middle or lowest); using middle\n",
+                        prio.c_str(), meta.name.c_str());
+            }
+        }
+    }
 
     // vram-mb, likewise: capture it NOW, while the preset still has it. update_args()
     // calls unset_reserved_args() immediately after every parse_model_placement() call
@@ -1397,6 +1464,7 @@ json server_models::gpu_slots_json() {
         out.push_back({
             {"name", slot.dev_name},
             {"id", ledger_slot_id("", slot.dev_name)},
+            {"board_resource", board_gpu_resource(slot.dev_name)},
             {"total_bytes", slot.total_bytes},
             {"reserved_bytes", slot.reserved_bytes},
             {"physical_free_bytes", physical_free_from_used(slot, used)},
@@ -1611,8 +1679,16 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
     return result;
 }
 
+// Thrown out of placement when the load has to wait (a foreign board claim, a busy resident);
+// load() catches it once its own lock is gone and records the queued load (on_queued()).
+struct router_queue_signal {
+    admission_result                         res;
+    std::optional<router_board_claim_result> raced; // the claim POST that found the resource taken (already queued on it)
+};
+
 admission_result server_models::decide_admission_locked(const std::string & name, const server_model_meta & meta,
-                                                        std::vector<admission_candidate> candidates, bool exclusive) {
+                                                        std::vector<admission_candidate> candidates, bool exclusive,
+                                                        const load_options & opts) {
     bool need_ram = false;
     std::set<std::string> cand_slots;
     for (const auto & c : candidates) {
@@ -1628,7 +1704,8 @@ admission_result server_models::decide_admission_locked(const std::string & name
     admission_input in;
     in.alias        = name;
     in.group        = meta.group;
-    in.priority     = ADMISSION_PRIORITY_MIDDLE; // per-request priority arrives with the board client
+    in.priority     = effective_priority(opts.req, meta);
+    in.machine      = admission_machine(opts.req.machine);
     in.exclusive    = exclusive;
     in.margin_bytes = ROUTER_GPU_MARGIN_BYTES;
     in.candidates   = std::move(candidates);
@@ -1639,9 +1716,9 @@ admission_result server_models::decide_admission_locked(const std::string & name
     const vram_snapshot snap = gate_vram ? take_vram_snapshot_locked() : vram_snapshot{};
     for (const auto & slot : gpu_slots) {
         const bool read = gate_vram && cand_slots.count(slot.dev_name) > 0;
-        in.slots.push_back({ slot.dev_name, "", "gpu:" + slot.dev_name, read ? effective_free_bytes_locked(slot, snap) : 0 });
+        in.slots.push_back({ slot.dev_name, "", board_gpu_resource(slot.dev_name), read ? effective_free_bytes_locked(slot, snap) : 0 });
     }
-    in.machines.push_back({ "", "ram", need_ram ? free_ram_bytes_locked(name) : -1 });
+    in.machines.push_back({ "", ROUTER_BOARD_RAM_RESOURCE, need_ram ? free_ram_bytes_locked(name) : -1 });
 
     for (const auto & [other, inst] : mapping) {
         if (other == name || same_group_locked(other, name) || !inst.meta.is_running()) {
@@ -1671,50 +1748,130 @@ admission_result server_models::decide_admission_locked(const std::string & name
         r.last_used = inst.meta.last_used;
         r.busy      = inst.req_count > 0;
         r.pinned    = p.pinned;
+        r.held      = is_held_locked(other); // a worker is held through its spine
         in.residents.push_back(std::move(r));
     }
-    // holds and board claims arrive with the board client: none yet
+    if (board) {
+        // the cached board state (no HTTP here); an unavailable board gives no claims
+        in.claims = board->admission_claims(machine_resources_locked());
+    }
 
     admission_result res = decide_admission(in);
     if (res.verdict != ADMISSION_QUEUE) {
         return res;
     }
 
-    // Queueing arrives with the board client; until then a `queue` verdict refuses the load.
-    SRV_INF("router admission for %s: queue (blocked=%s by='%s' on='%s')\n", name.c_str(),
-            admission_block_str(res.blocked), res.blocked_by.c_str(), res.blocked_on.c_str());
+    SRV_INF("router admission for %s at %s: queue (blocked=%s by='%s' on='%s')\n", name.c_str(),
+            admission_priority_str(in.priority), admission_block_str(res.blocked), res.blocked_by.c_str(), res.blocked_on.c_str());
+    if (router_admission_queue_action(res) == ROUTER_QUEUE_WAIT) {
+        throw router_queue_signal{ res }; // load() records the queued load (lock released)
+    }
+    // never fits as configured, or a pin / hold is in the way: refuse now
     if (res.blocked_on_ram) {
         int64_t need = 0;
         for (const auto & r : in.candidates[res.candidate].ram) {
             need += std::max<int64_t>(0, r.bytes);
         }
-        throw std::runtime_error("not enough host RAM for model '" + name + "': needs " +
-                                 std::to_string(need / (1024 * 1024)) + " MB, free " +
-                                 std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name)) / (1024 * 1024)) +
-                                 " MB after headroom, and no idle model can be evicted to make room");
+        throw router_refused_error("not enough host RAM for model '" + name + "': needs " +
+                                   std::to_string(need / (1024 * 1024)) + " MB, free " +
+                                   std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name)) / (1024 * 1024)) +
+                                   " MB after headroom, and no idle model can be evicted to make room");
     }
     switch (res.blocked) {
         case ADMISSION_BLOCK_PINNED:
-            throw std::runtime_error("model '" + name + "' cannot load: GPU is held by pinned model '"
-                                     + res.blocked_by + "' (unpin it first)");
-        case ADMISSION_BLOCK_BUSY:
-            throw std::runtime_error("model '" + name + "' cannot load: GPU is in use by busy model '"
-                                     + res.blocked_by + "' (in-flight requests; try again when idle)");
+            throw router_refused_error("model '" + name + "' cannot load: GPU is held by pinned model '"
+                                       + res.blocked_by + "' (unpin it first)");
         case ADMISSION_BLOCK_HELD:
-            throw std::runtime_error("model '" + name + "' cannot load: GPU is held by model '"
-                                     + res.blocked_by + "' (hold lease)");
-        case ADMISSION_BLOCK_CLAIM:
-            throw std::runtime_error("model '" + name + "' cannot load: " + res.blocked_on
-                                     + " is claimed on the board by '" + res.blocked_by + "'");
+            throw router_refused_error("model '" + name + "' cannot load: GPU is held by model '"
+                                       + res.blocked_by + "' (hold lease)");
+        case ADMISSION_BLOCK_NO_CANDIDATE:
+            throw router_refused_error("model '" + name + "' cannot load on machine '" + opts.req.machine
+                                       + "': none of its placements is there");
         default:
-            throw std::runtime_error("no configured GPU slot has enough capacity for model '" + name + "'");
+            throw router_refused_error("no configured GPU slot has enough capacity for model '" + name + "'");
     }
+}
+
+admission_result server_models::admit_locked(const std::string & name, const server_model_meta & meta,
+                                             const std::vector<admission_candidate> & candidates, bool exclusive,
+                                             const load_options & opts, std::unique_lock<std::mutex> & lk) {
+    // Claiming releases the lock, so whatever changed meanwhile (another load placed on the same
+    // slot, a resident gone) is decided again; the claims just taken are ours and never block.
+    // Bounded: if the picture keeps moving, go ahead with what is held (the board agent takes
+    // the rest for the resident later, and releases what it does not need).
+    admission_result res;
+    bool claim = true;
+    for (int attempt = 0; ; ++attempt) {
+        res = decide_admission_locked(name, meta, candidates, exclusive, opts);
+        if (!claim || attempt >= 2) {
+            break;
+        }
+        const int rc = take_board_claims_locked(name, res.board_claims_to_take, opts, lk);
+        if (rc == 0) {
+            break; // nothing to claim: the decision stands
+        }
+        claim = rc == 1; // a claim the board refused is not retried here (the agent retries it later)
+    }
+    return res;
+}
+
+int server_models::take_board_claims_locked(const std::string & owner, const std::vector<std::string> & resources,
+                                            const load_options & opts, std::unique_lock<std::mutex> & lk) {
+    if (!board || resources.empty()) {
+        return 0;
+    }
+    const std::vector<std::string> missing = board->missing(owner, resources);
+    if (missing.empty()) {
+        return 0;
+    }
+    if (!board->available()) {
+        // board outage: load as if nothing were claimed; the agent claims for the resident later
+        SRV_WRN("board unavailable: loading %s without claiming %zu resource(s)\n", owner.c_str(), missing.size());
+        return 0;
+    }
+    const std::string queue_owner = group_spine_locked(owner); // the load that waits (a group: its spine)
+    auto mit = mapping.find(owner);
+    const admission_priority prio = mit != mapping.end() ? effective_priority(opts.req, mit->second.meta)
+                                                         : (opts.req.priority_set ? opts.req.priority : ADMISSION_PRIORITY_MIDDLE);
+
+    lk.unlock();
+    const router_board_claim_result * raced = nullptr;
+    router_board_claim_result queued_result;
+    std::string raced_resource;
+    bool failed = false;
+    for (const auto & r : missing) {
+        router_board_claim_result cr = board->acquire(owner, queue_owner, r, owner, prio);
+        if (cr.ok && cr.granted) {
+            SRV_INF("board: claimed %s for %s (claim %s)\n", r.c_str(), owner.c_str(), cr.claim_id.c_str());
+        } else if (cr.ok && cr.queued) {
+            // someone claimed it after the last poll: this load waits behind them
+            queued_result  = cr;
+            raced          = &queued_result;
+            raced_resource = r;
+            break;
+        } else {
+            SRV_WRN("board: could not claim %s for %s (%s); loading without the claim\n", r.c_str(), owner.c_str(), cr.error.c_str());
+            failed = true;
+        }
+    }
+    lk.lock();
+    if (raced != nullptr) {
+        admission_result q;
+        q.verdict    = ADMISSION_QUEUE;
+        q.blocked    = ADMISSION_BLOCK_CLAIM;
+        q.blocked_by = raced->held_by;
+        q.blocked_on = raced_resource;
+        throw router_queue_signal{ q, *raced };
+    }
+    return failed ? 2 : 1;
 }
 
 void server_models::evict_and_wait_locked(const std::string & name, const std::vector<std::string> & victims, std::unique_lock<std::mutex> & lk) {
     for (const auto & victim : victims) {
         SRV_INF("router placement: evicting %s to make room for %s\n", victim.c_str(), name.c_str());
         auto it = mapping.find(victim);
+        notify_state("evicting", victim, it != mapping.end() ? it->second.meta.placement.devs : std::vector<std::string>{},
+                     "evicted to make room for " + name);
         const bool loading = it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
         if (loading) {
             it->second.subproc->terminate();
@@ -1737,7 +1894,8 @@ void server_models::evict_and_wait_locked(const std::string & name, const std::v
     });
 }
 
-void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, server_child_mode mode, std::unique_lock<std::mutex> & lk) {
+void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, const load_options & opts, std::unique_lock<std::mutex> & lk) {
+    const server_child_mode mode = opts.mode;
     if (!gpu_placement_enabled) {
         if (mode == SERVER_CHILD_MODE_NORMAL && !meta.placement.devs.empty()) {
             throw std::runtime_error("model '" + name + "' uses router gpu= but no router GPU slot table is configured");
@@ -1759,7 +1917,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         if (!ram_need.empty()) {
             admission_candidate c;
             c.ram = ram_need;
-            const admission_result res = decide_admission_locked(name, meta, { c }, false);
+            const admission_result res = admit_locked(name, meta, { c }, false, opts, lk);
             evict_and_wait_locked(name, res.victims, lk);
         }
         return;
@@ -1841,7 +1999,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
             c.vram.push_back({ meta.placement.devs[i], bytes });
         }
         c.ram = ram_need;
-        const admission_result res = decide_admission_locked(name, meta, { c }, true);
+        const admission_result res = admit_locked(name, meta, { c }, true, opts, lk);
         reserve_gpu_placement_locked(name, meta.placement);
         evict_and_wait_locked(name, res.victims, lk);
         return;
@@ -1857,7 +2015,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         c.ram  = ram_need;
         candidates.push_back(std::move(c));
     }
-    const admission_result res = decide_admission_locked(name, meta, std::move(candidates), false);
+    const admission_result res = admit_locked(name, meta, candidates, false, opts, lk);
     GGML_ASSERT(res.slots.size() == 1);
 
     meta.placement.devs = res.slots;
@@ -1877,6 +2035,442 @@ void server_models::notify_sse(const std::string & event, const std::string & mo
     }
     SRV_DBG("notifying SSE clients about event '%s' for model '%s': %s\n", event.c_str(), model_id.c_str(), safe_json_to_str(result->data).c_str());
     sse.broadcast(std::move(result));
+}
+
+void server_models::notify_state(const std::string & event, const std::string & name, const std::vector<std::string> & slots,
+                                 const std::string & reason, const json & extra) {
+    json data = json::object();
+    data["model"]   = name;
+    data["machine"] = local_machine;
+    data["slots"]   = slots;
+    data["reason"]  = reason;
+    if (extra.is_object()) {
+        for (const auto & [k, v] : extra.items()) {
+            data[k] = v;
+        }
+    }
+    notify_sse(event, name, data);
+}
+
+//
+// coordination board, holds, queued loads
+//
+
+std::string server_models::board_gpu_resource(const std::string & dev) const {
+    const int idx = find_slot_index(gpu_slots, dev);
+    if (idx >= 0 && !gpu_slots[idx].board_name.empty()) {
+        return "gpu:" + gpu_slots[idx].board_name;
+    }
+    return "gpu:" + dev;
+}
+
+std::vector<std::string> server_models::board_resources_locked(const server_model_meta & meta) const {
+    std::vector<std::string> out;
+    if (!gpu_placement_enabled) {
+        return out; // no admission, no claims
+    }
+    if (!meta.placement.need_bytes_per_dev.empty()) {
+        for (const auto & dev : meta.placement.devs) {
+            const std::string r = board_gpu_resource(dev);
+            if (std::find(out.begin(), out.end(), r) == out.end()) {
+                out.push_back(r);
+            }
+        }
+    }
+    if (meta.placement.ram_mb_override > 0) {
+        out.push_back(ROUTER_BOARD_RAM_RESOURCE);
+    }
+    return out;
+}
+
+std::vector<std::string> server_models::machine_resources_locked() const {
+    std::vector<std::string> out;
+    for (const auto & slot : gpu_slots) {
+        out.push_back(board_gpu_resource(slot.dev_name));
+    }
+    out.push_back(ROUTER_BOARD_RAM_RESOURCE);
+    return out;
+}
+
+bool server_models::is_held_locked(const std::string & name) const {
+    return holds.is_held(group_spine_locked(name), ggml_time_ms());
+}
+
+admission_priority server_models::effective_priority(const router_request_opts & req, const server_model_meta & meta) const {
+    if (req.priority_set) {
+        return req.priority;
+    }
+    if (meta.is_external() && !meta.group.empty()) {
+        auto it = mapping.find(meta.group); // a worker loads at its group's priority
+        if (it != mapping.end()) {
+            return it->second.meta.priority;
+        }
+    }
+    return meta.priority;
+}
+
+std::string server_models::admission_machine(const std::string & requested) const {
+    // only the local machine exists until node mode: its name (or "local") means "here"
+    if (requested.empty() || requested == local_machine || router_machine_is_local(requested)) {
+        return "";
+    }
+    return requested;
+}
+
+void server_models::bump_queue_locked() {
+    queue_epoch++;
+    cv.notify_all();
+}
+
+std::vector<router_board_resident> server_models::board_residents() {
+    std::lock_guard<std::mutex> lk(mutex);
+    std::vector<router_board_resident> out;
+    for (const auto & [name, inst] : mapping) {
+        const bool loading = loading_owners.count(name) > 0;
+        if (!inst.meta.is_running() && !loading) {
+            continue;
+        }
+        router_board_resident r;
+        r.name    = name;
+        r.alive   = true;
+        r.loading = loading;
+        if (inst.meta.is_running()) {
+            r.resources = board_resources_locked(inst.meta);
+        }
+        // a worker goes (and is judged) with its spine
+        const std::string spine = group_spine_locked(name);
+        r.stop_name = spine;
+        auto sit = mapping.find(spine);
+        if (sit != mapping.end()) {
+            const auto & sp = sit->second;
+            r.idle   = sp.meta.is_ready_or_sleep() && sp.req_count == 0 && !stopping_models.count(spine) &&
+                       !loading_owners.count(spine);
+            r.pinned = sp.meta.placement.pinned;
+        }
+        r.held = is_held_locked(name);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+void server_models::board_yield(const std::string & name, const std::string & reason) {
+    std::lock_guard<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    // checked again under the lock: the agent's view is a moment old
+    if (it == mapping.end() || !it->second.meta.is_ready_or_sleep() || it->second.req_count > 0 ||
+            stopping_models.count(name) || it->second.meta.placement.pinned || is_held_locked(name)) {
+        return;
+    }
+    SRV_INF("board: unloading idle %s (%s)\n", name.c_str(), reason.c_str());
+    notify_state("evicting", name, it->second.meta.placement.devs, reason);
+    request_stop(name, true);
+}
+
+void server_models::queue_runner_loop() {
+    uint64_t seen = 0;
+    std::unique_lock<std::mutex> lk(mutex);
+    while (!shutting_down) {
+        // retry when something moved (board change, a resident went idle or down), else every 30 s
+        cv.wait_for(lk, std::chrono::seconds(30), [&]() {
+            return shutting_down || (queue_epoch != seen && !queued_loads.empty());
+        });
+        if (shutting_down) {
+            break;
+        }
+        seen = queue_epoch;
+        if (queued_loads.empty()) {
+            continue;
+        }
+        std::vector<std::pair<std::string, router_request_opts>> todo;
+        for (const auto & [n, q] : queued_loads) {
+            todo.push_back({ n, q.req });
+        }
+        lk.unlock();
+        for (const auto & [n, req] : todo) {
+            load_options o;
+            o.req = req;
+            try {
+                load(n, o);
+            } catch (const router_queued_error &) {
+                // still waiting
+            } catch (const std::exception & e) {
+                SRV_WRN("queued load of %s gave up: %s\n", n.c_str(), e.what());
+            }
+        }
+        lk.lock();
+    }
+}
+
+void server_models::on_queued(const std::string & name, const load_options & opts, const admission_result & res,
+                              const router_board_claim_result * raced) {
+    router_queued_info info;
+    info.model      = name;
+    info.machine    = opts.req.machine;
+    info.board      = res.blocked == ADMISSION_BLOCK_CLAIM;
+    info.blocked_by = res.blocked_by;
+    info.blocked_on = res.blocked_on;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        info.priority = it != mapping.end() ? effective_priority(opts.req, it->second.meta)
+                                            : (opts.req.priority_set ? opts.req.priority : ADMISSION_PRIORITY_MIDDLE);
+    }
+    info.reason = info.board ? info.blocked_on + " is claimed on the board by " + info.blocked_by
+                             : "model '" + info.blocked_by + "' is busy";
+
+    if (info.board && board) {
+        // join the board queue (idempotent per resource: the board keeps one slot for the router)
+        router_board_claim_result jr = raced != nullptr ? *raced
+                                                        : board->acquire(name, name, res.blocked_on, name, info.priority);
+        if (jr.ok && jr.queued) {
+            info.queue_pos = jr.position;
+            if (!jr.held_by.empty()) {
+                info.blocked_by = jr.held_by;
+            }
+        } else if (jr.ok && jr.granted) {
+            std::lock_guard<std::mutex> lk(mutex);
+            bump_queue_locked(); // it freed meanwhile: try again right away
+        }
+        if (!res.notify.empty()) {
+            const bool yield = res.notify.front().kind == ADMISSION_NOTIFY_YIELD;
+            std::string content = "llama-router on " + local_machine + " needs " + res.blocked_on + " to load '" + name +
+                                  "' (priority " + admission_priority_str(info.priority) + ") and is queued behind your claim.";
+            if (yield) {
+                content += " Please release it as soon as you safely can.";
+            }
+            board->notify(res.notify, content);
+        }
+    }
+
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (shutting_down) {
+            throw router_refused_error("router is shutting down");
+        }
+        if (!info.board) {
+            // place among the router's own loads waiting on the same resident
+            int pos = 1;
+            for (const auto & [n, q] : queued_loads) {
+                if (n != name && !q.info.board && q.info.blocked_by == info.blocked_by && q.info.priority >= info.priority) {
+                    pos++;
+                }
+            }
+            info.queue_pos = pos;
+        }
+        auto it = queued_loads.find(name);
+        changed = it == queued_loads.end() || it->second.info.queue_pos != info.queue_pos ||
+                  it->second.info.blocked_by != info.blocked_by || it->second.info.blocked_on != info.blocked_on ||
+                  it->second.info.priority != info.priority;
+        queued_loads[name] = { info, opts.req };
+    }
+    if (changed) {
+        SRV_INF("load of %s queued: %s (position %d)\n", name.c_str(), info.reason.c_str(), info.queue_pos);
+        json extra = json::parse(router_queued_info_json(info));
+        extra["waiting"] = true;
+        notify_state(info.board ? "queued" : "blocked", name, res.slots, info.reason, extra);
+    }
+    throw router_queued_error(info);
+}
+
+void server_models::drop_queued(const std::string & name, const std::string & reason) {
+    bool had = false;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        had = queued_loads.erase(name) > 0;
+    }
+    if (!had) {
+        return;
+    }
+    if (board) {
+        board->leave_queue(name);
+    }
+    json extra = json::object();
+    extra["waiting"] = false;
+    notify_state("blocked", name, {}, reason, extra);
+}
+
+bool server_models::cancel_queued(const std::string & name) {
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!queued_loads.count(name)) {
+            return false;
+        }
+    }
+    drop_queued(name, "queued load cancelled");
+    return true;
+}
+
+void server_models::stop_threads() {
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        shutting_down = true;
+        cv.notify_all();
+    }
+    if (queue_th.joinable()) {
+        queue_th.join();
+    }
+    std::vector<async_load> loads;
+    {
+        std::lock_guard<std::mutex> lk(async_mu);
+        loads.swap(async_loads);
+    }
+    for (auto & l : loads) {
+        if (l.th.joinable()) {
+            l.th.join();
+        }
+    }
+    if (board) {
+        board->stop(); // releases every claim, leaves every queue it joined
+    }
+}
+
+void server_models::shutdown() {
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        shutting_down = true;
+        queued_loads.clear(); // waiters see their load gone; nothing retries it
+        cv.notify_all();
+    }
+    if (queue_th.joinable()) {
+        queue_th.join();
+    }
+    unload_all();
+    stop_threads();
+}
+
+json server_models::load_async(const std::string & name, const router_request_opts & req) {
+    struct outcome_t {
+        std::mutex              m;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::exception_ptr      err;
+    };
+    auto outcome = std::make_shared<outcome_t>();
+    auto done    = std::make_shared<std::atomic<bool>>(false);
+    {
+        std::lock_guard<std::mutex> lk(async_mu);
+        for (auto it = async_loads.begin(); it != async_loads.end();) {
+            if (it->done->load()) {
+                it->th.join();
+                it = async_loads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> l(mutex);
+            if (shutting_down) {
+                throw router_refused_error("router is shutting down");
+            }
+        }
+        load_options o;
+        o.req = req;
+        std::thread th([this, name, o, outcome, done]() {
+            std::exception_ptr err;
+            try {
+                load(name, o);
+            } catch (...) {
+                err = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> l(outcome->m);
+                outcome->done = true;
+                outcome->err  = err;
+            }
+            outcome->cv.notify_all();
+            done->store(true);
+        });
+        async_loads.push_back({ std::move(th), done });
+    }
+    {
+        // long enough for a queue verdict or a refusal; an estimate / eviction / group start keeps going
+        std::unique_lock<std::mutex> l(outcome->m);
+        outcome->cv.wait_for(l, std::chrono::milliseconds(1500), [&]() { return outcome->done; });
+        if (outcome->done && outcome->err) {
+            std::rethrow_exception(outcome->err);
+        }
+    }
+    json out = json::object();
+    out["model"] = name;
+    auto meta = get_meta(name);
+    if (meta.has_value() && !meta->queue_info.is_null()) {
+        for (const auto & [k, v] : meta->queue_info.items()) {
+            out[k] = v;
+        }
+        return out;
+    }
+    out["state"] = meta.has_value() && meta->is_ready_or_sleep() ? "ready" : "loading";
+    return out;
+}
+
+json server_models::hold(const std::string & model, int64_t ttl_s, const std::string & owner, const std::string & lease) {
+    std::lock_guard<std::mutex> lk(mutex);
+    std::string name;
+    if (mapping.count(model)) {
+        name = model;
+    } else {
+        for (const auto & [key, inst] : mapping) {
+            if (inst.meta.aliases.count(model)) {
+                name = key;
+                break;
+            }
+        }
+    }
+    if (name.empty()) {
+        throw std::out_of_range("model '" + model + "' not found");
+    }
+    name = group_spine_locked(name); // a group is held as a whole
+    std::string err;
+    const std::string l = holds.hold(name, ttl_s * 1000, owner, lease, ggml_time_ms(), err);
+    if (l.empty()) {
+        throw std::invalid_argument(err);
+    }
+    SRV_INF("hold %s on %s for %" PRId64 " s (owner '%s')\n", l.c_str(), name.c_str(), ttl_s, owner.c_str());
+    json out = json::object();
+    out["lease"] = l;
+    out["model"] = name;
+    out["ttl_s"] = ttl_s;
+    out["owner"] = owner;
+    return out;
+}
+
+bool server_models::release_hold(const std::string & lease) {
+    std::lock_guard<std::mutex> lk(mutex);
+    const bool ok = holds.release(lease, ggml_time_ms());
+    if (ok) {
+        SRV_INF("hold %s released\n", lease.c_str());
+    }
+    return ok;
+}
+
+json server_models::board_json() {
+    json out = json::object();
+    out["enabled"] = board != nullptr;
+    out["machine"] = local_machine;
+    if (board) {
+        out["available"] = board->available();
+        json claims = json::object();
+        for (const auto & [owner, res] : board->held()) {
+            claims[owner] = res;
+        }
+        out["claims"] = claims;
+    }
+    json hl = json::array();
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        const int64_t now = ggml_time_ms();
+        for (const auto & h : holds.list(now)) {
+            json o = json::object();
+            o["lease"]        = h.lease;
+            o["model"]        = h.model;
+            o["owner"]        = h.owner;
+            o["expires_in_s"] = (h.expires_ms - now) / 1000;
+            hl.push_back(o);
+        }
+    }
+    out["holds"] = hl;
+    return out;
 }
 
 void server_models::load_models() {
@@ -2286,7 +2880,12 @@ void server_models::load_startup_models() {
     }
     for (const auto & name : to_load) {
         SRV_INF("(startup) loading model %s\n", name.c_str());
-        load(name);
+        try {
+            load(name);
+        } catch (const router_queued_error & e) {
+            // waits for its turn (a board claim / a busy model); the router loads it then
+            SRV_WRN("(startup) %s\n", e.what());
+        }
     }
 }
 
@@ -2320,16 +2919,25 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         lk.lock();
     }
 
+    auto queue_info = [this](const std::string & key, const server_model_meta & meta) -> json {
+        auto q = queued_loads.find(key);
+        if (q == queued_loads.end() || meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+            return nullptr;
+        }
+        return json::parse(router_queued_info_json(q->second.info));
+    };
     auto it = mapping.find(name);
     if (it != mapping.end()) {
         server_model_meta out = it->second.meta;
         out.group_info = group_status_json_locked(it->first);
+        out.queue_info = queue_info(it->first, out);
         return out;
     }
     for (const auto & [key, inst] : mapping) {
         if (inst.meta.aliases.count(name)) {
             server_model_meta out = inst.meta;
             out.group_info = group_status_json_locked(key);
+            out.queue_info = queue_info(key, out);
             return out;
         }
     }
@@ -2349,6 +2957,10 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     for (const auto & [name, inst] : mapping) {
         result.push_back(inst.meta);
         result.back().group_info = group_status_json_locked(name);
+        auto q = queued_loads.find(name);
+        if (q != queued_loads.end() && inst.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
+            result.back().queue_info = json::parse(router_queued_info_json(q->second.info));
+        }
     }
     return result;
 }
@@ -2378,6 +2990,7 @@ void server_models::unload_lru() {
         // evict a second model. pick_victim only returns ready/sleeping models, so a
         // graceful exit request is always right here.
         SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+        notify_state("evicting", lru_model_name, mapping[lru_model_name].meta.placement.devs, "models_max reached (LRU)");
         request_stop(lru_model_name, true);
     }
     // wait for unload to complete (find-based: safe if the entry was erased mid-wait,
@@ -2425,6 +3038,61 @@ void server_models::load(const std::string & name) {
 }
 
 void server_models::load(const std::string & name, const load_options & opts) {
+    if (opts.custom_meta.has_value() || opts.mode != SERVER_CHILD_MODE_NORMAL) {
+        load_impl(name, opts); // downloads / estimates: no admission, no board, no queue
+        return;
+    }
+    // The owners of this load's board claims (the model; a group's workers) count as alive while
+    // it runs, though they are not running yet. Unregistered on every way out, before
+    // release_dead(), so a failed or queued attempt leaves no claim behind.
+    std::vector<std::string> owners = { name };
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (shutting_down) {
+            throw router_refused_error("router is shutting down");
+        }
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            owners.insert(owners.end(), it->second.meta.depends.begin(), it->second.meta.depends.end());
+        }
+        for (const auto & o : owners) {
+            loading_owners[o]++;
+        }
+    }
+    auto unregister = [&]() {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (const auto & o : owners) {
+            auto it = loading_owners.find(o);
+            if (it != loading_owners.end() && --it->second <= 0) {
+                loading_owners.erase(it);
+            }
+        }
+        owners.clear();
+    };
+    bool spawned = false;
+    try {
+        spawned = load_impl(name, opts);
+    } catch (const router_queue_signal & sig) {
+        unregister();
+        if (board) {
+            board->release_dead(); // claims this attempt took for a placement it will not use
+        }
+        on_queued(name, opts, sig.res, sig.raced.has_value() ? &*sig.raced : nullptr); // throws router_queued_error
+    } catch (const std::exception & e) {
+        unregister();
+        if (board) {
+            board->release_dead();
+        }
+        drop_queued(name, e.what()); // a queued load that can no longer go ahead
+        throw;
+    }
+    unregister();
+    if (spawned && board) {
+        board->leave_queue(name); // it was queued for a resource it got some other way
+    }
+}
+
+bool server_models::load_impl(const std::string & name, const load_options & opts) {
     if (debug_fake_timing) {
         // do not hold the mutex here, other requests must keep making progress
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -2474,7 +3142,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
     auto meta = opts.custom_meta.has_value() ? *opts.custom_meta : mapping[name].meta;
     if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model %s is not ready\n", name.c_str());
-        return;
+        return false;
     }
 
     if (!opts.custom_meta.has_value()) {
@@ -2590,7 +3258,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         worker_specs = prepare_group_locked(name, meta); // launch, port, env (+ temp-dir check) of every worker
     }
 
-    ensure_gpu_placement(name, meta, opts.mode, lk);
+    ensure_gpu_placement(name, meta, opts, lk);
     if (gpu_placement_enabled && opts.mode == SERVER_CHILD_MODE_NORMAL && !meta.placement.need_bytes_per_dev.empty()) {
         placement_reserved = true;
     }
@@ -2603,7 +3271,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
             throw std::runtime_error("model group '" + name + "': worker '" + spec.name + "' disappeared during the load");
         }
         server_model_meta wmeta = wit->second.meta;
-        ensure_gpu_placement(spec.name, wmeta, opts.mode, lk); // may wait (unlocked) for evictions
+        ensure_gpu_placement(spec.name, wmeta, opts, lk); // may wait (unlocked) for evictions
         wit = mapping.find(spec.name);
         if (wit == mapping.end()) {
             throw std::runtime_error("model group '" + name + "': worker '" + spec.name + "' disappeared during the load");
@@ -2651,7 +3319,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
             if (it == mapping.end() || it->second.meta.status != own_status || stopping_models.count(name)) {
                 // a concurrent path took over this model while we were evicting
                 SRV_INF("model %s no longer loadable after capacity wait\n", name.c_str());
-                return;
+                return false;
             }
             if (count_running() >= (size_t)base_params.models_max) {
                 // eviction couldn't free a slot yet (all residents pinned, or a concurrent
@@ -2720,6 +3388,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
         SRV_INF("group %s: all workers ready, spawning the spine\n", name.c_str());
     }
 
+    if (shutting_down) {
+        throw router_refused_error("router is shutting down");
+    }
+    // spawning now: no longer a queued load (its board queue slot is left by load())
+    queued_loads.erase(name);
+
     // prepare new instance info
     instance_t inst;
     inst.meta             = meta;
@@ -2778,12 +3452,16 @@ void server_models::load(const std::string & name, const load_options & opts) {
     notify_sse("model_status", name, {
         {"status", server_model_status_to_string(inst.meta.status)},
     });
+    if (opts.mode == SERVER_CHILD_MODE_NORMAL) {
+        notify_state("loading", name, inst.meta.placement.devs, "spawned");
+    }
 
     auto proc = inst.subproc;
     int  port = inst.meta.port;
     mapping[name] = std::move(inst);
     monitor->watch(name, proc, opts.mode, port);
     cv.notify_all();
+    return true;
 }
 
 void server_models::request_stop(const std::string & name_in, bool send_exit, bool drain) {
@@ -2852,6 +3530,9 @@ void server_models::set_worker_status_locked(const std::string & worker, server_
         data["exit_code"] = exit_code;
     }
     notify_sse("status_change", worker, data); // does not take the lock
+    if (status == SERVER_MODEL_STATUS_UNLOADED && board) {
+        board->wake(); // its claims go
+    }
     cv.notify_all();
 }
 
@@ -2998,6 +3679,7 @@ void server_models::on_group_worker_exit(const std::string & spine, const router
 void server_models::on_group_stopped(const std::string & spine, const router_worker_group * g) {
     int  code = 0;
     bool changed = false;
+    std::vector<std::string> slots;
     {
         std::unique_lock<std::mutex> lk(mutex);
         auto rt = groups.find(spine);
@@ -3030,10 +3712,18 @@ void server_models::on_group_stopped(const std::string & spine, const router_wor
         }
         rt->second.stop_done = true; // same critical section as the status change (see load())
         sched->tick(lk);
+        bump_queue_locked();
+        if (it != mapping.end()) {
+            slots = it->second.meta.placement.devs;
+        }
     }
     SRV_INF("group %s unloaded (spine and all workers stopped)\n", spine.c_str());
     if (changed) {
         notify_sse("status_change", spine, { {"status", "unloaded"}, {"exit_code", code} });
+        notify_state("unloaded", spine, slots, code == 0 ? "stopped" : "group failed or exited with status " + std::to_string(code));
+    }
+    if (board) {
+        board->wake();
     }
     cv.notify_all();
 }
@@ -3133,8 +3823,14 @@ void server_models::unload_all() {
 void server_models::update_status(const std::string & name, const update_status_args & args) {
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
+    bool                     found = false;
+    server_model_status      prev  = SERVER_MODEL_STATUS_UNLOADED;
+    std::vector<std::string> slots;
     if (it != mapping.end()) {
         auto & meta = it->second.meta;
+        found = true;
+        prev  = meta.status;
+        slots = meta.placement.devs;
         if (args.status == SERVER_MODEL_STATUS_UNLOADED && !meta.placement.need_bytes_per_dev.empty()) {
             credit_gpu_reservation_locked(name);
         }
@@ -3154,6 +3850,9 @@ void server_models::update_status(const std::string & name, const update_status_
         }
         // a model that comes up idle or goes down changes the slot count for queued requests
         sched->tick(lk);
+        if (prev != args.status) {
+            bump_queue_locked(); // queued loads may fit now
+        }
     }
     // broadcast status change to SSE
     {
@@ -3171,6 +3870,15 @@ void server_models::update_status(const std::string & name, const update_status_
         }
         // note: notify_sse doesn't acquire the lock, so no deadlock here
         notify_sse("status_change", name, data);
+    }
+    if (found && args.status == SERVER_MODEL_STATUS_LOADED && prev == SERVER_MODEL_STATUS_LOADING) {
+        notify_state("ready", name, slots, "");
+    }
+    if (found && args.status == SERVER_MODEL_STATUS_UNLOADED && prev != SERVER_MODEL_STATUS_UNLOADED) {
+        notify_state("unloaded", name, slots, args.exit_code == 0 ? "stopped" : "exited with status " + std::to_string(args.exit_code));
+        if (board) {
+            board->wake(); // release its claims now rather than at the next poll
+        }
     }
     cv.notify_all();
 }
@@ -3280,16 +3988,23 @@ void server_models::wait(std::unique_lock<std::mutex> & lk, const std::string & 
     });
 }
 
-bool server_models::ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop) {
+bool server_models::ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop,
+                                       const router_request_opts & req) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
     bool stopping;
+    bool wait_in_queue; // a queued load: `lowest` waits for it, `middle` / `highest` get told now
     {
         std::lock_guard<std::mutex> lk(mutex);
         stopping = stopping_models.count(name) > 0;
+        auto it = mapping.find(name);
+        wait_in_queue = router_request_waits_in_queue(it != mapping.end() ? effective_priority(req, it->second.meta)
+                                                                          : (req.priority_set ? req.priority : ADMISSION_PRIORITY_MIDDLE));
     }
+    load_options lo;
+    lo.req = req;
     if (!stopping && meta->is_ready()) {
         return false; // ready for taking requests
     }
@@ -3348,6 +4063,20 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             if (status == SERVER_MODEL_STATUS_DOWNLOADING || status == SERVER_MODEL_STATUS_DOWNLOADED) {
                 break; // do not wait on a download child
             }
+            if (status == SERVER_MODEL_STATUS_UNLOADED) {
+                // queued behind a board claim or a busy resident: the router retries the load itself
+                auto q = queued_loads.find(name);
+                if (q != queued_loads.end()) {
+                    if (!wait_in_queue) {
+                        throw router_queued_error(q->second.info);
+                    }
+                    if (should_stop && should_stop()) {
+                        throw std::runtime_error("request cancelled while model name=" + name + " was queued");
+                    }
+                    cv.wait_for(lk, std::chrono::milliseconds(200));
+                    continue;
+                }
+            }
             if (status == SERVER_MODEL_STATUS_LOADING) {
                 saw_loading = true;
             } else if (status == SERVER_MODEL_STATUS_UNLOADED) {
@@ -3372,10 +4101,19 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             if (status == SERVER_MODEL_STATUS_UNLOADED && sched->try_claim(lk, name)) {
                 lk.unlock();
                 bool ok = true;
+                std::exception_ptr fatal; // what the caller has to hear instead of a retry
                 try {
                     SRV_INF("slot available, loading queued model name=%s\n", name.c_str());
-                    load(name);
+                    load(name, lo);
                     did_load = true;
+                } catch (const router_queued_error &) {
+                    ok = false; // recorded as queued: `lowest` waits for it above, the others are told
+                    if (!wait_in_queue) {
+                        fatal = std::current_exception();
+                    }
+                } catch (const router_refused_error &) {
+                    ok    = false; // admission will not take it as things stand: no point retrying
+                    fatal = std::current_exception();
                 } catch (const std::exception & e) {
                     // lost a race for the slot, stay in line and retry
                     SRV_WRN("queued load of name=%s did not go through: %s\n", name.c_str(), e.what());
@@ -3384,6 +4122,9 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                 lk.lock();
                 sched->claim_done(lk, name, ok);
                 sched->tick(lk);
+                if (fatal) {
+                    std::rethrow_exception(fatal);
+                }
                 continue;
             }
 
@@ -3462,6 +4203,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
                 if (it->second.req_count == 0) {
                     maybe_finish_drain_locked(name, false); // a draining group spine stops now
                     sched->tick(lk);
+                    bump_queue_locked(); // a load waiting on this busy model may go now
                 }
             }
         }
@@ -3518,6 +4260,7 @@ void server_models::idle_sweeper_loop() {
         {
             std::unique_lock<std::mutex> lk(mutex);
             const int64_t now = ggml_time_ms();
+            holds.prune(now); // expired leases drop silently
             // group spines waiting for in-flight requests: stop them once their drain bound passes
             for (auto & [spine, rt] : groups) {
                 if (rt.drain_deadline > 0 && now >= rt.drain_deadline) {
@@ -3541,15 +4284,15 @@ void server_models::idle_sweeper_loop() {
                     }
                     continue;
                 }
-                if (inst.meta.last_used <= 0) {
-                    continue; // never served a request; leave it to LRU/eviction
-                }
-                const int timeout_s = effective_idle_timeout_s(inst.meta, global_timeout_s);
-                if (timeout_s <= 0) {
-                    continue; // 0 = never idle-unload
-                }
-                if (now - inst.meta.last_used >= (int64_t) timeout_s * 1000) {
-                    victims.emplace_back(name, timeout_s);
+                idle_resident ir;
+                ir.pinned    = inst.meta.placement.pinned;
+                ir.held      = is_held_locked(name); // a hold lease: no idle unload
+                ir.req_count = inst.req_count;
+                ir.last_used = inst.meta.last_used; // <= 0: never served a request; left to LRU/eviction
+                ir.timeout_s = effective_idle_timeout_s(inst.meta, global_timeout_s); // 0 = never idle-unload
+                if (idle_unload_due(ir, now)) {
+                    victims.emplace_back(name, ir.timeout_s);
+                    notify_state("evicting", name, inst.meta.placement.devs, "idle > " + std::to_string(ir.timeout_s) + " s");
                 }
             }
         }
@@ -3872,7 +4615,21 @@ static void res_err(std::unique_ptr<server_http_res> & res, const json & error_d
     res->data = safe_json_to_str({{ "error", error_data }});
 }
 
-static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res) {
+// 503 + Retry-After + where the load stands, for a `middle` / `highest` request whose model is queued
+static void res_queued(std::unique_ptr<server_http_res> & res, const router_queued_info & info) {
+    int status = 503;
+    std::string body;
+    std::map<std::string, std::string> headers;
+    router_queued_response(info, status, body, headers);
+    res->status = status;
+    res->data   = body;
+    for (const auto & [k, v] : headers) {
+        res->headers[k] = v;
+    }
+}
+
+static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res,
+                                  const router_request_opts & ro = {}, const std::function<bool()> & should_stop = nullptr) {
     if (name.empty()) {
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
         return false;
@@ -3891,7 +4648,10 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     name = meta->name;
     if (models_autoload) {
         try {
-            models.ensure_model_ready(name);
+            models.ensure_model_ready(name, should_stop, ro);
+        } catch (const router_queued_error & e) {
+            res_queued(res, e.info);
+            return false;
         } catch (const std::runtime_error & e) {
             res_err(res, {
                 {"message", e.what()},
@@ -3946,6 +4706,24 @@ static std::string header_value_ci(const std::map<std::string, std::string> & he
         }
     }
     return std::string();
+}
+
+// priority / machine of a request: JSON body fields `priority` / `machine` (when the body was
+// parsed), else the X-Priority / X-Machine headers. A bad priority answers 400.
+static bool router_request_opts_from(const server_http_req & req, const json * body, router_request_opts & out,
+                                     std::unique_ptr<server_http_res> & res) {
+    std::string bp;
+    std::string bm;
+    if (body != nullptr && body->is_object()) {
+        bp = json_value(*body, "priority", std::string());
+        bm = json_value(*body, "machine", std::string());
+    }
+    std::string err;
+    if (!router_parse_request_opts(bp, header_value_ci(req.headers, "x-priority"), bm, header_value_ci(req.headers, "x-machine"), out, err)) {
+        res_err(res, format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+        return false;
+    }
+    return true;
 }
 
 // percent encode one query or path component, covers reserved chars without pulling in
@@ -4062,11 +4840,15 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req, models);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
+        router_request_opts ro;
+        if (!router_request_opts_from(req, nullptr, ro, error_res)) {
+            return error_res;
+        }
+        if (!router_validate_model(name, models, autoload, error_res, ro, req.should_stop)) {
             return error_res;
         }
         if (autoload) {
-            models.ensure_model_ready(name, req.should_stop);
+            models.ensure_model_ready(name, req.should_stop, ro);
         }
         return models.proxy_request(req, method, name, false);
     };
@@ -4077,14 +4859,24 @@ void server_models_routes::init_routes() {
         // possibly multi-MB body (e.g. base64 images) just to read "model" — the
         // child parses the body again anyway. Fall back to the JSON parse when the
         // header is absent, preserving behavior for existing clients.
+        // priority / machine ride in the same body (or in X-Priority / X-Machine, the only
+        // source when X-Model spares the parse)
         std::string name = header_value_ci(req.headers, "x-model");
+        auto error_res = std::make_unique<server_http_res>();
+        router_request_opts ro;
         if (name.empty()) {
             json body = json::parse(req.body);
             name = json_value(body, "model", std::string());
+            if (!router_request_opts_from(req, &body, ro, error_res)) {
+                return error_res;
+            }
+        } else if (!router_request_opts_from(req, nullptr, ro, error_res)) {
+            return error_res;
         }
         bool autoload = is_autoload(params, req, models);
-        auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
+        // a session request (X-Conversation-Id) is not cancelled by its socket, see below
+        const bool session = !server_stream_conv_id_from_headers(req.headers).empty();
+        if (!router_validate_model(name, models, autoload, error_res, ro, session ? std::function<bool()>() : req.should_stop)) {
             return error_res;
         }
         // remember which child serves this conversation so the stream routes can route straight
@@ -4095,7 +4887,7 @@ void server_models_routes::init_routes() {
         uint64_t ticket = models.conv_models.remember(conv_id, name);
         // a dead socket must not cancel a session request, only a stop does (checked right below)
         auto should_stop = ticket == 0 ? req.should_stop : nullptr;
-        bool waited = autoload && models.ensure_model_ready(name, should_stop);
+        bool waited = autoload && models.ensure_model_ready(name, should_stop, ro);
         if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
             SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
                     conv_id.c_str(), name.c_str());
@@ -4109,30 +4901,57 @@ void server_models_routes::init_routes() {
         return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
     };
 
+    // POST /models/load {model, priority?, machine?} (or X-Priority / X-Machine). Answers right
+    // away: 200 {state: ready} when it is up, else 202 {state: loading | queued, queue_pos,
+    // blocked_by, ...}; 503 when admission refuses it. The load itself goes on in the background
+    // and a queued one is retried by the router; follow it on /models/sse.
     this->post_router_models_load = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
+        router_request_opts ro;
+        if (!router_request_opts_from(req, &body, ro, res)) {
+            return res;
+        }
         auto meta = models.get_meta(name);
         if (!meta.has_value()) {
             res_err(res, format_error_response("model is not found", ERROR_TYPE_NOT_FOUND));
             return res;
         }
-        if (meta->is_running()) {
-            res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
+        auto answer = [&res](int status, json out) {
+            out["success"] = true;
+            res->status = status;
+            res->data   = safe_json_to_str(out);
+        };
+        if (meta->is_ready_or_sleep()) {
+            json out = json::object();
+            out["model"] = meta->name;
+            out["state"] = "ready";
+            answer(200, out);
+            return res;
+        }
+        if (meta->status == SERVER_MODEL_STATUS_LOADING) {
+            json out = json::object();
+            out["model"] = meta->name;
+            out["state"] = "loading";
+            answer(202, out);
             return res;
         }
         try {
-            models.load(meta->name);
-        } catch (const std::runtime_error & e) {
+            json out = models.load_async(meta->name, ro);
+            const bool ready = json_value(out, "state", std::string()) == "ready";
+            answer(ready ? 200 : 202, out);
+        } catch (const router_queued_error & e) {
+            json out = json::parse(router_queued_info_json(e.info));
+            out["model"] = meta->name;
+            answer(202, out);
+        } catch (const std::exception & e) {
             res_err(res, {
                 {"message", e.what()},
                 {"type", "server_error"},
                 {"code", 503},
             });
-            return res;
         }
-        res_ok(res, {{"success", true}});
         return res;
     };
 
@@ -4175,6 +4994,15 @@ void server_models_routes::init_routes() {
                 // pid, state and which stop-snapshot line it printed (written / FAILED / timeout / none)
                 status["group"] = meta.group_info;
             }
+            if (!meta.queue_info.is_null()) {
+                // a queued load: queue_pos, blocked_by, blocked_on, board, priority, reason
+                status["value"] = "queued";
+                for (const auto & [k, v] : meta.queue_info.items()) {
+                    if (k != "state") {
+                        status[k] = v;
+                    }
+                }
+            }
 
             // pi coding agent multimodal compatibility
             json input_modalities = json::array({"text"});
@@ -4212,6 +5040,7 @@ void server_models_routes::init_routes() {
             };
             model_info["placement"] = placement;
             model_info["kind"]  = meta.is_external() ? "external" : "model";
+            model_info["priority"] = admission_priority_str(meta.priority); // the preset default
             model_info["group"] = meta.group.empty() ? json(nullptr) : json(meta.group);
             if (!meta.depends.empty()) {
                 model_info["depends"] = meta.depends;
@@ -4236,6 +5065,7 @@ void server_models_routes::init_routes() {
             {"data", models_json},
             {"devices", models.gpu_slots_json()},
             {"machines", models.machines_json()},
+            {"board", models.board_json()},
             {"object", "list"},
         });
         return res;
@@ -4253,6 +5083,10 @@ void server_models_routes::init_routes() {
             return res;
         }
         if (!model->is_running() && model->status != SERVER_MODEL_STATUS_DOWNLOADING) {
+            if (models.cancel_queued(model->name)) {
+                res_ok(res, {{"success", true}, {"cancelled", true}}); // a queued load, dropped
+                return res;
+            }
             res_err(res, format_error_response("model is not running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -4290,6 +5124,44 @@ void server_models_routes::init_routes() {
             SRV_INF("router unloaded %zu model(s); GPUs released\n", unloaded.size());
         }
         res_ok(res, {{"autoload", enabled}, {"unloaded", unloaded}});
+        return res;
+    };
+
+    // POST /models/hold {model, ttl_s, owner, lease?}: keep a model resident (no eviction, no
+    // idle unload, no yield to the board queue) for ttl_s seconds; re-POST with the lease to
+    // renew. -> {lease, model, ttl_s, owner}. Expired leases drop silently.
+    this->post_router_models_hold = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        const std::string model = json_value(body, "model", std::string());
+        const int64_t     ttl_s = json_value(body, "ttl_s", (long long) 0);
+        const std::string owner = json_value(body, "owner", std::string());
+        const std::string lease = json_value(body, "lease", std::string());
+        try {
+            res_ok(res, models.hold(model, ttl_s, owner, lease));
+        } catch (const std::out_of_range & e) {
+            res_err(res, format_error_response(e.what(), ERROR_TYPE_NOT_FOUND));
+        } catch (const std::invalid_argument & e) {
+            const bool unknown_lease = std::string(e.what()).rfind("unknown", 0) == 0;
+            res_err(res, format_error_response(e.what(), unknown_lease ? ERROR_TYPE_NOT_FOUND : ERROR_TYPE_INVALID_REQUEST));
+        }
+        return res;
+    };
+
+    // POST /models/release {lease}
+    this->post_router_models_release = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        const std::string lease = json_value(body, "lease", std::string());
+        if (lease.empty()) {
+            res_err(res, format_error_response("'lease' is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!models.release_hold(lease)) {
+            res_err(res, format_error_response("unknown or expired lease '" + lease + "'", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res_ok(res, {{"success", true}});
         return res;
     };
 

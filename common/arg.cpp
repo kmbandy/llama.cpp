@@ -4286,11 +4286,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--gpus"}, "SPEC",
         "for router server, declared GPU slots as name:total_mb:probe[,name:total_mb:probe...]\n"
         "total_mb may be empty or 0 (name::probe) to use the probe's physical total; a positive\n"
-        "value overrides (caps) the total",
+        "value overrides (caps) the total. name may be dev=board (e.g. ROCm0=R9700): the GPU's\n"
+        "name on the coordination board, claimed as gpu:<board> (default: the device name)",
         [](common_params & params, const std::string & value) {
             params.router_gpus = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPUS"));
+    add_opt(common_arg(
+        {"--board-url"}, "URL",
+        "for router server, coordination board base URL (e.g. http://host:18800): the router\n"
+        "claims the GPUs / RAM it loads onto, queues behind other claims and yields idle GPUs to\n"
+        "queued sessions (default: none, board features off)",
+        [](common_params & params, const std::string & value) {
+            params.router_board_url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BOARD_URL"));
+    add_opt(common_arg(
+        {"--board-token-file"}, "PATH",
+        "for router server, file holding the coordination board's bearer token (write routes)",
+        [](common_params & params, const std::string & value) {
+            params.router_board_token_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BOARD_TOKEN_FILE"));
     add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
@@ -5514,6 +5531,13 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "Set no-exclusive to allow the VRAM ledger to co-locate models on one GPU.",
         [](common_params &, bool) { /* unused */ }
     ).set_env("LLAMA_ARG_ROUTER_EXCLUSIVE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"priority"}, "highest|middle|lowest",
+        "in server router mode, default priority of requests and loads for this model when they\n"
+        "do not carry one (default: middle)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PRIORITY").set_preset_only());
 
     args.push_back(common_arg(
         {"idle-timeout"}, "SECONDS",

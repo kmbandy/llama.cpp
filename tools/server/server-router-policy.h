@@ -32,6 +32,20 @@ struct evict_blocker {
 // that cannot be evicted (pinned, held, or busy unless allow_busy), if any.
 std::optional<evict_blocker> evict_find_blocker(const std::vector<evict_resident> & residents, bool allow_busy = false);
 
+// What the idle sweeper knows about a resident that is up (loaded or sleeping).
+struct idle_resident {
+    bool    stopping  = false;
+    bool    pinned    = false;
+    bool    held      = false; // hold lease
+    int     req_count = 0;
+    int64_t last_used = 0;     // ms; <= 0 = never served a request
+    int     timeout_s = 0;     // effective idle timeout; <= 0 = never idle-unload
+};
+
+// Whether the idle sweeper unloads it now: idle past its timeout, nothing in flight, and
+// neither pinned nor held (a human / an orchestrator asked to keep it).
+bool idle_unload_due(const idle_resident & r, int64_t now_ms);
+
 // Checks TEMP / TMP / TMPDIR of a final child environment ("KEY=VALUE" entries; the last
 // definition of a key wins). Returns the offending entry ("TMPDIR=/etc/passwd") when a
 // variable is set, non-empty, and does not name an existing directory; "" when fine.

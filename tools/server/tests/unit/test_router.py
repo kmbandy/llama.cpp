@@ -99,7 +99,8 @@ def _load_model_and_wait(
     load_res = server.make_request(
         "POST", "/models/load", data={"model": model_id}, headers=headers
     )
-    assert load_res.status_code == 200
+    # 200 when already up, else 202 {state: loading | queued}: the load goes on in the background
+    assert load_res.status_code in (200, 202)
     assert isinstance(load_res.body, dict)
     assert load_res.body.get("success") is True
     _wait_for_model_status(model_id, {"loaded"}, timeout=timeout, headers=headers)
@@ -737,10 +738,8 @@ def test_router_model_group_lifecycle():
         watcher.start()
         t0 = time.time()
         load_res = server.make_request("POST", "/models/load", data={"model": GROUP_SPINE}, timeout=180)
-        load_returned = time.time()
-        assert load_res.status_code == 200, load_res.body
-        # load() returns only after every worker accepted TCP (and then spawns the spine)
-        assert load_returned - t0 >= listen_delay_ms / 1000.0
+        # /models/load answers 202 while the load goes on (workers first, then the spine)
+        assert load_res.status_code in (200, 202), load_res.body
         entry = _wait_group(lambda e: e["status"]["value"] == "loaded", 180, "spine loaded")
         stop_watch.set()
         watcher.join()

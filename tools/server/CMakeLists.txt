@@ -59,10 +59,14 @@ add_library(${TARGET}
     server-models.h
     server-router-admission.cpp
     server-router-admission.h
+    server-router-board.cpp
+    server-router-board.h
     server-router-groups.cpp
     server-router-groups.h
     server-router-group-lifecycle.cpp
     server-router-group-lifecycle.h
+    server-router-holds.cpp
+    server-router-holds.h
     server-router-ledger.cpp
     server-router-ledger.h
     server-router-policy.cpp

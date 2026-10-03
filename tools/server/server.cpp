@@ -300,6 +300,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.post("/models/autoload",      ex_wrapper(models_routes->post_router_models_autoload));
+        ctx_http.post("/models/hold",          ex_wrapper(models_routes->post_router_models_hold));
+        ctx_http.post("/models/release",       ex_wrapper(models_routes->post_router_models_release));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
@@ -478,7 +480,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
             server_stream_session_manager_stop();
             if (models_routes.has_value()) {
                 models_routes->stopping.store(true); // maybe redundant, but just to be safe
-                models_routes->models.unload_all();
+                // cancels queued loads, unloads everything, then releases the board claims
+                models_routes->models.shutdown();
             }
             mcp_mgr.shutdown();
             llama_backend_free();

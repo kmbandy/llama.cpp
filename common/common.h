@@ -872,7 +872,9 @@ struct common_params {
     int models_idle_timeout = 0;        // router: unload a model after N seconds idle (0 = never)
     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
     int router_ram_headroom_mb = 4096;  // router: host RAM kept free of model loads (MemAvailable - headroom)
-    std::string router_gpus = "";       // declared router GPU slots: name:total_mb:probe,...
+    std::string router_gpus = "";       // declared router GPU slots: name[=board name]:total_mb:probe,...
+    std::string router_board_url = "";        // router: coordination board base URL ("" = board features off)
+    std::string router_board_token_file = ""; // router: file holding the board's bearer token
 
     bool log_json = false;
 

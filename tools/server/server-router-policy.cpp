@@ -25,6 +25,16 @@ std::vector<evict_resident> evict_pick_lru(const std::vector<evict_resident> & r
     return out;
 }
 
+bool idle_unload_due(const idle_resident & r, int64_t now_ms) {
+    if (r.stopping || r.pinned || r.held || r.req_count > 0) {
+        return false;
+    }
+    if (r.last_used <= 0 || r.timeout_s <= 0) {
+        return false;
+    }
+    return now_ms - r.last_used >= (int64_t) r.timeout_s * 1000;
+}
+
 std::optional<evict_blocker> evict_find_blocker(const std::vector<evict_resident> & residents, bool allow_busy) {
     for (const auto & r : residents) {
         if (r.pinned) {
