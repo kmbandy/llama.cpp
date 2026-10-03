@@ -301,6 +301,20 @@ class graph_dispatcher {
                             int64_t n_tokens) noexcept;
     void flush_predicted_hints() noexcept;
     void predictor_loop();
+
+    // WP_HINT_TRACE=<path> (unset = off): offline-evaluation trace of ACTUAL
+    // routing (every layer, every row of a decode/verify ubatch) and the
+    // ROUTER2 predictor's raw top-16 scores at every target distance
+    // d = 1..WP_HINT_TRACE_K (default 6) from every source layer, independent
+    // of WP_HINT_ROUTER2_K / _EVERY_LAYER / margin / cap / quota. The dispatch
+    // thread only copies the ids, gate weights and activations into a bounded
+    // queue; a dedicated thread does the GEMVs and the buffered file writes.
+    // Format: tools/wp-expert-worker/hint_trace_read.py. Never throws.
+    static const char * hint_trace_path();
+    void trace_layer(int32_t layer, const std::vector<float> & activations, int64_t n_tokens,
+                     const ggml_tensor * selected_experts, const ggml_tensor * weights,
+                     int64_t n_expert_used) noexcept;
+    void trace_loop();
     // Prefill whole-slice L+1 CERTAIN hints. Advisory; never throws.
     // WP_PREFILL_LAYER_AHEAD=1 and n_tokens > width. Worker catalog path is
     // the fetch engine; these frames keep the spine/worker hint counters in
@@ -508,6 +522,27 @@ class graph_dispatcher {
     std::vector<uint8_t>                           phantom_rows_;
     // WP_PREDICT_CAPTURE stream; opened on first record, closed in the dtor.
     FILE *                                         capture_file_ = nullptr;
+    // WP_HINT_TRACE state. trace_step_ is bumped by begin_decode() (dispatch
+    // thread, under io_mutex_) and read by trace_layer() on the same thread.
+    struct trace_job {
+        uint32_t              step     = 0;
+        int32_t               layer    = -1;
+        uint32_t              n_rows   = 0;
+        uint32_t              k        = 0;
+        uint32_t              phantom  = 0;   // bit r set = row r is a phantom (padding) row
+        std::vector<int32_t>  ids;            // [n_rows][k]
+        std::vector<float>    gate;           // [n_rows][k]
+        std::vector<float>    activations;    // [n_rows][n_embd]; empty = routing only
+    };
+    std::mutex                                     trace_mutex_;
+    std::condition_variable                        trace_cv_;
+    std::deque<trace_job>                          trace_queue_;
+    bool                                           trace_stop_ = false;
+    std::thread                                    trace_thread_;
+    std::atomic<bool>                              trace_thread_started_{ false };
+    std::atomic<uint32_t>                          trace_step_{ 0 };
+    std::atomic<uint64_t>                          trace_dropped_pred_{ 0 };
+    std::atomic<uint64_t>                          trace_dropped_all_{ 0 };
     std::atomic<uint64_t>                          next_seq_id{ 1 };
     std::map<int32_t, std::unique_ptr<op_context>> op_contexts;
     std::map<int32_t, ggml_tensor *>                wait_tensors_;

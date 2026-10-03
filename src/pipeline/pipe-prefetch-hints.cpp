@@ -360,6 +360,62 @@ std::vector<std::vector<int32_t>> router2_row_tiers(const float *     weights,
     return tiers;
 }
 
+void router2_trace_scores(const float *     weights,
+                          const float *     bias,
+                          const float *     activations,
+                          int64_t           n_tokens,
+                          int32_t           n_expert,
+                          int32_t           n_embd,
+                          int32_t           top_n,
+                          router2_scratch & scratch,
+                          uint16_t *        ids_out,
+                          float *           score_out,
+                          float *           prob_out) {
+    if (weights == nullptr || bias == nullptr || activations == nullptr || n_tokens <= 0 || n_expert <= 0 ||
+        n_embd <= 0 || top_n <= 0) {
+        return;
+    }
+    std::vector<double> &  logits = scratch.logits;
+    std::vector<double> &  scores = scratch.scores;
+    std::vector<int32_t> & order  = scratch.order;
+    logits.resize((size_t) n_expert);
+    scores.resize((size_t) n_expert);
+    order.resize((size_t) n_expert);
+    const int32_t n_sort = std::min(top_n, n_expert);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        const float * h = activations + (size_t) token * (size_t) n_embd;
+        router2_score_token(h, weights, bias, n_expert, n_embd, logits, scores, order);
+        std::partial_sort(order.begin(), order.begin() + n_sort, order.end(),
+                          [&scores](int32_t a, int32_t b) {
+                              if (scores[(size_t) a] != scores[(size_t) b]) {
+                                  return scores[(size_t) a] > scores[(size_t) b];
+                              }
+                              return a < b;
+                          });
+        const double max_logit = *std::max_element(logits.begin(), logits.end());
+        double       denom     = 0.0;
+        for (const double l : logits) {
+            denom += std::exp(l - max_logit);
+        }
+        if (!(denom > 0.0)) {
+            denom = 1.0;
+        }
+        const size_t base = (size_t) token * (size_t) top_n;
+        for (int32_t i = 0; i < top_n; ++i) {
+            if (i < n_sort) {
+                const int32_t e = order[(size_t) i];
+                ids_out[base + (size_t) i]   = (uint16_t) e;
+                score_out[base + (size_t) i] = (float) scores[(size_t) e];
+                prob_out[base + (size_t) i]  = (float) (std::exp(logits[(size_t) e] - max_logit) / denom);
+            } else {
+                ids_out[base + (size_t) i]   = 0xFFFF;
+                score_out[base + (size_t) i] = -std::numeric_limits<float>::infinity();
+                prob_out[base + (size_t) i]  = 0.0f;
+            }
+        }
+    }
+}
+
 uint64_t ngram_hint_table::key(int32_t token, int32_t layer) {
     return ((uint64_t) (uint32_t) token << 32) | (uint32_t) layer;
 }

@@ -317,6 +317,16 @@ graph_dispatcher::~graph_dispatcher() {
             pred_thread_.join();
         }
     }
+    if (trace_thread_started_.load()) {
+        {
+            std::lock_guard<std::mutex> lock(trace_mutex_);
+            trace_stop_ = true;
+        }
+        trace_cv_.notify_one();
+        if (trace_thread_.joinable()) {
+            trace_thread_.join();
+        }
+    }
     if (capture_file_ != nullptr) {
         std::fclose(capture_file_);
         capture_file_ = nullptr;
@@ -1385,6 +1395,209 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP_HINT_TRACE: see graph_dispatcher::trace_layer in the header, and
+// tools/wp-expert-worker/hint_trace_read.py for the reader. All integers and
+// floats are little-endian (host order on every supported target).
+//
+//   file   := header record*
+//   header := "WPHT1\0\0\0" u32 version(=1) u32 n_expert u32 n_embd u32 trace_k
+//             u32 top_n(=16) u32 pid u32 reserved[4]                  (48 bytes)
+//   record := u32 type u32 payload_bytes payload
+//   type 1 ROUTING: u32 step i32 layer u32 n_rows u32 k u32 phantom_mask u32 flags
+//                   i32 ids[n_rows][k]  f32 gate[n_rows][k]
+//   type 2 PRED:    u32 step i32 src_layer u32 n_rows u32 n_dist u32 top_n
+//                   i32 dist[n_dist]
+//                   then for each dist index i, row r (row-major):
+//                   u16 ids[top_n] f32 score[top_n] f32 prob[top_n]
+//   type 3 FOOTER:  u64 dropped_pred u64 dropped_all
+// flags bit0 = decode batch (always set: prefill ubatches are not traced).
+// dist[i] = target_layer - src_layer; only targets with a registered router
+// are listed. 0xFFFF in ids = padding.
+static constexpr uint32_t TRACE_REC_ROUTING = 1;
+static constexpr uint32_t TRACE_REC_PRED    = 2;
+static constexpr uint32_t TRACE_REC_FOOTER  = 3;
+static constexpr uint32_t TRACE_TOP_N       = 16;
+static constexpr int64_t  TRACE_MAX_ROWS    = 32;   // above this = prefill, not traced
+
+const char * graph_dispatcher::hint_trace_path() {
+    static const char * value = [] {
+        const char * v = std::getenv("WP_HINT_TRACE");
+        return (v != nullptr && v[0] != '\0') ? v : (const char *) nullptr;
+    }();
+    return value;
+}
+
+void graph_dispatcher::trace_layer(int32_t layer, const std::vector<float> & activations, int64_t n_tokens,
+                                   const ggml_tensor * selected_experts, const ggml_tensor * weights,
+                                   int64_t n_expert_used) noexcept {
+    if (hint_trace_path() == nullptr) {
+        return;
+    }
+    try {
+        if (n_tokens <= 0 || n_tokens > TRACE_MAX_ROWS || n_expert_used <= 0 ||
+            selected_experts == nullptr || weights == nullptr) {
+            return;
+        }
+        static const size_t queue_cap = [] {
+            const char * v = std::getenv("WP_HINT_TRACE_QUEUE");
+            const long   n = (v != nullptr && v[0] != '\0') ? strtol(v, nullptr, 10) : 256;
+            return n > 0 ? (size_t) n : (size_t) 256;
+        }();
+        // Cheap pre-check so a stalled writer cannot grow the queue without bound.
+        {
+            std::lock_guard<std::mutex> lock(trace_mutex_);
+            if (trace_queue_.size() >= queue_cap * 16) {
+                trace_dropped_all_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        trace_job job;
+        job.step   = trace_step_.load(std::memory_order_relaxed);
+        job.layer  = layer;
+        job.n_rows = (uint32_t) n_tokens;
+        job.k      = (uint32_t) n_expert_used;
+        job.ids.resize((size_t) (n_tokens * n_expert_used));
+        job.gate.resize((size_t) (n_tokens * n_expert_used));
+        for (int64_t i = 0; i < n_tokens * n_expert_used; ++i) {
+            job.ids[(size_t) i]  = ggml_get_i32_1d(selected_experts, (int) i);
+            job.gate[(size_t) i] = ggml_get_f32_1d(weights, (int) i);
+        }
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            if (is_phantom_row(t)) {
+                job.phantom |= 1u << t;
+            }
+        }
+        if (!trace_thread_started_.exchange(true)) {
+            trace_thread_ = std::thread([this] { trace_loop(); });
+        }
+        {
+            std::lock_guard<std::mutex> lock(trace_mutex_);
+            if (trace_queue_.size() < queue_cap && !routers_.empty() &&
+                activations.size() >= (size_t) n_tokens * (size_t) remote.n_embd()) {
+                job.activations.assign(activations.begin(),
+                                       activations.begin() + (size_t) n_tokens * (size_t) remote.n_embd());
+            } else {
+                trace_dropped_pred_.fetch_add(1, std::memory_order_relaxed);
+            }
+            trace_queue_.push_back(std::move(job));
+        }
+        trace_cv_.notify_one();
+    } catch (...) {
+        // Diagnostics only: a lost record must not touch the decode.
+    }
+}
+
+void graph_dispatcher::trace_loop() {
+    FILE * fp = std::fopen(hint_trace_path(), "wb");
+    if (fp == nullptr) {
+        std::fprintf(stderr, "WP_HINT_TRACE: cannot open %s\n", hint_trace_path());
+    } else {
+        static char io_buf[1 << 20];
+        std::setvbuf(fp, io_buf, _IOFBF, sizeof(io_buf));
+    }
+    const int32_t n_expert = remote.n_expert();
+    const int32_t n_embd   = remote.n_embd();
+    int trace_k = 6;
+    if (const char * v = std::getenv("WP_HINT_TRACE_K"); v != nullptr && v[0] != '\0') {
+        trace_k = std::min(64, std::max(1, std::atoi(v)));
+    }
+    const auto put = [fp](const void * p, size_t n) {
+        if (fp != nullptr) {
+            std::fwrite(p, 1, n, fp);
+        }
+    };
+    const auto put_u32 = [&put](uint32_t v) { put(&v, sizeof(v)); };
+    {
+        const char magic[8] = { 'W', 'P', 'H', 'T', '1', 0, 0, 0 };
+        put(magic, sizeof(magic));
+        put_u32(1);
+        put_u32((uint32_t) n_expert);
+        put_u32((uint32_t) n_embd);
+        put_u32((uint32_t) trace_k);
+        put_u32(TRACE_TOP_N);
+        put_u32((uint32_t) getpid());
+        for (int i = 0; i < 4; ++i) {
+            put_u32(0);
+        }
+    }
+    router2_scratch       scratch;
+    std::vector<uint16_t> ids;
+    std::vector<float>    score, prob;
+    for (;;) {
+        trace_job job;
+        {
+            std::unique_lock<std::mutex> lock(trace_mutex_);
+            trace_cv_.wait(lock, [this] { return trace_stop_ || !trace_queue_.empty(); });
+            if (trace_queue_.empty()) {
+                break;   // stop requested and drained
+            }
+            job = std::move(trace_queue_.front());
+            trace_queue_.pop_front();
+        }
+        try {
+            {
+                put_u32(TRACE_REC_ROUTING);
+                put_u32((uint32_t) (6 * 4 + job.ids.size() * 4 + job.gate.size() * 4));
+                put_u32(job.step);
+                put_u32((uint32_t) job.layer);
+                put_u32(job.n_rows);
+                put_u32(job.k);
+                put_u32(job.phantom);
+                put_u32(1);
+                put(job.ids.data(), job.ids.size() * sizeof(int32_t));
+                put(job.gate.data(), job.gate.size() * sizeof(float));
+            }
+            if (job.activations.empty()) {
+                continue;
+            }
+            std::vector<int32_t> dists;
+            for (int d = 1; d <= trace_k; ++d) {
+                if (routers_.find(job.layer + d) != routers_.end()) {
+                    dists.push_back(d);
+                }
+            }
+            if (dists.empty()) {
+                continue;
+            }
+            const size_t per_row = TRACE_TOP_N;
+            const size_t n_cells = dists.size() * (size_t) job.n_rows;
+            ids.resize(n_cells * per_row);
+            score.resize(n_cells * per_row);
+            prob.resize(n_cells * per_row);
+            for (size_t i = 0; i < dists.size(); ++i) {
+                const router_layer & rl = routers_.find(job.layer + dists[i])->second;
+                const size_t         off = i * (size_t) job.n_rows * per_row;
+                router2_trace_scores(rl.w.data(), rl.b.data(), job.activations.data(), (int64_t) job.n_rows,
+                                     n_expert, n_embd, (int32_t) TRACE_TOP_N, scratch,
+                                     ids.data() + off, score.data() + off, prob.data() + off);
+            }
+            put_u32(TRACE_REC_PRED);
+            put_u32((uint32_t) (5 * 4 + dists.size() * 4 + n_cells * per_row * (2 + 4 + 4)));
+            put_u32(job.step);
+            put_u32((uint32_t) job.layer);
+            put_u32(job.n_rows);
+            put_u32((uint32_t) dists.size());
+            put_u32(TRACE_TOP_N);
+            put(dists.data(), dists.size() * sizeof(int32_t));
+            for (size_t cell = 0; cell < n_cells; ++cell) {
+                put(ids.data() + cell * per_row, per_row * sizeof(uint16_t));
+                put(score.data() + cell * per_row, per_row * sizeof(float));
+                put(prob.data() + cell * per_row, per_row * sizeof(float));
+            }
+        } catch (...) {
+            // Lose the record, keep tracing.
+        }
+    }
+    const uint64_t footer[2] = { trace_dropped_pred_.load(), trace_dropped_all_.load() };
+    put_u32(TRACE_REC_FOOTER);
+    put_u32(sizeof(footer));
+    put(footer, sizeof(footer));
+    if (fp != nullptr) {
+        std::fclose(fp);
+    }
+}
+
 void graph_dispatcher::predictor_loop() {
     // Reused across every job this thread ever scores (single-threaded
     // consumer, so no locking needed): see router2_scratch on why this
@@ -1820,6 +2033,7 @@ void graph_dispatcher::begin_decode() noexcept {
     phantom_rows_.clear();
     router2_pages_this_decode_ = 0;
     pred_snapshot_taken_       = false;
+    trace_step_.fetch_add(1, std::memory_order_relaxed);
     remote.begin_deferral_window();
     decode_t0_ = dispatch_clock::now();
     if (!collect_stats_ && forward_log_ == nullptr) {
@@ -2144,6 +2358,7 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             owner->flush_predicted_hints();
             owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
         }
+        owner->trace_layer(context->layer, wire_activations, n_tokens, selected_experts, weights, n_expert_used);
         owner->note_dispatched_experts(context->layer, assignments, (uint32_t) n_tokens);
         ml8_probe_maybe_dump(context->layer, wire_activations, selected_experts, weights,
                              n_tokens, n_embd, n_expert_used);
@@ -2378,6 +2593,8 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                     owner->flush_predicted_hints();
                     owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
                 }
+                owner->trace_layer(context->layer, full_wire_activations, full_tokens, full_selected,
+                                   full_weights, n_expert_used);
                 owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
                 ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
                                      full_tokens, n_embd, n_expert_used);
@@ -2407,6 +2624,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                         }
                         owner->enqueue_prediction(layer_id, wire, full_tokens);
                     }
+                    owner->trace_layer(layer_id, wire, full_tokens, full_selected, full_weights, n_expert_used);
                     owner->note_dispatched_experts(layer_id, full_assignments, (uint32_t) full_tokens);
                     ml8_probe_maybe_dump(layer_id, wire, full_selected, full_weights,
                                          full_tokens, n_embd, n_expert_used);

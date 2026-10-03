@@ -97,6 +97,24 @@ std::vector<std::vector<int32_t>> router2_row_tiers(const float *     weights,
                                                     size_t            total_cap,
                                                     router2_scratch & scratch);
 
+// WP_HINT_TRACE diagnostic: for every row, the top `top_n` experts by selection
+// score (sqrt(softplus(logit)) + bias -- the raw score row_tiers ranks on,
+// before margin/cap/quota), best first. Outputs are row-major
+// [n_tokens][top_n]: ids (0xFFFF pads rows when n_expert < top_n), the
+// selection score, and the softmax probability over the RAW logits (what the
+// confidence gate reads). Allocation-free after the first call on `scratch`.
+void router2_trace_scores(const float *     weights,
+                          const float *     bias,
+                          const float *     activations,
+                          int64_t           n_tokens,
+                          int32_t           n_expert,
+                          int32_t           n_embd,
+                          int32_t           top_n,
+                          router2_scratch & scratch,
+                          uint16_t *        ids_out,
+                          float *           score_out,
+                          float *           prob_out);
+
 // WPNGRAM v1 is little-endian: header(version, dimensions, row count), one
 // popularity row per layer, then keyed token rows. Each row stores its full
 // count total plus up to 16 (u16 expert, u32 count) entries.
