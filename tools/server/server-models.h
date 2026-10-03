@@ -110,6 +110,14 @@ struct server_model_placement {
     int64_t vram_mb_override = -1;
     // Preset `ram-mb`: host RAM this model needs (MiB). -1 = unset (RAM gate skipped). Same capture-now rule.
     int64_t ram_mb_override = -1;
+    // Pool (preset `placement = any`, or the legacy `gpu = any` + `exclusive = false`): each placement
+    // picks among the pool's slots afresh. `devs` / the model's machine hold the slot of the RUNNING
+    // instance only, never a memory of the last pick. Parsed at placement-parse time.
+    bool                     pool = false;
+    int                      replicas = 1;            // pool: up to this many instances (see replica_of)
+    std::vector<std::string> pool_gpus;               // allow-list, as slot ids; empty = every slot
+    std::string              pool_machine;            // the preset's machine ("" = none named)
+    bool                     pool_any_machine = false; // placement = any without a preset machine: slots of every machine
 };
 
 struct server_model_meta {
@@ -184,6 +192,10 @@ struct server_model_meta {
     // API key of a child on another machine (random per spawn, sent as LLAMA_API_KEY in its env);
     // the router sends it as a bearer on every request it proxies there. "" = local child.
     std::string              child_key;
+
+    // Replica k >= 2 of a pool alias: the alias's name (this entry is hidden and named
+    // "<alias>~r<k>"); "" = the alias itself / not a replica.
+    std::string              replica_of;
 
     // The machine of this model (or of one of its group's workers) is offline (its node's heartbeat
     // is lost): the model is `unavailable`. Filled into the copies get_meta() / get_all_meta() hand
@@ -473,6 +485,16 @@ private:
     // hold leases (server-router-holds.h); guarded by `mutex`. A worker is held through its spine.
     router_holds holds;
     bool is_held_locked(const std::string & name) const;
+    // pools / replicas (caller holds mutex)
+    // every slot a placement of this pool instance may consider: the allow-list (pool-gpus), narrowed to the
+    // preset's machine unless `placement = any` named none. Online-ness and sibling replicas are not applied.
+    std::vector<std::string> pool_slot_ids_locked(const server_model_meta & meta) const;
+    // the registry names of a pool alias's instances: the alias itself, then its "~r<k>" replicas
+    std::vector<std::string> replica_family_locked(const std::string & alias) const;
+    // the hidden replica entry for `name` of pool `alias`, fresh from the alias's current meta
+    server_model_meta make_replica_meta_locked(const std::string & alias, const std::string & name) const;
+    // starts `name`'s load on its own thread (a replica brought up on demand); a queued or refused load is logged
+    void load_in_background(const std::string & name, const router_request_opts & req);
 
     // Loads waiting in the queue (a foreign board claim or a busy resident), by model name;
     // guarded by `mutex`. The model's status stays UNLOADED; queue_th retries the load when
@@ -583,6 +605,12 @@ public:
     // POST /models/load: starts the load on its own thread and returns after a short wait:
     // {state: ready|loading|queued, ...}; throws what load() threw if it failed by then
     json load_async(const std::string & name, const router_request_opts & req);
+
+    // Pool aliases (placement = any, replicas = N): the registry name a request for `name` goes to --
+    // the ready replica with the fewest requests in flight; another replica is started in the
+    // background when all are busy. `name` itself for anything that is no pool. `allow_load` false
+    // (autoload off): only a ready replica is picked.
+    std::string select_replica(const std::string & name, const router_request_opts & req, bool allow_load);
 
     // hold leases: a held model is never evicted, idle-unloaded or yielded. hold() returns
     // {lease, model, ttl_s}; throws std::invalid_argument (bad input / unknown lease) or

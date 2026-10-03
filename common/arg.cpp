@@ -5575,6 +5575,27 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     ).set_env("LLAMA_ARG_ROUTER_PRIORITY").set_preset_only());
 
     args.push_back(common_arg(
+        {"placement"}, "pinned|any",
+        "in server router mode, 'any' makes this model a pool: each placement picks a slot among the\n"
+        "pool's online slots (all machines, or `pool-gpus`, or the preset's `machine`), nothing is\n"
+        "remembered between placements (default: pinned = the `gpu` key decides)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PLACEMENT").set_preset_only());
+
+    args.push_back(common_arg(
+        {"replicas"}, "N",
+        "in server router mode, a pool (placement = any) may run up to N instances on different slots; "
+        "requests go to the ready one with the fewest in flight and another loads on demand when all are busy (default: 1)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_REPLICAS").set_preset_only());
+
+    args.push_back(common_arg(
+        {"pool-gpus"}, "SLOT[,SLOT]",
+        "in server router mode, restrict a pool to these slots ([machine/]device); default: every slot",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_POOL_GPUS").set_preset_only());
+
+    args.push_back(common_arg(
         {"idle-timeout"}, "SECONDS",
         "in server router mode, unload this model after it has been idle this long (overrides\n"
         "the router-wide --models-idle-timeout). 0 = never idle-unload this model. Omit to\n"

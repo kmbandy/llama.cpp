@@ -8,7 +8,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -154,3 +156,55 @@ admission_result decide_admission(const admission_input & in);
 
 // One candidate per slot (each with `vram` on it and `ram` on its machine): a pool.
 std::vector<admission_candidate> admission_pool_candidates(const std::vector<admission_slot> & slots, int64_t vram, int64_t ram);
+
+// ---- Pools and replicas -------------------------------------------------------------------
+// A pool alias (preset `placement = any`) may run up to `replicas` instances, each a router child
+// on a different slot. Replica 1 is the alias itself; replica k >= 2 is the hidden registry entry
+// "<alias>~r<k>". A replica's slot and machine belong to that instance: every new placement
+// re-evaluates the pool's candidates (nothing is remembered in the alias's preset meta).
+
+struct router_pool_spec {
+    bool                     pool     = false;
+    int                      replicas = 1;
+    std::vector<std::string> gpus;       // `pool-gpus` entries as written (resolved to slot ids by the caller)
+    std::string              err;        // "" = fine
+};
+// `placement` ("" / "pinned" / "any"), `replicas` ("" = 1, 1..64), `pool-gpus` (comma list; only with `any`).
+// replicas > 1 needs `any`.
+router_pool_spec router_pool_parse(const std::string & placement, const std::string & replicas, const std::string & pool_gpus);
+
+// "<alias>" for replica 1, else "<alias>~r<k>"
+std::string router_replica_name(const std::string & alias, int k);
+// splits a registry name into its alias and replica number (1 when it is no replica name)
+bool router_replica_split(const std::string & name, std::string & alias, int & k);
+
+// The slots a placement of this pool instance may use: the pool's slots (`all`, already narrowed
+// to the allow-list / preset machine by the caller) that are `usable` (online) and not held by a
+// sibling replica (`taken`): one replica per slot.
+std::vector<std::string> router_pool_slots(const std::vector<std::string> & all, const std::function<bool(const std::string &)> & usable,
+                                           const std::set<std::string> & taken);
+
+enum router_replica_status {
+    ROUTER_REPLICA_DOWN    = 0, // unloaded / failed
+    ROUTER_REPLICA_LOADING = 1, // spawning, or its load is queued
+    ROUTER_REPLICA_READY   = 2,
+};
+struct router_replica_state {
+    int                   status   = ROUTER_REPLICA_DOWN;
+    int                   inflight = 0;
+};
+// What to do with one request to a pool alias. `use` indexes the states (-1 + use_new: a replica
+// that does not exist yet; -1 alone: nothing to use). `grow` is a replica to bring up in the
+// background because every ready one is busy (`grow_new`: a new one; else an index into the states).
+struct router_replica_choice {
+    int  use      = -1;
+    bool use_new  = false;
+    int  grow     = -1;
+    bool grow_new = false;
+};
+// Load-balances across the ready replicas (fewest in flight, first wins a tie). With none ready it
+// waits on one already loading, else loads one (an existing down one, else a new one while
+// `can_add`). All ready busy and nothing loading: the request still goes to the least busy ready
+// one, and one more replica is started in the background (it is placed only if admission allows it
+// at the request's priority: it never evicts a busy resident below `highest`).
+router_replica_choice router_replica_choose(const std::vector<router_replica_state> & states, bool can_add);

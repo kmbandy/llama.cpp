@@ -66,6 +66,9 @@ static constexpr const char * ROUTER_ARG_PINNED       = "LLAMA_ARG_ROUTER_PINNED
 static constexpr const char * ROUTER_ARG_EXCLUSIVE    = "LLAMA_ARG_ROUTER_EXCLUSIVE";
 static constexpr const char * ROUTER_ARG_IDLE_TIMEOUT = "LLAMA_ARG_ROUTER_IDLE_TIMEOUT";
 static constexpr const char * ROUTER_ARG_PRIORITY     = "LLAMA_ARG_ROUTER_PRIORITY";
+static constexpr const char * ROUTER_ARG_PLACEMENT    = "LLAMA_ARG_ROUTER_PLACEMENT";
+static constexpr const char * ROUTER_ARG_REPLICAS     = "LLAMA_ARG_ROUTER_REPLICAS";
+static constexpr const char * ROUTER_ARG_POOL_GPUS    = "LLAMA_ARG_ROUTER_POOL_GPUS";
 static constexpr const char * ROUTER_LOAD_TIMEOUT     = "LLAMA_SERVER_ROUTER_LOAD_TIMEOUT";
 
 static constexpr int DEFAULT_ROUTER_LOAD_TIMEOUT_S = 900;
@@ -413,6 +416,9 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     }
     preset.unset_option("LLAMA_ARG_ROUTER_NODE");
     preset.unset_option(ROUTER_ARG_PRIORITY);
+    preset.unset_option(ROUTER_ARG_PLACEMENT);
+    preset.unset_option(ROUTER_ARG_REPLICAS);
+    preset.unset_option(ROUTER_ARG_POOL_GPUS);
     preset.unset_option(ROUTER_ARG_GPU);
     preset.unset_option(ROUTER_ARG_VRAM_MB);
     preset.unset_option(ROUTER_ARG_RAM_MB);
@@ -816,6 +822,9 @@ std::optional<std::filesystem::file_time_type> server_models::get_models_preset_
 }
 
 void server_models::reload_models_preset_if_changed(server_model_meta & meta) {
+    if (!meta.replica_of.empty()) {
+        return; // a replica is made from its alias's current meta each time it is brought up
+    }
     const auto mtime_before = get_models_preset_mtime();
     const auto applied_mtime = models_preset_applied_mtimes.find(meta.name);
     if (!mtime_before.has_value() ||
@@ -1274,7 +1283,40 @@ void server_models::parse_model_placement(server_model_meta & meta) {
     if (meta.preset.get_option(ROUTER_ARG_GPU, gpu)) {
         gpu = string_strip(gpu);
     }
-    if (gpu.empty() || gpu == "any") {
+
+    // Pools: `placement = any` (+ `replicas`, `pool-gpus`), or the older `gpu = any` + `exclusive = false`.
+    // Captured here (stripped by update_args() like the keys above).
+    {
+        std::string pl, rep, pgpus;
+        meta.preset.get_option(ROUTER_ARG_PLACEMENT, pl);
+        meta.preset.get_option(ROUTER_ARG_REPLICAS, rep);
+        meta.preset.get_option(ROUTER_ARG_POOL_GPUS, pgpus);
+        router_pool_spec spec = router_pool_parse(pl, rep, pgpus);
+        if (!spec.err.empty()) {
+            SRV_WRN("model '%s': %s; running it as a plain model\n", meta.name.c_str(), spec.err.c_str());
+            spec = router_pool_spec{};
+        }
+        const bool legacy_pool = !spec.pool && (gpu.empty() || gpu == "any") && !model_wants_exclusive(meta) && !meta.is_external();
+        if (spec.pool && (meta.is_external() || !meta.depends.empty())) {
+            SRV_WRN("model '%s': placement = any does not apply to a model group; ignored\n", meta.name.c_str());
+            spec = router_pool_spec{};
+        }
+        meta.placement.pool             = spec.pool || legacy_pool;
+        meta.placement.replicas         = spec.pool ? spec.replicas : 1;
+        meta.placement.pool_machine     = meta.machine;
+        meta.placement.pool_any_machine = spec.pool && meta.machine.empty();
+        const auto is_local_m = [this](const std::string & m) { return machine_is_local_name(m); };
+        for (const auto & g : spec.gpus) {
+            meta.placement.pool_gpus.push_back(router_slot_resolve(g, meta.machine, is_local_m));
+        }
+        if (spec.pool) {
+            meta.placement.exclusive = false; // a pool member is one slot's tenant, never a span
+            if (!gpu.empty() && gpu != "any") {
+                SRV_WRN("model '%s': placement = any ignores gpu = %s (use pool-gpus to restrict the pool)\n", meta.name.c_str(), gpu.c_str());
+            }
+        }
+    }
+    if (gpu.empty() || gpu == "any" || meta.placement.pool) {
         return;
     }
 
@@ -2058,7 +2100,18 @@ void server_models::evict_and_wait_locked(const std::string & name, const std::v
 
 void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, const load_options & opts, std::unique_lock<std::mutex> & lk) {
     const server_child_mode mode = opts.mode;
-    if (mode == SERVER_CHILD_MODE_NORMAL) {
+    // A pool instance's slot and machine belong to the instance, not to the alias: nothing of the last
+    // pick survives into this placement (it picks among the online slots afresh; only an explicit request
+    // `machine=` narrows it, in decide_admission()).
+    const bool is_pool = meta.placement.pool && !meta.is_external() && mode == SERVER_CHILD_MODE_NORMAL;
+    if (is_pool) {
+        meta.placement.devs.clear();
+        meta.placement.need_bytes_per_dev.clear();
+        meta.placement.split.clear();
+        meta.placement.exclusive = false;
+        meta.machine = meta.placement.pool_machine;
+    }
+    if (mode == SERVER_CHILD_MODE_NORMAL && !is_pool) { // a pool is unavailable only when no slot of it is online (below)
         const std::string off = offline_machine_locked(meta);
         if (!off.empty()) {
             throw router_unavailable_error(off, "model '" + name + "' is unavailable: machine '" + off + "' is offline");
@@ -2110,10 +2163,14 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     }
 
     if (meta.placement.devs.empty()) {
-        // no gpu=: the slots of this model's machine
-        for (const auto & slot : gpu_slots) {
-            if (slot.machine == mkey) {
-                meta.placement.devs.push_back(slot.id());
+        if (is_pool) {
+            meta.placement.devs = pool_slot_ids_locked(meta);
+        } else {
+            // no gpu=: the slots of this model's machine
+            for (const auto & slot : gpu_slots) {
+                if (slot.machine == mkey) {
+                    meta.placement.devs.push_back(slot.id());
+                }
             }
         }
         if (meta.placement.devs.empty()) {
@@ -2131,7 +2188,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     // NOTE: this must OR with the parsed option, not overwrite it -- otherwise a
     // single-GPU model silently loses its exclusivity here and the ledger is free to
     // co-locate something alongside it.
-    meta.placement.exclusive = model_wants_exclusive(meta) || meta.placement.devs.size() > 1;
+    meta.placement.exclusive = !is_pool && (model_wants_exclusive(meta) || meta.placement.devs.size() > 1);
 
     // One llama-server runs on one machine: a span (exclusive) is on the slots' machine, which must
     // be the model's. (A pool picks its slot below and then its machine.)
@@ -2162,6 +2219,21 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         if (pool_devs.empty()) {
             const std::string off = slot_machine_of(meta.placement.devs.front());
             throw router_unavailable_error(off, "model '" + name + "' is unavailable: machine '" + off + "' is offline");
+        }
+        if (is_pool) {
+            // one replica per slot: the slots of this alias's other running instances are not candidates
+            std::set<std::string> taken;
+            const std::string alias = meta.replica_of.empty() ? name : meta.replica_of;
+            for (const auto & member : replica_family_locked(alias)) {
+                auto mit = mapping.find(member);
+                if (member != name && mit != mapping.end() && mit->second.meta.is_running()) {
+                    taken.insert(mit->second.meta.placement.devs.begin(), mit->second.meta.placement.devs.end());
+                }
+            }
+            pool_devs = router_pool_slots(pool_devs, nullptr, taken);
+            if (pool_devs.empty()) {
+                throw router_refused_error("model '" + alias + "' already runs its replicas on every slot of its pool");
+            }
         }
     }
 
@@ -2345,7 +2417,181 @@ std::vector<std::string> server_models::machine_resources_locked() const {
 }
 
 bool server_models::is_held_locked(const std::string & name) const {
-    return holds.is_held(group_spine_locked(name), ggml_time_ms());
+    auto it = mapping.find(name);
+    // a replica is held through its alias
+    const std::string & base = it != mapping.end() && !it->second.meta.replica_of.empty() ? it->second.meta.replica_of : name;
+    return holds.is_held(group_spine_locked(base), ggml_time_ms());
+}
+
+std::vector<std::string> server_models::pool_slot_ids_locked(const server_model_meta & meta) const {
+    const std::set<std::string> allow(meta.placement.pool_gpus.begin(), meta.placement.pool_gpus.end());
+    const std::string machine = admission_machine(meta.placement.pool_machine);
+    std::vector<std::string> out;
+    for (const auto & slot : gpu_slots) {
+        if (!allow.empty() && allow.count(slot.id()) == 0) {
+            continue;
+        }
+        // `placement = any` without a preset machine spans every machine; otherwise (the older pool form,
+        // or a machine named) the slots of that machine
+        if (!meta.placement.pool_any_machine && slot.machine != machine) {
+            continue;
+        }
+        out.push_back(slot.id());
+    }
+    return out;
+}
+
+std::vector<std::string> server_models::replica_family_locked(const std::string & alias) const {
+    std::vector<std::string> out;
+    if (mapping.count(alias)) {
+        out.push_back(alias);
+    }
+    std::vector<std::pair<int, std::string>> replicas;
+    for (const auto & [n, inst] : mapping) {
+        if (inst.meta.replica_of == alias) {
+            std::string a;
+            int k = 1;
+            router_replica_split(n, a, k);
+            replicas.emplace_back(k, n);
+        }
+    }
+    std::sort(replicas.begin(), replicas.end());
+    for (const auto & r : replicas) {
+        out.push_back(r.second);
+    }
+    return out;
+}
+
+server_model_meta server_models::make_replica_meta_locked(const std::string & alias, const std::string & name) const {
+    server_model_meta m = mapping.at(alias).meta;
+    m.name         = name;
+    m.replica_of   = alias;
+    m.hidden       = true;
+    m.aliases.clear();
+    m.status       = SERVER_MODEL_STATUS_UNLOADED;
+    m.port         = 0;
+    m.host.clear();
+    m.child_key.clear();
+    m.exit_code    = 0;
+    m.last_used    = 0;
+    m.loaded_info  = json{};
+    m.progress     = json{};
+    m.queue_info   = nullptr;
+    m.stopping     = false;
+    m.placement.devs.clear();
+    m.placement.need_bytes_per_dev.clear();
+    m.placement.split.clear();
+    m.machine      = m.placement.pool_machine; // the slot (and its machine) is picked when it is placed
+    return m;
+}
+
+void server_models::load_in_background(const std::string & name, const router_request_opts & req) {
+    std::lock_guard<std::mutex> lk(async_mu);
+    for (auto it = async_loads.begin(); it != async_loads.end();) {
+        if (it->done->load()) {
+            it->th.join();
+            it = async_loads.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    load_options o;
+    o.req = req;
+    {
+        std::lock_guard<std::mutex> l(mutex);
+        if (shutting_down) {
+            return;
+        }
+        o.cancel_gen = cancel_gen_locked(name);
+    }
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread th([this, name, o, done]() {
+        try {
+            load(name, o);
+        } catch (const router_queued_error &) {
+            SRV_INF("replica %s: no slot to start it on now, its load is queued\n", name.c_str());
+        } catch (const std::exception & e) {
+            SRV_INF("replica %s not started: %s\n", name.c_str(), e.what());
+        }
+        done->store(true);
+    });
+    async_loads.push_back({ std::move(th), done });
+}
+
+std::string server_models::select_replica(const std::string & name, const router_request_opts & req, bool allow_load) {
+    std::string use = name;
+    std::string grow;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto ait = mapping.find(name);
+        if (ait == mapping.end() || !ait->second.meta.placement.pool || ait->second.meta.placement.replicas <= 1 ||
+            !ait->second.meta.replica_of.empty()) {
+            return name;
+        }
+        const size_t max_replicas = (size_t) ait->second.meta.placement.replicas;
+        const std::vector<std::string> family = replica_family_locked(name);
+        std::vector<std::string>           names;
+        std::vector<router_replica_state>  states;
+        for (const auto & member : family) {
+            const auto & inst = mapping.at(member);
+            const auto & m    = inst.meta;
+            router_replica_state st;
+            if (m.is_running()) {
+                // stopping, or on an offline machine, or off the machine the request asked for: not for this request
+                if (stopping_models.count(member) || !offline_machine_locked(m).empty() ||
+                    (!req.machine.empty() && admission_machine(m.machine) != admission_machine(req.machine))) {
+                    continue;
+                }
+                st.status   = m.is_ready_or_sleep() ? ROUTER_REPLICA_READY : ROUTER_REPLICA_LOADING;
+                st.inflight = inst.req_count;
+            } else {
+                if (!allow_load || !offline_machine_locked(m).empty()) {
+                    continue; // nothing to load it on (every slot of the pool is on an offline machine)
+                }
+                st.status = queued_loads.count(member) ? ROUTER_REPLICA_LOADING : ROUTER_REPLICA_DOWN;
+            }
+            if (!allow_load && st.status != ROUTER_REPLICA_READY) {
+                continue;
+            }
+            names.push_back(member);
+            states.push_back(st);
+        }
+        const router_replica_choice ch = router_replica_choose(states, allow_load && family.size() < max_replicas);
+
+        const auto add_replica = [&]() {
+            int k = 2;
+            while (mapping.count(router_replica_name(name, k)) > 0) {
+                k++;
+            }
+            const std::string nm = router_replica_name(name, k);
+            mapping[nm] = instance_t{ std::make_shared<server_child_ref>(), make_replica_meta_locked(name, nm) };
+            SRV_INF("pool %s: new replica entry %s\n", name.c_str(), nm.c_str());
+            return nm;
+        };
+        // a replica that is down is rebuilt from the alias's current meta (its preset may have been reloaded)
+        const auto fresh = [&](const std::string & nm) {
+            auto it = mapping.find(nm);
+            if (nm != name && it != mapping.end() && !it->second.meta.is_running() && !queued_loads.count(nm)) {
+                it->second.meta = make_replica_meta_locked(name, nm);
+            }
+            return nm;
+        };
+        if (ch.use_new) {
+            use = add_replica();
+        } else if (ch.use >= 0) {
+            use = fresh(names[ch.use]);
+        }
+        if (ch.grow_new) {
+            grow = add_replica();
+        } else if (ch.grow >= 0) {
+            grow = fresh(names[ch.grow]);
+        }
+    }
+    if (!grow.empty()) {
+        SRV_INF("pool %s: every ready replica is busy, starting %s on demand\n", name.c_str(), grow.c_str());
+        load_in_background(grow, req);
+    }
+    return use;
 }
 
 admission_priority server_models::effective_priority(const router_request_opts & req, const server_model_meta & meta) const {
@@ -2381,6 +2627,22 @@ bool server_models::machine_offline_locked(const std::string & machine) const {
 }
 
 std::string server_models::offline_machine_locked(const server_model_meta & meta) const {
+    if (meta.placement.pool && !meta.is_running() && meta.depends.empty()) {
+        // Not placed: it has no machine of its own (a past pick is no claim on the next). It is unavailable
+        // only when every slot it could take is on an offline machine.
+        std::vector<std::string> off;
+        bool any_online = false;
+        for (const auto & id : pool_slot_ids_locked(meta)) {
+            const int idx = find_slot_index(gpu_slots, id);
+            const std::string m = idx >= 0 ? gpu_slots[idx].machine : std::string();
+            if (machine_offline_locked(m)) {
+                off.push_back(m);
+            } else {
+                any_online = true;
+            }
+        }
+        return any_online ? std::string() : availability.first_offline(off);
+    }
     std::vector<std::string> machines = { meta.machine };
     for (const auto & dep : meta.depends) { // a group: its workers' machines too
         auto it = mapping.find(dep);
@@ -3046,7 +3308,7 @@ void server_models::load_models() {
     };
     auto apply_hidden = [&]() {
         for (auto & [name, inst] : mapping) {
-            inst.meta.hidden = hidden_models.count(name) > 0;
+            inst.meta.hidden = hidden_models.count(name) > 0 || !inst.meta.replica_of.empty();
         }
     };
     // update_args() injects HOST/PORT/ALIAS, so strip them before comparing presets
@@ -3131,7 +3393,8 @@ void server_models::load_models() {
         std::vector<std::string> to_unload;
         for (const auto & [name, inst] : mapping) {
             if (!inst.meta.is_running()) continue;
-            auto it = final_presets.find(name);
+            // a replica follows its alias's preset
+            auto it = final_presets.find(inst.meta.replica_of.empty() ? name : inst.meta.replica_of);
             if (it == final_presets.end()) {
                 to_unload.push_back(name); // removed from source
             } else if (preset_options_for_compare(inst.meta.preset) != preset_options_for_compare(it->second)) {
@@ -3163,7 +3426,9 @@ void server_models::load_models() {
             } else if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADED) {
                 // download finished, safe to erase
                 it = mapping.erase(it);
-            } else if (final_presets.find(it->first) == final_presets.end()) {
+            } else if (!it->second.meta.replica_of.empty() && !it->second.meta.is_running()) {
+                it = mapping.erase(it); // a replica entry is made again when the pool needs it
+            } else if (final_presets.find(it->second.meta.replica_of.empty() ? it->first : it->second.meta.replica_of) == final_presets.end()) {
                 SRV_INF("(reload) removing model name=%s (no longer in source)\n", it->first.c_str());
                 it = mapping.erase(it);
             } else {
@@ -3173,7 +3438,7 @@ void server_models::load_models() {
 
         // update presets for non-running models still in source
         for (auto & [name, inst] : mapping) {
-            if (inst.meta.is_running()) continue;
+            if (inst.meta.is_running() || !inst.meta.replica_of.empty()) continue;
             auto it = final_presets.find(name);
             if (it == final_presets.end()) continue; // erased above
 
@@ -4322,6 +4587,24 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
 }
 
 void server_models::unload(const std::string & name_in) {
+    {
+        // a pool alias unloads with its replicas
+        std::vector<std::string> replicas;
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            auto it = mapping.find(name_in);
+            if (it != mapping.end() && it->second.meta.placement.pool && it->second.meta.replica_of.empty()) {
+                for (const auto & member : replica_family_locked(name_in)) {
+                    if (member != name_in) {
+                        replicas.push_back(member);
+                    }
+                }
+            }
+        }
+        for (const auto & r : replicas) {
+            unload(r);
+        }
+    }
     std::unique_lock<std::mutex> lk(mutex);
     const std::string name = group_spine_locked(name_in); // a worker unloads its whole group
     auto it = mapping.find(name);
@@ -5271,6 +5554,17 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     }
     // resolve alias to canonical model name
     name = meta->name;
+    if (meta->placement.pool && meta->placement.replicas > 1) {
+        // a pool: the replica for this request (the ready one with the fewest in flight; a busy pool
+        // starts another in the background). Everything below works on that replica.
+        name = models.select_replica(name, ro, models_autoload);
+        if (name != meta->name) {
+            auto picked = models.get_meta(name);
+            if (picked.has_value()) {
+                meta = picked;
+            }
+        }
+    }
     if (meta->unavailable) {
         // its machine's node is silent: 503 + Retry-After whether or not the model was loaded
         res_unavailable(res, name, meta->unavailable_machine, "");

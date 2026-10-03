@@ -3,6 +3,8 @@
 #include "server-router-policy.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <utility>
@@ -385,4 +387,136 @@ std::vector<admission_candidate> admission_pool_candidates(const std::vector<adm
         out.push_back(c);
     }
     return out;
+}
+
+// ---- Pools and replicas -------------------------------------------------------------------
+
+router_pool_spec router_pool_parse(const std::string & placement, const std::string & replicas, const std::string & pool_gpus) {
+    router_pool_spec out;
+    const auto strip = [](const std::string & s) {
+        size_t b = 0;
+        size_t e = s.size();
+        while (b < e && isspace((unsigned char) s[b])) { b++; }
+        while (e > b && isspace((unsigned char) s[e - 1])) { e--; }
+        return s.substr(b, e - b);
+    };
+    const std::string pl = strip(placement);
+    if (pl.empty() || pl == "pinned") {
+        out.pool = false;
+    } else if (pl == "any") {
+        out.pool = true;
+    } else {
+        out.err = "placement must be 'pinned' or 'any', got '" + pl + "'";
+        return out;
+    }
+    const std::string rep = strip(replicas);
+    if (!rep.empty()) {
+        char * end = nullptr;
+        const long n = strtol(rep.c_str(), &end, 10);
+        if (end == rep.c_str() || *end != '\0' || n < 1 || n > 64) {
+            out.err = "replicas must be an integer from 1 to 64, got '" + rep + "'";
+            return out;
+        }
+        out.replicas = (int) n;
+    }
+    size_t pos = 0;
+    while (pos <= pool_gpus.size()) {
+        size_t comma = pool_gpus.find(',', pos);
+        if (comma == std::string::npos) {
+            comma = pool_gpus.size();
+        }
+        const std::string g = strip(pool_gpus.substr(pos, comma - pos));
+        if (!g.empty()) {
+            out.gpus.push_back(g);
+        }
+        pos = comma + 1;
+    }
+    if (!out.pool && out.replicas > 1) {
+        out.err = "replicas > 1 needs placement = any";
+    } else if (!out.pool && !out.gpus.empty()) {
+        out.err = "pool-gpus needs placement = any";
+    }
+    return out;
+}
+
+std::string router_replica_name(const std::string & alias, int k) {
+    return k <= 1 ? alias : alias + "~r" + std::to_string(k);
+}
+
+bool router_replica_split(const std::string & name, std::string & alias, int & k) {
+    const size_t pos = name.rfind("~r");
+    if (pos == std::string::npos || pos == 0 || pos + 2 >= name.size()) {
+        alias = name;
+        k     = 1;
+        return false;
+    }
+    int n = 0;
+    for (size_t i = pos + 2; i < name.size(); ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            alias = name;
+            k     = 1;
+            return false;
+        }
+        n = n * 10 + (name[i] - '0');
+        if (n > 1000000) {
+            break;
+        }
+    }
+    if (n < 2) {
+        alias = name;
+        k     = 1;
+        return false;
+    }
+    alias = name.substr(0, pos);
+    k     = n;
+    return true;
+}
+
+std::vector<std::string> router_pool_slots(const std::vector<std::string> & all, const std::function<bool(const std::string &)> & usable,
+                                           const std::set<std::string> & taken) {
+    std::vector<std::string> out;
+    for (const auto & s : all) {
+        if (taken.count(s) == 0 && (!usable || usable(s))) {
+            out.push_back(s);
+        }
+    }
+    return out;
+}
+
+router_replica_choice router_replica_choose(const std::vector<router_replica_state> & states, bool can_add) {
+    router_replica_choice c;
+    int  least   = -1;
+    int  loading = -1;
+    int  down    = -1;
+    for (size_t i = 0; i < states.size(); ++i) {
+        const auto & s = states[i];
+        if (s.status == ROUTER_REPLICA_READY) {
+            if (least < 0 || s.inflight < states[least].inflight) {
+                least = (int) i;
+            }
+        } else if (s.status == ROUTER_REPLICA_LOADING) {
+            loading = loading < 0 ? (int) i : loading;
+        } else {
+            down = down < 0 ? (int) i : down;
+        }
+    }
+    if (least >= 0) {
+        c.use = least;
+        if (states[least].inflight > 0 && loading < 0) {
+            if (down >= 0) {
+                c.grow = down;
+            } else if (can_add) {
+                c.grow_new = true;
+            }
+        }
+        return c;
+    }
+    if (loading >= 0) {
+        c.use = loading;
+    } else if (down >= 0) {
+        c.use = down;
+    } else if (can_add) {
+        c.use_new = true;
+    }
+    return c;
 }
