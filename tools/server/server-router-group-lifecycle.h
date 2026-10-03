@@ -80,6 +80,7 @@ struct router_launch {
 // that needs expansion ($, `, globs, leading ~) is run as `/bin/sh -c "exec <command>"`, so the
 // tracked PID is still the worker's. Pipes, lists, redirections, subshells and comments are
 // refused: the router must own the worker's PID and read its output.
+// Without the shell the command must be an absolute path: PATH is never searched.
 // Returns "" on success, else the reason.
 std::string router_parse_launch(const std::string & launch, router_launch & out);
 

@@ -2502,7 +2502,7 @@ void server_models::unload_lru() {
 // Per-model `env` from the preset, applied OVER the environment the router inherited. Entries
 // REPLACE any existing definition rather than being appended: duplicate KEY= entries in envp
 // resolve inconsistently across libc getenv implementations.
-static void apply_env_overrides(std::vector<std::string> & env, const std::vector<std::string> & overrides, const std::string & name) {
+static void apply_env_overrides(std::vector<std::string> & env, const std::vector<std::string> & overrides, const std::string & name, bool verbose = true) {
     for (const auto & override_entry : overrides) {
         const bool remove = override_entry[0] == '-';
         const std::string key = remove
@@ -2515,8 +2515,10 @@ static void apply_env_overrides(std::vector<std::string> & env, const std::vecto
         if (!remove) {
             env.push_back(override_entry);
         }
-        SRV_INF("model '%s': env %s%s\n", name.c_str(),
-                remove ? "unset " : "", remove ? key.c_str() : override_entry.c_str());
+        if (verbose) {
+            SRV_INF("model '%s': env %s%s\n", name.c_str(),
+                    remove ? "unset " : "", remove ? key.c_str() : override_entry.c_str());
+        }
     }
 }
 
@@ -2544,8 +2546,20 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (!has_model(name)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        if (auto m = get_meta(name); m.has_value() && !router_model_requestable(m->kind)) {
+        auto m = get_meta(name);
+        if (m.has_value() && !router_model_requestable(m->kind)) {
             throw std::runtime_error("model name=" + name + " is not found");
+        }
+        // Refuse a load whose child env is bad before anything is evicted, in any mode (the
+        // LRU eviction just below runs before placement). Checked again, final, further down.
+        if (m.has_value()) {
+            std::vector<std::string> env = base_env;
+            apply_env_overrides(env, m->env_overrides, name, /*verbose=*/false);
+            check_temp_dirs(env, name);
+            if (opts.mode == SERVER_CHILD_MODE_NORMAL && !m->depends.empty()) {
+                std::lock_guard<std::mutex> l(mutex);
+                prepare_group_locked(name, *m, /*verbose=*/false);
+            }
         }
         if (!gpu_placement_enabled) {
             unload_lru();
@@ -2644,6 +2658,32 @@ void server_models::load(const std::string & name, const load_options & opts) {
     auto rollback_load_attempt = [&](void *) {
         if (!lk.owns_lock()) {
             lk.lock();
+        }
+        if (group_started) {
+            // The workers are up and only being asked to stop (up to quiesce + grace). The spine
+            // must keep counting as running -- holding its reservation, marked stopping -- until
+            // they are gone, or an evictor waiting on it would load onto VRAM/RAM the workers
+            // still hold. on_group_stopped() makes the final mark and credits, as on unload.
+            auto it = mapping.find(name);
+            if (it != mapping.end()) {
+                if (placement_reserved) {
+                    it->second.meta.placement = meta.placement; // credited by on_group_stopped()
+                    placement_reserved = false;
+                }
+                auto g = groups.find(name);
+                if (g != groups.end() && !stopping_models.count(name)) {
+                    // not a cancel: the spine itself could not be started
+                    g->second.failed = true;
+                    if (g->second.reason.empty()) {
+                        g->second.reason = "the spine of model group '" + name + "' failed to start";
+                    }
+                }
+                stopping_models.insert(name);
+            }
+            marked_loading = false; // the spine stays LOADING + stopping until its workers exit
+            rollback_group();
+            cv.notify_all();
+            return;
         }
         rollback_group();
         rollback_gpu_reservation();
@@ -2948,7 +2988,7 @@ static bool router_machine_is_local(const std::string & machine) {
     return false;
 }
 
-std::vector<router_worker_spec> server_models::prepare_group_locked(const std::string & name, const server_model_meta & spine_meta) {
+std::vector<router_worker_spec> server_models::prepare_group_locked(const std::string & name, const server_model_meta & spine_meta, bool verbose) {
     std::vector<router_worker_spec> specs;
     for (const auto & dep : spine_meta.depends) {
         auto it = mapping.find(dep);
@@ -2970,7 +3010,7 @@ std::vector<router_worker_spec> server_models::prepare_group_locked(const std::s
         spec.name = dep;
         spec.argv = launch.argv;
         std::vector<std::string> env = base_env; // carries LLAMA_ROUTER_GEN / LLAMA_ROUTER_PID
-        apply_env_overrides(env, w.env_overrides, dep);
+        apply_env_overrides(env, w.env_overrides, dep, verbose);
         spec.env = router_worker_env(std::move(env), launch.env, w.park_file, router_gen);
         check_temp_dirs(spec.env, dep);
 
@@ -3004,7 +3044,8 @@ json server_models::group_status_json_locked(const std::string & spine) const {
     } else if (meta.status == SERVER_MODEL_STATUS_LOADING) {
         status = stopping ? "stopping" : "loading";
     } else {
-        status = rt != groups.end() && rt->second.failed ? "failed" : "unloaded";
+        // a spine that crashed on its own (healthy workers) is a failed group too
+        status = (rt != groups.end() && rt->second.failed) || meta.is_failed() ? "failed" : "unloaded";
     }
     json workers = json::array();
     if (rt != groups.end() && rt->second.workers) {
@@ -3041,6 +3082,13 @@ void server_models::on_group_worker_exit(const std::string & spine, const router
     if (rt == groups.end() || rt->second.workers.get() != g || rt->second.stop_done) {
         return; // a group that is already gone
     }
+    // The group thread decides "unexpected" before it calls back, unlocked: an unload may have
+    // started in between. A group already on its way down is not failed by a worker that exits.
+    if (stopping_models.count(spine) || rt->second.pending_exit.has_value()) {
+        set_worker_status_locked(worker, SERVER_MODEL_STATUS_UNLOADED, exit_code);
+        maybe_finish_drain_locked(spine, true); // no point draining a group that lost a worker
+        return;
+    }
     rt->second.failed = true;
     if (rt->second.reason.empty()) {
         rt->second.reason = reason;
@@ -3048,10 +3096,6 @@ void server_models::on_group_worker_exit(const std::string & spine, const router
     set_worker_status_locked(worker, SERVER_MODEL_STATUS_UNLOADED, exit_code == 0 ? 1 : exit_code);
     auto it = mapping.find(spine);
     if (it == mapping.end() || !it->second.meta.is_running()) {
-        return;
-    }
-    if (stopping_models.count(spine)) {
-        maybe_finish_drain_locked(spine, true); // no point draining a group that lost a worker
         return;
     }
     SRV_ERR("group %s failed (%s); stopping its spine, the next request reloads the whole group\n",

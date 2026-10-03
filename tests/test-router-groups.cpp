@@ -130,6 +130,18 @@ int main() {
         assert(err.find("'w'") != std::string::npos && err.find("launch") != std::string::npos);
     }
 
+    // a launch that is not an absolute path (PATH is never searched) fails naming the section
+    {
+        const std::string err = resolve_error("[w]\nkind = external\nlaunch = expert-worker --port 9001\n");
+        assert(err.find("'w'") != std::string::npos && err.find("absolute path") != std::string::npos);
+    }
+
+    // a launch that is not a single command fails naming the section
+    {
+        const std::string err = resolve_error("[w]\nkind = external\nlaunch = /bin/worker > /tmp/log\n");
+        assert(err.find("'w'") != std::string::npos && err.find("launch") != std::string::npos);
+    }
+
     // bad enum values fail naming the section
     {
         const std::string path = "test-router-groups-tmp2.ini";

@@ -1,4 +1,5 @@
 #include "server-router-groups.h"
+#include "server-router-group-lifecycle.h"
 
 #include "common.h"
 #include "preset.h"
@@ -98,6 +99,11 @@ std::map<std::string, std::string> router_groups_resolve(const std::vector<route
             if (!s.depends.empty()) {
                 throw std::runtime_error(string_format(
                     "preset '%s': kind=external sections cannot have 'depends'", s.name.c_str()));
+            }
+            router_launch launch;
+            const std::string err = router_parse_launch(s.launch, launch);
+            if (!err.empty()) {
+                throw std::runtime_error(string_format("preset '%s': launch: %s", s.name.c_str(), err.c_str()));
             }
             continue;
         }

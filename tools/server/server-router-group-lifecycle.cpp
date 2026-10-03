@@ -216,6 +216,11 @@ std::string router_parse_launch(const std::string & launch, router_launch & out)
         // exec: the shell becomes the worker, so the PID the router tracks and signals is the worker's
         out.argv = { "/bin/sh", "-c", "exec " + launch.substr(words[first].start) };
     } else {
+        // no PATH search: the router's PATH is not the worker's, and a bare name would run
+        // whatever comes first there
+        if (out.words[0].empty() || out.words[0][0] != '/') {
+            return "command '" + out.words[0] + "' must be an absolute path (the router does not search PATH)";
+        }
         out.argv = out.words;
     }
     return "";
@@ -429,7 +434,28 @@ static long long status_field(const std::string & status, const char * key) {
     return -1;
 }
 
-std::vector<int> router_find_stale_children(const std::string & root, const std::string & gen, unsigned uid, int self_pid) {
+// LLAMA_ROUTER_GEN / LLAMA_ROUTER_PID out of a NUL-separated environ blob
+static void parse_router_environ(const std::string & environ_text, std::string & gen, long long & router_pid) {
+    const std::string gen_prefix = std::string(ROUTER_ENV_GEN) + "=";
+    const std::string pid_prefix = std::string(ROUTER_ENV_ROUTER_PID) + "=";
+    size_t start = 0;
+    while (start < environ_text.size()) {
+        size_t end = environ_text.find('\0', start);
+        if (end == std::string::npos) {
+            end = environ_text.size();
+        }
+        const std::string kv = environ_text.substr(start, end - start);
+        if (kv.compare(0, gen_prefix.size(), gen_prefix) == 0) {
+            gen = kv.substr(gen_prefix.size());
+        } else if (kv.compare(0, pid_prefix.size(), pid_prefix) == 0) {
+            router_pid = std::atoll(kv.c_str() + pid_prefix.size());
+        }
+        start = end + 1;
+    }
+}
+
+// router_find_stale_children(), with the generation each one carried
+static std::vector<std::pair<int, std::string>> find_stale(const std::string & root, const std::string & gen, unsigned uid, int self_pid) {
     struct entry_t {
         long long   ppid = -1;
         long long   uid  = -1;
@@ -461,27 +487,12 @@ std::vector<int> router_find_stale_children(const std::string & root, const std:
         std::string environ_text;
         if (read_whole_file((de.path() / "environ").string(), environ_text)) {
             e.has_env = true;
-            size_t start = 0;
-            while (start < environ_text.size()) {
-                size_t end = environ_text.find('\0', start);
-                if (end == std::string::npos) {
-                    end = environ_text.size();
-                }
-                const std::string kv = environ_text.substr(start, end - start);
-                const std::string gen_prefix = std::string(ROUTER_ENV_GEN) + "=";
-                const std::string pid_prefix = std::string(ROUTER_ENV_ROUTER_PID) + "=";
-                if (kv.compare(0, gen_prefix.size(), gen_prefix) == 0) {
-                    e.gen = kv.substr(gen_prefix.size());
-                } else if (kv.compare(0, pid_prefix.size(), pid_prefix) == 0) {
-                    e.router_pid = std::atoll(kv.c_str() + pid_prefix.size());
-                }
-                start = end + 1;
-            }
+            parse_router_environ(environ_text, e.gen, e.router_pid);
         }
         procs[pid] = std::move(e);
     }
 
-    std::vector<int> stale;
+    std::vector<std::pair<int, std::string>> stale;
     for (const auto & [pid, e] : procs) {
         if (pid == self_pid || !e.has_env || e.gen.empty() || e.gen == gen || e.uid != (long long) uid) {
             continue;
@@ -504,10 +515,18 @@ std::vector<int> router_find_stale_children(const std::string & root, const std:
             }
         }
         if (!owned_by_live_router) {
-            stale.push_back(pid);
+            stale.emplace_back(pid, e.gen);
         }
     }
     return stale;
+}
+
+std::vector<int> router_find_stale_children(const std::string & root, const std::string & gen, unsigned uid, int self_pid) {
+    std::vector<int> out;
+    for (const auto & [pid, _] : find_stale(root, gen, uid, self_pid)) {
+        out.push_back(pid);
+    }
+    return out;
 }
 
 #ifndef _WIN32
@@ -527,7 +546,11 @@ static bool real_pid_alive(int pid) {
 #endif
 
 std::vector<int> router_sweep_stale_children(const std::string & root, const std::string & gen, unsigned uid, int self_pid, int64_t grace_ms) {
-    std::vector<int> victims = router_find_stale_children(root, gen, uid, self_pid);
+    const std::vector<std::pair<int, std::string>> stale = find_stale(root, gen, uid, self_pid);
+    std::vector<int> victims;
+    for (const auto & [pid, _] : stale) {
+        victims.push_back(pid);
+    }
 #ifndef _WIN32
     if (victims.empty()) {
         return victims;
@@ -536,6 +559,8 @@ std::vector<int> router_sweep_stale_children(const std::string & root, const std
         LOG_WRN("router: stopping pid %d left behind by a previous router generation (SIGTERM)\n", pid);
         kill(pid, SIGTERM);
     }
+    LOG_WRN("router: sweeping %zu stale router children, waiting up to %" PRId64 " ms for them to exit\n",
+            victims.size(), grace_ms);
     const int64_t deadline = now_ms() + grace_ms;
     while (now_ms() < deadline) {
         if (std::none_of(victims.begin(), victims.end(), real_pid_alive)) {
@@ -543,11 +568,23 @@ std::vector<int> router_sweep_stale_children(const std::string & root, const std
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    for (int pid : victims) {
-        if (real_pid_alive(pid)) {
-            LOG_WRN("router: pid %d ignored SIGTERM for %" PRId64 " ms, sending SIGKILL\n", pid, grace_ms);
-            kill(pid, SIGKILL);
+    for (const auto & [pid, stale_gen] : stale) {
+        if (!real_pid_alive(pid)) {
+            continue;
         }
+        // the PID may have been reused during the wait: KILL only the same stale child
+        std::string environ_text;
+        std::string now_gen;
+        long long   now_router_pid = 0;
+        if (read_whole_file("/proc/" + std::to_string(pid) + "/environ", environ_text)) {
+            parse_router_environ(environ_text, now_gen, now_router_pid);
+        }
+        if (now_gen != stale_gen) {
+            LOG_WRN("router: pid %d no longer carries the stale generation, leaving it alone\n", pid);
+            continue;
+        }
+        LOG_WRN("router: pid %d ignored SIGTERM for %" PRId64 " ms, sending SIGKILL\n", pid, grace_ms);
+        kill(pid, SIGKILL);
     }
 #endif
     return victims;
@@ -824,8 +861,8 @@ bool router_worker_group::start(std::string & err, const std::function<bool()> &
         for (const auto & a : m.spec.argv) {
             LOG_INF("  %s\n", a.c_str());
         }
-        const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr |
-                            subprocess_option_search_user_path;
+        // argv[0] is absolute (router_parse_launch), so no PATH search
+        const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
         if (!proc->sproc.create(m.spec.argv, options, m.spec.env)) {
             err = string_format("worker '%s': failed to spawn '%s'", m.spec.name.c_str(),
                                 m.spec.argv.empty() ? "" : m.spec.argv[0].c_str());

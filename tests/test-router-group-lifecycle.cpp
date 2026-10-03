@@ -93,6 +93,12 @@ static void test_launch() {
     assert(!router_parse_launch("/bin/a; /bin/b", l).empty());
     assert(!router_parse_launch("/bin/w 'unterminated", l).empty());
     assert(!router_parse_launch("A=1", l).empty());
+    // without the shell the command must be absolute: PATH is never searched
+    {
+        const std::string err = router_parse_launch("llama-wp-expert-worker --listen 0.0.0.0:8801", l);
+        assert(has(err, "absolute path"));
+        assert(!router_parse_launch("./llama-wp-expert-worker --listen 0.0.0.0:8801", l).empty());
+    }
 
     // no port to be found
     assert(router_parse_launch("/bin/w --shard 0", l).empty());
@@ -193,7 +199,7 @@ static void spawn_sleep(common_subproc & proc, const std::vector<std::string> & 
     for (const auto & kv : extra_env) {
         router_env_set(env, kv.substr(0, kv.find('=')), kv.substr(kv.find('=') + 1));
     }
-    const bool ok = proc.create({ "sleep", "60" }, subprocess_option_search_user_path, env);
+    const bool ok = proc.create({ "/bin/sh", "-c", "exec sleep 60" }, 0, env);
     assert(ok);
 }
 
@@ -273,7 +279,8 @@ static router_worker_spec fake_spec(const std::string & name, const std::vector<
     router_worker_spec s;
     s.name = name;
     s.port = free_port();
-    s.argv = { "python3", "tests/router-fixtures/fake-worker.py", "--listen", "0.0.0.0:" + std::to_string(s.port) };
+    // absolute argv[0], as router_parse_launch() requires; env finds python3
+    s.argv = { "/usr/bin/env", "python3", "tests/router-fixtures/fake-worker.py", "--listen", "0.0.0.0:" + std::to_string(s.port) };
     std::vector<std::string> env;
     for (char ** e = environ; *e; e++) {
         env.emplace_back(*e);
@@ -478,7 +485,8 @@ static void test_group_start_failures() {
 }
 
 static bool have_python3() {
-    return std::system("python3 -c 'pass' >/dev/null 2>&1") == 0;
+    return fs::exists("/usr/bin/env") && fs::exists("tests/router-fixtures/fake-worker.py") &&
+           std::system("/usr/bin/env python3 -c 'pass' >/dev/null 2>&1") == 0;
 }
 
 #endif // !_WIN32

@@ -626,3 +626,174 @@ def test_router_delete_model():
     # Model should no longer appear in GET /models
     ids = _get_model_ids(is_reload=False)
     assert MODEL_DOWNLOAD_ID not in ids, f"{MODEL_DOWNLOAD_ID} still present after deletion"
+
+
+# model groups: one spine (a real model) + kind=external workers (the fake worker fixture).
+# Runs a model process: the controller runs this, not the implementer.
+
+FAKE_WORKER = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "tests", "router-fixtures", "fake-worker.py"))
+GROUP_SPINE = "group-spine"
+GROUP_WORKERS = ["group-w1", "group-w2"]
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _pid_gone(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            text = f.read()
+    except OSError:
+        return True
+    return text[text.rfind(")") + 2] == "Z"
+
+
+def _group_entry() -> dict:
+    res = server.make_request("GET", "/models")
+    assert res.status_code == 200
+    for item in res.body.get("data", []):
+        if item.get("id") == GROUP_SPINE:
+            return item
+    raise AssertionError(f"{GROUP_SPINE} not in /models")
+
+
+def _wait_group(predicate, timeout: float, what: str) -> dict:
+    deadline = time.time() + timeout
+    entry = None
+    while time.time() < deadline:
+        entry = _group_entry()
+        if predicate(entry):
+            return entry
+        time.sleep(0.1)
+    raise AssertionError(f"timed out waiting for {what}; last entry: {entry}")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="model groups are POSIX/Linux only")
+@pytest.mark.skipif(not os.path.exists(FAKE_WORKER), reason="fake worker fixture missing")
+@pytest.mark.skipif(not sys.executable or not os.path.isabs(sys.executable), reason="no absolute python3 for the fake worker")
+def test_router_model_group_lifecycle():
+    import shlex
+    import signal
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_group.ini")
+    park_dir = os.path.join(TMP_DIR, "group-park")
+    os.makedirs(park_dir, exist_ok=True)
+    listen_delay_ms = 1500
+    ports = {w: _free_port() for w in GROUP_WORKERS}
+    lines = [
+        f"[{GROUP_SPINE}]",
+        "hf-repo = ggml-org/test-model-stories260K",
+        f"depends = {','.join(GROUP_WORKERS)}",
+        "startup-timeout = 60",
+        "",
+    ]
+    for w in GROUP_WORKERS:
+        launch = " ".join(shlex.quote(a) for a in [sys.executable, FAKE_WORKER, "--listen", f"127.0.0.1:{ports[w]}"])
+        lines += [
+            f"[{w}]",
+            "kind = external",
+            f"launch = {launch}",
+            f"park-file = {os.path.join(park_dir, w + '.park')}",
+            f"env = FAKE_WORKER_LISTEN_DELAY_MS={listen_delay_ms}",
+            "",
+        ]
+    with open(preset_path, "w") as f:
+        f.write("\n".join(lines))
+
+    server.models_preset = preset_path
+    server.start()
+    try:
+        # workers are not requestable models: not in the OAI listing
+        res = server.make_request("GET", "/v1/models")
+        oai_ids = {m["id"] for m in res.body.get("data", [])}
+        assert GROUP_SPINE in oai_ids and not (set(GROUP_WORKERS) & oai_ids)
+
+        # load: watch from a second thread that the spine is never loaded before every worker is ready
+        seen_bad_order = []
+        seen_starting = []
+        stop_watch = threading.Event()
+
+        def watch():
+            while not stop_watch.is_set():
+                try:
+                    e = _group_entry()
+                except Exception:
+                    continue
+                g = e["status"].get("group") or {}
+                states = [w.get("state") for w in g.get("workers", [])]
+                if "starting" in states:
+                    seen_starting.append(e["status"]["value"])
+                if e["status"]["value"] == "loaded" and any(s != "ready" for s in states):
+                    seen_bad_order.append(states)
+                time.sleep(0.05)
+
+        watcher = threading.Thread(target=watch)
+        watcher.start()
+        t0 = time.time()
+        load_res = server.make_request("POST", "/models/load", data={"model": GROUP_SPINE}, timeout=180)
+        load_returned = time.time()
+        assert load_res.status_code == 200, load_res.body
+        # load() returns only after every worker accepted TCP (and then spawns the spine)
+        assert load_returned - t0 >= listen_delay_ms / 1000.0
+        entry = _wait_group(lambda e: e["status"]["value"] == "loaded", 180, "spine loaded")
+        stop_watch.set()
+        watcher.join()
+        assert not seen_bad_order, f"spine loaded while a worker was not ready: {seen_bad_order}"
+        assert seen_starting and all(v == "loading" for v in seen_starting), seen_starting
+
+        group = entry["status"]["group"]
+        assert group["status"] == "ready"
+        assert [w["name"] for w in group["workers"]] == GROUP_WORKERS
+        for w in group["workers"]:
+            assert w["state"] == "ready" and w["pid"] > 0 and w["port"] == ports[w["name"]]
+            assert w["stop_snapshot"] == "none"
+        first_pids = [w["pid"] for w in group["workers"]]
+
+        # unload: spine, then every worker (TERM -> stop snapshot written); no process left
+        unload_res = server.make_request("POST", "/models/unload", data={"model": GROUP_SPINE})
+        assert unload_res.status_code == 200
+        entry = _wait_group(lambda e: e["status"]["value"] == "unloaded", 120, "group unloaded")
+        group = entry["status"]["group"]
+        assert group["status"] == "unloaded"
+        for w in group["workers"]:
+            assert w["state"] == "exited" and w["exit_code"] == 0 and not w["killed"]
+            assert w["stop_snapshot"] == "written"
+            assert w["stop_snapshot_detail"].startswith(os.path.join(park_dir, w["name"] + ".park"))
+        for pid in first_pids:
+            assert _pid_gone(pid), f"worker pid {pid} still running after unload"
+
+        # reload, then kill a worker while ready: spine stopped, group failed
+        _load_model_and_wait(GROUP_SPINE, timeout=180)
+        group = _group_entry()["status"]["group"]
+        assert group["status"] == "ready"
+        victim = group["workers"][0]
+        os.kill(victim["pid"], signal.SIGKILL)
+        entry = _wait_group(lambda e: e["status"]["value"] == "unloaded", 120, "spine stopped after worker death")
+        assert entry["status"].get("failed") is True
+        group = entry["status"]["group"]
+        assert group["status"] == "failed"
+        assert victim["name"] in group.get("reason", "")
+        for w in group["workers"]:
+            assert w["state"] == "exited"
+            assert _pid_gone(w["pid"])
+
+        # the next request reloads the whole group
+        res = server.make_request("POST", "/tokenize", data={"model": GROUP_SPINE, "content": "hello"}, timeout=180)
+        assert res.status_code == 200, res.body
+        group = _group_entry()["status"]["group"]
+        assert group["status"] == "ready"
+        new_pids = [w["pid"] for w in group["workers"]]
+        assert all(p > 0 for p in new_pids) and victim["pid"] not in new_pids
+    finally:
+        try:
+            server.make_request("POST", "/models/unload", data={"model": GROUP_SPINE})
+            _wait_group(lambda e: e["status"]["value"] == "unloaded", 120, "final unload")
+        except Exception:
+            pass
+        os.remove(preset_path)

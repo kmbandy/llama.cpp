@@ -57,7 +57,7 @@ router_group_section router_group_parse_section(const common_preset & preset, co
 
 // Validates all sections together and returns worker name -> spine name. Throws
 // std::runtime_error naming the offending section when: a kind=external section has no
-// launch, `depends` names a missing section or one that is not kind=external, a worker is
+// launch or one router_parse_launch() refuses (e.g. not an absolute path), `depends` names a missing section or one that is not kind=external, a worker is
 // referenced by two groups (or twice by one), or an external itself declares depends.
 std::map<std::string, std::string> router_groups_resolve(const std::vector<router_group_section> & sections);
 

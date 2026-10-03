@@ -353,7 +353,7 @@ private:
     bool same_group_locked(const std::string & a, const std::string & b) const;
     // an eviction candidate as the policy sees it: a worker stands for its whole group
     evict_resident group_resident_locked(const std::string & name) const;
-    std::vector<router_worker_spec> prepare_group_locked(const std::string & name, const server_model_meta & spine_meta);
+    std::vector<router_worker_spec> prepare_group_locked(const std::string & name, const server_model_meta & spine_meta, bool verbose = true);
     json group_status_json_locked(const std::string & spine) const;
     void set_worker_status_locked(const std::string & worker, server_model_status status, int exit_code = 0);
     void maybe_finish_drain_locked(const std::string & name, bool force);
