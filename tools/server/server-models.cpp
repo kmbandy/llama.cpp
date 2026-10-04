@@ -4388,6 +4388,13 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
             load_attempt_guard.reset();
             throw std::runtime_error("failed to spawn server instance: " + bad);
         }
+        if (remote) {
+            // belt and braces: the on_spawn watch hook records this too, but the address must never
+            // depend on it alone (a remote child proxied on port 0 was exactly that)
+            it->second.meta.port = spawned.port;
+            it->second.meta.host = node->host();
+        }
+        child->pid.store(spawned.pid); // stop_child_locked / kill no-op while pid is 0 (BUG 2)
         load_attempt_guard.release();
         group_started.reset(); // the spine's exit now drives the workers' stop (on_child_exit)
         if (stopping_models.count(name) || shutting_down) {

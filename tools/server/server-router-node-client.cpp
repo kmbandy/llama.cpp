@@ -515,7 +515,7 @@ node_child_info router_node_link::spawn_once(const node_spawn_request & req, con
             throw server_node_error(409, "a child named '" + req.name + "' is still running on " + machine_label(cfg.machine));
         }
         e->id = next_watch_id++;
-        e->w  = std::move(w);
+        e->w  = w; // a copy: `w` is still needed below for on_spawn (a moved-from std::function is empty)
         watches[req.name] = e;
     }
     auto drop = [&]() {
