@@ -2087,7 +2087,7 @@ public:
     }
 
     // CPU-tier cold-miss attribution string (pool snapshot at record time).
-    void set_miss_attr(std::string v) { miss_attr_ = std::move(v); }
+    void set_pagein_attr(std::string v) { pagein_attr_ = std::move(v); }
 
     // Host arena snapshot, taken at record time: predicted hints landed as
     // speculative entries, resident/pinned bytes, and LRU evictions.
@@ -2528,7 +2528,7 @@ private:
                   << " n_pf_used=" << n_pf_used_
                   << " n_pf_stale_dropped=" << n_pf_stale_dropped_
                   << " n_pf_yield=" << n_pf_yield_
-                  << (miss_attr_.empty() ? std::string() : " " + miss_attr_)
+                  << (pagein_attr_.empty() ? std::string() : " " + pagein_attr_)
                   << " n_batch_mmid_fallback=" << n_batch_mmid_fallback_
                   << " n_batch_mmid_ineligible=" << n_batch_mmid_ineligible_
                   << " n_batch_mmid_arena_bytes=" << n_batch_mmid_arena_bytes_
@@ -2715,7 +2715,7 @@ private:
     uint64_t          n_pf_used_ = 0;
     uint64_t          n_pf_stale_dropped_ = 0;
     uint64_t          n_pf_yield_ = 0;
-    std::string       miss_attr_;
+    std::string       pagein_attr_;
     uint64_t          n_batch_mmid_fallback_ = 0;
     uint64_t          n_batch_mmid_ineligible_ = 0;
     uint64_t          n_batch_mmid_arena_bytes_ = 0;
@@ -5204,15 +5204,15 @@ public:
             attr_state_[i].store(kAttrNone, std::memory_order_relaxed);
             attr_done_[i].store(0, std::memory_order_relaxed);
         }
-        for (auto & c : attr_miss_)      { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_pagein_)      { c.store(0, std::memory_order_relaxed); }
         for (auto & c : attr_read_pct_)  { c.store(0, std::memory_order_relaxed); }
-        for (auto & c : attr_lead_miss_) { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_lead_pagein_) { c.store(0, std::memory_order_relaxed); }
         for (auto & c : attr_lead_hit_)  { c.store(0, std::memory_order_relaxed); }
         for (auto & k : attr_kind_ns_) {
             k = std::make_unique<std::atomic<int64_t>[]>(track_n_);
             for (size_t i = 0; i < track_n_; ++i) { k[i].store(0, std::memory_order_relaxed); }
         }
-        for (auto & c : attr_miss_dec_)        { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_pagein_dec_)        { c.store(0, std::memory_order_relaxed); }
         for (auto & c : attr_never_split_)     { c.store(0, std::memory_order_relaxed); }
         for (auto & c : attr_never_split_dec_) { c.store(0, std::memory_order_relaxed); }
         for (auto & c : attr_hint_kinds_)      { c.store(0, std::memory_order_relaxed); }
@@ -8106,7 +8106,7 @@ private:
                 hp.ram_hit = true;
                 return hp;
             }
-            if (first_try) { attr_note_miss(page, rows); first_try = false; }
+            if (first_try) { attr_note_pagein(page, rows); first_try = false; }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -8153,7 +8153,7 @@ private:
                 hp.ram_hit = true;
                 return true;
             }
-            if (first_try) { attr_note_miss(page, rows); first_try = false; }
+            if (first_try) { attr_note_pagein(page, rows); first_try = false; }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -10477,9 +10477,9 @@ private:
     std::unique_ptr<std::atomic<int64_t>[]>  attr_hint_ns_;
     std::unique_ptr<std::atomic<uint8_t>[]>  attr_state_;
     std::unique_ptr<std::atomic<uint32_t>[]> attr_done_;
-    std::atomic<uint64_t> attr_miss_[kAttrBuckets];
+    std::atomic<uint64_t> attr_pagein_[kAttrBuckets];
     std::atomic<uint64_t> attr_read_pct_[4];            // % complete of in-flight pf at demand
-    std::atomic<uint64_t> attr_lead_miss_[kAttrLeadBins];
+    std::atomic<uint64_t> attr_lead_pagein_[kAttrLeadBins];
     std::atomic<uint64_t> attr_lead_hit_[kAttrLeadBins];
 
     // ---- phase split + all-kinds hint stamps (added on top of the above) ----
@@ -10497,12 +10497,12 @@ private:
     // other-kind only.
     enum : size_t { kNsNone = 0, kNsCertainOnly, kNsPredNoHost, kNsOtherKind, kNsBuckets };
     std::unique_ptr<std::atomic<int64_t>[]> attr_kind_ns_[kKinds];
-    std::atomic<uint64_t> attr_miss_dec_[kAttrBuckets];
+    std::atomic<uint64_t> attr_pagein_dec_[kAttrBuckets];
     std::atomic<uint64_t> attr_never_split_[kNsBuckets];
     std::atomic<uint64_t> attr_never_split_dec_[kNsBuckets];
     std::atomic<uint64_t> attr_hint_kinds_[2 * kKinds];   // [0..2] overall, [3..5] while decode
-    std::atomic<uint64_t> attr_demand_all_{0}, attr_miss_all_{0}, attr_req_all_{0};
-    std::atomic<uint64_t> attr_demand_dec_{0}, attr_miss_dec_n_{0}, attr_req_dec_{0};
+    std::atomic<uint64_t> attr_demand_all_{0}, attr_pagein_all_{0}, attr_req_all_{0};
+    std::atomic<uint64_t> attr_demand_dec_{0}, attr_pagein_dec_n_{0}, attr_req_dec_{0};
     std::atomic<uint32_t> attr_last_rows_{0};   // rows of the latest demand request (hint phase)
 
     static size_t attr_lead_bin(int64_t ns) {
@@ -10565,13 +10565,13 @@ public:
         }
     }
     // CPU-tier cold miss (first borrow failed): file under exactly one bucket.
-    void attr_note_miss(const ExpertPage & page, uint32_t rows) {
+    void attr_note_pagein(const ExpertPage & page, uint32_t rows) {
         const bool dec = rows <= kAttrDecRows;
         attr_demand_all_.fetch_add(1, std::memory_order_relaxed);
-        attr_miss_all_.fetch_add(1, std::memory_order_relaxed);
+        attr_pagein_all_.fetch_add(1, std::memory_order_relaxed);
         if (dec) {
             attr_demand_dec_.fetch_add(1, std::memory_order_relaxed);
-            attr_miss_dec_n_.fetch_add(1, std::memory_order_relaxed);
+            attr_pagein_dec_n_.fetch_add(1, std::memory_order_relaxed);
         }
         if (!tracked(page.cache_id)) { return; }
         const int64_t now = track_now_ns();
@@ -10600,10 +10600,10 @@ public:
                 case kAttrLanded:  b = kAttrEvicted;  break;
                 default:           b = kAttrOther;    break;
             }
-            attr_lead_miss_[attr_lead_bin(age)].fetch_add(1, std::memory_order_relaxed);
+            attr_lead_pagein_[attr_lead_bin(age)].fetch_add(1, std::memory_order_relaxed);
         }
-        attr_miss_[b].fetch_add(1, std::memory_order_relaxed);
-        if (dec) { attr_miss_dec_[b].fetch_add(1, std::memory_order_relaxed); }
+        attr_pagein_[b].fetch_add(1, std::memory_order_relaxed);
+        if (dec) { attr_pagein_dec_[b].fetch_add(1, std::memory_order_relaxed); }
         if (b == kAttrNever) {
             const size_t ns = live(kKindCertain) && !live(kKindPred) ? kNsCertainOnly
                             : live(kKindPred)                        ? kNsPredNoHost
@@ -10613,8 +10613,8 @@ public:
             if (dec) { attr_never_split_dec_[ns].fetch_add(1, std::memory_order_relaxed); }
         }
     }
-    // "miss_attr[..] miss_read_pct[..] lead_miss_ms[..] lead_hit_ms[..]"
-    std::string miss_attr_str() const {
+    // "pagein_attr[..] pagein_read_pct[..] lead_pagein_ms[..] lead_hit_ms[..]"
+    std::string pagein_attr_str() const {
         static const char * const lead_names[kAttrLeadBins] =
             { "<1", "1-2", "2-4", "4-8", "8-16", "16-32", "32-64", "64-128", ">=128" };
         static const char * const pct_names[4] = { "0-25", "25-50", "50-75", "75-100" };
@@ -10633,11 +10633,11 @@ public:
             }
             out += ']';
         };
-        hist("miss_attr", attr_miss_, kAttrBuckets, bucket_names);
+        hist("pagein_attr", attr_pagein_, kAttrBuckets, bucket_names);
         out += ' ';
-        hist("miss_read_pct", attr_read_pct_, 4, pct_names);
+        hist("pagein_read_pct", attr_read_pct_, 4, pct_names);
         out += ' ';
-        hist("lead_miss_ms", attr_lead_miss_, kAttrLeadBins, lead_names);
+        hist("lead_pagein_ms", attr_lead_pagein_, kAttrLeadBins, lead_names);
         out += ' ';
         hist("lead_hit_ms", attr_lead_hit_, kAttrLeadBins, lead_names);
         static const char * const ns_names[kNsBuckets] =
@@ -10645,25 +10645,25 @@ public:
         static const char * const kind_names[2 * kKinds] =
             { "certain", "pred", "other", "certain_dec", "pred_dec", "other_dec" };
         out += ' ';
-        hist("miss_never_split", attr_never_split_, kNsBuckets, ns_names);
+        hist("pagein_unhinted_split", attr_never_split_, kNsBuckets, ns_names);
         out += ' ';
-        hist("miss_attr_dec", attr_miss_dec_, kAttrBuckets, bucket_names);
+        hist("pagein_attr_dec", attr_pagein_dec_, kAttrBuckets, bucket_names);
         out += ' ';
-        hist("miss_never_split_dec", attr_never_split_dec_, kNsBuckets, ns_names);
+        hist("pagein_unhinted_split_dec", attr_never_split_dec_, kNsBuckets, ns_names);
         out += ' ';
         hist("hint_kinds", attr_hint_kinds_, 2 * kKinds, kind_names);
         std::snprintf(b, sizeof(b), " n_dec_demand=%llu",
                       (unsigned long long) attr_demand_dec_.load(std::memory_order_relaxed));
         out += b;
-        std::snprintf(b, sizeof(b), " n_dec_miss=%llu",
-                      (unsigned long long) attr_miss_dec_n_.load(std::memory_order_relaxed));
+        std::snprintf(b, sizeof(b), " n_dec_pagein=%llu",
+                      (unsigned long long) attr_pagein_dec_n_.load(std::memory_order_relaxed));
         out += b;
         std::snprintf(b, sizeof(b), " n_dec_req=%llu",
                       (unsigned long long) attr_req_dec_.load(std::memory_order_relaxed));
         out += b;
-        std::snprintf(b, sizeof(b), " n_cpu_demand=%llu n_cpu_miss=%llu n_cpu_req=%llu",
+        std::snprintf(b, sizeof(b), " n_cpu_demand=%llu n_cpu_pagein=%llu n_cpu_req=%llu",
                       (unsigned long long) attr_demand_all_.load(std::memory_order_relaxed),
-                      (unsigned long long) attr_miss_all_.load(std::memory_order_relaxed),
+                      (unsigned long long) attr_pagein_all_.load(std::memory_order_relaxed),
                       (unsigned long long) attr_req_all_.load(std::memory_order_relaxed));
         out += b;
         return out;
@@ -13287,7 +13287,7 @@ public:
                       (unsigned long long) pool_.pf_quar_evicted_unused(),
                       (unsigned long long) pool_.pf_quar_skipped_full());
         return std::string(buf) + split + pool_.host_outcome_by_dist() + "] " +
-               pool_.miss_attr_str();
+               pool_.pagein_attr_str();
     }
 
     // R -- GROUND TRUTH: the experts a dispatch actually asked for. Without this
@@ -14581,7 +14581,7 @@ public:
         stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
         stats_.set_pf_stats(pool_.pf_issued(), pool_.pf_landed(), pool_.pf_used(),
                             pool_.pf_stale_dropped(), pool_.pf_yield());
-        stats_.set_miss_attr(pool_.miss_attr_str());
+        stats_.set_pagein_attr(pool_.pagein_attr_str());
         {
             const wp::HostArena & arena = pool_.arena();
             stats_.set_ram_stats(pool_.host_landed(), (uint64_t) arena.resident_bytes(),
