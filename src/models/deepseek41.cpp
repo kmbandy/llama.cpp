@@ -758,6 +758,13 @@ void llama_model_deepseek41::graph::build_dspark_stages(const llama_model & mode
     const auto & last = model.layers[hparams.n_layer_all - 1];
     cur = build_norm(cur, last.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
+    // WP_HINT_TRACE DRAFT record: tap the post-shared_head_norm collapsed hidden (the exact
+    // vector multiplied by output.weight below) on layer-input slot 1. Slot 0 is the pre-norm
+    // tap above (WP_DRAFT_CAPTURE). Armed only by the speculative driver when tracing.
+    if (cparams.embeddings_layer_inp.size() > 1 && cparams.embeddings_layer_inp[1]) {
+        res->t_layer_inp[1] = cur;
+        ggml_build_forward_expand(gf, cur);
+    }
 
     ggml_tensor * out_ids = build_inp_out_ids();
     const int64_t nt = n_tokens;

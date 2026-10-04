@@ -1411,12 +1411,24 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
 //                   then for each dist index i, row r (row-major):
 //                   u16 ids[top_n] f32 score[top_n] f32 prob[top_n]
 //   type 3 FOOTER:  u64 dropped_pred u64 dropped_all
+//   type 4 DRAFT:   u32 step u32 n_slots u32 n_embd_h u32 flags
+//                   i32 token[n_slots] f32 conf[n_slots] i32 anchor
+//                   f32 hidden[n_slots][n_embd_h]          (n_embd_h may be 0)
+//                   flags bit0 = hidden present, bit1 = hidden is post-norm LM-head input,
+//                   bits 8..15 = draft seq id. One per DSpark draft call (per seq); `step` is
+//                   the step of the draft decode (its layer 40-42 ROUTING records share it).
+//                   The verify batch that consumes it is the next target decode: step+1.
+//   type 5 BATCH:   u32 step u32 n_rows i32 pos0 i32 token[n_rows]
+//                   input tokens of every decode call with <= 32 rows (target verify AND
+//                   draft decodes), keyed by the same step as ROUTING.
 // flags bit0 = decode batch (always set: prefill ubatches are not traced).
 // dist[i] = target_layer - src_layer; only targets with a registered router
 // are listed. 0xFFFF in ids = padding.
 static constexpr uint32_t TRACE_REC_ROUTING = 1;
 static constexpr uint32_t TRACE_REC_PRED    = 2;
 static constexpr uint32_t TRACE_REC_FOOTER  = 3;
+static constexpr uint32_t TRACE_REC_DRAFT   = 4;
+static constexpr uint32_t TRACE_REC_BATCH   = 5;
 static constexpr uint32_t TRACE_TOP_N       = 16;
 static constexpr int64_t  TRACE_MAX_ROWS    = 32;   // above this = prefill, not traced
 
@@ -1488,6 +1500,60 @@ void graph_dispatcher::trace_layer(int32_t layer, const std::vector<float> & act
     }
 }
 
+void graph_dispatcher::trace_batch(const int32_t * tokens, uint32_t n_rows, int32_t pos0) noexcept {
+    if (hint_trace_path() == nullptr || tokens == nullptr || n_rows == 0 || n_rows > (uint32_t) TRACE_MAX_ROWS) {
+        return;
+    }
+    try {
+        trace_job job;
+        job.kind   = TRACE_REC_BATCH;
+        job.step   = trace_step_.load(std::memory_order_relaxed);
+        job.n_rows = n_rows;
+        job.pos0   = pos0;
+        job.tokens.assign(tokens, tokens + n_rows);
+        trace_push_aux(std::move(job));
+    } catch (...) {
+    }
+}
+
+void graph_dispatcher::trace_draft(uint32_t n_slots, const int32_t * tokens, const float * conf, int32_t anchor,
+                                   const float * hidden, uint32_t n_embd_h, uint32_t flags) noexcept {
+    if (hint_trace_path() == nullptr || n_slots == 0 || tokens == nullptr || conf == nullptr) {
+        return;
+    }
+    try {
+        trace_job job;
+        job.kind   = TRACE_REC_DRAFT;
+        job.step   = trace_step_.load(std::memory_order_relaxed);
+        job.n_rows = n_slots;
+        job.anchor = anchor;
+        job.flags  = flags;
+        job.tokens.assign(tokens, tokens + n_slots);
+        job.conf.assign(conf, conf + n_slots);
+        if (hidden != nullptr && n_embd_h > 0) {
+            job.n_embd_h = n_embd_h;
+            job.hidden.assign(hidden, hidden + (size_t) n_slots * n_embd_h);
+        }
+        trace_push_aux(std::move(job));
+    } catch (...) {
+    }
+}
+
+void graph_dispatcher::trace_push_aux(trace_job && job) {
+    if (!trace_thread_started_.exchange(true)) {
+        trace_thread_ = std::thread([this] { trace_loop(); });
+    }
+    {
+        std::lock_guard<std::mutex> lock(trace_mutex_);
+        if (trace_queue_.size() >= 16 * 256) {
+            trace_dropped_all_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        trace_queue_.push_back(std::move(job));
+    }
+    trace_cv_.notify_one();
+}
+
 void graph_dispatcher::trace_loop() {
     FILE * fp = std::fopen(hint_trace_path(), "wb");
     if (fp == nullptr) {
@@ -1536,6 +1602,28 @@ void graph_dispatcher::trace_loop() {
             trace_queue_.pop_front();
         }
         try {
+            if (job.kind == TRACE_REC_BATCH) {
+                put_u32(TRACE_REC_BATCH);
+                put_u32((uint32_t) (3 * 4 + job.tokens.size() * 4));
+                put_u32(job.step);
+                put_u32(job.n_rows);
+                put_u32((uint32_t) job.pos0);
+                put(job.tokens.data(), job.tokens.size() * sizeof(int32_t));
+                continue;
+            }
+            if (job.kind == TRACE_REC_DRAFT) {
+                put_u32(TRACE_REC_DRAFT);
+                put_u32((uint32_t) (4 * 4 + job.tokens.size() * 4 + job.conf.size() * 4 + 4 + job.hidden.size() * 4));
+                put_u32(job.step);
+                put_u32(job.n_rows);
+                put_u32(job.n_embd_h);
+                put_u32(job.flags);
+                put(job.tokens.data(), job.tokens.size() * sizeof(int32_t));
+                put(job.conf.data(), job.conf.size() * sizeof(float));
+                put(&job.anchor, sizeof(int32_t));
+                put(job.hidden.data(), job.hidden.size() * sizeof(float));
+                continue;
+            }
             {
                 put_u32(TRACE_REC_ROUTING);
                 put_u32((uint32_t) (6 * 4 + job.ids.size() * 4 + job.gate.size() * 4));

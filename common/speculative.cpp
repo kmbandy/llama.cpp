@@ -1209,6 +1209,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<std::vector<float>> capture_embd;
     int32_t capture_n_embd = 0;
 
+    // WP_HINT_TRACE DRAFT records: layer-input slot 1 of ctx_dft carries the post-norm hidden
+    // that feeds the LM head (DS4.1 in-graph path only; see deepseek41.cpp build_dspark_stages).
+    bool trace_hidden = false;
+
     // WP_SPEC_PREDICT_PREV=0 turns the predicted half off and leaves only
     // id_last, which is ground truth. One binary, both arms, and it isolates
     // exactly the part that can be wrong.
@@ -1608,6 +1612,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         if (common_speculative_capture_enabled()) {
             llama_set_embeddings_layer_inp(ctx_dft, 0, true);
+        }
+        if (is_dspark && !services_mode && llama_hint_trace_enabled(this->params.ctx_tgt)) {
+            char arch[32] = { 0 };
+            if (llama_model_meta_val_str(model_dft, "general.architecture", arch, sizeof(arch)) >= 0 &&
+                std::strcmp(arch, "deepseek41") == 0) {
+                llama_set_embeddings_layer_inp(ctx_dft, 1, true);
+                trace_hidden = true;
+            }
         }
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
@@ -2251,6 +2263,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
+            // WP_HINT_TRACE: per-slot drafted token (-1 = not drafted) and raw confidence.
+            const bool trace_draft_rec = is_dspark && llama_hint_trace_enabled(this->params.ctx_tgt);
+            std::vector<int32_t> slot_tok;
+            std::vector<float>   slot_conf;
+            if (trace_draft_rec) {
+                slot_tok.assign((size_t) n_block_tokens, -1);
+                slot_conf.assign((size_t) n_block_tokens, 1.0f);
+            }
+
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
@@ -2333,6 +2354,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                if (trace_draft_rec && conf) {
+                    for (int32_t i = 0; i < n_block_tokens; ++i) {
+                        slot_conf[(size_t) i] = conf_row(beg + i);
+                    }
+                }
+
                 float prefix_prod = 1.0f;
 
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
@@ -2375,6 +2402,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                     draft_conf[seq_id].push_back(raw_conf);
+                    if (trace_draft_rec) {
+                        slot_tok[(size_t) i] = (int32_t) id;
+                    }
 
                     if (capture_n_embd > 0) {
                         const float * row = capture_rows + (size_t) idx * capture_n_embd;
@@ -2410,6 +2440,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         capture_embd[seq_id].insert(capture_embd[seq_id].end(), row, row + capture_n_embd);
                     }
                 }
+            }
+
+            if (trace_draft_rec) {
+                if (result.size() < (size_t) params.n_min) {
+                    std::fill(slot_tok.begin(), slot_tok.end(), -1);   // driver gets nothing
+                }
+                // Hidden = vector fed to the LM head: in-graph = layer-inp slot 1 (batch-row
+                // indexed, n_embd_dec wide); services mode = hidden_buf (token indexed).
+                const float * h_rows = nullptr;
+                uint32_t      h_flags = 0;
+                if (services_mode) {
+                    if (!hidden_buf.empty()) {
+                        h_rows = hidden_buf.data() + (size_t) beg * n_embd_dec;
+                        h_flags = 1u | 2u;
+                    }
+                } else if (trace_hidden) {
+                    const float * rows = llama_get_embeddings_layer_inp(ctx_dft, 1);
+                    if (rows != nullptr) {
+                        h_rows = rows + (size_t) beg * n_embd_dec;
+                        h_flags = 1u | 2u;
+                    }
+                }
+                llama_hint_trace_draft(this->params.ctx_tgt, (uint32_t) n_block_tokens, slot_tok.data(),
+                                       slot_conf.data(), dp.id_last, h_rows,
+                                       h_rows != nullptr ? (uint32_t) n_embd_dec : 0u,
+                                       h_flags | ((uint32_t) seq_id << 8));
             }
 
             if (result.size() < (size_t) params.n_min) {

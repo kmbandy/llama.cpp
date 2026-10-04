@@ -930,6 +930,30 @@ int llama_expert_prefetch_hint(struct llama_context * ctx,
     return ctx->expert_prefetch_hint(tokens, n_tokens, n_certain, conf);
 }
 
+bool llama_context::hint_trace_enabled() const {
+    return expert_dispatch != nullptr && pipe_expert_dispatcher::graph_dispatcher::hint_trace_enabled();
+}
+
+void llama_context::hint_trace_draft(uint32_t n_slots, const llama_token * tokens, const float * conf,
+                                     llama_token anchor, const float * hidden, uint32_t n_embd_h, uint32_t flags) {
+    if (!hint_trace_enabled()) {
+        return;
+    }
+    expert_dispatch->trace_draft(n_slots, (const int32_t *) tokens, conf, (int32_t) anchor, hidden, n_embd_h, flags);
+}
+
+bool llama_hint_trace_enabled(struct llama_context * ctx) {
+    return ctx != nullptr && ctx->hint_trace_enabled();
+}
+
+void llama_hint_trace_draft(struct llama_context * ctx, uint32_t n_slots, const llama_token * tokens,
+                            const float * conf, llama_token anchor, const float * hidden,
+                            uint32_t n_embd_h, uint32_t flags) {
+    if (ctx != nullptr) {
+        ctx->hint_trace_draft(n_slots, tokens, conf, anchor, hidden, n_embd_h, flags);
+    }
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -4727,6 +4751,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     uint32_t n_ubatches_tp = 0; // WP_TP_TRACE only; see tp_trace_decode() below
     // MAD-LAB: the decode scope uses the shared dispatcher when borrowed.
     expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch);
+    // WP_HINT_TRACE type 5 BATCH: input token ids of this decode call (<= 32 rows). Off = one branch.
+    if (expert_dispatch != nullptr && pipe_expert_dispatcher::graph_dispatcher::hint_trace_enabled() &&
+        batch_inp.token != nullptr) {
+        expert_dispatch->trace_batch((const int32_t *) batch_inp.token, (uint32_t) batch_inp.n_tokens,
+                                     batch_inp.pos != nullptr ? (int32_t) batch_inp.pos[0] : -1);
+    }
 
     auto prepare_ubatch = [&](const llama_ubatch & ubatch) -> int32_t {
 

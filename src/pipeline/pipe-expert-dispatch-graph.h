@@ -221,6 +221,16 @@ class graph_dispatcher {
     bool failed() const noexcept;
     std::string failure_message() const;
     void begin_decode() noexcept;
+    static bool hint_trace_enabled() noexcept { return hint_trace_path() != nullptr; }
+    // WP_HINT_TRACE type 4 DRAFT / type 5 BATCH (same queue and file as ROUTING,
+    // so record order is preserved). No-ops when WP_HINT_TRACE is unset. Never throw.
+    //   trace_batch: input tokens of one decode call (n_rows <= 32), tagged with
+    //                the current step; called from llama_context::decode.
+    //   trace_draft: one DSpark draft call (slot tokens/conf/hidden); hidden may
+    //                be nullptr (n_embd_h written as 0). tokens/conf are n_slots long.
+    void trace_batch(const int32_t * tokens, uint32_t n_rows, int32_t pos0) noexcept;
+    void trace_draft(uint32_t n_slots, const int32_t * tokens, const float * conf, int32_t anchor,
+                     const float * hidden, uint32_t n_embd_h, uint32_t flags) noexcept;
     void end_decode() noexcept;
     uint64_t decode_dispatch_ns() const noexcept { return decode_ns_total_; }
 
@@ -525,6 +535,7 @@ class graph_dispatcher {
     // WP_HINT_TRACE state. trace_step_ is bumped by begin_decode() (dispatch
     // thread, under io_mutex_) and read by trace_layer() on the same thread.
     struct trace_job {
+        uint32_t              kind     = 1;   // 1 ROUTING (+PRED), 4 DRAFT, 5 BATCH
         uint32_t              step     = 0;
         int32_t               layer    = -1;
         uint32_t              n_rows   = 0;
@@ -533,7 +544,17 @@ class graph_dispatcher {
         std::vector<int32_t>  ids;            // [n_rows][k]
         std::vector<float>    gate;           // [n_rows][k]
         std::vector<float>    activations;    // [n_rows][n_embd]; empty = routing only
+        // kind 4/5 only. DRAFT: n_rows = n_slots, tokens[n_slots], conf[n_slots], hidden[n_slots][n_embd_h].
+        // BATCH: n_rows, tokens[n_rows], pos0.
+        std::vector<int32_t>  tokens;
+        std::vector<float>    conf;
+        std::vector<float>    hidden;
+        uint32_t              n_embd_h = 0;
+        uint32_t              flags    = 0;
+        int32_t               anchor   = -1;
+        int32_t               pos0     = -1;
     };
+    void trace_push_aux(trace_job && job);
     std::mutex                                     trace_mutex_;
     std::condition_variable                        trace_cv_;
     std::deque<trace_job>                          trace_queue_;

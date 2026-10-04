@@ -339,6 +339,16 @@ LLAMA_API int llama_expert_prefetch_hint(struct llama_context * ctx,
                                          int n_certain,
                                          const float * conf);
 
+// WP_HINT_TRACE (type 4 DRAFT record): true iff tracing is on and ctx has an expert dispatcher.
+// llama_hint_trace_draft queues one DRAFT record on the trace thread (step = current decode
+// counter). tokens/conf are n_slots long (token -1 = slot not drafted); hidden is
+// [n_slots][n_embd_h] or nullptr. No-op when tracing is off. Call with the TARGET ctx.
+LLAMA_API bool llama_hint_trace_enabled(struct llama_context * ctx);
+LLAMA_API void llama_hint_trace_draft(struct llama_context * ctx, uint32_t n_slots,
+                                      const llama_token * tokens, const float * conf,
+                                      llama_token anchor, const float * hidden,
+                                      uint32_t n_embd_h, uint32_t flags);
+
 // Adaptive gate: when false, skip running the draft model this step (pool
 // already warm for hash-layer experts). Default adaptive ON; WP_DRAFT_ADAPTIVE=0
 // always returns true. No-op / true if paging disabled.

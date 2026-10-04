@@ -13,6 +13,12 @@ Format (little-endian):
     2 PRED:    u32 step i32 src_layer u32 n_rows u32 n_dist u32 top_n
                i32 dist[n_dist]; then [n_dist][n_rows]: u16 ids[top_n] f32 score[top_n] f32 prob[top_n]
     3 FOOTER:  u64 dropped_pred u64 dropped_all
+    4 DRAFT:   u32 step u32 n_slots u32 n_embd_h u32 flags; i32 token[n_slots] f32 conf[n_slots]
+               i32 anchor; f32 hidden[n_slots][n_embd_h]  (n_embd_h may be 0)
+               flags bit0 hidden present, bit1 hidden = post-norm LM-head input, bits8..15 seq id.
+               token -1 = slot not drafted. Slot i's token is verify row i+1 (row 0 = anchor).
+               `step` = the draft decode's step; its verify is the next target decode (step+1).
+    5 BATCH:   u32 step u32 n_rows i32 pos0 i32 token[n_rows]   (input tokens of each <=32-row decode)
   Row 0 = committed token, rows 1..n = drafted. dist = target_layer - src_layer.
   Only decode/verify ubatches (<= 32 rows) are traced; prefill is skipped.
   A step is one begin_decode() call (draft-model decodes, if they share the
@@ -34,6 +40,20 @@ class Trace:
         self.routing = {}   # (step, layer) -> dict(ids[n_rows,k] i32, gate[n_rows,k] f32, phantom u32)
         self.pred = {}      # (step, src_layer) -> dict(dist[n_dist], ids[n_dist,n_rows,top_n] u16, score, prob f32)
         self.dropped_pred = self.dropped_all = 0
+        self.draft = {}     # step -> dict(tokens[n_slots] i32, conf f32, anchor, hidden[n_slots,n_embd_h] f32|None, flags, seq)
+        self.draft_all = []  # every DRAFT record in file order (multi-seq: several per step)
+        self.batch = {}     # step -> dict(tokens[n_rows] i32, pos0)
+
+    def verify_step_of_draft(self, step):
+        """Step of the target verify batch that consumes the DRAFT record at `step`:
+        the first later step whose BATCH starts with the anchor token and has >1 rows.
+        Falls back to step+1."""
+        d = self.draft.get(step)
+        for s in range(step + 1, step + 8):
+            b = self.batch.get(s)
+            if b is not None and len(b["tokens"]) > 1 and d is not None and b["tokens"][0] == d["anchor"]:
+                return s
+        return step + 1
 
 
 def load(path):
@@ -80,6 +100,25 @@ def load(path):
             )
         elif rtype == 3:
             t.dropped_pred, t.dropped_all = struct.unpack_from("<QQ", buf, p)
+        elif rtype == 4:
+            step, n_slots, n_h, flags = struct.unpack_from("<IIII", buf, p)
+            p += 16
+            tok = np.frombuffer(buf, "<i4", n_slots, p)
+            conf = np.frombuffer(buf, "<f4", n_slots, p + 4 * n_slots)
+            p += 8 * n_slots
+            (anchor,) = struct.unpack_from("<i", buf, p)
+            p += 4
+            hid = None
+            if n_h > 0:
+                hid = np.frombuffer(buf, "<f4", n_slots * n_h, p).reshape(n_slots, n_h)
+            rec = dict(tokens=tok, conf=conf, anchor=anchor, hidden=hid, flags=flags, seq=(flags >> 8) & 0xFF)
+            t.draft_all.append((step, rec))
+            if step not in t.draft or rec["seq"] == 0:
+                t.draft[step] = rec
+        elif rtype == 5:
+            step, n_rows, pos0 = struct.unpack_from("<IIi", buf, p)
+            p += 12
+            t.batch[step] = dict(tokens=np.frombuffer(buf, "<i4", n_rows, p), pos0=pos0)
         pos += nbytes
     return t
 
@@ -119,7 +158,7 @@ def main():
     args = ap.parse_args()
     t = load(args.trace)
     print(f"n_expert={t.n_expert} trace_k={t.trace_k} routing_records={len(t.routing)} "
-          f"pred_records={len(t.pred)} dropped_pred={t.dropped_pred} dropped_all={t.dropped_all}")
+          f"pred_records={len(t.pred)} draft_records={len(t.draft_all)} batch_records={len(t.batch)} dropped_pred={t.dropped_pred} dropped_all={t.dropped_all}")
     for d in range(1, (args.max_d or t.trace_k) + 1):
         prec, rec, n = precision_recall(t, d, args.max_m)
         rows = [r for r in range(len(n)) if n[r] > 0][:8]

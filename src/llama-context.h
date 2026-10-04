@@ -72,6 +72,11 @@ struct llama_context {
     int expert_prefetch_hint(const llama_token * tokens, int n_tokens, int n_certain = -1,
                              const float * conf = nullptr);
 
+    // WP_HINT_TRACE type 4 DRAFT (see llama_hint_trace_draft in llama-ext.h).
+    bool hint_trace_enabled() const;
+    void hint_trace_draft(uint32_t n_slots, const llama_token * tokens, const float * conf,
+                          llama_token anchor, const float * hidden, uint32_t n_embd_h, uint32_t flags);
+
     ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
