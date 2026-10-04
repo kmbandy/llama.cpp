@@ -35,6 +35,9 @@ struct common_subproc {
 
     bool alive();
 
+    // OS process id of the child; 0 if not created / already joined (always 0 on Windows)
+    int pid() const;
+
     // true if LLAMA_SUBPROCESS was enabled at build time; when false, create() always fails
     static bool is_supported();
 
