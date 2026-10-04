@@ -61,9 +61,16 @@ struct watch_log {
     int                      exits     = 0;
     int                      exit_code = -99;
     int                      pid       = 0;
+    int                      spawn_port = -1; // the port on_spawn saw (-1: on_spawn never ran)
+    int                      spawn_pid  = 0;
 
     router_node_watch watch() {
         router_node_watch w;
+        w.on_spawn = [this](const node_child_info & info) {
+            std::lock_guard<std::mutex> lk(mu);
+            spawn_port = info.port;
+            spawn_pid  = info.pid;
+        };
         w.on_line = [this](const std::string & line) {
             std::lock_guard<std::mutex> lk(mu);
             lines.push_back(line);
@@ -335,6 +342,12 @@ int main() {
             r.alloc_port = true;
             const node_child_info info = link->spawn(r, w.watch());
             assert(info.port > 0 && info.port != 1);
+            {
+                // regression: on_spawn must run, with the node's answer (the router records the
+                // child's port/host from it; a moved-from watch once skipped it -> proxy to port 0)
+                std::lock_guard<std::mutex> lk(w.mu);
+                assert(w.spawn_port == info.port && w.spawn_pid == info.pid);
+            }
             assert(w.wait_line("--port " + std::to_string(info.port), 10000));
             assert(node.children().size() >= 1);
             // stop (sync, term) -> exit event
