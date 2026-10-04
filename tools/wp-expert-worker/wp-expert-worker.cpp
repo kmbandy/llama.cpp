@@ -5208,6 +5208,14 @@ public:
         for (auto & c : attr_read_pct_)  { c.store(0, std::memory_order_relaxed); }
         for (auto & c : attr_lead_miss_) { c.store(0, std::memory_order_relaxed); }
         for (auto & c : attr_lead_hit_)  { c.store(0, std::memory_order_relaxed); }
+        for (auto & k : attr_kind_ns_) {
+            k = std::make_unique<std::atomic<int64_t>[]>(track_n_);
+            for (size_t i = 0; i < track_n_; ++i) { k[i].store(0, std::memory_order_relaxed); }
+        }
+        for (auto & c : attr_miss_dec_)        { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_never_split_)     { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_never_split_dec_) { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_hint_kinds_)      { c.store(0, std::memory_order_relaxed); }
         logs_ = logs;
         pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
         device_name_ = device_name.empty()
@@ -6082,6 +6090,7 @@ public:
                 ++spec_errors_;
             }
         }
+        if (n_tokens > 0) { attr_last_rows_.store(n_tokens, std::memory_order_relaxed); }
         Batch batch(this, pages.size());
         // Demand decode/verify only: never a speculative or prefill call.
         const bool cpu_tier_this_call = cpu_tier_enabled() && count_demand && !spec_call &&
@@ -8084,7 +8093,7 @@ private:
     // pool state. Unlike reserve_arena_for_pagein this never marks the entry
     // for drop under WP_HOST_TIER_VICTIM: the CPU tier computes FROM RAM, so the
     // page staying there is the point.
-    HostPage acquire_host_page(const ExpertPage & page, int fd) {
+    HostPage acquire_host_page(const ExpertPage & page, int fd, uint32_t rows = 0) {
         HostPage hp;
         bool first_try = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
@@ -8092,12 +8101,12 @@ private:
             const void * src = nullptr;
             if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
                               /*prefill_hint=*/false)) {
-                if (first_try) { attr_note_hit(page); }
+                if (first_try) { attr_note_hit(page, rows); }
                 hp.data    = src;
                 hp.ram_hit = true;
                 return hp;
             }
-            if (first_try) { attr_note_miss(page); first_try = false; }
+            if (first_try) { attr_note_miss(page, rows); first_try = false; }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -8131,19 +8140,20 @@ private:
     // (returns true, hp filled) or reserve an arena entry (returns false,
     // hp.handle + *data filled; the caller MUST read the page with
     // read_host_chunk and then call finish_host_read exactly once).
-    bool acquire_host_page_begin(const ExpertPage & page, HostPage & hp, void ** data) {
+    bool acquire_host_page_begin(const ExpertPage & page, HostPage & hp, void ** data,
+                                 uint32_t rows = 0) {
         bool first_try = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (true) {
             const void * src = nullptr;
             if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
                               /*prefill_hint=*/false)) {
-                if (first_try) { attr_note_hit(page); }
+                if (first_try) { attr_note_hit(page, rows); }
                 hp.data    = src;
                 hp.ram_hit = true;
                 return true;
             }
-            if (first_try) { attr_note_miss(page); first_try = false; }
+            if (first_try) { attr_note_miss(page, rows); first_try = false; }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -10472,6 +10482,29 @@ private:
     std::atomic<uint64_t> attr_lead_miss_[kAttrLeadBins];
     std::atomic<uint64_t> attr_lead_hit_[kAttrLeadBins];
 
+    // ---- phase split + all-kinds hint stamps (added on top of the above) ----
+    // Phase: a CPU-tier demand is "decode" when its request carries <= kAttrDecRows
+    // rows (request.n_tokens: decode = 1, DSpark verify <= 6, prefill = hundreds+).
+    // The tier itself only serves n_tokens <= WP_EXPERT_CPU_TIER_MAX_TOKENS (8), so
+    // with defaults every CPU-tier demand is decode by construction.
+    // Hint kinds: 0 certain, 1 predicted, 2 other (any provenance value beyond the
+    // two the protocol defines). attr_kind_ns_[k][cache_id] = last hint of kind k
+    // for the page since its last CPU-tier demand (zeroed on demand).
+    static constexpr uint32_t kAttrDecRows = 16;
+    enum : size_t { kKindCertain = 0, kKindPred, kKindOther, kKinds };
+    // never_split buckets: no hint of any kind / certain-only / predicted hint that
+    // never reached the host path (stamped as a kind but not in the host table) /
+    // other-kind only.
+    enum : size_t { kNsNone = 0, kNsCertainOnly, kNsPredNoHost, kNsOtherKind, kNsBuckets };
+    std::unique_ptr<std::atomic<int64_t>[]> attr_kind_ns_[kKinds];
+    std::atomic<uint64_t> attr_miss_dec_[kAttrBuckets];
+    std::atomic<uint64_t> attr_never_split_[kNsBuckets];
+    std::atomic<uint64_t> attr_never_split_dec_[kNsBuckets];
+    std::atomic<uint64_t> attr_hint_kinds_[2 * kKinds];   // [0..2] overall, [3..5] while decode
+    std::atomic<uint64_t> attr_demand_all_{0}, attr_miss_all_{0}, attr_req_all_{0};
+    std::atomic<uint64_t> attr_demand_dec_{0}, attr_miss_dec_n_{0}, attr_req_dec_{0};
+    std::atomic<uint32_t> attr_last_rows_{0};   // rows of the latest demand request (hint phase)
+
     static size_t attr_lead_bin(int64_t ns) {
         uint64_t ms = ns <= 0 ? 0 : (uint64_t) ns / 1000000u;
         size_t b = 0;
@@ -10488,6 +10521,26 @@ private:
         }
     }
 public:
+    // Every hint frame entry, any provenance (frame thread). Phase of a hint is the
+    // phase of the latest demand request (hints carry no row count).
+    void attr_note_hint_kind(const ExpertPage & page, uint32_t provenance) {
+        const size_t k = provenance == PIPE_HINT_CERTAIN ? kKindCertain
+                       : provenance == PIPE_HINT_PREDICTED ? kKindPred : kKindOther;
+        const uint32_t rows = attr_last_rows_.load(std::memory_order_relaxed);
+        attr_hint_kinds_[k].fetch_add(1, std::memory_order_relaxed);
+        if (rows != 0 && rows <= kAttrDecRows) {
+            attr_hint_kinds_[kKinds + k].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (tracked(page.cache_id)) {
+            attr_kind_ns_[k][page.cache_id].store(track_now_ns(), std::memory_order_relaxed);
+        }
+    }
+    // A dispatch request reached the CPU tier (rows = request.n_tokens).
+    void attr_note_req(uint32_t rows, size_t n_cpu_pages) {
+        if (n_cpu_pages == 0) { return; }
+        attr_req_all_.fetch_add(1, std::memory_order_relaxed);
+        if (rows <= kAttrDecRows) { attr_req_dec_.fetch_add(1, std::memory_order_relaxed); }
+    }
     // A PREDICTED hint arrived for this page (frame thread, before any drop).
     // A live prefetch (Queued/Reading/Landed) keeps its original hint time.
     void attr_note_hint(const ExpertPage & page) {
@@ -10498,8 +10551,11 @@ public:
         attr_state_[page.cache_id].store(kAttrHinted, std::memory_order_relaxed);
     }
     // CPU-tier demand found the page RAM-resident (first borrow succeeded).
-    void attr_note_hit(const ExpertPage & page) {
+    void attr_note_hit(const ExpertPage & page, uint32_t rows) {
+        attr_demand_all_.fetch_add(1, std::memory_order_relaxed);
+        if (rows <= kAttrDecRows) { attr_demand_dec_.fetch_add(1, std::memory_order_relaxed); }
         if (!tracked(page.cache_id)) { return; }
+        for (auto & k : attr_kind_ns_) { k[page.cache_id].store(0, std::memory_order_relaxed); }
         const uint8_t st = attr_state_[page.cache_id].exchange(kAttrNone, std::memory_order_relaxed);
         if (st == kAttrLanded) {
             const int64_t h = attr_hint_ns_[page.cache_id].load(std::memory_order_relaxed);
@@ -10509,9 +10565,22 @@ public:
         }
     }
     // CPU-tier cold miss (first borrow failed): file under exactly one bucket.
-    void attr_note_miss(const ExpertPage & page) {
+    void attr_note_miss(const ExpertPage & page, uint32_t rows) {
+        const bool dec = rows <= kAttrDecRows;
+        attr_demand_all_.fetch_add(1, std::memory_order_relaxed);
+        attr_miss_all_.fetch_add(1, std::memory_order_relaxed);
+        if (dec) {
+            attr_demand_dec_.fetch_add(1, std::memory_order_relaxed);
+            attr_miss_dec_n_.fetch_add(1, std::memory_order_relaxed);
+        }
         if (!tracked(page.cache_id)) { return; }
         const int64_t now = track_now_ns();
+        int64_t kind_age[kKinds];
+        for (size_t i = 0; i < kKinds; ++i) {
+            const int64_t t = attr_kind_ns_[i][page.cache_id].exchange(0, std::memory_order_relaxed);
+            kind_age[i] = t > 0 ? now - t : -1;   // -1 = no hint since last demand
+        }
+        const auto live = [&](size_t i) { return kind_age[i] >= 0 && kind_age[i] <= kAttrHintWindowNs; };
         const uint8_t st = attr_state_[page.cache_id].exchange(kAttrNone, std::memory_order_relaxed);
         const int64_t h  = attr_hint_ns_[page.cache_id].load(std::memory_order_relaxed);
         const int64_t age = now - h;
@@ -10534,6 +10603,15 @@ public:
             attr_lead_miss_[attr_lead_bin(age)].fetch_add(1, std::memory_order_relaxed);
         }
         attr_miss_[b].fetch_add(1, std::memory_order_relaxed);
+        if (dec) { attr_miss_dec_[b].fetch_add(1, std::memory_order_relaxed); }
+        if (b == kAttrNever) {
+            const size_t ns = live(kKindCertain) && !live(kKindPred) ? kNsCertainOnly
+                            : live(kKindPred)                        ? kNsPredNoHost
+                            : live(kKindOther)                       ? kNsOtherKind
+                            :                                          kNsNone;
+            attr_never_split_[ns].fetch_add(1, std::memory_order_relaxed);
+            if (dec) { attr_never_split_dec_[ns].fetch_add(1, std::memory_order_relaxed); }
+        }
     }
     // "miss_attr[..] miss_read_pct[..] lead_miss_ms[..] lead_hit_ms[..]"
     std::string miss_attr_str() const {
@@ -10543,7 +10621,7 @@ public:
         static const char * const bucket_names[kAttrBuckets] =
             { "never", "dropped", "queued", "reading", "evicted", "other" };
         std::string out;
-        char b[48];
+        char b[160];
         auto hist = [&](const char * key, const std::atomic<uint64_t> * v, size_t n,
                         const char * const * names) {
             out += key;
@@ -10562,6 +10640,32 @@ public:
         hist("lead_miss_ms", attr_lead_miss_, kAttrLeadBins, lead_names);
         out += ' ';
         hist("lead_hit_ms", attr_lead_hit_, kAttrLeadBins, lead_names);
+        static const char * const ns_names[kNsBuckets] =
+            { "none", "certain_only", "pred_nohost", "other_kind" };
+        static const char * const kind_names[2 * kKinds] =
+            { "certain", "pred", "other", "certain_dec", "pred_dec", "other_dec" };
+        out += ' ';
+        hist("miss_never_split", attr_never_split_, kNsBuckets, ns_names);
+        out += ' ';
+        hist("miss_attr_dec", attr_miss_dec_, kAttrBuckets, bucket_names);
+        out += ' ';
+        hist("miss_never_split_dec", attr_never_split_dec_, kNsBuckets, ns_names);
+        out += ' ';
+        hist("hint_kinds", attr_hint_kinds_, 2 * kKinds, kind_names);
+        std::snprintf(b, sizeof(b), " n_dec_demand=%llu",
+                      (unsigned long long) attr_demand_dec_.load(std::memory_order_relaxed));
+        out += b;
+        std::snprintf(b, sizeof(b), " n_dec_miss=%llu",
+                      (unsigned long long) attr_miss_dec_n_.load(std::memory_order_relaxed));
+        out += b;
+        std::snprintf(b, sizeof(b), " n_dec_req=%llu",
+                      (unsigned long long) attr_req_dec_.load(std::memory_order_relaxed));
+        out += b;
+        std::snprintf(b, sizeof(b), " n_cpu_demand=%llu n_cpu_miss=%llu n_cpu_req=%llu",
+                      (unsigned long long) attr_demand_all_.load(std::memory_order_relaxed),
+                      (unsigned long long) attr_miss_all_.load(std::memory_order_relaxed),
+                      (unsigned long long) attr_req_all_.load(std::memory_order_relaxed));
+        out += b;
         return out;
     }
 private:
@@ -12506,6 +12610,7 @@ public:
                 continue;
             }
             shield_pages.emplace_back(hint.layer, expert_id);
+            pool_.attr_note_hint_kind(catalog_.pages.at({ hint.layer, expert_id }), hint.provenance);
             if (whole_slice_ahead) {
                 continue;
             }
@@ -17498,6 +17603,7 @@ private:
     // ---- WP_EXPERT_CPU_TIER executor ---------------------------------------
     struct CpuTierJob {
         const pipe_expert_dispatch_req *       request = nullptr;
+        uint32_t                               n_tokens = 0;   // request rows (miss-attr phase)
         std::vector<size_t>                    index;   // assignment indices, ascending
         std::vector<const ExpertPage *>        pages;
         std::vector<int>                       fds;
@@ -17578,7 +17684,8 @@ private:
         job->reads.resize(job->index.size());
         job->hidden.resize(job->index.size());
         job->gu_done.assign(job->index.size(), 0);
-        (void) request;
+        job->n_tokens = request.n_tokens;
+        pool_.attr_note_req(request.n_tokens, job->index.size());
         {
             std::lock_guard<std::mutex> lock(cpu_tier_mu_);
             if (cpu_tier_threads_.empty()) {
@@ -17821,7 +17928,7 @@ private:
                 const size_t size = (size_t) page.size;
                 const size_t n = cpu_tier_chunks_for(size);
                 if (n <= 1) {
-                    ExpertSlotPool::HostPage hp = pool_.acquire_host_page(page, job->fds[k]);
+                    ExpertSlotPool::HostPage hp = pool_.acquire_host_page(page, job->fds[k], job->n_tokens);
                     {
                         std::lock_guard<std::mutex> lock(job->m);
                         job->holds[k] = hp;
@@ -17833,7 +17940,7 @@ private:
                 pr->page = &page;
                 pr->fd   = job->fds[k];
                 void * data = nullptr;
-                const bool hit = pool_.acquire_host_page_begin(page, pr->hp, &data);
+                const bool hit = pool_.acquire_host_page_begin(page, pr->hp, &data, job->n_tokens);
                 if (hit) {
                     {
                         std::lock_guard<std::mutex> lock(job->m);
