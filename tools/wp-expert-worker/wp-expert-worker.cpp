@@ -7132,7 +7132,7 @@ public:
     // dispatched is dropped mid-read, and landings are speculative arena
     // entries (never evicting borrowed/pinned/demand ones) that the tier's
     // borrow(demand=true) promotes. WP_EXPERT_CPU_TIER_PREFETCH_MAX bounds the
-    // pages queued per decode step (default 160; was 80, 40 originally; see PF_BUDGET_PAGES/PF_ORDER/PF_DEMAND_PRIORITY below).
+    // pages queued per decode step (default 80; was 40).
     // WP_EXPERT_CPU_TIER_PREFETCH_THREADS=N (default 2, clamp 1..4; 1 = the
     // old single reader) runs N readers off the one queue. Each reader gates
     // every chunk on demand_reads_pending_ independently, so N readers never
@@ -7175,27 +7175,6 @@ public:
         return n;
     }
 
-    // WP_EXPERT_CPU_TIER_PF_DEMAND_PRIORITY=1 (default 1; 0 = old behavior):
-    // prefetch never starts a chunk while a CPU-tier/GPU page-in demand read is
-    // queued or in flight (the gate always did this; the knob adds pause/resume
-    // accounting and caps the in-flight chunk at WP_EXPERT_CPU_TIER_PF_PRIO_CHUNK,
-    // default 512 KiB, so a demand arriving mid-chunk waits < ~0.3 ms, not a 2 MiB
-    // read). A paused read keeps its partial progress and resumes; it is only
-    // abandoned when its layer passes (stale), which also bounds the pause.
-    static bool pf_demand_priority() {
-        static const bool v = cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PF_DEMAND_PRIORITY", 1) != 0;
-        return v;
-    }
-    // WP_EXPERT_CPU_TIER_PF_ORDER=1 (default 1; 0 = old FIFO): queue sorted by
-    // deadline (target layer asc, FIFO within a layer: ids are ascending on the
-    // wire, no per-expert score), queued entries whose layer passed are dropped
-    // unread, and a full queue/step-budget displaces the farthest-deadline entry
-    // for a nearer hint instead of rejecting the nearer one.
-    static bool pf_order() {
-        static const bool v = cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PF_ORDER", 1) != 0;
-        return v;
-    }
-
     // Frame thread (== dispatch thread, so find_slot/fd_for are safe here).
     void cpu_pf_enqueue(const ExpertPage & page) {
         if (page.cache_id < 0 || page.is_resident || pf_paused_.load(std::memory_order_relaxed)) {
@@ -7217,46 +7196,21 @@ public:
         } catch (const std::exception &) {
             return;
         }
-        // PREFETCH_MAX is a PER-STEP ADMISSION count (pf_step_count_, reset when
-        // the layer wraps), not a queue length: once spent, every later hint in
-        // the step is 'capped' even if the queue has drained. PF_BUDGET_PAGES
-        // additionally bounds queued+active pages at once (default = MAX; 0 = off).
-        static const size_t cap = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_MAX", 160);
-        static const size_t budget = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PF_BUDGET_PAGES", cap);
+        static const size_t cap = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_MAX", 80);
         {
             std::lock_guard<std::mutex> lock(pf_mu_);
+            if (pf_step_count_ >= cap) {
+                n_pf_capped_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             for (const PfItem & q : pf_q_) {
                 if (q.page == &page) {
                     return;
                 }
             }
-            const bool full = pf_step_count_ >= cap ||
-                (budget != 0 && pf_q_.size() + (size_t) std::max(0, pf_active_.load(std::memory_order_relaxed)) >= budget);
-            bool displaced = false;
-            if (full) {
-                if (pf_order() && !pf_q_.empty() && pf_q_.back().layer > page.layer) {
-                    // Farthest deadline sits at the back (sorted): the new,
-                    // nearer hint takes its place.
-                    attr_cas(pf_q_.back().page->cache_id, kAttrQueued, kAttrHinted);
-                    pf_q_.pop_back();
-                    n_pf_evict_far_.fetch_add(1, std::memory_order_relaxed);
-                    displaced = true;
-                } else {
-                    n_pf_capped_.fetch_add(1, std::memory_order_relaxed);
-                    return;
-                }
-            }
-            if (pf_order()) {
-                auto pos = std::upper_bound(pf_q_.begin(), pf_q_.end(), page.layer,
-                    [](int32_t l, const PfItem & i) { return l < i.layer; });
-                pf_q_.insert(pos, PfItem{&page, fd, page.layer});
-            } else {
-                pf_q_.push_back(PfItem{&page, fd, page.layer});
-            }
+            pf_q_.push_back(PfItem{&page, fd});
             attr_set(page.cache_id, kAttrQueued);
-            if (!displaced) {
-                ++pf_step_count_;
-            }
+            ++pf_step_count_;
             // Readers start lazily, one more per enqueue until the cap, so a
             // run that never prefetches never spawns any. pf_threads_ is only
             // touched under pf_mu_ (here) and in stop_cpu_pf (join, after
@@ -7293,10 +7247,6 @@ public:
     uint64_t pf_stale_dropped() const { return n_pf_stale_dropped_.load(std::memory_order_relaxed); }
     uint64_t pf_yield() const         { return n_pf_yield_.load(std::memory_order_relaxed); }
     uint64_t pf_capped() const        { return n_pf_capped_.load(std::memory_order_relaxed); }
-    uint64_t pf_paused() const        { return n_pf_paused_.load(std::memory_order_relaxed); }
-    uint64_t pf_resumed() const       { return n_pf_resumed_.load(std::memory_order_relaxed); }
-    uint64_t pf_evict_far() const     { return n_pf_evict_far_.load(std::memory_order_relaxed); }
-    uint64_t pf_stale_dropped_queued() const { return n_pf_stale_dropped_queued_.load(std::memory_order_relaxed); }
     uint64_t pf_finished_late() const { return n_pf_finished_late_.load(std::memory_order_relaxed); }
     // Landed prefetch entries a demand borrow() later promoted (tag-counted).
     uint64_t pf_used() const {
@@ -7590,18 +7540,9 @@ public:
             // A layer below the previous one is a new decode step: the
             // per-step prefetch budget starts over. pf_layer_ is what the
             // prefetch reader's staleness test reads (atomic: other thread).
-            {
+            if (layer < current_layer_) {
                 std::lock_guard<std::mutex> lock(pf_mu_);
-                if (layer < current_layer_) {
-                    pf_step_count_ = 0;
-                } else if (pf_order()) {
-                    // Sorted by layer: stale entries are a prefix.
-                    while (!pf_q_.empty() && pf_q_.front().layer <= layer) {
-                        attr_cas(pf_q_.front().page->cache_id, kAttrQueued, kAttrHinted);
-                        pf_q_.pop_front();
-                        n_pf_stale_dropped_queued_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
+                pf_step_count_ = 0;
             }
             pf_layer_.store(layer, std::memory_order_relaxed);
         }
@@ -10496,7 +10437,6 @@ private:
     struct PfItem {
         const ExpertPage * page;
         int                fd;
-        int32_t            layer;   // deadline: page->layer (queue is sorted by it)
     };
     mutable std::mutex              pf_mu_;
     std::condition_variable         pf_cv_;
@@ -10511,10 +10451,6 @@ private:
     std::atomic<uint64_t>           n_pf_yield_{0};
     std::atomic<uint64_t>           n_pf_capped_{0};
     std::atomic<uint64_t>           n_pf_errors_{0};
-    std::atomic<uint64_t>           n_pf_paused_{0};              // chunk pauses for demand (PF_DEMAND_PRIORITY)
-    std::atomic<uint64_t>           n_pf_resumed_{0};             // pauses that ended with the read resuming
-    std::atomic<uint64_t>           n_pf_evict_far_{0};           // queued far-deadline entry displaced by a nearer hint
-    std::atomic<uint64_t>           n_pf_stale_dropped_queued_{0};// queued entry whose layer passed, dropped unread
     std::atomic<uint64_t>           n_pf_finished_late_{0};   // read finished past its layer start
 
     // ---- CPU-tier cold-miss attribution (always on; a few relaxed atomics) ----
@@ -10766,17 +10702,11 @@ private:
                 return PfGate::Stale;
             }
             if (demand_reads_pending_.load(std::memory_order_relaxed) <= 0) {
-                if (yielded && pf_demand_priority()) {
-                    n_pf_resumed_.fetch_add(1, std::memory_order_relaxed);
-                }
                 return PfGate::Go;
             }
             if (!yielded) {
                 yielded = true;
                 n_pf_yield_.fetch_add(1, std::memory_order_relaxed);
-                if (pf_demand_priority()) {
-                    n_pf_paused_.fetch_add(1, std::memory_order_relaxed);
-                }
             }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
@@ -10785,32 +10715,18 @@ private:
     void cpu_pf_loop() {
         static const size_t chunk = [] {
             const size_t v = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_CHUNK", 2u << 20);
-            size_t c = std::max<size_t>(64u << 10, (v + 4095) / 4096 * 4096);
-            if (pf_demand_priority()) {
-                const size_t pc = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PF_PRIO_CHUNK", 512u << 10);
-                c = std::min(c, std::max<size_t>(64u << 10, (pc + 4095) / 4096 * 4096));
-            }
-            return c;
+            return std::max<size_t>(64u << 10, (v + 4095) / 4096 * 4096);
         }();
         for (;;) {
             PfItem it;
             {
                 std::unique_lock<std::mutex> lock(pf_mu_);
-                for (;;) {
-                    pf_cv_.wait(lock, [&] { return pf_stop_ || !pf_q_.empty(); });
-                    if (pf_stop_) {
-                        return;
-                    }
-                    it = pf_q_.front();
-                    pf_q_.pop_front();
-                    if (pf_order() && it.layer <= pf_layer_.load(std::memory_order_relaxed)) {
-                        // Layer already passed while queued: drop unread.
-                        attr_cas(it.page->cache_id, kAttrQueued, kAttrHinted);
-                        n_pf_stale_dropped_queued_.fetch_add(1, std::memory_order_relaxed);
-                        continue;
-                    }
-                    break;
+                pf_cv_.wait(lock, [&] { return pf_stop_ || !pf_q_.empty(); });
+                if (pf_stop_) {
+                    return;
                 }
+                it = pf_q_.front();
+                pf_q_.pop_front();
                 pf_active_.fetch_add(1, std::memory_order_relaxed);
             }
             struct PfActiveGuard {
@@ -13350,12 +13266,11 @@ public:
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_ahead(),
                       (unsigned long long) pool_.n_layerahead_evicted_spec_other_behind(),
                       (unsigned long long) pool_.n_layerahead_spec_deferred());
-        char split[1024];
+        char split[768];
         std::snprintf(split, sizeof(split),
                       " host_skip_vram_late=%llu host_landed_late=%llu "
                       "host_begin_refused=%llu host_waited_inflight=%llu host_boosted=%llu "
                       "n_pf[issued/landed/used/stale/yield/capped]=%llu/%llu/%llu/%llu/%llu/%llu n_pf_late_fin=%llu "
-                      "n_pf_paused=%llu n_pf_resumed=%llu n_pf_evict_far=%llu n_pf_stale_dropped_queued=%llu "
                       "pf_quar_resident=%zu pf_quar_confirmed=%llu pf_quar_evicted_unused=%llu "
                       "pf_quar_skipped_full=%llu host_by_dist=[",
                       (unsigned long long) pool_.host_skip_vram_late(),
@@ -13367,9 +13282,6 @@ public:
                       (unsigned long long) pool_.pf_used(), (unsigned long long) pool_.pf_stale_dropped(),
                       (unsigned long long) pool_.pf_yield(), (unsigned long long) pool_.pf_capped(),
                       (unsigned long long) pool_.pf_finished_late(),
-                      (unsigned long long) pool_.pf_paused(), (unsigned long long) pool_.pf_resumed(),
-                      (unsigned long long) pool_.pf_evict_far(),
-                      (unsigned long long) pool_.pf_stale_dropped_queued(),
                       pool_.pf_quar_resident(),
                       (unsigned long long) pool_.pf_quar_confirmed(),
                       (unsigned long long) pool_.pf_quar_evicted_unused(),
