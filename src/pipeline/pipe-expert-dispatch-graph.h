@@ -419,6 +419,7 @@ class graph_dispatcher {
         std::vector<float> activations;
         bool               valid    = false;
         uint64_t           gen      = 0;   // pscore_gen_ at enqueue (decode step)
+        uint32_t           tstep    = 0;   // pscore_tstep_ at enqueue (target decode step, for the age factor)
     };
     // Legacy one-slot mailbox. Used verbatim (unconditional overwrite, no
     // count) when pred_queue_depth() == 0, for byte-identical default
@@ -475,6 +476,23 @@ class graph_dispatcher {
     std::atomic<uint64_t>                          pscore_admitted_d_[64] = {};
     std::atomic<uint64_t>                          pscore_admitted_dec_[10] = {};
     void pscore_process_job(const pred_job & job, router2_scratch & scratch);
+    // PSCORE "age" factor: target decode steps since expert e was last routed at
+    // layer L. pscore_tstep_ counts TARGET decode/verify steps only (<= 32 rows,
+    // layers 0..n_target-1); unlike pscore_gen_ (bumped by every begin_decode,
+    // including prefill ubatches and the draft model's own decodes) it is advanced
+    // by pscore_note_step() when the first target layer of a pass reaches dispatch.
+    // pscore_routed_[L * n_expert + e] packs (step last routed << 32 | step routed
+    // before that); 0 = never. Written on the dispatch thread by pscore_note_routing
+    // AFTER the layer's predictions were enqueued, read on the predictor thread.
+    static constexpr int32_t PSCORE_MAX_LAYERS = 64;
+    void pscore_note_step(int32_t layer, int64_t n_tokens) noexcept;
+    void pscore_note_routing(int32_t layer, const ggml_tensor * selected_experts, int64_t n_tokens,
+                             int64_t n_expert_used) noexcept;
+    uint32_t pscore_age(int32_t layer, int32_t expert, uint32_t tstep) const noexcept;
+    std::unique_ptr<std::atomic<uint64_t>[]>       pscore_routed_;
+    std::atomic<uint32_t>                          pscore_tstep_{ 0 };
+    int32_t                                        pscore_prev_layer_    = -1;   // dispatch thread only
+    int32_t                                        pscore_prefill_layer_ = -1;   // dispatch thread only
     bool                                           pred_snapshot_taken_ = false;
     // Prediction-cadence census (2026-08-19). offered = enqueue_prediction calls
     // (once per layer per forward pass); dropped = snapshots the latest-wins

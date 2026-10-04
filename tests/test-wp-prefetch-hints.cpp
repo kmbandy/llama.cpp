@@ -194,6 +194,30 @@ void test_pscore(const fs::path & path) {
     require(std::abs(p - 1.0 / (1.0 + std::exp(-1.0))) < 1e-9, "pscore eval");
     f.v[PSF_RANK] = 1; f.v[PSF_PROB] = 2.0f;
     require(std::abs(pscore_eval(m, f) - 1.0 / (1.0 + std::exp(1.0))) < 1e-9, "pscore bucket bounds");
+    {   // age factor: buckets parse, 99 = never, lo inclusive / hi exclusive; files without age still work
+        std::ofstream out(path);
+        out << "bias 0\nage 1 2 -1.0\nage 16 99 2.0\nage 99 100 0.25\nrank 0 1 0.5\n";
+    }
+    pscore_model ma;
+    require(parse_pscore_file(path.string(), ma, &err) && ma.buckets.size() == 4, "pscore age parse");
+    pscore_features fa;
+    fa.v[PSF_AGE] = 1;
+    require(std::abs(pscore_eval(ma, fa) - 1.0 / (1.0 + std::exp(-(-1.0 + 0.5)))) < 1e-9, "pscore age=1");
+    fa.v[PSF_AGE] = 98;
+    require(std::abs(pscore_eval(ma, fa) - 1.0 / (1.0 + std::exp(-(2.0 + 0.5)))) < 1e-9, "pscore age=98");
+    fa.v[PSF_AGE] = 99;
+    require(std::abs(pscore_eval(ma, fa) - 1.0 / (1.0 + std::exp(-(0.25 + 0.5)))) < 1e-9, "pscore age=99 never");
+    fa.v[PSF_AGE] = 5;
+    require(std::abs(pscore_eval(ma, fa) - 1.0 / (1.0 + std::exp(-0.5))) < 1e-9, "pscore age gap bucket");
+    require(parse_pscore_file(path.string(), m, &err) && m.buckets.size() == 4, "pscore reparse");
+    {   // old-format file (no age) is unaffected by the new feature value
+        std::ofstream out(path);
+        out << "bias 0\nrank 0 1 0.5\n";
+    }
+    require(parse_pscore_file(path.string(), m, &err), "pscore old file parses");
+    pscore_features fo;
+    fo.v[PSF_AGE] = 99;
+    require(std::abs(pscore_eval(m, fo) - 1.0 / (1.0 + std::exp(-0.5))) < 1e-9, "pscore old file ignores age");
     {
         std::ofstream out(path);
         out << "bias 0\nbogus 0 1 1\n";

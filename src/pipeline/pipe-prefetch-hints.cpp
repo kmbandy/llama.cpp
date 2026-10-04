@@ -418,7 +418,7 @@ void router2_trace_scores(const float *     weights,
 }
 
 bool parse_pscore_file(const std::string & path, pscore_model & out, std::string * err) {
-    static const char * const names[PSF_COUNT] = { "min_d", "rank", "margin", "prob", "n_dist", "layer", "gap", "row" };
+    static const char * const names[PSF_COUNT] = { "min_d", "rank", "margin", "prob", "n_dist", "layer", "gap", "row", "age" };
     const auto fail = [&](const std::string & m) {
         if (err != nullptr) {
             *err = m;

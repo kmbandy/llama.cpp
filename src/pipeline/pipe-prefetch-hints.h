@@ -119,9 +119,11 @@ void router2_trace_scores(const float *     weights,
 // bucketed features of one (target layer, expert) page, fitted offline on the
 // WP_HINT_TRACE records (score/prob exactly as router2_trace_scores emits them).
 // Weights file: '#' comments, "bias <w>", then "<factor> <lo> <hi> <weight>"
-// with factor in {min_d rank margin prob n_dist layer gap row}; a bucket
-// matches when lo <= value < hi.
-enum pscore_factor { PSF_MIN_D, PSF_RANK, PSF_MARGIN, PSF_PROB, PSF_N_DIST, PSF_LAYER, PSF_GAP, PSF_ROW, PSF_COUNT };
+// with factor in {min_d rank margin prob n_dist layer gap row age}; a bucket
+// matches when lo <= value < hi. "age" = target decode steps since the expert was
+// last routed at that layer (1..98 capped, 99 = never); files without age buckets
+// remain valid (the factor then contributes nothing).
+enum pscore_factor { PSF_MIN_D, PSF_RANK, PSF_MARGIN, PSF_PROB, PSF_N_DIST, PSF_LAYER, PSF_GAP, PSF_ROW, PSF_AGE, PSF_COUNT };
 
 struct pscore_features {
     float v[PSF_COUNT] = {};

@@ -259,6 +259,7 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
         remote.n_expert_used() != n_expert_used) {
         throw std::runtime_error("expert dispatcher workers do not match the model MoE dimensions");
     }
+    pscore_routed_.reset(new std::atomic<uint64_t>[(size_t) PSCORE_MAX_LAYERS * (size_t) n_expert]());
 
     const ngram_env_config ngram = get_ngram_env_config();
     if (ngram.top_m > 0 && !ngram.path.empty()) {
@@ -1400,6 +1401,7 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
                 pred_inbox_.activations.assign(activations.begin(), activations.end());
                 pred_inbox_.valid    = true;
                 pred_inbox_.gen      = pscore_gen_;
+                pred_inbox_.tstep    = pscore_tstep_.load(std::memory_order_relaxed);
             } else {
                 // Bounded FIFO: never overwrites a queued-but-undrained
                 // snapshot. Full is the only way to lose one here, and that
@@ -1415,6 +1417,7 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
                 job.activations.assign(activations.begin(), activations.end());
                 job.valid    = true;
                 job.gen      = pscore_gen_;
+                job.tstep    = pscore_tstep_.load(std::memory_order_relaxed);
                 pred_queue_.push_back(std::move(job));
                 pred_queue_hwm_ = std::max(pred_queue_hwm_, pred_queue_.size());
             }
@@ -1818,6 +1821,92 @@ void graph_dispatcher::predictor_loop() {
     }
 }
 
+// ---- PSCORE age factor ------------------------------------------------------
+// Step definition (matches fitpscore2.py: si = index among steps that have target
+// ROUTING records): one step = one target decode/verify pass of <= 32 rows. Wide
+// (prefill) ubatches and layers >= n_target (the DSpark draft model's NextN
+// layers 40-42) never advance it.
+void graph_dispatcher::pscore_note_step(int32_t layer, int64_t n_tokens) noexcept {
+    if (pscore_routed_ == nullptr || router2_pscore() == nullptr || layer < 0) {
+        return;
+    }
+    const int32_t n_target = std::min<int32_t>(remote.last_no_defer_layer() + 1, PSCORE_MAX_LAYERS);
+    if (layer >= n_target) {
+        return;   // draft / NextN layer
+    }
+    if (n_tokens <= 0) {
+        return;
+    }
+    if (n_tokens > TRACE_MAX_ROWS) {
+        // Prefill: forget decode history ("never routed since the last prefill").
+        if (layer <= pscore_prefill_layer_) {
+            const size_t n = (size_t) PSCORE_MAX_LAYERS * (size_t) remote.n_expert();
+            for (size_t i = 0; i < n; ++i) {
+                pscore_routed_[i].store(0, std::memory_order_relaxed);
+            }
+        }
+        pscore_prefill_layer_ = layer;
+        return;
+    }
+    if (layer <= pscore_prev_layer_ || pscore_tstep_.load(std::memory_order_relaxed) == 0) {
+        pscore_tstep_.fetch_add(1, std::memory_order_relaxed);   // first target layer of a new pass
+    }
+    pscore_prev_layer_ = layer;
+}
+
+// Record that layer's router picked these experts in the current target step.
+// Called after enqueue_prediction for the same layer, and the (cur, prev) pair
+// lets pscore_age ignore a same-step write that lands before a late evaluation.
+void graph_dispatcher::pscore_note_routing(int32_t layer, const ggml_tensor * selected_experts, int64_t n_tokens,
+                                           int64_t n_expert_used) noexcept {
+    if (pscore_routed_ == nullptr || router2_pscore() == nullptr || selected_experts == nullptr ||
+        n_tokens <= 0 || n_tokens > TRACE_MAX_ROWS || n_expert_used <= 0) {
+        return;
+    }
+    const int32_t n_target = std::min<int32_t>(remote.last_no_defer_layer() + 1, PSCORE_MAX_LAYERS);
+    const uint32_t step    = pscore_tstep_.load(std::memory_order_relaxed);
+    if (layer < 0 || layer >= n_target || step == 0) {
+        return;
+    }
+    const int32_t n_expert = remote.n_expert();
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        if (is_phantom_row(t)) {
+            continue;   // the fit's act_all skips phantom rows too
+        }
+        for (int64_t k = 0; k < n_expert_used; ++k) {
+            const int32_t e = ggml_get_i32_1d(selected_experts, (int) (t * n_expert_used + k));
+            if (e < 0 || e >= n_expert) {
+                continue;
+            }
+            std::atomic<uint64_t> & slot = pscore_routed_[(size_t) layer * (size_t) n_expert + (size_t) e];
+            const uint64_t          v    = slot.load(std::memory_order_relaxed);
+            if ((uint32_t) (v >> 32) == step) {
+                continue;   // already stamped this step (single writer)
+            }
+            slot.store(((uint64_t) step << 32) | (v >> 32), std::memory_order_relaxed);
+        }
+    }
+}
+
+// Age as of target step `tstep`: last routing STRICTLY before that step. 99 =
+// never, otherwise capped at 98.
+uint32_t graph_dispatcher::pscore_age(int32_t layer, int32_t expert, uint32_t tstep) const noexcept {
+    if (pscore_routed_ == nullptr || layer < 0 || layer >= PSCORE_MAX_LAYERS || expert < 0 ||
+        expert >= remote.n_expert()) {
+        return 99;
+    }
+    const uint64_t v   = pscore_routed_[(size_t) layer * (size_t) remote.n_expert() + (size_t) expert]
+                             .load(std::memory_order_relaxed);
+    uint32_t       cur = (uint32_t) (v >> 32);
+    if (cur >= tstep) {
+        cur = (uint32_t) v;   // routed at/after the evaluated step: fall back to the earlier one
+        if (cur >= tstep) {
+            return 99;        // cannot happen unless history was reset; treat as unknown
+        }
+    }
+    return cur == 0 ? 99u : std::min<uint32_t>(tstep - cur, 98u);
+}
+
 // PSCORE admission for one source layer's snapshot. Cells are (d, row) with
 // target = src + d, d = 2..K+1. Scores/probs come from router2_trace_scores --
 // the exact function WP_HINT_TRACE records -- so the features match the ones the
@@ -1905,6 +1994,7 @@ void graph_dispatcher::pscore_process_job(const pred_job & job, router2_scratch 
         f.v[PSF_LAYER]  = (float) (idx / n_expert);
         f.v[PSF_GAP]    = pg.gap;
         f.v[PSF_ROW]    = (float) std::min<int16_t>(pg.row, 5);
+        f.v[PSF_AGE]    = (float) pscore_age(idx / n_expert, idx % n_expert, job.tstep);
         const double P = pscore_eval(model, f);
         if (P < (double) pmin) {
             continue;
@@ -2594,11 +2684,13 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         // layer's activations. The GEMM runs off-thread and its result ships
         // at the NEXT layer's entry -- one layer of lead spent on the handoff
         // instead of +26 ms/step of critical-path scoring (2026-08-07 A/B).
+        owner->pscore_note_step(context->layer, n_tokens);
         if (owner->router2_topm() > 0) {
             owner->flush_predicted_hints();
             owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
         }
         owner->trace_layer(context->layer, wire_activations, n_tokens, selected_experts, weights, n_expert_used);
+        owner->pscore_note_routing(context->layer, selected_experts, n_tokens, n_expert_used);
         owner->note_dispatched_experts(context->layer, assignments, (uint32_t) n_tokens);
         ml8_probe_maybe_dump(context->layer, wire_activations, selected_experts, weights,
                              n_tokens, n_embd, n_expert_used);
@@ -2828,6 +2920,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                 const char * e = std::getenv("WP_HINT_INFLIGHT");
                 return e != nullptr && e[0] == '1';
             }();
+            owner->pscore_note_step(context->layer, full_tokens);   // before any enqueue_prediction below
             if (!hints_after_send) {
                 if (owner->router2_topm() > 0) {
                     owner->flush_predicted_hints();
@@ -2835,6 +2928,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                 }
                 owner->trace_layer(context->layer, full_wire_activations, full_tokens, full_selected,
                                    full_weights, n_expert_used);
+                owner->pscore_note_routing(context->layer, full_selected, full_tokens, n_expert_used);
                 owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
                 ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
                                      full_tokens, n_embd, n_expert_used);
@@ -2865,6 +2959,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                         owner->enqueue_prediction(layer_id, wire, full_tokens);
                     }
                     owner->trace_layer(layer_id, wire, full_tokens, full_selected, full_weights, n_expert_used);
+                    owner->pscore_note_routing(layer_id, full_selected, full_tokens, n_expert_used);
                     owner->note_dispatched_experts(layer_id, full_assignments, (uint32_t) full_tokens);
                     ml8_probe_maybe_dump(layer_id, wire, full_selected, full_weights,
                                          full_tokens, n_embd, n_expert_used);
