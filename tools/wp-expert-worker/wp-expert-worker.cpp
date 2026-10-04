@@ -2086,6 +2086,9 @@ public:
         n_pf_yield_ = yield;
     }
 
+    // CPU-tier cold-miss attribution string (pool snapshot at record time).
+    void set_miss_attr(std::string v) { miss_attr_ = std::move(v); }
+
     // Host arena snapshot, taken at record time: predicted hints landed as
     // speculative entries, resident/pinned bytes, and LRU evictions.
     void set_ram_stats(uint64_t spec_landed, uint64_t resident_bytes,
@@ -2525,6 +2528,7 @@ private:
                   << " n_pf_used=" << n_pf_used_
                   << " n_pf_stale_dropped=" << n_pf_stale_dropped_
                   << " n_pf_yield=" << n_pf_yield_
+                  << (miss_attr_.empty() ? std::string() : " " + miss_attr_)
                   << " n_batch_mmid_fallback=" << n_batch_mmid_fallback_
                   << " n_batch_mmid_ineligible=" << n_batch_mmid_ineligible_
                   << " n_batch_mmid_arena_bytes=" << n_batch_mmid_arena_bytes_
@@ -2711,6 +2715,7 @@ private:
     uint64_t          n_pf_used_ = 0;
     uint64_t          n_pf_stale_dropped_ = 0;
     uint64_t          n_pf_yield_ = 0;
+    std::string       miss_attr_;
     uint64_t          n_batch_mmid_fallback_ = 0;
     uint64_t          n_batch_mmid_ineligible_ = 0;
     uint64_t          n_batch_mmid_arena_bytes_ = 0;
@@ -5191,6 +5196,18 @@ public:
             hint_dist_[i].store(0, std::memory_order_relaxed);
             land_boost_[i].store(0, std::memory_order_relaxed);
         }
+        attr_hint_ns_ = std::make_unique<std::atomic<int64_t>[]>(track_n_);
+        attr_state_   = std::make_unique<std::atomic<uint8_t>[]>(track_n_);
+        attr_done_    = std::make_unique<std::atomic<uint32_t>[]>(track_n_);
+        for (size_t i = 0; i < track_n_; ++i) {
+            attr_hint_ns_[i].store(0, std::memory_order_relaxed);
+            attr_state_[i].store(kAttrNone, std::memory_order_relaxed);
+            attr_done_[i].store(0, std::memory_order_relaxed);
+        }
+        for (auto & c : attr_miss_)      { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_read_pct_)  { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_lead_miss_) { c.store(0, std::memory_order_relaxed); }
+        for (auto & c : attr_lead_hit_)  { c.store(0, std::memory_order_relaxed); }
         logs_ = logs;
         pagein_log_ = logs_ != nullptr ? logs_->pagein : nullptr;
         device_name_ = device_name.empty()
@@ -7183,6 +7200,7 @@ public:
                 }
             }
             pf_q_.push_back(PfItem{&page, fd});
+            attr_set(page.cache_id, kAttrQueued);
             ++pf_step_count_;
             // Readers start lazily, one more per enqueue until the cap, so a
             // run that never prefetches never spawns any. pf_threads_ is only
@@ -8068,15 +8086,18 @@ private:
     // page staying there is the point.
     HostPage acquire_host_page(const ExpertPage & page, int fd) {
         HostPage hp;
+        bool first_try = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (true) {
             const void * src = nullptr;
             if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
                               /*prefill_hint=*/false)) {
+                if (first_try) { attr_note_hit(page); }
                 hp.data    = src;
                 hp.ram_hit = true;
                 return hp;
             }
+            if (first_try) { attr_note_miss(page); first_try = false; }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -8111,15 +8132,18 @@ private:
     // hp.handle + *data filled; the caller MUST read the page with
     // read_host_chunk and then call finish_host_read exactly once).
     bool acquire_host_page_begin(const ExpertPage & page, HostPage & hp, void ** data) {
+        bool first_try = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (true) {
             const void * src = nullptr;
             if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
                               /*prefill_hint=*/false)) {
+                if (first_try) { attr_note_hit(page); }
                 hp.data    = src;
                 hp.ram_hit = true;
                 return true;
             }
+            if (first_try) { attr_note_miss(page); first_try = false; }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -10419,6 +10443,129 @@ private:
     std::atomic<uint64_t>           n_pf_errors_{0};
     std::atomic<uint64_t>           n_pf_finished_late_{0};   // read finished past its layer start
 
+    // ---- CPU-tier cold-miss attribution (always on; a few relaxed atomics) ----
+    // Per-page (indexed by cache_id) prefetch lifecycle, so every demand that
+    // finds its page not RAM-resident can be filed under exactly one cause.
+    //   None    no live hint (never hinted, or reset by the last demand)
+    //   Hinted  PREDICTED hint received, no live prefetch: never enqueued
+    //           (topm/dry drop, stale layer, PREFETCH_MAX cap, already in VRAM/
+    //           resident) or enqueued then abandoned (paused, stale/yield abort,
+    //           arena begin_read refused, read error)
+    //   Queued  in pf_q_, read not started
+    //   Reading a pf reader is mid-read (attr_done_ = bytes read so far)
+    //   Landed  prefetch landed in the arena and has not been demanded yet
+    // "Hinted" window: a hint counts only if the page has not been demanded
+    // (CPU-tier acquire, hit or miss) since it arrived AND it arrived within
+    // kAttrHintWindowNs (5 s, ~25 decode steps) -- older hints are treated as
+    // never_hinted. Only PREDICTED hints (the host/CPU-tier prefetch path) stamp
+    // the table; CERTAIN hints route to the VRAM spec queue and are not here.
+    enum : uint8_t { kAttrNone = 0, kAttrHinted, kAttrQueued, kAttrReading, kAttrLanded };
+    enum : size_t  { kAttrNever = 0, kAttrDropped, kAttrQueuedB, kAttrReadingB, kAttrEvicted,
+                     kAttrOther, kAttrBuckets };
+    static constexpr int64_t kAttrHintWindowNs = 5000000000LL;
+    static constexpr size_t  kAttrLeadBins = 9;   // <1,1-2,2-4,4-8,8-16,16-32,32-64,64-128,>=128 ms
+    std::unique_ptr<std::atomic<int64_t>[]>  attr_hint_ns_;
+    std::unique_ptr<std::atomic<uint8_t>[]>  attr_state_;
+    std::unique_ptr<std::atomic<uint32_t>[]> attr_done_;
+    std::atomic<uint64_t> attr_miss_[kAttrBuckets];
+    std::atomic<uint64_t> attr_read_pct_[4];            // % complete of in-flight pf at demand
+    std::atomic<uint64_t> attr_lead_miss_[kAttrLeadBins];
+    std::atomic<uint64_t> attr_lead_hit_[kAttrLeadBins];
+
+    static size_t attr_lead_bin(int64_t ns) {
+        uint64_t ms = ns <= 0 ? 0 : (uint64_t) ns / 1000000u;
+        size_t b = 0;
+        while (ms != 0) { ++b; ms >>= 1; }
+        return std::min<size_t>(b, kAttrLeadBins - 1);
+    }
+    void attr_set(int cache_id, uint8_t st) {
+        if (tracked(cache_id)) { attr_state_[cache_id].store(st, std::memory_order_relaxed); }
+    }
+    void attr_cas(int cache_id, uint8_t from, uint8_t to) {
+        if (tracked(cache_id)) {
+            uint8_t exp = from;
+            attr_state_[cache_id].compare_exchange_strong(exp, to, std::memory_order_relaxed);
+        }
+    }
+public:
+    // A PREDICTED hint arrived for this page (frame thread, before any drop).
+    // A live prefetch (Queued/Reading/Landed) keeps its original hint time.
+    void attr_note_hint(const ExpertPage & page) {
+        if (!tracked(page.cache_id)) { return; }
+        const uint8_t st = attr_state_[page.cache_id].load(std::memory_order_relaxed);
+        if (st == kAttrQueued || st == kAttrReading || st == kAttrLanded) { return; }
+        attr_hint_ns_[page.cache_id].store(track_now_ns(), std::memory_order_relaxed);
+        attr_state_[page.cache_id].store(kAttrHinted, std::memory_order_relaxed);
+    }
+    // CPU-tier demand found the page RAM-resident (first borrow succeeded).
+    void attr_note_hit(const ExpertPage & page) {
+        if (!tracked(page.cache_id)) { return; }
+        const uint8_t st = attr_state_[page.cache_id].exchange(kAttrNone, std::memory_order_relaxed);
+        if (st == kAttrLanded) {
+            const int64_t h = attr_hint_ns_[page.cache_id].load(std::memory_order_relaxed);
+            if (h > 0) {
+                attr_lead_hit_[attr_lead_bin(track_now_ns() - h)].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    // CPU-tier cold miss (first borrow failed): file under exactly one bucket.
+    void attr_note_miss(const ExpertPage & page) {
+        if (!tracked(page.cache_id)) { return; }
+        const int64_t now = track_now_ns();
+        const uint8_t st = attr_state_[page.cache_id].exchange(kAttrNone, std::memory_order_relaxed);
+        const int64_t h  = attr_hint_ns_[page.cache_id].load(std::memory_order_relaxed);
+        const int64_t age = now - h;
+        size_t b = kAttrNever;
+        if (st != kAttrNone && h > 0 && age <= kAttrHintWindowNs) {
+            switch (st) {
+                case kAttrHinted:  b = kAttrDropped;  break;
+                case kAttrQueued:  b = kAttrQueuedB;  break;
+                case kAttrReading: {
+                    b = kAttrReadingB;
+                    const uint64_t done = attr_done_[page.cache_id].load(std::memory_order_relaxed);
+                    const uint64_t size = page.size > 0 ? (uint64_t) page.size : 1;
+                    attr_read_pct_[std::min<uint64_t>(3, done * 100 / size / 25)]
+                        .fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                case kAttrLanded:  b = kAttrEvicted;  break;
+                default:           b = kAttrOther;    break;
+            }
+            attr_lead_miss_[attr_lead_bin(age)].fetch_add(1, std::memory_order_relaxed);
+        }
+        attr_miss_[b].fetch_add(1, std::memory_order_relaxed);
+    }
+    // "miss_attr[..] miss_read_pct[..] lead_miss_ms[..] lead_hit_ms[..]"
+    std::string miss_attr_str() const {
+        static const char * const lead_names[kAttrLeadBins] =
+            { "<1", "1-2", "2-4", "4-8", "8-16", "16-32", "32-64", "64-128", ">=128" };
+        static const char * const pct_names[4] = { "0-25", "25-50", "50-75", "75-100" };
+        static const char * const bucket_names[kAttrBuckets] =
+            { "never", "dropped", "queued", "reading", "evicted", "other" };
+        std::string out;
+        char b[48];
+        auto hist = [&](const char * key, const std::atomic<uint64_t> * v, size_t n,
+                        const char * const * names) {
+            out += key;
+            out += '[';
+            for (size_t i = 0; i < n; ++i) {
+                std::snprintf(b, sizeof(b), "%s%s=%llu", i ? "," : "", names[i],
+                              (unsigned long long) v[i].load(std::memory_order_relaxed));
+                out += b;
+            }
+            out += ']';
+        };
+        hist("miss_attr", attr_miss_, kAttrBuckets, bucket_names);
+        out += ' ';
+        hist("miss_read_pct", attr_read_pct_, 4, pct_names);
+        out += ' ';
+        hist("lead_miss_ms", attr_lead_miss_, kAttrLeadBins, lead_names);
+        out += ' ';
+        hist("lead_hit_ms", attr_lead_hit_, kAttrLeadBins, lead_names);
+        return out;
+    }
+private:
+
     enum class PfGate { Go, Stale, Stop };
     // Wait until no demand read is pending. A page a demand is already waiting
     // on (land_boost_) is exempt from both the yield and the staleness test:
@@ -10482,12 +10629,14 @@ private:
                 std::atomic<int> & c;
                 ~PfActiveGuard() { c.fetch_sub(1, std::memory_order_relaxed); }
             } pf_active_guard{ pf_active_ };
+            const ExpertPage & page = *it.page;
             if (pf_paused_.load(std::memory_order_relaxed)) {
+                attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
                 continue;   // parked: take no RAM-tier room
             }
-            const ExpertPage & page = *it.page;
             // The page may have landed or started reading since it was queued.
             if (arena_.state_of(page.cache_id) != wp::HostArena::State::Free) {
+                attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
                 continue;
             }
             PfGate g = cpu_pf_gate(page);
@@ -10495,6 +10644,7 @@ private:
                 return;
             }
             if (g == PfGate::Stale) {
+                attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
                 n_pf_stale_dropped_.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
@@ -10504,8 +10654,13 @@ private:
             // a borrowed/pinned/demand one; a refusal just skips the page.
             if (!arena_.begin_read(page.cache_id, /*speculative=*/true, &data, &handle)) {
                 host_begin_refused_.fetch_add(1, std::memory_order_relaxed);
+                attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
                 continue;
             }
+            if (tracked(page.cache_id)) {
+                attr_done_[page.cache_id].store(0, std::memory_order_relaxed);
+            }
+            attr_cas(page.cache_id, kAttrQueued, kAttrReading);
             n_pf_issued_.fetch_add(1, std::memory_order_relaxed);
             bool ok = true;
             bool stopped = false;
@@ -10529,6 +10684,9 @@ private:
                     const size_t n = std::min(chunk, (size_t) page.size - off);
                     read_page_range(page, it.fd, (char *) data + off, off, n);
                     off += n;
+                    if (tracked(page.cache_id)) {
+                        attr_done_[page.cache_id].store((uint32_t) off, std::memory_order_relaxed);
+                    }
                 }
             } catch (...) {
                 ok = false;
@@ -10539,6 +10697,9 @@ private:
                 arena_.set_spec_tag(page.cache_id, handle, (uint8_t) (kTagPf | landing_tag(page.cache_id)));
             }
             arena_.finish_read(page.cache_id, handle, ok);
+            // A demand that found the page Reading already reset the state to
+            // None; the CAS then fails, so a consumed page is not re-armed.
+            attr_cas(page.cache_id, kAttrReading, ok ? kAttrLanded : kAttrHinted);
             if (ok) {
                 n_pf_landed_.fetch_add(1, std::memory_order_relaxed);
                 if (late_finish) {
@@ -12362,6 +12523,7 @@ public:
                 // like it ran and measured nothing.
                 if (hint.provenance == PIPE_HINT_PREDICTED && spec_host_enabled_ &&
                     pool_.host_landing_available()) {
+                    pool_.attr_note_hint(*page);   // miss attribution; stamped before any drop
                     // A GUESS DOES NOT GET A VRAM SLOT. It lands in host RAM,
                     // where a wrong guess costs only the bandwidth that fetched
                     // it and a right one is promoted over PCIe instead of being
@@ -13019,7 +13181,8 @@ public:
                       (unsigned long long) pool_.pf_quar_confirmed(),
                       (unsigned long long) pool_.pf_quar_evicted_unused(),
                       (unsigned long long) pool_.pf_quar_skipped_full());
-        return std::string(buf) + split + pool_.host_outcome_by_dist() + "]";
+        return std::string(buf) + split + pool_.host_outcome_by_dist() + "] " +
+               pool_.miss_attr_str();
     }
 
     // R -- GROUND TRUTH: the experts a dispatch actually asked for. Without this
@@ -14313,6 +14476,7 @@ public:
         stats_.set_pin_stats(pool_.n_pinned(), pool_.n_pinned_demand_hits());
         stats_.set_pf_stats(pool_.pf_issued(), pool_.pf_landed(), pool_.pf_used(),
                             pool_.pf_stale_dropped(), pool_.pf_yield());
+        stats_.set_miss_attr(pool_.miss_attr_str());
         {
             const wp::HostArena & arena = pool_.arena();
             stats_.set_ram_stats(pool_.host_landed(), (uint64_t) arena.resident_bytes(),
