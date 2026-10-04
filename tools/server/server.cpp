@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-http.h"
 #include "server-models.h"
+#include "server-node.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
@@ -89,6 +90,87 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+static void install_signal_handlers() {
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    struct sigaction sigint_action;
+    sigint_action.sa_handler = signal_handler;
+    sigemptyset (&sigint_action.sa_mask);
+    sigint_action.sa_flags = 0;
+    sigaction(SIGINT, &sigint_action, NULL);
+    sigaction(SIGTERM, &sigint_action, NULL);
+#elif defined (_WIN32)
+    auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+        return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+    };
+    SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
+#endif
+}
+
+// --router-node: this machine's node daemon. Spawns / stops / signals model processes for the
+// leader router and reports their VRAM / RAM; no model, no GPU init, no board, no presets.
+static int llama_router_node(common_params & params) {
+    const std::string err = server_node_check_params(params);
+    if (!err.empty()) {
+        SRV_ERR("%s\n", err.c_str());
+        return 1;
+    }
+    std::string token_err;
+    const std::string token = server_node_read_token(params.node_token_file, token_err);
+    if (token.empty()) {
+        SRV_ERR("--node-token-file: %s\n", token_err.c_str());
+        return 1;
+    }
+    params.hostnames = server_node_bind_hosts(params.node_bind);
+    params.ui        = false;
+    for (const auto & h : params.hostnames) {
+        const std::string warn = server_node_bind_warning(h);
+        if (!warn.empty()) {
+            SRV_WRN("%s\n", warn.c_str());
+        }
+    }
+    if (params.node_exec_allow.empty()) {
+        SRV_WRN("%s", "spawn is unrestricted: the token holder can run any program as this user; "
+                      "limit it with --node-exec-allow DIR\n");
+    }
+
+    // destroyed last: its destructor stops every child still running
+    server_node_config node_cfg = server_node_default_config();
+    node_cfg.child_host = params.hostnames.front(); // validated: non-empty, not a wildcard / socket
+    node_cfg.exec_allow = params.node_exec_allow;
+    server_node node(node_cfg);
+    const size_t n_orphans = node.collect_orphans();
+    if (n_orphans > 0) {
+        SRV_WRN("%zu process(es) left by a previous generation: adoptable by the leader for %d s, then stopped\n",
+                n_orphans, (int) (node.config().adopt_window_ms / 1000));
+    }
+
+    server_node_routes routes(node, token);
+    server_http_context ctx_http;
+    if (!ctx_http.init(params)) {
+        SRV_ERR("%s", "failed to initialize HTTP server\n");
+        return 1;
+    }
+    routes.register_routes(ctx_http);
+    if (!ctx_http.start()) {
+        SRV_ERR("%s", "exiting due to HTTP server error\n");
+        return 1;
+    }
+    ctx_http.is_ready.store(true);
+
+    shutdown_handler = [&](int) {
+        node.close_events(); // ends the /node/events streams
+        ctx_http.stop();
+    };
+    install_signal_handlers();
+
+    for (const auto & address : ctx_http.listening_addresses) {
+        SRV_INF("router node listening on %s\n", address.c_str());
+    }
+    ctx_http.join();
+    SRV_INF("%s", "router node: stopping children before exit\n");
+    return 0;
+}
+
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -110,6 +192,14 @@ int llama_server(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
+    }
+
+    // the node daemon needs no backend: it never loads a model or touches a GPU
+    if (params.router_node) {
+        const int rc = llama_router_node(params);
+        server_stream_session_manager_stop();
+        common_log_flush(common_log_main());
+        return rc;
     }
 
     llama_backend_init();
@@ -192,6 +282,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
                                && params.model.hf_repo.empty()
                                && params.model.docker_repo.empty();
 
+    if (is_router_server && !params.node_token_file.empty()) {
+        // the leader sends this token to every node: same rule as the node's own file
+        const std::string mode_err = server_node_token_file_mode_error(params.node_token_file);
+        if (!mode_err.empty()) {
+            SRV_ERR("--node-token-file: %s\n", mode_err.c_str());
+            return 1;
+        }
+    }
+
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
 
@@ -244,6 +343,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // register API routes
     server_child child; // only used in non-router mode
     server_routes routes(params, ctx_server);
+    server_http_context::handler_t get_models_v1 = routes.get_models; // router mode swaps in the OAI-only listing
     server_tools tools;
 
     std::optional<server_models_routes> models_routes{};
@@ -293,11 +393,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
+        get_models_v1                      = models_routes->get_router_models_oai;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.post("/models/autoload",      ex_wrapper(models_routes->post_router_models_autoload));
+        ctx_http.post("/models/hold",          ex_wrapper(models_routes->post_router_models_hold));
+        ctx_http.post("/models/release",       ex_wrapper(models_routes->post_router_models_release));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
@@ -308,7 +411,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
-    ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
+    ctx_http.get ("/v1/models",                ex_wrapper(get_models_v1));
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
@@ -476,7 +579,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
             server_stream_session_manager_stop();
             if (models_routes.has_value()) {
                 models_routes->stopping.store(true); // maybe redundant, but just to be safe
-                models_routes->models.unload_all();
+                // cancels queued loads, unloads everything, then releases the board claims
+                models_routes->models.shutdown();
             }
             mcp_mgr.shutdown();
             llama_backend_free();
@@ -556,19 +660,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // register signal handler if not running by CLI
     if (!is_run_by_cli) {
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-        struct sigaction sigint_action;
-        sigint_action.sa_handler = signal_handler;
-        sigemptyset (&sigint_action.sa_mask);
-        sigint_action.sa_flags = 0;
-        sigaction(SIGINT, &sigint_action, NULL);
-        sigaction(SIGTERM, &sigint_action, NULL);
-#elif defined (_WIN32)
-        auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
-        };
-        SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
-#endif
+        install_signal_handlers();
     }
 
     bool uses_default_port = false;

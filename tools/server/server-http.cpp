@@ -665,7 +665,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -716,7 +717,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -737,7 +739,8 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -897,6 +900,7 @@ void server_http_context::register_gcp_compat() const {
                         payload.dump(),
                         {},
                         req.should_stop,
+                        req.remote_addr,
                     };
 
                     server_http_res_ptr internal_res = handlers.at(dispatch_path)(internal_req);

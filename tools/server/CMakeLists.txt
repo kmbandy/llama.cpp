@@ -57,6 +57,28 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    server-node.cpp
+    server-node.h
+    server-router-node-client.cpp
+    server-router-node-client.h
+    server-router-admission.cpp
+    server-router-admission.h
+    server-router-board.cpp
+    server-router-board.h
+    server-router-groups.cpp
+    server-router-groups.h
+    server-router-group-lifecycle.cpp
+    server-router-group-lifecycle.h
+    server-router-holds.cpp
+    server-router-holds.h
+    server-router-ledger.cpp
+    server-router-ledger.h
+    server-router-machines.cpp
+    server-router-machines.h
+    server-router-policy.cpp
+    server-router-policy.h
+    server-router-probe.cpp
+    server-router-probe.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 

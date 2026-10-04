@@ -4274,12 +4274,86 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_IDLE_TIMEOUT"));
     add_opt(common_arg(
+        {"--models-ram-headroom-mb"}, "N",
+        string_format("for router server, host RAM (MB) to keep free: a model load must fit in\n"
+                      "MemAvailable minus this headroom, else idle models are evicted (default: %d)",
+                      params.router_ram_headroom_mb),
+        [](common_params & params, int value) {
+            params.router_ram_headroom_mb = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_RAM_HEADROOM_MB"));
+    add_opt(common_arg(
         {"--gpus"}, "SPEC",
-        "for router server, declared GPU slots as name:total_mb:probe[,name:total_mb:probe...]",
+        "for router server, declared GPU slots as name:total_mb:probe[,name:total_mb:probe...]\n"
+        "total_mb may be empty or 0 (name::probe) to use the probe's physical total; a positive\n"
+        "value overrides (caps) the total. name may be dev=board (e.g. ROCm0=R9700): the GPU's\n"
+        "name on the coordination board, claimed as gpu:<board> (default: the device name)",
         [](common_params & params, const std::string & value) {
             params.router_gpus = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPUS"));
+    add_opt(common_arg(
+        {"--board-url"}, "URL",
+        "for router server, coordination board base URL (e.g. http://host:18800): the router\n"
+        "claims the GPUs / RAM it loads onto, queues behind other claims and yields idle GPUs to\n"
+        "queued sessions (default: none, board features off)",
+        [](common_params & params, const std::string & value) {
+            params.router_board_url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BOARD_URL"));
+    add_opt(common_arg(
+        {"--board-token-file"}, "PATH",
+        "for router server, file holding the coordination board's bearer token (write routes)",
+        [](common_params & params, const std::string & value) {
+            params.router_board_token_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BOARD_TOKEN_FILE"));
+    add_opt(common_arg(
+        {"--router-node"},
+        "run as a router node: spawn, stop and signal model processes on this machine on behalf of\n"
+        "the leader router, and report their VRAM / RAM (/node/* routes). Needs --node-token-file and\n"
+        "--node-bind; never loads a model and never talks to the board (no --board-url)",
+        [](common_params & params) {
+            params.router_node = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ROUTER_NODE"));
+    add_opt(common_arg(
+        {"--node-token-file"}, "PATH",
+        "file holding the bearer token required on every /node/* route (missing, unreadable or empty:\n"
+        "a router node refuses to start). For the leader router: the same token, sent to the nodes of\n"
+        "the machines in machines.json that have a router_node URL. A file readable by group or others\n"
+        "is refused (chmod 600)",
+        [](common_params & params, const std::string & value) {
+            params.node_token_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NODE_TOKEN_FILE"));
+    add_opt(common_arg(
+        {"--node-bind"}, "ADDR[,ADDR]",
+        "for router node, the LAN / Tailscale addresses to listen on (replaces --host; wildcard\n"
+        "addresses are refused); the port is --port. The API is cleartext HTTP guarded by one bearer\n"
+        "token: bind a Tailscale (100.64.0.0/10) or loopback address only (anything else is warned about)",
+        [](common_params & params, const std::string & value) {
+            params.node_bind = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NODE_BIND"));
+    add_opt(common_arg(
+        {"--node-exec-allow"}, "DIR",
+        "for router node, only run programs that resolve (realpath) under DIR; repeatable. Without it\n"
+        "any absolute path the bearer token holder names is run as this user (a warning is logged).\n"
+        "Run the node over Tailscale only: the API is cleartext HTTP guarded by one token",
+        [](common_params & params, const std::string & value) {
+            params.node_exec_allow.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--models-queue-max-wait-s"}, "SECONDS",
+        string_format("for router server, longest a `lowest`-priority request waits for its queued model before\n"
+                      "it is answered 503 + Retry-After (the load stays queued) (default: %d, 0 = no bound)",
+                      params.models_queue_max_wait_s),
+        [](common_params & params, int value) {
+            params.models_queue_max_wait_s = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_QUEUE_MAX_WAIT_S"));
     add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
@@ -5423,6 +5497,60 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     ).set_env("LLAMA_ARG_ROUTER_VRAM_MB").set_preset_only());
 
     args.push_back(common_arg(
+        {"ram-mb"}, "N",
+        "in server router mode, host RAM this model needs; a load must fit in MemAvailable minus the router headroom",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_RAM_MB").set_preset_only());
+
+    args.push_back(common_arg(
+        {"machine"}, "NAME",
+        "in server router mode, machine this section runs on (default: the router's own machine)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_MACHINE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"kind"}, "model|external",
+        "in server router mode, 'external' declares a worker process launched by 'launch' that is part of a model group, not a requestable model (default: model)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_KIND").set_preset_only());
+
+    args.push_back(common_arg(
+        {"depends"}, "NAME[,NAME]",
+        "in server router mode, kind=external sections that form this model's group",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_DEPENDS").set_preset_only());
+
+    args.push_back(common_arg(
+        {"launch"}, "CMD",
+        "in server router mode, full command line that starts a kind=external worker",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_LAUNCH").set_preset_only());
+
+    args.push_back(common_arg(
+        {"park-file"}, "PATH",
+        "in server router mode, file a kind=external worker parks its state into",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PARK_FILE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"park-mode"}, "none|opt-in",
+        "in server router mode, 'opt-in' reserves the SIGUSR1/SIGUSR2 park path for this worker (default: none)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PARK_MODE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"startup-timeout"}, "SECONDS",
+        "in server router mode, how long a model group may take to come up (default: 300)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_STARTUP_TIMEOUT").set_preset_only());
+
+    args.push_back(common_arg(
+        {"worker-port"}, "PORT",
+        "in server router mode, TCP port a kind=external worker listens on; only needed when it cannot be read from 'launch' (--listen HOST:PORT or --port N)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_WORKER_PORT").set_preset_only());
+
+    args.push_back(common_arg(
         {"env"}, "K=V[,K=V,-K]",
         "in server router mode, per-model environment for THIS model's child process only.\n"
         "Comma-separated. 'K=V' sets K, and a leading '-' ('-K') REMOVES K from the child's\n"
@@ -5449,6 +5577,34 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "Set no-exclusive to allow the VRAM ledger to co-locate models on one GPU.",
         [](common_params &, bool) { /* unused */ }
     ).set_env("LLAMA_ARG_ROUTER_EXCLUSIVE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"priority"}, "highest|middle|lowest",
+        "in server router mode, default priority of requests and loads for this model when they\n"
+        "do not carry one (default: middle)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PRIORITY").set_preset_only());
+
+    args.push_back(common_arg(
+        {"placement"}, "pinned|any",
+        "in server router mode, 'any' makes this model a pool: each placement picks a slot among the\n"
+        "pool's online slots (all machines, or `pool-gpus`, or the preset's `machine`), nothing is\n"
+        "remembered between placements (default: pinned = the `gpu` key decides)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PLACEMENT").set_preset_only());
+
+    args.push_back(common_arg(
+        {"replicas"}, "N",
+        "in server router mode, a pool (placement = any) may run up to N instances on different slots; "
+        "requests go to the ready one with the fewest in flight and another loads on demand when all are busy (default: 1)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_REPLICAS").set_preset_only());
+
+    args.push_back(common_arg(
+        {"pool-gpus"}, "SLOT[,SLOT]",
+        "in server router mode, restrict a pool to these slots ([machine/]device); default: every slot",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_POOL_GPUS").set_preset_only());
 
     args.push_back(common_arg(
         {"idle-timeout"}, "SECONDS",

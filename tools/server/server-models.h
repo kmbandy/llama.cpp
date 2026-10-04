@@ -6,6 +6,14 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-queue.h"
+#include "server-router-admission.h"
+#include "server-router-board.h"
+#include "server-router-node-client.h"
+#include "server-router-holds.h"
+#include "server-router-groups.h"
+#include "server-router-group-lifecycle.h"
+#include "server-router-policy.h"
+#include "server-router-probe.h"
 
 #include <atomic>
 #include <thread>
@@ -14,6 +22,7 @@
 #include <filesystem>
 #include <thread>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -75,11 +84,18 @@ static std::string server_model_source_to_string(server_model_source source) {
 }
 
 struct server_gpu_slot {
+    std::string machine; // "" = this machine; else the machine whose node reports this card (gpus= "<machine>/<dev>")
     std::string dev_name;
+    std::string board_name; // the GPU's name on the coordination board (gpus= dev=board); "" = dev_name
     std::string vram_probe;
+    std::string pdev; // PCI address resolved from vram_probe; "" for NVML / unresolved (whole-card)
     int64_t total_bytes = 0;
     int64_t reserved_bytes = 0;
     std::string exclusive_holder;
+    // The slot id: "<machine>/<dev>" for another machine's card, the bare device for this machine's
+    // (single-machine configs, placements and /models read exactly as before).
+    std::string id() const { return machine.empty() ? dev_name : machine + "/" + dev_name; }
+    bool remote() const { return !machine.empty(); }
 };
 
 struct server_model_placement {
@@ -92,6 +108,16 @@ struct server_model_placement {
     // MUST be captured here rather than read from the preset at use time: update_args() calls
     // unset_reserved_args(), which strips the router-only options from the preset in place.
     int64_t vram_mb_override = -1;
+    // Preset `ram-mb`: host RAM this model needs (MiB). -1 = unset (RAM gate skipped). Same capture-now rule.
+    int64_t ram_mb_override = -1;
+    // Pool (preset `placement = any`, or the legacy `gpu = any` + `exclusive = false`): each placement
+    // picks among the pool's slots afresh. `devs` / the model's machine hold the slot of the RUNNING
+    // instance only, never a memory of the last pick. Parsed at placement-parse time.
+    bool                     pool = false;
+    int                      replicas = 1;            // pool: up to this many instances (see replica_of)
+    std::vector<std::string> pool_gpus;               // allow-list, as slot ids; empty = every slot
+    std::string              pool_machine;            // the preset's machine ("" = none named)
+    bool                     pool_any_machine = false; // placement = any without a preset machine: slots of every machine
 };
 
 struct server_model_meta {
@@ -129,6 +155,58 @@ struct server_model_meta {
     // above silently shifts every one of them onto the wrong member.
     std::vector<std::string> env_overrides;
 
+    // Model-group keys (see server-router-groups.h), captured at placement-parse time for the
+    // same strip-in-update_args() reason as env_overrides. Also at the END of the struct.
+    // vram_mb / ram_mb for a worker are placement.vram_mb_override / ram_mb_override.
+    router_kind              kind = ROUTER_KIND_MODEL;
+    std::vector<std::string> depends;     // spine only: names of its kind=external workers
+    std::string              group;       // spine: own name; worker: its spine; "" = not in a group
+    std::string              launch;      // worker: full command line, verbatim
+    std::string              machine;     // "" = the router's own machine
+    std::string              gpu;         // device name as written in the preset
+    std::string              park_file;
+    router_park_mode         park_mode = ROUTER_PARK_NONE;
+    std::string              slot_autosave;
+    int                      startup_timeout_s = 300;
+    int                      worker_port = 0; // worker: preset worker-port, 0 = read it off launch
+
+    // spine of a group: the group's status (workers, stop-snapshot lines). Filled into the
+    // copies get_meta()/get_all_meta() hand out, never kept in the registry.
+    json group_info = nullptr;
+
+    // Preset `priority`: what a request / load for this model runs at when it names none.
+    // Captured at placement-parse time (stripped by update_args() like the keys above).
+    admission_priority priority = ADMISSION_PRIORITY_MIDDLE;
+
+    // a queued load: {state: "queued", queue_pos, blocked_by, ...}. Filled into the copies
+    // get_meta()/get_all_meta() hand out, never kept in the registry.
+    json queue_info = nullptr;
+
+    // asked to stop, still running (filled into the copies like queue_info)
+    bool stopping = false;
+
+    // Where the running child listens, as the router reaches it: "" = this machine (127.0.0.1),
+    // else the host of its node (machines.json router_node). `port` is the node's choice there.
+    std::string              host;
+    std::string              child_host() const { return host.empty() ? std::string("127.0.0.1") : host; }
+    // API key of a child on another machine (random per spawn, sent as LLAMA_API_KEY in its env);
+    // the router sends it as a bearer on every request it proxies there. "" = local child.
+    std::string              child_key;
+
+    // Replica k >= 2 of a pool alias: the alias's name (this entry is hidden and named
+    // "<alias>~r<k>"); "" = the alias itself / not a replica.
+    std::string              replica_of;
+
+    // The machine of this model (or of one of its group's workers) is offline (its node's heartbeat
+    // is lost): the model is `unavailable`. Filled into the copies get_meta() / get_all_meta() hand
+    // out, never kept in the registry: reversible by construction.
+    bool                     unavailable = false;
+    std::string              unavailable_machine;
+
+    bool is_external() const {
+        return kind == ROUTER_KIND_EXTERNAL;
+    }
+
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
     }
@@ -152,6 +230,20 @@ struct server_model_meta {
 struct server_models_routes;
 struct server_lru_sched; // defined in server-models.cpp
 struct server_monitor;   // defined in server-models.cpp
+class router_node_link;  // server-router-node-client.h
+
+// The router's handle on one child (spine, plain model, download) it runs through a node link.
+struct server_child_ref {
+    std::shared_ptr<router_node_link> node;    // null until spawned
+    std::string                       name;    // the child's name on its node
+    std::atomic<int>                  pid{0};
+    std::atomic<bool>                 stopped{false}; // its exit was seen
+    bool alive() const { return node && pid.load() > 0 && !stopped.load(); }
+    // SIGKILL, queued to the node link's command thread: safe under any lock
+    void kill() const;
+    // the exit command on the child's stdin (SIGKILL after timeout_s), queued
+    void request_exit(int timeout_s) const;
+};
 
 struct server_models {
     friend struct server_models_routes;
@@ -160,7 +252,7 @@ struct server_models {
 
 private:
     struct instance_t {
-        std::shared_ptr<server_subproc> subproc; // shared with the monitor thread
+        std::shared_ptr<server_child_ref> child; // shared with the monitor thread
         server_model_meta meta;
         // Requests currently being proxied to this model. The idle sweeper refuses to
         // unload a model with any in flight -- `meta.last_used` is stamped when a request
@@ -182,6 +274,8 @@ private:
     bool gpu_placement_enabled = false;
 
 public:
+    const std::string & local_machine_name() const { return local_machine; }
+
     // Runtime master switch for on-demand loading. Seeded from --models-autoload, but
     // flippable at runtime via POST /models/autoload so a human can take the GPUs back
     // (gaming, kernel work) without stopping the router: while this is false the router
@@ -198,6 +292,24 @@ private:
 
     // models asked to stop, still counted as running until the monitor records their exit
     std::set<std::string> stopping_models;
+
+    // Model groups at run time, keyed by spine name; guarded by `mutex`. Lock order is always
+    // this->mutex -> router_worker_group's own lock; the group calls back with none held.
+    struct group_runtime {
+        // the workers of the current (or last) load; kept after it stopped for the status JSON,
+        // replaced by the next load. Never destroyed while `mutex` is held by a thread its
+        // callbacks could be waiting on (see load()).
+        std::shared_ptr<router_worker_group> workers;
+        bool               stop_done = true;   // on_group_stopped() ran for `workers` (or nothing to stop)
+        bool               failed = false;     // a worker died / failed to start: status "failed"
+        std::string        reason;
+        std::optional<int> pending_exit;       // spine already exited, waiting for its workers
+        int64_t            drain_deadline = 0; // >0: spine stop is waiting for in-flight requests
+    };
+    std::map<std::string, group_runtime> groups;
+
+    // this router start's generation, injected into every child as LLAMA_ROUTER_GEN
+    std::string router_gen;
 
     // set to true while load_models() is executing a reload; load() will wait until clear
     bool is_reloading = false;
@@ -290,14 +402,155 @@ private:
     static bool model_wants_exclusive(const server_model_meta & meta);
     void validate_gpu_slots();
     json gpu_slots_json();
+    json machines_json();
     void credit_gpu_reservation_locked(const std::string & name);
     void reconcile_gpu_reservation_locked(const std::string & name);
-    void ensure_gpu_placement(const std::string & name, server_model_meta & meta, server_child_mode mode, std::unique_lock<std::mutex> & lk);
+public:
+    struct load_options {
+        server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
+        // used for spawning a downloading child process
+        std::optional<server_model_meta> custom_meta = std::nullopt;
+        // the request's priority (unset: the model's preset `priority`) and machine override
+        router_request_opts req;
+        // cancel generation of the model's queued load when the request began: if a cancel
+        // (POST /models/unload) moved it since, the load fails instead of queueing again
+        std::optional<uint64_t> cancel_gen;
+    };
+
+private:
+    void ensure_gpu_placement(const std::string & name, server_model_meta & meta, const load_options & opts, std::unique_lock<std::mutex> & lk);
     void reserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
-    std::vector<std::string> choose_gpu_evictions_locked(const std::string & name, const server_model_placement & placement);
+    // gathers the inputs for decide_admission() (server-router-admission.h) and runs it. A
+    // `queue` verdict throws: router_queue_signal when the load waits (a foreign board claim or
+    // a busy resident), router_refused_error otherwise, naming what is in the way.
+    admission_result decide_admission_locked(const std::string & name, const server_model_meta & meta,
+                                             std::vector<admission_candidate> candidates, bool exclusive,
+                                             const load_options & opts);
+    // decide_admission_locked(), then the board claims for the chosen placement (taken with the
+    // lock released, then decided again against the current state)
+    admission_result admit_locked(const std::string & name, const server_model_meta & meta,
+                                  const std::vector<admission_candidate> & candidates, bool exclusive,
+                                  const load_options & opts, std::unique_lock<std::mutex> & lk);
+    // claims `resources` for `owner` on the board: 0 = nothing to claim (lock kept), 1 = claimed
+    // (the lock was released), 2 = the board refused some (the lock was released)
+    int take_board_claims_locked(const std::string & owner, const std::vector<std::string> & resources,
+                                  const load_options & opts, std::unique_lock<std::mutex> & lk);
+    // stops the admission's victims and waits (unlocked) until none of them is running; throws
+    // router_unavailable_error (a victim's node went offline, or it did not exit within the bound) or
+    // router_refused_error (the router is shutting down), with the lock held
+    void evict_and_wait_locked(const std::string & name, const std::vector<std::string> & victims, std::unique_lock<std::mutex> & lk);
+    // takes back what reserve_gpu_placement_locked() reserved for a placement that is not in the registry yet
+    void unreserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
+    // THE bounded wait for children to leave "running" (evictions, reload, remove, LRU, unload_all):
+    // returns EXITED, OFFLINE (what is left runs on machines whose node is offline: nothing will report
+    // its exit), SHUTDOWN (only with honor_shutdown) or TIMEOUT (child_wait_bound_ms_locked()).
+    // `pending` gets the names still up. Drops the lock while it blocks.
+    router_child_wait wait_children_exit_locked(std::unique_lock<std::mutex> & lk, const std::vector<std::string> & names,
+                                                bool honor_shutdown, std::vector<std::string> * pending = nullptr);
+    int64_t child_wait_bound_ms_locked(const std::vector<std::string> & names) const;
+    // the error for a wait that did not end in EXITED; names the first pending child
+    [[noreturn]] void throw_child_wait_failed_locked(router_child_wait w, const std::vector<std::string> & pending) const;
     int64_t read_physical_free_bytes(const server_gpu_slot & slot) const;
-    int64_t effective_free_bytes_locked(const server_gpu_slot & slot) const;
+    int64_t physical_free_from_used(const server_gpu_slot & slot, int64_t used) const; // used < 0 = probe failed
+    std::set<int> router_child_pids_locked() const;
+
+    // model groups (caller holds mutex unless noted)
+    std::string group_spine_locked(const std::string & name) const; // worker -> its spine; else name
+    bool same_group_locked(const std::string & a, const std::string & b) const;
+    std::vector<router_worker_spec> prepare_group_locked(const std::string & name, const server_model_meta & spine_meta, bool verbose = true);
+    json group_status_json_locked(const std::string & spine) const;
+    void set_worker_status_locked(const std::string & worker, server_model_status status, int exit_code = 0);
+    void maybe_finish_drain_locked(const std::string & name, bool force);
+    // callbacks from a router_worker_group thread (take the lock themselves)
+    void on_group_worker_exit(const std::string & spine, const router_worker_group * g, const std::string & worker, int exit_code, const std::string & reason);
+    void on_group_stopped(const std::string & spine, const router_worker_group * g);
+    // One /proc fdinfo scan + router-PID set, taken once per listing/admission and passed down.
+    struct vram_snapshot {
+        std::vector<proc_vram> usage;
+        std::set<int>          router_pids;
+        std::map<std::string, router_node_probe> nodes; // remote machine -> its node's cached /node/state probe
+    };
+    vram_snapshot take_vram_snapshot_locked() const;
+    int64_t foreign_vram_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
+    // MemAvailable - headroom - RAM of other still-loading models on `machine` ("" = this machine; another
+    // machine's from its node's probe); -1 = unknown
+    int64_t free_ram_bytes_locked(const std::string & exclude, const std::string & machine = "") const;
+    int64_t resident_ram_bytes_locked(const std::string & name) const; // rss (anon+shmem, from the model's node), else ram-mb, else 0
+    int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
+    int64_t effective_free_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap, int64_t sysfs_used) const;
+    // card-wide VRAM used on a slot: the local sysfs / NVML probe, or the node's reading; -1 = unknown
+    int64_t slot_used_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
     std::vector<int64_t> estimate_need_bytes(const server_model_meta & meta);
+
+    // coordination board (server-router-board.h); null = no --board-url, board features off
+    std::unique_ptr<router_board_agent> board;
+    std::string local_machine; // this machine's name (machines.json `local: true`, else hostname)
+    std::string board_gpu_resource(const std::string & slot_id) const;     // "gpu:<board name>" ("...@<machine>" on another machine)
+    std::vector<std::string> board_resources_locked(const server_model_meta & meta) const; // what a resident holds
+    std::vector<std::string> machine_resources_locked() const;             // every resource on this machine
+    std::vector<router_board_resident> board_residents();                  // board agent callback
+    void board_yield(const std::string & name, const std::string & reason); // board agent callback
+    std::string admission_machine(const std::string & requested) const;    // the local machine -> ""
+    std::string board_ram_resource(const std::string & machine) const;     // "ram" / "ram@<machine>"
+    bool machine_is_local_name(const std::string & machine) const;         // "", "local", own name / hostname
+    admission_priority effective_priority(const router_request_opts & req, const server_model_meta & meta) const;
+
+    // hold leases (server-router-holds.h); guarded by `mutex`. A worker is held through its spine.
+    router_holds holds;
+    bool is_held_locked(const std::string & name) const;
+    // pools / replicas (caller holds mutex)
+    // every slot a placement of this pool instance may consider: the allow-list (pool-gpus), narrowed to the
+    // preset's machine unless `placement = any` named none. Online-ness and sibling replicas are not applied.
+    std::vector<std::string> pool_slot_ids_locked(const server_model_meta & meta) const;
+    // the registry names of a pool alias's instances: the alias itself, then its "~r<k>" replicas
+    std::vector<std::string> replica_family_locked(const std::string & alias) const;
+    // the hidden replica entry for `name` of pool `alias`, fresh from the alias's current meta
+    server_model_meta make_replica_meta_locked(const std::string & alias, const std::string & name) const;
+    // starts `name`'s load on its own thread (a replica brought up on demand); a queued or refused load is logged
+    void load_in_background(const std::string & name, const router_request_opts & req);
+
+    // Loads waiting in the queue (a foreign board claim or a busy resident), by model name;
+    // guarded by `mutex`. The model's status stays UNLOADED; queue_th retries the load when
+    // queue_epoch moves (board change, a resident went idle or down) and every 30 s.
+    struct queued_load {
+        router_queued_info  info;
+        router_request_opts req;
+        int64_t             since_ms = 0; // first queued (service order: priority, then this)
+    };
+    std::map<std::string, queued_load> queued_loads;
+    std::map<std::string, uint64_t>    queue_cancel_gen; // model -> cancels of its queued load so far
+    uint64_t cancel_gen_locked(const std::string & name) const;
+    uint64_t queue_epoch = 0;
+    void bump_queue_locked(); // caller holds mutex; wakes queue_th
+    std::thread queue_th;
+    void queue_runner_loop();
+    // records a load that waits, joins the board queue and notifies holders (lock not held)
+    [[noreturn]] void on_queued(const std::string & name, const load_options & opts, const admission_result & res,
+                                const router_board_claim_result * raced);
+    void drop_queued(const std::string & name, const std::string & reason); // lock not held
+
+    // the body of load(): admission (may throw router_queue_signal), board claims, spawn.
+    // true = a child was spawned; false = nothing to do (already loading / taken over)
+    bool load_impl(const std::string & name, const load_options & opts);
+
+    // models whose load() is in progress (a group: spine and workers), by name -> count;
+    // their board claims are kept even though they are not running yet. Guarded by `mutex`.
+    std::map<std::string, int> loading_owners;
+
+    // POST /models/load runs the load on its own thread and answers after a short wait
+    struct async_load {
+        std::thread                        th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::mutex              async_mu;
+    std::vector<async_load> async_loads;
+
+    bool shutting_down = false; // guarded by `mutex`
+    void stop_threads();        // queue runner, async loads, board agent (no unload)
+
+    // SSE `queued` / `blocked` / `loading` / `ready` / `evicting` / `unloaded`: {model, machine, slots, reason, ...}
+    void notify_state(const std::string & event, const std::string & name, const std::vector<std::string> & slots,
+                      const std::string & reason, const json & extra = nullptr);
 
 public:
     // Builds the on-disk cache key for estimate_need_bytes(). Exposed (and kept
@@ -314,11 +567,15 @@ private:
     void add_model(server_model_meta && meta);
 
     // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
+    // a worker name stops its whole group (through the spine); a group spine with requests in
+    // flight first drains them (bounded by its stop-timeout) unless drain is false
     // not thread-safe, caller must hold mutex
-    void request_stop(const std::string & name, bool send_exit = true);
+    void request_stop(const std::string & name, bool send_exit = true, bool drain = true);
+
+    void stop_child_locked(instance_t & inst, bool send_exit);
 
     // called by the monitor once a child exited and was reaped
-    void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code);
+    void on_child_exit(const std::string & name, const std::shared_ptr<server_child_ref> & proc, server_child_mode mode, int exit_code);
 
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
@@ -343,7 +600,8 @@ public:
     void load_startup_models();
 
     // check if a model instance exists (thread-safe)
-    bool has_model(const std::string & name);
+    // addressable_only: a pool replica's name does not count (it is not addressable by name)
+    bool has_model(const std::string & name, bool addressable_only = false);
 
     // return a copy of model metadata (thread-safe)
     std::optional<server_model_meta> get_meta(const std::string & name);
@@ -351,18 +609,41 @@ public:
     // return a copy of all model metadata (thread-safe)
     std::vector<server_model_meta> get_all_meta();
 
-    struct load_options {
-        server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
-        // used for spawning a downloading child process
-        std::optional<server_model_meta> custom_meta = std::nullopt;
-    };
-
     // load and unload model instances
     // these functions are thread-safe
+    // load() throws router_queued_error when the load waits in the queue (it is retried by the
+    // router; the model shows as `queued`), router_refused_error when admission refuses it
     void load(const std::string & name);
     void load(const std::string & name, const load_options & opts);
+
+    // POST /models/load: starts the load on its own thread and returns after a short wait:
+    // {state: ready|loading|queued, ...}; throws what load() threw if it failed by then
+    json load_async(const std::string & name, const router_request_opts & req);
+
+    // Pool aliases (placement = any, replicas = N): the registry name a request for `name` goes to --
+    // the ready replica with the fewest requests in flight; another replica is started in the
+    // background when all are busy. `name` itself for anything that is no pool. `allow_load` false
+    // (autoload off): only a ready replica is picked.
+    std::string select_replica(const std::string & name, const router_request_opts & req, bool allow_load);
+
+    // hold leases: a held model is never evicted, idle-unloaded or yielded. hold() returns
+    // {lease, model, ttl_s}; throws std::invalid_argument (bad input / unknown lease) or
+    // std::out_of_range (unknown model).
+    json hold(const std::string & model, int64_t ttl_s, const std::string & owner, const std::string & lease);
+    bool release_hold(const std::string & lease);
+
+    // drops a queued load (and its place in the board queue); false if it was not queued
+    bool cancel_queued(const std::string & name);
+
+    // {enabled, machine, available, claims: {owner: [resources]}, holds: [...]} for GET /models
+    json board_json();
+
+    // graceful shutdown: cancel queued loads, unload everything, release the board claims
+    void shutdown();
     void unload(const std::string & name);
+    bool has_running_replica(const std::string & alias); // a pool alias with an instance up (thread-safe)
     void unload_all();
+    void stop_all_children_locked(); // marks every running child stopping and hands the stop to its node
 
     struct update_status_args {
         server_model_status status;
@@ -390,7 +671,12 @@ public:
     // otherwise, load the model and blocking wait until it's ready, then return true (meta may need to be refreshed)
     // if models_max is reached, the request waits in a queue until a slot frees up
     // throws if the load fails, or if should_stop fires while waiting
-    bool ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop = nullptr);
+    // a queued load: `lowest` keeps waiting; `middle` / `highest` throw router_queued_error
+    // queue_should_stop: the client went away (also for session requests, whose load wait
+    // ignores the socket); a `lowest` wait in the queue is bounded by --models-queue-max-wait-s
+    // (then router_queued_error); a cancel of the queued load fails the wait (router_refused_error)
+    bool ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop = nullptr,
+                            const router_request_opts & req = {}, const std::function<bool()> & queue_should_stop = nullptr);
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
@@ -405,8 +691,37 @@ public:
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
 private:
-    // one thread watching every child; keep last, the destructor joins the thread
+    // one thread handling every child's output lines and exit (the node link hands them over);
+    // keep last, the destructor joins the thread
     std::unique_ptr<server_monitor> monitor;
+    // this machine's node: every child of the router is spawned, stopped and watched through it.
+    // Declared after the monitor: destroyed (its threads joined) before it.
+    std::shared_ptr<router_node_link> local_node;
+    // the other machines' nodes (machines.json `router_node`, --node-token-file): machine -> link.
+    // Empty without a token file. Their sync calls are HTTP: never made with `mutex` held.
+    std::map<std::string, std::shared_ptr<router_node_link>> remote_nodes;
+    // The node a section's `machine=` names: local_node for this machine (empty / "local" / its own
+    // name), else that machine's remote link; nullptr (err set) when there is none.
+    std::shared_ptr<router_node_link> node_for_machine(const std::string & machine, std::string & err) const;
+    bool machine_is_remote(const std::string & machine) const;
+
+    // Heartbeat loss. `availability` (guarded by `mutex`) holds the machines whose node is offline; their
+    // slots are skipped by pools and admission, their models are `unavailable`, requests for them get 503.
+    // All of it is derived from this set, so a node coming back (after its reconcile) undoes it.
+    router_machine_availability availability;
+    bool machine_offline_locked(const std::string & machine) const; // "" / local: never
+    // the offline machine this model (or a worker of its group) needs; "" = none
+    std::string offline_machine_locked(const server_model_meta & meta) const;
+    // link hook: machine's node went offline / is back
+    void on_machine_online(const std::string & machine, bool online);
+    // one-shot child (estimate, --list-devices) through this machine's node: its output lines, its exit code
+    bool run_oneshot(const std::string & name, const std::vector<std::string> & args, const std::vector<std::string> & env,
+                     const std::function<void(const std::string &)> & on_line, int & exit_code, std::string & err);
+    std::atomic<int> oneshot_seq{0};
+public:
+    // the offline machine a request for `name` would need ("" = available); takes the lock
+    std::string unavailable_machine(const std::string & name);
+private:
 };
 
 struct server_child {
@@ -456,9 +771,12 @@ struct server_models_routes {
     server_http_context::handler_t proxy_get;
     server_http_context::handler_t proxy_post;
     server_http_context::handler_t get_router_models;
+    server_http_context::handler_t get_router_models_oai; // /v1/models: loadable models only
     server_http_context::handler_t post_router_models_load;
     server_http_context::handler_t post_router_models_unload;
     server_http_context::handler_t post_router_models_autoload;
+    server_http_context::handler_t post_router_models_hold;    // {model, ttl_s, owner, lease?} -> {lease}
+    server_http_context::handler_t post_router_models_release; // {lease}
     // management API
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;

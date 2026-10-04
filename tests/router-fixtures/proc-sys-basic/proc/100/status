@@ -1,0 +1,5 @@
+Name:	llama-server
+VmRSS:	  900000 kB
+RssAnon:	  123456 kB
+RssFile:	   1000 kB
+RssShmem:	     789 kB
