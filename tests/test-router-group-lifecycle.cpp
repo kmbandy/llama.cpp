@@ -317,6 +317,20 @@ struct recorder {
     }
 };
 
+// callbacks run on the group thread after start()/wait_stopped() have already returned, so
+// recorder state is polled rather than asserted immediately
+template <typename Pred>
+static bool wait_until(Pred pred, int timeout_ms = 5000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return pred();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
+}
+
 static bool gone(int pid) {
     return pid > 0 && !pid_alive(pid);
 }
@@ -344,12 +358,14 @@ static void test_group_start_order_and_term() {
     }
     assert(g.pids().size() == 2);
     // router-injected env reached the worker
-    assert(rec.saw("w-slow: fake worker: env WP_EXPERT_PARK_FILE=/tmp/w-slow.park WP_EXPERT_SEED_FROM_PARK=1 LLAMA_ROUTER_GEN=gen-test"));
+    assert(wait_until([&]() {
+        return rec.saw("w-slow: fake worker: env WP_EXPERT_PARK_FILE=/tmp/w-slow.park WP_EXPERT_SEED_FROM_PARK=1 LLAMA_ROUTER_GEN=gen-test");
+    }));
 
     const auto before = g.status();
     g.request_stop();
     assert(g.wait_stopped(10000));
-    assert(rec.stopped == 1);
+    assert(wait_until([&]() { return rec.stopped == 1; }));
     assert(rec.unexpected.empty()); // a requested stop is not a failure
     for (const auto & w : g.status()) {
         assert(w.state == "exited");
@@ -399,7 +415,7 @@ static void test_group_kill_after_bound() {
     assert(w.killed);
     assert(w.snapshot == ROUTER_SNAPSHOT_NONE);
     assert(gone(pid));
-    assert(rec.stopped == 1);
+    assert(wait_until([&]() { return rec.stopped == 1; }));
 }
 
 // a worker dying after the group is up is reported (the router then stops the spine);
@@ -428,7 +444,7 @@ static void test_group_death_mid_serve() {
     }
     g.request_stop();
     assert(g.wait_stopped(10000));
-    assert(rec.stopped == 1);
+    assert(wait_until([&]() { return rec.stopped == 1; }));
     for (const auto & w : g.status()) {
         assert(gone(w.pid));
     }
