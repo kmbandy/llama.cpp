@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 extern char ** environ;
@@ -360,6 +361,12 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
     }
     if (!fs::path(req.args[0]).is_absolute()) {
         throw server_node_error(400, "args[0] must be an absolute path (PATH is never searched): " + req.args[0]);
+    }
+
+    if (!cfg.exec_allow.empty() && !server_node_exec_allowed(req.args[0], cfg.exec_allow)) {
+        // the token alone does not mean "run anything": only what lives under --node-exec-allow
+        NODE_WRN("refusing to spawn '%s': %s is not under an allowed directory (--node-exec-allow)\n", req.name.c_str(), req.args[0].c_str());
+        throw server_node_error(403, "args[0] is not under a directory allowed by --node-exec-allow: " + req.args[0]);
     }
 
     if (req.port < 0 || req.port > 65535) {
@@ -1016,6 +1023,137 @@ bool server_node_token_matches(const std::string & expected, const std::string &
     return !expected.empty() && diff == 0;
 }
 
+std::string server_node_token_file_mode_error(const std::string & path) {
+#ifdef _WIN32
+    (void) path;
+    return "";
+#else
+    struct stat st{};
+    if (path.empty() || stat(path.c_str(), &st) != 0) {
+        return ""; // missing / unreadable: server_node_read_token() says so
+    }
+    if ((st.st_mode & 077) != 0) {
+        char mode[16];
+        snprintf(mode, sizeof(mode), "%04o", (unsigned) (st.st_mode & 0777));
+        return "token file '" + path + "' is readable by group or others (mode " + mode + "): anyone who reads it can run "
+               "programs on the nodes; run `chmod 600 " + path + "` and start again";
+    }
+    return "";
+#endif
+}
+
+bool server_node_exec_allowed(const std::string & argv0, const std::vector<std::string> & allow_dirs) {
+    std::error_code ec;
+    const fs::path exe = fs::canonical(fs::path(argv0), ec); // realpath: symlinks followed, ".." collapsed
+    if (ec || exe.empty()) {
+        return false;
+    }
+    for (const auto & dir : allow_dirs) {
+        if (dir.empty()) {
+            continue;
+        }
+        const fs::path base = fs::canonical(fs::path(dir), ec);
+        if (ec || base.empty()) {
+            ec.clear();
+            continue;
+        }
+        // whole components: /opt/bin2/x is not under /opt/bin
+        auto b = base.begin();
+        auto e = exe.begin();
+        for (; b != base.end() && e != exe.end() && *b == *e; ++b, ++e) {
+        }
+        if (b == base.end() && e != exe.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool server_node_addr_is_overlay(const std::string & ip_literal) {
+#ifdef _WIN32
+    (void) ip_literal;
+    return true;
+#else
+    in_addr a4{};
+    if (inet_pton(AF_INET, ip_literal.c_str(), &a4) == 1) {
+        const uint32_t v = ntohl(a4.s_addr);
+        return (v >> 24) == 127 ||                // loopback
+               (v & 0xFFC00000u) == 0x64400000u;  // 100.64.0.0/10 (Tailscale CGNAT)
+    }
+    in6_addr a6{};
+    if (inet_pton(AF_INET6, ip_literal.c_str(), &a6) == 1) {
+        if (IN6_IS_ADDR_LOOPBACK(&a6)) {
+            return true;
+        }
+        if (IN6_IS_ADDR_V4MAPPED(&a6)) {
+            char buf[INET_ADDRSTRLEN];
+            return inet_ntop(AF_INET, &a6.s6_addr[12], buf, sizeof(buf)) != nullptr && server_node_addr_is_overlay(buf);
+        }
+        // fd7a:115c:a1e0::/48, Tailscale's IPv6 range
+        static const unsigned char ts[6] = { 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0 };
+        return std::equal(ts, ts + 6, a6.s6_addr);
+    }
+    return false;
+#endif
+}
+
+std::string server_node_bind_warning(const std::string & host_in) {
+#ifdef _WIN32
+    (void) host_in;
+    return "";
+#else
+    std::string host = host_in;
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo * res = nullptr;
+    if (host.empty() || getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+        return "";
+    }
+    std::string bad;
+    for (const addrinfo * ai = res; ai != nullptr && bad.empty(); ai = ai->ai_next) {
+        char buf[INET6_ADDRSTRLEN] = {};
+        if (ai->ai_family == AF_INET) {
+            inet_ntop(AF_INET, &((const sockaddr_in *) ai->ai_addr)->sin_addr, buf, sizeof(buf));
+        } else if (ai->ai_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((const sockaddr_in6 *) ai->ai_addr)->sin6_addr, buf, sizeof(buf));
+        } else {
+            continue;
+        }
+        if (!server_node_addr_is_overlay(buf)) {
+            bad = buf;
+        }
+    }
+    freeaddrinfo(res);
+    if (bad.empty()) {
+        return "";
+    }
+    return "--node-bind " + host_in + " (" + bad + ") is neither loopback nor a Tailscale address (100.64.0.0/10): the node API is "
+           "cleartext HTTP guarded by one bearer token, run it over Tailscale (WireGuard) only";
+#endif
+}
+
+bool server_node_log_limiter::allow(const std::string & key, int64_t now_ms) {
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = last.find(key);
+    if (it != last.end() && now_ms - it->second < interval_ms) {
+        return false;
+    }
+    if (it == last.end() && last.size() >= max_keys) {
+        for (auto i = last.begin(); i != last.end();) { // drop the entries that are due anyway
+            i = now_ms - i->second >= interval_ms ? last.erase(i) : std::next(i);
+        }
+        if (last.size() >= max_keys) {
+            last.clear(); // a flood of distinct peers: start over rather than grow
+        }
+    }
+    last[key] = now_ms;
+    return true;
+}
+
 std::vector<std::string> server_node_bind_hosts(const std::string & node_bind) {
     std::vector<std::string> out;
     std::string cur;
@@ -1100,6 +1238,16 @@ std::string server_node_check_params(const common_params & params) {
     server_node_read_token(params.node_token_file, err);
     if (!err.empty()) {
         return "--node-token-file: " + err;
+    }
+    const std::string mode_err = server_node_token_file_mode_error(params.node_token_file);
+    if (!mode_err.empty()) {
+        return "--node-token-file: " + mode_err;
+    }
+    for (const auto & d : params.node_exec_allow) {
+        std::error_code ec;
+        if (!fs::is_directory(fs::path(d), ec)) {
+            return "--node-exec-allow " + d + ": not a directory";
+        }
     }
     const std::vector<std::string> hosts = server_node_bind_hosts(params.node_bind);
     if (hosts.empty()) {
@@ -1363,7 +1511,10 @@ void server_node_routes::register_routes(const server_http_context & http) const
     auto guard = [this](const server_http_context::handler_t & h) -> server_http_context::handler_t {
         return [this, h](const server_http_req & req) -> server_http_res_ptr {
             if (!server_node_token_matches(token, header_ci(req, "Authorization"))) {
-                NODE_WRN("unauthorized request to %s\n", req.path.c_str());
+                const std::string peer = req.remote_addr.empty() ? std::string("?") : req.remote_addr;
+                if (unauthorized_log.allow(peer, steady_ms())) { // a scanner must not flood the log
+                    NODE_WRN("unauthorized request to %s from %s\n", req.path.c_str(), peer.c_str());
+                }
                 return node_error_res(401, "missing or invalid bearer token");
             }
             try {

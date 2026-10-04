@@ -298,6 +298,73 @@ std::string router_launch_listen_host(const std::vector<std::string> & words) {
     return "";
 }
 
+static bool router_host_is_wildcard(std::string h) {
+    if (h.size() >= 2 && h.front() == '[' && h.back() == ']') {
+        h = h.substr(1, h.size() - 2);
+    }
+    return h.empty() || h == "0.0.0.0" || h == "::" || h == "*";
+}
+
+// the host a launch word list names: 1 = a host (set in `host`), 0 = none; a `--listen` without a colon
+// names none either
+static int router_launch_named_host(const std::vector<std::string> & words, std::string & host) {
+    for (size_t i = 0; i < words.size(); i++) {
+        const std::string & w = words[i];
+        std::string value;
+        if ((w == "--listen" || w == "--host" || w == "-H") && i + 1 < words.size()) {
+            value = words[i + 1];
+        } else if (w.rfind("--listen=", 0) == 0) {
+            value = w.substr(strlen("--listen="));
+        } else if (w.rfind("--host=", 0) == 0) {
+            value = w.substr(strlen("--host="));
+        } else {
+            continue;
+        }
+        if (w == "--listen" || w.rfind("--listen=", 0) == 0) {
+            const size_t c = value.rfind(':');
+            value = c == std::string::npos ? std::string() : value.substr(0, c); // "host:port"
+        }
+        host = value;
+        return 1;
+    }
+    return 0;
+}
+
+std::string router_remote_worker_host_fix(router_launch & launch, const std::string & node_host) {
+    std::string host;
+    if (router_launch_named_host(launch.words, host) != 0) {
+        if (router_host_is_wildcard(host)) {
+            return "its launch listens on a wildcard address ('" + host + "'): a worker on another machine has no auth, "
+                   "name the node's LAN / Tailscale address (" + node_host + ") instead";
+        }
+        return "";
+    }
+    if (node_host.empty() || router_host_is_wildcard(node_host)) {
+        return "the node's address is not known, cannot tell the worker which address to listen on";
+    }
+    // no host in the launch: bind to the node's address only
+    if (launch.via_shell) {
+        if (launch.argv.size() < 3) {
+            return "launch has no command to add --host to";
+        }
+        std::string quoted = "'";
+        for (char ch : node_host) {
+            if (ch == '\'') {
+                quoted += "'\\''";
+            } else {
+                quoted.push_back(ch);
+            }
+        }
+        quoted += "'";
+        launch.argv[2] += " --host " + quoted;
+    } else {
+        router_args_set_host(launch.argv, node_host);
+    }
+    launch.words.push_back("--host");
+    launch.words.push_back(node_host);
+    return "";
+}
+
 void router_args_set_port(std::vector<std::string> & args, int port) {
     const std::string p = std::to_string(port);
     for (size_t i = 0; i < args.size(); i++) {

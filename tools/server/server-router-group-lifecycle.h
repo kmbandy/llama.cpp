@@ -94,6 +94,15 @@ int router_launch_endpoint(const std::vector<std::string> & words, std::string &
 // stripped); "" when there is none or it is a wildcard (0.0.0.0, ::, *, empty).
 std::string router_launch_listen_host(const std::vector<std::string> & words);
 
+// A worker that runs on another machine is reached over the LAN and has no auth in its protocol, so
+// it must not listen on every interface. Refuses (returns the reason) a launch that names a wildcard
+// listen address: `--listen 0.0.0.0:P` / `--listen=:P` / `--listen [::]:P`, `--host 0.0.0.0` /
+// `--host=::` / `-H ''` (0.0.0.0, ::, *, empty). A launch that names no host at all gets
+// `--host <node_host>` (the node's bind address: appended to argv, to the command string of a
+// /bin/sh launch, and to words) so it listens on that address only. A named, non-wildcard host is
+// left as written. Returns "" when the launch is fine (or was fixed).
+std::string router_remote_worker_host_fix(router_launch & launch, const std::string & node_host);
+
 // Sets the port of an argv: replaces the value of `--port N` / `--port=N`, else appends
 // `--port N`. Used when a node allocates a child's port.
 void router_args_set_port(std::vector<std::string> & args, int port);

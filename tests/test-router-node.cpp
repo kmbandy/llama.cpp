@@ -154,6 +154,7 @@ static void test_params_and_token() {
     fs::remove_all(dir);
     write_file(dir / "token", "  s3cret-token\n");
     write_file(dir / "empty", "\n  \n");
+    fs::permissions(dir / "token", fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace); // the node refuses a group/other-readable token
 
     std::string err;
     CHECK(server_node_read_token((dir / "token").string(), err) == "s3cret-token" && err.empty());

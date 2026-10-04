@@ -51,3 +51,33 @@ bool idle_unload_due(const idle_resident & r, int64_t now_ms);
 // variable is set, non-empty, and does not name an existing directory; "" when fine.
 // Unset and empty both count as unset.
 std::string env_temp_dir_violation(const std::vector<std::string> & env);
+
+//
+// bounded waits for a child to leave "running"
+//
+
+enum router_child_wait {
+    ROUTER_CHILD_WAIT_PENDING,  // keep waiting
+    ROUTER_CHILD_WAIT_EXITED,   // every child is down
+    ROUTER_CHILD_WAIT_OFFLINE,  // what is left runs on machines whose node is offline
+    ROUTER_CHILD_WAIT_SHUTDOWN, // the router is shutting down (only when the caller asked to honour it)
+    ROUTER_CHILD_WAIT_TIMEOUT,  // the bound passed with online children still up
+};
+
+// One wait step. `remaining` children are still running, `remaining_online` of them on a machine
+// that is online (the local one always is). Order: all exited wins, then shutdown (when honoured),
+// then "only offline machines are left" (nothing will ever exit it), then the deadline.
+router_child_wait router_child_wait_decide(int remaining, int remaining_online, bool shutting_down, bool timed_out);
+
+// The bound of such a wait, in ms: the longest stop-timeout among the children plus the SIGKILL
+// grace; a group adds its workers' quiesce + grace (what a stop of the group takes).
+int64_t router_child_wait_bound_ms(int max_stop_timeout_s, bool has_group, int64_t kill_grace_ms, int64_t group_stop_ms);
+
+// A pool replica is not addressable by name: it answers like an unknown model.
+inline bool router_name_addressable(const std::string & replica_of) {
+    return replica_of.empty();
+}
+
+// A hold's lease length: negative becomes 0, and the cap keeps `ttl_s * 1000` from overflowing.
+static constexpr int64_t ROUTER_HOLD_TTL_MAX_S = 7 * 24 * 3600;
+int64_t router_hold_ttl_clamp(int64_t ttl_s);

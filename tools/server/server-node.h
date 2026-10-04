@@ -67,6 +67,7 @@ struct server_node_config {
     size_t                   event_backlog      = 4096; // events kept for late / resuming subscribers
     bool                     log_lines          = true; // echo every child output line to the log (the --router-node daemon); an in-process node's owner logs them itself
     std::string              child_host;        // non-empty: a child spawned with alloc_port is told to `--host` this address (the daemon's first --node-bind), never a wildcard
+    std::vector<std::string> exec_allow;        // --node-exec-allow DIR (repeatable): when non-empty, a spawn's argv[0] must resolve (realpath) under one of them, else 403
     std::string              exe;               // this binary (state / heartbeat `exe`): the leader runs llama-server children as it
 };
 
@@ -123,7 +124,8 @@ class server_node {
     server_node & operator=(const server_node &) = delete;
 
     // Starts a child. Throws server_node_error: 400 bad request (empty name/gen/args,
-    // relative argv[0], malformed env entry, temp-dir violation), 409 a live child has that
+    // relative argv[0], malformed env entry, temp-dir violation), 403 argv[0] is outside the
+    // allowed directories (cfg.exec_allow, when set), 409 a live child has that
     // name, 500 spawn failure (or no free port for alloc_port). A name whose previous child
     // exited is reused.
     node_child_info spawn(const node_spawn_request & req);
@@ -209,6 +211,39 @@ class server_node {
 // missing, unreadable or empty.
 std::string server_node_read_token(const std::string & path, std::string & err);
 
+// "" when the token file is not readable by group or others (mode & 077 == 0) or does not exist
+// (reading it reports that); else why the daemon / leader must not start (it names chmod 600).
+std::string server_node_token_file_mode_error(const std::string & path);
+
+// Whether `argv0` is an executable under one of `allow_dirs`, both resolved by realpath (symlinks
+// followed, `..` collapsed): a symlink inside an allowed dir that points out of it, or a `..`
+// escape, is not allowed. Whole path components: /opt/bin2/x is not under /opt/bin. A path or a
+// dir that does not resolve never matches. An empty `allow_dirs` allows nothing (the caller
+// decides whether a list is in force).
+bool server_node_exec_allowed(const std::string & argv0, const std::vector<std::string> & allow_dirs);
+
+// A warning when `host` (an address or a name, as --node-bind takes it) resolves to something that is
+// neither loopback nor in the Tailscale CGNAT range 100.64.0.0/10 (nor Tailscale's IPv6 ULA
+// fd7a:115c:a1e0::/48): the node API is cleartext HTTP over what is meant to be a WireGuard
+// network. "" when fine or when it does not resolve.
+std::string server_node_bind_warning(const std::string & host);
+// The address-literal part of that check (a name is resolved first): true for loopback / CGNAT / Tailscale ULA.
+bool server_node_addr_is_overlay(const std::string & ip_literal);
+
+// At most one log line per key (a peer) per interval; the table is bounded.
+class server_node_log_limiter {
+  public:
+    explicit server_node_log_limiter(int64_t interval_ms = 10000, size_t max_keys = 1024)
+        : interval_ms(interval_ms), max_keys(max_keys) {}
+    // true when `key` may log now (and records it)
+    bool allow(const std::string & key, int64_t now_ms);
+  private:
+    int64_t                       interval_ms;
+    size_t                        max_keys;
+    std::mutex                    mu;
+    std::map<std::string, int64_t> last;
+};
+
 // Constant-time check of an "Authorization: Bearer <token>" value against the expected
 // token. An empty expected token never matches.
 bool server_node_token_matches(const std::string & expected, const std::string & authorization);
@@ -244,6 +279,7 @@ struct server_node_routes {
   private:
     server_node & node;
     std::string   token;
+    mutable server_node_log_limiter unauthorized_log; // one "unauthorized" line per peer per 10 s
 };
 
 // /node/stop's timeout_s: false for NaN / infinity, else clamped to 0..3600 and truncated.

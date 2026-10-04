@@ -4321,7 +4321,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--node-token-file"}, "PATH",
         "file holding the bearer token required on every /node/* route (missing, unreadable or empty:\n"
         "a router node refuses to start). For the leader router: the same token, sent to the nodes of\n"
-        "the machines in machines.json that have a router_node URL",
+        "the machines in machines.json that have a router_node URL. A file readable by group or others\n"
+        "is refused (chmod 600)",
         [](common_params & params, const std::string & value) {
             params.node_token_file = value;
         }
@@ -4329,11 +4330,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--node-bind"}, "ADDR[,ADDR]",
         "for router node, the LAN / Tailscale addresses to listen on (replaces --host; wildcard\n"
-        "addresses are refused); the port is --port",
+        "addresses are refused); the port is --port. The API is cleartext HTTP guarded by one bearer\n"
+        "token: bind a Tailscale (100.64.0.0/10) or loopback address only (anything else is warned about)",
         [](common_params & params, const std::string & value) {
             params.node_bind = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NODE_BIND"));
+    add_opt(common_arg(
+        {"--node-exec-allow"}, "DIR",
+        "for router node, only run programs that resolve (realpath) under DIR; repeatable. Without it\n"
+        "any absolute path the bearer token holder names is run as this user (a warning is logged).\n"
+        "Run the node over Tailscale only: the API is cleartext HTTP guarded by one token",
+        [](common_params & params, const std::string & value) {
+            params.node_exec_allow.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--models-queue-max-wait-s"}, "SECONDS",
         string_format("for router server, longest a `lowest`-priority request waits for its queued model before\n"

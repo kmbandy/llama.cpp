@@ -879,6 +879,7 @@ struct common_params {
     bool router_node = false;                 // --router-node: run as a machine's node daemon (spawns children for the leader)
     std::string node_token_file = "";         // router node: file holding the bearer token every /node/* route checks
     std::string node_bind = "";               // router node: LAN / Tailscale addresses to listen on, comma-separated
+    std::vector<std::string> node_exec_allow;  // router node: --node-exec-allow DIR (repeatable); when set, a spawn's argv[0] must resolve under one
 
     bool log_json = false;
 

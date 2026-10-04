@@ -2087,15 +2087,90 @@ void server_models::evict_and_wait_locked(const std::string & name, const std::v
     if (victims.empty()) {
         return;
     }
-    cv.wait(lk, [&]() {
-        for (const auto & victim : victims) {
-            auto it = mapping.find(victim);
-            if (it != mapping.end() && it->second.meta.is_running()) {
-                return false;
+    std::vector<std::string> pending;
+    const router_child_wait w = wait_children_exit_locked(lk, victims, /*honor_shutdown=*/true, &pending);
+    if (w != ROUTER_CHILD_WAIT_EXITED) {
+        SRV_WRN("router placement: giving up on evicting for %s (%s)\n", name.c_str(),
+                w == ROUTER_CHILD_WAIT_OFFLINE ? "its node is offline" : w == ROUTER_CHILD_WAIT_SHUTDOWN ? "shutting down" : "timed out");
+        throw_child_wait_failed_locked(w, pending);
+    }
+}
+
+int64_t server_models::child_wait_bound_ms_locked(const std::vector<std::string> & names) const {
+    int  max_stop = 1;
+    bool group    = false;
+    for (const auto & n : names) {
+        auto it = mapping.find(n);
+        if (it != mapping.end()) {
+            max_stop = std::max(max_stop, it->second.meta.stop_timeout);
+            group    = group || !it->second.meta.depends.empty();
+        }
+    }
+    return router_child_wait_bound_ms(max_stop, group, ROUTER_WORKER_KILL_GRACE_MS, (int64_t) ROUTER_NODE_RECONCILE_STOP_S * 1000);
+}
+
+router_child_wait server_models::wait_children_exit_locked(std::unique_lock<std::mutex> & lk, const std::vector<std::string> & names,
+                                                           bool honor_shutdown, std::vector<std::string> * pending) {
+    const int64_t deadline = ggml_time_ms() + child_wait_bound_ms_locked(names);
+    while (true) {
+        std::vector<std::string> left;
+        int online = 0;
+        for (const auto & n : names) {
+            auto it = mapping.find(n);
+            if (it == mapping.end()) {
+                continue; // erased: nothing left to wait for
+            }
+            if (it->second.meta.is_running() || it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
+                left.push_back(n);
+                if (offline_machine_locked(it->second.meta).empty()) {
+                    online++;
+                }
             }
         }
-        return true;
-    });
+        const int64_t now = ggml_time_ms();
+        const router_child_wait w = router_child_wait_decide((int) left.size(), online, honor_shutdown && shutting_down, now >= deadline);
+        if (w != ROUTER_CHILD_WAIT_PENDING) {
+            if (pending != nullptr) {
+                *pending = std::move(left);
+            }
+            return w;
+        }
+        // woken by every status change and by a machine going offline; the slice only bounds a missed wake
+        cv.wait_for(lk, std::chrono::milliseconds(std::min<int64_t>(1000, deadline - now + 1)));
+    }
+}
+
+void server_models::throw_child_wait_failed_locked(router_child_wait w, const std::vector<std::string> & pending) const {
+    if (w == ROUTER_CHILD_WAIT_SHUTDOWN) {
+        throw router_refused_error("router is shutting down");
+    }
+    const std::string first = pending.empty() ? std::string() : pending.front();
+    std::string machine;
+    auto it = mapping.find(first);
+    if (it != mapping.end()) {
+        machine = offline_machine_locked(it->second.meta);
+        if (machine.empty()) {
+            machine = it->second.meta.machine.empty() ? local_machine : it->second.meta.machine;
+        }
+    }
+    if (w == ROUTER_CHILD_WAIT_OFFLINE) {
+        throw router_unavailable_error(machine, "model '" + first + "' is unavailable: machine '" + machine + "' is offline");
+    }
+    throw router_unavailable_error(machine, "model '" + first + "' did not stop in time on machine '" + machine + "', try again later");
+}
+
+void server_models::unreserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement) {
+    for (size_t i = 0; i < placement.devs.size() && i < placement.need_bytes_per_dev.size(); ++i) {
+        const int slot_idx = find_slot_index(gpu_slots, placement.devs[i]);
+        if (slot_idx < 0) {
+            continue;
+        }
+        auto & slot = gpu_slots[slot_idx];
+        slot.reserved_bytes = std::max<int64_t>(0, slot.reserved_bytes - placement.need_bytes_per_dev[i]);
+        if (slot.exclusive_holder == name) {
+            slot.exclusive_holder.clear();
+        }
+    }
 }
 
 void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, const load_options & opts, std::unique_lock<std::mutex> & lk) {
@@ -2308,7 +2383,13 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         c.ram     = ram_for(c.machine);
         const admission_result res = admit_locked(name, meta, { c }, true, opts, lk);
         reserve_gpu_placement_locked(name, meta.placement);
-        evict_and_wait_locked(name, res.victims, lk);
+        try {
+            evict_and_wait_locked(name, res.victims, lk);
+        } catch (...) {
+            // the reservation is not in the registry yet, so the caller's rollback cannot see it
+            unreserve_gpu_placement_locked(name, meta.placement);
+            throw;
+        }
         return;
     }
 
@@ -2349,7 +2430,12 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     }
     meta.placement.need_bytes_per_dev = { need };
     reserve_gpu_placement_locked(name, meta.placement);
-    evict_and_wait_locked(name, res.victims, lk);
+    try {
+        evict_and_wait_locked(name, res.victims, lk);
+    } catch (...) {
+        unreserve_gpu_placement_locked(name, meta.placement); // see above
+        throw;
+    }
 }
 
 void server_models::notify_sse(const std::string & event, const std::string & model_id, const json & data) {
@@ -3023,6 +3109,9 @@ void server_models::shutdown() {
         std::lock_guard<std::mutex> lk(mutex);
         shutting_down = true;
         queued_loads.clear(); // waiters see their load gone; nothing retries it
+        // A load the queue thread is inside of (a group start, an eviction wait) ends once its children
+        // are stopping / the flag is seen: mark them before joining, not after.
+        stop_all_children_locked();
         cv.notify_all();
     }
     if (queue_th.joinable()) {
@@ -3101,18 +3190,19 @@ json server_models::load_async(const std::string & name, const router_request_op
     return out;
 }
 
-json server_models::hold(const std::string & model, int64_t ttl_s, const std::string & owner, const std::string & lease) {
+json server_models::hold(const std::string & model, int64_t ttl_s_in, const std::string & owner, const std::string & lease) {
+    const int64_t ttl_s = router_hold_ttl_clamp(ttl_s_in); // ttl_s * 1000 below must not overflow
     std::lock_guard<std::mutex> lk(mutex);
     std::string name;
     auto direct = mapping.find(model);
     if (direct != mapping.end()) {
         // a pool replica is not addressable by name: same answer as an unknown model
-        if (direct->second.meta.replica_of.empty()) {
+        if (router_name_addressable(direct->second.meta.replica_of)) {
             name = model;
         }
     } else {
         for (const auto & [key, inst] : mapping) {
-            if (inst.meta.replica_of.empty() && inst.meta.aliases.count(model)) {
+            if (router_name_addressable(inst.meta.replica_of) && inst.meta.aliases.count(model)) {
                 name = key;
                 break;
             }
@@ -3459,14 +3549,19 @@ void server_models::load_models() {
             lk.lock();
         }
 
-        // wait for all targeted models to reach UNLOADED; cv.wait handles unlock/relock
-        cv.wait(lk, [&]() {
-            for (const auto & name : to_unload) {
-                auto it = mapping.find(name);
-                if (it != mapping.end() && it->second.meta.is_running()) return false;
+        // wait for all targeted models to reach UNLOADED, bounded: one on an offline machine (or one that
+        // never exits) must not hold every load on every machine; it stays stopping, and the node's
+        // reconcile (or its exit) finishes the job
+        {
+            std::vector<std::string> pending;
+            const router_child_wait w = wait_children_exit_locked(lk, to_unload, /*honor_shutdown=*/true, &pending);
+            if (w != ROUTER_CHILD_WAIT_EXITED) {
+                for (const auto & name : pending) {
+                    SRV_WRN("(reload) %s is still running (%s); its entry is kept\n", name.c_str(),
+                            w == ROUTER_CHILD_WAIT_OFFLINE ? "its machine is offline" : w == ROUTER_CHILD_WAIT_SHUTDOWN ? "shutting down" : "stop timed out");
+                }
             }
-            return true;
-        });
+        }
 
         // erase models no longer in any source
         for (auto it = mapping.begin(); it != mapping.end(); ) {
@@ -3477,7 +3572,8 @@ void server_models::load_models() {
                 it = mapping.erase(it);
             } else if (!it->second.meta.replica_of.empty() && !it->second.meta.is_running()) {
                 it = mapping.erase(it); // a replica entry is made again when the pool needs it
-            } else if (final_presets.find(it->second.meta.replica_of.empty() ? it->first : it->second.meta.replica_of) == final_presets.end()) {
+            } else if (final_presets.find(it->second.meta.replica_of.empty() ? it->first : it->second.meta.replica_of) == final_presets.end() &&
+                       !it->second.meta.is_running()) { // one still running (its stop gave up above) keeps its entry
                 SRV_INF("(reload) removing model name=%s (no longer in source)\n", it->first.c_str());
                 it = mapping.erase(it);
             } else {
@@ -3609,13 +3705,14 @@ void server_models::update_meta(const std::string & name, const server_model_met
     cv.notify_all(); // notify wait_until_loading_finished
 }
 
-bool server_models::has_model(const std::string & name) {
+bool server_models::has_model(const std::string & name, bool addressable_only) {
     std::lock_guard<std::mutex> lk(mutex);
-    if (mapping.find(name) != mapping.end()) {
+    auto direct = mapping.find(name);
+    if (direct != mapping.end() && (!addressable_only || router_name_addressable(direct->second.meta.replica_of))) {
         return true;
     }
     for (const auto & [key, inst] : mapping) {
-        if (inst.meta.aliases.count(name)) {
+        if (inst.meta.aliases.count(name) && (!addressable_only || router_name_addressable(inst.meta.replica_of))) {
             return true;
         }
     }
@@ -3713,11 +3810,15 @@ void server_models::unload_lru() {
         notify_state("evicting", lru_model_name, mapping[lru_model_name].meta.placement.devs, "models_max reached (LRU)");
         request_stop(lru_model_name, true);
     }
-    // wait for unload to complete (find-based: safe if the entry was erased mid-wait,
-    // unlike the previous mapping[name] which default-constructed a stray entry)
-    wait(lru_model_name, [](const server_model_meta & meta) {
-        return meta.status == SERVER_MODEL_STATUS_UNLOADED;
-    });
+    // wait for unload to complete, bounded (find-based: safe if the entry was erased mid-wait,
+    // unlike the previous mapping[name] which default-constructed a stray entry). A victim whose node
+    // went offline, or that never exits, fails the caller's load instead of hanging it.
+    std::unique_lock<std::mutex> lk(mutex);
+    std::vector<std::string> pending;
+    const router_child_wait w = wait_children_exit_locked(lk, { lru_model_name }, /*honor_shutdown=*/true, &pending);
+    if (w != ROUTER_CHILD_WAIT_EXITED) {
+        throw_child_wait_failed_locked(w, pending);
+    }
 }
 
 // Per-model `env` from the preset, applied OVER the environment the router inherited. Entries
@@ -3848,7 +3949,7 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     std::unique_lock<std::mutex> lk(mutex);
     // edge case: block until any in-progress reload has finished so we always load
     // against the freshest preset and a consistent mapping state
-    cv.wait(lk, [this]() { return !is_reloading; });
+    cv.wait(lk, [this]() { return !is_reloading || shutting_down; });
 
     // A model group: one spine plus the workers it depends on. A previous load of this group
     // may still be stopping its workers (spine already down): wait for that to finish, so two
@@ -3858,10 +3959,13 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     if (is_group) {
         cv.wait(lk, [this, &name]() {
             auto g = groups.find(name);
-            return !is_reloading && (g == groups.end() || g->second.stop_done);
+            return shutting_down || (!is_reloading && (g == groups.end() || g->second.stop_done));
         });
     }
 
+    if (shutting_down) {
+        throw router_refused_error("router is shutting down");
+    }
     auto meta = opts.custom_meta.has_value() ? *opts.custom_meta : mapping[name].meta;
     if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model %s is not ready\n", name.c_str());
@@ -4038,7 +4142,10 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
             lk.unlock();
             unload_lru();
             lk.lock();
-            cv.wait(lk, [this]() { return !is_reloading; });
+            cv.wait(lk, [this]() { return !is_reloading || shutting_down; });
+            if (shutting_down) {
+                throw router_refused_error("router is shutting down");
+            }
             auto it = mapping.find(name);
             // a group spine is marked loading by this call itself; a stop request cancels it
             const server_model_status own_status = marked_loading ? SERVER_MODEL_STATUS_LOADING : SERVER_MODEL_STATUS_UNLOADED;
@@ -4089,7 +4196,7 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
         std::string err;
         const bool ok = grp->start(err, [this, name]() {
             std::lock_guard<std::mutex> l(mutex);
-            return stopping_models.count(name) > 0; // unload() / eviction / load timeout while starting
+            return shutting_down || stopping_models.count(name) > 0; // unload() / eviction / load timeout / router exit while starting
         });
         lk.lock();
         if (!ok) {
@@ -4423,6 +4530,14 @@ std::vector<router_worker_spec> server_models::prepare_group_locked(const std::s
         if (!err.empty()) {
             throw std::runtime_error("model group '" + name + "': worker '" + dep + "': " + err);
         }
+        if (remote) {
+            // the worker protocol has no auth (and no per-worker key): a remote worker listens on the node's
+            // address only, like a remote llama-server child does; a wildcard listen address is refused
+            const std::string bad_host = router_remote_worker_host_fix(launch, node->host());
+            if (!bad_host.empty()) {
+                throw std::runtime_error("model group '" + name + "': worker '" + dep + "': " + bad_host);
+            }
+        }
 
         router_worker_spec spec;
         spec.name = dep;
@@ -4638,6 +4753,17 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
     }
 }
 
+bool server_models::has_running_replica(const std::string & alias) {
+    std::lock_guard<std::mutex> lk(mutex);
+    for (const auto & member : replica_family_locked(alias)) {
+        auto it = mapping.find(member);
+        if (member != alias && it != mapping.end() && it->second.meta.is_running()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void server_models::unload(const std::string & name_in) {
     {
         // a pool alias unloads with its replicas
@@ -4684,8 +4810,7 @@ void server_models::unload(const std::string & name_in) {
     }
 }
 
-void server_models::unload_all() {
-    std::unique_lock<std::mutex> lk(mutex);
+void server_models::stop_all_children_locked() {
     for (auto & [name, inst] : mapping) {
         if (inst.meta.is_external()) {
             continue; // stopped with its spine; the wait below still waits for it
@@ -4693,7 +4818,7 @@ void server_models::unload_all() {
         if (inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
             SRV_INF("cancelling download for model name=%s\n", name.c_str());
             inst.request_exit();
-        } else if (inst.meta.is_running()) {
+        } else if (inst.meta.is_running() && !stopping_models.count(name)) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
             bool loading = inst.meta.status == SERVER_MODEL_STATUS_LOADING;
             if (loading) {
@@ -4702,15 +4827,37 @@ void server_models::unload_all() {
             request_stop(name, !loading);
         }
     }
-    // wait for every child to exit, the monitor force-kills the ones that ignore the exit command
-    cv.wait(lk, [this]() {
-        for (const auto & [name, inst] : mapping) {
-            if (inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
-                return false;
-            }
+}
+
+void server_models::unload_all() {
+    std::unique_lock<std::mutex> lk(mutex);
+    stop_all_children_locked();
+    // Wait for every child to exit: the node force-kills the ones that ignore the exit command (local
+    // children: exit command, TERM, KILL at their stop-timeout). Bounded, so the router can always
+    // exit; a child on an offline machine will never report, and is left to the node.
+    std::vector<std::string> names;
+    for (const auto & [name, inst] : mapping) {
+        names.push_back(name);
+    }
+    std::vector<std::string> pending;
+    const router_child_wait w = wait_children_exit_locked(lk, names, /*honor_shutdown=*/false, &pending);
+    if (w == ROUTER_CHILD_WAIT_EXITED) {
+        return;
+    }
+    for (const auto & name : pending) {
+        auto it = mapping.find(name);
+        if (it == mapping.end()) {
+            continue;
         }
-        return true;
-    });
+        const std::string off = offline_machine_locked(it->second.meta);
+        if (!off.empty()) {
+            SRV_WRN("shutdown: giving up on %s: machine '%s' is offline; it may be left running there (the node stops it when this router's "
+                    "next generation reconciles with it, or at the node's next start)\n", name.c_str(), off.c_str());
+        } else {
+            SRV_WRN("shutdown: giving up on %s: it did not exit within its stop bound (pid %d)\n", name.c_str(),
+                    it->second.child ? it->second.child->pid.load() : 0);
+        }
+    }
 }
 
 void server_models::update_status(const std::string & name, const update_status_args & args) {
@@ -4808,13 +4955,34 @@ void server_models::update_download_progress(const std::string & name, const com
 }
 
 bool server_models::remove(const std::string & name) {
+    // an alias takes its pool replicas with it (they would be left as hidden orphans)
+    {
+        std::vector<std::string> replicas;
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            auto it = mapping.find(name);
+            if (it != mapping.end() && router_name_addressable(it->second.meta.replica_of) &&
+                it->second.meta.source == SERVER_MODEL_SOURCE_CACHE) {
+                for (const auto & member : replica_family_locked(name)) {
+                    if (member != name) {
+                        replicas.push_back(member);
+                    }
+                }
+            }
+        }
+        for (const auto & r : replicas) {
+            unload(r);
+        }
+    }
+
     // do everything under one lock acquisition; avoid get_meta() /
     // unload() because they can trigger load_models() which erases
     // transient DOWNLOADING / DOWNLOADED entries as a side-effect
     std::unique_lock<std::mutex> lk(mutex);
 
     auto it = mapping.find(name);
-    if (it == mapping.end()) {
+    // a pool replica is not addressable by name: same answer as an unknown model
+    if (it == mapping.end() || !router_name_addressable(it->second.meta.replica_of)) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
     if (it->second.meta.source != SERVER_MODEL_SOURCE_CACHE) {
@@ -4835,11 +5003,14 @@ bool server_models::remove(const std::string & name) {
         request_stop(name, !loading);
     }
 
-    // wait until the child is gone
-    wait(lk, name, [](const server_model_meta & meta) {
-        return meta.status == SERVER_MODEL_STATUS_UNLOADED
-            || meta.status == SERVER_MODEL_STATUS_DOWNLOADED;
-    });
+    // wait until the child is gone, bounded: its files are not removed from under a child that is still up
+    {
+        std::vector<std::string> pending;
+        const router_child_wait w = wait_children_exit_locked(lk, { name }, /*honor_shutdown=*/true, &pending);
+        if (w != ROUTER_CHILD_WAIT_EXITED) {
+            throw_child_wait_failed_locked(w, pending);
+        }
+    }
 
     // re-find after wait - load_models() may have erased the entry during the wait
     it = mapping.find(name);
@@ -4947,6 +5118,17 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             }
             if (router_cancel_moved(gen0, cancel_gen_locked(name))) {
                 throw router_refused_error("the queued load of model '" + name + "' was cancelled");
+            }
+            if (shutting_down) {
+                throw router_refused_error("router is shutting down");
+            }
+            {
+                // its node dropped while this request waited (loading, stopping or queued): 503 + Retry-After
+                // now, not a wait until the client gives up; the machine coming back makes a retry work
+                const std::string off = offline_machine_locked(it->second.meta);
+                if (!off.empty()) {
+                    throw router_unavailable_error(off, "model '" + name + "' is unavailable: machine '" + off + "' is offline");
+                }
             }
             if (stopping_models.count(name)) {
                 // a stopping instance takes no new request, the next instance serves it
@@ -6089,7 +6271,8 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is not found", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (!model->is_running() && model->status != SERVER_MODEL_STATUS_DOWNLOADING) {
+        // a pool alias that is itself down still unloads its running replicas (unload() takes the family)
+        if (!model->is_running() && model->status != SERVER_MODEL_STATUS_DOWNLOADING && !models.has_running_replica(model->name)) {
             if (models.cancel_queued(model->name)) {
                 res_ok(res, {{"success", true}, {"cancelled", true}}); // a queued load, dropped
                 return res;
@@ -6219,7 +6402,7 @@ void server_models_routes::init_routes() {
         }
 
         // reject if model already exists
-        if (models.has_model(name)) {
+        if (models.has_model(name, /*addressable_only=*/true)) { // a pool replica's name counts as unknown
             throw std::invalid_argument("model '" + name + "' already exists");
         }
 

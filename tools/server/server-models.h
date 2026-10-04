@@ -435,8 +435,21 @@ private:
     // (the lock was released), 2 = the board refused some (the lock was released)
     int take_board_claims_locked(const std::string & owner, const std::vector<std::string> & resources,
                                   const load_options & opts, std::unique_lock<std::mutex> & lk);
-    // stops the admission's victims and waits (unlocked) until none of them is running
+    // stops the admission's victims and waits (unlocked) until none of them is running; throws
+    // router_unavailable_error (a victim's node went offline, or it did not exit within the bound) or
+    // router_refused_error (the router is shutting down), with the lock held
     void evict_and_wait_locked(const std::string & name, const std::vector<std::string> & victims, std::unique_lock<std::mutex> & lk);
+    // takes back what reserve_gpu_placement_locked() reserved for a placement that is not in the registry yet
+    void unreserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
+    // THE bounded wait for children to leave "running" (evictions, reload, remove, LRU, unload_all):
+    // returns EXITED, OFFLINE (what is left runs on machines whose node is offline: nothing will report
+    // its exit), SHUTDOWN (only with honor_shutdown) or TIMEOUT (child_wait_bound_ms_locked()).
+    // `pending` gets the names still up. Drops the lock while it blocks.
+    router_child_wait wait_children_exit_locked(std::unique_lock<std::mutex> & lk, const std::vector<std::string> & names,
+                                                bool honor_shutdown, std::vector<std::string> * pending = nullptr);
+    int64_t child_wait_bound_ms_locked(const std::vector<std::string> & names) const;
+    // the error for a wait that did not end in EXITED; names the first pending child
+    [[noreturn]] void throw_child_wait_failed_locked(router_child_wait w, const std::vector<std::string> & pending) const;
     int64_t read_physical_free_bytes(const server_gpu_slot & slot) const;
     int64_t physical_free_from_used(const server_gpu_slot & slot, int64_t used) const; // used < 0 = probe failed
     std::set<int> router_child_pids_locked() const;
@@ -587,7 +600,8 @@ public:
     void load_startup_models();
 
     // check if a model instance exists (thread-safe)
-    bool has_model(const std::string & name);
+    // addressable_only: a pool replica's name does not count (it is not addressable by name)
+    bool has_model(const std::string & name, bool addressable_only = false);
 
     // return a copy of model metadata (thread-safe)
     std::optional<server_model_meta> get_meta(const std::string & name);
@@ -627,7 +641,9 @@ public:
     // graceful shutdown: cancel queued loads, unload everything, release the board claims
     void shutdown();
     void unload(const std::string & name);
+    bool has_running_replica(const std::string & alias); // a pool alias with an instance up (thread-safe)
     void unload_all();
+    void stop_all_children_locked(); // marks every running child stopping and hands the stop to its node
 
     struct update_status_args {
         server_model_status status;

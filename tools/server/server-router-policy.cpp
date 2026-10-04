@@ -74,3 +74,24 @@ std::string env_temp_dir_violation(const std::vector<std::string> & env) {
     }
     return "";
 }
+
+router_child_wait router_child_wait_decide(int remaining, int remaining_online, bool shutting_down, bool timed_out) {
+    if (remaining <= 0) {
+        return ROUTER_CHILD_WAIT_EXITED;
+    }
+    if (shutting_down) {
+        return ROUTER_CHILD_WAIT_SHUTDOWN;
+    }
+    if (remaining_online <= 0) {
+        return ROUTER_CHILD_WAIT_OFFLINE;
+    }
+    return timed_out ? ROUTER_CHILD_WAIT_TIMEOUT : ROUTER_CHILD_WAIT_PENDING;
+}
+
+int64_t router_child_wait_bound_ms(int max_stop_timeout_s, bool has_group, int64_t kill_grace_ms, int64_t group_stop_ms) {
+    return (int64_t) std::max(1, max_stop_timeout_s) * 1000 + kill_grace_ms + (has_group ? group_stop_ms : 0);
+}
+
+int64_t router_hold_ttl_clamp(int64_t ttl_s) {
+    return std::min<int64_t>(std::max<int64_t>(ttl_s, 0), ROUTER_HOLD_TTL_MAX_S);
+}

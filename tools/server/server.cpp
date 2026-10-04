@@ -122,10 +122,21 @@ static int llama_router_node(common_params & params) {
     }
     params.hostnames = server_node_bind_hosts(params.node_bind);
     params.ui        = false;
+    for (const auto & h : params.hostnames) {
+        const std::string warn = server_node_bind_warning(h);
+        if (!warn.empty()) {
+            SRV_WRN("%s\n", warn.c_str());
+        }
+    }
+    if (params.node_exec_allow.empty()) {
+        SRV_WRN("%s", "spawn is unrestricted: the token holder can run any program as this user; "
+                      "limit it with --node-exec-allow DIR\n");
+    }
 
     // destroyed last: its destructor stops every child still running
     server_node_config node_cfg = server_node_default_config();
     node_cfg.child_host = params.hostnames.front(); // validated: non-empty, not a wildcard / socket
+    node_cfg.exec_allow = params.node_exec_allow;
     server_node node(node_cfg);
     const size_t n_orphans = node.collect_orphans();
     if (n_orphans > 0) {
@@ -270,6 +281,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty()
                                && params.model.docker_repo.empty();
+
+    if (is_router_server && !params.node_token_file.empty()) {
+        // the leader sends this token to every node: same rule as the node's own file
+        const std::string mode_err = server_node_token_file_mode_error(params.node_token_file);
+        if (!mode_err.empty()) {
+            SRV_ERR("--node-token-file: %s\n", mode_err.c_str());
+            return 1;
+        }
+    }
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
