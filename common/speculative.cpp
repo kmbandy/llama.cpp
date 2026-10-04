@@ -1617,7 +1617,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             char arch[32] = { 0 };
             if (llama_model_meta_val_str(model_dft, "general.architecture", arch, sizeof(arch)) >= 0 &&
                 std::strcmp(arch, "deepseek41") == 0) {
-                llama_set_embeddings_layer_inp(ctx_dft, 1, true);
+                // Armed only around the draft decode in draft(): process()'s encode/inject
+                // graphs never build the DSpark head, and an armed slot asserts there.
                 trace_hidden = true;
             }
         }
@@ -1660,6 +1661,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        if (trace_hidden) {
+            llama_set_embeddings_layer_inp(this->params.ctx_dft, 1, false);
+        }
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -2098,6 +2102,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         assert(batch.n_tokens <= (int32_t) llama_n_ubatch(ctx_dft));
 
         // decode all sequence's noise block in a single batch
+        if (trace_hidden) {
+            llama_set_embeddings_layer_inp(ctx_dft, 1, true);
+        }
         int ret = llama_decode(ctx_dft, batch);
 
         // Detach before any path can free the batch: llama_batch_free() frees ->embd,
