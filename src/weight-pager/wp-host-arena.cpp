@@ -364,6 +364,7 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
         if (!e.ever_borrowed) {
             ++spec_evicted_unused_;
             ++spec_unused_by_tag_[e.tag];
+            if (unused_evict_hook_ != nullptr) { unused_evict_hook_(page_idx, e.tag); }
             if (e.quar) ++quar_evicted_unused_;
         }
         quar_clear_locked_(e);
@@ -661,8 +662,9 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borr
 // --- hit path ---------------------------------------------------------
 
 bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand,
-                       bool prefill_hint) {
+                       bool prefill_hint, int * promoted_tag_out) {
     std::lock_guard<std::mutex> lock(mu_);
+    if (promoted_tag_out != nullptr) { *promoted_tag_out = -1; }
     ++lookups_;   // unconditional: proves the lookup path is even reached (see .h comment)
     auto it = by_page_.find(page_idx);
     if (it == by_page_.end()) return false;
@@ -726,6 +728,7 @@ bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out,
             spec_bytes_ -= cfg_.entry_bytes;
             ++spec_promotions_;
             ++spec_used_by_tag_[e.tag];
+            if (promoted_tag_out != nullptr) { *promoted_tag_out = e.tag; }
             if (e.quar) ++quar_confirmed_;
             quar_clear_locked_(e);
             if (reject_promotion) {

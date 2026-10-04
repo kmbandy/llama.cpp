@@ -4926,6 +4926,151 @@ private:
 
 class ExpertSlotPool;
 
+// WP_DEMAND_LOG=<path>: ground truth for every DEMANDED expert page, joinable
+// offline with the spine's WP_HINT_TRACE. Vocabulary: a PAGE-IN is a needed
+// expert read from NVMe because it was not resident (normal pager operation);
+// a MISS is ONLY a prefetched page that was never used.
+//   D <seq> <t_ns> <layer> <n_tokens> <n_experts> <expert>:<src> ...
+//     seq = wire seq_id of the dispatch frame (spine per-channel counter);
+//     t_ns = steady_clock ns at request arrival (BEGIN frame for split dispatch).
+//     src: V resident in VRAM, no I/O | R RAM tier, page from an earlier demand |
+//          P page a PREFETCH brought in, first use (prefetch hit) |
+//          W prefetch was queued/in flight and the demand waited for / took it |
+//          N read from NVMe on demand (page-in, no prefetch involved) | ? unknown
+//   F <t_ns> <layer> <expert> issued|landed|used|evicted|stale|dropped
+//     CPU-tier prefetch lifecycle. issued = read started; landed = read done;
+//     used = first demand borrow of a landed prefetch; evicted = arena evicted it
+//     unused (a MISS); stale/dropped = never read (or abandoned mid-read).
+// Zero cost when unset: DemandLog::get() is nullptr. Flushed every ~1000 lines,
+// every second by a watcher thread, at exit, and on SIGTERM/SIGINT (handler
+// pokes a self-pipe; the watcher flushes then re-raises with default action).
+class DemandLog {
+public:
+    static DemandLog * get() {
+        static DemandLog * inst = [] () -> DemandLog * {
+            const char * p = std::getenv("WP_DEMAND_LOG");
+            if (p == nullptr || p[0] == '\0') { return nullptr; }
+            FILE * f = std::fopen(p, "w");
+            if (f == nullptr) {
+                std::fprintf(stderr, "WP_DEMAND_LOG: cannot open %s\n", p);
+                return nullptr;
+            }
+            return new DemandLog(f);   // intentionally leaked: used by detached threads
+        }();
+        return inst;
+    }
+    static int64_t now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void write(const char * buf, size_t n) {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::fwrite(buf, 1, n, f_);
+        dirty_ = true;
+        if (++lines_since_flush_ >= 1000) { flush_locked(); }
+    }
+    void f_event(int layer, int expert, const char * what) {
+        char buf[96];
+        const int n = std::snprintf(buf, sizeof buf, "F %lld %d %d %s\n",
+                                    (long long) now_ns(), layer, expert, what);
+        write(buf, (size_t) n);
+    }
+    void note_ident(int cache_id, int layer, int expert) {
+        std::lock_guard<std::mutex> lock(id_mu_);
+        ident_[cache_id] = { layer, expert };
+    }
+    bool ident(int cache_id, int & layer, int & expert) {
+        std::lock_guard<std::mutex> lock(id_mu_);
+        const auto it = ident_.find(cache_id);
+        if (it == ident_.end()) { return false; }
+        layer = it->second.first; expert = it->second.second;
+        return true;
+    }
+    void flush() { std::lock_guard<std::mutex> lock(mu_); flush_locked(); }
+
+private:
+    explicit DemandLog(FILE * f) : f_(f) {
+#if defined(__linux__)
+        if (::pipe(pipe_) == 0) {
+            ::fcntl(pipe_[1], F_SETFL, O_NONBLOCK);
+            struct sigaction sa;
+            std::memset(&sa, 0, sizeof sa);
+            sa.sa_handler = &DemandLog::on_signal;
+            sigemptyset(&sa.sa_mask);
+            ::sigaction(SIGTERM, &sa, nullptr);
+            ::sigaction(SIGINT, &sa, nullptr);
+        }
+        std::atexit([] { if (DemandLog * l = DemandLog::get()) { l->flush(); } });
+        std::thread([this] { watch(); }).detach();
+#endif
+    }
+#if defined(__linux__)
+    static void on_signal(int sig) {
+        const int saved = errno;
+        g_sig_ = sig;
+        DemandLog * l = inst_for_signal();
+        if (l != nullptr) { const char c = 'x'; (void) !::write(l->pipe_[1], &c, 1); }
+        errno = saved;
+    }
+    static DemandLog *& inst_for_signal() { static DemandLog * p = nullptr; return p; }
+    void watch() {
+        inst_for_signal() = this;
+        for (;;) {
+            struct pollfd pfd { pipe_[0], POLLIN, 0 };
+            const int r = ::poll(&pfd, 1, 1000);
+            if (r > 0 && (pfd.revents & POLLIN)) {
+                flush();
+                const int sig = g_sig_ != 0 ? g_sig_ : SIGTERM;
+                ::signal(sig, SIG_DFL);
+                ::raise(sig);
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(mu_);
+            if (dirty_) { flush_locked(); }
+        }
+    }
+    static inline volatile sig_atomic_t g_sig_ = 0;
+    int pipe_[2] = { -1, -1 };
+#endif
+    void flush_locked() { std::fflush(f_); dirty_ = false; lines_since_flush_ = 0; }
+
+    FILE *     f_;
+    std::mutex mu_;
+    bool       dirty_ = false;
+    int        lines_since_flush_ = 0;
+    std::mutex id_mu_;
+    std::unordered_map<int, std::pair<int, int>> ident_;
+};
+
+// One per demanded request (only when WP_DEMAND_LOG is set). Each element of
+// src is written by exactly one thread; emit() runs after those settle.
+struct DemandRec {
+    uint64_t           seq = 0;
+    int64_t            t_ns = 0;
+    int                layer = -1;
+    uint32_t           n_tokens = 0;
+    std::vector<int>   expert;
+    std::vector<char>  src;
+    std::atomic<bool>  emitted{false};
+    void emit() {
+        if (emitted.exchange(true)) { return; }
+        DemandLog * l = DemandLog::get();
+        if (l == nullptr) { return; }
+        std::string line = "D " + std::to_string(seq) + " " + std::to_string(t_ns) + " " +
+                           std::to_string(layer) + " " + std::to_string(n_tokens) + " " +
+                           std::to_string(expert.size());
+        for (size_t i = 0; i < expert.size(); ++i) {
+            line += ' ';
+            line += std::to_string(expert[i]);
+            line += ':';
+            line += src[i];
+        }
+        line += '\n';
+        l->write(line.data(), line.size());
+    }
+    ~DemandRec() { emit(); }
+};
+
 struct WorkerLogFiles {
     WorkerLogFiles() {
         if (const char * path = std::getenv("WP_PAGEIN_LOG")) {
@@ -4967,6 +5112,7 @@ private:
         size_t             slot_index  = 0;
         const ExpertPage * page        = nullptr;
         int                fd          = -1;
+        std::shared_ptr<DemandRec> demand_rec;   // WP_DEMAND_LOG (null when off)
         // Destination tensor for this page-in's H2D, captured HERE, at plan
         // time, under g_worker_gpu_mutex (see the pageins.push_back() call
         // site in ensure_batch). reader threads copy through
@@ -5195,6 +5341,18 @@ public:
             demand_ns_[i].store(0, std::memory_order_relaxed);
             hint_dist_[i].store(0, std::memory_order_relaxed);
             land_boost_[i].store(0, std::memory_order_relaxed);
+        }
+        if (DemandLog::get() != nullptr) {
+            // F evicted: a prefetched CPU-tier page the arena dropped unused
+            // (a MISS). Runs under the arena lock; touches only the log.
+            arena_.set_unused_evict_hook([](int page_idx, uint8_t tag) {
+                if ((tag & kTagPf) == 0) { return; }
+                int layer = -1, expert = -1;
+                DemandLog * dl = DemandLog::get();
+                if (dl != nullptr && dl->ident(page_idx, layer, expert)) {
+                    dl->f_event(layer, expert, "evicted");
+                }
+            });
         }
         attr_hint_ns_ = std::make_unique<std::atomic<int64_t>[]>(track_n_);
         attr_state_   = std::make_unique<std::atomic<uint8_t>[]>(track_n_);
@@ -5651,6 +5809,7 @@ public:
         size_t n_cpu_tier() const {
             return n_cpu_tier_;
         }
+        const std::shared_ptr<DemandRec> & demand_rec() const { return demand_rec_; }
 
         // Slot this entry landed in, or SIZE_MAX for a pinned-resident page that
         // occupies no pool slot. Used by the speculative page-in path to re-stamp the LRU tick.
@@ -5834,6 +5993,7 @@ public:
 
         ExpertSlotPool *           owner_ = nullptr;
         std::vector<Entry>         entries_;
+        std::shared_ptr<DemandRec> demand_rec_;
         std::shared_ptr<BatchState> state_;
         std::vector<std::thread>   workers_;
         bool                       completed_ = false;
@@ -6017,6 +6177,18 @@ public:
             bool spec_call = false,
             bool spec_call_is_layer_ahead = false) {
         const bool protect_this_call = spec_call && spec_protect_layerahead_evict_;
+        // WP_DEMAND_LOG: arrival stamp, and which demanded pages a speculative
+        // (VRAM) read was already in flight for -> src W if the demand waits.
+        DemandLog * const dlog = (count_demand && !spec_call && n_tokens > 0 && !pages.empty())
+            ? DemandLog::get() : nullptr;
+        const int64_t dlog_t0 = dlog != nullptr ? DemandLog::now_ns() : 0;
+        std::vector<char> dlog_inflight;
+        if (dlog != nullptr && spec_any_in_flight() && !spec_recursion_) {
+            dlog_inflight.assign(pages.size(), 0);
+            for (size_t i = 0; i < pages.size(); ++i) {
+                if (pages[i] != nullptr && spec_in_flight_for(*pages[i])) { dlog_inflight[i] = 1; }
+            }
+        }
         // Take anything the reader threads already landed -- free residency for
         // this request, and it frees the pins. Non-blocking. spec_any_in_flight
         // ("is anything live"), not spec_in_flight ("at the WP_EXPERT_SPEC_MAX_
@@ -6092,6 +6264,16 @@ public:
         }
         if (n_tokens > 0) { attr_last_rows_.store(n_tokens, std::memory_order_relaxed); }
         Batch batch(this, pages.size());
+        if (dlog != nullptr) {
+            auto rec = std::make_shared<DemandRec>();
+            rec->t_ns     = dlog_t0;
+            rec->layer    = pages[0]->layer;
+            rec->n_tokens = n_tokens;
+            rec->expert.resize(pages.size());
+            for (size_t i = 0; i < pages.size(); ++i) { rec->expert[i] = pages[i]->expert; }
+            rec->src.assign(pages.size(), '?');
+            batch.demand_rec_ = std::move(rec);
+        }
         // Demand decode/verify only: never a speculative or prefill call.
         const bool cpu_tier_this_call = cpu_tier_enabled() && count_demand && !spec_call &&
             n_tokens >= 1 && n_tokens <= cpu_tier_max_tokens();
@@ -6147,6 +6329,7 @@ public:
                         batch.entries_[i].upload_hash = page.upload_hash;
                         batch.entries_[i].upload_hash_valid = page.upload_hash_valid;
                         ++batch.n_resident_;
+                        if (batch.demand_rec_) { batch.demand_rec_->src[i] = 'V'; }
                         continue;
                     }
                     if (cpu_eligible && (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
@@ -6158,6 +6341,7 @@ public:
                         continue;
                     }
                     pageins.push_back(i);
+                    if (batch.demand_rec_) { batch.demand_rec_->src[i] = 'N'; }   // refined by reserve_arena_for_pagein
                     continue;
                 }
                 Slot & slot = slots_[slot_index];
@@ -6171,6 +6355,12 @@ public:
                 // slot confirms the guess. It stops counting against
                 // WP_EXPERT_SPEC_MAX_SLOTS from this point on, same as the
                 // pager's speculative_[slot]=0 on a demand hit (wp-pool.cpp).
+                if (batch.demand_rec_) {
+                    // spec_pending = a speculative VRAM page-in no demand has
+                    // used yet -> a prefetch hit (W if its read was in flight).
+                    batch.demand_rec_->src[i] = slot.spec_pending
+                        ? ((i < dlog_inflight.size() && dlog_inflight[i]) ? 'W' : 'P') : 'V';
+                }
                 if (slot.spec_pending) {
                     if (slot.layer_ahead) {
                         ++n_layerahead_hits_;
@@ -6333,6 +6523,7 @@ public:
                     PageIn pi;
                     pi.entry_index = entry_index;
                     pi.page        = &page;
+                    pi.demand_rec  = batch.demand_rec_;
                     // speculative verify (2-8 tokens) is decode traffic. Prefill
                     // layer-ahead batches arrive with n_tokens=0 (spec_pagein_submit)
                     // but are prefill by construction; without this ~96% of prefill
@@ -7175,6 +7366,14 @@ public:
         return n;
     }
 
+    // WP_DEMAND_LOG F line for a CPU-tier prefetch transition (no-op when off).
+    static void pf_log(const ExpertPage & page, const char * what) {
+        if (DemandLog * dl = DemandLog::get()) {
+            if (what[0] == 'i') { dl->note_ident(page.cache_id, page.layer, page.expert); }
+            dl->f_event(page.layer, page.expert, what);
+        }
+    }
+
     // Frame thread (== dispatch thread, so find_slot/fd_for are safe here).
     void cpu_pf_enqueue(const ExpertPage & page) {
         if (page.cache_id < 0 || page.is_resident || pf_paused_.load(std::memory_order_relaxed)) {
@@ -7188,6 +7387,7 @@ public:
         }
         if (page.layer <= current_layer_) {
             n_pf_stale_dropped_.fetch_add(1, std::memory_order_relaxed);
+            pf_log(page, "stale");
             return;
         }
         int fd = -1;
@@ -7201,6 +7401,7 @@ public:
             std::lock_guard<std::mutex> lock(pf_mu_);
             if (pf_step_count_ >= cap) {
                 n_pf_capped_.fetch_add(1, std::memory_order_relaxed);
+                pf_log(page, "dropped");
                 return;
             }
             for (const PfItem & q : pf_q_) {
@@ -8084,6 +8285,7 @@ private:
         const void *          data   = nullptr;
         wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
         bool                  ram_hit = false;
+        char                  src = '?';   // WP_DEMAND_LOG classification
     };
 
     // CPU tier: hold `page`'s bytes in the arena -- borrow on a RAM hit,
@@ -8093,20 +8295,43 @@ private:
     // pool state. Unlike reserve_arena_for_pagein this never marks the entry
     // for drop under WP_HOST_TIER_VICTIM: the CPU tier computes FROM RAM, so the
     // page staying there is the point.
+    // WP_DEMAND_LOG: classify a CPU-tier borrow that succeeded. A promoted
+    // (speculative, unused) entry is a prefetch hit: P on the first try, W if the
+    // demand had to wait for it. A non-promoted one is R (earlier demand).
+    // Also emits F used for a CPU-tier-prefetch landing.
+    void note_host_src(const ExpertPage & page, HostPage & hp, int promoted_tag,
+                       bool first_try, bool pf_live) {
+        DemandLog * dl = DemandLog::get();
+        if (dl == nullptr) { return; }
+        const bool waited = !first_try;
+        hp.src = promoted_tag >= 0 ? ((waited || pf_live) ? 'W' : 'P')
+                                   : (pf_live ? 'W' : 'R');
+        if (promoted_tag >= 0 && (promoted_tag & kTagPf)) {
+            dl->f_event(page.layer, page.expert, "used");
+        }
+    }
+
     HostPage acquire_host_page(const ExpertPage & page, int fd, uint32_t rows = 0) {
         HostPage hp;
         bool first_try = true;
+        bool pf_live = false;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (true) {
             const void * src = nullptr;
+            int promoted_tag = -1;
             if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
-                              /*prefill_hint=*/false)) {
+                              /*prefill_hint=*/false, &promoted_tag)) {
+                note_host_src(page, hp, promoted_tag, first_try, pf_live);
                 if (first_try) { attr_note_hit(page, rows); }
                 hp.data    = src;
                 hp.ram_hit = true;
                 return hp;
             }
-            if (first_try) { attr_note_pagein(page, rows); first_try = false; }
+            if (first_try) {
+                const uint8_t st = attr_note_pagein(page, rows);
+                pf_live = st == kAttrQueued || st == kAttrReading;
+                first_try = false;
+            }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -8127,6 +8352,7 @@ private:
                 arena_.finish_read(page.cache_id, hp.handle, /*ok=*/true,
                                    /*keep_borrowed=*/true, /*prefill_hint=*/false);
                 hp.data = data;
+                hp.src  = pf_live ? 'W' : 'N';
                 return hp;
             }
             if (r == wp::HostArena::Reserve::Timeout) {
@@ -8143,17 +8369,24 @@ private:
     bool acquire_host_page_begin(const ExpertPage & page, HostPage & hp, void ** data,
                                  uint32_t rows = 0) {
         bool first_try = true;
+        bool pf_live = false;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (true) {
             const void * src = nullptr;
+            int promoted_tag = -1;
             if (arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
-                              /*prefill_hint=*/false)) {
+                              /*prefill_hint=*/false, &promoted_tag)) {
+                note_host_src(page, hp, promoted_tag, first_try, pf_live);
                 if (first_try) { attr_note_hit(page, rows); }
                 hp.data    = src;
                 hp.ram_hit = true;
                 return true;
             }
-            if (first_try) { attr_note_pagein(page, rows); first_try = false; }
+            if (first_try) {
+                const uint8_t st = attr_note_pagein(page, rows);
+                pf_live = st == kAttrQueued || st == kAttrReading;
+                first_try = false;
+            }
             const auto now = std::chrono::steady_clock::now();
             const uint64_t left_ms = now >= deadline ? 0 :
                 (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -8167,6 +8400,7 @@ private:
             if (r == wp::HostArena::Reserve::Reserved) {
                 *data = d;
                 hp.data = d;
+                hp.src  = pf_live ? 'W' : 'N';
                 return false;
             }
             if (r == wp::HostArena::Reserve::Timeout) {
@@ -8366,6 +8600,11 @@ private:
                  ? std::chrono::milliseconds(seed_reserve_ms)
                  : std::chrono::milliseconds(60000));
         bool waited = false;
+        // WP_DEMAND_LOG: a prefetch queued/reading for this page at entry means
+        // the demand waits for or takes over that read (W).
+        const bool pf_live = pagein.demand_rec && tracked(pagein.page->cache_id) &&
+            (attr_state_[pagein.page->cache_id].load(std::memory_order_relaxed) == kAttrQueued ||
+             attr_state_[pagein.page->cache_id].load(std::memory_order_relaxed) == kAttrReading);
         while (true) {
             // C1: a page another thread is READING right now (a speculative
             // landing, another connection's or device's demand read) must be
@@ -8379,8 +8618,19 @@ private:
             // nearly all traffic entered demand standing ungated -- see
             // HostArena::borrow()'s prefill_hint comment) sees this access
             // the same way finish_read()'s prefill_hint already does.
+            int promoted_tag = -1;
             if (arena_.borrow(pagein.page->cache_id, &src, &pagein.arena_handle,
-                              /*demand=*/true, pagein.prefill)) {
+                              /*demand=*/true, pagein.prefill, &promoted_tag)) {
+                if (pagein.demand_rec) {
+                    pagein.demand_rec->src[pagein.entry_index] =
+                        promoted_tag >= 0 ? ((pf_live || waited) ? 'W' : 'P')
+                                          : (pf_live ? 'W' : 'R');
+                    if (promoted_tag >= 0 && (promoted_tag & kTagPf)) {
+                        if (DemandLog * dl = DemandLog::get()) {
+                            dl->f_event(pagein.page->layer, pagein.page->expert, "used");
+                        }
+                    }
+                }
                 pagein.ram_hit    = true;
                 pagein.arena_data = const_cast<void *>(src);
                 pagein.hold_released = false;
@@ -8406,6 +8656,9 @@ private:
             const wp::HostArena::Reserve r = arena_.reserve_wait(
                 pagein.page->cache_id, /*speculative=*/false, &data, &pagein.arena_handle, left_ms);
             if (r == wp::HostArena::Reserve::Reserved) {
+                if (pagein.demand_rec) {
+                    pagein.demand_rec->src[pagein.entry_index] = pf_live ? 'W' : 'N';
+                }
                 pagein.ram_hit    = false;
                 pagein.arena_data = data;
                 pagein.hold_released = false;
@@ -10565,7 +10818,8 @@ public:
         }
     }
     // CPU-tier cold miss (first borrow failed): file under exactly one bucket.
-    void attr_note_pagein(const ExpertPage & page, uint32_t rows) {
+    // Returns the page's prefetch state before this demand (kAttrNone if untracked).
+    uint8_t attr_note_pagein(const ExpertPage & page, uint32_t rows) {
         const bool dec = rows <= kAttrDecRows;
         attr_demand_all_.fetch_add(1, std::memory_order_relaxed);
         attr_pagein_all_.fetch_add(1, std::memory_order_relaxed);
@@ -10573,7 +10827,7 @@ public:
             attr_demand_dec_.fetch_add(1, std::memory_order_relaxed);
             attr_pagein_dec_n_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!tracked(page.cache_id)) { return; }
+        if (!tracked(page.cache_id)) { return kAttrNone; }
         const int64_t now = track_now_ns();
         int64_t kind_age[kKinds];
         for (size_t i = 0; i < kKinds; ++i) {
@@ -10612,6 +10866,7 @@ public:
             attr_never_split_[ns].fetch_add(1, std::memory_order_relaxed);
             if (dec) { attr_never_split_dec_[ns].fetch_add(1, std::memory_order_relaxed); }
         }
+        return st;
     }
     // "pagein_attr[..] pagein_read_pct[..] lead_pagein_ms[..] lead_hit_ms[..]"
     std::string pagein_attr_str() const {
@@ -10736,11 +10991,13 @@ private:
             const ExpertPage & page = *it.page;
             if (pf_paused_.load(std::memory_order_relaxed)) {
                 attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
+                pf_log(page, "dropped");
                 continue;   // parked: take no RAM-tier room
             }
             // The page may have landed or started reading since it was queued.
             if (arena_.state_of(page.cache_id) != wp::HostArena::State::Free) {
                 attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
+                pf_log(page, "dropped");
                 continue;
             }
             PfGate g = cpu_pf_gate(page);
@@ -10750,6 +11007,7 @@ private:
             if (g == PfGate::Stale) {
                 attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
                 n_pf_stale_dropped_.fetch_add(1, std::memory_order_relaxed);
+                pf_log(page, "stale");
                 continue;
             }
             void *                data   = nullptr;
@@ -10759,6 +11017,7 @@ private:
             if (!arena_.begin_read(page.cache_id, /*speculative=*/true, &data, &handle)) {
                 host_begin_refused_.fetch_add(1, std::memory_order_relaxed);
                 attr_cas(page.cache_id, kAttrQueued, kAttrHinted);
+                pf_log(page, "dropped");
                 continue;
             }
             if (tracked(page.cache_id)) {
@@ -10766,9 +11025,11 @@ private:
             }
             attr_cas(page.cache_id, kAttrQueued, kAttrReading);
             n_pf_issued_.fetch_add(1, std::memory_order_relaxed);
+            pf_log(page, "issued");
             bool ok = true;
             bool stopped = false;
             bool late_finish = false;
+            bool stopped_stale = false;
             try {
                 size_t off = 0;
                 while (off < (size_t) page.size) {
@@ -10782,6 +11043,7 @@ private:
                         stopped = g == PfGate::Stop;
                         if (g == PfGate::Stale) {
                             n_pf_stale_dropped_.fetch_add(1, std::memory_order_relaxed);
+                            stopped_stale = true;
                         }
                         break;
                     }
@@ -10804,6 +11066,11 @@ private:
             // A demand that found the page Reading already reset the state to
             // None; the CAS then fails, so a consumed page is not re-armed.
             attr_cas(page.cache_id, kAttrReading, ok ? kAttrLanded : kAttrHinted);
+            if (ok) {
+                pf_log(page, "landed");
+            } else {
+                pf_log(page, stopped_stale ? "stale" : "dropped");
+            }
             if (ok) {
                 n_pf_landed_.fetch_add(1, std::memory_order_relaxed);
                 if (late_finish) {
@@ -11463,6 +11730,7 @@ size_t ExpertSlotPool::seed_land(const std::vector<SeedItem> & chunk) {
 ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     owner_(other.owner_),
     entries_(std::move(other.entries_)),
+    demand_rec_(std::move(other.demand_rec_)),
     state_(std::move(other.state_)),
     workers_(std::move(other.workers_)),
     completed_(other.completed_),
@@ -13745,6 +14013,14 @@ public:
         ExpertSlotPool::Batch batch = prepared.has_value()
             ? std::move(*prepared)
             : pool_.ensure_batch(pages, measure, lookup_started, request.n_tokens, conn_index);
+        // WP_DEMAND_LOG: stamp the wire seq_id; emit the D line once the request
+        // is fully settled (destroyed after the CPU-tier wait guard below,
+        // before batch).
+        if (batch.demand_rec()) { batch.demand_rec()->seq = trace_req; }
+        struct DemandEmitGuard {
+            const std::shared_ptr<DemandRec> & rec;
+            ~DemandEmitGuard() { if (rec) { rec->emit(); } }
+        } demand_emit_guard{ batch.demand_rec() };
         // Declare this after batch: its destructor synchronizes before batch
         // releases pins or permits slot reuse on an exceptional exit.
         AsyncDispatchGuard async_dispatch_guard(*this, conn_index, trace_req);
@@ -14342,6 +14618,7 @@ public:
             pending.batch.emplace(pool_.ensure_batch(pages, stats_.enabled(), lookup_started,
                                                      pending.request.n_tokens, conn_index,
                                                      gpu_lock));
+            if (pending.batch->demand_rec()) { pending.batch->demand_rec()->seq = seq_id; }
             pending.arena_eligible = arena_id_eligible(pending.request, *pending.batch);
             // WP_EXPERT_CPU_TIER_EARLY_IO: the tier's NVMe reads need only the
             // page list, not the activation, so start them now and overlap the
@@ -17604,6 +17881,7 @@ private:
     struct CpuTierJob {
         const pipe_expert_dispatch_req *       request = nullptr;
         uint32_t                               n_tokens = 0;   // request rows (miss-attr phase)
+        std::shared_ptr<DemandRec>             demand_rec;     // WP_DEMAND_LOG (null when off)
         std::vector<size_t>                    index;   // assignment indices, ascending
         std::vector<const ExpertPage *>        pages;
         std::vector<int>                       fds;
@@ -17685,6 +17963,7 @@ private:
         job->hidden.resize(job->index.size());
         job->gu_done.assign(job->index.size(), 0);
         job->n_tokens = request.n_tokens;
+        job->demand_rec = batch.demand_rec();
         pool_.attr_note_req(request.n_tokens, job->index.size());
         {
             std::lock_guard<std::mutex> lock(cpu_tier_mu_);
@@ -17929,6 +18208,7 @@ private:
                 const size_t n = cpu_tier_chunks_for(size);
                 if (n <= 1) {
                     ExpertSlotPool::HostPage hp = pool_.acquire_host_page(page, job->fds[k], job->n_tokens);
+                    if (job->demand_rec) { job->demand_rec->src[job->index[k]] = hp.src; }
                     {
                         std::lock_guard<std::mutex> lock(job->m);
                         job->holds[k] = hp;
@@ -17941,6 +18221,7 @@ private:
                 pr->fd   = job->fds[k];
                 void * data = nullptr;
                 const bool hit = pool_.acquire_host_page_begin(page, pr->hp, &data, job->n_tokens);
+                if (job->demand_rec) { job->demand_rec->src[job->index[k]] = pr->hp.src; }
                 if (hit) {
                     {
                         std::lock_guard<std::mutex> lock(job->m);

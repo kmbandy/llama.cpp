@@ -202,8 +202,10 @@ public:
     // un-gated promotion path made the whole policy a no-op in production
     // (ram_evictions_lru tracked ram_lookups almost 1:1, ~0 hit rate) even
     // though the demand-landing gate alone looked correct in isolation.
+    // promoted_tag_out (optional): set to -1, or to the spec tag when this
+    // borrow promoted a still-speculative (prefetched, unused) entry.
     bool borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand = true,
-               bool prefill_hint = false);
+               bool prefill_hint = false, int * promoted_tag_out = nullptr);
     void release(int page_idx, Handle handle);
 
     // --- exclusive victim tier (WP_HOST_TIER_VICTIM in the worker) ---
@@ -222,6 +224,10 @@ public:
     // spec_used_tag on a promotion, spec_unused_tag on an unused eviction.
     // The worker encodes hint distance and a "demand got there first" bit.
     void set_spec_tag(int page_idx, Handle handle, uint8_t tag);
+    // Called (under the arena lock; must not call back into the arena) when a
+    // speculative entry is evicted before any borrow used it.
+    using UnusedEvictHook = void (*)(int page_idx, uint8_t tag);
+    void set_unused_evict_hook(UnusedEvictHook hook) { unused_evict_hook_ = hook; }
     uint64_t spec_used_tag(uint8_t tag) const;
     uint64_t spec_unused_tag(uint8_t tag) const;
 
@@ -437,6 +443,7 @@ private:
     uint64_t quar_confirmed_        = 0;
     uint64_t quar_evicted_unused_   = 0;
     uint64_t quar_skipped_full_     = 0;
+    UnusedEvictHook unused_evict_hook_ = nullptr;
     uint64_t spec_used_by_tag_[256]   = {};
     uint64_t spec_unused_by_tag_[256] = {};
 
