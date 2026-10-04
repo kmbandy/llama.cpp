@@ -6,6 +6,7 @@
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -414,6 +415,71 @@ void router2_trace_scores(const float *     weights,
             }
         }
     }
+}
+
+bool parse_pscore_file(const std::string & path, pscore_model & out, std::string * err) {
+    static const char * const names[PSF_COUNT] = { "min_d", "rank", "margin", "prob", "n_dist", "layer", "gap", "row" };
+    const auto fail = [&](const std::string & m) {
+        if (err != nullptr) {
+            *err = m;
+        }
+        return false;
+    };
+    std::ifstream in(path);
+    if (!in) {
+        return fail("cannot open " + path);
+    }
+    pscore_model m;
+    std::string  line;
+    size_t       lineno = 0;
+    while (std::getline(in, line)) {
+        ++lineno;
+        const size_t a = line.find_first_not_of(" \t\r");
+        if (a == std::string::npos || line[a] == '#') {
+            continue;
+        }
+        std::istringstream ss(line);
+        std::string        tok;
+        ss >> tok;
+        const std::string where = path + ":" + std::to_string(lineno) + ": ";
+        if (tok == "bias") {
+            if (!(ss >> m.bias)) {
+                return fail(where + "bad bias");
+            }
+            continue;
+        }
+        int factor = -1;
+        for (int i = 0; i < PSF_COUNT; ++i) {
+            if (tok == names[i]) {
+                factor = i;
+            }
+        }
+        pscore_model::bucket b{};
+        b.factor = factor;
+        if (factor < 0) {
+            return fail(where + "unknown factor '" + tok + "'");
+        }
+        if (!(ss >> b.lo >> b.hi >> b.w) || !(b.lo < b.hi)) {
+            return fail(where + "expected '<factor> <lo> <hi> <weight>' with lo < hi");
+        }
+        m.buckets.push_back(b);
+    }
+    if (m.buckets.empty()) {
+        return fail(path + ": no buckets");
+    }
+    out = std::move(m);
+    return true;
+}
+
+double pscore_eval(const pscore_model & model, const pscore_features & f) {
+    double z = model.bias;
+    for (const pscore_model::bucket & b : model.buckets) {
+        const float x = f.v[b.factor];
+        if (b.lo <= x && x < b.hi) {
+            z += b.w;
+        }
+    }
+    return 1.0 / (1.0 + std::exp(-z));
 }
 
 uint64_t ngram_hint_table::key(int32_t token, int32_t layer) {

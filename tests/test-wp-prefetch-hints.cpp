@@ -1,6 +1,7 @@
 #include "pipe-prefetch-hints.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include <unistd.h>
 
@@ -179,6 +180,27 @@ void test_ngram_format_and_scoring(const fs::path & path) {
 
 }  // namespace
 
+void test_pscore(const fs::path & path) {
+    {
+        std::ofstream out(path);
+        out << "# c\nbias -1.0\nrank 0 1 0.5\nprob 0.1 2 1.5\nmargin 1 99 9\n";
+    }
+    pscore_model m;
+    std::string  err;
+    require(parse_pscore_file(path.string(), m, &err) && m.buckets.size() == 3, "pscore parse");
+    pscore_features f;
+    f.v[PSF_RANK] = 0; f.v[PSF_PROB] = 0.1f; f.v[PSF_MARGIN] = 0.5f;
+    const double p = pscore_eval(m, f);   // z = -1 + 0.5 + 1.5 = 1 (hi is exclusive, lo inclusive)
+    require(std::abs(p - 1.0 / (1.0 + std::exp(-1.0))) < 1e-9, "pscore eval");
+    f.v[PSF_RANK] = 1; f.v[PSF_PROB] = 2.0f;
+    require(std::abs(pscore_eval(m, f) - 1.0 / (1.0 + std::exp(1.0))) < 1e-9, "pscore bucket bounds");
+    {
+        std::ofstream out(path);
+        out << "bias 0\nbogus 0 1 1\n";
+    }
+    require(!parse_pscore_file(path.string(), m, &err) && !err.empty(), "pscore must reject bad factor");
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2) {
         const ngram_hint_table table(argv[1]);
@@ -194,6 +216,7 @@ int main(int argc, char ** argv) {
         test_router2_per_token_union();
         test_router2_confidence_gate();
         test_ngram_format_and_scoring(path);
+        test_pscore(path);
         std::error_code ignored;
         fs::remove(path, ignored);
         return 0;

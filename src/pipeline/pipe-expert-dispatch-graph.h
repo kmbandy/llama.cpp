@@ -2,6 +2,7 @@
 
 #include "pipe-expert-dispatcher.h"
 #include "pipe-hash-oracle.h"
+#include "pipe-prefetch-hints.h"
 
 #include <atomic>
 #include <chrono>
@@ -204,6 +205,11 @@ class graph_dispatcher {
     // Added to the floor per extra layer of depth (WP_HINT_ROUTER2_CONF_STEP,
     // default 0.05).
     static float router2_conf_step();
+    // WP_HINT_ROUTER2_PSCORE=<weights file>: PSCORE admission mode. nullptr =
+    // off (or the file failed to parse). WP_HINT_ROUTER2_PMIN (default 0.6) is
+    // the admission threshold. Parsed once; logs to stderr.
+    static const pscore_model * router2_pscore();
+    static float                router2_pmin();
 
     // WP_HINT_QUEUE_DEPTH=N (default 0/unset): 0 keeps the legacy one-slot
     // mailbox byte-identical (a snapshot the predictor thread has not yet
@@ -412,6 +418,7 @@ class graph_dispatcher {
         int64_t            n_tokens = 0;
         std::vector<float> activations;
         bool               valid    = false;
+        uint64_t           gen      = 0;   // pscore_gen_ at enqueue (decode step)
     };
     // Legacy one-slot mailbox. Used verbatim (unconditional overwrite, no
     // count) when pred_queue_depth() == 0, for byte-identical default
@@ -445,6 +452,29 @@ class graph_dispatcher {
     // MoE layer and a per-call cap never bound (measured 2026-08-19: +23k
     // spec_pageins when the 16-page cap reset 43x per token).
     size_t                                         router2_pages_this_decode_ = 0;
+    // PSCORE admission state (WP_HINT_ROUTER2_PSCORE). pscore_gen_ is bumped by
+    // begin_decode (dispatch thread) and stamped on each pred_job; the pages_
+    // array (n_layer x n_expert, sized once on the predictor thread) is touched
+    // only by the predictor thread and validated lazily by comparing a page's
+    // stamp to the job's gen, so a new step never clears anything.
+    struct pscore_page {
+        uint64_t stamp        = 0;   // gen the aggregates below belong to
+        uint64_t eval_stamp   = 0;   // pscore_job_seq_ of the last job that listed it
+        uint64_t hinted_stamp = 0;   // gen at which the page was admitted
+        uint64_t d_mask       = 0;   // distinct distances naming the page (bit d, d < 64)
+        float    margin = 0, prob = 0, gap = 0;
+        int16_t  min_d = 0, rank = 0, row = 0;
+    };
+    uint64_t                                       pscore_gen_ = 0;
+    uint64_t                                       pscore_job_seq_ = 0;
+    std::vector<pscore_page>                       pscore_pages_;
+    int32_t                                        pscore_n_layer_ = 0;
+    std::vector<int32_t>                           pscore_touched_;
+    // Counters (predictor thread writes, end_decode reads).
+    std::atomic<uint64_t>                          pscore_evaluated_{0};
+    std::atomic<uint64_t>                          pscore_admitted_d_[64] = {};
+    std::atomic<uint64_t>                          pscore_admitted_dec_[10] = {};
+    void pscore_process_job(const pred_job & job, router2_scratch & scratch);
     bool                                           pred_snapshot_taken_ = false;
     // Prediction-cadence census (2026-08-19). offered = enqueue_prediction calls
     // (once per layer per forward pass); dropped = snapshots the latest-wins

@@ -115,6 +115,33 @@ void router2_trace_scores(const float *     weights,
                           float *           score_out,
                           float *           prob_out);
 
+// ROUTER2 PSCORE admission (WP_HINT_ROUTER2_PSCORE). A logistic model over
+// bucketed features of one (target layer, expert) page, fitted offline on the
+// WP_HINT_TRACE records (score/prob exactly as router2_trace_scores emits them).
+// Weights file: '#' comments, "bias <w>", then "<factor> <lo> <hi> <weight>"
+// with factor in {min_d rank margin prob n_dist layer gap row}; a bucket
+// matches when lo <= value < hi.
+enum pscore_factor { PSF_MIN_D, PSF_RANK, PSF_MARGIN, PSF_PROB, PSF_N_DIST, PSF_LAYER, PSF_GAP, PSF_ROW, PSF_COUNT };
+
+struct pscore_features {
+    float v[PSF_COUNT] = {};
+};
+
+struct pscore_model {
+    struct bucket {
+        int   factor;
+        float lo, hi, w;
+    };
+    double              bias = 0.0;
+    std::vector<bucket> buckets;
+};
+
+// false + *err on any parse failure (unknown factor, bad number, lo >= hi, no buckets).
+bool parse_pscore_file(const std::string & path, pscore_model & out, std::string * err);
+
+// P(page used) = sigmoid(bias + sum of matching bucket weights).
+double pscore_eval(const pscore_model & model, const pscore_features & f);
+
 // WPNGRAM v1 is little-endian: header(version, dimensions, row count), one
 // popularity row per layer, then keyed token rows. Each row stores its full
 // count total plus up to 16 (u16 expert, u32 count) entries.

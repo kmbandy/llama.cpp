@@ -1211,6 +1211,33 @@ static const bool s_depth_decay = [] {
     return v != nullptr && v[0] == '1';
 }();
 
+const pscore_model * graph_dispatcher::router2_pscore() {
+    static const pscore_model * model = []() -> const pscore_model * {
+        const char * path = std::getenv("WP_HINT_ROUTER2_PSCORE");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        static pscore_model m;
+        std::string         err;
+        if (!parse_pscore_file(path, m, &err)) {
+            std::fprintf(stderr, "WP_HINT_ROUTER2_PSCORE: %s -- pscore admission OFF\n", err.c_str());
+            return nullptr;
+        }
+        std::fprintf(stderr, "WP_HINT_ROUTER2_PSCORE: loaded %zu buckets from %s, PMIN=%.3f\n",
+                     m.buckets.size(), path, (double) router2_pmin());
+        return &m;
+    }();
+    return model;
+}
+
+float graph_dispatcher::router2_pmin() {
+    static const float value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_PMIN");
+        return (v != nullptr && v[0] != '\0') ? (float) std::atof(v) : 0.6f;
+    }();
+    return value;
+}
+
 int graph_dispatcher::router2_lookahead() {
     static const int value = [] {
         const char * v = std::getenv("WP_HINT_ROUTER2_K");
@@ -1307,6 +1334,7 @@ void graph_dispatcher::register_router_layer(int32_t layer, int32_t n_expert, in
     if (w == nullptr || b == nullptr) {
         throw std::invalid_argument("router layer registered without weights");
     }
+    (void) router2_pscore();   // parse + log once at startup
     router_layer & rl = routers_[layer];
     rl.w.assign(w, w + (size_t) n_expert * (size_t) n_embd);
     rl.b.assign(b, b + (size_t) n_expert);
@@ -1371,6 +1399,7 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
                 pred_inbox_.n_tokens = n_tokens;
                 pred_inbox_.activations.assign(activations.begin(), activations.end());
                 pred_inbox_.valid    = true;
+                pred_inbox_.gen      = pscore_gen_;
             } else {
                 // Bounded FIFO: never overwrites a queued-but-undrained
                 // snapshot. Full is the only way to lose one here, and that
@@ -1385,6 +1414,7 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
                 job.n_tokens = n_tokens;
                 job.activations.assign(activations.begin(), activations.end());
                 job.valid    = true;
+                job.gen      = pscore_gen_;
                 pred_queue_.push_back(std::move(job));
                 pred_queue_hwm_ = std::max(pred_queue_hwm_, pred_queue_.size());
             }
@@ -1712,6 +1742,10 @@ void graph_dispatcher::predictor_loop() {
             ++pred_scored_;
         }
         try {
+            if (router2_pscore() != nullptr) {
+                pscore_process_job(job, scratch);
+                continue;
+            }
             const int32_t n_expert = remote.n_expert();
             const int32_t n_embd   = remote.n_embd();
             const int     K        = router2_lookahead();
@@ -1784,6 +1818,107 @@ void graph_dispatcher::predictor_loop() {
     }
 }
 
+// PSCORE admission for one source layer's snapshot. Cells are (d, row) with
+// target = src + d, d = 2..K+1. Scores/probs come from router2_trace_scores --
+// the exact function WP_HINT_TRACE records -- so the features match the ones the
+// weights were fitted on. Top-7 is requested: ranks 0..5 are candidates, rank 6
+// gives s6 for margin/gap.
+void graph_dispatcher::pscore_process_job(const pred_job & job, router2_scratch & scratch) {
+    static constexpr int TOP_N = 7;
+    const pscore_model & model  = *router2_pscore();
+    const int32_t n_expert = remote.n_expert();
+    const int32_t n_embd   = remote.n_embd();
+    if (n_expert < TOP_N || job.n_tokens <= 0 || job.n_tokens > TRACE_MAX_ROWS) {
+        return;   // same coverage as the tracer (decode/verify batches only)
+    }
+    if (pscore_pages_.empty()) {
+        for (const auto & kv : routers_) {
+            pscore_n_layer_ = std::max(pscore_n_layer_, kv.first + 1);
+        }
+        pscore_pages_.resize((size_t) pscore_n_layer_ * (size_t) n_expert);
+        pscore_touched_.reserve((size_t) 64 * (size_t) job.n_tokens * 6);
+    }
+    const uint64_t gen = job.gen + 1;   // stamp 0 = never written
+    const int      K   = router2_lookahead();
+    const float    pmin = router2_pmin();
+    uint16_t ids[TRACE_MAX_ROWS * TOP_N];
+    float    score[TRACE_MAX_ROWS * TOP_N];
+    float    prob[TRACE_MAX_ROWS * TOP_N];
+    const uint64_t job_seq = ++pscore_job_seq_;
+    pscore_touched_.clear();
+    for (int dd = 0; dd < K; ++dd) {
+        const int32_t d      = 2 + dd;
+        const int32_t target = job.layer + d;
+        const auto    it     = routers_.find(target);
+        if (it == routers_.end() || d >= 64) {
+            continue;
+        }
+        const router_layer & rl = it->second;
+        router2_trace_scores(rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens, n_expert, n_embd,
+                             TOP_N, scratch, ids, score, prob);
+        for (int64_t r = 0; r < job.n_tokens; ++r) {
+            const float * sc  = score + r * TOP_N;
+            const float   s6  = sc[6];
+            const float   gap = sc[0] - s6;
+            for (int k = 0; k < 6; ++k) {
+                const int32_t e = ids[r * TOP_N + k];
+                pscore_page & pg = pscore_pages_[(size_t) target * (size_t) n_expert + (size_t) e];
+                const float   margin = sc[k] - s6;
+                const float   p      = prob[r * TOP_N + k];
+                if (pg.stamp != gen) {
+                    pg.stamp  = gen;
+                    pg.d_mask = 0;
+                    pg.min_d  = (int16_t) d;
+                    pg.rank   = (int16_t) k;
+                    pg.row    = (int16_t) std::min<int64_t>(r, 5);
+                    pg.margin = margin;
+                    pg.prob   = p;
+                    pg.gap    = gap;
+                } else {
+                    pg.min_d  = std::min<int16_t>(pg.min_d, (int16_t) d);
+                    pg.rank   = std::min<int16_t>(pg.rank, (int16_t) k);
+                    pg.row    = std::min<int16_t>(pg.row, (int16_t) std::min<int64_t>(r, 5));
+                    pg.margin = std::max(pg.margin, margin);
+                    pg.prob   = std::max(pg.prob, p);
+                    pg.gap    = std::max(pg.gap, gap);
+                }
+                pg.d_mask |= (uint64_t) 1 << d;
+                if (pg.eval_stamp != job_seq && pg.hinted_stamp != gen) {
+                    pg.eval_stamp = job_seq;
+                    pscore_touched_.push_back(target * n_expert + e);
+                }
+            }
+        }
+    }
+    // All cells of this source layer are in: evaluate each touched, not-yet-hinted page once.
+    // Admission d = target - src of this job (each page is hit by exactly one d per source layer).
+    std::lock_guard<std::mutex> lock(pred_mutex_);
+    for (const int32_t idx : pscore_touched_) {
+        pscore_page & pg = pscore_pages_[(size_t) idx];
+        pscore_evaluated_.fetch_add(1, std::memory_order_relaxed);
+        pscore_features f;
+        f.v[PSF_MIN_D]  = (float) pg.min_d;
+        f.v[PSF_RANK]   = (float) std::min<int16_t>(pg.rank, 5);
+        f.v[PSF_MARGIN] = pg.margin;
+        f.v[PSF_PROB]   = pg.prob;
+        f.v[PSF_N_DIST] = (float) __builtin_popcountll(pg.d_mask);
+        f.v[PSF_LAYER]  = (float) (idx / n_expert);
+        f.v[PSF_GAP]    = pg.gap;
+        f.v[PSF_ROW]    = (float) std::min<int16_t>(pg.row, 5);
+        const double P = pscore_eval(model, f);
+        if (P < (double) pmin) {
+            continue;
+        }
+        pg.hinted_stamp = gen;
+        pscore_admitted_d_[idx / n_expert - job.layer].fetch_add(1, std::memory_order_relaxed);
+        pscore_admitted_dec_[std::min(9, (int) (P * 10.0))].fetch_add(1, std::memory_order_relaxed);
+        pred_result & res = pred_ready_[idx / n_expert];
+        res.n_tokens      = (uint32_t) job.n_tokens;
+        res.experts.insert(std::upper_bound(res.experts.begin(), res.experts.end(), idx % n_expert),
+                           idx % n_expert);   // ascending, merged with earlier unflushed admissions
+    }
+}
+
 void graph_dispatcher::flush_predicted_hints() noexcept {
     // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
     // Recursive because this is called from INSIDE compute()/compute_issue()
@@ -1819,12 +1954,13 @@ void graph_dispatcher::flush_predicted_hints() noexcept {
             if (experts.empty()) {
                 continue;
             }
-            if (page_budget != 0 &&
+            const bool pscore = router2_pscore() != nullptr;   // admission is the cap
+            if (!pscore && page_budget != 0 &&
                 router2_pages_this_decode_ + experts.size() > page_budget) {
                 break;
             }
             std::vector<int32_t> & previous = last_pred_hint_[entry.first];
-            if (previous == experts) {
+            if (!pscore && previous == experts) {
                 continue;
             }
             if (!entry.second.tiers.empty()) {
@@ -2121,6 +2257,7 @@ void graph_dispatcher::begin_decode() noexcept {
     phantom_rows_.clear();
     router2_pages_this_decode_ = 0;
     pred_snapshot_taken_       = false;
+    ++pscore_gen_;
     trace_step_.fetch_add(1, std::memory_order_relaxed);
     remote.begin_deferral_window();
     decode_t0_ = dispatch_clock::now();
@@ -2228,6 +2365,21 @@ void graph_dispatcher::end_decode() noexcept {
             (unsigned long long) hstats.n_no_oracle,
             (unsigned long long) hstats.n_skipped_dynamic,
             (unsigned long long) hstats.n_skipped_in_flight);
+        if (router2_pscore() != nullptr) {
+            // Cumulative since process start. admit_by_d lists d=2..K+1; admit_by_p
+            // is deciles of P (0.0-0.1 ... 0.9-1.0; only >= PMIN are nonzero).
+            std::string by_d, by_p;
+            for (int d = 2; d < 64 && d <= router2_lookahead() + 1; ++d) {
+                by_d += (by_d.empty() ? "" : ",") + std::to_string(pscore_admitted_d_[d].load());
+            }
+            for (int i = 0; i < 10; ++i) {
+                by_p += (by_p.empty() ? "" : ",") + std::to_string(pscore_admitted_dec_[i].load());
+            }
+            std::fprintf(stderr,
+                "expert dispatch pscore: pmin=%.2f evaluated=%llu admit_by_d[2..]=%s admit_by_p[deciles]=%s\n",
+                (double) router2_pmin(), (unsigned long long) pscore_evaluated_.load(),
+                by_d.c_str(), by_p.c_str());
+        }
     }
 
     const uint64_t ns_wall = elapsed_ns(decode_t0_, dispatch_clock::now());
