@@ -134,7 +134,9 @@
 #include <hip/hip_runtime.h>
 #include "gemm_ml84_decode_v2.h"
 #include "bench/trfeed_ml84_kernels.h"   // ml84_lut_gather4/ml84_expand_frag, float8_t/v2i32/v8f32/WAVE_SIZE (trfeed_kernels.h), ml84_tile_nib_base (ml84_trfeed_layout.h), QK_ML8 (ggml-common.h)
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -442,6 +444,17 @@ static ml84_v2_scratch* ml84_v2_scratch_get(int device, hipStream_t stream) {
     hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
     hipStreamIsCapturing(stream, &cap_status);
     if (cap_status != hipStreamCaptureStatusNone) {
+        // The caller then falls back to rdna4_gemm_ml84_trfeed_decode_splitk, whose
+        // fp32 ATOMIC split-K accumulation is order-nondeterministic -- so a graph
+        // captured here would bake a DIFFERENT (nondeterministic) kernel than eager
+        // execution runs. ggml-cuda.cu pre-warms this scratch via
+        // rdna4_gemm_ml84_decode_v2_prewarm() before it begins a capture; reaching
+        // this line means that hook was bypassed.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            fprintf(stderr, "ml84 decode-v2: no warm scratch for (device=%d, stream=%p) while capturing -- "
+                            "falling back to atomic split-K in the captured graph\n", device, (void *) stream);
+        }
         return nullptr;   // no allocation inside capture -- see comment above
     }
     ml84_v2_scratch s;
@@ -463,6 +476,15 @@ static ml84_v2_scratch* ml84_v2_scratch_get(int device, hipStream_t stream) {
     }
     auto res = g_ml84_v2_scratch.emplace(key, s);
     return &res.first->second;
+}
+
+// Allocates (if absent) the persistent split-K scratch for (device, stream).
+// MUST be called while `stream` is NOT capturing (ggml-cuda.cu calls it right
+// before cudaStreamBeginCapture): a first-ever use inside a capture cannot
+// allocate and would silently fall back to the atomic split-K kernel. Returns
+// true if the scratch exists on return.
+extern "C" bool rdna4_gemm_ml84_decode_v2_prewarm(int device, hipStream_t stream) {
+    return ml84_v2_scratch_get(device, stream) != nullptr;
 }
 
 // Split-K fill law -- radiance_mxfp4_fp8.hip:1099-1112, verbatim constants

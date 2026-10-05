@@ -107,6 +107,12 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
 // normal backend teardown path (the OS reclaims VRAM at process exit).
 void ggml_cuda_ml8_clear_cache(void);
 
+// Call on a NON-capturing stream right before cudaStreamBeginCapture of a
+// graph that contains ML8 ops: warms the per-(device,stream) scratch the
+// decode GEMMs would otherwise be unable to allocate mid-capture (their
+// capture-time fallback is a different, nondeterministic kernel).
+void ggml_cuda_ml8_prewarm_for_capture(int device, cudaStream_t stream);
+
 // ─────────────────────────────────────────────────────────────────────
 // ML8_FP8 in-place repack (load-time).
 //

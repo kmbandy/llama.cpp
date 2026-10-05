@@ -69,6 +69,12 @@ bool rdna4_gemm_ml84_decode_v2_grouped(int G, int M, const void* A,
                                        int M_pad, int N, int K, int lda, int sa, int ldc,
                                        hipStream_t stream);
 
+// Pre-allocate the persistent split-K scratch for (device, stream). Call only
+// while `stream` is not capturing; lets a later capture of a graph that
+// contains v2 launches bake the v2 kernel instead of the atomic split-K
+// fallback. Returns false on allocation failure.
+bool rdna4_gemm_ml84_decode_v2_prewarm(int device, hipStream_t stream);
+
 // Compiled ceiling for N that the persistent split-K scratch is sized for
 // (248320 — Qwen3.8-27B's output head). rdna4_gemm_ml84_decode_v2 returns
 // false for any N above this rather than growing scratch mid-launch.

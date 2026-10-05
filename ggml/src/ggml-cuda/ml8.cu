@@ -502,6 +502,20 @@ static const ml8_weight_repack_t * ml8_repack_ephemeral_get(
     return &e.info;
 }
 
+void ggml_cuda_ml8_prewarm_for_capture(int device, cudaStream_t stream) {
+#if defined(GGML_HIP_AITER) && ML8_4_DECODE_V2_AVAILABLE
+    static const bool v2_enabled = [] {
+        const char * e = std::getenv("MT_ML8_4_DECODE_V2");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    if (v2_enabled) {
+        (void) rdna4_gemm_ml84_decode_v2_prewarm(device, stream);
+    }
+#else
+    GGML_UNUSED(device); GGML_UNUSED(stream);
+#endif
+}
+
 const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     cudaStream_t        stream,
     const ggml_tensor * w) {

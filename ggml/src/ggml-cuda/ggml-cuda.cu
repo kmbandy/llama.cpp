@@ -10761,6 +10761,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
 
+        // Warm per-(device,stream) ML8 decode scratch while the stream is still eager (it
+        // cannot be allocated mid-capture; the capture-time fallback kernel differs).
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_op op = cgraph->nodes[i]->op;
+            if (op == GGML_OP_ML8_MUL_MAT || op == GGML_OP_ML8_MUL_MAT_ID) {
+                ggml_cuda_ml8_prewarm_for_capture(cuda_ctx->device, cuda_ctx->stream());
+                break;
+            }
+        }
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
