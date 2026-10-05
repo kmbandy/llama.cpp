@@ -4854,6 +4854,65 @@ static void ggml_cuda_wp_graph_count_tick() {
     }
 }
 
+// WP_HIP_GRAPH_EXCLUDE_OPS=OP1,OP2|name=substr : bisect knob (separators: ',' ':' '|'). A fragment holding
+// any matching node is treated as graph-incompatible, i.e. runs eagerly while all
+// other fragments keep using graphs. Entries match ggml_op_name(op), and for
+// UNARY/GLU/custom ops also ggml_op_desc(node); "name:X" matches nodes whose
+// name contains X (prefix is "name=", since ":" is a list separator). Unset = no effect.
+static const std::vector<std::string> & ggml_cuda_wp_graph_exclude_list() {
+    static const std::vector<std::string> list = [] {
+        std::vector<std::string> v;
+        const char * e = std::getenv("WP_HIP_GRAPH_EXCLUDE_OPS");
+        if (e == nullptr) { return v; }
+        std::string cur;
+        for (const char * c = e;; ++c) {
+            if (*c == ',' || *c == ':' || *c == '|' || *c == '\0') {
+                while (!cur.empty() && isspace((unsigned char) cur.back())) { cur.pop_back(); }
+                if (!cur.empty()) { v.push_back(cur); }
+                cur.clear();
+                if (*c == '\0') { break; }
+            } else if (!cur.empty() || !isspace((unsigned char) *c)) {
+                cur += *c;
+            }
+        }
+        return v;
+    }();
+    return list;
+}
+
+// Returns the matching list entry's label (op name) or nullptr.
+static bool ggml_cuda_wp_graph_exclude_match(const ggml_tensor * node, std::string * label) {
+    const std::vector<std::string> & list = ggml_cuda_wp_graph_exclude_list();
+    for (const std::string & ent : list) {
+        bool hit = false;
+        if (ent.compare(0, 5, "name=") == 0) {
+            hit = ent.size() > 5 && strstr(node->name, ent.c_str() + 5) != nullptr;
+        } else if (ent == ggml_op_name(node->op)) {
+            hit = true;
+        } else if (node->op == GGML_OP_UNARY || node->op == GGML_OP_GLU || node->op >= GGML_OP_CUSTOM) {
+            hit = ent == ggml_op_desc(node);
+        }
+        if (hit) {
+            if (label) { *label = ent; }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ggml_cuda_wp_graph_exclude_log(const std::string & label) {
+    if (!ggml_cuda_wp_hip_graphs_log_enabled()) {
+        return;
+    }
+    static std::mutex m;
+    static std::set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        if (!seen.insert(label).second) { return; }
+    }
+    fprintf(stderr, "wp hip-graphs exclude: op=%s forced eager\n", label.c_str());
+}
+
 // 2026-09-07: `blocker`/`why` (both optional) report WHICH node vetoed capture.
 // Without them the wp hip-graphs counter could say "64 fallbacks, 0 captures"
 // forever with no way to attribute it: a graph that fails this test never
@@ -4867,6 +4926,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph,
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        if (!ggml_cuda_wp_graph_exclude_list().empty()) {
+            std::string label;
+            if (ggml_cuda_wp_graph_exclude_match(node, &label)) {
+                ggml_cuda_wp_graph_exclude_log(label);
+                if (blocker) { *blocker = node; }
+                if (why)     { *why = "WP_HIP_GRAPH_EXCLUDE_OPS match"; }
+                return false;
+            }
+        }
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
@@ -5144,12 +5213,23 @@ static bool ggml_cuda_graph_update_required(
     }();
     const bool wp_hip_graphs = ggml_cuda_wp_hip_graphs_enabled();
 
-    if (cgraph->uid != 0 &&
-        cgraph->uid == graph->uid) {
+    // WP_HIP_GRAPH_NO_UID_SHORTCUT=1: skip the uid early return so the full
+    // comparison always runs. Under WP_HIP_GRAPHS_LOG, a case where the shortcut
+    // WOULD have returned false but the comparison finds an update is required
+    // is logged as "uid-shortcut MISMATCH" (the shortcut hiding a real change).
+    static const bool no_uid_shortcut = [] {
+        const char * e = std::getenv("WP_HIP_GRAPH_NO_UID_SHORTCUT");
+        return e != nullptr && e[0] == '1';
+    }();
+    const bool uid_shortcut_would_hit = cgraph->uid != 0 && cgraph->uid == graph->uid;
+    int         uid_diff_idx    = -1;
+    const char * uid_diff_reason = "n_nodes";
+    if (uid_shortcut_would_hit && !no_uid_shortcut) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
     }
+    const uint64_t uid_prev = graph->uid;
 
     graph->uid = cgraph->uid;
 
@@ -5241,6 +5321,19 @@ static bool ggml_cuda_graph_update_required(
                 fprintf(stderr, "wp hip-graphs churn: node[%d] op=%s name='%s' %s\n",
                         i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name, kind);
             }
+            if (uid_shortcut_would_hit && uid_diff_idx < 0 && (!stored || topo_changed || addrs_changed)) {
+                const ggml_cuda_graph::node_properties & o = graph->node_props[i];
+                uid_diff_idx = i;
+                if (!stored)                                            { uid_diff_reason = "first_snapshot"; }
+                else if (o.node.op != prop.node.op)                     { uid_diff_reason = "op"; }
+                else if (memcmp(o.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0) { uid_diff_reason = "ne"; }
+                else if (memcmp(o.node.nb, prop.node.nb, sizeof(prop.node.nb)) != 0) { uid_diff_reason = "nb"; }
+                else if (o.node.data != prop.node.data)                 { uid_diff_reason = "data ptr"; }
+                else if (memcmp(o.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs)) != 0) { uid_diff_reason = "src ptr"; }
+                else if (memcmp(o.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) != 0) { uid_diff_reason = "src ne"; }
+                else if (memcmp(o.node_src_nb, prop.node_src_nb, sizeof(prop.node_src_nb)) != 0) { uid_diff_reason = "src nb"; }
+                else                                                    { uid_diff_reason = "other"; }
+            }
             graph->node_props[i] = prop;
             // Object-pointer churn (src[] / buffer / extra) is expected on
             // ephemeral split rebuilds and is not a capture miss. Only topology
@@ -5304,6 +5397,21 @@ static bool ggml_cuda_graph_update_required(
                     recap_first_idx, ggml_op_name(recap_first_op), cgraph->nodes[recap_first_idx]->name,
                     recap_first_old_data, recap_first_new_data,
                     recap_first_old_src0, recap_first_new_src0);
+            fflush(stderr);
+        }
+    }
+
+    if (uid_shortcut_would_hit && res && ggml_cuda_wp_hip_graphs_log_enabled()) {
+        static std::atomic<uint64_t> uid_mismatch_count{0};
+        const uint64_t n = uid_mismatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 20 || n % 1000 == 0) {
+            const ggml_tensor * dn = uid_diff_idx >= 0 ? cgraph->nodes[uid_diff_idx] : nullptr;
+            fprintf(stderr,
+                    "wp hip-graphs uid-shortcut MISMATCH key=%016llx uid=%llu n_nodes=%d first_diff_node=%d "
+                    "op=%s name=%s reason=%s (count=%llu)\n",
+                    (unsigned long long) (uintptr_t) graph_key, (unsigned long long) uid_prev, cgraph->n_nodes,
+                    uid_diff_idx, dn ? ggml_op_name(dn->op) : "-", dn ? dn->name : "-", uid_diff_reason,
+                    (unsigned long long) n);
             fflush(stderr);
         }
     }
@@ -9972,6 +10080,69 @@ static void wp_node_trace_live_print(int i, const ggml_tensor * node) {
     fflush(stderr);
 }
 
+// WP_HIP_GRAPH_NODE_HASH=2: additionally, on EAGER execution of FILL-containing
+// fragments, hash each node right after it executes ("imm") and verify the FILL
+// output ("fillcheck"). g_wp_nodehash_launch != 0 only while such a fragment runs.
+static thread_local uint64_t g_wp_nodehash_launch = 0;
+
+// WP_HIP_GRAPH_CAPTURE_PREFIX=<k>: for FILL-containing fragments only, capture
+// nodes [0,k) into the graph and run [k,n) eagerly afterwards on the same stream.
+// g_wp_prefix_k   : >=0 while a prefix capture pass is active (node loop stops at
+//                   the first fusion-group boundary i >= k and records it in _eff)
+// g_wp_prefix_start: first node index of the eager tail pass (0 normally)
+static thread_local int g_wp_prefix_k     = -1;
+static thread_local int g_wp_prefix_eff   = -1;
+static thread_local int g_wp_prefix_start = 0;
+static int ggml_cuda_wp_capture_prefix() {
+    static const int k = [] {
+        const char * e = std::getenv("WP_HIP_GRAPH_CAPTURE_PREFIX");
+        if (e == nullptr || e[0] == '\0') { return -1; }
+        const long v = std::strtol(e, nullptr, 10);
+        return v >= 0 ? (int) v : -1;
+    }();
+    return k;
+}
+static bool ggml_cuda_wp_tensor_hash(cudaStream_t stream, const ggml_tensor * t, uint64_t * out);
+
+static void ggml_cuda_wp_fillcheck(cudaStream_t stream, const ggml_tensor * n, uint64_t launch, const char * tag) {
+    if (n->type != GGML_TYPE_F32 || n->data == nullptr) { return; }
+    const size_t cnt = ggml_nelements(n);
+    float fv;
+    memcpy(&fv, n->op_params, sizeof(fv));
+    std::vector<float> buf(cnt);
+    if (cnt == 0) { return; }
+    if (n->buffer != nullptr && ggml_backend_buffer_is_host(n->buffer)) {
+        memcpy(buf.data(), n->data, cnt * sizeof(float));
+    } else if (cudaMemcpyAsync(buf.data(), n->data, cnt * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+               cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    long long first_bad = -1;
+    for (size_t k = 0; k < cnt; ++k) {
+        if (memcmp(&buf[k], &fv, sizeof(float)) != 0) { first_bad = (long long) k; break; }
+    }
+    fprintf(stderr, "NODEH %llu fillcheck%s%s name=%s ok=%d first_bad=%lld val=%g\n",
+            (unsigned long long) launch, tag[0] ? " " : "", tag, n->name, first_bad < 0 ? 1 : 0, first_bad,
+            first_bad < 0 ? (double) fv : (double) buf[first_bad]);
+}
+
+static void ggml_cuda_wp_node_hash_imm(cudaStream_t stream, const ggml_tensor * n, int i) {
+    const uint64_t launch = g_wp_nodehash_launch;
+    if (launch == 0 || ggml_cuda_is_view_or_noop(n)) { return; }
+    (void) cudaStreamSynchronize(stream);
+    uint64_t h = 0;
+    if (ggml_cuda_wp_tensor_hash(stream, n, &h)) {
+        fprintf(stderr, "NODEH %llu imm i=%d op=%s name=%s ne=[%lld,%lld,%lld,%lld] hash=%016llx\n",
+                (unsigned long long) launch, i, ggml_op_desc(n), n->name,
+                (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                (unsigned long long) h);
+    }
+    if (n->op == GGML_OP_FILL) {
+        ggml_cuda_wp_fillcheck(stream, n, launch, "");
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -10148,7 +10319,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            for (int i = 0; i < cgraph->n_nodes; i++) {
+            for (int i = g_wp_prefix_start; i < cgraph->n_nodes; i++) {
+                // WP_HIP_GRAPH_CAPTURE_PREFIX: stop capturing at a fusion-group
+                // boundary (top of iteration) at or after k; the tail runs eager.
+                if (g_wp_prefix_k >= 0 && use_cuda_graph && cuda_graph_update_required &&
+                    !is_concurrent_event_active && i >= g_wp_prefix_k) {
+                    g_wp_prefix_eff = i;
+                    break;
+                }
                 ggml_tensor * node = cgraph->nodes[i];
                 // Chain 269 fix 1: service any pending deferred copy plan
                 // for `node` BEFORE the skip check below, not only from
@@ -10310,6 +10488,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
                 wp_op_profile_end_node(cuda_ctx->device, cuda_ctx->stream(), node, 1, wp_prof_capture);
+
+                if (g_wp_nodehash_launch != 0 && !use_cuda_graph) {
+                    ggml_cuda_wp_node_hash_imm(cuda_ctx->stream(), node, i);
+                }
 
                 if (wp_node_trace_enabled()) {
                     // In capture iff this pass is being captured into a
@@ -10496,7 +10678,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
         // Launch graph
         wp_op_profile_begin_replay(cuda_ctx->device, cuda_ctx->stream());
+        static const int wp_presync_mode = []() {
+            const char * e = getenv("WP_HIP_GRAPH_PRESYNC");
+            return e ? atoi(e) : 0;
+        }();
+        if (wp_presync_mode) {
+            static std::atomic<unsigned long long> wp_presync_n{0};
+            if (wp_presync_mode == 2) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+            } else {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            }
+            const unsigned long long n = ++wp_presync_n;
+            if (n % 1000 == 0) {
+                fprintf(stderr, "WP_HIP_GRAPH_PRESYNC mode=%d launches=%llu\n", wp_presync_mode, n);
+            }
+        }
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (wp_presync_mode == 2) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        }
         wp_op_profile_end_replay(cuda_ctx->device, cuda_ctx->stream());
         // Record right after launch (async, no host sync) so a later TTL/LRU
         // eviction of THIS graph can tell whether this replay has finished
@@ -10610,6 +10811,36 @@ static void ggml_cuda_wp_graph_log_fallback(
     }
 }
 
+// WP_HIP_GRAPH_LIST_OPS=1: on each newly captured fragment, print the distinct
+// ggml_op_desc names it holds, once per distinct set.
+static void ggml_cuda_wp_graph_list_ops(const ggml_cgraph * cgraph) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_HIP_GRAPH_LIST_OPS");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    std::set<std::string> ops;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(n)) { continue; }
+        ops.insert(ggml_op_desc(n));
+    }
+    std::string joined;
+    for (const std::string & o : ops) {
+        if (!joined.empty()) { joined += ","; }
+        joined += o;
+    }
+    static std::mutex m;
+    static std::set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        if (!seen.insert(joined).second) { return; }
+    }
+    fprintf(stderr, "wp hip-graphs captured ops: n_nodes=%d ops=[%s]\n", cgraph->n_nodes, joined.c_str());
+}
+
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -10626,6 +10857,79 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     return graph->is_enabled();
 }
 #endif // USE_CUDA_GRAPH
+
+// WP_HIP_GRAPH_NODE_HASH=1: for fragments containing a GGML_OP_FILL node, hash
+// the fragment's external inputs before the launch and every node output after
+// it (captured or eager alike), to compare eager vs captured runs.
+static int ggml_cuda_wp_node_hash_mode() {
+    static const int mode = [] {
+        const char * e = std::getenv("WP_HIP_GRAPH_NODE_HASH");
+        return (e != nullptr && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0;
+    }();
+    return mode;
+}
+static bool ggml_cuda_wp_node_hash_enabled() { return ggml_cuda_wp_node_hash_mode() >= 1; }
+
+static bool ggml_cuda_wp_node_hash_frag(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_FILL) { return true; }
+    }
+    return false;
+}
+
+static bool ggml_cuda_wp_tensor_hash(cudaStream_t stream, const ggml_tensor * t, uint64_t * out) {
+    if (t->data == nullptr) { return false; }
+    const size_t n = ggml_nbytes(t);
+    uint64_t h = 1469598103934665603ULL;
+    if (n == 0) { *out = h; return true; }
+    std::vector<uint8_t> buf(n);
+    if (t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+        memcpy(buf.data(), t->data, n);
+    } else if (cudaMemcpyAsync(buf.data(), t->data, n, cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+               cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) { h = (h ^ buf[i]) * 1099511628211ULL; }
+    *out = h;
+    return true;
+}
+
+static void ggml_cuda_wp_node_hash_pre(cudaStream_t stream, const ggml_cgraph * cgraph, uint64_t launch,
+                                       const void * key, bool captured) {
+    fprintf(stderr, "NODEH %llu BEGIN key=%p n_nodes=%d captured=%d\n",
+            (unsigned long long) launch, key, cgraph->n_nodes, (int) captured);
+    (void) cudaStreamSynchronize(stream);
+    std::set<const ggml_tensor *> produced, seen;
+    for (int i = 0; i < cgraph->n_nodes; ++i) { produced.insert(cgraph->nodes[i]); }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * s = cgraph->nodes[i]->src[j];
+            if (s == nullptr || produced.count(s) || !seen.insert(s).second) { continue; }
+            uint64_t h = 0;
+            if (!ggml_cuda_wp_tensor_hash(stream, s, &h)) { continue; }
+            fprintf(stderr, "NODEH %llu pre src=%s op=%s ne=[%lld,%lld,%lld,%lld] hash=%016llx\n",
+                    (unsigned long long) launch, s->name, s->op == GGML_OP_NONE ? "LEAF" : ggml_op_name(s->op),
+                    (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
+                    (unsigned long long) h);
+        }
+    }
+}
+
+static void ggml_cuda_wp_node_hash_post(cudaStream_t stream, const ggml_cgraph * cgraph, uint64_t launch) {
+    (void) cudaStreamSynchronize(stream);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(n)) { continue; }
+        uint64_t h = 0;
+        if (!ggml_cuda_wp_tensor_hash(stream, n, &h)) { continue; }
+        fprintf(stderr, "NODEH %llu i=%d op=%s name=%s ne=[%lld,%lld,%lld,%lld] hash=%016llx\n",
+                (unsigned long long) launch, i, ggml_op_desc(n), n->name,
+                (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                (unsigned long long) h);
+    }
+    fflush(stderr);
+}
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
 #if defined(GGML_USE_HIP)
@@ -10754,6 +11058,35 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // WP_HIP_GRAPH_CAPTURE_PREFIX: only FILL-containing fragments, only when a
+    // real prefix split exists (0 <= k < n). k == 0 means fully eager.
+    int prefix_k = -1;
+    if (use_cuda_graph && ggml_cuda_wp_capture_prefix() >= 0 &&
+        ggml_cuda_wp_capture_prefix() < cgraph->n_nodes && ggml_cuda_wp_node_hash_frag(cgraph)) {
+        prefix_k = ggml_cuda_wp_capture_prefix();
+        if (prefix_k == 0) {
+            use_cuda_graph = false;
+            cuda_graph_update_required = false;
+            prefix_k = -1;
+            static std::mutex m0; static std::set<const void *> seen0;
+            std::lock_guard<std::mutex> lock(m0);
+            if (seen0.insert(graph_key).second) {
+                fprintf(stderr, "wp hip-graphs capture-prefix key=%p k=0 n=%d\n", graph_key, cgraph->n_nodes);
+            }
+        }
+    }
+
+    uint64_t node_hash_launch = 0;
+    const bool node_hash = ggml_cuda_wp_node_hash_enabled() && ggml_cuda_wp_node_hash_frag(cgraph);
+    if (node_hash) {
+        static std::atomic<uint64_t> launch_counter{0};
+        node_hash_launch = launch_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        ggml_cuda_wp_node_hash_pre(cuda_ctx->stream(), cgraph, node_hash_launch, graph_key, use_cuda_graph);
+        if (ggml_cuda_wp_node_hash_mode() >= 2 && !use_cuda_graph) {
+            g_wp_nodehash_launch = node_hash_launch;
+        }
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -10771,11 +11104,46 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+#ifdef USE_CUDA_GRAPH
+        ggml_cuda_wp_graph_list_ops(cgraph);
+#endif
     }
 
     try {
-        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+        if (prefix_k >= 0) {
+            static std::mutex pm;
+            static std::map<const void *, int> eff_by_key;
+            g_wp_prefix_k = prefix_k; g_wp_prefix_eff = -1; g_wp_prefix_start = 0;
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+            g_wp_prefix_k = -1;
+            int eff = cgraph->n_nodes;
+            {
+                std::lock_guard<std::mutex> lock(pm);
+                if (cuda_graph_update_required) {
+                    eff = g_wp_prefix_eff < 0 ? cgraph->n_nodes : g_wp_prefix_eff;
+                    if (eff_by_key.emplace(graph_key, eff).second || eff_by_key[graph_key] != eff) {
+                        eff_by_key[graph_key] = eff;
+                        fprintf(stderr, "wp hip-graphs capture-prefix key=%p k=%d n=%d\n", graph_key, eff, cgraph->n_nodes);
+                    }
+                } else {
+                    auto it = eff_by_key.find(graph_key);
+                    if (it != eff_by_key.end()) { eff = it->second; }
+                }
+            }
+            if (eff < cgraph->n_nodes) {
+                // prefix graph has been launched; run the tail eagerly on the same stream
+                if (node_hash && ggml_cuda_wp_node_hash_mode() >= 2) {
+                    g_wp_nodehash_launch = node_hash_launch;
+                }
+                g_wp_prefix_start = eff;
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+                g_wp_prefix_start = 0;
+            }
+        } else {
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+        }
     } catch (const ggml_cuda_pool_oom & e) {
+        g_wp_prefix_k = -1; g_wp_prefix_start = 0;
         // MAD-LAB: a device allocation was refused by the VRAM reserve mid-graph.
         // Unwind an in-progress stream capture (discard the partial graph) and the
         // capture lock the begin above took, then fail this compute so llama_decode
@@ -10799,6 +11167,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("%s: device %d: allocation of %.1f MiB refused (free was %.1f MiB) -- returning GGML_STATUS_ALLOC_FAILED\n",
                        __func__, e.device, e.requested / 1048576.0, e.free_before / 1048576.0);
         return GGML_STATUS_ALLOC_FAILED;
+    }
+
+    if (node_hash) {
+        g_wp_nodehash_launch = 0;
+        ggml_cuda_wp_node_hash_post(cuda_ctx->stream(), cgraph, node_hash_launch);
+        if (ggml_cuda_wp_node_hash_mode() >= 2 && (!use_cuda_graph || prefix_k >= 0)) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op == GGML_OP_FILL) {
+                    ggml_cuda_wp_fillcheck(cuda_ctx->stream(), cgraph->nodes[i], node_hash_launch, "end");
+                }
+            }
+        }
     }
 
     return GGML_STATUS_SUCCESS;

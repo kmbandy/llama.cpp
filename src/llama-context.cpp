@@ -5,6 +5,7 @@
 
 #include "ggml.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -3495,9 +3496,73 @@ void llama_context::wp_reset_graph_results() {
     }
 }
 
+// WP_INPUT_HASH_TRACE: 1 = header + per-input readback hash (syncs); 2 = header only
+// (host-side source hashing is not cheaply accessible from the input setters).
+static int wp_input_hash_trace_mode() {
+    static const int mode = []() {
+        const char * v = getenv("WP_INPUT_HASH_TRACE");
+        return v ? atoi(v) : 0;
+    }();
+    return mode;
+}
+
+static uint64_t wp_input_hash_fnv1a(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void wp_input_hash_trace(const void * ctx_id, ggml_cgraph * gf, const llama_ubatch & ubatch,
+                                bool reused) {
+    const int mode = wp_input_hash_trace_mode();
+    if (mode <= 0) {
+        return;
+    }
+    static std::mutex mtx;
+    static std::unordered_map<const void *, uint64_t> counters;
+    std::lock_guard<std::mutex> lock(mtx);
+    const uint64_t counter = counters[ctx_id]++;
+
+    unsigned n_out = 0;
+    if (ubatch.output) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            n_out += ubatch.output[i] != 0;
+        }
+    }
+    fprintf(stderr, "INPH %p %" PRIu64 " BEGIN n_tokens=%u n_outputs=%u pos0=%d graph_reused=%d\n",
+            ctx_id, counter, (unsigned) ubatch.n_tokens, n_out,
+            (ubatch.pos ? (int) ubatch.pos[0] : -1), reused ? 1 : 0);
+    if (mode != 1 || gf == nullptr) {
+        return;
+    }
+    std::vector<uint8_t> buf;
+    auto dump = [&](ggml_tensor * t) {
+        if (t == nullptr || !(t->flags & GGML_TENSOR_FLAG_INPUT) || t->buffer == nullptr || t->data == nullptr) {
+            return;
+        }
+        const size_t nb = ggml_nbytes(t);
+        buf.resize(nb);
+        ggml_backend_tensor_get(t, buf.data(), 0, nb);
+        fprintf(stderr, "INPH %p %" PRIu64 " n_tokens=%u name=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] hash=%016" PRIx64 "\n",
+                ctx_id, counter, (unsigned) ubatch.n_tokens, t->name, ggml_type_name(t->type),
+                t->ne[0], t->ne[1], t->ne[2], t->ne[3], wp_input_hash_fnv1a(buf.data(), nb));
+    };
+    for (int i = 0; i < gf->n_leafs; ++i) {
+        dump(gf->leafs[i]);
+    }
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        dump(gf->nodes[i]);
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret,
                                                  ggml_backend_sched_t sched_override, llm_graph_result * res_override, bool defer_compute,
                                                  bool disable_reuse) {
+    const int32_t wp_ih_n_reused0 = n_reused;
     if (!sched_override && layer_cut_eligible(ubatch, gtype)) {
         return process_ubatch_staged(ubatch, gtype, mctx, ret);
     }
@@ -3616,6 +3681,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        wp_input_hash_trace(this, res->get_gf(), ubatch, n_reused != wp_ih_n_reused0);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -4008,6 +4075,8 @@ llm_graph_result * llama_context::process_ubatch_staged(
         // the ordinary per-ubatch inputs (positions, masks, QSA, hybrid-memory
         // handles) this stage rebuilt for itself
         res->set_inputs(&ubatch);
+
+        wp_input_hash_trace(this, gf, ubatch, false);
 
         // stage 0 builds its own input from the embedding and has no t_stage_in;
         // every later stage reads the previous stage's boundary here

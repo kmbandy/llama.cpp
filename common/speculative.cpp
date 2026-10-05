@@ -120,6 +120,44 @@ static void wp_spec_fnv1a_update(uint64_t & hash, const void * data, size_t size
     }
 }
 
+// WP_DSPARK_HASH_TRACE=1: read-only FNV-1a trace ("DSPH " lines on stderr) used to align two
+// greedy runs by order via a monotonically increasing per-process counter. Read once; unset
+// = no hashing, no extra syncs beyond what the traced code already does.
+static bool wp_dsph_on() {
+    static const bool s_on = [](){
+        const char * e = std::getenv("WP_DSPARK_HASH_TRACE");
+        return e && e[0] == '1';
+    }();
+    return s_on;
+}
+
+static uint64_t wp_dsph_next() {
+    static uint64_t s_n = 0;
+    return s_n++;
+}
+
+static uint64_t wp_dsph_hash(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int32_t wp_dsph_zero_rows(const float * rows, int64_t n_rows, int64_t n_cols) {
+    int32_t n_zero = 0;
+    for (int64_t r = 0; r < n_rows; ++r) {
+        bool z = true;
+        for (int64_t c = 0; c < n_cols && z; ++c) {
+            z = rows[r * n_cols + c] == 0.0f;
+        }
+        n_zero += z ? 1 : 0;
+    }
+    return n_zero;
+}
+
 // MAD-LAB / verify-width padding is a separate, opt-in knob from
 // WP_DS4_CONST_SHAPE (2026-08-24 split, mirrors tools/server/server-context.cpp
 // server_spec_const_width()). WP_DS4_CONST_SHAPE=1 alone no longer defaults
@@ -1700,6 +1738,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // WP_DSPARK_HASH_TRACE (1/4): hash every tap over the whole ubatch the target just
+        // produced, BEFORE injection selects rows. llama_get_embeddings_layer_inp() syncs
+        // (ctx->synchronize(), or the lid's own event wait) before returning, so the async
+        // device->host copy from extract_layer_inputs() has landed.
+        if (wp_dsph_on()) {
+            const int64_t n_rows_t = batch_in.n_tokens;
+            const int64_t n_emb_t  = n_embd_tgt;
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    continue;
+                }
+                const int64_t n_last = std::min<int64_t>(128, n_rows_t);
+                const int32_t p0 = n_rows_t > 0 ? (int32_t) batch_in.pos[0] : -1;
+                const int32_t p1 = n_rows_t > 0 ? (int32_t) batch_in.pos[n_rows_t - 1] : -1;
+                fprintf(stderr, "DSPH %" PRIu64 " tap lid=%d n_rows=%" PRId64 " n_embd=%" PRId64
+                        " pos=[%d,%d] hash_all=%016" PRIx64 " hash_last128=%016" PRIx64 " zero_rows=%d\n",
+                        wp_dsph_next(), (int) target_layer_ids[k], n_rows_t, n_emb_t, p0, p1,
+                        wp_dsph_hash(layer, (size_t) (n_rows_t * n_emb_t) * sizeof(float)),
+                        wp_dsph_hash(layer + (n_rows_t - n_last) * n_emb_t, (size_t) (n_last * n_emb_t) * sizeof(float)),
+                        wp_dsph_zero_rows(layer, n_rows_t, n_emb_t));
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1862,6 +1924,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.n_seq_id[i]  = 1;
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
+                }
+                // WP_DSPARK_HASH_TRACE (2/4): the feature rows actually injected (post
+                // gather, fused layout [n_chunk][n_embd_enc]) and the draft cache census.
+                if (wp_dsph_on()) {
+                    int32_t   n_cells = -1, n_ge = -1, n_dup = -1;
+                    llama_pos p_min   = -1, p_max = -1;
+                    const bool ok = llama_dspark_kv_census(llama_get_memory(ctx_dft), seq_id,
+                            (int32_t) batch_inject.pos[0], &n_cells, &n_ge, &n_dup, &p_min, &p_max);
+                    fprintf(stderr, "DSPH %" PRIu64 " inject seq=%d offset=%d n_chunk=%d n_embd_enc=%d fused=%d"
+                            " pos=[%d,%d] feat_hash=%016" PRIx64 " | pre-decode cache ok=%d cells=%d pos=[%d,%d] dup=%d\n",
+                            wp_dsph_next(), (int) seq_id, (int) offset, (int) n_chunk, (int) n_embd_enc, (int) fused_enc,
+                            (int) batch_inject.pos[0], (int) batch_inject.pos[n_chunk - 1],
+                            wp_dsph_hash(features, (size_t) n_chunk * n_embd_enc * sizeof(float)),
+                            (int) ok, n_cells, (int) p_min, (int) p_max, n_dup);
                 }
                 static const bool s_inject_phase = [] { const char * e = std::getenv("WP_SPEC_PHASE"); return e && e[0] != '0'; }();
                 const int64_t t_inj0 = s_inject_phase ? ggml_time_us() : 0;
@@ -2101,6 +2177,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // constructor's.
         assert(batch.n_tokens <= (int32_t) llama_n_ubatch(ctx_dft));
 
+        // WP_DSPARK_HASH_TRACE (3/4): the draft block input, just before the draft decode.
+        if (wp_dsph_on()) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                const int32_t b0 = i_block_beg[seq_id];
+                const int32_t nb = n_block[seq_id];
+                const uint64_t h_emb = batch.embd
+                    ? wp_dsph_hash(batch.embd + (size_t) b0 * n_embd_dec, (size_t) nb * n_embd_dec * sizeof(float))
+                    : 0;
+                fprintf(stderr, "DSPH %" PRIu64 " draft_in seq=%d anchor=%d n_block_tokens=%d n_batch=%d"
+                        " pos=[%d,%d] tok_hash=%016" PRIx64 " has_embd=%d embd_hash=%016" PRIx64 "\n",
+                        wp_dsph_next(), (int) seq_id, (int) batch.token[b0], (int) nb, (int) batch.n_tokens,
+                        (int) batch.pos[b0], (int) batch.pos[b0 + nb - 1],
+                        wp_dsph_hash(batch.token + b0, (size_t) nb * sizeof(llama_token)),
+                        (int) (batch.embd != nullptr), h_emb);
+            }
+        }
+
         // decode all sequence's noise block in a single batch
         if (trace_hidden) {
             llama_set_embeddings_layer_inp(ctx_dft, 1, true);
@@ -2201,6 +2297,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
+
+            // WP_DSPARK_HASH_TRACE (4/4a): logits rows the sampler reads, per block position
+            // (llama_get_logits_ith synchronizes ctx_dft, so the data is valid), plus the
+            // services-mode hidden/base rows that feed them.
+            if (wp_dsph_on() && !is_dflash2) {
+                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                    const int32_t idx = beg + i;
+                    const float * lg = llama_get_logits_ith(ctx_dft, idx);
+                    fprintf(stderr, "DSPH %" PRIu64 " draft_logits seq=%d i=%d idx=%d logits_hash=%016" PRIx64,
+                            wp_dsph_next(), (int) seq_id, (int) i, (int) idx,
+                            lg ? wp_dsph_hash(lg, (size_t) n_vocab_dft * sizeof(float)) : 0);
+                    if (services_mode && (size_t) (idx + 1) * n_embd_dec <= hidden_buf.size()) {
+                        fprintf(stderr, " hidden_hash=%016" PRIx64,
+                                wp_dsph_hash(hidden_buf.data() + (size_t) idx * n_embd_dec, (size_t) n_embd_dec * sizeof(float)));
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
 
             // (b) MAD-LAB / WP_DSPARK_DEBUG: per-slot dump, first few draft calls only.
             //
@@ -2409,6 +2523,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                     draft_conf[seq_id].push_back(raw_conf);
+                    // WP_DSPARK_HASH_TRACE (4/4b): per-position raw conf and chosen token.
+                    if (wp_dsph_on()) {
+                        fprintf(stderr, "DSPH %" PRIu64 " draft_tok seq=%d i=%d idx=%d raw_conf=%.9e gate_conf=%.9e"
+                                " tok=%d p=%.6f\n",
+                                wp_dsph_next(), (int) seq_id, (int) i, (int) idx, (double) raw_conf, (double) gate_conf,
+                                (int) id, (double) cur_p->data[0].p);
+                    }
                     if (trace_draft_rec) {
                         slot_tok[(size_t) i] = (int32_t) id;
                     }
