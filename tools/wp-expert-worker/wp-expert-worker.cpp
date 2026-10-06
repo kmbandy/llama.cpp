@@ -290,16 +290,44 @@ static bool wp_worker_hash_trace_enabled() {
 // WP_PLACEMENT_LOG=<path>: one line per dispatch request (default off):
 //   seq layer n_tokens id:P ... hash
 // seq = the spine seq_id (WP_REQ_LOG timeline col 30); P = V (VRAM resident),
-// N (paged in this request), C (CPU tier); ids in assignment order; hash = FNV-1a
-// of the final f32 sum BEFORE the ml8_4 wire encode. While the log is on, the
-// device-side wire pre-pack in read_result is skipped so the f32 sum is
-// available (the protocol encoder then packs it with the same kernel).
+// N (paged in this request), C (CPU tier); ids in assignment order; hash = 4-lane
+// 64-bit-word multiplicative hash of `sum` as the dispatcher holds it after
+// read_result/finish_cpu_tier. The log does NOT change the compute or wire
+// path: with WP_EXPERT_WIRE=ml8_4 and no CPU job `sum` is the unpacked wire
+// (already ml8_4-rounded) values, otherwise the f32 sum; either way a pure
+// function of what the spine receives. Writes are fully buffered (1 MiB) and
+// flushed every 512 lines and at exit.
 static FILE * wp_placement_log_file() {
     static FILE * const f = [] {
         const char * e = std::getenv("WP_PLACEMENT_LOG");
-        return (e != nullptr && e[0] != '\0') ? std::fopen(e, "w") : (FILE *) nullptr;
+        FILE * fp = (e != nullptr && e[0] != '\0') ? std::fopen(e, "w") : (FILE *) nullptr;
+        if (fp != nullptr) {
+            std::setvbuf(fp, nullptr, _IOFBF, 1 << 20);
+        }
+        return fp;
     }();
     return f;
+}
+
+static uint64_t wp_placement_hash(const float * data, size_t n) {
+    const auto * w = reinterpret_cast<const uint8_t *>(data);
+    const size_t bytes = n * sizeof(float);
+    constexpr uint64_t M = UINT64_C(0x9E3779B97F4A7C15);
+    uint64_t h[4] = { 1, 2, 3, 4 };
+    size_t i = 0;
+    for (; i + 32 <= bytes; i += 32) {
+        for (int l = 0; l < 4; ++l) {
+            uint64_t v;
+            std::memcpy(&v, w + i + 8 * l, 8);
+            h[l] = (h[l] ^ v) * M;
+            h[l] ^= h[l] >> 29;
+        }
+    }
+    uint64_t r = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+    for (; i < bytes; ++i) {
+        r = (r ^ w[i]) * UINT64_C(1099511628211);
+    }
+    return r ^ (uint64_t) bytes;
 }
 
 static bool wp_worker_stream_partials_enabled() {
@@ -6334,6 +6362,24 @@ public:
             std::vector<size_t> pageins;
             pageins.reserve(pages.size());
 
+            // WP_EXPERT_CPU_TIER_DETERMINISTIC: shadow residency is fed by
+            // demand calls only (decode, verify and prefill; never spec /
+            // prefetch / hint / layer-ahead / pin / seed, whose timing is
+            // nondeterministic). Capacity = the slots demand pages can occupy
+            // = all carved slots minus the startup-pinned ones.
+            const bool shadow_active = cpu_tier_deterministic() && count_demand && !spec_call;
+            if (shadow_active) {
+                const size_t shadow_cap =
+                    slots_.size() > n_pinned_ ? slots_.size() - n_pinned_ : 0;
+                if (!shadow_.init || shadow_.cap != shadow_cap) {
+                    shadow_.reset(shadow_cap);
+                    std::fprintf(stderr,
+                        "wp: WP_EXPERT_CPU_TIER_DETERMINISTIC: shadow residency capacity=%zu "
+                        "(slots=%zu pinned=%zu)\n",
+                        shadow_cap, slots_.size(), n_pinned_);
+                }
+            }
+
             // Resolve and pin every hit before selecting a victim. A hit is
             // immediately usable while sibling pageins are read.
             for (size_t i = 0; i < pages.size(); ++i) {
@@ -6360,19 +6406,32 @@ public:
                         }
                     }
                 }
-                // WP_EXPERT_CPU_TIER_DETERMINISTIC: decide from stream state
-                // only, before looking at VRAM. A resident page chosen here is
-                // fetched by the CPU path (RAM-tier borrow or NVMe read into
-                // the arena, via fd_for(page.blob)); its slot is neither
-                // pinned nor ticked.
-                if (cpu_tier_deterministic() && cpu_eligible &&
-                        (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
-                        batch.n_cpu_tier_ < cpu_tier_max()) {
-                    batch.entries_[i].cpu_tier = true;
-                    batch.entries_[i].ready    = true;
-                    batch.entries_[i].cpu_fd   = fd_for(page.blob);
-                    ++batch.n_cpu_tier_;
-                    continue;
+                // WP_EXPERT_CPU_TIER_DETERMINISTIC: decide from the SHADOW
+                // residency model (demand-stream-only LRU, see ShadowLru), not
+                // from real slot state. A page the shadow calls non-resident
+                // goes to the CPU tier if it qualifies, even if it happens to
+                // sit in VRAM (it is then fetched by the CPU path via
+                // fd_for(page.blob); its slot is neither pinned nor ticked).
+                // CPU-tier pages are NOT inserted into the shadow (they never
+                // occupy VRAM); every GPU-assigned page is touched.
+                if (shadow_active) {
+                    const uint64_t skey = slot_key(page.layer, page.expert);
+                    const bool shadow_hit = page.is_resident ||
+                        (!shadow_pinned_.empty() && shadow_pinned_.count(skey) != 0) ||
+                        shadow_.contains(skey);
+                    if (cpu_eligible && !shadow_hit &&
+                            (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
+                            batch.n_cpu_tier_ < cpu_tier_max()) {
+                        batch.entries_[i].cpu_tier = true;
+                        batch.entries_[i].ready    = true;
+                        batch.entries_[i].cpu_fd   = fd_for(page.blob);
+                        ++batch.n_cpu_tier_;
+                        continue;
+                    }
+                    if (!page.is_resident &&
+                            (shadow_pinned_.empty() || shadow_pinned_.count(skey) == 0)) {
+                        shadow_.touch(skey);
+                    }
                 }
                 const size_t slot_index = find_slot(page);
                 if (slot_index == slots_.size()) {
@@ -6389,7 +6448,8 @@ public:
                         if (batch.demand_rec_) { batch.demand_rec_->src[i] = 'V'; }
                         continue;
                     }
-                    if (cpu_eligible && (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
+                    if (!shadow_active && cpu_eligible &&
+                            (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
                             batch.n_cpu_tier_ < cpu_tier_max()) {
                         batch.entries_[i].cpu_tier = true;
                         batch.entries_[i].ready    = true;
@@ -8017,6 +8077,64 @@ private:
     static uint64_t slot_key(int layer, int expert) {
         return ((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert;
     }
+
+    // WP_EXPERT_CPU_TIER_DETERMINISTIC shadow residency: a demand-stream-only
+    // LRU set of pages standing in for "is this page in VRAM". Index-based
+    // intrusive list + hash map; all storage is sized once in reset(), so
+    // touch()/contains() are O(1) and allocation-free in steady state. Fed ONLY
+    // from ensure_batch's demand calls (decode + prefill, assignment order).
+    struct ShadowLru {
+        static constexpr uint32_t NIL = UINT32_MAX;
+        std::unordered_map<uint64_t, uint32_t> map;
+        std::vector<uint64_t> key;
+        std::vector<uint32_t> prev, next;
+        uint32_t head = NIL, tail = NIL;
+        size_t   cap  = 0;
+        bool     init = false;
+
+        void reset(size_t new_cap) {
+            map.clear();
+            cap = new_cap;
+            init = true;
+            head = tail = NIL;
+            key.assign(cap, 0);
+            prev.assign(cap, NIL);
+            next.assign(cap, NIL);
+            map.reserve(cap * 2 + 16);
+        }
+        bool contains(uint64_t k) const { return map.find(k) != map.end(); }
+        void unlink(uint32_t n) {
+            if (prev[n] != NIL) { next[prev[n]] = next[n]; } else { head = next[n]; }
+            if (next[n] != NIL) { prev[next[n]] = prev[n]; } else { tail = prev[n]; }
+        }
+        void push_front(uint32_t n) {
+            prev[n] = NIL;
+            next[n] = head;
+            if (head != NIL) { prev[head] = n; }
+            head = n;
+            if (tail == NIL) { tail = n; }
+        }
+        // Hit: move to MRU. Miss: insert at MRU, evicting the LRU when full.
+        void touch(uint64_t k) {
+            if (cap == 0) { return; }
+            const auto it = map.find(k);
+            if (it != map.end()) {
+                if (head != it->second) { unlink(it->second); push_front(it->second); }
+                return;
+            }
+            uint32_t n;
+            if (map.size() < cap) {
+                n = (uint32_t) map.size();
+            } else {
+                n = tail;
+                map.erase(key[n]);
+                unlink(n);
+            }
+            key[n] = k;
+            map.emplace(k, n);
+            push_front(n);
+        }
+    };
 
     // Index of the slot already holding `page`, or slots_.size(). ONE definition:
     // the speculative path must agree with ensure_batch about what "already here" means,
@@ -11319,6 +11437,9 @@ private:
     uint64_t                    lfu_history_references_ = 0;
     size_t                      n_pinned_ = 0;
     uint64_t                    n_pinned_demand_hits_ = 0;
+    // WP_EXPERT_CPU_TIER_DETERMINISTIC shadow residency (see ShadowLru).
+    ShadowLru                   shadow_;
+    std::unordered_set<uint64_t> shadow_pinned_;   // pages pinned at startup: always shadow-resident
     // WP_EXPERT_PIN_MODE=seed: preload the hot-expert set like pin mode does,
     // but leave slot.pinned false and instead seed slot.uses (and, when history
     // mode is on, lfu_history_) so the frequency-ranked evictor protects the
@@ -11458,6 +11579,7 @@ size_t ExpertSlotPool::pin_pages(const std::vector<const ExpertPage *> & pages) 
             slot.pinned = true;
             ++n_pinned_;
             ++n_pinned;
+            shadow_pinned_.insert(slot_key(page->layer, page->expert));
         }
     }
     return n_pinned;
@@ -11702,6 +11824,8 @@ uint64_t ExpertSlotPool::park_release_arenas() {
     }
     slot_index_.clear();
     n_pinned_ = 0;
+    shadow_pinned_.clear();
+    shadow_.init = false;
     n_spec_pending_ = 0;
     arena_layout_.reset();
     // buffer_ptr's deleter is ggml_backend_buffer_free: this is the VRAM free.
@@ -11928,6 +12052,7 @@ size_t ExpertSlotPool::seed_land(const std::vector<SeedItem> & chunk) {
         if (item.pinned && !slot.pinned) {
             slot.pinned = true;
             ++n_pinned_;
+            shadow_pinned_.insert(slot_key(item.page->layer, item.page->expert));
         }
         ++landed;
     }
@@ -14713,8 +14838,7 @@ public:
                 request.assignments.size() > batch.n_cpu_tier()) {
             read_result(sum, request_stats, std::numeric_limits<size_t>::max(),
                         (int) request.layer, last_compute_path_,
-                        /* capture_wire = */ cpu_job == nullptr &&
-                            wp_placement_log_file() == nullptr);
+                        /* capture_wire = */ cpu_job == nullptr);
             last_compute_path_ = "none";
         }
         request_stats.ns_result = lap();
@@ -14724,7 +14848,6 @@ public:
             ml8_wire_partial_.clear();   // the encoder packs the full f32 sum
         }
         if (FILE * plog = wp_placement_log_file()) {
-            static std::mutex plog_mutex;
             std::string line = std::to_string((unsigned long long) trace_req) + " " +
                 std::to_string(request.layer) + " " + std::to_string(request.n_tokens);
             for (size_t i = 0; i < request.assignments.size(); ++i) {
@@ -14733,12 +14856,14 @@ public:
                 line += batch.is_cpu_tier(i) ? ":C" : (batch.is_resident(i) ? ":V" : ":N");
             }
             line += ' ';
-            line += std::to_string((unsigned long long) wp_worker_hash_fnv1a(
-                sum.data(), sum.size() * sizeof(float)));
+            line += std::to_string((unsigned long long) wp_placement_hash(
+                sum.data(), sum.size()));
             line += '\n';
-            std::lock_guard<std::mutex> lock(plog_mutex);
-            std::fwrite(line.data(), 1, line.size(), plog);
-            std::fflush(plog);
+            static std::atomic<uint64_t> plog_lines{0};
+            std::fwrite(line.data(), 1, line.size(), plog);   // one call: lines stay whole
+            if ((++plog_lines & 511) == 0) {
+                std::fflush(plog);
+            }
         }
 
         // *** WP_SELFCHECK=1: EQUIVALENCE PROBE (default OFF, diagnostic only). ***
