@@ -5316,6 +5316,13 @@ private:
         bool               hold_released = false;
         bool               async_hold    = false;
         bool               quota_held    = false;
+        // Issued by spec_pagein_submit (spec_call). Speculative / layer-ahead
+        // page-ins draw drain-hold quota from their own bucket so their
+        // undrained results (retired only by this pool's own dispatch thread)
+        // can never starve a demand batch's readers of the same pool.
+        bool               spec          = false;
+        // Which bucket acquire_drain_quota charged (release must refund it).
+        bool               quota_spec    = false;
     };
 
     // One STRIPE of one page-in. A page is read in WP_EXPERT_READ_STRIPES
@@ -6810,6 +6817,7 @@ public:
                     pi.slot_index = slot_index;
                     pi.raw        = slot.raw;
                     pi.reader_h2d = reader_h2d_this_batch;
+                    pi.spec       = spec_call;
                     pi.cpu_direct = cpu_direct_ok(slot.raw, page);
                     pi.fd         = fd_for(page.blob);
                     // cpu_direct reads straight into slot.raw and never
@@ -7252,6 +7260,15 @@ public:
         drain_quota_cap_ = reader_h2d_enabled_ || n_drainers <= 1
             ? 0
             : std::max<size_t>(1, global_inflight / n_drainers);
+        // Speculative page-ins (conn -1, the idle pump) get a SEPARATE bucket
+        // of half the demand cap. Sharing one bucket with demand let a pool's
+        // own undrained layer-ahead results fill it while its dispatch thread
+        // (the only drainer) waited on a demand read whose reader was blocked
+        // here -- a self-deadlock that only exists when cap != 0 (multi-
+        // device / multi-conn); cap == 0 stays unlimited and unchanged.
+        drain_quota_spec_cap_ = drain_quota_cap_ == 0
+            ? 0
+            : std::max<size_t>(1, drain_quota_cap_ / 2);
     }
     void acquire_drain_quota(PageIn & pagein, int conn_index) {
         if (pagein.quota_held || pagein.reader_h2d || pagein.cpu_direct) {
@@ -7261,10 +7278,13 @@ public:
         if (drain_quota_cap_ == 0) {
             return;
         }
-        size_t & held = drain_quota_held_[conn_index];
-        drain_quota_cv_.wait(lock, [&]() { return held < drain_quota_cap_; });
+        const bool   spec = pagein.spec;
+        const size_t cap  = spec ? drain_quota_spec_cap_ : drain_quota_cap_;
+        size_t & held = drain_quota_held_[spec ? kDrainQuotaSpecKey : conn_index];
+        drain_quota_cv_.wait(lock, [&]() { return held < cap; });
         ++held;
         pagein.quota_held = true;
+        pagein.quota_spec = spec;
     }
     void release_drain_quota(PageIn & pagein, int conn_index) {
         if (!pagein.quota_held) {
@@ -7273,7 +7293,7 @@ public:
         pagein.quota_held = false;
         {
             std::lock_guard<std::mutex> lock(drain_quota_mu_);
-            auto it = drain_quota_held_.find(conn_index);
+            auto it = drain_quota_held_.find(pagein.quota_spec ? kDrainQuotaSpecKey : conn_index);
             if (it != drain_quota_held_.end() && it->second > 0) {
                 --it->second;
             }
@@ -10739,6 +10759,8 @@ private:
     std::mutex                 drain_quota_mu_;
     std::condition_variable    drain_quota_cv_;
     std::unordered_map<int, size_t> drain_quota_held_;
+    static constexpr int       kDrainQuotaSpecKey = std::numeric_limits<int>::min();
+    size_t                     drain_quota_spec_cap_ = 0; // 0 = unlimited (cap_ == 0)
     size_t                     drain_quota_cap_ = 0;      // 0 = unlimited
     size_t                     arena_inflight_max_ = 0;   // arena Config.read_inflight_max
     // Copy-stream state (WP_EXPERT_COPY_STREAM): set once in the ctor body
