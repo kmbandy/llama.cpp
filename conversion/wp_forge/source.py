@@ -174,6 +174,10 @@ class HFSource:
             yield _SafetensorsReader(f)
 
     def release_shard(self, shard_id: str) -> None:
+        # forget the finished download too, or the next _ensure returns its
+        # (now deleted) path instead of fetching again
+        with self._dl_lock:
+            self._dl_futs.pop(shard_id, None)
         (self.cache_dir / shard_id).unlink(missing_ok=True)
 
 
