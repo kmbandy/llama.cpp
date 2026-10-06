@@ -4880,9 +4880,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch);
     // WP_HINT_TRACE type 5 BATCH: input token ids of this decode call (<= 32 rows). Off = one branch.
     if (expert_dispatch != nullptr && pipe_expert_dispatcher::graph_dispatcher::hint_trace_enabled() &&
-        batch_inp.token != nullptr) {
-        expert_dispatch->trace_batch((const int32_t *) batch_inp.token, (uint32_t) batch_inp.n_tokens,
-                                     batch_inp.pos != nullptr ? (int32_t) batch_inp.pos[0] : -1);
+        !batch_inp.tokens.empty() && batch_inp.tokens[0].id != LLAMA_TOKEN_NULL) {
+        std::vector<int32_t> trace_ids;
+        trace_ids.reserve(batch_inp.tokens.size());
+        for (const auto & t : batch_inp.tokens) {
+            trace_ids.push_back((int32_t) t.id);
+        }
+        expert_dispatch->trace_batch(trace_ids.data(), (uint32_t) trace_ids.size(),
+                                     (int32_t) batch_inp.tokens[0].pos[0]);
     }
 
     auto prepare_ubatch = [&](const llama_ubatch & ubatch) -> int32_t {
@@ -5170,6 +5175,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const bool masked    = cparams.embeddings_nextn_masked;
             const int64_t n_rows = masked ? n_outputs_ubatch       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? output_prev  : token_prev;
+
+            // the unmasked consumer owns every row position even for a ubatch whose graph has no nextn
+            // tensor (rows stay unwritten), so embd_batch_idxs must still advance for it
+            if (embd_nextn.data && !masked && n_rows > 0 && !tp_skip_output_readback &&
+                    cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                extract_all_idxs = true;
+            }
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && !tp_skip_output_readback &&
                     cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
@@ -5994,6 +6006,7 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
             const size_t row_floats = (size_t) llama_context_layer_inp_size(model);
             GGML_ASSERT((token_offset + n_tokens) * row_floats <= embd_layer_inp[il].size);
             std::memset(embd_layer_inp[il].data + token_offset * row_floats, 0, n_tokens * row_floats * sizeof(float));
+            extracted = true; // zero rows still occupy batch positions: embd_batch_idxs must stay in step
             continue;
         }
         if (!t) {

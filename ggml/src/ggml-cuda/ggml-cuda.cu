@@ -3559,7 +3559,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
-    const bool force_mm = hint == GGML_HINT_MUL_MAT_PIN;
+    const bool force_mm = ggml_get_op_params_i32(dst, 1) == GGML_HINT_MUL_MAT_PIN;
 
     // MAD Task 11: scaled-fp8 (ml8-fp8) weights stay a plain GGML_OP_MUL_MAT
     // (no centroid sidecar, no load-time op-swap). Route them to the no-LUT
@@ -12825,12 +12825,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
-        case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_FILL:
+            return ggml_is_contiguous(op) &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16);
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 
