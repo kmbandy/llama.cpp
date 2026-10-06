@@ -83,6 +83,10 @@ bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int6
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// These weak references MUST be extern "C": ggml-cuda.h defines the symbols with
+// C linkage (unmangled). With C++ linkage the worker referenced mangled names
+// that never resolve, so every weak pointer was null and copy_stream stayed off.
+extern "C" {
 bool ggml_backend_cuda_wp_copy_stream_enabled(ggml_backend_t)
     __attribute__((weak));
 bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t, ggml_tensor *,
@@ -106,6 +110,7 @@ bool ggml_backend_cuda_wp_reader_copy(ggml_backend_t, ggml_tensor *,
 bool ggml_backend_cuda_wp_graph_counts(ggml_backend_t, uint64_t *, uint64_t *,
                                        uint64_t *, uint64_t *, uint64_t *)
     __attribute__((weak));
+}  // extern "C"
 bool ggml_backend_vk_wp_fused_expert(
         ggml_backend_t,
         const struct ggml_backend_vk_wp_fused_expert_params *,
