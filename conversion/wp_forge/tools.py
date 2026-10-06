@@ -1,7 +1,7 @@
 """Thin wrappers around the external llama.cpp CPU tools.
 
 `Tools` resolves binary paths once per run (WP_FORGE_BUILD_DIR env, then the
-repo's build-cpu/bin). Each wrapper builds one exact argv, runs it, and
+repo's main build, build-hip/bin). Each wrapper builds one exact argv, runs it, and
 returns the path(s) the tool produced, raising `ToolError` on non-zero exit.
 No policy lives here: what to repack, which quant types to pick, and what to
 do with the outputs are all the caller's calls.
@@ -23,8 +23,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STDERR_TAIL_CHARS = 4000
+# The machine's one llama.cpp build; the forge uses it rather than keeping its own.
+MAIN_BUILD_BIN = REPO_ROOT / "build-hip" / "bin"
 
-# binary -> the cmake target (in build-cpu) that produces it
+
+def build_bin_dir() -> Path:
+    env = os.environ.get("WP_FORGE_BUILD_DIR")
+    return Path(env) if env else MAIN_BUILD_BIN
+
+
+# binary -> the cmake target that produces it
 BINARIES: dict[str, str] = {
     "llama-wp-repack": "llama-wp-repack",
     "llama-wp-expert-descriptor": "llama-wp-expert-descriptor",
@@ -61,8 +69,7 @@ class Tools:
         slice_manifests: tuple[int, ...] | None = None,
     ) -> "Tools":
         if build_dir is None:
-            env = os.environ.get("WP_FORGE_BUILD_DIR")
-            build_dir = Path(env) if env else REPO_ROOT / "build-cpu" / "bin"
+            build_dir = build_bin_dir()
         else:
             build_dir = Path(build_dir)
         missing = [

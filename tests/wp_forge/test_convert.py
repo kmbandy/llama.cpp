@@ -18,7 +18,7 @@ from conversion.wp_forge.convert import Ml8Opts, convert  # noqa: E402
 from conversion.wp_forge.rules import QuantRules, RulesError  # noqa: E402
 
 GQT = gguf.GGMLQuantizationType
-needs_lib = pytest.mark.skipif(not ggml_quant.lib_path().is_file(), reason="no build-forge libggml-base")
+needs_lib = pytest.mark.skipif(not ggml_quant.lib_path().is_file(), reason="no build-hip libggml-base")
 
 
 def test_rules_parse_and_decide() -> None:

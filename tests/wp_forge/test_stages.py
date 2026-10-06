@@ -3,7 +3,7 @@
 Drives a real ``ExpertStage`` (quant -> one-layer GGUF -> llama-wp-repack ->
 sink stream -> stitch -> llama-wp-expert-descriptor) over the synthetic
 DeepSeek-V4.1-shaped HF repo from ``synth``. The C++ tools must be built
-(``build-cpu/bin``); tests skip if ``Tools.discover()`` cannot find them.
+(the main build, ``build-hip/bin``); tests skip if ``Tools.discover()`` cannot find them.
 """
 from __future__ import annotations
 

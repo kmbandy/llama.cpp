@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import bundle as bundle_mod
+from .tools import build_bin_dir
 from . import machines as machines_mod
 from . import sink as sink_mod
 from .bundle import ExpertSetResult
@@ -271,7 +272,7 @@ class Job:
     def _load_test(self, b: dict) -> object:
         if self.rplan.arch.name != "deepseek41":
             return "skipped: no load test for this arch"
-        binary = Path(__file__).resolve().parents[2] / "build-cpu" / "bin" / "test-dsv41-spine-load"
+        binary = build_bin_dir() / "test-dsv41-spine-load"
         if not binary.is_file():
             return "skipped: no binary"
         env = dict(os.environ)

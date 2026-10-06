@@ -9,6 +9,7 @@ from conversion.wp_forge.tools import (
     REPO_ROOT,
     STDERR_TAIL_CHARS,
     BINARIES,
+    build_bin_dir,
     ToolError,
     Tools,
 )
@@ -88,19 +89,17 @@ def test_discover_missing_error_names_targets(tmp_path: Path):
     assert str(d) in msg
 
 
-def test_discover_repo_default_requires_build_cpu_bin(monkeypatch):
-    """No env var: discovery falls back to <repo>/build-cpu/bin. This worktree
-    has none by design, so it must error naming every target. (If a build
-    ever exists there, the fallback is what we want -- skip instead of
-    asserting against a built tree.)"""
+def test_discover_repo_default_is_main_build(monkeypatch):
+    """No env var: discovery uses the checkout's main build, build-hip/bin --
+    the tools resolve there when it is built, and the error names it when not."""
     monkeypatch.delenv("WP_FORGE_BUILD_DIR", raising=False)
-    default = REPO_ROOT / "build-cpu" / "bin"
-    if default.exists():
-        pytest.skip("build-cpu/bin exists in this worktree; fallback path is live")
+    default = REPO_ROOT / "build-hip" / "bin"
+    assert build_bin_dir() == default
+    if all((default / name).exists() for name in BINARIES):
+        assert Tools.discover().repack_bin == default / "llama-wp-repack"
+        return
     with pytest.raises(FileNotFoundError) as e:
         Tools.discover()
-    for name in BINARIES:
-        assert f"cmake target {name}" in str(e.value)
     assert str(default) in str(e.value)
 
 

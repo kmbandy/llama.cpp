@@ -7,11 +7,10 @@ quantizer directly gives the forge every type llama-quantize can make,
 byte-identical to it, with an optional importance matrix, and without a
 BF16 GGUF round trip through llama-quantize.
 
-The library is found, in order: $WP_FORGE_GGML_LIB, then
-<repo>/build-forge/bin/libggml-base.so (a CPU-only build made for the forge:
-``cmake -B build-forge -DGGML_HIP=OFF -DGGML_CUDA=OFF && cmake --build
-build-forge --target ggml-base``). Nothing else is searched: GPU builds of
-the same repo belong to other work.
+The library is found, in order: $WP_FORGE_GGML_LIB, then libggml-base.so in
+the forge's build dir (tools.build_bin_dir: $WP_FORGE_BUILD_DIR, else the
+checkout's main build, build-hip/bin). libggml-base carries no backend code,
+so the forge shares the machine's one build instead of keeping its own.
 
 ctypes releases the GIL for the duration of each foreign call, so row chunks
 run in parallel on a thread pool.
@@ -30,6 +29,8 @@ import numpy as np
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "gguf-py"))
 import gguf  # noqa: E402
+
+from .tools import build_bin_dir  # noqa: E402
 
 # The cases of ggml_quantize_chunk's switch (ggml/src/ggml.c) that gguf-py's
 # GGMLQuantizationType also names -- a type outside this set would hit
@@ -57,7 +58,7 @@ def lib_path() -> Path:
     env = os.environ.get("WP_FORGE_GGML_LIB")
     if env:
         return Path(env)
-    return _REPO / "build-forge" / "bin" / "libggml-base.so"
+    return build_bin_dir() / "libggml-base.so"
 
 
 def _load():
@@ -68,9 +69,8 @@ def _load():
         p = lib_path()
         if not p.is_file():
             raise GgmlQuantError(
-                f"libggml-base not found at {p}: build it with `cmake -B build-forge "
-                "-DGGML_HIP=OFF -DGGML_CUDA=OFF && cmake --build build-forge --target "
-                "ggml-base -j`, or point WP_FORGE_GGML_LIB at one")
+                f"libggml-base not found at {p}: build the checkout's main build (build-hip), "
+                "or point WP_FORGE_GGML_LIB at one")
         lib = ctypes.CDLL(str(p))
         lib.ggml_quantize_chunk.argtypes = [
             ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,

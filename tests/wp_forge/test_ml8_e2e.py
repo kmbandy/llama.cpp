@@ -18,7 +18,7 @@ ggml_ml8_mul_mat(weight, centroids, x) and everything else through plain
 ggml_mul_mat.
 
 Skipped unless the CPU tools are built (Tools.discover(), plus
-llama-wp-expert-worker / llama-wp-worker-verify under build-cpu/bin).
+llama-wp-expert-worker / llama-wp-worker-verify in the forge's build dir).
 """
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ from conversion.wp_forge.plan import LayerRange, Ml8Settings, SetSpec
 from conversion.wp_forge.sink import LocalSink
 from conversion.wp_forge.source import HFSource
 from conversion.wp_forge.stages import ExpertStage
-from conversion.wp_forge.tools import REPO_ROOT, Tools
+from conversion.wp_forge.tools import Tools, build_bin_dir
 from synth import make_synthetic_hf_repo
 
 # ml8_4's QK_ML8=64 needs n_embd (gate/up K) and n_ff (down K) both %64==0.
@@ -53,11 +53,11 @@ N_TOKENS = 3
 
 
 def _worker_bin() -> Path:
-    return REPO_ROOT / "build-cpu" / "bin" / "llama-wp-expert-worker"
+    return build_bin_dir() / "llama-wp-expert-worker"
 
 
 def _verify_bin() -> Path:
-    return REPO_ROOT / "build-cpu" / "bin" / "llama-wp-worker-verify"
+    return build_bin_dir() / "llama-wp-worker-verify"
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def env(tmp_path: Path):
         pytest.skip("wp-forge C++ tools not built (Tools.discover raised)")
     if not _worker_bin().exists() or not _verify_bin().exists():
         pytest.skip("llama-wp-expert-worker / llama-wp-worker-verify not built "
-                     "(cmake --build build-cpu --target llama-wp-expert-worker llama-wp-worker-verify)")
+                     "(cmake --build build-hip --target llama-wp-expert-worker llama-wp-worker-verify)")
 
     hub = make_synthetic_hf_repo(
         tmp_path / "hub", n_layer=N_LAYER, n_expert=N_EXPERT,

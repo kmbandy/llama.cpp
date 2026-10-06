@@ -1,6 +1,6 @@
 """End-to-end tests for the wp-forge Job driver + CLI.
 
-Real CPU tools (build-cpu/bin), synthetic DeepSeek-V4.1-shaped HF repo, two
+Real tools (the main build, build-hip/bin), synthetic DeepSeek-V4.1-shaped HF repo, two
 local "machines" (tmp/a, tmp/b). Covers: CLI --dry-run JSON shape, a full
 run (spine + engram sidecar + 3 sets + bundle + deep verify + event log),
 resume (crashed second expert group, rerun skips done stages), and the
