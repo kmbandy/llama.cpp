@@ -4235,6 +4235,96 @@ void wp_cpu_tier_pin_self() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// WP_EXPERT_CPU_TIER_AFFINITY (DEFAULT OFF) -- strict 1:1 placement of the CPU
+// expert tier's compute team (the OpenMP team behind cpu_tier_compute_loop).
+//
+// WHY. The tier's backend is a bare ggml_backend_cpu_init(): no threadpool, so
+// each graph runs on an unpinned libomp team. On a 3900X the 8 threads can
+// clump inside one 3-core CCX / one CCD and share cores with their own SMT
+// siblings. Zen 2 reads DRAM through one Infinity-Fabric link PER CCD (~25-30
+// GB/s each), so a team living on one CCD cannot exceed ~one link; the in-situ
+// 23 GB/s vs the 44 GB/s two-CCD bench is the signature. This pins thread i of
+// the team to ONE logical CPU, chosen round-robin across the L3 domains (CCXs)
+// and preferring one thread per physical core (no SMT siblings).
+//
+//   unset / "0" / "off"   no change (default)
+//   "1" / "spread"        auto topology from sysfs (L3 domains x physical cores)
+//   "<cpulist>"           explicit Linux CPU list, e.g. "0-1,3-4,6-7,9-10"
+//
+// Pure placement: thread count, kernels, row split and quantization are
+// untouched, so every output element is computed by the same code on the same
+// inputs -- bit-identical. Applied by ggml inside its parallel region from a
+// strict threadpool carrier (see configure_cpu_backend for the mechanism);
+// prio stays NORMAL.
+// ---------------------------------------------------------------------------
+bool cpu_tier_affinity_mask(int n_threads, bool * mask /* GGML_MAX_N_THREADS */, std::string & how) {
+    std::memset(mask, 0, GGML_MAX_N_THREADS);
+    const char * e = std::getenv("WP_EXPERT_CPU_TIER_AFFINITY");
+    if (e == nullptr || e[0] == '\0' || std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) {
+        return false;
+    }
+    if (std::strcmp(e, "1") != 0 && std::strcmp(e, "spread") != 0) {
+        if (parse_cpu_list(e, mask)) {
+            how = std::string("list ") + e;
+            return true;
+        }
+        std::memset(mask, 0, GGML_MAX_N_THREADS);
+        std::fprintf(stderr, "wp: WP_EXPERT_CPU_TIER_AFFINITY=%s unparseable; ignored\n", e);
+        return false;
+    }
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return false;
+    }
+    const auto slurp = [](int cpu, const char * file) {
+        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file);
+        std::string s;
+        std::getline(f, s);
+        return s;
+    };
+    // L3 domain -> physical cores (first sibling in the allowed set) -> extra SMT siblings.
+    std::map<std::string, std::vector<int>> primary;   // key: L3 shared_cpu_list ("" if unknown)
+    std::vector<int> smt;
+    std::set<std::string> seen_core;
+    for (int c = 0; c < GGML_MAX_N_THREADS && c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &allowed)) { continue; }
+        const std::string sib = slurp(c, "topology/thread_siblings_list");
+        if (!sib.empty() && !seen_core.insert(sib).second) {
+            smt.push_back(c);
+        } else {
+            primary[slurp(c, "cache/index3/shared_cpu_list")].push_back(c);
+        }
+    }
+    std::vector<std::vector<int>> doms;
+    for (auto & kv : primary) { doms.push_back(kv.second); }
+    std::sort(doms.begin(), doms.end(),
+              [](const std::vector<int> & a, const std::vector<int> & b) { return a[0] < b[0]; });
+    std::vector<int> order;   // round-robin across L3 domains, physical cores first
+    for (size_t i = 0;; ++i) {
+        bool any = false;
+        for (auto & d : doms) {
+            if (i < d.size()) { order.push_back(d[i]); any = true; }
+        }
+        if (!any) { break; }
+    }
+    order.insert(order.end(), smt.begin(), smt.end());
+    if (order.empty()) { return false; }
+    std::string cpus;
+    for (int t = 0; t < n_threads; ++t) {
+        const int c = order[(size_t) t % order.size()];
+        mask[c] = true;
+        cpus += (cpus.empty() ? "" : ",") + std::to_string(c);
+    }
+    how = "spread l3_domains=" + std::to_string(doms.size()) + " cpus=" + cpus;
+    return true;
+#else
+    return false;
+#endif
+}
+
 // Configure a CPU backend that will carry the CPU EXPERT TIER.
 //
 // `tier` must be true ONLY for the backend of the "CPU" expert device -- the one
@@ -18764,9 +18854,29 @@ private:
     void cpu_tier_compute_loop() {
         // Own backend on this thread: ggml applies the threadpool's settings to
         // OpenMP thread 0, which is the calling thread -- never a GPU thread here.
+        // Declared before the backend so it is destroyed after it.
+        std::unique_ptr<ggml_threadpool, void (*)(ggml_threadpool *)> tier_pool(
+            nullptr, [](ggml_threadpool * tp) { ggml_threadpool_free(tp); });
         backend_ptr cpu(ggml_backend_cpu_init());
         if (cpu) {
-            ggml_backend_cpu_set_n_threads(cpu.get(), cpu_tier_compute_threads());
+            const int n_threads = cpu_tier_compute_threads();
+            ggml_backend_cpu_set_n_threads(cpu.get(), n_threads);
+            // WP_EXPERT_CPU_TIER_AFFINITY (default off): strict 1:1 placement of the
+            // team, applied by ggml inside its parallel region. Placement only.
+            ggml_threadpool_params tpp;
+            ggml_threadpool_params_init(&tpp, n_threads);
+            std::string how;
+            if (n_threads > 1 && cpu_tier_affinity_mask(n_threads, tpp.cpumask, how)) {
+                tpp.strict_cpu = true;
+                tpp.prio       = GGML_SCHED_PRIO_NORMAL;
+                tpp.paused     = false;
+                tier_pool.reset(ggml_threadpool_new(&tpp));
+                if (tier_pool) {
+                    ggml_backend_cpu_set_threadpool(cpu.get(), tier_pool.get());
+                    std::fprintf(stderr, "wp: WP_EXPERT_CPU_TIER_AFFINITY: threads=%d %s\n",
+                                 n_threads, how.c_str());
+                }
+            }
         }
         galloc_ptr galloc(ggml_gallocr_new(ggml_backend_cpu_buffer_type()));
         for (;;) {
