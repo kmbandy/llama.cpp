@@ -5259,6 +5259,19 @@ private:
         // half-read slot -- the serial path got this via failed-stripe-ends-
         // the-page, which parallel stripes cannot do.
         std::atomic<bool>                   failed{false};
+        // Consumer (drain_one_read) side only, no atomics: results arrive in
+        // completion order, so the result carrying `last` can be drained
+        // BEFORE a sibling stripe's. The page publishes only when every
+        // stripe has been drained (H2D issued); the facts the publish block
+        // needs from the `last` result are parked here until then.
+        size_t                              total = 0;      // stripes in this page
+        size_t                              drained = 0;    // stripe results drained
+        bool                                fin_seen = false;
+        bool                                fin_error = false;
+        bool                                fin_uploaded = false;
+        bool                                fin_cpu_direct = false;
+        uint64_t                            fin_hash = 0;
+        bool                                fin_hash_valid = false;
     };
 
     // Stripe-parallel counterpart to reserve_arena_for_pagein: several
@@ -6732,6 +6745,7 @@ public:
                     const auto plan = stripe_plan(st.pageins[pi].page->size, st.pageins.size());
                     auto ps = std::make_unique<PageShared>();
                     ps->remaining.store(plan.size(), std::memory_order_relaxed);
+                    ps->total = plan.size();
                     st.page_shared.push_back(std::move(ps));
                     for (const auto & part : plan) {
                         st.stripe_jobs.push_back({ pi, part.first, part.second });
@@ -9212,6 +9226,25 @@ private:
                 }
                 batch.have_read_time_ = true;
             }
+            // Stripe-parallel: `last` marks the stripe that COMPLETED last on a
+            // reader thread, not the last one drained here. The page is done
+            // (publish / hold release / received_) only once every stripe has
+            // been drained and its H2D issued; `last`'s facts are parked in
+            // PageShared until then. Serial path: unchanged, `last` is final.
+            PageShared * const pshared = batch.state_->page_shared.empty()
+                ? nullptr : batch.state_->page_shared[result->pagein_indexb].get();
+            bool page_done = result->last;
+            if (pshared != nullptr) {
+                if (result->last) {
+                    pshared->fin_seen        = true;
+                    pshared->fin_error       = result->error != nullptr;
+                    pshared->fin_uploaded    = result->uploaded;
+                    pshared->fin_cpu_direct  = result->cpu_direct;
+                    pshared->fin_hash        = result->upload_hash;
+                    pshared->fin_hash_valid  = result->upload_hash_valid;
+                }
+                page_done = ++pshared->drained == pshared->total;
+            }
             if (result->error != nullptr) {
                 if (batch.first_error_ == nullptr) {
                     batch.first_error_ = result->error;
@@ -9315,7 +9348,7 @@ private:
                     batch.bytes_h2d_ += result->len;
                 }
                 copy_stream_async = used_copy_stream && !used_fallback;
-                if (result->last) {
+                if (page_done) {
                     if (copy_stream_async) {
                         ++batch.n_copy_stream_ok_;
                     } else if (wanted_copy_stream) {
@@ -9328,9 +9361,16 @@ private:
                 // half-uploaded slot becomes visible, and the page-in log and LRU
                 // tick would fire once per stripe.
                 pagein.async_hold = pagein.async_hold || result_async;
-                if (result->last) {
-                    if (cpu_direct_pagein_ && !result->uploaded) {
-                        if (pagein.cpu_direct && result->cpu_direct) {
+                // Stripe mode: facts of the stripe that completed last, which
+                // may not be the one being drained now.
+                const bool fin_uploaded   = pshared != nullptr ? pshared->fin_uploaded   : result->uploaded;
+                const bool fin_cpu_direct = pshared != nullptr ? pshared->fin_cpu_direct : result->cpu_direct;
+                const uint64_t fin_hash   = pshared != nullptr ? pshared->fin_hash       : result->upload_hash;
+                const bool fin_hash_valid = pshared != nullptr ? pshared->fin_hash_valid : result->upload_hash_valid;
+                // A failed `last` (or sibling failure folded into it) never publishes.
+                if (page_done && !(pshared != nullptr && pshared->fin_error)) {
+                    if (cpu_direct_pagein_ && !fin_uploaded) {
+                        if (pagein.cpu_direct && fin_cpu_direct) {
                             ++batch.n_cpu_direct_pagein_;
                         } else {
                             ++batch.n_cpu_direct_pagein_fallback_;
@@ -9340,9 +9380,9 @@ private:
                     // tier_bytes=0 the entry can be mid-pread for another
                     // page the instant it is. Reader-H2D results carry the
                     // hash taken on the reader thread (hash_uploaded_page).
-                    if (result->uploaded) {
-                        slot.upload_hash       = result->upload_hash;
-                        slot.upload_hash_valid = result->upload_hash_valid;
+                    if (fin_uploaded) {
+                        slot.upload_hash       = fin_hash;
+                        slot.upload_hash_valid = fin_hash_valid;
                     } else if (wp_worker_cuda_async_hash_trace_enabled(backend_) &&
                             result->src != nullptr) {
                         slot.upload_hash = hash_page_upload(
@@ -9415,8 +9455,11 @@ private:
                     // are already sitting in the arena entry this page-in
                     // read from (or hit), and they STAY there -- the arena
                     // is the RAM copy, not a side effect of uploading it.
+                    // Stripe mode: any stripe's async copy needs the event, not
+                    // just the one drained last.
                     const bool delay_valid =
-                        wp_copy_stream_events_enabled() && copy_stream_async;
+                        wp_copy_stream_events_enabled() &&
+                        (copy_stream_async || (pshared != nullptr && pagein.async_hold));
                     if (delay_valid) {
                         ggml_backend_event_t ev = new_copy_event();
                         if (ev != nullptr && record_copy_event(ev)) {
@@ -9450,7 +9493,6 @@ private:
             }
             // received_ counts PAGES, not stripes -- complete_batch's loop is
             // bounded by pageins.size().
-            const bool page_done = result->last;
             result.reset();
             if (page_done) {
                 ++batch.received_;
