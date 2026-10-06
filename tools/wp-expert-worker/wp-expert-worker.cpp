@@ -5537,6 +5537,9 @@ public:
         device_name_ = device_name.empty()
             ? (ggml_backend_name(backend_) ? ggml_backend_name(backend_) : "")
             : device_name;
+        cpu_tier_dev_on_ = cpu_tier_enabled() && cpu_tier_device_listed(device_name_);
+        std::fprintf(stderr, "wp: CPU tier device=%s enabled=%d\n",
+            device_name_.c_str(), (int) cpu_tier_dev_on_);
         device_ = backend_ != nullptr ? ggml_backend_get_device(backend_) : nullptr;
         // *** COPY-STREAM / ASYNC H2D PROBES, FORMERLY STAGINGPOOL'S. ***
         // Moved verbatim onto the pool: these gate drain_one_read's H2D shape
@@ -6443,7 +6446,7 @@ public:
             batch.demand_rec_ = std::move(rec);
         }
         // Demand decode/verify only: never a speculative or prefill call.
-        const bool cpu_tier_this_call = cpu_tier_enabled() && count_demand && !spec_call &&
+        const bool cpu_tier_this_call = cpu_tier_dev_on_ && count_demand && !spec_call &&
             n_tokens >= 1 && n_tokens <= cpu_tier_max_tokens();
         // Call-based decay: once per tier-eligible dispatch call (not per
         // page), so lifetime counts cannot saturate past PROMOTE and switch
@@ -6464,7 +6467,7 @@ public:
             // prefetch / hint / layer-ahead / pin / seed, whose timing is
             // nondeterministic). Capacity = the slots demand pages can occupy
             // = all carved slots minus the startup-pinned ones.
-            const bool shadow_active = cpu_tier_deterministic() && count_demand && !spec_call;
+            const bool shadow_active = cpu_tier_dev_on_ && cpu_tier_deterministic() && count_demand && !spec_call;
             if (shadow_active) {
                 const size_t shadow_cap =
                     slots_.size() > n_pinned_ ? slots_.size() - n_pinned_ : 0;
@@ -6637,7 +6640,7 @@ public:
                 slots_[slot_index].lease_until = 0;
                 ++slots_[slot_index].pin_count;
                 batch.entries_[entry_index].slot_index = slot_index;
-                if (cpu_tier_deterministic()) {
+                if (cpu_tier_dev_on_ && cpu_tier_deterministic()) {
                     batch.entries_[entry_index].plan_tick = ++tick_;
                 }
             }
@@ -7566,13 +7569,12 @@ public:
     // of its bytes are in; the reader finishes it at full speed and the demand
     // read that wants it waits on the Reading entry (reserve_wait) instead of
     // re-reading from byte 0.
-    static bool cpu_tier_prefetch_enabled() {
+    bool cpu_tier_prefetch_enabled() const {
         static const bool v = [] {
-            const char * e = std::getenv("WP_EXPERT_CPU_TIER");
             const char * p = std::getenv("WP_EXPERT_CPU_TIER_PREFETCH");
-            return e != nullptr && e[0] == '1' && p != nullptr && p[0] == '1';
+            return p != nullptr && p[0] == '1';
         }();
-        return v;
+        return cpu_tier_dev_on_ && v;
     }
     // Spec-tag bit marking a prefetch landing, so its used/unused outcome is
     // countable apart from the old host landings (which use only 0x80 | dist).
@@ -8491,6 +8493,28 @@ private:
             return e != nullptr && e[0] == '1';
         }();
         return enabled;
+    }
+    // WP_EXPERT_CPU_TIER_DEVICES=ROCm0,ROCm1: restrict the tier to the named
+    // devices. Unset/empty = every device (today's behaviour).
+    static bool cpu_tier_device_listed(const std::string & name) {
+        const char * e = std::getenv("WP_EXPERT_CPU_TIER_DEVICES");
+        if (e == nullptr || e[0] == '\0') {
+            return true;
+        }
+        std::string list = e;
+        size_t pos = 0;
+        while (pos <= list.size()) {
+            size_t end = list.find(',', pos);
+            if (end == std::string::npos) { end = list.size(); }
+            size_t b = pos, f = end;
+            while (b < f && std::isspace((unsigned char) list[b])) { ++b; }
+            while (f > b && std::isspace((unsigned char) list[f - 1])) { --f; }
+            if (f > b && list.compare(b, f - b, name) == 0) {
+                return true;
+            }
+            pos = end + 1;
+        }
+        return false;
     }
     static uint64_t cpu_tier_env_u64(const char * name, uint64_t def) {
         const char * e = std::getenv(name);
@@ -10681,6 +10705,7 @@ private:
     size_t                     read_chunk_bytes_ = read_chunk_bytes_from_env();
     const bool                 read_direct_ = read_direct_from_env();
     std::string                device_name_;
+    bool                       cpu_tier_dev_on_ = false;  // WP_EXPERT_CPU_TIER[_DEVICES]
     bool                       cpu_direct_pagein_ = false;
 #if defined(__linux__)
     cpu_set_t                  reader_cpu_set_{};
@@ -13471,7 +13496,7 @@ public:
                         continue;
                     }
                     pool_.note_host_hint(*page);
-                    if (ExpertSlotPool::cpu_tier_prefetch_enabled()) {
+                    if (pool_.cpu_tier_prefetch_enabled()) {
                         // Strictly low-priority reader instead of host_queue_.
                         pool_.cpu_pf_enqueue(*page);
                         continue;
