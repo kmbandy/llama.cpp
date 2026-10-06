@@ -8271,6 +8271,17 @@ private:
         }();
         return v;
     }
+    // WP_EXPERT_CPU_TIER_HITS_INLINE=1: resolve the tier's RAM hits on the
+    // submitting thread (one non-blocking borrow, no I/O) and queue only the
+    // misses to the IO threads, so hits neither wait behind NVMe-blocked IO
+    // threads nor pay the dispatch->IO->compute handoff. Default 0 (today's path).
+    static bool cpu_tier_hits_inline() {
+        static const bool v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_HITS_INLINE");
+            return e != nullptr && e[0] == '1';
+        }();
+        return v;
+    }
     // WP_EXPERT_CPU_TIER_CHUNK_COMPUTE=1: with chunked NVMe reads, run a page's
     // gate/up projections (+ swiglu) as soon as the chunks that hold the gate and
     // up roles have landed, while the remaining chunk(s) (down) are still being
@@ -8386,6 +8397,24 @@ private:
             }
             // Present: another reader landed it meanwhile -- borrow on the next pass.
         }
+    }
+
+    // Single non-blocking borrow: the RAM-hit half of acquire_host_page (same
+    // demand borrow, same hit accounting). Returns false -- touching nothing, no
+    // attribution -- when the page is not resident; the caller then takes the
+    // normal acquire path, which does its own first-try accounting.
+    bool try_borrow_host_page(const ExpertPage & page, HostPage & hp, uint32_t rows = 0) {
+        const void * src = nullptr;
+        int promoted_tag = -1;
+        if (!arena_.borrow(page.cache_id, &src, &hp.handle, /*demand=*/true,
+                           /*prefill_hint=*/false, &promoted_tag)) {
+            return false;
+        }
+        note_host_src(page, hp, promoted_tag, /*first_try=*/true, /*pf_live=*/false);
+        attr_note_hit(page, rows);
+        hp.data    = src;
+        hp.ram_hit = true;
+        return true;
     }
 
     // Chunked variant of acquire_host_page, step 1: borrow on a RAM hit
@@ -18188,6 +18217,46 @@ private:
         job->n_tokens = request.n_tokens;
         job->demand_rec = batch.demand_rec();
         pool_.attr_note_req(request.n_tokens, job->index.size());
+        // These reads are DEMAND: count them from queueing until settled so
+        // the prefetch reader (and the preempt gate) hold off for them.
+        pool_.cpu_tier_demand_begin(job->index.size());
+        // WP_EXPERT_CPU_TIER_HITS_INLINE: borrow the resident pages right here
+        // and land them before any IO task exists, so job->landed already holds
+        // the hits (ahead of every miss) when the compute thread takes the job
+        // -- also under EARLY_IO, where this runs at BEGIN and the compute
+        // thread only picks the job up at dispatch. Partials are per expert and
+        // summed in assignment order by finish_cpu_tier, so landing order never
+        // reaches the result. A page that misses here goes to the IO threads
+        // unchanged (they redo the borrow, so a page that lands meanwhile is
+        // still a hit).
+        std::vector<char> inline_hit(job->index.size(), 0);
+        if (ExpertSlotPool::cpu_tier_hits_inline()) {
+            size_t k = 0;
+            try {
+                for (; k < job->index.size(); ++k) {
+                    ExpertSlotPool::HostPage hp;
+                    if (!pool_.try_borrow_host_page(*job->pages[k], hp, job->n_tokens)) {
+                        continue;
+                    }
+                    if (job->demand_rec) { job->demand_rec->src[job->index[k]] = hp.src; }
+                    job->holds[k] = hp;   // job is not shared yet: no lock needed
+                    inline_hit[k] = 1;
+                    cpu_tier_settle(*job, k, true, true, nullptr);
+                }
+            } catch (...) {
+                // Nothing is queued yet: give back what was borrowed and the
+                // demand count of every page that will never settle.
+                for (size_t i = 0; i < job->index.size(); ++i) {
+                    if (inline_hit[i]) {
+                        pool_.release_host_page(*job->pages[i], job->holds[i]);
+                    }
+                }
+                for (size_t i = k; i < job->index.size(); ++i) {
+                    pool_.cpu_tier_demand_end();
+                }
+                throw;
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(cpu_tier_mu_);
             if (cpu_tier_threads_.empty()) {
@@ -18199,19 +18268,20 @@ private:
                 std::fprintf(stderr,
                     "wp: WP_EXPERT_CPU_TIER=1: promote=%u max=%zu max_tokens=%u io=%zu "
                     "compute_threads=%d halflife=%llu halflife_calls=%llu read_chunks=%zu early_io=%d "
-                    "chunk_compute=%d\n",
+                    "chunk_compute=%d hits_inline=%d\n",
                     ExpertSlotPool::cpu_tier_promote(), ExpertSlotPool::cpu_tier_max(),
                     ExpertSlotPool::cpu_tier_max_tokens(), n_io, cpu_tier_compute_threads(),
                     (unsigned long long) ExpertSlotPool::cpu_tier_halflife(),
                     (unsigned long long) ExpertSlotPool::cpu_tier_halflife_calls(),
                     ExpertSlotPool::cpu_tier_read_chunks(),
                     (int) ExpertSlotPool::cpu_tier_early_io(),
-                    (int) ExpertSlotPool::cpu_tier_chunk_compute());
+                    (int) ExpertSlotPool::cpu_tier_chunk_compute(),
+                    (int) ExpertSlotPool::cpu_tier_hits_inline());
             }
-            // These reads are DEMAND: count them from queueing until settled so
-            // the prefetch reader (and the preempt gate) hold off for them.
-            pool_.cpu_tier_demand_begin(job->index.size());
             for (size_t k = 0; k < job->index.size(); ++k) {
+                if (inline_hit[k]) {
+                    continue;   // already landed above
+                }
                 cpu_tier_io_q_.push_back(CpuTierIoTask{job, k, -1});
             }
         }
