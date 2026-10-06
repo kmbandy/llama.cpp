@@ -287,6 +287,21 @@ static bool wp_worker_hash_trace_enabled() {
     return enabled;
 }
 
+// WP_PLACEMENT_LOG=<path>: one line per dispatch request (default off):
+//   seq layer n_tokens id:P ... hash
+// seq = the spine seq_id (WP_REQ_LOG timeline col 30); P = V (VRAM resident),
+// N (paged in this request), C (CPU tier); ids in assignment order; hash = FNV-1a
+// of the final f32 sum BEFORE the ml8_4 wire encode. While the log is on, the
+// device-side wire pre-pack in read_result is skipped so the f32 sum is
+// available (the protocol encoder then packs it with the same kernel).
+static FILE * wp_placement_log_file() {
+    static FILE * const f = [] {
+        const char * e = std::getenv("WP_PLACEMENT_LOG");
+        return (e != nullptr && e[0] != '\0') ? std::fopen(e, "w") : (FILE *) nullptr;
+    }();
+    return f;
+}
+
 static bool wp_worker_stream_partials_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("WP_STREAM_PARTIALS");
@@ -6000,6 +6015,9 @@ public:
             // compute path must skip it (compute_batch's selected()).
             bool   cpu_tier = false;
             int    cpu_fd   = -1;
+            // WP_EXPERT_CPU_TIER_DETERMINISTIC: LRU tick taken at plan time (in
+            // assignment-index order); 0 = take ++tick_ at publish (completion).
+            uint64_t plan_tick = 0;
         };
 
         struct PendingCopy {
@@ -6342,6 +6360,20 @@ public:
                         }
                     }
                 }
+                // WP_EXPERT_CPU_TIER_DETERMINISTIC: decide from stream state
+                // only, before looking at VRAM. A resident page chosen here is
+                // fetched by the CPU path (RAM-tier borrow or NVMe read into
+                // the arena, via fd_for(page.blob)); its slot is neither
+                // pinned nor ticked.
+                if (cpu_tier_deterministic() && cpu_eligible &&
+                        (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
+                        batch.n_cpu_tier_ < cpu_tier_max()) {
+                    batch.entries_[i].cpu_tier = true;
+                    batch.entries_[i].ready    = true;
+                    batch.entries_[i].cpu_fd   = fd_for(page.blob);
+                    ++batch.n_cpu_tier_;
+                    continue;
+                }
                 const size_t slot_index = find_slot(page);
                 if (slot_index == slots_.size()) {
                     if (page.is_resident) {
@@ -6448,6 +6480,9 @@ public:
                 slots_[slot_index].lease_until = 0;
                 ++slots_[slot_index].pin_count;
                 batch.entries_[entry_index].slot_index = slot_index;
+                if (cpu_tier_deterministic()) {
+                    batch.entries_[entry_index].plan_tick = ++tick_;
+                }
             }
             if (!dropped_pageins.empty()) {
                 // Remove the dropped entries from `pageins` before the read-
@@ -8295,6 +8330,18 @@ private:
         }();
         return v;
     }
+    // WP_EXPERT_CPU_TIER_DETERMINISTIC=1: the CPU/GPU split of a request is a
+    // function of request-stream state only (refs, PROMOTE, MAX, assignment
+    // order), never of VRAM residency: a cold page computes on the CPU even if
+    // it happens to sit in VRAM. Also stamps page-in LRU ticks in assignment
+    // order at plan time instead of read-completion order. Default 0.
+    static bool cpu_tier_deterministic() {
+        static const bool v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_DETERMINISTIC");
+            return e != nullptr && e[0] == '1';
+        }();
+        return v;
+    }
     // Every this many tier demand references, halve every page's count (0 = never).
     static uint64_t cpu_tier_halflife() {
         static const uint64_t v = cpu_tier_env_u64("WP_EXPERT_CPU_TIER_HALFLIFE", 0);
@@ -9184,11 +9231,11 @@ private:
         slot.cache_id = page.cache_id;
         slot.page     = &page;
         slot.size     = page.size;
-        slot.tick     = ++tick_;
+        Batch::Entry & entry = batch.entries_[entry_index];
+        slot.tick     = entry.plan_tick != 0 ? entry.plan_tick : ++tick_;
         slot.uses     = lfu_history_enabled_ ? history_uses(page) : evict_age_ + 1;
         slot.upload_hash = upload_hash;
         slot.upload_hash_valid = upload_hash_valid;
-        Batch::Entry & entry = batch.entries_[entry_index];
         entry.loaded = { slot.buffer, slot.raw->data };
         entry.upload_hash = upload_hash;
         entry.upload_hash_valid = upload_hash_valid;
@@ -14666,7 +14713,8 @@ public:
                 request.assignments.size() > batch.n_cpu_tier()) {
             read_result(sum, request_stats, std::numeric_limits<size_t>::max(),
                         (int) request.layer, last_compute_path_,
-                        /* capture_wire = */ cpu_job == nullptr);
+                        /* capture_wire = */ cpu_job == nullptr &&
+                            wp_placement_log_file() == nullptr);
             last_compute_path_ = "none";
         }
         request_stats.ns_result = lap();
@@ -14674,6 +14722,23 @@ public:
             finish_cpu_tier(cpu_job, sum, request_stats);
             cpu_job.reset();
             ml8_wire_partial_.clear();   // the encoder packs the full f32 sum
+        }
+        if (FILE * plog = wp_placement_log_file()) {
+            static std::mutex plog_mutex;
+            std::string line = std::to_string((unsigned long long) trace_req) + " " +
+                std::to_string(request.layer) + " " + std::to_string(request.n_tokens);
+            for (size_t i = 0; i < request.assignments.size(); ++i) {
+                line += ' ';
+                line += std::to_string(request.assignments[i].expert_id);
+                line += batch.is_cpu_tier(i) ? ":C" : (batch.is_resident(i) ? ":V" : ":N");
+            }
+            line += ' ';
+            line += std::to_string((unsigned long long) wp_worker_hash_fnv1a(
+                sum.data(), sum.size() * sizeof(float)));
+            line += '\n';
+            std::lock_guard<std::mutex> lock(plog_mutex);
+            std::fwrite(line.data(), 1, line.size(), plog);
+            std::fflush(plog);
         }
 
         // *** WP_SELFCHECK=1: EQUIVALENCE PROBE (default OFF, diagnostic only). ***
@@ -18268,7 +18333,7 @@ private:
                 std::fprintf(stderr,
                     "wp: WP_EXPERT_CPU_TIER=1: promote=%u max=%zu max_tokens=%u io=%zu "
                     "compute_threads=%d halflife=%llu halflife_calls=%llu read_chunks=%zu early_io=%d "
-                    "chunk_compute=%d hits_inline=%d\n",
+                    "chunk_compute=%d hits_inline=%d deterministic=%d\n",
                     ExpertSlotPool::cpu_tier_promote(), ExpertSlotPool::cpu_tier_max(),
                     ExpertSlotPool::cpu_tier_max_tokens(), n_io, cpu_tier_compute_threads(),
                     (unsigned long long) ExpertSlotPool::cpu_tier_halflife(),
@@ -18276,7 +18341,8 @@ private:
                     ExpertSlotPool::cpu_tier_read_chunks(),
                     (int) ExpertSlotPool::cpu_tier_early_io(),
                     (int) ExpertSlotPool::cpu_tier_chunk_compute(),
-                    (int) ExpertSlotPool::cpu_tier_hits_inline());
+                    (int) ExpertSlotPool::cpu_tier_hits_inline(),
+                    (int) ExpertSlotPool::cpu_tier_deterministic());
             }
             for (size_t k = 0; k < job->index.size(); ++k) {
                 if (inline_hit[k]) {
