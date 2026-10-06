@@ -4,6 +4,8 @@
 
 #include "common.h"
 
+#include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -87,6 +89,51 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// MAD-LAB: speculative SAMPLING (Leviathan/Chen et al.) verification, the stochastic counterpart of
+// common_sampler_sample_and_accept_n(). The draft tokens x_i were sampled from q_i; x_i is accepted
+// with probability min(1, p_i(x_i)/q_i(x_i)) where p_i is the target's FINAL sampling distribution at
+// position i (the candidates the full sampler chain leaves, normalized -- penalties, top-k/top-p/min-p,
+// temperature, ...). The first rejection resamples from norm(max(0, p_i - q_i)) and stops; if every
+// draft token is accepted a bonus token is sampled from p_n. The output distribution equals the
+// target's exactly, for any q.
+//
+// Pure math core, no llama context needed (also used by tests/test-spec-sampling):
+//   target_p(i, cand)  fill cand with the target distribution at position i, i in [0, n_draft], given
+//                      that tokens 0..i-1 of the result were already reported through on_token
+//   q_prob(i, tok)     q_i(tok), the draft distribution the token at position i was sampled from
+//   on_token(i, tok)   called for every returned token, in order, before target_p(i + 1, ...)
+// accept_probs (optional) receives min(1, p/q) of every draft position that was tested.
+std::vector<llama_token> common_spec_verify_stochastic(
+        size_t                        n_draft,
+        const llama_token           * draft,
+        const std::function<void(size_t, std::vector<llama_token_data> &)> & target_p,
+        const std::function<double(size_t, llama_token)>                    & q_prob,
+        const std::function<void(size_t, llama_token)>                      & on_token,
+        std::mt19937                & rng,
+        std::vector<float>          * accept_probs = nullptr);
+
+// true if this sampler's final distribution is a plain softmax over its post-chain candidates, i.e. the
+// stochastic verification above is exact for it: temp > 0, no mirostat / XTC / adaptive-p, no grammar.
+bool common_sampler_spec_sampling_ok(const struct common_sampler * gsmpl);
+
+// Sampler-chain driven stochastic verification. q_logits is [draft.size()][n_vocab_q] row-major draft
+// logits; the draft token at row i was sampled from softmax(q_logits[i] / q_temp). Falls back to
+// common_sampler_sample_and_accept_n() (exact match) when the sampler is not eligible, backend sampling
+// already picked the target tokens, or q_logits is missing.
+// is_replay: the draft is the already-accepted output of an earlier stochastic round (restored from a
+// checkpoint) -- accept it unconditionally and only draw the bonus token.
+std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens    & draft,
+        const float           * q_logits,
+        int32_t                 n_vocab_q,
+        float                   q_temp,
+        std::mt19937          & rng,
+        bool                    is_replay,
+        std::vector<float>    * accept_probs = nullptr);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

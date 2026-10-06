@@ -12762,7 +12762,7 @@ public:
             const char * demote_env = std::getenv("WP_EXPERT_PARK_DEMOTE");
             if (demote_env != nullptr && demote_env[0] == '1') {
                 std::vector<ExpertSlotPool::SeedItem> hot_first;
-                hot_first.reserve(vram.size());
+                hot_first.reserve(park_rows_.size());
                 for (const ParkRow & row : park_rows_) {
                     if (row.vram) {
                         hot_first.push_back(row.item);

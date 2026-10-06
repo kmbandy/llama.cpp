@@ -50,6 +50,19 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// MAD-LAB: DSpark speculative sampling. The draft distribution of a stochastically drafted block, kept
+// next to the draft tokens (it must survive until the draft is verified) so the verifier can run the
+// accept/reject test. Row i (n_vocab floats) holds the draft logits that token i was sampled from as
+// softmax(logits / temp).
+struct common_speculative_draft_q {
+    float              temp    = 0.0f;
+    int32_t            n_vocab = 0;
+    std::vector<float> logits;
+
+    void   clear()       { temp = 0.0f; n_vocab = 0; logits.clear(); }
+    size_t n() const     { return n_vocab > 0 ? logits.size() / (size_t) n_vocab : 0; }
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -69,6 +82,15 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // MAD-LAB: DSpark speculative sampling (only honored with --spec-draft-sampling stochastic).
+    // temp > 0 asks the drafter to SAMPLE its chain at that temperature, seeded by noise_seed, and to
+    // fill *q with the draft logits; temp <= 0 or q == nullptr keeps the greedy chain. q is cleared by
+    // common_speculative_draft() for every drafting sequence and is only left non-empty when the
+    // returned draft is a stochastic one.
+    float                         temp       = 0.0f;
+    uint64_t                      noise_seed = 0;
+    common_speculative_draft_q *  q          = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

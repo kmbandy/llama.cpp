@@ -1117,6 +1117,7 @@ llama_context::llama_context(
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
+    cparams.dspark_state            = &dspark_state;
     cparams.embeddings_nextn_masked = false;
     cparams.embd_sparse_outputs     = params.embd_sparse_outputs;
     cparams.offload_kqv             = params.offload_kqv;
@@ -3034,6 +3035,28 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+void llama_context::set_dspark_sampling(bool value) {
+    if (cparams.dspark_sample == value) {
+        return;
+    }
+    cparams.dspark_sample = value;
+
+    // the graph topology changes (Gumbel inputs + token export), drop cached graphs
+    wp_reset_graph_results();
+}
+
+void llama_context::set_dspark_noise(const float * noise, const float * inv_t, const llama_seq_id * seq_ids,
+                                     int64_t n_vocab, int64_t n_blocks, int64_t block_len) {
+    dspark_state.applied   = false;
+    dspark_state.noise     = noise;
+    dspark_state.n_vocab   = n_vocab;
+    dspark_state.n_blocks  = n_blocks;
+    dspark_state.block_len = block_len;
+    const bool have = noise && inv_t && seq_ids;
+    dspark_state.inv_t.assign(inv_t, inv_t + (have ? n_blocks : 0));
+    dspark_state.seq_ids.assign(seq_ids, seq_ids + (have ? n_blocks : 0));
 }
 
 void llama_context::set_no_output_head(bool value) {
@@ -8360,6 +8383,20 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_dspark_sampling(llama_context * ctx, bool value) {
+    ctx->set_dspark_sampling(value);
+}
+
+void llama_dspark_set_noise(llama_context * ctx, const float * noise, const float * inv_t,
+                            const llama_seq_id * seq_ids,
+                            int64_t n_vocab, int64_t n_blocks, int64_t block_len) {
+    ctx->set_dspark_noise(noise, inv_t, seq_ids, n_vocab, n_blocks, block_len);
+}
+
+bool llama_dspark_noise_applied(const llama_context * ctx) {
+    return ctx->get_dspark_noise_applied();
 }
 
 void llama_set_no_output_head(llama_context * ctx, bool value) {

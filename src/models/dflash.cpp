@@ -523,6 +523,122 @@ int64_t llama_dspark_markov_ragged_skipped_fetch_reset(void) {
     return g_dspark_markov_ragged_skipped.exchange(0, std::memory_order_relaxed);
 }
 
+
+// ---------------------------------------------------------------------------------------
+// DSpark speculative sampling: Gumbel-max chain
+//
+// With cparams.dspark_sample the Markov chain conditions position i+1 on
+//   x_i = argmax(col_i * (1/T) + g_i),  g ~ Gumbel(0,1)   (== a sample from softmax(col_i/T))
+// instead of argmax(col_i). g comes from the host (llama_dspark_set_noise) so the request RNG
+// owns the randomness; 1/T is per block. Blocks that must stay greedy get 1/T = 1 and g = 0,
+// for which the expression is bit-identical to argmax(col_i). The chosen x_i of every
+// position are exported on the nextn rows (column 1) so the host sees exactly the tokens
+// that conditioned the chain, with no re-derivation.
+// ---------------------------------------------------------------------------------------
+class llm_graph_input_dspark_gumbel : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_gumbel(ggml_tensor * noise, ggml_tensor * inv_t, llama_dspark_sample_state * st)
+        : noise(noise), inv_t(inv_t), st(st) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        if (noise->buffer == nullptr) {
+            return; // inert (e.g. gallocr left it unallocated)
+        }
+        const int64_t nv = noise->ne[0], bl = noise->ne[1], nb = noise->ne[2];
+        const size_t  n  = (size_t) (nv * bl * nb);
+        const size_t  blk = (size_t) (nv * bl);
+
+        // host block (by sequence id) feeding each ubatch block; -1 = mismatch
+        std::vector<int64_t> src(nb, -1);
+        bool ok = st && st->noise && st->n_vocab == nv && st->n_blocks == nb && st->block_len == bl &&
+                  (int64_t) st->inv_t.size() == nb && (int64_t) st->seq_ids.size() == nb &&
+                  ubatch && ubatch->seq_id && ubatch->n_seq_id && (int64_t) ubatch->n_tokens == bl*nb;
+        for (int64_t b = 0; ok && b < nb; ++b) {
+            const llama_seq_id sid = ubatch->seq_id[b*bl][0];
+            for (int64_t h = 0; h < nb; ++h) {
+                if (st->seq_ids[h] == sid) {
+                    src[b] = h;
+                    break;
+                }
+            }
+            ok = src[b] >= 0;
+        }
+
+        if (ok) {
+            for (int64_t b = 0; b < nb; ++b) {
+                ggml_backend_tensor_set(noise, st->noise + (size_t) src[b]*blk, (size_t) b*blk*sizeof(float), blk*sizeof(float));
+                ggml_backend_tensor_set(inv_t, &st->inv_t[src[b]], (size_t) b*sizeof(float), sizeof(float));
+            }
+        } else {
+            std::vector<float> local_zeros;
+            std::vector<float> local_ones;
+            std::vector<float> & zeros = st ? st->zeros : local_zeros;
+            std::vector<float> & ones  = st ? st->ones  : local_ones;
+            if (zeros.size() != n)           { zeros.assign(n, 0.0f); }
+            if ((int64_t) ones.size() != nb) { ones.assign((size_t) nb, 1.0f); }
+            ggml_backend_tensor_set(noise, zeros.data(), 0, n*sizeof(float));
+            ggml_backend_tensor_set(inv_t, ones.data(),  0, (size_t) nb*sizeof(float));
+        }
+        if (st) {
+            st->applied = ok;
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params); // shapes follow the ubatch dims that allow_reuse() already compares
+        return true;
+    }
+
+    ggml_tensor * noise;
+    ggml_tensor * inv_t;
+    llama_dspark_sample_state * st;
+};
+
+bool llama_dspark_gumbel_init(llm_graph_context & g, llama_dspark_gumbel & gm,
+                              int64_t n_vocab, int64_t n_blocks, int64_t block_len) {
+    if (!g.cparams.dspark_sample) {
+        return false;
+    }
+    gm.n_vocab   = n_vocab;
+    gm.n_blocks  = n_blocks;
+    gm.block_len = block_len;
+    gm.noise = ggml_new_tensor_3d(g.ctx0, GGML_TYPE_F32, n_vocab, block_len, n_blocks);
+    gm.inv_t = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, 1, n_blocks);
+    ggml_set_input(gm.noise);
+    ggml_set_input(gm.inv_t);
+    ggml_set_name(gm.noise, "dspark_gumbel_noise");
+    ggml_set_name(gm.inv_t, "dspark_gumbel_inv_t");
+    g.res->add_input(std::make_unique<llm_graph_input_dspark_gumbel>(gm.noise, gm.inv_t, g.cparams.dspark_state));
+    return true;
+}
+
+ggml_tensor * llama_dspark_gumbel_pick(ggml_context * ctx0, llama_dspark_gumbel & gm, ggml_tensor * col, int64_t i) {
+    ggml_tensor * noise_i = ggml_view_2d(ctx0, gm.noise, gm.n_vocab, gm.n_blocks, gm.noise->nb[2], i*gm.noise->nb[1]);
+    ggml_tensor * scaled  = ggml_add(ctx0, ggml_mul(ctx0, col, gm.inv_t), noise_i);
+    ggml_tensor * tok     = ggml_argmax(ctx0, scaled); // I32 [n_blocks]
+    ggml_tensor * tokf    = ggml_reshape_2d(ctx0, ggml_cast(ctx0, tok, GGML_TYPE_F32), 1, gm.n_blocks);
+    gm.cat_tok = gm.cat_tok ? ggml_concat(ctx0, gm.cat_tok, tokf, 1) : tokf;
+    return tok;
+}
+
+void llama_dspark_gumbel_skip(ggml_context * ctx0, llama_dspark_gumbel & gm) {
+    ggml_tensor * z = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, gm.n_blocks), 0.0f);
+    gm.cat_tok = gm.cat_tok ? ggml_concat(ctx0, gm.cat_tok, z, 1) : z;
+}
+
+ggml_tensor * llama_dspark_gumbel_pack(ggml_context * ctx0, llama_dspark_gumbel & gm,
+                                       ggml_tensor * conf_tok, ggml_tensor * t_embd) {
+    GGML_ASSERT(gm.cat_tok && gm.cat_tok->ne[1] == gm.block_len);
+    GGML_ASSERT(t_embd->ne[0] >= 2);
+    // position-major -> ubatch block-major, same as the confidence column
+    ggml_tensor * tok = ggml_reshape_3d(ctx0, gm.cat_tok, 1, gm.n_blocks, gm.block_len);
+    tok = ggml_cont(ctx0, ggml_permute(ctx0, tok, 0, 2, 1, 3));
+    tok = ggml_reshape_2d(ctx0, tok, 1, gm.n_blocks*gm.block_len);
+
+    ggml_tensor * row = ggml_concat(ctx0, conf_tok, tok, 0); // [2, n_tok]
+    return ggml_pad(ctx0, row, (int) (t_embd->ne[0] - 2), 0, 0, 0);
+}
+
 bool llama_dspark_build_markov_graph(
         ggml_context      * ctx0,
         const llama_model & model,
@@ -531,7 +647,8 @@ bool llama_dspark_build_markov_graph(
         ggml_tensor       * conf_inp,  // F32 [n_embd, n_tok]
         int64_t             n_blocks,
         ggml_tensor      ** out_logits,
-        ggml_tensor      ** out_conf) {
+        ggml_tensor      ** out_conf,
+        llama_dspark_gumbel * gm) {
     ggml_tensor * w1 = model.dspark_markov_w1;
     ggml_tensor * w2 = model.dspark_markov_w2;
     GGML_ASSERT(w1 && w2 && "DSpark markov weights not loaded");
@@ -616,8 +733,11 @@ bool llama_dspark_build_markov_graph(
         }
     }
 
-    // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
-    //       token pick, not the Markov conditioning path
+    // The chain is greedy (argmax) unless `gm` is given: then it is Gumbel-max sampling, see
+    // llama_dspark_gumbel_pick(). The bonus anchor slot (when present) has no sampled token.
+    if (gm && i_draft_beg > 0) {
+        llama_dspark_gumbel_skip(ctx0, *gm);
+    }
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
         ggml_tensor * bias    = ggml_mul_mat(ctx0, w2, w1_prev); // [n_vocab_draft, n_blocks]
@@ -652,7 +772,13 @@ bool llama_dspark_build_markov_graph(
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (i + 1 < block_drafts) {
+        if (gm) {
+            // the last position's token is not needed for the chain but is exported for the verifier
+            ggml_tensor * tok = llama_dspark_gumbel_pick(ctx0, *gm, col, i);
+            if (i + 1 < block_drafts) {
+                prev = tok;
+            }
+        } else if (i + 1 < block_drafts) {
             prev = ggml_argmax(ctx0, col);
         }
     }
@@ -820,8 +946,13 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * out  = nullptr;
     ggml_tensor * conf = nullptr;
 
+    // speculative sampling (off by default -> gm stays null and the graph is unchanged)
+    llama_dspark_gumbel gm;
+    const bool sample = model.dspark_conf_proj != nullptr &&
+        llama_dspark_gumbel_init(g, gm, g.res->t_logits->ne[0], n_blocks_chk, n_tok_chk / n_blocks_chk);
+
     if (!llama_dspark_build_markov_graph(g.ctx0, model, tokens,
-                g.res->t_logits, g.res->t_embd, n_blocks_chk, &out, &conf)) {
+                g.res->t_logits, g.res->t_embd, n_blocks_chk, &out, &conf, sample ? &gm : nullptr)) {
         // Only the block_drafts > block_size case can reach here now (the ragged shape was
         // already handled above) -- unchanged behavior: base stays unbiased, conf is left
         // alone. This is the same pre-existing, opt-in-only (WP_DS4_CONST_SHAPE) early-out
@@ -830,7 +961,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     }
 
     // broadcast the [1, n_tok] confidences to n_embd-wide rows to reuse `llama_get_embeddings_nextn`
-    conf = ggml_repeat(g.ctx0, conf, g.res->t_embd);
+    // (sampling: col 0 = confidence, col 1 = sampled token, rest zero)
+    conf = sample ? llama_dspark_gumbel_pack(g.ctx0, gm, conf, g.res->t_embd)
+                  : ggml_repeat(g.ctx0, conf, g.res->t_embd);
 
     g.res->t_h_nextn = conf;
     ggml_build_forward_expand(g.gf, conf);

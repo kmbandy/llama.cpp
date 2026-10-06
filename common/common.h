@@ -194,6 +194,14 @@ enum common_speculative_draft_conf_mode {
     COMMON_SPECULATIVE_DRAFT_CONF_MODE_PREFIX,
 };
 
+// MAD-LAB: how the DSpark draft chain picks its tokens.
+enum common_speculative_draft_sampling {
+    COMMON_SPECULATIVE_DRAFT_SAMPLING_GREEDY,     // argmax chain + exact-match verification (default)
+    // Gumbel-max sampled chain + Leviathan/Chen accept/reject verification, only for requests
+    // with temperature > 0 (temperature <= 0 behaves exactly like greedy)
+    COMMON_SPECULATIVE_DRAFT_SAMPLING_STOCHASTIC,
+};
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set
@@ -360,6 +368,8 @@ struct common_params_speculative_draft {
     // prefix 0..i is accepted (product of the per-position conditionals) is >= this;
     // 0 disables. conf_min is ignored in prefix mode.
     float conf_prefix_min = 0.27f;
+    // MAD-LAB: DSpark speculative sampling mode, see common_speculative_draft_sampling.
+    common_speculative_draft_sampling sampling = COMMON_SPECULATIVE_DRAFT_SAMPLING_GREEDY;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

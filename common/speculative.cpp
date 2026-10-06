@@ -22,6 +22,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <thread>
 #include <cinttypes>
 #include <cstdlib>
 
@@ -45,6 +46,38 @@ static bool wp_dspark_debug() {
         return e && e[0] == '1';
     }();
     return s_on;
+}
+
+// MAD-LAB: fill `out` with n iid Gumbel(0,1) samples, g = -log(-log(u)), counter-based (splitmix64 of
+// seed and index) so the stream is a pure function of `seed`, independent of the thread count.
+static void wp_fill_gumbel(float * out, size_t n, uint64_t seed) {
+    const auto fill = [out, seed](size_t beg, size_t end) {
+        for (size_t i = beg; i < end; ++i) {
+            uint64_t z = seed + 0x9E3779B97F4A7C15ull * (uint64_t) (i + 1);
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+            z =  z ^ (z >> 31);
+            // u in (0, 1): 24 random bits offset by half a step. -log(u) is taken in double
+            // (a float u would round up to exactly 1.0 for the top bit patterns -> g = +inf).
+            const double u = ((double) (z >> 40) + 0.5) * (1.0 / 16777216.0);
+            out[i] = -std::log((float) -std::log(u));
+        }
+    };
+
+    const size_t n_thr = n >= (1u << 16) ? std::min<size_t>(8, std::max(1u, std::thread::hardware_concurrency())) : 1;
+    if (n_thr <= 1) {
+        fill(0, n);
+        return;
+    }
+    std::vector<std::thread> thr;
+    const size_t chunk = (n + n_thr - 1) / n_thr;
+    for (size_t t = 1; t < n_thr; ++t) {
+        thr.emplace_back(fill, std::min(n, t*chunk), std::min(n, (t + 1)*chunk));
+    }
+    fill(0, std::min(n, chunk));
+    for (auto & th : thr) {
+        th.join();
+    }
 }
 
 // WP_DSPARK_CONF_LOG=<path>: calibration log for the DSpark confidence head. One line per
@@ -1227,6 +1260,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<float> base_buf;
     std::vector<float> conf_buf;
 
+    // MAD-LAB: DSpark speculative sampling (--spec-draft-sampling stochastic). The in-graph Markov chain
+    // is sampled with Gumbel-max noise generated here from the request-derived dp.noise_seed; the
+    // chosen tokens come back on the nextn rows and the draft logits are kept for the verifier.
+    bool                      sampling_stochastic = false;
+    std::vector<float>        noise_buf;
+    std::vector<float>        inv_t_buf;
+    std::vector<llama_seq_id> noise_seq;
+
     const bool collect_conf_stats;
 
     // The previous block's drafted tokens, carried across draft() calls to be
@@ -1415,6 +1456,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         services_mode = !llama_model_has_output_head(model_dft) && llama_model_has_dspark_markov(model_dft);
         n_vocab_dft   = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
 
+        if (is_dspark && this->params.sampling == COMMON_SPECULATIVE_DRAFT_SAMPLING_STOCHASTIC) {
+            if (services_mode) {
+                LOG_WRN("%s: --spec-draft-sampling stochastic needs the in-graph Markov head (services_mode=0); staying greedy\n", __func__);
+            } else {
+                llama_set_dspark_sampling(ctx_dft, true);
+                sampling_stochastic = true;
+                LOG_WRN("%s: - draft sampling = stochastic (Gumbel-max chain + speculative-sampling verification for temp > 0)\n", __func__);
+            }
+        }
+
         if (is_dspark && this->params.p_min > 0.0f) {
             char buf[16] = {};
             const bool has_conf =
@@ -1556,7 +1607,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2) {
+        // (not in stochastic mode: the host needs the draft's full logits rows for q)
+        if (this->params.backend_sampling && !is_dflash2 && !sampling_stochastic) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -2197,11 +2249,64 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // MAD-LAB: stochastic draft chain -- hand the graph its Gumbel noise for this decode.
+        // Blocks are keyed by sequence id (the graph input maps them onto the ubatch order).
+        // Requests that are not stochastic ride along with 1/T = 1 and zero noise, which is
+        // exactly the greedy argmax chain.
+        std::vector<char> seq_stochastic(n_seq, 0);
+        bool noise_armed = false;
+        if (sampling_stochastic && !services_mode) {
+            int32_t n_blocks_noise = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                const auto & dp = dparams[seq_id];
+                seq_stochastic[seq_id] = dp.q != nullptr && dp.temp > 0.0f;
+                n_blocks_noise++;
+            }
+            const bool any_stochastic = std::any_of(seq_stochastic.begin(), seq_stochastic.end(), [](char c) { return c != 0; });
+            if (any_stochastic && n_blocks_noise > 0 && batch.n_tokens % n_blocks_noise == 0) {
+                const int64_t block_len = batch.n_tokens / n_blocks_noise;
+                const size_t  per_block = (size_t) block_len * n_vocab_dft;
+                noise_buf.assign(per_block * n_blocks_noise, 0.0f);
+                inv_t_buf.assign(n_blocks_noise, 1.0f);
+                noise_seq.assign(n_blocks_noise, 0);
+                int32_t b = 0;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_block_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    noise_seq[b] = seq_id;
+                    if (seq_stochastic[seq_id]) {
+                        inv_t_buf[b] = 1.0f / dparams[seq_id].temp;
+                        wp_fill_gumbel(noise_buf.data() + per_block * b, per_block, dparams[seq_id].noise_seed);
+                    }
+                    b++;
+                }
+                llama_dspark_set_noise(ctx_dft, noise_buf.data(), inv_t_buf.data(), noise_seq.data(),
+                                       n_vocab_dft, n_blocks_noise, block_len);
+                noise_armed = true;
+            } else {
+                std::fill(seq_stochastic.begin(), seq_stochastic.end(), 0);
+            }
+        }
+
         // decode all sequence's noise block in a single batch
         if (trace_hidden) {
             llama_set_embeddings_layer_inp(ctx_dft, 1, true);
         }
         int ret = llama_decode(ctx_dft, batch);
+
+        if (noise_armed) {
+            // the graph input flags whether it really consumed the noise; never trust a stochastic
+            // draft the graph did not sample (shape mismatch), fall back to greedy for the round
+            if (!llama_dspark_noise_applied(ctx_dft)) {
+                std::fill(seq_stochastic.begin(), seq_stochastic.end(), 0);
+                SPC_WRN("%s", "stochastic draft noise was not applied by the graph; this round is greedy\n");
+            }
+            llama_dspark_set_noise(ctx_dft, nullptr, nullptr, nullptr, 0, 0, 0);
+        }
 
         // Detach before any path can free the batch: llama_batch_free() frees ->embd,
         // and this buffer is owned by embd_buf.
@@ -2507,17 +2612,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         break;
                     }
 
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
+                    llama_token id = LLAMA_TOKEN_NULL;
+                    float trace_p = -1.0f; // top-1 prob, only known on the greedy sampler path
 
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    if (seq_stochastic[seq_id]) {
+                        // MAD-LAB: the token the graph's Gumbel-max chain actually picked (column 1 of
+                        // the nextn row) -- the very token the next Markov position was conditioned on.
+                        // q_i = softmax(draft logits / T) is kept for the verifier.
+                        const float * row    = llama_get_embeddings_nextn_ith(ctx_dft, idx);
+                        const float * logits = llama_get_logits_ith(ctx_dft, idx);
+                        const float   tokf   = row != nullptr ? row[1] : -1.0f;
+                        if (logits == nullptr || !(tokf >= 0.0f && tokf < (float) n_vocab_dft)) {
+                            // cannot trust this block: end the stochastic draft here (a prefix stays valid)
+                            break;
+                        }
+                        id = (llama_token) tokf;
+                        auto & q = *dp.q;
+                        if (q.n_vocab == 0) {
+                            q.temp    = dp.temp;
+                            q.n_vocab = n_vocab_dft;
+                        }
+                        q.logits.insert(q.logits.end(), logits, logits + n_vocab_dft);
+                    } else {
+                        common_sampler_sample(smpl, ctx_dft, idx, true);
 
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                        for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                            LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                    seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                    common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        }
+
+                        id = cur_p->data[0].id;
+                        trace_p = cur_p->data[0].p;
                     }
-
-                    const llama_token id = cur_p->data[0].id;
 
                     common_sampler_accept(smpl, id, true);
 
@@ -2528,7 +2657,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         fprintf(stderr, "DSPH %" PRIu64 " draft_tok seq=%d i=%d idx=%d raw_conf=%.9e gate_conf=%.9e"
                                 " tok=%d p=%.6f\n",
                                 wp_dsph_next(), (int) seq_id, (int) i, (int) idx, (double) raw_conf, (double) gate_conf,
-                                (int) id, (double) cur_p->data[0].p);
+                                (int) id, (double) trace_p);
                     }
                     if (trace_draft_rec) {
                         slot_tok[(size_t) i] = (int32_t) id;
@@ -2598,6 +2727,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (dp.q) {
+                    dp.q->clear();
+                }
                 draft_conf[seq_id].clear();
                 if (common_speculative_capture_enabled()) {
                     capture_embd[seq_id].clear();
@@ -5139,6 +5271,11 @@ void common_speculative_draft(common_speculative * spec) {
 
             if (dp.drafting) {
                 n_drafting++;
+
+                // MAD-LAB: a stale stochastic draft distribution must never be paired with a new draft
+                if (dp.q) {
+                    dp.q->clear();
+                }
             }
         }
 

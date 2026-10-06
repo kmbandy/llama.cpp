@@ -95,6 +95,24 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// DSpark speculative SAMPLING. Enables Gumbel-max sampling of the draft's in-graph Markov
+// chain (draft context of an in-model DSpark head only). With it on, the graph takes an
+// extra noise input and exports the chosen token of every block position as float in
+// column 1 of the nextn rows (column 0 stays the confidence). Off = graph unchanged.
+LLAMA_API void llama_set_dspark_sampling(struct llama_context * ctx, bool value);
+
+// Provide the noise for the NEXT draft decode: noise is [n_blocks][block_len][n_vocab] F32
+// Gumbel samples (host memory that must outlive that decode), inv_t is [n_blocks] with the
+// per-block 1/T (1.0 and all-zero noise for blocks that must stay greedy). seq_ids[b] names
+// the sequence block b belongs to, so the graph input can follow whatever order the ubatch
+// ends up in. noise == nullptr reverts to the plain greedy chain.
+LLAMA_API void llama_dspark_set_noise(struct llama_context * ctx, const float * noise, const float * inv_t,
+                                      const llama_seq_id * seq_ids,
+                                      int64_t n_vocab, int64_t n_blocks, int64_t block_len);
+
+// True when the last decode really consumed the noise provided above (shape matched).
+LLAMA_API bool llama_dspark_noise_applied(const struct llama_context * ctx);
+
 // MAD-LAB logits-on-head. Stop the decode graph after output_norm and never build
 // the LM head, so llama_get_logits() is not produced but llama_get_embeddings()
 // returns the post-output_norm hidden state. Set on a dense-segment TAIL worker,
