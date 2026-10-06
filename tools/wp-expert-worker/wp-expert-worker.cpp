@@ -8538,6 +8538,24 @@ private:
         }();
         return v;
     }
+    // WP_EXPERT_CPU_TIER_BATCH=1 (default 0 = one graph per expert, today's path):
+    // each time the compute thread wakes it drains every landed page of the job
+    // (up to WP_EXPERT_CPU_TIER_BATCH_MAX, default 16, clamp 1..64) and computes
+    // them in ONE ggml graph / one graph_compute, with a persistent context and
+    // no per-expert weight-buffer wrap. Per-expert nodes and partials are
+    // unchanged (bit-identical). Applies only when CHUNK_COMPUTE is off.
+    static bool cpu_tier_batch() {
+        static const bool v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_BATCH");
+            return e != nullptr && e[0] == '1' && !cpu_tier_chunk_compute();
+        }();
+        return v;
+    }
+    static size_t cpu_tier_batch_max() {
+        static const size_t v = (size_t) std::min<uint64_t>(
+            64, std::max<uint64_t>(1, cpu_tier_env_u64("WP_EXPERT_CPU_TIER_BATCH_MAX", 16)));
+        return v;
+    }
     // WP_EXPERT_CPU_TIER_DETERMINISTIC=1: the CPU/GPU split of a request is a
     // function of request-stream state only (refs, PROMOTE, MAX, assignment
     // order), never of VRAM residency: a cold page computes on the CPU even if
@@ -18548,7 +18566,7 @@ private:
                 std::fprintf(stderr,
                     "wp: WP_EXPERT_CPU_TIER=1: promote=%u max=%zu max_tokens=%u io=%zu "
                     "compute_threads=%d halflife=%llu halflife_calls=%llu read_chunks=%zu early_io=%d "
-                    "chunk_compute=%d hits_inline=%d deterministic=%d\n",
+                    "chunk_compute=%d hits_inline=%d deterministic=%d batch=%d batch_max=%zu\n",
                     ExpertSlotPool::cpu_tier_promote(), ExpertSlotPool::cpu_tier_max(),
                     ExpertSlotPool::cpu_tier_max_tokens(), n_io, cpu_tier_compute_threads(),
                     (unsigned long long) ExpertSlotPool::cpu_tier_halflife(),
@@ -18557,7 +18575,8 @@ private:
                     (int) ExpertSlotPool::cpu_tier_early_io(),
                     (int) ExpertSlotPool::cpu_tier_chunk_compute(),
                     (int) ExpertSlotPool::cpu_tier_hits_inline(),
-                    (int) ExpertSlotPool::cpu_tier_deterministic());
+                    (int) ExpertSlotPool::cpu_tier_deterministic(),
+                    (int) ExpertSlotPool::cpu_tier_batch(), ExpertSlotPool::cpu_tier_batch_max());
             }
             for (size_t k = 0; k < job->index.size(); ++k) {
                 if (inline_hit[k]) {
@@ -18851,6 +18870,164 @@ private:
         }
     }
 
+    // Persistent state of the batched CPU-tier compute (WP_EXPERT_CPU_TIER_BATCH):
+    // one graph-metadata context sized for `cap` experts (ggml_reset per call, so
+    // no steady-state malloc), one placeholder buffer shared by every weight
+    // tensor (the weights are addressed directly in the arena page, so a
+    // per-expert ggml_backend_cpu_buffer_from_ptr wrap is not needed), and
+    // per-expert scratch vectors that keep their capacity across calls.
+    struct CpuTierBatchState {
+        static constexpr size_t kTensorsPerExpert = 16;   // 12 used (clamps on)
+        static constexpr size_t kNodesPerExpert   = 8;    // 7 used (clamps on)
+        struct Slot {
+            std::vector<int64_t> rows;
+            std::vector<float>   x, w, y;
+            ggml_tensor *        input    = nullptr;
+            ggml_tensor *        route    = nullptr;
+            ggml_tensor *        weighted = nullptr;
+        };
+        size_t                cap;
+        context_ptr           ctx;
+        buffer_ptr            dummy;
+        std::vector<Slot>     slots;
+        alignas(64) uint8_t   dummy_mem[64] = {};
+
+        explicit CpuTierBatchState(size_t cap_) : cap(cap_), slots(cap_) {
+            const ggml_init_params params = {
+                /* .mem_size = */ ggml_tensor_overhead() * kTensorsPerExpert * cap_ +
+                                  ggml_graph_overhead_custom(kNodesPerExpert * cap_, false) + 4096,
+                /* .mem_base = */ nullptr,
+                /* .no_alloc = */ true,
+            };
+            ctx.reset(ggml_init(params));
+            dummy.reset(ggml_backend_cpu_buffer_from_ptr(dummy_mem, sizeof(dummy_mem)));
+        }
+    };
+
+    // Computes the pages ks[0..n) of `job` (all landed, holds[k].data valid) in
+    // ONE graph. Per expert the node sequence, types, shapes, input rows and
+    // routing weights are exactly cpu_tier_compute_one(stage 0)'s, so each
+    // partial is bit-identical: every mul_mat node picks its kernel from its own
+    // shapes (ne00/ne01/ne11, thread slice of that node) and quantizes its own
+    // src1 into the shared work buffer, nodes run in order with a barrier
+    // between them, outputs are marked graph outputs (never reused by gallocr)
+    // and are copied into partials[k] only after the whole graph finished.
+    void cpu_tier_compute_batch(CpuTierJob & job, const std::vector<size_t> & ks,
+                                ggml_backend_t cpu, ggml_gallocr_t galloc,
+                                CpuTierBatchState & st) {
+        const pipe_expert_dispatch_req & request = *job.request;
+        const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
+        if (!st.ctx || !st.dummy) {
+            throw std::runtime_error("failed to initialize the CPU tier batch state");
+        }
+        if (ks.size() > st.cap) {
+            throw std::logic_error("cpu tier batch exceeds its capacity");
+        }
+        ggml_reset(st.ctx.get());
+        ggml_context * ctx = st.ctx.get();
+        ggml_cgraph * graph = ggml_new_graph_custom(
+            ctx, CpuTierBatchState::kNodesPerExpert * st.cap, false);
+        const ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        size_t n_active = 0;
+        for (size_t i = 0; i < ks.size(); ++i) {
+            const size_t k = ks[i];
+            CpuTierBatchState::Slot & sl = st.slots[i];
+            sl.input = sl.route = sl.weighted = nullptr;
+            const ExpertPage & page = *job.pages[k];
+            const pipe_expert_assignment & assignment = request.assignments[job.index[k]];
+            const auto & specs = catalog_.descriptor.layers.at(page.layer);
+            if (assignment.weights.size() != (size_t) request.n_tokens) {
+                throw std::runtime_error("cpu tier routing weights do not match n_tokens");
+            }
+            sl.rows.clear();
+            for (size_t t = 0; t < assignment.weights.size(); ++t) {
+                if (assignment.weights[t] != 0.0f) {
+                    sl.rows.push_back((int64_t) t);
+                }
+            }
+            std::vector<float> & out = job.partials[k];
+            out.assign((size_t) request.n_tokens * (size_t) n_embd, 0.0f);
+            if (sl.rows.empty()) {
+                continue;
+            }
+            const int64_t m = (int64_t) sl.rows.size();
+            sl.x.resize((size_t) m * (size_t) n_embd);
+            sl.w.resize((size_t) m);
+            for (int64_t r = 0; r < m; ++r) {
+                std::memcpy(sl.x.data() + (size_t) r * n_embd,
+                            request.activation_data() + (size_t) sl.rows[r] * n_embd,
+                            (size_t) n_embd * sizeof(float));
+                sl.w[r] = assignment.weights[sl.rows[r]];
+            }
+            const void * data = job.holds[k].data;
+            const auto role = [&](const char * name) {
+                const RoleSpec & spec = specs.at(name);
+                ggml_tensor * t = ggml_new_tensor_2d(ctx, spec.type, spec.ne0, spec.ne1);
+                const uint64_t off = page.roles.at(name).offset;
+                const size_t alloc = ggml_backend_buft_get_alloc_size(cpu_buft, t);
+                if (off > (uint64_t) page.size || alloc > (size_t) page.size - (size_t) off) {
+                    throw std::runtime_error("expert weight allocation does not fit its buffer");
+                }
+                t->buffer = st.dummy.get();
+                t->data   = (uint8_t *) const_cast<void *>(data) + off;
+                return t;
+            };
+            ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, m);
+            ggml_set_input(input);
+            ggml_tensor * gate = role("gate");
+            ggml_tensor * up   = role("up");
+            ggml_tensor * gate_x = ggml_mul_mat(ctx, gate, input);
+            ggml_tensor * up_x   = ggml_mul_mat(ctx, up, input);
+            if (request.swiglu_clamp > 1e-6f) {
+                up_x   = ggml_clamp(ctx, up_x, -request.swiglu_clamp, request.swiglu_clamp);
+                gate_x = ggml_clamp(ctx, gate_x, -INFINITY, request.swiglu_clamp);
+            }
+            ggml_tensor * hidden = ggml_swiglu_split(ctx, gate_x, up_x);
+            ggml_tensor * down   = role("down");
+            ggml_tensor * output = ggml_mul_mat(ctx, down, hidden);
+            ggml_tensor * route  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, m);
+            ggml_set_input(route);
+            ggml_tensor * weighted = ggml_mul(ctx, output, route);
+            ggml_set_output(weighted);
+            ggml_build_forward_expand(graph, weighted);
+            sl.input = input;
+            sl.route = route;
+            sl.weighted = weighted;
+            ++n_active;
+        }
+        if (n_active == 0) {
+            return;
+        }
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+            throw std::runtime_error("failed to allocate CPU tier graph");
+        }
+        for (size_t i = 0; i < ks.size(); ++i) {
+            CpuTierBatchState::Slot & sl = st.slots[i];
+            if (sl.input == nullptr) {
+                continue;
+            }
+            ggml_backend_tensor_set(sl.input, sl.x.data(), 0, ggml_nbytes(sl.input));
+            ggml_backend_tensor_set(sl.route, sl.w.data(), 0, ggml_nbytes(sl.route));
+        }
+        if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("CPU tier graph compute failed");
+        }
+        for (size_t i = 0; i < ks.size(); ++i) {
+            CpuTierBatchState::Slot & sl = st.slots[i];
+            if (sl.weighted == nullptr) {
+                continue;
+            }
+            const int64_t m = (int64_t) sl.rows.size();
+            sl.y.resize((size_t) m * (size_t) n_embd);
+            ggml_backend_tensor_get(sl.weighted, sl.y.data(), 0, sl.y.size() * sizeof(float));
+            std::vector<float> & out = job.partials[ks[i]];
+            for (int64_t r = 0; r < m; ++r) {
+                std::memcpy(out.data() + (size_t) sl.rows[r] * n_embd, sl.y.data() + (size_t) r * n_embd,
+                            (size_t) n_embd * sizeof(float));
+            }
+        }
+    }
+
     void cpu_tier_compute_loop() {
         // Own backend on this thread: ggml applies the threadpool's settings to
         // OpenMP thread 0, which is the calling thread -- never a GPU thread here.
@@ -18879,6 +19056,14 @@ private:
             }
         }
         galloc_ptr galloc(ggml_gallocr_new(ggml_backend_cpu_buffer_type()));
+        const bool batch_on = ExpertSlotPool::cpu_tier_batch();
+        const size_t batch_cap = ExpertSlotPool::cpu_tier_batch_max();
+        std::unique_ptr<CpuTierBatchState> batch_state;
+        std::vector<size_t> batch_ks;
+        if (batch_on) {
+            batch_state = std::make_unique<CpuTierBatchState>(batch_cap);
+            batch_ks.reserve(batch_cap);
+        }
         for (;;) {
             std::shared_ptr<CpuTierJob> job;
             {
@@ -18903,6 +19088,15 @@ private:
                     if (!job->landed.empty()) {
                         k = job->landed.front();
                         job->landed.pop_front();
+                        if (batch_on) {
+                            // Drain everything that has landed (up to the cap).
+                            batch_ks.clear();
+                            batch_ks.push_back(k);
+                            while (!job->landed.empty() && batch_ks.size() < batch_cap) {
+                                batch_ks.push_back(job->landed.front());
+                                job->landed.pop_front();
+                            }
+                        }
                         // A settled page takes the full path below; drop its early request.
                         job->gu_ready.erase(
                             std::remove(job->gu_ready.begin(), job->gu_ready.end(), k),
@@ -18952,6 +19146,30 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(job->m);
                     failed = job->error != nullptr;
+                }
+                if (batch_on) {
+                    // WP_EXPERT_CPU_TIER_BATCH: one graph for every drained page.
+                    // ns_compute stays the job's total compute wall time.
+                    if (!failed) {
+                        try {
+                            if (!cpu || !galloc) {
+                                throw std::runtime_error("failed to initialize the CPU tier backend");
+                            }
+                            const auto t0 = std::chrono::steady_clock::now();
+                            cpu_tier_compute_batch(*job, batch_ks, cpu.get(), galloc.get(), *batch_state);
+                            job->ns_compute += (uint64_t) std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(job->m);
+                            if (!job->error) {
+                                job->error = std::current_exception();
+                            }
+                        }
+                    }
+                    for (const size_t bk : batch_ks) {
+                        pool_.release_host_page(*job->pages[bk], job->holds[bk]);
+                    }
+                    continue;
                 }
                 if (!failed) {
                     try {
