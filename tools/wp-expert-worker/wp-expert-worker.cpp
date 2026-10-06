@@ -5736,6 +5736,13 @@ public:
     // hotter RAM page is never displaced. Returns pages demoted.
     size_t   park_demote(const std::vector<SeedItem> & hot_first, uint64_t & bytes,
                          uint64_t & not_demoted);
+    // WP_EXPERT_SEED_RAM_TIER: read pages of `list` (hottest-first, from
+    // `cursor`) from NVMe into FREE RAM-tier entries, at most `max_pages`.
+    // Never evicts: sets `full` and stops the moment the tier has no free
+    // room. Restores each page's heat. Synchronous on the calling (serving)
+    // thread, like seed_land. Returns pages landed.
+    size_t   seed_land_host(const std::vector<SeedItem> & list, size_t & cursor,
+                            size_t max_pages, uint64_t & bytes, bool & full);
     // Invalidate every slot and free every slot arena. Returns bytes freed.
     uint64_t park_release_arenas();
     // Re-allocate the arenas exactly as the constructor did and re-point every
@@ -11724,6 +11731,83 @@ void ExpertSlotPool::seed_pick(const std::vector<SeedItem> & list, size_t & curs
     done = cursor >= list.size() || total_free == 0;
 }
 
+size_t ExpertSlotPool::seed_land_host(const std::vector<SeedItem> & list, size_t & cursor,
+                                      size_t max_pages, uint64_t & bytes, bool & full) {
+    size_t landed = 0;
+    const size_t entry = arena_.entry_bytes();
+    const size_t tier  = arena_.tier_bytes();
+    if (entry == 0 || tier == 0) {
+        full = true;   // no retention tier configured
+        return 0;
+    }
+    while (cursor < list.size() && landed < max_pages) {
+        const SeedItem & item = list[cursor];
+        const ExpertPage * page = item.page;
+        if (page == nullptr || page->cache_id < 0 || page->is_resident ||
+                find_slot(*page) != slots_.size() ||
+                arena_.state_of(page->cache_id) != wp::HostArena::State::Free) {
+            ++cursor;   // pinned-resident, in VRAM, or already in / entering the tier
+            continue;
+        }
+        // Free-room-only rule, same as park_demote: staying under the retention
+        // cap means a Free entry exists, so begin_read never displaces anything.
+        if (arena_.resident_bytes() + entry > tier) {
+            full = true;
+            return landed;
+        }
+        int fd = -1;
+        try {
+            fd = fd_for(page->blob);
+        } catch (const std::exception &) {
+            ++cursor;
+            continue;
+        }
+        void * data = nullptr;
+        wp::HostArena::Handle handle = wp::HostArena::kInvalidHandle;
+        if (!arena_.begin_read(page->cache_id, /*speculative=*/false, &data, &handle)) {
+            ++cursor;
+            continue;
+        }
+        ++cursor;
+        bool ok = true;
+        try {
+            if (test_hooks_ != nullptr && test_hooks_->read_started) {
+                test_hooks_->read_started(page->layer, page->expert);
+            }
+            read_page_range(*page, fd, data, 0, (size_t) page->size);
+            if (test_hooks_ != nullptr && test_hooks_->read_finished) {
+                test_hooks_->read_finished(page->layer, page->expert);
+            }
+        } catch (...) {
+            ok = false;
+            host_errors_.fetch_add(1, std::memory_order_relaxed);
+        }
+        arena_.finish_read(page->cache_id, handle, ok);
+        if (!ok) {
+            continue;
+        }
+        // Heat for the RAM-tier page (it has no slot): demand_count_ is what
+        // page_heat() ranks it by in the next snapshot; the LFU history too
+        // when enabled.
+        const size_t heat_id = (size_t) page->cache_id;
+        if (heat_id >= demand_count_.size()) {
+            demand_count_.resize(heat_id + 1, 0);
+        }
+        demand_count_[heat_id] = (uint32_t) std::min<uint64_t>(
+            std::max<uint64_t>(demand_count_[heat_id], item.heat),
+            std::numeric_limits<uint32_t>::max());
+        if (lfu_history_enabled_) {
+            if (heat_id >= lfu_history_.size()) {
+                lfu_history_.resize(heat_id + 1, 0);
+            }
+            lfu_history_[heat_id] = std::max(lfu_history_[heat_id], item.heat);
+        }
+        bytes += page->size;
+        ++landed;
+    }
+    return landed;
+}
+
 size_t ExpertSlotPool::seed_land(const std::vector<SeedItem> & chunk) {
     if (chunk.empty()) {
         return 0;
@@ -12669,42 +12753,7 @@ public:
             ggml_backend_synchronize(backend_.get());
 
             // --- residency snapshot, hottest first ---
-            std::vector<ExpertSlotPool::SeedItem> vram;
-            pool_.collect_vram_pages(vram);
-            std::unordered_set<int> in_vram;
-            park_rows_.reserve(vram.size() + 1024);
-            for (const ExpertSlotPool::SeedItem & item : vram) {
-                in_vram.insert(item.page->cache_id);
-                park_rows_.push_back(ParkRow{ item, true });
-            }
-            st.n_vram = vram.size();
-            for (const auto & kv : catalog_.pages) {
-                const ExpertPage & page = kv.second;
-                if (page.is_resident || page.cache_id < 0 || in_vram.count(page.cache_id) != 0) {
-                    continue;
-                }
-                if (page_owner_ && !page_owner_(page.layer, page.expert)) {
-                    continue;
-                }
-                if (pool_.arena().state_of(page.cache_id) != wp::HostArena::State::Resident) {
-                    continue;
-                }
-                ExpertSlotPool::SeedItem item;
-                item.page = &page;
-                item.heat = pool_.page_heat(page);
-                park_rows_.push_back(ParkRow{ item, false });
-                ++st.n_ram;
-            }
-            std::stable_sort(park_rows_.begin(), park_rows_.end(),
-                             [](const ParkRow & a, const ParkRow & b) {
-                if (a.item.heat != b.item.heat) {
-                    return a.item.heat > b.item.heat;
-                }
-                if (a.item.page->layer != b.item.page->layer) {
-                    return a.item.page->layer < b.item.page->layer;
-                }
-                return a.item.page->expert < b.item.page->expert;
-            });
+            snapshot_residency(park_rows_, st.n_vram, st.n_ram);
 
             // --- OPT-IN: demote VRAM pages into free RAM-tier room, hottest
             // first (WP_EXPERT_PARK_DEMOTE=1; default OFF). The D2H -> RAM ->
@@ -12744,6 +12793,94 @@ public:
         return true;
     }
 
+    // Residency snapshot, hottest first: V rows = pages holding a VRAM slot,
+    // R rows = pages resident ONLY in the RAM tier. Shared by park (rows kept
+    // in park_rows_) and the SIGTERM stop snapshot, so the row content is
+    // identical. Bookkeeping only (no GPU access); caller holds this device's
+    // mutex. Does not touch the slot arenas, so it is also valid while parked
+    // (then there are simply no VRAM rows -- use park_rows_ instead).
+    void snapshot_residency(std::vector<ParkRow> & rows, size_t & n_vram, size_t & n_ram) {
+        rows.clear();
+        n_vram = 0;
+        n_ram = 0;
+        std::vector<ExpertSlotPool::SeedItem> vram;
+        pool_.collect_vram_pages(vram);
+        std::unordered_set<int> in_vram;
+        rows.reserve(vram.size() + 1024);
+        for (const ExpertSlotPool::SeedItem & item : vram) {
+            in_vram.insert(item.page->cache_id);
+            rows.push_back(ParkRow{ item, true });
+        }
+        n_vram = vram.size();
+        for (const auto & kv : catalog_.pages) {
+            const ExpertPage & page = kv.second;
+            if (page.is_resident || page.cache_id < 0 || in_vram.count(page.cache_id) != 0) {
+                continue;
+            }
+            if (page_owner_ && !page_owner_(page.layer, page.expert)) {
+                continue;
+            }
+            if (pool_.arena().state_of(page.cache_id) != wp::HostArena::State::Resident) {
+                continue;
+            }
+            ExpertSlotPool::SeedItem item;
+            item.page = &page;
+            item.heat = pool_.page_heat(page);
+            rows.push_back(ParkRow{ item, false });
+            ++n_ram;
+        }
+        std::stable_sort(rows.begin(), rows.end(),
+                         [](const ParkRow & a, const ParkRow & b) {
+            if (a.item.heat != b.item.heat) {
+                return a.item.heat > b.item.heat;
+            }
+            if (a.item.page->layer != b.item.page->layer) {
+                return a.item.page->layer < b.item.page->layer;
+            }
+            return a.item.page->expert < b.item.page->expert;
+        });
+    }
+
+    // Stop-snapshot only: a startup / unpark seed that has not finished still
+    // owes pages (VRAM list remainder -> V rows, RAM-tier list remainder -> R
+    // rows, original heat and pinned tag). Add them to `rows`, skipping pages
+    // already present (landed), and re-sort hottest-first. Caller holds the
+    // device mutex. Returns rows added.
+    size_t append_pending_seed(std::vector<ParkRow> & rows) {
+        std::unordered_set<int> have;
+        for (const ParkRow & row : rows) {
+            have.insert(row.item.page->cache_id);
+        }
+        size_t added = 0;
+        const auto add = [&](const ExpertSlotPool::SeedItem & item, bool vram) {
+            if (item.page == nullptr || have.count(item.page->cache_id) != 0) {
+                return;
+            }
+            have.insert(item.page->cache_id);
+            rows.push_back(ParkRow{ item, vram });
+            ++added;
+        };
+        for (size_t i = seed_cursor_; i < seed_list_.size(); ++i) {
+            add(seed_list_[i], true);
+        }
+        for (size_t i = ram_cursor_; i < ram_list_.size(); ++i) {
+            add(ram_list_[i], false);
+        }
+        if (added != 0) {
+            std::stable_sort(rows.begin(), rows.end(),
+                             [](const ParkRow & a, const ParkRow & b) {
+                if (a.item.heat != b.item.heat) {
+                    return a.item.heat > b.item.heat;
+                }
+                if (a.item.page->layer != b.item.page->layer) {
+                    return a.item.page->layer < b.item.page->layer;
+                }
+                return a.item.page->expert < b.item.page->expert;
+            });
+        }
+        return added;
+    }
+
     // Re-allocate the arenas. Slots come back empty; seeding is separate.
     bool unpark(double & realloc_ms, std::string & err) {
         if (!parked()) {
@@ -12772,6 +12909,8 @@ public:
         seed_list_.clear();
         seed_cursor_ = 0;
         seed_ram_items_ = 0;
+        ram_list_.clear();
+        ram_cursor_ = 0;
         std::vector<ExpertSlotPool::SeedItem> accepted;
         size_t cursor = 0;
         bool done = false;
@@ -12799,13 +12938,16 @@ public:
         seed_prepare(rows, n_selected, n_ram);
     }
     // Startup seed from a park file: resolve (layer, expert, heat, pinned).
+    // `n_host` (when ram_phase): rows the VRAM seed will not take, queued for
+    // the RAM-tier phase (hottest first) that runs after the VRAM seed.
     void seed_prepare_from_file_rows(
-            const std::vector<std::tuple<int, int, uint64_t, bool>> & rows,
-            size_t & n_selected, size_t & n_ram) {
+            const std::vector<ParkFileRow> & rows,
+            size_t & n_selected, size_t & n_ram, bool ram_phase, size_t & n_host) {
+        n_host = 0;
         std::vector<ExpertSlotPool::SeedItem> items;
         items.reserve(rows.size());
-        for (const auto & row : rows) {
-            const auto it = catalog_.pages.find({ std::get<0>(row), std::get<1>(row) });
+        for (const ParkFileRow & row : rows) {
+            const auto it = catalog_.pages.find({ row.layer, row.expert });
             if (it == catalog_.pages.end() || it->second.is_resident) {
                 continue;
             }
@@ -12814,8 +12956,8 @@ public:
             }
             ExpertSlotPool::SeedItem item;
             item.page = &it->second;
-            item.heat = std::get<2>(row);
-            item.pinned = std::get<3>(row);
+            item.heat = row.heat;
+            item.pinned = row.pinned;
             items.push_back(item);
         }
         std::stable_sort(items.begin(), items.end(),
@@ -12823,18 +12965,52 @@ public:
             return a.heat > b.heat;
         });
         seed_prepare(items, n_selected, n_ram);
+        if (ram_phase && pool_.host_landing_available()) {
+            std::unordered_set<int> taken;
+            for (const ExpertSlotPool::SeedItem & item : seed_list_) {
+                taken.insert(item.page->cache_id);
+            }
+            for (const ExpertSlotPool::SeedItem & item : items) {   // already hottest-first
+                if (taken.count(item.page->cache_id) == 0 &&
+                        pool_.arena().state_of(item.page->cache_id) ==
+                            wp::HostArena::State::Free) {
+                    ram_list_.push_back(item);
+                }
+            }
+            n_host = ram_list_.size();
+        }
     }
-    bool seed_pending() const { return seed_cursor_ < seed_list_.size(); }
+    bool seed_pending() const { return seed_cursor_ < seed_list_.size() || ram_pending(); }
+    bool ram_pending() const { return ram_cursor_ < ram_list_.size(); }
     bool has_any_split_dispatch() const { return !split_pending_by_conn_.empty(); }
     bool seed_in_ram_phase() const { return seed_cursor_ < seed_ram_items_; }
-    void seed_cancel() { seed_cursor_ = seed_list_.size(); }
+    void seed_cancel() {
+        seed_cursor_ = seed_list_.size();
+        ram_cursor_ = ram_list_.size();
+    }
     // One bounded seed step (caller holds the device mutex). Returns true while
     // more remains. Throws like ensure_batch; the caller cancels on throw.
-    bool seed_step(size_t max_pages, size_t & landed, uint64_t & bytes) {
+    // host_phase: this step was a RAM-tier landing (not a VRAM seed step).
+    // ram_full: the RAM-tier phase stopped because the tier had no free room.
+    bool seed_step(size_t max_pages, size_t & landed, uint64_t & bytes,
+                   bool & host_phase, bool & ram_full) {
         landed = 0;
         bytes = 0;
-        if (parked() || seed_cursor_ >= seed_list_.size()) {
+        host_phase = false;
+        ram_full = false;
+        if (parked()) {
             return false;
+        }
+        if (seed_cursor_ >= seed_list_.size()) {
+            if (!ram_pending()) {
+                return false;
+            }
+            host_phase = true;
+            landed = pool_.seed_land_host(ram_list_, ram_cursor_, max_pages, bytes, ram_full);
+            if (ram_full) {
+                ram_cursor_ = ram_list_.size();
+            }
+            return ram_pending();
         }
         std::vector<ExpertSlotPool::SeedItem> chunk;
         bool done = false;
@@ -12848,7 +13024,7 @@ public:
         if (done) {
             seed_cursor_ = seed_list_.size();
         }
-        return !done;
+        return !done || ram_pending();
     }
 
     // The large device allocations other than the slot arenas that park frees:
@@ -21392,6 +21568,10 @@ private:
     std::vector<ExpertSlotPool::SeedItem> seed_list_;
     size_t seed_cursor_ = 0;
     size_t seed_ram_items_ = 0;
+    // RAM-tier phase (WP_EXPERT_SEED_RAM_TIER): rows the VRAM seed did not take,
+    // hottest first, read from NVMe into the host RAM tier after the VRAM seed.
+    std::vector<ExpertSlotPool::SeedItem> ram_list_;
+    size_t ram_cursor_ = 0;
 };
 
 DeviceWorker::~DeviceWorker() {
@@ -22320,6 +22500,7 @@ public:
             lock.unlock();
             std::lock_guard<std::mutex> seed_lock(seed_mu_);
             seed_active_.store(false, std::memory_order_release);
+            log_ram_phase_end("cancelled");
             lock.lock();
         }
         const long quiesce_ms = park_env_ll("WP_EXPERT_PARK_QUIESCE_MS", 30000);
@@ -22378,18 +22559,136 @@ public:
         return ok;
     }
 
+    // *** STOP SNAPSHOT (SIGTERM / SIGINT, control thread). ***
+    // Quiesces like park() -- new transactions wait at park_frame_enter, the
+    // background seed is stopped, then zero frames in flight / no open
+    // transaction, bounded by WP_EXPERT_PARK_QUIESCE_MS -- but frees and
+    // demotes NOTHING. Then snapshots each device's residency under its mutex
+    // (V rows = VRAM slots, R rows = RAM tier only; pinned keeps the P tag; a
+    // parked device contributes its park_rows_) and writes park_file_
+    // atomically in the park-file format. The caller exits the process; the
+    // worker is left in the Parking state on purpose. A quiesce timeout still
+    // snapshots (residency bookkeeping is mutex-protected).
+    bool stop_snapshot(std::string & path, size_t & rows, size_t & pending,
+                       std::string & err) {
+        path = park_file_;
+        rows = 0;
+        pending = 0;
+        if (park_file_.empty()) {
+            err = "no park file path";
+            return false;
+        }
+        const long quiesce_ms = park_env_ll("WP_EXPERT_PARK_QUIESCE_MS", 30000);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(quiesce_ms);
+        bool timed_out = false;
+        {
+            std::unique_lock<std::mutex> lock(park_mu_);
+            // A park/unpark transition on another thread: let it finish (bounded).
+            if (!park_cv_.wait_until(lock, deadline, [&] {
+                    return park_state_ == ParkState::Active || park_state_ == ParkState::Parked;
+                })) {
+                timed_out = true;
+            } else if (park_state_ == ParkState::Active) {
+                park_armed_.store(true, std::memory_order_seq_cst);
+                set_park_state(ParkState::Parking);
+                {
+                    lock.unlock();
+                    std::lock_guard<std::mutex> seed_lock(seed_mu_);
+                    seed_active_.store(false, std::memory_order_release);
+                    log_ram_phase_end("cancelled");
+                    lock.lock();
+                }
+                for (;;) {
+                    bool quiet = park_inflight_ == 0 && park_txn_conns_.empty() &&
+                                 park_fast_inflight_.load(std::memory_order_seq_cst) == 0;
+                    if (quiet) {
+                        lock.unlock();
+                        quiet = !split_pending_any();
+                        lock.lock();
+                        quiet = quiet && park_inflight_ == 0 &&
+                                park_fast_inflight_.load(std::memory_order_seq_cst) == 0;
+                    }
+                    if (quiet) {
+                        break;
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        timed_out = true;
+                        break;
+                    }
+                    park_cv_.wait_for(lock, std::chrono::milliseconds(20));
+                }
+            }
+            // else: already Parked -- park_rows_ hold the snapshot; do not unpark.
+        }
+        if (timed_out) {
+            std::fprintf(stderr, "wp expert worker: stop snapshot: quiesce timeout after %ld ms, "
+                                 "snapshotting anyway\n", quiesce_ms);
+            std::fflush(stderr);
+        }
+        ParkFileSections sections;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            DeviceWorker & dev = *devices_[i];
+            std::unique_lock<std::mutex> dlock(device_mutexes_[i], std::defer_lock);
+            bool got = false;
+            for (int k = 0; k < 500 && !got; ++k) {   // <= 5 s; never block forever
+                got = dlock.try_lock();
+                if (!got) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+            if (!got) {
+                err = "device mutex busy: " + dev.device_name();
+                return false;
+            }
+            std::vector<DeviceWorker::ParkRow> dev_rows;
+            if (dev.parked()) {
+                dev_rows = dev.park_rows();
+            } else if (dev.can_park()) {
+                size_t n_vram = 0;
+                size_t n_ram = 0;
+                dev.snapshot_residency(dev_rows, n_vram, n_ram);
+                // A seed still in progress: write landed + not-yet-landed.
+                pending += dev.append_pending_seed(dev_rows);
+            }
+            if (!dev_rows.empty()) {
+                sections.emplace_back(dev.device_name(), to_file_rows(dev_rows));
+            }
+        }
+        size_t n_rows = 0;
+        for (const auto & sec : sections) {
+            n_rows += sec.second.size();
+        }
+        if (n_rows == 0) {
+            // Nothing resident (cold worker): do not clobber an earlier snapshot.
+            err = "no residency rows to write (existing file kept)";
+            return false;
+        }
+        int werr = 0;
+        if (!park_file_write(park_file_, sections, rows, werr)) {
+            err = werr == 1 ? "cannot write " + park_file_ + ".tmp"
+                            : "write/rename to " + park_file_ + " failed";
+            return false;
+        }
+        return true;
+    }
+
     // WP_EXPERT_SEED_FROM_PARK=1: warm a freshly started worker from a park
     // file with the same background hottest-first seed. Call once, before
     // serving starts.
     bool seed_from_park_file(const std::string & path) {
-        std::map<std::string, std::vector<std::tuple<int, int, uint64_t, bool>>> sections;
-        if (!parse_park_file(path, sections)) {
+        std::map<std::string, std::vector<ParkFileRow>> sections;
+        if (!park_file_parse(path, sections)) {
             std::fprintf(stderr, "wp expert worker: WP_EXPERT_SEED_FROM_PARK=1 but %s is "
                                  "missing/empty; starting cold\n", path.c_str());
             return false;
         }
+        // WP_EXPERT_SEED_RAM_TIER (default 1): after the VRAM seed, read the
+        // remaining rows (R rows + V rows that got no slot) into the RAM tier.
+        const char * ram_env = std::getenv("WP_EXPERT_SEED_RAM_TIER");
+        const bool ram_phase = !(ram_env != nullptr && ram_env[0] == '0');
         size_t total = 0;
         size_t total_ram = 0;
+        size_t total_host = 0;
         for (size_t i = 0; i < devices_.size(); ++i) {
             DeviceWorker & dev = *devices_[i];
             if (!dev.can_park()) {
@@ -22404,22 +22703,34 @@ public:
             }
             size_t sel = 0;
             size_t ram = 0;
+            size_t host = 0;
             {
                 std::lock_guard<std::mutex> lock(device_mutexes_[i]);
-                dev.seed_prepare_from_file_rows(it->second, sel, ram);
+                dev.seed_prepare_from_file_rows(it->second, sel, ram, ram_phase, host);
             }
             total += sel;
             total_ram += ram;
+            total_host += host;
             std::fprintf(stderr, "wp expert worker: seed-from-park device=%s file=%s rows=%zu "
                                  "seed_pages=%zu (ram_tier=%zu)\n",
                          dev.device_name().c_str(), path.c_str(), it->second.size(), sel, ram);
         }
-        if (total == 0) {
+        if (total == 0 && total_host == 0) {
             return false;
         }
         std::fprintf(stderr, "wp expert worker: seed-from-park: %zu page(s) planned "
                              "(%zu from the RAM tier), seeding between frames\n",
                      total, total_ram);
+        if (total_host != 0) {
+            {
+                std::lock_guard<std::mutex> seed_lock(seed_mu_);
+                ram_phase_ = RamPhase{};
+                ram_phase_.active = true;
+                ram_phase_.planned = total_host;
+            }
+            std::fprintf(stderr, "wp expert worker: seed-from-park ram phase: %zu page(s) planned\n",
+                         total_host);
+        }
         begin_seed("startup seed from park file");
         return true;
     }
@@ -22466,6 +22777,8 @@ public:
             uint64_t bytes = 0;
             double   step_ms = 0.0;
             bool     ram_phase = false;
+            bool     host_phase = false;
+            bool     ram_full = false;
             run_on_device(i, [&] {
                 std::lock_guard<std::mutex> lock(device_mutexes_[i]);
                 if (dev.parked() || !dev.seed_pending()) {
@@ -22479,7 +22792,7 @@ public:
                 }
                 const auto t0 = std::chrono::steady_clock::now();
                 try {
-                    status = dev.seed_step(n, landed, bytes) ? 1 : 2;
+                    status = dev.seed_step(n, landed, bytes, host_phase, ram_full) ? 1 : 2;
                 } catch (const std::exception & e) {
                     // Includes the bounded arena reservation timing out: give
                     // up on THIS chunk (the cursor already moved past it) and
@@ -22500,16 +22813,32 @@ public:
                 ++r.dev;
                 continue;
             }
-            if (!r.dev_started) {
-                r.dev_started = true;
-                r.t_dev = std::chrono::steady_clock::now();
-            }
-            if (landed > 0) {
-                r.per_page_ms = 0.7 * r.per_page_ms + 0.3 * (step_ms / (double) landed);
-                r.landed_dev += landed;
-                r.bytes_dev += bytes;
-                if (ram_phase) {
-                    r.landed_ram += landed;
+            if (host_phase) {
+                // RAM-tier phase: accounted apart from the VRAM seed totals.
+                if (!ram_phase_.started) {
+                    ram_phase_.started = true;
+                    ram_phase_.t0 = std::chrono::steady_clock::now() -
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double, std::milli>(step_ms));
+                }
+                ram_phase_.landed += landed;
+                ram_phase_.bytes += bytes;
+                ram_phase_.full = ram_phase_.full || ram_full;
+                if (landed > 0) {
+                    r.per_page_ms = 0.7 * r.per_page_ms + 0.3 * (step_ms / (double) landed);
+                }
+            } else {
+                if (!r.dev_started) {
+                    r.dev_started = true;
+                    r.t_dev = std::chrono::steady_clock::now();
+                }
+                if (landed > 0) {
+                    r.per_page_ms = 0.7 * r.per_page_ms + 0.3 * (step_ms / (double) landed);
+                    r.landed_dev += landed;
+                    r.bytes_dev += bytes;
+                    if (ram_phase) {
+                        r.landed_ram += landed;
+                    }
                 }
             }
             if (status == 2) {
@@ -22522,6 +22851,7 @@ public:
             "wp expert worker: SEED finished (%s): pages=%zu bytes=%llu total_seconds=%.3f\n",
             r.reason.c_str(), r.all_landed, (unsigned long long) r.all_bytes,
             std::chrono::duration<double>(std::chrono::steady_clock::now() - r.t_start).count());
+        log_ram_phase_end(ram_phase_.full ? "full" : "done");
         std::fflush(stderr);
         seed_active_.store(false, std::memory_order_release);
         return false;
@@ -22706,6 +23036,21 @@ private:
         return true;
     }
 
+    // End line of the startup RAM-tier phase (once). Caller holds seed_mu_.
+    void log_ram_phase_end(const char * stopped) {
+        if (!ram_phase_.active) {
+            return;
+        }
+        ram_phase_.active = false;
+        const double ms = ram_phase_.started ? std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ram_phase_.t0).count() : 0.0;
+        std::fprintf(stderr,
+            "wp expert worker: seed-from-park ram phase done: landed=%zu bytes=%llu ms=%.1f "
+            "(stopped: %s)\n",
+            ram_phase_.landed, (unsigned long long) ram_phase_.bytes, ms, stopped);
+        std::fflush(stderr);
+    }
+
     // Arm a seed from the per-device lists prepared under the device mutex
     // (seed_prepare*). The seed itself runs in seed_pump on the serving thread.
     void begin_seed(const char * why) {
@@ -22755,90 +23100,44 @@ private:
         r.fails = 0;
     }
 
-    // "# device NAME" opens a section; "layer expert  # heat [V|R] [P]" rows.
-    // Rows before any header go to section "" (applies to any device).
-    static bool parse_park_file(
-            const std::string & path,
-            std::map<std::string, std::vector<std::tuple<int, int, uint64_t, bool>>> & out) {
-        std::ifstream in(path);
-        if (!in) {
-            return false;
-        }
-        std::string section;
-        std::string line;
-        size_t rows = 0;
-        while (std::getline(in, line)) {
-            if (line.empty()) {
-                continue;
-            }
-            if (line[0] == '#') {
-                if (line.compare(0, 9, "# device ") == 0) {
-                    section = line.substr(9);
-                }
-                continue;
-            }
-            std::istringstream input(line);
-            int layer = -1;
-            int expert = -1;
-            if (!(input >> layer >> expert)) {
-                continue;
-            }
-            uint64_t heat = 1;
-            bool pinned = false;
-            const size_t hash = line.find('#');
-            if (hash != std::string::npos) {
-                std::istringstream tail(line.substr(hash + 1));
-                uint64_t parsed = 0;
-                if (tail >> parsed) {
-                    heat = parsed;
-                }
-                std::string tok;
-                while (tail >> tok) {
-                    if (tok == "P") {
-                        pinned = true;
-                    }
-                }
-            }
-            out[section].emplace_back(layer, expert, heat, pinned);
-            ++rows;
-        }
-        return rows != 0;
-    }
-
     // Residency snapshot of every parked device, hottest first (tmp + rename).
     // Same "layer expert  # count" shape as WP_EXPERT_COUNTS_DUMP, so it is
     // also a valid WP_EXPERT_PIN_FILE; the tier tag after the count is ignored
     // by that loader.
+    static std::vector<ParkFileRow> to_file_rows(const std::vector<DeviceWorker::ParkRow> & rows) {
+        std::vector<ParkFileRow> out;
+        out.reserve(rows.size());
+        for (const DeviceWorker::ParkRow & row : rows) {
+            ParkFileRow r;
+            r.layer  = row.item.page->layer;
+            r.expert = row.item.page->expert;
+            r.heat   = row.item.heat;
+            r.vram   = row.vram;
+            r.pinned = row.item.pinned;
+            out.push_back(r);
+        }
+        return out;
+    }
+
     void write_park_file() const {
         if (park_file_.empty()) {
             return;
         }
-        const std::string tmp = park_file_ + ".tmp";
-        std::ofstream out(tmp, std::ios::trunc);
-        if (!out) {
-            std::fprintf(stderr, "wp expert worker: park snapshot: cannot write %s\n", tmp.c_str());
-            return;
-        }
-        out << "# wp-expert-worker park snapshot v1 t=" << (long long) std::time(nullptr) << '\n'
-            << "# rows: layer expert  # heat tier [P]; tier V = held a VRAM slot, "
-               "R = RAM tier only; hottest first per device\n";
-        size_t rows = 0;
+        ParkFileSections sections;
         for (const std::unique_ptr<DeviceWorker> & dev : devices_) {
             if (!dev->parked() || dev->park_rows().empty()) {
                 continue;
             }
-            out << "# device " << dev->device_name() << '\n';
-            for (const DeviceWorker::ParkRow & row : dev->park_rows()) {
-                out << row.item.page->layer << ' ' << row.item.page->expert << "  # "
-                    << row.item.heat << ' ' << (row.vram ? 'V' : 'R')
-                    << (row.item.pinned ? " P" : "") << '\n';
-                ++rows;
-            }
+            sections.emplace_back(dev->device_name(), to_file_rows(dev->park_rows()));
         }
-        out.close();
-        if (out && std::rename(tmp.c_str(), park_file_.c_str()) == 0) {
+        size_t rows = 0;
+        int err = 0;
+        if (park_file_write(park_file_, sections, rows, err)) {
             std::fprintf(stderr, "wp expert worker: park snapshot written: %s (%zu rows)\n",
                          park_file_.c_str(), rows);
+        } else if (err == 1) {
+            std::fprintf(stderr, "wp expert worker: park snapshot: cannot write %s.tmp\n",
+                         park_file_.c_str());
         } else {
             std::fprintf(stderr, "wp expert worker: park snapshot: write/rename to %s failed\n",
                          park_file_.c_str());
@@ -24689,6 +24988,18 @@ private:
     // against the serving thread's seed_pump chunk.
     std::mutex        seed_mu_;
     SeedRun           seed_run_;
+    // Startup RAM-tier phase bookkeeping (WP_EXPERT_SEED_RAM_TIER); guarded
+    // by seed_mu_.
+    struct RamPhase {
+        bool     active  = false;   // planned and its end line not yet logged
+        bool     started = false;
+        bool     full    = false;
+        size_t   planned = 0;
+        size_t   landed  = 0;
+        uint64_t bytes   = 0;
+        std::chrono::steady_clock::time_point t0{};
+    };
+    RamPhase          ram_phase_;
     std::atomic<bool> seed_active_{false};
     std::unique_ptr<pipe_expert_shm_ring> local_shm_;
     uint32_t local_shm_tokens_ = 0;
@@ -27333,6 +27644,87 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
 
 } // namespace
 
+// ---- park file: one row per page, "layer expert  # heat V|R [P]" ----------
+bool park_file_write(const std::string & path, const ParkFileSections & sections,
+                     size_t & rows, int & err) {
+    err = 0;
+    const std::string tmp = path + ".tmp";
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) {
+        err = 1;
+        return false;
+    }
+    out << "# wp-expert-worker park snapshot v1 t=" << (long long) std::time(nullptr) << '\n'
+        << "# rows: layer expert  # heat tier [P]; tier V = held a VRAM slot, "
+           "R = RAM tier only; hottest first per device\n";
+    rows = 0;
+    for (const auto & sec : sections) {
+        if (sec.second.empty()) {
+            continue;
+        }
+        out << "# device " << sec.first << '\n';
+        for (const ParkFileRow & row : sec.second) {
+            out << row.layer << ' ' << row.expert << "  # " << row.heat << ' '
+                << (row.vram ? 'V' : 'R') << (row.pinned ? " P" : "") << '\n';
+            ++rows;
+        }
+    }
+    out.close();
+    if (!out || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        err = 2;
+        return false;
+    }
+    return true;
+}
+
+// "# device NAME" opens a section; rows before any header go to section ""
+// (applies to any device). A row without a V/R tag parses as vram=false.
+bool park_file_parse(const std::string & path,
+                     std::map<std::string, std::vector<ParkFileRow>> & out) {
+    std::ifstream in(path);
+    if (!in) {
+        return false;
+    }
+    std::string section;
+    std::string line;
+    size_t rows = 0;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        if (line[0] == '#') {
+            if (line.compare(0, 9, "# device ") == 0) {
+                section = line.substr(9);
+            }
+            continue;
+        }
+        std::istringstream input(line);
+        ParkFileRow row;
+        if (!(input >> row.layer >> row.expert)) {
+            continue;
+        }
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) {
+            std::istringstream tail(line.substr(hash + 1));
+            uint64_t parsed = 0;
+            if (tail >> parsed) {
+                row.heat = parsed;
+            }
+            std::string tok;
+            while (tail >> tok) {
+                if (tok == "P") {
+                    row.pinned = true;
+                } else if (tok == "V") {
+                    row.vram = true;
+                }
+            }
+        }
+        out[section].push_back(row);
+        ++rows;
+    }
+    return rows != 0;
+}
+
 bool self_bench_stats(uint64_t & n, uint64_t & min_us, uint64_t & mean_us) {
     if (g_probe.n == 0) return false;
     n = g_probe.n;
@@ -27399,6 +27791,25 @@ void park_signal_handler(int sig) {
     errno = saved_errno;
 }
 
+// SIGTERM / SIGINT = stop snapshot (WP_EXPERT_STOP_SNAPSHOT=0 keeps the
+// default disposition). Same shape: the handler only writes a byte ('T') to the
+// pipe, EXCEPT that a second signal exits at once (_exit is async-signal-safe),
+// so a router's second TERM never waits on a stuck quiesce or snapshot.
+volatile sig_atomic_t g_stop_signals = 0;
+
+void stop_signal_handler(int) {
+    const int saved_errno = errno;
+    if (++g_stop_signals > 1) {
+        _exit(0);
+    }
+    if (g_park_pipe[1] >= 0) {
+        const char c = 'T';
+        const ssize_t r = ::write(g_park_pipe[1], &c, 1);
+        (void) r;
+    }
+    errno = saved_errno;
+}
+
 // WP_EXPERT_PARK_FILE, else next to the worker's other logs (the directory of
 // WP_EXPERT_COUNTS_DUMP / WP_HINT_LOG / WP_PAGEIN_LOG / WP_EXPERT_PIN_FILE,
 // first one set), else the cwd. Named per listen port so workers sharing a log
@@ -27424,6 +27835,7 @@ struct ParkControl {
     Worker &    worker;
     std::thread thread;
     bool        installed = false;
+    bool        stop_armed = false;
 
     explicit ParkControl(Worker & w) : worker(w) {}
     ParkControl(const ParkControl &) = delete;
@@ -27448,6 +27860,19 @@ struct ParkControl {
         sigemptyset(&sa.sa_mask);
         ::sigaction(SIGUSR1, &sa, nullptr);
         ::sigaction(SIGUSR2, &sa, nullptr);
+        const char * stop_env = std::getenv("WP_EXPERT_STOP_SNAPSHOT");
+        stop_armed = !(stop_env != nullptr && stop_env[0] == '0');
+        if (stop_armed) {
+            struct sigaction st;
+            std::memset(&st, 0, sizeof(st));
+            st.sa_handler = stop_signal_handler;
+            st.sa_flags = SA_RESTART;
+            sigemptyset(&st.sa_mask);
+            sigaddset(&st.sa_mask, SIGTERM);
+            sigaddset(&st.sa_mask, SIGINT);
+            ::sigaction(SIGTERM, &st, nullptr);
+            ::sigaction(SIGINT, &st, nullptr);
+        }
         installed = true;
         const int read_fd = g_park_pipe[0];
         thread = std::thread([this, read_fd] {
@@ -27459,6 +27884,38 @@ struct ParkControl {
                 }
                 if (n <= 0 || c == 'Q') {
                     return;
+                }
+                if (c == 'T') {
+                    // Never returns: snapshot, then _exit(0) without running
+                    // destructors that could race the serving thread(s).
+                    std::fprintf(stderr, "wp expert worker: SIGTERM/SIGINT received: "
+                                         "stop snapshot\n");
+                    std::string path;
+                    std::string err;
+                    size_t rows = 0;
+                    size_t pending = 0;
+                    bool ok = false;
+                    try {
+                        ok = worker.stop_snapshot(path, rows, pending, err);
+                    } catch (const std::exception & e) {
+                        err = e.what();
+                    } catch (...) {
+                        err = "unknown exception";
+                    }
+                    if (ok && pending != 0) {
+                        std::fprintf(stderr, "wp expert worker: stop snapshot written: %s "
+                                             "(%zu rows, %zu from pending seed)\n",
+                                     path.c_str(), rows, pending);
+                    } else if (ok) {
+                        std::fprintf(stderr, "wp expert worker: stop snapshot written: %s "
+                                             "(%zu rows)\n", path.c_str(), rows);
+                    } else {
+                        std::fprintf(stderr, "wp expert worker: stop snapshot FAILED: %s\n",
+                                     err.c_str());
+                    }
+                    std::fflush(stderr);
+                    std::fflush(stdout);
+                    _exit(0);
                 }
                 try {
                     if (c == 'P') {
@@ -27483,6 +27940,10 @@ struct ParkControl {
         }
         ::signal(SIGUSR1, SIG_DFL);
         ::signal(SIGUSR2, SIG_DFL);
+        if (stop_armed) {
+            ::signal(SIGTERM, SIG_DFL);
+            ::signal(SIGINT, SIG_DFL);
+        }
         const char q = 'Q';
         const int wfd = g_park_pipe[1];
         g_park_pipe[1] = -1;
@@ -27762,7 +28223,8 @@ int run(const Options & options) {
     // Signal handlers are armed only after the startup seed has been planned.
     park_control.start();
     std::fprintf(stderr, "wp expert worker: park control armed: SIGUSR1=park SIGUSR2=unpark "
-                         "park_file=%s\n", park_file.c_str());
+                         "park_file=%s stop_snapshot=%s\n", park_file.c_str(),
+                 park_control.stop_armed ? "on (SIGTERM/SIGINT)" : "off");
 
     // WP_WORKER_MULTI_CONN=N (N>=2) -- see g_worker_gpu_mutex comment above
     // serve_connection for the lock design. Unset/absent/"1"/anything <2 is
@@ -27783,10 +28245,11 @@ int run(const Options & options) {
     //
     // SHUTDOWN: this loop has no in-process stop condition -- an
     // orchestrator drives connect/disconnect cycles, this worker does not
-    // decide when it's done. No signal handler is installed here (same as
-    // the single-connection default path above), so SIGTERM's default
-    // disposition (terminate) applies immediately, even with every slot
-    // thread blocked in accept() or mid-request. The orchestrator-visible
+    // decide when it's done. SIGTERM/SIGINT are handled by the ParkControl
+    // armed above (same as the single-connection path): the control thread
+    // quiesces, writes the stop snapshot and _exit(0)s, even with every slot
+    // thread blocked in accept() or mid-request; WP_EXPERT_STOP_SNAPSHOT=0
+    // restores the default terminate disposition. The orchestrator-visible
     // change from the old accept-exactly-N probe is: this worker no longer
     // exits on its own once the streams close, so re-running the probe
     // comparison against this version means killing the process

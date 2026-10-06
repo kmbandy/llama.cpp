@@ -6654,6 +6654,65 @@ static void test_fuse_gate_up_layout_matches_split() {
     require(any_nonzero, "split and fused-layout partials were both zero");
 }
 
+// Park / stop-snapshot file: V/R/P tags, heat, per-device sections and the
+// tmp+rename write all survive a write -> parse round trip.
+static void test_park_file_round_trip() {
+    namespace fs = std::filesystem;
+    using wp_expert_worker::ParkFileRow;
+    const fs::path path = fs::temp_directory_path() /
+        ("wp-park-roundtrip-" + std::to_string((long) getpid()) + ".txt");
+    wp_expert_worker::ParkFileSections sections;
+    sections.emplace_back("ROCm0", std::vector<ParkFileRow>{
+        { 3, 17, 900, true,  true  },
+        { 3, 4,  500, true,  false },
+        { 40, 255, 12, false, false },
+    });
+    sections.emplace_back("ROCm1", std::vector<ParkFileRow>{
+        { 1, 2, 77, false, true },
+    });
+    size_t rows = 0;
+    int err = -1;
+    require(wp_expert_worker::park_file_write(path.string(), sections, rows, err) &&
+                err == 0 && rows == 4,
+            "park file write failed or miscounted rows");
+    require(!fs::exists(path.string() + ".tmp"), "park file write left its .tmp behind");
+
+    std::map<std::string, std::vector<ParkFileRow>> back;
+    require(wp_expert_worker::park_file_parse(path.string(), back) && back.size() == 2,
+            "park file parse failed or lost a device section");
+    const std::vector<ParkFileRow> & a = back.at("ROCm0");
+    require(a.size() == 3, "ROCm0 section lost rows");
+    require(a[0].layer == 3 && a[0].expert == 17 && a[0].heat == 900 && a[0].vram && a[0].pinned,
+            "V+P row did not round trip");
+    require(a[1].layer == 3 && a[1].expert == 4 && a[1].heat == 500 && a[1].vram && !a[1].pinned,
+            "V row did not round trip");
+    require(a[2].layer == 40 && a[2].expert == 255 && a[2].heat == 12 && !a[2].vram && !a[2].pinned,
+            "R row did not round trip");
+    const std::vector<ParkFileRow> & b = back.at("ROCm1");
+    require(b.size() == 1 && b[0].layer == 1 && b[0].expert == 2 && b[0].heat == 77 &&
+                !b[0].vram && b[0].pinned,
+            "R+P row did not round trip");
+
+    // An untagged WP_EXPERT_COUNTS_DUMP-style row parses (section "", heat kept).
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << "5 6  # 42\n";
+    }
+    std::map<std::string, std::vector<ParkFileRow>> plain;
+    require(wp_expert_worker::park_file_parse(path.string(), plain) &&
+                plain.at("").size() == 1 && plain.at("")[0].heat == 42,
+            "untagged row did not parse");
+    // Missing / empty files report false.
+    fs::remove(path);
+    std::map<std::string, std::vector<ParkFileRow>> none;
+    require(!wp_expert_worker::park_file_parse(path.string(), none),
+            "missing park file parsed as non-empty");
+    // An unwritable destination reports err=1.
+    require(!wp_expert_worker::park_file_write("/nonexistent-dir-wp/x.txt", sections, rows, err) &&
+                err == 1,
+            "unwritable park file path did not report err=1");
+}
+
 int main() {
     try {
         require(setenv("WP_EXPERT_MM_PIN", "1", 1) == 0,
@@ -6663,6 +6722,7 @@ int main() {
         require(setenv("WP_EXPERT_GATHER", "1", 1) == 0 &&
                     setenv("WP_EXPERT_GATHER_MIN_TOKENS", "2", 1) == 0,
                 "failed to enable expert gather");
+        test_park_file_round_trip();
         test_owner_policy_proportional_unchanged();
         test_owner_policy_hot_packs_priority_device();
         test_owner_policy_hot_is_deterministic();
