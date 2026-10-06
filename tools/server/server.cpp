@@ -66,6 +66,10 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             // treat invalid_argument as invalid request (400)
             error = ERROR_TYPE_INVALID_REQUEST;
             message = e.what();
+        } catch (const common_json_error & e) {
+            // JSON parse and type errors are invalid requests (400)
+            error = ERROR_TYPE_INVALID_REQUEST;
+            message = e.what();
         } catch (const std::exception & e) {
             // treat other exceptions as server error (500)
             error = ERROR_TYPE_SERVER;
@@ -188,8 +192,6 @@ int llama_server(int argc, char ** argv) {
     // touch it. lifecycle is symmetric, stop_gc() runs in clean_up() before backend free
     server_stream_session_manager_start();
 
-    SRV_INF("%s", "initializing ...\n");
-
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
@@ -201,6 +203,8 @@ int llama_server(int argc, char ** argv) {
         common_log_flush(common_log_main());
         return rc;
     }
+
+    SRV_INF("%s", "initializing ...\n");
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -380,6 +384,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
+        routes.post_systemone              = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -431,6 +436,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
+    ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

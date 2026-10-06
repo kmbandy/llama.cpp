@@ -1295,6 +1295,7 @@ llama_context::llama_context(
 
     // initialized later
     cparams.pipeline_parallel = false;
+    cparams.training = false;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -1809,10 +1810,7 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     }
 
     for (const auto & [tensor, nodes] : users) {
-        if (tensor->op != GGML_OP_NONE) {
-            LLAMA_LOG_WARN("%s: input tensor '%32s' has op %s, expected GGML_OP_NONE\n",
-                    __func__, tensor->name, ggml_op_name(tensor->op));
-        }
+        GGML_ASSERT(tensor->op == GGML_OP_NONE);
         for (const ggml_tensor * node : nodes) {
             LLAMA_LOG_DEBUG("%s: input tensor '%32s' [%s, ne = { %5" PRId64 ", %5" PRId64 ", %5" PRId64 ", %5" PRId64 " }] is used by node '%s' (%s)\n",
                     __func__, tensor->name, ggml_type_name(tensor->type),
@@ -1938,7 +1936,11 @@ void llama_context::sched_reserve() {
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
-    {
+    if (cparams.training) {
+        // no tg graph for training
+        n_splits_tg = n_splits_pp;
+        n_nodes_tg  = n_nodes_pp;
+    } else {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
@@ -2829,8 +2831,14 @@ float * llama_context::sync_embeddings_layer_inp(uint32_t lid) {
     // nothing pending for output_reorder() to do; otherwise fall back to the
     // original full synchronize(), which is also what covers the
     // WP_LAYER_INP_NARROW_SYNC-unset default path below.
+    // embd_batch_idxs (upstream ggml-org#29019) is the same kind of pending reorder: the
+    // narrow path is only safe while it is the identity
+    bool idxs_identity = true;
+    for (size_t i = 0; i < embd_batch_idxs.size() && idxs_identity; ++i) {
+        idxs_identity = embd_batch_idxs[i] == (int32_t) i;
+    }
     bool waited_narrow = false;
-    if (wp_layer_inp_narrow_sync_enabled() && output_swaps.empty() &&
+    if (wp_layer_inp_narrow_sync_enabled() && output_swaps.empty() && idxs_identity &&
             lid < embd_layer_inp_backend.size() && embd_layer_inp_backend[lid] != nullptr) {
         if (lid < embd_layer_inp_event.size() && embd_layer_inp_event[lid] != nullptr) {
             ggml_backend_event_synchronize(embd_layer_inp_event[lid]);
@@ -3164,7 +3172,12 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    sched_need_reserve = true;
+    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
+    //sched_need_reserve = true;
+}
+
+bool llama_context::get_causal_attn() const {
+    return cparams.causal_attn;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -4223,12 +4236,110 @@ llm_graph_result * llama_context::process_ubatch_staged(
     return res_terminal;
 }
 
-int llama_context::encode(const llama_batch & batch_inp) {
-    // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
-    // so accept either present rather than requiring exactly one.
-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
+// fork: the embd row width of a decode batch. Upstream picks one width per context
+// (llama_batch_ext_select_n_embd_inp); the fork's width also depends on whether the batch
+// carries token ids. The history of each gate is kept below.
+//
+// *** STOPGAP, NOT THE INTENDED DESIGN. READ THIS BEFORE CHANGING IT. ***
+//
+// DSPARK IS SUPPOSED TO RUN ON FOUR 4096-WIDE STREAMS. n_embd_out() is exactly
+// that: deepseek4.cpp:130 sets n_embd_out_impl = dsv4_hc_mult * n_embd
+// = 4 * 4096 = 16384. Including LLAMA_CONTEXT_TYPE_DSPARK below (the state this
+// fork shipped, and DELIBERATE -- we diverged from upstream, which gates on MTP
+// alone, precisely because upstream was not faithful to real DSpark) is the
+// CORRECT INTENT. Narrowing the reader to 4096 -- which is what excluding DSPARK
+// does -- hard-codes a ONE-STREAM DSpark and is wrong as a design.
+//
+// THE ACTUAL DEFECT IS UPSTREAM OF HERE: the 4-stream path is NOT WIRED.
+//   source  llama_get_embeddings_nextn -> ctx->n_embd_nextn = 4096  (ONE stream)
+//   writer  speculative.cpp:1123  memcpy n_chunk * n_embd_dec (4096), contiguous
+//   alloc   speculative.cpp:1001  llama_batch_init(n_batch, n_embd_dec=4096)
+// The encoder emits one stream and the writer lays rows down back-to-back at
+// 4096. MEASURED CONSEQUENCE: because batch_inject is decoded one chunk at a
+// time with n_chunk <= n_ubatch, split_simple always yields idxs = 0..n_chunk-1,
+// so ubatch_add's copy is contiguous from offset 0 at EITHER stride and the graph
+// sees the SAME 4096-wide bytes both ways. Verified by A/B: 4 arms, acceptance
+// byte-identical at 0.57616 (87/151, mean len 1.98) with the toggle on and off.
+// So DSpark currently runs on 1 of its 4 streams REGARDLESS of this condition --
+// consistent with mean accepted len ~2.0 against a trained block size of 5.
+//
+// WHY THIS LINE IS CURRENTLY MTP-ONLY ANYWAY: with the writer supplying only
+// 4096, the 16384 stride reads past the end of batch_inject's embd buffer once
+// n_chunk > 512 (alloc 2048*4096*4 = 32 MiB; row 512 starts at 512*16384*4 =
+// exactly 32 MiB) -> SIGSEGV at idxs[i]==512, which is what killed n_ubatch=1024.
+// n_ubatch=512 masked it for a year by capping the chunk one row inside the cliff.
+//
+// THE REAL FIX (not yet done): make the encoder produce all 4 streams and widen
+// speculative.cpp:1001/1123 to n_embd_out(), then restore DSPARK here permanently.
+// Do NOT "fix" a future OOB by narrowing this again.
+// WP_DSPARK_MTP_EMBD=1 restores the PRE-FIX behaviour (DSPARK included above) so the
+// two can be A/B'd in one harness run with NO REBUILD between arms -- one variable.
+// WHY THIS TOGGLE EXISTS: after the fix, draft acceptance fell to 0.576/0.627 with
+// mean len ~2.0, BELOW THE ENTIRE HISTORICAL RECORD (0.799-0.988, mean len 3.5-5.9).
+// That is the OPPOSITE of what the fix predicts -- the old path was supposedly reading
+// past the buffer, which should have produced WORSE drafts, not better. Either the
+// prompt change explains it, or the 16384 stride is INTENTIONAL (the DSpark decoder
+// consuming hc_mult=4 rows per step), in which case the allocation+writer are the
+// broken pair and should be 4x wider instead. Do not resolve this by argument.
+// Default (unset) = FIXED behaviour, which is also the only one that does not segfault
+// at n_ubatch > 512.
+// *** 2026-08-04 EVENING: DSPARK NOW TAKES n_embd_out PERMANENTLY. ***
+// The segfault this stopgap was avoiding was never in this condition -- it was that
+// common/speculative.cpp allocated batch_inject at n_embd (4096) while the nextn
+// buffer's rows are n_embd_out (16384 = hc_mult*n_embd), so a chunk > 512 tokens
+// overran the allocation. That is now fixed at source (n_embd_nextn), so excluding
+// DSPARK here is no longer necessary -- and it was actively harmful: it fed the
+// draft head ONE of its four Manifold-Constrained Hyper-Connection streams, which
+// is what dropped acceptance to 0.576-0.627 / mean len ~2.0 against a historical
+// 0.799-0.988 / 3.5-5.9. DSpark is SUPPOSED to run on four 4096-wide streams.
+// WP_DSPARK_MTP_EMBD=0 restores the narrowed behaviour for A/B only.
+// MAD-LAB 2026-09-07 / upstream ggml-org#27310: DFlash embd batches carry the raw
+// target features at the ENCODER INPUT width, because the encoder is fused into the
+// injection graph (src/models/dflash.cpp, graph<false>).
+//
+// Upstream's condition is just `arch == DFLASH && batch_inp.embd`. That is too wide
+// for this fork, which has two more kinds of DFlash embd batch, and both must keep
+// their existing width:
+//   * a DSpark services-mode DRAFT batch carries embd (precomputed token embeddings,
+//     n_embd_inp() wide) AND token ids -- hence `!batch_inp.token`, the same guard
+//     graph<false> uses to pick its injection branch;
+//   * the DS4 in-model DSpark head (arch DFLASH, dsv4_hc_mult > 0) runs graph_dsv4,
+//     which deliberately keeps the SPLIT-encoder contract and is handed an
+//     already-encoded n_embd_out()-wide row -- hence `dsv4_hc_mult == 0`.
+// The three gates (here, graph<false>'s branch, and speculative.cpp's n_embd_inject)
+// are the same predicate written three times; keep them in step.
+//
+// This is checked BEFORE mtp_embd: an in-model DSpark ctx is LLAMA_CONTEXT_TYPE_DSPARK
+// and would otherwise be captured by mtp_embd first, but dsv4_hc_mult > 0 excludes it
+// here anyway, so the two are disjoint by construction.
+static size_t llama_fork_n_embd(const llama_cparams & cparams, const llama_model & model, bool has_token) {
+    static const bool s_dspark_mtp_embd = [](){
+        const char * e = std::getenv("WP_DSPARK_MTP_EMBD");
+        return e == nullptr || e[0] != '0';   // default ON
+    }();
 
-    if (batch_inp.n_tokens == 0) {
+    const auto & hparams = model.hparams;
+
+    if (model.arch == LLM_ARCH_DFLASH && !has_token && hparams.dsv4_hc_mult == 0) {
+        return hparams.n_embd_inp_enc();
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+            (s_dspark_mtp_embd && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK)) {
+        return hparams.n_embd_out();
+    }
+    return hparams.n_embd_inp();
+}
+
+static size_t llama_batch_fork_n_embd(const llama_context & ctx, const llama_batch_ext & batch) {
+    bool has_token = false;
+    for (const auto & tok : batch.tokens) {
+        has_token = has_token || tok.id != LLAMA_TOKEN_NULL;
+    }
+    return llama_fork_n_embd(ctx.get_cparams(), ctx.get_model(), has_token);
+}
+
+int llama_context::encode(const llama_batch_ext & batch_inp, bool sparse_outputs) {
+    if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
@@ -4244,12 +4355,17 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     const auto & hparams = model.hparams;
 
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != hparams.n_embd_inp_enc()) {
+        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the encoder input %u\n",
+                __func__, batch_inp.n_embd, hparams.n_embd_inp_enc());
+        return -1;
+    }
+
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
-    const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    // note: during encode, we always output all tokens and skip position continuity checks (output_all=true)
+    if (!balloc->init(batch_inp, model.vocab, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -4281,11 +4397,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // Encoder outputs are the rows that actually produce logits, not every
     // token in the ubatch. Passing n_tokens here used to allocate
     // n_vocab*n_ubatch of pinned host logits on every DSpark encode.
+    // fork: sparse encoder outputs are only honoured for a llama_batch that carried logits
+    // (sparse_outputs, set by the compat wrapper); llama_batch_ext callers get every row, as upstream
     uint32_t n_enc_outputs = n_tokens;
-    if (batch_inp.logits) {
+    if (sparse_outputs) {
         n_enc_outputs = 0;
         for (uint32_t i = 0; i < n_tokens; ++i) {
-            n_enc_outputs += batch_inp.logits[i] != 0;
+            n_enc_outputs += batch_inp.tokens[i].output;
         }
         if (n_enc_outputs == 0) {
             n_enc_outputs = 1;
@@ -4298,10 +4416,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
         return -2;
     };
 
-    if (batch_inp.logits) {
+    if (sparse_outputs) {
         uint32_t o = 0;
         for (uint32_t i = 0; i < n_tokens; ++i) {
-            if (batch_inp.logits[i] != 0 && o < n_enc_outputs) {
+            if (batch_inp.tokens[i].output && o < n_enc_outputs) {
                 output_ids[o++] = (int32_t) i;
             }
         }
@@ -4507,11 +4625,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
-    // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
-    // so accept either present rather than requiring exactly one.
-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
-
+int llama_context::decode(const llama_batch_ext & batch_inp) {
     // WP_STEP_STATS=1: reset the per-decode-call graph_compute accumulator
     // (see wp_last_graph_compute_ns() in llama-context.h) so process_ubatch()
     // below can SUM across every ubatch this call splits into (a wide
@@ -4531,7 +4645,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
-    if (batch_inp.n_tokens == 0) {
+    if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
@@ -4545,121 +4659,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // fork: besides upstream's per-context width, accept the fork's per-batch embd width
+    // (DSpark n_embd_out rows, DFlash encoder-width injection; see llama_batch_fork_n_embd)
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp &&
+            batch_inp.n_embd != llama_batch_fork_n_embd(*this, batch_inp)) {
+        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
+                __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
+        return -1;
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    // *** STOPGAP, NOT THE INTENDED DESIGN. READ THIS BEFORE CHANGING IT. ***
-    //
-    // DSPARK IS SUPPOSED TO RUN ON FOUR 4096-WIDE STREAMS. n_embd_out() is exactly
-    // that: deepseek4.cpp:130 sets n_embd_out_impl = dsv4_hc_mult * n_embd
-    // = 4 * 4096 = 16384. Including LLAMA_CONTEXT_TYPE_DSPARK below (the state this
-    // fork shipped, and DELIBERATE -- we diverged from upstream, which gates on MTP
-    // alone, precisely because upstream was not faithful to real DSpark) is the
-    // CORRECT INTENT. Narrowing the reader to 4096 -- which is what excluding DSPARK
-    // does -- hard-codes a ONE-STREAM DSpark and is wrong as a design.
-    //
-    // THE ACTUAL DEFECT IS UPSTREAM OF HERE: the 4-stream path is NOT WIRED.
-    //   source  llama_get_embeddings_nextn -> ctx->n_embd_nextn = 4096  (ONE stream)
-    //   writer  speculative.cpp:1123  memcpy n_chunk * n_embd_dec (4096), contiguous
-    //   alloc   speculative.cpp:1001  llama_batch_init(n_batch, n_embd_dec=4096)
-    // The encoder emits one stream and the writer lays rows down back-to-back at
-    // 4096. MEASURED CONSEQUENCE: because batch_inject is decoded one chunk at a
-    // time with n_chunk <= n_ubatch, split_simple always yields idxs = 0..n_chunk-1,
-    // so ubatch_add's copy is contiguous from offset 0 at EITHER stride and the graph
-    // sees the SAME 4096-wide bytes both ways. Verified by A/B: 4 arms, acceptance
-    // byte-identical at 0.57616 (87/151, mean len 1.98) with the toggle on and off.
-    // So DSpark currently runs on 1 of its 4 streams REGARDLESS of this condition --
-    // consistent with mean accepted len ~2.0 against a trained block size of 5.
-    //
-    // WHY THIS LINE IS CURRENTLY MTP-ONLY ANYWAY: with the writer supplying only
-    // 4096, the 16384 stride reads past the end of batch_inject's embd buffer once
-    // n_chunk > 512 (alloc 2048*4096*4 = 32 MiB; row 512 starts at 512*16384*4 =
-    // exactly 32 MiB) -> SIGSEGV at idxs[i]==512, which is what killed n_ubatch=1024.
-    // n_ubatch=512 masked it for a year by capping the chunk one row inside the cliff.
-    //
-    // THE REAL FIX (not yet done): make the encoder produce all 4 streams and widen
-    // speculative.cpp:1001/1123 to n_embd_out(), then restore DSPARK here permanently.
-    // Do NOT "fix" a future OOB by narrowing this again.
-    // WP_DSPARK_MTP_EMBD=1 restores the PRE-FIX behaviour (DSPARK included above) so the
-    // two can be A/B'd in one harness run with NO REBUILD between arms -- one variable.
-    // WHY THIS TOGGLE EXISTS: after the fix, draft acceptance fell to 0.576/0.627 with
-    // mean len ~2.0, BELOW THE ENTIRE HISTORICAL RECORD (0.799-0.988, mean len 3.5-5.9).
-    // That is the OPPOSITE of what the fix predicts -- the old path was supposedly reading
-    // past the buffer, which should have produced WORSE drafts, not better. Either the
-    // prompt change explains it, or the 16384 stride is INTENTIONAL (the DSpark decoder
-    // consuming hc_mult=4 rows per step), in which case the allocation+writer are the
-    // broken pair and should be 4x wider instead. Do not resolve this by argument.
-    // Default (unset) = FIXED behaviour, which is also the only one that does not segfault
-    // at n_ubatch > 512.
-    // *** 2026-08-04 EVENING: DSPARK NOW TAKES n_embd_out PERMANENTLY. ***
-    // The segfault this stopgap was avoiding was never in this condition -- it was that
-    // common/speculative.cpp allocated batch_inject at n_embd (4096) while the nextn
-    // buffer's rows are n_embd_out (16384 = hc_mult*n_embd), so a chunk > 512 tokens
-    // overran the allocation. That is now fixed at source (n_embd_nextn), so excluding
-    // DSPARK here is no longer necessary -- and it was actively harmful: it fed the
-    // draft head ONE of its four Manifold-Constrained Hyper-Connection streams, which
-    // is what dropped acceptance to 0.576-0.627 / mean len ~2.0 against a historical
-    // 0.799-0.988 / 3.5-5.9. DSpark is SUPPOSED to run on four 4096-wide streams.
-    // WP_DSPARK_MTP_EMBD=0 restores the narrowed behaviour for A/B only.
-    static const bool s_dspark_mtp_embd = [](){
-        const char * e = std::getenv("WP_DSPARK_MTP_EMBD");
-        return e == nullptr || e[0] != '0';   // default ON
-    }();
-    const bool    mtp_embd = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
-                              (s_dspark_mtp_embd && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK)
-                             ) && batch_inp.embd;
-    // MAD-LAB 2026-09-07 / upstream ggml-org#27310: DFlash embd batches carry the raw
-    // target features at the ENCODER INPUT width, because the encoder is fused into the
-    // injection graph (src/models/dflash.cpp, graph<false>).
-    //
-    // Upstream's condition is just `arch == DFLASH && batch_inp.embd`. That is too wide
-    // for this fork, which has two more kinds of DFlash embd batch, and both must keep
-    // their existing width:
-    //   * a DSpark services-mode DRAFT batch carries embd (precomputed token embeddings,
-    //     n_embd_inp() wide) AND token ids -- hence `!batch_inp.token`, the same guard
-    //     graph<false> uses to pick its injection branch;
-    //   * the DS4 in-model DSpark head (arch DFLASH, dsv4_hc_mult > 0) runs graph_dsv4,
-    //     which deliberately keeps the SPLIT-encoder contract and is handed an
-    //     already-encoded n_embd_out()-wide row -- hence `dsv4_hc_mult == 0`.
-    // The three gates (here, graph<false>'s branch, and speculative.cpp's n_embd_inject)
-    // are the same predicate written three times; keep them in step.
-    //
-    // This is checked BEFORE mtp_embd: an in-model DSpark ctx is LLAMA_CONTEXT_TYPE_DSPARK
-    // and would otherwise be captured by mtp_embd first, but dsv4_hc_mult > 0 excludes it
-    // here anyway, so the two are disjoint by construction.
-    const bool dflash_enc_embd = model.arch == LLM_ARCH_DFLASH &&
-                                 batch_inp.embd && !batch_inp.token &&
-                                 hparams.dsv4_hc_mult == 0;
-    const int64_t n_embd  = dflash_enc_embd ? hparams.n_embd_inp_enc()
-                          : mtp_embd        ? hparams.n_embd_out()
-                                            : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output -- unless the caller opted into
-    // sparse outputs (system1-rows) and the batch supplies explicit logits flags, in
-    // which case only the flagged rows are output. Any other combination is unchanged.
+    // sparse outputs (system1-rows), in which case only the flagged rows are output
+    // (a llama_batch without logits is marked all-output by the compat wrapper)
     const bool output_all   = cparams.embeddings &&
                                !(cparams.embd_sparse_outputs &&
-                                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE &&
-                                 batch_inp.logits);
+                                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE);
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
-    // embedding contexts output every token even when batch.logits is not set
-    if (has_samplers && (output_all || batch_inp.logits)) {
+    // TODO: avoid this workaround in the future
+    // embedding contexts output every token even when no token is explicitly marked as output
+    if (has_samplers) {
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
 
-        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
-            if (!output_all && batch_inp.logits[i] == 0) {
+        for (const auto & tok : batch_inp.tokens) {
+            if (!output_all && !tok.output) {
                 continue;
             }
 
-            const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
-
-            for (int32_t s = 0; s < ns; ++s) {
-                const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
-
+            for (auto seq_id : tok.seq_ids) {
                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
                     continue;
                 }
@@ -4677,7 +4711,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -4711,6 +4745,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    embd_batch_idxs.clear();
 
     ggml_backend_t overlap_meta = nullptr;
     for (ggml_backend_t backend : backend_ptrs) {
@@ -5126,7 +5161,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, token_prev, ubatch.n_tokens, sched_active);
+        // [TAG_EXTRACT_TARGET_EMBEDDINGS]
+        bool extract_all_idxs = extract_layer_inputs(res, token_prev, ubatch.n_tokens, sched_active);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -5249,7 +5285,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                 ns / 1e6, nextn_stage_copy_ns / 1e6);
                     }
                 }
+                extract_all_idxs = extract_all_idxs || !masked;
             }
+        }
+
+        if (extract_all_idxs) {
+            GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
+            GGML_ASSERT(embd_batch_idxs.size() == (size_t) token_prev);
+            const auto & batch_idxs = ubatch.data->batch_idxs;
+            embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
         }
 
         if (has_samplers && !tp_skip_output_readback) {
@@ -5715,8 +5759,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // disagreement. Off by default, and unreachable without --tp-world.
     if (tp_enabled()) {
         tp_trace_decode(/*is_encode =*/ false, n_tokens_all, n_outputs_all, n_ubatches_tp,
-                batch_inp.pos ? batch_inp.pos[0] : -1,
-                batch_inp.pos ? batch_inp.pos[batch_inp.n_tokens - 1] : -1);
+                batch_inp.tokens.front().pos[0], batch_inp.tokens.back().pos[0]);
     }
 
     return 0;
@@ -5935,9 +5978,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
+bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
                                          ggml_backend_sched_t sched_override) {
     ggml_backend_sched_t sched_active = sched_override ? sched_override : sched.get();
+    bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -5987,6 +6031,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
             }
         }
         GGML_ASSERT(backend != nullptr);
+        // Tensor-split backends require a zero source offset.
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
 
         // MAD-LAB (WP_LAYER_INP_NARROW_SYNC): record an event on the SAME
@@ -6017,7 +6062,9 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
                 ggml_backend_event_record(embd_layer_inp_event[il], backend);
             }
         }
+        extracted = true;
     }
+    return extracted;
 }
 
 void llama_context::output_reorder() {
@@ -6052,25 +6099,9 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_nextn; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_nextn + k], embd_nextn.data[i1*n_embd_nextn + k]);
-            }
-        }
-
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                // Externally supplied rows arrive from the wire already in batch order,
-                // so the output permutation does not apply to them -- applying it would
-                // scramble them against the batch indices their reader uses.
-                if (cparams.embeddings_layer_inp_external[lid]) {
-                    continue;
-                }
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd_layer_inp; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd_layer_inp + k], embd_layer_inp[lid].data[i1*n_embd_layer_inp + k]);
-                    }
-                }
             }
         }
 
@@ -6103,6 +6134,34 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+
+    // [TAG_EXTRACT_TARGET_EMBEDDINGS]
+    // Layer inputs and unmasked NextN embeddings contain all token rows, independent of logits selection.
+    for (size_t i = 0; i < embd_batch_idxs.size(); ++i) {
+        while (embd_batch_idxs[i] != (int32_t) i) {
+            const int32_t j = embd_batch_idxs[i];
+            GGML_ASSERT(j >= 0 && (size_t) j < embd_batch_idxs.size());
+            // fork: nextn rows are n_embd_nextn wide (0 on a pipeline-band head, whose rows arrive
+            // from the wire already in batch order)
+            if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
+                for (size_t k = 0; k < n_embd_nextn; ++k) {
+                    std::swap(embd_nextn.data[i*n_embd_nextn + k], embd_nextn.data[j*n_embd_nextn + k]);
+                }
+            }
+            for (size_t lid = 0; lid < embd_layer_inp.size(); ++lid) {
+                auto & layer = embd_layer_inp[lid];
+                // fork: externally supplied rows arrive from the wire already in batch order
+                if (cparams.embeddings_layer_inp_external[lid] || !layer.has_data()) {
+                    continue;
+                }
+                for (size_t k = 0; k < n_embd_layer_inp; ++k) {
+                    std::swap(layer.data[i*n_embd_layer_inp + k], layer.data[j*n_embd_layer_inp + k]);
+                }
+            }
+            std::swap(embd_batch_idxs[i], embd_batch_idxs[j]);
+        }
+    }
+    embd_batch_idxs.clear();
 }
 
 //
@@ -6111,7 +6170,7 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3) {
+    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
@@ -6160,6 +6219,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+
+    if (cparams.training) {
+        res *= 4;
+    }
+
     return res;
 }
 
@@ -6313,6 +6377,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         // MAD-LAB: pass the borrowed or owned dispatcher to graph construction.
         /*.expert_dispatch =*/ expert_dispatch,
+        /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(sched_active),
@@ -6758,6 +6823,10 @@ public:
         buf_size -= size;
     }
 
+    void discard() override {
+        rinfos.clear();
+    }
+
     size_t n_bytes() override {
         return size_read;
     }
@@ -7108,6 +7177,11 @@ public:
         rinfos.push_back({tensor, ptr, size, offset});
     }
 
+    void discard() override {
+        rinfos.clear();
+        buf_size = 0;
+    }
+
     size_t n_bytes() override {
         return size_read;
     }
@@ -7154,6 +7228,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
         return state_read_data(io);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io.discard();
         return 0;
     }
 }
@@ -7542,6 +7617,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         return state_seq_read_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io->discard();
         return 0;
     }
 }
@@ -7824,11 +7900,18 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     if (cparams.flash_attn) {
         LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
         cparams.flash_attn = false;
-
-        // the graph changes without flash attention, need to reserve again
-        sched_need_reserve = true;
-        sched_reserve();
     }
+
+    // gradients cannot flow through the KV cache, so the attention reads the K and V of the current ubatch directly
+    if (n_ubatch == cparams.n_ctx) {
+        cparams.training = true;
+    } else {
+        LLAMA_LOG_WARN("%s: n_ubatch (%u) != n_ctx (%u), the K and V projections will not receive gradients\n", __func__, n_ubatch, cparams.n_ctx);
+    }
+
+    // the training graph is different, need to reserve again
+    sched_need_reserve = true;
+    sched_reserve();
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
@@ -7891,9 +7974,13 @@ void llama_context::opt_epoch_iter(
             batch.logits  [pos_batch]    = true;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
-            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-            return;
+        // TODO: use llama_batch_ext here
+        {
+            llama_batch_compat compat(this, batch);
+            if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
+                LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+                return;
+            }
         }
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
@@ -8333,6 +8420,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+bool llama_get_causal_attn(const llama_context * ctx) {
+    return ctx->get_causal_attn();
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
@@ -8947,6 +9038,33 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
+// compat: llama_batch -> llama_batch_ext -> encode/decode
+
+int llama_context::encode(const llama_batch & batch_inp) {
+    // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+    // so accept either present rather than requiring exactly one.
+    GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc());
+    // fork: a llama_batch with logits asks for sparse encoder outputs (DSpark encode)
+    return encode(*compat.batch_ext, batch_inp.logits != nullptr);
+}
+
+int llama_context::decode(const llama_batch & batch_inp) {
+    GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    // fork: carry the embd rows at the fork's per-batch width (llama_fork_n_embd)
+    const size_t n_embd_row = batch_inp.embd ? llama_fork_n_embd(cparams, model, batch_inp.token != nullptr) : 0;
+    llama_batch_compat compat(this, batch_inp, n_embd_row);
+    if (!batch_inp.logits && cparams.embeddings) {
+        // fork: without logits an embeddings context outputs every row, also under embd_sparse_outputs
+        for (auto & tok : compat.batch_ext->tokens) {
+            tok.output = true;
+        }
+    }
+    return decode(*compat.batch_ext);
+}
+
 ///
 
 int32_t llama_encode(
@@ -9034,6 +9152,14 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {
+    switch (type) {
+        case LLAMA_PROCESS_TYPE_ENCODE: return ctx->encode(*batch);
+        case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
+    }
+    return -1;
 }
 
 //

@@ -20,6 +20,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_prec_policy;
 
 struct ml8_registry;
 
@@ -991,6 +992,8 @@ struct llm_graph_params {
     const llama_cross            * cross;
     pipe_expert_dispatcher::graph_dispatcher * expert_dispatch = nullptr;
 
+    const llama_prec_policy * prec_policy = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1396,6 +1399,8 @@ struct llm_graph_context {
     ggml_tensor * complete_moe_dispatch(ggml_tensor * moe_or_issued,
                                         ggml_tensor * shexp,
                                         int           il);
+
+    const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

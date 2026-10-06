@@ -104,7 +104,7 @@ vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_ty
 void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne);
 void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mixes, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst);
 void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * weights, ggml_tensor * dst);
-void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst);
+void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in = nullptr);
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
 void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
@@ -289,18 +289,47 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffers.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
-    vk::DescriptorSet& descriptor_set = descriptor_sets[descriptor_set_idx++];
+    const uint32_t set_idx = descriptor_set_idx++;
+    vk::DescriptorSet& descriptor_set = descriptor_sets[set_idx];
     std::array<vk::DescriptorBufferInfo, MAX_PARAMETER_COUNT> & descriptor_buffer_infos =
         ctx->descriptor_buffer_infos;
     size_t descriptor_buffer_count = 0;
     for (const vk_subbuffer & buffer : descriptor_buffers) {
         descriptor_buffer_infos[descriptor_buffer_count++] = buffer;
     }
-    vk::WriteDescriptorSet write_descriptor_set{
-        descriptor_set, 0, 0, pipeline->parameter_count,
-        vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.data()
-    };
-    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+
+    // upstream ggml-org#29280: skip the write if this set already holds these bindings from the
+    // last graph. fork: only for the context's own sets -- a graph plan writes its sets once, while
+    // recording, and descriptor_set_bindings is indexed by the context's sets
+    bool same = false;
+    if (ctx->recording_plan == nullptr) {
+        // a new buffer can get the handle of a destroyed one, so drop all cached bindings after any destroy
+        const uint64_t destroy_count = ctx->device->buffer_destroy_count.load(std::memory_order_acquire);
+        if (ctx->descriptor_set_bindings_destroy_count != destroy_count) {
+            for (auto & b : ctx->descriptor_set_bindings) {
+                b.clear();
+            }
+            ctx->descriptor_set_bindings_destroy_count = destroy_count;
+        }
+
+        std::vector<vk::DescriptorBufferInfo> & bindings = ctx->descriptor_set_bindings[set_idx];
+        same = !ctx->device->disable_descriptor_reuse && bindings.size() == descriptor_buffer_count;
+        for (size_t i = 0; same && i < descriptor_buffer_count; ++i) {
+            const vk::DescriptorBufferInfo & prev = bindings[i];
+            const vk::DescriptorBufferInfo & info = descriptor_buffer_infos[i];
+            same = prev.buffer == info.buffer && prev.offset == info.offset && prev.range == info.range;
+        }
+        if (!same) {
+            bindings.assign(descriptor_buffer_infos.begin(), descriptor_buffer_infos.begin() + descriptor_buffer_count);
+        }
+    }
+    if (!same) {
+        vk::WriteDescriptorSet write_descriptor_set{
+            descriptor_set, 0, 0, pipeline->parameter_count,
+            vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.data()
+        };
+        ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+    }
 
     if (ctx->recording_plan != nullptr) {
         ggml_backend_vk_graph_plan::descriptor_update update;

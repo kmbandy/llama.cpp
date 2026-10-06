@@ -40,6 +40,9 @@ public:
     // store them into `tensor` (whose own type is the decode target).
     virtual void read_tensor_as(ggml_tensor * tensor, size_t offset, size_t n_rows, size_t n_per_row, ggml_type src_type);
 
+    // drop tensor data that has been read but not yet applied (e.g. when a restore fails)
+    virtual void discard() {}
+
     // bytes read so far
     virtual size_t n_bytes() = 0;
 

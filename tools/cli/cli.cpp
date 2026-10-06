@@ -42,6 +42,9 @@ int llama_cli(int argc, char ** argv) {
         return 1;
     }
 
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
     // Cross-host tensor parallelism: a follower rank has no prompt, no sampler and no UI. It runs
     // the lockstep loop instead of the CLI, using the same model/context construction (spec T7 -
     // deliberately not a separate binary). Unreachable without --tp-world.

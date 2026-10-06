@@ -42,6 +42,7 @@
 // error - a failed request, not a hung one.
 
 #include "llama-context.h"
+#include "llama-batch.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -50,6 +51,7 @@
 #include "pipeline/pipe-tp-comm.h"
 #include "pipeline/pipe-tp-msg.h"
 
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 
@@ -219,6 +221,48 @@ bool llama_context::tp_mirror_batch(const llama_batch & batch, bool is_encode) {
     }
     tp_op_seq++;
     return true;
+}
+
+// fork: upstream's decode/encode take llama_batch_ext now; the wire format stays a llama_batch,
+// so flatten the ext batch into one (token batches only, see pipe_tp_encode_batch)
+bool llama_context::tp_mirror_batch(const llama_batch_ext & batch, bool is_encode) {
+    if (!tp_comm || !tp_is_rank0) {
+        return true; // not a leader: nothing to mirror
+    }
+
+    const size_t n = batch.tokens.size();
+
+    std::vector<llama_token>    token(n);
+    std::vector<llama_pos>      pos(n);
+    std::vector<int32_t>        n_seq_id(n);
+    std::vector<std::vector<llama_seq_id>> seq_ids(n);
+    std::vector<llama_seq_id *> seq_id(n);
+    std::vector<int8_t>         logits(n);
+
+    bool has_embd = false;
+    for (size_t i = 0; i < n; ++i) {
+        const auto & tok = batch.tokens[i];
+        has_embd    = has_embd || tok.has_embd;
+        token[i]    = tok.id;
+        pos[i]      = tok.pos[0];
+        seq_ids[i].assign(tok.seq_ids.begin(), tok.seq_ids.end());
+        std::sort(seq_ids[i].begin(), seq_ids[i].end());
+        n_seq_id[i] = (int32_t) seq_ids[i].size();
+        seq_id[i]   = seq_ids[i].data();
+        logits[i]   = tok.output;
+    }
+
+    llama_batch b = {};
+    b.n_tokens = (int32_t) n;
+    b.token    = token.data();
+    // a non-null embd makes pipe_tp_encode_batch refuse the batch with its own message
+    b.embd     = has_embd ? const_cast<float *>(batch.embd.data()) : nullptr;
+    b.pos      = pos.data();
+    b.n_seq_id = n_seq_id.data();
+    b.seq_id   = seq_id.data();
+    b.logits   = logits.data();
+
+    return tp_mirror_batch(b, is_encode);
 }
 
 bool llama_context::tp_mirror_ctrl(uint8_t op, int32_t a, int32_t b, int32_t c, int32_t d, uint8_t b0) {

@@ -83,14 +83,21 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 
+    // candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // the target's temp and seed, read only when the drafter samples probabilistically
+    float    temp = 1.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
+
     // MAD-LAB: DSpark speculative sampling (only honored with --spec-draft-sampling stochastic).
-    // temp > 0 asks the drafter to SAMPLE its chain at that temperature, seeded by noise_seed, and to
-    // fill *q with the draft logits; temp <= 0 or q == nullptr keeps the greedy chain. q is cleared by
+    // dspark_temp > 0 asks the drafter to SAMPLE its chain at that temperature, seeded by noise_seed, and to
+    // fill *dspark_q with the draft logits; dspark_temp <= 0 or dspark_q == nullptr keeps the greedy chain. dspark_q is cleared by
     // common_speculative_draft() for every drafting sequence and is only left non-empty when the
     // returned draft is a stochastic one.
-    float                         temp       = 0.0f;
-    uint64_t                      noise_seed = 0;
-    common_speculative_draft_q *  q          = nullptr;
+    float                         dspark_temp = 0.0f;
+    uint64_t                      noise_seed  = 0;
+    common_speculative_draft_q *  dspark_q    = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -103,6 +110,10 @@ void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+
+// fork: the speculative implementations still consume llama_batch; this overload lets upstream's
+// common_batch callers through by flattening the batch
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
 // MAD-LAB: prefill-sync pipelining (see draft-sync-cost-0912.txt). Resolves
 // whatever a prior common_speculative_process() call deferred (currently

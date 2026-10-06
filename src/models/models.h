@@ -401,6 +401,12 @@ struct llama_model_modern_bert : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_decision_head(
+                const llama_model & model,
+                ggml_tensor * inp,
+                llm_graph_input_attn_no_cache * inp_attn,
+                ggml_tensor * inp_out_ids);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -1250,6 +1256,16 @@ struct llama_model_deepseek4 : public llama_model_base {
         graph(const llm_graph_params & params) : llm_graph_context(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // collapse the hc streams with per-stream weights
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x,
+                ggml_tensor * weights,
+                int il) const;
+
+        // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+        ggml_tensor * build_hc_mean(ggml_tensor * x) const;
+
+        // returns the collapsed input and fills the post / comb weights
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
@@ -1274,6 +1290,10 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * x,
                 ggml_tensor * residual,
                 ggml_tensor * post,
+                ggml_tensor * comb,
+                int il) const;
+
+        ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
 
@@ -1370,15 +1390,6 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * kv,
                 ggml_tensor * sinks,
                 float kq_scale,
-                int il) const;
-
-        ggml_tensor * build_hc_pre(
-                ggml_tensor * x,
-                ggml_tensor * weights,
-                int il) const;
-
-        ggml_tensor * build_hc_sinkhorn(
-                ggml_tensor * comb,
                 int il) const;
 
         // WP_DS4_CONST_SHAPE: pins graph topology (indexer/CSA top-k padding,
@@ -2620,7 +2631,7 @@ struct llama_model_qwen35 : public llama_model_base {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
-    class llm_graph_input_qsa;
+    class llm_graph_input_kpool;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2628,9 +2639,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
-        // The MTP block reuses the builders below, so graph_mtp chains to this ctor
-        // (which does NOT build the trunk graph) and then builds its own.
-        graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/);
+        // the helpers alone, graph_mtp builds its own body
+        struct no_build {};
+        // fork: defined in qwen4exp.cpp (sets up the expert-dispatch shexp split)
+        graph(const llama_model & model, const llm_graph_params & params, no_build);
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2651,28 +2663,30 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells that top_k names
+        // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
+                    ggml_tensor * sel,
+                        int64_t   n_sel,
                           float   kq_scale,
                             int   il);
 
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
+        ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
@@ -2726,6 +2740,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_trunk_layer(
               llm_graph_input_mem_hybrid * inp,
   const llama_memory_hybrid_idx_context * mctx_hyb,
+           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * inp_pos,
                     ggml_tensor * inp_out_ids,
                             int * sections,
@@ -2755,9 +2770,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         const llama_model & model;
     };
 
-    // The MTP/NextN draft block: one dense-attention layer that predicts the
-    // next-next token from the target's hyper-connection streams plus the
-    // embedding of the token the target just produced. ref: ggml-org#27739
+    // MTP draft head: one QSA block after the trunk, fed by the trunk's hc-wide residual
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
@@ -2898,6 +2911,68 @@ struct llama_model_kimi_k3 : public llama_model_base {
 
         ggml_tensor * build_latent_moe(ggml_tensor * cur, const llama_layer & layer,
                                        int64_t n_embd_latent, int il);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_glm5_next : public llama_model_base {
+    llama_model_glm5_next(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // k-pool indexer inputs on top of the generic hybrid input
+    class llm_graph_input_kpool;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        // collapse the hc streams with per-stream weights
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x,
+                ggml_tensor * weights,
+                int il) const;
+
+        // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+        ggml_tensor * build_hc_mean(ggml_tensor * x) const;
+
+        // returns the collapsed input and fills the post / comb weights
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                int il) const;
+
+        ggml_tensor * build_hc_post(
+                ggml_tensor * x,
+                ggml_tensor * residual,
+                ggml_tensor * post,
+                ggml_tensor * comb,
+                int il) const;
+
+        ggml_tensor * build_hc_sinkhorn(
+                ggml_tensor * comb,
+                int il) const;
+
+        const llama_model & model;
+
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
+
+        ggml_tensor * build_kda_layer(ggml_tensor * cur, const llama_layer & layer,
+                                      llm_graph_input_rs * inp_rs,
+                                      int64_t d_conv, int64_t head_dim, int64_t n_head_kda,
+                                      int64_t d_inner, int64_t n_seq_tokens, int64_t n_seqs, int il);
+
+        ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
+                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
+
+        ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
+                                      const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
+                                      llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il);
+
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

@@ -54,6 +54,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
+    // optional projection of the embeddings output
+    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
+    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
+
     // if output is NULL, init from the input tok embed (tied LM head)
     const bool output_tied = (output == NULL);
     if (output == NULL) {
@@ -491,6 +495,16 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     if (cparams.no_output_head) {
         ggml_build_forward_expand(gf, cur);
         return;
+    }
+
+    if (model.cls_out) {
+        ggml_tensor * embd = build_lora_mm(model.cls_out, cur);
+        if (model.cls_out_b) {
+            embd = ggml_add(ctx0, embd, model.cls_out_b);
+        }
+        cb(embd, "result_embd_proj", -1);
+        res->t_embd = embd;
+        ggml_build_forward_expand(gf, embd);
     }
 
     // LM head

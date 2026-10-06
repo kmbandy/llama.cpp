@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-decision.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -381,6 +382,31 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
+static std::vector<llama_token> server_accept_replay(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        // the token is discarded - the call is what advances the sampler over this position
+        common_sampler_sample(smpl, ctx, idxs[i]);
+        common_sampler_accept(smpl, draft[i], true);
+        result.push_back(draft[i]);
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
+    return result;
+}
+
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
 static std::vector<llama_token> server_sample_and_accept_synth(
@@ -614,15 +640,19 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+
+    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
     // MAD-LAB: DSpark speculative sampling (--spec-draft-sampling stochastic)
-    common_speculative_draft_q spec_draft_q;      // draft distribution of spec_draft, filled by the drafter
+    common_speculative_draft_q spec_dspark_q;     // draft distribution of spec_draft, filled by the drafter
     std::mt19937               spec_accept_rng;   // accept/reject + residual + bonus draws
     bool                       spec_replay_stoch = false; // the replayed draft is a stochastic round's output
+    bool                       spec_replay_reject = false; // the replayed draft was verified by upstream rejection (#27694)
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -764,7 +794,9 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_draft_q.clear();
+            spec_dspark_q.clear();
             spec_replay_stoch = false;
+            spec_replay_reject = false;
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -824,15 +856,30 @@ struct server_slot {
         return task->need_embd();
     }
 
-    // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
-    // also we cannot split if the pooling would require any past tokens
-    // (MTP supports splitting — uses task->need_embd() not need_embd())
     bool can_split() const {
         GGML_ASSERT(task);
-
-        return
-            !task->need_embd() ||
-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+        // MTP supports splitting - uses task->need_embd() not need_embd()
+        if (!task->need_embd()) {
+            return true;
+        }
+        // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
+        if (!llama_get_memory(ctx_tgt)) {
+            return false;
+        }
+        // context can be chunked/split if the pooling type is LAST
+        const auto pooling = llama_pooling_type(ctx_tgt);
+        if (pooling == LLAMA_POOLING_TYPE_LAST) {
+            return true;
+        }
+        // causal rerankers read the last token and have a KV cache, so they can also be chunked/split.
+        if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx_tgt)) {
+            return true;
+        }
+        // a decision task reads its outputs from the last batch
+        if (task->type == SERVER_TASK_TYPE_DECISION) {
+            return true;
+        }
+        return false;
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -858,6 +905,11 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    bool use_spec_rejection() const {
+        return task && task->params.sampling.temp > 0.0f;
     }
 
     void add_token(const completion_token_output & token) {
@@ -1224,6 +1276,14 @@ struct server_slot {
         return res;
     }
 
+    // the other slot continues from the tokens processed so far
+    void copy_prompt_to(server_slot & other) const {
+        mem.seq_rm(other.id,     -1, -1);
+        mem.seq_cp(id, other.id, -1, -1);
+
+        other.prompt = prompt.clone();
+    }
+
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
@@ -1268,12 +1328,28 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
                 void * cb_data = slot.spec;
-                static auto cb = [](llama_batch batch, void * user_data) {
+                static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) -> int32_t {
                     common_speculative * spec = static_cast<common_speculative *>(user_data);
-                    if (!common_speculative_process(spec, batch)) {
-                        return 1;
+
+                    // upstream's helper now hands over a view; rebuild the llama_batch the fork's
+                    // speculative implementations consume (pos is section-major in both)
+                    std::vector<int32_t>      n_seq_id(b->n_tokens, 1);
+                    std::vector<llama_seq_id> seq_id_val(b->n_tokens, b->seq_id);
+                    std::vector<llama_seq_id *> seq_id(b->n_tokens);
+                    std::vector<int8_t>       logits(b->n_tokens, 0);
+                    for (int32_t i = 0; i < b->n_tokens; ++i) {
+                        seq_id[i] = &seq_id_val[i];
                     }
-                    return 0;
+
+                    llama_batch batch = {};
+                    batch.n_tokens = b->n_tokens;
+                    batch.embd     = const_cast<float *>(b->embd);
+                    batch.pos      = const_cast<llama_pos *>(b->pos);
+                    batch.n_seq_id = n_seq_id.data();
+                    batch.seq_id   = seq_id.data();
+                    batch.logits   = logits.data();
+
+                    return common_speculative_process(spec, batch) ? 0 : 1;
                 };
 
                 llama_pos new_n_past; // unused for now
@@ -1432,6 +1508,8 @@ public:
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
+
+    server_decision_context decision;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -2081,11 +2159,19 @@ private:
             mparams.progress_callback_user_data = &load_progress_mmproj;
         }
 
-        // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        // get the memory usage of mmproj, also used to check image_max_tokens against n_ubatch
+        mtmd_memory_usage mmproj_usage = {{}, -1, false};
+        int64_t mmproj_usage_t_us = 0;
+        if (has_mmproj) {
             int64_t t_start = ggml_time_us();
-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
-            int64_t t_elapsed = ggml_time_us() - t_start;
+            mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+            mmproj_usage_t_us = ggml_time_us() - t_start;
+        }
+
+        // optionally fit mmproj memory usage
+        if (has_mmproj && params_base.fit_params) {
+            const auto & mmproj_mem = mmproj_usage.backend_mem_usage;
+            const int64_t t_elapsed = mmproj_usage_t_us;
             if (!mmproj_mem.empty()) {
                 size_t total = 0;
                 for (auto & [dev, size] : mmproj_mem) {
@@ -2170,6 +2256,13 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        try {
+            decision.init(model_tgt);
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to init decision model: %s\n", e.what());
+            return false;
+        }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
@@ -2409,6 +2502,17 @@ private:
 
             if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
+            }
+
+            // non-causal models need the whole image in one ubatch
+            {
+                const int n_ubatch = llama_n_ubatch(ctx_tgt);
+                if (mmproj_usage.use_non_causal && mmproj_usage.image_max_tokens > n_ubatch) {
+                    SRV_WRN("cap image_max_tokens (original=%d) to n_ubatch (%d) because model needs non-causal attention on image\n", mmproj_usage.image_max_tokens, n_ubatch);
+                    SRV_WRN("%s\n", "increase n_ubatch (-ub) to increase vision token budget");
+                    mparams.image_max_tokens = n_ubatch;
+                    mparams.image_min_tokens = std::min(mparams.image_min_tokens, n_ubatch);
+                }
             }
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
@@ -3699,8 +3803,9 @@ private:
                     ? std::random_device{}()
                     : task.params.sampling.seed;
                 slot.spec_accept_rng.seed(seed ^ 0x5DEECE66u);
-                slot.spec_draft_q.clear();
+                slot.spec_dspark_q.clear();
                 slot.spec_replay_stoch = false;
+                slot.spec_replay_reject = false;
             }
 
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
@@ -4082,7 +4187,7 @@ private:
             res->is_begin = true;
         } else {
             res->content = tkn.text_to_send;
-            res->tokens  = { tkn.tok };
+            res->tokens.assign(1, tkn.tok);
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -4212,6 +4317,67 @@ private:
         }
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
+
+        queue_results.send(std::move(res));
+    }
+
+    void send_decision(const server_slot & slot, const llama_batch & batch, int32_t i_batch) {
+        auto res = std::make_unique<server_task_result_decision>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+
+        const auto & decision = slot.task->decision;
+
+        if (!decision.labels.empty()) {
+            const float * logits = llama_get_logits_ith(slot.ctx_tgt, i_batch);
+            if (logits == nullptr) {
+                send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
+                return;
+            }
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            for (const llama_token label : decision.labels) {
+                GGML_ASSERT(label >= 0 && label < n_vocab);
+                res->scores.push_back(logits[label]);
+            }
+        } else {
+            // the outputs of this slot in this batch are the last tokens of the prompt
+            std::vector<int32_t> idx;
+            for (int i = 0; i < batch.n_tokens; ++i) {
+                if (batch.logits[i] && batch.seq_id[i][0] == slot.stream_slot_idx) {
+                    idx.push_back(i);
+                }
+            }
+            const int32_t pos_first = slot.prompt.n_tokens() - (int32_t) idx.size();
+            auto get_embd = [&](int32_t pos) -> const float * {
+                const int32_t i = pos - pos_first;
+                return i >= 0 && i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
+            };
+
+            const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
+            const int32_t n_pointer  = n_embd_out / 2;
+            const float * embd_q = decision.pointer >= 0 ? get_embd(decision.pointer) : nullptr;
+            GGML_ASSERT(decision.column >= 0 && decision.column < n_embd_out);
+
+            for (const int32_t marker : decision.markers) {
+                const float * embd = get_embd(marker);
+                if (embd == nullptr || (decision.pointer >= 0 && embd_q == nullptr)) {
+                    send_error(slot, "failed to get embeddings, the question and its options must fit in one batch", ERROR_TYPE_SERVER);
+                    return;
+                }
+                if (decision.pointer < 0) {
+                    res->scores.push_back(embd[decision.column]);
+                    continue;
+                }
+                float dot = 0.0f;
+                for (int32_t i = 0; i < n_pointer; i++) {
+                    dot += embd_q[i] * embd[n_pointer + i];
+                }
+                res->scores.push_back(dot / sqrtf((float) n_pointer));
+            }
+        }
+
+        SLT_DBG(slot, "%s", "sending decision result\n");
 
         queue_results.send(std::move(res));
     }
@@ -4527,6 +4693,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_DECISION:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -5626,6 +5793,9 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
+                    // stale candidates: a replay never reads them, a new draft refills them
+                    slot.spec_draft_q.clear();
+
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
@@ -5647,6 +5817,8 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        const bool spec_reject = slot.use_spec_rejection();
+
                         common_speculative_get_draft_params(spec, slot.stream_slot_idx) = { // MAD-LAB: spec is now a raw ptr
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -5654,6 +5826,9 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .temp     = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ slot.task->params.sampling.seed,
                         };
 
                         // MAD-LAB: ask the drafter to sample its chain when the request can be verified
@@ -5661,9 +5836,9 @@ private:
                         if (params_base.speculative.draft.sampling == COMMON_SPECULATIVE_DRAFT_SAMPLING_STOCHASTIC &&
                                 slot.task && common_sampler_spec_sampling_ok(slot.smpl.get())) {
                             auto & dp = common_speculative_get_draft_params(spec, slot.stream_slot_idx);
-                            dp.temp       = slot.task->params.sampling.temp;
-                            dp.noise_seed = ((uint64_t) slot.spec_accept_rng() << 32) | (uint64_t) slot.spec_accept_rng();
-                            dp.q          = &slot.spec_draft_q;
+                            dp.dspark_temp = slot.task->params.sampling.temp;
+                            dp.noise_seed  = ((uint64_t) slot.spec_accept_rng() << 32) | (uint64_t) slot.spec_accept_rng();
+                            dp.dspark_q    = &slot.spec_dspark_q;
                         }
 
                         drafting.push_back(&slot);
@@ -5938,7 +6113,7 @@ private:
 
                         // TODO: support memory-less logits computation
                         if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
-                            send_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER);
+                            send_error(slot, "the current context does not support logits computation. skipping", ERROR_TYPE_SERVER);
                             slot.release();
                             return;
                         }
@@ -6044,9 +6219,28 @@ private:
                                 }
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // the outputs of a decision are read from one batch
+                            const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+                            if (n_decision_first >= 0 && slot.task->n_tokens() - n_decision_first > n_batch) {
+                                send_error(slot,
+                                           string_format("the question and its options (%d tokens) are too large to process. "
+                                                         "increase the batch size (current batch size: %d)",
+                                                         slot.task->n_tokens() - n_decision_first, n_batch),
+                                           ERROR_TYPE_INVALID_REQUEST);
+                                slot.release();
+                                return;
+                            }
+
+                            const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
+
+                            if (slot.task->params.cache_prompt && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // the children start from the shared prefix, do not go past it
+                                if (slot.task->n_tokens_shared > 0) {
+                                    n_past = std::min(n_past, slot.task->n_tokens_shared);
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -6311,6 +6505,25 @@ private:
                         SLT_DBG(slot, "draft cache trimmed to p0=%d\n", p0);
                     }
 
+                    // shared prompt prefix: once it is processed, the children continue from it with their own prompt
+                    bool wait_shared = false;
+                    if (slot.task->n_tokens_shared > 0) {
+                        const bool is_shared_done = slot.prompt.n_tokens() == slot.task->n_tokens_shared;
+                        for (server_slot * other_ptr : slots) {
+                            server_slot & other = *other_ptr;
+                            if (other.state != SLOT_STATE_WAIT_OTHER || other.task->id_parent != slot.task->id) {
+                                continue;
+                            }
+                            if (is_shared_done) {
+                                SLT_TRC(slot, " - copying shared prompt (%d tokens) to child %d\n", slot.prompt.n_tokens(), other.id);
+                                slot.copy_prompt_to(other);
+                                other.state = SLOT_STATE_STARTED;
+                            } else {
+                                wait_shared = true;
+                            }
+                        }
+                    }
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be
@@ -6466,12 +6679,24 @@ private:
                         }
                     }
 
+                    const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot_cap) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break; // end of text chunk
+                        }
+
+                        // stop at the end of the shared prefix, the children are started from this state
+                        if (wait_shared && slot.prompt.n_tokens() == slot.task->n_tokens_shared) {
+                            break;
+                        }
+
+                        // the outputs of a decision are read from one batch, do not split them
+                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
+                            break;
                         }
 
                         // if this is an alora request with pre-invocation
@@ -7053,6 +7278,8 @@ private:
                     SLT_TRC(slot, " - copying state to child %d\n", child->id);
 
                     GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
+                    // children with their own prompt are started at the end of the shared prefix
+                    GGML_ASSERT(slot.task->n_tokens_shared == 0);
 
                     slot.copy_state_to(*child);
                     child->state = SLOT_STATE_DONE_PROMPT;
@@ -7118,6 +7345,13 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
+                    send_decision(slot, batch_view, slot.i_batch - off);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -7261,27 +7495,45 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec);
-                // MAD-LAB: speculative sampling when the drafter sampled this draft (spec_draft_q holds one
-                // draft-logit row per token), or when replaying a stochastic round's already-accepted output.
+                // MAD-LAB: DSpark speculative sampling (--spec-draft-sampling stochastic) when the drafter sampled
+                // this draft (spec_dspark_q holds one draft-logit row per token), or when replaying a stochastic
+                // round's already-accepted output. Takes precedence over upstream's rejection path below; the two
+                // never both apply to one draft (DSpark fills spec_dspark_q, MTP/draft-simple fill spec_draft_q).
                 const bool stoch_replay = slot.spec_is_replay && slot.spec_replay_stoch;
                 const bool stoch_round  = !stoch_replay && !slot.spec_is_replay &&
-                        slot.spec_draft_q.temp > 0.0f && slot.spec_draft_q.n() >= n_draft;
+                        slot.spec_dspark_q.temp > 0.0f && slot.spec_dspark_q.n() >= n_draft;
                 const bool use_stoch    = synth_probs.empty() && (stoch_replay || stoch_round);
                 std::vector<float> accept_probs;
-                auto accepted = use_stoch
-                    ? common_sampler_sample_and_accept_n_stochastic(
-                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            stoch_replay ? nullptr : slot.spec_draft_q.logits.data(),
-                            slot.spec_draft_q.n_vocab, slot.spec_draft_q.temp,
-                            slot.spec_accept_rng, stoch_replay, &accept_probs)
-                    : synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+
+                // upstream #27694: drafters that fill no distribution fall back to sample-and-match
+                const bool use_rejection = !use_stoch && slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+
+                std::vector<llama_token> accepted;
+                if (!synth_probs.empty()) {
+                    // synthetic acceptance replaces verification entirely, so it comes first
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (use_stoch) {
+                    accepted = common_sampler_sample_and_accept_n_stochastic(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            stoch_replay ? nullptr : slot.spec_dspark_q.logits.data(),
+                            slot.spec_dspark_q.n_vocab, slot.spec_dspark_q.temp,
+                            slot.spec_accept_rng, stoch_replay, &accept_probs);
+                } else if (slot.spec_is_replay && slot.spec_replay_reject) {
+                    // only when the round being replayed was verified by rejection; otherwise (e.g. greedy DSpark at
+                    // temp > 0) keep master's sample-and-match so default behaviour is unchanged
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (use_rejection) {
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
-                slot.spec_draft_q.clear(); // consumed with its draft
+                slot.spec_draft_q.clear();
+                slot.spec_dspark_q.clear(); // consumed with its draft
                 if (use_stoch && !accept_probs.empty()) {
                     float mean = 0.0f;
                     for (float a : accept_probs) { mean += a; }
@@ -7352,6 +7604,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_replay_stoch = use_stoch;
+                        slot.spec_replay_reject = use_rejection;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -7398,6 +7651,7 @@ private:
             }
             slot.spec_is_replay = false;
             slot.spec_replay_stoch = false;
+            slot.spec_replay_reject = false;
 
             slot.stats.update_gen_last();
 
@@ -8726,6 +8980,76 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->post_systemone = [this](const server_http_req & req) {
+        auto res = create_response();
+        const auto & decision = ctx_server.decision;
+        if (decision.type == COMMON_DECISION_TYPE_NONE) {
+            res->error(format_error_response("This model is not a decision model", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+        const auto questions = decision.parse_questions(body);
+
+        std::vector<raw_buffer> files;
+        const json state = decision.parse_state(body, files);
+        if (!files.empty() && (!decision.can_use_images() || !meta->has_inp_image)) {
+            res->error(format_error_response("This server does not support image input for decisions. For a model that supports it, start it with `--mmproj`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        // one task per variant of each question
+        auto & rd = res->rd;
+        {
+            std::vector<server_task> tasks;
+            for (const auto & question : questions) {
+                for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
+                    server_task task = server_task(SERVER_TASK_TYPE_DECISION);
+                    task.id = rd.get_new_id();
+                    decision.fill_task(state, questions, question, variant, files, ctx_server.mctx, ctx_server.init_opt, task);
+                    tasks.push_back(std::move(task));
+                }
+            }
+            if (decision.can_share_prompt()) {
+                tasks = server_decision_group_tasks(std::move(tasks), params.n_parallel);
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+
+        if (all_results.is_terminated) {
+            return res; // connection is closed
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+
+        json answers = json::object();
+        int32_t n_tokens = 0;
+        size_t i_result = 0;
+        for (const auto & question : questions) {
+            std::vector<std::vector<float>> scores;
+            for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
+                auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[i_result++].get());
+                GGML_ASSERT(result != nullptr);
+                scores.push_back(result->scores);
+                n_tokens += result->n_tokens;
+            }
+            answers[question.id] = decision.format_answer(question, scores);
+        }
+
+        res->ok(json{
+            {"model",   meta->model_name},
+            {"answers", answers},
+            {"usage",   {
+                {"input_tokens",  n_tokens},
+                {"output_tokens", 0},
+            }},
+        });
+        return res;
+    };
+
     this->get_lora_adapters = [this](const server_http_req & req) {
         auto res = create_response();
 
@@ -8926,7 +9250,27 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+    // same shapes as tokenize_input_prompts(), plus OAI content: { "content": [ { "type": "text"|"image_url"|"input_audio"|"input_video", ... } ] }
+    auto tokenize_entry = [&](const json & p) {
+        if (p.is_object() && p.contains("content")) {
+            return tokenize_oai_content_array(ctx_server.vocab, ctx_server.mctx, meta->chat_params, p.at("content"), true, true, ctx_server.init_opt);
+        }
+        return tokenize_input_subprompt(ctx_server.vocab, ctx_server.mctx, p, true, true, ctx_server.init_opt);
+    };
+
+    std::vector<server_tokens> tokenized_prompts;
+    if (prompt.is_array() && !json_is_array_and_contains_numbers(prompt)) {
+        for (const auto & p : prompt) {
+            tokenized_prompts.push_back(tokenize_entry(p));
+        }
+    } else {
+        tokenized_prompts.push_back(tokenize_entry(prompt));
+    }
+    if (tokenized_prompts.empty()) {
+        res->error(format_error_response("\"input\" must not be empty", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {
