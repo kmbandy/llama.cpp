@@ -572,6 +572,38 @@ static void test_freq_admission_hot_page_resists_a_cold_scan() {
     require(arena.admission_cold_landed() >= 64, "every cold-scan page went through the loss path");
 }
 
+// lfu_eviction: with tier_bytes = 2 slots, pages 0 and 1 resident and page 0
+// (the LRU front) hit repeatedly, a new page must evict the low-frequency
+// page 1 instead of the oldest page 0; plain LRU (lfu off) evicts page 0.
+static void run_lfu_case(bool lfu, bool & front_survived, uint64_t & nonfront) {
+    CountingAlloc a;
+    HostArena::Config c = cfg(8);
+    c.tier_bytes      = 2 * ENTRY;
+    c.lfu_eviction    = lfu;
+    c.freq_admission  = false;
+    c.sketch_width    = 64;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+    read_page(arena, 0);
+    read_page(arena, 1);
+    for (int i = 0; i < 4; ++i) require(hit_page(arena, 0), "hot hit");
+    // hit_page touches 0 to MRU; re-touch 1 so 0 is the LRU front again.
+    require(hit_page(arena, 1), "touch 1");
+    read_page(arena, 2);
+    front_survived = arena.state_of(0) == HostArena::State::Resident;
+    nonfront = arena.evictions_lfu_nonfront();
+}
+
+static void test_lfu_evicts_low_frequency_not_lru_front() {
+    bool survived = false; uint64_t nf = 0;
+    run_lfu_case(true, survived, nf);
+    require(survived, "lfu must keep the high-frequency LRU-front page");
+    require(nf == 1, "lfu pick that differs from the LRU front is counted");
+    run_lfu_case(false, survived, nf);
+    require(!survived, "plain LRU evicts the oldest page regardless of frequency");
+    require(nf == 0, "lfu counter stays 0 with the policy off");
+}
+
 // freq_admission=false (the default, unset in cfg()) must be exactly the
 // pre-existing behaviour: admission_cold_landed() stays 0 even under the
 // same pressure that exercises it above.
@@ -1059,6 +1091,7 @@ int main() {
         test_freq_admission_speculative_never_evicts_demand();
         test_freq_admission_off_speculative_can_still_evict_demand();
         test_freq_admission_off_never_touches_admission_counters();
+        test_lfu_evicts_low_frequency_not_lru_front();
         test_protect_demand_from_spec_speculative_never_evicts_demand();
         test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand();
         test_mark_drop_frees_when_idle();

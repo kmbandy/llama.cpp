@@ -38,7 +38,7 @@ bool HostArena::init(const Config & cfg, Allocator alloc, Deallocator dealloc) {
 
     initialized_ = !entries_.empty();
 
-    if (cfg_.freq_admission && initialized_) {
+    if ((cfg_.freq_admission || cfg_.lfu_eviction) && initialized_) {
         sketch_.assign((size_t) kSketchRows * std::max<size_t>(cfg_.sketch_width, 1), 0);
         // Aging period: halve every counter after this many record() calls,
         // same shape as the WP_EXPERT_LFU_HALFLIFE / doorkeeper_lru sim
@@ -46,7 +46,9 @@ bool HostArena::init(const Config & cfg, Allocator alloc, Deallocator dealloc) {
         // rather than sketch width, so a bigger sketch doesn't make aging
         // slower. Floor of 4096 keeps a tiny test arena from aging on
         // nearly every record.
-        sketch_period_ = std::max<uint64_t>(8 * entries_.size(), 4096);
+        sketch_period_ = cfg_.lfu_eviction && cfg_.lfu_age_period > 0
+                             ? cfg_.lfu_age_period
+                             : std::max<uint64_t>(8 * entries_.size(), 4096);
     }
 
     return initialized_;
@@ -77,6 +79,7 @@ void HostArena::shutdown() {
     evictions_spec_       = 0;
     evictions_reject_     = 0;
     evictions_lru_        = 0;
+    evictions_lfu_nonfront_ = 0;
     spec_evicted_unused_  = 0;
     spec_promotions_      = 0;
     reject_promotions_    = 0;
@@ -347,8 +350,28 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
         }
     }
     if (!found && scope == EvictScope::Any) {
-        for (size_t cand : lru_) {
-            if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::Lru; break; }
+        if (cfg_.lfu_eviction) {
+            // lfu: of the first lfu_sample evictable entries from the LRU
+            // (oldest) end, evict the lowest sketch estimate; strict '<'
+            // keeps ties on the oldest. Borrowed entries are skipped in
+            // place and don't count toward the sample.
+            const size_t K = std::max<size_t>(cfg_.lfu_sample, 1);
+            size_t seen = 0, first_idx = 0;
+            uint32_t best_f = 0;
+            for (size_t cand : lru_) {
+                if (entries_[cand].borrows != 0) continue;
+                const uint32_t f = sketch_estimate_locked_(entries_[cand].page_idx);
+                if (seen == 0) { first_idx = cand; idx = cand; best_f = f; }
+                else if (f < best_f) { idx = cand; best_f = f; }
+                found = true;
+                from  = ListLoc::Lru;
+                if (++seen >= K) break;
+            }
+            if (found && idx != first_idx) ++evictions_lfu_nonfront_;
+        } else {
+            for (size_t cand : lru_) {
+                if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::Lru; break; }
+            }
         }
     }
     if (!found) return false;
@@ -591,7 +614,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
     // admit_landed_locked_) actually every access exactly once: a page
     // either hits (borrow() records) or misses and reserves here (this
     // records) -- never both for the same access.
-    if (cfg_.freq_admission && !speculative) {
+    if ((cfg_.freq_admission || cfg_.lfu_eviction) && !speculative) {
         sketch_record_locked_(page_idx);
     }
 
@@ -677,7 +700,7 @@ bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out,
     ++e.borrows;
     e.ever_borrowed = true;   // any borrow, demand or peek, counts as "used"
 
-    if (cfg_.freq_admission && demand) {
+    if ((cfg_.freq_admission || cfg_.lfu_eviction) && demand) {
         // Every real demand hit grows the page's persistent frequency --
         // this (not the per-Entry LRU touch, which is forgotten on
         // eviction) is what lets a hot decode expert keep winning admission
@@ -920,6 +943,8 @@ uint64_t HostArena::admission_cold_landed() const { std::lock_guard<std::mutex> 
 uint64_t HostArena::evictions_spec()   const { std::lock_guard<std::mutex> lock(mu_); return evictions_spec_; }
 uint64_t HostArena::evictions_reject() const { std::lock_guard<std::mutex> lock(mu_); return evictions_reject_; }
 uint64_t HostArena::evictions_lru()    const { std::lock_guard<std::mutex> lock(mu_); return evictions_lru_; }
+uint64_t HostArena::sketch_period() const { std::lock_guard<std::mutex> lock(mu_); return sketch_period_; }
+uint64_t HostArena::evictions_lfu_nonfront() const { std::lock_guard<std::mutex> lock(mu_); return evictions_lfu_nonfront_; }
 uint64_t HostArena::reject_promotions() const { std::lock_guard<std::mutex> lock(mu_); return reject_promotions_; }
 uint64_t HostArena::spec_promotions_rejected() const { std::lock_guard<std::mutex> lock(mu_); return spec_promotions_rejected_; }
 uint64_t HostArena::lookups()     const { std::lock_guard<std::mutex> lock(mu_); return lookups_; }

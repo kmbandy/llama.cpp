@@ -76,6 +76,19 @@ public:
         // (4 * 65536 bytes at the default) but exposed for the unit tests
         // to exercise aging on a small sketch without a slow test.
         size_t sketch_width    = 65536;
+        // WP_HOST_TIER_POLICY=lfu in the worker. Default false: byte-for-byte
+        // plain LRU. When true, the demand lru_ eviction step picks the
+        // LOWEST sketch estimate among the first lfu_sample evictable
+        // entries from the LRU (oldest) end instead of the front, for ALL
+        // demand traffic (prefill and decode); admission is never gated
+        // (every landing is MRU as in plain LRU). Shares freq_admission's
+        // sketch, recorded at the same demand-access points; mutually
+        // exclusive with freq_admission at the worker's env parse.
+        bool   lfu_eviction    = false;
+        size_t lfu_sample      = 16;
+        // Sketch aging period override (records between halvings) for lfu.
+        // 0 = the default derived in init() (max(8 * entries, 4096)).
+        uint64_t lfu_age_period = 0;
         // WP_HOST_TIER_PROTECT_DEMAND in the worker. Default false: byte-
         // for-byte unchanged (see test_freq_admission_off_speculative_can_
         // still_evict_demand). When true, narrows a SPECULATIVE begin_read's
@@ -270,6 +283,12 @@ public:
     uint64_t evictions_spec()   const;
     uint64_t evictions_reject() const;
     uint64_t evictions_lru()    const;
+    // lfu_eviction only: demand lru_ evictions where the lowest-frequency
+    // pick was NOT the LRU-front evictable entry (the policy actually
+    // changed the choice). Always 0 when the policy is off.
+    uint64_t evictions_lfu_nonfront() const;
+    // Sketch aging period in effect (0 when no sketch is allocated).
+    uint64_t sketch_period() const;
     // freq_admission only: a demand hit promoted an entry out of
     // reject_lru_ into lru_ (parallel to spec_promotions()).
     uint64_t reject_promotions() const;
@@ -430,6 +449,7 @@ private:
     uint64_t evictions_spec_      = 0;
     uint64_t evictions_reject_    = 0;
     uint64_t evictions_lru_       = 0;
+    uint64_t evictions_lfu_nonfront_ = 0;
     uint64_t spec_evicted_unused_ = 0;
     uint64_t spec_promotions_     = 0;
     uint64_t reject_promotions_   = 0;

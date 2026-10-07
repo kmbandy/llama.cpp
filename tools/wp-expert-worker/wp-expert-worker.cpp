@@ -2145,7 +2145,9 @@ public:
                        uint64_t lookups, uint64_t lookup_hits,
                        uint64_t evictions_spec, uint64_t evictions_reject,
                        uint64_t evictions_lru, uint64_t reject_promotions,
-                       uint64_t spec_promotions_rejected) {
+                       uint64_t spec_promotions_rejected,
+                       uint64_t evictions_lfu_nonfront = 0) {
+        ram_evictions_lfu_nonfront_ = evictions_lfu_nonfront;
         ram_spec_landed_    = spec_landed;
         ram_resident_bytes_ = resident_bytes;
         ram_pinned_bytes_   = pinned_bytes;
@@ -2433,6 +2435,9 @@ private:
                   // reject_lru_ keeps churning by design (see
                   // HostArena::admit_landed_locked_'s 2026-09-25 revision).
                   << " ram_evictions_lru=" << ram_evictions_lru_
+                  // lfu picks that were not the LRU front (policy changed
+                  // the choice); 0 unless WP_HOST_TIER_POLICY=lfu.
+                  << " ram_evictions_lfu_nonfront=" << ram_evictions_lfu_nonfront_
                   << " ram_admission_cold_landed=" << ram_admission_cold_landed_
                   << " ram_reject_promotions=" << ram_reject_promotions_
                   << " ram_spec_promotions_rejected=" << ram_spec_promotions_rejected_
@@ -2685,6 +2690,7 @@ private:
     uint64_t           ram_evictions_spec_    = 0;
     uint64_t           ram_evictions_reject_  = 0;
     uint64_t           ram_evictions_lru_     = 0;
+    uint64_t           ram_evictions_lfu_nonfront_ = 0;
     uint64_t           ram_reject_promotions_ = 0;
     uint64_t           ram_spec_promotions_rejected_ = 0;
     uint64_t          n_host_hit_ = 0;
@@ -15589,7 +15595,8 @@ public:
                                  arena.lookups(), arena.lookup_hits(),
                                  arena.evictions_spec(), arena.evictions_reject(),
                                  arena.evictions_lru(), arena.reject_promotions(),
-                                 arena.spec_promotions_rejected());
+                                 arena.spec_promotions_rejected(),
+                                 arena.evictions_lfu_nonfront());
             stats_.set_victim_stats(pool_.n_victim_demoted(), pool_.n_victim_skipped(),
                                     pool_.ns_victim_demote(), arena.drops(), pool_.ns_victim_wait());
         }
@@ -22596,6 +22603,21 @@ public:
             // it converges instead of thrashing.
             if (const char * e = std::getenv("WP_HOST_TIER_POLICY")) {
                 cfg.freq_admission = std::strcmp(e, "freq_admit") == 0;
+                // lfu: frequency-based RAM-tier EVICTION for all demand
+                // traffic (no admission gating); mutually exclusive with
+                // freq_admit (same env var). Only reorders which RAM-tier
+                // page is evicted -- never CPU-tier membership.
+                cfg.lfu_eviction = std::strcmp(e, "lfu") == 0;
+            }
+            if (cfg.lfu_eviction) {
+                if (const char * e = std::getenv("WP_HOST_TIER_LFU_SAMPLE")) {
+                    const long v = std::strtol(e, nullptr, 10);
+                    if (v > 0) cfg.lfu_sample = (size_t) v;
+                }
+                if (const char * e = std::getenv("WP_HOST_TIER_LFU_AGE_PERIOD")) {
+                    const long long v = std::strtoll(e, nullptr, 10);
+                    if (v > 0) cfg.lfu_age_period = (uint64_t) v;
+                }
             }
             // WP_HOST_TIER_PROTECT_DEMAND=1: default off. Narrows a
             // speculative begin_read's reservation-time eviction fallback
@@ -22753,6 +22775,14 @@ public:
                           << " tier_mb=" << (cfg.tier_bytes >> 20)
                           << " entries=" << arena_.entry_count()
                           << " sketch_width=" << cfg.sketch_width << std::endl;
+            }
+            if (cfg.lfu_eviction) {
+                std::cerr << "wp::HostArena: WP_HOST_TIER_POLICY=lfu engaged"
+                          << " sample=" << cfg.lfu_sample
+                          << " age_period=" << arena_.sketch_period()
+                          << " tier_mb=" << (cfg.tier_bytes >> 20)
+                          << " entries=" << arena_.entry_count()
+                          << " sketch=" << 4 << "x" << cfg.sketch_width << std::endl;
             }
             arena_inflight_max_ = (size_t) cfg.read_inflight_max;
             if (test_hooks != nullptr && test_hooks->arena_ready) {
