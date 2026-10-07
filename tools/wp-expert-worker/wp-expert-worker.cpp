@@ -1,3 +1,4 @@
+#include "pipe-ml8-pack-cpu.h"
 #include "wp-expert-worker.h"
 
 #include "ggml.h"
@@ -15161,6 +15162,21 @@ public:
             finish_cpu_tier(cpu_job, sum, request_stats);
             cpu_job.reset();
             ml8_wire_partial_.clear();   // the encoder packs the full f32 sum
+            // WP_EXPERT_WIRE_CPU_PACK=1 (opt-in): pack the merged sum here on the CPU with
+            // a pack that is bit-identical to the GPU kernel (pipe-ml8-pack-cpu.h,
+            // tests/test-ml8-4-pack-cpu-vs-gpu.cpp). The encoder then ships these bytes
+            // via response.wire_bytes and never takes the GPU pack + global mutex +
+            // stream sync on the response critical path. Default off = unchanged.
+            static const bool cpu_pack = [] {
+                const char * k = std::getenv("WP_EXPERT_WIRE_CPU_PACK");
+                const char * w = std::getenv("WP_EXPERT_WIRE");
+                return k != nullptr && k[0] == '1' && w != nullptr &&
+                       (std::strcmp(w, "ml8_4") == 0 || std::strcmp(w, "ml8-4") == 0);
+            }();
+            if (cpu_pack && !sum.empty() && sum.size() % 32 == 0) {
+                ml8_wire_partial_.resize((sum.size() / 32) * 18);
+                pipe_ml8::pack_ml8_4(ml8_wire_partial_.data(), sum.data(), sum.size());
+            }
         }
         if (FILE * plog = wp_placement_log_file()) {
             std::string line = std::to_string((unsigned long long) trace_req) + " " +
