@@ -8,6 +8,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace pipe_expert_dispatcher {
@@ -181,6 +182,55 @@ float router2_margin_late() {
         return f > 0.0f ? f : 0.0f;
     }();
     return value;
+}
+
+namespace {
+// Comma list -> one optional double per element (nullopt = empty / "-" / unparsable).
+std::vector<std::pair<bool, double>> parse_by_d(const char * name) {
+    std::vector<std::pair<bool, double>> out;
+    const char * e = std::getenv(name);
+    if (e == nullptr || e[0] == '\0') {
+        return out;
+    }
+    std::string s(e);
+    size_t      pos = 0;
+    while (pos <= s.size()) {
+        size_t      end = s.find(',', pos);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        const std::string tok = s.substr(pos, end - pos);
+        char *            endp = nullptr;
+        const double      v    = std::strtod(tok.c_str(), &endp);
+        out.emplace_back(!tok.empty() && endp != tok.c_str() && v >= 0.0, v);
+        pos = end + 1;
+    }
+    return out;
+}
+}  // namespace
+
+float router2_margin_for_d(int32_t d) {
+    static const auto list = parse_by_d("WP_HINT_ROUTER2_MARGIN_BY_D");
+    if (d >= 1 && (size_t) d <= list.size() && list[(size_t) d - 1].first) {
+        return (float) list[(size_t) d - 1].second;
+    }
+    return router2_margin();
+}
+
+float router2_margin_late_for_d(int32_t d) {
+    static const bool late_set = [] {
+        const char * e = std::getenv("WP_HINT_ROUTER2_MARGIN_LATE");
+        return e != nullptr && e[0] != '\0';
+    }();
+    return late_set ? router2_margin_late() : router2_margin_for_d(d);
+}
+
+int32_t router2_topm_for_d(int32_t d, int32_t base_top_m) {
+    static const auto list = parse_by_d("WP_HINT_ROUTER2_TOPM_BY_D");
+    if (d >= 1 && (size_t) d <= list.size() && list[(size_t) d - 1].first && list[(size_t) d - 1].second >= 1.0) {
+        return std::min<int32_t>(PREFETCH_HINT_MAX_EXPERTS, (int32_t) list[(size_t) d - 1].second);
+    }
+    return base_top_m;
 }
 
 std::vector<int32_t> router2_top_experts(const float * weights,

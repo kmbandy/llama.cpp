@@ -74,6 +74,21 @@ std::vector<int32_t> router2_top_experts(const float * weights,
 float router2_margin();
 float router2_margin_late();
 
+// Per-DISTANCE overrides for the row-tier scorer (default off = the single
+// margin / top-M above, byte-for-byte). `d` is the target distance in layers
+// (target layer - source layer). Precision rises steeply with the margin and
+// falls with distance, so a near target wants a low margin and a far one a high
+// margin:
+//   WP_HINT_ROUTER2_MARGIN_BY_D="m1,m2,m3,..."  element i is distance i+1;
+//       an empty / "-" element (or a distance past the list) keeps the default
+//       margin; an explicit 0 turns the gate off for that distance.
+//   WP_HINT_ROUTER2_TOPM_BY_D="t1,t2,..."       same indexing; a value > 0 replaces
+//       top-M for that distance (clamped to PREFETCH_HINT_MAX_EXPERTS).
+// margin_late_for_d follows margin_for_d unless WP_HINT_ROUTER2_MARGIN_LATE is set.
+float   router2_margin_for_d(int32_t d);
+float   router2_margin_late_for_d(int32_t d);
+int32_t router2_topm_for_d(int32_t d, int32_t base_top_m);
+
 // ROW-AWARE variant of router2_top_experts. Instead of one union capped by
 // votes, return one ascending TIER per verify row, in priority order: tier 0
 // is row 0's top-`row_cap` (0 = top_m) experts, tier r is row r's picks not

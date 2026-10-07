@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -225,6 +226,21 @@ void test_pscore(const fs::path & path) {
     require(!parse_pscore_file(path.string(), m, &err) && !err.empty(), "pscore must reject bad factor");
 }
 
+// Per-distance margin / top-M overrides (WP_HINT_ROUTER2_MARGIN_BY_D / _TOPM_BY_D).
+// The env is parsed once on first use, so main() sets it before anything calls these.
+void test_router2_per_distance_knobs() {
+    const float base = router2_margin();
+    require(std::abs(router2_margin_for_d(1) - 0.3f) < 1e-6f, "margin_by_d element 1");
+    require(router2_margin_for_d(2) == base, "empty element keeps the default margin");
+    require(std::abs(router2_margin_for_d(3) - 0.5f) < 1e-6f, "margin_by_d element 3");
+    require(router2_margin_for_d(4) == 0.0f, "explicit 0 turns the gate off for that distance");
+    require(router2_margin_for_d(5) == base && router2_margin_for_d(0) == base, "outside the list -> default");
+    require(std::abs(router2_margin_late_for_d(3) - 0.5f) < 1e-6f, "late margin follows the per-d margin when unset");
+    require(router2_topm_for_d(1, 6) == 6 && router2_topm_for_d(2, 6) == 10, "topm_by_d override");
+    require(router2_topm_for_d(3, 6) == PREFETCH_HINT_MAX_EXPERTS, "topm_by_d clamps to the wire cap");
+    require(router2_topm_for_d(4, 6) == 6, "past the list -> base top-M");
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2) {
         const ngram_hint_table table(argv[1]);
@@ -235,8 +251,12 @@ int main(int argc, char ** argv) {
         return 0;
     }
     require(argc == 1, "usage: test-wp-prefetch-hints [table]");
+    setenv("WP_HINT_ROUTER2_MARGIN_BY_D", "0.3,,0.5,0", 1);
+    setenv("WP_HINT_ROUTER2_TOPM_BY_D", "-,10,99", 1);
+    unsetenv("WP_HINT_ROUTER2_MARGIN_LATE");
     const fs::path path = fs::temp_directory_path() / ("wp-prefetch-hints-" + std::to_string((long) getpid()) + ".bin");
     try {
+        test_router2_per_distance_knobs();
         test_router2_per_token_union();
         test_router2_confidence_gate();
         test_ngram_format_and_scoring(path);

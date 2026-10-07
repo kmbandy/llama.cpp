@@ -202,6 +202,12 @@ class graph_dispatcher {
     // RAISED floor, because prediction quality decays with distance and the
     // whole-expert measurements showed the tail is where the wasted bytes are.
     static int   router2_lookahead();
+    // First target distance scored (WP_HINT_ROUTER2_DMIN, default 2, clamp >= 1):
+    // targets are L+DMIN .. L+DMIN+K-1. Default 2 skips d=1 because the scorer's
+    // result ships at the NEXT layer's entry (see compute()), so a d=1 hint reaches
+    // the worker no earlier than the request for its own layer. Row-tier scorer only
+    // (the PSCORE path always starts at d=2).
+    static int   router2_dmin();
     // Added to the floor per extra layer of depth (WP_HINT_ROUTER2_CONF_STEP,
     // default 0.05).
     static float router2_conf_step();

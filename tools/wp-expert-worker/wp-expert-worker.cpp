@@ -7761,9 +7761,14 @@ public:
             return;
         }
         static const size_t cap = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_MAX", 80);
+        // WP_EXPERT_CPU_TIER_PREFETCH_PER_LAYER=B (default 0 = off, the global
+        // per-step cap above): bound the pages queued per TARGET layer per step
+        // instead. The global cap is spent on whichever layers' hints arrive
+        // first, which starves the later layers of the step.
+        static const size_t per_layer = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_PER_LAYER", 0);
         {
             std::lock_guard<std::mutex> lock(pf_mu_);
-            if (pf_step_count_ >= cap) {
+            if (per_layer != 0 ? pf_layer_count_[page.layer] >= per_layer : pf_step_count_ >= cap) {
                 n_pf_capped_.fetch_add(1, std::memory_order_relaxed);
                 pf_log(page, "dropped");
                 return;
@@ -7776,6 +7781,9 @@ public:
             pf_q_.push_back(PfItem{&page, fd});
             attr_set(page.cache_id, kAttrQueued);
             ++pf_step_count_;
+            if (per_layer != 0) {
+                ++pf_layer_count_[page.layer];
+            }
             // Readers start lazily, one more per enqueue until the cap, so a
             // run that never prefetches never spawns any. pf_threads_ is only
             // touched under pf_mu_ (here) and in stop_cpu_pf (join, after
@@ -8108,6 +8116,7 @@ public:
             if (layer < current_layer_) {
                 std::lock_guard<std::mutex> lock(pf_mu_);
                 pf_step_count_ = 0;
+                pf_layer_count_.clear();
             }
             pf_layer_.store(layer, std::memory_order_relaxed);
         }
@@ -11231,6 +11240,7 @@ private:
     std::vector<std::thread>        pf_threads_;
     bool                            pf_stop_ = false;
     size_t                          pf_step_count_ = 0;
+    std::unordered_map<int32_t, size_t> pf_layer_count_;   // pages queued this step per target layer (PER_LAYER mode)
     std::atomic<int32_t>            pf_layer_{-1};
     std::atomic<uint64_t>           n_pf_issued_{0};
     std::atomic<uint64_t>           n_pf_landed_{0};
@@ -11514,8 +11524,27 @@ private:
                 if (pf_stop_) {
                     return;
                 }
-                it = pf_q_.front();
-                pf_q_.pop_front();
+                // WP_EXPERT_CPU_TIER_PREFETCH_ORDER=soonest (default fifo): read the
+                // queued page whose layer is nearest next (ties keep arrival
+                // order) instead of strict arrival order, so a page that is
+                // needed in two layers is not held up by one needed in five.
+                static const bool soonest = [] {
+                    const char * e = std::getenv("WP_EXPERT_CPU_TIER_PREFETCH_ORDER");
+                    return e != nullptr && std::strcmp(e, "soonest") == 0;
+                }();
+                if (soonest) {
+                    auto best = pf_q_.begin();
+                    for (auto q = pf_q_.begin(); q != pf_q_.end(); ++q) {
+                        if (q->page->layer < best->page->layer) {
+                            best = q;
+                        }
+                    }
+                    it = *best;
+                    pf_q_.erase(best);
+                } else {
+                    it = pf_q_.front();
+                    pf_q_.pop_front();
+                }
                 pf_active_.fetch_add(1, std::memory_order_relaxed);
             }
             struct PfActiveGuard {
@@ -22642,6 +22671,17 @@ public:
                 const long v = std::strtol(e, nullptr, 10);
                 if (v >= 0 && v <= 100) {
                     cfg.spec_frac_pct = (int) v;
+                }
+            }
+            // WP_HOST_ARENA_SPEC_PROTECT_PCT (default 0 = off): demand landings and the
+            // tier_bytes trim leave the landed speculative segment alone while it holds
+            // <= this % of the arena's entries (they take a demand/reject victim
+            // instead of the oldest spec entry). See
+            // wp::HostArena::Config::spec_protect_pct. RAM-arena contents only.
+            if (const char * e = std::getenv("WP_HOST_ARENA_SPEC_PROTECT_PCT")) {
+                const long v = std::strtol(e, nullptr, 10);
+                if (v >= 0 && v <= 100) {
+                    cfg.spec_protect_pct = (int) v;
                 }
             }
             // WP_EXPERT_CPU_TIER_PF_QUARANTINE=1 (default 0 = old behavior):

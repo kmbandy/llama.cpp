@@ -1257,6 +1257,17 @@ int graph_dispatcher::router2_lookahead() {
     return value;
 }
 
+int graph_dispatcher::router2_dmin() {
+    static const int value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_DMIN");
+        if (v == nullptr || v[0] == '\0') {
+            return 2;
+        }
+        return std::min(64, std::max(1, std::atoi(v)));
+    }();
+    return value;
+}
+
 bool graph_dispatcher::router2_row_quota() {
     static const bool value = [] {
         const char * v = std::getenv("WP_HINT_ROUTER2_ROW_QUOTA");
@@ -1350,7 +1361,7 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
         }
         bool any_target = false;
         for (int d = 0; d < router2_lookahead(); ++d) {
-            if (routers_.find(layer + 2 + d) != routers_.end()) {
+            if (routers_.find(layer + router2_dmin() + d) != routers_.end()) {
                 any_target = true;
                 break;
             }
@@ -1760,7 +1771,8 @@ void graph_dispatcher::predictor_loop() {
             // (M, conf) at depth 3 spends real bandwidth on noise -- and on this
             // rig speculative bytes compete with demand reads for the same queue.
             for (int d = 0; d < K; ++d) {
-                const int32_t target = job.layer + 2 + d;
+                const int32_t dist   = router2_dmin() + d;   // default 2: L+2 .. L+K+1
+                const int32_t target = job.layer + dist;
                 const auto    it     = routers_.find(target);
                 if (it == routers_.end()) {
                     continue;
@@ -1776,7 +1788,7 @@ void graph_dispatcher::predictor_loop() {
                 // At K=36 the old rule emitted 6,3,1,1,1... i.e. one expert against
                 // a layer needing six, which cannot prevent a single page-in.
                 // WP_HINT_ROUTER2_DEPTH_DECAY=1 restores the old behaviour for A/B.
-                const int32_t m = s_depth_decay ? std::max(1, base_m >> d) : base_m;
+                const int32_t m = router2_topm_for_d(dist, s_depth_decay ? std::max(1, base_m >> d) : base_m);
                 // Clamp at 1.0 -- the bound of a PROBABILITY -- not at an
                 // arbitrary 0.99. The whole-expert pager hardcodes 0.99 here
                 // (wp-pager.cpp:838 and :960) and that ceiling silently
@@ -1797,7 +1809,8 @@ void graph_dispatcher::predictor_loop() {
                     tiers = router2_row_tiers(
                         rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
                         n_expert, n_embd, m, router2_row_cap(), conf,
-                        router2_margin(), router2_margin_late(), router2_total_cap(), scratch);
+                        router2_margin_for_d(dist), router2_margin_late_for_d(dist),
+                        router2_total_cap(), scratch);
                     for (const std::vector<int32_t> & tier : tiers) {
                         experts.insert(experts.end(), tier.begin(), tier.end());
                     }

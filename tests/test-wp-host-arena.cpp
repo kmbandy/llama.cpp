@@ -1067,6 +1067,70 @@ static void test_spec_tags_count_outcomes() {
     require(arena.spec_used_tag(0) + arena.spec_unused_tag(0) == 0, "untagged side untouched");
 }
 
+// Config::spec_protect_pct: a DEMAND-driven eviction leaves the landed
+// speculative segment alone while it is within its protected size, and takes the
+// oldest demand entry instead; default 0 keeps "spec is always the first victim".
+static void test_spec_protect_pct_demand_eviction_spares_spec_segment() {
+    for (int protect : {0, 25}) {
+        CountingAlloc a;
+        HostArena arena;
+        HostArena::Config c = cfg(8);
+        c.spec_frac_pct    = 50;
+        c.spec_protect_pct = protect;   // 25% of 8 entries = 2 protected spec entries
+        require(arena.init(c, a.alloc(), a.dealloc()), "init");
+        void * data; HostArena::Handle h;
+        for (int p = 0; p < 6; ++p) {
+            require(arena.begin_read(p, false, &data, &h), "demand fill");
+            arena.finish_read(p, h, true);
+        }
+        for (int p = 100; p < 102; ++p) {
+            require(arena.begin_read(p, true, &data, &h), "spec fill");
+            arena.finish_read(p, h, true);
+        }
+        require(arena.resident_count() == 8 && arena.spec_bytes() == 2 * ENTRY, "arena full, 2 spec");
+        require(arena.begin_read(6, false, &data, &h), "demand landing on a full arena");
+        arena.finish_read(6, h, true);
+        if (protect == 0) {
+            require(!arena.is_resident(100) && arena.is_resident(0),
+                    "default: the oldest spec entry is the first victim of a demand landing");
+        } else {
+            require(arena.is_resident(100) && arena.is_resident(101),
+                    "protected: spec segment survives a demand landing");
+            require(!arena.is_resident(0), "protected: the oldest demand entry was evicted instead");
+            // Over the floor (3 spec > 2): spec is evictable again.
+            require(arena.begin_read(102, true, &data, &h), "third spec reservation");
+            arena.finish_read(102, h, true);
+            require(arena.begin_read(7, false, &data, &h), "demand landing with spec over its floor");
+            arena.finish_read(7, h, true);
+            require(arena.spec_bytes() == 2 * ENTRY && !arena.is_resident(100),
+                    "over the floor, a demand landing recycles the oldest spec entry");
+        }
+        arena.shutdown();
+    }
+}
+
+// The protection never refuses a demand read: with every demand entry pinned the
+// protected spec entry is still taken.
+static void test_spec_protect_pct_falls_back_to_spec_when_nothing_else() {
+    CountingAlloc a;
+    HostArena arena;
+    HostArena::Config c = cfg(4);
+    c.spec_frac_pct    = 50;
+    c.spec_protect_pct = 50;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+    void * data; HostArena::Handle h;
+    for (int p = 0; p < 3; ++p) {
+        require(arena.begin_read(p, false, &data, &h), "demand fill");
+        arena.finish_read(p, h, true);
+        require(arena.pin(p), "pin demand entry");
+    }
+    require(arena.begin_read(100, true, &data, &h), "spec fill");
+    arena.finish_read(100, h, true);
+    require(arena.begin_read(9, false, &data, &h), "demand read still succeeds");
+    arena.finish_read(9, h, true);
+    require(!arena.is_resident(100) && arena.is_resident(9), "protected spec entry was the only victim");
+}
+
 int main() {
     try {
         test_init_chunked_and_shrink_on_failure();
@@ -1096,6 +1160,8 @@ int main() {
         test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand();
         test_mark_drop_frees_when_idle();
         test_spec_tags_count_outcomes();
+        test_spec_protect_pct_demand_eviction_spares_spec_segment();
+        test_spec_protect_pct_falls_back_to_spec_when_nothing_else();
         std::cout << "test-wp-host-arena: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

@@ -125,6 +125,23 @@ public:
         // confirms the entry out of the quarantine.
         bool   pf_quarantine     = false;
         int    pf_quarantine_pct = 10;   // % of the tier (tier_bytes/entry_bytes, else all entries)
+        // WP_HOST_ARENA_SPEC_PROTECT_PCT in the worker. Default 0 = off,
+        // byte-for-byte the eviction order above (spec_lru_ is ALWAYS the first
+        // victim of every eviction, including the ones a DEMAND landing or the
+        // tier_bytes trim triggers). Under continuous prefetch with a full arena
+        // that makes every landing -- ~60 demand page-ins per decode step on
+        // DS4.1 -- evict the oldest unconfirmed speculative entry, so a
+        // prefetched page lives only a few landings (measured: 86% of landed
+        // prefetches evicted unused). When > 0, a DEMAND-driven eviction (a
+        // non-speculative begin_read, or the tier_bytes trim) skips spec_lru_
+        // while the landed-speculative population is <= this % of the arena's
+        // entries and takes the reject_lru_/lru_ victim instead, i.e. a fixed
+        // protected speculative segment. A speculative reservation still
+        // recycles spec entries first (and spec_frac_pct still caps the total),
+        // and a demand eviction falls back to spec_lru_ if nothing else is
+        // evictable, so this can never refuse a demand read that would have
+        // succeeded. Only changes which RAM-arena page is resident.
+        int    spec_protect_pct  = 0;
     };
     // alloc(bytes) returns 4096-aligned memory or nullptr; free(ptr, bytes).
     using Allocator   = std::function<void *(size_t)>;
@@ -373,7 +390,7 @@ private:
     // list, and reject_lru_/spec_lru_ ahead of lru_ across lists.
     enum class EvictScope { Any, SpecOnly, SpecOrReject };
 
-    bool     evict_one_locked_(EvictScope scope);
+    bool     evict_one_locked_(EvictScope scope, bool for_demand = false);
     void     trim_to_tier_cap_locked_();
     // Caller holds mu_. Frees a Resident, unborrowed, unpinned entry flagged
     // drop_when_idle; returns whether it did.

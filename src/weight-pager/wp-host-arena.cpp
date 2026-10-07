@@ -336,13 +336,19 @@ void HostArena::admit_landed_locked_(size_t idx, bool prefill_hint) {
 // rather than falling back to lru_, because a speculative read must never
 // steal room from a confirmed demand page just to seat a guess (see the
 // .h EvictScope comment).
-bool HostArena::evict_one_locked_(EvictScope scope) {
+bool HostArena::evict_one_locked_(EvictScope scope, bool for_demand) {
     size_t idx   = 0;
     bool   found = false;
     ListLoc from = ListLoc::None;
 
-    for (size_t cand : spec_lru_) {
-        if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::SpecLru; break; }
+    // spec_protect_pct: a demand-driven eviction leaves the landed speculative
+    // segment alone while it is within its protected size (see Config).
+    const bool protect_spec = for_demand && cfg_.spec_protect_pct > 0 && scope == EvictScope::Any &&
+        spec_bytes_ <= entries_.size() * (size_t) cfg_.spec_protect_pct / 100 * cfg_.entry_bytes;
+    if (!protect_spec) {
+        for (size_t cand : spec_lru_) {
+            if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::SpecLru; break; }
+        }
     }
     if (!found && scope != EvictScope::SpecOnly) {
         for (size_t cand : reject_lru_) {
@@ -372,6 +378,13 @@ bool HostArena::evict_one_locked_(EvictScope scope) {
             for (size_t cand : lru_) {
                 if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::Lru; break; }
             }
+        }
+    }
+    if (!found && protect_spec) {
+        // Nothing but protected speculative entries left: a demand read must
+        // not be refused for the sake of the guess segment.
+        for (size_t cand : spec_lru_) {
+            if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::SpecLru; break; }
         }
     }
     if (!found) return false;
@@ -594,7 +607,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
         if (!free_.empty()) {
             idx = free_.back();
             free_.pop_back();
-        } else if (evict_one_locked_(EvictScope::Any)) {
+        } else if (evict_one_locked_(EvictScope::Any, /*for_demand=*/true)) {
             idx = free_.back();
             free_.pop_back();
         } else {
@@ -853,7 +866,7 @@ uint64_t HostArena::spec_unused_tag(uint8_t tag) const {
 // evictable.
 void HostArena::trim_to_tier_cap_locked_() {
     while (resident_bytes_ - pinned_bytes_ > cfg_.tier_bytes) {
-        if (!evict_one_locked_(EvictScope::Any)) break;
+        if (!evict_one_locked_(EvictScope::Any, /*for_demand=*/true)) break;
     }
 }
 
