@@ -4071,6 +4071,7 @@ bool parse_reader_cpu_spec(const char * spec, const char * device_name, cpu_set_
 // Set once by apply_other_cpus_early() (WP_EXPERT_OTHER_CPUS). Declared here so
 // the per-thread affinity paths below can yield to it instead of widening it.
 bool g_other_cpus_active = false;
+cpu_set_t g_other_set;
 
 void apply_reader_cpu_affinity(const cpu_set_t * set, bool enabled) {
     if (!enabled || set == nullptr) {
@@ -4388,6 +4389,38 @@ std::string cpu_set_to_string(const cpu_set_t & set) {
     return out;
 }
 
+// Re-confine every thread that is not a CPU-tier team thread to the
+// WP_EXPERT_OTHER_CPUS mask. Some runtimes (ROCr's kfd event threads) widen their
+// own affinity to the whole machine after main(), so inheritance alone is not
+// enough. Team threads are recognised by their affinity: ggml pins each one to
+// exactly ONE CPU inside WP_EXPERT_CPU_TIER_CPUS, which nothing else does, so
+// they are skipped (no tid registry needed, and it holds for any team size).
+void sweep_other_cpus() {
+#if defined(__linux__)
+    if (!g_other_cpus_active) { return; }
+    bool tier[GGML_MAX_N_THREADS];
+    std::memset(tier, 0, sizeof(tier));
+    const char * t = std::getenv("WP_EXPERT_CPU_TIER_CPUS");
+    const bool have_tier = t != nullptr && t[0] != '\0' && parse_cpu_list(t, tier);
+    int n_moved = 0;
+    std::error_code ec;
+    for (const auto & ent : fs::directory_iterator("/proc/self/task", ec)) {
+        const pid_t tid = (pid_t) std::atoi(ent.path().filename().c_str());
+        cpu_set_t cur;
+        CPU_ZERO(&cur);
+        if (tid <= 0 || sched_getaffinity(tid, sizeof(cur), &cur) != 0) { continue; }
+        if (have_tier && CPU_COUNT(&cur) == 1) {
+            int c = 0;
+            while (!CPU_ISSET(c, &cur)) { ++c; }
+            if (c < GGML_MAX_N_THREADS && tier[c]) { continue; }   // team thread
+        }
+        if (CPU_EQUAL(&cur, &g_other_set)) { continue; }
+        if (sched_setaffinity(tid, sizeof(g_other_set), &g_other_set) == 0) { ++n_moved; }
+    }
+    std::fprintf(stderr, "wp: WP_EXPERT_OTHER_CPUS: sweep re-confined %d thread(s)\n", n_moved);
+#endif
+}
+
 // Log once, after the first CPU-tier graph compute: every thread of the process
 // with its tid, name and allowed CPUs. The compute team shows up as threads
 // pinned to a single CPU inside WP_EXPERT_CPU_TIER_CPUS; anything else sitting
@@ -4399,6 +4432,7 @@ void cpu_tier_log_team_once() {
          std::getenv("WP_EXPERT_OTHER_CPUS") == nullptr) || done.exchange(true)) {
         return;
     }
+    sweep_other_cpus();
     std::error_code ec;
     for (const auto & ent : fs::directory_iterator("/proc/self/task", ec)) {
         const std::string dir = ent.path().string();
@@ -28707,6 +28741,7 @@ void apply_other_cpus_early() {
         return;
     }
     bool mask[GGML_MAX_N_THREADS];
+    std::memset(mask, 0, sizeof(mask));   // parse_cpu_list only sets bits
     cpu_set_t set;
     CPU_ZERO(&set);
     if (!parse_cpu_list(e, mask)) {
@@ -28722,6 +28757,7 @@ void apply_other_cpus_early() {
         return;
     }
     g_other_cpus_active = true;
+    g_other_set = set;
     std::fprintf(stderr, "wp: WP_EXPERT_OTHER_CPUS: main thread + all later threads confined to [%s]\n",
                  cpu_set_to_string(set).c_str());
     if (const char * t = std::getenv("WP_EXPERT_CPU_TIER_CPUS"); t != nullptr && t[0] != '\0') {
@@ -28905,6 +28941,8 @@ int run(const Options & options) {
               << " alignment=" << DIRECT_ALIGNMENT
               << " stats_interval_ms=" << g_read_path_stats.interval_ms()
               << std::endl;
+
+    sweep_other_cpus();   // backends/devices are up; ROCr has widened its threads by now
 
     pipe_socket_ptr server =
         pipe_socket_t::create_server(options.listen_host.c_str(), options.listen_port);
