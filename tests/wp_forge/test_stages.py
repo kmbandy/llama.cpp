@@ -130,7 +130,8 @@ def test_unsliced_layer_band(env):
     assert desc["sharding_mode"] == "layer-ranges"
     assert desc["hparams"]["n_expert"] == 4 and desc["hparams"]["n_embd"] == 32
     assert manifest["total_blob_bytes"] == sum(sink.size(b[0]) for b in r.blobs)
-    assert [e["layer"] for e in events if e.get("kind") == "layer_done"] == [0, 1]
+    # layers run on a pool, so layer_done arrives in completion order
+    assert sorted(e["layer"] for e in events if e.get("kind") == "layer_done") == [0, 1]
 
 
 def test_width_sliced(env):
