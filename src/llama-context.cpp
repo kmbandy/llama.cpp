@@ -4323,6 +4323,10 @@ static size_t llama_fork_n_embd(const llama_cparams & cparams, const llama_model
     if (model.arch == LLM_ARCH_DFLASH && !has_token && hparams.dsv4_hc_mult == 0) {
         return hparams.n_embd_inp_enc();
     }
+    // WP_DSPARK_FUSED_ENC: DS4.1 injection batches carry the raw concatenated taps
+    if (!has_token && llama_model_dspark_fused_enc(&model)) {
+        return hparams.n_embd_inp_enc();
+    }
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
             (s_dspark_mtp_embd && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK)) {
         return hparams.n_embd_out();

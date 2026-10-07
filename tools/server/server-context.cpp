@@ -7517,11 +7517,17 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (use_stoch) {
+                    // WP_DSPARK_Q_PRECOMPUTE: join the normaliser worker (no-op when it never started)
+                    slot.spec_dspark_q.pre_join();
+                    const bool q_pre = !stoch_replay && slot.spec_dspark_q.pre_ready() &&
+                            slot.spec_dspark_q.pre_z.size() >= n_draft;
                     accepted = common_sampler_sample_and_accept_n_stochastic(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             stoch_replay ? nullptr : slot.spec_dspark_q.logits.data(),
                             slot.spec_dspark_q.n_vocab, slot.spec_dspark_q.temp,
-                            slot.spec_accept_rng, stoch_replay, &accept_probs);
+                            slot.spec_accept_rng, stoch_replay, &accept_probs,
+                            q_pre ? slot.spec_dspark_q.pre_max.data() : nullptr,
+                            q_pre ? slot.spec_dspark_q.pre_z.data()   : nullptr);
                 } else if (slot.spec_is_replay && slot.spec_replay_reject) {
                     // only when the round being replayed was verified by rejection; otherwise (e.g. greedy DSpark at
                     // temp > 0) keep master's sample-and-match so default behaviour is unchanged

@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <thread>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -59,7 +61,35 @@ struct common_speculative_draft_q {
     int32_t            n_vocab = 0;
     std::vector<float> logits;
 
-    void   clear()       { temp = 0.0f; n_vocab = 0; logits.clear(); }
+    // WP_DSPARK_Q_PRECOMPUTE=1: per-row normaliser stats (max, Z) of the stochastic-accept q_prob, computed by
+    // a worker thread started once logits is complete. Values come from common_spec_q_norm_stats(), the very
+    // function the lazy path uses, so they are bit-identical. pre_start() / pre_join() / clear() manage it.
+    std::vector<double> pre_max;
+    std::vector<double> pre_z;
+    std::thread         pre_th;
+
+    common_speculative_draft_q() = default;
+    common_speculative_draft_q(const common_speculative_draft_q &) = delete;
+    common_speculative_draft_q & operator=(const common_speculative_draft_q &) = delete;
+    // moves are safe with a running worker: it only holds raw pointers into the vectors' heap buffers, which a
+    // vector move keeps in place
+    common_speculative_draft_q(common_speculative_draft_q &&) noexcept = default;
+    common_speculative_draft_q & operator=(common_speculative_draft_q && o) noexcept {
+        if (this != &o) {
+            pre_join();
+            temp = o.temp; n_vocab = o.n_vocab;
+            logits = std::move(o.logits); pre_max = std::move(o.pre_max); pre_z = std::move(o.pre_z);
+            pre_th = std::move(o.pre_th);
+        }
+        return *this;
+    }
+    ~common_speculative_draft_q() { pre_join(); }
+
+    void pre_join() { if (pre_th.joinable()) { pre_th.join(); } }
+    bool pre_ready() const { return !pre_th.joinable() && n_vocab > 0 && pre_z.size() == n() && !pre_z.empty(); }
+    void pre_start();   // speculative.cpp / sampling.cpp: launches the worker over the current logits
+
+    void   clear()       { pre_join(); pre_max.clear(); pre_z.clear(); temp = 0.0f; n_vocab = 0; logits.clear(); }
     size_t n() const     { return n_vocab > 0 ? logits.size() / (size_t) n_vocab : 0; }
 };
 

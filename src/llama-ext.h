@@ -292,6 +292,11 @@ LLAMA_API uint32_t        llama_model_n_embd_inp_enc    (const struct llama_mode
 // which keeps this fork's SEPARATE-encoder injection contract; zero selects graph<false>,
 // which is upstream's FUSED-encoder contract. See the contract note in speculative.cpp.
 LLAMA_API uint32_t        llama_model_dsv4_hc_mult      (const struct llama_model * model);
+// MAD-LAB: WP_DSPARK_FUSED_ENC=1 on a DeepSeek-V4.1 in-model DSpark head: the KV-injection batch carries the RAW
+// concatenated target taps (n_embd_inp_enc wide) and fc + output_norm_enc run inside the injection graph, instead
+// of a separate llama_encode + host round trip. false (default) = the split contract. One predicate shared by the
+// graph (deepseek41.cpp), the embd-row width (llama-context.cpp) and the drafter (common/speculative.cpp).
+LLAMA_API bool            llama_model_dspark_fused_enc  (const struct llama_model * model);
 // true if this model carries its own DSpark Markov/confidence head weights (in-graph
 // path, model.dspark_markov_w1 != nullptr) -- used by the draft context constructor
 // (common/speculative.cpp) to decide whether the multi-sequence-safe n_ubatch >=

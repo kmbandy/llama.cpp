@@ -5585,6 +5585,14 @@ uint32_t llama_model_dsv4_hc_mult(const struct llama_model * model) {
     return model->hparams.dsv4_hc_mult;
 }
 
+bool llama_model_dspark_fused_enc(const struct llama_model * model) {
+    static const bool s_on = [] {
+        const char * e = std::getenv("WP_DSPARK_FUSED_ENC");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return s_on && model->arch == LLM_ARCH_DEEPSEEK41 && model->fc != nullptr;
+}
+
 bool llama_model_has_dspark_markov(const struct llama_model * model) {
     return model->dspark_markov_w1 != nullptr;
 }

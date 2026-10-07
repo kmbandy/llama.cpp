@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "speculative.h"
 
 #include "ggml.h"
 
@@ -961,6 +962,41 @@ bool common_sampler_spec_sampling_ok(const struct common_sampler * gsmpl) {
     return true;
 }
 
+// noinline: one out-of-line instance shared by the lazy path and the precompute worker thread
+__attribute__((noinline))
+void common_spec_q_norm_stats(const float * row, int32_t n_vocab, double inv_t, double & m_out, double & z_out) {
+    double m = -INFINITY;
+    for (int32_t k = 0; k < n_vocab; ++k) {
+        m = std::max(m, (double) row[k]);
+    }
+    double z = 0.0;
+    for (int32_t k = 0; k < n_vocab; ++k) {
+        z += std::exp(((double) row[k] - m) * inv_t);
+    }
+    m_out = m;
+    z_out = z;
+}
+
+void common_speculative_draft_q::pre_start() {
+    pre_join();
+    const size_t rows = n();
+    pre_max.assign(rows, 0.0);
+    pre_z  .assign(rows, 0.0);
+    if (rows == 0 || !(temp > 0.0f)) {
+        return;
+    }
+    const double  inv_t = 1.0 / (double) temp;
+    const float * base  = logits.data();
+    const int32_t nv    = n_vocab;
+    double * pm = pre_max.data();
+    double * pz = pre_z.data();
+    pre_th = std::thread([=]() {
+        for (size_t i = 0; i < rows; ++i) {
+            common_spec_q_norm_stats(base + i * (size_t) nv, nv, inv_t, pm[i], pz[i]);
+        }
+    });
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         struct common_sampler * gsmpl,
         struct llama_context  * ctx,
@@ -971,7 +1007,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         float                   q_temp,
         std::mt19937          & rng,
         bool                    is_replay,
-        std::vector<float>    * accept_probs) {
+        std::vector<float>    * accept_probs,
+        const double          * q_pre_max,
+        const double          * q_pre_z) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     llama_synchronize(ctx);
@@ -1007,16 +1045,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
     const auto q_prob = [&](size_t i, llama_token tok) -> double {
         const float * row = q_logits + i * (size_t) n_vocab_q;
         if (!q_ok[i]) {
-            double m = -INFINITY;
-            for (int32_t k = 0; k < n_vocab_q; ++k) {
-                m = std::max(m, (double) row[k]);
+            if (q_pre_max != nullptr && q_pre_z != nullptr) {
+                q_max[i] = q_pre_max[i];
+                q_z  [i] = q_pre_z  [i];
+            } else {
+                common_spec_q_norm_stats(row, n_vocab_q, inv_t, q_max[i], q_z[i]);
             }
-            double z = 0.0;
-            for (int32_t k = 0; k < n_vocab_q; ++k) {
-                z += std::exp(((double) row[k] - m) * inv_t);
-            }
-            q_max[i] = m;
-            q_z  [i] = z;
             q_ok [i] = 1;
         }
         if (tok < 0 || tok >= n_vocab_q || !(q_z[i] > 0.0)) {

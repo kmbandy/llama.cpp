@@ -153,6 +153,15 @@ static void wp_spec_fnv1a_update(uint64_t & hash, const void * data, size_t size
     }
 }
 
+// WP_DSPARK_Q_PRECOMPUTE=1: opt-in worker-thread precompute of the stochastic-accept q normaliser stats.
+static bool wp_dspark_q_precompute() {
+    static const bool s_on = [](){
+        const char * e = std::getenv("WP_DSPARK_Q_PRECOMPUTE");
+        return e && *e && std::strcmp(e, "0") != 0;
+    }();
+    return s_on;
+}
+
 // WP_DSPARK_HASH_TRACE=1: read-only FNV-1a trace ("DSPH " lines on stderr) used to align two
 // greedy runs by order via a monotonically increasing per-process counter. Read once; unset
 // = no hashing, no extra syncs beyond what the traced code already does.
@@ -1406,6 +1415,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // MAD-LAB 2026-09-07 / #27310: pick the injection contract (see the member decls).
         fused_enc     = llama_model_dsv4_hc_mult(model_dft) == 0;
+        // WP_DSPARK_FUSED_ENC=1: DS4.1 in-model head also takes the fused contract (fc + output_norm_enc in the
+        // injection graph, raw taps in batch_inject). Default off = split encode + D2H + memcpy, unchanged.
+        if (!fused_enc && llama_model_dspark_fused_enc(model_dft)) {
+            fused_enc = true;
+        }
         n_embd_inject = fused_enc ? n_embd_enc : n_embd_nextn;
 
         if (fused_enc) {
@@ -2689,6 +2703,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             q.temp    = dp.dspark_temp;
                             q.n_vocab = n_vocab_dft;
                         }
+                        if (q.logits.empty() && wp_dspark_q_precompute()) {
+                            // no realloc once the worker owns the pointer; at most n_block_tokens rows
+                            q.logits.reserve((size_t) n_block_tokens * (size_t) n_vocab_dft);
+                        }
                         q.logits.insert(q.logits.end(), logits, logits + n_vocab_dft);
                     } else {
                         common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -2724,6 +2742,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         const float * row = capture_rows + (size_t) idx * capture_n_embd;
                         capture_embd[seq_id].insert(capture_embd[seq_id].end(), row, row + capture_n_embd);
                     }
+                }
+
+                // WP_DSPARK_Q_PRECOMPUTE: q.logits is complete -- start the normaliser-stats worker now so
+                // it overlaps with the rest of the step; the verifier joins it before first use.
+                if (seq_stochastic[seq_id] && dp.dspark_q != nullptr && wp_dspark_q_precompute() &&
+                        dp.dspark_q->n() > 0) {
+                    dp.dspark_q->pre_start();
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1

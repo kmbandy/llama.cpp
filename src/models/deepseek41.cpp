@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-ml8.h"
 #include "llama-batch.h"
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-kv-cache-dsv4.h"
 
@@ -629,11 +630,25 @@ void llama_model_deepseek41::graph::build_dspark_stages(const llama_model & mode
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
 
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->embd);
-        ggml_tensor * inp_g = inp->embd;
-        res->add_input(std::move(inp));
+        ggml_tensor * inp_g = nullptr;
+        if (llama_model_dspark_fused_enc(&model)) {
+            // WP_DSPARK_FUSED_ENC: fused contract -- the batch carries the raw concatenated taps and the exact
+            // build_dspark_encoder ops (fc matmul, output_norm_enc RMS norm) run here, ahead of the stage loop.
+            const int64_t n_target = model.target_layer_ids.size();
+            auto inp = std::make_unique<llm_graph_input_embd>(n_target*n_embd);
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, inp->n_embd, n_tokens);
+            ggml_set_input(inp->embd);
+            ggml_tensor * enc = build_lora_mm(model.fc, inp->embd);
+            enc = build_norm(enc, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+            inp_g = enc;
+            res->add_input(std::move(inp));
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp->embd);
+            inp_g = inp->embd;
+            res->add_input(std::move(inp));
+        }
 
         // Split encoder contract: the input is already fc + output_norm_enc encoded.
         for (int il = 0; il < n_stages; ++il) {

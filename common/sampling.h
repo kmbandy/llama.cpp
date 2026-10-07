@@ -136,7 +136,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_stochastic(
         float                   q_temp,
         std::mt19937          & rng,
         bool                    is_replay,
-        std::vector<float>    * accept_probs = nullptr);
+        std::vector<float>    * accept_probs = nullptr,
+        // WP_DSPARK_Q_PRECOMPUTE: per-row (max, Z) from common_spec_q_norm_stats(); nullptr = compute lazily
+        const double          * q_pre_max = nullptr,
+        const double          * q_pre_z   = nullptr);
+
+// Normaliser stats of one draft-logit row for the stochastic-accept q_prob: m = max(row), z = sum exp((row-m)*inv_t),
+// plain sequential double loops. The ONLY implementation (lazy path and precompute worker both call it).
+void common_spec_q_norm_stats(const float * row, int32_t n_vocab, double inv_t, double & m_out, double & z_out);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
