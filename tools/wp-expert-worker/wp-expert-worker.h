@@ -199,6 +199,11 @@ ResourcePlan inspect_resources(const Options & options);
 // and return after it closes; this is used by the CPU integration test.
 int run(const Options & options);
 
+// WP_EXPERT_OTHER_CPUS: confine the calling (main) thread, and so every thread
+// it creates afterwards, to the listed CPUs. Call first thing in main(), before
+// any thread / backend / GPU runtime exists. No-op when the env var is unset.
+void apply_other_cpus_early();
+
 // Register an in-process factory with the expert dispatcher. When
 // WP_TRUNK_INPROC=1 and WP_TRUNK_INPROC_SHARDS lists a port, that worker is
 // constructed inside the spine process instead of over TCP. llama-server

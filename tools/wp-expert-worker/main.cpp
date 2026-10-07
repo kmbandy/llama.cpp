@@ -291,6 +291,7 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    wp_expert_worker::apply_other_cpus_early();
     try {
         return wp_expert_worker::run(parse_cli(argc, argv));
     } catch (const std::exception & error) {

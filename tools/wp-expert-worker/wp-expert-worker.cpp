@@ -4068,8 +4068,17 @@ bool parse_reader_cpu_spec(const char * spec, const char * device_name, cpu_set_
     return false;
 }
 
+// Set once by apply_other_cpus_early() (WP_EXPERT_OTHER_CPUS). Declared here so
+// the per-thread affinity paths below can yield to it instead of widening it.
+bool g_other_cpus_active = false;
+
 void apply_reader_cpu_affinity(const cpu_set_t * set, bool enabled) {
     if (!enabled || set == nullptr) {
+        return;
+    }
+    // WP_EXPERT_OTHER_CPUS takes precedence: a reader set outside it would let
+    // the thread back onto the CPU-tier team's cores.
+    if (g_other_cpus_active) {
         return;
     }
     if (sched_setaffinity(0, sizeof(*set), set) != 0) {
@@ -4096,6 +4105,14 @@ void apply_reader_cpu_affinity(const cpu_set_t * set, bool enabled) {
 // measure, then pin explicitly.
 void cpu_tier_cpumask(bool * mask /* GGML_MAX_N_THREADS */) {
     std::memset(mask, 0, GGML_MAX_N_THREADS);
+    // WP_EXPERT_CPU_TIER_CPUS (the isolation knob) takes precedence over the
+    // legacy WP_CPU_TIER_CPUS / last-N default.
+    if (const char * e = std::getenv("WP_EXPERT_CPU_TIER_CPUS")) {
+        if (e[0] != '\0' && parse_cpu_list(e, mask)) {
+            return;
+        }
+        std::memset(mask, 0, GGML_MAX_N_THREADS);
+    }
     if (const char * e = std::getenv("WP_CPU_TIER_CPUS")) {
         if (parse_cpu_list(e, mask)) {
             return;
@@ -4260,6 +4277,15 @@ void wp_cpu_tier_pin_self() {
 // ---------------------------------------------------------------------------
 bool cpu_tier_affinity_mask(int n_threads, bool * mask /* GGML_MAX_N_THREADS */, std::string & how) {
     std::memset(mask, 0, GGML_MAX_N_THREADS);
+    // WP_EXPERT_CPU_TIER_CPUS (see below) wins over WP_EXPERT_CPU_TIER_AFFINITY.
+    if (const char * c = std::getenv("WP_EXPERT_CPU_TIER_CPUS"); c != nullptr && c[0] != '\0') {
+        if (parse_cpu_list(c, mask)) {
+            how = std::string("cpus ") + c;
+            return true;
+        }
+        std::memset(mask, 0, GGML_MAX_N_THREADS);
+        std::fprintf(stderr, "wp: WP_EXPERT_CPU_TIER_CPUS=%s unparseable; ignored\n", c);
+    }
     const char * e = std::getenv("WP_EXPERT_CPU_TIER_AFFINITY");
     if (e == nullptr || e[0] == '\0' || std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) {
         return false;
@@ -4322,6 +4348,71 @@ bool cpu_tier_affinity_mask(int n_threads, bool * mask /* GGML_MAX_N_THREADS */,
     return true;
 #else
     return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// WP_EXPERT_CPU_TIER_CPUS=<cpulist> / WP_EXPERT_OTHER_CPUS=<cpulist> (DEFAULT
+// OFF) -- isolate the CPU tier's compute team from every other worker thread.
+//
+// WP_EXPERT_CPU_TIER_AFFINITY alone only pins the compute team; NVMe readers,
+// CPU-tier IO, socket reader/writer, GPU submit and the HIP runtime's own
+// threads still float onto those cores and steal time from a team that spins
+// in a barrier. Two knobs, used together:
+//
+//   WP_EXPERT_CPU_TIER_CPUS  e.g. "0-8"       team thread i -> i-th listed CPU
+//                                             (ascending, wrapping), applied by
+//                                             ggml from inside its OpenMP region
+//                                             via the strict threadpool above.
+//   WP_EXPERT_OTHER_CPUS     e.g. "9-11,21-23" sched_setaffinity on the MAIN
+//                                             thread at the very top of main(),
+//                                             before any std::thread / backend /
+//                                             HIP init, so every thread created
+//                                             later inherits it. The compute team
+//                                             re-pins itself out of it.
+//
+// OTHER_CPUS also makes WP_READER_CPUS a no-op (it could only widen the mask).
+// Placement only; unset = unchanged behavior.
+// ---------------------------------------------------------------------------
+std::string cpu_set_to_string(const cpu_set_t & set) {
+    std::string out;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &set)) { continue; }
+        int e = c;
+        while (e + 1 < CPU_SETSIZE && CPU_ISSET(e + 1, &set)) { ++e; }
+        if (!out.empty()) { out += ","; }
+        out += std::to_string(c);
+        if (e > c) { out += "-" + std::to_string(e); }
+        c = e;
+    }
+    return out;
+}
+
+// Log once, after the first CPU-tier graph compute: every thread of the process
+// with its tid, name and allowed CPUs. The compute team shows up as threads
+// pinned to a single CPU inside WP_EXPERT_CPU_TIER_CPUS; anything else sitting
+// inside that range is an escape.
+void cpu_tier_log_team_once() {
+#if defined(__linux__)
+    static std::atomic<bool> done{false};
+    if ((std::getenv("WP_EXPERT_CPU_TIER_CPUS") == nullptr &&
+         std::getenv("WP_EXPERT_OTHER_CPUS") == nullptr) || done.exchange(true)) {
+        return;
+    }
+    std::error_code ec;
+    for (const auto & ent : fs::directory_iterator("/proc/self/task", ec)) {
+        const std::string dir = ent.path().string();
+        std::string comm, allowed;
+        std::ifstream(dir + "/comm") >> comm;
+        std::ifstream st(dir + "/status");
+        for (std::string line; std::getline(st, line);) {
+            if (line.rfind("Cpus_allowed_list:", 0) == 0) {
+                allowed = line.substr(line.find_first_not_of(" \t", 18));
+            }
+        }
+        std::fprintf(stderr, "wp: CPU_TIER_ISOLATION: tid=%s comm=%s cpus=[%s]\n",
+                     ent.path().filename().c_str(), comm.c_str(), allowed.c_str());
+    }
 #endif
 }
 
@@ -19361,6 +19452,7 @@ private:
         if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("CPU tier graph compute failed");
         }
+        cpu_tier_log_team_once();
         if (stage == 1) {
             job.hidden[k].resize((size_t) ggml_nelements(hidden));
             ggml_backend_tensor_get(hidden, job.hidden[k].data(), 0, ggml_nbytes(hidden));
@@ -28607,6 +28699,36 @@ struct ParkControl {
 };
 
 } // namespace
+
+void apply_other_cpus_early() {
+#if defined(__linux__)
+    const char * e = std::getenv("WP_EXPERT_OTHER_CPUS");
+    if (e == nullptr || e[0] == '\0') {
+        return;
+    }
+    bool mask[GGML_MAX_N_THREADS];
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (!parse_cpu_list(e, mask)) {
+        std::fprintf(stderr, "wp: WP_EXPERT_OTHER_CPUS=%s unparseable; ignored\n", e);
+        return;
+    }
+    for (int c = 0; c < GGML_MAX_N_THREADS && c < CPU_SETSIZE; ++c) {
+        if (mask[c]) { CPU_SET(c, &set); }
+    }
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        std::fprintf(stderr, "wp: WP_EXPERT_OTHER_CPUS: sched_setaffinity failed: %s\n",
+                     std::strerror(errno));
+        return;
+    }
+    g_other_cpus_active = true;
+    std::fprintf(stderr, "wp: WP_EXPERT_OTHER_CPUS: main thread + all later threads confined to [%s]\n",
+                 cpu_set_to_string(set).c_str());
+    if (const char * t = std::getenv("WP_EXPERT_CPU_TIER_CPUS"); t != nullptr && t[0] != '\0') {
+        std::fprintf(stderr, "wp: WP_EXPERT_CPU_TIER_CPUS: compute team will pin to [%s]\n", t);
+    }
+#endif
+}
 
 int run(const Options & options) {
     std::vector<std::string> devices = options.devices;
