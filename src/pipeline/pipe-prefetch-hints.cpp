@@ -185,7 +185,8 @@ float router2_margin_late() {
 }
 
 namespace {
-// Comma list -> one optional double per element (nullopt = empty / "-" / unparsable).
+// Comma or colon list -> one optional double per element (nullopt = empty / "-" / unparsable).
+// Colon exists because the router preset's env line is itself comma-separated.
 std::vector<std::pair<bool, double>> parse_by_d(const char * name) {
     std::vector<std::pair<bool, double>> out;
     const char * e = std::getenv(name);
@@ -195,7 +196,7 @@ std::vector<std::pair<bool, double>> parse_by_d(const char * name) {
     std::string s(e);
     size_t      pos = 0;
     while (pos <= s.size()) {
-        size_t      end = s.find(',', pos);
+        size_t      end = s.find_first_of(",:", pos);
         if (end == std::string::npos) {
             end = s.size();
         }
