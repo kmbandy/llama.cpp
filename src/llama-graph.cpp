@@ -1914,6 +1914,23 @@ ggml_tensor * llm_graph_context::shexp_after_issue(ggml_tensor * cur, int il) {
     // scale(1) is a real op (new storage); after_issue then pins that storage
     // to the issue node. Issue copies `cur` first; this acc runs after.
     ggml_tensor * gated = ggml_scale(ctx0, cur, 1.0f);
+    static const bool no_gate = [] {
+        const char * e = std::getenv("WP_SHEXP_NO_GATE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (no_gate) {
+        // Opt-in: no data edge to the CPU issue node, so the shexp FFN stays in
+        // the GPU split BEFORE issue (no separate post-issue GPU split, no 4-byte
+        // H2D of the issue output). The issue output is always exactly +0.0f, so
+        // the original gate was `elem0 += +0`. Reproduce it GPU-locally with a
+        // +0 derived from cur itself (sqr(x)*0+0 = +0 for every finite x) so the
+        // result stays bit-identical, incl. -0.0 -> +0.0 canonicalisation.
+        ggml_tensor * e0   = ggml_view_1d(ctx0, cur, 1, 0);
+        ggml_tensor * zero = ggml_scale_bias(ctx0, ggml_sqr(ctx0, e0), 0.0f, 0.0f);
+        gated = ggml_acc_inplace(ctx0, gated, zero, gated->nb[1], gated->nb[2], gated->nb[3], 0);
+        cb(gated, "ffn_shexp_in", il);
+        return gated;
+    }
     gated = expert_dispatch->after_issue(ctx0, gated, il);
     cb(gated, "ffn_shexp_in", il);
     return gated;
