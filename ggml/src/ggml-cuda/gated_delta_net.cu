@@ -1363,6 +1363,7 @@ gated_delta_net_prefill_wmma_cuda(const float * q,
 // Ragged final chunk: tokens t >= n_valid get k = q = v = 0, gate 0, beta 0 -> they leave S
 // and every valid output untouched; their outputs are not written.
 // ---------------------------------------------------------------------------------------
+#if defined(GGML_USE_HIP)
 namespace gdn_wmma2 {
 typedef _Float16 h8_t __attribute__((ext_vector_type(8)));
 typedef float    f8_t __attribute__((ext_vector_type(8)));
@@ -1710,6 +1711,24 @@ static void launch_gated_delta_net_prefill_wmma2(
     }
 #undef GDN_WMMA2_LAUNCH
 }
+#else
+// gdn_wmma2 uses gfx12 WMMA builtins and clang ext_vector_type: HIP-only. The caller gates it on
+// GGML_CUDA_CC_IS_RDNA4 (wmma_ok), so this stub is unreachable on CUDA; it exists only to link.
+static void launch_gated_delta_net_prefill_wmma2(
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d,
+        int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1,   int64_t sq2, int64_t sq3,
+        int64_t sv1,   int64_t sv2, int64_t sv3,
+        int64_t sb1,   int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, int64_t dst_seq_stride, cudaStream_t stream) {
+    GGML_UNUSED_VARS(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3,
+                     sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, dst_seq_stride, stream);
+    GGML_ABORT("gdn wmma2: HIP (gfx12) only");
+}
+#endif // defined(GGML_USE_HIP)
 
 static void launch_gated_delta_net_prefill_wmma(
         const float * q_d, const float * k_d, const float * v_d,
