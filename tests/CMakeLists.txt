@@ -866,3 +866,8 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# CPU-tier expert benchmark (mirrors wp-expert-worker cpu_tier_compute_one; not a test)
+add_executable(wp-cpu-tier-expert-bench wp-cpu-tier-expert-bench.cpp)
+target_link_libraries(wp-cpu-tier-expert-bench PRIVATE ggml ${CMAKE_DL_LIBS})
+target_compile_features(wp-cpu-tier-expert-bench PRIVATE cxx_std_17)
