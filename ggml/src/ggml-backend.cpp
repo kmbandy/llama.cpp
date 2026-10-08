@@ -3532,6 +3532,7 @@ void ggml_backend_sched_set_split_callback(ggml_backend_sched_t sched, ggml_back
     GGML_ASSERT(sched);
     sched->callback_split = callback;
     sched->callback_split_user_data = user_data;
+}
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
     GGML_ASSERT(sched);
