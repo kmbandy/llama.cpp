@@ -22,8 +22,10 @@
 
 #pragma once
 
+#ifdef GGML_USE_HIP
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#endif // GGML_USE_HIP
 
 #include <cstdint>
 
@@ -41,7 +43,11 @@ static __device__ __forceinline__ float e4m3_to_fp32(uint8_t b) {
     int m    = b & 0x7;
     float v;
     if (e == 0) v = (1.0f / 64.0f) * (m / 8.0f);
+#ifdef GGML_USE_HIP
     else        v = __builtin_amdgcn_ldexp(1.0f + m / 8.0f, e - 7);
+#else
+    else        v = ldexpf(1.0f + m / 8.0f, e - 7);
+#endif // GGML_USE_HIP
     return sign ? -v : v;
 }
 

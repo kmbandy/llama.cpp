@@ -136,6 +136,7 @@
 
 namespace mt {
 
+#if defined(GGML_USE_HIP)
 // ─────────────────────────── env gate ───────────────────────────
 bool paged_attn_wmma_fp8_env_enabled() {
     static int mode = -1;
@@ -740,5 +741,23 @@ void ggml_cuda_op_paged_attn_mt_wmma_fp8(ggml_backend_cuda_context & ctx, ggml_t
             d_centroids_k, d_centroids_v,
             max_bps, n_kv_heads, n_heads, scale);
 }
+#else  // !defined(GGML_USE_HIP)
+// mt_pagedattn_wmma_fp8 uses gfx12 WMMA builtins and clang ext_vector_type: HIP-only.
+// CUDA stubs: paged_attn_wmma_fp8_shape_ok returns false (not handled), so the caller
+// (mt_pagedattn.cu) falls back to AITER. The dispatch function is never called.
+
+bool paged_attn_wmma_fp8_env_enabled() {
+    return false;
+}
+
+bool paged_attn_wmma_fp8_shape_ok(int /*cc*/, int /*head_size*/, ggml_type /*cache_type*/,
+                                   int /*n_heads*/, int /*n_kv_heads*/, int /*max_q_len*/) {
+    return false;
+}
+
+void ggml_cuda_op_paged_attn_mt_wmma_fp8(ggml_backend_cuda_context & /*ctx*/, ggml_tensor * /*dst*/) {
+    GGML_ABORT("paged_attn_wmma_fp8: HIP (gfx12 WMMA) only");
+}
+#endif  // defined(GGML_USE_HIP)
 
 }  // namespace mt

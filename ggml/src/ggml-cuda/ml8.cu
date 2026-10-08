@@ -14,6 +14,8 @@
 #include "vecdotq.cuh"      // get_int_from_table_16 (generic ML8_4 skinny GEMM)
 #include "mmvq.cuh"         // ggml_cuda_ml8_4_mul_mat_vec_q
 #include "mmq.cuh"          // ggml_cuda_ml8_4_mul_mat_q
+
+#ifdef GGML_USE_HIP
 #ifdef GGML_HIP_AITER
 // The ml8 GEMM dispatch goes through the AITER Triton-AOT kernels. Their headers
 // only live on the include path when ggml-hip is configured with -DGGML_HIP_AITER=ON
@@ -24,6 +26,7 @@
 #include "mt_ml8_moe_gemm.h"       // G.7: ml8 MoE GEMM Triton wrapper
 #include "mt_fp8_b128_gemm.h"      // FP8_B128 phase 2: AITER preshuffle GEMM
 #endif // GGML_HIP_AITER
+#endif // GGML_USE_HIP
 // MAD-305 Phase 5: hand-written gfx1201 WMMA "trfeed" block-scale GEMM for
 // GGML_TYPE_ML8_FP8 (production integration). Pure HIP, no Triton AOT
 // dependency — included unconditionally (unlike the AITER wrapper headers
@@ -31,7 +34,9 @@
 // (ggml_cuda_ml8_inplace_set, below), which runs regardless of whether
 // ggml-hip was configured with -DGGML_HIP_AITER=ON. Only the GEMM COMPUTE
 // dispatch (ggml_cuda_op_fp8_mul_mat) is AITER-gated, matching FP8_B128.
+#ifdef GGML_USE_HIP
 #include "aiter-integration/rdna4_fp8_gemm/gemm_capi.h"
+#endif // GGML_USE_HIP
 #include "allreduce.cuh"       // MT_ML8_4_EXPAND_ON_AR_STREAM: reuse the AR pipeline's
                                // per-device stream as the expand-cache lookahead's
                                // second queue (ggml_cuda_ar_stream_for_device)
@@ -46,8 +51,10 @@
 // itself to the include path (added alongside gemm_ml84_prod.hip; see that
 // CMakeLists.txt comment) -- the standalone bench/build.sh has always passed
 // this same directory via -I for exactly that reason.
+#ifdef GGML_USE_HIP
 #include "aiter-integration/rdna4_fp8_gemm/bench/ml84_trfeed_layout.h"
 #include "turbo_fp8_hadamard.cuh"  // G.6.f: FWHT for rotation H_b leg
+#endif // GGML_USE_HIP
 
 // MT_ML8_4_DECODE_V2: optional second decode-splitk launcher, written
 // concurrently by another agent (gemm_ml84_decode_v2.h/.hip — not this
@@ -149,6 +156,7 @@ static inline bool rdna4_ml8_qrot_tiled(
 #include <vector>
 #include <algorithm>
 
+#ifdef GGML_USE_HIP
 // G.6.g.C: debug hooks to dump rotation input + ml8_mul_mat output to /tmp
 // for Python-side bit-equivalence comparison. Set env var ML8_DUMP=1 to
 // enable. First-call-only; the static atomics track which dumps have fired.
@@ -7640,3 +7648,47 @@ extern "C" GGML_BACKEND_API bool ggml_cuda_ml8_4_pack_device(const void * src, v
         (int32_t) N, (int32_t) K, n_groups_k, layout);
     return true;
 }
+#else  // !defined(GGML_USE_HIP)
+// ml8.cu uses HIP-specific kernels and functions: CUDA stubs return false (not handled).
+// Call sites in ggml-cuda.cu and other backends should have fallbacks for when ml8 is unavailable.
+
+void ggml_cuda_ml8_repack_blocks(cudaStream_t, const void *, void *, float *, int32_t, int32_t, int32_t) { GGML_ABORT("ggml_cuda_ml8_repack_blocks: HIP only (unreachable on CUDA: ml8 inplace/quant paths are gated off)"); }
+const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(ggml_backend_cuda_context &, const ggml_tensor *) { return nullptr; }
+void ggml_cuda_ml8_clear_cache(void) {}
+void ggml_cuda_ml8_prewarm_for_capture(int, cudaStream_t) {}
+bool ggml_cuda_ml8_inplace_eligible(const ggml_tensor *) { return false; }
+size_t ggml_cuda_ml8_inplace_alloc_size(const ggml_tensor *) { return 0; }
+void ggml_cuda_ml8_inplace_set(cudaStream_t, ggml_tensor *, const void *, size_t, size_t, size_t, size_t, size_t) { GGML_ABORT("ggml_cuda_ml8_inplace_set: HIP only (unreachable on CUDA: ml8 inplace/quant paths are gated off)"); }
+void ggml_cuda_ml8_inplace_get(cudaStream_t, const ggml_tensor *, void *, size_t, size_t) { GGML_ABORT("ggml_cuda_ml8_inplace_get: HIP only (unreachable on CUDA: ml8 inplace/quant paths are gated off)"); }
+bool ggml_cuda_ml8_inplace_is_packed(const void *) { return false; }
+bool ggml_cuda_ml8_inplace_get_rows(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+void ggml_cuda_ml8_inplace_alias(const void *, const void *) {}
+void ggml_cuda_ml8_inplace_forget_range(const void *, size_t) {}
+void ggml_cuda_ml8_quantize_activations(ggml_backend_cuda_context &, ggml_tensor *, bool) { GGML_ABORT("ggml_cuda_ml8_quantize_activations: HIP only (unreachable on CUDA: ml8 inplace/quant paths are gated off)"); }
+void ggml_cuda_ml8_quantize_activations_generic(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("ggml_cuda_ml8_quantize_activations_generic: HIP only (unreachable on CUDA: ml8 inplace/quant paths are gated off)"); }
+void ggml_cuda_op_ml8_mul_mat(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("ml8_mul_mat: HIP only"); }
+bool ggml_cuda_ml8_4_use_generic(int) { return false; }
+bool ggml_cuda_ml8_4_gemv_generic(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+void ggml_cuda_ml8_4_dequant_f16(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, int, __half *) { GGML_ABORT("ml8_4_dequant_f16: HIP only"); }
+bool ggml_cuda_ml8_4_mul_mat_supports_bf16_out(int64_t, int64_t) { return false; }
+bool ggml_cuda_ml8_4_mul_mat_prequant(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+bool ggml_cuda_ml8_4_grouped_decode(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor * const *, int, ggml_tensor *) { return false; }
+void ggml_cuda_op_ml8_get_rows(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("ml8_get_rows: HIP only"); }
+void ggml_cuda_op_ml8_fp8_mul_mat(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("ml8_fp8_mul_mat: HIP only"); }
+void ggml_cuda_ml8_repack_blocks_moe(cudaStream_t, const void *, void *, float *, int32_t, int32_t, int32_t, const int32_t *, int32_t, int32_t) { GGML_ABORT("ggml_cuda_ml8_repack_blocks_moe: HIP only (unreachable on CUDA: ml8 inplace/quant paths are gated off)"); }
+const ml8_weight_repack_moe_t * ggml_cuda_ml8_get_or_repack_moe(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return nullptr; }
+void ggml_cuda_op_ml8_mul_mat_id(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("ml8_mul_mat_id: HIP only"); }
+void ggml_cuda_op_ml8_apply_rotation(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("ml8_apply_rotation: HIP only"); }
+bool ggml_cuda_ml8_can_fuse_rot_mm(const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_op_ml8_mul_mat_fused(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("ml8_mul_mat_fused: HIP only"); }
+bool ggml_cuda_ml8_can_fuse_ffn_swiglu(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_op_ml8_ffn_gate_up_swiglu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("ml8_ffn_gate_up_swiglu: HIP only"); }
+bool ggml_cuda_op_fp8_quant_rot_fused_norm(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
+void ggml_cuda_op_fp8_quant_rot(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("fp8_quant_rot: HIP only"); }
+void ggml_cuda_op_fp8_mul_mat(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("fp8_mul_mat: HIP only"); }
+void * ggml_cuda_ml8_inplace_fp8_b128_unpack_to_device(cudaStream_t, const ggml_tensor *) { return nullptr; }
+void * ggml_cuda_ml8_inplace_ml8fp8_unpack_to_device(cudaStream_t, const ggml_tensor *) { return nullptr; }
+bool ggml_cuda_fp8_b128_layout_is_per_row(void) { return false; }
+bool ggml_cuda_ml8_4_mul_mat_q(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+bool ggml_cuda_ml8_4_mul_mat_vec_q(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+#endif  // defined(GGML_USE_HIP)

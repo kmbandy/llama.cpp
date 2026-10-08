@@ -106,7 +106,7 @@
 //        pattern C / mt_gdn_r4d.cuh's r4d_gdn_raw_out for the handshake.
 // All six return false ("not handled", A_tiled/a_scale untouched) when
 // they decline a shape; a `true` return means a kernel was launched.
-#if __has_include("ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.h")
+#if defined(GGML_USE_HIP) && __has_include("ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.h")
 #include "ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.h"
 #define ML8_4_RADIANCE_QUANT_AVAILABLE 1
 #else
@@ -116,33 +116,33 @@
 static inline bool rdna4_ml8_qrot_tiled(
     const float * /*x*/, const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/,
     const float * /*norm_w*/, float /*norm_eps*/, int /*M*/, int /*K*/, uint8_t * /*A_tiled*/,
-    float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    float * /*a_scale*/, cudaStream_t /*stream*/, float * /*y_out*/ = nullptr) {
     return false;
 }
 static inline bool rdna4_ml8_qrot_add_tiled(
     const float * /*x*/, const float * /*residual*/, float * /*residual_out*/,
     const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/,
     const float * /*norm_w*/, float /*norm_eps*/, int /*M*/, int /*K*/,
-    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, cudaStream_t /*stream*/, float * /*y_out*/ = nullptr) {
     return false;
 }
 static inline bool rdna4_ml8_qrot_silu_mul_tiled(
     const float * /*gate_up*/, int /*gate_first*/, const void * /*h_a*/,
     int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/, int /*N*/,
-    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/) {
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, cudaStream_t /*stream*/) {
     return false;
 }
 static inline bool rdna4_ml8_qrot_silu_mul_split_tiled(
     const float * /*gate*/, const float * /*up*/, const void * /*h_a*/,
     int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/, int /*N*/,
-    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/) {
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, cudaStream_t /*stream*/) {
     return false;
 }
 static inline bool rdna4_ml8_qrot_gated_norm_tiled(
     const float * /*o*/, const float * /*z*/, size_t /*z_nb1*/, size_t /*z_nb2*/,
     const float * /*norm_w*/, float /*norm_eps*/, int /*head_dim*/, int /*n_heads*/,
     const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/,
-    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, cudaStream_t /*stream*/, float * /*y_out*/ = nullptr) {
     return false;
 }
 static inline bool rdna4_ml8_qrot_gated_norm_tiled_r4d(
@@ -150,7 +150,7 @@ static inline bool rdna4_ml8_qrot_gated_norm_tiled_r4d(
     const float * /*z*/, size_t /*z_nb1*/, size_t /*z_nb2*/,
     const float * /*norm_w*/, float /*norm_eps*/, int /*head_dim*/, int /*n_heads*/,
     const void * /*h_a*/, int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/,
-    uint8_t * /*A_tiled*/, float * /*a_scale*/, hipStream_t /*stream*/, float * /*y_out*/ = nullptr) {
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, cudaStream_t /*stream*/, float * /*y_out*/ = nullptr) {
     return false;
 }
 #endif
@@ -8998,11 +8998,13 @@ static int ggml_cuda_try_ml8_group_fuse(ggml_backend_cuda_context * ctx, ggml_cg
     // Verify: the fused path reads its own copy of x3d and writes a scratch
     // output (the allocator may place dst over x3d, which is dead by then), the
     // original nodes then compute dst as usual, and the two are compared.
+#ifdef GGML_USE_HIP
     hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
     hipStreamIsCapturing(ctx->stream(), &cap);
     if (cap != hipStreamCaptureStatusNone) {
         return 0;   // verify syncs; leave captured segments on the original path
     }
+#endif // GGML_USE_HIP
     ggml_cuda_pool_alloc<uint8_t> x_copy(ctx->pool(), ggml_nbytes(x3d));
     ggml_cuda_pool_alloc<uint8_t> out_copy(ctx->pool(), ggml_nbytes(dst));
     CUDA_CHECK(cudaMemcpyAsync(x_copy.get(), x3d->data, ggml_nbytes(x3d), cudaMemcpyDeviceToDevice, ctx->stream()));
