@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -18,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 struct pipe_tp_comm; // cross-host tensor-parallel exchange, src/pipeline/pipe-tp-comm.h
+class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -479,6 +481,9 @@ private:
 
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_override = nullptr) const;
 
+    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -540,6 +545,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    llama_moe_cache_ptr moe_cache;
 
     // MAD-LAB: the target context owns the dispatcher; speculative contexts borrow it.
     std::unique_ptr<pipe_expert_dispatcher::graph_dispatcher> expert_dispatch_owned;
@@ -746,6 +752,21 @@ private:
     ggml_backend_sched_ptr sched_proj;
 
     bool sched_need_reserve = true;
+
+    // state of sched_copy_experts, reset before each graph compute
+    struct copy_experts_info {
+        const ggml_tensor *  ids = nullptr;
+        std::vector<int32_t> ids_data;
+        std::vector<bool>    used;
+
+        void reset() {
+            ids = nullptr;
+            ids_data.clear();
+            used.clear();
+        }
+    };
+
+    copy_experts_info copy_experts;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

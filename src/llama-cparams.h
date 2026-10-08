@@ -89,6 +89,8 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
+    size_t moe_cache_size;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     // [n_layer()] EXTERNALLY SUPPLIED layer inputs. Same host buffer as above, but the
     // rows are written in by the caller instead of being extracted from this context's

@@ -1200,6 +1200,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         // The `!ubatch.token` guard is kept and is load-bearing here: a DSpark
         // services-mode DRAFT batch carries BOTH embd (precomputed token embeddings,
         // n_embd_inp() wide) and token ids, and must not be routed into this branch --
+    ASSERT_EMBD_OR_TOKEN(ubatch);
         // if it were, it would be read at the far wider encoder-input stride.
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
@@ -1618,6 +1619,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     const int n_st = n_stages > 0 ? n_stages : n_layer;
 
     // KV cache injection: fused target features from the encoder
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 

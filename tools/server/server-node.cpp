@@ -215,7 +215,7 @@ struct server_node::child {
     int                             exit_code = -1;
     int64_t                         kill_deadline = 0; // steady ms, 0 = none
     int64_t                         started_ms    = 0; // unix ms
-    std::string                     buf;               // partial output line (reaper only)
+    std::string                     buf[SERVER_SUBPROC_STREAMS]; // partial output line of each pipe (reaper only)
     bool                            eof = false;
 };
 
@@ -419,7 +419,7 @@ node_child_info server_node::spawn(const node_spawn_request & req) {
 
     // spawn without the lock: fork/exec of a big binary is not instant
     auto proc = std::make_unique<server_subproc>();
-    const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
+    const int options = subprocess_option_no_window; // stdout and stderr stay separate pipes, both are logs
     const bool ok = proc->sproc.create(args, options, env);
     if (ok) {
         proc->has_output(); // non-blocking pipe before the reaper reads it
@@ -808,35 +808,43 @@ void server_node::handle_line_locked(child & c, const std::string & raw) {
 }
 
 void server_node::read_output_locked(child & c) {
+    // a node child is a plain server (no router state commands), so both pipes are logs
     static constexpr size_t max_line = 1024 * 1024;
     char chunk[4096];
-    while (!c.eof && c.proc) {
-        const int n = c.proc->read_output(chunk, sizeof(chunk));
-        if (n < 0) {
-            c.eof = true;
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        c.buf.append(chunk, (size_t) n);
-        size_t start = 0;
+    for (int i = 0; i < SERVER_SUBPROC_STREAMS && c.proc; i++) {
+        std::string & buf = c.buf[i];
+        bool closed = false;
         while (true) {
-            const size_t nl = c.buf.find('\n', start);
-            if (nl == std::string::npos) {
+            const int n = c.proc->read_output((server_subproc_stream) i, chunk, sizeof(chunk));
+            if (n < 0) {
+                closed = true;
                 break;
             }
-            handle_line_locked(c, c.buf.substr(start, nl - start));
-            start = nl + 1;
+            if (n == 0) {
+                break;
+            }
+            buf.append(chunk, (size_t) n);
+            size_t start = 0;
+            while (true) {
+                const size_t nl = buf.find('\n', start);
+                if (nl == std::string::npos) {
+                    break;
+                }
+                handle_line_locked(c, buf.substr(start, nl - start));
+                start = nl + 1;
+            }
+            buf.erase(0, start);
+            if (buf.size() > max_line) {
+                buf.clear(); // a child that never writes a newline must not grow this without bound
+            }
         }
-        c.buf.erase(0, start);
-        if (c.buf.size() > max_line) {
-            c.buf.clear(); // a child that never writes a newline must not grow this without bound
+        if (closed && !buf.empty()) {
+            handle_line_locked(c, buf);
+            buf.clear();
         }
     }
-    if (c.eof && !c.buf.empty()) {
-        handle_line_locked(c, c.buf);
-        c.buf.clear();
+    if (c.proc && c.proc->output_closed()) {
+        c.eof = true;
     }
 }
 
@@ -915,9 +923,11 @@ void server_node::run() {
 #endif
                 } else if (!c.proc->is_alive()) {
                     read_output_locked(c); // whatever it wrote before going
-                    if (!c.buf.empty()) {
-                        handle_line_locked(c, c.buf);
-                        c.buf.clear();
+                    for (auto & b : c.buf) {
+                        if (!b.empty()) {
+                            handle_line_locked(c, b);
+                            b.clear();
+                        }
                     }
                     c.exit_code = c.proc->join(); // the only place a child is reaped
                     c.eof       = true;           // join() closed the pipe

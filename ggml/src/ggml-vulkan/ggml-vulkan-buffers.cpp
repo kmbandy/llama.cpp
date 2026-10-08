@@ -731,8 +731,11 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
         static_cast<bool>(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
     const bool host_cached =
         static_cast<bool>(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+    // AMD UMA: uncached host-visible memory is write-combined, CPU reads are slow (upstream), so the
+    // implicit UMA direct read is skipped there; the explicit byte-cap opt-in still applies.
+    const bool slow_host_read = src->device->vendor_id == VK_VENDOR_ID_AMD && !host_cached;
     const bool direct_host_read = host_visible &&
-        (src->device->uma ||
+        ((src->device->uma && !slow_host_read) ||
          (direct_read_max_bytes != 0 && height != 0 && width <= direct_read_max_bytes / height));
 
     // *** WP_VK_HOST_READ_FASTPATH -- the read half of the io-small BAR fix. ***

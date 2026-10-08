@@ -17,7 +17,9 @@ namespace mma = ggml_cuda_mma;
 // pathological/NaN-free model producing a positive gate and overflowing f32.
 #define GGML_CUDA_GDN_EXP_CLAMP 30.0f
 
-template <int S_v, bool KDA, bool keep_rs_t>
+constexpr int gdn_cols_per_warp = 4;
+
+template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -48,9 +50,19 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       dst_seq_stride) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
-    // each warp owns one column, using warp-level primitives to reduce across rows
-    const int      lane     = threadIdx.x;
-    const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    // the warp is split into cols_per_warp segments of lanes_per_col lanes; each segment owns
+    // one state column and reduces within itself
+    constexpr int lanes_per_col = warp_size / cols_per_warp;
+    constexpr int rows_per_lane = S_v / lanes_per_col;
+    static_assert(S_v % lanes_per_col == 0, "S_v must be a multiple of lanes_per_col");
+
+    const int lane        = threadIdx.x;
+    const int col_in_warp = lane / lanes_per_col;              // column slot within the warp
+    const int lane_in_col = lane - col_in_warp * lanes_per_col;  // lane within the column's reduction segment
+    const int col = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp + col_in_warp;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
@@ -68,16 +80,13 @@ gated_delta_net_cuda(const float * q,
     // prefill+tail launch, see ggml_cuda_op_gated_delta_net_impl).
     attn_data += (sequence * dst_seq_stride * H + h_idx) * S_v + tok_offset * S_v * H;
 
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
-    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
-    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
+        const int i = r * lanes_per_col + lane_in_col;
         s_shard[r]  = curr_state[i];
     }
 
@@ -124,7 +133,7 @@ gated_delta_net_cuda(const float * q,
 
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 k_reg[r] = k_t[i];
                 q_reg[r] = q_t[i];
             }
@@ -138,7 +147,7 @@ gated_delta_net_cuda(const float * q,
             } else {
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
+                    const int i = r * lanes_per_col + lane_in_col;
                     g_reg[r] = expf(g_t[i]);
                 }
 #pragma unroll
@@ -149,10 +158,10 @@ gated_delta_net_cuda(const float * q,
         }
 
         // ---- one fused cross-lane reduction: kv[t] and attn[t-1] ----
-        const float2 red = warp_reduce_sum<warp_size>(make_float2(kv_partial, attn_partial));
+        const float2 red = warp_reduce_sum<lanes_per_col>(make_float2(kv_partial, attn_partial));
 
         // token t-1's attention output (at t == 0 this reduces a zero, which is discarded)
-        if (t > 0 && lane == 0) {
+        if (t > 0 && lane_in_col == 0) {
             attn_data[(int64_t) (t - 1) * S_v * H + col] = red.y * scale;
         }
 
@@ -187,7 +196,7 @@ gated_delta_net_cuda(const float * q,
                 float * snap = state + target_slot * state_slot_stride;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
+                    const int i = r * lanes_per_col + lane_in_col;
                     snap[col * S_v + i] = s_shard[r];
                 }
             }
@@ -197,7 +206,7 @@ gated_delta_net_cuda(const float * q,
     if constexpr (!keep_rs_t) {
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
-            const int i          = r * warp_size + lane;
+            const int i          = r * lanes_per_col + lane_in_col;
             state[col * S_v + i] = s_shard[r];
         }
     }
@@ -1817,8 +1826,16 @@ static void launch_gated_delta_net(
         dst_seq_stride = n_tokens;
     }
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
-    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+    // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
+    // SMs without a CTA, so small head counts keep the device filled
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int cols_per_warp = gdn_cols_per_warp;
+    int num_warps = 4;
+    while (num_warps > 1 && H*n_seqs*(S_v / (cols_per_warp * num_warps)) < nsm) {
+        num_warps /= 2;
+    }
+    // one CTA covers cols_per_warp*num_warps columns (see the kernel)
+    dim3      grid_dims(H, n_seqs, (S_v + cols_per_warp * num_warps - 1) / (cols_per_warp * num_warps));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
