@@ -1169,11 +1169,11 @@ bool ggml_cuda_op_rms_norm_fused_scale(ggml_backend_cuda_context & ctx, ggml_ten
     if (rms_norm_rows_f32_try(src0, (float *) scale_tensor->data, nullptr, eps, s, ctx.stream())) {
         return true;
     }
-    const dim3 blocks_num(ne01, ne02, ne03);
+    const dim3 blocks_num(ne01, MIN(ne02, UINT16_MAX), MIN(ne03, UINT16_MAX));
     const dim3 block_dims(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), ctx.stream()};
     ggml_cuda_kernel_launch(rms_norm_f32<256, float, float, false>, launch_params,
-        (const float *) src0->data, (float *) scale_tensor->data, (int) ne00, s01, s02, s03, eps,
+        (const float *) src0->data, (float *) scale_tensor->data, (int) ne00, (int) ne02, (int) ne03, s01, s02, s03, eps,
         (const float *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         (const float *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         ggml_cuda_mt_wide_kernels_enabled(), s);
