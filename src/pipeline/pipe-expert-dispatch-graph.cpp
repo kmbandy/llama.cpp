@@ -1,5 +1,6 @@
 #include "pipe-expert-dispatch-graph.h"
 #include "pipe-prefetch-hints.h"
+#include "pipe-issue-trace.h"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -3015,11 +3016,16 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
         }
         owner = context->owner;
+        // WP_ISSUE_TRACE (default off): per-call issue timers, see pipe-issue-trace.h.
+        wp_issue_trace::call_guard it_guard(context->layer, (uint32_t) activations->ne[1],
+                                            (uint32_t) context->chunk_index);
         // WP_WAIT_GPU_FLAG: join the previous layer's background fold (happens-before
         // for the remote state it touched) and surface any GPU spin timeout BEFORE
         // this layer talks to the workers again.
+        const uint64_t it_drain = wp_issue_trace::mark();
         owner->wait_drain();
         owner->check_wait_gpu_failures();
+        wp_issue_trace::add(wp_issue_trace::PH_WAIT_DRAIN, it_drain);
         // GPU-flag layers must publish exactly once per issue, on EVERY exit path
         // (the consuming kernel is already queued or about to be): armed here,
         // disarmed right before the real fold job is queued at the end of the try.
@@ -3053,7 +3059,9 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
         const bool layer_profile_span = layer_profile &&
                                         (context->chunk_count == 1 || context->chunk_index == 0);
         // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
+        const uint64_t it_io = wp_issue_trace::mark();
         std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
+        wp_issue_trace::add(wp_issue_trace::PH_IO_LOCK, it_io);
         if (owner->failed()) {
             if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
                 *static_cast<float *>(dst->data) = 0.0f;
@@ -3091,6 +3099,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch issue op input shapes do not match");
         }
 
+        const uint64_t it_act = wp_issue_trace::mark();
         std::vector<float> wire_activations((size_t) n_embd * (size_t) n_tokens);
         const dispatch_clock::time_point pack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
@@ -3104,6 +3113,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
         }
         const dispatch_clock::time_point pack_end =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+        wp_issue_trace::add(wp_issue_trace::PH_ACT_COPY, it_act);
 
         const auto make_assignments = [&](const ggml_tensor * selected,
                                           const ggml_tensor * route_weights,
@@ -3137,8 +3147,10 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             return result;
         };
 
+        const uint64_t it_asg = wp_issue_trace::mark();
         std::vector<pipe_expert_assignment> assignments =
             make_assignments(selected_experts, weights, n_tokens, context->token_offset);
+        wp_issue_trace::add(wp_issue_trace::PH_ASSIGN_CHUNK, it_asg);
 
         std::vector<pipe_expert_assignment> full_assignments;
         std::function<void()> post_send_hints; // WP_ISSUE_HINTS_AFTER_SEND
@@ -3152,6 +3164,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             const ggml_tensor * full_weights = context->full_weights != nullptr
                 ? context->full_weights : weights;
             const int64_t full_tokens = full_activations->ne[1];
+            const uint64_t it_fa = wp_issue_trace::mark();
             std::vector<float> full_wire_activations((size_t) n_embd * (size_t) full_tokens);
             if (ggml_is_contiguous(full_activations)) {
                 std::memcpy(full_wire_activations.data(), full_activations->data,
@@ -3161,7 +3174,10 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                     full_wire_activations[i] = ggml_get_f32_1d(full_activations, (int) i);
                 }
             }
+            wp_issue_trace::add(wp_issue_trace::PH_FULL_ACT_COPY, it_fa);
+            const uint64_t it_af = wp_issue_trace::mark();
             full_assignments = make_assignments(full_selected, full_weights, full_tokens, 0);
+            wp_issue_trace::add(wp_issue_trace::PH_ASSIGN_FULL, it_af);
             layer_assignments = &full_assignments;
             layer_n_tokens = (uint32_t) full_tokens;
             // WP_ISSUE_HINTS_AFTER_SEND (default ON, 0 restores the old order):
@@ -3205,20 +3221,29 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                 if (!defer_sock) {
                     // socket-touching hints stay ahead of the send (in_flight == 0)
                     // flush before enqueue, as before
+                    const uint64_t it_hf = wp_issue_trace::mark();
                     if (owner->router2_topm() > 0) {
                         owner->flush_predicted_hints();
                     }
+                    wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_FLUSH, it_hf);
+                    const uint64_t it_hp = wp_issue_trace::mark();
                     owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
+                    wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_PREFETCH, it_hp);
                 }
                 const int32_t layer_id = context->layer;
                 post_send_hints = [owner, layer_id, full_tokens, full_selected, full_weights, n_embd, n_expert_used,
                                    defer_sock, &full_assignments,
                                    wire = std::move(full_wire_activations)]() {
+                    const uint64_t it_ph = wp_issue_trace::mark();
                     if (owner->router2_topm() > 0) {
+                        const uint64_t it_pf = wp_issue_trace::mark();
                         if (defer_sock) {
                             owner->flush_predicted_hints();
                         }
+                        wp_issue_trace::add(wp_issue_trace::PH_POST_FLUSH_HINTS, it_pf);
+                        const uint64_t it_pe = wp_issue_trace::mark();
                         owner->enqueue_prediction(layer_id, wire, full_tokens);
+                        wp_issue_trace::add(wp_issue_trace::PH_POST_ENQUEUE_PRED, it_pe);
                     }
                     owner->trace_layer(layer_id, wire, full_tokens, full_selected, full_weights, n_expert_used);
                     owner->pscore_note_routing(layer_id, full_selected, full_tokens, n_expert_used);
@@ -3231,18 +3256,23 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                                                full_selected, full_tokens, n_expert_used);
                     }
                     if (defer_sock) {
+                        const uint64_t it_pp = wp_issue_trace::mark();
                         owner->prefetch_layer_ahead(layer_id, (uint32_t) full_tokens);
+                        wp_issue_trace::add(wp_issue_trace::PH_POST_PREFETCH, it_pp);
                     }
+                    wp_issue_trace::add(wp_issue_trace::PH_POST_SEND_HINTS, it_ph);
                 };
             }
         }
 
         const uint64_t seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
         context->seq_id = seq_id;
+        const uint64_t it_bd = wp_issue_trace::mark();
         context->handle = owner->remote.begin_dispatch(context->layer, seq_id, (uint32_t) n_tokens,
                                                        wire_activations, assignments, context->swiglu_clamp,
                                                        (uint32_t) context->chunk_index, layer_assignments,
                                                        layer_n_tokens, "graph_dispatcher::compute_issue");
+        wp_issue_trace::add(wp_issue_trace::PH_BEGIN_DISPATCH, it_bd);
         if (post_send_hints) {
             post_send_hints();
         }

@@ -6,6 +6,7 @@
 #include "pipe-reduce-simd.h"
 #include "pipe-expert-shm.h"
 #include "pipe-thread-pool.h"
+#include "pipe-issue-trace.h"
 
 #include <algorithm>
 #include <numeric>
@@ -2375,13 +2376,16 @@ struct dispatcher::impl {
     // Enqueue one frame onto a worker's writer FIFO. Throws if the writer has
     // already failed or the queue is over its cap (a wedged worker).
     void enqueue_frame(worker & value, wire_frame frame) {
+        const uint64_t it_eq = wp_issue_trace::mark();
         socket_writer * w = value.writer.get();
         if (!w) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " has no writer (async issue off)");
         }
         {
+            const uint64_t it_lk = wp_issue_trace::mark();
             std::lock_guard<std::mutex> lock(w->mutex);
+            wp_issue_trace::add(wp_issue_trace::PH_IR_ENQ_LOCK, it_lk);
             if (w->failed) {
                 throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                          " writer failed: " + w->error_msg);
@@ -2395,6 +2399,7 @@ struct dispatcher::impl {
             ++w->enqueued;
         }
         w->cv.notify_one();
+        wp_issue_trace::add(wp_issue_trace::PH_IR_ENQUEUE, it_eq);
     }
 
     // WP_STREAM_SEND_OVERLAP: block until every frame enqueued to this
@@ -2409,8 +2414,10 @@ struct dispatcher::impl {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " has no writer (stream send overlap requires WP_ASYNC_ISSUE-style writers)");
         }
+        const uint64_t it_fw = wp_issue_trace::mark();
         std::unique_lock<std::mutex> lock(w->mutex);
         w->cv.wait(lock, [w]() { return w->failed || w->completed >= w->enqueued; });
+        wp_issue_trace::add(wp_issue_trace::PH_IR_FLUSH_WRITER, it_fw);
         if (w->failed) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " writer failed: " + w->error_msg);
@@ -3166,6 +3173,7 @@ struct dispatcher::impl {
             by_worker[i].worker_index = i;
             by_worker[i].layer = layer;
         }
+        const uint64_t it_cl = wp_issue_trace::mark();
         const bool layer_is_slice = layer_slice_mode.at(layer);
         // WP_EXPERT_PLAN_THREADS: classify assignments to workers in parallel
         // chunks, then merge in original chunk order so each worker's
@@ -3227,6 +3235,7 @@ struct dispatcher::impl {
             }
         }
 
+        wp_issue_trace::add(wp_issue_trace::PH_PR_CLASSIFY, it_cl);
         std::vector<planned_request> requests;
         // WP_SLICE_ENCODE_ONCE: on a sliced layer the covering workers' frames
         // are byte-identical, so build + encode once (first covering worker) and
@@ -3277,9 +3286,11 @@ struct dispatcher::impl {
             }
             const dispatch_clock::time_point pack_started =
                 layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+            const uint64_t it_pk = wp_issue_trace::mark();
             packed_all.resize((size_t) n_tokens * (size_t) packed_row_bytes);
             pipe_expert_wire_pack_matrix(packed_all.data(), activations.data(), n_tokens, n_embd);
             packed_all_ready = true;
+            wp_issue_trace::add(wp_issue_trace::PH_PR_PACK, it_pk);
             // Counts against encode_ns, same bucket the per-request pack this
             // replaces used to add to -- see the WP_DS4_LAYER_TRACE note at
             // each call site below.
@@ -3501,6 +3512,7 @@ struct dispatcher::impl {
                     }
                     request.stream_payloads[chunk_index] = std::move(chunk_payload);
                 };
+                const uint64_t it_enc = wp_issue_trace::mark();
                 const int encode_nt = pipe_expert_encode_threads();
                 if (encode_nt > 1 && chunk_count >= 2) {
                     pipe_parallel_for((size_t) chunk_count, (size_t) encode_nt,
@@ -3518,6 +3530,7 @@ struct dispatcher::impl {
                     add_layer_trace(layer, &layer_trace_stats::encode_ns,
                                     elapsed_ns(stream_encode_started, dispatch_clock::now()));
                 }
+                wp_issue_trace::add(wp_issue_trace::PH_PR_ENCODE, it_enc);
                 request.stream_wire = true;
                 // WP_STREAM_SEND_OVERLAP: hand every chunk to this worker's
                 // writer FIFO right now, in chunk order, rather than waiting
@@ -3538,6 +3551,8 @@ struct dispatcher::impl {
                         frame.seq_id      = seq_id;
                         frame.layer       = layer;
                         frame.chunk_index = chunk_index;
+                        wp_issue_trace::add_bytes((uint32_t) request.worker_index,
+                                                  request.stream_payloads[chunk_index].size());
                         frame.payload     = std::move(request.stream_payloads[chunk_index]);
                         enqueue_frame(workers[request.worker_index], std::move(frame));
                     }
@@ -3546,6 +3561,7 @@ struct dispatcher::impl {
                 requests.push_back(std::move(request));
                 continue;
             }
+            const uint64_t it_enc1 = wp_issue_trace::mark();
             const dispatch_clock::time_point encode_started =
                 layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
             request.split_wire = split_wire_requested &&
@@ -3576,6 +3592,7 @@ struct dispatcher::impl {
                 add_layer_trace(layer, &layer_trace_stats::encode_ns,
                                 elapsed_ns(encode_started, dispatch_clock::now()));
             }
+            wp_issue_trace::add(wp_issue_trace::PH_PR_ENCODE, it_enc1);
             if (slice_encode_once) {
                 // Stash the first covering worker's encoded frame for reuse.
                 shared_token_ids = request.token_ids;
@@ -3692,6 +3709,7 @@ struct dispatcher::impl {
                 ++hint_stats.n_send_failed;
                 continue;
             }
+            wp_issue_trace::note_hint_frame((uint64_t) payload.size());
             ++hint_stats.n_frames;
             hint_stats.n_experts += (uint64_t) hint.expert_ids.size();
             if (sent_in_flight) {
@@ -3902,14 +3920,27 @@ struct dispatcher::impl {
                 ++state.stats.requests_issued;
                 continue;
             }
-            const auto send_frame = [&](pipe_frame_type type, const std::vector<uint8_t> & payload) {
-                if (!layer_trace_enabled()) {
-                    return pipe_send_frame(*value.socket, type, seq_id, payload.data(), payload.size());
+            // WP_ISSUE_TRACE: bytes this request puts on the wire, taken before any
+            // payload is moved out below. Dedup'd requests (already_issued) were
+            // sent from dedup_publish_and_ref() and are not counted here.
+            if (wp_issue_trace::cur != nullptr) {
+                uint64_t nb = request.payload.size() + request.begin_payload.size() +
+                              request.acts_payload.size();
+                for (const std::vector<uint8_t> & sp : request.stream_payloads) {
+                    nb += sp.size();
                 }
-                const dispatch_clock::time_point send_started = dispatch_clock::now();
+                wp_issue_trace::add_bytes((uint32_t) request.worker_index, nb);
+            }
+            const auto send_frame = [&](pipe_frame_type type, const std::vector<uint8_t> & payload) {
+                const uint64_t it_s = wp_issue_trace::mark();
+                const dispatch_clock::time_point send_started =
+                    layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
                 const bool send_ok = pipe_send_frame(*value.socket, type, seq_id, payload.data(), payload.size());
-                add_layer_trace(request.layer, &layer_trace_stats::send_ns,
-                                elapsed_ns(send_started, dispatch_clock::now()));
+                if (layer_trace_enabled()) {
+                    add_layer_trace(request.layer, &layer_trace_stats::send_ns,
+                                    elapsed_ns(send_started, dispatch_clock::now()));
+                }
+                wp_issue_trace::add(wp_issue_trace::PH_IR_SEND_BLOCK, it_s);
                 return send_ok;
             };
             if (collect_stats || req_log_ != nullptr) {
@@ -5104,6 +5135,7 @@ struct dispatcher::impl {
                         const std::vector<pipe_expert_assignment> * layer_assignments,
                         uint32_t                                    layer_n_tokens,
                         const char *                                caller_tag) {
+        wp_issue_trace::note_workers((uint32_t) workers.size());
         if (dispatch_chunks_trace_enabled()) {
             LLAMA_LOG_WARN("expert dispatch chunks trace: begin_dispatch caller=%s layer=%d chunk=%u open_slots=%zu\n",
                            caller_tag != nullptr ? caller_tag : "unknown", layer, chunk_index, open_dispatch_slots());
@@ -5147,8 +5179,10 @@ struct dispatcher::impl {
             const std::vector<pipe_expert_assignment> & routed =
                 layer_assignments != nullptr ? *layer_assignments : assignments;
             const uint32_t routed_tokens = layer_n_tokens != 0 ? layer_n_tokens : n_tokens;
+            const uint64_t it_loc = wp_issue_trace::mark();
             add_temporal_locality(layer, routed_tokens, routed);
             dump_routing(layer, routed_tokens, routed);
+            wp_issue_trace::add(wp_issue_trace::PH_BD_LOCALITY_DUMP, it_loc);
         }
 
         try {
@@ -5196,11 +5230,13 @@ struct dispatcher::impl {
             std::vector<pipe_expert_assignment> immediate;
             std::vector<pipe_expert_assignment> deferred;
             size_t                              n_def = 0;
+            const uint64_t it_split = wp_issue_trace::mark();
             if (may_defer) {
                 split_immediate_deferred(assignments, n_tokens, defer_k_value, immediate, deferred, n_def);
             } else {
                 immediate = assignments;
             }
+            wp_issue_trace::add(wp_issue_trace::PH_BD_SPLIT_DEFER, it_split);
             deferral.n_deferred += n_def;
 
             const dispatch_clock::time_point issue_start =
@@ -5215,18 +5251,22 @@ struct dispatcher::impl {
             std::vector<size_t> assigned_counts(workers.size(), 0);
             const dispatch_clock::time_point plan_started =
                 layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
+            const uint64_t it_pi = wp_issue_trace::mark();
             std::vector<planned_request> imm_requests =
                 plan_requests(layer, n_tokens, activations, immediate, route_it->second, assigned_counts,
                               swiglu_clamp, seq_id);
+            wp_issue_trace::add(wp_issue_trace::PH_BD_PLAN_IMM, it_pi);
             if (layer_trace_enabled()) {
                 add_layer_trace(layer, &layer_trace_stats::plan_ns, elapsed_ns(plan_started, dispatch_clock::now()));
             }
+            const uint64_t it_pd = wp_issue_trace::mark();
             std::vector<planned_request> def_requests =
                 deferred.empty()
                     ? std::vector<planned_request>{}
                     : plan_requests(layer, n_tokens, activations, deferred, route_it->second, assigned_counts,
                                     swiglu_clamp, seq_id);
 
+            wp_issue_trace::add(wp_issue_trace::PH_BD_PLAN_DEF, it_pd);
             state.stats              = {};
             state.stats.workers_used = imm_requests.size() + def_requests.size();
             for (const planned_request & request : imm_requests) {
@@ -5260,8 +5300,12 @@ struct dispatcher::impl {
             // (default 32) -- the two windows do not overlap in practice, and
             // folding dedup into the deferred-fold's own cross-layer bookkeeping
             // is not a safe thing to do without its own dedicated design.
+            const uint64_t it_dd = wp_issue_trace::mark();
             dedup_publish_and_ref(imm_requests, seq_id, layer, n_tokens, activations, state);
+            wp_issue_trace::add(wp_issue_trace::PH_BD_DEDUP, it_dd);
+            const uint64_t it_ii = wp_issue_trace::mark();
             issue_requests(imm_requests, seq_id, state);
+            wp_issue_trace::add(wp_issue_trace::PH_BD_ISSUE_IMM, it_ii);
             // WP_DISPATCH_RECV_AHEAD: hand this layer's stream_wire immediate
             // requests to their workers' reader threads NOW, right after the
             // bytes went out, so draining/decoding overlaps everything this
@@ -5273,10 +5317,14 @@ struct dispatcher::impl {
             // deferred request sharing a worker's socket cannot be posted to
             // that worker's reader thread by mistake -- start_recv_ahead()
             // only ever sees imm_requests).
+            const uint64_t it_ra = wp_issue_trace::mark();
             start_recv_ahead(imm_requests, state);
+            wp_issue_trace::add(wp_issue_trace::PH_BD_RECV_AHEAD, it_ra);
+            const uint64_t it_id = wp_issue_trace::mark();
             if (!def_requests.empty()) {
                 issue_requests(def_requests, seq_id, state);
             }
+            wp_issue_trace::add(wp_issue_trace::PH_BD_ISSUE_DEF, it_id);
             if (collect_stats) {
                 state.stats.ns_issue = elapsed_ns(issue_start, dispatch_clock::now());
             }
@@ -5286,7 +5334,9 @@ struct dispatcher::impl {
             // carries both, N-1 deferred frames were SENT before N's frames, so
             // they ARRIVE first (TCP FIFO). await_response validates seq_id and
             // throws on mismatch — do not weaken that check.
+            const uint64_t it_cd = wp_issue_trace::mark();
             std::vector<float> folded_prev = collect_pending_deferred(/*mark_fold_open=*/true, state);
+            wp_issue_trace::add(wp_issue_trace::PH_BD_COLLECT_DEFER, it_cd);
 
             state.hash_reqs       = imm_requests.size() + def_requests.size();
             state.imm_requests    = std::move(imm_requests);
