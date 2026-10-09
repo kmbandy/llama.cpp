@@ -29,3 +29,16 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,
                                    const ggml_tensor * logits,
                                    const ggml_tensor * ids);
+
+// WP_DSV4_ROUTER_FUSE (default off): exact fused DeepSeek-V4.1 sqrtsoftplus router tail.
+bool ggml_cuda_dsv4_router_fuse_enabled();
+bool ggml_cuda_dsv4_router_fuse_diff_enabled();
+bool ggml_cuda_dsv4_router_exact_match(const ggml_tensor * logits, const ggml_tensor * weights,
+                                       const ggml_tensor * ids, const ggml_tensor * clamp,
+                                       const ggml_tensor * scale, const ggml_tensor * bias);
+void ggml_cuda_op_topk_moe_dsv4_exact(ggml_backend_cuda_context & ctx, const ggml_tensor * logits,
+                                      ggml_tensor * weights, ggml_tensor * ids, const ggml_tensor * clamp,
+                                      const ggml_tensor * scale, const ggml_tensor * bias);
+void ggml_cuda_op_topk_moe_dsv4_exact_diff(ggml_backend_cuda_context & ctx, const ggml_tensor * logits,
+                                           ggml_tensor * weights, ggml_tensor * ids, const ggml_tensor * clamp,
+                                           const ggml_tensor * scale, const ggml_tensor * bias);

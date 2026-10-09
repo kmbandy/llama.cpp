@@ -9307,7 +9307,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 weights      = cgraph->nodes[i + ops.size() - 1];
                 out_nodes[1] = i + ops.size() - 1;
 
-                if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                // WP_DSV4_ROUTER_FUSE (default off): DeepSeek-V4.1 sqrtsoftplus router tail with
+                // exp_probs_b and norm. Uses the bit-exact kernel in topk-moe.cu. The generic
+                // ggml_cuda_should_use_topk_moe whitelist rejects 384 experts, so this branch
+                // bypasses it only when the knob is set.
+                if (args.sqrt_softplus && args.prob_bias && args.norm && clamp != nullptr &&
+                        ggml_cuda_dsv4_router_fuse_enabled()) {
+                    if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                            ggml_cuda_dsv4_router_exact_match(logits, weights, ids, clamp, scale, bias) &&
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        if (ggml_cuda_dsv4_router_fuse_diff_enabled()) {
+                            // debug: run the unfused chain, then compare the fused result against it
+                            for (int j = i; j < i + (int) ops.size(); ++j) {
+                                ggml_tensor * n = cgraph->nodes[j];
+                                if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                                    continue;
+                                }
+                                ggml_cuda_compute_forward(*cuda_ctx, n);
+                            }
+                            ggml_cuda_op_topk_moe_dsv4_exact_diff(*cuda_ctx, logits, weights, ids, clamp, scale, bias);
+                        } else {
+                            ggml_cuda_op_topk_moe_dsv4_exact(*cuda_ctx, logits, weights, ids, clamp, scale, bias);
+                        }
+                        return ops.size() - 1;
+                    }
+                } else if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
