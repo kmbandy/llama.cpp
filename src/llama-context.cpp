@@ -43,6 +43,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>  // getpid (WP_ROUTER_SCORE_LOG)
 #include <unordered_map>
 
 // WP ubatch-width hint into ggml-cuda's graph-capture prefill classifier
@@ -408,12 +409,282 @@ static bool wp_ced_nan_trace_chain_cb(struct ggml_tensor * t, bool ask, void * u
     return true; // never abort the graph -- this is observation only
 }
 
+// WP_ROUTER_SCORE_LOG=1 (diagnostic, default off): for each DS4.1 MoE layer
+// and token row, append the unbiased router probs (ffn_moe_probs-L, f16,
+// 384 wide) and the selected ids (ffn_moe_topk-L) to a binary file. The
+// exp_probs_b bias of each layer is written once. Observe-only: tensors are
+// read after compute and never written. The extra ask=true nodes only add
+// sync points; the default CUDA router fusion rejects 384 experts
+// (ggml-cuda/topk-moe.cu ggml_cuda_should_use_topk_moe), so kernels are unchanged.
+// Record and header layout: ~/ds4-runs/dsv41/tier/score/read_scores.py.
+// Knobs: WP_ROUTER_SCORE_LOG_FILE (default /tmp/wp-router-scores.<pid>.bin),
+// WP_ROUTER_SCORE_LOG_PREFILL=1 (also log graphs with n_tokens > 16).
+static const uint32_t WP_RS_VERSION     = 1;
+static const uint32_t WP_RS_REC_ROUTE   = 1;
+static const uint32_t WP_RS_REC_BIAS    = 2;
+static const int      WP_RS_MAX_LAYER   = 256;
+static const int      WP_RS_MAX_ROWS    = 16;
+static const int      WP_RS_MAX_USED    = 8;
+static const size_t   WP_RS_FLUSH_BYTES = (size_t) 16 << 20;
+
+static bool wp_rs_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("WP_ROUTER_SCORE_LOG");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool wp_rs_prefill() {
+    static const bool on = [] {
+        const char * e = getenv("WP_ROUTER_SCORE_LOG_PREFILL");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    return on;
+}
+
+struct wp_rs_state {
+    std::mutex mu;
+    FILE *     f = nullptr;
+    std::vector<uint8_t> buf;
+    uint32_t   seq     = 0;
+    int64_t    last_il = INT64_MAX; // a layer index <= this starts a new graph
+    bool       bias_done[WP_RS_MAX_LAYER] = {};
+    bool       stage_valid[WP_RS_MAX_LAYER] = {};
+    uint32_t   stage_seq[WP_RS_MAX_LAYER] = {};
+    uint32_t   stage_rows[WP_RS_MAX_LAYER] = {};
+    uint32_t   stage_n_expert[WP_RS_MAX_LAYER] = {};
+    std::vector<uint16_t> stage_probs[WP_RS_MAX_LAYER];
+};
+
+static wp_rs_state * wp_rs_st = nullptr;
+static ggml_backend_sched_eval_callback wp_rs_inner_cb = nullptr;
+static void *                           wp_rs_inner_ud = nullptr;
+
+template <typename T> static void wp_rs_put(std::vector<uint8_t> & b, T v) {
+    const size_t o = b.size();
+    b.resize(o + sizeof(T));
+    memcpy(b.data() + o, &v, sizeof(T));
+}
+
+// Caller holds wp_rs_st->mu.
+static void wp_rs_flush_locked() {
+    if (wp_rs_st->buf.empty()) {
+        return;
+    }
+    if (!wp_rs_st->f) {
+        char def[256];
+        snprintf(def, sizeof(def), "/tmp/wp-router-scores.%d.bin", (int) getpid());
+        const char * p = getenv("WP_ROUTER_SCORE_LOG_FILE");
+        wp_rs_st->f = fopen(p ? p : def, "wb");
+        if (!wp_rs_st->f) {
+            wp_rs_st->buf.clear();
+            return;
+        }
+        // header: magic[8] "WPRSCOR1", u32 version, u32 header_bytes=32, u32 prob_dtype=1 (f16),
+        // u32 reserved, u64 pid
+        std::vector<uint8_t> h;
+        h.insert(h.end(), {'W', 'P', 'R', 'S', 'C', 'O', 'R', '1'});
+        wp_rs_put<uint32_t>(h, WP_RS_VERSION);
+        wp_rs_put<uint32_t>(h, 32);
+        wp_rs_put<uint32_t>(h, 1);
+        wp_rs_put<uint32_t>(h, 0);
+        wp_rs_put<uint64_t>(h, (uint64_t) getpid());
+        fwrite(h.data(), 1, h.size(), wp_rs_st->f);
+    }
+    fwrite(wp_rs_st->buf.data(), 1, wp_rs_st->buf.size(), wp_rs_st->f);
+    wp_rs_st->buf.clear();
+}
+
+static void wp_rs_at_exit() {
+    if (!wp_rs_st) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(wp_rs_st->mu);
+    wp_rs_flush_locked();
+    if (wp_rs_st->f) {
+        fclose(wp_rs_st->f);
+        wp_rs_st->f = nullptr;
+    }
+}
+
+// Parses the layer index from a cb() name such as "ffn_moe_probs-42".
+// Returns -1 when the name does not have exactly this prefix or no index.
+static int wp_rs_layer(const char * name, const char * prefix) {
+    const size_t n = strlen(prefix);
+    if (strncmp(name, prefix, n) != 0) {
+        return -1;
+    }
+    const int il = atoi(name + n);
+    return (il >= 0 && il < WP_RS_MAX_LAYER) ? il : -1;
+}
+
+static bool wp_rs_rows_ok(const struct ggml_tensor * t) {
+    return wp_rs_prefill() || t->ne[1] <= WP_RS_MAX_ROWS;
+}
+
+static bool wp_rs_wants(const struct ggml_tensor * t) {
+    if (t->ne[2] != 1 || t->ne[3] != 1 || !wp_rs_rows_ok(t)) {
+        return false;
+    }
+    if (wp_rs_layer(t->name, "ffn_moe_probs-") >= 0 || wp_rs_layer(t->name, "ffn_moe_topk-") >= 0) {
+        return true;
+    }
+    const int il = wp_rs_layer(t->name, "ffn_moe_probs_biased-");
+    return il >= 0 && !wp_rs_st->bias_done[il] && t->src[1] != nullptr;
+}
+
+// Returns the host-readable bytes of t (copies if the buffer is not host).
+static const uint8_t * wp_rs_read(const struct ggml_tensor * t, std::vector<uint8_t> & tmp) {
+    if (!t->buffer) {
+        return nullptr;
+    }
+    const size_t n = ggml_nbytes(t);
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        return (const uint8_t *) t->data;
+    }
+    tmp.resize(n);
+    ggml_backend_tensor_get(t, tmp.data(), 0, n);
+    return tmp.data();
+}
+
+static void wp_rs_observe(const struct ggml_tensor * t) {
+    std::lock_guard<std::mutex> lk(wp_rs_st->mu);
+    std::vector<uint8_t> tmp;
+
+    const int il_p = wp_rs_layer(t->name, "ffn_moe_probs-");
+    if (il_p >= 0 && wp_rs_rows_ok(t) && t->type == GGML_TYPE_F32 && t->ne[2] == 1 && t->ne[3] == 1) {
+        if (il_p <= wp_rs_st->last_il) {
+            wp_rs_st->seq++;
+        }
+        wp_rs_st->last_il = il_p;
+        const uint8_t * d = wp_rs_read(t, tmp);
+        if (!d) {
+            return;
+        }
+        const int64_t n_expert = t->ne[0];
+        const int64_t rows     = t->ne[1];
+        std::vector<uint16_t> & sp = wp_rs_st->stage_probs[il_p];
+        sp.resize((size_t) (n_expert * rows));
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t i = 0; i < n_expert; ++i) {
+                const float v = *(const float *) (d + r * t->nb[1] + i * t->nb[0]);
+                sp[(size_t) (r * n_expert + i)] = ggml_fp32_to_fp16(v);
+            }
+        }
+        wp_rs_st->stage_valid[il_p]    = true;
+        wp_rs_st->stage_seq[il_p]      = wp_rs_st->seq;
+        wp_rs_st->stage_rows[il_p]     = (uint32_t) rows;
+        wp_rs_st->stage_n_expert[il_p] = (uint32_t) n_expert;
+        return;
+    }
+
+    const int il_k = wp_rs_layer(t->name, "ffn_moe_topk-");
+    if (il_k >= 0 && wp_rs_rows_ok(t) && wp_rs_st->stage_valid[il_k]) {
+        wp_rs_st->stage_valid[il_k] = false;
+        const int64_t n_used = t->ne[0];
+        const int64_t rows   = t->ne[1];
+        if (n_used > WP_RS_MAX_USED || rows != (int64_t) wp_rs_st->stage_rows[il_k] || t->type != GGML_TYPE_I32) {
+            return;
+        }
+        const uint8_t * d = wp_rs_read(t, tmp);
+        if (!d) {
+            return;
+        }
+        const uint32_t n_expert = wp_rs_st->stage_n_expert[il_k];
+        const std::vector<uint16_t> & sp = wp_rs_st->stage_probs[il_k];
+        std::vector<uint8_t> & b = wp_rs_st->buf;
+        for (int64_t r = 0; r < rows; ++r) {
+            const uint32_t rec_bytes = 16 + 16 + 32 + 2 * n_expert;
+            wp_rs_put<uint32_t>(b, WP_RS_REC_ROUTE);
+            wp_rs_put<uint32_t>(b, rec_bytes);
+            wp_rs_put<uint32_t>(b, wp_rs_st->stage_seq[il_k]);
+            wp_rs_put<uint32_t>(b, (uint32_t) il_k);
+            wp_rs_put<uint32_t>(b, (uint32_t) rows);
+            wp_rs_put<uint32_t>(b, (uint32_t) r);
+            wp_rs_put<uint32_t>(b, n_expert);
+            wp_rs_put<uint32_t>(b, (uint32_t) n_used);
+            for (int k = 0; k < WP_RS_MAX_USED; ++k) {
+                const int32_t id = k < n_used ? *(const int32_t *) (d + r * t->nb[1] + k * t->nb[0]) : -1;
+                wp_rs_put<int32_t>(b, id);
+            }
+            const size_t o = b.size();
+            b.resize(o + 2 * n_expert);
+            memcpy(b.data() + o, sp.data() + (size_t) r * n_expert, 2 * n_expert);
+        }
+        if (b.size() >= WP_RS_FLUSH_BYTES) {
+            wp_rs_flush_locked();
+        }
+        return;
+    }
+
+    const int il_b = wp_rs_layer(t->name, "ffn_moe_probs_biased-");
+    if (il_b >= 0 && !wp_rs_st->bias_done[il_b] && t->src[1] && t->src[1]->type == GGML_TYPE_F32) {
+        wp_rs_st->bias_done[il_b] = true;
+        const ggml_tensor * bias = t->src[1];
+        const uint8_t * d = wp_rs_read(bias, tmp);
+        if (!d) {
+            return;
+        }
+        const uint32_t n_expert = (uint32_t) bias->ne[0];
+        std::vector<uint8_t> & b = wp_rs_st->buf;
+        wp_rs_put<uint32_t>(b, WP_RS_REC_BIAS);
+        wp_rs_put<uint32_t>(b, 16 + 8 + 4 * n_expert);
+        wp_rs_put<uint32_t>(b, 0);
+        wp_rs_put<uint32_t>(b, (uint32_t) il_b);
+        wp_rs_put<uint32_t>(b, n_expert);
+        wp_rs_put<uint32_t>(b, 0);
+        const size_t o = b.size();
+        b.resize(o + 4 * n_expert);
+        for (uint32_t i = 0; i < n_expert; ++i) {
+            memcpy(b.data() + o + 4 * i, d + i * bias->nb[0], 4);
+        }
+    }
+}
+
+// Lock-free name filter so the hot path only takes the mutex for watched nodes.
+static bool wp_rs_is_watched(const struct ggml_tensor * t) {
+    return (wp_rs_layer(t->name, "ffn_moe_probs-") >= 0 || wp_rs_layer(t->name, "ffn_moe_topk-") >= 0 ||
+                       wp_rs_layer(t->name, "ffn_moe_probs_biased-") >= 0);
+}
+
+static bool wp_rs_chain_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    (void) user_data;
+    bool inner_need = true;
+    if (wp_rs_inner_cb) {
+        inner_need = wp_rs_inner_cb(t, ask, wp_rs_inner_ud);
+    }
+    if (t == nullptr || !wp_rs_is_watched(t)) {
+        return inner_need;
+    }
+    if (ask) {
+        return inner_need || wp_rs_wants(t);
+    }
+    wp_rs_observe(t);
+    return inner_need;
+}
+
+// Call at each eval-callback install site, before the CED trace chains on.
+static void wp_router_score_install(ggml_backend_sched_eval_callback & eval_cb, void * & eval_cb_user_data) {
+    if (!wp_rs_enabled()) {
+        return;
+    }
+    if (!wp_rs_st) {
+        wp_rs_st = new wp_rs_state();
+        std::atexit(wp_rs_at_exit);
+    }
+    wp_rs_inner_cb = eval_cb;
+    wp_rs_inner_ud = eval_cb_user_data;
+    eval_cb = wp_rs_chain_cb;
+}
+
 // Call at each `ggml_backend_sched_set_eval_callback` site, after `eval_cb`/
 // `eval_cb_user_data` have been resolved to whatever they would otherwise be
 // (cparams.cb_eval, or the weight pager's callback when paging is active).
 // Chains the trace onto whichever of those is already selected rather than
 // replacing it.
 static void wp_ced_nan_trace_install(ggml_backend_sched_eval_callback & eval_cb, void * & eval_cb_user_data) {
+    wp_router_score_install(eval_cb, eval_cb_user_data);
     if (!wp_ced_nan_trace_enabled() && !wp_ced_value_dump_path()) {
         return;
     }
