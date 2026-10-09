@@ -303,6 +303,8 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
 }
 
 graph_dispatcher::~graph_dispatcher() {
+    // Queued GPU-flag fold jobs finish (and publish) before the sockets go away.
+    wait_stop_thread();
     // Best-effort drain so a short-lived context does not leave workers hanging.
     try {
         while (remote.has_open_dispatch()) {
@@ -864,9 +866,22 @@ static bool wait_env_on(const char * name) {
     return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
 }
 
-// 0 = off (legacy), 1 = WP_WAIT_ZEROCOPY.
+// 0 = off (legacy), 1 = WP_WAIT_ZEROCOPY, 2 = WP_WAIT_GPU_FLAG (implies 1).
 static int wait_knob_mode() {
-    static const int mode = wait_env_on("WP_WAIT_ZEROCOPY") ? 1 : 0;
+    static const int mode = [] {
+        const bool zc = wait_env_on("WP_WAIT_ZEROCOPY");
+        const bool gf = wait_env_on("WP_WAIT_GPU_FLAG");
+        if (gf && wait_env_on("WP_SHEXP_NO_GATE")) {
+            // The GPU flag path orders the consuming kernel after the CPU issue
+            // only through the shexp gate; without it the kernel could start
+            // before `expect` is written.
+            std::fprintf(stderr,
+                         "expert dispatch: WP_WAIT_GPU_FLAG needs the shexp gate; "
+                         "WP_SHEXP_NO_GATE is set -> using WP_WAIT_ZEROCOPY only\n");
+            return 1;
+        }
+        return gf ? 2 : ((zc || gf) ? 1 : 0);
+    }();
     return mode;
 }
 
@@ -954,10 +969,97 @@ ggml_tensor * graph_dispatcher::build_wait_add(ggml_context * ctx, ggml_tensor *
     wait_slot * slot = nullptr;
     const int   mode = wait_mode(layer, shexp->ne[1], 1, &slot);
     GGML_ASSERT(mode != 0 && slot != nullptr);
-    // ctrl == nullptr: no device wait; the host already folded into the slot
-    // before the consuming split runs, and `wait` is the ordering edge.
-    GGML_ASSERT(mode == 1 && wait != nullptr);
-    return ggml_wait_add(ctx, shexp, wait, slot->data, nullptr, wait_timeout_ms());
+    // mode 1: ctrl == nullptr (no device wait; the host already folded into the
+    // slot before the consuming split runs) and `wait` is the ordering edge.
+    // mode 2: no CPU wait node at all; the op spins on the slot's epoch flag.
+    GGML_ASSERT(mode == 2 ? wait == nullptr : wait != nullptr);
+    return ggml_wait_add(ctx, shexp, wait, slot->data, mode == 2 ? slot->ctrl : nullptr, wait_timeout_ms());
+}
+
+void graph_dispatcher::wait_publish(wait_slot * slot, uint64_t epoch) noexcept {
+    // Data first (plain stores / memcpy by the caller), then a release fence, then
+    // the release store of the flag the device spins on.
+    std::atomic_thread_fence(std::memory_order_release);
+    __atomic_store_n(&slot->ctrl->flag, epoch, __ATOMIC_RELEASE);
+}
+
+void graph_dispatcher::wait_publish_zero(wait_slot * slot, uint64_t epoch, int64_t n_floats) noexcept {
+    if (slot == nullptr) {
+        return;
+    }
+    std::memset(slot->data, 0, (size_t) n_floats * sizeof(float));
+    wait_publish(slot, epoch);
+}
+
+void graph_dispatcher::wait_enqueue(const wait_job & job) {
+    {
+        std::lock_guard<std::mutex> lock(wait_mu_);
+        if (!wait_thread_started_) {
+            wait_thread_ = std::thread([this] { wait_bg_loop(); });
+            wait_thread_started_ = true;
+        }
+        wait_q_.push_back(job);
+        ++wait_inflight_;
+    }
+    wait_cv_.notify_one();
+}
+
+void graph_dispatcher::wait_bg_loop() {
+    for (;;) {
+        wait_job job;
+        {
+            std::unique_lock<std::mutex> lock(wait_mu_);
+            wait_cv_.wait(lock, [this] { return wait_stop_ || !wait_q_.empty(); });
+            if (wait_q_.empty()) {
+                return;   // stop requested and drained
+            }
+            job = wait_q_.front();
+            wait_q_.pop_front();
+        }
+        // Same receive + FIXED-worker-order fold as the host-blocking op; wait_core
+        // never throws (failures latch and zero the slot). Publish is the very last
+        // touch of dispatcher state for this layer.
+        wait_core(job.context, nullptr, job.slot->data, job.n_tokens, true);
+        wait_publish(job.slot, job.epoch);
+        {
+            std::lock_guard<std::mutex> lock(wait_mu_);
+            --wait_inflight_;
+        }
+        wait_idle_cv_.notify_all();
+    }
+}
+
+void graph_dispatcher::wait_drain() {
+    std::unique_lock<std::mutex> lock(wait_mu_);
+    wait_idle_cv_.wait(lock, [this] { return wait_inflight_ == 0; });
+}
+
+void graph_dispatcher::wait_stop_thread() noexcept {
+    try {
+        {
+            std::lock_guard<std::mutex> lock(wait_mu_);
+            wait_stop_ = true;
+        }
+        wait_cv_.notify_all();
+        if (wait_thread_.joinable()) {
+            wait_thread_.join();
+        }
+    } catch (...) {
+    }
+}
+
+void graph_dispatcher::check_wait_gpu_failures() {
+    for (auto & entry : wait_slots_) {
+        ggml_wait_ctrl * ctrl = entry.second.ctrl;
+        if (__atomic_load_n(&ctrl->fail, __ATOMIC_ACQUIRE) != 0) {
+            __atomic_store_n(&ctrl->fail, (uint64_t) 0, __ATOMIC_RELEASE);
+            const std::string message = "expert dispatch: GPU timed out (" + std::to_string(wait_timeout_ms()) +
+                                        " ms) waiting for the remote partial of layer " +
+                                        std::to_string(entry.first) + " (WP_WAIT_GPU_FLAG); output is invalid";
+            std::fprintf(stderr, "%s\n", message.c_str());
+            latch_failure(message.c_str());
+        }
+    }
 }
 
 void graph_dispatcher::begin_graph_build(ggml_context * ctx) {
@@ -2501,6 +2603,10 @@ void graph_dispatcher::begin_decode() noexcept {
 void graph_dispatcher::end_decode() noexcept {
     // begin_decode() holds this recursive lock for the decode scope.
     std::unique_lock<std::recursive_mutex> io_lock(io_mutex_, std::adopt_lock);
+    // WP_WAIT_GPU_FLAG: the last layer's fold job must be finished (and its
+    // happens-before acquired) before anything below touches the remote state.
+    wait_drain();
+    check_wait_gpu_failures();
     // PREDICTION CADENCE. Emitted once per decode so a run's log says how often
     // the predictor actually ran, rather than how often it was asked to. See the
     // latest-wins comment in enqueue_prediction.
@@ -2909,6 +3015,36 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch custom op has no dispatcher");
         }
         owner = context->owner;
+        // WP_WAIT_GPU_FLAG: join the previous layer's background fold (happens-before
+        // for the remote state it touched) and surface any GPU spin timeout BEFORE
+        // this layer talks to the workers again.
+        owner->wait_drain();
+        owner->check_wait_gpu_failures();
+        // GPU-flag layers must publish exactly once per issue, on EVERY exit path
+        // (the consuming kernel is already queued or about to be): armed here,
+        // disarmed right before the real fold job is queued at the end of the try.
+        wait_slot * gf_slot = nullptr;
+        const int   gf_mode = owner->wait_mode(context->layer, activations->ne[1], context->chunk_count, &gf_slot);
+        struct gf_guard_t {
+            graph_dispatcher * o;
+            wait_slot *        slot;
+            uint64_t           epoch;
+            int64_t            n_floats;
+            bool               armed;
+            ~gf_guard_t() {
+                if (armed) {
+                    o->wait_publish_zero(slot, epoch, n_floats);
+                }
+            }
+        } gf_guard{ owner, gf_slot, 0, 0, false };
+        if (gf_mode == 2) {
+            gf_guard.epoch    = ++gf_slot->seq;
+            gf_guard.n_floats = activations->ne[0] * activations->ne[1];
+            // Read by the device when the consuming kernel starts; the kernel is
+            // only launched after this issue op returns (shexp gate / data deps).
+            __atomic_store_n(&gf_slot->ctrl->expect, gf_guard.epoch, __ATOMIC_RELEASE);
+            gf_guard.armed = true;
+        }
         const bool trace_layer = owner->layer_trace_ != nullptr &&
                                  (context->chunk_count == 1 || context->chunk_index == 0);
         const bool trace_profile = owner->spine_profile_.active &&
@@ -3153,6 +3289,16 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
             if (trace_profile) {
                 owner->spine_profile_issue_end(context->layer, issue_return);
             }
+        }
+        if (gf_mode == 2) {
+            // LAST statement: the fold job owns the publish from here on.
+            gf_guard.armed = false;
+            wait_job job;
+            job.context  = context;
+            job.slot     = gf_slot;
+            job.epoch    = gf_guard.epoch;
+            job.n_tokens = activations->ne[1];
+            owner->wait_enqueue(job);
         }
     } catch (const std::exception & error) {
         if (owner != nullptr) {

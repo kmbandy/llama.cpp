@@ -84,18 +84,21 @@ class graph_dispatcher {
     ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer);
     ggml_tensor * build_wait(ggml_context * ctx, int32_t layer);
 
-    // WP_WAIT_ZEROCOPY (default OFF): build the join of the shared-expert output
-    // with the remote partial as one GGML_OP_WAIT_ADD that reads the folded
-    // partial from a persistent pinned slot. The CPU wait node still blocks the
-    // host and folds (in fixed worker order) into the slot; WAIT_ADD only has an
-    // ordering edge to it, so there is no H2D copy of the wait output.
-    // wait_add_mode() is 0 when the layer is not eligible (knob off, chunked
+    // WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG (both default OFF): build the join of
+    // the shared-expert output with the remote partial as one GGML_OP_WAIT_ADD
+    // that reads the folded partial from a persistent pinned slot.
+    //   mode 1 (ZEROCOPY): the CPU wait node still blocks the host and folds into
+    //          the slot; WAIT_ADD only has an ordering edge to it (no H2D copy).
+    //   mode 2 (GPU_FLAG): no CPU wait node at all. A background thread folds and
+    //          release-stores the slot's epoch flag; the GPU op spins on it.
+    // Returns nullptr when the layer is not eligible (knob off, chunked
     // dispatch, shexp not F32/contiguous/same shape, token count above the slot
     // capacity, no pinned allocator); the caller then builds the legacy
-    // build_wait + ggml_add. The decision depends only on (layer, n_tokens, env),
-    // so the compute callbacks reproduce it identically at run time.
+    // build_wait + ggml_add. Decision depends only on (layer, n_tokens, env), so
+    // it is reproduced identically by the compute callbacks at run time.
+    // 0 = not eligible (use build_wait + ggml_add), 1 = zerocopy, 2 = gpu flag.
     int           wait_add_mode(const ggml_tensor * shexp, int32_t layer);
-    // `wait` is the CPU wait node.
+    // `wait` is the CPU wait node (mode 1) or nullptr (mode 2).
     ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer);
 
     void begin_graph_build(ggml_context * ctx);
@@ -309,21 +312,42 @@ class graph_dispatcher {
 
     void latch_failure(const char * message) noexcept;
 
-    // ---- WP_WAIT_ZEROCOPY ----------------------------------------------------
+    // ---- WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG -------------------------------
     struct wait_slot {
         float *            data = nullptr;   // n_embd * cap_tokens floats, mapped coherent pinned
         ggml_wait_ctrl *   ctrl = nullptr;   // 64 B handshake block, same allocation
         size_t             cap_floats = 0;
         uint64_t           seq = 0;          // epoch counter (dispatch thread only)
     };
-    // 0 = legacy, 1 = zerocopy; also resolves the slot.
+    struct wait_job {
+        op_context * context = nullptr;
+        wait_slot *  slot = nullptr;
+        uint64_t     epoch = 0;
+        int64_t      n_tokens = 0;
+    };
+    // 0 = legacy, 1 = zerocopy, 2 = gpu flag; also resolves the slot.
     int  wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out);
     wait_slot * wait_slot_for(int32_t layer, int64_t n_floats, bool create);
     // Body shared by compute_wait (host blocking; dst is the CPU wait node) and the
     // background job (dst == nullptr, bg == true). zc_out != nullptr redirects the
     // folded result into the pinned slot instead of dst->data.
     void wait_core(op_context * context, ggml_tensor * dst, float * zc_out, int64_t n_tokens, bool bg);
-    std::map<int32_t, wait_slot>      wait_slots_;   // keyed by layer; created at graph build
+    void wait_publish(wait_slot * slot, uint64_t epoch) noexcept;
+    void wait_publish_zero(wait_slot * slot, uint64_t epoch, int64_t n_floats) noexcept;
+    void wait_enqueue(const wait_job & job);
+    void wait_bg_loop();
+    void wait_drain();                 // dispatch thread: block until every queued job is published+done
+    void wait_stop_thread() noexcept;
+    void check_wait_gpu_failures();    // dispatch thread: GPU spin timeouts -> latch_failure
+    std::map<int32_t, wait_slot>      wait_slots_;
+    std::thread                       wait_thread_;
+    std::mutex                        wait_mu_;
+    std::condition_variable           wait_cv_;
+    std::condition_variable           wait_idle_cv_;
+    std::deque<wait_job>              wait_q_;
+    size_t                            wait_inflight_ = 0;   // queued + running; guarded by wait_mu_
+    bool                              wait_stop_ = false;
+    bool                              wait_thread_started_ = false;
     void layer_trace_issue_return(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
     void layer_trace_wait_entry(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
     void spine_profile_issue_begin(std::chrono::steady_clock::time_point time) noexcept;
