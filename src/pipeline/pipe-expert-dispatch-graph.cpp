@@ -3198,6 +3198,17 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                 const char * e = std::getenv("WP_HINT_INFLIGHT");
                 return e != nullptr && e[0] == '1';
             }();
+            // WP_HINT_FLUSH_AFTER_SEND=1 (default OFF): the pre-send flush and
+            // layer-ahead prefetch (hint_pre_flush, ~179 us/call of blocking
+            // socket sends) move to after the request frames are sent. Hints are
+            // sent in the same order and with the same content; only the request
+            // no longer waits behind them. Post-send hints go through the
+            // WP_HINT_INFLIGHT path (hint_inflight_scope), because send_prefetch_hints
+            // would otherwise decline them while the request is in flight.
+            static const bool hint_flush_after_send = [] {
+                const char * e = std::getenv("WP_HINT_FLUSH_AFTER_SEND");
+                return e != nullptr && e[0] == '1';
+            }();
             owner->pscore_note_step(context->layer, full_tokens);   // before any enqueue_prediction below
             if (!hints_after_send) {
                 if (owner->router2_topm() > 0) {
@@ -3217,7 +3228,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                 }
                 owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
             } else {
-                const bool defer_sock = hint_inflight;
+                const bool defer_sock = hint_inflight || hint_flush_after_send;
                 if (!defer_sock) {
                     // socket-touching hints stay ahead of the send (in_flight == 0)
                     // flush before enqueue, as before
@@ -3238,6 +3249,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                     if (owner->router2_topm() > 0) {
                         const uint64_t it_pf = wp_issue_trace::mark();
                         if (defer_sock) {
+                            const hint_inflight_scope in_flight_ok;
                             owner->flush_predicted_hints();
                         }
                         wp_issue_trace::add(wp_issue_trace::PH_POST_FLUSH_HINTS, it_pf);
@@ -3257,6 +3269,7 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                     }
                     if (defer_sock) {
                         const uint64_t it_pp = wp_issue_trace::mark();
+                        const hint_inflight_scope in_flight_ok;
                         owner->prefetch_layer_ahead(layer_id, (uint32_t) full_tokens);
                         wp_issue_trace::add(wp_issue_trace::PH_POST_PREFETCH, it_pp);
                     }

@@ -181,6 +181,19 @@ class inproc_backend {
 using inproc_backend_factory = std::unique_ptr<inproc_backend> (*)(const endpoint &);
 void set_inproc_backend_factory(inproc_backend_factory factory);
 
+// RAII: while one of these is alive on this thread, send_prefetch_hints() may
+// send even though a request is in flight -- the WP_HINT_INFLIGHT=1 rule, scoped
+// to the call sites that opt in (compute_issue's WP_HINT_FLUSH_AFTER_SEND path).
+// Frames are still enqueued/written in order behind the request on the same
+// socket; the worker consumes complete frames and handles hints by type.
+class hint_inflight_scope {
+public:
+    hint_inflight_scope();
+    ~hint_inflight_scope();
+    hint_inflight_scope(const hint_inflight_scope &) = delete;
+    hint_inflight_scope & operator=(const hint_inflight_scope &) = delete;
+};
+
 class dispatcher {
   public:
     using dispatch_handle = uint64_t;

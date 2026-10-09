@@ -102,6 +102,9 @@ bool hint_inflight_enabled() {
     return value != nullptr && value[0] == '1';
 }
 
+// Depth of live hint_inflight_scope objects on this thread (see the header).
+thread_local int hint_inflight_scope_depth = 0;
+
 // Decode/verify (n_tokens <= max) prefer this worker port among candidates.
 // DEFAULT OFF. Opt in with WP_DISPATCH_DECODE_PORT=8803 (GTX 1070). This
 // shifts 0-84 decode off the RX 480; it does not make either card faster.
@@ -3621,7 +3624,7 @@ struct dispatcher::impl {
         // WP_HINT_INFLIGHT=1 can safely use the same socket while a response is
         // outstanding.
         const bool sent_in_flight = in_flight != 0;
-        if (sent_in_flight && !hint_inflight) {
+        if (sent_in_flight && !hint_inflight && hint_inflight_scope_depth == 0) {
             ++hint_stats.n_skipped_in_flight;
             return 0;
         }
@@ -5697,6 +5700,14 @@ void dispatcher::end_deferral_window() noexcept {
 
 std::vector<float> dispatcher::drain_deferred() {
     return pimpl->drain();
+}
+
+hint_inflight_scope::hint_inflight_scope() {
+    ++hint_inflight_scope_depth;
+}
+
+hint_inflight_scope::~hint_inflight_scope() {
+    --hint_inflight_scope_depth;
 }
 
 }  // namespace pipe_expert_dispatcher
