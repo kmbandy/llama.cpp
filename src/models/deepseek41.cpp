@@ -6,6 +6,7 @@
 #include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-mmap.h"
 
 #include <atomic>
 #include <algorithm>
@@ -860,7 +861,8 @@ public:
     llm_graph_input_engram(
             const llama_model_deepseek41::engram_hasher & hasher,
             const llama_kv_cache_dsv4_raw_context * mctx,
-            int ordinal) : hasher(hasher), mctx(mctx), ordinal(ordinal) {}
+            int ordinal,
+            const ggml_tensor * engram_embd = nullptr) : hasher(hasher), mctx(mctx), ordinal(ordinal), engram_embd(engram_embd) {}
     ~llm_graph_input_engram() override = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -881,7 +883,65 @@ public:
     // which engram layer this is (ordinal in dsv41_engram_layer_ids), so the right
     // multipliers/primes/offsets rows are used
     const int ordinal;
+
+    // this layer's engram_embd table; only read by the WP_DSV41_ENGRAM_PREFETCH page-cache warm-up
+    const ggml_tensor * engram_embd = nullptr;
 };
+
+// WP_DSV41_ENGRAM_PREFETCH=1: after the row indices for this step are known, advise the kernel
+// to read the engram_embd pages they touch (MADV_WILLNEED via llama_prefetch). This only warms
+// the page cache; the indices and the gather are unchanged.
+static void engram_prefetch_rows(const ggml_tensor * table, const int32_t * idx, size_t n_idx, int ordinal) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_DSV41_ENGRAM_PREFETCH");
+        return e && e[0] == '1';
+    }();
+    static int n_logged = 0;
+    if (!enabled || table == nullptr || table->buffer == nullptr || table->data == nullptr ||
+        !ggml_backend_buffer_is_host(table->buffer) || table->ne[1] <= 0 || n_idx == 0) {
+        return;
+    }
+
+    const size_t row_bytes = table->nb[1];
+    const size_t n_rows    = (size_t) table->ne[1];
+    const uintptr_t base   = (uintptr_t) table->data;
+    // 4 KiB granularity for the dedupe; llama_prefetch() rounds to the real page size and merges runs
+    const uintptr_t page   = 4096;
+    if (row_bytes == 0) {
+        return;
+    }
+
+    // every 4 KiB page overlapped by a row [start, start + row_bytes), deduplicated
+    std::vector<uintptr_t> pages;
+    pages.reserve(n_idx * 2);
+    for (size_t i = 0; i < n_idx; ++i) {
+        const int32_t r = idx[i];
+        if (r < 0 || (size_t) r >= n_rows) {
+            continue;
+        }
+        const uintptr_t start = base + (uintptr_t) r * row_bytes;
+        const uintptr_t first = start / page;
+        const uintptr_t last  = (start + row_bytes - 1) / page;
+        for (uintptr_t p = first; p <= last; ++p) {
+            pages.push_back(p);
+        }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+    llama_memory_ranges mr;
+    mr.reserve(pages.size());
+    for (uintptr_t p : pages) {
+        mr.push_back({ (const void *) (p * page), (size_t) page });
+    }
+    llama_prefetch(std::move(mr));
+
+    if (n_logged < 3) {
+        n_logged++;
+        LLAMA_LOG_INFO("%s: WP_DSV41_ENGRAM_PREFETCH: engram layer ordinal %d advised %zu pages (%zu rows, %zu row bytes)\n",
+                __func__, ordinal, pages.size(), n_idx, row_bytes);
+    }
+}
 
 void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     if (rows == nullptr || rows->data == nullptr || ubatch == nullptr) {
@@ -928,6 +988,8 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         hasher.hash_position(ctx_ids.data(), (uint32_t) ordinal, idx.data() + i * n_cols);
     }
 
+    engram_prefetch_rows(engram_embd, idx.data(), idx.size(), ordinal);
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * ggml_element_size(rows));
 }
 
@@ -968,7 +1030,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
 
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
 
-    auto inp = std::make_unique<llm_graph_input_engram>(pmodel.engram, mctx_cur->get_raw(), pmodel.engram_index(il));
+    auto inp = std::make_unique<llm_graph_input_engram>(pmodel.engram, mctx_cur->get_raw(), pmodel.engram_index(il),
+            model.layers[il].engram_embd);
 
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);
