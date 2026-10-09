@@ -1,4 +1,5 @@
 #include "pipe-protocol.h"
+#include "pipe-ml8-pack-cpu.h"
 #include "pipe-transport.h"
 #include "pipe-reduce-simd.h"
 #include "pipe-thread-pool.h"
@@ -1361,12 +1362,33 @@ int pipe_expert_encode_threads() {
     return n;
 }
 
+// WP_SPINE_WIRE_CPU_PACK=1 (default OFF): the spine's per-layer activation pack
+// for small row counts (decode/verify/draft, n_tokens <= 16) runs the bit-exact
+// CPU ml8_4 pack (pipe-ml8-pack-cpu.h) instead of the CUDA pack, whose global
+// mutex, pageable H2D/D2H and stream sync cost ~264 us/call for ~6 rows. Output
+// bytes are identical (tests/test-ml8-4-pack-cpu-vs-gpu.cpp). Prefill keeps the
+// GPU path. Only meaningful when the wire dtype is ml8_4.
+static bool spine_wire_cpu_pack_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_SPINE_WIRE_CPU_PACK");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 void pipe_expert_wire_pack_matrix(uint8_t * dst, const float * src, uint32_t n_tokens, int32_t n_embd) {
     if (n_embd <= 0) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert wire pack requires positive n_embd");
     }
     const int32_t  dtype     = expert_wire_dtype();
     const size_t   row_bytes = (size_t) expert_wire_bytes((size_t) n_embd, dtype);
+    if (dtype == PIPE_HIDDEN_ML8_4 && n_tokens <= 16 && (n_embd % 32) == 0 &&
+        spine_wire_cpu_pack_enabled()) {
+        // ml8_4 blocks are independent 32-value groups, so one call over the
+        // whole [n_tokens x n_embd] matrix gives the same bytes as the GPU pack.
+        pipe_ml8::pack_ml8_4(dst, src, (size_t) n_tokens * (size_t) n_embd);
+        return;
+    }
     const int      nt        = pipe_expert_encode_threads();
     // Below ~256 rows the per-thread slice is too small to be worth a pool
     // hop (matches the >=4096-block threshold expert_wire_unpack_ml8_4 uses

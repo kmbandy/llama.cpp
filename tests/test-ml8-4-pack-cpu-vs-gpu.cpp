@@ -2,6 +2,7 @@
 // Standalone; build one-off against libggml-hip (see commit message). Uses GPU 0 briefly.
 #include "../src/pipeline/pipe-ml8-pack-cpu.h"
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 #include <random>
@@ -35,7 +36,43 @@ static void check(const std::vector<float> & x, const char * what) {
     g_floats += n; g_blocks += n / 32;
 }
 
-int main() {
+// CPU-only (no GPU use): `test-ml8-4-pack-cpu-vs-gpu --cpu-only`. Covers the
+// spine's call shape (pipe_expert_wire_pack_matrix with WP_SPINE_WIRE_CPU_PACK=1:
+// n_tokens <= 16, n_embd % 32 == 0) -- the whole [rows x n_embd] matrix packed in
+// one call must equal row-by-row packing and the per-block scalar reference.
+// The GPU-equality part of the claim is only checked by the default mode above.
+static int cpu_only_spine_shape() {
+    std::mt19937_64 rng(777);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    size_t bad = 0, cases = 0;
+    for (int rows : {1, 2, 3, 6, 8, 16}) {
+        for (int n_embd : {32, 2048, 4096}) {
+            for (int mode = 0; mode < 3; ++mode) {
+                std::vector<float> x((size_t) rows * n_embd);
+                for (auto & v : x) v = mode == 0 ? nd(rng) : mode == 1 ? nd(rng) * 1e-4f : (nd(rng) > 0 ? 1.f : -1.f) * 0.9375f;
+                const size_t rb = (size_t) n_embd / 32 * 18;
+                std::vector<uint8_t> whole(rows * rb), byrow(rows * rb), sc(rows * rb);
+                pipe_ml8::pack_ml8_4(whole.data(), x.data(), x.size());
+                for (int r = 0; r < rows; ++r) {
+                    pipe_ml8::pack_ml8_4(byrow.data() + r * rb, x.data() + (size_t) r * n_embd, n_embd);
+                    for (int b = 0; b < n_embd / 32; ++b) {
+                        pipe_ml8::pack_block_scalar(x.data() + (size_t) r * n_embd + b * 32, sc.data() + r * rb + b * 18);
+                    }
+                }
+                cases++;
+                if (std::memcmp(whole.data(), byrow.data(), whole.size()) != 0) bad++;
+                if (std::memcmp(whole.data(), sc.data(), whole.size()) != 0) bad++;
+            }
+        }
+    }
+    std::printf("cpu-only spine shape: cases=%zu mismatches=%zu\n", cases, bad);
+    return bad ? 1 : 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--cpu-only") == 0) {
+        return cpu_only_spine_shape();
+    }
     std::mt19937_64 rng(12345);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::uniform_real_distribution<float> ud(-1.f, 1.f);
