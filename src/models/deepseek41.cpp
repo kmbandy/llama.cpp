@@ -1737,6 +1737,29 @@ static void dsv41_ced_check_idxs_cb(ggml_tensor * dst, const ggml_tensor * a, in
     }
 }
 
+// WP_DSV41_CED_CHECK: when dsv41_ced_check_indices builds its side nodes.
+// unset/"auto" = prefill only (n_tokens > 32), "1" = always, "0" = never.
+enum dsv41_ced_check_mode { DSV41_CED_CHECK_AUTO, DSV41_CED_CHECK_ALWAYS, DSV41_CED_CHECK_NEVER };
+static constexpr int64_t dsv41_ced_check_prefill_min_tokens = 32;
+
+static dsv41_ced_check_mode dsv41_ced_check_mode_env() {
+    static const dsv41_ced_check_mode mode = []() {
+        const char * e = std::getenv("WP_DSV41_CED_CHECK");
+        if (e == nullptr) {
+            return DSV41_CED_CHECK_AUTO;
+        }
+        const std::string v(e);
+        if (v == "1") {
+            return DSV41_CED_CHECK_ALWAYS;
+        }
+        if (v == "0") {
+            return DSV41_CED_CHECK_NEVER;
+        }
+        return DSV41_CED_CHECK_AUTO;
+    }();
+    return mode;
+}
+
 // Checks `idxs` as a wholly SEPARATE, forward-expanded side node -- idxs
 // itself is returned to callers unmodified and untouched, never spliced into
 // its own consumer's data path. This is deliberately NOT what an earlier
@@ -1764,9 +1787,20 @@ static void dsv41_ced_check_idxs_cb(ggml_tensor * dst, const ggml_tensor * a, in
 // never had anything to report. Keeping the check itself (it is not useless:
 // it still verifies the CPU-side values are correct) but no longer letting
 // it sit on the path to the actual scatter.
-static void dsv41_ced_check_indices(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * idxs, int64_t limit, int il, const char * label) {
+static void dsv41_ced_check_indices(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * idxs, int64_t limit, int il, const char * label, int64_t n_tokens) {
     if (!dsv41_ced_prefill_env_enabled() || idxs == nullptr) {
         return;
+    }
+    switch (dsv41_ced_check_mode_env()) {
+        case DSV41_CED_CHECK_NEVER:
+            return;
+        case DSV41_CED_CHECK_AUTO:
+            if (n_tokens <= dsv41_ced_check_prefill_min_tokens) {
+                return;
+            }
+            break;
+        case DSV41_CED_CHECK_ALWAYS:
+            break;
     }
 
     // Small, deliberately leaked per call: ggml_map_custom1's own op_params
@@ -2496,7 +2530,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             // unmodified -- see dsv41_ced_check_indices's comment for why this
             // must not splice a graph node into cpy_k's own index argument.
             dsv41_ced_check_indices(ctx0, gf, inp_comp.state_write_idxs,
-                    (int64_t) inp_dsv4->mctx->get_lid()->get_write_capacity(), il, "lid");
+                    (int64_t) inp_dsv4->mctx->get_lid()->get_write_capacity(), il, "lid", n_tokens);
             // Build-time width check (see the crash-report investigation): if
             // the seam split ever left idx_k narrowed while state_write_idxs
             // stayed full-width, or vice versa, llama_kv_cache::cpy_k reads
@@ -2519,7 +2553,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         }
 
         dsv41_ced_check_indices(ctx0, gf, inp_comp.state_write_idxs,
-                (int64_t) inp_dsv4->mctx->get_csa()->get_write_capacity(), il, "csa");
+                (int64_t) inp_dsv4->mctx->get_csa()->get_write_capacity(), il, "csa", n_tokens);
         if (dsv41_ced_prefill_env_enabled()) {
             GGML_ASSERT(latent->ne[2] == inp_comp.state_write_idxs->ne[0] &&
                     "CED prefill trim: CSA cpy_k source row count (latent->ne[2]) != index count (state_write_idxs->ne[0])");
@@ -2593,7 +2627,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     // this SAME tensor as a separate side node -- it must not wrap or
     // replace it (see dsv41_ced_check_indices's comment).
     ggml_tensor * raw_write_idxs = dsv41_ced_raw_k_idxs_for_nt(inp_attn, nt);
-    dsv41_ced_check_indices(ctx0, gf, raw_write_idxs, (int64_t) mctx_raw->get_write_capacity(), il, "raw");
+    dsv41_ced_check_indices(ctx0, gf, raw_write_idxs, (int64_t) mctx_raw->get_write_capacity(), il, "raw", n_tokens);
     if (dsv41_ced_prefill_env_enabled()) {
         GGML_ASSERT(kv->ne[2] == raw_write_idxs->ne[0] &&
                 "CED prefill trim: raw-window cpy_k source row count (kv->ne[2]) != index count (k_idxs->ne[0])");
@@ -2644,7 +2678,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     // over NaN is not guaranteed to stay in range, and a garbage index
     // feeding a set_rows-style scatter is exactly the shape of an async OOB
     // memory fault.
-    dsv41_ced_check_indices(ctx0, gf, top_k, n_comp, il, "top_k");
+    dsv41_ced_check_indices(ctx0, gf, top_k, n_comp, il, "top_k", n_tokens);
 
     ggml_tensor * comp_mask = top_k
         ? build_top_k_mask(inp_comp_q.kq_mask, top_k, "comp_top_k_mask", il)
