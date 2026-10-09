@@ -1,14 +1,17 @@
 // Bit-exactness: CPU ml8_4 pack (pipe-ml8-pack-cpu.h) vs ggml_cuda_expert_wire_pack_ml8_4.
 // Standalone; build one-off against libggml-hip (see commit message). Uses GPU 0 briefly.
 #include "../src/pipeline/pipe-ml8-pack-cpu.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <limits>
 #include <random>
 #include <vector>
 
-extern "C" bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne);
+// Weak: --cpu-only links without any GPU library (the GPU reference is absent).
+extern "C" __attribute__((weak)) bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne);
 
 static size_t g_floats = 0, g_blocks = 0, g_bad_blocks = 0, g_bad_scalar = 0;
 
@@ -16,6 +19,7 @@ static void check(const std::vector<float> & x, const char * what) {
     const size_t n = x.size() / 32 * 32;
     if (!n) { return; }
     std::vector<uint8_t> gpu(n / 32 * 18), cpu(gpu.size()), sc(gpu.size());
+    if (!ggml_cuda_expert_wire_pack_ml8_4) { std::printf("no GPU reference linked (use --cpu-only)\n"); std::exit(2); }
     if (!ggml_cuda_expert_wire_pack_ml8_4(x.data(), gpu.data(), (int64_t) n)) { std::printf("GPU pack failed\n"); std::exit(2); }
     pipe_ml8::pack_ml8_4(cpu.data(), x.data(), n);
     for (size_t b = 0; b < n / 32; ++b) pipe_ml8::pack_block_scalar(x.data() + b * 32, sc.data() + b * 18);
@@ -69,9 +73,172 @@ static int cpu_only_spine_shape() {
     return bad ? 1 : 0;
 }
 
+// AVX2 kernel vs scalar reference, bitwise, over spine shapes and adversarial inputs.
+// Also checks the runtime-dispatched pack_ml8_4 equals the scalar path.
+static int cpu_only_avx2_vs_scalar() {
+#ifndef PIPE_ML8_PACK_X86
+    std::printf("avx2 vs scalar: skipped (not x86-64 GCC/Clang build)\n");
+    return 0;
+#else
+    if (!pipe_ml8::ml8_pack_avx2_supported()) {
+        std::printf("avx2 vs scalar: skipped (CPU lacks avx2/fma/f16c)\n");
+        return 0;
+    }
+    std::mt19937_64 rng(4242);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_real_distribution<float> ud(-1.f, 1.f);
+    const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const float sp[] = {0.f, -0.f, 1e-45f, -1e-45f, 1e-40f, 6e-5f, 6.1e-5f, 65504.f, -65504.f, 65519.f, 65520.f, 65536.f,
+                        3.4e38f, -3.4e38f, inf, -inf, nan, -nan, 1.f, -1.f, 0.9375f, -0.9375f, 2.9802322e-8f, 5.96e-8f, 3e-8f};
+    const int n_sp = (int) (sizeof(sp) / sizeof(sp[0]));
+    size_t cases = 0, bad_blocks = 0, bad_dispatch = 0, blocks = 0;
+    std::vector<uint8_t> a, s;
+    auto cmp = [&](const std::vector<float> & x, const char * what) {
+        const size_t n = x.size() / 32 * 32;
+        if (!n) { return; }
+        a.assign(n / 32 * 18, 0xAA); s.assign(a.size(), 0x55);
+        std::vector<uint8_t> d(a.size(), 0x33);
+        pipe_ml8::pack_ml8_4_avx2(a.data(), x.data(), n);
+        pipe_ml8::pack_ml8_4_scalar(s.data(), x.data(), n);
+        pipe_ml8::pack_ml8_4(d.data(), x.data(), n);
+        cases++; blocks += n / 32;
+        for (size_t b = 0; b < n / 32; ++b) {
+            if (std::memcmp(&a[b * 18], &s[b * 18], 18) != 0) {
+                if (bad_blocks++ < 3) {
+                    std::printf("MISMATCH avx2 vs scalar [%s] block %zu\n  in:", what, b);
+                    for (int j = 0; j < 32; ++j) std::printf(" %a", x[b * 32 + j]);
+                    std::printf("\n  avx2:"); for (int j = 0; j < 18; ++j) std::printf(" %02x", a[b * 18 + j]);
+                    std::printf("\n  scal:"); for (int j = 0; j < 18; ++j) std::printf(" %02x", s[b * 18 + j]);
+                    std::printf("\n");
+                }
+            }
+        }
+        if (std::memcmp(d.data(), s.data(), d.size()) != 0) bad_dispatch++;
+    };
+    // 1) spine shapes with the same distributions as the GPU test
+    for (int rows = 1; rows <= 16; ++rows) {
+        for (int n_embd : {32, 2048, 4096}) {
+            for (int mode = 0; mode < 6; ++mode) {
+                std::vector<float> x((size_t) rows * n_embd);
+                for (auto & v : x) {
+                    switch (mode) {
+                        case 0: v = nd(rng); break;
+                        case 1: v = nd(rng) * 1e-4f; break;
+                        case 2: { float t = nd(rng); v = t * t * t * t * (ud(rng) < 0 ? -1.f : 1.f); break; }
+                        case 3: v = ud(rng); break;
+                        case 4: v = (nd(rng) > 0 ? 1.f : -1.f) * 0.9375f; break;   // exact centroids
+                        default: v = (ud(rng) < 0 ? -1.f : 1.f) * std::ldexp(1.f, (int) (rng() % 60) - 30) * (1.f + ud(rng) * 0.5f); break;
+                    }
+                }
+                cmp(x, "spine-shape");
+            }
+        }
+    }
+    // 2) exact ties: amax = 1 (fp16-exact, inv = 1 exact), entries exactly at midpoints
+    //    between adjacent centroids, +-1 ulp around them, and at the centroids.
+    {
+        std::vector<float> x;
+        for (int rep = 0; rep < 2000; ++rep) {
+            for (int i = 0; i < 15; ++i) {
+                const float mid = 0.5f * (pipe_ml8::k_cent4[i] + pipe_ml8::k_cent4[i + 1]);
+                float blk[32];
+                for (auto & b : blk) b = ud(rng);
+                blk[0] = (rep & 1) ? 1.f : -1.f;
+                blk[1] = mid; blk[2] = -mid; blk[3] = std::nextafterf(mid, 1.f); blk[4] = std::nextafterf(mid, -1.f);
+                blk[5] = pipe_ml8::k_cent4[i]; blk[6] = pipe_ml8::k_cent4[i + 1]; blk[7] = 0.f; blk[8] = -0.f;
+                for (int j = 0; j < 32; ++j) x.push_back(blk[j] * std::ldexp(1.f, (rep % 17) - 8));
+            }
+        }
+        cmp(x, "ties-pow2");
+        // ties at non-pow2 scale: amax = d (fp16-exact) so inv = 1/d rounded; midpoints scaled by d
+        x.clear();
+        for (float d : {0.5f, 0.75f, 3.f, 1234.f, 60000.f}) {
+            for (int i = 0; i < 15; ++i) {
+                const float mid = 0.5f * (pipe_ml8::k_cent4[i] + pipe_ml8::k_cent4[i + 1]);
+                float blk[32] = {};
+                blk[0] = d;
+                blk[1] = mid * d; blk[2] = -mid * d; blk[3] = pipe_ml8::k_cent4[i] * d; blk[4] = 0.f;
+                for (int j = 5; j < 32; ++j) blk[j] = (ud(rng)) * d;
+                for (float v : blk) x.push_back(v);
+            }
+        }
+        cmp(x, "ties-scaled");
+        // dense sweep around each midpoint (1-ulp steps)
+        x.clear();
+        for (int i = 0; i < 15; ++i) {
+            const float mid = 0.5f * (pipe_ml8::k_cent4[i] + pipe_ml8::k_cent4[i + 1]);
+            float v = mid; for (int st = 0; st < 2000; ++st) v = std::nextafterf(v, -2.f);
+            for (int st = 0; st < 4000; ++st) {
+                x.push_back(st % 32 == 0 ? 1.f : v);
+                v = std::nextafterf(v, 2.f);
+            }
+        }
+        while (x.size() % 32) x.push_back(0.f);
+        cmp(x, "midpoint-sweep");
+    }
+    // 3) zeros, denormals, +-max, specials (NaN/Inf propagate exactly as the scalar path)
+    {
+        std::vector<float> z(32 * 64, 0.f); cmp(z, "zeros");
+        std::vector<float> nz(32 * 64, -0.f); cmp(nz, "neg-zeros");
+        std::vector<float> dn;
+        for (int b = 0; b < 20000; ++b) { const float sc = std::ldexp(1.f, -149 + (b % 150)); for (int j = 0; j < 32; ++j) dn.push_back(nd(rng) * sc); }
+        cmp(dn, "denormal");
+        std::vector<float> mx;
+        for (int b = 0; b < 20000; ++b) { for (int j = 0; j < 32; ++j) mx.push_back(((rng() & 1) ? 1.f : -1.f) * (rng() % 3 == 0 ? 3.4028235e38f : rng() % 2 ? 65504.f : nd(rng))); }
+        cmp(mx, "max");
+        std::vector<float> spx;
+        std::uniform_int_distribution<int> pick(0, n_sp - 1);
+        for (int b = 0; b < 200000; ++b) {
+            for (int j = 0; j < 32; ++j) {
+                const int mode = b % 3;
+                spx.push_back(mode == 0 ? sp[pick(rng)] : mode == 1 ? (j < 3 ? sp[pick(rng)] : nd(rng)) : sp[pick(rng)] * (ud(rng) * 0.5f + 0.5f));
+            }
+        }
+        cmp(spx, "special");
+        std::vector<float> rb;
+        std::uniform_int_distribution<uint32_t> bits;
+        for (size_t i = 0; i < 32 * 200000; ++i) { uint32_t u = bits(rng); float f; std::memcpy(&f, &u, 4); rb.push_back(f); }
+        cmp(rb, "randbits");
+    }
+    std::printf("avx2 vs scalar: cases=%zu blocks=%zu block_mismatches=%zu dispatch_mismatches=%zu\n",
+                cases, blocks, bad_blocks, bad_dispatch);
+    return (bad_blocks || bad_dispatch) ? 1 : 0;
+#endif
+}
+
+// Micro-benchmark, median of 1000 runs per configuration (6 rows x 4096 floats).
+static void cpu_only_bench() {
+    std::mt19937_64 rng(99);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x(6 * 4096); for (auto & v : x) v = nd(rng);
+    std::vector<uint8_t> o(x.size() / 32 * 18);
+    auto median_us = [&](auto && fn) {
+        for (int w = 0; w < 50; ++w) fn();
+        std::vector<double> t(1000);
+        for (auto & ti : t) {
+            auto t0 = std::chrono::steady_clock::now();
+            fn();
+            ti = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        }
+        std::nth_element(t.begin(), t.begin() + 500, t.end());
+        return t[500];
+    };
+    const double sc = median_us([&] { pipe_ml8::pack_ml8_4_scalar(o.data(), x.data(), x.size()); });
+    std::printf("bench 6x4096 scalar: median %.2f us\n", sc);
+#ifdef PIPE_ML8_PACK_X86
+    if (pipe_ml8::ml8_pack_avx2_supported()) {
+        const double av = median_us([&] { pipe_ml8::pack_ml8_4_avx2(o.data(), x.data(), x.size()); });
+        std::printf("bench 6x4096 avx2:   median %.2f us (speedup %.2fx)\n", av, sc / av);
+    }
+#endif
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--cpu-only") == 0) {
-        return cpu_only_spine_shape();
+        int rc = cpu_only_spine_shape();
+        rc |= cpu_only_avx2_vs_scalar();
+        cpu_only_bench();
+        return rc ? 1 : 0;
     }
     std::mt19937_64 rng(12345);
     std::normal_distribution<float> nd(0.f, 1.f);

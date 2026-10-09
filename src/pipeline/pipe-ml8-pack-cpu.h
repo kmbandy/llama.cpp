@@ -16,9 +16,11 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+// AVX2 path: compiled per-function (no global -mavx2), selected at runtime.
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
-#define PIPE_ML8_PACK_AVX2 1
+#define PIPE_ML8_PACK_X86 1
+#define PIPE_ML8_TARGET __attribute__((target("avx2,fma,f16c")))
 #endif
 
 namespace pipe_ml8 {
@@ -100,8 +102,8 @@ static inline void pack_block_scalar(const float * v, uint8_t * blk) {
     }
 }
 
-#ifdef PIPE_ML8_PACK_AVX2
-static inline void pack_block_avx2(const float * v, uint8_t * blk, const __m256 * cneg) {
+#ifdef PIPE_ML8_PACK_X86
+PIPE_ML8_TARGET static inline void pack_block_avx2(const float * v, uint8_t * blk, const __m256 * cneg) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     const __m256 x0 = _mm256_loadu_ps(v), x1 = _mm256_loadu_ps(v + 8),
                  x2 = _mm256_loadu_ps(v + 16), x3 = _mm256_loadu_ps(v + 24);
@@ -137,22 +139,47 @@ static inline void pack_block_avx2(const float * v, uint8_t * blk, const __m256 
         qs[j] = (uint8_t) (idx[2 * j] | (idx[2 * j + 1] << 4));
     }
 }
-#endif
 
-// n must be a multiple of 32. dst gets (n/32)*18 bytes.
-static inline void pack_ml8_4(uint8_t * dst, const float * src, size_t n) {
-    const size_t nb = n / 32;
-#ifdef PIPE_ML8_PACK_AVX2
+PIPE_ML8_TARGET static inline void pack_ml8_4_avx2(uint8_t * dst, const float * src, size_t n) {
     __m256 cneg[16];
     for (int i = 0; i < 16; ++i) { cneg[i] = _mm256_set1_ps(-k_cent4[i]); }
+    const size_t nb = n / 32;
     for (size_t b = 0; b < nb; ++b) {
         pack_block_avx2(src + b * 32, dst + b * 18, cneg);
     }
+}
+
+// True when the AVX2/FMA/F16C kernel can run on this CPU (checked once).
+static inline bool ml8_pack_avx2_supported() {
+    static const bool ok = [] {
+#ifdef PIPE_ML8_PACK_X86
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
 #else
+        return false;
+#endif
+    }();
+    return ok;
+}
+#endif
+
+static inline void pack_ml8_4_scalar(uint8_t * dst, const float * src, size_t n) {
+    const size_t nb = n / 32;
     for (size_t b = 0; b < nb; ++b) {
         pack_block_scalar(src + b * 32, dst + b * 18);
     }
+}
+
+// n must be a multiple of 32. dst gets (n/32)*18 bytes. Runtime dispatch:
+// AVX2 kernel when the CPU supports it, scalar otherwise (identical bytes).
+static inline void pack_ml8_4(uint8_t * dst, const float * src, size_t n) {
+#ifdef PIPE_ML8_PACK_X86
+    if (ml8_pack_avx2_supported()) {
+        pack_ml8_4_avx2(dst, src, n);
+        return;
+    }
 #endif
+    pack_ml8_4_scalar(dst, src, n);
 }
 
 } // namespace pipe_ml8
