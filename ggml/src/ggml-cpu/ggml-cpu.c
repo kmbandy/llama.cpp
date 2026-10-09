@@ -2072,6 +2072,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_sinkhorn_norm(params, tensor);
             } break;
+        case GGML_OP_WAIT_ADD:
+            {
+                ggml_compute_forward_wait_add(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
@@ -2689,6 +2693,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
         case GGML_OP_GET_REL_POS:
+        case GGML_OP_WAIT_ADD:
             {
                 n_tasks = 1;
             } break;

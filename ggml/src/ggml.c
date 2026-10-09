@@ -1271,9 +1271,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FP8_MUL_MAT",
 
     "SINKHORN_NORM",
+    "WAIT_ADD",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1400,9 +1401,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "fp8_mul_mat(w,a)",
 
     "sinkhorn_norm(x)",
+    "wait_add(x,slot)",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3490,6 +3492,34 @@ struct ggml_tensor * ggml_sinkhorn_norm(
 
     result->op     = GGML_OP_SINKHORN_NORM;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_wait_add
+
+struct ggml_tensor * ggml_wait_add(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * dep,
+        float               * slot,
+        struct ggml_wait_ctrl * ctrl,
+        int32_t               timeout_ms) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(slot != NULL);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    // op_params layout (byte offsets): [0] slot ptr, [8] ctrl ptr, [16] timeout_ms
+    static_assert(2*sizeof(void *) + sizeof(int32_t) <= GGML_MAX_OP_PARAMS, "wait_add op_params");
+    memcpy((char *) result->op_params + 0, &slot, sizeof(void *));
+    memcpy((char *) result->op_params + sizeof(void *), &ctrl, sizeof(void *));
+    memcpy((char *) result->op_params + 2*sizeof(void *), &timeout_ms, sizeof(int32_t));
+
+    result->op     = GGML_OP_WAIT_ADD;
+    result->src[0] = a;
+    result->src[1] = dep;
 
     return result;
 }

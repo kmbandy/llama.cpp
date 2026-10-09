@@ -201,6 +201,7 @@ static inline bool rdna4_ml8_qrot_gated_norm_tiled_r4d(
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/wait-add.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2102,6 +2103,37 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     return buffer;
+}
+
+// Mapped + coherent host-pinned memory for the GGML_OP_WAIT_ADD slot/flag
+// handshake (see wait-add.cu). HIP only; NULL elsewhere or on failure, in which
+// case the caller must not build WAIT_ADD nodes.
+void * ggml_backend_cuda_host_alloc_coherent(size_t size) {
+#if defined(GGML_USE_HIP)
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+    void * ptr = nullptr;
+    if (hipHostMalloc(&ptr, size, hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+#else
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+void ggml_backend_cuda_host_free_coherent(void * ptr) {
+#if defined(GGML_USE_HIP)
+    if (ptr != nullptr) {
+        (void) hipHostFree(ptr);
+    }
+#else
+    GGML_UNUSED(ptr);
+#endif
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
@@ -4225,6 +4257,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SINKHORN_NORM:
             ggml_cuda_op_sinkhorn_norm(ctx, dst);
+            break;
+        case GGML_OP_WAIT_ADD:
+            ggml_cuda_op_wait_add(ctx, dst);
             break;
         case GGML_OP_CONCAT:
             ggml_cuda_op_concat(ctx, dst);
@@ -12663,6 +12698,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_WAIT_ADD:
+#if defined(GGML_USE_HIP)
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+#else
+            return false;
+#endif
         case GGML_OP_SINKHORN_NORM:
             // stricter than the norms above: the kernel holds the whole n*n
             // matrix per thread, so it needs FULL contiguity (not just rows),

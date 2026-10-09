@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 
 extern "C" int turbo3_cpu_wht_group_size;
@@ -13422,5 +13423,53 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+// ggml_compute_forward_wait_add
+//
+// Reference implementation of GGML_OP_WAIT_ADD (the production consumer is the
+// HIP kernel in ggml-cuda/wait-add.cu). dst = src0 + slot, one fp32 add per
+// element -- the same arithmetic as ggml_add(src0, slot). Never scheduled on
+// the CPU backend (supports_op is false); reachable via ggml_graph_compute()
+// for the CPU-only unit test of the slot/flag handshake.
+
+void ggml_compute_forward_wait_add(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+
+    const float *    slot = nullptr;
+    ggml_wait_ctrl * ctrl = nullptr;
+    int32_t timeout_ms = 0;
+    memcpy(&slot, (const char *) dst->op_params, sizeof(void *));
+    memcpy(&ctrl, (const char *) dst->op_params + sizeof(void *), sizeof(void *));
+    memcpy(&timeout_ms, (const char *) dst->op_params + 2*sizeof(void *), sizeof(int32_t));
+
+    bool good = true;
+    if (ctrl != nullptr) {
+        const uint64_t expect = __atomic_load_n(&ctrl->expect, __ATOMIC_ACQUIRE);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (__atomic_load_n(&ctrl->flag, __ATOMIC_ACQUIRE) != expect) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(timeout_ms)) {
+                __atomic_store_n(&ctrl->fail, (uint64_t) 1, __ATOMIC_RELEASE);
+                good = false;   // same as the device kernel: contribute 0, host aborts after the step
+                break;
+            }
+        }
+    }
+
+    const float * a = (const float *) src0->data;
+    float *       d = (float *) dst->data;
+    const int64_t n = ggml_nelements(dst);
+    for (int64_t i = 0; i < n; ++i) {
+        d[i] = a[i] + (good ? slot[i] : 0.0f);
     }
 }

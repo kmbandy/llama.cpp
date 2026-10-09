@@ -21,6 +21,7 @@
 struct ggml_context;
 struct ggml_cgraph;
 struct ggml_tensor;
+struct ggml_wait_ctrl;
 
 namespace pipe_expert_dispatcher {
 
@@ -82,6 +83,20 @@ class graph_dispatcher {
                               int64_t        token_offset = 0);
     ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer);
     ggml_tensor * build_wait(ggml_context * ctx, int32_t layer);
+
+    // WP_WAIT_ZEROCOPY (default OFF): build the join of the shared-expert output
+    // with the remote partial as one GGML_OP_WAIT_ADD that reads the folded
+    // partial from a persistent pinned slot. The CPU wait node still blocks the
+    // host and folds (in fixed worker order) into the slot; WAIT_ADD only has an
+    // ordering edge to it, so there is no H2D copy of the wait output.
+    // wait_add_mode() is 0 when the layer is not eligible (knob off, chunked
+    // dispatch, shexp not F32/contiguous/same shape, token count above the slot
+    // capacity, no pinned allocator); the caller then builds the legacy
+    // build_wait + ggml_add. The decision depends only on (layer, n_tokens, env),
+    // so the compute callbacks reproduce it identically at run time.
+    int           wait_add_mode(const ggml_tensor * shexp, int32_t layer);
+    // `wait` is the CPU wait node.
+    ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer);
 
     void begin_graph_build(ggml_context * ctx);
     bool begin_issue_build(ggml_context * ctx, int32_t layer);
@@ -293,6 +308,22 @@ class graph_dispatcher {
     };
 
     void latch_failure(const char * message) noexcept;
+
+    // ---- WP_WAIT_ZEROCOPY ----------------------------------------------------
+    struct wait_slot {
+        float *            data = nullptr;   // n_embd * cap_tokens floats, mapped coherent pinned
+        ggml_wait_ctrl *   ctrl = nullptr;   // 64 B handshake block, same allocation
+        size_t             cap_floats = 0;
+        uint64_t           seq = 0;          // epoch counter (dispatch thread only)
+    };
+    // 0 = legacy, 1 = zerocopy; also resolves the slot.
+    int  wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out);
+    wait_slot * wait_slot_for(int32_t layer, int64_t n_floats, bool create);
+    // Body shared by compute_wait (host blocking; dst is the CPU wait node) and the
+    // background job (dst == nullptr, bg == true). zc_out != nullptr redirects the
+    // folded result into the pinned slot instead of dst->data.
+    void wait_core(op_context * context, ggml_tensor * dst, float * zc_out, int64_t n_tokens, bool bg);
+    std::map<int32_t, wait_slot>      wait_slots_;   // keyed by layer; created at graph build
     void layer_trace_issue_return(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
     void layer_trace_wait_entry(int32_t layer, std::chrono::steady_clock::time_point time) noexcept;
     void spine_profile_issue_begin(std::chrono::steady_clock::time_point time) noexcept;

@@ -745,6 +745,12 @@ extern "C" {
         //   op_params[1] = iters (int32, >= 1)
         GGML_OP_SINKHORN_NORM,
 
+        // dst = src[0] + <host-published F32 partial> (expert-dispatch wait
+        // consume). The partial lives in a persistent pinned slot referenced by
+        // pointer from op_params, NOT by a src tensor, so no H2D copy exists.
+        // See ggml_wait_add().
+        GGML_OP_WAIT_ADD,
+
         GGML_OP_COUNT,
     };
 
@@ -1591,6 +1597,38 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps,
             int32_t               iters);
+
+    // Host->GPU handshake word block for GGML_OP_WAIT_ADD. Lives in coherent
+    // host-pinned memory (hipHostMalloc Mapped|Coherent). One per slot, 64 B.
+    //   expect: written by the host BEFORE the consuming op is launched; the
+    //           epoch the op must observe in `flag`.
+    //   flag:   release-stored by the host (after the slot data and a release
+    //           fence) with the value of `expect` once the partial is complete.
+    //   fail:   written (1) by the device if the spin timed out; the host checks
+    //           it after the step and aborts.
+    struct ggml_wait_ctrl {
+        uint64_t expect;
+        uint64_t flag;
+        uint64_t fail;
+        uint64_t pad[5];
+    };
+
+    // dst = a + slot, element-wise F32 (a is src0, slot is the addend, i.e.
+    // exactly ggml_add(a, slot)'s arithmetic). `slot` is a contiguous F32
+    // buffer with the same number of elements as `a`, in memory the consuming
+    // backend can read directly (mapped host-pinned). If `ctrl` is non-NULL the
+    // op first spins (on the device) until ctrl->flag == ctrl->expect, timing
+    // out after timeout_ms (-> ctrl->fail = 1). With ctrl == NULL there is no
+    // wait: the host guarantees the slot is complete before the op runs.
+    // `dep` (may be NULL) is a pure ordering edge: it becomes src[1], is never
+    // read, and the scheduler does not copy it to the consuming backend.
+    GGML_API struct ggml_tensor * ggml_wait_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * dep,
+            float               * slot,
+            struct ggml_wait_ctrl * ctrl,
+            int32_t               timeout_ms);
 
     // a - x
     // b - dy

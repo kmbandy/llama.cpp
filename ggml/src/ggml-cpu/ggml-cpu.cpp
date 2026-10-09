@@ -481,6 +481,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_WAIT_ADD:
+            // Reference implementation exists for ggml_graph_compute() (unit
+            // test), but the scheduler must never place it on the CPU backend:
+            // it is only ever built when a GPU backend consumes the slot.
+            return false;
         default:
             return true;
     }

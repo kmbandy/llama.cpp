@@ -1251,6 +1251,25 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+static bool wp_sched_hip_graphs_env(void) {
+    static const bool v = [] {
+        const char * e = getenv("WP_HIP_GRAPHS");
+        return e != NULL && strcmp(e, "1") == 0;
+    }();
+    return v;
+}
+
+static bool wp_sched_split_starts_with_wait_add(const struct ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const struct ggml_tensor * node = split->graph.nodes[i];
+        if (node == NULL || ggml_is_view_op(node->op)) {
+            continue;
+        }
+        return node->op == GGML_OP_WAIT_ADD;
+    }
+    return false;
+}
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1854,6 +1873,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (src == NULL) {
                     continue;
                 }
+                // GGML_OP_WAIT_ADD src[1] is a pure ordering edge (the CPU wait node
+                // that folded the partial into the pinned slot); the data is read
+                // from the slot by pointer, so it must NOT be copied to this backend.
+                if (node->op == GGML_OP_WAIT_ADD && j == 1) {
+                    continue;
+                }
 
                 size_t src_id = hash_id(src);
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
@@ -2447,8 +2472,13 @@ struct ggml_backend_sched_compute_runner {
 
         // HIP graph capture needs an idle stream. Overlap wait with shexp, then
         // drain the GPU before the next split that actually uses that backend.
+        // WP_WAIT_ZEROCOPY: a split that starts with GGML_OP_WAIT_ADD consumes the
+        // host-folded partial straight from pinned memory (stream-ordered after the
+        // in-flight shexp), so the drain is only needed for HIP graph capture.
         if (unsynced_backend_id >= 0 && split_backend_id == unsynced_backend_id) {
-            sync_backend(unsynced_backend_id);
+            if (!(wp_sched_split_starts_with_wait_add(split) && !wp_sched_hip_graphs_env())) {
+                sync_backend(unsynced_backend_id);
+            }
             unsynced_backend_id = -1;
         }
 
@@ -2850,8 +2880,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
         // HIP graph capture needs an idle stream. Overlap wait with shexp, then
         // drain the GPU before the next split that actually uses that backend.
+        // WP_WAIT_ZEROCOPY: a split that starts with GGML_OP_WAIT_ADD consumes the
+        // host-folded partial straight from pinned memory (stream-ordered after the
+        // in-flight shexp), so the drain is only needed for HIP graph capture.
         if (unsynced_backend_id >= 0 && split_backend_id == unsynced_backend_id) {
-            sync_backend(unsynced_backend_id);
+            if (!(wp_sched_split_starts_with_wait_add(split) && !wp_sched_hip_graphs_env())) {
+                sync_backend(unsynced_backend_id);
+            }
             unsynced_backend_id = -1;
         }
 

@@ -26,6 +26,10 @@
 
 #include <unistd.h>
 
+// Weak: only present when the HIP backend is linked in (WP_WAIT_* knobs).
+extern "C" void * ggml_backend_cuda_host_alloc_coherent(size_t size) __attribute__((weak));
+extern "C" void   ggml_backend_cuda_host_free_coherent(void * ptr) __attribute__((weak));
+
 namespace pipe_expert_dispatcher {
 namespace {
 
@@ -340,6 +344,12 @@ graph_dispatcher::~graph_dispatcher() {
         std::fclose(layer_trace_);
         layer_trace_ = nullptr;
     }
+    if (ggml_backend_cuda_host_free_coherent != nullptr) {
+        for (auto & entry : wait_slots_) {
+            ggml_backend_cuda_host_free_coherent(entry.second.ctrl);
+        }
+    }
+    wait_slots_.clear();
 }
 
 void graph_dispatcher::layer_trace_issue_return(int32_t layer, dispatch_clock::time_point time) noexcept {
@@ -845,6 +855,109 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     }
     wait_tensors_[layer] = wait;
     return wait;
+}
+
+// ---- WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG ---------------------------------------
+
+static bool wait_env_on(const char * name) {
+    const char * e = std::getenv(name);
+    return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+}
+
+// 0 = off (legacy), 1 = WP_WAIT_ZEROCOPY.
+static int wait_knob_mode() {
+    static const int mode = wait_env_on("WP_WAIT_ZEROCOPY") ? 1 : 0;
+    return mode;
+}
+
+static int64_t wait_slot_tokens() {
+    static const int64_t v = [] {
+        const char * e = std::getenv("WP_WAIT_SLOT_TOKENS");
+        const long   n = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 32;
+        return n > 0 ? (int64_t) n : (int64_t) 32;
+    }();
+    return v;
+}
+
+static int32_t wait_timeout_ms() {
+    static const int32_t v = [] {
+        const char * e = std::getenv("WP_WAIT_GPU_TIMEOUT_MS");
+        const long   n = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 10000;
+        return n > 0 ? (int32_t) n : (int32_t) 10000;
+    }();
+    return v;
+}
+
+graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int64_t n_floats, bool create) {
+    const auto it = wait_slots_.find(layer);
+    if (it != wait_slots_.end()) {
+        return (size_t) n_floats <= it->second.cap_floats ? &it->second : nullptr;
+    }
+    if (!create || ggml_backend_cuda_host_alloc_coherent == nullptr) {
+        return nullptr;
+    }
+    const size_t cap_floats = (size_t) remote.n_embd() * (size_t) wait_slot_tokens();
+    if ((size_t) n_floats > cap_floats) {
+        return nullptr;
+    }
+    void * mem = ggml_backend_cuda_host_alloc_coherent(sizeof(ggml_wait_ctrl) + cap_floats * sizeof(float));
+    if (mem == nullptr) {
+        return nullptr;
+    }
+    wait_slot slot;
+    slot.ctrl       = static_cast<ggml_wait_ctrl *>(mem);
+    slot.data       = reinterpret_cast<float *>(static_cast<char *>(mem) + sizeof(ggml_wait_ctrl));
+    slot.cap_floats = cap_floats;
+    return &wait_slots_.emplace(layer, slot).first->second;
+}
+
+int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out) {
+    const int mode = wait_knob_mode();
+    if (mode == 0 || chunk_count != 1 || remote.dispatch_chunks() == 2 || n_tokens <= 0 ||
+        n_tokens > wait_slot_tokens()) {
+        return 0;
+    }
+    wait_slot * slot = wait_slot_for(layer, n_tokens * (int64_t) remote.n_embd(), false);
+    if (slot == nullptr) {
+        return 0;
+    }
+    if (slot_out != nullptr) {
+        *slot_out = slot;
+    }
+    return mode;
+}
+
+int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer) {
+    if (wait_knob_mode() == 0 || shexp == nullptr) {
+        return 0;
+    }
+    const auto it = op_contexts.find(layer * 2);
+    if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr ||
+        it->second->chunk_count != 1) {
+        return 0;
+    }
+    const ggml_tensor * issued = it->second->issued;
+    if (shexp->type != GGML_TYPE_F32 || issued->type != GGML_TYPE_F32 || !ggml_is_contiguous(shexp) ||
+        !ggml_are_same_shape(shexp, issued) || shexp->ne[0] != remote.n_embd() ||
+        shexp->ne[2] != 1 || shexp->ne[3] != 1) {
+        return 0;
+    }
+    // Creates the slot (build time, dispatch thread); wait_mode() then resolves it.
+    if (wait_slot_for(layer, shexp->ne[0] * shexp->ne[1], true) == nullptr) {
+        return 0;
+    }
+    return wait_mode(layer, shexp->ne[1], 1, nullptr);
+}
+
+ggml_tensor * graph_dispatcher::build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait,
+                                               int32_t layer) {
+    wait_slot * slot = nullptr;
+    const int   mode = wait_mode(layer, shexp->ne[1], 1, &slot);
+    GGML_ASSERT(mode != 0 && slot != nullptr);
+    // ctrl == nullptr: no device wait; the host already folded into the slot
+    // before the consuming split runs, and `wait` is the ordering edge.
+    GGML_ASSERT(mode == 1 && wait != nullptr);
+    return ggml_wait_add(ctx, shexp, wait, slot->data, nullptr, wait_timeout_ms());
 }
 
 void graph_dispatcher::begin_graph_build(ggml_context * ctx) {
@@ -3066,28 +3179,49 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
                                     void *              userdata) {
     GGML_UNUSED(issued);
     GGML_UNUSED(shexp);
-    graph_dispatcher * owner = nullptr;
+    // The op is registered with n_tasks=1, but ggml_graph_plan sizes the
+    // split's thread pool from its WIDEST op: when the two chunk waits
+    // share a split with their CONCAT (K=2), every pool thread calls in
+    // with nth>1. Thread 0 does the work; the rest return to the barrier.
+    if (ith != 0) {
+        return;
+    }
+    GGML_UNUSED(nth);
+    op_context * context = static_cast<op_context *>(userdata);
+    if (context == nullptr || context->owner == nullptr) {
+        // No dispatcher to latch the failure on (as before): zero the output.
+        ggml_set_zero(dst);
+        return;
+    }
+    // WP_WAIT_ZEROCOPY: fold into the persistent pinned slot instead of dst->data;
+    // the GPU consumes the slot directly (GGML_OP_WAIT_ADD), no H2D copy.
+    wait_slot * slot = nullptr;
+    const int   mode = context->owner->wait_mode(context->layer, dst->ne[1], context->chunk_count, &slot);
+    context->owner->wait_core(context, dst, mode == 1 ? slot->data : nullptr, dst->ne[1], false);
+}
+
+void graph_dispatcher::wait_core(op_context * context,
+                                 ggml_tensor * dst,
+                                 float *       zc_out,
+                                 int64_t       n_tokens,
+                                 bool          bg) {
+    graph_dispatcher * owner = this;
+    const auto put_zero = [&]() {
+        if (zc_out != nullptr) {
+            std::memset(zc_out, 0, (size_t) n_tokens * (size_t) remote.n_embd() * sizeof(float));
+        } else if (dst != nullptr) {
+            ggml_set_zero(dst);
+        }
+    };
     try {
-        // The op is registered with n_tasks=1, but ggml_graph_plan sizes the
-        // split's thread pool from its WIDEST op: when the two chunk waits
-        // share a split with their CONCAT (K=2), every pool thread calls in
-        // with nth>1. Thread 0 does the work; the rest return to the barrier.
-        // Throwing here (as before) fired before `owner` was set, so the
-        // failure was never latched and the dispatch slots leaked silently.
-        if (ith != 0) {
-            return;
-        }
-        GGML_UNUSED(nth);
-        op_context * context = static_cast<op_context *>(userdata);
-        if (context == nullptr || context->owner == nullptr) {
-            throw std::runtime_error("expert dispatch wait op has no dispatcher");
-        }
-        owner = context->owner;
-        const bool trace_layer = owner->layer_trace_ != nullptr &&
+        // Background (GPU-flag) jobs run concurrently with the dispatch thread's
+        // split callbacks, so the diagnostic profilers (which are not
+        // thread-safe) are skipped there.
+        const bool trace_layer = !bg && owner->layer_trace_ != nullptr &&
                                  (context->chunk_count == 1 || context->chunk_index == 0);
-        const bool trace_profile = owner->spine_profile_.active &&
+        const bool trace_profile = !bg && owner->spine_profile_.active &&
                                    (context->chunk_count == 1 || context->chunk_index == 0);
-        const bool layer_profile = owner->spine_layer_profile_.active;
+        const bool layer_profile = !bg && owner->spine_layer_profile_.active;
         if (trace_layer || trace_profile) {
             const auto wait_entry = dispatch_clock::now();
             if (trace_layer) {
@@ -3098,7 +3232,14 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             }
         }
         // MAD-LAB DS4-Flash pipeline-streams: see io_mutex_'s declaration.
-        std::lock_guard<std::recursive_mutex> io_lock(owner->io_mutex_);
+        // The bg job must NOT take io_mutex_: begin_decode() holds it for the whole
+        // llama_decode() on the dispatch thread. The dispatch thread issues no
+        // remote op between this layer's issue and the GPU consuming the result
+        // (the next issue depends on it), and wait_drain() gives the happens-before.
+        std::unique_lock<std::recursive_mutex> io_lock(owner->io_mutex_, std::defer_lock);
+        if (!bg) {
+            io_lock.lock();
+        }
         static const bool wait_trace = [] {
             const char * e = std::getenv("WP_DISPATCH_CHUNKS_TRACE");
             return e != nullptr && e[0] == '1';
@@ -3111,7 +3252,7 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
                          owner->remote.has_open_dispatch(context->handle) ? 1 : 0);
         }
         if (owner->failed()) {
-            ggml_set_zero(dst);
+            put_zero();
             return;
         }
         const bool collect_stats = owner->decode_active_;
@@ -3130,7 +3271,7 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
                          owner->remote.has_open_dispatch(context->handle) ? 1 : 0,
                          owner->remote.has_open_dispatch() ? 1 : 0);
         }
-        owner->zero_phantom_rows(result, dst->ne[1], owner->remote.n_embd(), context->token_offset);
+        owner->zero_phantom_rows(result, n_tokens, owner->remote.n_embd(), context->token_offset);
         context->stats = layer_stats;
         if (layer_profile) {
             owner->spine_layer_profile_wait(context->layer, layer_stats.ns_wait);
@@ -3173,7 +3314,14 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         }
         const dispatch_clock::time_point unpack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
-        if (ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32) {
+        if (zc_out != nullptr) {
+            // Pinned-slot target (WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG): the fold above
+            // already happened in fixed worker order; this is the same flat copy.
+            if (result.size() != (size_t) n_tokens * (size_t) owner->remote.n_embd()) {
+                throw std::runtime_error("expert dispatch wait result size does not match the pinned slot");
+            }
+            std::memcpy(zc_out, result.data(), result.size() * sizeof(float));
+        } else if (ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32) {
             std::memcpy(dst->data, result.data(), result.size() * sizeof(float));
         } else {
             for (size_t i = 0; i < result.size(); ++i) {
@@ -3183,7 +3331,7 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
         if (trace_profile) {
             owner->spine_profile_wait_end(dispatch_clock::now());
         }
-        if (context->chunk_count == 1 || context->chunk_index == context->chunk_count - 1) {
+        if (!bg && (context->chunk_count == 1 || context->chunk_index == context->chunk_count - 1)) {
             owner->write_layer_trace(context->layer);
         }
         if (collect_stats) {
@@ -3213,15 +3361,11 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
             }
         }
     } catch (const std::exception & error) {
-        if (owner != nullptr) {
-            owner->latch_failure(error.what());
-        }
-        ggml_set_zero(dst);
+        owner->latch_failure(error.what());
+        put_zero();
     } catch (...) {
-        if (owner != nullptr) {
-            owner->latch_failure("expert dispatch wait op failed with an unknown exception");
-        }
-        ggml_set_zero(dst);
+        owner->latch_failure("expert dispatch wait op failed with an unknown exception");
+        put_zero();
     }
 }
 

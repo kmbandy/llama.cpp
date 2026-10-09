@@ -448,6 +448,14 @@ target_link_libraries(test-wp-host-arena PRIVATE llama llama-common ${CMAKE_THRE
 target_compile_features(test-wp-host-arena PRIVATE cxx_std_17)
 llama_test(test-wp-host-arena)
 
+# GGML_OP_WAIT_ADD slot/epoch-flag handshake, CPU reference implementation only
+# (links ggml-base + ggml-cpu, never a GPU backend).
+add_executable(test-wait-add test-wait-add.cpp)
+target_include_directories(test-wait-add PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include)
+target_link_libraries(test-wait-add PRIVATE ggml-base ggml-cpu ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-wait-add PRIVATE cxx_std_17)
+llama_test(test-wait-add)
+
 # POSIX expert shared-memory ring: pure byte-ring and wraparound coverage.
 add_executable(
     test-pipe-expert-shm

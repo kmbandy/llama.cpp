@@ -1971,6 +1971,25 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
                                                        ggml_tensor * shexp,
                                                        int           il) {
     if (moe_dispatch_split_shexp && expert_dispatch != nullptr && il >= 0) {
+        // WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG (default off -> mode 0 -> unchanged
+        // path below). GGML_OP_WAIT_ADD computes shexp + partial in ONE fp32 add,
+        // the same arithmetic and operand order as the ggml_add(shexp, wait) below.
+        const int wait_mode = expert_dispatch->wait_add_mode(shexp, il);
+        if (wait_mode != 0) {
+            ggml_tensor * wait = nullptr;
+            if (wait_mode == 1) {
+                // Host still blocks and folds, but into the pinned slot; the GPU op
+                // only keeps an ordering edge to this node (never copied).
+                wait = expert_dispatch->build_wait(ctx0, il);
+                ggml_backend_sched_set_tensor_backend(sched, wait, backend_cpu);
+                cb(wait, "ffn_moe_out", il);
+                expert_dispatch->mark_wait_tensor(wait, il);
+            }
+            ggml_tensor * joined = expert_dispatch->build_wait_add(ctx0, shexp, wait, il);
+            expert_dispatch->note_wait_expanded(ctx0, il);
+            cb(joined, "ffn_out", il);
+            return joined;
+        }
         // shexp FFN is already pinned to issue via shexp_after_issue on its
         // input. Do NOT after_issue the shexp *output* — that made the GPU
         // FFN a split that finished before wait, so skip-sync only overlapped
