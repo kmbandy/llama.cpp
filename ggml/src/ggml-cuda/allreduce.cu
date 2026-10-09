@@ -1148,7 +1148,24 @@ GGML_CUDA_AR_ML8_DEF(8)
 // when the dispatch op runs, so this uploads a chunk, packs with the same
 // kernel the AllReduce uses, and downloads the 18-byte blocks. Chunked so a
 // full worker GPU does not have to hold a 160 MB staging buffer.
-extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne) {
+// Optional host-side timing of one pack (worker instrumentation). Layout must
+// match pipe_ml8_pack_timing in src/pipeline/pipe-protocol.h.
+struct ggml_cuda_ml8_pack_timing {
+    uint64_t ns_lock        = 0;
+    uint64_t ns_h2d         = 0;
+    uint64_t ns_kernel_sync = 0;
+    uint64_t ns_d2h         = 0;
+};
+
+static inline uint64_t ggml_cuda_ml8_pack_ns_since(std::chrono::steady_clock::time_point t0) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
+// Same work and same calls as ggml_cuda_expert_wire_pack_ml8_4; `timing` (may be
+// null) only adds steady_clock reads around them. No extra syncs.
+GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4_timed(
+        const float * src, void * dst, int64_t ne, ggml_cuda_ml8_pack_timing * timing) {
     if (src == nullptr || dst == nullptr || ne <= 0 || (ne % QK_ML8_WIRE) != 0) {
         return false;
     }
@@ -1172,7 +1189,12 @@ extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * 
     }
     static scratch s_dev[GGML_CUDA_MAX_DEVICES];
     scratch & s = s_dev[dev];
+    const auto t_lock0 = timing != nullptr ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point();
     std::lock_guard<std::mutex> lock(mu);
+    if (timing != nullptr) {
+        timing->ns_lock += ggml_cuda_ml8_pack_ns_since(t_lock0);
+    }
     if (s.stream == nullptr || s.dev != dev) {
         if (s.d_src != nullptr) { cudaFree(s.d_src); s.d_src = nullptr; }
         if (s.d_dst != nullptr) { cudaFree(s.d_dst); s.d_dst = nullptr; }
@@ -1197,16 +1219,41 @@ extern "C" GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * 
     for (int64_t off = 0; off < ne; off += k_chunk) {
         const int64_t n = std::min(k_chunk, ne - off);
         const int64_t nb = n / QK_ML8_WIRE;
+        const auto t_h2d = timing != nullptr ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point();
         if (cudaMemcpyAsync(s.d_src, src + off, n * sizeof(float), cudaMemcpyHostToDevice, s.stream) != cudaSuccess) {
             return false;
         }
+        if (timing != nullptr) {
+            timing->ns_h2d += ggml_cuda_ml8_pack_ns_since(t_h2d);
+        }
+        const auto t_kern = timing != nullptr ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point();
         ggml_cuda_ar_codec_pack_ml8_4<float>(s.d_src, s.d_dst, n, s.stream);
+        if (timing != nullptr) {
+            timing->ns_kernel_sync += ggml_cuda_ml8_pack_ns_since(t_kern);
+        }
+        const auto t_d2h = timing != nullptr ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point();
         if (cudaMemcpyAsync(out + (off / QK_ML8_WIRE), s.d_dst, nb * sizeof(block_ml8_4_wire),
                             cudaMemcpyDeviceToHost, s.stream) != cudaSuccess) {
             return false;
         }
+        if (timing != nullptr) {
+            timing->ns_d2h += ggml_cuda_ml8_pack_ns_since(t_d2h);
+        }
     }
-    return cudaStreamSynchronize(s.stream) == cudaSuccess;
+    const auto t_sync = timing != nullptr ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point();
+    const bool ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
+    if (timing != nullptr) {
+        timing->ns_kernel_sync += ggml_cuda_ml8_pack_ns_since(t_sync);
+    }
+    return ok;
+}
+
+GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne) {
+    return ggml_cuda_expert_wire_pack_ml8_4_timed(src, dst, ne, nullptr);
 }
 
 // src is already a device pointer (the worker's result tensor). One kernel,

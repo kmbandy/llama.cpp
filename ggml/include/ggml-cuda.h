@@ -37,6 +37,10 @@ GGML_BACKEND_API void ggml_backend_cuda_ar_dump_state(const char * reason);
 // Pack host f32 into the ml8-4 AllReduce wire layout on the current device.
 // ne must be a multiple of 32. False if the device pack cannot run.
 GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne);
+// Same as above; timing (nullable) receives host-side wall times (see allreduce.cu).
+struct ggml_cuda_ml8_pack_timing;
+GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4_timed(const float * src, void * dst, int64_t ne,
+                                                             struct ggml_cuda_ml8_pack_timing * timing);
 // Same pack, but src is already on the current device. Downloads only the
 // 18-byte blocks. False if the pointer is not device memory.
 GGML_BACKEND_API bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int64_t ne);

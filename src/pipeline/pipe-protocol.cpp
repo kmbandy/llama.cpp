@@ -1018,9 +1018,16 @@ static int ml8_4_nearest(float v) {
 
 extern "C" {
 __attribute__((weak)) bool ggml_cuda_expert_wire_pack_ml8_4(const float * src, void * dst, int64_t ne);
+__attribute__((weak)) bool ggml_cuda_expert_wire_pack_ml8_4_timed(const float * src, void * dst, int64_t ne,
+                                                                  pipe_ml8_pack_timing * timing);
 }
 
-static void expert_wire_pack_ml8_4(uint8_t * dst, const float * src, size_t n) {
+static void expert_wire_pack_ml8_4(uint8_t * dst, const float * src, size_t n,
+                                   pipe_ml8_pack_timing * ml8_timing) {
+    if (ml8_timing != nullptr && ggml_cuda_expert_wire_pack_ml8_4_timed != nullptr &&
+        ggml_cuda_expert_wire_pack_ml8_4_timed(src, dst, (int64_t) n, ml8_timing)) {
+        return;
+    }
     if (ggml_cuda_expert_wire_pack_ml8_4 != nullptr &&
         ggml_cuda_expert_wire_pack_ml8_4(src, dst, (int64_t) n)) {
         return;
@@ -1175,7 +1182,8 @@ static uint64_t expert_wire_bytes(size_t n, int32_t dtype) {
     }
 }
 
-static void expert_wire_pack(uint8_t * dst, const float * src, size_t n, int32_t dtype) {
+static void expert_wire_pack(uint8_t * dst, const float * src, size_t n, int32_t dtype,
+                             pipe_ml8_pack_timing * ml8_timing = nullptr) {
     if (n == 0) {
         return;
     }
@@ -1188,7 +1196,7 @@ static void expert_wire_pack(uint8_t * dst, const float * src, size_t n, int32_t
         return;
     }
     if (dtype == PIPE_HIDDEN_ML8_4) {
-        expert_wire_pack_ml8_4(dst, src, n);
+        expert_wire_pack_ml8_4(dst, src, n, ml8_timing);
         return;
     }
     const size_t wrote = ggml_quantize_chunk(GGML_TYPE_Q8_0, src, dst, 0, 1, (int64_t) n, nullptr);
@@ -1888,7 +1896,8 @@ void pipe_expert_wire_unpack_ml8_4(float * dst, const uint8_t * src, size_t n) {
     expert_wire_unpack_ml8_4(dst, src, n);
 }
 
-void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expert_partial & p) {
+void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expert_partial & p,
+                                     pipe_ml8_pack_timing * ml8_timing) {
     if (!p.wire_bytes.empty()) {
         const uint64_t expect = expert_wire_bytes(p.partial.size(), PIPE_HIDDEN_ML8_4);
         if (p.wire_bytes.size() != (size_t) expect || p.n_tokens == 0 || 12ull + expect > PIPE_MAX_PAYLOAD) {
@@ -1921,7 +1930,7 @@ void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expe
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
     wr_i32(w, dtype);
-    expert_wire_pack(w, p.partial.data(), p.partial.size(), dtype);
+    expert_wire_pack(w, p.partial.data(), p.partial.size(), dtype, ml8_timing);
 }
 
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {

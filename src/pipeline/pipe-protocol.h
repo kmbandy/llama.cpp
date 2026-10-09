@@ -954,7 +954,18 @@ void pipe_encode_expert_partial_stream_into(
 // The caller owns the lifetime and the aliasing: `out` must not be the source
 // of anything still in flight, and a reused buffer must not be shared between
 // threads. Contents before the call are irrelevant and are not read.
-void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expert_partial & p);
+// Host-side wall times of one ml8_4 pack (instrumentation). Filled only when a
+// non-null pointer is passed to pipe_encode_expert_partial_into; the layout must
+// match the struct of the same name that ggml_cuda_expert_wire_pack_ml8_4_timed
+// (ggml/src/ggml-cuda/allreduce.cu) fills.
+struct pipe_ml8_pack_timing {
+    uint64_t ns_lock        = 0;   // waiting for the process-global pack mutex
+    uint64_t ns_h2d         = 0;   // H2D enqueue calls
+    uint64_t ns_kernel_sync = 0;   // pack-kernel launch calls + cudaStreamSynchronize
+    uint64_t ns_d2h         = 0;   // D2H enqueue calls
+};
+void pipe_encode_expert_partial_into(std::vector<uint8_t> & out, const pipe_expert_partial & p,
+                                     pipe_ml8_pack_timing * ml8_timing = nullptr);
 std::vector<uint8_t> pipe_encode_segment_hello(const pipe_segment_hello & p);
 std::vector<uint8_t> pipe_encode_segment_hello_ack(const pipe_segment_hello_ack & p);
 std::vector<uint8_t> pipe_encode_segment_fwd_req(const pipe_segment_fwd_req & p, int32_t n_embd);

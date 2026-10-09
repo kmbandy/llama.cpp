@@ -1918,6 +1918,29 @@ struct RequestStats {
     uint64_t n_cpu_tier_gu_early = 0;   // WP_EXPERT_CPU_TIER_CHUNK_COMPUTE
     uint64_t ns_cpu_tier_compute = 0;   // WP_EXPERT_CPU_TIER
     uint64_t ns_cpu_tier_wait = 0;   // WP_EXPERT_CPU_TIER
+    // Instrumentation only (no behavior). ns_cpu_graph is the subset of
+    // ns_cpu_tier_compute spent inside ggml_backend_graph_compute for the CPU
+    // tier experts (compute_one: every stage; batch: the one shared graph).
+    // n_cpu_rows = sum over CPU-tier experts of routed rows m (nonzero weight);
+    // n_cpu_m_ge3 = CPU-tier experts with m >= 3.
+    uint64_t ns_cpu_graph = 0;
+    uint64_t n_cpu_rows = 0;
+    uint64_t n_cpu_m_ge3 = 0;
+    // bytes_pf_read: bytes of CPU-tier prefetch reads that COMPLETED (landed)
+    // during this request, claimed from the pool's counter at the end of
+    // dispatch (attribution by completion time; see ExpertSlotPool::take_bytes_pf_landed).
+    // bytes_cpu_miss: bytes read from NVMe for CPU-tier pages that were not
+    // RAM hits (demand, summed in cpu_tier_settle).
+    uint64_t bytes_pf_read = 0;
+    uint64_t bytes_cpu_miss = 0;
+    // ml8_4 pack in the response encoder (pipe_encode_expert_partial_into ->
+    // ggml_cuda_expert_wire_pack_ml8_4_timed). Host-side wall times: lock wait
+    // on the process-global pack mutex, H2D enqueue, pack-kernel launch plus
+    // cudaStreamSynchronize, and D2H enqueue. 0 on non-ml8_4 responses.
+    uint64_t ns_pack_lock = 0;
+    uint64_t ns_pack_h2d = 0;
+    uint64_t ns_pack_kernel_sync = 0;
+    uint64_t ns_pack_d2h = 0;
     uint64_t n_batch_mmid_fallback = 0;
     uint64_t n_batch_mmid_ineligible = 0;
     uint64_t n_batch_mmid_arena_bytes = 0;
@@ -2272,6 +2295,15 @@ public:
         n_cpu_tier_gu_early_ += request.n_cpu_tier_gu_early;
         ns_cpu_tier_compute_ += request.ns_cpu_tier_compute;
         ns_cpu_tier_wait_ += request.ns_cpu_tier_wait;
+        ns_cpu_graph_ += request.ns_cpu_graph;
+        n_cpu_rows_ += request.n_cpu_rows;
+        n_cpu_m_ge3_ += request.n_cpu_m_ge3;
+        bytes_pf_read_ += request.bytes_pf_read;
+        bytes_cpu_miss_ += request.bytes_cpu_miss;
+        ns_pack_lock_ += request.ns_pack_lock;
+        ns_pack_h2d_ += request.ns_pack_h2d;
+        ns_pack_kernel_sync_ += request.ns_pack_kernel_sync;
+        ns_pack_d2h_ += request.ns_pack_d2h;
         n_batch_mmid_fallback_ += request.n_batch_mmid_fallback;
         n_batch_mmid_ineligible_ += request.n_batch_mmid_ineligible;
         n_batch_mmid_arena_bytes_ += request.n_batch_mmid_arena_bytes;
@@ -2577,6 +2609,15 @@ private:
                   << " n_cpu_tier_gu_early=" << n_cpu_tier_gu_early_
                   << " ns_cpu_tier_compute=" << ns_cpu_tier_compute_
                   << " ns_cpu_tier_wait=" << ns_cpu_tier_wait_
+                  << " ns_cpu_graph=" << ns_cpu_graph_
+                  << " n_cpu_rows=" << n_cpu_rows_
+                  << " n_cpu_m_ge3=" << n_cpu_m_ge3_
+                  << " bytes_pf_read=" << bytes_pf_read_
+                  << " bytes_cpu_miss=" << bytes_cpu_miss_
+                  << " ns_pack_lock=" << ns_pack_lock_
+                  << " ns_pack_h2d=" << ns_pack_h2d_
+                  << " ns_pack_kernel_sync=" << ns_pack_kernel_sync_
+                  << " ns_pack_d2h=" << ns_pack_d2h_
                   << " n_pf_issued=" << n_pf_issued_
                   << " n_pf_landed=" << n_pf_landed_
                   << " n_pf_used=" << n_pf_used_
@@ -2765,6 +2806,15 @@ private:
     uint64_t          n_cpu_tier_gu_early_ = 0;
     uint64_t          ns_cpu_tier_compute_ = 0;
     uint64_t          ns_cpu_tier_wait_ = 0;
+    uint64_t          ns_cpu_graph_ = 0;
+    uint64_t          n_cpu_rows_ = 0;
+    uint64_t          n_cpu_m_ge3_ = 0;
+    uint64_t          bytes_pf_read_ = 0;
+    uint64_t          bytes_cpu_miss_ = 0;
+    uint64_t          ns_pack_lock_ = 0;
+    uint64_t          ns_pack_h2d_ = 0;
+    uint64_t          ns_pack_kernel_sync_ = 0;
+    uint64_t          ns_pack_d2h_ = 0;
     uint64_t          n_pf_issued_ = 0;
     uint64_t          n_pf_landed_ = 0;
     uint64_t          n_pf_used_ = 0;
@@ -7818,6 +7868,10 @@ public:
 
     uint64_t pf_issued() const        { return n_pf_issued_.load(std::memory_order_relaxed); }
     uint64_t pf_landed() const        { return n_pf_landed_.load(std::memory_order_relaxed); }
+    // Bytes of CPU-tier prefetch reads that landed since the last call. Claimed
+    // (exchange to 0) by the request that ends now, so each landed byte is
+    // attributed to the request being served at its completion time.
+    uint64_t take_bytes_pf_landed() { return bytes_pf_landed_.exchange(0, std::memory_order_relaxed); }
     uint64_t pf_stale_dropped() const { return n_pf_stale_dropped_.load(std::memory_order_relaxed); }
     uint64_t pf_yield() const         { return n_pf_yield_.load(std::memory_order_relaxed); }
     uint64_t pf_capped() const        { return n_pf_capped_.load(std::memory_order_relaxed); }
@@ -11245,6 +11299,7 @@ private:
     std::atomic<int32_t>            pf_layer_{-1};
     std::atomic<uint64_t>           n_pf_issued_{0};
     std::atomic<uint64_t>           n_pf_landed_{0};
+    std::atomic<uint64_t>           bytes_pf_landed_{0};   // instrumentation: see take_bytes_pf_landed
     std::atomic<uint64_t>           n_pf_stale_dropped_{0};
     std::atomic<uint64_t>           n_pf_yield_{0};
     std::atomic<uint64_t>           n_pf_capped_{0};
@@ -11637,6 +11692,7 @@ private:
             }
             if (ok) {
                 n_pf_landed_.fetch_add(1, std::memory_order_relaxed);
+                bytes_pf_landed_.fetch_add((uint64_t) page.size, std::memory_order_relaxed);
                 if (late_finish) {
                     n_pf_finished_late_.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -14777,7 +14833,6 @@ public:
             // -- so these RequestStats/WorkerStats fields (and the stats-log
             // columns that print them) stay at their zero default rather
             // than touching every consumer of that log format.
-            request_stats.bytes_read = batch.bytes_read();
             request_stats.ns_ensure_post = batch.ns_ensure_post();
             request_stats.host_bytes = batch.host_bytes();
             request_stats.n_pagein_sorted = batch.n_pagein_sorted();
@@ -15097,6 +15152,11 @@ public:
         request_stats.ns_wait += lap();
         time_layer_ahead(request, request_stats);
         if (measure) {
+            // bytes_read is set here, not at the lookup above: batch.bytes_read_
+            // only grows in drain_one_read, which runs inside batch.complete().
+            // Read at the lookup point it was always 0 in WP_REQ_LOG.
+            request_stats.bytes_read = batch.bytes_read();
+            request_stats.bytes_pf_read = pool_.take_bytes_pf_landed();
             request_stats.ns_read = batch.read_ns();
             request_stats.n_read_inflight_max = batch.n_read_inflight_max();
             request_stats.ns_read_issue = batch.ns_read_issue();
@@ -18674,6 +18734,11 @@ private:
         size_t                                 n_settled = 0;   // landed or failed
         size_t                                 n_ram_hit = 0;
         uint64_t                               ns_compute = 0;
+        // Instrumentation (compute thread writes, read after finished):
+        uint64_t                               ns_graph = 0;      // graph-compute subset of ns_compute
+        uint64_t                               n_rows = 0;        // routed rows m, summed over experts
+        uint64_t                               n_m_ge3 = 0;       // experts with m >= 3
+        uint64_t                               bytes_miss = 0;    // NVMe bytes for non-RAM-hit pages (cpu_tier_settle)
         std::exception_ptr                     error;
         bool                                   finished = false;
         // Chunked NVMe read state of one page (WP_EXPERT_CPU_TIER_READ_CHUNKS > 1).
@@ -18877,6 +18942,10 @@ private:
         request_stats.n_cpu_tier_ram_hit  += job->n_ram_hit;
         request_stats.n_cpu_tier_gu_early += job->n_gu_early;
         request_stats.ns_cpu_tier_compute += job->ns_compute;
+        request_stats.ns_cpu_graph        += job->ns_graph;
+        request_stats.n_cpu_rows          += job->n_rows;
+        request_stats.n_cpu_m_ge3         += job->n_m_ge3;
+        request_stats.bytes_cpu_miss      += job->bytes_miss;
     }
 
     void stop_cpu_tier() noexcept {
@@ -18904,6 +18973,9 @@ private:
             }
             if (landed) {
                 job.n_ram_hit += ram_hit ? 1 : 0;
+                if (!ram_hit) {
+                    job.bytes_miss += job.pages[k]->size;
+                }
                 job.landed.push_back(k);
             } else if (err && !job.error) {
                 job.error = err;
@@ -19233,15 +19305,20 @@ private:
             ggml_backend_tensor_set(sl.input, sl.x.data(), 0, ggml_nbytes(sl.input));
             ggml_backend_tensor_set(sl.route, sl.w.data(), 0, ggml_nbytes(sl.route));
         }
+        const auto t_graph = std::chrono::steady_clock::now();
         if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("CPU tier graph compute failed");
         }
+        job.ns_graph += (uint64_t) std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_graph).count();
         for (size_t i = 0; i < ks.size(); ++i) {
             CpuTierBatchState::Slot & sl = st.slots[i];
             if (sl.weighted == nullptr) {
                 continue;
             }
             const int64_t m = (int64_t) sl.rows.size();
+            job.n_rows  += (uint64_t) m;
+            job.n_m_ge3 += m >= 3 ? 1 : 0;
             sl.y.resize((size_t) m * (size_t) n_embd);
             ggml_backend_tensor_get(sl.weighted, sl.y.data(), 0, sl.y.size() * sizeof(float));
             std::vector<float> & out = job.partials[ks[i]];
@@ -19535,8 +19612,15 @@ private:
         if (route != nullptr) {
             ggml_backend_tensor_set(route, w.data(), 0, ggml_nbytes(route));
         }
+        const auto t_graph = std::chrono::steady_clock::now();
         if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("CPU tier graph compute failed");
+        }
+        job.ns_graph += (uint64_t) std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_graph).count();
+        if (stage != 2) {   // count each expert once: stage 1 or the single stage 0
+            job.n_rows  += (uint64_t) m;
+            job.n_m_ge3 += m >= 3 ? 1 : 0;
         }
         cpu_tier_log_team_once();
         if (stage == 1) {
@@ -22505,6 +22589,15 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_cpu_tier_gu_early += src.n_cpu_tier_gu_early;
     dst.ns_cpu_tier_compute += src.ns_cpu_tier_compute;
     dst.ns_cpu_tier_wait += src.ns_cpu_tier_wait;
+    dst.ns_cpu_graph += src.ns_cpu_graph;
+    dst.n_cpu_rows += src.n_cpu_rows;
+    dst.n_cpu_m_ge3 += src.n_cpu_m_ge3;
+    dst.bytes_pf_read += src.bytes_pf_read;
+    dst.bytes_cpu_miss += src.bytes_cpu_miss;
+    dst.ns_pack_lock += src.ns_pack_lock;
+    dst.ns_pack_h2d += src.ns_pack_h2d;
+    dst.ns_pack_kernel_sync += src.ns_pack_kernel_sync;
+    dst.ns_pack_d2h += src.ns_pack_d2h;
     dst.n_batch_mmid_fallback += src.n_batch_mmid_fallback;
     dst.n_batch_mmid_ineligible += src.n_batch_mmid_ineligible;
     dst.n_batch_mmid_arena_bytes += src.n_batch_mmid_arena_bytes;
@@ -27013,6 +27106,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         "ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end "
         "ns_params_set n_host_hit n_cpu_tier ns_cpu_tier_wait ns_cpu_tier_compute ns_ensure_post "
         "ns_final_sync";
+    // Instrumentation block (added 2026-10): always the LAST nine columns of every
+    // row, after the chunk_index / WP_REQ_LOG_TIMELINE suffix and any per-device
+    // block, so no earlier column moves. Parse it from the right.
+    static const char * const k_req_log_header_instr =
+        "ns_cpu_graph n_cpu_rows n_cpu_m_ge3 bytes_pf_read bytes_cpu_miss "
+        "ns_pack_lock ns_pack_h2d ns_pack_kernel_sync ns_pack_d2h";
     static const char * const k_req_log_header_dev =
         " n_experts_on_device n_pagein_on_device ns_prologue ns_prep ns_wait "
         "ns_pagein_compute ns_graph_build ns_submit ns_result ns_final_sync ns_readback "
@@ -27025,7 +27124,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     FILE * const req_log = (req_log_path != nullptr && req_log_path[0] != '\0')
         ? fopen(req_log_path, "w") : (FILE *) nullptr;
     if (req_log != nullptr && req_log_header) {
-        fprintf(req_log, "# %s\n", k_req_log_header);
+        fprintf(req_log, "# %s [last 9 columns: %s]\n", k_req_log_header, k_req_log_header_instr);
         fflush(req_log);
     }
     const bool req_log_per_device = [] {
@@ -27045,7 +27144,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         const std::string path = std::string(req_log_path) + "." + name;
         FILE * f = fopen(path.c_str(), "w");
         if (f != nullptr && req_log_header) {
-            fprintf(f, "# %s%s\n", k_req_log_header, k_req_log_header_dev);
+            fprintf(f, "# %s%s [last 9 columns: %s]\n", k_req_log_header, k_req_log_header_dev,
+                    k_req_log_header_instr);
             fflush(f);
         }
         req_log_dev_files.emplace(name, f);
@@ -27118,6 +27218,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         } else {
             fprintf(out, "%s", chunk_suffix);
         }
+        fprintf(out, " %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                (unsigned long long) s.ns_cpu_graph, (unsigned long long) s.n_cpu_rows,
+                (unsigned long long) s.n_cpu_m_ge3, (unsigned long long) s.bytes_pf_read,
+                (unsigned long long) s.bytes_cpu_miss, (unsigned long long) s.ns_pack_lock,
+                (unsigned long long) s.ns_pack_h2d, (unsigned long long) s.ns_pack_kernel_sync,
+                (unsigned long long) s.ns_pack_d2h);
         fprintf(out, "\n");
         fflush(out);
     };
@@ -27672,8 +27778,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 }
             };
         }
-        const auto send_legacy_response = [&](const pipe_expert_partial & response) {
-            pipe_encode_expert_partial_into(encode_buf, response);
+        const auto send_legacy_response = [&](const pipe_expert_partial & response,
+                                              RequestStats & stats) {
+            pipe_ml8_pack_timing pack_t;
+            pipe_encode_expert_partial_into(encode_buf, response,
+                                            worker.stats_enabled() ? &pack_t : nullptr);
+            stats.ns_pack_lock        += pack_t.ns_lock;
+            stats.ns_pack_h2d         += pack_t.ns_h2d;
+            stats.ns_pack_kernel_sync += pack_t.ns_kernel_sync;
+            stats.ns_pack_d2h         += pack_t.ns_d2h;
             const std::vector<uint8_t> & encoded = encode_buf;
             if (shm_request) {
                 pipe_expert_shm_ref ref;
@@ -27844,7 +27957,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         ? worker.device_name(0).c_str() : "fold";
                     wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
                 }
-                const bool sent1 = stream_sent_count != 0 || send_legacy_response(response);
+                const bool sent1 = stream_sent_count != 0 || send_legacy_response(response, split_log_stats);
                 // Stamped before the bookkeeping below so ns_resp_send is
                 // exactly encode + unlock + send + relock -- the worker->spine
                 // leg, and the last thing that is still inside the spine's wait.
@@ -27952,7 +28065,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         ? worker.device_name(0).c_str() : "fold";
                     wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
                 }
-                const bool sent2 = stream_sent_count != 0 || send_legacy_response(response);
+                const bool sent2 = stream_sent_count != 0 || send_legacy_response(response, split_log_stats);
                 // See the ACTS branch: encode + unlock + send + relock only.
                 const auto t_resp_sent = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
@@ -28069,7 +28182,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         ? worker.device_name(0).c_str() : "fold";
                     wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
                 }
-                const bool sent3 = stream_sent_count != 0 || send_legacy_response(response);
+                const bool sent3 = stream_sent_count != 0 || send_legacy_response(response, split_log_stats);
                 // See the ACTS branch: encode + unlock + send + relock only.
                 const auto t_resp_sent = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
@@ -28392,7 +28505,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     ? worker.device_name(0).c_str() : "fold";
                 wp_worker_hash_emit(seq_id, response.layer, device, response.partial);
             }
-            const bool sent4 = stream_sent_count != 0 || send_legacy_response(response);
+            const bool sent4 = stream_sent_count != 0 || send_legacy_response(response, request_stats);
             if (!sent4) {
                 return 1;
             }
