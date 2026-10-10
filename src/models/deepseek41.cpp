@@ -3298,6 +3298,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             }
             const uint32_t R = (uint32_t) n_tokens;
             const char * why = nullptr;
+            std::string why_buf;
             const auto * rmctx = dynamic_cast<const llama_kv_cache_dsv4_context *>(mctx);
             // WP_WAIT_ZEROCOPY is supported per (layer, group) slot; WP_WAIT_GPU_FLAG
             // (spin-on-flag, background fold) still falls back.
@@ -3343,6 +3344,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 why = "no-ubatch-state (reserve/worst-case graph)";
             } else if (rmctx->get_csa_plan(ubatch).n_stream != 1) {
                 why = "multi-stream";
+            } else {
+                // Each compressor state must satisfy the split's state-size rule.
+                const llama_dsv4_comp_state * sts[3] = { rmctx->get_csa_state(), rmctx->get_hca_state(), rmctx->get_lid_state() };
+                const char * names[3] = { "csa", "hca", "lid" };
+                const uint32_t k_gate = (R + 1) / 2;
+                for (int g = 0; g < 3 && why == nullptr; ++g) {
+                    const char * why_s = nullptr;
+                    if (!llama_dsv4_split_supported(ubatch, sts[g]->get_ratio(), sts[g]->get_overlap(),
+                                sts[g]->get_state_size(), sts[g]->get_n_stream(), k_gate, &why_s)) {
+                        why_buf = std::string(why_s) + "(" + names[g] + ")";
+                        why = why_buf.c_str();
+                    }
+                }
             }
             row_groups_active = why == nullptr;
             if (row_groups_active) {

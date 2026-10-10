@@ -124,6 +124,9 @@ int main() {
         { 4,   true,  8,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 100, 101, 102, 103, 104, 205 } },
         { 4,   true,  16,  128, { 0, 3, 7, 101, 203 } },
         { 128, false, 256, 8,   { 0, 1, 125, 126, 127, 128, 129, 130, 253, 254, 255, 256, 257, 300 } },
+        // DS4.1 real configs: state_size == ratio, overlap=false.
+        { 4,   false, 4,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 } },
+        { 128, false, 128, 8,   { 0, 1, 2, 124, 125, 126, 127, 128, 129, 130, 252, 253, 254, 255, 256, 257, 383 } },
     };
 
     long n_cases = 0;
@@ -314,20 +317,28 @@ int main() {
                         n_b_snap++;
                     }
 
-                    // Persist: A and B pairs partition the whole persist list.
-                    std::map<std::pair<int32_t,int32_t>, int> left;
+                    // Persist: each group dedups per ring slot (min(rows, S) entries).
+                    // Applied A then B, the last writer per slot must match the whole plan.
+                    std::map<int32_t, int32_t> whole_src;
                     for (size_t j = 0; j < whole.state_persist_src_idxs.size(); ++j) {
-                        left[{ whole.state_persist_src_idxs[j], whole.state_persist_dst_idxs[j] }]++;
+                        whole_src[whole.state_persist_dst_idxs[j]] = whole.state_persist_src_idxs[j];
                     }
-                    size_t n_persist = 0;
+                    if (sp.a.state_persist_dst_idxs.size() != std::min<size_t>(k, c.S) ||
+                            sp.b.state_persist_dst_idxs.size() != std::min<size_t>(R - k, c.S)) {
+                        fail("persist size is not min(group rows, S)");
+                    }
+                    std::map<int32_t, int32_t> last_src;
                     for (const comp_plan * P : { &sp.a, &sp.b }) {
                         for (size_t j = 0; j < P->state_persist_src_idxs.size(); ++j) {
-                            auto key = std::make_pair(P->state_persist_src_idxs[j], P->state_persist_dst_idxs[j]);
-                            if (left[key]-- <= 0) fail("persist pair not in whole plan");
-                            n_persist++;
+                            const int32_t dst = P->state_persist_dst_idxs[j];
+                            if (whole_src.count(dst) == 0) fail("persist dst not in whole plan");
+                            last_src[dst] = P->state_persist_src_idxs[j];
                         }
                     }
-                    if (n_persist != whole.state_persist_src_idxs.size()) fail("persist partition size");
+                    if (last_src.size() != whole_src.size()) fail("persist slot coverage");
+                    for (const auto & it : whole_src) {
+                        if (last_src[it.first] != it.second) fail("persist last writer differs from whole");
+                    }
 
                     ggml_free(ctx);
                     n_cases++;

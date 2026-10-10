@@ -9,9 +9,11 @@
 #include "llama-batch.h"
 #include "llama-kv-cache-dsv4.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -224,6 +226,73 @@ static llama_ubatch make_ubatch(std::shared_ptr<llama_ubatch::data_t> & data, in
     return ub;
 }
 
+// llama_dsv4_split_supported: accept/reject table. Returns the number of checks run.
+static long run_supported_checks() {
+    long n = 0;
+    const char * why = nullptr;
+
+    auto expect = [&](bool want, uint32_t R, uint32_t ratio, bool overlap, uint32_t S,
+                      uint32_t n_stream, uint32_t k, const char * label, const std::function<void(llama_ubatch &, std::shared_ptr<llama_ubatch::data_t> &)> & mut) {
+        std::shared_ptr<llama_ubatch::data_t> data;
+        llama_ubatch ub = make_ubatch(data, (int32_t) R, 100);
+        if (mut) {
+            mut(ub, data);
+        }
+        const bool got = llama_dsv4_split_supported(ub, ratio, overlap, S, n_stream, k, &why);
+        if (got != want) {
+            std::fprintf(stderr, "split_supported(%s): want %d got %d (why=%s)\n", label, (int) want, (int) got,
+                         why ? why : "none");
+            std::exit(1);
+        }
+        if (!got && (why == nullptr || why[0] == '\0')) {
+            fail("split_supported rejected without a reason");
+        }
+        ++n;
+    };
+    const std::function<void(llama_ubatch &, std::shared_ptr<llama_ubatch::data_t> &)> none = nullptr;
+
+    // v41 configs, every R and k = ceil(R/2).
+    for (uint32_t R = 4; R <= 8; ++R) {
+        expect(true, R, 4,   false, 4,   1, (R + 1)/2, "v41 ratio4 S4", none);
+        expect(true, R, 128, false, 128, 1, (R + 1)/2, "v41 ratio128 S128", none);
+    }
+    // Existing overlap configs.
+    expect(true, 8, 4,   true,  8,   1, 4, "overlap ratio4 S8", none);
+    expect(true, 8, 4,   true,  16,  1, 4, "overlap ratio4 S16", none);
+    expect(true, 6, 128, false, 256, 1, 3, "non-overlap ratio128 S256", none);
+
+    // Rejections.
+    expect(false, 8, 2, false, 3, 1, 4, "S < k", none);
+    expect(false, 8, 2, false, 4, 1, 2, "S < R-k", none);
+    expect(false, 8, 4, false, 2, 1, 4, "S < ratio", none);
+    expect(false, 8, 4, true,  4, 1, 4, "overlap S < 2*ratio", none);
+    expect(false, 8, 2, true,  4, 1, 4, "overlap S < R", none);
+    expect(false, 8, 4, false, 4, 2, 4, "n_stream != 1", none);
+    expect(false, 8, 4, false, 4, 1, 0, "k == 0", none);
+    expect(false, 8, 4, false, 4, 1, 8, "k == R", none);
+    expect(false, 8, 0, false, 4, 1, 4, "ratio == 0", none);
+    expect(false, 8, 4, false, 4, 1, 4, "multi-seq",
+            [](llama_ubatch & ub, std::shared_ptr<llama_ubatch::data_t> & d) {
+                d->seq_id_unq = { 0, 1 };
+                ub.n_seqs_unq = 2;
+                ub.seq_id_unq = d->seq_id_unq.data();
+            });
+    expect(false, 8, 4, false, 4, 1, 4, "coupled rows",
+            [](llama_ubatch & ub, std::shared_ptr<llama_ubatch::data_t> & d) {
+                d->n_seq_id[3] = 2;
+                (void) ub;
+            });
+    expect(false, 8, 4, false, 4, 1, 4, "non-consecutive pos",
+            [](llama_ubatch &, std::shared_ptr<llama_ubatch::data_t> & d) {
+                d->pos[5] += 2;
+            });
+    expect(false, 8, 4, false, 4, 1, 4, "negative pos",
+            [](llama_ubatch &, std::shared_ptr<llama_ubatch::data_t> & d) {
+                for (auto & p : d->pos) p -= 200;
+            });
+    return n;
+}
+
 int main() {
     struct cfg {
         uint32_t ratio;
@@ -236,12 +305,18 @@ int main() {
         { 4,   true,  8,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 100, 101, 102, 103, 104, 205 } },
         { 4,   true,  16,  128, { 0, 3, 7, 101, 203 } },
         { 128, false, 256, 8,   { 0, 1, 125, 126, 127, 128, 129, 130, 253, 254, 255, 256, 257, 300 } },
+        // DS4.1 real configs: state_size == ratio, overlap=false.
+        { 4,   false, 4,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 } },
+        { 128, false, 128, 8,   { 0, 1, 2, 124, 125, 126, 127, 128, 129, 130, 252, 253, 254, 255, 256, 257, 383 } },
     };
 
     long n_cases = 0;
     long n_order_neg = 0;
+    std::vector<long> cfg_cases(cfgs.size(), 0);
+    std::vector<long> cfg_neg(cfgs.size(), 0);
 
-    for (const cfg & c : cfgs) {
+    for (size_t ci = 0; ci < cfgs.size(); ++ci) {
+        const cfg & c = cfgs[ci];
         for (int32_t R = 4; R <= 8; ++R) {
             const int32_t k = (R + 1) / 2;
             // Persist-before-snapshot only shows up when d > R-k, so n_rs goes to 4.
@@ -279,22 +354,28 @@ int main() {
                             for (int32_t r = 0; r < c.S*(1 + n_rs); ++r) {
                                 if (bad.X[r] != want.X[r]) {
                                     ++n_order_neg;
+                                    ++cfg_neg[ci];
                                     break;
                                 }
                             }
                         }
 
-                        // Fixed rank per group: A has ceil(k/ratio) write blocks and k
-                        // persist rows; B has ceil((R-k)/ratio) and R-k.
+                        // Fixed rank per group: A has ceil(k/ratio) write blocks and
+                        // min(k,S) persist rows; B has ceil((R-k)/ratio) and min(R-k,S).
                         const size_t rank_a = (k + c.ratio - 1) / c.ratio;
                         const size_t rank_b = (R - k + c.ratio - 1) / c.ratio;
                         if (sp.a.state_write_idxs.size() != rank_a || sp.b.state_write_idxs.size() != rank_b) {
                             fail("write rank is not the per-group reserve rank");
                         }
+                        if (sp.a.state_persist_dst_idxs.size() != std::min<size_t>(k, c.S) ||
+                                sp.b.state_persist_dst_idxs.size() != std::min<size_t>(R - k, c.S)) {
+                            fail("persist size is not min(group rows, S)");
+                        }
                         if (sp.a.state_pos.size() != (size_t) k || sp.b.state_pos.size() != (size_t) (R - k)) {
                             fail("state_pos slice has the wrong size");
                         }
                         ++n_cases;
+                        ++cfg_cases[ci];
                     }
                 }
             }
@@ -307,7 +388,22 @@ int main() {
     if (n_order_neg == 0) {
         fail("persist-before-snapshot never changed the planes: the negative check is blind");
     }
-    std::printf("PASS: %ld partitioned-vs-whole cases; persist-before-snapshot detected in %ld cases\n",
-                n_cases, n_order_neg);
+    for (size_t ci = 0; ci < cfgs.size(); ++ci) {
+        std::printf("  cfg %zu (ratio=%u overlap=%d S=%d): %ld cases, persist-before-snapshot detected in %ld\n",
+                    ci, cfgs[ci].ratio, (int) cfgs[ci].overlap, cfgs[ci].S, cfg_cases[ci], cfg_neg[ci]);
+        if (cfg_cases[ci] == 0) {
+            fail("config ran no cases");
+        }
+    }
+    // The new real configs must each be covered by the negative check too.
+    for (size_t ci = cfgs.size() - 2; ci < cfgs.size(); ++ci) {
+        if (cfg_neg[ci] == 0) {
+            fail("negative check is blind for a DS4.1 config");
+        }
+    }
+    const long n_supported = run_supported_checks();
+    std::printf("PASS: %ld partitioned-vs-whole cases; persist-before-snapshot detected in %ld cases; "
+                "%ld split_supported checks\n",
+                n_cases, n_order_neg, n_supported);
     return 0;
 }

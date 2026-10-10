@@ -955,6 +955,65 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
     return plan;
 }
 
+bool llama_dsv4_split_supported(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t n_stream,
+        uint32_t k,
+        const char ** why) {
+    const uint32_t R = ubatch.n_tokens;
+    const char * dummy = nullptr;
+    const char ** out = why != nullptr ? why : &dummy;
+
+    if (ubatch.n_seqs_unq != 1) {
+        *out = "multi-seq";
+        return false;
+    }
+    if (dsv4_ubatch_has_coupled(ubatch)) {
+        *out = "coupled-rows";
+        return false;
+    }
+    if (n_stream != 1) {
+        *out = "multi-stream";
+        return false;
+    }
+    if (ratio == 0) {
+        *out = "ratio-zero";
+        return false;
+    }
+    if (R == 0 || k == 0 || k >= R) {
+        *out = "k-out-of-range";
+        return false;
+    }
+    if (ubatch.pos == nullptr) {
+        *out = "no-pos";
+        return false;
+    }
+    for (uint32_t i = 0; i < R; ++i) {
+        if (ubatch.pos[i] < 0) {
+            *out = "negative-pos";
+            return false;
+        }
+        if (ubatch.pos[i] != ubatch.pos[0] + (llama_pos) i) {
+            *out = "non-consecutive-pos";
+            return false;
+        }
+    }
+    // Overlap reads a 2*ratio window and needs one slot per token. Non-overlap
+    // reads ratio rows; each group persists at most min(rows, S) slots.
+    const bool state_ok = overlap
+        ? (state_size >= 2*ratio && state_size >= R)
+        : (state_size >= ratio && state_size >= k && state_size >= R - k);
+    if (!state_ok) {
+        *out = "state-too-small";
+        return false;
+    }
+    *out = nullptr;
+    return true;
+}
+
 llama_dsv4_comp_plan_split llama_dsv4_split_comp_plan(
         const llama_ubatch & ubatch,
         uint32_t ratio,
@@ -968,12 +1027,9 @@ llama_dsv4_comp_plan_split llama_dsv4_split_comp_plan(
     using comp_plan = llama_kv_cache_dsv4_context::comp_plan;
 
     const uint32_t R = ubatch.n_tokens;
-    GGML_ASSERT(ubatch.n_seqs_unq == 1 && !dsv4_ubatch_has_coupled(ubatch));
-    GGML_ASSERT(n_stream == 1);
-    GGML_ASSERT(ratio > 0 && k > 0 && k < R);
-    GGML_ASSERT(state_size >= 2*ratio && state_size >= R);
-    for (uint32_t i = 0; i < R; ++i) {
-        GGML_ASSERT(ubatch.pos[i] >= 0 && ubatch.pos[i] == ubatch.pos[0] + (llama_pos) i);
+    const char * why = nullptr;
+    if (!llama_dsv4_split_supported(ubatch, ratio, overlap, state_size, n_stream, k, &why)) {
+        GGML_ABORT("row-group split not supported: %s", why);
     }
 
     const int32_t S          = (int32_t) state_size;
@@ -1080,13 +1136,22 @@ llama_dsv4_comp_plan_split llama_dsv4_split_comp_plan(
     emit_blocks(A, blocks_a, k);
     emit_blocks(B, blocks_b, R - k);
 
-    // Persist: src is the token row. S >= R guarantees one slot per token.
-    for (size_t j = 0; j < whole.state_persist_dst_idxs.size(); ++j) {
-        comp_plan & P = whole.state_persist_src_idxs[j] < (int32_t) k ? A : B;
-        P.state_persist_src_idxs.push_back(whole.state_persist_src_idxs[j]);
-        P.state_persist_dst_idxs.push_back(whole.state_persist_dst_idxs[j]);
-    }
-    GGML_ASSERT(A.state_persist_dst_idxs.size() == k && B.state_persist_dst_idxs.size() == R - k);
+    // Persist per group: one entry per ring slot, last writer in the group wins.
+    // Size is min(group rows, S). B's persist runs after B's commits.
+    const auto persist_group = [&](comp_plan & P, uint32_t r0, uint32_t r1) {
+        std::map<int32_t, int32_t> last; // ring slot -> token row
+        for (uint32_t i = r0; i < r1; ++i) {
+            last[(int32_t) (ubatch.pos[i] % state_size)] = (int32_t) i;
+        }
+        for (const auto & it : last) {
+            P.state_persist_dst_idxs.push_back(it.first);
+            P.state_persist_src_idxs.push_back(it.second);
+        }
+    };
+    persist_group(A, 0, k);
+    persist_group(B, k, R);
+    GGML_ASSERT(A.state_persist_dst_idxs.size() == std::min<size_t>(k, state_size));
+    GGML_ASSERT(B.state_persist_dst_idxs.size() == std::min<size_t>(R - k, state_size));
 
     // Restore runs once, at the start of group A.
     A.state_restore_src_idxs = whole.state_restore_src_idxs;
