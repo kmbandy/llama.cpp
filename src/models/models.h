@@ -1469,6 +1469,19 @@ void          llama_dspark_gumbel_skip  (ggml_context * ctx0, llama_dspark_gumbe
 ggml_tensor * llama_dspark_gumbel_pack  (ggml_context * ctx0, llama_dspark_gumbel & gm,
                                          ggml_tensor * conf_tok, ggml_tensor * t_embd);
 
+// WP_SPINE_ROW_GROUPS (S4): per-group state hook for build_attention_v41.
+// Group A (group 0, rows [0,k)) records its compressor state_kv/state_score per
+// kv-source layer in `stash` while it is built. Group B (group 1, rows [k,R))
+// reads them, and its compressor source/snapshot/persist use the concatenation
+// [A rows | B rows], which is the whole-ubatch row numbering the split plan's
+// indices already use. `inp_pos` is the group's dedicated RoPE position leaf.
+// A null hook (the default) leaves build_attention_v41 unchanged.
+struct dsv41_row_group_state {
+    int group = 0;                        // 0 = A, 1 = B
+    ggml_tensor * inp_pos = nullptr;      // group RoPE positions, [width]
+    std::vector<dsv4_state_tensors> stash; // indexed by layer; written by A, read by B
+};
+
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1543,6 +1556,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         // the layers whose dsv41_topk_source names it.
         mutable ggml_tensor * dsv41_shared_top_k     = nullptr;
         mutable int           dsv41_shared_top_k_src = -1;
+
+        // WP_SPINE_ROW_GROUPS (S4): set by the row-group driver around each group's
+        // build; nullptr (default) keeps build_attention_v41 on the legacy path.
+        mutable dsv41_row_group_state * row_group = nullptr;
 
         // which compressed positions this layer's queries attend to
         ggml_tensor * build_indexer_top_k(

@@ -506,6 +506,13 @@ target_link_libraries(test-dsv4-rowgroup-inputs PRIVATE llama)
 target_compile_features(test-dsv4-rowgroup-inputs PRIVATE cxx_std_17)
 llama_test(test-dsv4-rowgroup-inputs)
 
+# WP_SPINE_ROW_GROUPS (S4): group B's compressor state concat and plan indices match the whole plan (CPU only)
+add_executable(test-dsv4-rowgroup-state test-dsv4-rowgroup-state.cpp)
+target_include_directories(test-dsv4-rowgroup-state PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-rowgroup-state PRIVATE llama)
+target_compile_features(test-dsv4-rowgroup-state PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-state)
+
 # cross-host tensor parallelism: the rank-windowed row split (pure arithmetic, no model, no GPU)
 add_executable(
     test-tp-rank-window

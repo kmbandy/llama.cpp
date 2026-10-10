@@ -2372,6 +2372,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     const int64_t nt               = cur->ne[1];
     const int64_t ratio            = hparams.dsv4_compress_ratios[il];
 
+    // WP_SPINE_ROW_GROUPS (S4): a row group takes its RoPE positions from its own
+    // facade leaf (ubatch rows [r0, r0+nt)), never from the graph-wide inp_pos.
+    if (row_group) {
+        GGML_ASSERT(row_group->inp_pos && row_group->inp_pos->ne[0] == nt &&
+                "row group: group RoPE positions must cover the group's rows");
+        GGML_ASSERT(!ced_log_shapes && !publish_only && cur_state == nullptr &&
+                "row group: CED prefill trim is incompatible with row groups");
+        inp_pos = row_group->inp_pos;
+    }
+
     GGML_ASSERT(n_embd_head == n_embd_head_v);
     GGML_ASSERT(n_head % hparams.dsv4_o_group_count == 0);
     // graph::graph()'s gate already refuses the whole trim for a ratio==0
@@ -2484,6 +2494,23 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             ? build_lora_mm(layer.attn_comp_wgate, cur_kv)
             : state_kv;
         cb(state_score, "comp_state_score", il);
+
+        // WP_SPINE_ROW_GROUPS (S4): group A stashes its state rows for this layer;
+        // group B prepends them, so state_kv/state_score cover all R rows in
+        // whole-ubatch order and the split plan's indices apply unchanged.
+        if (row_group) {
+            GGML_ASSERT((int) row_group->stash.size() > il);
+            if (row_group->group == 0) {
+                row_group->stash[il] = { state_kv, state_score };
+            } else {
+                const dsv4_state_tensors & a = row_group->stash[il];
+                GGML_ASSERT(a.kv && a.score && "row group B: group A must build this layer's state first");
+                state_kv    = ggml_concat(ctx0, a.kv,    state_kv,    1);
+                state_score = ggml_concat(ctx0, a.score, state_score, 1);
+                cb(state_kv,    "comp_state_kv_rg",    il);
+                cb(state_score, "comp_state_score_rg", il);
+            }
+        }
 
         const dsv4_state_tensors restored = dsv4_build_state_restore(ctx0, inp_comp, comp_state, il);
 
