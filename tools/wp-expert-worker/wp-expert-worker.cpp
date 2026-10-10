@@ -85,6 +85,202 @@ bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int6
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// WP_WORKER_SPAN_TRACE=1 (default OFF): worker-side interval timeline.
+// Each span is one POD record in a preallocated ring (4M entries, calloc'd only
+// when the knob is on), claimed with one relaxed fetch_add. Timestamps are
+// CLOCK_REALTIME so they join the spine's realtime stamps across hosts.
+// Output: TSV at WP_WORKER_SPAN_FILE (default /tmp/wp-worker-span.<pid>.tsv).
+// Flushed from the recording thread when the ring is 90% full (rare), from the
+// SIGTERM/SIGINT stop path, and at normal exit. Off = one branch on a latched
+// bool per call site. Records are not ordered across threads; a record still
+// being written during a flush may be dropped (kind 0 = not yet written).
+// Spans on the lap()/measure paths need the phase timers, so the knob also
+// forces `measure` on in dispatch() and the request handler.
+enum wp_span_kind : uint8_t {
+    WP_SPAN_REQ = 1,         // frame arrival -> response sent (aux = n_tokens)
+    WP_SPAN_PAGEIN_WAIT,     // batch.complete() wait (ns_wait)
+    WP_SPAN_PAGEIN_COMPUTE,  // compute of paged-in experts (ns_pagein_compute)
+    WP_SPAN_GPU_SUBMIT,      // graph submit (ns_submit)
+    WP_SPAN_FINAL_SYNC,      // deferred backend sync (ns_final_sync)
+    WP_SPAN_READBACK,        // GPU->host result copy (aux = bytes)
+    WP_SPAN_CPU_TIER_WAIT,   // wait for CPU-tier job (ns_cpu_tier_wait)
+    WP_SPAN_CPU_TIER_JOB,    // one CPU-tier compute (aux = expert id; batch: page count)
+    WP_SPAN_ENCODE,          // fp32 -> wire encode of the reply (ns_encode)
+    WP_SPAN_SEND,            // response frame send (aux = part index for streamed)
+    WP_SPAN_NVME_READ_DEMAND,// pread of one expert range, demand (aux = bytes)
+    WP_SPAN_NVME_READ_SPEC,  // pread of one expert range, speculative/prefetch
+    WP_SPAN_H2D,             // host->device copy (aux = bytes)
+};
+
+inline const char * wp_span_kind_name(uint8_t k) {
+    static const char * const names[] = {
+        "?", "REQ", "PAGEIN_WAIT", "PAGEIN_COMPUTE", "GPU_SUBMIT", "FINAL_SYNC",
+        "READBACK", "CPU_TIER_WAIT", "CPU_TIER_JOB", "ENCODE", "SEND",
+        "NVME_READ_DEMAND", "NVME_READ_SPEC", "H2D",
+    };
+    return k < sizeof(names) / sizeof(names[0]) ? names[k] : "?";
+}
+
+struct WpSpanRec {
+    uint8_t  kind;
+    int16_t  layer;
+    uint32_t seq;
+    uint32_t tid;
+    int64_t  t0_ns;
+    int64_t  t1_ns;
+    int64_t  aux;
+};
+
+struct WpSpanRing {
+    static constexpr size_t kCap = size_t(1) << 22;   // 4M records
+    WpSpanRec *           buf = nullptr;
+    FILE *                f = nullptr;
+    std::atomic<uint64_t> idx{0};        // next record index (fetch_add relaxed)
+    std::atomic<uint64_t> flushed{0};    // records [0, flushed) are on disk
+    std::atomic<uint64_t> dropped{0};    // records lost to a full, unflushed ring
+    std::atomic<uint32_t> next_tid{1};
+    std::mutex            flush_mu;
+};
+
+inline WpSpanRing * g_wp_span_ring = nullptr;
+
+inline int64_t wp_now_realtime_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
+}
+
+// Writes records [flushed, idx) that are complete. block=false: skip if another
+// thread is already flushing (the recording thread must never wait on I/O).
+inline void wp_span_flush(bool block) {
+    WpSpanRing * r = g_wp_span_ring;
+    if (r == nullptr) { return; }
+    std::unique_lock<std::mutex> lk(r->flush_mu, std::defer_lock);
+    if (block) { lk.lock(); } else if (!lk.try_lock()) { return; }
+    const uint64_t hi = r->idx.load(std::memory_order_acquire);
+    uint64_t lo = r->flushed.load(std::memory_order_relaxed);
+    if (hi - lo > WpSpanRing::kCap) { lo = hi - WpSpanRing::kCap; }
+    for (uint64_t i = lo; i < hi; ++i) {
+        const WpSpanRec & rec = r->buf[i % WpSpanRing::kCap];
+        if (rec.kind == 0) { continue; }
+        std::fprintf(r->f, "%s\t%d\t%u\t%u\t%lld\t%lld\t%lld\n",
+                     wp_span_kind_name(rec.kind), (int) rec.layer, (unsigned) rec.seq,
+                     (unsigned) rec.tid, (long long) rec.t0_ns, (long long) rec.t1_ns,
+                     (long long) rec.aux);
+    }
+    r->flushed.store(hi, std::memory_order_relaxed);
+    if (block) {
+        std::fprintf(r->f, "# dropped %llu\n",
+                     (unsigned long long) r->dropped.load(std::memory_order_relaxed));
+    }
+    std::fflush(r->f);
+}
+
+inline bool wp_span_init() {
+    const char * e = std::getenv("WP_WORKER_SPAN_TRACE");
+    if (e == nullptr || e[0] != '1') { return false; }
+    std::string path;
+    if (const char * p = std::getenv("WP_WORKER_SPAN_FILE"); p != nullptr && p[0] != '\0') {
+        path = p;
+    } else {
+#if defined(__linux__)
+        path = "/tmp/wp-worker-span." + std::to_string((long) ::getpid()) + ".tsv";
+#else
+        path = "/tmp/wp-worker-span.tsv";
+#endif
+    }
+    WpSpanRing * r = new WpSpanRing();   // intentionally leaked: used by detached threads
+    r->buf = static_cast<WpSpanRec *>(std::calloc(WpSpanRing::kCap, sizeof(WpSpanRec)));
+    r->f   = r->buf != nullptr ? std::fopen(path.c_str(), "w") : nullptr;
+    if (r->f == nullptr) {
+        std::fprintf(stderr, "WP_WORKER_SPAN_TRACE: cannot open %s; trace disabled\n", path.c_str());
+        std::free(r->buf);
+        delete r;
+        return false;
+    }
+    std::fprintf(r->f, "kind_name\tlayer\tseq\ttid\tt0_ns\tt1_ns\taux\n");
+    g_wp_span_ring = r;
+    std::atexit([] { wp_span_flush(true); });
+    std::fprintf(stderr, "wp expert worker: WP_WORKER_SPAN_TRACE on, writing %s\n", path.c_str());
+    return true;
+}
+
+// Latched once (dynamic init). Read as a plain bool on every hot path.
+inline const bool g_wp_span_on = wp_span_init();
+inline bool wp_span_on() { return g_wp_span_on; }
+
+// Thread-local request context so deep helpers (graph submit, sync, readback,
+// H2D completion) can tag their spans without threading seq/layer through.
+// Set by DeviceWorker::dispatch() for its duration; 0 / -1 outside a request
+// (reader threads, speculative reads).
+inline thread_local uint32_t wp_span_ctx_seq   = 0;
+inline thread_local int      wp_span_ctx_layer = -1;
+struct WpSpanCtxScope {
+    uint32_t prev_seq;
+    int      prev_layer;
+    bool     on;
+    WpSpanCtxScope(uint32_t seq, int layer) : prev_seq(wp_span_ctx_seq),
+                                              prev_layer(wp_span_ctx_layer), on(g_wp_span_on) {
+        if (on) { wp_span_ctx_seq = seq; wp_span_ctx_layer = layer; }
+    }
+    ~WpSpanCtxScope() {
+        if (on) { wp_span_ctx_seq = prev_seq; wp_span_ctx_layer = prev_layer; }
+    }
+};
+
+// Explicit interval [t0, t1] in CLOCK_REALTIME ns.
+inline void wp_span(uint8_t kind, int layer, uint32_t seq, int64_t t0, int64_t t1, int64_t aux) {
+    if (!g_wp_span_on) { return; }
+    WpSpanRing * r = g_wp_span_ring;
+    static thread_local uint32_t tid = 0;
+    if (tid == 0) { tid = r->next_tid.fetch_add(1, std::memory_order_relaxed); }
+    const uint64_t i = r->idx.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t fl = r->flushed.load(std::memory_order_relaxed);
+    if (i - fl >= WpSpanRing::kCap) {
+        r->dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    WpSpanRec & rec = r->buf[i % WpSpanRing::kCap];
+    rec.layer = (int16_t) layer;
+    rec.seq   = seq;
+    rec.tid   = tid;
+    rec.t0_ns = t0;
+    rec.t1_ns = t1;
+    rec.aux   = aux;
+    std::atomic_thread_fence(std::memory_order_release);
+    rec.kind  = kind;                       // written last: 0 means "not yet"
+    if (i - fl >= WpSpanRing::kCap / 10 * 9) { wp_span_flush(false); }
+}
+
+// Interval ending now, of length elapsed_ns (what lap() / elapsed sites return).
+// elapsed_ns == 0 means the phase timer was not running: record nothing.
+inline void wp_span_end(uint8_t kind, int layer, uint32_t seq, uint64_t elapsed_ns, int64_t aux) {
+    if (!g_wp_span_on || elapsed_ns == 0) { return; }
+    const int64_t t1 = wp_now_realtime_ns();
+    wp_span(kind, layer, seq, t1 - (int64_t) elapsed_ns, t1, aux);
+}
+
+// Same as wp_span_end, returning elapsed_ns so a lap() site stays one line.
+inline uint64_t wp_span_took(uint8_t kind, int layer, uint32_t seq, uint64_t elapsed_ns,
+                             int64_t aux = 0) {
+    wp_span_end(kind, layer, seq, elapsed_ns, aux);
+    return elapsed_ns;
+}
+
+// REQ span for one serve-loop frame: t0 = arrival (0 = now), recorded on exit.
+struct WpSpanReqScope {
+    bool     on;
+    uint32_t seq;
+    int      layer = -1;
+    int64_t  aux = 0;
+    int64_t  t0;
+    WpSpanReqScope(bool on_, uint32_t seq_, int64_t arrive_ns)
+        : on(on_), seq(seq_), t0(on_ ? (arrive_ns != 0 ? arrive_ns : wp_now_realtime_ns()) : 0) {}
+    ~WpSpanReqScope() {
+        if (on) { wp_span(WP_SPAN_REQ, layer, seq, t0, wp_now_realtime_ns(), aux); }
+    }
+};
+
 // These weak references MUST be extern "C": ggml-cuda.h defines the symbols with
 // C linkage (unmangled). With C++ linkage the worker referenced mangled names
 // that never resolve, so every weak pointer was null and copy_stream stayed off.
@@ -5454,6 +5650,7 @@ private:
         size_t             entry_index = 0;
         size_t             slot_index  = 0;
         const ExpertPage * page        = nullptr;
+        uint32_t           span_seq    = 0;   // WP_WORKER_SPAN_TRACE request tag
         int                fd          = -1;
         std::shared_ptr<DemandRec> demand_rec;   // WP_DEMAND_LOG (null when off)
         // Destination tensor for this page-in's H2D, captured HERE, at plan
@@ -5648,6 +5845,7 @@ private:
 
     struct BatchState {
         std::vector<PageIn>                       pageins;
+        uint32_t                                span_seq = 0;   // WP_WORKER_SPAN_TRACE request tag
         std::atomic<size_t>                     next{0};
         // Which connection's transaction this batch belongs to (-1 = none:
         // single-connection default path, or a speculative/prefetch batch
@@ -6896,6 +7094,7 @@ public:
             }
             batch.state_ = std::make_shared<BatchState>();
             batch.state_->conn_index = conn_index;
+            batch.state_->span_seq = wp_span_ctx_seq;
             batch.copy_event_ = new_copy_event();
             batch.state_->pageins.reserve(pageins.size());
             // Reader-thread H2D: decide once, here, under the lock, for every
@@ -6947,6 +7146,7 @@ public:
                     const ExpertPage & page = *pages[entry_index];
                     PageIn pi;
                     pi.entry_index = entry_index;
+                    pi.span_seq   = wp_span_ctx_seq;
                     pi.page        = &page;
                     pi.demand_rec  = batch.demand_rec_;
                     // speculative verify (2-8 tokens) is decode traffic. Prefill
@@ -9281,7 +9481,7 @@ private:
 
     void reader_h2d_upload(const PageIn & pagein, bool measure, ReadResult & result) {
         const std::chrono::steady_clock::time_point t0 =
-            measure ? std::chrono::steady_clock::now()
+            measure || wp_span_on() ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point();
         try {
             // NOT tensor_set_page_range / ggml_backend_tensor_set: on
@@ -9305,10 +9505,15 @@ private:
         }
         result.uploaded  = true;
         result.h2d_bytes = (uint64_t) pagein.page->size;
+        const uint64_t h2d_ns = (measure || wp_span_on())
+            ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0).count()
+            : 0;
         if (measure) {
-            result.h2d_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0).count();
+            result.h2d_ns = h2d_ns;
         }
+        wp_span_end(WP_SPAN_H2D, pagein.page->layer, pagein.span_seq, h2d_ns,
+                    (int64_t) pagein.page->size);
         if (reader_h2d_verify_enabled()) {
             const size_t page_size = (size_t) pagein.page->size;
             const size_t sample    = std::min<size_t>(4096, page_size);
@@ -9749,9 +9954,11 @@ private:
             if (it->event != nullptr) {
                 ggml_backend_event_synchronize(it->event);
                 if (measure) {
-                    batch.ns_h2d_complete_ += (uint64_t) std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - it->issued).count();
+                    batch.ns_h2d_complete_ += wp_span_took(WP_SPAN_H2D,
+                        it->page != nullptr ? it->page->layer : -1, wp_span_ctx_seq,
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - it->issued).count(),
+                        it->page != nullptr ? (int64_t) it->page->size : 0);
                 }
                 batch.copy_wait_events_.push_back(it->event);
                 it->event = nullptr;
@@ -9923,6 +10130,8 @@ private:
                     batch.ns_h2d_issue_ += h2d_issue_ns;
                     batch.bytes_h2d_ += result->len;
                 }
+                wp_span_end(WP_SPAN_H2D, pagein.page->layer, wp_span_ctx_seq, h2d_issue_ns,
+                            (int64_t) result->len);
                 copy_stream_async = used_copy_stream && !used_fallback;
                 if (page_done) {
                     if (copy_stream_async) {
@@ -10709,8 +10918,9 @@ private:
         }
         ssize_t n = -1;
         const bool measure_read = g_read_path_stats.enabled();
+        const bool span_read = state != nullptr && wp_span_on();
         const std::chrono::steady_clock::time_point read_started =
-            measure_read ? std::chrono::steady_clock::now() :
+            measure_read || span_read ? std::chrono::steady_clock::now() :
                             std::chrono::steady_clock::time_point();
         do {
             n = pread(fd, dst, len, (off_t) (page.offset + (uint64_t) offset));
@@ -10738,6 +10948,12 @@ private:
             g_read_path_stats.record(
                 n > 0 ? std::min<size_t>((size_t) n, len) : 0,
                 elapsed, started_ns, finished_ns);
+        }
+        if (span_read) {
+            wp_span_end(state->speculative ? WP_SPAN_NVME_READ_SPEC : WP_SPAN_NVME_READ_DEMAND,
+                        page.layer, state->span_seq,
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - read_started).count(), (int64_t) len);
         }
         if (n < 0 || (size_t) n != len) {
             throw std::runtime_error(
@@ -14745,6 +14961,8 @@ public:
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
             int conn_index = -1,
             uint64_t trace_req = 0) {
+        const WpSpanCtxScope span_ctx(
+            (uint32_t) trace_req, request.layer);
         if (parked()) {
             // Tripwire only: Worker::park_frame_enter auto-unparks before any
             // dispatch frame reaches here.
@@ -14833,7 +15051,7 @@ public:
         // f16 value back to f32, which recovered the storage type but NOT the
         // ~3e-4 of precision the spine had already thrown away.
         const float * activation = request.activation_data();
-        const bool measure = stats_.enabled();
+        const bool measure = stats_.enabled() || wp_span_on();
         const std::chrono::steady_clock::time_point lookup_started =
             measure ? std::chrono::steady_clock::now() :
                       std::chrono::steady_clock::time_point();
@@ -15179,20 +15397,20 @@ public:
                     continue;
                 }
                 batch.complete_upto(end);
-                request_stats.ns_wait += lap();
+                request_stats.ns_wait += wp_span_took(WP_SPAN_PAGEIN_WAIT, request.layer, (uint32_t) trace_req, lap());
                 time_layer_ahead(request, request_stats);
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ c > 0, request_stats,
                     /* all_experts = */ true, /* force_dense = */ false,
                     beg, end);
-                request_stats.ns_pagein_compute += lap();
+                request_stats.ns_pagein_compute += wp_span_took(WP_SPAN_PAGEIN_COMPUTE, request.layer, (uint32_t) trace_req, lap());
             }
         }
         // Always: joins the reader threads, finalises ns_read and rethrows the
         // first read error. Cheap and already drained after the loop above.
         batch.complete();
-        request_stats.ns_wait += lap();
+        request_stats.ns_wait += wp_span_took(WP_SPAN_PAGEIN_WAIT, request.layer, (uint32_t) trace_req, lap());
         time_layer_ahead(request, request_stats);
         if (measure) {
             // bytes_read is set here, not at the lookup above: batch.bytes_read_
@@ -15243,7 +15461,7 @@ public:
                 request, pages, batch, /* hits = */ false,
                 /* add_previous = */ have_hits, request_stats);
         }
-        request_stats.ns_pagein_compute += lap();
+        request_stats.ns_pagein_compute += wp_span_took(WP_SPAN_PAGEIN_COMPUTE, request.layer, (uint32_t) trace_req, lap());
         if (measure_vk && !request.assignments.empty()) {
             request_stats.ns_vk_dispatch_path +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -15416,7 +15634,7 @@ public:
             response.wire_bytes = std::move(ml8_wire_partial_);
             response.dtype = PIPE_HIDDEN_ML8_4;
         }
-        request_stats.ns_encode = lap();
+        request_stats.ns_encode = wp_span_took(WP_SPAN_ENCODE, request.layer, (uint32_t) trace_req, lap());
         return response;
     }
 
@@ -15919,7 +16137,7 @@ private:
             std::chrono::steady_clock::now() - started).count();
         finalize_work_input_expected();
         if (request_stats != nullptr) {
-            request_stats->ns_final_sync += elapsed;
+            request_stats->ns_final_sync += wp_span_took(WP_SPAN_FINAL_SYNC, wp_span_ctx_layer, wp_span_ctx_seq, elapsed);
             if (stats_.enabled() && is_vulkan_backend()) {
                 request_stats->ns_vk_sync += elapsed;
             }
@@ -16170,7 +16388,7 @@ private:
         }
         const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
-        request_stats.ns_submit += elapsed;
+        request_stats.ns_submit += wp_span_took(WP_SPAN_GPU_SUBMIT, wp_span_ctx_layer, wp_span_ctx_seq, elapsed);
         if (stats_.enabled() && is_vulkan_backend()) {
             request_stats.ns_vk_graph_compute += elapsed;
         }
@@ -18762,6 +18980,8 @@ private:
     struct CpuTierJob {
         const pipe_expert_dispatch_req *       request = nullptr;
         uint32_t                               n_tokens = 0;   // request rows (miss-attr phase)
+        uint32_t                               span_seq = 0;   // WP_WORKER_SPAN_TRACE tags
+        int                                    span_layer = -1;
         std::shared_ptr<DemandRec>             demand_rec;     // WP_DEMAND_LOG (null when off)
         std::vector<size_t>                    index;   // assignment indices, ascending
         std::vector<const ExpertPage *>        pages;
@@ -18931,6 +19151,8 @@ private:
     void queue_cpu_tier_compute(const std::shared_ptr<CpuTierJob> & job,
                                 const pipe_expert_dispatch_req * request) noexcept {
         job->compute_queued = true;
+        job->span_seq   = wp_span_ctx_seq;
+        job->span_layer = wp_span_ctx_layer;
         if (request != nullptr) {
             job->request = request;
         } else {
@@ -18972,8 +19194,8 @@ private:
                          RequestStats & request_stats) {
         const auto t0 = std::chrono::steady_clock::now();
         wait_cpu_tier(*job);
-        request_stats.ns_cpu_tier_wait += (uint64_t) std::chrono::duration_cast<
-            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        request_stats.ns_cpu_tier_wait += wp_span_took(WP_SPAN_CPU_TIER_WAIT, wp_span_ctx_layer, wp_span_ctx_seq, (uint64_t) std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         if (job->error) {
             std::rethrow_exception(job->error);
         }
@@ -19476,8 +19698,8 @@ private:
                             if (!pr.failed.load(std::memory_order_relaxed)) {
                                 const auto t0 = std::chrono::steady_clock::now();
                                 cpu_tier_compute_one(*job, k, cpu.get(), galloc.get(), 1, pr.data);
-                                job->ns_compute += (uint64_t) std::chrono::duration_cast<
-                                    std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                                job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->pages[k]->layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
+                                    std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), job->pages[k]->expert);
                                 job->gu_done[k] = 1;
                                 ++job->n_gu_early;
                             }
@@ -19505,8 +19727,8 @@ private:
                             }
                             const auto t0 = std::chrono::steady_clock::now();
                             cpu_tier_compute_batch(*job, batch_ks, cpu.get(), galloc.get(), *batch_state);
-                            job->ns_compute += (uint64_t) std::chrono::duration_cast<
-                                std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                            job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->pages[batch_ks[0]]->layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), (int64_t) batch_ks.size());
                         } catch (...) {
                             std::lock_guard<std::mutex> lock(job->m);
                             if (!job->error) {
@@ -19527,8 +19749,8 @@ private:
                         const auto t0 = std::chrono::steady_clock::now();
                         cpu_tier_compute_one(*job, k, cpu.get(), galloc.get(),
                                              job->gu_done[k] ? 2 : 0, job->holds[k].data);
-                        job->ns_compute += (uint64_t) std::chrono::duration_cast<
-                            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                        job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->pages[k]->layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), job->pages[k]->expert);
                     } catch (...) {
                         std::lock_guard<std::mutex> lock(job->m);
                         if (!job->error) {
@@ -21861,7 +22083,7 @@ private:
             const uint64_t submit_elapsed =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - submit_started).count();
-            request_stats.ns_submit += submit_elapsed;
+            request_stats.ns_submit += wp_span_took(WP_SPAN_GPU_SUBMIT, wp_span_ctx_layer, wp_span_ctx_seq, submit_elapsed);
             if (measure_vk) {
                 request_stats.ns_vk_graph_compute += submit_elapsed;
             }
@@ -21880,7 +22102,7 @@ private:
                 const uint64_t fallback_elapsed =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - fallback_started).count();
-                request_stats.ns_submit += fallback_elapsed;
+                request_stats.ns_submit += wp_span_took(WP_SPAN_GPU_SUBMIT, wp_span_ctx_layer, wp_span_ctx_seq, fallback_elapsed);
                 if (measure_vk) {
                     request_stats.ns_vk_graph_compute += fallback_elapsed;
                 }
@@ -22032,7 +22254,7 @@ private:
         const uint64_t readback_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - readback_started).count();
-        request_stats.ns_readback += readback_elapsed;
+        request_stats.ns_readback += wp_span_took(WP_SPAN_READBACK, wp_span_ctx_layer, wp_span_ctx_seq, readback_elapsed, (int64_t) result_bytes);
         if (stats_.enabled() && is_vulkan_backend()) {
             request_stats.ns_vk_readback += readback_elapsed;
         }
@@ -26835,6 +27057,8 @@ struct WpPipelineFrame {
     // latter is what RequestStats::ns_recv_body has ever meant. 0 when
     // time_recv is false, same as the direct path.
     uint64_t              ns_recv_body = 0;
+    // WP_WORKER_SPAN_TRACE: CLOCK_REALTIME ns when the reader finished this frame.
+    int64_t               span_arrive_ns = 0;
     // WP_REQ_LOG_TIMELINE=1 only (0 otherwise): steady_clock ns (since
     // epoch) at the instant this frame was pushed onto the queue -- i.e.
     // right after the reader's own recv completed, same instant as
@@ -26997,6 +27221,7 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
         f.ok = pipe_recv_frame(socket, f.type, f.seq_id, f.payload,
                                time_recv ? &hdr_done_ns : nullptr);
         f.hdr_done_ns = hdr_done_ns;
+        if (wp_span_on()) { f.span_arrive_ns = wp_now_realtime_ns(); }
         if (time_recv && hdr_done_ns != 0) {
             const uint64_t now_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -27547,6 +27772,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // by the reader thread (see WpPipelineFrame::ns_recv_body) -- unused on
     // the direct path.
     uint64_t       pipeline_ns_recv_body = 0;
+    int64_t        pipeline_span_arrive = 0;
     // WP_REQ_LOG_TIMELINE=1 (and WP_WORKER_PIPELINE=1): the reader-queue wait
     // for the current frame -- now() at pop time minus WpPipelineFrame::
     // queued_at_ns (the reader's push-time reading). 0 on the direct path
@@ -27722,6 +27948,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                      payload     = std::move(f.payload);
                      hdr_done_ns = f.hdr_done_ns;
                      pipeline_ns_recv_body = f.ns_recv_body;
+                     pipeline_span_arrive = f.span_arrive_ns;
                      if (req_log_timeline && f.queued_at_ns != 0) {
                          const uint64_t now_ns = (uint64_t) std::chrono::duration_cast<
                              std::chrono::nanoseconds>(
@@ -27757,6 +27984,17 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             frame_trace_enabled(), (int) type,
             frame_trace_enabled() ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point() };
+        // WP_WORKER_SPAN_TRACE: REQ = frame arrival -> response sent. Dispatch-type
+        // frames only; layer/aux are filled in by the DISPATCH_REQ branch below.
+        WpSpanReqScope req_span(
+            wp_span_on() && (type == PIPE_EXPERT_DISPATCH_REQ ||
+                             type == PIPE_EXPERT_SHM_DISPATCH_REQ ||
+                             type == PIPE_EXPERT_DISPATCH_BEGIN ||
+                             type == PIPE_EXPERT_DISPATCH_ACTS ||
+                             type == PIPE_EXPERT_DISPATCH_ACTS_PUBLISH ||
+                             type == PIPE_EXPERT_DISPATCH_ACTS_REF ||
+                             type == PIPE_EXPERT_DISPATCH_CHUNK),
+            (uint32_t) seq_id, pipeline_on ? pipeline_span_arrive : 0);
         // Segment stamps. Reuse the scope's own start so the two agree exactly.
         const bool seg_trace = frame_trace_enabled();
         const std::chrono::steady_clock::time_point t_frame =
@@ -27885,7 +28123,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                                    const pipe_expert_partial & partial,
                                    std::chrono::steady_clock::time_point ready_at,
                                    RequestStats & request_stats) {
-                const bool measure_stream = worker.stats_enabled();
+                const bool measure_stream = worker.stats_enabled() || wp_span_on();
                 if (measure_stream &&
                     (stream_last_ready == std::chrono::steady_clock::time_point() ||
                      ready_at > stream_last_ready)) {
@@ -27919,6 +28157,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         std::chrono::nanoseconds>(std::chrono::steady_clock::now() - send_started).count();
                     request_stats.ns_send += ns_send;
                     request_stats.ns_resp_send += ns_send;
+                    wp_span_end(WP_SPAN_SEND, partial.layer, (uint32_t) seq_id, ns_send,
+                                (int64_t) part_index);
                     request_stats.ns_stream_overlap =
                         (stream_last_ready > stream_first_sent)
                             ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -28603,6 +28843,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             // WP_HOST_TIER_SCORE_FROM_REQ: feed the hybrid score table from this
             // request's routing weights (inline; a few hundred bytes of work).
             worker.note_request_scores(request.layer, request.assignments, request.n_tokens);
+            req_span.layer = request.layer;
+            req_span.aux   = request.n_tokens;
             RequestStats request_stats;
             if (seg_trace) {
                 request_stats.ns_lock_wait =
@@ -28662,7 +28904,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const std::chrono::steady_clock::time_point t_dispatched =
                 seg_trace ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point();
-            const bool measure = worker.stats_enabled();
+            const bool measure = worker.stats_enabled() || wp_span_on();
             const std::chrono::steady_clock::time_point send_started =
                 measure ? std::chrono::steady_clock::now() :
                           std::chrono::steady_clock::time_point();
@@ -28686,6 +28928,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     request_stats.ns_send =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             t_sent - send_started).count();
+                    wp_span_end(WP_SPAN_SEND, request.layer, (uint32_t) seq_id, request_stats.ns_send, 0);
                 }
                 request_stats.ns_recv_body  = ns_recv_body_frame;
                 request_stats.ns_req_decode = ns_req_decode_frame;
@@ -29045,6 +29288,7 @@ struct ParkControl {
                         std::fprintf(stderr, "wp expert worker: stop snapshot FAILED: %s\n",
                                      err.c_str());
                     }
+                    wp_span_flush(true);   // WP_WORKER_SPAN_TRACE: no atexit on _exit
                     std::fflush(stderr);
                     std::fflush(stdout);
                     _exit(0);
