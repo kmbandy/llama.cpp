@@ -34,6 +34,9 @@ static constexpr const char * CHILD_ARG_SLOT_AUTOSAVE_DIR       = "--slot-autosa
 static constexpr const char * CHILD_ARG_SLOT_AUTOSAVE_BUDGET_MB = "--slot-autosave-budget-mb";
 // stop-timeout floor for a kv-preserve child, so a multi-slot save is not SIGKILLed
 static constexpr int ROUTER_KV_PRESERVE_STOP_TIMEOUT_S = 60;
+// largest kv-preserve-mb: MiB -> bytes must fit in uint64 (the child's --slot-autosave-budget-mb
+// is parsed with the same cap in common/arg.cpp)
+static constexpr uint64_t ROUTER_KV_PRESERVE_MB_MAX = UINT64_MAX / (1024ull * 1024ull);
 
 enum router_kind {
     ROUTER_KIND_MODEL    = 0, // a normal router-spawned llama-server

@@ -904,7 +904,7 @@ struct common_params {
     std::string slot_save_path;
     std::string slot_autosave;      // MAD-LAB: file path; slot 0 state is saved on graceful shutdown and restored at startup (empty = off)
     std::string slot_autosave_dir;  // MAD-LAB: directory with one state file per slot; all slots saved/restored (empty = off, exclusive with slot_autosave)
-    int32_t     slot_autosave_budget_mb = 0; // MAD-LAB: LRU prune budget for the parent of slot_autosave_dir, MiB (0 = unlimited)
+    uint64_t    slot_autosave_budget_mb = 0; // MAD-LAB: LRU prune budget for the parent of slot_autosave_dir, MiB (0 = unlimited); capped at UINT64_MAX / 1048576 by the parser
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

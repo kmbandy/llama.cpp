@@ -58,6 +58,16 @@ bool is_regular_nofollow(const fs::path & p) {
     return !ec && fs::is_regular_file(st);
 }
 
+// True for a filesystem root ("/") or an empty path. A lexically normal path whose parent is
+// itself is a root; a root must never be used as an alias dir or as a prune root.
+bool is_fs_root(const fs::path & p) {
+    fs::path q = p.lexically_normal();
+    while (q.filename().empty() && q.parent_path() != q) {
+        q = q.parent_path();
+    }
+    return q.empty() || q.parent_path() == q;
+}
+
 // Normalises a caller-supplied alias dir before any symlink check or use. lexically_normal()
 // folds "." components ("a/link/." -> "a/link/"), then trailing separators are stripped so
 // symlink_status() judges the entry itself: symlink_status("link/") resolves the link and
@@ -73,7 +83,7 @@ bool normalise_alias_dir(const fs::path & in, fs::path & out) {
     while (p.filename().empty() && p.parent_path() != p) {
         p = p.parent_path();
     }
-    if (p.empty() || p.filename() == ".") {
+    if (p.empty() || p.filename() == "." || is_fs_root(p)) {
         return false;
     }
     out = p;
@@ -140,27 +150,28 @@ bool older_first(const alias_dir & a, const alias_dir & b) {
     return a.path.filename() < b.path.filename();
 }
 
-// A slot store is a dir with a .last_used marker, or a dir whose entries are all regular
-// files named slot-<id>.wpslot or *.tmp (at least one). Anything else is foreign.
+// slot-<id>.wpslot.tmp: the temp name a slot save writes before its rename.
+bool is_slot_tmp_name(const std::string & name) {
+    const std::string tmp = ".tmp";
+    if (name.size() <= tmp.size() || name.compare(name.size() - tmp.size(), tmp.size(), tmp) != 0) {
+        return false;
+    }
+    int id = 0;
+    return parse_slot_name(name.substr(0, name.size() - tmp.size()), id);
+}
+
+// A slot store is a dir in which EVERY entry is a regular file named .last_used,
+// slot-<id>.wpslot or slot-<id>.wpslot.tmp, and which holds at least one such entry.
+// A dir with any other entry (foreign file, subdir, symlink, other *.tmp) is foreign: it is
+// never deleted and never counted. Ruling 8.
 bool is_slot_store_dir(const fs::path & p, bool & marked, fs::file_time_type & last_used) {
     marked = false;
-    const fs::path mark = p / LAST_USED;
-    if (is_regular_nofollow(mark)) {
-        std::error_code mec;
-        const fs::file_time_type t = fs::last_write_time(mark, mec);
-        if (!mec) {
-            marked = true;
-            last_used = t;
-            return true;
-        }
-    }
-
-    size_t slot_files = 0;
     std::error_code ec;
     fs::directory_iterator it(p, ec);
     if (ec) {
         return false;
     }
+    size_t members = 0;
     const fs::directory_iterator end;
     for (; it != end; it.increment(ec)) {
         if (ec) {
@@ -171,14 +182,23 @@ bool is_slot_store_dir(const fs::path & p, bool & marked, fs::file_time_type & l
             return false;
         }
         const std::string name = e.filename().string();
-        int id = 0;
-        const bool is_tmp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
-        if (!parse_slot_name(name, id) && !is_tmp) {
-            return false;
+        if (name == LAST_USED) {
+            std::error_code mec;
+            const fs::file_time_type t = fs::last_write_time(e, mec);
+            if (mec) {
+                return false;
+            }
+            marked = true;
+            last_used = t;
+        } else {
+            int id = 0;
+            if (!parse_slot_name(name, id) && !is_slot_tmp_name(name)) {
+                return false;
+            }
         }
-        slot_files++;
+        members++;
     }
-    return slot_files > 0;
+    return members > 0;
 }
 
 fs::path canon(const fs::path & p) {
@@ -280,8 +300,21 @@ void slot_store_touch(const std::string & dir) {
     }
 }
 
+bool slot_store_alias_dir_ok(const std::string & dir) {
+    fs::path d;
+    if (!normalise_alias_dir(fs::path(dir), d)) {
+        return false;
+    }
+    return !is_symlink_nofollow(d);
+}
+
 uint64_t slot_store_prune(const std::string & root, const std::string & keep_dir, uint64_t budget_bytes) {
     if (budget_bytes == 0) {
+        return 0;
+    }
+    // a prune root of "/" (or empty) would scan the whole filesystem: refuse
+    if (is_fs_root(fs::path(root))) {
+        LOG_WRN("slot-store: refusing to prune root '%s': not a usable directory\n", root.c_str());
         return 0;
     }
 

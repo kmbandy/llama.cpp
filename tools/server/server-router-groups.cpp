@@ -84,16 +84,31 @@ router_group_section router_group_parse_section(const common_preset & preset, co
     bool has_kv_preserve_mb = false;
     if (preset.get_option(ROUTER_ARG_KV_PRESERVE_MB, val) && !string_strip(val).empty()) {
         val = string_strip(val);
-        bool digits = val.size() <= 18;
+        // the child parses this as uint64 whole MiB; the largest accepted value is the one whose
+        // MiB -> bytes conversion still fits in uint64 (ROUTER_KV_PRESERVE_MB_MAX)
+        bool ok = !val.empty();
+        uint64_t mb = 0;
         for (char c : val) {
-            digits = digits && c >= '0' && c <= '9';
+            if (!ok) {
+                break;
+            }
+            if (c < '0' || c > '9') {
+                ok = false;
+                break;
+            }
+            const uint64_t d = (uint64_t) (c - '0');
+            if (mb > (ROUTER_KV_PRESERVE_MB_MAX - d) / 10) {
+                ok = false; // mb * 10 + d would exceed the cap
+                break;
+            }
+            mb = mb * 10 + d;
         }
-        if (!digits) {
+        if (!ok) {
             throw std::runtime_error(string_format(
-                "preset '%s': invalid kv-preserve-mb '%s' (must be a non-negative whole number of MiB)",
-                name.c_str(), val.c_str()));
+                "preset '%s': invalid kv-preserve-mb '%s' (must be a non-negative whole number of MiB, at most %llu)",
+                name.c_str(), val.c_str(), (unsigned long long) ROUTER_KV_PRESERVE_MB_MAX));
         }
-        s.kv_preserve_mb = std::stoull(val);
+        s.kv_preserve_mb = mb;
         has_kv_preserve_mb = true;
     }
     if (preset.get_option(ROUTER_ARG_KV_PRESERVE, val)) {

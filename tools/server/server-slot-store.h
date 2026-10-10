@@ -24,10 +24,16 @@ std::vector<int> slot_store_list(const std::string & dir);
 // so an alias dir can never redirect writes outside root.
 void slot_store_touch(const std::string & dir);
 
+// True when dir is usable as an alias dir for writes: it normalises (same rules as touch/list,
+// so "<link>/." and trailing separators are judged on the real entry), is not "/" or empty, and
+// is not a symlink. The save path refuses (logs, writes nothing) when this is false.
+bool slot_store_alias_dir_ok(const std::string & dir);
+
 // Deletes slot-store dirs directly under root, least recently used first, until the bytes of
-// slot-store dirs under root are <= budget_bytes. A slot-store dir has a .last_used marker, or
-// holds only regular files named slot-<id>.wpslot / *.tmp (at least one). Any other dir is
-// foreign: never deleted and not counted (logged as skipped). An unmarked slot-store dir counts
-// as oldest. Symlinks are never followed or deleted. keep_dir is never deleted.
-// budget_bytes == 0 means unlimited (no-op). Returns the bytes freed.
+// slot-store dirs under root are <= budget_bytes. A slot-store dir is one in which EVERY entry is
+// a regular file named .last_used, slot-<id>.wpslot or slot-<id>.wpslot.tmp, holding at least one
+// such entry. Any other dir (a foreign file, subdir, symlink, other *.tmp, or empty) is foreign:
+// never deleted and not counted (logged as skipped). An unmarked slot-store dir counts as oldest.
+// Symlinks are never followed or deleted. keep_dir is never deleted. A root that is "/" or empty
+// is refused. budget_bytes == 0 means unlimited (no-op). Returns the bytes freed.
 uint64_t slot_store_prune(const std::string & root, const std::string & keep_dir, uint64_t budget_bytes);

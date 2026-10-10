@@ -69,6 +69,24 @@ static void test_slot_autosave_dir_flags() {
         common_params p;
         assert(!parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave-budget-mb", "-1"}, p));
     }
+    // I2: the budget is a 64-bit unsigned whole MiB, capped so MiB -> bytes cannot overflow
+    {
+        common_params p;
+        assert(parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave-budget-mb", "17592186044415"}, p));
+        assert(p.slot_autosave_budget_mb == 17592186044415ull);
+    }
+    {
+        common_params p;
+        assert(!parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave-budget-mb", "17592186044416"}, p));
+    }
+    {
+        common_params p;
+        assert(!parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave-budget-mb", "18446744073709551615"}, p));
+    }
+    {
+        common_params p;
+        assert(!parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave-budget-mb", "12x"}, p));
+    }
 }
 
 int main() {
@@ -184,14 +202,98 @@ int main() {
         const fs::path r = root / "sym";
         write_bytes(r / "s" / "slot-0.wpslot", 1000);
         mark_used(r / "s", base);
-        fs::create_directory_symlink(outside, r / "s" / "link");
+        // a marked dir holding a symlink is foreign (ruling 8): kept, not counted
+        write_bytes(r / "linked" / "slot-0.wpslot", 1000);
+        mark_used(r / "linked", base - std::chrono::hours(1));
+        fs::create_directory_symlink(outside, r / "linked" / "link");
         fs::create_directory_symlink(outside, r / "evil");
 
         const uint64_t freed = slot_store_prune(r.string(), (r / "none").string(), 1);
         assert(freed == 1000);
         assert(!fs::exists(r / "s"));
+        assert(fs::is_directory(r / "linked"));
+        assert(fs::is_symlink(r / "linked" / "link"));
         assert(fs::is_symlink(r / "evil"));
         assert(fs::exists(outside / "victim.bin"));
+    }
+
+    // ruling 8: a dir is a slot store only if EVERY entry is .last_used, slot-<id>.wpslot or
+    // slot-<id>.wpslot.tmp (regular files) and it holds at least one of them.
+    {
+        // marked dir with a foreign file survives a tight budget (not deleted, not counted)
+        const fs::path r = root / "inv-foreign-marked";
+        write_bytes(r / "m" / "slot-0.wpslot", 1000);
+        write_bytes(r / "m" / "notes.txt", 1000);
+        mark_used(r / "m", base);
+
+        assert(slot_store_prune(r.string(), (r / "none").string(), 1) == 0);
+        assert(fs::exists(r / "m" / "notes.txt"));
+        assert(fs::exists(r / "m" / "slot-0.wpslot"));
+    }
+    {
+        // dir with only slot files + marker (incl. a slot tmp) is pruned
+        const fs::path r = root / "inv-slots-only";
+        write_bytes(r / "ok" / "slot-0.wpslot", 1000);
+        write_bytes(r / "ok" / "slot-1.wpslot.tmp", 500);
+        mark_used(r / "ok", base);
+
+        assert(slot_store_prune(r.string(), (r / "none").string(), 1) == 1500);
+        assert(!fs::exists(r / "ok"));
+    }
+    {
+        // a foreign *.tmp blocks deletion of its dir, and is not counted
+        const fs::path r = root / "inv-foreign-tmp";
+        write_bytes(r / "t" / "slot-0.wpslot", 1000);
+        write_bytes(r / "t" / "report.tmp", 1000);
+        write_bytes(r / "u" / "slot-0.wpslot", 1000);
+        write_bytes(r / "u" / "slot-2.tmp", 1000);
+
+        assert(slot_store_prune(r.string(), (r / "none").string(), 1) == 0);
+        assert(fs::exists(r / "t" / "report.tmp"));
+        assert(fs::exists(r / "u" / "slot-2.tmp"));
+    }
+    {
+        // a subdir inside a slot-looking dir makes it foreign
+        const fs::path r = root / "inv-subdir";
+        write_bytes(r / "d" / "slot-0.wpslot", 1000);
+        fs::create_directories(r / "d" / "sub");
+
+        assert(slot_store_prune(r.string(), (r / "none").string(), 1) == 0);
+        assert(fs::exists(r / "d" / "sub"));
+    }
+    {
+        // the root "/" (or empty) is refused: nothing is scanned or deleted
+        assert(slot_store_prune("/", "", 1) == 0);
+        assert(slot_store_prune("", "", 1) == 0);
+        assert(slot_store_prune("//", "", 1) == 0);
+    }
+
+    // ruling 8 + I1: the alias-dir helper used by the save path
+    {
+        const fs::path outside = root_base / "alias-ok-target";
+        fs::create_directories(outside);
+        const fs::path r = root / "alias-ok";
+        fs::create_directories(r / "plain");
+        fs::create_directory_symlink(outside, r / "link");
+
+        assert(slot_store_alias_dir_ok((r / "plain").string()));
+        assert(slot_store_alias_dir_ok((r / "plain").string() + "/"));
+        assert(slot_store_alias_dir_ok((r / "fresh").string()));   // need not exist yet
+        assert(!slot_store_alias_dir_ok((r / "link").string()));
+        assert(!slot_store_alias_dir_ok((r / "link").string() + "/"));
+        assert(!slot_store_alias_dir_ok((r / "link").string() + "/."));
+        assert(!slot_store_alias_dir_ok((r / "plain" / ".." / "link").string()));
+        assert(!slot_store_alias_dir_ok("/"));
+        assert(!slot_store_alias_dir_ok("//"));
+        assert(!slot_store_alias_dir_ok(""));
+        assert(!slot_store_alias_dir_ok("."));
+        assert(!slot_store_alias_dir_ok("../escape"));
+    }
+
+    // I3: touch refuses the filesystem root and writes nothing there
+    {
+        slot_store_touch("/");
+        assert(!fs::exists("/.last_used"));
     }
 
     // symlinked alias dir: touch refuses and writes nothing outside root; list returns {}

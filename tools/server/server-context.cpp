@@ -3609,6 +3609,12 @@ private:
             SRV_INF("%s", "slot autosave-dir: skipped, server is sleeping (no context)\n");
             return;
         }
+        // same normalised symlink check the store uses: never write through an alias dir
+        // that is a symlink (restore and prune refuse it too), so nothing is saved there
+        if (!slot_store_alias_dir_ok(dir)) {
+            SRV_WRN("slot autosave-dir: refusing to save into '%s' (symlink, '/' or not a plain dir); nothing saved\n", dir.c_str());
+            return;
+        }
 
         for (server_slot & slot : slots) {
             const std::string path = slot_store_file(dir, slot.id);
@@ -3639,6 +3645,9 @@ private:
             } catch (const std::exception & err) {
                 // serialize() throws on multimodal chunks; those slots are skipped, not fatal
                 SRV_WRN("slot autosave-dir: slot %d not saved, skipped (%s)\n", slot.id, err.what());
+            } catch (...) {
+                // a non-std throw must not abort the remaining slots or shutdown
+                SRV_WRN("slot autosave-dir: slot %d not saved, skipped (unknown exception)\n", slot.id);
             }
         }
 

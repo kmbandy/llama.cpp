@@ -242,6 +242,33 @@ int main() {
         assert(err.find("kv-preserve-mb") != std::string::npos && err.find("'m'") != std::string::npos);
     }
 
+    // I2: kv-preserve-mb is capped so MiB -> bytes fits in uint64 (UINT64_MAX / 1 MiB).
+    // The largest value is accepted and carried through; one more, or any 20+ digit value, is refused.
+    {
+        const std::string err = parse_error("[m]\nmodel = /m.gguf\nkv-preserve = /kv\nkv-preserve-mb = 17592186044416\n");
+        assert(err.find("kv-preserve-mb") != std::string::npos && err.find("'m'") != std::string::npos);
+    }
+    {
+        const std::string err = parse_error("[m]\nmodel = /m.gguf\nkv-preserve = /kv\nkv-preserve-mb = 18446744073709551615\n");
+        assert(err.find("kv-preserve-mb") != std::string::npos);
+    }
+    {
+        const std::string err = parse_error("[m]\nmodel = /m.gguf\nkv-preserve = /kv\nkv-preserve-mb = 99999999999999999999\n");
+        assert(err.find("kv-preserve-mb") != std::string::npos);
+    }
+    {
+        const std::string path = "test-router-kv-preserve-max.ini";
+        {
+            std::ofstream f(path);
+            f << "[m]\nmodel = /m.gguf\nkv-preserve = /kv\nkv-preserve-mb = 17592186044415\n";
+        }
+        std::vector<router_group_section> sections;
+        load_presets(path, &sections);
+        std::remove(path.c_str());
+        assert(find(sections, "m").kv_preserve_mb == 17592186044415ull);
+        assert(17592186044415ull * 1024ull * 1024ull <= UINT64_MAX);
+    }
+
     // alias sanitisation: anything outside [A-Za-z0-9._-] becomes '_'
     assert(router_kv_preserve_dirname("qwen3.5-27b_Q4") == "qwen3.5-27b_Q4");
     assert(router_kv_preserve_dirname("my model/x:y") == "my_model_x_y");

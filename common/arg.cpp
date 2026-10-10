@@ -4258,11 +4258,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--slot-autosave-budget-mb"}, "N",
         "LRU budget in MiB for the slot autosave directories under the parent of --slot-autosave-dir (default: 0, unlimited)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("--slot-autosave-budget-mb must be >= 0");
+        [](common_params & params, const std::string & value) {
+            // unsigned 64-bit whole MiB; capped so that MiB -> bytes cannot overflow uint64
+            const uint64_t max_mb = UINT64_MAX / (1024ull * 1024ull);
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::invalid_argument("--slot-autosave-budget-mb must be a non-negative whole number of MiB");
             }
-            params.slot_autosave_budget_mb = value;
+            uint64_t mb = 0;
+            for (const char c : value) {
+                const uint64_t d = (uint64_t) (c - '0');
+                if (mb > (max_mb - d) / 10) {
+                    throw std::invalid_argument("--slot-autosave-budget-mb is too large (max " + std::to_string(max_mb) + ")");
+                }
+                mb = mb * 10 + d;
+            }
+            params.slot_autosave_budget_mb = mb;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE_BUDGET_MB"));
     add_opt(common_arg(
